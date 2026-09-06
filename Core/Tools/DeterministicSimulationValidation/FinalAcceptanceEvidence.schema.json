@@ -10,18 +10,19 @@
     "runtimeClosure", "attachments", "details"
   ],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "type": "integer", "const": 1 },
     "evidenceKind": {
+      "type": "string",
       "enum": [
         "deterministic-runtime", "replay-determinism", "fresh-ai",
         "performance-scaling", "mixed-worker-multiplayer",
         "combined-stage4-stage5-installed-runtime", "premium-review", "manual-acceptance"
       ]
     },
-    "status": { "const": "passed" },
+    "status": { "type": "string", "const": "passed" },
     "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-    "title": { "enum": ["Generals", "ZeroHour", "Both"] },
-    "architecture": { "const": "x64" },
+    "title": { "type": "string", "enum": ["Generals", "ZeroHour", "Both"] },
+    "architecture": { "type": "string", "const": "x64" },
     "artifactSetSha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
     "recordedUtc": { "type": "string", "format": "date-time" },
     "cohortNonce": { "type": "string", "format": "uuid" },
@@ -40,15 +41,17 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["role", "path", "sha256", "trustDomain"],
+        "required": ["role", "title", "path", "sha256", "trustDomain"],
         "properties": {
           "role": { "type": "string", "minLength": 1 },
+          "title": { "type": "string", "enum": ["Generals", "ZeroHour", "Both"] },
           "path": { "$ref": "#/$defs/relativePath" },
           "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
           "trustDomain": {
+            "type": "string",
             "enum": [
               "executable", "host-runner", "reviewed-fixture", "premium-review",
-              "manual-approval"
+              "manual-approval", "installed-runtime"
             ]
           }
         }

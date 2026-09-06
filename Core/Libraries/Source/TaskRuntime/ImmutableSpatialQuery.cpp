@@ -16,6 +16,9 @@ ImmutableSpatialExecutionOptions::ImmutableSpatialExecutionOptions()
 	: workerCount(1), dispatch(0), dispatchContext(0), isCancelled(0),
 	  cancellationContext(0), resolveArenaGeneration(0),
 	  resolveObjectGeneration(0), generationContext(0)
+#if defined(_WIN64)
+	, checkpoint(0), observeRange(0), checkpointContext(0)
+#endif
 {
 }
 
@@ -656,11 +659,35 @@ struct QueryBatchContext
 	QueryPhase phase;
 };
 
+#if defined(_WIN64)
+bool queryCheckpointCancelled(QueryBatchContext &context, unsigned range,
+	unsigned query, ImmutableSpatialCheckpointSite site, unsigned radius)
+{
+	const bool actual = cancellationRequested(*context.options);
+	return context.options->checkpoint != 0 ? context.options->checkpoint(
+		context.options->checkpointContext, static_cast<unsigned>(context.phase) + 1,
+		range, query, site, radius, actual) : actual;
+}
+
+void observeQueryRange(QueryBatchContext &context, unsigned range,
+	unsigned begin, unsigned end, bool entry, ImmutableSpatialStatus status)
+{
+	if (context.options->observeRange != 0)
+		context.options->observeRange(context.options->checkpointContext,
+			static_cast<unsigned>(context.phase) + 1, range, begin, end, entry, status);
+}
+#endif
+
 ImmutableSpatialStatus executeOneQuery(QueryBatchContext &context,
 	ImmutableSpatialUInt32 queryIndex,
 	ImmutableSpatialUInt32 rangeIndex)
 {
+#if defined(_WIN64)
+	if (queryCheckpointCancelled(context, rangeIndex, queryIndex,
+		IMMUTABLE_SPATIAL_CHECKPOINT_QUERY_ENTRY, 0))
+#else
 	if (cancellationRequested(*context.options))
+#endif
 		return IMMUTABLE_SPATIAL_CANCELLED;
 	const ArenaView &view = *context.view;
 	const ImmutableSpatialQuery &query = context.queries[queryIndex];
@@ -674,7 +701,12 @@ ImmutableSpatialStatus executeOneQuery(QueryBatchContext &context,
 	ImmutableSpatialUInt32 radiusIndex;
 	for (radiusIndex = 0; radiusIndex <= query.maximumRadius; ++radiusIndex)
 	{
+#if defined(_WIN64)
+		if (queryCheckpointCancelled(context, rangeIndex, queryIndex,
+			IMMUTABLE_SPATIAL_CHECKPOINT_RADIUS, radiusIndex))
+#else
 		if (cancellationRequested(*context.options))
+#endif
 			return IMMUTABLE_SPATIAL_CANCELLED;
 		const ImmutableSpatialRadiusRecord &radius = view.radii[radiusIndex];
 		if (radius.offsetBegin > view.header->offsetCount ||
@@ -791,6 +823,9 @@ bool executeQueryRange(void *opaque, ImmutableSpatialUInt32 rangeIndex)
 	const ImmutableSpatialUInt32 count = quotient +
 		(rangeIndex < remainder ? 1u : 0u);
 	const ImmutableSpatialUInt32 end = begin + count;
+#if defined(_WIN64)
+	observeQueryRange(context, rangeIndex, begin, end, true, IMMUTABLE_SPATIAL_SUCCESS);
+#endif
 	ImmutableSpatialUInt32 queryIndex;
 	for (queryIndex = begin; queryIndex < end; ++queryIndex)
 	{
@@ -799,8 +834,16 @@ bool executeQueryRange(void *opaque, ImmutableSpatialUInt32 rangeIndex)
 		context.scratch->states[queryIndex] =
 			static_cast<ImmutableSpatialUInt32>(status) + 1;
 		if (status != IMMUTABLE_SPATIAL_SUCCESS)
+		{
+#if defined(_WIN64)
+			observeQueryRange(context, rangeIndex, begin, end, false, status);
+#endif
 			return false;
+		}
 	}
+#if defined(_WIN64)
+	observeQueryRange(context, rangeIndex, begin, end, false, IMMUTABLE_SPATIAL_SUCCESS);
+#endif
 	return true;
 }
 

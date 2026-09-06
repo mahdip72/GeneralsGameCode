@@ -73,6 +73,8 @@ public:
 
 	class AppendLockClass : public VertexBufferLockClass
 	{
+		unsigned StartVertex;
+		unsigned VertexRange;
 	public:
 		AppendLockClass(VertexBufferClass *vertex_buffer,
 			unsigned start_index, unsigned index_range);
@@ -186,6 +188,8 @@ public:
 		unsigned char **data, unsigned long flags);
 	long Unlock();
 #if defined(_WIN64)
+	bool Acquire_Native_Vertex_Buffer(
+		rts::render::GpuHandle *validated) const;
 	bool Acquire_Native_Vertex_Buffer(unsigned int stride, unsigned int offset,
 		unsigned int start_vertex, unsigned int vertex_count,
 		rts::render::GpuHandle *validated) const;
@@ -223,11 +227,16 @@ class SortingVertexBufferClass : public VertexBufferClass
 	friend class VertexBufferClass::WriteLockClass;
 	friend class VertexBufferClass::AppendLockClass;
 	VertexFormatXYZNDUV2 *VertexBuffer;
+	unsigned short InitializedVertexCount;
 protected:
 	virtual ~SortingVertexBufferClass() override;
 public:
 	SortingVertexBufferClass(unsigned short VertexCount);
 	const VertexFormatXYZNDUV2 *Get_Vertex_Data() const { return VertexBuffer; }
+	unsigned Get_Initialized_Vertex_Count() const
+	{
+		return InitializedVertexCount;
+	}
 };
 
 #endif

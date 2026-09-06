@@ -135,11 +135,14 @@ void testTerminalSealStillRejectsWorldReset()
 }
 }
 
+int RunCollisionNativeBypassTitleTests();
+
 int main()
 {
 	testRepeatedFrameZeroTraversal(0, 0);
 	testRepeatedFrameZeroTraversal(9, 0);
 	testNormalFramesAndGameplayOrder();
 	testTerminalSealStillRejectsWorldReset();
-	return failures == 0 ? 0 : 1;
+	const int nativeFailures = RunCollisionNativeBypassTitleTests();
+	return failures == 0 && nativeFailures == 0 ? 0 : 1;
 }

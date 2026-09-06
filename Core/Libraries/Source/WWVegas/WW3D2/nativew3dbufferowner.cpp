@@ -1,4 +1,5 @@
 #include "nativew3dbufferowner.h"
+#include "Renderer/RenderGameClientNative.h"
 
 #include <cstring>
 #include <limits.h>
@@ -25,6 +26,7 @@ bool IsSupportedUpdateMode(RenderBufferUpdateMode mode)
 
 RenderResult BindNativeW3DBufferResources(NativeW3DResources *resources)
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (resources == 0 || !resources->IsOwnerThread() ||
 		(g_nativeW3DBufferResources != 0 &&
 		 g_nativeW3DBufferResources != resources))
@@ -48,6 +50,7 @@ RenderResult BindNativeW3DBufferResources(NativeW3DResources *resources)
 
 RenderResult UnbindNativeW3DBufferResources(NativeW3DResources *resources)
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (g_nativeW3DBufferResources == 0)
 	{
 		return RENDER_RESULT_OK;
@@ -61,8 +64,20 @@ RenderResult UnbindNativeW3DBufferResources(NativeW3DResources *resources)
 	return RENDER_RESULT_OK;
 }
 
+void InvalidateNativeW3DBufferResources(NativeW3DResources *resources)
+{
+	NativeGameRenderOwnerScope ownerScope;
+	if (resources != 0 && g_nativeW3DBufferResources == resources)
+	{
+		// Metadata only: the owner lifecycle gate has already quiesced every
+		// native buffer operation before this exact publication is removed.
+		g_nativeW3DBufferResources = 0;
+	}
+}
+
 bool IsNativeW3DBufferOwnerThread()
 {
+	NativeGameRenderOwnerScope ownerScope;
 	return g_nativeW3DBufferResources != 0 &&
 		g_nativeW3DBufferResources->IsOwnerThread();
 }
@@ -93,6 +108,7 @@ NativeW3DBufferOwner::~NativeW3DBufferOwner()
 RenderResult NativeW3DBufferOwner::Create(
 	const BufferDescriptor &descriptor)
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (m_resources != 0 || m_handle.isValid() || m_locked ||
 		descriptor.byteCount == 0 || descriptor.stride == 0 ||
 		(descriptor.binding != RENDER_BUFFER_VERTEX &&
@@ -292,6 +308,7 @@ RenderResult NativeW3DBufferOwner::RecreateForDiscard()
 RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 	size_t byteCount, RenderBufferUpdateMode mode, void **data)
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (data == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -360,6 +377,7 @@ RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 
 RenderResult NativeW3DBufferOwner::Unlock()
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (!m_locked)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -389,6 +407,7 @@ RenderResult NativeW3DBufferOwner::AcquireVertexRange(unsigned int stride,
 	unsigned int offset, unsigned int startVertex, unsigned int vertexCount,
 	GpuHandle *validated) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (validated == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -410,10 +429,35 @@ RenderResult NativeW3DBufferOwner::AcquireVertexRange(unsigned int stride,
 		startVertex, vertexCount, validated);
 }
 
+RenderResult NativeW3DBufferOwner::AcquireVertexBinding(
+	GpuHandle *validated) const
+{
+	NativeGameRenderOwnerScope ownerScope;
+	if (validated == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*validated = GpuHandle();
+	NativeW3DResources *resources = ActiveResources();
+	ObserveAuthorityFailure(resources);
+	if (resources == 0 || m_locked || m_failedMutation ||
+		!m_handle.isValid() || !resources->IsValid(m_handle))
+	{
+		return RENDER_RESULT_FAILED;
+	}
+	if (m_descriptor.binding != RENDER_BUFFER_VERTEX)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*validated = m_handle;
+	return RENDER_RESULT_OK;
+}
+
 RenderResult NativeW3DBufferOwner::AcquireIndexRange(RenderFormat format,
 	unsigned int offset, unsigned int startIndex, unsigned int indexCount,
 	GpuHandle *validated) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (validated == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -437,6 +481,30 @@ RenderResult NativeW3DBufferOwner::AcquireIndexRange(RenderFormat format,
 		startIndex, indexCount, validated);
 }
 
+RenderResult NativeW3DBufferOwner::AcquireIndexBinding(
+	GpuHandle *validated) const
+{
+	NativeGameRenderOwnerScope ownerScope;
+	if (validated == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*validated = GpuHandle();
+	NativeW3DResources *resources = ActiveResources();
+	ObserveAuthorityFailure(resources);
+	if (resources == 0 || m_locked || m_failedMutation ||
+		!m_handle.isValid() || !resources->IsValid(m_handle))
+	{
+		return RENDER_RESULT_FAILED;
+	}
+	if (m_descriptor.binding != RENDER_BUFFER_INDEX)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*validated = m_handle;
+	return RENDER_RESULT_OK;
+}
+
 bool NativeW3DBufferOwner::IsLocked() const
 {
 	return m_locked;
@@ -444,6 +512,7 @@ bool NativeW3DBufferOwner::IsLocked() const
 
 bool NativeW3DBufferOwner::HasFailedMutation() const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	ObserveAuthorityFailure(ActiveResources());
 	return m_failedMutation;
 }

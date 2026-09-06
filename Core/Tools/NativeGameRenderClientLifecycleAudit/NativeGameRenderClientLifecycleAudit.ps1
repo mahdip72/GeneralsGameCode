@@ -90,8 +90,90 @@ function Assert-InitialRender2DResolutionContract {
         "W3DDisplay::init for $TitleRoot must publish actualWidth/actualHeight to Render2D"
 }
 
-foreach ($titleRoot in @('Generals', 'GeneralsMD')) {
-    Assert-InitialRender2DResolutionContract $titleRoot
+function Assert-InitialMSAAContract {
+    param(
+        [string] $TitleRoot
+    )
+
+    $displayPath = Join-Path $SourceRoot "$TitleRoot/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp"
+    if (-not (Test-Path -LiteralPath $displayPath -PathType Leaf)) {
+        throw "W3D display source is missing: $displayPath"
+    }
+
+    $displaySource = Get-Content -LiteralPath $displayPath -Raw
+    $initStart = $displaySource.IndexOf('void W3DDisplay::init()')
+    $initEnd = $displaySource.IndexOf('void W3DDisplay::reset()', $initStart)
+    Assert-SourceContract ($initStart -ge 0 -and $initEnd -gt $initStart) `
+        "could not isolate W3DDisplay::init for $TitleRoot"
+
+    $init = $displaySource.Substring($initStart, $initEnd - $initStart)
+    $savedMSAA = $init.IndexOf('WW3D::Set_MSAA_Mode(')
+    $rendererInitialization = $init.IndexOf('WW3D::Init( ApplicationHWnd )')
+    $deviceSelection = $init.IndexOf('WW3D::Set_Render_Device(')
+    $effectiveMSAA = $init.IndexOf('WW3D::Get_MSAA_Mode()', $deviceSelection)
+    Assert-SourceContract ($savedMSAA -ge 0 -and
+        $savedMSAA -lt $rendererInitialization -and
+        $rendererInitialization -lt $deviceSelection -and
+        $deviceSelection -lt $effectiveMSAA) `
+        "W3DDisplay::init for $TitleRoot must apply saved MSAA before native renderer initialization, then publish the effective mode after device selection"
+    Assert-SourceContract ($init.LastIndexOf('WW3D::Set_MSAA_Mode(') -eq $savedMSAA) `
+        "W3DDisplay::init for $TitleRoot must apply saved MSAA exactly once before native renderer initialization"
 }
 
-Write-Output 'Native GameRenderClient lifecycle and startup 2D viewport source audit passed.'
+function Assert-RendererCaptureContract {
+    param(
+        [string] $TitleRoot
+    )
+
+    $displayPath = Join-Path $SourceRoot "$TitleRoot/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp"
+    $displaySource = Get-Content -LiteralPath $displayPath -Raw
+    Assert-SourceContract ($displaySource.Contains('ConsumeGameBackBufferCaptureSuccess()')) `
+        "W3DDisplay for $TitleRoot must acknowledge a capture only from the native completion result"
+    Assert-SourceContract (-not ($displaySource -match '(?s)rendererCaptureFrameGate.*?Get_Frame_Count\(\)')) `
+        "W3DDisplay for $TitleRoot must not consume capture requests from WW3D FrameCount advancement"
+    Assert-SourceContract ($displaySource -match '(?s)captureArmed.*?End_Render\(\).*?ConsumeGameBackBufferCaptureSuccess\(\)') `
+        "W3DDisplay for $TitleRoot must evaluate native capture completion after End_Render"
+}
+
+function Assert-NativeCaptureAndTeardownContract {
+    $nativePath = Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/nativew3d2.cpp'
+    $rendererPath = Join-Path $SourceRoot 'Core/Libraries/Source/Renderer/NativeW3DRenderer.cpp'
+    $nativeSource = Get-Content -LiteralPath $nativePath -Raw
+    $rendererSource = Get-Content -LiteralPath $rendererPath -Raw
+    Assert-SourceContract ($nativeSource.Contains('D3D11RendererCapture.tga')) `
+        'native one-shot capture must retain the documented deterministic TGA path'
+    Assert-SourceContract ($nativeSource.Contains('RenderCaptureRequestDescriptor')) `
+        'native one-shot capture must enqueue a real descriptor and completion/cancellation callbacks'
+    Assert-SourceContract ($nativeSource.Contains('WriteNativeGameCaptureTga')) `
+        'native one-shot capture must use an owner-independent D3D11 pixel-to-TGA writer'
+    Assert-SourceContract ($nativeSource.Contains('CompleteGameCaptureFile') -and
+        $nativeSource.Contains('CancelGameCaptureFile')) `
+        'native one-shot capture must distinguish successful completion from cancellation'
+    Assert-SourceContract ($nativeSource.Contains('m_gameCaptureResult ==') -and
+        $nativeSource.Contains('m_gameCaptureResult !=')) `
+        'native capture acknowledgement must inspect both success and failure results'
+    Assert-SourceContract ($nativeSource.Contains('const bool ownerThread = m_renderer.HasBackendState()') -and
+        $nativeSource.Contains('m_resources.IsOwnerThread()')) `
+        'native aggregate teardown must preserve owner affinity after renderer detachment'
+    Assert-SourceContract ($nativeSource.Contains('ClearGameRendererStateForDestroyedOwner(this)')) `
+        'off-owner native aggregate teardown must clear stale bootstrap publication metadata'
+    Assert-SourceContract (-not $nativeSource.Contains('assert(shutdownResult ==')) `
+        'native aggregate destruction must not terminate when owner-thread shutdown is rejected'
+    Assert-SourceContract ($rendererSource.Contains('DeferShutdownOnOwner')) `
+        'off-owner renderer destruction must defer owned backend shutdown to its producer'
+    Assert-SourceContract ($rendererSource.Contains('EnqueueFallbackCleanup')) `
+        'deferred renderer teardown must use the owner cleanup queue'
+    Assert-SourceContract ($rendererSource.Contains('ThreadedRenderDevice::shutdown') -and
+        $rendererSource.Contains('!IsOwnerThread()')) `
+        'renderer teardown must retain an explicit owner-thread guard around threaded shutdown'
+}
+
+foreach ($titleRoot in @('Generals', 'GeneralsMD')) {
+    Assert-InitialRender2DResolutionContract $titleRoot
+    Assert-InitialMSAAContract $titleRoot
+    Assert-RendererCaptureContract $titleRoot
+}
+
+Assert-NativeCaptureAndTeardownContract
+
+Write-Output 'Native GameRenderClient lifecycle, capture acknowledgement, teardown, startup MSAA, and 2D viewport source audit passed.'

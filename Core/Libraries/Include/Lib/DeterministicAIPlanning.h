@@ -309,6 +309,10 @@ struct AIPlanningBatchStatus
 	uint32_t distinctPhysicalWorkers;
 	uint32_t peakConcurrentPhysicalWorkers;
 	uint32_t ownerHelpedJobs;
+	// True only when the native source accepted at least one recorded range.
+	// Owners use this to distinguish refusal from an admitted abort when they
+	// close an authenticated performance-receipt attempt.
+	uint32_t nativeAdmissionAccepted;
 };
 
 #if defined(_WIN64)
@@ -368,6 +372,40 @@ private:
 // this seam never allocates or changes the authoritative planner path. A
 // null ledger, token, callback, or zero operation count leaves the transport
 // inert. The timing batch identity remains the source of frame/ordinal truth.
+enum AIPlanningTestEvent
+{
+	AI_PLANNING_TEST_RANGE_ENTRY = 0,
+	AI_PLANNING_TEST_PLAYER_BODY,
+	AI_PLANNING_TEST_PREPARED_FACT,
+	AI_PLANNING_TEST_VERIFICATION_FACT,
+	AI_PLANNING_TEST_OWNER_FACT_COMPARISON,
+	AI_PLANNING_TEST_OWNER_WINNER,
+	AI_PLANNING_TEST_OWNER_VALIDATION,
+	AI_PLANNING_TEST_SERIAL_FALLBACK
+};
+
+// Borrowed, default-inert focused-test observations at the actual executor
+// sites. The optional mutable fact is supplied only after a verification
+// build, so a test can prove that the owner rejects a corrupted second view.
+// Production callers never supply these hooks or the bounded rendezvous.
+struct AIPlanningTestHooks
+{
+	AIPlanningTestHooks() : context(0), observe(0), cancelAtEntry(0),
+		rendezvous(0), rendezvousTarget(0), beforeWait(0), afterCancel(0), releasedGroup(0) {}
+	void *context;
+	void (*observe)(void *, AIPlanningTestEvent, uint32_t playerOrdinal,
+		uint32_t begin, uint32_t end, AIProductionCandidateFact *verification);
+	bool (*cancelAtEntry)(void *, uint32_t playerOrdinal,
+		uint32_t begin, uint32_t end);
+	std::atomic<uint32_t> *rendezvous;
+	uint32_t rendezvousTarget;
+	// Observations at real owner boundaries only; none selects cancellation,
+	// completion, publication, or a diagnostic outcome.
+	void (*beforeWait)(void *);
+	void (*afterCancel)(void *);
+	void (*releasedGroup)(void *, bool cancelled, unsigned completed, unsigned submitted, unsigned reason);
+};
+
 struct AIPlanningReferenceBatchTransport
 {
 	AIPlanningReferenceBatchTransport();
@@ -381,6 +419,10 @@ struct AIPlanningReferenceBatchTransport
 	void *detachedSerialOutput;
 	JobMetricCounter operationCount;
 	unsigned fieldSchema;
+	// Authentic owner identity is created before native preflight. Keep the
+	// ledger pointer even after an instrumentation failure: runMode is latched.
+	performance::KernelPerformanceAttempt referenceAttempt;
+	AIPlanningTestHooks *testHooks;
 };
 
 // Canonical shared AI views used by the native title adapters. The production
@@ -502,6 +544,11 @@ bool ValidateAIPlayerPlanningResult(const AIPlayerPlanningSnapshot &snapshot,
 	const AIPlayerPlanningResult &result);
 bool ValidateAIPlanningBatchResults(const AIPlayerPlanningSnapshot *snapshots,
 	const AIPlayerPlanningResult *results, uint32_t resultCount);
+
+// Mirrors the production runner's immutable admission shape so a title can
+// mint a trace attempt only for work that reaches the native dispatcher.
+uint32_t CountAIPlanningBatchJobs(const AIPlayerPlanningSnapshot *snapshots,
+	uint32_t snapshotCount);
 
 // No result becomes commit-visible until the whole requested path succeeds.
 // Parallel failure and shadow mismatch publish the complete serial batch.

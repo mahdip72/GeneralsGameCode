@@ -8,7 +8,7 @@
     "configurePresets": [
         {
             "name": "vc6",
-            "displayName": "Windows 32bit VC6 Release",
+            "displayName": "Windows 32bit VC6 Non-Product Tools",
             "generator": "Ninja",
             "hidden": false,
             "binaryDir": "${sourceDir}/build/${presetName}",
@@ -18,9 +18,7 @@
                 "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT": "",
                 "CMAKE_BUILD_TYPE": "Release",
                 "RTS_FLAGS": "/W3",
-                "RTS_TASK_OWNED_INSTALL_ROOT": "${sourceDir}/build/${presetName}/install",
-                "RTS_INSTALL_PREFIX_GENERALS": "${sourceDir}/build/${presetName}/install/Generals",
-                "RTS_INSTALL_PREFIX_ZEROHOUR": "${sourceDir}/build/${presetName}/install/ZeroHour"
+                "RTS_BUILD_PRODUCT": "OFF"
             },
             "vendor": {
                 "jetbrains.com/clion": {
@@ -58,46 +56,6 @@
             }
         },
         {
-            "name": "vc6-weekly",
-            "displayName": "Windows 32bit VC6 Weekly Release",
-            "inherits": "vc6",
-            "cacheVariables": {
-                "RTS_BUILD_OPTION_VC6_FULL_DEBUG": "ON"
-            }
-        },
-        {
-            "name": "vc6-generals-oracle",
-            "displayName": "Windows 32bit VC6 Generals Optimized Oracle",
-            "inherits": "vc6",
-            "cacheVariables": {
-                "RTS_BUILD_CORE_TOOLS": "OFF",
-                "RTS_BUILD_CORE_EXTRAS": "OFF",
-                "RTS_BUILD_PRODUCT": "ON",
-                "RTS_BUILD_GENERALS": "ON",
-                "RTS_BUILD_ZEROHOUR": "OFF",
-                "RTS_BUILD_GENERALS_PRODUCT": "ON",
-                "RTS_BUILD_GENERALS_TOOLS": "OFF",
-                "RTS_BUILD_GENERALS_EXTRAS": "OFF",
-                "RTS_BUILD_OPTION_FFMPEG": "OFF"
-            }
-        },
-        {
-            "name": "vc6-zerohour-oracle",
-            "displayName": "Windows 32bit VC6 Zero Hour Optimized Oracle",
-            "inherits": "vc6",
-            "cacheVariables": {
-                "RTS_BUILD_CORE_TOOLS": "OFF",
-                "RTS_BUILD_CORE_EXTRAS": "OFF",
-                "RTS_BUILD_PRODUCT": "ON",
-                "RTS_BUILD_GENERALS": "OFF",
-                "RTS_BUILD_ZEROHOUR": "ON",
-                "RTS_BUILD_ZEROHOUR_PRODUCT": "ON",
-                "RTS_BUILD_ZEROHOUR_TOOLS": "OFF",
-                "RTS_BUILD_ZEROHOUR_EXTRAS": "OFF",
-                "RTS_BUILD_OPTION_FFMPEG": "OFF"
-            }
-        },
-        {
             "name": "default",
             "displayName": "Default Config (don't use directly!)",
             "generator": "Ninja Multi-Config",
@@ -127,13 +85,14 @@
             "name": "win32",
             "inherits": "default",
             "hidden": false,
-            "displayName": "Windows 32bit Release",
+            "displayName": "Windows 32bit Non-Product Tools",
             "architecture": {
                 "value": "Win32",
                 "strategy": "external"
             },
             "cacheVariables": {
-                "RTS_FLAGS": "/W3"
+                "RTS_FLAGS": "/W3",
+                "RTS_BUILD_PRODUCT": "OFF"
             },
             "vendor": {
                 "jetbrains.com/clion": {
@@ -210,7 +169,8 @@
                 "RTS_BUILD_ZEROHOUR_TOOLS": "OFF",
                 "RTS_BUILD_GENERALS_EXTRAS": "ON",
                 "RTS_BUILD_ZEROHOUR_EXTRAS": "ON",
-                "RTS_BUILD_OPTION_FFMPEG": "ON"
+                "RTS_BUILD_OPTION_FFMPEG": "ON",
+                "RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY": "ON"
             }
         },
         {
@@ -267,7 +227,8 @@
             "hidden": false,
             "displayName": "Windows x64 Debug Product",
             "cacheVariables": {
-                "RTS_BUILD_OPTION_DEBUG": "ON"
+                "RTS_BUILD_OPTION_DEBUG": "ON",
+                "RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY": "OFF"
             }
         },
         {
@@ -277,7 +238,8 @@
             "displayName": "Windows x64 Profile Product",
             "cacheVariables": {
                 "RTS_BUILD_OPTION_PROFILE": "ON",
-                "RTS_BUILD_OPTION_PROFILE_TRACY": "ON"
+                "RTS_BUILD_OPTION_PROFILE_TRACY": "ON",
+                "RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY": "OFF"
             }
         },
         {
@@ -341,13 +303,14 @@
             "name": "win32-vcpkg",
             "inherits": "default-vcpkg",
             "hidden": false,
-            "displayName": "Windows 32bit VCPKG Release",
+            "displayName": "Windows 32bit VCPKG Non-Product Tools",
             "architecture": {
                 "value": "Win32",
                 "strategy": "external"
             },
             "cacheVariables": {
-                "RTS_FLAGS": "/W3"
+                "RTS_FLAGS": "/W3",
+                "RTS_BUILD_PRODUCT": "OFF"
             },
             "vendor": {
                 "jetbrains.com/clion": {
@@ -393,7 +356,8 @@
             "toolchainFile": "${sourceDir}/cmake/toolchains/mingw-w64-i686.cmake",
             "cacheVariables": {
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "CMAKE_BUILD_TYPE": "Release"
+                "CMAKE_BUILD_TYPE": "Release",
+                "RTS_BUILD_PRODUCT": "OFF"
             }
         },
         {
@@ -420,8 +384,8 @@
         {
             "name": "vc6",
             "configurePreset": "vc6",
-            "displayName": "Build Windows 32bit VC6 Release",
-            "description": "Build Windows 32bit VC6 Release"
+            "displayName": "Build Windows 32bit VC6 Non-Product Tools",
+            "description": "Build historical VC6 authoring and diagnostic tools only"
         },
         {
             "name": "vc6-profile",
@@ -442,28 +406,10 @@
             "description": "Build Windows 32bit VC6 Release Logging"
         },
         {
-            "name": "vc6-weekly",
-            "configurePreset": "vc6-weekly",
-            "displayName": "Build Windows 32bit VC6 Weekly Release",
-            "description": "Build Windows 32bit VC6 Weekly Release"
-        },
-        {
-            "name": "vc6-generals-oracle",
-            "configurePreset": "vc6-generals-oracle",
-            "displayName": "Build Windows 32bit VC6 Generals Optimized Oracle",
-            "description": "Build the isolated Generals legacy replay oracle"
-        },
-        {
-            "name": "vc6-zerohour-oracle",
-            "configurePreset": "vc6-zerohour-oracle",
-            "displayName": "Build Windows 32bit VC6 Zero Hour Optimized Oracle",
-            "description": "Build the isolated Zero Hour legacy replay oracle"
-        },
-        {
             "name": "win32",
             "configurePreset": "win32",
-            "displayName": "Build Windows 32bit Release",
-            "description": "Build Windows 32bit Release",
+            "displayName": "Build Windows 32bit Non-Product Tools",
+            "description": "Build historical Win32 authoring and diagnostic tools only",
             "configuration": "Release"
         },
         {
@@ -497,8 +443,8 @@
         {
             "name": "win32-vcpkg",
             "configurePreset": "win32-vcpkg",
-            "displayName": "Build Windows 32bit VCPKG Release",
-            "description": "Build Windows 32bit VCPKG Release",
+            "displayName": "Build Windows 32bit VCPKG Non-Product Tools",
+            "description": "Build historical Win32 VCPKG authoring and diagnostic tools only",
             "configuration": "Release"
         },
         {
@@ -773,19 +719,6 @@
                 {
                     "type": "build",
                     "name": "vc6-releaselog"
-                }
-            ]
-        },
-        {
-            "name": "vc6-weekly",
-            "steps": [
-                {
-                    "type": "configure",
-                    "name": "vc6-weekly"
-                },
-                {
-                    "type": "build",
-                    "name": "vc6-weekly"
                 }
             ]
         },

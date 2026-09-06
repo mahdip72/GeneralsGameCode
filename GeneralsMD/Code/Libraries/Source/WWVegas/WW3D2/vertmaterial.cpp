@@ -945,12 +945,14 @@ void VertexMaterialClass::Apply() const
 		}
 	}
 	rts::render::SetGameMaterial(this);
+#if !defined(_WIN64)
 	for (unsigned int mapperIndex = 0;
 		mapperIndex < MeshBuilderClass::MAX_STAGES; ++mapperIndex) {
 		if (Mapper[mapperIndex]) {
 			Mapper[mapperIndex]->Apply(UVSource[mapperIndex]);
 		}
 	}
+#endif
 }
 
 void VertexMaterialClass::Apply_Null()

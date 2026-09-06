@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [ValidateSet('development', 'development-readiness', 'pre-manual')]
     [string]$ReadinessMode = 'development-readiness',
-    [switch]$DevelopmentReadiness
+    [switch]$DevelopmentReadiness,
+    [switch]$ExternalQualificationExempt
 )
 
 Set-StrictMode -Version 2.0
@@ -28,6 +29,7 @@ if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
 $report = Invoke-Stage5FinalAcceptanceAggregation `
     -AcceptanceManifestPath $AcceptanceManifestPath `
     -ReadinessMode $ReadinessMode `
-    -DevelopmentReadiness:$DevelopmentReadiness
+    -DevelopmentReadiness:$DevelopmentReadiness `
+    -ExternalQualificationExempt:$ExternalQualificationExempt
 [IO.File]::WriteAllText($outputFull, ($report | ConvertTo-Json -Depth 10))
 Write-Output "Stage 5 development readiness passed for commit $($report.sourceCommit); final user manual approval remains required."

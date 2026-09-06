@@ -119,6 +119,43 @@ enum PhysicsIntegrationTestFault
 	PHYSICS_INTEGRATION_TEST_PHYSICAL_WAIT_TIMEOUT
 };
 
+#if defined(_WIN64)
+// Optional native-site observations and fault injection. Null hooks leave the
+// shipping scheduler, body and publication behavior unchanged.
+enum PhysicsIntegrationTestEvent
+{
+	PHYSICS_INTEGRATION_TEST_RANGE_ENTERED,
+	PHYSICS_INTEGRATION_TEST_ITEM_EVALUATED,
+	PHYSICS_INTEGRATION_TEST_RANGE_FINISHED,
+	PHYSICS_INTEGRATION_TEST_OWNER_VALIDATION,
+	PHYSICS_INTEGRATION_TEST_PUBLICATION,
+	PHYSICS_INTEGRATION_TEST_RANGE_RELEASED
+};
+enum PhysicsIntegrationTestCheckpoint
+{
+	PHYSICS_INTEGRATION_TEST_CHECKPOINT_ENTRY,
+	PHYSICS_INTEGRATION_TEST_CHECKPOINT_BLOCK,
+	PHYSICS_INTEGRATION_TEST_CHECKPOINT_POST_BODY
+};
+struct PhysicsIntegrationTestHooks
+{
+	PhysicsIntegrationTestHooks() : context(0), observe(0), checkpoint(0), beforeWait(0), afterCancel(0),
+		releasedGroup(0), physicalWaitMilliseconds(0) {}
+	void *context;
+	void (*observe)(void *, PhysicsIntegrationTestEvent, unsigned rangeIndex,
+		unsigned begin, unsigned end, unsigned completedWorkUnits, bool completed,
+		PhysicsIntegrationOutput *mutableOwnerStorage);
+	bool (*checkpoint)(void *, unsigned rangeIndex, PhysicsIntegrationTestCheckpoint,
+		unsigned completedWorkUnits, bool actualCancellation);
+	void (*beforeWait)(void *);
+	void (*afterCancel)(void *);
+	void (*releasedGroup)(void *, bool cancelled, unsigned completedBodies,
+		unsigned submitted, unsigned reason);
+	// Bounded readiness budget for an explicitly controlled test source only.
+	unsigned physicalWaitMilliseconds;
+};
+#endif
+
 struct PhysicsIntegrationOptions
 {
 	PhysicsIntegrationOptions();
@@ -132,6 +169,8 @@ struct PhysicsIntegrationOptions
 	// Optional reference evidence is injected by the owner. The kernel leaves
 	// these inert until a native reference mode is active.
 	performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	performance::KernelPerformanceAttempt performanceReferenceAttempt;
+	const PhysicsIntegrationTestHooks *testHooks;
 	performance::KernelPerformanceReferenceBatch *performanceReferenceBatch;
 	PhysicsIntegrationOutput *performanceReferenceOutput;
 	unsigned performanceReferenceOutputCapacity;
@@ -151,6 +190,9 @@ struct PhysicsIntegrationMetrics
 	PhysicsIntegrationMetricCounter physicalWorkerMask;
 	unsigned distinctPhysicalWorkers;
 	bool physicalWorkerMaskComplete;
+	// True once the authenticated source/reference admission decision accepts
+	// this batch, including baseline inline execution with no physical submits.
+	bool referenceAdmissionAccepted;
 	unsigned peakConcurrentPhysicalWorkers;
 	unsigned serialFallbacks;
 	unsigned allocatedBytes;

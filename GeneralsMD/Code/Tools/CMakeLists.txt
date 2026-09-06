@@ -16,15 +16,14 @@ if(RTS_BUILD_ZEROHOUR_EXTRAS AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     add_subdirectory(PATCHGET)
 endif()
 
-# The native x64 product always carries the runtime contract utility.  Keep
-# the legacy Win32 target extras-only so its D3D8/Miles/Bink lane is unchanged.
+# The native x64 product always carries the runtime contract utility. Historical
+# Win32 authoring graphs may build it only when their extras are requested.
 if(RTS_BUILD_ZEROHOUR_EXTRAS OR (CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_BUILD_PRODUCT))
     add_subdirectory(RuntimeRegressionTests)
 endif()
 
-# Native x64 product builds always need the launcher in their installed
-# product graph.  Keep the legacy Win32 option behavior: Win32 gets it only
-# when the extras preset is selected.
+# Native x64 product builds always need the launcher in their installed graph.
+# Historical Win32 authoring graphs get it only with their extras.
 if(RTS_BUILD_ZEROHOUR_EXTRAS OR (CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_BUILD_PRODUCT))
     add_subdirectory(Launcher)
 endif()

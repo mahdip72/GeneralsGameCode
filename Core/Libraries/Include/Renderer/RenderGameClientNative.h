@@ -429,6 +429,14 @@ public:
 			*info = RenderBackBufferInfo();
 		return RENDER_RESULT_UNSUPPORTED;
 	}
+	// Returns the dimensions and format of the logical output selected by the
+	// owner. Older owners expose only the swap-chain query, so retain that
+	// behavior as the source-compatible default.
+	virtual RenderResult GetGameRenderTargetInfo(
+		RenderBackBufferInfo *info) const
+	{
+		return GetGameBackBufferInfo(info);
+	}
 	// Capture admission is asynchronous.  The owner copies this descriptor
 	// and retains only the callback/consumer values until completion or
 	// cancellation; no caller-owned command envelope is retained.
@@ -449,6 +457,10 @@ public:
 		return 0;
 	}
 	virtual void RequestGameBackBufferCapture() {}
+	// Returns true exactly once for a successfully written one-shot capture.
+	// Queue admission, frame-count advancement, and failed/cancelled captures do
+	// not acknowledge the request.
+	virtual bool ConsumeGameBackBufferCaptureSuccess() { return false; }
 	virtual void RecordGameFailure(RenderResult result) { (void)result; }
 };
 
@@ -456,6 +468,11 @@ public:
 // backend selector.  A null owner means that no native target is published.
 IGameRenderClientNativeOwner *GetGameRenderClientNativeOwner();
 void SetGameRenderClientNativeOwner(IGameRenderClientNativeOwner *owner);
+// Clears bootstrap metadata when an aggregate is destroyed outside the
+// normal ShutdownGameRenderer owner path. The caller must have unpublished
+// the owner first; this function only touches the bootstrap bookkeeping.
+void ClearGameRendererStateForDestroyedOwner(
+	IGameRenderClientNativeOwner *owner);
 
 // Lifecycle entry points must reject reentry before mutating resources or
 // invoking callbacks. A same-thread command/lifecycle pin cannot be released

@@ -13,8 +13,9 @@
 // A narrow native WW3D entry point.  It owns the lifetime ordering between
 // the facade and the resource registry; gameplay integration follows only as
 // individual legacy classes are migrated to this target.  The aggregate is
-// render-owner-thread affine: initialization, commands, shutdown, and
-// destruction must all run on the thread that owns its resource state.
+// render-owner-thread affine: initialization, commands, and shutdown must run
+// on the thread that owns its resource state. Destruction may arrive from a
+// worker; owned backend teardown is then transferred to the owner queue.
 class NativeW3D2 : public rts::render::IGameRenderClientNativeOwner,
 	public rts::render::NativeSortedGeometrySink
 {
@@ -105,12 +106,15 @@ public:
 	virtual rts::render::RenderResult InvalidateGameMeshRendererCache();
 	virtual rts::render::RenderResult GetGameBackBufferInfo(
 		rts::render::RenderBackBufferInfo *info) const;
+	virtual rts::render::RenderResult GetGameRenderTargetInfo(
+		rts::render::RenderBackBufferInfo *info) const;
 	virtual rts::render::RenderResult QueueGameBackBufferCapture(
 		const rts::render::RenderCaptureRequestDescriptor &descriptor,
 		rts::render::RenderCaptureHandle *handle);
 	virtual unsigned int CancelGameBackBufferCaptures(
 		void *consumer, rts::render::RenderResult reason);
 	virtual void RequestGameBackBufferCapture();
+	virtual bool ConsumeGameBackBufferCaptureSuccess();
 	virtual void RecordGameFailure(rts::render::RenderResult result);
 
 	// NativeSortedGeometrySink implementation.  The sorter passes one
@@ -154,6 +158,9 @@ private:
 	// NativeW3D2 attach/shutdown lifecycle below.
 	rts::render::NativeLine3DRenderContext m_line3DContext;
 	rts::render::GameRenderTargetKind m_activeRenderTargetKind;
+	// The neutral logical target survives between frames. The renderer binds
+	// its defaults at BeginFrame, then reapplies this POD binding before clear.
+	rts::render::RenderTargetBinding m_gameRenderTargetBinding;
 	bool m_debugConsoleDisabled;
 	rts::render::RenderFrameFailureLatch m_gameFailure;
 	// Threaded completion is producer-owned state.  The completion sequence is
@@ -167,8 +174,16 @@ private:
 	// and publication. Resource recreation is admitted during that interval,
 	// while frame/draw entry points continue to require IsOperational().
 	bool m_rebuildingResources;
+	// Reacquire callbacks are void and report individual factory failures through
+	// the owner boundary. Keep that narrow result separate from the frame latch
+	// so an unsuccessful rebuild cannot be mistaken for a clean recovery.
+	bool m_reacquiringResources;
+	rts::render::RenderFrameFailureLatch m_reacquireFailure;
 	rts::render::RenderCaptureQueue m_gameCaptureQueue;
 	rts::render::RenderCaptureRequest m_gameCaptureRequest;
+	bool m_gameCaptureDescriptorQueued;
+	bool m_gameCaptureCompleted;
+	rts::render::RenderResult m_gameCaptureResult;
 	unsigned int m_displayIterationEpoch;
 	rts::render::NativeSortingRenderer m_nativeSortingRenderer;
 	bool m_gameShaderCullInverted;
@@ -231,7 +246,9 @@ private:
 		rts::render::NativeW3DSubmissionSequence sequence);
 	rts::render::RenderResult ServiceThreadedCompletions();
 	rts::render::RenderResult FenceThreadedRender();
+	static rts::render::RenderResult FenceBufferPublications(void *owner);
 	rts::render::RenderResult RecoverOwnedDevice();
+	rts::render::RenderResult ReAcquireGameResources();
 	rts::render::RenderResult CancelOpenThreadedFrame(
 		rts::render::RenderResult reason);
 	bool CanRebuildResources() const;
@@ -242,8 +259,18 @@ private:
 	rts::render::RenderResult CompleteGameBackBufferCaptures(
 		const rts::render::RenderBackBufferInfo &info, size_t rowPitch,
 		rts::render::RenderFormat format, const std::vector<unsigned char> &pixels);
+	static void CompleteGameCaptureFile(void *consumer,
+		const rts::render::RenderCaptureHandle *handle, unsigned int width,
+		unsigned int height, size_t rowPitch, rts::render::RenderFormat format,
+		const void *pixels, size_t pixelBytes);
+	static void CancelGameCaptureFile(void *consumer,
+		const rts::render::RenderCaptureHandle *handle,
+		rts::render::RenderResult reason);
 	rts::render::RenderResult FinishGameRenderFrame(bool capture,
 		bool present);
+	rts::render::RenderResult ValidateGameRenderTargetBinding(
+		const rts::render::RenderTargetBinding &binding,
+		rts::render::RenderBackBufferInfo *info) const;
 
 	rts::render::RenderResult SubmitGamePacket(
 		const rts::render::LegacyLogicalState &state,

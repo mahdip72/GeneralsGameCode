@@ -39,10 +39,9 @@ enum MultiplayerSimulationKernel
 		MULTIPLAYER_SIMULATION_KERNEL_AI_PLANNING |
 		MULTIPLAYER_SIMULATION_KERNEL_SPATIAL |
 		MULTIPLAYER_SIMULATION_KERNEL_PATH,
-	// A live integration is only a diagnostic candidate. Product peers advertise
-	// none of these bits: the InstalledNet3Validation v1 evidence and its
-	// external proof are deliberately unable to authorize live lockstep work.
-	// A separately reviewed lockstep-v2 contract is required before promotion.
+	// A live integration is only a promotion candidate. InstalledNet3Validation
+	// v1 evidence and its external proof remain diagnostic-only; a separately
+	// embedded lockstep-v2 product authority selects the reviewed Release bits.
 	MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK =
 		MULTIPLAYER_SIMULATION_KERNEL_KNOWN_MASK,
 	MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK =
@@ -57,10 +56,10 @@ enum
 };
 
 // Legacy-compatible policy fixture retained for device-free contract tests.
-// Product startup never loads this object or any generated source header; it
-// resolves authority only from the exact external installed-runtime bundle in
-// MultiplayerSimulationRuntimeProof.h. Missing or malformed fixture data still
-// resolves to zero.
+// Product startup never loads this object or any generated source header.
+// Diagnostic v1 files remain non-authorizing; live authority is supplied only
+// by the separately embedded lockstep-v2 promotion contract. Missing or
+// malformed fixture data still resolves to zero.
 struct MultiplayerSimulationGeneratedReleaseProof
 {
 	unsigned schema;

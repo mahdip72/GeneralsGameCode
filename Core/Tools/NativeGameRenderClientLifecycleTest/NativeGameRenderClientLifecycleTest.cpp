@@ -69,14 +69,18 @@ int TestLogicalPolicies()
 		failures += !Check(rts::render::SetGameMSAAMode(validModes[i]) ==
 			rts::render::RENDER_RESULT_OK &&
 			rts::render::GetGameMSAAMode() ==
-			rts::render::GAME_RENDER_MULTISAMPLE_NONE,
-			"valid MSAA policy is accepted with effective NONE");
+			validModes[i],
+			"valid MSAA policy is retained before device publication");
 	}
 	failures += !Check(rts::render::SetGameMSAAMode(1) ==
 		rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
 		rts::render::GetGameMSAAMode() ==
-		rts::render::GAME_RENDER_MULTISAMPLE_NONE,
-		"invalid MSAA policy is rejected");
+		rts::render::GAME_RENDER_MULTISAMPLE_8X,
+		"invalid MSAA policy is rejected without changing state");
+	failures += !Check(rts::render::SetGameMSAAMode(
+		rts::render::GAME_RENDER_MULTISAMPLE_4X) ==
+		rts::render::RENDER_RESULT_OK,
+		"logical MSAA policy selects 4x for native initialization");
 	return failures;
 }
 
@@ -156,6 +160,17 @@ int TestNativeLifecycle(HWND window)
 	if (!Check(initializeResult == rts::render::RENDER_RESULT_OK,
 		"native bootstrap initializes the hidden D3D11 target"))
 		return 1;
+	// Mirror W3DDisplay startup: the saved policy is published before Init,
+	// then Set_Render_Device selects the final dimensions without recreating
+	// the already initialized native device.
+	const rts::render::RenderResult startupSelectionResult =
+		rts::render::SetGameRenderDeviceByIndex(0, 640, 480, 32, 1, true,
+		false, true);
+	failures += !Check(startupSelectionResult ==
+		rts::render::RENDER_RESULT_OK &&
+		rts::render::GetGameMSAAMode() ==
+		rts::render::GAME_RENDER_MULTISAMPLE_4X,
+		"product startup ordering preserves the effective 4x D3D11 scene target");
 
 	const long intervals[] = { 0, 1, 3 };
 	for (unsigned int i = 0; i != sizeof(intervals) / sizeof(intervals[0]); ++i)
@@ -271,6 +286,9 @@ int TestNativeLifecycle(HWND window)
 		&bitDepth, &windowed) == rts::render::RENDER_RESULT_OK &&
 		width == 800 && height == 600 && bitDepth == 32 && windowed,
 		"native selection reports effective 32-bit resized state");
+	failures += !Check(rts::render::GetGameMSAAMode() ==
+		rts::render::GAME_RENDER_MULTISAMPLE_4X,
+		"native resize preserves the effective 4x D3D11 scene target");
 
 	failures += !Check(rts::render::SetGameRenderDeviceByName(deviceName,
 		640, 480, 16, 0, true) == rts::render::RENDER_RESULT_OK,

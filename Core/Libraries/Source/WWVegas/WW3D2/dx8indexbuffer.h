@@ -61,6 +61,8 @@ public:
 	{
 		IndexBufferClass *index_buffer;
 		unsigned short *indices;
+		unsigned start_index;
+		unsigned index_range;
 		bool locked;
 	public:
 		AppendLockClass(IndexBufferClass *index_buffer,
@@ -153,6 +155,8 @@ public:
 		unsigned char **data, unsigned long flags);
 	long Unlock();
 #if defined(_WIN64)
+	bool Acquire_Native_Index_Buffer(
+		rts::render::GpuHandle *validated) const;
 	bool Acquire_Native_Index_Buffer(unsigned int offset,
 		unsigned int start_index, unsigned int index_count,
 		rts::render::GpuHandle *validated) const;
@@ -181,9 +185,14 @@ public:
 	SortingIndexBufferClass(unsigned short index_count);
 	virtual ~SortingIndexBufferClass() override;
 	const unsigned short *Get_Index_Data() const { return index_buffer; }
+	unsigned Get_Initialized_Index_Count() const
+	{
+		return initialized_index_count;
+	}
 
 protected:
 	unsigned short *index_buffer;
+	unsigned short initialized_index_count;
 };
 
 #if defined(_WIN64)

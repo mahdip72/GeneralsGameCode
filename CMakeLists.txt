@@ -47,6 +47,17 @@ include(cmake/config.cmake)
 include(cmake/asan.cmake)
 include(cmake/native-product-packaging.cmake)
 
+# Stage 5 completes the product cutover: supported game executables are native
+# Windows x64 builds.  The 32-bit graph remains available only for historical
+# authoring and diagnostic tools, never as a shippable product fallback.
+if(RTS_BUILD_PRODUCT AND
+        (NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8))
+    message(FATAL_ERROR
+        "Stage 5 product builds are native x64-only. The legacy Win32/VC6 "
+        "D3D8, Miles, and Bink product runtime has been retired; configure "
+        "RTS_BUILD_PRODUCT=OFF for historical authoring or diagnostic tools.")
+endif()
+
 # MinGW-w64 specific configuration
 if(MINGW)
     include(cmake/mingw.cmake)
@@ -54,23 +65,19 @@ if(MINGW)
     include(cmake/widl.cmake)
 endif()
 
-# Find/Add build dependencies and stubs shared by all projects
+# Historical SDK stubs are confined to an explicit non-product x86 graph.
 if(WIN32 OR "${CMAKE_SYSTEM}" MATCHES "Windows")
-	set(_RTS_BUILD_REQUIRES_DX8 OFF)
-	if(RTS_BUILD_PRODUCT OR RTS_BUILD_CORE_TOOLS OR RTS_BUILD_CORE_EXTRAS OR
-		RTS_BUILD_GENERALS_TOOLS OR RTS_BUILD_GENERALS_EXTRAS OR
-		RTS_BUILD_ZEROHOUR_TOOLS OR RTS_BUILD_ZEROHOUR_EXTRAS)
-		set(_RTS_BUILD_REQUIRES_DX8 ON)
-	endif()
-    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
-        include(cmake/miles.cmake)
-    endif()
-    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)
-        include(cmake/bink.cmake)
-    endif()
-    if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND _RTS_BUILD_REQUIRES_DX8 AND
-            NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
-        include(cmake/dx8.cmake)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BUILD_PRODUCT)
+        if(NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+            include(cmake/miles.cmake)
+        endif()
+        if(NOT RTS_BUILD_OPTION_FFMPEG)
+            include(cmake/bink.cmake)
+        endif()
+        if(NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+            include(cmake/dx8.cmake)
+        endif()
+        include(cmake/legacy-tool-runtime.cmake)
     endif()
 endif()
 
@@ -131,9 +138,9 @@ add_subdirectory(Core)
 
 include(cmake/legacy-renderer.cmake)
 
-# The x86 renderer lane is created only after Core has defined the shared
-# CPU-side libraries; native x64 targets never link it.
-if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4 AND
+# The non-product x86 renderer lane is created only after Core has defined the
+# shared CPU-side libraries; supported product targets can never link it.
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BUILD_PRODUCT AND
         NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
     rts_add_legacy_renderer_targets()
 endif()

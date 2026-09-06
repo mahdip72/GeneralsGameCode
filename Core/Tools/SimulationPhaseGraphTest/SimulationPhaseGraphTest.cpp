@@ -1552,7 +1552,7 @@ int main(int argc, char **argv)
 	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
 	{
 		std::cerr << "Usage: simulation_phase_graph_tests "
-			"[--local-capacity]\n";
+			"[--local-capacity|--external-qualification]\n";
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);

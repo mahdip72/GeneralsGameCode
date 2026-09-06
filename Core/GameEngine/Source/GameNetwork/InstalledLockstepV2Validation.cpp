@@ -118,6 +118,12 @@ bool IsSafeMapName(const std::string &path)
 	{
 		return false;
 	}
+	for (std::size_t index = 0U; index < path.size(); ++index)
+	{
+		const unsigned char value = static_cast<unsigned char>(path[index]);
+		if (std::iscntrl(value) || (std::isspace(value) && value != ' '))
+			return false;
+	}
 	if (path.size() < 4U)
 		return false;
 	const std::string extension = path.substr(path.size() - 4U);
@@ -350,7 +356,7 @@ bool ParseConfiguration(const char *configuration,
 		const std::string name = field.substr(0U, equals);
 		const std::string value = field.substr(equals + 1U);
 		if (!GetFieldIndex(name, &fieldIndex) || seen[fieldIndex] ||
-			!IsSafeValue(value))
+			(fieldIndex != FIELD_MAP && !IsSafeValue(value)))
 		{
 			return false;
 		}

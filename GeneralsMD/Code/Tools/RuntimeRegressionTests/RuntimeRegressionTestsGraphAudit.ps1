@@ -554,6 +554,19 @@ function Assert-NoRegistryInstallFallback {
     }
 }
 
+function Assert-NativeX64ProductRetirementContract {
+    param(
+        [Parameter(Mandatory = $true)][string]$Content,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+
+    $retirementCondition = '^if\(\s*RTS_BUILD_PRODUCT\s+AND\s+\(\s*' +
+        'NOT\s+WIN32\s+OR\s+NOT\s+CMAKE_SIZEOF_VOID_P\s+EQUAL\s+8\s*\)\s*\)$'
+    $retirementBody = '(?is)\bmessage\s*\(\s*FATAL_ERROR\b.*?' +
+        'native\s+x64-only.*?retired'
+    Get-CMakeIfBlock $Content $retirementCondition $Context $retirementBody | Out-Null
+}
+
 function Assert-Vc6InstallPrefixContract {
     param(
         [Parameter(Mandatory = $true)][string]$Content,
@@ -642,6 +655,9 @@ function Assert-SourceContracts {
 
     Assert-RuntimeRegressionSourceContract $SourceRoot
     Assert-RegistryMacroContract $SourceRoot
+    Assert-NativeX64ProductRetirementContract `
+        (Get-Content -LiteralPath (Join-Path $SourceRoot 'CMakeLists.txt') -Raw) `
+        'top-level native x64 product retirement'
     $configBuild = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/config-build.cmake') -Raw
     if ($configBuild -notmatch '(?im)^include\(\$\{CMAKE_CURRENT_LIST_DIR\}/task-owned-install-prefix\.cmake\)\s*$') {
         throw 'cmake/config-build.cmake does not include the task-owned VC6 install-prefix validator.'
@@ -658,14 +674,16 @@ function Assert-SourceContracts {
     Assert-NativeLauncherBuildContract $SourceRoot 'GeneralsMD' 'ZEROHOUR' 'z_launcher'
 
     foreach ($installContract in @(
-            @{ Path = 'Generals/CMakeLists.txt'; Prefix = 'RTS_INSTALL_PREFIX_GENERALS'; EffectivePrefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS'; RegistryPrefix = 'RTS_REGISTRY_INSTALL_PREFIX_GENERALS'; TitleOption = 'GENERALS'; MainTarget = 'g_generals'; LauncherTarget = 'g_launcher' },
-            @{ Path = 'GeneralsMD/CMakeLists.txt'; Prefix = 'RTS_INSTALL_PREFIX_ZEROHOUR'; EffectivePrefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR'; RegistryPrefix = 'RTS_REGISTRY_INSTALL_PREFIX_ZEROHOUR'; TitleOption = 'ZEROHOUR'; MainTarget = 'z_generals'; LauncherTarget = 'z_launcher'; RequireRuntimeRegressionInstall = $true })) {
+            @{ Path = 'Generals/CMakeLists.txt'; EffectivePrefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS'; RegistryPrefix = 'RTS_REGISTRY_INSTALL_PREFIX_GENERALS'; MainTarget = 'g_generals'; LauncherTarget = 'g_launcher' },
+            @{ Path = 'GeneralsMD/CMakeLists.txt'; EffectivePrefix = '_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR'; RegistryPrefix = 'RTS_REGISTRY_INSTALL_PREFIX_ZEROHOUR'; MainTarget = 'z_generals'; LauncherTarget = 'z_launcher'; RequireRuntimeRegressionInstall = $true })) {
         $installCmake = Get-Content -LiteralPath (Join-Path $SourceRoot $installContract.Path) -Raw
         Assert-RegistryDiscoveryContract $installCmake $installContract.Path $installContract.RegistryPrefix
         Assert-NoRegistryInstallFallback $installCmake $installContract.Path `
             $installContract.EffectivePrefix $installContract.RegistryPrefix
-        Assert-Vc6InstallPrefixContract $installCmake $installContract.Path `
-            $installContract.TitleOption $installContract.Prefix
+        # The top-level product gate makes these target-bearing install blocks
+        # native x64-only.  VC6 can configure historical non-product tools, so
+        # requiring a per-title VC6 product guard here would audit a retired
+        # graph instead of the supported install graph.
         $requireRuntime = [bool]$installContract.RequireRuntimeRegressionInstall
         if ($requireRuntime) {
             Assert-InstallPrefixContract $installCmake $installContract.EffectivePrefix $installContract.Path $installContract.MainTarget $installContract.LauncherTarget -RequireRuntimeRegressionInstall
@@ -889,6 +907,58 @@ set(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR
     }
     if (-not $registryInstallFallbackCaught) {
         throw 'Self-test accepted a registry-derived install destination.'
+    }
+
+    $validNativeProductRetirement = @'
+if(RTS_BUILD_PRODUCT AND
+        (NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8))
+    message(FATAL_ERROR
+        "Stage 5 product builds are native x64-only. The legacy Win32/VC6 product runtime has been retired.")
+endif()
+'@
+    Assert-NativeX64ProductRetirementContract $validNativeProductRetirement `
+        'Self-test valid native x64 product retirement'
+    $weakenedNativeProductRetirement = $validNativeProductRetirement.Replace(
+        'NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8',
+        'NOT WIN32 AND NOT CMAKE_SIZEOF_VOID_P EQUAL 8')
+    $weakenedNativeProductRetirementCaught = $false
+    try {
+        Assert-NativeX64ProductRetirementContract $weakenedNativeProductRetirement `
+            'Self-test weakened native x64 product retirement'
+    }
+    catch {
+        $weakenedNativeProductRetirementCaught = $true
+    }
+    if (-not $weakenedNativeProductRetirementCaught) {
+        throw 'Self-test accepted a product graph that permits a non-Windows or non-x64 product.'
+    }
+
+    $validNativeInstallPrefix = @'
+if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS AND TARGET g_generals)
+    install(TARGETS g_generals RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET g_launcher)
+        install(TARGETS g_launcher RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
+        install(FILES $<TARGET_PDB_FILE:g_launcher> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}" OPTIONAL)
+    endif()
+endif()
+'@
+    Assert-InstallPrefixContract $validNativeInstallPrefix `
+        '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS' `
+        'Self-test valid native install prefix' 'g_generals' 'g_launcher'
+    $unscopedNativeInstallPrefix = $validNativeInstallPrefix.Replace(
+        'if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS AND TARGET g_generals)',
+        'if(TARGET g_generals)')
+    $unscopedNativeInstallPrefixCaught = $false
+    try {
+        Assert-InstallPrefixContract $unscopedNativeInstallPrefix `
+            '_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS' `
+            'Self-test unscoped native install prefix' 'g_generals' 'g_launcher'
+    }
+    catch {
+        $unscopedNativeInstallPrefixCaught = $true
+    }
+    if (-not $unscopedNativeInstallPrefixCaught) {
+        throw 'Self-test accepted a native product install outside its explicit effective-prefix guard.'
     }
 
     $validVc6InstallPrefixGuard = @'

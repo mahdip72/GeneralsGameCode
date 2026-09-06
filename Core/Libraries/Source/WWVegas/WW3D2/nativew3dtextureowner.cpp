@@ -1,4 +1,5 @@
 #include "nativew3dtextureowner.h"
+#include "Renderer/RenderGameClientNative.h"
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1900
 
@@ -52,6 +53,7 @@ RenderResult ValidateCandidate(NativeW3DResources *resources,
 
 RenderResult BindNativeW3DTextureResources(NativeW3DResources *resources)
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (resources == 0 || !resources->IsOwnerThread() ||
 		(g_nativeW3DTextureResources != 0 &&
 		 g_nativeW3DTextureResources != resources))
@@ -75,6 +77,7 @@ RenderResult BindNativeW3DTextureResources(NativeW3DResources *resources)
 
 RenderResult UnbindNativeW3DTextureResources(NativeW3DResources *resources)
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (g_nativeW3DTextureResources == 0)
 	{
 		return RENDER_RESULT_OK;
@@ -86,6 +89,17 @@ RenderResult UnbindNativeW3DTextureResources(NativeW3DResources *resources)
 	}
 	g_nativeW3DTextureResources = 0;
 	return RENDER_RESULT_OK;
+}
+
+void InvalidateNativeW3DTextureResources(NativeW3DResources *resources)
+{
+	NativeGameRenderOwnerScope ownerScope;
+	if (resources != 0 && g_nativeW3DTextureResources == resources)
+	{
+		// Metadata only: the owner lifecycle gate has already quiesced every
+		// native texture operation before this exact publication is removed.
+		g_nativeW3DTextureResources = 0;
+	}
 }
 
 NativeW3DTextureCandidate::NativeW3DTextureCandidate() :
@@ -151,6 +165,7 @@ RenderResult NativeW3DTextureOwner::CreateCandidate(
 	unsigned int subresourceCount,
 	NativeW3DTextureCandidate *candidate) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (candidate == 0 || candidate->IsValid())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -201,6 +216,7 @@ RenderResult NativeW3DTextureOwner::BorrowCandidate(
 	NativeW3DTextureHandle handle, const TextureDescriptor &descriptor,
 	NativeW3DTextureCandidate *candidate) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (candidate == 0 || candidate->IsValid())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -235,6 +251,7 @@ RenderResult NativeW3DTextureOwner::PublishCandidate(
 	NativeW3DTextureCandidate *candidate,
 	unsigned int expectedPublicationGeneration)
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (candidate == 0 || !candidate->IsValid())
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -299,6 +316,7 @@ RenderResult NativeW3DTextureOwner::AcquireForSampling(
 	NativeW3DTextureHandle *handle,
 	NativeW3DGpuContentLease *gpuLease) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (handle == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -364,6 +382,7 @@ RenderResult NativeW3DTextureOwner::AcquireSurface(unsigned int mipLevel,
 	unsigned int arraySlice, NativeW3DSurfaceHandle *surface,
 	NativeW3DGpuContentLease *gpuLease) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (surface == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -390,6 +409,7 @@ RenderResult NativeW3DTextureOwner::AcquireOutputSurface(
 	unsigned int mipLevel, unsigned int arraySlice,
 	NativeW3DSurfaceHandle *surface) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (surface == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -411,6 +431,7 @@ RenderResult NativeW3DTextureOwner::AcquireOutputSurface(
 RenderResult NativeW3DTextureOwner::PublishOutputWrite(
 	NativeW3DSurfaceHandle surface, NativeW3DGpuContentLease *gpuLease) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (gpuLease == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -429,6 +450,7 @@ RenderResult NativeW3DTextureOwner::PublishOutputWrite(
 RenderResult NativeW3DTextureOwner::CopyActiveColorTarget(
 	NativeW3DGpuContentLease *gpuLease) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (gpuLease == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -448,6 +470,7 @@ RenderResult NativeW3DTextureOwner::RefreshCpuContent(
 	const TextureSubresourceData *subresources,
 	unsigned int subresourceCount) const
 {
+	NativeGameRenderOwnerScope ownerScope;
 	NativeW3DResources *resources = ActiveResources();
 	if (resources == 0 || !m_handle.isValid() ||
 		!EqualTextureDescriptors(descriptor, m_descriptor) ||
@@ -462,6 +485,7 @@ RenderResult NativeW3DTextureOwner::RefreshCpuContent(
 
 RenderResult NativeW3DTextureOwner::Reset()
 {
+	NativeGameRenderOwnerScope ownerScope;
 	if (!m_handle.isValid())
 	{
 		return RENDER_RESULT_OK;

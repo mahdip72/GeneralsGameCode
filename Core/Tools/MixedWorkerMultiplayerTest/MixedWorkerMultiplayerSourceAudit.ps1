@@ -6,6 +6,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $failures = [System.Collections.Generic.List[string]]::new()
+$lockstepV2NamespaceDeclarationPattern =
+    '(?m)^[ \t]*namespace[ \t]+lockstep_v2[ \t]*$'
 
 function Read-Source([string]$relativePath) {
     $path = Join-Path $SourceRoot $relativePath
@@ -119,6 +121,76 @@ MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK = MULTIPLAYER_SIMULATI
         'MULTIPLAYER_SIMULATION_KERNEL_KNOWN_MASK', 'MULTIPLAYER_SIMULATION_KERNEL_NONE')
     if ($malformedPolicyHeader -match '(?s)MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK\s*=\s*MULTIPLAYER_SIMULATION_KERNEL_KNOWN_MASK') {
         throw 'Self-test accepted a malformed integrated-kernel mask fixture.'
+    }
+
+    $validPromotionBoundary = @'
+unsigned candidateKernelMask =
+    rts::lockstep_v2::ResolveEmbeddedProductPromotionKernelMask(
+        rts::MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK);
+if (candidateKernelMask ==
+    rts::MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK)
+{
+    candidateKernelMask =
+        getRuntimeMultiplayerSimulationReleaseProvenKernelMask(
+            TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC);
+}
+'@
+    $promotionBoundaryPattern = '(?s)candidateKernelMask\s*=\s*rts::lockstep_v2::ResolveEmbeddedProductPromotionKernelMask\(.*?MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK\).*?if \(candidateKernelMask ==\s*rts::MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK\).*?candidateKernelMask\s*=\s*getRuntimeMultiplayerSimulationReleaseProvenKernelMask\('
+    if ($validPromotionBoundary -notmatch $promotionBoundaryPattern) {
+        throw 'Self-test rejected the valid lockstep-v2 promotion boundary fixture.'
+    }
+    $malformedPromotionBoundary = $validPromotionBoundary.Replace(
+        'ResolveEmbeddedProductPromotionKernelMask(',
+        'removed_v2_promotion_boundary(')
+    if ($malformedPromotionBoundary -match $promotionBoundaryPattern) {
+        throw 'Self-test accepted an ordinary policy path without lockstep-v2 promotion.'
+    }
+
+    $validPromotionHeader = @'
+namespace lockstep_v2
+{
+if (authority.promotedKernelMask != liveIntegratedKernelMask)
+{
+    return MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK;
+}
+} // namespace lockstep_v2
+'@
+    if ([regex]::Matches($validPromotionHeader,
+            $lockstepV2NamespaceDeclarationPattern).Count -ne 1) {
+        throw 'Self-test rejected one lockstep-v2 namespace declaration with a closing comment.'
+    }
+    $duplicatePromotionNamespace = $validPromotionHeader.Replace(
+        'namespace lockstep_v2',
+        "namespace lockstep_v2`nnamespace lockstep_v2")
+    if ([regex]::Matches($duplicatePromotionNamespace,
+            $lockstepV2NamespaceDeclarationPattern).Count -eq 1) {
+        throw 'Self-test accepted duplicate lockstep-v2 namespace declarations.'
+    }
+    $promotionFailClosedPattern = '(?s)authority\.promotedKernelMask != liveIntegratedKernelMask.*?return MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK;'
+    if ($validPromotionHeader -notmatch $promotionFailClosedPattern) {
+        throw 'Self-test rejected the valid complete-mask promotion guard.'
+    }
+    $malformedPromotionHeader = $validPromotionHeader.Replace(
+        '!= liveIntegratedKernelMask', '& ~liveIntegratedKernelMask')
+    if ($malformedPromotionHeader -match $promotionFailClosedPattern) {
+        throw 'Self-test accepted a partial-mask promotion guard.'
+    }
+
+    $validInstalledMapParser = @'
+if (std::iscntrl(value) || (std::isspace(value) && value != ' '))
+    return false;
+if (!GetFieldIndex(name, &fieldIndex) || seen[fieldIndex] ||
+    (fieldIndex != FIELD_MAP && !IsSafeValue(value)))
+    return false;
+'@
+    foreach ($token in @(
+            "std::iscntrl(value) || (std::isspace(value) && value != ' ')",
+            '(fieldIndex != FIELD_MAP && !IsSafeValue(value))')) {
+        Assert-SelfTestAcceptsCount $validInstalledMapParser $token 1 `
+            "installed lockstep-v2 map parser fixture contains '$token'"
+        Assert-SelfTestRejectsCount ($validInstalledMapParser.Replace(
+                $token, 'removed_map_parser_guard')) $token 1 `
+            "installed lockstep-v2 map parser fixture missing '$token'"
     }
 
     $validWrapper = 'IsWrappedNetworkCommandOriginAuthorized(temp->getPlayerID(), msg->getCommand()->getPlayerID(), MAX_SLOTS) retlist->addMessage'
@@ -267,9 +339,14 @@ Require-Count $network 'ResolveMultiplayerSimulationSessionPolicy(' 1 `
 Require-Count $network 'm_networkSimulationPolicyResolved = TRUE;' 1 `
     "$networkPath publishes resolution only after the complete handshake"
 Require-Count $network 'getRuntimeMultiplayerSimulationReleaseProvenKernelMask(' 2 `
-	"$networkPath derives its advertisement from build-capped runtime evidence"
+	"$networkPath retains the isolated diagnostic-v1 resolver and fallback"
+Require-Count $network 'ResolveEmbeddedProductPromotionKernelMask(' 1 `
+	"$networkPath derives ordinary product authority from the embedded lockstep-v2 trust root"
+if ($network -notmatch '(?s)candidateKernelMask\s*=\s*rts::lockstep_v2::ResolveEmbeddedProductPromotionKernelMask\(.*?MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK\).*?if \(candidateKernelMask ==\s*rts::MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK\).*?candidateKernelMask\s*=\s*getRuntimeMultiplayerSimulationReleaseProvenKernelMask\(') {
+    $failures.Add("$networkPath must select lockstep-v2 promotion before the diagnostic-v1 serial fallback")
+}
 Require-Count $network 'ResolveMultiplayerSimulationRuntimeProofMask(' 1 `
-	"$networkPath validates runtime evidence against embedded build authority before advertising"
+	"$networkPath keeps the diagnostic-v1 proof resolver intact"
 Require-Count $network 'calculateFileSha256(' 5 `
 	"$networkPath independently hashes the executable, lockstep-v2 origin, and every external proof-bundle layer"
 Require-Count $network 'MultiplayerSimulationRuntimeProof.txt' 1 `
@@ -320,6 +397,15 @@ Require-Count $network 'm_networkSimulationPolicyResolved ?' 1 `
 Require-Count $network 'm_networkHelloExpectedSlots &=' 0 `
     "$networkPath never renegotiates against a reduced remote roster"
 
+$installedLockstepPath = 'Core/GameEngine/Source/GameNetwork/InstalledLockstepV2Validation.cpp'
+$installedLockstep = Read-Source $installedLockstepPath
+Require-Count $installedLockstep `
+    "std::iscntrl(value) || (std::isspace(value) && value != ' ')" 1 `
+    "$installedLockstepPath permits ordinary spaces in reviewed map names while rejecting other whitespace"
+Require-Count $installedLockstep `
+    '(fieldIndex != FIELD_MAP && !IsSafeValue(value))' 1 `
+    "$installedLockstepPath limits the whitespace exception to FIELD_MAP"
+
 $runtimeProofPath = 'Core/Libraries/Include/Lib/MultiplayerSimulationRuntimeProof.h'
 $runtimeProof = Read-Source $runtimeProofPath
 Require-Count $runtimeProof 'proof.executableSha256 != actualExecutableSha256' 1 `
@@ -343,18 +429,81 @@ Require-Count $runtimeProof 'proof.producer == "installed-runtime-runner-v1"' 1 
 Require-Count $runtimeProof 'proof.validationMode == "scoped-net3-loopback-release-proof"' 1 `
 	"$runtimeProofPath identifies the diagnostic v1 validation mode explicitly"
 
+$promotionHeaderPath = 'Core/Libraries/Include/Lib/LockstepV2Promotion.h'
+$promotionHeader = Read-Source $promotionHeaderPath
+$promotionNamespaceDeclarationCount = [regex]::Matches($promotionHeader,
+    $lockstepV2NamespaceDeclarationPattern).Count
+if ($promotionNamespaceDeclarationCount -ne 1) {
+    $failures.Add("$promotionHeaderPath owns exactly one namespace declaration separate from diagnostic v1 (expected 1, found $promotionNamespaceDeclarationCount)")
+}
+Require-Count $promotionHeader 'struct ProductPromotionAuthority' 1 `
+	"$promotionHeaderPath models the embedded v2 release trust root"
+Require-Count $promotionHeader '#include "Lib/LockstepV2Contract.h"' 1 `
+	"$promotionHeaderPath binds promotion metadata to the reviewed lockstep-v2 contract"
+Require-Count $promotionHeader 'promotionSchemaVersion' 3 `
+	"$promotionHeaderPath binds construction, storage, and validation to the promotion schema"
+Require-Count $promotionHeader 'lockstepSchemaVersion' 3 `
+	"$promotionHeaderPath binds construction, storage, and validation to lockstep-v2"
+Require-Count $promotionHeader 'protocolEpoch' 3 `
+	"$promotionHeaderPath binds construction, storage, and validation to protocol epoch two"
+Require-Count $promotionHeader 'promotedKernelMask' 4 `
+	"$promotionHeaderPath stores, constructs, validates, and returns the exact promoted mask"
+Require-Count $promotionHeader 'ResolveProductPromotionKernelMask(' 2 `
+	"$promotionHeaderPath has one resolver and one embedded-authority call"
+Require-Count $promotionHeader 'ResolveEmbeddedProductPromotionKernelMask(' 1 `
+	"$promotionHeaderPath exposes one ordinary-product authority entry point"
+Require-Count $promotionHeader 'RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK' 3 `
+	"$promotionHeaderPath defaults and consumes only the dedicated v2 build definition"
+Require-Count $promotionHeader 'kSchemaVersion' 2 `
+	"$promotionHeaderPath constructs and validates the current lockstep-v2 schema"
+Require-Count $promotionHeader 'kProtocolEpoch' 2 `
+	"$promotionHeaderPath constructs and validates the current lockstep-v2 protocol epoch"
+if ($promotionHeader -notmatch '(?s)authority\.promotedKernelMask != liveIntegratedKernelMask.*?return MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK;') {
+    $failures.Add("$promotionHeaderPath must fail closed unless the complete live kernel mask was promoted")
+}
+
 $configBuildPath = 'cmake/config-build.cmake'
 $configBuild = Read-Source $configBuildPath
 Require-Count $configBuild 'option(RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY' 1 `
 	"$configBuildPath exposes one boolean post-gate promotion configuration"
-Require-Count $configBuild 'set(RTS_MULTIPLAYER_SIMULATION_TRUSTED_PROMOTED_KERNEL_MASK 0)' 1 `
-	"$configBuildPath defaults embedded multiplayer authority to zero"
-Require-Count $configBuild 'set(RTS_MULTIPLAYER_SIMULATION_TRUSTED_PROMOTED_KERNEL_MASK 63)' 0 `
-	"$configBuildPath never embeds the v1 diagnostic mask as product authority"
-Require-Count $configBuild 'lockstep-v2 authority contract is required' 1 `
-	"$configBuildPath blocks promotion until the reviewed lockstep-v2 contract exists"
+Require-Count $configBuild 'RTS_MULTIPLAYER_SIMULATION_TRUSTED_PROMOTED_KERNEL_MASK' 0 `
+	"$configBuildPath does not reuse the v1 promotion namespace"
+Require-Count $configBuild 'RTS_MULTIPLAYER_SIMULATION_TRUSTED_SOURCE_REVISION' 0 `
+	"$configBuildPath does not reuse the v1 source-trust namespace"
+Require-Count $configBuild 'set(RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK 0)' 1 `
+	"$configBuildPath defaults the dedicated v2 product authority to serial"
+Require-Count $configBuild 'set(RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK 63)' 1 `
+	"$configBuildPath promotes exactly the six lockstep-v2-qualified kernels"
+Require-Count $configBuild 'RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK=' 1 `
+	"$configBuildPath embeds the dedicated v2 authority in the product compilation"
+Require-Count $configBuild 'CMAKE_SIZEOF_VOID_P EQUAL 8' 2 `
+	"$configBuildPath requires and records the native x64 promotion boundary"
+Require-Count $configBuild 'RTS_BUILD_OPTION_DEBUG OR RTS_BUILD_OPTION_PROFILE OR' 1 `
+	"$configBuildPath rejects debug, profile, and sanitizer promotion lanes"
+Require-Count $configBuild 'RTS_BUILD_OPTION_PROFILE_TRACY OR RTS_BUILD_OPTION_ASAN' 1 `
+	"$configBuildPath rejects Tracy profiling promotion lanes"
 Require-Count $configBuild 'status --porcelain --untracked-files=all' 0 `
-	"$configBuildPath has no stale v1 promotion trust checks"
+	"$configBuildPath does not derive product authority from mutable worktree state"
+
+$presetsPath = 'CMakePresets.json'
+$presets = Read-Source $presetsPath
+$presetDocument = $presets | ConvertFrom-Json
+$x64ReleasePreset = @($presetDocument.configurePresets | Where-Object {
+        [string]$_.name -ceq 'x64'
+    })
+if ($x64ReleasePreset.Count -ne 1 -or
+    [string]$x64ReleasePreset[0].cacheVariables.RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY -cne 'ON') {
+    $failures.Add("$presetsPath must enable lockstep-v2 promotion in the native x64 Release product preset")
+}
+foreach ($nonReleasePreset in @('x64-debug', 'x64-profile')) {
+    $matchingPreset = @($presetDocument.configurePresets | Where-Object {
+            [string]$_.name -ceq $nonReleasePreset
+        })
+    if ($matchingPreset.Count -ne 1 -or
+        [string]$matchingPreset[0].cacheVariables.RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY -cne 'OFF') {
+        $failures.Add("$presetsPath must keep $nonReleasePreset outside the promoted product boundary")
+    }
+}
 
 $gameEngineCmakePath = 'Core/GameEngine/CMakeLists.txt'
 $gameEngineCmake = Read-Source $gameEngineCmakePath
@@ -482,6 +631,24 @@ Require-Count $policyTest 'first quitting peer revokes policy usability' 1 `
     "$policyTestPath covers immediate quitting fail-closed behavior"
 Require-Count $policyTest 'policy cannot renegotiate a reduced roster after resolution' 1 `
     "$policyTestPath rejects reduced-roster renegotiation"
+
+$wireTestPath = 'Core/Tools/NetworkWireContractTest/NetworkWireContractTest.cpp'
+$wireTest = Read-Source $wireTestPath
+Require-Count $wireTest 'reviewed lockstep-v2 promotion grants ordinary product authority' 1 `
+	"$wireTestPath covers positive ordinary product promotion"
+Require-Count $wireTest 'ordinary NET3 hello advertises the reviewed lockstep-v2 product mask' 1 `
+	"$wireTestPath covers positive ordinary NET3 advertisement"
+Require-Count $wireTest 'matching ordinary promoted peers resolve all six worker kernels' 1 `
+	"$wireTestPath covers positive ordinary session-policy authority"
+Require-Count $wireTest 'InstalledNet3Validation v1 remains diagnostic even with a nonzero caller mask' 1 `
+	"$wireTestPath preserves the diagnostic-v1 negative authority proof"
+
+$wireTestCMakePath = 'Core/Tools/NetworkWireContractTest/CMakeLists.txt'
+$wireTestCMake = Read-Source $wireTestCMakePath
+Require-Count $wireTestCMake 'core_config' 1 `
+	"$wireTestCMakePath validates the same embedded promotion definition as the product graph"
+Require-Count $wireTestCMake 'core_task_runtime' 1 `
+	"$wireTestCMakePath links the ordinary session-policy resolver exercised by the positive promotion test"
 
 $loopbackHeaderPath = 'Core/Tools/MixedWorkerMultiplayerTest/MixedWorkerMultiplayerLoopbackContract.h'
 $loopbackHeader = Read-Source $loopbackHeaderPath

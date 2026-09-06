@@ -106,6 +106,12 @@ struct ImmutableSpatialCollectionCompletion
 private:
 	bool m_completed[MAXIMUM_QUERIES];
 };
+
+// A successfully validated query is a committed transaction even when its
+// immutable result set requires no owner mutations. Shadow disagreement still
+// rejects publication independently of mutation count.
+bool ImmutableSpatialConsumerTransactionCommitted(
+	ImmutableSpatialUInt32 mutationCount, bool referenceMatched);
 #endif
 
 struct ImmutableSpatialJobSystemOptions
@@ -126,6 +132,17 @@ struct ImmutableSpatialJobSystemOptions
 	performance::KernelPerformanceReferenceBatch *referenceBatch;
 	const ImmutableSpatialQueryOwnerIdentity *queryOwners;
 	ImmutableSpatialUInt32 queryOwnerCount;
+	performance::KernelPerformanceAttempt referenceAttempt;
+	// Default-inert focused-test controls forwarded to the actual local query
+	// checkpoints and range entries; no replacement range executor is supplied.
+	ImmutableSpatialCheckpointFunction testCheckpoint;
+	ImmutableSpatialRangeObservation testObserveRange;
+	void *testCheckpointContext;
+	// Default-null observations at existing physical owner boundaries.
+	void (*testBeforeWait)(void *);
+	void (*testAfterCancel)(void *);
+	void (*testReleasedGroup)(void *, unsigned pass, bool cancelled,
+		unsigned completed, unsigned submitted, unsigned reason);
 #endif
 };
 
@@ -142,6 +159,9 @@ struct ImmutableSpatialJobSystemMetrics
 	JobMetricCounter physicalWorkerMask;
 	unsigned distinctPhysicalWorkers;
 	bool physicalWorkerMaskComplete;
+	// Set by the native source boundary after at least one dispatch is accepted;
+	// baseline replay sets it only when the recorded decision was admitted.
+	bool referenceAdmissionAccepted;
 	// Exact maximum number of physical workers executing either dispatch of
 	// this immutable collection at the same time. This is non-authoritative.
 	unsigned peakConcurrentPhysicalWorkers;

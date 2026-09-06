@@ -27,7 +27,7 @@
   ],
   "ai": {
     "seeds": [1729, 1730, 1731],
-    "scenarios": ["4v3", "4v2"],
+    "scenarios": ["4v3", "4v2", "hard-ai-2v6"],
     "repeats": 2
   }
 }

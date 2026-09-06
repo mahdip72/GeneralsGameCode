@@ -418,7 +418,7 @@ function Assert-ImmutableSpatialDiagnosticsRuntimeContract {
     param([string]$Content, [string]$Context)
     # This boundary retires observations only: it must neither invent a commit
     # nor reset the arena, query epoch, or authoritative collection state.
-    $closePattern = 'void endCollection\(\)\s*\{\s*if\s*\(m_performanceBatchActive\s*\|\|\s*m_referenceBatch\.valid\(\)\)\s*finishPerformanceBatch\(\s*rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION\s*\);\s*\}'
+	$closePattern = 'void endCollection\(\)\s*\{\s*if\s*\(m_performanceBatchActive\s*\|\|\s*m_referenceBatch\.valid\(\)\s*\|\|\s*m_referenceAttempt\.valid\(\)\)\s*finishPerformanceBatch\(fallbackPerformanceDisposition\(\)\);\s*\}'
     if ($Content -notmatch $closePattern -or
         $Content.IndexOf('liveSpatialRuntime().endCollection();',
             [StringComparison]::Ordinal) -lt 0) {
@@ -646,7 +646,9 @@ function Assert-CollisionAdapterContract {
     foreach ($marker in @(
         'class LivePartitionCollisionWorkspace',
         'rts::CollisionAdmissionSampler admissionSampler;',
-        'admissionSampler.hasUsefulSpread()',
+        'static bool hasUsefulPartitionCollisionSpread(',
+        'const bool useful = sampler.hasUsefulSpread();',
+        'hasUsefulPartitionCollisionSpread(admissionSampler)',
         'rts::RecordCollisionCandidateIneligibleSlice();',
         'rts::frame_timing::CollisionAdmission',
         'rts::frame_timing::SimulationSnapshot',
@@ -704,6 +706,15 @@ function Assert-CollisionAdapterContract {
 
 function Assert-ObjectStatusAuthoritativeCommitContract {
     param([string]$Content, [string]$Context)
+	$authoritativeMatch = [regex]::Match($Content,
+		'(?s)const\s+Bool\s+authoritativePerformanceBatch\s*=\s*(?<expression>.*?);')
+	if (-not $authoritativeMatch.Success) {
+		throw "$Context is missing the object-status authoritative-batch predicate."
+	}
+	$authoritativeExpression = $authoritativeMatch.Groups['expression'].Value -replace '\s+', ''
+	if ($authoritativeExpression -match 'preparedCount(?:!=|>|>=)0|0(?:!=|<|<=)preparedCount') {
+		throw "$Context incorrectly requires a nonzero object-status command count for authoritative completion."
+	}
     $committedCountMarker = 'UnsignedInt committedCount = 0;'
     $committedCountIndex = $Content.IndexOf($committedCountMarker,
         [StringComparison]::Ordinal)
@@ -1406,6 +1417,8 @@ preparePhysicsIntegrationBatch(this, m_sleepyUpdates,
 		if ($_.Exception.Message -like 'Self-test failed*') { throw }
 	}
 	$validObjectStatusCompletion = @'
+const Bool authoritativePerformanceBatch = !shadow &&
+    preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL;
 UnsignedInt committedCount = 0;
 Bool allCommandsResolved = TRUE;
 performanceBatch.finish(
@@ -1420,6 +1433,9 @@ performanceBatch.finish(
 			'committedCount == preparedCount', 'removed_commit_cardinality'),
 		$validObjectStatusCompletion.Replace(
 			'allCommandsResolved', 'removed_command_resolution'),
+		$validObjectStatusCompletion.Replace(
+			'preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL;',
+			'preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL && preparedCount != 0;'),
 		$validObjectStatusCompletion.Replace(
 			'performanceBatch.finish(',
 			'const Bool complete = committedCount == preparedCount; performanceBatch.finish(').Replace(
@@ -1438,7 +1454,9 @@ performanceBatch.finish(
 	$validCollisionAdapter = @'
 class LivePartitionCollisionWorkspace
 rts::CollisionAdmissionSampler admissionSampler;
-admissionSampler.hasUsefulSpread()
+static bool hasUsefulPartitionCollisionSpread(
+const bool useful = sampler.hasUsefulSpread();
+hasUsefulPartitionCollisionSpread(admissionSampler)
 rts::RecordCollisionCandidateIneligibleSlice();
 rts::frame_timing::CollisionAdmission
 rts::frame_timing::SimulationSnapshot
@@ -1462,7 +1480,8 @@ rts::frame_timing::SimulationReduce
     Assert-CollisionAdapterContract $validCollisionAdapter $validCollisionKernel `
         'valid collision adapter fixture'
     foreach ($missingAdapterMarker in @('LivePartitionCollisionWorkspace',
-        'CollisionAdmissionSampler', 'CollisionLiveValidation',
+        'CollisionAdmissionSampler', 'hasUsefulPartitionCollisionSpread',
+        'sampler.hasUsefulSpread', 'CollisionLiveValidation',
         'ValidateCollisionCandidateGenerations', 'if (liveValid)',
         'addToContactList', 'RecordCollisionCandidateAcceptedParallelWork',
         'CollisionExistingFilter', 'CollisionCommitPrepare', 'containsContact',
@@ -1503,15 +1522,16 @@ rts::frame_timing::SimulationReduce
     $validSpatialClose = @'
 void endCollection()
 {
-    if (m_performanceBatchActive || m_referenceBatch.valid())
-        finishPerformanceBatch(rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+    if (m_performanceBatchActive || m_referenceBatch.valid() ||
+        m_referenceAttempt.valid())
+        finishPerformanceBatch(fallbackPerformanceDisposition());
 }
 liveSpatialRuntime().endCollection();
 '@
     Assert-ImmutableSpatialDiagnosticsRuntimeContract $validSpatialClose 'valid spatial diagnostics close'
     foreach ($invalidClose in @(
-        $validSpatialClose.Replace('m_performanceBatchActive || m_referenceBatch.valid()', 'true'),
-        $validSpatialClose.Replace('KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION', 'KERNEL_PERFORMANCE_COMMITTED'),
+		$validSpatialClose.Replace('m_performanceBatchActive || m_referenceBatch.valid() ||', 'true ||'),
+		$validSpatialClose.Replace('fallbackPerformanceDisposition()', 'rts::performance::KERNEL_PERFORMANCE_COMMITTED'),
         $validSpatialClose.Replace('liveSpatialRuntime().endCollection();', ''),
         $validSpatialClose.Replace('void endCollection()', 'void noBoundaryClose()'),
         $validSpatialClose.Replace('    if (m_performanceBatchActive', '    clearCollection(); if (m_performanceBatchActive')

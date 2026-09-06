@@ -91,10 +91,9 @@ $legacyGameEngineDeviceInventory = @(
     }
 )
 
-# The title WW3D2/GameEngineDevice graph still contains the compatibility
-# facade while it is being ported.  AuthorityOnly therefore proves the
-# native renderer/device ownership and final PE/link closure, while
-# StrictFinal remains the hard migration gate over the complete title graph.
+# AuthorityOnly remains available for focused diagnostics. Stage 5 product
+# validation uses StrictFinal so the complete title graph and native
+# renderer/device PE/link closure are both mandatory.
 $legacySourceEdgePattern = '(?im)^\s*#\s*include\s*[<"](?:[^">]*[\\/]\s*)?(?:dx8wrapper|dx8webbrowser|d3d8(?:types|caps)?)\.h[>"]|\b(?:DX8Wrapper|IDirect3[A-Za-z]*8|D3D(?:FVF|TS|RS|TSS|LOCK|POOL|USAGE|PRIMITIVE|FORMAT|CAPS)8?)_[A-Za-z0-9_]*|\bD3D[A-Z0-9_]*8\b'
 
 function Add-Finding {

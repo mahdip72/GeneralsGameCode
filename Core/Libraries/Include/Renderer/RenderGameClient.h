@@ -365,7 +365,10 @@ RenderResult SetGameLightState(unsigned int index,
 	const LegacyLightState &light);
 void SetGameTransform(GameRenderTransformSlot slot, const Matrix3D &matrix);
 void SetGameTransform(GameRenderTransformSlot slot, const Matrix4x4 &matrix);
+// Opaque 4x4 matrices use the renderer's row-vector layout. The typed
+// WWMath getter preserves its column-vector layout for save/restore callers.
 void SetGameTransform(GameRenderTransformSlot slot, const void *matrix);
+void GetGameTransform(GameRenderTransformSlot slot, Matrix4x4 *matrix);
 void GetGameTransform(GameRenderTransformSlot slot, void *matrix);
 void SetGameViewport(unsigned int x, unsigned int y, unsigned int width,
 	unsigned int height, float minimumDepth, float maximumDepth);
@@ -426,6 +429,7 @@ RenderResult QueueGameBackBufferCapture(
 	RenderCaptureHandle *handle);
 unsigned int CancelGameBackBufferCaptures(void *consumer, RenderResult reason);
 void RequestGameBackBufferCapture();
+bool ConsumeGameBackBufferCaptureSuccess();
 
 // Legacy-only output helpers are kept behind the same source-level contract;
 // native callers use TextureClass publication and never receive a raw object.

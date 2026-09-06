@@ -27,6 +27,38 @@ void expect(bool condition, const char *message)
 	++failures;
 }
 
+void testModeParsingUsesFailSafeCapacityDefault()
+{
+	char program[] = "object-computation-test";
+	char externalSelector[] = "--external-qualification";
+	char fallbackSelector[] = "--allow-serial-fallback";
+	char localSelector[] = "--local-capacity";
+	char *defaultArguments[] = { program };
+	char *externalArguments[] = { program, externalSelector };
+	char *externalFallbackArguments[] = { program, externalSelector,
+		fallbackSelector };
+	char *conflictingArguments[] = { program, localSelector,
+		externalSelector };
+	bool localCapacity = false;
+	rts_test::ObjectComputationTestMode mode =
+		rts_test::OBJECT_COMPUTATION_TEST_ALLOW_SERIAL_FALLBACK;
+
+	expect(rts_test::ParseObjectComputationTestMode(1, defaultArguments,
+		&localCapacity, &mode) && localCapacity &&
+		mode == rts_test::OBJECT_COMPUTATION_TEST_STRICT_SCALING,
+		"object computation defaults to bounded local capacity");
+	expect(rts_test::ParseObjectComputationTestMode(2, externalArguments,
+		&localCapacity, &mode) && !localCapacity,
+		"object computation requires an explicit external selector");
+	expect(rts_test::ParseObjectComputationTestMode(3,
+		externalFallbackArguments, &localCapacity, &mode) && !localCapacity &&
+		mode == rts_test::OBJECT_COMPUTATION_TEST_ALLOW_SERIAL_FALLBACK,
+		"external capacity and fallback selectors may be combined");
+	expect(!rts_test::ParseObjectComputationTestMode(3,
+		conflictingArguments, &localCapacity, &mode),
+		"conflicting capacity selectors are rejected");
+}
+
 bool noCaptureOrJobWork(const rts::ObjectComputationMetrics &metrics)
 {
 	return metrics.objectCount == 0 && metrics.moduleCount == 0 &&
@@ -770,13 +802,14 @@ int main(int argc, char **argv)
 	{
 		fprintf(stderr,
 			"Usage: core_object_computation_island_tests "
-			"[--local-capacity] "
+			"[--local-capacity|--external-qualification] "
 			"[--strict-scaling|--allow-serial-fallback]\n");
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);
 	printf("Object computation test mode: %s\n",
 		rts_test::ObjectComputationTestModeName(mode));
+	testModeParsingUsesFailSafeCapacityDefault();
 	testReadViewValidation();
 	testInvalidInputDisposition(mode);
 	testCapturePreflightRejectsBeforeWork();

@@ -10,6 +10,7 @@
 // The real Runtime begin/observe/terminal/scheduler/finish and ledgers are linked.
 // Only external Recorder/world data and observation of call order are controlled.
 #include "Common/GameThreadOwnership.h"
+#include "Common/GlobalData.h"
 #include "Common/INI.h"
 #include "Common/INIException.h"
 #include "Common/SkirmishAITestRunner.h"
@@ -35,10 +36,12 @@
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <string>
 #include <vector>
+#include "NativeReceiptCallerFenceInputs.h"
 
 #ifdef TheGlobalData
 #undef TheGlobalData
@@ -57,6 +60,15 @@ void Check(bool condition, const char *message)
 	{
 		fprintf(stderr, "FAIL [%s]: %s\n", caseName, message);
 		++failures;
+	}
+}
+
+void Require(bool condition, const char *message)
+{
+	if (!condition)
+	{
+		fprintf(stderr, "PREREQUISITE [%s]: %s\n", caseName, message);
+		exit(2);
 	}
 }
 
@@ -81,7 +93,8 @@ struct Outcome
 		borrowAtRecorder(false), borrowAtEveryUpdate(true),
 		collectorAfterEndFrame(true), detachedBeforeRuntimeDestruction(false),
 		finalized(false), terminalKnown(false), lastCompletedFrame(0),
-		terminalFrame(0), phaseRequested(false) {}
+		terminalFrame(0), phaseRequested(false), playbackCalls(0),
+		engineExecuteCalls(0), processStartCalls(0), allowInteractive(false), engineQuitting(false) {}
 	unsigned runtimeInstances, runtimeDestroyed, recorderCalls;
 	unsigned updateCalls, collectorCalls, endFrames;
 	bool frameOpen, borrowAtRecorder, borrowAtEveryUpdate;
@@ -89,6 +102,9 @@ struct Outcome
 	bool finalized, terminalKnown;
 	unsigned lastCompletedFrame, terminalFrame;
 	bool phaseRequested;
+	unsigned playbackCalls, engineExecuteCalls, processStartCalls;
+	bool allowInteractive, engineQuitting;
+	std::wstring workerCommand;
 	PerformanceReceiptWorkload workload;
 };
 
@@ -101,11 +117,18 @@ public:
 	AsciiString() {}
 	AsciiString(const char *text) : value(text != 0 ? text : "") {}
 	const char *str() const { return value.c_str(); }
+	const char *find(char character) const { return strchr(value.c_str(), character); }
+	int getLength() const { return static_cast<int>(value.size()); }
+	char getCharAt(int index) const { return value[static_cast<size_t>(index)]; }
+	void set(const char *text) { value = text != 0 ? text : ""; }
+	void removeLastChar() { if (!value.empty()) value.resize(value.size() - 1); }
 private:
 	std::string value;
 };
 
-struct GlobalData { Bool m_headless; } globalData = { TRUE };
+#include "NativeReceiptReplayShapeDependencies.inc"
+
+struct GlobalData { Bool m_headless, m_windowed; } globalData = { TRUE, FALSE };
 GlobalData *TheGlobalData = &globalData;
 
 class Player
@@ -160,6 +183,7 @@ public:
 	bool detachPerformanceReceiptRuntime(PerformanceReceiptRuntime *expectedRuntime);
 	Bool isInGameLogicUpdate() const { return m_isInUpdate; }
 	unsigned getFrame() const { return m_frame; }
+	void replaceFrameForFault(unsigned frame) { m_frame = frame; }
 	Object *getFirstObject() { return &object; }
 	unsigned getCRC(Int) const { return 0x89ABCDEFU; }
 	const rts::LiveSimulationPhaseRuntimeMetrics &getStage5PhaseRuntimeMetrics() const
@@ -231,6 +255,15 @@ public:
 		captureCompletedFrameFromSource(previousFrame, collision, physics,
 			status, spatial, path);
 	}
+	const PerformanceReceiptWorkload &capturedWorkload() const
+	{
+		return m_receipt.workload;
+	}
+	bool qualificationFailed() const
+	{
+		return !m_failure.empty() ||
+			m_phaseObservationFailed.load(std::memory_order_acquire);
+	}
 private:
 	void captureCompletedFrameFromSource(unsigned previousFrame,
 		const rts::CollisionCandidateRuntimeMetrics &collision,
@@ -265,11 +298,17 @@ class RecorderClass
 {
 public:
 	RecorderClass(bool failOpen, unsigned updates)
-		: m_failOpen(failOpen), m_updates(updates) {}
+		: m_failOpen(failOpen), m_updates(updates), m_updateStart(0) {}
 	static AsciiString getReplayDir() { return AsciiString("."); }
-	Bool playbackFile(const AsciiString &) { return FALSE; }
+	Bool playbackFile(const AsciiString &)
+	{
+		Check(outcome.allowInteractive, "headless fixture must not enter interactive playback");
+		++outcome.playbackCalls;
+		return m_failOpen ? FALSE : TRUE;
+	}
 	Bool simulateReplay(const AsciiString &)
 	{
+		m_updateStart = outcome.updateCalls;
 		++outcome.recorderCalls;
 		outcome.borrowAtRecorder = currentRuntime != 0 && currentRuntime->active() &&
 			TheGameLogic != 0 && TheGameLogic->m_performanceReceiptRuntime == currentRuntime;
@@ -279,17 +318,21 @@ public:
 	Bool hasReplayReadError() const { return FALSE; }
 	Bool sawCRCMismatch() const { return FALSE; }
 	unsigned getPlaybackFrameCount() const { return m_updates; }
-	Bool isPlaybackInProgress() const { return outcome.updateCalls < m_updates; }
+	Bool isPlaybackInProgress() const { return outcome.updateCalls - m_updateStart < m_updates; }
 private:
 	bool m_failOpen;
-	unsigned m_updates;
+	unsigned m_updates, m_updateStart;
 };
 RecorderClass *TheRecorder = 0;
 
 struct GameEngine
 {
-	void execute() { Check(false, "headless fixture must not enter interactive engine"); }
-	void setQuitting(Bool) {}
+	void execute()
+	{
+		Check(outcome.allowInteractive, "headless fixture must not enter interactive engine");
+		++outcome.engineExecuteCalls;
+	}
+	void setQuitting(Bool value) { outcome.engineQuitting = value != FALSE; }
 } gameEngine;
 GameEngine *TheGameEngine = &gameEngine;
 
@@ -297,6 +340,9 @@ class ReplaySimulation
 {
 public:
 	static int simulateReplaysInThisProcess(const std::vector<AsciiString> &filenames);
+	static int simulateReplaysInWorkerProcesses(const std::vector<AsciiString> &filenames, int maxProcesses);
+	static std::vector<AsciiString> resolveFilenameWildcards(const std::vector<AsciiString> &filenames);
+	static int simulateReplays(const std::vector<AsciiString> &filenames, int maxProcesses);
 	static Bool s_isRunning;
 	static UnsignedInt s_replayIndex, s_replayCount;
 };
@@ -304,9 +350,41 @@ Bool ReplaySimulation::s_isRunning = FALSE;
 UnsignedInt ReplaySimulation::s_replayIndex = 0;
 UnsignedInt ReplaySimulation::s_replayCount = 0;
 
+#include "PerformanceReceiptNativePathIdentity.inc"
 #include "PerformanceReceiptProducerSourceHold.inc"
 #include "PerformanceReceiptProducerPrintMetrics.inc"
+#include "PerformanceReceiptRawProducer.inc"
 #include "PerformanceReceiptProducerJobScope.inc"
+#include "PerformanceReceiptProducerCountProcesses.inc"
+
+void TestRawProducerSchemaLabel()
+{
+	const char *const expected[] = {
+		"producer=game-executable-performance-receipt-v5\n",
+		"producer=game-executable-performance-receipt-v6\n"
+	};
+	for (unsigned index = 0; index != 2; ++index)
+	{
+		rts::performance::PerformanceReceipt receipt;
+		receipt.schemaVersion = index == 0 ? 5 : 6;
+		char path[128] = {};
+		_snprintf(path, sizeof(path), "raw-producer-%lu-%u.log",
+			static_cast<unsigned long>(GetCurrentProcessId()), index);
+		remove(path);
+		receipt.rawEvidence.rawLogPath = path;
+		Check(writePerformanceReceiptRawDiagnostic(receipt),
+			"schema-specific raw diagnostic closes successfully");
+		// Read as text so the assertion tests the producer identity rather than
+		// depending on the Windows text writer's CRLF representation.
+		FILE *file = fopen(path, "r");
+		char line[128] = {};
+		Check(file != 0 && fgets(line, sizeof(line), file) != 0 &&
+			strcmp(line, expected[index]) == 0,
+			"raw diagnostic producer label matches its actual V5/V6 receipt schema");
+		if (file != 0) Check(fclose(file) == 0, "raw diagnostic assertion closes its reader");
+		remove(path);
+	}
+}
 } // namespace performance_receipt_producer_fixture
 
 namespace rts { namespace frame_timing {
@@ -331,6 +409,9 @@ namespace performance_receipt_producer_fixture
 #include "PerformanceReceiptProducerLoop.inc"
 #undef EndFrame
 #undef BeginFrame
+#include "PerformanceReceiptProducerWorkerLoop.inc"
+#include "PerformanceReceiptProducerResolveWildcards.inc"
+#include "PerformanceReceiptProducerPublicRoute.inc"
 
 class ReceiptEnvironment
 {
@@ -368,16 +449,23 @@ private:
 class SourceFile
 {
 public:
-	SourceFile() : created(false) {}
+	SourceFile() : created(false), directoryCreated(false) {}
 	bool create()
 	{
-		char directory[MAX_PATH], name[96], absolute[MAX_PATH];
-		const DWORD size = GetCurrentDirectoryA(sizeof(directory), directory);
-		if (size == 0 || size >= sizeof(directory)) return false;
-		_snprintf(name, sizeof(name), "producer-contract-%lu-%lu.rep",
+		char workingDirectory[MAX_PATH], name[96], absolute[MAX_PATH];
+		const DWORD size = GetCurrentDirectoryA(sizeof(workingDirectory), workingDirectory);
+		if (size == 0 || size >= sizeof(workingDirectory)) return false;
+		_snprintf(name, sizeof(name), "producer-contract-%lu-%lu",
 			GetCurrentProcessId(), GetTickCount());
 		name[sizeof(name) - 1] = '\0';
-		const int length = _snprintf(absolute, sizeof(absolute), "%s\\%s", directory, name);
+		const int directoryLength = _snprintf(absolute, sizeof(absolute), "%s\\%s",
+			workingDirectory, name);
+		if (directoryLength <= 0 || directoryLength >= static_cast<int>(sizeof(absolute))) return false;
+		directory = absolute;
+		if (CreateDirectoryA(directory.c_str(), 0) == FALSE) return false;
+		directoryCreated = true;
+		const int length = _snprintf(absolute, sizeof(absolute), "%s\\source.rep",
+			directory.c_str());
 		if (length <= 0 || length >= static_cast<int>(sizeof(absolute))) return false;
 		path = absolute;
 		HANDLE file = CreateFileA(path.c_str(), GENERIC_WRITE, 0, 0,
@@ -396,11 +484,118 @@ public:
 	{
 		if (created) Check(DeleteFileA(path.c_str()) != FALSE,
 			"only the exclusively created fixture source is removed after all holds close");
+		if (directoryCreated) Check(RemoveDirectoryA(directory.c_str()) != FALSE,
+			"only the exclusively created fixture source directory is removed after all holds close");
 	}
-	std::string path;
+	std::string path, directory;
 private:
-	bool created;
+	bool created, directoryCreated;
 };
+
+void TestImmutableReplayReceiptSource(const char *path)
+{
+	caseName = "immutable-replay-source";
+	const unsigned char bytes[] = { 0x44, 0x32, 0x42, 0x01, 0x00, 0x83, 0x01 };
+	char expected[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1] = {0};
+	Check(HashSkirmishAITestBytes(bytes, sizeof(bytes), expected),
+		"independent byte hash prerequisite is available");
+	{
+		ImmutableReplayReceiptSource source;
+		Check(source.open(path),
+			"immutable replay source opens the exact source handle and hashes it");
+		Check(strcmp(source.sha256(), expected) == 0,
+			"immutable replay source digest comes from the held handle bytes");
+		SetLastError(ERROR_SUCCESS);
+		HANDLE writer = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, 0,
+			OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+		const DWORD writeError = writer == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+		if (writer != INVALID_HANDLE_VALUE)
+			CloseHandle(writer);
+		Check(writer == INVALID_HANDLE_VALUE && writeError == ERROR_SHARING_VIOLATION,
+			"held replay source denies mutation while its digest and replay identity are live");
+		char replacement[MAX_PATH] = {0};
+		const int replacementLength = _snprintf(replacement, sizeof(replacement),
+			"%s.alias", path);
+		SetLastError(ERROR_SUCCESS);
+		const BOOL removedExisting = DeleteFileA(replacement);
+		const DWORD removeError = removedExisting ? ERROR_SUCCESS : GetLastError();
+		Check(replacementLength > 0 && replacementLength < static_cast<int>(sizeof(replacement)) &&
+			(removedExisting != FALSE || removeError == ERROR_FILE_NOT_FOUND),
+			"immutable replay alias fixture starts absent");
+		const BOOL moved = MoveFileExA(path, replacement, 0);
+		if (moved)
+		{
+			Check(MoveFileExA(replacement, path, 0) != FALSE,
+				"unexpected replay replacement is restored before the fixture continues");
+		}
+		Check(moved == FALSE,
+			"held replay source denies pathname replacement while replay is admitted");
+		char directoryReplacement[MAX_PATH] = {0};
+		const char *leaf = strrchr(path, '\\');
+		Require(leaf != 0, "absolute replay source has a leaf component");
+		const std::string directory(path, static_cast<size_t>(leaf - path));
+		const int directoryReplacementLength = _snprintf(directoryReplacement,
+			sizeof(directoryReplacement), "%s.alias", directory.c_str());
+		DeleteFileA(directoryReplacement);
+		RemoveDirectoryA(directoryReplacement);
+		const BOOL movedDirectory = MoveFileExA(directory.c_str(), directoryReplacement, 0);
+		if (movedDirectory)
+			Check(MoveFileExA(directoryReplacement, directory.c_str(), 0) != FALSE,
+				"unexpected replay ancestor replacement is restored before the fixture continues");
+		Check(directoryReplacementLength > 0 &&
+			directoryReplacementLength < static_cast<int>(sizeof(directoryReplacement)) &&
+			movedDirectory == FALSE,
+			"each replay ancestor remains held against pathname retargeting through Recorder");
+		Check(source.finish(),
+			"immutable replay source rechecks its extent and identity before checked closure");
+	}
+	const char *leaf = strrchr(path, '\\');
+	Require(leaf != 0, "absolute replay source has a leaf component");
+	std::string nonCanonical(path, static_cast<size_t>(leaf - path + 1));
+	nonCanonical += ".\\";
+	nonCanonical += leaf + 1;
+	{
+		ImmutableReplayReceiptSource aliasedAncestor;
+		Check(!aliasedAncestor.open(nonCanonical.c_str()),
+			"replay admission rejects a pathname alias before any source identity is trusted");
+	}
+	char alias[MAX_PATH] = {0};
+	const int aliasLength = _snprintf(alias, sizeof(alias), "%s.hardlink", path);
+	Check(aliasLength > 0 && aliasLength < static_cast<int>(sizeof(alias)),
+		"immutable replay alias path remains bounded");
+	DeleteFileA(alias);
+	Check(CreateHardLinkA(alias, path, 0) != FALSE,
+		"hard-link alias prerequisite is available for replay identity fencing");
+	{
+		ImmutableReplayReceiptSource aliased;
+		Check(!aliased.open(alias),
+			"immutable replay source rejects a hard-link pathname alias before hashing");
+	}
+	Check(DeleteFileA(alias) != FALSE,
+		"only the task-owned replay hard-link alias is removed after the identity test");
+	char oversized[MAX_PATH] = {0};
+	const int oversizedLength = _snprintf(oversized, sizeof(oversized), "%s.oversized", path);
+	Require(oversizedLength > 0 && oversizedLength < static_cast<int>(sizeof(oversized)),
+		"oversized replay fixture path remains bounded");
+	DeleteFileA(oversized);
+	HANDLE oversizedFile = CreateFileA(oversized, GENERIC_WRITE, 0, 0,
+		CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
+	Require(oversizedFile != INVALID_HANDLE_VALUE,
+		"oversized replay fixture is exclusively created");
+	LARGE_INTEGER oversizedExtent = {};
+	oversizedExtent.QuadPart = static_cast<LONGLONG>(SKIRMISH_AI_TEST_MAX_REPLAY_BYTES) + 1;
+	const bool oversizedCreated = SetFilePointerEx(oversizedFile, oversizedExtent, 0,
+		FILE_BEGIN) != FALSE && SetEndOfFile(oversizedFile) != FALSE &&
+		CloseHandle(oversizedFile) != FALSE;
+	Require(oversizedCreated, "sparse oversized replay fixture has an exact bounded extent");
+	{
+		ImmutableReplayReceiptSource oversizedSource;
+		Check(!oversizedSource.open(oversized),
+			"replay admission rejects content above its fixed extent ceiling before hashing");
+	}
+	Check(DeleteFileA(oversized) != FALSE,
+		"only the task-owned oversized replay fixture is removed");
+}
 
 void RunCase(const char *name, const char *sourcePath, unsigned entryFrame,
 	bool controlPass, bool failOpen)
@@ -454,6 +649,241 @@ void RunCase(const char *name, const char *sourcePath, unsigned entryFrame,
 	TheGameLogic = 0;
 	TheRecorder = 0;
 }
+
+void CaptureCurrentOwnerCompletion(PerformanceReceiptRuntime &runtime,
+	unsigned previousFrame)
+{
+	// Call the actual collector, not a replacement completion accumulator.
+	runtime.captureCompletedFrame(previousFrame,
+		rts::GetCollisionCandidateRuntimeMetrics(),
+		rts::GetPhysicsIntegrationRuntimeMetrics(),
+		rts::GetObjectStatusTimerRuntimeMetrics(),
+		rts::GetImmutableSpatialRuntimeMetrics(), GetOrdinaryPathRuntimeMetrics());
+}
+
+struct OrdinaryObservationClock
+{
+	OrdinaryObservationClock() : reads(0) {}
+	static rts::JobMetricCounter Read(void *context)
+	{
+		OrdinaryObservationClock &clock = *static_cast<OrdinaryObservationClock *>(context);
+		return 100 + 10 * clock.reads++;
+	}
+	unsigned reads;
+};
+
+void TestBaselineMetricProjection()
+{
+	caseName = "baseline-metric-projection";
+	const char *const phaseNames[KERNEL_PHASE_COUNT] = {
+		"owner-intake", "legacy-mutable-island", "spatial-work",
+		"owner-tail", "verification-publication"
+	};
+	const char *const kernelNames[KERNEL_PERFORMANCE_KERNEL_COUNT] = {
+		"physics", "status", "collision", "ai-planning", "spatial", "path"
+	};
+	const rts::JobMetricCounter totals[KERNEL_PHASE_COUNT] = { 101, 202, 303, 404, 505 };
+	const rts::JobMetricCounter maximums[KERNEL_PHASE_COUNT] = { 51, 92, 153, 204, 255 };
+	const rts::JobMetricCounter serials[KERNEL_PHASE_COUNT] = { 31, 82, 123, 164, 205 };
+	const rts::JobMetricCounter pures[KERNEL_PHASE_COUNT] = { 70, 120, 180, 240, 300 };
+
+	PerformanceReceipt baseline;
+	baseline.schemaVersion = 6;
+	baseline.kernelReference.mode = KERNEL_REFERENCE_PHASE_BASELINE_BINDING;
+	baseline.kernelTiming.runRole = KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE;
+	KernelPerformancePhaseAccountingSnapshot &accounting =
+		baseline.kernelTiming.phaseAccounting;
+	accounting.requested = true;
+	accounting.frozen = true;
+	accounting.complete = true;
+	accounting.errors = 0;
+	accounting.completedFrameCount = 3;
+	accounting.schedulerClosureKnown = true;
+	for (unsigned index = 0; index != KERNEL_PHASE_COUNT; ++index)
+	{
+		KernelPerformancePhaseAccountingRow &row = accounting.phases[index];
+		row.totalNanoseconds = totals[index];
+		row.maximumNanoseconds = maximums[index];
+		row.samples = 3;
+		row.serialNanoseconds = serials[index];
+		row.pureNanoseconds = pures[index];
+		appendPerformanceReceiptPhase(baseline, phaseNames[index], true,
+			900 + index, 800 + index, 7);
+		baseline.phases[index].serialNanoseconds = 700 + index;
+		baseline.phases[index].serialNanosecondsKnown = false;
+		baseline.phases[index].pureNanoseconds = 600 + index;
+		baseline.phases[index].pureNanosecondsKnown = false;
+	}
+	for (unsigned index = 0; index != KERNEL_PERFORMANCE_KERNEL_COUNT; ++index)
+	{
+		appendPerformanceReceiptKernel(baseline, kernelNames[index], true,
+			11 + index, 21 + index, 31 + index, 41 + index,
+			51 + index, 2 + index, true);
+		baseline.kernels[index].elapsedNanoseconds = 61 + index;
+		baseline.kernels[index].elapsedNanosecondsKnown = true;
+	}
+
+	PerformanceReceipt throughput = baseline;
+	throughput.kernelReference.mode = KERNEL_REFERENCE_THROUGHPUT_BINDING;
+	PerformanceReceiptPhase *const throughputPhases = &throughput.phases[0];
+	PerformanceReceiptKernel *const throughputKernels = &throughput.kernels[0];
+	const std::size_t throughputPhaseCapacity = throughput.phases.capacity();
+	const std::size_t throughputKernelCapacity = throughput.kernels.capacity();
+	Check(projectPerformanceReceiptBaselineMetrics(throughput),
+		"throughput projection is a successful strict no-op");
+	Check(&throughput.phases[0] == throughputPhases &&
+		throughput.phases.capacity() == throughputPhaseCapacity &&
+		throughput.phases[0].totalNanoseconds == 900 &&
+		throughput.phases[0].serialNanoseconds == 700 &&
+		!throughput.phases[0].serialNanosecondsKnown,
+		"throughput projection preserves existing phase storage and evidence");
+	Check(&throughput.kernels[0] == throughputKernels &&
+		throughput.kernels.capacity() == throughputKernelCapacity &&
+		throughput.kernels[0].available &&
+		throughput.kernels[0].submittedJobs == 11 &&
+		throughput.kernels[0].elapsedNanoseconds == 61 &&
+		throughput.kernels[0].elapsedNanosecondsKnown,
+		"throughput projection preserves existing kernel storage and evidence");
+
+	PerformanceReceipt incomplete = baseline;
+	incomplete.kernelTiming.phaseAccounting.complete = false;
+	Check(!projectPerformanceReceiptBaselineMetrics(incomplete),
+		"incomplete frozen baseline accounting fails closed");
+	Check(incomplete.phases[0].totalNanoseconds == 900 &&
+		incomplete.phases[0].serialNanoseconds == 700 &&
+		incomplete.kernels[0].available &&
+		incomplete.kernels[0].submittedJobs == 11 &&
+		incomplete.kernels[0].elapsedNanosecondsKnown,
+		"failed projection does not partially rewrite receipt metrics");
+
+	PerformanceReceiptPhase *const baselinePhases = &baseline.phases[0];
+	PerformanceReceiptKernel *const baselineKernels = &baseline.kernels[0];
+	const std::size_t baselinePhaseCapacity = baseline.phases.capacity();
+	const std::size_t baselineKernelCapacity = baseline.kernels.capacity();
+	Check(projectPerformanceReceiptBaselineMetrics(baseline),
+		"complete V6 phase baseline projects its frozen accounting");
+	Check(&baseline.phases[0] == baselinePhases &&
+		baseline.phases.capacity() == baselinePhaseCapacity &&
+		&baseline.kernels[0] == baselineKernels &&
+		baseline.kernels.capacity() == baselineKernelCapacity,
+		"baseline projection mutates existing canonical rows in place");
+	for (unsigned index = 0; index != KERNEL_PHASE_COUNT; ++index)
+	{
+		const PerformanceReceiptPhase &phase = baseline.phases[index];
+		Check(phase.name == phaseNames[index] && phase.available &&
+			phase.totalNanoseconds == totals[index] &&
+			phase.maximumNanoseconds == maximums[index] &&
+			phase.sampleCount == 3 &&
+			phase.serialNanoseconds == serials[index] &&
+			phase.serialNanosecondsKnown &&
+			phase.pureNanoseconds == pures[index] &&
+			phase.pureNanosecondsKnown,
+			"each baseline wire phase exactly matches its frozen partition row");
+	}
+	for (unsigned index = 0; index != KERNEL_PERFORMANCE_KERNEL_COUNT; ++index)
+	{
+		const PerformanceReceiptKernel &kernel = baseline.kernels[index];
+		Check(kernel.name == kernelNames[index] && !kernel.available &&
+			kernel.submittedJobs == 0 && kernel.completedJobs == 0 &&
+			kernel.physicalWorkerJobs == 0 && kernel.ownerHelpedJobs == 0 &&
+			kernel.physicalWorkerMask == 0 && kernel.distinctPhysicalWorkers == 0 &&
+			!kernel.physicalWorkerMaskComplete && kernel.elapsedNanoseconds == 0 &&
+			!kernel.elapsedNanosecondsKnown,
+			"phase baseline clears every physical kernel execution claim");
+	}
+}
+
+void TestPendingOwnerCompletion(const char *sourcePath)
+{
+	const char *names[] = {
+		"terminal-before-matching-consumption", "unobserved-world-frame",
+		"duplicate-completion-consumption", "unconsumed-previous-completion",
+		"world-changed-before-consumption", "outer-loop-without-update",
+		"collector-inside-update", "missing-roster-at-consumption",
+		"wrong-update-entry-frame", "terminal-consumed-before-real-tail-updates",
+		"terminal-pending-world-mismatch"
+	};
+	for (unsigned scenario = 0; scenario != ARRAY_SIZE(names); ++scenario)
+	{
+		caseName = names[scenario];
+		outcome = Outcome();
+		GameLogic logic(scenario == 8 ? 83 : 0, false);
+		TheGameLogic = &logic;
+		{
+			PerformanceReceiptRuntime runtime;
+			Check(runtime.begin("replay", sourcePath),
+				"completion contract begins the actual receipt runtime");
+			OrdinaryObservationClock clock;
+			KernelPerformanceLedger &timing = KernelPerformanceLedger::instance();
+			timing.freeze();
+			KernelPerformanceTimingRunOptions timingOptions;
+			timingOptions.enabled = true;
+			timingOptions.role = KERNEL_PERFORMANCE_PIPELINE;
+			timingOptions.clock = &OrdinaryObservationClock::Read;
+			timingOptions.clockContext = &clock;
+			Check(timing.beginRun(timingOptions),
+				"ordinary clock observer uses the unchanged pipeline ledger role");
+			Check(logic.attachPerformanceReceiptRuntime(&runtime),
+				"completion contract uses the actual title borrow");
+			if (scenario == 1)
+				logic.replaceFrameForFault(1);
+			else
+				logic.UPDATE();
+
+			if (scenario == 0 || scenario == 9 || scenario == 10)
+				runtime.captureTerminalResult(1, 0x89ABCDEFU, true, true);
+			if (scenario == 3)
+				logic.UPDATE(); // No collector consumed the first real completion.
+			if (scenario == 4 || scenario == 10)
+				logic.replaceFrameForFault(2);
+			if (scenario == 6)
+				logic.m_isInUpdate = TRUE;
+			if (scenario == 7)
+				ThePlayerList = 0;
+
+			CaptureCurrentOwnerCompletion(runtime, scenario == 3 ? 1 : 0);
+			logic.m_isInUpdate = FALSE;
+			ThePlayerList = &playerList;
+			if (scenario == 2)
+				CaptureCurrentOwnerCompletion(runtime, 0);
+			if (scenario == 5)
+				CaptureCurrentOwnerCompletion(runtime, 1);
+			if (scenario == 9)
+			{
+				// The genuine terminal completion was consumed above. Later
+				// real owner updates belong to teardown, not this workload.
+				logic.UPDATE();
+				CaptureCurrentOwnerCompletion(runtime, 1);
+				CaptureCurrentOwnerCompletion(runtime, 2); // Outer tick without UPDATE.
+				logic.UPDATE();
+				CaptureCurrentOwnerCompletion(runtime, 2);
+			}
+
+			const bool valid = scenario == 0 || scenario == 5 || scenario == 9;
+			Check(clock.reads == 0 && timing.runRole() == KERNEL_PERFORMANCE_PIPELINE,
+				"ordinary completion tracking adds no phase clocks or baseline authority");
+			Check(runtime.qualificationFailed() == !valid,
+				"only the matching once-consumed real owner completion qualifies");
+			const PerformanceReceiptWorkload &workload = runtime.capturedWorkload();
+			if (valid || scenario == 2)
+			{
+				Check(workload.sampleCount == 1 && workload.firstFrame == 1 &&
+					workload.lastFrame == 1,
+					"matching completion contributes one independently observed world sample");
+			}
+			else
+			{
+				Check(workload.sampleCount == 0,
+					"unobserved, skipped, mismatched or unsafe completion adds no world sample");
+			}
+			Check(logic.detachPerformanceReceiptRuntime(&runtime),
+				"completion contract releases the actual expected title borrow");
+			KernelPerformanceReferenceLedger::instance().freeze();
+			KernelPerformanceLedger::instance().freeze();
+		}
+		TheGameLogic = 0;
+	}
+}
 } // namespace performance_receipt_producer_fixture
 
 int RunPerformanceReceiptProducerTitleTests()
@@ -506,14 +936,21 @@ int RunPerformanceReceiptProducerTitleTests()
 		Check(source.create(), "unique source bytes are created in the dedicated test working directory");
 		if (failures == 0)
 		{
+			TestRawProducerSchemaLabel();
+			TestBaselineMetricProjection();
+			TestImmutableReplayReceiptSource(source.path.c_str());
 			RunCase("normal", source.path.c_str(), 0, false, false);
 			RunCase("reset83-to1", source.path.c_str(), 83, false, false);
 			RunCase("control0-then1", source.path.c_str(), 83, true, false);
 			RunCase("failed-open", source.path.c_str(), 83, false, true);
+			TestPendingOwnerCompletion(source.path.c_str());
 		}
 	}
 	if (attachOwner) GameThreadOwnership::DetachCurrentThread();
 	if (failures != 0) return 1;
-	printf("Performance receipt producer title tests passed (four bounded replay cases).\n");
+	printf("Performance receipt producer title tests passed (replay and owner completion contracts).\n");
 	return 0;
 }
+
+#include "PerformanceReceiptReplayCallerFence.inc"
+#include "PerformanceReceiptReplayOwnerShape.inc"

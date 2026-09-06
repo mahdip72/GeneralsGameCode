@@ -43,7 +43,7 @@ $cmakeArguments = @(
     '-B', $BuildRoot,
     '-G', 'Visual Studio 17 2022',
     '-A', 'Win32',
-    '-DRTS_BUILD_PRODUCT=ON',
+    '-DRTS_BUILD_PRODUCT=OFF',
     '-DRTS_BUILD_ZEROHOUR=ON',
     '-DRTS_BUILD_GENERALS=OFF',
     '-DRTS_BUILD_CORE_TOOLS=OFF',

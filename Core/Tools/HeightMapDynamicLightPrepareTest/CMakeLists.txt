@@ -34,3 +34,11 @@ endif()
 add_test(NAME height_map_dynamic_light_prepare_tests
     COMMAND height_map_dynamic_light_prepare_tests)
 set_tests_properties(height_map_dynamic_light_prepare_tests PROPERTIES TIMEOUT 30)
+
+if(WIN32)
+    add_test(NAME height_map_buffer_failure_contract_tests
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/HeightMapBufferFailureContract.Tests.ps1"
+            -SourceRoot "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(height_map_buffer_failure_contract_tests PROPERTIES TIMEOUT 30)
+endif()

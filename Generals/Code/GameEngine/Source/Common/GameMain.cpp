@@ -163,6 +163,7 @@ Int GameMain()
 #if defined(_WIN64)
 	if (performanceFixtureRequested)
 		exitcode = FinalizeStage5PerformanceFixtureRunner(exitcode);
+	ReleaseSkirmishAITestPerformanceReceiptOwner();
 #endif
 
 	// since execute() returned, we are exiting the game

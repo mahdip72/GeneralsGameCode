@@ -21,9 +21,8 @@ target_include_directories(z_runtime_regression_tests PRIVATE
     "${CMAKE_SOURCE_DIR}/Core/Tools/XferCrcSnapshotTest"
 )
 
-# Exercise the same architecture-selected product boundary as the title
-# executable. Win32/VC6 resolves this to the legacy D3D8/Miles/Bink lane;
-# native x64 resolves it to the D3D11/XAudio2 boundary.
+# Exercise the same native runtime boundary as the title executable. On a
+# historical non-product x86 graph this interface intentionally has no payload.
 target_link_libraries(z_runtime_regression_tests PRIVATE
 	comctl32
 	core_debug
@@ -57,6 +56,40 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
 	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/PerformanceReceiptProducerTitleTest.cmake")
 	rts_add_performance_receipt_producer_test(z_runtime_regression_tests
 		GeneralsMD z_performance_receipt_producer_tests)
+	rts_add_performance_receipt_fresh_producer_test(z_runtime_regression_tests
+		GeneralsMD z_performance_receipt_fresh_producer_tests)
+	rts_add_performance_receipt_attempt_test(z_runtime_regression_tests
+		GeneralsMD z_performance_receipt_attempt_tests)
+	rts_add_performance_receipt_bootstrap_test(z_runtime_regression_tests
+		GeneralsMD z_performance_receipt_bootstrap_tests)
+	rts_add_performance_receipt_policy_test(z_runtime_regression_tests
+		z_performance_receipt_policy_tests)
+	rts_add_performance_receipt_mode_test(z_runtime_regression_tests
+		z_performance_receipt_mode_tests)
+	rts_add_performance_receipt_wide_path_test(z_runtime_regression_tests
+		z_performance_receipt_wide_path_tests)
+	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/NativeReceiptTraceFileTest.cmake")
+	rts_add_native_receipt_trace_file_test(z_runtime_regression_tests)
+	add_test(NAME z_performance_receipt_consume_wide_path_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-consume-wide-path)
+	set_tests_properties(z_performance_receipt_consume_wide_path_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-wide-path")
+	add_test(NAME z_performance_receipt_replay_caller_fence_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-replay-caller-fence)
+	set_tests_properties(z_performance_receipt_replay_caller_fence_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-producer")
+	add_test(NAME z_performance_receipt_fresh_caller_fence_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-fresh-caller-fence)
+	set_tests_properties(z_performance_receipt_fresh_caller_fence_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-fresh-producer")
+	add_test(NAME z_performance_receipt_replay_owner_shape_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-replay-owner-shape)
+	set_tests_properties(z_performance_receipt_replay_owner_shape_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-producer")
+	add_test(NAME z_performance_receipt_practical_owner_shape_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-practical-owner-shape)
+	set_tests_properties(z_performance_receipt_practical_owner_shape_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-fresh-producer")
 	add_executable(z_native_render_target_texture_tests
 		"${CMAKE_SOURCE_DIR}/Core/Tools/NativeW3DTextureOwnerTest/NativeRenderTargetTextureTest.cpp"
 	)

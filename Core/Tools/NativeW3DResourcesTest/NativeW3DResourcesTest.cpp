@@ -4,6 +4,7 @@
 #include "nativew3dbufferowner.h"
 #include "nativew3d2.h"
 
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -848,6 +849,92 @@ int TestThreadedResourceCompletion()
 	return result;
 }
 
+int TestThreadedBetweenFrameBufferUpdates()
+{
+	int result = 0;
+	FakeRenderControl control;
+	ThreadedRenderOptions options;
+	IRenderDevice *device = CreateThreadedRenderDevice(
+		CreateThreadedFakeRenderDevice, &control, options);
+	if (device == 0)
+		return Check(false, "between-frame fixture allocates its device");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = reinterpret_cast<void *>(1);
+	parameters.width = 4;
+	parameters.height = 4;
+	result |= Check(device->initialize(parameters) == RENDER_RESULT_OK,
+		"between-frame fixture initializes the render owner");
+	NativeW3D2 product;
+	result |= Check(product.AttachBackend(device, device->immediateContext()) ==
+		RENDER_RESULT_OK, "product binds its buffer publication fence");
+	BufferDescriptor descriptor;
+	descriptor.byteCount = 16;
+	descriptor.stride = 4;
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	descriptor.usage = RENDER_USAGE_DEFAULT;
+	NativeW3DBufferOwner owner;
+	result |= Check(owner.Create(descriptor) == RENDER_RESULT_OK,
+		"terrain-shaped DEFAULT buffer is created");
+	void *bytes = 0;
+	result |= Check(product.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+		owner.Lock(0, 0, RENDER_BUFFER_UPDATE_PRESERVE, &bytes) ==
+			RENDER_RESULT_OK && bytes != 0,
+		"terrain upload begins inside the preceding frame");
+	if (bytes != 0) std::memset(bytes, 0x31, descriptor.byteCount);
+	result |= Check(owner.Unlock() == RENDER_RESULT_OK &&
+		product.Renderer().EndFrame(false) == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK,
+		"terrain upload submits without consuming its frame completion");
+	// Deliberately do not poll completion or begin another frame. Dynamic
+	// lighting runs at this same point in the animated shell update.
+	result |= Check(owner.Lock(4, 4, RENDER_BUFFER_UPDATE_PRESERVE, &bytes) ==
+		RENDER_RESULT_OK && bytes != 0 &&
+		static_cast<unsigned char *>(bytes)[0] == 0x31,
+		"between-frame lighting starts with the accepted terrain image");
+	if (bytes != 0) std::memset(bytes, 0x42, 4);
+	GpuHandle handle;
+	NativeW3DBufferDescription description;
+	result |= Check(owner.Unlock() == RENDER_RESULT_OK &&
+		!owner.HasFailedMutation() && ReadCount(&control.updateCalls) == 2 &&
+		owner.AcquireVertexRange(4, 0, 0, 4, &handle) == RENDER_RESULT_OK &&
+		product.Resources().DescribeBuffer(handle, &description) ==
+			RENDER_RESULT_OK && description.authority == NATIVE_W3D_CONTENT_CPU,
+		"completion fence orders the lighting write without poisoning terrain");
+	ThreadedRenderFrameCompletion consumed;
+	result |= Check(!PollThreadedRenderCompletion(device, &consumed),
+		"product completion owner consumed the preceding frame exactly once");
+	result |= Check(owner.Lock(0, 0, RENDER_BUFFER_UPDATE_PRESERVE, &bytes) ==
+		RENDER_RESULT_OK && bytes != 0 &&
+		static_cast<unsigned char *>(bytes)[0] == 0x31 &&
+		static_cast<unsigned char *>(bytes)[4] == 0x42 &&
+		static_cast<unsigned char *>(bytes)[8] == 0x31 &&
+		owner.Unlock() == RENDER_RESULT_OK,
+		"later terrain locks retain changed and untouched bytes");
+
+	InterlockedExchange(&control.failUpdate, 1);
+	result |= Check(product.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+		owner.Lock(0, 0, RENDER_BUFFER_UPDATE_PRESERVE, &bytes) ==
+			RENDER_RESULT_OK && owner.Unlock() == RENDER_RESULT_OK &&
+		product.Renderer().EndFrame(false) == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		owner.Lock(4, 4, RENDER_BUFFER_UPDATE_PRESERVE, &bytes) ==
+			RENDER_RESULT_OK,
+		"failed preceding upload is still pending when lighting acquires staging");
+	result |= Check(owner.Unlock() == RENDER_RESULT_FAILED &&
+		owner.HasFailedMutation() &&
+		owner.Lock(0, 0, RENDER_BUFFER_UPDATE_PRESERVE, &bytes) ==
+			RENDER_RESULT_FAILED && bytes == 0,
+		"fence publishes real upload failure and continues rejecting stale preserve");
+	InterlockedExchange(&control.failUpdate, 0);
+	result |= Check(owner.Reset() == RENDER_RESULT_OK &&
+		product.Shutdown() == RENDER_RESULT_OK,
+		"between-frame fixture releases its product binding");
+	device->shutdown();
+	delete device;
+	return result;
+}
+
 int TestThreadedNativeBufferOwnerFailureRecovery()
 {
 	int result = 0;
@@ -1495,11 +1582,83 @@ int main()
 		device.LiveCount() == liveBeforeOpenShutdown &&
 		productResources.Renderer().EndFrame(false) == RENDER_RESULT_OK,
 		"public and product borrowed shutdown reject an open frame without detaching state");
+	const unsigned short indexedValues[3] = { 0, 0, 0 };
+	const unsigned short negativeIndexedValues[3] = { 1, 1, 1 };
+	BufferDescriptor indexedIndexDescriptor;
+	indexedIndexDescriptor.byteCount = sizeof(indexedValues);
+	indexedIndexDescriptor.stride = sizeof(unsigned short);
+	indexedIndexDescriptor.binding = RENDER_BUFFER_INDEX;
+	indexedIndexDescriptor.usage = RENDER_USAGE_IMMUTABLE;
+	GpuHandle indexedIndexBuffer;
+	GpuHandle negativeIndexedIndexBuffer;
+	NativeDrawPacket indexedPacket = partialPacket;
+	indexedPacket.indexed = true;
+	indexedPacket.indexCount = 3;
+	indexedPacket.indexFormat = RENDER_FORMAT_R16_UINT;
+	indexedPacket.indexBuffer = indexedIndexBuffer;
+	result |= Check(productResources.Resources().CreateBuffer(
+		indexedIndexDescriptor, indexedValues, sizeof(indexedValues),
+		&indexedIndexBuffer) == RENDER_RESULT_OK,
+		"product seam creates an initialized R16 index fixture");
+	result |= Check(productResources.Resources().CreateBuffer(
+		indexedIndexDescriptor, negativeIndexedValues,
+		sizeof(negativeIndexedValues), &negativeIndexedIndexBuffer) ==
+		RENDER_RESULT_OK,
+		"product seam creates the negative-base R16 index fixture");
+	indexedPacket.indexBuffer = indexedIndexBuffer;
+	LegacyLogicalState indexedState;
+	const auto SubmitIndexedPacket = [&](const NativeDrawPacket &packet,
+		RenderResult expected, const char *message) {
+		const RenderResult begin = productResources.Renderer().BeginFrame();
+		const RenderResult submit = begin == RENDER_RESULT_OK ?
+			productResources.Renderer().Submit(productResources.Resources(),
+				indexedState, packet) : RENDER_RESULT_INVALID_ARGUMENT;
+		const RenderResult end = begin == RENDER_RESULT_OK ?
+			productResources.Renderer().EndFrame(false) :
+			RENDER_RESULT_INVALID_ARGUMENT;
+		result |= Check(begin == RENDER_RESULT_OK && submit == expected &&
+			end == RENDER_RESULT_OK, message);
+	};
+	indexedPacket.baseVertex = 0;
+	indexedPacket.minimumVertexIndex = 0;
+	SubmitIndexedPacket(indexedPacket, RENDER_RESULT_OK,
+		"indexed range accepts initialized vertex zero with zero base");
+	indexedPacket.baseVertex = 1;
+	SubmitIndexedPacket(indexedPacket, RENDER_RESULT_INVALID_ARGUMENT,
+		"indexed range rejects a base before the second vertex is initialized");
+	result |= Check(productResources.Resources().UpdateBuffer(
+		partialProductBuffer, latestBytes + 1, sizeof(latestBytes[0]),
+		sizeof(latestBytes[0]), RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK,
+		"product seam initializes the second vertex slot");
+	indexedPacket.baseVertex = 1;
+	SubmitIndexedPacket(indexedPacket, RENDER_RESULT_OK,
+		"indexed range accepts the initialized positive base");
+	indexedPacket.baseVertex = -1;
+	indexedPacket.minimumVertexIndex = 1;
+	indexedPacket.indexBuffer = negativeIndexedIndexBuffer;
+	SubmitIndexedPacket(indexedPacket, RENDER_RESULT_OK,
+		"indexed range accepts a legal negative base cancellation");
+	indexedPacket.baseVertex = -2;
+	indexedPacket.minimumVertexIndex = 1;
+	SubmitIndexedPacket(indexedPacket, RENDER_RESULT_INVALID_ARGUMENT,
+		"indexed range rejects a negative effective start");
+	indexedPacket.baseVertex = INT_MAX;
+	indexedPacket.minimumVertexIndex = UINT_MAX;
+	SubmitIndexedPacket(indexedPacket, RENDER_RESULT_INVALID_ARGUMENT,
+		"indexed range rejects signed base and minimum overflow");
+	if (indexedIndexBuffer.isValid())
+		result |= Check(productResources.Resources().Destroy(indexedIndexBuffer),
+			"product seam destroys the indexed range index fixture");
+	if (negativeIndexedIndexBuffer.isValid())
+		result |= Check(productResources.Resources().Destroy(
+			negativeIndexedIndexBuffer),
+			"product seam destroys the negative-base index fixture");
 	result |= Check(productResources.Renderer().Shutdown() == RENDER_RESULT_OK &&
 		productResources.Shutdown() == RENDER_RESULT_OK &&
 		device.LiveCount() == 0 && device.isOperational(),
 		"public borrowed shutdown succeeds after EndFrame and product cleanup preserves backend ownership");
 	result |= TestThreadedResourceCompletion();
 	result |= TestThreadedNativeBufferOwnerFailureRecovery();
+	result |= TestThreadedBetweenFrameBufferUpdates();
 	return result;
 }

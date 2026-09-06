@@ -175,6 +175,42 @@ private:
 	unsigned m_sampleIDs[COLLISION_ADMISSION_SAMPLE_CAPACITY];
 };
 
+#if defined(_WIN64)
+// Optional native-site observations and fault injection. Null hooks leave the
+// shipping scheduler, body and publication behavior unchanged.
+enum CollisionCandidateTestEvent
+{
+	COLLISION_CANDIDATE_TEST_RANGE_ENTERED,
+	COLLISION_CANDIDATE_TEST_GENERIC_NORMALIZED,
+	COLLISION_CANDIDATE_TEST_PARTITION_NORMALIZED,
+	COLLISION_CANDIDATE_TEST_LOCAL_SORT,
+	COLLISION_CANDIDATE_TEST_RANGE_FINISHED,
+	COLLISION_CANDIDATE_TEST_OWNER_VALIDATION,
+	COLLISION_CANDIDATE_TEST_OWNER_REDUCTION,
+	COLLISION_CANDIDATE_TEST_PUBLICATION,
+	COLLISION_CANDIDATE_TEST_RANGE_RELEASED
+};
+enum CollisionCandidateTestCheckpoint
+{
+	COLLISION_CANDIDATE_TEST_CHECKPOINT_ENTRY,
+	COLLISION_CANDIDATE_TEST_CHECKPOINT_BLOCK,
+	COLLISION_CANDIDATE_TEST_CHECKPOINT_POST_NORMALIZE,
+	COLLISION_CANDIDATE_TEST_CHECKPOINT_POST_SORT
+};
+struct CollisionCandidateTestHooks
+{
+	CollisionCandidateTestHooks() : context(0), observe(0), checkpoint(0), physicalWaitMilliseconds(0) {}
+	void *context;
+	void (*observe)(void *, CollisionCandidateTestEvent, unsigned rangeIndex,
+		unsigned begin, unsigned end, unsigned completedWorkUnits, bool completed,
+		CollisionCandidate *mutableOwnerStorage);
+	bool (*checkpoint)(void *, unsigned rangeIndex, CollisionCandidateTestCheckpoint,
+		unsigned completedWorkUnits, bool actualCancellation);
+	// Bounded readiness budget for an explicitly controlled test source only.
+	unsigned physicalWaitMilliseconds;
+};
+#endif
+
 struct CollisionCandidateOptions
 {
 	CollisionCandidateOptions();
@@ -193,6 +229,12 @@ struct CollisionCandidateOptions
 	// token only after live validation and closes it after authoritative
 	// publication (or fallback). Null pointers are inert.
 	performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	performance::KernelPerformanceAttempt performanceReferenceAttempt;
+	// Source decision ordinal for a same-attempt native continuation. The
+	// ordinary collision source defaults to zero; native title handoff sets the
+	// next ordinal after its authenticated prefix.
+	JobMetricCounter performanceReferenceDecisionOrdinal;
+	const CollisionCandidateTestHooks *testHooks;
 	performance::KernelPerformanceReferenceBatch *performanceReferenceBatch;
 	// Dedicated detached serial-oracle output. It is never an alias for the
 	// authoritative output or worker scratch; capacity zero keeps the optional

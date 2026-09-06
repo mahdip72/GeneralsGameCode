@@ -6,21 +6,18 @@ FetchContent_Declare(
 
 FetchContent_MakeAvailable(dx8)
 
-# The native D3D11 product still compiles the temporary D3D8 parity backend,
-# whose public types are used by legacy render packets.  Keep that source
-# compatibility separate from the 32-bit D3D8 import-library dependency.
+# Historical x86 authoring and diagnostic targets retain the D3D8 SDK surface.
+# The root graph never loads this module for a supported product build.
 if(NOT TARGET rts_d3d8_headers)
     add_library(rts_d3d8_headers INTERFACE)
     target_compile_definitions(rts_d3d8_headers INTERFACE BUILD_WITH_D3D8)
     target_include_directories(rts_d3d8_headers INTERFACE ${dx8_SOURCE_DIR})
 endif()
 
-# The game runtime uses the D3D8 ABI only as the temporary parity backend.  It
-# does not use the optional D3DX8 helper ABI: runtime texture/mipmap/math paths
-# are implemented in-tree and the D3D11 bridge owns the visible renderer.
+# Historical tooling does not use the optional D3DX8 helper ABI: its
+# texture/mipmap/math paths are implemented in-tree.
 # Keep the upstream d3d8lib target intact for authoring tools and differential
-# tests that still need D3DX8, but give product targets a dependency that does
-# not pull the obsolete helper library into the game executables.
+# tests that still need D3DX8. Supported product targets cannot see this module.
 if(NOT TARGET rts_d3d8lib)
     add_library(rts_d3d8lib INTERFACE)
     target_link_libraries(rts_d3d8lib INTERFACE

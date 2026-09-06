@@ -219,7 +219,7 @@ public:
 		rts::render::NativeW3DSurfaceHandle *surface,
 		rts::render::NativeW3DGpuContentLease *gpu_lease = 0) const;
 	bool Publish_Native_Output(rts::render::NativeW3DSurfaceHandle surface,
-		rts::render::NativeW3DGpuContentLease *gpu_lease) const;
+		rts::render::NativeW3DGpuContentLease *gpu_lease = 0) const;
 	bool Copy_Native_Active_Color_Target();
 	bool Publish_Native_BGRA8(const void *data, size_t row_pitch,
 		size_t slice_pitch);

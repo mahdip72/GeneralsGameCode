@@ -174,10 +174,54 @@ jobs:
           "VCPKG_OVERLAY_TRIPLETS=${{ github.workspace }}\triplets" >> $env:GITHUB_ENV
           "VCPKG_INSTALL_OPTIONS=--x-abi-tools-use-exact-versions" >> $env:GITHUB_ENV
 
+      - name: Provision Stage 5 validation scratch
+        if: ${{ inputs.extras }}
+        shell: pwsh
+        run: |
+          $scratchToken = "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.preset }}"
+          $scratchToken = [regex]::Replace($scratchToken, '[^A-Za-z0-9._-]', '-')
+          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+            throw 'RUNNER_TEMP is unavailable for Stage 5 scratch backing.'
+          }
+
+          $backingRoot = Join-Path $env:RUNNER_TEMP `
+            ('Stage5ValidationH-' + $scratchToken)
+          $hDrive = Get-PSDrive -Name H -ErrorAction SilentlyContinue
+          $hExists = $null -ne $hDrive -or
+            (Test-Path -LiteralPath 'H:\' -PathType Container)
+          if (-not $hExists) {
+            if (Test-Path -LiteralPath $backingRoot) {
+              throw "Stage 5 scratch backing path already exists: $backingRoot"
+            }
+            New-Item -ItemType Directory -Path $backingRoot -Force | Out-Null
+            & subst H: $backingRoot
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not map H: to the unique Stage 5 scratch backing path: $backingRoot"
+            }
+            if (-not (Test-Path -LiteralPath 'H:\' -PathType Container)) {
+              throw 'H: was not available after mapping the Stage 5 scratch backing path.'
+            }
+          }
+
+          $scratchRoot = Join-Path 'H:\Stage5CiScratch' $scratchToken
+          if (Test-Path -LiteralPath $scratchRoot) {
+            throw "Stage 5 validation scratch path already exists: $scratchRoot"
+          }
+          New-Item -ItemType Directory -Path $scratchRoot -Force | Out-Null
+          if (-not (Test-Path -LiteralPath $scratchRoot -PathType Container)) {
+            throw "Stage 5 validation scratch path was not created: $scratchRoot"
+          }
+          "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=$scratchRoot" >> $env:GITHUB_ENV
+          Write-Host "Stage 5 validation scratch: $scratchRoot"
+
       - name: Configure ${{ inputs.game }} with CMake Using ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Preset
         shell: pwsh
         run: |
           $buildProduct = '${{ inputs.product }}' -eq 'true'
+          if ($buildProduct -and '${{ inputs.preset }}' -notlike 'x64*') {
+            Write-Error 'Stage 5 product builds are native x64-only. Use product=false for historical authoring and diagnostic presets.'
+            exit 1
+          }
           $productFlag = if ($buildProduct) { 'ON' } else { 'OFF' }
           # Select the requested title subtree independently from its product
           # executable.  Authoring jobs intentionally keep the subtree ON but
@@ -200,6 +244,9 @@ jobs:
           $buildFlags += "-DRTS_BUILD_${gamePrefix}_TOOLS=${{ inputs.tools && 'ON' || 'OFF' }}"
           $buildFlags += "-DRTS_BUILD_CORE_EXTRAS=${{ inputs.extras && 'ON' || 'OFF' }}"
           $buildFlags += "-DRTS_BUILD_${gamePrefix}_EXTRAS=${{ inputs.extras && 'ON' || 'OFF' }}"
+          if (-not [string]::IsNullOrWhiteSpace($env:RTS_STAGE5_VALIDATION_SCRATCH_ROOT)) {
+            $buildFlags += "-DRTS_STAGE5_VALIDATION_SCRATCH_ROOT=$env:RTS_STAGE5_VALIDATION_SCRATCH_ROOT"
+          }
 
           Write-Host "Build flags: $($buildFlags -join ' | ')"
           cmake --preset ${{ inputs.preset }} $buildFlags
@@ -243,6 +290,16 @@ jobs:
         if: inputs.extras
         shell: pwsh
         run: |
+          $scratchRoot = $env:RTS_STAGE5_VALIDATION_SCRATCH_ROOT
+          if ([string]::IsNullOrWhiteSpace($scratchRoot) -or
+              -not $scratchRoot.StartsWith('H:\', [StringComparison]::OrdinalIgnoreCase) -or
+              -not (Test-Path -LiteralPath $scratchRoot -PathType Container)) {
+            throw "Stage 5 validation scratch root is not an existing H: directory: $scratchRoot"
+          }
+          $scratchItem = Get-Item -LiteralPath $scratchRoot -Force
+          if (($scratchItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Stage 5 validation scratch root is a reparse point: $scratchRoot"
+          }
           $arguments = @('--test-dir', "build\${{ inputs.preset }}", '--output-on-failure', '--no-tests=error')
           if (-not [string]::IsNullOrWhiteSpace('${{ inputs.focused_test_regex }}')) {
             $arguments += @('-R', '${{ inputs.focused_test_regex }}')
@@ -251,8 +308,23 @@ jobs:
             $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
             $arguments += @('-C', $configuration)
           }
-          & ctest @arguments
-          exit $LASTEXITCODE
+          $originalPsModulePath = $env:PSModulePath
+          $ctestExitCode = 1
+          try {
+            # CTest launches Windows PowerShell test scripts; let them rebuild
+            # their standard module path instead of inheriting pwsh's path.
+            Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+            & ctest @arguments
+            $ctestExitCode = $LASTEXITCODE
+          }
+          finally {
+            if ($null -eq $originalPsModulePath) {
+              Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+            } else {
+              $env:PSModulePath = $originalPsModulePath
+            }
+          }
+          exit $ctestExitCode
 
       - name: Install native runtime for ${{ inputs.game }} with ${{ inputs.preset }}
         if: ${{ inputs.product && startsWith(inputs.preset, 'x64') }}
@@ -280,7 +352,9 @@ jobs:
           $testName = '${{ inputs.game == 'Generals' && 'g_skirmish_ai_runner_contract_tests.exe' || 'z_runtime_regression_tests.exe' }}'
           $installedRuntime = [IO.Path]::GetFullPath(
             (Join-Path "build\${{ inputs.preset }}\installed" $titleDirectory))
-          $test = Join-Path $installedRuntime $testName
+          $validationRoot = [IO.Path]::GetFullPath(
+            (Join-Path "build\${{ inputs.preset }}\installed\Validation" $titleDirectory))
+          $test = Join-Path $validationRoot $testName
           if (-not (Test-Path -LiteralPath $test -PathType Leaf)) {
             Write-Error "Installed native contract utility was not produced at $test"
             exit 1
@@ -316,23 +390,12 @@ jobs:
           $buildDir = "build\${{ inputs.preset }}"
           $artifactsDir = New-Item -ItemType Directory -Force -Path "$buildDir\${{ inputs.game }}\artifacts" -Verbose
 
-          if ('${{ inputs.preset }}' -like 'x64*') {
-            $installedRuntime = Join-Path $buildDir "installed\${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}"
-            if (-not (Test-Path -LiteralPath $installedRuntime -PathType Container)) {
-              Write-Error "Installed native runtime was not found at $installedRuntime"
-              exit 1
-            }
-            Copy-Item -Path (Join-Path $installedRuntime '*') -Destination $artifactsDir -Recurse -Force -Verbose
-          } elseif ('${{ inputs.preset }}' -like 'win32*') {
-            $configToUse = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
-            $files = Get-ChildItem -Path "$buildDir\Core\$configToUse","$buildDir\${{ inputs.game }}\$configToUse" -File |
-              Where-Object { $_.Extension -in @(".exe", ".dll", ".pdb") } -Verbose
-            $files | Move-Item -Destination $artifactsDir -Verbose -Force
-          } else {
-            $files = Get-ChildItem -Path "$buildDir\Core","$buildDir\${{ inputs.game }}" -File |
-              Where-Object { $_.Extension -in @(".exe", ".dll", ".pdb") } -Verbose
-            $files | Move-Item -Destination $artifactsDir -Verbose -Force
+          $installedRuntime = Join-Path $buildDir "installed\${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}"
+          if (-not (Test-Path -LiteralPath $installedRuntime -PathType Container)) {
+            Write-Error "Installed native runtime was not found at $installedRuntime"
+            exit 1
           }
+          Copy-Item -Path (Join-Path $installedRuntime '*') -Destination $artifactsDir -Recurse -Force -Verbose
 
       - name: Upload ${{ inputs.game }} ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Artifact
         if: ${{ inputs.product }}

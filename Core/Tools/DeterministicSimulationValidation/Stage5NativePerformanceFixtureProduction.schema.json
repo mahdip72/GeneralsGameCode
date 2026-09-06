@@ -1,0 +1,236 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-native-performance-fixture-production.json",
+  "title": "GeneralsGameCode native Stage 5 performance fixture production receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "evidenceKind",
+    "producer",
+    "status",
+    "recordedUtc",
+    "cohortNonce",
+    "cohortCreatedUtc",
+    "qualificationMode",
+    "acceptanceScope",
+    "finalAcceptanceClaim",
+    "performanceScalingClaim",
+    "title",
+    "sourceCommit",
+    "artifactSetSha256",
+    "runtimeClosure",
+    "reviewedFixtureManifest",
+    "prelaunchPlan",
+    "attemptStart",
+    "executableSha256",
+    "hostRunNonce",
+    "process",
+    "commandLine",
+    "argumentString",
+    "taskRoot",
+    "nativeProfileRoot",
+    "map",
+    "rawLog",
+    "retainedReplay",
+    "completion",
+    "lifecycle"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "evidenceKind": { "type": "string", "const": "stage5-native-performance-fixture-production" },
+    "producer": { "type": "string", "const": "installed-runtime-performance-fixture-producer-v1" },
+    "status": { "type": "string", "const": "passed" },
+    "recordedUtc": { "$ref": "#/$defs/canonicalUtc" },
+    "cohortNonce": { "$ref": "#/$defs/uuidV4" },
+    "cohortCreatedUtc": { "$ref": "#/$defs/canonicalUtc" },
+    "qualificationMode": { "type": "string", "const": "InstalledKernelExecution" },
+    "acceptanceScope": { "type": "string", "const": "fixture-production-only" },
+    "finalAcceptanceClaim": { "const": false },
+    "performanceScalingClaim": { "const": false },
+    "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "runtimeClosure": { "$ref": "#/$defs/runtimeClosure" },
+    "reviewedFixtureManifest": { "$ref": "#/$defs/fileBinding" },
+    "prelaunchPlan": { "$ref": "#/$defs/fileBinding" },
+    "attemptStart": { "$ref": "#/$defs/fileBinding" },
+    "executableSha256": { "$ref": "#/$defs/sha256" },
+    "hostRunNonce": { "$ref": "#/$defs/uuidV4" },
+    "process": { "$ref": "#/$defs/process" },
+    "commandLine": { "type": "string", "minLength": 1, "maxLength": 32767 },
+    "argumentString": { "type": "string", "minLength": 1, "maxLength": 32767 },
+    "taskRoot": {
+      "type": "string",
+      "pattern": "^[A-Za-z]:\\\\[^\\r\\n\"]+$"
+    },
+    "nativeProfileRoot": {
+      "type": "string",
+      "pattern": "^[A-Za-z]:\\\\[^\\r\\n\"]+$"
+    },
+    "map": { "$ref": "#/$defs/map" },
+    "rawLog": { "$ref": "#/$defs/fileBinding" },
+    "retainedReplay": { "$ref": "#/$defs/replay" },
+    "completion": { "$ref": "#/$defs/completion" },
+    "lifecycle": { "$ref": "#/$defs/lifecycle" }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+    "uuidV4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "nativeNonce": {
+      "type": "string",
+      "pattern": "^[0-9A-F]{8}-[0-9A-F]{8}-[0-9A-F]{8}$"
+    },
+    "canonicalUtc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{7}Z$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?![/\\\\])(?!.*:)(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"
+    },
+    "fileBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "runtimeClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependencyManifestSha256", "closureSha256"],
+      "properties": {
+        "dependencyManifestSha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "process": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "creationTimeUtc100ns", "exitCode"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "creationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "exitCode": { "const": 0 }
+      }
+    },
+    "map": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "sha256", "crc32", "byteCount"],
+      "properties": {
+        "key": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "crc32": { "type": "string", "pattern": "^[0-9A-F]{8}$" },
+        "byteCount": { "type": "integer", "minimum": 16384, "maximum": 67108864 }
+      }
+    },
+    "replay": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "frameCount"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "frameCount": { "type": "integer", "minimum": 2, "maximum": 4294967295 }
+      }
+    },
+    "playerUnits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["slot", "initialUnitCount", "peakUnitCount"],
+      "properties": {
+        "slot": { "type": "integer", "minimum": 0, "maximum": 7 },
+        "initialUnitCount": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "peakUnitCount": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+      }
+    },
+    "completion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nativeRunNonce",
+        "mapKey",
+        "mapSha256",
+        "mapCrc32",
+        "mapByteCount",
+        "seed",
+        "frameBudget",
+        "endFrame",
+        "winnerTeam",
+        "finalCrc",
+        "replayEpoch",
+        "aiEpochMarker",
+        "observedFirstFrame",
+        "observedLastFrame",
+        "observedFrameSamples",
+        "observedPlayerCount",
+        "initialUnitCount",
+        "peakUnitCount",
+        "playerUnits",
+        "replaySha256",
+        "replayFrameCount",
+        "nativeRetainedReplayPath"
+      ],
+      "properties": {
+        "nativeRunNonce": { "$ref": "#/$defs/nativeNonce" },
+        "mapKey": { "type": "string", "minLength": 1 },
+        "mapSha256": { "$ref": "#/$defs/sha256" },
+        "mapCrc32": { "type": "string", "pattern": "^[0-9A-F]{8}$" },
+        "mapByteCount": { "type": "integer", "minimum": 16384, "maximum": 67108864 },
+        "seed": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "frameBudget": { "type": "integer", "minimum": 1, "maximum": 108000 },
+        "endFrame": { "type": "integer", "minimum": 1, "maximum": 108000 },
+        "winnerTeam": { "enum": [0, 1] },
+        "finalCrc": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+        "replayEpoch": { "enum": [1, 3] },
+        "aiEpochMarker": { "type": "string", "minLength": 1 },
+        "observedFirstFrame": { "type": "integer", "minimum": 1, "maximum": 108000 },
+        "observedLastFrame": { "type": "integer", "minimum": 1, "maximum": 108000 },
+        "observedFrameSamples": { "type": "integer", "minimum": 1, "maximum": 108000 },
+        "observedPlayerCount": { "const": 8 },
+        "initialUnitCount": { "type": "integer", "minimum": 8000, "maximum": 4294967295 },
+        "peakUnitCount": { "type": "integer", "minimum": 8000, "maximum": 4294967295 },
+        "playerUnits": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/playerUnits" }
+        },
+        "replaySha256": { "$ref": "#/$defs/sha256" },
+        "replayFrameCount": { "type": "integer", "minimum": 2, "maximum": 4294967295 },
+        "nativeRetainedReplayPath": {
+          "type": "string",
+          "pattern": "^[A-Za-z]:\\\\[^\\r\\n\"]+$"
+        }
+      }
+    },
+    "lifecycle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mutexAcquired",
+        "noInstalledTitleProcessesAtPreflight",
+        "childExitProven",
+        "registryRestored",
+        "profileRemoved",
+        "recoveryJournalAbsent"
+      ],
+      "properties": {
+        "mutexAcquired": { "const": true },
+        "noInstalledTitleProcessesAtPreflight": { "const": true },
+        "childExitProven": { "const": true },
+        "registryRestored": { "const": true },
+        "profileRemoved": { "const": true },
+        "recoveryJournalAbsent": { "const": true }
+      }
+    }
+  }
+}

@@ -52,6 +52,45 @@ enum ObjectStatusTimerResult
 	OBJECT_STATUS_TIMER_INVALID_INPUT
 };
 
+#if defined(_WIN64)
+class SimulationCommand;
+// Optional native-site observations and fault injection. Null hooks leave the
+// shipping scheduler, body and publication behavior unchanged.
+enum ObjectStatusTimerTestEvent
+{
+	OBJECT_STATUS_TIMER_TEST_RANGE_ENTERED,
+	OBJECT_STATUS_TIMER_TEST_ITEM_EVALUATED,
+	OBJECT_STATUS_TIMER_TEST_COMMAND_APPENDED,
+	OBJECT_STATUS_TIMER_TEST_RANGE_FINISHED,
+	OBJECT_STATUS_TIMER_TEST_OWNER_REDUCTION,
+	OBJECT_STATUS_TIMER_TEST_PUBLICATION,
+	OBJECT_STATUS_TIMER_TEST_RANGE_RELEASED
+};
+enum ObjectStatusTimerTestCheckpoint
+{
+	OBJECT_STATUS_TIMER_TEST_CHECKPOINT_ENTRY,
+	OBJECT_STATUS_TIMER_TEST_CHECKPOINT_BLOCK,
+	OBJECT_STATUS_TIMER_TEST_CHECKPOINT_POST_BODY
+};
+struct ObjectStatusTimerTestHooks
+{
+	ObjectStatusTimerTestHooks() : context(0), observe(0), checkpoint(0), beforeWait(0), afterCancel(0),
+		releasedGroup(0), physicalWaitMilliseconds(0) {}
+	void *context;
+	void (*observe)(void *, ObjectStatusTimerTestEvent, unsigned rangeIndex,
+		unsigned begin, unsigned end, unsigned completedWorkUnits, bool completed,
+		SimulationCommand *mutableOwnerStorage);
+	bool (*checkpoint)(void *, unsigned rangeIndex, ObjectStatusTimerTestCheckpoint,
+		unsigned completedWorkUnits, bool actualCancellation);
+	void (*beforeWait)(void *);
+	void (*afterCancel)(void *);
+	void (*releasedGroup)(void *, bool cancelled, unsigned completedBodies,
+		unsigned submitted, unsigned reason);
+	// Bounded readiness budget for an explicitly controlled test source only.
+	unsigned physicalWaitMilliseconds;
+};
+#endif
+
 struct ObjectStatusTimerOptions
 {
 	ObjectStatusTimerOptions();
@@ -64,6 +103,8 @@ struct ObjectStatusTimerOptions
 	// Optional reference evidence is injected by the owner. The kernel leaves
 	// these inert until a native reference mode is active.
 	performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	performance::KernelPerformanceAttempt performanceReferenceAttempt;
+	const ObjectStatusTimerTestHooks *testHooks;
 	performance::KernelPerformanceReferenceBatch *performanceReferenceBatch;
 	ObjectStatusTimerCommand *performanceReferenceOutput;
 	unsigned performanceReferenceOutputCapacity;
@@ -82,6 +123,9 @@ struct ObjectStatusTimerMetrics
 	ObjectStatusTimerMetricCounter physicalWorkerMask;
 	unsigned distinctPhysicalWorkers;
 	bool physicalWorkerMaskComplete;
+	// True once the authenticated source/reference admission decision accepts
+	// this batch, including baseline inline execution with no physical submits.
+	bool referenceAdmissionAccepted;
 	unsigned peakConcurrentPhysicalWorkers;
 	unsigned serialFallbacks;
 };

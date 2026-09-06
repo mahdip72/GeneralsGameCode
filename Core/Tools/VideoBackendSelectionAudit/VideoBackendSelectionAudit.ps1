@@ -186,8 +186,8 @@ function Assert-IntroVideoService {
 }
 
 if ($SelfTest) {
-    $valid = "    if(`${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
-    Assert-ExactConditionalBlock $valid '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Valid conditional block was rejected.'
+    $valid = "        if(NOT RTS_BUILD_OPTION_FFMPEG)`n            include(cmake/bink.cmake)`n        endif()"
+    Assert-ExactConditionalBlock $valid '        if(NOT RTS_BUILD_OPTION_FFMPEG)' '            include(cmake/bink.cmake)' '        endif()' 'Valid conditional block was rejected.'
 
     $wrongCondition = "    if(RTS_BUILD_OPTION_FFMPEG)`n        include(cmake/bink.cmake)`n    endif()"
     try {
@@ -199,7 +199,7 @@ if ($SelfTest) {
 
     $duplicate = $valid + "`n" + $valid
     try {
-        Assert-ExactConditionalBlock $duplicate '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Duplicate conditional block was accepted.'
+        Assert-ExactConditionalBlock $duplicate '        if(NOT RTS_BUILD_OPTION_FFMPEG)' '            include(cmake/bink.cmake)' '        endif()' 'Duplicate conditional block was accepted.'
         throw 'Negative conditional self-test did not reject a duplicate block.'
     } catch {
         if ($_.Exception.Message -ne 'Duplicate conditional block was accepted.') { throw }
@@ -372,12 +372,12 @@ foreach ($title in @(
         "FFmpeg runtime DLLs are not installed through the effective prefix in $($title.Path)"
 }
 
-$runtimeCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/legacy-product-runtime.cmake') -Raw
-if ($runtimeCMake -notmatch '(?ms)^if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^    target_link_libraries\(rts_legacy_product_runtime INTERFACE binkstub\)\s*^endif\(\)') {
-    throw 'Bink link ownership is not conditional on the FFmpeg backend option.'
+$runtimeCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/legacy-tool-runtime.cmake') -Raw
+if ($runtimeCMake -notmatch '(?ms)^if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^    target_link_libraries\(rts_legacy_tool_runtime INTERFACE binkstub\)\s*^endif\(\)') {
+    throw 'Historical tool Bink ownership is not conditional on the FFmpeg backend option.'
 }
-Assert-ExactConditionalBlock $runtimeCMake 'if(NOT RTS_BUILD_OPTION_FFMPEG)' '    target_link_libraries(rts_legacy_product_runtime INTERFACE binkstub)' 'endif()' 'Bink link conditional block is not exact.'
-Assert-TokenCount $runtimeCMake 'binkstub' 1 'Bink runtime link ownership is ambiguous.'
+Assert-ExactConditionalBlock $runtimeCMake 'if(NOT RTS_BUILD_OPTION_FFMPEG)' '    target_link_libraries(rts_legacy_tool_runtime INTERFACE binkstub)' 'endif()' 'Historical tool Bink link conditional block is not exact.'
+Assert-TokenCount $runtimeCMake 'binkstub' 1 'Historical tool Bink link ownership is ambiguous.'
 
 $rootCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'CMakeLists.txt') -Raw
 $configIndex = $rootCMake.IndexOf('include(cmake/config.cmake)', [System.StringComparison]::Ordinal)
@@ -385,10 +385,10 @@ $binkIndex = $rootCMake.IndexOf('include(cmake/bink.cmake)', [System.StringCompa
 if ($configIndex -lt 0 -or $binkIndex -lt 0 -or $configIndex -ge $binkIndex) {
     throw 'Build configuration must be available before selecting video backend dependencies.'
 }
-if ($rootCMake -notmatch '(?ms)^    if\(\$\{CMAKE_SIZEOF_VOID_P\} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG\)\s*^        include\(cmake/bink\.cmake\)\s*^    endif\(\)') {
-    throw 'Bink dependency fetch is not conditional on the FFmpeg backend option.'
+if ($rootCMake -notmatch '(?ms)^    if\(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_BUILD_PRODUCT\)\s*.*?^        if\(NOT RTS_BUILD_OPTION_FFMPEG\)\s*^            include\(cmake/bink\.cmake\)\s*^        endif\(\)') {
+    throw 'Bink dependency fetch is not confined to a non-product x86 graph and the FFmpeg backend option.'
 }
-Assert-ExactConditionalBlock $rootCMake '    if(${CMAKE_SIZEOF_VOID_P} EQUAL 4 AND NOT RTS_BUILD_OPTION_FFMPEG)' '        include(cmake/bink.cmake)' '    endif()' 'Bink fetch conditional block is not exact.'
+Assert-ExactConditionalBlock $rootCMake '        if(NOT RTS_BUILD_OPTION_FFMPEG)' '            include(cmake/bink.cmake)' '        endif()' 'Bink fetch conditional block is not exact.'
 Assert-TokenCount $rootCMake 'include\(cmake/bink\.cmake\)' 1 'Bink dependency fetch ownership is ambiguous.'
 
 $runtimeTestsCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'GeneralsMD/Code/Tools/RuntimeRegressionTests/CMakeLists.txt') -Raw

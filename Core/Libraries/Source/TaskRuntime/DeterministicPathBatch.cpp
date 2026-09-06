@@ -24,10 +24,93 @@
 #include <memory>
 #include <new>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace rts
 {
+#if defined(_WIN64)
+DeterministicPathOwnerCompletion::DeterministicPathOwnerCompletion() noexcept
+	: m_expectedOperations(0), m_completedOperations(0),
+	  m_allOperationsCommitted(true),
+	  m_activeOperationNeedsLegacyFallback(false),
+	  m_batchNeedsLegacyFallback(false), m_fallbackEntered(false),
+	  m_fallbackCompleted(false)
+{
+}
+
+void DeterministicPathOwnerCompletion::reset(
+	std::size_t expectedOperations) noexcept
+{
+	m_expectedOperations = expectedOperations;
+	m_completedOperations = 0;
+	m_allOperationsCommitted = true;
+	m_activeOperationNeedsLegacyFallback = false;
+	m_batchNeedsLegacyFallback = false;
+	m_fallbackEntered = false;
+	m_fallbackCompleted = false;
+}
+
+void DeterministicPathOwnerCompletion::beginOperation() noexcept
+{
+	m_activeOperationNeedsLegacyFallback = false;
+}
+
+void DeterministicPathOwnerCompletion::finishOperation(
+	bool committedOperation, bool materializationBegan) noexcept
+{
+	if (m_completedOperations < m_expectedOperations)
+		++m_completedOperations;
+	else
+		m_allOperationsCommitted = false;
+	if (!committedOperation)
+	{
+		m_allOperationsCommitted = false;
+		m_activeOperationNeedsLegacyFallback = !materializationBegan;
+	}
+}
+
+void DeterministicPathOwnerCompletion::expectLegacyFallback() noexcept
+{
+	m_batchNeedsLegacyFallback = true;
+}
+
+bool DeterministicPathOwnerCompletion::beginLegacyFallback() noexcept
+{
+	if (!m_activeOperationNeedsLegacyFallback && !m_batchNeedsLegacyFallback)
+		return false;
+	m_activeOperationNeedsLegacyFallback = false;
+	m_batchNeedsLegacyFallback = false;
+	m_fallbackEntered = true;
+	m_fallbackCompleted = false;
+	return true;
+}
+
+void DeterministicPathOwnerCompletion::completeLegacyFallback(
+	bool entered) noexcept
+{
+	if (entered && m_fallbackEntered)
+		m_fallbackCompleted = true;
+}
+
+bool DeterministicPathOwnerCompletion::committed() const noexcept
+{
+	return m_expectedOperations != 0 &&
+		m_completedOperations == m_expectedOperations &&
+		m_allOperationsCommitted;
+}
+
+bool DeterministicPathOwnerCompletion::fallbackEntered() const noexcept
+{
+	return m_fallbackEntered;
+}
+
+bool DeterministicPathOwnerCompletion::fallbackCompleted() const noexcept
+{
+	return m_fallbackCompleted;
+}
+#endif
+
 namespace
 {
 
@@ -79,6 +162,10 @@ enum DirectPathWorkState
 	DIRECT_PATH_WORK_WORKER,
 	DIRECT_PATH_WORK_OWNER,
 	DIRECT_PATH_WORK_FAILURE
+#if defined(_WIN64)
+	, DIRECT_PATH_WORK_RUNNING_INLINE,
+	DIRECT_PATH_WORK_INLINE
+#endif
 };
 
 #if defined(RTS_BUILD_CORE_EXTRAS)
@@ -87,6 +174,9 @@ std::atomic<unsigned> s_directPathTestPauseReachedMask(0);
 std::atomic<unsigned> s_directPathTestPauseReachedCount(0);
 std::atomic<unsigned> s_directPathTestPauseReleasedMask(0);
 std::atomic<unsigned> s_directPathTestFaultMask(0);
+const unsigned DIRECT_PATH_TEST_SOURCE_RECORD_ALLOCATION_FAILURE = 32U;
+const unsigned DIRECT_PATH_TEST_CHECKPOINT_ALLOCATION_FAILURE = 64U;
+const unsigned DIRECT_PATH_TEST_GROUP_COPY_ALLOCATION_FAILURE = 128U;
 
 void pauseDirectPathTest(unsigned pausePoint)
 {
@@ -147,10 +237,53 @@ struct DirectPathWork
 	std::atomic<unsigned> physicalWorkerIndex;
 };
 
+#if defined(_WIN64)
+struct DirectPathSourceRecord
+{
+	DirectPathSourceRecord() : ledger(nullptr), workers(0), pending(0),
+		outstanding(0), baseline(false), admitted(false), planned(false),
+		collected(false), failed(false), sourceOwnerCommitAllowed(false) {}
+
+	performance::KernelPerformanceReferenceLedger *ledger;
+	performance::KernelPerformanceAttempt attempt;
+	performance::KernelPerformanceDigest facts;
+	std::unique_ptr<performance::KernelPerformanceCheckpointProbe[]> checkpoints;
+	JobGroup group;
+	unsigned workers;
+	JobMetricCounter pending, outstanding;
+	bool baseline, admitted, planned, collected, failed;
+	bool sourceOwnerCommitAllowed;
+	performance::KernelPerformanceInlineBody inlineBody;
+};
+
+struct OrdinaryPathSourceRecord;
+
+// These gates deliberately require the owner thread, an authentic attempt and
+// a retained source record.  A missing owner/attempt is a refusal, never an
+// invitation to execute a serial-looking body or reap a live group.
+struct InlineBodyReadiness
+{
+	static bool direct(const DirectPathSourceRecord &source,
+		const JobSystem &jobs);
+	static bool ordinary(const OrdinaryPathSourceRecord &source,
+		const JobSystem &jobs);
+};
+
+struct ReapReadiness
+{
+	static bool direct(const DirectPathSourceRecord &source,
+		const JobSystem &jobs);
+	static bool ordinary(const OrdinaryPathSourceRecord &source,
+		const JobSystem &jobs);
+};
+#endif
+
 struct DirectPathBatchWork
 {
 	DirectPathBatchWork() : requestCount(0), activeWorkers(0),
-		peakActiveWorkers(0), liveJobs(0), ownsActiveSlot(false) {}
+		peakActiveWorkers(0), liveJobs(0), ownsActiveSlot(false),
+		referenceAdmissionAccepted(false)
+	{}
 
 	~DirectPathBatchWork()
 	{
@@ -165,7 +298,29 @@ struct DirectPathBatchWork
 	std::atomic<unsigned> peakActiveWorkers;
 	std::atomic<unsigned> liveJobs;
 	std::atomic<bool> ownsActiveSlot;
+	bool referenceAdmissionAccepted;
+#if defined(_WIN64)
+	std::unique_ptr<DirectPathSourceRecord> reference;
+#endif
 };
+
+#if defined(_WIN64)
+bool InlineBodyReadiness::direct(const DirectPathSourceRecord &source,
+	const JobSystem &jobs)
+{
+	return source.ledger != nullptr && source.attempt.valid() &&
+		source.baseline && !source.failed && !source.inlineBody.valid() &&
+		jobs.isCurrentThread(JOB_OWNER_GAME);
+}
+
+bool ReapReadiness::direct(const DirectPathSourceRecord &source,
+	const JobSystem &jobs)
+{
+	return source.ledger != nullptr && source.attempt.valid() &&
+		!source.baseline && jobs.isCurrentThread(JOB_OWNER_GAME) &&
+		source.group.isValid() && source.group.isComplete();
+}
+#endif
 
 #if defined(_WIN64)
 /*
@@ -324,6 +479,281 @@ bool SerialComputeDirectPathReference(const void *immutableInput,
 	return true;
 }
 
+// Defined below the job body; source execution can publish cancellation from
+// either a physical worker or an authenticated owner-inline body.
+void publishDirectPathCancellation(DirectPathWork &work);
+void publishPeak(std::atomic<unsigned> &peak, unsigned value);
+
+bool PrepareDirectPathSourceRecord(DirectPathBatchWork &batch,
+	JobSystem &jobs, performance::KernelPerformanceReferenceLedger *ledger,
+	performance::KernelPerformanceAttempt attempt)
+{
+	if (ledger == nullptr)
+		return true;
+	if (!attempt.valid())
+		return !ledger->traceRequested();
+	const performance::KernelPerformanceReferenceMode mode = ledger->runMode();
+	if (mode != performance::KERNEL_REFERENCE_THROUGHPUT_BINDING &&
+		mode != performance::KERNEL_REFERENCE_SERIAL_ORACLE &&
+		mode != performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING)
+		return false;
+	#if defined(RTS_BUILD_CORE_EXTRAS)
+	if ((s_directPathTestFaultMask.load(std::memory_order_acquire) &
+		DIRECT_PATH_TEST_SOURCE_RECORD_ALLOCATION_FAILURE) != 0)
+		throw std::bad_alloc();
+	#endif
+	std::unique_ptr<DirectPathSourceRecord> source(new DirectPathSourceRecord());
+	source->ledger = ledger;
+	source->attempt = attempt;
+	source->baseline = mode == performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING;
+	source->workers = jobs.workerCount();
+	source->pending = jobs.pendingOwnerCompletionCount();
+	source->outstanding = jobs.outstandingJobCount();
+	#if defined(RTS_BUILD_CORE_EXTRAS)
+	if ((s_directPathTestFaultMask.load(std::memory_order_acquire) &
+		DIRECT_PATH_TEST_CHECKPOINT_ALLOCATION_FAILURE) != 0)
+		throw std::bad_alloc();
+	#endif
+	source->checkpoints.reset(new performance::KernelPerformanceCheckpointProbe[
+		batch.requestCount]);
+	performance::KernelPerformanceCanonicalWriter facts;
+	const DirectPathReferenceInput input = {&batch, batch.requestCount};
+	if (!facts.begin(1) || !WriteDirectPathReferenceInput(facts, &input))
+		return false;
+	source->facts = facts.finish();
+	if (!source->facts.valid || !ledger->bindCapturedInput(attempt, 1,
+		batch.requestCount, WriteDirectPathReferenceInput, &input))
+		return false;
+	batch.reference = std::move(source);
+	return true;
+}
+
+bool ObserveDirectPathSourceAdmission(DirectPathBatchWork &batch,
+	bool admitted)
+{
+	if (!batch.reference)
+		return true;
+	DirectPathSourceRecord &source = *batch.reference;
+	source.admitted = admitted;
+	performance::KernelPerformanceAttemptDecision decision = {};
+	decision.site = 1;
+	decision.reasonSchema = 1;
+	decision.reason = admitted ? 1 : 2;
+	decision.deterministicEligible = true;
+	decision.deterministicFacts = source.facts;
+	decision.admission = admitted ? performance::KERNEL_ADMISSION_ACCEPTED :
+		performance::KERNEL_ADMISSION_REFUSED;
+	decision.sourceConfiguredWorkers = source.workers;
+	decision.dynamicFactsKnownMask = 7;
+	decision.pendingJobs = source.pending;
+	decision.outstandingJobs = source.outstanding;
+	decision.activeSlots = 0;
+	if (!source.ledger->observeDecision(source.attempt, decision))
+	{
+		source.failed = true;
+		return false;
+	}
+	if (!admitted)
+		return true;
+	batch.referenceAdmissionAccepted = true;
+	const performance::KernelPerformanceDispatchPlan dispatch = {
+		1, 1, 1, static_cast<unsigned>(batch.requestCount),
+		static_cast<rts::JobMetricCounter>(batch.requestCount), 1,
+		source.workers};
+	if (!source.ledger->observeDispatch(source.attempt, dispatch))
+	{
+		source.failed = true;
+		return false;
+	}
+	for (unsigned i = 0; i < batch.requestCount; ++i)
+	{
+		const performance::KernelPerformanceRangePlan range = {
+			1, i, 0, i, i + 1, 1};
+		if (!source.ledger->observeRangePlan(source.attempt, range))
+		{
+			source.failed = true;
+			return false;
+		}
+	}
+	source.planned = true;
+	return true;
+}
+
+performance::KernelPerformanceRangeProgress DirectPathReleasedProgress(
+	const DirectPathBatchWork &batch, unsigned index)
+{
+	performance::KernelPerformanceRangeProgress progress = {};
+	progress.checkpoint = batch.reference->checkpoints[index].snapshot();
+	progress.publication = !progress.checkpoint.entered ?
+		performance::KERNEL_PUBLICATION_NOT_APPLICABLE :
+		batch.reference->group.wasCancelled() ||
+		progress.checkpoint.terminal == performance::KERNEL_RANGE_CANCELLED ?
+		performance::KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL :
+		progress.checkpoint.terminal == performance::KERNEL_RANGE_COMPLETED ?
+		performance::KERNEL_PUBLICATION_PUBLISHED :
+		performance::KERNEL_PUBLICATION_REJECTED;
+	return progress;
+}
+
+bool CollectDirectPathSourceRecord(DirectPathBatchWork &batch, JobSystem &jobs)
+{
+	if (!jobs.isCurrentThread(JOB_OWNER_GAME) || !batch.reference)
+		return false;
+	DirectPathSourceRecord &source = *batch.reference;
+	if (source.failed)
+		return false;
+	if (source.collected)
+		return true;
+	if (source.baseline)
+		return false;
+	if (!ReapReadiness::direct(source, jobs) || !source.admitted ||
+		!source.planned)
+		return false;
+	for (unsigned i = 0; i < batch.requestCount; ++i)
+	{
+		const performance::KernelPerformanceRangeProgress progress =
+			DirectPathReleasedProgress(batch, i);
+		const performance::KernelPerformanceRangePlan range = {1, i, 0,
+			i, i + 1, 1};
+		if (!source.ledger->observeReleasedRange(source.attempt, range,
+			progress))
+		{
+			source.failed = true;
+			return false;
+		}
+	}
+	source.collected = true;
+	return true;
+}
+
+class DirectPathSourceCheckpointScope
+{
+public:
+	DirectPathSourceCheckpointScope(DirectPathBatchWork &batch,
+		unsigned requestIndex) :
+		m_probe(batch.reference ? &batch.reference->checkpoints[requestIndex] : nullptr),
+		m_range(requestIndex), m_completed(0), m_last{1, requestIndex,
+			requestIndex}, m_cancelled(false), m_succeeded(false)
+	{
+		if (m_probe != nullptr && !batch.reference->baseline)
+			m_probe->beginRecord();
+	}
+	~DirectPathSourceCheckpointScope()
+	{
+		if (m_probe == nullptr)
+			return;
+		const performance::KernelPerformanceCheckpoint end = {
+			3, m_range, m_range + m_completed};
+		m_probe->finish(m_cancelled ? m_last : end, m_completed,
+			m_cancelled ? performance::KERNEL_RANGE_CANCELLED :
+			m_succeeded ? performance::KERNEL_RANGE_COMPLETED :
+			performance::KERNEL_RANGE_FAILED);
+	}
+	bool cancelled(unsigned site, std::size_t request, bool actual)
+	{
+		m_last = {site, m_range, request};
+		m_cancelled = m_probe != nullptr ? m_probe->cancelled(m_last,
+			actual) : actual;
+		return m_cancelled;
+	}
+	void completedRequest() { ++m_completed; }
+	void finish(bool succeeded) { m_succeeded = succeeded; }
+private:
+	performance::KernelPerformanceCheckpointProbe *m_probe;
+	unsigned m_range;
+	std::size_t m_completed;
+	performance::KernelPerformanceCheckpoint m_last;
+	bool m_cancelled, m_succeeded;
+};
+
+bool ExecuteDirectPathBody(const std::shared_ptr<DirectPathBatchWork> &batch,
+	std::size_t requestIndex, JobContext *context)
+{
+	DirectPathWork &work = batch->requests[requestIndex];
+	bool inlineExecution = false;
+	#if defined(_WIN64)
+	inlineExecution = context == nullptr && batch->reference &&
+		batch->reference->baseline && batch->reference->inlineBody.valid();
+	#endif
+	if (context == nullptr && !inlineExecution)
+		return false;
+	#if defined(_WIN64)
+	DirectPathSourceCheckpointScope checkpoint(*batch,
+		static_cast<unsigned>(requestIndex));
+	#endif
+	const bool cancelled = context != nullptr && context->isCancellationRequested();
+	#if defined(_WIN64)
+	if (checkpoint.cancelled(1, requestIndex, cancelled))
+	#else
+	if (cancelled)
+	#endif
+	{
+		publishDirectPathCancellation(work);
+		if (context != nullptr)
+			s_directPathLateDrainExecutions.fetch_add(1,
+				std::memory_order_relaxed);
+		return false;
+	}
+	const bool workerExecution = context != nullptr &&
+		context->isPhysicalWorkerExecution();
+	const unsigned runningState =
+		#if defined(_WIN64)
+		inlineExecution ? DIRECT_PATH_WORK_RUNNING_INLINE :
+		#endif
+		workerExecution ? DIRECT_PATH_WORK_RUNNING_WORKER :
+		DIRECT_PATH_WORK_RUNNING_OWNER;
+	const unsigned completedState =
+		#if defined(_WIN64)
+		inlineExecution ? DIRECT_PATH_WORK_INLINE :
+		#endif
+		workerExecution ? DIRECT_PATH_WORK_WORKER : DIRECT_PATH_WORK_OWNER;
+	unsigned expectedState = DIRECT_PATH_WORK_PENDING;
+	if (!work.executionState.compare_exchange_strong(expectedState,
+		runningState, std::memory_order_acq_rel, std::memory_order_acquire))
+	{
+		if (expectedState == DIRECT_PATH_WORK_CANCELLED && context != nullptr)
+			s_directPathLateDrainExecutions.fetch_add(1,
+				std::memory_order_relaxed);
+		return false;
+	}
+	if (workerExecution)
+	{
+		work.physicalWorkerIndex.store(context->physicalWorkerIndex(),
+			std::memory_order_release);
+		const unsigned active = batch->activeWorkers.fetch_add(1,
+			std::memory_order_acq_rel) + 1;
+		publishPeak(batch->peakActiveWorkers, active);
+		#if defined(RTS_BUILD_CORE_EXTRAS)
+		pauseDirectPathTest(2);
+		#endif
+	}
+	bool succeeded = true;
+	#if defined(RTS_BUILD_CORE_EXTRAS)
+	if ((s_directPathTestFaultMask.load(std::memory_order_acquire) & 1) != 0)
+		succeeded = false;
+	#endif
+	if (succeeded)
+		FindDeterministicDirectPath(work.snapshot, work.result);
+	#if defined(_WIN64)
+	if (succeeded)
+		checkpoint.completedRequest();
+	checkpoint.finish(succeeded);
+	#endif
+	if (workerExecution)
+		batch->activeWorkers.fetch_sub(1, std::memory_order_acq_rel);
+	expectedState = runningState;
+	if (!work.executionState.compare_exchange_strong(expectedState,
+		(succeeded ? completedState : DIRECT_PATH_WORK_FAILURE),
+		std::memory_order_release, std::memory_order_acquire) &&
+		expectedState == DIRECT_PATH_WORK_CANCELLED)
+	{
+		if (context != nullptr)
+			s_directPathLateDrainExecutions.fetch_add(1,
+				std::memory_order_relaxed);
+	}
+	return succeeded;
+}
+
 void ObserveDirectPathReference(const DirectPathBatchWork &batch,
 	std::size_t requestCount, performance::KernelPerformanceBatch *timingBatch,
 	performance::KernelPerformanceReferenceLedger *referenceLedger,
@@ -338,6 +768,9 @@ void ObserveDirectPathReference(const DirectPathBatchWork &batch,
 	const performance::KernelPerformanceReferenceMode mode =
 		referenceLedger->mode();
 	if (mode == performance::KERNEL_REFERENCE_DISABLED)
+		return;
+	if (batch.reference && (!batch.reference->collected ||
+		batch.reference->failed))
 		return;
 	performance::KernelPerformanceBatchIdentity identity;
 	if (!performance::KernelPerformanceLedger::instance().describeBatch(
@@ -364,6 +797,13 @@ void ObserveDirectPathReference(const DirectPathBatchWork &batch,
 			return;
 		}
 	}
+	if (batch.reference)
+	{
+		*referenceBatch = referenceLedger->observeValidatedAttempt(
+			batch.reference->attempt, WriteDirectPathReferenceOutput,
+			&production);
+		return;
+	}
 	*referenceBatch = referenceLedger->observeValidatedBatch(
 		performance::KERNEL_PERFORMANCE_PATH, identity.subtype, identity.frame,
 		identity.ordinal, 1, static_cast<rts::JobMetricCounter>(requestCount),
@@ -373,6 +813,107 @@ void ObserveDirectPathReference(const DirectPathBatchWork &batch,
 			SerialComputeDirectPathReference : nullptr,
 		mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
 			static_cast<void *>(&detached->view) : nullptr);
+}
+
+bool ConsumeDirectPathReference(const std::shared_ptr<DirectPathBatchWork> &work,
+	JobSystem &jobs, PathPerformanceInterval &schedule)
+{
+	using namespace performance;
+	DirectPathBatchWork &batch = *work;
+	if (!InlineBodyReadiness::direct(*batch.reference, jobs))
+		return false;
+	DirectPathSourceRecord &source = *batch.reference;
+	KernelPerformanceReferenceLedger &ledger = *source.ledger;
+	KernelPerformanceAttemptDecision decision = {};
+	if (!ledger.replayDecision(source.attempt, 1, true, source.facts, decision) ||
+		decision.admission != KERNEL_ADMISSION_ACCEPTED ||
+		decision.reasonSchema != 1 || decision.reason != 1 ||
+		decision.sourceConfiguredWorkers != source.workers)
+	{
+		source.failed = true;
+		return false;
+	}
+	source.admitted = true;
+	batch.referenceAdmissionAccepted = true;
+	const KernelPerformanceDispatchPlan dispatch = {1, 1, 1,
+		static_cast<unsigned>(batch.requestCount),
+		static_cast<JobMetricCounter>(batch.requestCount), 1, source.workers};
+	if (!ledger.observeDispatch(source.attempt, dispatch))
+	{
+		source.failed = true;
+		return false;
+	}
+	for (unsigned i = 0; i < batch.requestCount; ++i)
+	{
+		const KernelPerformanceRangePlan plan = {1, i, 0, i, i + 1, 1};
+		if (!ledger.observeRangePlan(source.attempt, plan))
+		{
+			source.failed = true;
+			return false;
+		}
+	}
+	source.planned = true;
+	schedule.end();
+	bool allSucceeded = true;
+	for (unsigned i = 0; i < batch.requestCount; ++i)
+	{
+		const KernelPerformanceRangePlan plan = {1, i, 0, i, i + 1, 1};
+		if (!InlineBodyReadiness::direct(source, jobs))
+		{
+			source.failed = true;
+			return false;
+		}
+		const KernelPerformanceInlineAction action = ledger.beginInlineBody(
+			source.attempt, plan, KernelPerformanceLedger::instance(),
+			source.inlineBody, source.checkpoints[i]);
+		if (action == KERNEL_INLINE_INVALID)
+		{
+			source.failed = true;
+			return false;
+		}
+		bool succeeded = action == KERNEL_INLINE_SKIP_SOURCE_NEVER_ENTERED;
+		if (action == KERNEL_INLINE_EXECUTE)
+		{
+			try
+			{
+				succeeded = ExecuteDirectPathBody(work, i, nullptr);
+			}
+			catch (...)
+			{
+				succeeded = false;
+			}
+		}
+		const KernelPerformanceRangeProgress progress =
+			DirectPathReleasedProgress(batch, i);
+		if (source.failed ||
+			(action == KERNEL_INLINE_EXECUTE &&
+				!ledger.finishInlineBody(source.inlineBody, progress)))
+		{
+			source.failed = true;
+			return false;
+		}
+		source.inlineBody = KernelPerformanceInlineBody();
+		if (!ledger.observeReleasedRange(source.attempt, plan, progress))
+		{
+			source.failed = true;
+			return false;
+		}
+		allSucceeded = allSucceeded && succeeded;
+	}
+	source.collected = true;
+	KernelPerformanceAttemptFinish sourceFinish = {};
+	if (!ledger.readSourceFinish(source.attempt, sourceFinish) ||
+		(sourceFinish.disposition != KERNEL_PERFORMANCE_COMMITTED &&
+		 sourceFinish.disposition != KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION) ||
+		(sourceFinish.disposition == KERNEL_PERFORMANCE_COMMITTED &&
+		 !sourceFinish.validationObserved))
+	{
+		source.failed = true;
+		return false;
+	}
+	source.sourceOwnerCommitAllowed =
+		sourceFinish.disposition == KERNEL_PERFORMANCE_COMMITTED;
+	return allSucceeded;
 }
 #endif
 
@@ -419,73 +960,10 @@ public:
 
 	void execute(JobContext &context) override
 	{
-		DirectPathWork &work = m_batch->requests[m_requestIndex];
 		#if defined(RTS_BUILD_CORE_EXTRAS)
 		pauseDirectPathTest(1);
 		#endif
-		if (context.isCancellationRequested())
-		{
-			publishDirectPathCancellation(work);
-			s_directPathLateDrainExecutions.fetch_add(1,
-				std::memory_order_relaxed);
-			return;
-		}
-		const bool workerExecution = context.isPhysicalWorkerExecution();
-		const unsigned runningState = workerExecution ?
-			DIRECT_PATH_WORK_RUNNING_WORKER : DIRECT_PATH_WORK_RUNNING_OWNER;
-		unsigned expectedState = DIRECT_PATH_WORK_PENDING;
-		if (!work.executionState.compare_exchange_strong(expectedState,
-			runningState, std::memory_order_acq_rel, std::memory_order_acquire))
-		{
-			if (expectedState == DIRECT_PATH_WORK_CANCELLED)
-			{
-				s_directPathLateDrainExecutions.fetch_add(1,
-					std::memory_order_relaxed);
-			}
-			return;
-		}
-
-		if (workerExecution)
-		{
-			work.physicalWorkerIndex.store(context.physicalWorkerIndex(),
-				std::memory_order_release);
-			const unsigned active = m_batch->activeWorkers.fetch_add(1,
-				std::memory_order_acq_rel) + 1;
-			publishPeak(m_batch->peakActiveWorkers, active);
-			#if defined(RTS_BUILD_CORE_EXTRAS)
-			pauseDirectPathTest(2);
-			#endif
-			#if defined(RTS_BUILD_CORE_EXTRAS)
-			if ((s_directPathTestFaultMask.load(std::memory_order_acquire) & 1) == 0)
-			#endif
-				FindDeterministicDirectPath(work.snapshot, work.result);
-			m_batch->activeWorkers.fetch_sub(1, std::memory_order_acq_rel);
-		}
-		else
-		{
-			#if defined(RTS_BUILD_CORE_EXTRAS)
-			if ((s_directPathTestFaultMask.load(std::memory_order_acquire) & 1) == 0)
-			#endif
-				FindDeterministicDirectPath(work.snapshot, work.result);
-		}
-
-		#if defined(RTS_BUILD_CORE_EXTRAS)
-		const bool injectedFailure =
-			(s_directPathTestFaultMask.load(std::memory_order_acquire) & 1) != 0;
-		#else
-		const bool injectedFailure = false;
-		#endif
-		const unsigned completedState = workerExecution ?
-			(injectedFailure ? DIRECT_PATH_WORK_FAILURE : DIRECT_PATH_WORK_WORKER) :
-			(injectedFailure ? DIRECT_PATH_WORK_FAILURE : DIRECT_PATH_WORK_OWNER);
-		expectedState = runningState;
-		if (!work.executionState.compare_exchange_strong(expectedState,
-			completedState, std::memory_order_release, std::memory_order_acquire) &&
-			expectedState == DIRECT_PATH_WORK_CANCELLED)
-		{
-			s_directPathLateDrainExecutions.fetch_add(1,
-				std::memory_order_relaxed);
-		}
+		ExecuteDirectPathBody(m_batch, m_requestIndex, &context);
 	}
 
 private:
@@ -566,6 +1044,7 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 	, performance::KernelPerformanceBatch *performanceBatch
 	, performance::KernelPerformanceReferenceLedger *performanceReferenceLedger
 	, performance::KernelPerformanceReferenceBatch *performanceReferenceBatch
+	, performance::KernelPerformanceAttempt performanceReferenceAttempt
 #endif
 	)
 {
@@ -580,6 +1059,18 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 	m_state->submittedJobCount = 0;
 	m_state->completed = false;
 	m_state->timedOut = false;
+	#if defined(_WIN64)
+	const bool traceRequested = performanceReferenceLedger != nullptr &&
+		performanceReferenceLedger->traceRequested();
+	const bool sourceBoundInline = performanceReferenceLedger != nullptr &&
+		performanceReferenceLedger->runMode() ==
+			performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING;
+	if ((traceRequested || sourceBoundInline) &&
+		!performanceReferenceAttempt.valid())
+		return false;
+	#else
+	const bool sourceBoundInline = false;
+	#endif
 	if (snapshots == nullptr || requestCount < 2 ||
 		requestCount > DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS ||
 		workerWaitTimeoutMilliseconds == 0 || !jobs.isRunning() ||
@@ -588,7 +1079,7 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 		return false;
 	}
 	unsigned expectedActiveBatches = 0;
-	if (!s_activeDirectPathBatches.compare_exchange_strong(expectedActiveBatches,
+	if (!sourceBoundInline && !s_activeDirectPathBatches.compare_exchange_strong(expectedActiveBatches,
 		1, std::memory_order_acq_rel, std::memory_order_acquire))
 	{
 		return false;
@@ -603,11 +1094,12 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 	}
 	catch (...)
 	{
-		s_activeDirectPathBatches.fetch_sub(1, std::memory_order_acq_rel);
+		if (!sourceBoundInline)
+			s_activeDirectPathBatches.fetch_sub(1, std::memory_order_acq_rel);
 		return false;
 	}
 	DirectPathBatchWork &batch = *m_state->work;
-	batch.ownsActiveSlot.store(true, std::memory_order_release);
+	batch.ownsActiveSlot.store(!sourceBoundInline, std::memory_order_release);
 	batch.requestCount = requestCount;
 
 	for (std::size_t requestIndex = 0; requestIndex < requestCount;
@@ -640,16 +1132,85 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 			std::memory_order_relaxed);
 	}
 	#if defined(_WIN64)
-	capture.end();
-	PathPerformanceInterval schedule(performanceBatch,
-		performance::KERNEL_PERFORMANCE_SCHEDULE);
-	#endif
-	const JobGroup group = jobs.createGroup();
-	if (!group.isValid())
+	try
+	{
+		if (!PrepareDirectPathSourceRecord(batch, jobs, performanceReferenceLedger,
+			performanceReferenceAttempt))
+		{
+			m_state->work.reset();
+			return false;
+		}
+	}
+	catch (...)
 	{
 		m_state->work.reset();
 		return false;
 	}
+	#endif
+	#if defined(_WIN64)
+	capture.end();
+	PathPerformanceInterval schedule(performanceBatch,
+		performance::KERNEL_PERFORMANCE_SCHEDULE);
+	#endif
+	#if defined(_WIN64)
+	if (sourceBoundInline)
+	{
+		m_state->completed = ConsumeDirectPathReference(m_state->work, jobs,
+			schedule);
+		if (!m_state->completed)
+			return false;
+		PathPerformanceInterval validate(performanceBatch,
+			performance::KERNEL_PERFORMANCE_VALIDATE);
+		for (std::size_t i = 0; i < batch.requestCount; ++i)
+		{
+			if (batch.requests[i].executionState.load(std::memory_order_acquire) !=
+				DIRECT_PATH_WORK_INLINE)
+			{
+				m_state->completed = false;
+				return false;
+			}
+		}
+		ObserveDirectPathReference(batch, requestCount, performanceBatch,
+			performanceReferenceLedger, performanceReferenceBatch);
+		if (performanceReferenceBatch == nullptr ||
+			!performanceReferenceBatch->valid() ||
+			!batch.reference->sourceOwnerCommitAllowed)
+		{
+			m_state->completed = false;
+			return false;
+		}
+		return true;
+	}
+	#endif
+	const JobGroup group = jobs.createGroup();
+	if (!group.isValid())
+	{
+		#if defined(_WIN64)
+		ObserveDirectPathSourceAdmission(batch, false);
+		#endif
+		m_state->work.reset();
+		return false;
+	}
+	#if defined(_WIN64)
+	if (batch.reference)
+	{
+		try
+		{
+			#if defined(RTS_BUILD_CORE_EXTRAS)
+			if ((s_directPathTestFaultMask.load(std::memory_order_acquire) &
+				DIRECT_PATH_TEST_GROUP_COPY_ALLOCATION_FAILURE) != 0)
+				throw std::bad_alloc();
+			#endif
+			batch.reference->group = group;
+		}
+		catch (...)
+		{
+			ObserveDirectPathSourceAdmission(batch, false);
+			m_state->work.reset();
+			return false;
+		}
+	}
+	#endif
 	JobSubmission submissions[DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS];
 	JobHandle handles[DETERMINISTIC_DIRECT_PATH_MAX_BATCH_REQUESTS];
 	std::size_t allocated = 0;
@@ -669,6 +1230,9 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 			delete submissions[i].job;
 		if (allocated == 0)
 			releaseDirectPathActiveSlot(batch);
+		#if defined(_WIN64)
+		ObserveDirectPathSourceAdmission(batch, false);
+		#endif
 		m_state->work.reset();
 		return false;
 	}
@@ -677,24 +1241,33 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 	{
 		for (std::size_t i = 0; i < requestCount; ++i)
 			delete submissions[i].job;
+		#if defined(_WIN64)
+		ObserveDirectPathSourceAdmission(batch, false);
+		#endif
 		m_state->work.reset();
 		return false;
 	}
 	m_state->submittedJobCount = requestCount;
 	#if defined(_WIN64)
+	ObserveDirectPathSourceAdmission(batch, true);
 	schedule.end();
 	PathPerformanceInterval wait(performanceBatch,
 		performance::KERNEL_PERFORMANCE_WAIT);
 	#endif
 
 	#if defined(RTS_BUILD_CORE_EXTRAS)
-	if ((s_directPathTestPauseMask.load(std::memory_order_acquire) & 1) != 0 &&
-		!waitForDirectPathTestPause(1, 1, 15000))
+	if ((s_directPathTestPauseMask.load(std::memory_order_acquire) & 1) != 0)
 	{
-		for (std::size_t i = 0; i < requestCount; ++i)
-			publishDirectPathCancellation(batch.requests[i]);
-		jobs.cancel(group);
-		return false;
+		const unsigned requiredWorkers = static_cast<unsigned>(requestCount) <
+			jobs.workerCount() ? static_cast<unsigned>(requestCount) :
+			jobs.workerCount();
+		if (!waitForDirectPathTestPause(1, requiredWorkers, 15000))
+		{
+			for (std::size_t i = 0; i < requestCount; ++i)
+				publishDirectPathCancellation(batch.requests[i]);
+			jobs.cancel(group);
+			return false;
+		}
 	}
 	#endif
 	#if defined(RTS_BUILD_CORE_EXTRAS)
@@ -740,9 +1313,14 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 	const bool joined = jobs.wait(group);
 	#if defined(_WIN64)
 	wait.end();
+	const bool collected = !batch.reference ||
+		CollectDirectPathSourceRecord(batch, jobs);
+	#else
+	const bool collected = true;
 	#endif
 	releaseDirectPathActiveSlot(batch);
-	m_state->completed = joined && !group.failed() && !group.wasCancelled();
+	m_state->completed = joined && collected && !group.failed() &&
+		!group.wasCancelled();
 	if (!m_state->completed)
 		return false;
 	#if defined(_WIN64)
@@ -762,9 +1340,23 @@ bool DeterministicDirectPathBatch::executeSynchronously(JobSystem &jobs,
 	#if defined(_WIN64)
 	ObserveDirectPathReference(batch, requestCount, performanceBatch,
 		performanceReferenceLedger, performanceReferenceBatch);
+	if (batch.reference && (performanceReferenceBatch == nullptr ||
+		!performanceReferenceBatch->valid()))
+	{
+		m_state->completed = false;
+		return false;
+	}
 	#endif
 	return true;
 }
+
+#if defined(_WIN64)
+bool DeterministicDirectPathBatch::collectPerformanceReference(JobSystem &jobs)
+{
+	return m_state != nullptr && m_state->work != nullptr &&
+		CollectDirectPathSourceRecord(*m_state->work, jobs);
+}
+#endif
 
 DeterministicDirectPathBatchExecutionSnapshot
 DeterministicDirectPathBatch::executionSnapshot() const
@@ -774,6 +1366,8 @@ DeterministicDirectPathBatch::executionSnapshot() const
 		return snapshot;
 	snapshot.requestCount = m_state->requestCount;
 	snapshot.submittedJobCount = m_state->submittedJobCount;
+	snapshot.referenceAdmissionAccepted = m_state->work != nullptr &&
+		m_state->work->referenceAdmissionAccepted;
 	snapshot.completed = m_state->completed;
 	snapshot.timedOut = m_state->timedOut;
 	if (m_state->work == nullptr)
@@ -840,6 +1434,10 @@ DeterministicDirectPathBatch::requestExecutionSnapshot(
 		snapshot.state = DIRECT_PATH_EXECUTION_WORKER;
 	else if (state == DIRECT_PATH_WORK_OWNER)
 		snapshot.state = DIRECT_PATH_EXECUTION_OWNER;
+	#if defined(_WIN64)
+	else if (state == DIRECT_PATH_WORK_INLINE)
+		snapshot.state = DIRECT_PATH_EXECUTION_INLINE;
+	#endif
 	else if (state == DIRECT_PATH_WORK_FAILURE)
 		snapshot.state = DIRECT_PATH_EXECUTION_FAILURE;
 	if (snapshot.state == DIRECT_PATH_EXECUTION_WORKER)
@@ -848,7 +1446,11 @@ DeterministicDirectPathBatch::requestExecutionSnapshot(
 			std::memory_order_acquire);
 	}
 	snapshot.succeeded = m_state->completed &&
-		snapshot.state == DIRECT_PATH_EXECUTION_WORKER;
+		(snapshot.state == DIRECT_PATH_EXECUTION_WORKER
+	#if defined(_WIN64)
+			|| snapshot.state == DIRECT_PATH_EXECUTION_INLINE
+	#endif
+		);
 	return snapshot;
 }
 
@@ -859,7 +1461,12 @@ const DirectPathSearchResult &DeterministicDirectPathBatch::result(
 	if (m_state == nullptr || m_state->work == nullptr ||
 		!m_state->completed || requestIndex >= m_state->requestCount ||
 		m_state->work->requests[requestIndex].executionState.load(
-			std::memory_order_acquire) != DIRECT_PATH_WORK_WORKER)
+			std::memory_order_acquire) != DIRECT_PATH_WORK_WORKER
+	#if defined(_WIN64)
+		&& m_state->work->requests[requestIndex].executionState.load(
+			std::memory_order_acquire) != DIRECT_PATH_WORK_INLINE
+	#endif
+		)
 	{
 		return invalidResult;
 	}
@@ -927,6 +1534,8 @@ const unsigned ORDINARY_PATH_TEST_ENTRY_PAUSE = 4U;
 const unsigned ORDINARY_PATH_TEST_ACTIVE_PAUSE = 8U;
 const unsigned ORDINARY_PATH_TEST_EXECUTION_FAILURE = 4U;
 const unsigned ORDINARY_PATH_TEST_SCHEDULER_STOPPED = 8U;
+const unsigned ORDINARY_PATH_TEST_SOURCE_COLLECTION_FAILURE = 16U;
+const unsigned ORDINARY_PATH_TEST_DISPATCH_VECTOR_ALLOCATION_FAILURE = 256U;
 
 std::atomic<unsigned> s_activeOrdinaryPathBatches(0);
 std::atomic<unsigned> s_ordinaryPathLateDrainExecutions(0);
@@ -970,11 +1579,51 @@ struct OrdinaryPathRangeWork
 	std::atomic<unsigned> physicalWorkerIndex;
 };
 
+#if defined(_WIN64)
+struct OrdinaryPathSourceRecord
+{
+	OrdinaryPathSourceRecord() : ledger(nullptr), workers(0), pending(0),
+		outstanding(0), baseline(false), admitted(false), planned(false), collected(false), failed(false),
+		sourceOwnerCommitAllowed(false) {}
+
+	performance::KernelPerformanceReferenceLedger *ledger;
+	performance::KernelPerformanceAttempt attempt;
+	performance::KernelPerformanceDigest facts;
+	std::unique_ptr<performance::KernelPerformanceCheckpointProbe[]> checkpoints;
+	std::unique_ptr<performance::KernelPerformanceRequestBudget[]> budgets;
+	JobGroup group;
+	performance::KernelPerformanceInlineBody inlineBody;
+	performance::KernelPerformanceInlineOwnerSerial materialization;
+	unsigned workers;
+	JobMetricCounter pending, outstanding;
+	bool baseline, admitted, planned, collected, failed;
+	bool sourceOwnerCommitAllowed;
+};
+
+bool InlineBodyReadiness::ordinary(const OrdinaryPathSourceRecord &source,
+	const JobSystem &jobs)
+{
+	return source.ledger != nullptr && source.attempt.valid() &&
+		source.baseline && !source.failed && !source.inlineBody.valid() &&
+		!source.materialization.valid() && jobs.isCurrentThread(JOB_OWNER_GAME);
+}
+
+bool ReapReadiness::ordinary(const OrdinaryPathSourceRecord &source,
+	const JobSystem &jobs)
+{
+	return source.ledger != nullptr && source.attempt.valid() &&
+		!source.baseline && jobs.isCurrentThread(JOB_OWNER_GAME) &&
+		source.group.isValid() && source.group.isComplete();
+}
+#endif
+
 struct OrdinaryPathBatchWork
 {
 	OrdinaryPathBatchWork() : requestCount(0), rangeCount(0), grainSize(0),
 		activeWorkers(0), peakActiveWorkers(0), liveJobs(0),
-		resultStorageBytes(0), ownsActiveSlot(false) {}
+		resultStorageBytes(0), ownsActiveSlot(false),
+		referenceAdmissionAccepted(false)
+	{}
 
 	~OrdinaryPathBatchWork()
 	{
@@ -994,7 +1643,91 @@ struct OrdinaryPathBatchWork
 	std::atomic<unsigned> liveJobs;
 	std::atomic<std::size_t> resultStorageBytes;
 	std::atomic<bool> ownsActiveSlot;
+	bool referenceAdmissionAccepted;
+#if defined(_WIN64)
+	DeterministicOrdinaryPathTestHooks testHooks;
+	// Separate trace-only storage preserves the ordinary request-size admission bound.
+	std::unique_ptr<OrdinaryPathSourceRecord> reference;
+#endif
 };
+
+#if defined(_WIN64)
+void ObserveOrdinaryPathTestRequest(const OrdinaryPathBatchWork &batch,
+	DeterministicOrdinaryPathTestEvent site, unsigned rangeIndex,
+	std::size_t requestIndex, std::size_t actualBytes = 0, bool actualGranted = false)
+{
+	if (batch.testHooks.observeRequest != nullptr)
+		batch.testHooks.observeRequest(batch.testHooks.context, site,
+			rangeIndex, requestIndex, actualBytes, actualGranted);
+}
+
+void ObserveOrdinaryPathMaterializationTest(const OrdinaryPathBatchWork &batch,
+	const OrdinaryPathRangeWork &range, const OrdinaryPathRequestWork &work,
+	DeterministicOrdinaryPathTestEvent site, std::size_t actualBytes = 0,
+	bool actualGranted = false)
+{
+	ObserveOrdinaryPathTestRequest(batch, site,
+		static_cast<unsigned>(&range - batch.ranges.get()),
+		static_cast<std::size_t>(&work - batch.requests.get()), actualBytes, actualGranted);
+}
+
+class OrdinaryPathMaterializationTestScope
+{
+public:
+	OrdinaryPathMaterializationTestScope(const OrdinaryPathBatchWork &batch,
+		const OrdinaryPathRangeWork &range, const OrdinaryPathRequestWork &work) :
+		m_batch(batch), m_range(range), m_work(work)
+	{
+		ObserveOrdinaryPathMaterializationTest(m_batch, m_range, m_work,
+			DETERMINISTIC_ORDINARY_PATH_TEST_MATERIALIZATION_ENTER);
+	}
+	~OrdinaryPathMaterializationTestScope()
+	{
+		ObserveOrdinaryPathMaterializationTest(m_batch, m_range, m_work,
+			DETERMINISTIC_ORDINARY_PATH_TEST_MATERIALIZATION_EXIT);
+	}
+private:
+	const OrdinaryPathBatchWork &m_batch;
+	const OrdinaryPathRangeWork &m_range;
+	const OrdinaryPathRequestWork &m_work;
+};
+
+// The same native body records on a physical worker or advances an already
+// authenticated inline probe. Physical POD import follows the real group fence.
+class OrdinaryPathSourceCheckpointScope
+{
+public:
+	OrdinaryPathSourceCheckpointScope(OrdinaryPathBatchWork &batch, unsigned range) :
+		m_probe(batch.reference ? &batch.reference->checkpoints[range] : nullptr),
+		m_range(range), m_begin(batch.ranges[range].begin), m_completed(0),
+		m_last{1, range, m_begin}, m_cancelled(false), m_succeeded(false)
+	{
+		if (m_probe != nullptr && !batch.reference->baseline) m_probe->beginRecord();
+	}
+	~OrdinaryPathSourceCheckpointScope()
+	{
+		if (m_probe == nullptr) return;
+		const performance::KernelPerformanceCheckpoint end = {3, m_range, m_begin + m_completed};
+		m_probe->finish(m_cancelled ? m_last : end, m_completed,
+			m_cancelled ? performance::KERNEL_RANGE_CANCELLED : m_succeeded ?
+			performance::KERNEL_RANGE_COMPLETED : performance::KERNEL_RANGE_FAILED);
+	}
+	bool cancelled(unsigned site, std::size_t request, bool actual)
+	{
+		m_last = {site, m_range, request};
+		m_cancelled = m_probe != nullptr ? m_probe->cancelled(m_last, actual) : actual;
+		return m_cancelled;
+	}
+	void completedRequest() { ++m_completed; }
+	void finish(bool succeeded) { m_succeeded = succeeded; }
+private:
+	performance::KernelPerformanceCheckpointProbe *m_probe;
+	unsigned m_range;
+	std::size_t m_begin, m_completed;
+	performance::KernelPerformanceCheckpoint m_last;
+	bool m_cancelled, m_succeeded;
+};
+#endif
 
 void releaseOrdinaryPathActiveSlot(OrdinaryPathBatchWork &batch)
 {
@@ -1198,6 +1931,132 @@ bool WriteOrdinaryPathReferenceInput(
 	return true;
 }
 
+bool PrepareOrdinaryPathSourceRecord(OrdinaryPathBatchWork &batch,
+	std::size_t hierarchyBlockCount, JobSystem &jobs,
+	performance::KernelPerformanceReferenceLedger *ledger,
+	performance::KernelPerformanceAttempt attempt)
+{
+	if (ledger == nullptr) return true;
+	if (!attempt.valid()) return !ledger->traceRequested();
+	const bool baseline = ledger->runMode() == performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING;
+	if (!baseline && ledger->runMode() != performance::KERNEL_REFERENCE_THROUGHPUT_BINDING) return false;
+	std::unique_ptr<OrdinaryPathSourceRecord> source(new OrdinaryPathSourceRecord());
+	source->ledger = ledger; source->attempt = attempt;
+	source->baseline = baseline;
+	source->workers = jobs.workerCount();
+	source->pending = jobs.pendingOwnerCompletionCount();
+	source->outstanding = jobs.outstandingJobCount();
+	source->checkpoints.reset(new performance::KernelPerformanceCheckpointProbe[batch.rangeCount]);
+	source->budgets.reset(new performance::KernelPerformanceRequestBudget[batch.requestCount]);
+	for (std::size_t i = 0; i != batch.requestCount; ++i)
+		source->budgets[i].requestOrdinal = i;
+	performance::KernelPerformanceCanonicalWriter facts;
+	if (!facts.begin(1) || !facts.u64(1, batch.requestCount) ||
+		!facts.u64(2, batch.cells.size()) || !facts.u64(3, hierarchyBlockCount) ||
+		!facts.u64(4, ORDINARY_PATH_MAX_SCRATCH_BYTES) ||
+		!facts.u64(5, ORDINARY_PATH_MAX_RESULT_BYTES)) return false;
+	source->facts = facts.finish();
+	const OrdinaryPathReferenceInput input = {&batch, batch.requestCount,
+		batch.cells.size(), hierarchyBlockCount};
+	if (!source->facts.valid || !ledger->bindCapturedInput(attempt, 1,
+		batch.requestCount, WriteOrdinaryPathReferenceInput, &input)) return false;
+	batch.reference = std::move(source);
+	return true;
+}
+
+void ObserveOrdinaryPathSourceAdmission(OrdinaryPathBatchWork &batch, bool admitted)
+{
+	if (!batch.reference) return;
+	OrdinaryPathSourceRecord &source = *batch.reference;
+	source.admitted = admitted;
+	performance::KernelPerformanceAttemptDecision decision = {};
+	decision.site = 1; decision.reasonSchema = 1; decision.reason = admitted ? 1 : 2;
+	decision.deterministicEligible = true; decision.deterministicFacts = source.facts;
+	decision.admission = admitted ? performance::KERNEL_ADMISSION_ACCEPTED :
+		performance::KERNEL_ADMISSION_REFUSED;
+	decision.sourceConfiguredWorkers = source.workers;
+	decision.dynamicFactsKnownMask = 7;
+	decision.pendingJobs = source.pending; decision.outstandingJobs = source.outstanding;
+	// The existing active-slot CAS succeeded from zero before capture.
+	decision.activeSlots = 0;
+	if (!source.ledger->observeDecision(source.attempt, decision))
+	{ source.failed = true; return; }
+	if (!admitted) return;
+	batch.referenceAdmissionAccepted = true;
+	const performance::KernelPerformanceDispatchPlan dispatch = {1, 2, 1,
+		batch.rangeCount, batch.requestCount, batch.grainSize, source.workers};
+	if (!source.ledger->observeDispatch(source.attempt, dispatch))
+	{ source.failed = true; return; }
+	for (unsigned i = 0; i != batch.rangeCount; ++i)
+	{
+		const OrdinaryPathRangeWork &range = batch.ranges[i];
+		const performance::KernelPerformanceRangePlan plan = {1, i, 0,
+			range.begin, range.end, range.end - range.begin};
+		if (!source.ledger->observeRangePlan(source.attempt, plan))
+		{ source.failed = true; return; }
+	}
+	source.planned = true;
+}
+
+performance::KernelPerformanceRangeProgress OrdinaryPathReleasedProgress(
+	const OrdinaryPathBatchWork &batch, unsigned index)
+{
+	performance::KernelPerformanceRangeProgress progress = {};
+	progress.checkpoint = batch.reference->checkpoints[index].snapshot();
+	progress.publication = !progress.checkpoint.entered ? performance::KERNEL_PUBLICATION_NOT_APPLICABLE :
+		batch.reference->group.wasCancelled() || progress.checkpoint.terminal == performance::KERNEL_RANGE_CANCELLED ?
+		performance::KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL :
+		progress.checkpoint.terminal == performance::KERNEL_RANGE_COMPLETED ?
+		performance::KERNEL_PUBLICATION_PUBLISHED : performance::KERNEL_PUBLICATION_REJECTED;
+	return progress;
+}
+
+bool ImportOrdinaryPathReferenceRange(OrdinaryPathBatchWork &batch, unsigned index,
+	const performance::KernelPerformanceRangeProgress &progress)
+{
+	OrdinaryPathSourceRecord &source = *batch.reference;
+	const OrdinaryPathRangeWork &range = batch.ranges[index];
+	const performance::KernelPerformanceRangePlan plan = {1, index, 0,
+		range.begin, range.end, range.end - range.begin};
+	for (std::size_t request = range.begin; request != range.end; ++request)
+	{
+		const performance::KernelPerformanceRequestBudget &budget = source.budgets[request];
+		if (!source.ledger->observeReleasedRequestBudget(source.attempt, plan, budget))
+		{ source.failed = true; return false; }
+		if (batch.testHooks.observeReleasedBudget != nullptr)
+			batch.testHooks.observeReleasedBudget(batch.testHooks.context, plan, budget);
+	}
+	if (!source.ledger->observeReleasedRange(source.attempt, plan, progress))
+	{ source.failed = true; return false; }
+	if (batch.testHooks.observeReleasedRange != nullptr)
+		batch.testHooks.observeReleasedRange(batch.testHooks.context, plan, progress);
+	return true;
+}
+
+bool CollectOrdinaryPathSourceRecord(OrdinaryPathBatchWork &batch, JobSystem &jobs)
+{
+	if (!jobs.isCurrentThread(JOB_OWNER_GAME) || !batch.reference) return false;
+	OrdinaryPathSourceRecord &source = *batch.reference;
+	#if defined(RTS_BUILD_CORE_EXTRAS)
+	const bool forceReportedFailure =
+		(s_directPathTestFaultMask.load(std::memory_order_acquire) &
+		 ORDINARY_PATH_TEST_SOURCE_COLLECTION_FAILURE) != 0;
+	#else
+	const bool forceReportedFailure = false;
+	#endif
+	if (source.failed) return false;
+	if (source.collected) return true;
+	if (source.baseline || !source.admitted || !source.planned ||
+		!ReapReadiness::ordinary(source, jobs)) return false;
+	for (unsigned i = 0; i != batch.rangeCount; ++i)
+		if (!ImportOrdinaryPathReferenceRange(batch, i, OrdinaryPathReleasedProgress(batch, i))) return false;
+	source.collected = true;
+	// The injected failure exercises propagation after terminal source evidence
+	// has been collected.  It must not strand the admitted attempt or erase the
+	// already-observed range releases needed for an authenticated reap.
+	return !forceReportedFailure;
+}
+
 bool WriteOrdinaryPathReferenceOutput(
 	performance::KernelPerformanceCanonicalWriter &writer, const void *context)
 {
@@ -1256,7 +2115,7 @@ void SetOrdinaryPathReferenceResultView(
 	std::uint64_t materializationPlanHash)
 {
 	view.points = points.empty() ? nullptr : points.data();
-	view.pointCount = result.pointCount;
+	view.pointCount = points.size();
 	view.allocationOrder = allocationOrder.empty() ? nullptr :
 		allocationOrder.data();
 	view.allocationCount = allocationOrder.size();
@@ -1428,6 +2287,9 @@ bool SerialComputeOrdinaryPathReference(const void *immutableInput,
 {
 	const OrdinaryPathReferenceInput &input =
 		*static_cast<const OrdinaryPathReferenceInput *>(immutableInput);
+	if (input.batch != nullptr)
+		ObserveOrdinaryPathTestRequest(*input.batch,
+			DETERMINISTIC_ORDINARY_PATH_TEST_REFERENCE_SERIAL_ENTER, 0, 0);
 	OrdinaryPathReferenceOutputView &view =
 		*static_cast<OrdinaryPathReferenceOutputView *>(detachedSerialOutput);
 	if (view.detachedStorage == nullptr)
@@ -1513,6 +2375,11 @@ bool PrepareOrdinaryPathReferenceBundle(const OrdinaryPathBatchWork &batch,
 		SetOrdinaryPathReferenceResultView(bundle.productionResults[index],
 			result, work, work.points, work.allocationOrder, work.cleanupOrder,
 			work.passableBlocks, planHash);
+		if (batch.testHooks.observeReferenceResult != nullptr)
+			batch.testHooks.observeReferenceResult(batch.testHooks.context, index,
+				result.status, result.pointCount, work.points.size(),
+				bundle.productionResults[index].pointCount,
+				bundle.productionResults[index].points != nullptr);
 	}
 	bundle.production.results = bundle.productionResults.data();
 	bundle.production.count = requestCount;
@@ -1567,6 +2434,8 @@ void ObserveOrdinaryPathReference(const OrdinaryPathBatchWork &batch,
 		referenceLedger->mode();
 	if (mode == performance::KERNEL_REFERENCE_DISABLED)
 		return;
+	if (batch.reference && (!batch.reference->collected || batch.reference->failed))
+		return;
 	performance::KernelPerformanceBatchIdentity identity;
 	if (!performance::KernelPerformanceLedger::instance().describeBatch(
 		*timingBatch, identity) || identity.kernel !=
@@ -1583,6 +2452,12 @@ void ObserveOrdinaryPathReference(const OrdinaryPathBatchWork &batch,
 	{
 		return;
 	}
+	if (batch.reference)
+	{
+		*referenceBatch = referenceLedger->observeValidatedAttempt(batch.reference->attempt,
+			WriteOrdinaryPathReferenceOutput, &bundle.production);
+		return;
+	}
 	*referenceBatch = referenceLedger->observeValidatedBatch(
 		performance::KERNEL_PERFORMANCE_PATH, identity.subtype, identity.frame,
 		identity.ordinal, 1, static_cast<rts::JobMetricCounter>(requestCount),
@@ -1595,9 +2470,41 @@ void ObserveOrdinaryPathReference(const OrdinaryPathBatchWork &batch,
 }
 #endif
 
+#if defined(_WIN64)
+class OrdinaryPathInlineMaterializationScope
+{
+public:
+	OrdinaryPathInlineMaterializationScope(OrdinaryPathSourceRecord &source,
+		std::size_t request) : m_source(source), m_budget(source.budgets[request])
+	{
+		m_source.materialization = m_source.ledger->beginInlineOwnerSerial(m_source.inlineBody,
+			performance::KERNEL_INLINE_SERIAL_ORDINARY_PATH_MATERIALIZATION);
+		if (!valid()) m_source.failed = true;
+	}
+	~OrdinaryPathInlineMaterializationScope()
+	{
+		if (!valid()) return;
+		// The whole native helper has returned, including its local-vector and
+		// test-scope destruction. Settle only a grant site it actually reached.
+		if (m_budget.grantSite != 0 &&
+			!m_source.ledger->finishInlineRequestBudget(m_source.materialization, m_budget))
+			m_source.failed = true;
+		if (!m_source.ledger->endInlineOwnerSerial(m_source.materialization)) m_source.failed = true;
+		m_source.materialization = performance::KernelPerformanceInlineOwnerSerial();
+	}
+	bool valid() const { return m_source.materialization.valid(); }
+private:
+	OrdinaryPathSourceRecord &m_source;
+	performance::KernelPerformanceRequestBudget &m_budget;
+};
+#endif
+
 bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 	OrdinaryPathRangeWork &range, OrdinaryPathRequestWork &work)
 {
+	#if defined(_WIN64)
+	const OrdinaryPathMaterializationTestScope testScope(batch, range, work);
+	#endif
 	if (work.result.status != DETERMINISTIC_PATH_FOUND)
 		return true;
 	const std::size_t cellCount = batch.cells.size();
@@ -1613,6 +2520,10 @@ bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 	std::vector<std::uint32_t> discovered;
 	std::vector<std::uint32_t> open;
 	std::vector<std::uint32_t> closed;
+	#if defined(_WIN64)
+	ObserveOrdinaryPathMaterializationTest(batch, range, work,
+		DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_DISCOVERED_ALLOCATION);
+	#endif
 	try
 	{
 		discovered.reserve(work.result.discoveredNodeCount);
@@ -1642,6 +2553,10 @@ bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 		return false;
 	}
 
+	#if defined(_WIN64)
+	ObserveOrdinaryPathMaterializationTest(batch, range, work,
+		DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_SORT);
+	#endif
 	std::sort(discovered.begin(), discovered.end(),
 		[&](std::uint32_t left, std::uint32_t right)
 		{
@@ -1663,6 +2578,10 @@ bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 			return range.nodes[left].closeOrdinal >
 				range.nodes[right].closeOrdinal;
 		});
+	#if defined(_WIN64)
+	ObserveOrdinaryPathMaterializationTest(batch, range, work,
+		DETERMINISTIC_ORDINARY_PATH_TEST_AFTER_SORT);
+	#endif
 
 	std::size_t allocationCount = 0;
 	if (!hasInitialCellInfo(batch, goalIndex))
@@ -1682,6 +2601,10 @@ bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 		static_cast<std::size_t>(work.result.requiredCellInfoCount))
 		return false;
 
+	#if defined(_WIN64)
+	ObserveOrdinaryPathMaterializationTest(batch, range, work,
+		DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_BYTE_ARITHMETIC);
+	#endif
 	if (work.result.pointCount >
 		std::numeric_limits<std::size_t>::max() /
 			sizeof(DeterministicPathPoint) ||
@@ -1712,7 +2635,44 @@ bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 	}
 	const std::size_t outputBytes = pointBytes + allocationBytes + cleanupBytes +
 		passableBlockBytes;
-	if (!reserveOrdinaryPathResultStorage(batch, outputBytes))
+	#if defined(_WIN64)
+	ObserveOrdinaryPathMaterializationTest(batch, range, work,
+		DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_GRANT, outputBytes);
+	#endif
+	bool storageReserved = false;
+	#if defined(_WIN64)
+	if (batch.reference && batch.reference->baseline)
+	{
+		OrdinaryPathSourceRecord &source = *batch.reference;
+		if (!source.ledger->replayRequestBudgetGrant(source.materialization,
+			&work - batch.requests.get(), 1, 1, outputBytes, storageReserved))
+		{ source.failed = true; return false; }
+	}
+	else
+	#endif
+	{
+		#if defined(_WIN64)
+		ObserveOrdinaryPathMaterializationTest(batch, range, work,
+			DETERMINISTIC_ORDINARY_PATH_TEST_PHYSICAL_RESERVE, outputBytes);
+		#endif
+		storageReserved = reserveOrdinaryPathResultStorage(batch, outputBytes);
+	}
+	#if defined(_WIN64)
+	if (batch.reference)
+	{
+		performance::KernelPerformanceRequestBudget &budget =
+			batch.reference->budgets[&work - batch.requests.get()];
+		budget.grantSite = 1; budget.localGrantOrdinal = 1;
+		budget.requestedBytes = outputBytes;
+		budget.grantedBytes = storageReserved ? outputBytes : 0;
+		budget.consumedBytes = budget.grantedBytes;
+		budget.disposition = storageReserved ? performance::KERNEL_REQUEST_BUDGET_RETAINED :
+			performance::KERNEL_REQUEST_BUDGET_REFUSED;
+	}
+	ObserveOrdinaryPathMaterializationTest(batch, range, work,
+		DETERMINISTIC_ORDINARY_PATH_TEST_GRANT_RETURNED, outputBytes, storageReserved);
+	#endif
+	if (!storageReserved)
 	{
 		work.result.status = DETERMINISTIC_PATH_BUDGET_EXHAUSTED;
 		return true;
@@ -1720,6 +2680,10 @@ bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 
 	try
 	{
+		#if defined(_WIN64)
+		ObserveOrdinaryPathMaterializationTest(batch, range, work,
+			DETERMINISTIC_ORDINARY_PATH_TEST_FIRST_OUTPUT_ALLOCATION, outputBytes);
+		#endif
 		work.points.assign(range.pointScratch.begin(),
 			range.pointScratch.begin() + work.result.pointCount);
 		work.allocationOrder.reserve(allocationCount);
@@ -1744,15 +2708,34 @@ bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 	}
 	catch (...)
 	{
-		batch.resultStorageBytes.fetch_sub(outputBytes, std::memory_order_acq_rel);
+		#if defined(_WIN64)
+		if (!batch.reference || !batch.reference->baseline)
+		#endif
+			batch.resultStorageBytes.fetch_sub(outputBytes, std::memory_order_acq_rel);
 		work.points.clear();
 		work.allocationOrder.clear();
 		work.cleanupOrder.clear();
 		work.passableBlocks.clear();
+		#if defined(_WIN64)
+		if (batch.reference)
+		{
+			performance::KernelPerformanceRequestBudget &budget =
+				batch.reference->budgets[&work - batch.requests.get()];
+			budget.refundSite = 2; budget.localRefundOrdinal = 2;
+			budget.refundedBytes = outputBytes; budget.consumedBytes = 0;
+			budget.disposition = performance::KERNEL_REQUEST_BUDGET_REFUNDED;
+		}
+		ObserveOrdinaryPathMaterializationTest(batch, range, work,
+			DETERMINISTIC_ORDINARY_PATH_TEST_REFUND_COMPLETED, outputBytes);
+		#endif
 		return false;
 	}
 	work.result.points = work.points.data();
 	work.result.pointCapacity = work.points.size();
+	#if defined(_WIN64)
+	ObserveOrdinaryPathMaterializationTest(batch, range, work,
+		DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_FINAL_VALIDATION);
+	#endif
 	if (work.allocationOrder.size() != allocationCount ||
 		work.cleanupOrder.size() !=
 			static_cast<std::size_t>(work.result.cumulativeCellCount) ||
@@ -1760,6 +2743,10 @@ bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 	{
 		return false;
 	}
+	#if defined(_WIN64)
+	ObserveOrdinaryPathMaterializationTest(batch, range, work,
+		DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_HASH);
+	#endif
 	work.materializationPlanHash = ComputeDeterministicOrdinaryPathPlanHash(
 		work.points.data(), work.points.size(), work.allocationOrder.data(),
 		work.allocationOrder.size(), work.cleanupOrder.data(),
@@ -1767,8 +2754,266 @@ bool buildOrdinaryPathMaterializationPlan(OrdinaryPathBatchWork &batch,
 		work.passableBlocks.size(), work.result.hierarchyAllPassable != 0,
 		work.result.snapshotGeneration,
 		work.request.objectId, work.ownerToken);
+	#if defined(_WIN64)
+	ObserveOrdinaryPathMaterializationTest(batch, range, work,
+		DETERMINISTIC_ORDINARY_PATH_TEST_AFTER_HASH);
+	#endif
 	return work.materializationPlanHash != 0;
 }
+
+bool MaterializeOrdinaryPathRequest(OrdinaryPathBatchWork &batch,
+	OrdinaryPathRangeWork &range, OrdinaryPathRequestWork &work)
+{
+	#if defined(_WIN64)
+	if (batch.reference && batch.reference->baseline)
+	{
+		bool materialized = false;
+		{
+			OrdinaryPathInlineMaterializationScope extent(*batch.reference, &work - batch.requests.get());
+			if (!extent.valid()) return false;
+			materialized = buildOrdinaryPathMaterializationPlan(batch, range, work);
+		}
+		return materialized && !batch.reference->failed;
+	}
+	#endif
+	return buildOrdinaryPathMaterializationPlan(batch, range, work);
+}
+
+bool ExecuteOrdinaryPathRangeBody(const std::shared_ptr<OrdinaryPathBatchWork> &batch,
+	unsigned rangeIndex, JobContext *context)
+{
+	OrdinaryPathRangeWork &range = batch->ranges[rangeIndex];
+	bool inlineExecution = false;
+	#if defined(_WIN64)
+	inlineExecution = context == nullptr && batch->reference && batch->reference->baseline &&
+		batch->reference->inlineBody.valid();
+	#endif
+	if (context == nullptr && !inlineExecution) return false;
+	#if defined(_WIN64)
+	OrdinaryPathSourceCheckpointScope checkpoint(*batch, rangeIndex);
+	#endif
+	#if defined(RTS_BUILD_CORE_EXTRAS)
+	if (context != nullptr) pauseDirectPathTest(ORDINARY_PATH_TEST_ENTRY_PAUSE);
+	#endif
+	const bool entryCancelled = context != nullptr && context->isCancellationRequested();
+	#if defined(_WIN64)
+	if (checkpoint.cancelled(1, range.begin, entryCancelled))
+	#else
+	if (entryCancelled)
+	#endif
+	{
+		publishOrdinaryPathCancellation(range);
+		if (context != nullptr) s_ordinaryPathLateDrainExecutions.fetch_add(1,
+			std::memory_order_relaxed);
+		return false;
+	}
+	const bool workerExecution = context != nullptr && context->isPhysicalWorkerExecution();
+	unsigned runningState = workerExecution ?
+		DIRECT_PATH_WORK_RUNNING_WORKER : DIRECT_PATH_WORK_RUNNING_OWNER;
+	unsigned requestRunningState = DIRECT_PATH_WORK_RUNNING_WORKER;
+	unsigned requestCompletedState = DIRECT_PATH_WORK_WORKER;
+	#if defined(_WIN64)
+	if (inlineExecution)
+	{
+		runningState = requestRunningState = DIRECT_PATH_WORK_RUNNING_INLINE;
+		requestCompletedState = DIRECT_PATH_WORK_INLINE;
+	}
+	#endif
+	unsigned expectedState = DIRECT_PATH_WORK_PENDING;
+	if (!range.executionState.compare_exchange_strong(expectedState,
+		runningState, std::memory_order_acq_rel, std::memory_order_acquire))
+	{
+		if (expectedState == DIRECT_PATH_WORK_CANCELLED && context != nullptr)
+			s_ordinaryPathLateDrainExecutions.fetch_add(1,
+				std::memory_order_relaxed);
+		return false;
+	}
+
+	if (workerExecution)
+	{
+		range.physicalWorkerIndex.store(context->physicalWorkerIndex(),
+			std::memory_order_release);
+		const unsigned active = batch->activeWorkers.fetch_add(1,
+			std::memory_order_acq_rel) + 1;
+		publishPeak(batch->peakActiveWorkers, active);
+		#if defined(RTS_BUILD_CORE_EXTRAS)
+		pauseDirectPathTest(ORDINARY_PATH_TEST_ACTIVE_PAUSE);
+		#endif
+	}
+
+	bool succeeded = workerExecution || inlineExecution;
+	#if defined(RTS_BUILD_CORE_EXTRAS)
+	if ((s_directPathTestFaultMask.load(std::memory_order_acquire) &
+		ORDINARY_PATH_TEST_EXECUTION_FAILURE) != 0)
+	{
+		succeeded = false;
+	}
+	#endif
+	for (std::size_t requestIndex = range.begin;
+		succeeded && requestIndex < range.end; ++requestIndex)
+	{
+		const bool requestCancelled = (context != nullptr && context->isCancellationRequested()) ||
+			range.executionState.load(std::memory_order_acquire) ==
+				DIRECT_PATH_WORK_CANCELLED;
+		#if defined(_WIN64)
+		if (checkpoint.cancelled(2, requestIndex, requestCancelled))
+		#else
+		if (requestCancelled)
+		#endif
+		{
+			succeeded = false;
+			break;
+		}
+		OrdinaryPathRequestWork &work = batch->requests[requestIndex];
+		unsigned requestExpected = DIRECT_PATH_WORK_PENDING;
+		if (!work.executionState.compare_exchange_strong(requestExpected,
+			requestRunningState, std::memory_order_acq_rel,
+			std::memory_order_acquire))
+		{
+			succeeded = false;
+			break;
+		}
+		if (workerExecution)
+			work.physicalWorkerIndex.store(context->physicalWorkerIndex(), std::memory_order_release);
+		DeterministicPathSearchScratch scratch = {
+			range.nodes.data(), range.nodes.size(), range.heap.data(),
+			range.heap.size(), range.hierarchyPassableScratch.data(),
+			range.hierarchyPassableScratch.size()
+		};
+		work.result = {};
+		work.result.points = range.pointScratch.data();
+		work.result.pointCapacity = range.pointScratch.size();
+		work.result.passableBlockIndices = range.hierarchyBlockScratch.data();
+		work.result.passableBlockCapacity =
+			range.hierarchyBlockScratch.size();
+		#if defined(_WIN64)
+		ObserveOrdinaryPathTestRequest(*batch,
+			DETERMINISTIC_ORDINARY_PATH_TEST_SEARCH_ENTER, rangeIndex, requestIndex);
+		#endif
+		FindDeterministicPath(batch->grid, work.request, scratch,
+			work.result);
+		#if defined(_WIN64)
+		ObserveOrdinaryPathTestRequest(*batch,
+			DETERMINISTIC_ORDINARY_PATH_TEST_SEARCH_EXIT, rangeIndex, requestIndex);
+		#endif
+		const bool materialized = MaterializeOrdinaryPathRequest(*batch, range, work);
+		#if defined(_WIN64)
+		ObserveOrdinaryPathTestRequest(*batch,
+			DETERMINISTIC_ORDINARY_PATH_TEST_BODY_EXIT, rangeIndex, requestIndex);
+		#endif
+		if (!materialized)
+		{
+			work.executionState.store(DIRECT_PATH_WORK_FAILURE,
+				std::memory_order_release);
+			succeeded = false;
+			break;
+		}
+		requestExpected = requestRunningState;
+		if (!work.executionState.compare_exchange_strong(requestExpected,
+			requestCompletedState, std::memory_order_release,
+			std::memory_order_acquire))
+		{
+			succeeded = false;
+			break;
+		}
+		#if defined(_WIN64)
+		checkpoint.completedRequest();
+		#endif
+	}
+
+	#if defined(_WIN64)
+	checkpoint.finish(succeeded);
+	#endif
+	if (workerExecution)
+		batch->activeWorkers.fetch_sub(1, std::memory_order_acq_rel);
+	const unsigned completedState = succeeded ? requestCompletedState : DIRECT_PATH_WORK_FAILURE;
+	expectedState = runningState;
+	if (!range.executionState.compare_exchange_strong(expectedState,
+		completedState, std::memory_order_release, std::memory_order_acquire) &&
+		expectedState == DIRECT_PATH_WORK_CANCELLED)
+	{
+		if (context != nullptr) s_ordinaryPathLateDrainExecutions.fetch_add(1,
+			std::memory_order_relaxed);
+	}
+	return succeeded;
+}
+
+#if defined(_WIN64)
+bool ConsumeOrdinaryPathReference(const std::shared_ptr<OrdinaryPathBatchWork> &work,
+	JobSystem &jobs, PathPerformanceInterval &schedule)
+{
+	using namespace performance;
+	OrdinaryPathBatchWork &batch = *work;
+	if (!jobs.isCurrentThread(JOB_OWNER_GAME) || !batch.reference || !batch.reference->baseline)
+		return false;
+	OrdinaryPathSourceRecord &source = *batch.reference;
+	if (!InlineBodyReadiness::ordinary(source, jobs))
+		return false;
+	KernelPerformanceReferenceLedger &ledger = *source.ledger;
+	KernelPerformanceAttemptDecision decision = {};
+	if (!ledger.replayDecision(source.attempt, 1, true, source.facts, decision) ||
+		decision.admission != KERNEL_ADMISSION_ACCEPTED || decision.reasonSchema != 1 ||
+		decision.reason != 1 || decision.sourceConfiguredWorkers != source.workers)
+	{ source.failed = true; return false; }
+	source.admitted = true;
+	batch.referenceAdmissionAccepted = true;
+	const KernelPerformanceDispatchPlan dispatch = {1, 2, 1, batch.rangeCount,
+		batch.requestCount, batch.grainSize, source.workers};
+	if (!ledger.observeDispatch(source.attempt, dispatch))
+	{ source.failed = true; return false; }
+	for (unsigned i = 0; i != batch.rangeCount; ++i)
+	{
+		if (!InlineBodyReadiness::ordinary(source, jobs))
+		{
+			source.failed = true;
+			return false;
+		}
+		const OrdinaryPathRangeWork &range = batch.ranges[i];
+		const KernelPerformanceRangePlan plan = {1, i, 0, range.begin, range.end, range.end - range.begin};
+		if (!ledger.observeRangePlan(source.attempt, plan))
+		{ source.failed = true; return false; }
+	}
+	source.planned = true;
+	schedule.end();
+	bool allSucceeded = true;
+	for (unsigned i = 0; i != batch.rangeCount; ++i)
+	{
+		const OrdinaryPathRangeWork &range = batch.ranges[i];
+		const KernelPerformanceRangePlan plan = {1, i, 0, range.begin, range.end, range.end - range.begin};
+		const KernelPerformanceInlineAction action = ledger.beginInlineBody(source.attempt, plan,
+			KernelPerformanceLedger::instance(), source.inlineBody, source.checkpoints[i]);
+		if (action == KERNEL_INLINE_INVALID)
+		{ source.failed = true; return false; }
+		bool succeeded = false;
+		if (action == KERNEL_INLINE_EXECUTE)
+		{
+			try { succeeded = ExecuteOrdinaryPathRangeBody(work, i, nullptr); }
+			catch (...) { succeeded = false; }
+		}
+		const KernelPerformanceRangeProgress progress = OrdinaryPathReleasedProgress(batch, i);
+		if (source.failed || (action == KERNEL_INLINE_EXECUTE &&
+			!ledger.finishInlineBody(source.inlineBody, progress)))
+		{ source.failed = true; return false; }
+		source.inlineBody = KernelPerformanceInlineBody();
+		if (!ImportOrdinaryPathReferenceRange(batch, i, progress)) return false;
+		allSucceeded = succeeded && allSucceeded;
+	}
+	source.collected = true;
+	KernelPerformanceAttemptFinish sourceFinish = {};
+	if (!ledger.readSourceFinish(source.attempt, sourceFinish) ||
+		(sourceFinish.disposition != KERNEL_PERFORMANCE_COMMITTED &&
+		 sourceFinish.disposition != KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION) ||
+		(sourceFinish.disposition == KERNEL_PERFORMANCE_COMMITTED &&
+		 !sourceFinish.validationObserved))
+	{
+		source.failed = true;
+		return false;
+	}
+	source.sourceOwnerCommitAllowed =
+		sourceFinish.disposition == KERNEL_PERFORMANCE_COMMITTED;
+	return allSucceeded;
+}
+#endif
 
 class OrdinaryPathRangeJob final : public Job
 {
@@ -1784,113 +3029,7 @@ public:
 
 	void execute(JobContext &context) override
 	{
-		OrdinaryPathRangeWork &range = m_batch->ranges[m_rangeIndex];
-		#if defined(RTS_BUILD_CORE_EXTRAS)
-		pauseDirectPathTest(ORDINARY_PATH_TEST_ENTRY_PAUSE);
-		#endif
-		if (context.isCancellationRequested())
-		{
-			publishOrdinaryPathCancellation(range);
-			s_ordinaryPathLateDrainExecutions.fetch_add(1,
-				std::memory_order_relaxed);
-			return;
-		}
-		const bool workerExecution = context.isPhysicalWorkerExecution();
-		const unsigned runningState = workerExecution ?
-			DIRECT_PATH_WORK_RUNNING_WORKER : DIRECT_PATH_WORK_RUNNING_OWNER;
-		unsigned expectedState = DIRECT_PATH_WORK_PENDING;
-		if (!range.executionState.compare_exchange_strong(expectedState,
-			runningState, std::memory_order_acq_rel, std::memory_order_acquire))
-		{
-			if (expectedState == DIRECT_PATH_WORK_CANCELLED)
-				s_ordinaryPathLateDrainExecutions.fetch_add(1,
-					std::memory_order_relaxed);
-			return;
-		}
-
-		if (workerExecution)
-		{
-			range.physicalWorkerIndex.store(context.physicalWorkerIndex(),
-				std::memory_order_release);
-			const unsigned active = m_batch->activeWorkers.fetch_add(1,
-				std::memory_order_acq_rel) + 1;
-			publishPeak(m_batch->peakActiveWorkers, active);
-			#if defined(RTS_BUILD_CORE_EXTRAS)
-			pauseDirectPathTest(ORDINARY_PATH_TEST_ACTIVE_PAUSE);
-			#endif
-		}
-
-		bool succeeded = workerExecution;
-		#if defined(RTS_BUILD_CORE_EXTRAS)
-		if ((s_directPathTestFaultMask.load(std::memory_order_acquire) &
-			ORDINARY_PATH_TEST_EXECUTION_FAILURE) != 0)
-		{
-			succeeded = false;
-		}
-		#endif
-		for (std::size_t requestIndex = range.begin;
-			succeeded && requestIndex < range.end; ++requestIndex)
-		{
-			if (context.isCancellationRequested() ||
-				range.executionState.load(std::memory_order_acquire) ==
-					DIRECT_PATH_WORK_CANCELLED)
-			{
-				succeeded = false;
-				break;
-			}
-			OrdinaryPathRequestWork &work = m_batch->requests[requestIndex];
-			unsigned requestExpected = DIRECT_PATH_WORK_PENDING;
-			if (!work.executionState.compare_exchange_strong(requestExpected,
-				DIRECT_PATH_WORK_RUNNING_WORKER, std::memory_order_acq_rel,
-				std::memory_order_acquire))
-			{
-				succeeded = false;
-				break;
-			}
-			work.physicalWorkerIndex.store(context.physicalWorkerIndex(),
-				std::memory_order_release);
-			DeterministicPathSearchScratch scratch = {
-				range.nodes.data(), range.nodes.size(), range.heap.data(),
-				range.heap.size(), range.hierarchyPassableScratch.data(),
-				range.hierarchyPassableScratch.size()
-			};
-			work.result = {};
-			work.result.points = range.pointScratch.data();
-			work.result.pointCapacity = range.pointScratch.size();
-			work.result.passableBlockIndices = range.hierarchyBlockScratch.data();
-			work.result.passableBlockCapacity =
-				range.hierarchyBlockScratch.size();
-			FindDeterministicPath(m_batch->grid, work.request, scratch,
-				work.result);
-			if (!buildOrdinaryPathMaterializationPlan(*m_batch, range, work))
-			{
-				work.executionState.store(DIRECT_PATH_WORK_FAILURE,
-					std::memory_order_release);
-				succeeded = false;
-				break;
-			}
-			requestExpected = DIRECT_PATH_WORK_RUNNING_WORKER;
-			if (!work.executionState.compare_exchange_strong(requestExpected,
-				DIRECT_PATH_WORK_WORKER, std::memory_order_release,
-				std::memory_order_acquire))
-			{
-				succeeded = false;
-				break;
-			}
-		}
-
-		if (workerExecution)
-			m_batch->activeWorkers.fetch_sub(1, std::memory_order_acq_rel);
-		const unsigned completedState = succeeded ?
-			DIRECT_PATH_WORK_WORKER : DIRECT_PATH_WORK_FAILURE;
-		expectedState = runningState;
-		if (!range.executionState.compare_exchange_strong(expectedState,
-			completedState, std::memory_order_release, std::memory_order_acquire) &&
-			expectedState == DIRECT_PATH_WORK_CANCELLED)
-		{
-			s_ordinaryPathLateDrainExecutions.fetch_add(1,
-				std::memory_order_relaxed);
-		}
+		ExecuteOrdinaryPathRangeBody(m_batch, m_rangeIndex, &context);
 	}
 
 private:
@@ -1938,6 +3077,8 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	, performance::KernelPerformanceBatch *performanceBatch
 	, performance::KernelPerformanceReferenceLedger *performanceReferenceLedger
 	, performance::KernelPerformanceReferenceBatch *performanceReferenceBatch
+	, const DeterministicOrdinaryPathTestHooks *testHooks
+	, performance::KernelPerformanceAttempt performanceReferenceAttempt
 #endif
 	)
 {
@@ -1952,6 +3093,16 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	m_state->submittedRangeJobCount = 0;
 	m_state->completed = false;
 	m_state->timedOut = false;
+	#if defined(_WIN64)
+	const bool traceRequested = performanceReferenceLedger != nullptr &&
+		performanceReferenceLedger->traceRequested();
+	const bool sourceBoundInline = performanceReferenceLedger != nullptr &&
+		performanceReferenceLedger->runMode() == performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING;
+	if ((traceRequested || sourceBoundInline) &&
+		!performanceReferenceAttempt.valid()) return false;
+	#else
+	const bool sourceBoundInline = false;
+	#endif
 	if (grid.cells == nullptr || grid.width == 0 || grid.height == 0 ||
 		requests == nullptr || requestCount == 0 ||
 		requestCount > std::numeric_limits<unsigned>::max() ||
@@ -2019,7 +3170,7 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 		(requestCount + rangeCount - 1) / rangeCount);
 
 	unsigned expectedActiveBatches = 0;
-	if (!s_activeOrdinaryPathBatches.compare_exchange_strong(
+	if (!sourceBoundInline && !s_activeOrdinaryPathBatches.compare_exchange_strong(
 		expectedActiveBatches, 1, std::memory_order_acq_rel,
 		std::memory_order_acquire))
 	{
@@ -2039,16 +3190,19 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	catch (...)
 	{
 		m_state->work.reset();
-		s_activeOrdinaryPathBatches.fetch_sub(1, std::memory_order_acq_rel);
+		if (!sourceBoundInline) s_activeOrdinaryPathBatches.fetch_sub(1, std::memory_order_acq_rel);
 		return false;
 	}
 	OrdinaryPathBatchWork &batch = *m_state->work;
-	batch.ownsActiveSlot.store(true, std::memory_order_release);
+	batch.ownsActiveSlot.store(!sourceBoundInline, std::memory_order_release);
 	batch.grid = grid;
 	batch.grid.cells = batch.cells.data();
 	batch.requestCount = requestCount;
 	batch.rangeCount = rangeCount;
 	batch.grainSize = grainSize;
+	#if defined(_WIN64)
+	if (testHooks != nullptr) batch.testHooks = *testHooks;
+	#endif
 	try
 	{
 		for (std::size_t i = 0; i < requestCount; ++i)
@@ -2059,14 +3213,35 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 		for (unsigned rangeIndex = 0; rangeIndex < rangeCount; ++rangeIndex)
 		{
 			OrdinaryPathRangeWork &range = batch.ranges[rangeIndex];
-			range.begin = static_cast<std::size_t>(rangeIndex) * grainSize;
-			range.end = std::min(requestCount, range.begin + grainSize);
+			JobRange rangeBounds = {};
+			if (!JobSystem::rangeForIndex(static_cast<unsigned>(requestCount),
+				rangeCount, rangeIndex, rangeBounds))
+			{
+				m_state->work.reset();
+				return false;
+			}
+			range.begin = rangeBounds.begin;
+			range.end = rangeBounds.end;
+			#if defined(_WIN64)
+			if (testHooks != nullptr && testHooks->observe != nullptr)
+				testHooks->observe(testHooks->context,
+					DETERMINISTIC_ORDINARY_PATH_TEST_RANGE_PLANNED,
+					rangeIndex, range.begin, range.end);
+			#endif
 			range.nodes.resize(cellCount);
 			range.heap.resize(cellCount);
 			range.pointScratch.resize(cellCount);
 			range.hierarchyPassableScratch.resize(hierarchyBlockCount);
 			range.hierarchyBlockScratch.resize(hierarchyBlockCount);
 		}
+		#if defined(_WIN64)
+		if (!PrepareOrdinaryPathSourceRecord(batch, hierarchyBlockCount, jobs,
+			performanceReferenceLedger, performanceReferenceAttempt))
+		{
+			m_state->work.reset();
+			return false;
+		}
+		#endif
 	}
 	catch (...)
 	{
@@ -2077,16 +3252,70 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	capture.end();
 	PathPerformanceInterval schedule(performanceBatch,
 		performance::KERNEL_PERFORMANCE_SCHEDULE);
+	if (sourceBoundInline)
+	{
+		m_state->completed = ConsumeOrdinaryPathReference(m_state->work, jobs, schedule);
+		if (!m_state->completed) return false;
+		PathPerformanceInterval validate(performanceBatch, performance::KERNEL_PERFORMANCE_VALIDATE);
+		for (unsigned i = 0; i != batch.rangeCount; ++i)
+			if (batch.ranges[i].executionState.load(std::memory_order_acquire) != DIRECT_PATH_WORK_INLINE)
+			{ m_state->completed = false; return false; }
+		ObserveOrdinaryPathReference(batch, requestCount, performanceBatch,
+			performanceReferenceLedger, performanceReferenceBatch);
+		if (performanceReferenceBatch == nullptr ||
+			!performanceReferenceBatch->valid() ||
+			!batch.reference->sourceOwnerCommitAllowed)
+		{
+			m_state->completed = false;
+			return false;
+		}
+		return true;
+	}
 	#endif
 
 	const JobGroup group = jobs.createGroup();
 	if (!group.isValid())
 	{
+		#if defined(_WIN64)
+		ObserveOrdinaryPathSourceAdmission(batch, false);
+		#endif
 		m_state->work.reset();
 		return false;
 	}
-	std::vector<JobSubmission> submissions(rangeCount);
-	std::vector<JobHandle> handles(rangeCount);
+	#if defined(_WIN64)
+	if (batch.reference)
+	{
+		// JobGroup copies allocate their small handle. Retain it before any
+		// submission, never as a rescue allocation after an owner timeout.
+		try { batch.reference->group = group; }
+		catch (...)
+		{
+			ObserveOrdinaryPathSourceAdmission(batch, false);
+			m_state->work.reset();
+			return false;
+		}
+	}
+	#endif
+	std::vector<JobSubmission> submissions;
+	std::vector<JobHandle> handles;
+	try
+	{
+		#if defined(RTS_BUILD_CORE_EXTRAS)
+		if ((s_directPathTestFaultMask.load(std::memory_order_acquire) &
+			ORDINARY_PATH_TEST_DISPATCH_VECTOR_ALLOCATION_FAILURE) != 0)
+			throw std::bad_alloc();
+		#endif
+		submissions.resize(rangeCount);
+		handles.resize(rangeCount);
+	}
+	catch (...)
+	{
+		#if defined(_WIN64)
+		ObserveOrdinaryPathSourceAdmission(batch, false);
+		#endif
+		m_state->work.reset();
+		return false;
+	}
 	unsigned allocated = 0;
 	for (; allocated < rangeCount; ++allocated)
 	{
@@ -2103,6 +3332,9 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 			delete submissions[i].job;
 		if (allocated == 0)
 			releaseOrdinaryPathActiveSlot(batch);
+		#if defined(_WIN64)
+		ObserveOrdinaryPathSourceAdmission(batch, false);
+		#endif
 		m_state->work.reset();
 		return false;
 	}
@@ -2111,11 +3343,15 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	{
 		for (unsigned i = 0; i < rangeCount; ++i)
 			delete submissions[i].job;
+		#if defined(_WIN64)
+		ObserveOrdinaryPathSourceAdmission(batch, false);
+		#endif
 		m_state->work.reset();
 		return false;
 	}
 	m_state->submittedRangeJobCount = rangeCount;
 	#if defined(_WIN64)
+	ObserveOrdinaryPathSourceAdmission(batch, true);
 	schedule.end();
 	PathPerformanceInterval wait(performanceBatch,
 		performance::KERNEL_PERFORMANCE_WAIT);
@@ -2171,9 +3407,14 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	const bool joined = jobs.wait(group);
 	#if defined(_WIN64)
 	wait.end();
+	const bool collected = !batch.reference ||
+		CollectOrdinaryPathSourceRecord(batch, jobs);
+	#else
+	const bool collected = true;
 	#endif
 	releaseOrdinaryPathActiveSlot(batch);
-	m_state->completed = joined && !group.failed() && !group.wasCancelled();
+	m_state->completed = joined && collected && !group.failed() &&
+		!group.wasCancelled();
 	if (!m_state->completed)
 		return false;
 	#if defined(_WIN64)
@@ -2193,9 +3434,23 @@ bool DeterministicOrdinaryPathBatch::executeSynchronously(JobSystem &jobs,
 	#if defined(_WIN64)
 	ObserveOrdinaryPathReference(batch, requestCount, performanceBatch,
 		performanceReferenceLedger, performanceReferenceBatch);
+	if (batch.reference && (performanceReferenceBatch == nullptr ||
+		!performanceReferenceBatch->valid()))
+	{
+		m_state->completed = false;
+		return false;
+	}
 	#endif
 	return true;
 }
+
+#if defined(_WIN64)
+bool DeterministicOrdinaryPathBatch::collectPerformanceReference(JobSystem &jobs)
+{
+	return m_state != nullptr && m_state->work != nullptr &&
+		CollectOrdinaryPathSourceRecord(*m_state->work, jobs);
+}
+#endif
 
 DeterministicOrdinaryPathBatchExecutionSnapshot
 DeterministicOrdinaryPathBatch::executionSnapshot() const
@@ -2206,6 +3461,8 @@ DeterministicOrdinaryPathBatch::executionSnapshot() const
 		return snapshot;
 	snapshot.requestCount = m_state->requestCount;
 	snapshot.submittedRangeJobCount = m_state->submittedRangeJobCount;
+	snapshot.referenceAdmissionAccepted = m_state->work != nullptr &&
+		m_state->work->referenceAdmissionAccepted;
 	snapshot.completed = m_state->completed;
 	snapshot.timedOut = m_state->timedOut;
 	if (m_state->work == nullptr)
@@ -2279,11 +3536,19 @@ DeterministicOrdinaryPathBatch::requestExecutionSnapshot(
 		snapshot.state = DIRECT_PATH_EXECUTION_OWNER;
 	else if (state == DIRECT_PATH_WORK_FAILURE)
 		snapshot.state = DIRECT_PATH_EXECUTION_FAILURE;
+	#if defined(_WIN64)
+	else if (state == DIRECT_PATH_WORK_INLINE)
+		snapshot.state = DIRECT_PATH_EXECUTION_INLINE;
+	#endif
 	if (snapshot.state == DIRECT_PATH_EXECUTION_WORKER)
 		snapshot.physicalWorkerIndex = work.physicalWorkerIndex.load(
 			std::memory_order_acquire);
 	snapshot.succeeded = m_state->completed &&
-		snapshot.state == DIRECT_PATH_EXECUTION_WORKER;
+		(snapshot.state == DIRECT_PATH_EXECUTION_WORKER
+		#if defined(_WIN64)
+		|| snapshot.state == DIRECT_PATH_EXECUTION_INLINE
+		#endif
+		);
 	return snapshot;
 }
 
@@ -2292,13 +3557,17 @@ DeterministicOrdinaryPathBatch::result(std::size_t requestIndex) const
 {
 	DeterministicOrdinaryPathBatchResult result = {};
 	if (m_state == nullptr || m_state->work == nullptr ||
-		!m_state->completed || requestIndex >= m_state->requestCount ||
-		m_state->work->requests[requestIndex].executionState.load(
-			std::memory_order_acquire) != DIRECT_PATH_WORK_WORKER)
+		!m_state->completed || requestIndex >= m_state->requestCount)
 	{
 		return result;
 	}
 	const OrdinaryPathRequestWork &work = m_state->work->requests[requestIndex];
+	const unsigned state = work.executionState.load(std::memory_order_acquire);
+	if (state != DIRECT_PATH_WORK_WORKER
+		#if defined(_WIN64)
+		&& state != DIRECT_PATH_WORK_INLINE
+		#endif
+		) return result;
 	result.points = work.points.empty() ? nullptr : work.points.data();
 	result.pointCount = work.points.size();
 	result.allocationOrder = work.allocationOrder.empty() ? nullptr :

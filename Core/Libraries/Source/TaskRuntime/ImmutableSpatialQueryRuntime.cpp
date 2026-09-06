@@ -340,11 +340,38 @@ void observeSpatialReference(const void *arena, ImmutableSpatialUInt32 arenaCapa
 		// return value. Allocation is outside the pure serial callback clock.
 		storage.prepare(queryCount, header.objectCount, resultCount, detached);
 	}
-	*options.referenceBatch = options.referenceLedger->observeValidatedBatch(
+	*options.referenceBatch = options.referenceAttempt.valid() ?
+		options.referenceLedger->observeValidatedAttempt(options.referenceAttempt,
+			writeSpatialReferenceOutput, &actual) : options.referenceLedger->observeValidatedBatch(
 		identity.kernel, identity.subtype, identity.frame, identity.ordinal, 1,
 		queryCount, writeSpatialReferenceInput, &input, writeSpatialReferenceOutput,
 		&actual, computeSpatialReference, &detached);
 }
+
+struct SpatialSourceRange
+{
+	performance::KernelPerformanceRangePlan plan = {};
+	performance::KernelPerformanceCheckpointProbe checkpoint;
+	performance::KernelPerformanceCheckpoint last = {};
+	bool finished = false;
+
+	void begin()
+	{
+		checkpoint.beginRecord();
+		last = {1, plan.dispatchOrdinal, plan.rangeOrdinal};
+	}
+	void finish(ImmutableSpatialStatus status, bool enteredQueryRange)
+	{
+		if (finished) return;
+		finished = true;
+		const bool cancelled = status == IMMUTABLE_SPATIAL_CANCELLED;
+		const JobMetricCounter completed = status == IMMUTABLE_SPATIAL_SUCCESS ? plan.operationCount :
+			enteredQueryRange && last.first >= plan.begin && last.first < plan.end ? last.first - plan.begin : 0;
+		const performance::KernelPerformanceCheckpoint end = {4, plan.begin + completed, plan.dispatchOrdinal};
+		checkpoint.finish(cancelled ? last : end, completed, cancelled ? performance::KERNEL_RANGE_CANCELLED :
+			status == IMMUTABLE_SPATIAL_SUCCESS ? performance::KERNEL_RANGE_COMPLETED : performance::KERNEL_RANGE_FAILED);
+	}
+};
 #endif
 
 struct SpatialRangeJob : public Job
@@ -356,7 +383,11 @@ struct SpatialRangeJob : public Job
 		bool fail,
 		const JobFloatingPointState &floatingPointState,
 		SpatialJobAtomicUnsigned *activePhysicalWorkers,
-		SpatialJobAtomicUnsigned *peakPhysicalWorkers)
+		SpatialJobAtomicUnsigned *peakPhysicalWorkers
+#if defined(_WIN64)
+		, SpatialSourceRange *source = 0
+#endif
+		)
 		: function(rangeFunction), context(rangeContext), rangeIndex(ordinal),
 		  identity(executionIdentity),
 		  physicalWorkerIndex(executionPhysicalWorkerIndex),
@@ -364,6 +395,9 @@ struct SpatialRangeJob : public Job
 		  floatingPointState(floatingPointState),
 		  activePhysicalWorkers(activePhysicalWorkers),
 		  peakPhysicalWorkers(peakPhysicalWorkers)
+#if defined(_WIN64)
+		  , source(source)
+#endif
 	{
 	}
 
@@ -392,10 +426,35 @@ struct SpatialRangeJob : public Job
 		volatile unsigned spinValue = rangeIndex;
 		for (unsigned spin = 0; spin != testSpinIterations; ++spin)
 			spinValue = spinValue * 1664525u + 1013904223u;
+#if defined(_WIN64)
+		if (source != 0) source->begin();
+		if (!executeBody(jobContext.isCancellationRequested())) jobContext.fail();
+#else
 		if (forceFailure || jobContext.isCancellationRequested() ||
 			function == 0 || !function(context, rangeIndex))
 			jobContext.fail();
+#endif
 	}
+
+#if defined(_WIN64)
+	bool executeInline()
+	{
+		const JobFloatingPointScope scope(floatingPointState);
+		source->last = {1, source->plan.dispatchOrdinal, source->plan.rangeOrdinal};
+		return executeBody(false);
+	}
+	bool executeBody(bool cancellationRequested)
+	{
+		bool cancelled = !forceFailure && cancellationRequested;
+		if (source != 0 && !forceFailure)
+			cancelled = source->checkpoint.cancelled(source->last, cancelled);
+		const bool succeeded = !forceFailure && !cancelled && function != 0 && function(context, rangeIndex);
+		if (source != 0 && !source->finished)
+			source->finish(cancelled ? IMMUTABLE_SPATIAL_CANCELLED :
+				succeeded ? IMMUTABLE_SPATIAL_SUCCESS : IMMUTABLE_SPATIAL_DISPATCH_FAILURE, false);
+		return succeeded;
+	}
+#endif
 
 	ImmutableSpatialRangeFunction function;
 	void *context;
@@ -407,6 +466,9 @@ struct SpatialRangeJob : public Job
 	const JobFloatingPointState floatingPointState;
 	SpatialJobAtomicUnsigned *activePhysicalWorkers;
 	SpatialJobAtomicUnsigned *peakPhysicalWorkers;
+#if defined(_WIN64)
+	SpatialSourceRange *source;
+#endif
 };
 
 struct SpatialDispatchContext
@@ -430,7 +492,257 @@ struct SpatialDispatchContext
 	unsigned observedPhysicalWorkerCount;
 	unsigned observedPhysicalWorkerCapacity;
 	const JobFloatingPointState floatingPointState;
+#if defined(_WIN64)
+	SpatialReferenceInput sourceInput = {};
+	bool sourceCaptureAttempted = false, sourceCaptured = false;
+	SpatialSourceRange *sourceRanges = 0;
+	unsigned sourceRangeCount = 0;
+	bool sourceBoundInline = false;
+#endif
 };
+
+#if defined(_WIN64)
+performance::KernelPerformanceDigest spatialDecisionFacts(unsigned queries)
+{
+	performance::KernelPerformanceCanonicalWriter facts;
+	if (!facts.begin(1) || !facts.u32(1, queries)) return performance::KernelPerformanceDigest();
+	return facts.finish();
+}
+
+bool spatialSourceCheckpoint(void *context, unsigned pass, unsigned range,
+	unsigned query, ImmutableSpatialCheckpointSite site, unsigned radius, bool actual)
+{
+	SpatialDispatchContext &dispatch = *static_cast<SpatialDispatchContext *>(context);
+	const ImmutableSpatialJobSystemOptions &options = *dispatch.options;
+	if (options.testCheckpoint != 0)
+		actual = options.testCheckpoint(options.testCheckpointContext, pass, range, query, site, radius, actual);
+	if (dispatch.sourceRanges == 0 || range >= dispatch.sourceRangeCount) return actual;
+	SpatialSourceRange &source = dispatch.sourceRanges[range];
+	// Site 1 is the job-entry poll; sites 2/3 are the existing query/radius polls.
+	source.last = {static_cast<unsigned>(site) + 1, query, radius};
+	return source.checkpoint.cancelled(source.last, actual);
+}
+
+void spatialSourceRangeObservation(void *context, unsigned pass, unsigned range,
+	unsigned begin, unsigned end, bool entry, ImmutableSpatialStatus status)
+{
+	SpatialDispatchContext &dispatch = *static_cast<SpatialDispatchContext *>(context);
+	if (dispatch.sourceRanges != 0 && range < dispatch.sourceRangeCount)
+	{
+		SpatialSourceRange &source = dispatch.sourceRanges[range];
+		if (entry)
+		{
+			// Record the actual core partition, not a reconstructed completed prefix.
+			source.plan.begin = begin; source.plan.end = end; source.plan.operationCount = end - begin;
+		}
+		else source.finish(status, true);
+	}
+	const ImmutableSpatialJobSystemOptions &options = *dispatch.options;
+	if (options.testObserveRange != 0)
+		options.testObserveRange(options.testCheckpointContext, pass, range, begin, end, entry, status);
+}
+
+// Owner-side capture/import only. The ordinary executor still owns admission,
+// cancellation, range execution, release, validation, and publication.
+class SpatialSourceDispatch
+{
+public:
+	SpatialSourceDispatch(SpatialDispatchContext &dispatch, unsigned count, JobSystem &jobs) :
+		m_dispatch(dispatch), m_count(count), m_workers(0),
+		m_pending(0), m_outstanding(0),
+		m_enabled(false), m_released(false)
+	{
+		const ImmutableSpatialJobSystemOptions &options = *dispatch.options;
+		if (options.referenceLedger == 0 || !options.referenceAttempt.valid()) return;
+		const performance::KernelPerformanceReferenceMode mode = options.referenceLedger->mode();
+		if (mode != performance::KERNEL_REFERENCE_THROUGHPUT_BINDING &&
+			mode != performance::KERNEL_REFERENCE_SERIAL_ORACLE) return;
+		m_workers = jobs.workerCount(); m_pending = jobs.pendingOwnerCompletionCount();
+		m_outstanding = jobs.outstandingJobCount();
+		if (!dispatch.sourceCaptureAttempted)
+		{
+			dispatch.sourceCaptureAttempted = true;
+			// The actual core reaches dispatch only after validating every arena
+			// offset, query and scratch region. Capture precedes native submission.
+			dispatch.sourceCaptured = options.referenceLedger->bindCapturedInput(options.referenceAttempt,
+				1, dispatch.sourceInput.queryCount, writeSpatialReferenceInput, &dispatch.sourceInput);
+		}
+		if (!dispatch.sourceCaptured) return;
+		m_ranges.reset(new (std::nothrow) SpatialSourceRange[count]);
+		if (!m_ranges)
+		{
+			// Invalidate this diagnostic attempt; an allocation failure must not
+			// silently describe actual executed bodies as never entered.
+			options.referenceLedger->bindCapturedInput(options.referenceAttempt, 1,
+				dispatch.sourceInput.queryCount, 0, 0);
+			return;
+		}
+		m_enabled = true;
+		dispatch.sourceRanges = m_ranges.get(); dispatch.sourceRangeCount = count;
+		const unsigned queries = dispatch.sourceInput.queryCount;
+		const unsigned quotient = queries / count, remainder = queries % count;
+		for (unsigned i = 0; i != count; ++i)
+		{
+			const unsigned begin = i * quotient + (i < remainder ? i : remainder);
+			const unsigned size = quotient + (i < remainder ? 1U : 0U);
+			m_ranges[i].plan = {dispatch.dispatchOrdinal, i, dispatch.dispatchOrdinal, begin, begin + size, size};
+		}
+		m_facts = spatialDecisionFacts(queries);
+	}
+	~SpatialSourceDispatch()
+	{
+		release(false, false);
+		m_dispatch.sourceRanges = 0; m_dispatch.sourceRangeCount = 0;
+	}
+	SpatialSourceRange *range(unsigned index) { return m_enabled ? m_ranges.get() + index : 0; }
+	void release(bool admitted, bool cancelled)
+	{
+		if (!m_enabled || m_released) return;
+		m_released = true;
+		// Admission is monotonic across the COUNT and FILL dispatches that make
+		// up one spatial collection. A later pre-admission refusal must not erase
+		// an earlier accepted dispatch from the owner disposition decision.
+		if (admitted)
+			m_dispatch.metrics->referenceAdmissionAccepted = true;
+		const ImmutableSpatialJobSystemOptions &options = *m_dispatch.options;
+		performance::KernelPerformanceReferenceLedger &ledger = *options.referenceLedger;
+		const performance::KernelPerformanceAttempt attempt = options.referenceAttempt;
+		performance::KernelPerformanceAttemptDecision decision = {};
+		decision.decisionOrdinal = m_dispatch.dispatchOrdinal; decision.site = m_dispatch.dispatchOrdinal;
+		decision.reasonSchema = 1; decision.reason = admitted ? (cancelled ? 3 : 1) : 2;
+		decision.deterministicEligible = m_dispatch.sourceInput.queryCount != 0;
+		decision.deterministicFacts = m_facts;
+		decision.admission = admitted ? performance::KERNEL_ADMISSION_ACCEPTED : performance::KERNEL_ADMISSION_REFUSED;
+		decision.sourceConfiguredWorkers = m_workers; decision.dynamicFactsKnownMask = 3;
+		decision.pendingJobs = m_pending; decision.outstandingJobs = m_outstanding;
+		if (options.testReleasedGroup != 0)
+		{
+			unsigned completed = 0;
+			for (unsigned i = 0; i != m_count; ++i)
+				if (m_ranges[i].checkpoint.snapshot().terminal == performance::KERNEL_RANGE_COMPLETED) ++completed;
+			options.testReleasedGroup(options.testCheckpointContext, m_dispatch.dispatchOrdinal,
+				cancelled, completed, admitted ? m_count : 0, decision.reason);
+		}
+		ledger.observeDecision(attempt, decision);
+		if (!admitted) return;
+		const unsigned queries = m_dispatch.sourceInput.queryCount;
+		const performance::KernelPerformanceDispatchPlan plan = {m_dispatch.dispatchOrdinal, 1, 1,
+			m_count, queries, queries / m_count + (queries % m_count != 0 ? 1U : 0U), m_workers};
+		ledger.observeDispatch(attempt, plan);
+		for (unsigned i = 0; i != m_count; ++i) ledger.observeRangePlan(attempt, m_ranges[i].plan);
+		for (unsigned i = 0; i != m_count; ++i)
+		{
+			performance::KernelPerformanceRangeProgress progress = {};
+			progress.checkpoint = m_ranges[i].checkpoint.snapshot();
+			progress.publication = !progress.checkpoint.entered ? performance::KERNEL_PUBLICATION_NOT_APPLICABLE :
+				cancelled || progress.checkpoint.terminal == performance::KERNEL_RANGE_CANCELLED ?
+				performance::KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL :
+				progress.checkpoint.terminal == performance::KERNEL_RANGE_COMPLETED ?
+				performance::KERNEL_PUBLICATION_PUBLISHED : performance::KERNEL_PUBLICATION_REJECTED;
+			ledger.observeReleasedRange(attempt, m_ranges[i].plan, progress);
+		}
+	}
+private:
+	SpatialDispatchContext &m_dispatch;
+	unsigned m_count, m_workers;
+	JobMetricCounter m_pending, m_outstanding;
+	bool m_enabled, m_released;
+	std::unique_ptr<SpatialSourceRange[]> m_ranges;
+	performance::KernelPerformanceDigest m_facts;
+};
+
+bool spatialInlineDispatch(SpatialDispatchContext &dispatch, unsigned count,
+	ImmutableSpatialRangeFunction rangeFunction, void *rangeContext)
+{
+	using namespace performance;
+	const ImmutableSpatialJobSystemOptions &options = *dispatch.options;
+	if (options.referenceLedger == 0 || options.performanceLedger == 0 ||
+		!options.referenceAttempt.valid()) return false;
+	SpatialPerformanceInterval schedule(options.performanceLedger, options.performanceBatch,
+		KERNEL_PERFORMANCE_SCHEDULE);
+	KernelPerformanceReferenceLedger &ledger = *options.referenceLedger;
+	const KernelPerformanceAttempt attempt = options.referenceAttempt;
+	if (!dispatch.sourceCaptureAttempted)
+	{
+		dispatch.sourceCaptureAttempted = true;
+		dispatch.sourceCaptured = ledger.bindCapturedInput(attempt, 1,
+			dispatch.sourceInput.queryCount, writeSpatialReferenceInput, &dispatch.sourceInput);
+	}
+	if (!dispatch.sourceCaptured) return false;
+	const unsigned queries = dispatch.sourceInput.queryCount;
+	KernelPerformanceAttemptDecision decision = {};
+	if (!ledger.replayDecision(attempt, dispatch.dispatchOrdinal, queries != 0,
+		spatialDecisionFacts(queries), decision) || decision.admission != KERNEL_ADMISSION_ACCEPTED)
+		return false;
+	dispatch.metrics->referenceAdmissionAccepted = true;
+	if (decision.reasonSchema != 1 || (decision.reason != 1 && decision.reason != 3)) return false;
+	const bool sourceCancelled = decision.reason == 3;
+	if (decision.sourceConfiguredWorkers == 0 ||
+		count != (queries < decision.sourceConfiguredWorkers ? queries : decision.sourceConfiguredWorkers))
+		return false;
+	const KernelPerformanceDispatchPlan plan = {dispatch.dispatchOrdinal, 1, 1, count,
+		queries, queries / count + (queries % count != 0 ? 1U : 0U), decision.sourceConfiguredWorkers};
+	if (!ledger.observeDispatch(attempt, plan)) return false;
+	// This owner allocation and all range-plan validation stay outside the
+	// authenticated body interval. The actual core still owns COUNT/FILL and
+	// invokes its one existing executeQueryRange callback below.
+	struct Ranges
+	{
+		SpatialDispatchContext &dispatch;
+		std::unique_ptr<SpatialSourceRange[]> storage;
+		Ranges(SpatialDispatchContext &owner, unsigned count) : dispatch(owner),
+			storage(new (std::nothrow) SpatialSourceRange[count])
+		{
+			dispatch.sourceRanges = storage.get();
+			dispatch.sourceRangeCount = storage ? count : 0;
+		}
+		~Ranges() { dispatch.sourceRanges = 0; dispatch.sourceRangeCount = 0; }
+	} ranges(dispatch, count);
+	if (!ranges.storage) return false;
+	const unsigned quotient = queries / count, remainder = queries % count;
+	for (unsigned i = 0; i != count; ++i)
+	{
+		const unsigned begin = i * quotient + (i < remainder ? i : remainder);
+		const unsigned size = quotient + (i < remainder ? 1U : 0U);
+		ranges.storage[i].plan = {dispatch.dispatchOrdinal, i, dispatch.dispatchOrdinal, begin, begin + size, size};
+		if (!ledger.observeRangePlan(attempt, ranges.storage[i].plan)) return false;
+	}
+	schedule.end();
+	bool completed = !sourceCancelled;
+	for (unsigned i = 0; i != count; ++i)
+	{
+		SpatialSourceRange &range = ranges.storage[i];
+		KernelPerformanceInlineBody body;
+		const KernelPerformanceInlineAction action = ledger.beginInlineBody(attempt,
+			range.plan, *options.performanceLedger, body, range.checkpoint);
+		if (action == KERNEL_INLINE_INVALID) return false;
+		bool succeeded = false;
+		if (action == KERNEL_INLINE_EXECUTE)
+		{
+			const bool forceFailure = options.testFault == IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_RANGE_FAILURE &&
+				dispatch.dispatchOrdinal == options.testDispatchOrdinal && i == options.testRangeOrdinal;
+			SpatialRangeJob job(rangeFunction, rangeContext, i, 0, 0, 0, forceFailure,
+				dispatch.floatingPointState, 0, 0, &range);
+			succeeded = job.executeInline();
+		}
+		KernelPerformanceRangeProgress progress = {};
+		progress.checkpoint = range.checkpoint.snapshot();
+		progress.publication = !progress.checkpoint.entered ? KERNEL_PUBLICATION_NOT_APPLICABLE :
+			sourceCancelled || progress.checkpoint.terminal == KERNEL_RANGE_CANCELLED ? KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL :
+			progress.checkpoint.terminal == KERNEL_RANGE_COMPLETED ? KERNEL_PUBLICATION_PUBLISHED :
+			KERNEL_PUBLICATION_REJECTED;
+		if (action == KERNEL_INLINE_EXECUTE && !ledger.finishInlineBody(body, progress)) return false;
+		if (!ledger.observeReleasedRange(attempt, range.plan, progress)) return false;
+		completed = succeeded && completed;
+	}
+	// Reproduce the recorded owner disposition only after consuming every
+	// admitted range. This issues no scheduler cancellation and changes no
+	// completed checkpoint, but retains the native CANCELLED result category.
+	if (sourceCancelled) dispatch.cancelled.store(true, std::memory_order_release);
+	dispatch.metrics->ranges += count;
+	return completed;
+}
+#endif
 
 void observePhysicalWorker(SpatialDispatchContext *dispatch,
 	unsigned workerIndex)
@@ -482,11 +794,18 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 	++dispatch->dispatchOrdinal;
 	++dispatch->metrics->dispatches;
 	const ImmutableSpatialJobSystemOptions &options = *dispatch->options;
+#if defined(_WIN64)
+	if (dispatch->sourceBoundInline)
+		return spatialInlineDispatch(*dispatch, rangeCount, rangeFunction, rangeContext);
+#endif
+	JobSystem &jobs = JobSystem::instance();
+#if defined(_WIN64)
+	SpatialSourceDispatch source(*dispatch, rangeCount, jobs);
+#endif
 	if (options.testFault == IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_GROUP_FAILURE &&
 		dispatch->dispatchOrdinal == options.testDispatchOrdinal)
 		return false;
 
-	JobSystem &jobs = JobSystem::instance();
 	JobGroup group = jobs.createGroup();
 	if (!group.isValid())
 		return false;
@@ -526,7 +845,11 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 			rangeFunction, rangeContext, allocated, identities + allocated,
 			physicalWorkerIndices + allocated, options.testSpinIterations,
 			forceFailure, dispatch->floatingPointState,
-			&dispatch->activePhysicalWorkers, &dispatch->peakPhysicalWorkers);
+			&dispatch->activePhysicalWorkers, &dispatch->peakPhysicalWorkers
+#if defined(_WIN64)
+			, source.range(allocated)
+#endif
+			);
 		if (job == 0)
 			break;
 		rangeJobs[allocated] = job;
@@ -586,6 +909,7 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 		IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_TIMEOUT &&
 		dispatch->dispatchOrdinal == options.testDispatchOrdinal;
 #if defined(_WIN64)
+	if (options.testBeforeWait != 0) options.testBeforeWait(options.testCheckpointContext);
 	SpatialPerformanceInterval waitInterval(options.performanceLedger,
 		options.performanceBatch, performance::KERNEL_PERFORMANCE_WAIT);
 #endif
@@ -594,12 +918,16 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 	{
 		dispatch->cancelled.store(true, std::memory_order_release);
 		jobs.cancel(group);
+#if defined(_WIN64)
+		if (options.testAfterCancel != 0) options.testAfterCancel(options.testCheckpointContext);
+#endif
 		// Cancellation makes queued jobs terminal. Any already executing range
 		// owns only immutable input and private scratch, so drain before the
 		// dispatch-owned metadata leaves scope.
 		jobs.wait(group);
 #if defined(_WIN64)
 		waitInterval.end();
+		source.release(true, group.wasCancelled());
 #endif
 		publishPhysicalWorkerPeak(dispatch);
 		delete[] rangeJobs;
@@ -613,6 +941,7 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 	{
 #if defined(_WIN64)
 		waitInterval.end();
+		source.release(true, group.wasCancelled());
 #endif
 		publishPhysicalWorkerPeak(dispatch);
 		delete[] rangeJobs;
@@ -624,6 +953,7 @@ bool spatialDispatch(void *context, ImmutableSpatialUInt32 rangeCount,
 	}
 #if defined(_WIN64)
 	waitInterval.end();
+	source.release(true, group.wasCancelled());
 #endif
 	publishPhysicalWorkerPeak(dispatch);
 
@@ -966,6 +1296,13 @@ bool ImmutableSpatialCollectionCompletion::finished() const
 {
 	return expectedConsumers != 0 && completedConsumers == expectedConsumers;
 }
+
+bool ImmutableSpatialConsumerTransactionCommitted(
+	ImmutableSpatialUInt32 mutationCount, bool referenceMatched)
+{
+	(void)mutationCount;
+	return referenceMatched;
+}
 #endif
 
 ImmutableSpatialJobSystemOptions::ImmutableSpatialJobSystemOptions()
@@ -973,7 +1310,9 @@ ImmutableSpatialJobSystemOptions::ImmutableSpatialJobSystemOptions()
 	  testDispatchOrdinal(1), testRangeOrdinal(0), testSpinIterations(0)
 #if defined(_WIN64)
 	, performanceLedger(0), performanceBatch(), referenceLedger(0),
-	  referenceBatch(0), queryOwners(0), queryOwnerCount(0)
+	  referenceBatch(0), queryOwners(0), queryOwnerCount(0), referenceAttempt(),
+	  testCheckpoint(0), testObserveRange(0), testCheckpointContext(0),
+	  testBeforeWait(0), testAfterCancel(0), testReleasedGroup(0)
 #endif
 {
 }
@@ -982,6 +1321,7 @@ ImmutableSpatialJobSystemMetrics::ImmutableSpatialJobSystemMetrics()
 	: dispatches(0), ranges(0), submittedJobs(0), completedJobs(0),
 	  physicalWorkerJobs(0), ownerHelpedJobs(0), physicalWorkerMask(0),
 	  distinctPhysicalWorkers(0), physicalWorkerMaskComplete(true),
+	  referenceAdmissionAccepted(false),
 	  peakConcurrentPhysicalWorkers(0)
 {
 }
@@ -1031,19 +1371,54 @@ ImmutableSpatialJobSystemResult ExecuteImmutableSpatialQueryBatchOnJobSystem(
 		*kernelStatus = IMMUTABLE_SPATIAL_INVALID_ARGUMENT;
 
 	JobSystem &jobs = JobSystem::instance();
-	if (!jobs.isRunning() || jobs.isWorkerThread() ||
-		!jobs.isCurrentThread(JOB_OWNER_GAME) || jobs.workerCount() <= 1)
+#if defined(_WIN64)
+	const bool sourceBoundInline = options.referenceLedger != 0 &&
+		options.referenceLedger->runMode() == performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING;
+#endif
+	if (
+#if defined(_WIN64)
+		!sourceBoundInline &&
+#endif
+		(!jobs.isRunning() || jobs.isWorkerThread() ||
+		!jobs.isCurrentThread(JOB_OWNER_GAME) || jobs.workerCount() <= 1))
 		return IMMUTABLE_SPATIAL_JOB_SYSTEM_INELIGIBLE;
 	SpatialDispatchContext dispatch;
 	dispatch.options = &options;
 	dispatch.metrics = jobMetrics;
-	dispatch.observedPhysicalWorkerCapacity = jobs.workerCount();
-	dispatch.observedPhysicalWorkerIndices = new (std::nothrow) unsigned[
-		dispatch.observedPhysicalWorkerCapacity];
-	if (dispatch.observedPhysicalWorkerIndices == 0)
-		return IMMUTABLE_SPATIAL_JOB_SYSTEM_FAILED;
+#if defined(_WIN64)
+	dispatch.sourceInput = {arena, arenaCapacity, queries, queryCount,
+		options.queryOwners, options.queryOwnerCount, &dispatch.floatingPointState};
+	dispatch.sourceBoundInline = sourceBoundInline;
+#endif
 	ImmutableSpatialExecutionOptions executionOptions;
 	executionOptions.workerCount = jobs.workerCount();
+#if defined(_WIN64)
+	if (sourceBoundInline)
+	{
+		// The recorded native worker policy determines the ordinary core's
+		// partition, independently of any physical pool in this baseline run.
+		// With no admitted source dispatch, one validation-only range reaches
+		// the exact captured-input/refusal boundary without executing a body.
+		performance::KernelPerformanceDispatchPlan source = {};
+		executionOptions.workerCount = 1;
+		if (options.referenceLedger->readSourceDispatch(options.referenceAttempt, 1, source))
+		{
+			if (source.sourceLimit == 0 || source.sourceLimit > 0xffffffffU)
+				return IMMUTABLE_SPATIAL_JOB_SYSTEM_FAILED;
+			executionOptions.workerCount = static_cast<unsigned>(source.sourceLimit);
+		}
+	}
+	else
+	{
+#endif
+		dispatch.observedPhysicalWorkerCapacity = jobs.workerCount();
+		dispatch.observedPhysicalWorkerIndices = new (std::nothrow) unsigned[
+			dispatch.observedPhysicalWorkerCapacity];
+		if (dispatch.observedPhysicalWorkerIndices == 0)
+			return IMMUTABLE_SPATIAL_JOB_SYSTEM_FAILED;
+#if defined(_WIN64)
+	}
+#endif
 	executionOptions.dispatch = spatialDispatch;
 	executionOptions.dispatchContext = &dispatch;
 	executionOptions.isCancelled = spatialCancelled;
@@ -1051,6 +1426,16 @@ ImmutableSpatialJobSystemResult ExecuteImmutableSpatialQueryBatchOnJobSystem(
 	executionOptions.resolveArenaGeneration = arenaResolver;
 	executionOptions.resolveObjectGeneration = objectResolver;
 	executionOptions.generationContext = generationContext;
+#if defined(_WIN64)
+	const performance::KernelPerformanceReferenceMode referenceMode = options.referenceLedger != 0 ?
+		options.referenceLedger->mode() : performance::KERNEL_REFERENCE_DISABLED;
+	const bool traceSource = options.referenceAttempt.valid() &&
+		(referenceMode == performance::KERNEL_REFERENCE_THROUGHPUT_BINDING ||
+		 referenceMode == performance::KERNEL_REFERENCE_SERIAL_ORACLE);
+	executionOptions.checkpoint = traceSource || sourceBoundInline ? spatialSourceCheckpoint : options.testCheckpoint;
+	executionOptions.observeRange = traceSource || sourceBoundInline ? spatialSourceRangeObservation : options.testObserveRange;
+	executionOptions.checkpointContext = traceSource || sourceBoundInline ? &dispatch : options.testCheckpointContext;
+#endif
 
 	const ImmutableSpatialStatus status = ExecuteImmutableSpatialQueryBatch(
 		arena, arenaCapacity, queries, queryCount, executionOptions, scratch,
@@ -1069,8 +1454,26 @@ ImmutableSpatialJobSystemResult ExecuteImmutableSpatialQueryBatchOnJobSystem(
 		result = IMMUTABLE_SPATIAL_JOB_SYSTEM_CANCELLED;
 #if defined(_WIN64)
 	if (result == IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS)
+	{
 		observeSpatialReference(arena, arenaCapacity, queries, queryCount, output,
 			outputSpans, *outputCount, dispatch.floatingPointState, options);
+		if (options.referenceAttempt.valid() &&
+			(options.referenceBatch == 0 || !options.referenceBatch->valid()))
+			result = IMMUTABLE_SPATIAL_JOB_SYSTEM_FAILED;
+		if (sourceBoundInline)
+		{
+			performance::KernelPerformanceAttemptFinish sourceFinish = {};
+			if (options.referenceBatch == 0 ||
+				!options.referenceBatch->valid() ||
+				!options.referenceLedger->readSourceFinish(
+					options.referenceAttempt, sourceFinish) ||
+				!sourceFinish.validationObserved ||
+				(sourceFinish.disposition != performance::KERNEL_PERFORMANCE_COMMITTED &&
+				 sourceFinish.disposition != performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION) ||
+				sourceFinish.disposition != performance::KERNEL_PERFORMANCE_COMMITTED)
+				result = IMMUTABLE_SPATIAL_JOB_SYSTEM_FAILED;
+		}
+	}
 #endif
 	delete[] dispatch.observedPhysicalWorkerIndices;
 	return result;

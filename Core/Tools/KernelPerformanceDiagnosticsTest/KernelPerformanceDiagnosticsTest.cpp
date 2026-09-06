@@ -610,13 +610,13 @@ void testMultipleFramesHaveExactIndependentTotals()
 	KernelPerformanceLedger ledger;
 	if (!startBaseline(ledger, clock)) return;
 	KernelPerformanceSchedulerBoundary actual;
-	const auto first = ledger.beginFrame(0, 10, actual);
+	const auto first = ledger.beginFrame(1, 10, actual);
 	clock.now += 2;
 	measuredPhases(ledger, first, clock, 1);
 	clock.now += 1;
 	require(ledger.endFrame(first, 11, actual), "first measured frame closes");
 	clock.now = 500;
-	const auto second = ledger.beginFrame(1, 11, actual);
+	const auto second = ledger.beginFrame(2, 11, actual);
 	clock.now += 4;
 	measuredPhases(ledger, second, clock, 2);
 	clock.now += 2;
@@ -883,6 +883,37 @@ void testBaselineCompletionRetainsActualLateStageWork()
 		"completion includes late owner work exactly once without importing inclusive latency or the wall gap");
 }
 
+void testBaselineCommitNeedsRealOwnerStagesWithoutFabricatedWait()
+{
+	// Break: the baseline is forced to invent WAIT to satisfy the ordinary
+	// five-stage mask, or its four owner stages weaken the ordinary contract.
+	for (unsigned scenario = 0; scenario != 3; ++scenario)
+	{
+		Clock clock; KernelPerformanceLedger ledger;
+		KernelPerformanceTimingRunOptions options;
+		options.enabled = true; options.clock = Clock::read; options.clockContext = &clock;
+		options.role = scenario == 2 ? KERNEL_PERFORMANCE_PIPELINE : KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE;
+		require(ledger.beginRun(options), "role-specific stage-mask fixture starts");
+		const auto batch = ledger.beginBatch(KERNEL_PERFORMANCE_PHYSICS, 0, 7, 0);
+		const KernelPerformanceStage ownerStages[] = {
+			KERNEL_PERFORMANCE_CAPTURE, KERNEL_PERFORMANCE_SCHEDULE,
+			KERNEL_PERFORMANCE_VALIDATE, KERNEL_PERFORMANCE_COMMIT };
+		for (const auto stage : ownerStages) interval(ledger, batch, stage, clock, 1);
+		if (scenario == 1) interval(ledger, batch, KERNEL_PERFORMANCE_WAIT, clock, 1);
+		const bool ended = ledger.endBatch(batch, KERNEL_PERFORMANCE_COMMITTED);
+		require(ended == (scenario == 0),
+			"baseline commits four actual owner stages without WAIT while ordinary commits still require all five stages");
+		if (ended && scenario == 0)
+		{
+			const auto result = ledger.freeze();
+			require(result.streamCount == 1 && result.streams[0].committedBatches == 1 &&
+				result.streams[0].stageSamples[KERNEL_PERFORMANCE_WAIT] == 0 &&
+				result.streams[0].activePipelineNanoseconds == 4,
+				"baseline stage evidence records no fabricated wait sample or duration");
+		}
+	}
+}
+
 void testPhaseIntegerPrecisionAndForeignMutation()
 {
 	Clock clock;
@@ -921,6 +952,190 @@ void testPhaseIntegerPrecisionAndForeignMutation()
 		failed.runRole == KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE,
 		"foreign mutation fails qualification while retaining the baseline role");
 }
+bool openDeclaredControl(KernelPerformanceLedger &ledger, Clock &clock, KernelPerformanceFrame &frame)
+{
+	if (!startBaseline(ledger, clock)) return false;
+	frame = ledger.beginFrame(1, 83, KernelPerformanceSchedulerBoundary());
+	clock.now = 110;
+	if (!frame.valid() || !ledger.beginPhase(frame, KERNEL_PHASE_OWNER_INTAKE)) return false;
+	const unsigned reads = clock.calls;
+	const bool declared = ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_DECLARED);
+	require(declared && clock.calls == reads, "control fixture records the actual deferred transition without reading a clock");
+	return declared;
+}
+bool closeControlFixturePhases(KernelPerformanceLedger &ledger, Clock &clock, KernelPerformanceFrame frame)
+{
+	clock.now = 120;
+	if (!ledger.endPhase(frame, KERNEL_PHASE_OWNER_INTAKE)) return false;
+	for (unsigned ordinal = 1; ordinal != 5; ++ordinal)
+	{
+		const auto phase = static_cast<KernelPerformancePhase>(ordinal);
+		++clock.now; if (!ledger.beginPhase(frame, phase)) return false;
+		clock.now += 10; if (!ledger.endPhase(frame, phase)) return false;
+	}
+	clock.now = 165;
+	return true;
+}
+void testControlWindowsPreserveFivePhasesAndWorldCompletion()
+{
+	// Break: a deferred/reset pass is dropped, relabelled completed frame0,
+	// forced wholly serial, or loses its pending cause across a movie pass.
+	Clock clock; KernelPerformanceLedger ledger;
+	if (!startBaseline(ledger, clock)) return;
+	const rts::JobMetricCounter starts[3][5] = { {110,145,160,175,190}, {260,275,290,305,320}, {410,455,480,525,560} };
+	const rts::JobMetricCounter ends[3][5] = { {140,155,170,185,195}, {270,285,300,315,325}, {450,475,520,555,590} };
+	const rts::JobMetricCounter begins[] = {100,250,400}, closes[] = {200,330,600};
+	for (unsigned window = 0; window != 3; ++window)
+	{
+		clock.now = begins[window];
+		const auto frame = ledger.beginFrame(window + 1, window == 0 ? 83 : 0, KernelPerformanceSchedulerBoundary());
+		require(frame.valid(), "control and loaded windows have unique stable sample tokens");
+		if (!frame.valid()) return;
+		for (unsigned ordinal = 0; ordinal != 5; ++ordinal)
+		{
+			const auto phase = static_cast<KernelPerformancePhase>(ordinal);
+			clock.now = starts[window][ordinal]; require(ledger.beginPhase(frame, phase), "control cohort opens the next real phase");
+			if (ordinal == 0 && window != 1)
+			{
+				const unsigned reads = clock.calls;
+				const bool observed = ledger.observeControlTransition(frame, window == 0 ?
+					KERNEL_CONTROL_DEFERRED_START_DECLARED : KERNEL_CONTROL_DEFERRED_START_CONSUMED);
+				require(observed && clock.calls == reads, "one deferred declaration and one real consumption survive an intervening pending window");
+				if (!observed) return;
+			}
+			clock.now = ends[window][ordinal]; require(ledger.endPhase(frame, phase), "control cohort closes every measured phase");
+		}
+		clock.now = closes[window];
+		const bool ended = window == 2 ? ledger.endFrame(frame, 1, KernelPerformanceSchedulerBoundary()) :
+			ledger.endControlWindow(frame, 0, KernelPerformanceSchedulerBoundary());
+		require(ended, "pending controls close separately until the loaded world actually completes frame1");
+		if (!ended) return;
+	}
+	require(ledger.sealAdmissions(), "completed world boundary seals control cohort ingress");
+	clock.now = 700; const auto completion = ledger.beginCompletionSerial(); clock.now = 710;
+	require(completion.valid() && ledger.endCompletionSerial(completion) && ledger.sealExecutionClosure(KernelPerformanceSchedulerBoundary()),
+		"consumed startup state and actual late serial work permit execution closure");
+	const auto result = ledger.freeze(); const auto &a = result.phaseAccounting;
+	require(a.complete && !result.complete && result.streamCount == 0 && a.completedFrameCount == 1 &&
+		a.firstCompletedFrame == 1 && a.lastCompletedFrame == 1 && a.frameNanoseconds == 200 && a.maximumFrameNanoseconds == 200 &&
+		a.unscopedSerialNanoseconds == 40 && a.controlWindowCount == 2 && a.controlNanoseconds == 180 &&
+		a.maximumControlNanoseconds == 100 && a.controlUnscopedSerialNanoseconds == 70 &&
+		a.firstControlSampleOrdinal == 1 && a.lastControlSampleOrdinal == 2 && a.completionSerialNanoseconds == 10,
+		"control rows retain exact totals without inventing completed0 or a successful kernel timing stream");
+	const rts::JobMetricCounter controls[] = {40,20,20,20,10}, worlds[] = {40,20,40,30,30}, maxima[] = {30,10,10,10,5};
+	for (unsigned i = 0; i != 5; ++i)
+		require(a.controlPhases[i].totalNanoseconds == controls[i] && a.controlPhases[i].serialNanoseconds == controls[i] &&
+			a.controlPhases[i].pureNanoseconds == 0 && a.controlPhases[i].samples == 2 && a.controlPhases[i].maximumNanoseconds == maxima[i] &&
+			a.phases[i].totalNanoseconds == worlds[i] && a.phases[i].samples == 1,
+			"independent control and world rows preserve five-phase sample counts and per-phase maxima");
+	const unsigned reads = clock.calls; const auto again = ledger.freeze();
+	require(again.phaseAccounting.controlNanoseconds == 180 && again.phaseAccounting.controlWindowCount == 2 && clock.calls == reads,
+		"control evidence is immutable and clock-free after freeze");
+}
+void testControlProvenanceAndClosureFailuresStaySticky()
+{
+	for (unsigned mutation = 0; mutation != 12; ++mutation)
+	{
+		Clock clock; KernelPerformanceLedger ledger; KernelPerformanceFrame frame;
+		if (!openDeclaredControl(ledger, clock, frame)) continue;
+		bool accepted = false;
+		if (mutation == 0) accepted = ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_DECLARED);
+		if (mutation == 1) accepted = ledger.observeControlTransition(frame, static_cast<KernelPerformanceControlTransition>(3));
+		if (mutation == 4) accepted = ledger.endControlWindow(frame, 0, KernelPerformanceSchedulerBoundary());
+		if (mutation == 5 || mutation == 6)
+		{
+			require(ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_CONSUMED), "negative fixture consumes its real pending declaration once");
+			if (mutation == 5) { require(closeControlFixturePhases(ledger, clock, frame), "consumed negative closes all five phases"); accepted = ledger.endControlWindow(frame, 0, KernelPerformanceSchedulerBoundary()); }
+			else accepted = ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_CONSUMED);
+		}
+		if (mutation == 7)
+		{ ++frame.sampleOrdinal; accepted = ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_CONSUMED); }
+		if (mutation == 8)
+		{ std::thread worker([&]() { accepted = ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_CONSUMED); }); worker.join(); }
+		if (mutation == 9)
+		{
+			const auto batch = ledger.beginBatch(KERNEL_PERFORMANCE_PATH, 0, 0, 1);
+			require(ledger.beginInterval(batch, KERNEL_PERFORMANCE_CAPTURE).valid(), "control misuse opens a genuine ordinary interval");
+			accepted = ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_CONSUMED);
+		}
+		if (mutation == 2 || mutation == 3 || mutation == 10 || mutation == 11)
+		{
+			require(closeControlFixturePhases(ledger, clock, frame), "control misuse preserves all five balanced phases before closure");
+			KernelPerformanceSchedulerBoundary actual;
+			if (mutation == 2) accepted = ledger.endFrame(frame, 1, actual);
+			if (mutation == 3) accepted = ledger.endControlWindow(frame, 1, actual);
+			if (mutation == 10) { actual.submittedJobs = 1; accepted = ledger.endControlWindow(frame, 0, actual); }
+			if (mutation == 11) accepted = ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_CONSUMED);
+		}
+		const auto failed = ledger.freeze();
+		require(!accepted && !failed.phaseAccounting.complete && failed.phaseAccounting.errors != 0 &&
+			failed.runRole == KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE,
+			"invalid native control provenance scope identity scheduler or closure remains sticky incomplete baseline evidence");
+	}
+	for (unsigned mutation = 0; mutation != 3; ++mutation)
+	{
+		Clock clock; KernelPerformanceLedger ledger; if (!startBaseline(ledger, clock)) continue;
+		const auto frame = ledger.beginFrame(1, 0, KernelPerformanceSchedulerBoundary());
+		if (mutation == 0) require(!ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_DECLARED), "control declaration outside intake is rejected");
+		else
+		{
+			require(ledger.beginPhase(frame, KERNEL_PHASE_OWNER_INTAKE), "undeclared control fixture opens intake");
+			if (mutation == 1) require(!ledger.observeControlTransition(frame, KERNEL_CONTROL_DEFERRED_START_CONSUMED), "consumption cannot invent a missing deferred declaration");
+			else { require(closeControlFixturePhases(ledger, clock, frame), "undeclared fixture closes phases"); require(!ledger.endControlWindow(frame, 0, KernelPerformanceSchedulerBoundary()), "frame0 without native deferred provenance cannot become a control sample"); }
+		}
+		require(!ledger.freeze().phaseAccounting.complete, "missing control provenance never qualifies");
+	}
+}
+void testControlSamplesCannotResetOrMasqueradeAsCompletedZero()
+{
+	{
+		Clock clock; KernelPerformanceLedger ledger; if (!startBaseline(ledger, clock)) return;
+		const unsigned before = clock.calls;
+		require(!ledger.beginFrame(0, 0, KernelPerformanceSchedulerBoundary()).valid() && clock.calls == before,
+			"zero sample ordinal is rejected before a frame clock read");
+	}
+	{
+		Clock clock; KernelPerformanceLedger ledger; if (!startBaseline(ledger, clock)) return;
+		const auto frame = ledger.beginFrame(1, 0, KernelPerformanceSchedulerBoundary());
+		measuredPhases(ledger, frame, clock, 1);
+		require(!ledger.endFrame(frame, 0, KernelPerformanceSchedulerBoundary()), "actual completed frame0 is never accepted as the first world sample");
+	}
+	for (unsigned nextSample = 0; nextSample != 2; ++nextSample)
+	{
+		Clock clock; KernelPerformanceLedger ledger; KernelPerformanceFrame frame;
+		if (!openDeclaredControl(ledger, clock, frame)) continue;
+		require(closeControlFixturePhases(ledger, clock, frame) && ledger.endControlWindow(frame, 0, KernelPerformanceSchedulerBoundary()),
+			"sample ordering fixture retains the first real control before any completed frame");
+		const unsigned before = clock.calls;
+		require(!ledger.beginFrame(nextSample, 0, KernelPerformanceSchedulerBoundary()).valid() && clock.calls == before &&
+			!ledger.freeze().phaseAccounting.complete, "sample ordinals remain increasing across controls before first world completion");
+	}
+	{
+		Clock clock; KernelPerformanceLedger ledger; KernelPerformanceFrame frame;
+		if (!openDeclaredControl(ledger, clock, frame)) return;
+		require(closeControlFixturePhases(ledger, clock, frame) && ledger.endControlWindow(frame, 0, KernelPerformanceSchedulerBoundary()),
+			"control-only prefix closes its measured rows without pretending the run completed");
+		const auto result = ledger.freeze();
+		require(!result.phaseAccounting.complete && result.phaseAccounting.controlWindowCount == 1 && result.phaseAccounting.controlNanoseconds == 65 &&
+			result.phaseAccounting.completedFrameCount == 0 && result.phaseAccounting.frameNanoseconds == 0,
+			"incomplete control-only run retains actual control cost without a fabricated completed frame");
+	}
+}
+void testControlHooksAreInertOutsideBaseline()
+{
+	for (unsigned mode = 0; mode != 2; ++mode)
+	{
+		Clock clock; KernelPerformanceLedger ledger; KernelPerformanceTimingRunOptions options;
+		options.enabled = mode != 0; options.role = mode == 0 ? KERNEL_PERFORMANCE_PHASE_SERIAL_BASELINE : KERNEL_PERFORMANCE_PIPELINE;
+		options.clock = Clock::read; options.clockContext = &clock; require(ledger.beginRun(options), "inert control fixture starts its actual role");
+		require(!ledger.observeControlTransition(KernelPerformanceFrame(), KERNEL_CONTROL_DEFERRED_START_DECLARED) &&
+			!ledger.endControlWindow(KernelPerformanceFrame(), 0, KernelPerformanceSchedulerBoundary()) && clock.calls == 0,
+			"disabled and ordinary pipeline control hooks read no clock and grant no frame authority");
+		const auto snapshot = ledger.freeze();
+		require(snapshot.phaseAccounting.controlWindowCount == 0 && snapshot.phaseAccounting.controlNanoseconds == 0,
+			"inert control hooks never fabricate control totals");
+	}
+}
 }
 
 int main()
@@ -948,7 +1163,12 @@ int main()
 	testCompletionAndClockFailuresCannotProduceCoverage();
 	testTimingRoleSurvivesRejectedReconfigurationAndForeignAccess();
 	testBaselineCompletionRetainsActualLateStageWork();
+	testBaselineCommitNeedsRealOwnerStagesWithoutFabricatedWait();
 	testPhaseIntegerPrecisionAndForeignMutation();
+	testControlWindowsPreserveFivePhasesAndWorldCompletion();
+	testControlProvenanceAndClosureFailuresStaySticky();
+	testControlSamplesCannotResetOrMasqueradeAsCompletedZero();
+	testControlHooksAreInertOutsideBaseline();
 	if (failures != 0) fprintf(stderr, "%u kernel performance diagnostics assertions failed\n", failures);
 	return failures == 0 ? 0 : 1;
 }

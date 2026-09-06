@@ -105,6 +105,7 @@ OrdinaryPathRuntimeMetrics s_ordinaryPathMetricsFrozen;
 Bool s_ordinaryPathMetricsAwaitingInitialReset = FALSE;
 #if defined(_WIN64)
 std::unique_ptr<PerformanceReceiptRuntime> s_performanceReceipt;
+GameLogic *s_performanceReceiptOwner = 0;
 bool s_performanceReceiptAttempted = false;
 rts::AIPlanningRuntimeMetrics s_aiPlanningMetricsAtStart;
 rts::CollisionCandidateRuntimeMetrics s_collisionMetricsAtStart;
@@ -362,6 +363,117 @@ Bool HashSkirmishAITestFile(const char *path,
 	return success;
 }
 
+Bool HashSkirmishAITestHandle(void *opaqueHandle,
+	char digest[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1])
+{
+#if defined(_WIN32)
+	if (opaqueHandle == nullptr || digest == nullptr)
+		return FALSE;
+	digest[0] = '\0';
+	HANDLE handle = static_cast<HANDLE>(opaqueHandle);
+	if (handle == INVALID_HANDLE_VALUE || handle == nullptr)
+		return FALSE;
+	LARGE_INTEGER origin = {};
+	LARGE_INTEGER position = {};
+	LARGE_INTEGER extent = {};
+	if (!SetFilePointerEx(handle, origin, &position, FILE_CURRENT) ||
+		!GetFileSizeEx(handle, &extent) || extent.QuadPart < 0 ||
+		extent.QuadPart > static_cast<LONGLONG>(SKIRMISH_AI_TEST_MAX_REPLAY_BYTES) ||
+		!SetFilePointerEx(handle, origin, nullptr, FILE_BEGIN))
+		return FALSE;
+	SkirmishAITestSha256 sha256;
+	unsigned char bytes[32768];
+	Bool success = TRUE;
+	unsigned long long remaining = static_cast<unsigned long long>(extent.QuadPart);
+	while (remaining != 0)
+	{
+		const DWORD requested = static_cast<DWORD>(remaining < sizeof(bytes) ?
+			remaining : sizeof(bytes));
+		DWORD readCount = 0;
+		if (!ReadFile(handle, bytes, requested, &readCount, nullptr) ||
+			readCount != requested)
+		{
+			success = FALSE;
+			break;
+		}
+		sha256.update(bytes, readCount);
+		remaining -= readCount;
+	}
+	// Reading exactly the admitted extent is not enough if the underlying
+	// object changed length. Confirm EOF and the same extent before accepting
+	// the digest; the replay owner performs this again at checked closure.
+	unsigned char extra = 0;
+	DWORD extraCount = 0;
+	LARGE_INTEGER closedExtent = {};
+	if (success && (!ReadFile(handle, &extra, 1, &extraCount, nullptr) ||
+		extraCount != 0 || !GetFileSizeEx(handle, &closedExtent) ||
+		closedExtent.QuadPart != extent.QuadPart))
+		success = FALSE;
+	// The caller retains ownership of the identity-bound handle. Restoring its
+	// position also prevents this validation pass from changing later users.
+	if (!SetFilePointerEx(handle, position, nullptr, FILE_BEGIN))
+		success = FALSE;
+	if (success)
+		sha256.finish(digest);
+	return success;
+#else
+	(void)opaqueHandle;
+	(void)digest;
+	return FALSE;
+#endif
+}
+
+#if defined(_WIN64)
+struct SkirmishAITestReplayIdentity
+{
+	DWORD volume, high, low;
+	unsigned long long size;
+};
+
+Bool QuerySkirmishAITestReplayIdentity(HANDLE handle, const char *expectedPath,
+	SkirmishAITestReplayIdentity &identity)
+{
+	if (handle == INVALID_HANDLE_VALUE || handle == nullptr || expectedPath == nullptr)
+		return FALSE;
+	BY_HANDLE_FILE_INFORMATION information = {};
+	char nativePath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH + 4] = {};
+	char fullPath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH] = {};
+	const DWORD nativeLength = GetFinalPathNameByHandleA(handle, nativePath,
+		static_cast<DWORD>(sizeof(nativePath)), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+	const DWORD fullLength = GetFullPathNameA(expectedPath,
+		static_cast<DWORD>(sizeof(fullPath)), fullPath, nullptr);
+	if (!GetFileInformationByHandle(handle, &information) ||
+		nativeLength < 7 || nativeLength >= sizeof(nativePath) ||
+		strncmp(nativePath, "\\\\?\\", 4) != 0 ||
+		fullLength == 0 || fullLength >= sizeof(fullPath) ||
+		_stricmp(nativePath + 4, fullPath) != 0 ||
+		(information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+		information.nNumberOfLinks != 1)
+		return FALSE;
+	identity.volume = information.dwVolumeSerialNumber;
+	identity.high = information.nFileIndexHigh;
+	identity.low = information.nFileIndexLow;
+	identity.size = (static_cast<unsigned long long>(information.nFileSizeHigh) << 32) |
+		information.nFileSizeLow;
+	return TRUE;
+}
+
+Bool SameSkirmishAITestReplayIdentity(const SkirmishAITestReplayIdentity &left,
+	const SkirmishAITestReplayIdentity &right)
+{
+	return left.volume == right.volume && left.high == right.high &&
+		left.low == right.low && left.size == right.size;
+}
+
+void DeleteSkirmishAITestReplayHandle(HANDLE handle)
+{
+	if (handle == INVALID_HANDLE_VALUE || handle == nullptr) return;
+	FILE_DISPOSITION_INFO disposition = { TRUE };
+	SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition));
+}
+
+#endif
+
 Bool CommitSkirmishAITestReplay(const char *temporaryPath,
 	const char *destinationPath,
 	SkirmishAITestDetail::ReplayCommitCallback commitCallback,
@@ -397,7 +509,9 @@ Bool RetainSkirmishAITestReplayAtomicallyInternal(const char *sourcePath,
 	const char *destinationPath,
 	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1],
 	SkirmishAITestDetail::ReplayCommitCallback commitCallback,
-	void *commitContext)
+	void *commitContext,
+	SkirmishAITestDetail::ReplayFinalHandleCloseCallback finalCloseCallback,
+	void *finalCloseContext)
 {
 	if (sourcePath == nullptr || destinationPath == nullptr || sha256 == nullptr ||
 		!HasBoundedString(sourcePath, SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH) ||
@@ -417,6 +531,141 @@ Bool RetainSkirmishAITestReplayAtomicallyInternal(const char *sourcePath,
 		return FALSE;
 	_snprintf(temporaryPath, sizeof(temporaryPath), "%s.tmp", destinationPath);
 	temporaryPath[sizeof(temporaryPath) - 1] = '\0';
+#if defined(_WIN64)
+	HANDLE source = CreateFileA(sourcePath, GENERIC_READ, FILE_SHARE_READ, nullptr,
+		OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
+		FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+	if (source == INVALID_HANDLE_VALUE) return FALSE;
+	HANDLE temporary = CreateFileA(temporaryPath,
+		GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+		nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
+		FILE_FLAG_WRITE_THROUGH, nullptr);
+	if (temporary == INVALID_HANDLE_VALUE)
+	{
+		CloseHandle(source);
+		return FALSE;
+	}
+	SkirmishAITestReplayIdentity sourceIdentity = {}, temporaryIdentity = {};
+	Bool success = QuerySkirmishAITestReplayIdentity(source, sourcePath, sourceIdentity) &&
+		sourceIdentity.size <= SKIRMISH_AI_TEST_MAX_REPLAY_BYTES &&
+		QuerySkirmishAITestReplayIdentity(temporary, temporaryPath, temporaryIdentity) &&
+		temporaryIdentity.size == 0;
+	SkirmishAITestSha256 hasher;
+	unsigned char bytes[32768];
+	unsigned long long remaining = sourceIdentity.size;
+	while (success && remaining != 0)
+	{
+		const DWORD requested = static_cast<DWORD>(remaining < sizeof(bytes) ?
+			remaining : sizeof(bytes));
+		DWORD readCount = 0, written = 0;
+		if (!ReadFile(source, bytes, requested, &readCount, nullptr) ||
+			readCount != requested ||
+			!WriteFile(temporary, bytes, readCount, &written, nullptr) ||
+			written != readCount)
+		{
+			success = FALSE;
+			break;
+		}
+		hasher.update(bytes, readCount);
+		remaining -= readCount;
+	}
+	unsigned char extra = 0;
+	DWORD extraCount = 0;
+	SkirmishAITestReplayIdentity closedSourceIdentity = {}, writtenIdentity = {};
+	if (success && (!ReadFile(source, &extra, 1, &extraCount, nullptr) ||
+		extraCount != 0 ||
+		!QuerySkirmishAITestReplayIdentity(source, sourcePath, closedSourceIdentity) ||
+		!SameSkirmishAITestReplayIdentity(sourceIdentity, closedSourceIdentity) ||
+		!FlushFileBuffers(temporary) ||
+		!QuerySkirmishAITestReplayIdentity(temporary, temporaryPath, writtenIdentity) ||
+		writtenIdentity.volume != temporaryIdentity.volume ||
+		writtenIdentity.high != temporaryIdentity.high ||
+		writtenIdentity.low != temporaryIdentity.low ||
+		writtenIdentity.size != sourceIdentity.size)) success = FALSE;
+	char sourceDigest[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1] = {};
+	char temporaryDigest[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1] = {};
+	if (success)
+	{
+		hasher.finish(sourceDigest);
+		success = HashSkirmishAITestHandle(temporary, temporaryDigest) &&
+			strcmp(sourceDigest, temporaryDigest) == 0;
+	}
+	if (!CloseHandle(source)) success = FALSE;
+	Bool committed = FALSE;
+	if (success)
+		committed = CommitSkirmishAITestReplay(temporaryPath, destinationPath,
+			commitCallback, commitContext);
+	SkirmishAITestReplayIdentity committedIdentity = {};
+	if (committed && (!QuerySkirmishAITestReplayIdentity(temporary,
+		destinationPath, committedIdentity) ||
+		!SameSkirmishAITestReplayIdentity(writtenIdentity, committedIdentity))) success = FALSE;
+	HANDLE sharedDestination = INVALID_HANDLE_VALUE;
+	if (success && committed)
+	{
+		// The writer remains live while this exact-identity bridge is admitted.
+		// Share its existing write access, but retain DELETE authority so failure
+		// cleanup never depends on a later pathname reopen.
+		sharedDestination = CreateFileA(destinationPath, GENERIC_READ | DELETE,
+			FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT |
+			FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+		SkirmishAITestReplayIdentity sharedIdentity = {};
+		if (sharedDestination == INVALID_HANDLE_VALUE ||
+			!QuerySkirmishAITestReplayIdentity(sharedDestination, destinationPath, sharedIdentity) ||
+			!SameSkirmishAITestReplayIdentity(committedIdentity, sharedIdentity)) success = FALSE;
+	}
+	if (!success || !committed) DeleteSkirmishAITestReplayHandle(temporary);
+	if (!CloseHandle(temporary)) success = FALSE;
+	HANDLE lockedDestination = INVALID_HANDLE_VALUE;
+	HANDLE cleanupDestination = INVALID_HANDLE_VALUE;
+	Bool lockedMatchesCommit = FALSE;
+	if (success && committed)
+	{
+		// This DELETE-capable exact-object handle denies later writers while its
+		// cleanup twin survives the checked final close. Rename sharing is required
+		// for exact-handle cleanup; the repeated canonical-path checks reject any
+		// displacement or pathname substitution before acceptance.
+		lockedDestination = ReOpenFile(sharedDestination, GENERIC_READ | DELETE,
+			FILE_SHARE_READ | FILE_SHARE_DELETE,
+			FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+		SkirmishAITestReplayIdentity lockedIdentity = {}, closedLockedIdentity = {};
+		char lockedDigest[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1] = {};
+		lockedMatchesCommit = lockedDestination != INVALID_HANDLE_VALUE &&
+			QuerySkirmishAITestReplayIdentity(lockedDestination, destinationPath, lockedIdentity) &&
+			SameSkirmishAITestReplayIdentity(committedIdentity, lockedIdentity);
+		if (!lockedMatchesCommit ||
+			!DuplicateHandle(GetCurrentProcess(), lockedDestination, GetCurrentProcess(),
+				&cleanupDestination, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+			!SetHandleInformation(cleanupDestination, HANDLE_FLAG_INHERIT, 0) ||
+			!HashSkirmishAITestHandle(lockedDestination, lockedDigest) ||
+			strcmp(sourceDigest, lockedDigest) != 0 ||
+			!QuerySkirmishAITestReplayIdentity(lockedDestination, destinationPath,
+				closedLockedIdentity) ||
+			!SameSkirmishAITestReplayIdentity(lockedIdentity, closedLockedIdentity)) success = FALSE;
+	}
+	if ((!success || !committed) && cleanupDestination == INVALID_HANDLE_VALUE)
+	{
+		if (lockedMatchesCommit) DeleteSkirmishAITestReplayHandle(lockedDestination);
+		else DeleteSkirmishAITestReplayHandle(sharedDestination);
+	}
+	if (sharedDestination != INVALID_HANDLE_VALUE && !CloseHandle(sharedDestination)) success = FALSE;
+	if (lockedDestination != INVALID_HANDLE_VALUE)
+	{
+		const Bool closed = finalCloseCallback != nullptr ?
+			finalCloseCallback(lockedDestination, finalCloseContext) :
+			(CloseHandle(lockedDestination) ? TRUE : FALSE);
+		if (!closed) success = FALSE;
+	}
+	if (!success || !committed)
+		DeleteSkirmishAITestReplayHandle(cleanupDestination);
+	if (cleanupDestination != INVALID_HANDLE_VALUE && !CloseHandle(cleanupDestination))
+		success = FALSE;
+	if (!success || !committed) return FALSE;
+	strlcpy(sha256, sourceDigest, SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1);
+	return TRUE;
+#else
+	(void)finalCloseCallback;
+	(void)finalCloseContext;
 	FILE *existingTemporary = fopen(temporaryPath, "rb");
 	if (existingTemporary != nullptr)
 	{
@@ -474,6 +723,7 @@ Bool RetainSkirmishAITestReplayAtomicallyInternal(const char *sourcePath,
 	}
 	hasher.finish(sha256);
 	return TRUE;
+#endif
 }
 
 Bool CaptureSkirmishAITestExecutableHash(
@@ -593,7 +843,7 @@ Bool RetainSkirmishAITestReplayAtomically(const char *sourcePath,
 	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1])
 {
 	return SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(
-		sourcePath, destinationPath, sha256, nullptr, nullptr);
+		sourcePath, destinationPath, sha256, nullptr, nullptr, nullptr, nullptr);
 }
 
 namespace SkirmishAITestDetail
@@ -601,13 +851,16 @@ namespace SkirmishAITestDetail
 Bool RetainSkirmishAITestReplayAtomically(const char *sourcePath,
 	const char *destinationPath,
 	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1],
-	ReplayCommitCallback commitCallback, void *commitContext)
+	ReplayCommitCallback commitCallback, void *commitContext,
+	ReplayFinalHandleCloseCallback finalCloseCallback, void *finalCloseContext)
 {
 	if (commitCallback == nullptr)
 		return RetainSkirmishAITestReplayAtomicallyInternal(sourcePath,
-			destinationPath, sha256, nullptr, nullptr);
+			destinationPath, sha256, nullptr, nullptr,
+			finalCloseCallback, finalCloseContext);
 	return RetainSkirmishAITestReplayAtomicallyInternal(sourcePath,
-		destinationPath, sha256, commitCallback, commitContext);
+		destinationPath, sha256, commitCallback, commitContext,
+		finalCloseCallback, finalCloseContext);
 }
 }
 
@@ -634,6 +887,12 @@ Bool HashSkirmishAITestContentFile(const char *path,
 	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1])
 {
 	return HashSkirmishAITestFile(path, sha256);
+}
+
+Bool HashSkirmishAITestContentHandle(void *handle,
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1])
+{
+	return HashSkirmishAITestHandle(handle, sha256);
 }
 
 void AccumulateSkirmishAITestDirectPathMetrics(
@@ -2021,6 +2280,18 @@ Bool StartSkirmishAITestRunner()
 {
 	if (!s_runner.armed)
 		return TRUE;
+#if defined(_WIN64)
+	// Explicit native trace intent is a caller contract, not a game-start
+	// fallback. Reject it before observing or mutating any game, global, lobby,
+	// RNG, or owner state so an unsupported fresh shape is side-effect free.
+	if (PerformanceReceiptRuntime::explicitTraceRequestedFromEnvironment())
+	{
+		FailSkirmishAITest(IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) ?
+			"explicit trace admission is unsupported for practical controller" :
+			"explicit trace admission is unsupported for fresh matches");
+		return FALSE;
+	}
+#endif
 	DEBUG_LOG(("SkirmishAITestRunner::start phase=entry seed=%d", s_runner.seed));
 	s_runner.startupStartMilliseconds = GetTickCount();
 	CaptureSkirmishAITestRuntimeState();
@@ -2110,7 +2381,21 @@ Bool StartSkirmishAITestRunner()
 	{
 		s_performanceReceiptAttempted = true;
 		s_performanceReceipt.reset(new PerformanceReceiptRuntime);
-		if (!s_performanceReceipt->begin("fresh-ai-map", "")) s_performanceReceipt.reset();
+		if (!s_performanceReceipt->begin("fresh-ai-map", ""))
+		{
+			const bool traceRequested = s_performanceReceipt->traceRequested();
+			s_performanceReceipt.reset();
+			if (traceRequested)
+			{
+				FailSkirmishAITest("explicit trace admission is unsupported for fresh matches");
+				return FALSE;
+			}
+		}
+		else if (TheGameLogic != 0 &&
+			TheGameLogic->attachPerformanceReceiptRuntime(s_performanceReceipt.get()))
+			s_performanceReceiptOwner = TheGameLogic;
+		else
+			s_performanceReceipt->invalidate("fresh owner rejected the receipt runtime borrow");
 	}
 #endif
 	GameMessage *message = TheMessageStream->appendMessage(GameMessage::MSG_NEW_GAME);
@@ -2457,8 +2742,28 @@ void ObserveSkirmishAITestCompletedFrame(unsigned previousFrame)
 		s_spatialMetricsFrozen, s_ordinaryPathMetricsFrozen);
 }
 
+void ReleaseSkirmishAITestPerformanceReceiptOwner()
+{
+	if (s_performanceReceiptOwner == 0) return;
+	// Check identity before dereferencing the retained address. Ordinary attach
+	// rejection only disables evidence; an impossible detach cannot leave a
+	// live GameLogic referring to runtime storage which will be released.
+	if (!s_performanceReceipt || TheGameLogic != s_performanceReceiptOwner ||
+		!s_performanceReceiptOwner->detachPerformanceReceiptRuntime(s_performanceReceipt.get()))
+	{
+		RELEASE_CRASH(("Fresh receipt runtime borrow could not be released before owner destruction."));
+		abort();
+	}
+	s_performanceReceiptOwner = 0;
+}
+
 void FinalizeSkirmishAITestPerformanceReceipt(Int engineExitCode)
 {
+	if (s_performanceReceiptOwner != 0)
+	{
+		RELEASE_CRASH(("Fresh receipt runtime cannot be freed while its owner borrow remains live."));
+		abort();
+	}
 	if (s_performanceReceipt)
 	{
 		s_performanceReceipt->finish(engineExitCode, "GameMain:engine-destroyed-before-owner-detach");

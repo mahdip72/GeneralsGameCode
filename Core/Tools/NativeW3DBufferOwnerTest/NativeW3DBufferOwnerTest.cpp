@@ -611,6 +611,10 @@ int main()
 		&bytes) == RENDER_RESULT_OK && bytes != nullptr &&
 		staticBuffer.IsLocked(),
 		"a zero-sized full lock spans the remaining static buffer");
+	GpuHandle lockedBinding;
+	result |= Check(staticBuffer.AcquireVertexBinding(&lockedBinding) ==
+		RENDER_RESULT_FAILED && !lockedBinding.isValid(),
+		"binding admission rejects a buffer while its write lock is held");
 	void *nested = reinterpret_cast<void *>(1);
 	result |= Check(staticBuffer.Lock(0, 4, RENDER_BUFFER_UPDATE_PRESERVE,
 		&nested) == RENDER_RESULT_INVALID_ARGUMENT && nested == nullptr,
@@ -664,7 +668,9 @@ int main()
 		!rejectedHandle.isValid() &&
 		staticBuffer.AcquireVertexRange(8, 0, 0, 2,
 			&rejectedHandle) == RENDER_RESULT_INVALID_ARGUMENT &&
-		!rejectedHandle.isValid() &&
+			!rejectedHandle.isValid() &&
+		staticBuffer.AcquireIndexBinding(&rejectedHandle) ==
+			RENDER_RESULT_INVALID_ARGUMENT && !rejectedHandle.isValid() &&
 		staticBuffer.AcquireIndexRange(RENDER_FORMAT_R16_UINT, 0, 0, 1,
 			&rejectedHandle) == RENDER_RESULT_INVALID_ARGUMENT &&
 		!rejectedHandle.isValid(),
@@ -685,6 +691,10 @@ int main()
 	result |= Check(dynamicBuffer.Lock(0, 8, RENDER_BUFFER_UPDATE_DISCARD,
 		&bytes) == RENDER_RESULT_OK && bytes != nullptr,
 		"dynamic buffer accepts a discard-at-zero range");
+	GpuHandle lockedDynamicBinding;
+	result |= Check(dynamicBuffer.AcquireIndexBinding(&lockedDynamicBinding) ==
+		RENDER_RESULT_FAILED && !lockedDynamicBinding.isValid(),
+		"index binding admission rejects a dynamic buffer while locked");
 	Fill(bytes, 8, 0x22);
 	result |= Check(dynamicBuffer.Unlock() == RENDER_RESULT_OK &&
 		device.LastOffset() == 0 && device.LastBytes() == 8 &&
@@ -699,6 +709,10 @@ int main()
 		resources.DescribeBuffer(dynamicHandle, &description) == RENDER_RESULT_OK &&
 		description.authority == NATIVE_W3D_CONTENT_INVALID,
 		"partial discard acquires only its initialized index prefix");
+	GpuHandle dynamicBindingHandle;
+	result |= Check(dynamicBuffer.AcquireIndexBinding(&dynamicBindingHandle) ==
+		RENDER_RESULT_OK && dynamicBindingHandle == dynamicHandle,
+		"partial discard still exposes a valid index binding handle");
 	result |= Check(dynamicBuffer.AcquireIndexRange(RENDER_FORMAT_R16_UINT,
 		0, 4, 1, &rejectedHandle) == RENDER_RESULT_INVALID_ARGUMENT &&
 		!rejectedHandle.isValid() &&
@@ -734,6 +748,28 @@ int main()
 		&bytes) == RENDER_RESULT_INVALID_ARGUMENT && bytes == nullptr,
 		"discard with a nonzero destination fails closed");
 
+	BufferDescriptor dynamicVertexDescriptor = staticDescriptor;
+	dynamicVertexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	NativeW3DBufferOwner partialVertex;
+	result |= Check(partialVertex.Create(dynamicVertexDescriptor) ==
+		RENDER_RESULT_OK && partialVertex.Lock(0, 4,
+		RENDER_BUFFER_UPDATE_DISCARD, &bytes) == RENDER_RESULT_OK,
+		"partial dynamic vertex binding accepts a discard prefix");
+	if (bytes != nullptr)
+		Fill(bytes, 4, 0x66);
+	GpuHandle partialVertexHandle;
+	GpuHandle partialVertexBinding;
+	result |= Check(partialVertex.Unlock() == RENDER_RESULT_OK &&
+		partialVertex.AcquireVertexBinding(&partialVertexBinding) ==
+			RENDER_RESULT_OK &&
+		partialVertex.AcquireVertexRange(4, 0, 0, 1,
+			&partialVertexHandle) == RENDER_RESULT_OK &&
+		partialVertexBinding == partialVertexHandle &&
+		partialVertex.AcquireVertexRange(4, 0, 0, 2,
+			&rejectedHandle) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!rejectedHandle.isValid(),
+		"vertex binding accepts partial capacity while exact draw range rejects its untouched tail");
+
 	device.FailUpdate(true);
 	result |= Check(dynamicBuffer.Lock(8, 4,
 		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &bytes) == RENDER_RESULT_OK,
@@ -742,6 +778,8 @@ int main()
 	rejectedHandle = GpuHandle(1, 1);
 	result |= Check(dynamicBuffer.Unlock() == RENDER_RESULT_FAILED &&
 		dynamicBuffer.HasFailedMutation() &&
+		dynamicBuffer.AcquireIndexBinding(&rejectedHandle) ==
+			RENDER_RESULT_FAILED && !rejectedHandle.isValid() &&
 		dynamicBuffer.AcquireIndexRange(RENDER_FORMAT_R16_UINT, 0, 0, 1,
 			&rejectedHandle) == RENDER_RESULT_FAILED &&
 		!rejectedHandle.isValid(),
@@ -874,6 +912,7 @@ int main()
 
 	result |= Check(staticBuffer.Reset() == RENDER_RESULT_OK &&
 		dynamicBuffer.Reset() == RENDER_RESULT_OK &&
+		partialVertex.Reset() == RENDER_RESULT_OK &&
 		failedCreate.Reset() == RENDER_RESULT_OK &&
 		!resources.IsValid(staticHandle) &&
 		!resources.IsValid(recoveredHandle),

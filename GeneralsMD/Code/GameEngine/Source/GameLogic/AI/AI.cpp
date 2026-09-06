@@ -465,6 +465,91 @@ void ConfigureSharedAIPlanningReferenceTransport(
 	}
 }
 
+void BeginLiveAIPlanningReferenceAttempt(
+	rts::AIPlanningReferenceBatchTransport *transport,
+	rts::AIPlanningExecutionMode executionMode, UnsignedInt subtype,
+	UnsignedInt nativeJobCount)
+{
+	if (!transport || !transport->referenceLedger || !TheGameLogic ||
+		executionMode != rts::AI_PLANNING_EXECUTION_PARALLEL ||
+		nativeJobCount < 2U || !transport->referenceLedger->traceRequested())
+		return;
+	transport->referenceAttempt = TheGameLogic->beginPerformanceReceiptAttempt(
+		rts::performance::KERNEL_PERFORMANCE_AI, subtype);
+}
+
+struct DeferredAIPlanningReferenceFinish
+{
+	DeferredAIPlanningReferenceFinish() : disposition(
+		rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED), active(FALSE) {}
+	rts::performance::KernelPerformanceAttempt attempt;
+	rts::performance::KernelPerformanceReferenceBatch batch;
+	rts::performance::KernelPerformanceDisposition disposition;
+	Bool active;
+};
+
+DeferredAIPlanningReferenceFinish s_deferredAIPlanningReferenceFinish;
+
+void CompleteDeferredAIPlanningReferenceFinish()
+{
+	if (!s_deferredAIPlanningReferenceFinish.active)
+		return;
+	if (TheGameLogic)
+		TheGameLogic->finishPerformanceReceiptAttempt(
+			s_deferredAIPlanningReferenceFinish.attempt,
+			s_deferredAIPlanningReferenceFinish.batch,
+			s_deferredAIPlanningReferenceFinish.disposition, true, true);
+	s_deferredAIPlanningReferenceFinish = DeferredAIPlanningReferenceFinish();
+}
+
+void FinishLiveAIPlanningReferenceAttempt(
+	rts::AIPlanningReferenceBatchTransport *transport,
+	const rts::AIPlanningBatchStatus *status, Bool ownerCommitted)
+{
+	if (!transport || !transport->referenceLedger ||
+		!transport->referenceBatch)
+		return;
+	const rts::performance::KernelPerformanceReferenceBatch linked =
+		*transport->referenceBatch;
+	const Bool fallbackCompleted = ownerCommitted && status &&
+		status->usedSerialFallback != 0U;
+	const Bool attemptCommitted = ownerCommitted && linked.valid() &&
+		!fallbackCompleted;
+	const rts::performance::KernelPerformanceDisposition disposition =
+		attemptCommitted ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
+		(status && status->nativeAdmissionAccepted != 0U ?
+			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+			rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
+	if (transport->referenceAttempt.valid() && TheGameLogic)
+	{
+		if (!ownerCommitted)
+		{
+			s_deferredAIPlanningReferenceFinish.attempt =
+				transport->referenceAttempt;
+			s_deferredAIPlanningReferenceFinish.batch = linked;
+			s_deferredAIPlanningReferenceFinish.disposition = disposition;
+			s_deferredAIPlanningReferenceFinish.active = TRUE;
+			*transport->referenceBatch =
+				rts::performance::KernelPerformanceReferenceBatch();
+			transport->referenceAttempt =
+				rts::performance::KernelPerformanceAttempt();
+			return;
+		}
+		TheGameLogic->finishPerformanceReceiptAttempt(
+			transport->referenceAttempt, linked, disposition,
+			fallbackCompleted != FALSE, fallbackCompleted != FALSE);
+		*transport->referenceBatch =
+			rts::performance::KernelPerformanceReferenceBatch();
+		transport->referenceAttempt =
+			rts::performance::KernelPerformanceAttempt();
+	}
+	else
+	{
+		rts::FinishAIPlanningReferenceBatch(transport,
+			attemptCommitted != FALSE);
+	}
+}
+
 Bool RunSkirmishEnemyPlanningBatch()
 {
 	if (!ShouldRunCounterBasedEnemyPlanning())
@@ -482,6 +567,7 @@ Bool RunSkirmishEnemyPlanningBatch()
 	rts::AIPlanningReferencePlayerInputView referenceInput;
 	rts::AIPlanningReferencePlayerOutputView referenceOutput;
 	rts::AIPlanningReferencePlayerOutputView referenceDetachedOutput;
+	rts::AIPlanningBatchStatus status = {};
 
 	try
 	{
@@ -531,14 +617,16 @@ Bool RunSkirmishEnemyPlanningBatch()
 	ConfigureSharedAIPlanningReferenceTransport(snapshots, parallelScratch,
 		&serialScratch[0], 0U, &referenceTransport, &referenceBatch,
 		&referenceInput, &referenceOutput, &referenceDetachedOutput);
-	rts::AIPlanningBatchStatus status;
+	BeginLiveAIPlanningReferenceAttempt(&referenceTransport, executionMode, 0U,
+		rts::CountAIPlanningBatchJobs(&snapshots[0],
+			static_cast<uint32_t>(snapshots.size())));
 	if (!rts::ExecuteAIPlanningBatchOnJobSystem(executionMode,
 		&snapshots[0], (UnsignedInt)snapshots.size(), &committed[0],
 		&serialScratch[0], &parallelScratch[0], &status,
 		performanceBatch.token(), &referenceTransport))
 	{
 		performanceBatch.abort();
-		rts::FinishAIPlanningReferenceBatch(&referenceTransport, false);
+		FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
 	}
@@ -553,7 +641,7 @@ Bool RunSkirmishEnemyPlanningBatch()
 			snapshots[i].enemyTarget, committed[i].enemyTarget))
 		{
 			performanceBatch.abort();
-			rts::FinishAIPlanningReferenceBatch(&referenceTransport, false);
+			FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 			rts::RecordAIPlanningOwnerCommit(false);
 			return false;
 		}
@@ -565,8 +653,7 @@ Bool RunSkirmishEnemyPlanningBatch()
 		status.parallelSucceeded != 0U &&
 		status.committedMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.usedSerialFallback == 0U;
-	rts::FinishAIPlanningReferenceBatch(&referenceTransport,
-		referenceCommitted);
+	FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, true);
 	if (referenceCommitted)
 		performanceBatch.commit();
 	else
@@ -579,7 +666,7 @@ Bool RunSkirmishEnemyPlanningBatch()
 		// owner update. A failed batch therefore returns control to that
 		// deterministic serial boundary without publishing a partial result.
 		performanceBatch.abort();
-		rts::FinishAIPlanningReferenceBatch(&referenceTransport, false);
+		FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
 	}
@@ -602,6 +689,7 @@ Bool RunSkirmishProductionPlanningBatch()
 	rts::AIPlanningReferencePlayerInputView referenceInput;
 	rts::AIPlanningReferencePlayerOutputView referenceOutput;
 	rts::AIPlanningReferencePlayerOutputView referenceDetachedOutput;
+	rts::AIPlanningBatchStatus status = {};
 
 	try
 	{
@@ -668,14 +756,16 @@ Bool RunSkirmishProductionPlanningBatch()
 	ConfigureSharedAIPlanningReferenceTransport(snapshots, parallelScratch,
 		&serialScratch[0], 1U, &referenceTransport, &referenceBatch,
 		&referenceInput, &referenceOutput, &referenceDetachedOutput);
-	rts::AIPlanningBatchStatus status;
+	BeginLiveAIPlanningReferenceAttempt(&referenceTransport, executionMode, 1U,
+		rts::CountAIPlanningBatchJobs(&snapshots[0],
+			static_cast<uint32_t>(snapshots.size())));
 	if (!rts::ExecuteAIPlanningBatchOnJobSystem(executionMode,
 		&snapshots[0], (UnsignedInt)snapshots.size(), &committed[0],
 		&serialScratch[0], &parallelScratch[0], &status,
 		performanceBatch.token(), &referenceTransport))
 	{
 		performanceBatch.abort();
-		rts::FinishAIPlanningReferenceBatch(&referenceTransport, false);
+		FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
 	}
@@ -689,7 +779,7 @@ Bool RunSkirmishProductionPlanningBatch()
 			snapshots[i].production, committed[i].production))
 		{
 			performanceBatch.abort();
-			rts::FinishAIPlanningReferenceBatch(&referenceTransport, false);
+			FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 			rts::RecordAIPlanningOwnerCommit(false);
 			return false;
 		}
@@ -702,7 +792,7 @@ Bool RunSkirmishProductionPlanningBatch()
 			for (UnsignedInt prior = 0; prior < i; ++prior)
 				owners[prior]->discardStagedProductionPlanningResult();
 			performanceBatch.abort();
-			rts::FinishAIPlanningReferenceBatch(&referenceTransport, false);
+			FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 			rts::RecordAIPlanningOwnerCommit(false);
 			return false;
 		}
@@ -714,8 +804,7 @@ Bool RunSkirmishProductionPlanningBatch()
 		status.parallelSucceeded != 0U &&
 		status.committedMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.usedSerialFallback == 0U;
-	rts::FinishAIPlanningReferenceBatch(&referenceTransport,
-		referenceCommitted);
+	FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, true);
 	if (referenceCommitted)
 		performanceBatch.commit();
 	else
@@ -727,7 +816,7 @@ Bool RunSkirmishProductionPlanningBatch()
 		// No result has been staged when allocation fails. PlayerList::UPDATE
 		// consumes any owner queue marker and runs the legacy serial selector.
 		performanceBatch.abort();
-		rts::FinishAIPlanningReferenceBatch(&referenceTransport, false);
+		FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
 	}
@@ -751,6 +840,9 @@ void AI::update()
 	{
 		ThePlayerList->UPDATE();
 	}
+#if defined(_WIN64)
+	CompleteDeferredAIPlanningReferenceFinish();
+#endif
 
 }
 

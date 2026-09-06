@@ -98,6 +98,12 @@ struct KernelPerformanceSchedulerBoundary
 	JobMetricCounter outstandingJobs, pendingJobs;
 };
 
+enum KernelPerformanceControlTransition
+{
+	KERNEL_CONTROL_DEFERRED_START_DECLARED = 1,
+	KERNEL_CONTROL_DEFERRED_START_CONSUMED = 2
+};
+
 struct KernelPerformancePhaseAccountingRow
 {
 	KernelPerformancePhaseAccountingRow();
@@ -114,6 +120,11 @@ struct KernelPerformancePhaseAccountingSnapshot
 	unsigned firstCompletedFrame, lastCompletedFrame;
 	JobMetricCounter frameNanoseconds, maximumFrameNanoseconds;
 	JobMetricCounter unscopedSerialNanoseconds;
+	JobMetricCounter controlWindowCount;
+	JobMetricCounter controlNanoseconds, maximumControlNanoseconds;
+	JobMetricCounter controlUnscopedSerialNanoseconds;
+	JobMetricCounter firstControlSampleOrdinal, lastControlSampleOrdinal;
+	KernelPerformancePhaseAccountingRow controlPhases[KERNEL_PHASE_COUNT];
 	JobMetricCounter completionSerialNanoseconds, completionSampleCount;
 	KernelPerformancePhaseAccountingRow phases[KERNEL_PHASE_COUNT];
 	KernelPerformanceSchedulerBoundary schedulerBegin, schedulerEnd;
@@ -194,6 +205,12 @@ public:
 	bool endPhase(KernelPerformanceFrame frame, KernelPerformancePhase phase);
 	bool endFrame(KernelPerformanceFrame frame, unsigned completedFrame,
 		const KernelPerformanceSchedulerBoundary &actual);
+	// Native deferred-start facts share the existing frame/phase engine. A
+	// pending control window is not a completed world frame or completion tail.
+	bool observeControlTransition(KernelPerformanceFrame frame,
+		KernelPerformanceControlTransition transition);
+	bool endControlWindow(KernelPerformanceFrame frame, unsigned actualOwnerFrameAtExit,
+		const KernelPerformanceSchedulerBoundary &actual);
 	KernelPerformanceInterval beginCompletionSerial();
 	bool endCompletionSerial(KernelPerformanceInterval interval);
 	bool sealExecutionClosure(const KernelPerformanceSchedulerBoundary &actual);
@@ -215,6 +232,13 @@ public:
 	KernelPerformanceSnapshot freeze();
 
 private:
+	friend class KernelPerformanceReferenceLedger;
+	// Private source-authenticated operations share the existing clock/stack.
+	KernelPerformanceInterval beginAuthenticatedInline(JobMetricCounter sampleOrdinal,
+		KernelPerformancePhase phase, bool pure);
+	bool endAuthenticatedInline(KernelPerformanceInterval body);
+	KernelPerformanceInterval beginAuthenticatedOwnerSerial(KernelPerformanceInterval body);
+	bool endAuthenticatedOwnerSerial(KernelPerformanceInterval extent);
 	struct BatchState
 	{
 		bool active;
@@ -238,8 +262,11 @@ private:
 		PhaseState();
 		KernelPerformanceFrame frame;
 		KernelPerformanceInterval completion;
+		KernelPerformanceInterval body, ownerSerial;
+		bool bodyPure;
+		unsigned bodyDepth;
 		bool phaseOpen, closureSealed, boundaryKnown;
-		unsigned nextPhase;
+		unsigned nextPhase, controlState;
 		JobMetricCounter nextFrame, lastSampleOrdinal, frameStart, phaseStart;
 		JobMetricCounter lastClock, unscoped, completionStart, completionElapsed;
 		KernelPerformancePhaseAccountingRow phases[KERNEL_PHASE_COUNT];
@@ -249,6 +276,8 @@ private:
 	bool writable();
 	bool phaseWritable();
 	bool frameMatches(KernelPerformanceFrame frame);
+	bool finishFrame(KernelPerformanceFrame frame, unsigned actualOwnerFrameAtExit,
+		const KernelPerformanceSchedulerBoundary &actual, bool control);
 	bool checkSchedulerBoundary(const KernelPerformanceSchedulerBoundary &actual);
 	bool settlePhaseAccounting(JobMetricCounter value);
 	bool checkPhaseTotals();

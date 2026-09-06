@@ -11,6 +11,9 @@
 #include <float.h>
 #include <math.h>
 #include <new>
+#if defined(_WIN64)
+#include <memory>
+#endif
 #include <string.h>
 
 #if defined(_MSC_VER) && _MSC_VER < 1300
@@ -441,6 +444,13 @@ void observePhysicsReferenceBatch(const PhysicsIntegrationOptions &options,
 	production.outputs = outputs;
 	production.count = count;
 	production.capacity = count;
+	if (options.performanceReferenceAttempt.valid())
+	{
+		*options.performanceReferenceBatch =
+			options.performanceReferenceLedger->observeValidatedAttempt(
+				options.performanceReferenceAttempt, writePhysicsReferenceOutput, &production);
+		return;
+	}
 	PhysicsReferenceOutput detached;
 	detached.outputs = mode == performance::KERNEL_REFERENCE_SERIAL_ORACLE ?
 		options.performanceReferenceOutput : 0;
@@ -465,12 +475,127 @@ struct PhysicsIntegrationExecutionRecord
 {
 	PhysicsIntegrationExecutionRecord()
 		: completed(false), physicalWorker(false), ownerHelped(false),
-		  physicalWorkerIndex(JOB_INVALID_PHYSICAL_WORKER_INDEX) {}
+		  physicalWorkerIndex(JOB_INVALID_PHYSICAL_WORKER_INDEX)
+#if defined(_WIN64)
+		, traceSource(false), range()
+#endif
+	{}
 	bool completed;
 	bool physicalWorker;
 	bool ownerHelped;
 	unsigned physicalWorkerIndex;
+#if defined(_WIN64)
+	bool traceSource;
+	performance::KernelPerformanceRangePlan range;
+	performance::KernelPerformanceCheckpointProbe checkpoint;
+#endif
 };
+
+#if defined(_WIN64)
+class PhysicsSourceBodyScope
+{
+public:
+	PhysicsSourceBodyScope(PhysicsIntegrationExecutionRecord &execution,
+		const unsigned &units, bool inlineExecution) : m_execution(execution), m_units(units)
+	{ if (m_execution.traceSource && !inlineExecution) m_execution.checkpoint.beginRecord(); }
+	~PhysicsSourceBodyScope()
+	{
+		if (!m_execution.traceSource) return;
+		const performance::KernelPerformanceCheckpoint at = {4, m_units, m_execution.range.end};
+		m_execution.checkpoint.finish(at, m_units, m_execution.completed ?
+			performance::KERNEL_RANGE_COMPLETED : m_execution.checkpoint.snapshot().firstTruePoll != 0 ?
+			performance::KERNEL_RANGE_CANCELLED : performance::KERNEL_RANGE_FAILED);
+	}
+private:
+	PhysicsIntegrationExecutionRecord &m_execution;
+	const unsigned &m_units;
+};
+
+bool physicsSourceCheckpoint(PhysicsIntegrationExecutionRecord &execution,
+	unsigned site, unsigned units, bool actual)
+{
+	if (!execution.traceSource) return actual;
+	const performance::KernelPerformanceCheckpoint at = {site, units, execution.range.end};
+	return execution.checkpoint.cancelled(at, actual);
+}
+
+// Owner-only metadata import follows the real acquire; it never executes work.
+class PhysicsSourceAttempt
+{
+public:
+	PhysicsSourceAttempt(const PhysicsIntegrationOptions &options,
+		const PhysicsIntegrationSnapshot *snapshots, unsigned count, unsigned grain,
+		JobSystem &jobs, PhysicsIntegrationMetrics &metrics) : m_options(options),
+		m_metrics(metrics), m_count(count), m_grain(grain),
+		m_workers(jobs.workerCount()), m_pending(jobs.pendingOwnerCompletionCount()),
+		m_outstanding(jobs.outstandingJobCount()), m_enabled(false), m_released(false)
+	{
+		if (options.performanceReferenceLedger == 0 || !options.performanceReferenceAttempt.valid()) return;
+		const performance::KernelPerformanceReferenceMode mode = options.performanceReferenceLedger->mode();
+		if (mode != performance::KERNEL_REFERENCE_THROUGHPUT_BINDING &&
+			mode != performance::KERNEL_REFERENCE_SERIAL_ORACLE) return;
+		const PhysicsReferenceInput input = {snapshots, count};
+		m_enabled = options.performanceReferenceLedger->bindCapturedInput(
+			options.performanceReferenceAttempt, PHYSICS_REFERENCE_FIELD_SCHEMA,
+			count, writePhysicsReferenceInput, &input);
+		performance::KernelPerformanceCanonicalWriter facts;
+		if (m_enabled && facts.begin(1) && facts.u32(1, count) && facts.u32(2, grain))
+			m_facts = facts.finish();
+	}
+	~PhysicsSourceAttempt() { release(0, 0, false, false); }
+	void plan(PhysicsIntegrationExecutionRecord &execution, unsigned ordinal,
+		unsigned begin, unsigned end)
+	{
+		execution.traceSource = m_enabled;
+		execution.range = {1, ordinal, 1, begin, end, end - begin};
+	}
+	void release(PhysicsIntegrationExecutionRecord *executions, unsigned submitted,
+		bool published, bool cancelled)
+	{
+		if (!m_enabled || m_released) return;
+		m_released = true;
+		performance::KernelPerformanceReferenceLedger &ledger = *m_options.performanceReferenceLedger;
+		const performance::KernelPerformanceAttempt attempt = m_options.performanceReferenceAttempt;
+		performance::KernelPerformanceAttemptDecision decision = {};
+		decision.site = 1; decision.reasonSchema = 1; decision.reason = submitted == 0 ? 2 : cancelled ? 3 : 1;
+		decision.deterministicEligible = true; decision.deterministicFacts = m_facts;
+		decision.admission = submitted != 0 ? performance::KERNEL_ADMISSION_ACCEPTED : performance::KERNEL_ADMISSION_REFUSED;
+		decision.sourceConfiguredWorkers = m_workers; decision.dynamicFactsKnownMask = 3;
+		decision.pendingJobs = m_pending; decision.outstandingJobs = m_outstanding;
+		if (m_options.testHooks != 0 && m_options.testHooks->releasedGroup != 0)
+		{
+			unsigned completedBodies = 0;
+			for (unsigned i = 0; i != submitted; ++i) if (executions[i].completed) ++completedBodies;
+			m_options.testHooks->releasedGroup(m_options.testHooks->context,
+				cancelled, completedBodies, submitted, decision.reason);
+		}
+		ledger.observeDecision(attempt, decision);
+		if (submitted == 0) return;
+		m_metrics.referenceAdmissionAccepted = true;
+		const performance::KernelPerformanceDispatchPlan dispatch = {1, 1, 1, submitted,
+			m_count, m_grain, PHYSICS_INTEGRATION_MAXIMUM_SNAPSHOTS};
+		ledger.observeDispatch(attempt, dispatch);
+		for (unsigned i = 0; i != submitted; ++i) ledger.observeRangePlan(attempt, executions[i].range);
+		for (unsigned i = 0; i != submitted; ++i)
+		{
+			performance::KernelPerformanceRangeProgress progress = {};
+			progress.checkpoint = executions[i].checkpoint.snapshot();
+			progress.publication = !progress.checkpoint.entered ? performance::KERNEL_PUBLICATION_NOT_APPLICABLE :
+				published ? performance::KERNEL_PUBLICATION_PUBLISHED : cancelled ||
+				progress.checkpoint.terminal == performance::KERNEL_RANGE_CANCELLED ?
+				performance::KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL : performance::KERNEL_PUBLICATION_REJECTED;
+			ledger.observeReleasedRange(attempt, executions[i].range, progress);
+		}
+	}
+private:
+	const PhysicsIntegrationOptions &m_options;
+	PhysicsIntegrationMetrics &m_metrics;
+	unsigned m_count, m_grain, m_workers;
+	JobMetricCounter m_pending, m_outstanding;
+	bool m_enabled, m_released;
+	performance::KernelPerformanceDigest m_facts;
+};
+#endif
 
 class PhysicsPhysicalExecutionScope
 {
@@ -494,6 +619,43 @@ private:
 	PhysicsJobAtomicUnsigned *m_active;
 };
 
+#if defined(_WIN64)
+void observePhysicsTest(const PhysicsIntegrationTestHooks *hooks,
+	PhysicsIntegrationTestEvent event, unsigned rangeIndex, unsigned begin,
+	unsigned end, unsigned workUnits = 0, bool completed = false,
+	PhysicsIntegrationOutput *storage = 0)
+{
+	if (hooks != 0 && hooks->observe != 0)
+		hooks->observe(hooks->context, event, rangeIndex, begin, end,
+			workUnits, completed, storage);
+}
+
+bool physicsTestCheckpoint(const PhysicsIntegrationTestHooks *hooks,
+	unsigned rangeIndex, PhysicsIntegrationTestCheckpoint site,
+	unsigned workUnits, bool actual)
+{
+	return hooks != 0 && hooks->checkpoint != 0 ?
+		hooks->checkpoint(hooks->context, rangeIndex, site, workUnits, actual) : actual;
+}
+
+class PhysicsTestBodyScope
+{
+public:
+	PhysicsTestBodyScope(const PhysicsIntegrationTestHooks *hooks, unsigned range,
+		unsigned begin, unsigned end, const unsigned &units, const bool &completed)
+		: m_hooks(hooks), m_range(range), m_begin(begin), m_end(end),
+		m_units(units), m_completed(completed)
+	{ observePhysicsTest(m_hooks, PHYSICS_INTEGRATION_TEST_RANGE_ENTERED, m_range, m_begin, m_end); }
+	~PhysicsTestBodyScope()
+	{ observePhysicsTest(m_hooks, PHYSICS_INTEGRATION_TEST_RANGE_FINISHED, m_range, m_begin, m_end, m_units, m_completed); }
+private:
+	const PhysicsIntegrationTestHooks *m_hooks;
+	unsigned m_range, m_begin, m_end;
+	const unsigned &m_units;
+	const bool &m_completed;
+};
+#endif
+
 class PhysicsIntegrationJob : public Job
 {
 public:
@@ -503,45 +665,86 @@ public:
 		PhysicsIntegrationTestFault testFault, unsigned testOrdinal,
 		PhysicsIntegrationExecutionRecord *execution,
 		PhysicsJobAtomicUnsigned *activePhysicalWorkers,
-		PhysicsJobAtomicUnsigned *peakPhysicalWorkers)
+		PhysicsJobAtomicUnsigned *peakPhysicalWorkers
+#if defined(_WIN64)
+		, const PhysicsIntegrationTestHooks *testHooks
+#endif
+		)
 		: m_snapshots(snapshots), m_scratch(scratch),
 		  m_rangeIndex(rangeIndex), m_begin(begin), m_end(end),
 		  m_floatingPointState(floatingPointState), m_testFault(testFault),
 		  m_testOrdinal(testOrdinal), m_execution(execution),
 		  m_activePhysicalWorkers(activePhysicalWorkers),
 		  m_peakPhysicalWorkers(peakPhysicalWorkers)
+#if defined(_WIN64)
+		, m_testHooks(testHooks)
+#endif
 	{
 	}
 
-	virtual void execute(JobContext &context)
+	virtual void execute(JobContext &context) { executeBody(&context); }
+#if defined(_WIN64)
+	void executeInline() { executeBody(0); }
+#endif
+
+	void executeBody(JobContext *context)
 	{
 		JobFloatingPointScope floatingPointScope(m_floatingPointState);
-		m_execution->physicalWorker = context.isPhysicalWorkerExecution();
-		m_execution->ownerHelped = !m_execution->physicalWorker;
+		m_execution->physicalWorker = context != 0 && context->isPhysicalWorkerExecution();
+		m_execution->ownerHelped = context != 0 && !m_execution->physicalWorker;
 		if (m_execution->physicalWorker)
-			m_execution->physicalWorkerIndex = context.physicalWorkerIndex();
+			m_execution->physicalWorkerIndex = context->physicalWorkerIndex();
 		PhysicsPhysicalExecutionScope physicalScope(m_execution->physicalWorker,
 			m_activePhysicalWorkers, m_peakPhysicalWorkers);
+#if defined(_WIN64)
+		unsigned completedUnits = 0;
+		PhysicsSourceBodyScope sourceScope(*m_execution, completedUnits, context == 0);
+		PhysicsTestBodyScope testScope(m_testHooks, m_rangeIndex, m_begin, m_end,
+			completedUnits, m_execution->completed);
+#endif
 		if (m_testFault == PHYSICS_INTEGRATION_TEST_WORKER_FAILURE &&
 			m_rangeIndex == m_testOrdinal)
 		{
-			context.fail();
+			if (context != 0) context->fail();
 			return;
 		}
 		for (unsigned index = m_begin; index != m_end; ++index)
 		{
-			if ((index - m_begin) % 64 == 0 && context.isCancellationRequested())
-				return;
+			if ((index - m_begin) % 64 == 0)
+			{
+				bool cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+				cancelled = physicsTestCheckpoint(m_testHooks, m_rangeIndex,
+					index == m_begin ? PHYSICS_INTEGRATION_TEST_CHECKPOINT_ENTRY :
+					PHYSICS_INTEGRATION_TEST_CHECKPOINT_BLOCK, index - m_begin, cancelled);
+				cancelled = physicsSourceCheckpoint(*m_execution,
+					index == m_begin ? 1 : 2, index - m_begin, cancelled);
+#endif
+				if (cancelled) return;
+			}
+#if defined(_WIN64)
+			observePhysicsTest(m_testHooks, PHYSICS_INTEGRATION_TEST_ITEM_EVALUATED,
+				m_rangeIndex, m_begin, m_end, index - m_begin);
+#endif
 			if (!ComputePhysicsIntegrationPrefix(m_snapshots[index], m_scratch[index]))
 			{
-				context.fail();
+				if (context != 0) context->fail();
 				return;
 			}
 			if (m_testFault == PHYSICS_INTEGRATION_TEST_NONFINITE_OUTPUT &&
 				m_rangeIndex == m_testOrdinal && index == m_begin)
 				m_scratch[index].velocity[0] = FLT_MAX * FLT_MAX;
+#if defined(_WIN64)
+			completedUnits = index - m_begin + 1;
+#endif
 		}
-		if (context.isCancellationRequested())
+		bool cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+		cancelled = physicsTestCheckpoint(m_testHooks, m_rangeIndex,
+			PHYSICS_INTEGRATION_TEST_CHECKPOINT_POST_BODY, completedUnits, cancelled);
+		cancelled = physicsSourceCheckpoint(*m_execution, 3, completedUnits, cancelled);
+#endif
+		if (cancelled)
 			return;
 		m_execution->completed = true;
 	}
@@ -558,7 +761,128 @@ private:
 	PhysicsIntegrationExecutionRecord *m_execution;
 	PhysicsJobAtomicUnsigned *m_activePhysicalWorkers;
 	PhysicsJobAtomicUnsigned *m_peakPhysicalWorkers;
+#if defined(_WIN64)
+	const PhysicsIntegrationTestHooks *m_testHooks;
+#endif
 };
+
+
+#if defined(_WIN64)
+bool validatePhysicsPreparedOutput(const PhysicsIntegrationOptions &options,
+	const PhysicsIntegrationSnapshot *snapshots, unsigned count, PhysicsIntegrationOutput *scratch)
+{
+	observePhysicsTest(options.testHooks, PHYSICS_INTEGRATION_TEST_OWNER_VALIDATION,
+		0, 0, count, count, true, scratch);
+	for (unsigned i = 0; i != count; ++i)
+		if (!ValidatePhysicsIntegrationOutput(snapshots[i], scratch[i])) return false;
+	return true;
+}
+
+PhysicsIntegrationBatchResult consumePhysicsPrefixes(
+	const PhysicsIntegrationSnapshot *snapshots, unsigned count, PhysicsIntegrationOutput *output,
+	PhysicsIntegrationOutput *scratch, const PhysicsIntegrationOptions &options,
+	PhysicsIntegrationMetrics &metrics)
+{
+	using namespace performance;
+	KernelPerformanceReferenceLedger &ledger = *options.performanceReferenceLedger;
+	const KernelPerformanceAttempt attempt = options.performanceReferenceAttempt;
+	if (!attempt.valid() || ledger.mode() != KERNEL_REFERENCE_PHASE_BASELINE_BINDING ||
+		!options.performanceBatch.valid()) return PHYSICS_INTEGRATION_SERIAL_FALLBACK;
+	const unsigned grain = metrics.effectiveMinimumGrain;
+	const PhysicsReferenceInput input = {snapshots, count};
+	KernelPerformanceCanonicalWriter facts;
+	KernelPerformanceAttemptDecision decision = {};
+	if (!facts.begin(1) || !facts.u32(1, count) || !facts.u32(2, grain) ||
+		!ledger.bindCapturedInput(attempt, PHYSICS_REFERENCE_FIELD_SCHEMA, count, writePhysicsReferenceInput, &input) ||
+		!ledger.replayDecision(attempt, 1, true, facts.finish(), decision) ||
+		decision.admission != KERNEL_ADMISSION_ACCEPTED || decision.reasonSchema != 1 ||
+		(decision.reason != 1 && decision.reason != 3)) return PHYSICS_INTEGRATION_SERIAL_FALLBACK;
+	metrics.referenceAdmissionAccepted = true;
+	KernelPerformanceDispatchPlan dispatch = {};
+	KernelPerformanceAttemptFinish sourceFinish = {};
+	if (!ledger.readSourceDispatch(attempt, 1, dispatch) || !ledger.readSourceFinish(attempt, sourceFinish) ||
+		dispatch.bodySchema != 1 || dispatch.checkpointSchema != 1 || dispatch.operationCount != count ||
+		dispatch.sourceGrain != grain || dispatch.sourceLimit != PHYSICS_INTEGRATION_MAXIMUM_SNAPSHOTS ||
+		dispatch.rangeCount < 2 || dispatch.rangeCount > count ||
+		dispatch.rangeCount != JobSystem::chooseRangeCount(count, grain, decision.sourceConfiguredWorkers) ||
+		(decision.reason == 3 && sourceFinish.disposition == KERNEL_PERFORMANCE_COMMITTED))
+		return PHYSICS_INTEGRATION_SERIAL_FALLBACK;
+	const unsigned rangeCount = dispatch.rangeCount;
+	std::unique_ptr<PhysicsIntegrationExecutionRecord[]> executions(
+		new (std::nothrow) PhysicsIntegrationExecutionRecord[rangeCount]);
+	{
+		// Real owner plan setup ends before any authenticated inline body.
+		KernelPerformanceScope schedule(&KernelPerformanceLedger::instance(), options.performanceBatch, KERNEL_PERFORMANCE_SCHEDULE);
+		if (!executions || !ledger.observeDispatch(attempt, dispatch)) return PHYSICS_INTEGRATION_SERIAL_FALLBACK;
+		for (unsigned i = 0; i != rangeCount; ++i)
+		{
+			JobRange range;
+			KernelPerformanceRangePlan source = {};
+			if (!JobSystem::rangeForIndex(count, rangeCount, i, range) ||
+				!ledger.readSourceRange(attempt, 1, i, source) || source.bodyKind != 1 ||
+				source.begin != range.begin || source.end != range.end || source.operationCount != range.end - range.begin ||
+				!ledger.observeRangePlan(attempt, source)) return PHYSICS_INTEGRATION_SERIAL_FALLBACK;
+			executions[i].range = source;
+		}
+	}
+	bool complete = true;
+	const JobFloatingPointState floatingPointState;
+	for (unsigned i = 0; i != rangeCount; ++i)
+	{
+		PhysicsIntegrationExecutionRecord &record = executions[i];
+		KernelPerformanceInlineBody body;
+		const KernelPerformanceInlineAction action = ledger.beginInlineBody(attempt,
+			record.range, KernelPerformanceLedger::instance(), body, record.checkpoint);
+		if (action == KERNEL_INLINE_INVALID) return PHYSICS_INTEGRATION_SERIAL_FALLBACK;
+		if (action == KERNEL_INLINE_EXECUTE)
+		{
+			record.traceSource = true;
+			PhysicsIntegrationJob job(snapshots, scratch, i, static_cast<unsigned>(record.range.begin),
+				static_cast<unsigned>(record.range.end), floatingPointState, options.testFault,
+				options.testOrdinal, &record, 0, 0, options.testHooks);
+			job.executeInline();
+		}
+		KernelPerformanceRangeProgress progress = {};
+		progress.checkpoint = record.checkpoint.snapshot();
+		progress.publication = !progress.checkpoint.entered ? KERNEL_PUBLICATION_NOT_APPLICABLE :
+			decision.reason == 3 || progress.checkpoint.terminal == KERNEL_RANGE_CANCELLED ?
+			KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL : sourceFinish.validationObserved ?
+			KERNEL_PUBLICATION_PUBLISHED : KERNEL_PUBLICATION_REJECTED;
+		if ((action == KERNEL_INLINE_EXECUTE && !ledger.finishInlineBody(body, progress)) ||
+			!ledger.observeReleasedRange(attempt, record.range, progress)) return PHYSICS_INTEGRATION_SERIAL_FALLBACK;
+		complete = record.completed && complete;
+	}
+	bool published = false;
+	{
+		KernelPerformanceScope validate(&KernelPerformanceLedger::instance(),
+			options.performanceBatch, KERNEL_PERFORMANCE_VALIDATE);
+		if (decision.reason != 3 && complete &&
+			validatePhysicsPreparedOutput(options, snapshots, count, scratch) &&
+			sourceFinish.validationObserved)
+		{
+			observePhysicsReferenceBatch(options, snapshots, count, scratch);
+			if (options.performanceReferenceBatch != 0 &&
+				options.performanceReferenceBatch->valid() &&
+				sourceFinish.disposition == KERNEL_PERFORMANCE_COMMITTED)
+			{
+				memcpy(output, scratch, count * sizeof(PhysicsIntegrationOutput));
+				observePhysicsTest(options.testHooks, PHYSICS_INTEGRATION_TEST_PUBLICATION,
+					0, 0, count, count, true);
+				published = true;
+			}
+		}
+	}
+	executions.reset();
+	for (unsigned i = 0; i != rangeCount; ++i)
+	{
+		JobRange range; JobSystem::rangeForIndex(count, rangeCount, i, range);
+		observePhysicsTest(options.testHooks, PHYSICS_INTEGRATION_TEST_RANGE_RELEASED, i, range.begin, range.end);
+	}
+	metrics.rangeCount = rangeCount;
+	return published ? PHYSICS_INTEGRATION_PARALLEL : decision.reason == 3 ?
+		PHYSICS_INTEGRATION_CANCELLED : PHYSICS_INTEGRATION_SERIAL_FALLBACK;
+}
+#endif
 
 PhysicsIntegrationBatchResult fallback(JobSystem *jobs,
 	PhysicsIntegrationMetrics &metrics,
@@ -575,7 +899,7 @@ PhysicsIntegrationOptions::PhysicsIntegrationOptions()
 	: minimumGrain(PHYSICS_INTEGRATION_DEFAULT_MINIMUM_GRAIN),
 	  testFault(PHYSICS_INTEGRATION_TEST_NO_FAULT), testOrdinal(0)
 #if defined(_WIN64)
-	, performanceBatch(), performanceReferenceLedger(0),
+	, performanceBatch(), performanceReferenceLedger(0), performanceReferenceAttempt(), testHooks(0),
 	performanceReferenceBatch(0), performanceReferenceOutput(0),
 	performanceReferenceOutputCapacity(0)
 #endif
@@ -586,7 +910,8 @@ PhysicsIntegrationMetrics::PhysicsIntegrationMetrics()
 	: snapshotCount(0), rangeCount(0), effectiveMinimumGrain(0),
 	  submittedJobs(0), completedJobs(0), physicalWorkerJobs(0),
 	  ownerHelpedJobs(0), physicalWorkerMask(0), distinctPhysicalWorkers(0),
-	  physicalWorkerMaskComplete(true), peakConcurrentPhysicalWorkers(0),
+	  physicalWorkerMaskComplete(true), referenceAdmissionAccepted(false),
+	  peakConcurrentPhysicalWorkers(0),
 	  serialFallbacks(0), allocatedBytes(0),
 	  captureNanoseconds(0), prepareNanoseconds(0), waitNanoseconds(0),
 	  commitNanoseconds(0), storageBytes(0), storageCapacityBytes(0),
@@ -878,6 +1203,11 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 	if (!jobs.isRunning() || jobs.isWorkerThread() ||
 		!jobs.isCurrentThread(JOB_OWNER_GAME))
 		return fallback(&jobs, *metrics);
+#if defined(_WIN64)
+	if (options.performanceReferenceLedger != 0 &&
+		options.performanceReferenceLedger->runMode() == performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING)
+		return consumePhysicsPrefixes(snapshots, snapshotCount, output, scratch, options, *metrics);
+#endif
 	if (jobs.workerCount() <= 1)
 		return PHYSICS_INTEGRATION_POLICY_INELIGIBLE;
 	const unsigned rangeCount = JobSystem::chooseRangeCount(snapshotCount,
@@ -885,6 +1215,11 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 	metrics->rangeCount = rangeCount;
 	if (rangeCount <= 1)
 		return PHYSICS_INTEGRATION_POLICY_INELIGIBLE;
+
+#if defined(_WIN64)
+	PhysicsSourceAttempt sourceAttempt(options, snapshots, snapshotCount,
+		metrics->effectiveMinimumGrain, jobs, *metrics);
+#endif
 
 	JobSubmission *submissions = 0;
 	JobHandle *handles = 0;
@@ -934,8 +1269,15 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 		for (unsigned pointerIndex = 0; pointerIndex != rangeCount; ++pointerIndex)
 			jobPointers[pointerIndex] = 0;
 
-		if (options.testFault != PHYSICS_INTEGRATION_TEST_GROUP_FAILURE)
-			group = jobs.createGroup();
+		try
+		{
+			if (options.testFault != PHYSICS_INTEGRATION_TEST_GROUP_FAILURE)
+				group = jobs.createGroup();
+		}
+		catch (...)
+		{
+			// Treat allocator exhaustion exactly like an invalid scheduler group.
+		}
 		if (!group.isValid())
 		{
 			delete[] submissions;
@@ -959,11 +1301,18 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 				jobsReady = false;
 				break;
 			}
+#if defined(_WIN64)
+			sourceAttempt.plan(executions[rangeIndex], rangeIndex, range.begin, range.end);
+#endif
 			jobPointers[rangeIndex] = new (std::nothrow) PhysicsIntegrationJob(
 				snapshots, scratch, rangeIndex, range.begin, range.end,
 				floatingPointState, options.testFault, options.testOrdinal,
 				executions + rangeIndex, &activePhysicalWorkers,
-				&peakPhysicalWorkers);
+				&peakPhysicalWorkers
+#if defined(_WIN64)
+				, options.testHooks
+#endif
+				);
 			if (jobPointers[rangeIndex] == 0)
 			{
 				jobsReady = false;
@@ -994,7 +1343,12 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 		prepareStart;
 	const PhysicsIntegrationMetricCounter waitStart =
 		PhysicsIntegrationClockNowNanoseconds();
-	const unsigned physicalCompletionTimeoutMilliseconds = 8;
+	unsigned physicalCompletionTimeoutMilliseconds = 8;
+#if defined(_WIN64)
+	if (options.testHooks != 0 && options.testHooks->physicalWaitMilliseconds != 0)
+		physicalCompletionTimeoutMilliseconds = options.testHooks->physicalWaitMilliseconds < 1000 ?
+			options.testHooks->physicalWaitMilliseconds : 1000;
+#endif
 	const bool forcePhysicalTimeout = options.testFault ==
 		PHYSICS_INTEGRATION_TEST_PHYSICAL_WAIT_TIMEOUT;
 	bool physicalFenceCompleted = false;
@@ -1002,12 +1356,18 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 #if defined(_WIN64)
 		performance::KernelPerformanceScope waitScope(performanceLedger,
 			options.performanceBatch, performance::KERNEL_PERFORMANCE_WAIT);
+		if (options.testHooks != 0 && options.testHooks->beforeWait != 0)
+			options.testHooks->beforeWait(options.testHooks->context);
 #endif
 		physicalFenceCompleted = !forcePhysicalTimeout &&
 			jobs.waitWithoutOwnerHelp(group, physicalCompletionTimeoutMilliseconds);
 		if (!physicalFenceCompleted)
 		{
 			jobs.cancel(group);
+#if defined(_WIN64)
+			if (options.testHooks != 0 && options.testHooks->afterCancel != 0)
+				options.testHooks->afterCancel(options.testHooks->context);
+#endif
 			jobs.wait(group);
 		}
 		else
@@ -1069,6 +1429,10 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 			result = fallback(&jobs, *metrics);
 		if (result == PHYSICS_INTEGRATION_PARALLEL)
 		{
+#if defined(_WIN64)
+			if (!validatePhysicsPreparedOutput(options, snapshots, snapshotCount, scratch))
+				result = fallback(&jobs, *metrics);
+#else
 			for (unsigned validationIndex = 0; validationIndex != snapshotCount; ++validationIndex)
 			{
 				if (!ValidatePhysicsIntegrationOutput(snapshots[validationIndex], scratch[validationIndex]))
@@ -1077,22 +1441,39 @@ PhysicsIntegrationBatchResult PreparePhysicsIntegrationPrefixes(
 					break;
 				}
 			}
+#endif
 		}
 		if (result == PHYSICS_INTEGRATION_PARALLEL)
 		{
 			memcpy(output, scratch, snapshotCount * sizeof(PhysicsIntegrationOutput));
 		#if defined(_WIN64)
+			observePhysicsTest(options.testHooks, PHYSICS_INTEGRATION_TEST_PUBLICATION,
+				0, 0, snapshotCount, snapshotCount, true);
+			sourceAttempt.release(executions, metrics->submittedJobs, true, false);
 			// Reference hashing and any detached oracle work belong to the owner
 			// validation interval, after the real output is complete.
 			observePhysicsReferenceBatch(options, snapshots, snapshotCount, output);
 		#endif
 		}
+#if defined(_WIN64)
+		else sourceAttempt.release(executions, metrics->submittedJobs, false, group.wasCancelled());
+#endif
 	}
 
 	delete[] submissions;
 	delete[] handles;
 	delete[] jobPointers;
 	delete[] executions;
+#if defined(_WIN64)
+	if (options.testHooks != 0)
+		for (unsigned released = 0; released != rangeCount; ++released)
+		{
+			JobRange range;
+			JobSystem::rangeForIndex(snapshotCount, rangeCount, released, range);
+			observePhysicsTest(options.testHooks, PHYSICS_INTEGRATION_TEST_RANGE_RELEASED,
+				released, range.begin, range.end);
+		}
+#endif
 	// prepareNanoseconds is owner CPU overhead on both sides of the fence:
 	// validation/allocation/submission plus validation/publication/reclamation.
 	metrics->prepareNanoseconds +=

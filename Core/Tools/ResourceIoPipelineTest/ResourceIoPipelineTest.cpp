@@ -1,4 +1,5 @@
 #include "Lib/ResourceIoPipeline.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -347,13 +348,14 @@ void testOwnedNativeRange()
 
 int main(int argc, char **argv)
 {
-	const bool localCapacity = argc == 2 &&
-		std::strcmp(argv[1], "--local-capacity") == 0;
-	if (argc != 1 && !localCapacity)
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
 	{
-		std::fprintf(stderr, "Usage: core_resource_io_pipeline_tests [--local-capacity]\n");
+		std::fprintf(stderr, "Usage: core_resource_io_pipeline_tests "
+			"[--local-capacity|--external-qualification]\n");
 		return 2;
 	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	owner = std::this_thread::get_id();
 	const unsigned workers[] = {1, 2, 4, 8, 16, 0};
 	const unsigned localWorkers[] = {1, 2, 4, 8, 12};

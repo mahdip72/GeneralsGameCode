@@ -473,7 +473,9 @@ int main(int argc, char **argv)
 	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity,
 		&serialPipelines, "--serial-policy"))
 	{
-		fprintf(stderr, "Usage: core_water_polygon_kernel_tests [--local-capacity] [--serial-policy]\n");
+		fprintf(stderr, "Usage: core_water_polygon_kernel_tests "
+			"[--local-capacity|--external-qualification] "
+			"[--serial-policy]\n");
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);

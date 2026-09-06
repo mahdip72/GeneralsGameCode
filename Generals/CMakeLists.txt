@@ -55,11 +55,6 @@ if("${CMAKE_HOST_SYSTEM}" MATCHES "Windows" AND "${CMAKE_SYSTEM}" MATCHES "Windo
 
 endif()
 
-if(IS_VS6_BUILD AND RTS_BUILD_GENERALS_PRODUCT)
-    rts_validate_task_owned_vc6_install_prefix(
-        "${RTS_INSTALL_PREFIX_GENERALS}" "RTS_INSTALL_PREFIX_GENERALS")
-endif()
-
 # Native products have no compatible retail registry location.  Keep an
 # explicit title prefix authoritative, otherwise install below the standard
 # CMake prefix so presets and --prefix remain portable.
@@ -110,13 +105,13 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS AND TARGET g_generals)
             DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
     endif()
 
-    # Exercise the Generals title graph from the exact disposable native
-    # runtime that is promoted. Keep this test-only utility out of Win32.
+    # Exercise the Generals title graph beside the exact disposable native
+    # runtime. Keep validation-only binaries outside the promoted title tree.
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET g_skirmish_ai_runner_contract_tests)
         install(TARGETS g_skirmish_ai_runner_contract_tests
-            RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
+            RUNTIME DESTINATION "Validation/Generals")
         install(FILES $<TARGET_PDB_FILE:g_skirmish_ai_runner_contract_tests>
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}" OPTIONAL)
+            DESTINATION "Validation/Generals" OPTIONAL)
     endif()
 endif()
 

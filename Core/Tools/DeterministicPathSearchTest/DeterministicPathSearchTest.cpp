@@ -4,6 +4,11 @@
 #if defined(_WIN64)
 #include "Lib/KernelPerformanceDiagnostics.h"
 #include "Lib/KernelPerformanceReference.h"
+#include "../TestSupport/NativeKernelSourceConsumerTest.h"
+#if !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 
 #include <algorithm>
@@ -15,6 +20,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -34,6 +41,12 @@ extern "C" bool rts_direct_path_wait_for_test_pause_count(
 	unsigned pausePoint, unsigned requiredCount, unsigned timeoutMilliseconds);
 extern "C" void rts_direct_path_release_test_pause(unsigned pausePoint);
 extern "C" void rts_direct_path_set_test_fault_mask(unsigned faultMask);
+#if defined(_WIN64)
+extern "C" void rts_job_system_set_test_pause_mask(unsigned pauseMask);
+extern "C" bool rts_job_system_wait_for_test_pause(unsigned pausePoint,
+	unsigned timeoutMilliseconds);
+extern "C" void rts_job_system_release_test_pause(unsigned pausePoint);
+#endif
 
 namespace
 {
@@ -2043,6 +2056,31 @@ void TestOrdinaryAdaptiveLargeObstructedBatchAndFaults()
 	assert(faulted.executionSnapshot().failedRangeJobCount != 0);
 	rts_direct_path_set_test_fault_mask(0);
 
+	const unsigned dispatchVectorAllocationFault = 256U;
+	rts::DeterministicOrdinaryPathBatch allocationFaulted;
+	bool allocationExceptionEscaped = false;
+	bool allocationCompleted = true;
+	rts_direct_path_set_test_fault_mask(dispatchVectorAllocationFault);
+	try
+	{
+		allocationCompleted = allocationFaulted.executeSynchronously(jobs,
+			fixture.grid, requests.data(), 4, 1000);
+	}
+	catch (...)
+	{
+		allocationExceptionEscaped = true;
+	}
+	rts_direct_path_set_test_fault_mask(0);
+	assert(!allocationExceptionEscaped);
+	assert(!allocationCompleted);
+	const rts::DeterministicOrdinaryPathBatchExecutionSnapshot allocationExecution =
+		allocationFaulted.executionSnapshot();
+	assert(!allocationExecution.completed && !allocationExecution.timedOut);
+	assert(allocationExecution.submittedRangeJobCount == 0);
+	rts::DeterministicOrdinaryPathBatch recoveredAfterAllocation;
+	assert(recoveredAfterAllocation.executeSynchronously(jobs, fixture.grid,
+		requests.data(), 4, 1000));
+
 	std::vector<rts::DeterministicOrdinaryPathBatchRequest> staleRequests(1,
 		requests[0]);
 	staleRequests[0].search.expectedSnapshotGeneration = fixture.generation + 1;
@@ -2063,6 +2101,1584 @@ void TestOrdinaryAdaptiveLargeObstructedBatchAndFaults()
 	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
 	jobs.shutdown();
 }
+
+#if defined(_WIN64)
+struct NativePathWorkerScope
+{
+	NativePathWorkerScope() : jobs(rts::JobSystem::instance())
+	{
+		assert(jobs.outstandingJobCount() == 0);
+		rts::JobSystemConfig config;
+		config.workerCount = 4;
+		config.queueCapacity = 64;
+		config.scratchBytesPerWorker = 4096;
+		config.pinWorkers = false;
+		assert(jobs.start(config));
+		assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+	}
+
+	~NativePathWorkerScope()
+	{
+		assert(jobs.outstandingJobCount() == 0);
+		jobs.shutdown();
+		// Native owners must drain and shut down the scheduler while the owner
+		// identity is still attached.  Unregister is the final teardown step;
+		// doing it first hides late source/reap calls behind a null owner.
+		assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+	}
+
+	rts::JobSystem &jobs;
+};
+
+struct NativeOrdinaryQuotaFixture
+{
+	explicit NativeOrdinaryQuotaFixture(std::size_t requestCount) :
+		cells(3277), requests(requestCount), grid()
+	{
+		for (auto &cell : cells)
+		{
+			cell = {};
+			cell.traversalMask = 1;
+			cell.obstacleObjectId = rts::DETERMINISTIC_PATH_INVALID_OBJECT_ID;
+			cell.positionObjectId = rts::DETERMINISTIC_PATH_INVALID_OBJECT_ID;
+			cell.goalObjectId = rts::DETERMINISTIC_PATH_INVALID_OBJECT_ID;
+			cell.blockZone = cell.globalZone = cell.zone = 7;
+			cell.type = rts::DETERMINISTIC_PATH_CELL_CLEAR;
+			cell.flags = rts::DETERMINISTIC_PATH_NO_UNITS;
+			cell.layer = rts::DETERMINISTIC_PATH_LAYER_GROUND;
+			cell.connectsToLayer = rts::DETERMINISTIC_PATH_LAYER_INVALID;
+			cell.blockPassable = 1;
+			cell.navigationFlags = rts::DETERMINISTIC_PATH_INSIDE_LOGICAL_EXTENT;
+		}
+		grid.cells = cells.data();
+		grid.width = 3277;
+		grid.height = 1;
+		grid.snapshotGeneration = 3207;
+		for (std::size_t i = 0; i < requestCount; ++i)
+		{
+			auto &request = requests[i].search;
+			request = {};
+			request.expectedSnapshotGeneration = grid.snapshotGeneration;
+			request.objectId = static_cast<std::uint32_t>(1000 + i);
+			request.goalX = 3276;
+			request.traversalMask = 1;
+			request.maximumExpandedNodes = 3277;
+			request.availableCellInfoCount = 3277;
+			request.requiredZone = 7;
+			request.centerInCell = 1;
+			request.allowDiagonal = 1;
+			request.expectedLayer = rts::DETERMINISTIC_PATH_LAYER_GROUND;
+			request.isHuman = 1;
+			request.hierarchyMode = rts::DETERMINISTIC_PATH_HIERARCHY_PREPUBLISHED;
+			request.hierarchyBlockSize = 10;
+			// This is the native ordinary A* helper's valid clear-line subset,
+			// not the title owner's separate obstructed-only admission fixture.
+			request.requireLegacyDirectLine = 0;
+			request.requireObstructedSearch = 0;
+			requests[i].ownerToken = (std::uint64_t(3207) << 32) | (i + 1);
+		}
+	}
+
+	std::vector<rts::DeterministicPathCell> cells;
+	std::vector<rts::DeterministicOrdinaryPathBatchRequest> requests;
+	rts::ImmutableNavigationGrid grid;
+};
+
+void AssertLiteralNativeOrdinaryQuotaPath(
+	const rts::DeterministicOrdinaryPathBatchResult &result,
+	const rts::DeterministicOrdinaryPathBatchRequest &request)
+{
+	assert(result.status == rts::DETERMINISTIC_PATH_FOUND);
+	assert(result.pointCount == 3277 && result.allocationCount == 3277);
+	assert(result.cleanupCount == 3276 && result.passableBlockCount == 0);
+	assert(result.expandedNodeCount == 2 && result.discoveredNodeCount == 3277);
+	assert(result.cumulativeCellCount == 3276 && !result.hierarchyAllPassable);
+	assert(result.snapshotGeneration == 3207);
+	assert(result.objectId == request.search.objectId);
+	assert(result.ownerToken == request.ownerToken);
+	assert(result.materializationPlanHash != 0);
+	// The initial direct injection discovers the complete horizontal chain.
+	// Its decreasing estimated totals make the goal the second pop. The goal
+	// is terminal rather than open/closed, so cleanup excludes exactly one cell.
+	assert(result.pointCount * 12 + result.allocationCount * 4 +
+		result.cleanupCount * 4 == 65536);
+	for (std::size_t i = 0; i < 3277; ++i)
+	{
+		assert(result.points[i].x == static_cast<std::int32_t>(i));
+		assert(result.points[i].y == 0);
+		assert(result.points[i].layer == rts::DETERMINISTIC_PATH_LAYER_GROUND);
+		assert(result.points[i].reserved[0] == 0 &&
+			result.points[i].reserved[1] == 0 && result.points[i].reserved[2] == 0);
+		const std::uint32_t expectedAllocation = i == 0 ? 3276 :
+			(i == 1 ? 0 : static_cast<std::uint32_t>(i - 1));
+		assert(result.allocationOrder[i] == expectedAllocation);
+	}
+	for (std::size_t i = 0; i < 3276; ++i)
+	{
+		const std::uint32_t expectedCleanup = i == 3275 ? 0 :
+			static_cast<std::uint32_t>(3275 - i);
+		assert(result.cleanupOrder[i] == expectedCleanup);
+	}
+}
+
+void TestNativeOrdinaryQuotaOneRequestLiteral()
+{
+	NativePathWorkerScope runtime;
+	NativeOrdinaryQuotaFixture input(1);
+	const auto before = runtime.jobs.metrics();
+	rts::DeterministicOrdinaryPathBatch batch;
+	assert(batch.executeSynchronously(runtime.jobs, input.grid,
+		input.requests.data(), input.requests.size(), 10000));
+	const auto execution = batch.executionSnapshot();
+	assert(execution.completed && !execution.timedOut);
+	assert(execution.requestCount == 1 && execution.rangeCount == 1);
+	assert(execution.grainSize == 1 && execution.submittedRangeJobCount == 1);
+	assert(execution.workerExecutedRangeJobCount == 1);
+	assert(execution.ownerExecutedRangeJobCount == 0);
+	assert(execution.resultStorageBytes == 65536);
+	AssertLiteralNativeOrdinaryQuotaPath(batch.result(0), input.requests[0]);
+	assert(runtime.jobs.metrics().ownerHelpCount == before.ownerHelpCount);
+}
+
+void TestNativeOrdinaryQuotaRetains2048AndRefusesOne()
+{
+	NativePathWorkerScope runtime;
+	NativeOrdinaryQuotaFixture input(2049);
+	const auto before = runtime.jobs.metrics();
+	rts::DeterministicOrdinaryPathBatch batch;
+	assert(batch.executeSynchronously(runtime.jobs, input.grid,
+		input.requests.data(), input.requests.size(), 10000));
+	const auto execution = batch.executionSnapshot();
+	assert(execution.completed && !execution.timedOut);
+	assert(execution.requestCount == 2049 && execution.rangeCount == 4);
+	assert(execution.grainSize == 513 && execution.submittedRangeJobCount == 4);
+	assert(execution.workerExecutedRangeJobCount == 4);
+	assert(execution.ownerExecutedRangeJobCount == 0);
+	assert(execution.failedRangeJobCount == 0);
+	assert(execution.resultStorageBytes == 134217728);
+	unsigned found = 0, refused = 0;
+	for (std::size_t i = 0; i < input.requests.size(); ++i)
+	{
+		const auto result = batch.result(i);
+		assert(batch.requestExecutionSnapshot(i).state ==
+			rts::DIRECT_PATH_EXECUTION_WORKER);
+		if (result.status == rts::DETERMINISTIC_PATH_FOUND)
+		{
+			++found;
+			AssertLiteralNativeOrdinaryQuotaPath(result, input.requests[i]);
+		}
+		else
+		{
+			++refused;
+			assert(result.status == rts::DETERMINISTIC_PATH_BUDGET_EXHAUSTED);
+			assert(result.expandedNodeCount == 2 && result.discoveredNodeCount == 3277);
+			assert(result.pointCount == 0 && result.allocationCount == 0);
+			assert(result.cleanupCount == 0 && result.materializationPlanHash == 0);
+		}
+	}
+	// Which request loses the shared reservation race is source-dynamic. Its
+	// identity is not guessed from range order; the real total is exact.
+	assert(found == 2048 && refused == 1);
+	assert(runtime.jobs.metrics().ownerHelpCount == before.ownerHelpCount);
+}
+
+struct NativeOrdinaryRangeObservation
+{
+	struct Entry
+	{
+		unsigned rangeIndex;
+		std::size_t begin;
+		std::size_t end;
+	};
+
+	NativeOrdinaryRangeObservation() : entries(), count(0) {}
+
+	std::array<Entry, 4> entries;
+	unsigned count;
+};
+
+void ObserveNativeOrdinaryRange(void *opaque,
+	rts::DeterministicOrdinaryPathTestEvent event, unsigned rangeIndex,
+	std::size_t begin, std::size_t end)
+{
+	assert(event == rts::DETERMINISTIC_ORDINARY_PATH_TEST_RANGE_PLANNED);
+	NativeOrdinaryRangeObservation &observation =
+		*static_cast<NativeOrdinaryRangeObservation *>(opaque);
+	if (observation.count < observation.entries.size())
+	{
+		NativeOrdinaryRangeObservation::Entry &entry =
+			observation.entries[observation.count];
+		entry.rangeIndex = rangeIndex;
+		entry.begin = begin;
+		entry.end = end;
+	}
+	++observation.count;
+}
+
+void TestNativeOrdinaryFiveRequestCanonicalRanges()
+{
+	NativePathWorkerScope runtime;
+	NativeOrdinaryQuotaFixture input(5);
+	NativeOrdinaryRangeObservation observation;
+	rts::DeterministicOrdinaryPathTestHooks hooks;
+	hooks.context = &observation;
+	hooks.observe = &ObserveNativeOrdinaryRange;
+	const auto before = runtime.jobs.metrics();
+	rts::DeterministicOrdinaryPathBatch batch;
+	assert(batch.executeSynchronously(runtime.jobs, input.grid,
+		input.requests.data(), input.requests.size(), 10000,
+		nullptr, nullptr, nullptr, &hooks));
+
+	assert(observation.count == 4);
+	const std::size_t expectedBegins[4] = {0, 2, 3, 4};
+	const std::size_t expectedEnds[4] = {2, 3, 4, 5};
+	for (unsigned i = 0; i < 4; ++i)
+	{
+		const NativeOrdinaryRangeObservation::Entry &entry =
+			observation.entries[i];
+		assert(entry.rangeIndex == i);
+		assert(entry.begin == expectedBegins[i]);
+		assert(entry.end == expectedEnds[i]);
+		assert(entry.begin < entry.end);
+		assert(i == 0 ? entry.begin == 0 :
+			entry.begin == observation.entries[i - 1].end);
+		rts::JobRange canonical = {};
+		assert(rts::JobSystem::rangeForIndex(5, 4, i, canonical));
+		assert(entry.begin == canonical.begin && entry.end == canonical.end);
+	}
+	assert(observation.entries[3].end == 5);
+
+	const rts::DeterministicOrdinaryPathBatchExecutionSnapshot execution =
+		batch.executionSnapshot();
+	assert(execution.completed && !execution.timedOut);
+	assert(execution.requestCount == 5 && execution.rangeCount == 4);
+	assert(execution.grainSize == 2);
+	assert(execution.submittedRangeJobCount == 4);
+	assert(execution.workerExecutedRangeJobCount == 4);
+	assert(execution.ownerExecutedRangeJobCount == 0);
+	assert(execution.failedRangeJobCount == 0);
+	assert(execution.resultStorageBytes == 327680);
+
+	unsigned found = 0;
+	for (std::size_t i = 0; i < input.requests.size(); ++i)
+	{
+		const rts::DeterministicDirectPathExecutionSnapshot requestExecution =
+			batch.requestExecutionSnapshot(i);
+		assert(requestExecution.submitted && requestExecution.succeeded);
+		assert(requestExecution.state == rts::DIRECT_PATH_EXECUTION_WORKER);
+		assert(requestExecution.physicalWorkerIndex !=
+			rts::JOB_INVALID_PHYSICAL_WORKER_INDEX);
+		const rts::DeterministicOrdinaryPathBatchResult result = batch.result(i);
+		AssertLiteralNativeOrdinaryQuotaPath(result, input.requests[i]);
+		assert(result.status == rts::DETERMINISTIC_PATH_FOUND);
+		++found;
+	}
+	assert(found == 5);
+	assert(runtime.jobs.outstandingJobCount() == 0);
+	assert(runtime.jobs.metrics().ownerHelpCount == before.ownerHelpCount);
+}
+
+void WaitForNativePathDrain(rts::JobSystem &jobs)
+{
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (jobs.outstandingJobCount() != 0 && std::chrono::steady_clock::now() < deadline)
+		std::this_thread::yield();
+	assert(jobs.outstandingJobCount() == 0);
+}
+
+// Release the already-existing scheduler finalizer pause after one new real
+// submission. The deadline always releases it; failure is asserted only after
+// joining the controller, so an admission regression cannot strand a worker.
+struct NativePathFinalizerRelease
+{
+	explicit NativePathFinalizerRelease(rts::JobSystem &jobs) :
+		observedSubmission(false), controller([this, &jobs,
+			submittedBefore = jobs.metrics().submittedJobCount]()
+		{
+			const auto deadline = std::chrono::steady_clock::now() +
+				std::chrono::seconds(5);
+			while (jobs.metrics().submittedJobCount == submittedBefore &&
+				std::chrono::steady_clock::now() < deadline)
+			{
+				std::this_thread::yield();
+			}
+			observedSubmission.store(jobs.metrics().submittedJobCount !=
+				submittedBefore, std::memory_order_release);
+			rts_job_system_release_test_pause(32768);
+		})
+	{}
+
+	void join()
+	{
+		controller.join();
+		rts_job_system_set_test_pause_mask(0);
+		assert(observedSubmission.load(std::memory_order_acquire));
+	}
+
+	std::atomic<bool> observedSubmission;
+	std::thread controller;
+};
+
+void TestNativeDirectEntryPauseWaitsForBothAdmittedWorkers()
+{
+	NativePathWorkerScope runtime;
+	DirectFixture first(0, 0, 4, 0), second(0, 1, 4, 1);
+	second.snapshot.requestToken = 74;
+	second.snapshot.objectId = 100;
+	const rts::DirectPathSnapshot inputs[] = {first.snapshot, second.snapshot};
+	const auto before = runtime.jobs.metrics();
+	const unsigned lateBefore = rts::GetDeterministicDirectPathLateDrainExecutionCount();
+	std::atomic<unsigned> entered(0);
+	std::atomic<bool> releaseBlockers(false), batchReturned(false);
+	std::atomic<bool> firstReached(false), prematureReturn(false);
+	rts::JobGroup blockers = runtime.jobs.createGroup();
+	assert(blockers.isValid());
+	rts::JobSubmission submissions[3];
+	rts::JobHandle handles[3];
+	for (unsigned index = 0; index != 3; ++index)
+	{
+		submissions[index].job = new BlockingJob(entered, releaseBlockers);
+		submissions[index].priority = rts::JOB_PRIORITY_NORMAL;
+	}
+	const bool blockersSubmitted = runtime.jobs.trySubmitBatch(submissions, 3, blockers, handles);
+	if (!blockersSubmitted)
+	{
+		for (unsigned index = 0; index != 3; ++index) delete submissions[index].job;
+		assert(blockersSubmitted);
+		return;
+	}
+	const auto entryDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+	while (entered.load(std::memory_order_acquire) != 3 &&
+		std::chrono::steady_clock::now() < entryDeadline)
+		std::this_thread::yield();
+	const bool allBlockersEntered = entered.load(std::memory_order_acquire) == 3;
+	if (!allBlockersEntered)
+	{
+		releaseBlockers.store(true, std::memory_order_release);
+		WaitForNativePathDrain(runtime.jobs);
+		assert(allBlockersEntered);
+		return;
+	}
+
+	// Exactly one worker is available. The second admitted direct request
+	// cannot enter until this controller releases the three real blockers.
+	// The 100-ms observation is bounded adverse scheduling evidence, not an
+	// ordinary timeout/qualification measurement or an absolute scheduler proof.
+	rts_direct_path_set_test_pause_mask(1);
+	std::thread controller;
+	try
+	{
+		controller = std::thread([&]()
+		{
+			const bool reached = rts_direct_path_wait_for_test_pause(1, 5000);
+			firstReached.store(reached, std::memory_order_release);
+			if (reached)
+			{
+				const auto observationDeadline = std::chrono::steady_clock::now() +
+					std::chrono::milliseconds(100);
+				while (!batchReturned.load(std::memory_order_acquire) &&
+					std::chrono::steady_clock::now() < observationDeadline)
+					std::this_thread::yield();
+				prematureReturn.store(batchReturned.load(std::memory_order_acquire),
+					std::memory_order_release);
+			}
+			releaseBlockers.store(true, std::memory_order_release);
+		});
+	}
+	catch (...)
+	{
+		releaseBlockers.store(true, std::memory_order_release);
+		rts_direct_path_set_test_pause_mask(0);
+		WaitForNativePathDrain(runtime.jobs);
+		assert(false && "direct entry-pause controller could not start");
+		return;
+	}
+	rts::DeterministicDirectPathBatch retained;
+	const bool completed = retained.executeSynchronously(runtime.jobs, inputs, 2, 1);
+	batchReturned.store(true, std::memory_order_release);
+	controller.join();
+	const bool bothReached = rts_direct_path_wait_for_test_pause_count(1, 2, 25);
+	rts_direct_path_release_test_pause(1);
+	rts_direct_path_set_test_pause_mask(0);
+	WaitForNativePathDrain(runtime.jobs);
+
+	// Every held job is released and drained before any behavioral assertion.
+	assert(firstReached.load(std::memory_order_acquire));
+	assert(!prematureReturn.load(std::memory_order_acquire));
+	assert(bothReached);
+	assert(!completed && retained.executionSnapshot().timedOut);
+	assert(retained.executionSnapshot().submittedJobCount == 2);
+	assert(blockers.isComplete() && !blockers.failed() && !blockers.wasCancelled());
+	for (unsigned index = 0; index != 2; ++index)
+	{
+		assert(retained.requestExecutionSnapshot(index).state == rts::DIRECT_PATH_EXECUTION_CANCELLED);
+		assert(!retained.requestExecutionSnapshot(index).succeeded);
+		assert(retained.result(index).status == rts::DIRECT_PATH_INVALID_INPUT);
+		assert(retained.result(index).rawPointCount == 0);
+	}
+	assert(rts::GetDeterministicDirectPathLateDrainExecutionCount() == lateBefore + 2);
+	assert(runtime.jobs.metrics().submittedJobCount == before.submittedJobCount + 5);
+	assert(runtime.jobs.metrics().executedJobCount == before.executedJobCount + 5);
+	assert(runtime.jobs.metrics().ownerHelpCount == before.ownerHelpCount);
+}
+
+void TestNativeDirectLateDrainSlotBeforeGroupTerminal()
+{
+	// Entry pause covers a helper never entered. Active pause is after the
+	// original cancellation check: the real direct helper runs on release,
+	// but its cancelled request must never regain publication authority.
+	const unsigned pausePoints[] = {1, 2};
+	for (const unsigned pausePoint : pausePoints)
+	{
+		NativePathWorkerScope runtime;
+		DirectFixture first(0, 0, 4, 0), second(0, 1, 4, 1);
+		second.snapshot.requestToken = 74;
+		second.snapshot.objectId = 100;
+		const rts::DirectPathSnapshot inputs[] = {first.snapshot, second.snapshot};
+		const auto before = runtime.jobs.metrics();
+		const unsigned lateBefore = rts::GetDeterministicDirectPathLateDrainExecutionCount();
+		rts::DeterministicDirectPathBatch retained, busy, later;
+		rts_direct_path_set_test_pause_mask(pausePoint);
+		assert(!retained.executeSynchronously(runtime.jobs, inputs, 2, 1));
+		assert(retained.executionSnapshot().timedOut);
+		assert(retained.executionSnapshot().submittedJobCount == 2);
+		assert(!busy.executeSynchronously(runtime.jobs, inputs, 2, 1));
+		assert(busy.executionSnapshot().submittedJobCount == 0);
+		for (unsigned index = 0; index != 2; ++index)
+			assert(retained.requestExecutionSnapshot(index).state == rts::DIRECT_PATH_EXECUTION_CANCELLED);
+
+		rts_job_system_set_test_pause_mask(32768);
+		rts_direct_path_release_test_pause(pausePoint);
+		assert(rts_job_system_wait_for_test_pause(32768, 5000));
+		const auto releaseDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (runtime.jobs.metrics().executedJobCount != before.executedJobCount + 2 &&
+			std::chrono::steady_clock::now() < releaseDeadline)
+			std::this_thread::yield();
+		assert(runtime.jobs.metrics().executedJobCount == before.executedJobCount + 2);
+		rts_direct_path_set_test_pause_mask(0);
+		// The actual executed count advances only after each job destructor.
+		// Both retained jobs have freed the path slot, while scheduler finish
+		// remains held before terminal/outstanding publication.
+		assert(runtime.jobs.outstandingJobCount() == 2);
+		assert(rts::GetDeterministicDirectPathLateDrainExecutionCount() == lateBefore + 2);
+		for (unsigned index = 0; index != 2; ++index)
+			assert(retained.result(index).status == rts::DIRECT_PATH_INVALID_INPUT);
+		NativePathFinalizerRelease release(runtime.jobs);
+		const bool laterCompleted = later.executeSynchronously(runtime.jobs,
+			inputs, 2, 10000);
+		release.join();
+		assert(laterCompleted && later.executionSnapshot().submittedJobCount == 2);
+		WaitForNativePathDrain(runtime.jobs);
+		for (unsigned index = 0; index != 2; ++index)
+		{
+			assert(later.result(index).status == rts::DIRECT_PATH_FOUND);
+			assert(retained.requestExecutionSnapshot(index).state == rts::DIRECT_PATH_EXECUTION_CANCELLED);
+			assert(!retained.requestExecutionSnapshot(index).succeeded);
+			assert(retained.result(index).rawPointCount == 0);
+		}
+		assert(runtime.jobs.metrics().submittedJobCount == before.submittedJobCount + 4);
+		assert(runtime.jobs.metrics().executedJobCount == before.executedJobCount + 4);
+		assert(runtime.jobs.metrics().ownerHelpCount == before.ownerHelpCount);
+	}
+}
+
+void TestNativeOrdinaryLateDrainSlotBeforeGroupTerminal()
+{
+	// Both entry and active-before-loop cancellation are real existing seams.
+	// Neither proves a completed ordinary search/materialization after timeout.
+	const unsigned pausePoints[] = {4, 8};
+	for (const unsigned pausePoint : pausePoints)
+	{
+		NativePathWorkerScope runtime;
+		OrdinaryFixture input(40, 40, 3210);
+		const auto request = input.makeRequest(0);
+		const auto before = runtime.jobs.metrics();
+		const unsigned lateBefore = rts::GetDeterministicOrdinaryPathLateDrainExecutionCount();
+		rts::DeterministicOrdinaryPathBatch retained, busy, later;
+		rts_direct_path_set_test_pause_mask(pausePoint);
+		assert(!retained.executeSynchronously(runtime.jobs, input.grid, &request, 1, 1));
+		assert(retained.executionSnapshot().timedOut);
+		assert(retained.executionSnapshot().submittedRangeJobCount == 1);
+		assert(!busy.executeSynchronously(runtime.jobs, input.grid, &request, 1, 1));
+		assert(busy.executionSnapshot().submittedRangeJobCount == 0);
+
+		rts_job_system_set_test_pause_mask(32768);
+		rts_direct_path_release_test_pause(pausePoint);
+		assert(rts_job_system_wait_for_test_pause(32768, 5000));
+		rts_direct_path_set_test_pause_mask(0);
+		assert(runtime.jobs.outstandingJobCount() == 1);
+		assert(rts::GetDeterministicOrdinaryPathLateDrainExecutionCount() == lateBefore + 1);
+		assert(retained.result(0).status == rts::DETERMINISTIC_PATH_INVALID_INPUT);
+		NativePathFinalizerRelease release(runtime.jobs);
+		const bool laterCompleted = later.executeSynchronously(runtime.jobs,
+			input.grid, &request, 1, 10000);
+		release.join();
+		assert(laterCompleted && later.executionSnapshot().submittedRangeJobCount == 1);
+		assert(later.result(0).status == rts::DETERMINISTIC_PATH_FOUND);
+		WaitForNativePathDrain(runtime.jobs);
+		assert(!retained.requestExecutionSnapshot(0).succeeded);
+		assert(retained.result(0).pointCount == 0);
+		assert(runtime.jobs.metrics().submittedJobCount == before.submittedJobCount + 2);
+		assert(runtime.jobs.metrics().executedJobCount == before.executedJobCount + 2);
+		assert(runtime.jobs.metrics().ownerHelpCount == before.ownerHelpCount);
+	}
+}
+
+// Actual ordinary native source/consumer controls, without a copied executor or quota.
+
+unsigned g_nativeOrdinaryBudgetFailures = 0;
+const char *g_nativeOrdinaryBudgetRole = "unset";
+const char *g_nativeOrdinaryBudgetCase = "unset";
+
+bool NativeOrdinaryBudgetExpect(bool value, const char *message)
+{
+	if (!value)
+	{
+		++g_nativeOrdinaryBudgetFailures;
+		std::printf("FAIL ordinary-budget case=%s role=%s: %s\n",
+			g_nativeOrdinaryBudgetCase, g_nativeOrdinaryBudgetRole, message);
+	}
+	return value;
+}
+
+struct NativeOrdinaryBudgetObservations
+{
+	static constexpr unsigned Maximum = 2050, A = 512, B = 2048, C = 2049;
+	std::array<std::atomic<unsigned>, Maximum> searches{}, materializers{}, grants{}, granted{}, refunds{}, imports{}, faults{};
+	std::array<rts::performance::KernelPerformanceRequestBudget, Maximum> budgets{};
+	std::array<rts::performance::KernelPerformanceRangeProgress, 4> progress{};
+	std::array<unsigned, 4> releasedRanges{};
+	std::array<std::atomic<unsigned>, rts::DETERMINISTIC_ORDINARY_PATH_TEST_BODY_EXIT + 1> sites{};
+	std::atomic<unsigned> physicalReserves{0}, detachedCalls{0};
+	std::atomic<bool> failed{false}, middle1Done{false}, middle2Done{false};
+	std::atomic<bool> bAtGrant{false}, aGranted{false}, bRefused{false}, aRefunded{false};
+	bool baseline, pressure;
+	rts_test::NativeKernelClock &clock;
+	const std::chrono::steady_clock::time_point deadline;
+
+	NativeOrdinaryBudgetObservations(bool consume, bool large, rts_test::NativeKernelClock &time) :
+		baseline(consume), pressure(large), clock(time),
+		deadline(std::chrono::steady_clock::now() + std::chrono::seconds(5)) {}
+	~NativeOrdinaryBudgetObservations() { releaseAll(); }
+	unsigned count() const { return pressure ? Maximum : 1; }
+	unsigned rangeCount() const { return pressure ? 4 : 1; }
+	void releaseAll() noexcept
+	{
+		middle1Done.store(true, std::memory_order_release);
+		middle2Done.store(true, std::memory_order_release);
+		bAtGrant.store(true, std::memory_order_release);
+		aGranted.store(true, std::memory_order_release);
+		bRefused.store(true, std::memory_order_release);
+		aRefunded.store(true, std::memory_order_release);
+	}
+	void waitFor(std::atomic<bool> &flag) noexcept
+	{
+		while (!flag.load(std::memory_order_acquire) && !failed.load(std::memory_order_acquire) &&
+			std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+		if (!flag.load(std::memory_order_acquire))
+		{
+			failed.store(true, std::memory_order_release);
+			releaseAll();
+		}
+	}
+	static void observe(void *opaque, rts::DeterministicOrdinaryPathTestEvent site,
+		unsigned range, std::size_t request, std::size_t bytes, bool actualGranted)
+	{
+		using namespace rts;
+		auto &self = *static_cast<NativeOrdinaryBudgetObservations *>(opaque);
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_REFERENCE_SERIAL_ENTER)
+		{
+			++self.detachedCalls;
+			return; // This event has no range/request identity.
+		}
+		if (site <= DETERMINISTIC_ORDINARY_PATH_TEST_REFERENCE_SERIAL_ENTER ||
+			site > DETERMINISTIC_ORDINARY_PATH_TEST_BODY_EXIT || request >= self.count() ||
+			range >= self.rangeCount() ||
+			JobSystem::instance().isCurrentThread(JOB_OWNER_GAME) != self.baseline)
+		{ self.failed = true; self.releaseAll(); return; }
+		const unsigned literalRange = !self.pressure || request < 513 ? 0 :
+			request < 1026 ? 1 : request < 1538 ? 2 : 3;
+		if (range != literalRange) { self.failed = true; self.releaseAll(); return; }
+		++self.sites[site];
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_SEARCH_ENTER) ++self.searches[request];
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_MATERIALIZATION_ENTER) ++self.materializers[request];
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_PHYSICAL_RESERVE) ++self.physicalReserves;
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_GRANT ||
+			site == DETERMINISTIC_ORDINARY_PATH_TEST_PHYSICAL_RESERVE ||
+			site == DETERMINISTIC_ORDINARY_PATH_TEST_GRANT_RETURNED ||
+			site == DETERMINISTIC_ORDINARY_PATH_TEST_REFUND_COMPLETED)
+			if (bytes != 65536) self.failed = true;
+
+		// Source-only actual-site interleaving; no owner waits in the consumer.
+		if (self.pressure && !self.baseline && site == DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_GRANT)
+		{
+			if (request == A)
+			{ self.waitFor(self.middle1Done); self.waitFor(self.middle2Done); self.waitFor(self.bAtGrant); }
+			if (request == B)
+			{ self.bAtGrant.store(true, std::memory_order_release); self.waitFor(self.aGranted); }
+			if (request == C) self.waitFor(self.aRefunded);
+		}
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_GRANT_RETURNED)
+		{
+			++self.grants[request];
+			if (actualGranted) ++self.granted[request];
+			if (actualGranted != (!self.pressure || request != B)) self.failed = true;
+			if (self.pressure && request == A) self.aGranted.store(true, std::memory_order_release);
+			if (self.pressure && request == B) self.bRefused.store(true, std::memory_order_release);
+		}
+		if (self.pressure && site == DETERMINISTIC_ORDINARY_PATH_TEST_FIRST_OUTPUT_ALLOCATION && request == A)
+		{
+			if (!self.baseline) self.waitFor(self.bRefused);
+			if (self.faults[request].fetch_add(1) != 0) self.failed = true;
+			throw std::bad_alloc(); // Same independently selected actual site in both roles.
+		}
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_REFUND_COMPLETED)
+		{
+			++self.refunds[request];
+			if (!self.pressure || request != A || bytes != 65536) self.failed = true;
+			if (request == A) self.aRefunded.store(true, std::memory_order_release);
+		}
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_MATERIALIZATION_EXIT && request == 1025)
+			self.middle1Done.store(true, std::memory_order_release);
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_MATERIALIZATION_EXIT && request == 1537)
+			self.middle2Done.store(true, std::memory_order_release);
+		rts::JobMetricCounter ticks = self.pressure ? 1 : 31 + static_cast<unsigned>(site);
+		if (!self.pressure && site == DETERMINISTIC_ORDINARY_PATH_TEST_SEARCH_ENTER) ticks = 7;
+		if (!self.pressure && site == DETERMINISTIC_ORDINARY_PATH_TEST_SEARCH_EXIT) ticks = 11;
+		if (!self.pressure && site == DETERMINISTIC_ORDINARY_PATH_TEST_BODY_EXIT) ticks = 5;
+		self.clock.now.fetch_add(ticks);
+	}
+	static void importedBudget(void *opaque, const rts::performance::KernelPerformanceRangePlan &range,
+		const rts::performance::KernelPerformanceRequestBudget &actual)
+	{
+		auto &self = *static_cast<NativeOrdinaryBudgetObservations *>(opaque);
+		const auto request = actual.requestOrdinal;
+		if (!rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) ||
+			request >= self.count() || request < range.begin || request >= range.end)
+		{ self.failed = true; self.releaseAll(); return; }
+		if (self.imports[request].fetch_add(1) != 0) self.failed = true;
+		self.budgets[request] = actual; // Observe actual native POD; never construct one.
+	}
+	static void importedRange(void *opaque, const rts::performance::KernelPerformanceRangePlan &range,
+		const rts::performance::KernelPerformanceRangeProgress &actual)
+	{
+		auto &self = *static_cast<NativeOrdinaryBudgetObservations *>(opaque);
+		static constexpr unsigned begins[] = {0, 513, 1026, 1538};
+		static constexpr unsigned ends[] = {513, 1026, 1538, 2050};
+		const unsigned i = range.rangeOrdinal;
+		if (!rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) || i >= self.rangeCount() ||
+			range.begin != (self.pressure ? begins[i] : 0) ||
+			range.end != (self.pressure ? ends[i] : 1) ||
+			range.operationCount != range.end - range.begin)
+		{ self.failed = true; self.releaseAll(); return; }
+		if (++self.releasedRanges[i] != 1) self.failed = true;
+		self.progress[i] = actual;
+	}
+};
+
+void CheckNativeOrdinaryBudgetBodyControls(const NativeOrdinaryBudgetObservations &observed)
+{
+	using namespace rts;
+	NativeOrdinaryBudgetExpect(!observed.failed.load(), "actual sites retain owner, request, byte and rendezvous invariants");
+	bool once = true, actualGrants = true, actualRefunds = true, actualFaults = true;
+	unsigned grantCount = 0, refundCount = 0;
+	for (unsigned i = 0; i != observed.count(); ++i)
+	{
+		once = once && observed.searches[i] == 1 && observed.materializers[i] == 1 && observed.grants[i] == 1;
+		actualGrants = actualGrants && observed.granted[i] == (observed.pressure && i == 2048 ? 0U : 1U);
+		actualRefunds = actualRefunds && observed.refunds[i] == (observed.pressure && i == 512 ? 1U : 0U);
+		actualFaults = actualFaults && observed.faults[i] == (observed.pressure && i == 512 ? 1U : 0U);
+		grantCount += observed.granted[i]; refundCount += observed.refunds[i];
+	}
+	NativeOrdinaryBudgetExpect(once, "each literal request searches, materializes and reaches grant exactly once");
+	NativeOrdinaryBudgetExpect(actualGrants && grantCount == (observed.pressure ? 2049U : 1U),
+		"actual grant results preserve the literal refusal rather than an empty consumer quota");
+	NativeOrdinaryBudgetExpect(actualRefunds && actualFaults && refundCount == (observed.pressure ? 1U : 0U),
+		"one selected real allocation exception reaches the actual catch/refund once");
+	NativeOrdinaryBudgetExpect(observed.physicalReserves == (observed.baseline ? 0U : observed.count()),
+		"only physical source executes the real result-budget CAS helper");
+	NativeOrdinaryBudgetExpect(observed.detachedCalls == 0, "no detached ordinary serial oracle is executed");
+	if (!observed.pressure)
+	{
+		bool sitesOnce = true;
+		for (unsigned site = DETERMINISTIC_ORDINARY_PATH_TEST_SEARCH_ENTER;
+			site <= DETERMINISTIC_ORDINARY_PATH_TEST_BODY_EXIT; ++site)
+		{
+			const unsigned expected = site == DETERMINISTIC_ORDINARY_PATH_TEST_REFUND_COMPLETED ||
+				(observed.baseline && site == DETERMINISTIC_ORDINARY_PATH_TEST_PHYSICAL_RESERVE) ? 0 : 1;
+			sitesOnce = sitesOnce && observed.sites[site] == expected;
+		}
+		NativeOrdinaryBudgetExpect(sitesOnce, "all whole-materializer segments and search/body boundaries are observed once");
+	}
+	std::printf("ordinary-budget case=%s role=%s actual requests=%u grants=%u refunds=%u physicalReserves=%u\n",
+		g_nativeOrdinaryBudgetCase, g_nativeOrdinaryBudgetRole, observed.count(), grantCount, refundCount,
+		observed.physicalReserves.load());
+}
+
+void CheckNativeOrdinaryReleasedBudgets(const NativeOrdinaryBudgetObservations &observed)
+{
+	using namespace rts::performance;
+	bool matched = !observed.failed.load();
+	std::uint64_t requested = 0, granted = 0, refunded = 0, consumed = 0;
+	unsigned retainedCount = 0, refusedCount = 0, refundedCount = 0;
+	for (unsigned i = 0; i != observed.count(); ++i)
+	{
+		const bool refund = observed.pressure && i == 512, refuse = observed.pressure && i == 2048;
+		const auto &b = observed.budgets[i];
+		matched = matched && observed.imports[i] == 1 && b.requestOrdinal == i &&
+			b.grantSite == 1 && b.localGrantOrdinal == 1 && b.requestedBytes == 65536 &&
+			b.grantedBytes == (refuse ? 0U : 65536U) && b.refundSite == (refund ? 2U : 0U) &&
+			b.localRefundOrdinal == (refund ? 2U : 0U) && b.refundedBytes == (refund ? 65536U : 0U) &&
+			b.consumedBytes == (refund || refuse ? 0U : 65536U) &&
+			b.disposition == (refund ? KERNEL_REQUEST_BUDGET_REFUNDED :
+				refuse ? KERNEL_REQUEST_BUDGET_REFUSED : KERNEL_REQUEST_BUDGET_RETAINED);
+		requested += b.requestedBytes; granted += b.grantedBytes;
+		refunded += b.refundedBytes; consumed += b.consumedBytes;
+		retainedCount += b.disposition == KERNEL_REQUEST_BUDGET_RETAINED;
+		refusedCount += b.disposition == KERNEL_REQUEST_BUDGET_REFUSED;
+		refundedCount += b.disposition == KERNEL_REQUEST_BUDGET_REFUNDED;
+	}
+	NativeOrdinaryBudgetExpect(matched, "every actual released request POD matches literal identity, sites and settlement once");
+	NativeOrdinaryBudgetExpect(requested == (observed.pressure ? 134348800ULL : 65536ULL) &&
+		granted == (observed.pressure ? 134283264ULL : 65536ULL) &&
+		refunded == (observed.pressure ? 65536ULL : 0ULL) &&
+		consumed == (observed.pressure ? 134217728ULL : 65536ULL) &&
+		retainedCount == (observed.pressure ? 2048U : 1U) &&
+		refusedCount == (observed.pressure ? 1U : 0U) && refundedCount == (observed.pressure ? 1U : 0U),
+		"actual settlements preserve exact charge/refusal/refund/retained totals");
+	static constexpr unsigned completed[] = {512, 513, 512, 512};
+	bool progressMatched = true;
+	for (unsigned i = 0; i != observed.rangeCount(); ++i)
+	{
+		const auto &p = observed.progress[i].checkpoint;
+		progressMatched = progressMatched && observed.releasedRanges[i] == 1 && p.entered && p.errors == 0 &&
+			p.completedWorkUnits == (observed.pressure ? completed[i] : 1U) && p.firstTruePoll == 0 &&
+			p.terminal == (observed.pressure && i == 0 ? KERNEL_RANGE_FAILED : KERNEL_RANGE_COMPLETED);
+	}
+	NativeOrdinaryBudgetExpect(progressMatched, "actual fence progress preserves completed requests and the one failed materialization range");
+}
+
+bool RunNativeOrdinaryBudgetRole(rts_test::NativeKernelTrace &trace, bool baseline, bool pressure)
+{
+	using namespace rts::performance;
+	g_nativeOrdinaryBudgetRole = baseline ? "consumer" : "source";
+	g_nativeOrdinaryBudgetCase = pressure ? "pressure2050" : "one-success";
+	const unsigned before = g_nativeOrdinaryBudgetFailures;
+	NativePathWorkerScope runtime; // Existing fixed four-worker owner fixture.
+	rts_test::NativeKernelOwnerRun run;
+	if (!NativeOrdinaryBudgetExpect(run.begin(trace, baseline, 3207, KERNEL_PHASE_LEGACY_MUTABLE_ISLAND),
+		"actual scoped source/consumer ledgers start")) return false;
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_PATH, 0);
+	if (!NativeOrdinaryBudgetExpect(attempt.valid(), "core owner opens authentic ordinary attempt before preflight")) return false;
+	auto timing = run.timing.beginBatch(KERNEL_PERFORMANCE_PATH, 0, 3207, 1);
+	KernelPerformanceReferenceBatch validated;
+	NativeOrdinaryQuotaFixture input(pressure ? 2050 : 1);
+	auto observed = std::make_unique<NativeOrdinaryBudgetObservations>(baseline, pressure, run.clock);
+	rts::DeterministicOrdinaryPathTestHooks hooks;
+	hooks.context = observed.get();
+	hooks.observeRequest = NativeOrdinaryBudgetObservations::observe;
+	hooks.observeReleasedBudget = NativeOrdinaryBudgetObservations::importedBudget;
+	hooks.observeReleasedRange = NativeOrdinaryBudgetObservations::importedRange;
+	rts::DeterministicOrdinaryPathBatch batch;
+	const bool accepted = batch.executeSynchronously(runtime.jobs, input.grid,
+		input.requests.data(), input.requests.size(), 10000, &timing, &run.reference,
+		&validated, &hooks, attempt);
+	// Cleanup before every native result/protocol assertion, including timeout.
+	observed->releaseAll();
+	WaitForNativePathDrain(runtime.jobs); // Cleanup only; collector must prove its own real group boundary.
+	const unsigned controlsBefore = g_nativeOrdinaryBudgetFailures;
+	const auto native = batch.executionSnapshot();
+	NativeOrdinaryBudgetExpect(accepted == !pressure && native.completed == accepted && !native.timedOut,
+		"literal native outcome is success or allocation-abort, never a timeout/retry");
+	NativeOrdinaryBudgetExpect(native.referenceAdmissionAccepted,
+		"ordinary path retains authenticated admission for physical and baseline-inline execution");
+	NativeOrdinaryBudgetExpect(native.requestCount == input.requests.size() &&
+		native.rangeCount == (pressure ? 4U : 1U) && native.grainSize == (pressure ? 513U : 1U),
+		"actual native canonical range shape matches the literal fixture");
+	CheckNativeOrdinaryBudgetBodyControls(*observed);
+	if (!baseline)
+	{
+		NativeOrdinaryBudgetExpect(native.submittedRangeJobCount == (pressure ? 4U : 1U) &&
+			native.workerExecutedRangeJobCount == (pressure ? 3U : 1U) &&
+			native.failedRangeJobCount == (pressure ? 1U : 0U) &&
+			native.resultStorageBytes == (pressure ? 134217728U : 65536U),
+			"real source jobs retain exact physical result charge and one failed range only for pressure");
+	}
+	else
+		NativeOrdinaryBudgetExpect(native.submittedRangeJobCount == 0 && native.workerExecutedRangeJobCount == 0 &&
+			native.ownerExecutedRangeJobCount == 0 && native.physicalWorkerMask == 0 && native.resultStorageBytes == 0,
+			"baseline has no fabricated worker, owner-help, physical mask or local quota counter");
+	unsigned ownerAccepts = 0;
+	std::vector<rts::DeterministicPathPoint> ownerPoints;
+	if (!pressure && accepted)
+	{
+		const auto commit = run.timing.beginInterval(timing, KERNEL_PERFORMANCE_COMMIT);
+		const auto actual = batch.result(0);
+		AssertLiteralNativeOrdinaryQuotaPath(actual, input.requests[0]);
+		ownerPoints.assign(actual.points, actual.points + actual.pointCount);
+		++ownerAccepts; // Actual core-owner result acceptance, not a gameplay commit claim.
+		run.clock.now.fetch_add(17);
+		NativeOrdinaryBudgetExpect(run.timing.endInterval(commit), "real owner result copy closes its commit interval");
+	}
+	if (pressure)
+	{
+		bool gettersEmpty = true;
+		for (unsigned i = 0; i != 2050; ++i)
+			gettersEmpty = gettersEmpty && batch.result(i).pointCount == 0 && !batch.requestExecutionSnapshot(i).succeeded;
+		NativeOrdinaryBudgetExpect(gettersEmpty && ownerAccepts == 0 && ownerPoints.empty(),
+			"aborted batch publishes no discarded result or fabricated core fallback");
+	}
+	else
+		NativeOrdinaryBudgetExpect(ownerAccepts == 1 && ownerPoints.size() == 3277 &&
+			ownerPoints.front().x == 0 && ownerPoints.back().x == 3276,
+			"core owner accepts the literal actual native path exactly once");
+	const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+	NativeOrdinaryBudgetExpect(scheduler.submittedJobs == (baseline ? 0U : pressure ? 4U : 1U) &&
+		scheduler.executedJobs == scheduler.submittedJobs && scheduler.ownerHelpJobs == 0 &&
+		scheduler.pendingJobs == 0 && scheduler.outstandingJobs == 0,
+		"actual scheduler closure is physical only for source and fully drained for both roles");
+	const bool controlsValid = g_nativeOrdinaryBudgetFailures == controlsBefore;
+	std::printf("ordinary-budget case=%s role=%s native-control-failures=%u\n",
+		g_nativeOrdinaryBudgetCase, g_nativeOrdinaryBudgetRole,
+		g_nativeOrdinaryBudgetFailures - controlsBefore);
+
+	// FIRST RED starts here: collection is an explicit fail-closed native stub,
+	// and the old anonymous validated-batch route cannot link a traced attempt.
+	const bool collected = batch.collectPerformanceReference(runtime.jobs);
+	NativeOrdinaryBudgetExpect(collected, "native owner collects its genuinely terminal reference work");
+	NativeOrdinaryBudgetExpect(validated.valid() == accepted,
+		"native output is linked to its authentic attempt only on actual success");
+	bool canonicalClosed = !accepted;
+	if (validated.valid()) canonicalClosed = run.reference.finishBatch(validated, accepted);
+	if (accepted && validated.valid())
+		NativeOrdinaryBudgetExpect(canonicalClosed, "actual owner acceptance closes canonical batch before attempt finish");
+	const auto disposition = accepted ? KERNEL_PERFORMANCE_COMMITTED : KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION;
+	NativeOrdinaryBudgetExpect(run.timing.endBatch(timing, disposition), "timing records actual native owner disposition");
+	if (!controlsValid || !collected || (accepted && (!validated.valid() || !canonicalClosed)))
+	{
+		// Keep first source rows independent without manufacturing an empty trace
+		// or weakening a failed assertion. Consumer runs only after genuine source closure.
+		run.reference.freeze();
+		NativeOrdinaryBudgetExpect(run.closeTiming(scheduler), "failed protocol row still closes its own actual timing run");
+		return false;
+	}
+	CheckNativeOrdinaryReleasedBudgets(*observed);
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = disposition; finish.reasonSchema = 1; finish.reason = accepted ? 1 : 2;
+	finish.validatedBatch = validated;
+	NativeOrdinaryBudgetExpect(run.reference.finishAttempt(attempt, finish), "actual native outcome closes authentic attempt");
+	KernelPerformanceAttemptReap reap = {}; reap.reasonSchema = 1; reap.reason = 1;
+	reap.pendingJobs = scheduler.pendingJobs; reap.outstandingJobs = scheduler.outstandingJobs;
+	NativeOrdinaryBudgetExpect(run.reference.reapAttempt(attempt, reap), "reference reap follows native terminal collection");
+	const bool sealed = run.reference.sealObservationWindow() && run.reference.sealExecutionClosure();
+	const auto snapshot = run.reference.freeze();
+	const bool timingClosed = run.closeTiming(scheduler);
+	NativeOrdinaryBudgetExpect(sealed && snapshot.errors == 0 && snapshot.trace.complete &&
+		snapshot.complete == accepted && snapshot.streamCount == (accepted ? 1U : 0U),
+		"source or consumer closes the actual native trace without a synthetic successful stream");
+	NativeOrdinaryBudgetExpect(snapshot.trace.attemptCount == 1 && snapshot.trace.capturedAttemptCount == 1 &&
+		snapshot.trace.capturedOperationCount == input.requests.size() && snapshot.trace.dispatchCount == 1 &&
+		snapshot.trace.rangeCount == observed->rangeCount() && snapshot.trace.releasedRangeCount == observed->rangeCount() &&
+		snapshot.trace.reapCount == 1, "native capture, dispatch, releases and reap have exact cardinalities");
+	NativeOrdinaryBudgetExpect(timingClosed, "real owner phase and scheduler boundary reconcile");
+	if (baseline && timingClosed)
+		NativeOrdinaryBudgetExpect(run.timingSnapshot.phaseAccounting.phases[KERNEL_PHASE_LEGACY_MUTABLE_ISLAND].pureNanoseconds ==
+			(pressure ? 0U : 23U), "whole materialization is serial; successful search alone contributes literal pure ticks");
+	const bool complete = g_nativeOrdinaryBudgetFailures == before && snapshot.trace.complete;
+	std::printf("ordinary-budget case=%s role=%s failures=%u traceComplete=%u\n",
+		g_nativeOrdinaryBudgetCase, g_nativeOrdinaryBudgetRole, g_nativeOrdinaryBudgetFailures - before,
+		snapshot.trace.complete ? 1U : 0U);
+	if (!baseline && complete) trace.source = snapshot;
+	return complete; // Batch/payload dies here BEFORE constructing consumer outputs.
+}
+
+bool TestNativeOrdinaryBudgetSourceConsumers()
+{
+	const unsigned before = g_nativeOrdinaryBudgetFailures;
+	for (unsigned variant = 0; variant != 2; ++variant)
+	{
+		rts_test::NativeKernelTrace trace(70 + variant);
+		if (RunNativeOrdinaryBudgetRole(trace, false, variant != 0))
+			RunNativeOrdinaryBudgetRole(trace, true, variant != 0);
+	}
+	return g_nativeOrdinaryBudgetFailures == before;
+}
+
+void TestNativeOrdinarySourceCollectionFailureRejectsCompletion()
+{
+	using namespace rts::performance;
+	NativePathWorkerScope runtime;
+	rts_test::NativeKernelTrace trace(72);
+	rts_test::NativeKernelOwnerRun run;
+	assert(run.begin(trace, false, 3208, KERNEL_PHASE_LEGACY_MUTABLE_ISLAND));
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_PATH, 0);
+	assert(attempt.valid());
+	auto timing = run.timing.beginBatch(KERNEL_PERFORMANCE_PATH, 0, 3208, 1);
+	assert(timing.valid());
+	NativeOrdinaryQuotaFixture input(1);
+	rts::DeterministicOrdinaryPathBatch batch;
+	rts_direct_path_set_test_fault_mask(16);
+	const bool completed = batch.executeSynchronously(runtime.jobs, input.grid,
+		input.requests.data(), input.requests.size(), 10000, &timing,
+		&run.reference, nullptr, nullptr, attempt);
+	rts_direct_path_set_test_fault_mask(0);
+	WaitForNativePathDrain(runtime.jobs);
+	assert(!completed);
+	assert(!batch.executionSnapshot().completed);
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION;
+	finish.reasonSchema = 1;
+	finish.reason = 2;
+	assert(run.reference.finishAttempt(attempt, finish));
+	const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+	KernelPerformanceAttemptReap reap = {};
+	reap.reasonSchema = 1;
+	reap.reason = 1;
+	reap.pendingJobs = scheduler.pendingJobs;
+	reap.outstandingJobs = scheduler.outstandingJobs;
+	assert(run.reference.reapAttempt(attempt, reap));
+	assert(run.timing.endBatch(timing,
+		KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION));
+	assert(run.reference.sealObservationWindow());
+	assert(run.reference.sealExecutionClosure());
+	const auto snapshot = run.reference.freeze();
+	assert(snapshot.errors == 0 && snapshot.trace.complete &&
+		snapshot.trace.abortedAfterAdmissionAttemptCount == 1 &&
+		snapshot.trace.reapCount == 1);
+	assert(run.closeTiming(scheduler));
+}
+
+// Traced version of the existing real 2049-request native quota control.
+struct NativeCompletedQuotaObservation
+{
+	static constexpr unsigned Count = 2049, Refused = 2048;
+	std::array<std::atomic<unsigned>, Count> searches{}, materializers{}, grants{}, granted{};
+	std::array<unsigned, Count> imports{}, views{};
+	std::array<rts::performance::KernelPerformanceRequestBudget, Count> budgets{};
+	std::array<std::size_t, Count> searchPoints{}, storedPoints{}, canonicalPoints{};
+	std::array<bool, Count> canonicalHasPoints{};
+	std::array<rts::DeterministicPathSearchStatus, Count> statuses{};
+	std::array<unsigned, 4> releases{};
+	std::array<rts::performance::KernelPerformanceRangeProgress, 4> progress{};
+	std::array<std::atomic<bool>, 3> prefixesDone{};
+	std::atomic<unsigned> physicalReserves{0}, refunds{0}, detachedCalls{0};
+	std::atomic<bool> failed{false};
+	bool baseline, nativeControlsChecked = false;
+	rts_test::NativeKernelClock &clock;
+	rts::DeterministicOrdinaryPathBatch &batch;
+	const std::chrono::steady_clock::time_point deadline;
+
+	NativeCompletedQuotaObservation(bool consume, rts_test::NativeKernelClock &time,
+		rts::DeterministicOrdinaryPathBatch &native) : baseline(consume), clock(time), batch(native),
+		deadline(std::chrono::steady_clock::now() + std::chrono::seconds(5)) {}
+	~NativeCompletedQuotaObservation() { releaseAll(); }
+	void releaseAll() noexcept
+	{ for (auto &ready : prefixesDone) ready.store(true, std::memory_order_release); }
+	void waitFor(std::atomic<bool> &ready) noexcept
+	{
+		while (!ready.load(std::memory_order_acquire) && !failed.load(std::memory_order_acquire) &&
+			std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+		if (!ready.load(std::memory_order_acquire)) { failed = true; releaseAll(); }
+	}
+	static unsigned rangeOf(std::size_t request)
+	{ return request < 513 ? 0 : request < 1025 ? 1 : request < 1537 ? 2 : 3; }
+	static void observe(void *context, rts::DeterministicOrdinaryPathTestEvent site,
+		unsigned range, std::size_t request, std::size_t bytes, bool actualGranted)
+	{
+		using namespace rts;
+		auto &self = *static_cast<NativeCompletedQuotaObservation *>(context);
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_REFERENCE_SERIAL_ENTER)
+		{ ++self.detachedCalls; return; }
+		if (request >= Count || range != rangeOf(request) ||
+			JobSystem::instance().isCurrentThread(JOB_OWNER_GAME) != self.baseline)
+		{ self.failed = true; self.releaseAll(); return; }
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_SEARCH_ENTER) ++self.searches[request];
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_MATERIALIZATION_ENTER) ++self.materializers[request];
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_PHYSICAL_RESERVE) ++self.physicalReserves;
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_REFUND_COMPLETED) ++self.refunds;
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_GRANT && request == Refused && !self.baseline)
+			for (auto &ready : self.prefixesDone) self.waitFor(ready);
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_GRANT_RETURNED)
+		{
+			++self.grants[request];
+			if (actualGranted) ++self.granted[request];
+			if (bytes != 65536 || actualGranted != (request != Refused)) self.failed = true;
+		}
+		if (site == DETERMINISTIC_ORDINARY_PATH_TEST_MATERIALIZATION_EXIT)
+		{
+			if (request == 512) self.prefixesDone[0].store(true, std::memory_order_release);
+			if (request == 1024) self.prefixesDone[1].store(true, std::memory_order_release);
+			if (request == 1536) self.prefixesDone[2].store(true, std::memory_order_release);
+		}
+		++self.clock.now;
+	}
+	static void importedBudget(void *context, const rts::performance::KernelPerformanceRangePlan &range,
+		const rts::performance::KernelPerformanceRequestBudget &actual)
+	{
+		auto &self = *static_cast<NativeCompletedQuotaObservation *>(context);
+		if (!rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) ||
+			actual.requestOrdinal >= Count || actual.requestOrdinal < range.begin ||
+			actual.requestOrdinal >= range.end)
+		{ self.failed = true; return; }
+		if (++self.imports[actual.requestOrdinal] != 1) self.failed = true;
+		self.budgets[actual.requestOrdinal] = actual;
+	}
+	static void importedRange(void *context, const rts::performance::KernelPerformanceRangePlan &range,
+		const rts::performance::KernelPerformanceRangeProgress &actual)
+	{
+		auto &self = *static_cast<NativeCompletedQuotaObservation *>(context);
+		static constexpr unsigned begins[] = {0, 513, 1025, 1537}, ends[] = {513, 1025, 1537, 2049};
+		if (!rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) || range.rangeOrdinal >= 4 ||
+			range.begin != begins[range.rangeOrdinal] || range.end != ends[range.rangeOrdinal])
+		{ self.failed = true; return; }
+		if (++self.releases[range.rangeOrdinal] != 1) self.failed = true;
+		self.progress[range.rangeOrdinal] = actual;
+	}
+	void checkNativeControls()
+	{
+		using namespace rts;
+		using namespace rts::performance;
+		const unsigned before = g_nativeOrdinaryBudgetFailures;
+		nativeControlsChecked = true;
+		const auto native = batch.executionSnapshot();
+		NativeOrdinaryBudgetExpect(!failed && native.completed && !native.timedOut &&
+			native.requestCount == Count && native.rangeCount == 4 && native.grainSize == 513,
+			"completed quota fixture has real native completion and canonical partition");
+		NativeOrdinaryBudgetExpect(native.referenceAdmissionAccepted,
+			"completed ordinary path retains authenticated admission in both roles");
+		NativeOrdinaryBudgetExpect(native.submittedRangeJobCount == (baseline ? 0U : 4U) &&
+			native.workerExecutedRangeJobCount == (baseline ? 0U : 4U) &&
+			native.ownerExecutedRangeJobCount == 0 && native.failedRangeJobCount == 0 &&
+			native.resultStorageBytes == (baseline ? 0U : 134217728U) &&
+			(!baseline || native.physicalWorkerMask == 0),
+			"completed quota source is physically charged; baseline has no fabricated work or counter");
+		unsigned found = 0, refused = 0, actualGrants = 0;
+		std::uint64_t actualStoredPoints = 0, actualConsumedBytes = 0;
+		bool eachOnce = true, outputs = true, settlements = true, progressValid = true;
+		for (unsigned i = 0; i != Count; ++i)
+		{
+			const auto result = batch.result(i);
+			const auto execution = batch.requestExecutionSnapshot(i);
+			const bool isRefused = i == Refused;
+			eachOnce = eachOnce && searches[i] == 1 && materializers[i] == 1 && grants[i] == 1 &&
+				granted[i] == (isRefused ? 0U : 1U);
+			actualGrants += granted[i]; actualStoredPoints += result.pointCount;
+			outputs = outputs && execution.succeeded && execution.submitted == !baseline &&
+				execution.state == (baseline ? DIRECT_PATH_EXECUTION_INLINE : DIRECT_PATH_EXECUTION_WORKER) &&
+				(!baseline || execution.physicalWorkerIndex == JOB_INVALID_PHYSICAL_WORKER_INDEX) &&
+				result.expandedNodeCount == 2 && result.discoveredNodeCount == 3277 &&
+				result.objectId == 1000 + i;
+			if (isRefused)
+			{
+				++refused;
+				outputs = outputs && result.status == DETERMINISTIC_PATH_BUDGET_EXHAUSTED &&
+					result.points == nullptr && result.pointCount == 0 && result.allocationCount == 0 &&
+					result.cleanupCount == 0 && result.passableBlockCount == 0 && result.materializationPlanHash == 0;
+			}
+			else
+			{
+				++found;
+				outputs = outputs && result.status == DETERMINISTIC_PATH_FOUND && result.points != nullptr &&
+					result.pointCount == 3277 && result.allocationCount == 3277 && result.cleanupCount == 3276 &&
+					result.passableBlockCount == 0 && result.materializationPlanHash != 0;
+				if (result.points != nullptr && result.pointCount == 3277)
+					outputs = outputs && result.points[0].x == 0 && result.points[3276].x == 3276;
+			}
+			const auto &budget = budgets[i];
+			settlements = settlements && imports[i] == 1 && budget.requestOrdinal == i &&
+				budget.grantSite == 1 && budget.localGrantOrdinal == 1 && budget.requestedBytes == 65536 &&
+				budget.grantedBytes == (isRefused ? 0U : 65536U) && budget.refundSite == 0 &&
+				budget.localRefundOrdinal == 0 && budget.refundedBytes == 0 &&
+				budget.consumedBytes == budget.grantedBytes && budget.disposition ==
+				(isRefused ? KERNEL_REQUEST_BUDGET_REFUSED : KERNEL_REQUEST_BUDGET_RETAINED);
+			actualConsumedBytes += budget.consumedBytes;
+		}
+		for (unsigned i = 0; i != 4; ++i)
+		{
+			const auto &actual = progress[i];
+			progressValid = progressValid && releases[i] == 1 && actual.checkpoint.entered &&
+				actual.checkpoint.errors == 0 && actual.checkpoint.firstTruePoll == 0 &&
+				actual.checkpoint.completedWorkUnits == (i == 0 ? 513U : 512U) &&
+				actual.checkpoint.terminal == KERNEL_RANGE_COMPLETED && actual.publication == KERNEL_PUBLICATION_PUBLISHED;
+		}
+		NativeOrdinaryBudgetExpect(eachOnce && actualGrants == 2048 && refunds == 0 && detachedCalls == 0 &&
+			physicalReserves == (baseline ? 0U : Count), "all 2049 actual native bodies execute once, with 2048 grants and no refund");
+		NativeOrdinaryBudgetExpect(outputs && found == 2048 && refused == 1 && actualStoredPoints == 6711296ULL,
+			"native retained/materialized outputs are truthful even though the refused search had a path");
+		NativeOrdinaryBudgetExpect(settlements && actualConsumedBytes == 134217728ULL && progressValid,
+			"actual completed ranges and request settlements close without a synthetic range failure");
+		std::printf("ordinary-completed-quota role=%s native-control-failures=%u requests=2049 grants=%u refunds=%u storedPoints=%llu consumedBytes=%llu\n",
+			g_nativeOrdinaryBudgetRole, g_nativeOrdinaryBudgetFailures - before, actualGrants, refunds.load(),
+			static_cast<unsigned long long>(actualStoredPoints), static_cast<unsigned long long>(actualConsumedBytes));
+		std::fflush(stdout);
+	}
+	static void referenceView(void *context, std::size_t request, rts::DeterministicPathSearchStatus status,
+		std::size_t searchCount, std::size_t storedCount, std::size_t canonicalCount, bool hasPoints)
+	{
+		auto &self = *static_cast<NativeCompletedQuotaObservation *>(context);
+		if (!rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) || request >= Count)
+		{ self.failed = true; return; }
+		if (++self.views[request] != 1) self.failed = true;
+		self.searchPoints[request] = searchCount; self.storedPoints[request] = storedCount;
+		self.canonicalPoints[request] = canonicalCount; self.canonicalHasPoints[request] = hasPoints;
+		self.statuses[request] = status;
+		if (request == Refused)
+		{
+			// The real join and native range validation already completed. This
+			// read-only callback returns, allowing the REAL canonical writer next.
+			self.checkNativeControls();
+			bool matched = true;
+			std::uint64_t searchTotal = 0, storedTotal = 0, canonicalTotal = 0;
+			for (unsigned i = 0; i != Count; ++i)
+			{
+				const bool refused = i == Refused;
+				matched = matched && self.views[i] == 1 && self.searchPoints[i] == 3277 &&
+					self.storedPoints[i] == (refused ? 0U : 3277U) &&
+					self.canonicalPoints[i] == self.storedPoints[i] && self.canonicalHasPoints[i] == !refused &&
+					self.statuses[i] == (refused ? rts::DETERMINISTIC_PATH_BUDGET_EXHAUSTED : rts::DETERMINISTIC_PATH_FOUND);
+				searchTotal += self.searchPoints[i]; storedTotal += self.storedPoints[i]; canonicalTotal += self.canonicalPoints[i];
+			}
+			NativeOrdinaryBudgetExpect(matched && searchTotal == 6714573ULL && storedTotal == 6711296ULL &&
+				canonicalTotal == storedTotal, "actual canonical view uses retained points, not unmaterialized search count");
+			std::printf("ordinary-completed-quota role=%s canonical-view request=2048 search=%zu stored=%zu canonical=%zu hasPoints=%u; returning to actual canonical writer\n",
+				g_nativeOrdinaryBudgetRole, searchCount, storedCount, canonicalCount, hasPoints ? 1U : 0U);
+			std::fflush(stdout);
+		}
+		++self.clock.now;
+	}
+};
+
+bool RunNativeCompletedQuotaRole(rts_test::NativeKernelTrace &trace, bool baseline)
+{
+	using namespace rts::performance;
+	g_nativeOrdinaryBudgetRole = baseline ? "consumer" : "source";
+	g_nativeOrdinaryBudgetCase = "completed-refusal2049";
+	const unsigned before = g_nativeOrdinaryBudgetFailures;
+	NativePathWorkerScope runtime;
+	rts_test::NativeKernelOwnerRun run;
+	if (!NativeOrdinaryBudgetExpect(run.begin(trace, baseline, 3207, KERNEL_PHASE_LEGACY_MUTABLE_ISLAND),
+		"completed-refusal actual owner run starts")) return false;
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_PATH, 0);
+	if (!NativeOrdinaryBudgetExpect(attempt.valid(), "completed-refusal authentic attempt opens")) return false;
+	auto timing = run.timing.beginBatch(KERNEL_PERFORMANCE_PATH, 0, 3207, 1);
+	KernelPerformanceReferenceBatch validated;
+	NativeOrdinaryQuotaFixture input(2049);
+	rts::DeterministicOrdinaryPathBatch batch;
+	auto observed = std::make_unique<NativeCompletedQuotaObservation>(baseline, run.clock, batch);
+	rts::DeterministicOrdinaryPathTestHooks hooks;
+	hooks.context = observed.get(); hooks.observeRequest = NativeCompletedQuotaObservation::observe;
+	hooks.observeReleasedBudget = NativeCompletedQuotaObservation::importedBudget;
+	hooks.observeReleasedRange = NativeCompletedQuotaObservation::importedRange;
+	hooks.observeReferenceResult = NativeCompletedQuotaObservation::referenceView;
+	std::printf("ordinary-completed-quota role=%s entering actual native execute and canonical validation\n", g_nativeOrdinaryBudgetRole);
+	std::fflush(stdout);
+	const bool accepted = batch.executeSynchronously(runtime.jobs, input.grid, input.requests.data(), input.requests.size(),
+		10000, &timing, &run.reference, &validated, &hooks, attempt);
+	observed->releaseAll();
+	WaitForNativePathDrain(runtime.jobs);
+	NativeOrdinaryBudgetExpect(accepted && observed->nativeControlsChecked && validated.valid(),
+		"completed native quota refusal reaches real safe canonical validation and authentic linkage");
+	if (!observed->nativeControlsChecked) observed->checkNativeControls();
+	NativeOrdinaryBudgetExpect(batch.collectPerformanceReference(runtime.jobs), "completed-refusal real collection is already terminal and once-only");
+	std::uint64_t ownerReadout = 0;
+	unsigned ownerFound = 0, ownerRefused = 0;
+	if (accepted)
+	{
+		const auto commit = run.timing.beginInterval(timing, KERNEL_PERFORMANCE_COMMIT);
+		for (unsigned i = 0; i != 2049; ++i)
+		{
+			const auto result = batch.result(i);
+			ownerReadout += result.objectId + result.pointCount;
+			ownerFound += result.status == rts::DETERMINISTIC_PATH_FOUND;
+			ownerRefused += result.status == rts::DETERMINISTIC_PATH_BUDGET_EXHAUSTED;
+		}
+		// Actual core owner consumes every advisory result/status once. This is
+		// not gameplay path authority or a made-up fallback for the refused row.
+		++run.clock.now;
+		NativeOrdinaryBudgetExpect(run.timing.endInterval(commit) && ownerReadout == 10858472ULL &&
+			ownerFound == 2048 && ownerRefused == 1,
+			"core owner consumes the truthful completed batch once");
+	}
+	const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+	NativeOrdinaryBudgetExpect(scheduler.submittedJobs == (baseline ? 0U : 4U) &&
+		scheduler.executedJobs == scheduler.submittedJobs && scheduler.ownerHelpJobs == 0 &&
+		scheduler.pendingJobs == 0 && scheduler.outstandingJobs == 0, "completed-refusal actual scheduler is drained with no baseline jobs");
+	const bool canonicalClosed = validated.valid() && run.reference.finishBatch(validated, accepted);
+	NativeOrdinaryBudgetExpect(canonicalClosed, "actual core-owner readout closes canonical batch before attempt finish");
+	NativeOrdinaryBudgetExpect(run.timing.endBatch(timing, accepted ? KERNEL_PERFORMANCE_COMMITTED :
+		KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION), "completed-refusal timing records actual native outcome");
+	if (!accepted || !validated.valid() || !canonicalClosed)
+	{
+		run.reference.freeze();
+		NativeOrdinaryBudgetExpect(run.closeTiming(scheduler), "failed canonical row still closes its own timing run");
+		return false;
+	}
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = KERNEL_PERFORMANCE_COMMITTED; finish.reasonSchema = 1; finish.reason = 1; finish.validatedBatch = validated;
+	NativeOrdinaryBudgetExpect(run.reference.finishAttempt(attempt, finish), "truthful completed-refusal attempt commits after actual owner readout");
+	KernelPerformanceAttemptReap reap = {}; reap.reasonSchema = 1; reap.reason = 1;
+	reap.pendingJobs = scheduler.pendingJobs; reap.outstandingJobs = scheduler.outstandingJobs;
+	NativeOrdinaryBudgetExpect(run.reference.reapAttempt(attempt, reap), "completed-refusal reap follows actual native terminal collection");
+	const bool sealed = run.reference.sealObservationWindow() && run.reference.sealExecutionClosure();
+	const auto snapshot = run.reference.freeze();
+	NativeOrdinaryBudgetExpect(sealed && snapshot.errors == 0 && snapshot.complete && snapshot.trace.complete &&
+		snapshot.streamCount == 1 && snapshot.streams[0].validatedOperationCount == 2049 &&
+		snapshot.streams[0].committedOperationCount == 2049 && snapshot.trace.capturedOperationCount == 2049 &&
+		snapshot.trace.rangeCount == 4 && snapshot.trace.releasedRangeCount == 4 && snapshot.trace.reapCount == 1,
+		"completed-refusal real source/consumer trace closes with truthful successful output stream");
+	NativeOrdinaryBudgetExpect(run.closeTiming(scheduler), "completed-refusal actual phase and scheduler closure reconcile");
+	const bool complete = g_nativeOrdinaryBudgetFailures == before && snapshot.trace.complete;
+	std::printf("ordinary-completed-quota role=%s failures=%u traceComplete=%u\n", g_nativeOrdinaryBudgetRole,
+		g_nativeOrdinaryBudgetFailures - before, snapshot.trace.complete ? 1U : 0U);
+	if (!baseline && complete) trace.source = snapshot;
+	return complete; // All source output storage dies before consumer construction.
+}
+
+bool TestNativeCompletedQuotaSourceConsumer()
+{
+	// Same process-local modal-dialog suppression as JobSystemTest. A genuine
+	// access violation is still a failing CTest process, never an expected pass.
+	struct ErrorModeScope
+	{
+		UINT prior;
+		ErrorModeScope() : prior(SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX)) {}
+		~ErrorModeScope() { SetErrorMode(prior); }
+	} errorMode;
+	rts_test::NativeKernelTrace trace(72);
+	return RunNativeCompletedQuotaRole(trace, false) && RunNativeCompletedQuotaRole(trace, true);
+}
+
+// These are intentionally narrow lifecycle probes.  The title queue owns the
+// batch context beyond processPathfindQueue's stack frame, so a timed-out
+// source must remain collectible after the synchronous call has returned.
+void TestNativeDirectRetainedTitleContext()
+{
+	using namespace rts::performance;
+	NativePathWorkerScope runtime;
+	rts_test::NativeKernelTrace trace(73);
+	rts_test::NativeKernelOwnerRun run;
+	assert(run.begin(trace, false, 3207, KERNEL_PHASE_SPATIAL_WORK));
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_PATH, 1);
+	assert(attempt.valid());
+	auto timing = run.timing.beginBatch(KERNEL_PERFORMANCE_PATH, 1, 3207, 1);
+	assert(timing.valid());
+	KernelPerformanceReferenceBatch validated;
+	DirectFixture first(0, 0, 4, 0), second(0, 1, 4, 1);
+	second.snapshot.requestToken = 74;
+	second.snapshot.objectId = 100;
+	const rts::DirectPathSnapshot inputs[] = {first.snapshot, second.snapshot};
+
+	std::unique_ptr<rts::DeterministicDirectPathBatch> retained(
+		new rts::DeterministicDirectPathBatch());
+	rts_direct_path_set_test_pause_mask(1);
+	assert(!retained->executeSynchronously(runtime.jobs, inputs, 2, 1,
+		&timing, &run.reference, &validated, attempt));
+	assert(retained->executionSnapshot().timedOut);
+	assert(retained->executionSnapshot().submittedJobCount == 2);
+	assert(retained->executionSnapshot().referenceAdmissionAccepted);
+	// The title context stays alive while the workers finish the cancelled
+	// group; its copied source record must not be a stack-local dependency.
+	rts_direct_path_release_test_pause(1);
+	rts_direct_path_set_test_pause_mask(0);
+	WaitForNativePathDrain(runtime.jobs);
+	assert(retained->collectPerformanceReference(runtime.jobs));
+	assert(!validated.valid());
+	retained.reset();
+
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION;
+	finish.reasonSchema = 1;
+	finish.reason = 2;
+	assert(run.timing.endBatch(timing,
+		KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION));
+	assert(run.reference.finishAttempt(attempt, finish));
+	KernelPerformanceAttemptReap reap = {};
+	reap.reasonSchema = 1;
+	reap.reason = 1;
+	reap.dynamicFactsKnownMask = 7;
+	reap.pendingJobs = runtime.jobs.pendingOwnerCompletionCount();
+	reap.outstandingJobs = runtime.jobs.outstandingJobCount();
+	reap.activeSlots = 0;
+	assert(run.reference.reapAttempt(attempt, reap));
+	assert(run.reference.sealObservationWindow());
+	assert(run.reference.sealExecutionClosure());
+	const auto snapshot = run.reference.freeze();
+	assert(snapshot.errors == 0 && snapshot.trace.reapCount == 1);
+	assert(run.closeTiming(rts_test::NativeKernelSchedulerBoundary()));
+}
+
+bool RunNativeDirectReferenceRole(rts_test::NativeKernelTrace &trace,
+	bool baseline)
+{
+	using namespace rts::performance;
+	NativePathWorkerScope runtime;
+	rts_test::NativeKernelOwnerRun run;
+	if (!run.begin(trace, baseline, 3209, KERNEL_PHASE_SPATIAL_WORK))
+		return false;
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_PATH, 1);
+	auto timing = run.timing.beginBatch(KERNEL_PERFORMANCE_PATH, 1, 3209, 1);
+	KernelPerformanceReferenceBatch validated;
+	DirectFixture first(3, 4, 11, 7), second(17, 9, 10, 14);
+	second.snapshot.requestToken = 74;
+	second.snapshot.objectId = 100;
+	const rts::DirectPathSnapshot inputs[] = {first.snapshot, second.snapshot};
+	rts::DeterministicDirectPathBatch batch;
+	const bool completed = attempt.valid() && timing.valid() &&
+		batch.executeSynchronously(runtime.jobs, inputs, 2, 10000,
+			&timing, &run.reference, &validated, attempt);
+	const auto execution = batch.executionSnapshot();
+	assert(completed && execution.completed && !execution.timedOut &&
+		execution.referenceAdmissionAccepted);
+	assert(execution.submittedJobCount == (baseline ? 0U : 2U));
+	assert(baseline ? execution.workerExecutedJobCount == 0U :
+		execution.workerExecutedJobCount == 2U);
+	assert(validated.valid());
+	AssertBatchResultMatchesSerial(first, batch, 0);
+	AssertBatchResultMatchesSerial(second, batch, 1);
+	const auto commit = run.timing.beginInterval(timing,
+		KERNEL_PERFORMANCE_COMMIT);
+	run.clock.now.fetch_add(11);
+	assert(run.timing.endInterval(commit));
+	assert(run.reference.finishBatch(validated, true));
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = KERNEL_PERFORMANCE_COMMITTED;
+	finish.reasonSchema = 1;
+	finish.reason = 1;
+	finish.validatedBatch = validated;
+	assert(run.reference.finishAttempt(attempt, finish));
+	const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+	KernelPerformanceAttemptReap reap = {};
+	reap.reasonSchema = 1;
+	reap.reason = 1;
+	reap.dynamicFactsKnownMask = 7;
+	reap.pendingJobs = scheduler.pendingJobs;
+	reap.outstandingJobs = scheduler.outstandingJobs;
+	reap.activeSlots = 0;
+	assert(run.reference.reapAttempt(attempt, reap));
+	assert(run.timing.endBatch(timing, KERNEL_PERFORMANCE_COMMITTED));
+	const bool sealed = run.reference.sealObservationWindow() &&
+		run.reference.sealExecutionClosure();
+	const auto snapshot = run.reference.freeze();
+	const bool timingClosed = run.closeTiming(scheduler);
+	const bool complete = sealed && timingClosed && snapshot.complete &&
+		snapshot.trace.complete && snapshot.errors == 0 &&
+		snapshot.streamCount == 1 &&
+		snapshot.streams[0].kernel == KERNEL_PERFORMANCE_PATH &&
+		snapshot.streams[0].subtype == 1 &&
+		snapshot.trace.admittedAttemptCount == 1 &&
+		snapshot.trace.reapCount == 1;
+	if (!baseline && complete)
+		trace.source = snapshot;
+	else if (baseline && complete)
+		assert(snapshot.streams[0].inputDigest.equals(
+			trace.source.streams[0].inputDigest) &&
+			snapshot.streams[0].outputDigest.equals(
+				trace.source.streams[0].outputDigest) &&
+			snapshot.streams[0].commitDigest.equals(
+				trace.source.streams[0].commitDigest));
+	return complete;
+}
+
+bool TestNativeDirectReferenceSourceConsumer()
+{
+	rts_test::NativeKernelTrace trace(75);
+	return RunNativeDirectReferenceRole(trace, false) &&
+		RunNativeDirectReferenceRole(trace, true);
+}
+
+void TestNativeDirectReferenceAllocationFailuresFallBack()
+{
+	using namespace rts::performance;
+	static constexpr unsigned allocationFailures[] = {32U, 64U, 128U};
+	for (const unsigned faultMask : allocationFailures)
+	{
+		NativePathWorkerScope runtime;
+		rts_test::NativeKernelTrace trace(76 + faultMask);
+		rts_test::NativeKernelClock clock;
+		trace.options.clock = rts_test::NativeKernelClock::read;
+		trace.options.clockContext = &clock;
+		KernelPerformanceReferenceLedger reference;
+		assert(reference.beginRun(trace.options));
+		const KernelPerformanceAttemptIdentity identity = {
+			KERNEL_PERFORMANCE_PATH, 1, 1, 0,
+			KERNEL_PHASE_SPATIAL_WORK, 3211};
+		const KernelPerformanceAttempt attempt = reference.beginAttempt(identity);
+		assert(attempt.valid());
+
+		DirectFixture first(3, 4, 11, 7), second(17, 9, 10, 14);
+		second.snapshot.requestToken = 74;
+		second.snapshot.objectId = 100;
+		const rts::DirectPathSnapshot inputs[] = {first.snapshot, second.snapshot};
+		rts::DeterministicDirectPathBatch batch;
+		bool exceptionEscaped = false;
+		bool completed = true;
+		rts_direct_path_set_test_fault_mask(faultMask);
+		try
+		{
+			completed = batch.executeSynchronously(runtime.jobs, inputs, 2, 1000,
+				nullptr, &reference, nullptr, attempt);
+		}
+		catch (...)
+		{
+			exceptionEscaped = true;
+		}
+		rts_direct_path_set_test_fault_mask(0);
+		assert(!exceptionEscaped);
+		assert(!completed);
+		const rts::DeterministicDirectPathBatchExecutionSnapshot execution =
+			batch.executionSnapshot();
+		assert(!execution.completed && !execution.timedOut);
+		assert(!execution.referenceAdmissionAccepted);
+		assert(execution.submittedJobCount == 0);
+	}
+}
+
+void TestNativeOrdinaryRetainedTitleContext()
+{
+	using namespace rts::performance;
+	NativePathWorkerScope runtime;
+	rts_test::NativeKernelTrace trace(74);
+	rts_test::NativeKernelOwnerRun run;
+	assert(run.begin(trace, false, 3207, KERNEL_PHASE_SPATIAL_WORK));
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_PATH, 0);
+	assert(attempt.valid());
+	auto timing = run.timing.beginBatch(KERNEL_PERFORMANCE_PATH, 0, 3207, 1);
+	assert(timing.valid());
+	KernelPerformanceReferenceBatch validated;
+	NativeOrdinaryQuotaFixture input(1);
+	std::unique_ptr<rts::DeterministicOrdinaryPathBatch> retained(
+		new rts::DeterministicOrdinaryPathBatch());
+	rts_direct_path_set_test_pause_mask(4);
+	assert(!retained->executeSynchronously(runtime.jobs, input.grid,
+		input.requests.data(), input.requests.size(), 1, &timing, &run.reference,
+		&validated, nullptr, attempt));
+	assert(retained->executionSnapshot().timedOut);
+	assert(retained->executionSnapshot().submittedRangeJobCount == 1);
+	rts_direct_path_release_test_pause(4);
+	rts_direct_path_set_test_pause_mask(0);
+	WaitForNativePathDrain(runtime.jobs);
+	assert(retained->collectPerformanceReference(runtime.jobs));
+	assert(!validated.valid());
+	retained.reset();
+
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION;
+	finish.reasonSchema = 1;
+	finish.reason = 2;
+	assert(run.timing.endBatch(timing,
+		KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION));
+	assert(run.reference.finishAttempt(attempt, finish));
+	KernelPerformanceAttemptReap reap = {};
+	reap.reasonSchema = 1;
+	reap.reason = 1;
+	reap.dynamicFactsKnownMask = 7;
+	reap.pendingJobs = runtime.jobs.pendingOwnerCompletionCount();
+	reap.outstandingJobs = runtime.jobs.outstandingJobCount();
+	reap.activeSlots = 0;
+	assert(run.reference.reapAttempt(attempt, reap));
+	assert(run.reference.sealObservationWindow());
+	assert(run.reference.sealExecutionClosure());
+	const auto snapshot = run.reference.freeze();
+	assert(snapshot.errors == 0 && snapshot.trace.reapCount == 1);
+	assert(run.closeTiming(rts_test::NativeKernelSchedulerBoundary()));
+}
+
+void TestNativePathNullOwnerTeardown()
+{
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	jobs.shutdown();
+	rts::JobSystemConfig config;
+	config.workerCount = 2;
+	config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+	DirectFixture first(0, 0, 4, 0), second(0, 1, 4, 1);
+	second.snapshot.requestToken = 74;
+	second.snapshot.objectId = 100;
+	const rts::DirectPathSnapshot inputs[] = {first.snapshot, second.snapshot};
+	{
+		std::unique_ptr<rts::DeterministicDirectPathBatch> context(
+			new rts::DeterministicDirectPathBatch());
+		assert(context->executeSynchronously(jobs, inputs, 2, 1000));
+		assert(context->executionSnapshot().completed);
+		// Teardown deliberately clears the owner only after scheduler shutdown;
+		// destroying the retained title context must then be harmless and must
+		// not attempt owner-only collection through a null identity.
+		jobs.shutdown();
+		assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+		context.reset();
+	}
+}
+
+void TestDirectPathOwnerMixedOutcomeReceiptState()
+{
+	rts::DeterministicPathOwnerCompletion completion;
+	completion.reset(2);
+	completion.beginOperation();
+	completion.finishOperation(true, false);
+	completion.beginOperation();
+	completion.finishOperation(false, false);
+	assert(!completion.committed());
+	const bool fallback = completion.beginLegacyFallback();
+	assert(fallback && completion.fallbackEntered() &&
+		!completion.fallbackCompleted());
+	completion.completeLegacyFallback(fallback);
+	assert(completion.fallbackCompleted());
+}
+
+void TestPathOwnerFullBatchCommitState()
+{
+	rts::DeterministicPathOwnerCompletion completion;
+	completion.reset(2);
+	completion.beginOperation();
+	completion.finishOperation(true, false);
+	completion.beginOperation();
+	completion.finishOperation(true, false);
+	assert(completion.committed());
+	assert(!completion.fallbackEntered() &&
+		!completion.fallbackCompleted());
+}
+
+void TestDirectPathOwnerNoFallbackReceiptState()
+{
+	rts::DeterministicPathOwnerCompletion completion;
+	completion.reset(2);
+	completion.beginOperation();
+	completion.finishOperation(true, false);
+	completion.beginOperation();
+	completion.finishOperation(false, true);
+	assert(!completion.committed());
+	assert(!completion.beginLegacyFallback());
+	assert(!completion.fallbackEntered() &&
+		!completion.fallbackCompleted());
+}
+
+void TestOrdinaryPathOwnerMixedOutcomeReceiptState()
+{
+	rts::DeterministicPathOwnerCompletion completion;
+	completion.reset(2);
+	completion.beginOperation();
+	completion.finishOperation(false, false);
+	const bool fallback = completion.beginLegacyFallback();
+	completion.completeLegacyFallback(fallback);
+	completion.beginOperation();
+	completion.finishOperation(true, false);
+	assert(!completion.committed());
+	assert(completion.fallbackEntered() && completion.fallbackCompleted());
+}
+
+void TestOrdinaryPathOwnerUnconsumedReceiptStateHasNoFallback()
+{
+	rts::DeterministicPathOwnerCompletion completion;
+	completion.reset(2);
+	completion.expectLegacyFallback();
+	assert(!completion.committed());
+	assert(!completion.fallbackEntered() &&
+		!completion.fallbackCompleted());
+}
+#endif
 
 } // namespace
 
@@ -2103,6 +3719,27 @@ int main()
 	TestOrdinaryPathReferenceModesAndCommitBoundary();
 #endif
 	TestOrdinaryAdaptiveLargeObstructedBatchAndFaults();
+#if defined(_WIN64)
+	TestNativeOrdinaryQuotaOneRequestLiteral();
+	TestNativeOrdinaryQuotaRetains2048AndRefusesOne();
+	TestNativeOrdinaryFiveRequestCanonicalRanges();
+	TestNativeDirectEntryPauseWaitsForBothAdmittedWorkers();
+	TestNativeDirectLateDrainSlotBeforeGroupTerminal();
+	TestNativeOrdinaryLateDrainSlotBeforeGroupTerminal();
+	if (!TestNativeOrdinaryBudgetSourceConsumers()) return 1;
+	TestNativeOrdinarySourceCollectionFailureRejectsCompletion();
+	if (!TestNativeCompletedQuotaSourceConsumer()) return 1;
+	if (!TestNativeDirectReferenceSourceConsumer()) return 1;
+	TestNativeDirectReferenceAllocationFailuresFallBack();
+	TestNativeDirectRetainedTitleContext();
+	TestNativeOrdinaryRetainedTitleContext();
+	TestNativePathNullOwnerTeardown();
+	TestDirectPathOwnerMixedOutcomeReceiptState();
+	TestPathOwnerFullBatchCommitState();
+	TestDirectPathOwnerNoFallbackReceiptState();
+	TestOrdinaryPathOwnerMixedOutcomeReceiptState();
+	TestOrdinaryPathOwnerUnconsumedReceiptStateHasNoFallback();
+#endif
 	std::puts("DeterministicPathSearchTest passed");
 	return 0;
 }

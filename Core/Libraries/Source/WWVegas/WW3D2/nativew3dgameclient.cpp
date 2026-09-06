@@ -67,6 +67,13 @@ struct NativeGameRendererState
 std::mutex g_bootstrap_mutex;
 NativeGameRendererState g_renderer_state;
 
+// These are renderer bootstrap policies rather than title texture objects.
+// Keeping them with the product-neutral bootstrap prevents resource-only
+// consumers from pulling the title-facing texture command adapter.
+std::atomic<int> g_native_texture_bit_depth(16);
+std::atomic<unsigned int> g_native_multisample_mode(
+	GAME_RENDER_MULTISAMPLE_NONE);
+
 // The native D3D11 product currently exposes one logical renderer.  The
 // bootstrap may use WARP when hardware creation fails, so do not publish
 // hardware or feature-level claims that this facade cannot query. Display
@@ -400,8 +407,70 @@ namespace rts
 namespace render
 {
 
+void ClearGameRendererStateForDestroyedOwner(
+	IGameRenderClientNativeOwner *owner)
+{
+	if (owner == 0)
+		return;
+	std::lock_guard<std::mutex> lock(g_bootstrap_mutex);
+	if (g_renderer_state.aggregate != 0 &&
+		static_cast<IGameRenderClientNativeOwner *>(g_renderer_state.aggregate) ==
+		owner)
+	{
+		ResetRendererStateLocked();
+	}
+}
+
 bool GameRenderer_IsWindowed = true;
 int GameRenderer_PreserveFPU = 0;
+
+RenderResult SetGameTextureBitdepth(int bitDepth)
+{
+	if (bitDepth != 16 && bitDepth != 32)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	g_native_texture_bit_depth.store(bitDepth, std::memory_order_release);
+	return RENDER_RESULT_OK;
+}
+
+int GetGameTextureBitdepth()
+{
+	return g_native_texture_bit_depth.load(std::memory_order_acquire);
+}
+
+RenderResult SetGameMSAAMode(unsigned int mode)
+{
+	if (mode != GAME_RENDER_MULTISAMPLE_NONE &&
+		mode != GAME_RENDER_MULTISAMPLE_2X &&
+		mode != GAME_RENDER_MULTISAMPLE_4X &&
+		mode != GAME_RENDER_MULTISAMPLE_8X)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	g_native_multisample_mode.store(mode, std::memory_order_release);
+	return RENDER_RESULT_OK;
+}
+
+unsigned int GetGameMSAAMode()
+{
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (owner == 0 || !owner->IsInitialized() || !owner->IsOperational())
+	{
+		return g_native_multisample_mode.load(std::memory_order_acquire);
+	}
+	RenderBackBufferInfo info;
+	if (owner->GetGameBackBufferInfo(&info) != RENDER_RESULT_OK)
+		return GAME_RENDER_MULTISAMPLE_NONE;
+	switch (info.multisampleCount)
+	{
+	case 2:
+		return GAME_RENDER_MULTISAMPLE_2X;
+	case 4:
+		return GAME_RENDER_MULTISAMPLE_4X;
+	case 8:
+		return GAME_RENDER_MULTISAMPLE_8X;
+	default:
+		return GAME_RENDER_MULTISAMPLE_NONE;
+	}
+}
 
 RenderResult InitializeGameRenderer(void *window, unsigned int width,
 	unsigned int height, bool lite, bool enableVsync)
@@ -450,6 +519,9 @@ RenderResult InitializeGameRenderer(void *window, unsigned int width,
 	descriptor.width = width;
 	descriptor.height = height;
 	descriptor.adapterIndex = UINT_MAX;
+	const unsigned int requestedMultisampleMode = GetGameMSAAMode();
+	descriptor.multisampleCount = requestedMultisampleMode ==
+		GAME_RENDER_MULTISAMPLE_NONE ? 1U : requestedMultisampleMode;
 	descriptor.enableDebugLayer = false;
 	descriptor.enableVsync = enableVsync;
 	descriptor.allowSoftwareFallback = true;
@@ -694,7 +766,56 @@ RenderResult GetGameRendererResolution(int *width, int *height,
 RenderResult GetGameRendererTargetResolution(int *width, int *height,
 	int *bitDepth, bool *windowed)
 {
-	return ReadRendererState(width, height, bitDepth, windowed);
+	if (width == 0 || height == 0 || bitDepth == 0 || windowed == 0)
+		return Fail(0, RENDER_RESULT_INVALID_ARGUMENT);
+
+	// Snapshot bootstrap availability without holding the bootstrap mutex while
+	// entering the owner lifecycle gate. Resize and shutdown use the same
+	// two-phase order (bootstrap transition, then owner),
+	// so this keeps the target query free of a lock inversion.
+	{
+		std::lock_guard<std::mutex> lock(g_bootstrap_mutex);
+		if (g_renderer_state.aggregate == 0 ||
+			g_renderer_state.transitionInProgress ||
+			!IsRendererOwnerThreadLocked())
+			return Fail(0, RENDER_RESULT_INVALID_ARGUMENT);
+	}
+
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	// Bootstrap metadata comes from the renderer state, while target dimensions
+	// come from whichever owner is currently published and pinned.
+	if (!IsReady(owner))
+		return Fail(owner, RENDER_RESULT_INVALID_ARGUMENT);
+	RenderBackBufferInfo targetInfo;
+	const RenderResult targetResult = owner->GetGameRenderTargetInfo(
+		&targetInfo);
+	if (targetResult != RENDER_RESULT_OK)
+		return Fail(owner, targetResult);
+	if (targetInfo.width == 0 || targetInfo.height == 0 ||
+		targetInfo.width > static_cast<unsigned int>(INT_MAX) ||
+		targetInfo.height > static_cast<unsigned int>(INT_MAX))
+		return Fail(owner, RENDER_RESULT_INVALID_ARGUMENT);
+
+	// Publish all four outputs only while the owner pin is held and after the
+	// bootstrap state has been revalidated. Width/height come from the current
+	// logical target; bit depth and window mode remain presentation metadata.
+	bool stateChanged = false;
+	{
+		std::lock_guard<std::mutex> lock(g_bootstrap_mutex);
+		stateChanged = g_renderer_state.aggregate == 0 ||
+			g_renderer_state.transitionInProgress ||
+			!IsRendererOwnerThreadLocked();
+		if (!stateChanged)
+		{
+			*width = static_cast<int>(targetInfo.width);
+			*height = static_cast<int>(targetInfo.height);
+			*bitDepth = g_renderer_state.bitDepth;
+			*windowed = g_renderer_state.windowed;
+		}
+	}
+	return stateChanged ? Fail(owner, RENDER_RESULT_INVALID_ARGUMENT) :
+		RENDER_RESULT_OK;
 }
 
 RenderResult SetGameRendererResolution(int width, int height, int bitDepth,
@@ -836,6 +957,17 @@ void RequestGameBackBufferCapture()
 		return;
 	}
 	owner->RequestGameBackBufferCapture();
+}
+
+bool ConsumeGameBackBufferCaptureSuccess()
+{
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	// A failed End_Render may have made the owner non-operational, but its
+	// cancellation callback is still the authoritative negative completion for
+	// this one-shot request.  Query the pinned owner directly and let it clear
+	// that result exactly once.
+	return owner != 0 && owner->ConsumeGameBackBufferCaptureSuccess();
 }
 
 } // namespace render

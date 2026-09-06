@@ -81,12 +81,9 @@ $rawD3D8BoundaryPaths = @(
     'Core/Tools/NativeD3D8CompatibilityTest/NativeD3D8CompatibilityTest.cpp'
 )
 
-# These are the only product-runtime files allowed to mention the legacy
-# D3D8 ABI during the staged renderer cutover.  Keep this list explicit: a
-# wildcard here would allow an entire subsystem to silently remain on D3D8.
-# StrictD3D8Boundary enforces this temporary containment list. StrictFinal
-# permits no matches at all and must remain red until native device ownership
-# replaces the compatibility bridge.
+# This inventory identifies relocated non-product compatibility sources.
+# StrictD3D8Boundary keeps that historical surface explicit, while StrictFinal
+# permits no D3D8 occurrences anywhere in the supported product prefixes.
 $strictD3D8BoundaryPaths = @(
     # These are retained only as an explicit external-adapter inventory. They
     # are outside product-runtime prefixes, so StrictFinal still requires zero

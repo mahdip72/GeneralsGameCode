@@ -90,13 +90,20 @@ if(RTS_BUILD_CORE_EXTRAS)
             "${CMAKE_SOURCE_DIR}|${CMAKE_BINARY_DIR}")
         string(SUBSTRING "${_native_product_runtime_audit_source_hash}" 0 16
             _native_product_runtime_audit_source_hash)
-        get_filename_component(_native_product_runtime_audit_fallback_root
-            "${CMAKE_SOURCE_DIR}" DIRECTORY)
-        set(_native_product_runtime_audit_build_root
-            "${_native_product_runtime_audit_fallback_root}/.gga/${_native_product_runtime_audit_source_hash}/${_native_product_runtime_audit_configuration}")
-        if(DEFINED ENV{RUNNER_TEMP} AND NOT "$ENV{RUNNER_TEMP}" STREQUAL "")
+        set(RTS_NATIVE_PRODUCT_AUDIT_BUILD_ROOT "" CACHE PATH
+            "Base root for nested native product audit builds; source hash and configuration are appended")
+        if("${RTS_NATIVE_PRODUCT_AUDIT_BUILD_ROOT}" STREQUAL "")
+            get_filename_component(_native_product_runtime_audit_fallback_root
+                "${CMAKE_SOURCE_DIR}" DIRECTORY)
             set(_native_product_runtime_audit_build_root
-                "$ENV{RUNNER_TEMP}/gga/${_native_product_runtime_audit_source_hash}/${_native_product_runtime_audit_configuration}")
+                "${_native_product_runtime_audit_fallback_root}/.gga/${_native_product_runtime_audit_source_hash}/${_native_product_runtime_audit_configuration}")
+            if(DEFINED ENV{RUNNER_TEMP} AND NOT "$ENV{RUNNER_TEMP}" STREQUAL "")
+                set(_native_product_runtime_audit_build_root
+                    "$ENV{RUNNER_TEMP}/gga/${_native_product_runtime_audit_source_hash}/${_native_product_runtime_audit_configuration}")
+            endif()
+        else()
+            set(_native_product_runtime_audit_build_root
+                "${RTS_NATIVE_PRODUCT_AUDIT_BUILD_ROOT}/${_native_product_runtime_audit_source_hash}/${_native_product_runtime_audit_configuration}")
         endif()
         set(_native_product_runtime_audit_budget_root
             "${_native_product_runtime_audit_build_root}")
@@ -298,6 +305,7 @@ if(RTS_BUILD_CORE_EXTRAS)
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/PortabilityAudit/PortabilityAudit.ps1"
                 -SourceRoot "${CMAKE_SOURCE_DIR}"
+                -StrictFinal
         )
         set_tests_properties(core_portability_audit PROPERTIES TIMEOUT 300)
         add_test(NAME core_portability_audit_self_test
@@ -464,7 +472,7 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
                 -Targets core_renderer,core_ww3d2_native
                 -MigrationTargets "${_native_renderer_graph_audit_migration_targets}"
                 -ProductTargets "${_native_renderer_graph_audit_product_targets}"
-                -AuthorityOnly
+                -StrictFinal
         )
         set_tests_properties(core_native_renderer_graph_audit PROPERTIES TIMEOUT 120)
         unset(_native_renderer_graph_audit_configuration)

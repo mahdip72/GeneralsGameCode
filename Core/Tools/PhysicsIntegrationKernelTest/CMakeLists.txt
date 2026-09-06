@@ -26,5 +26,5 @@ if(MINGW)
 endif()
 
 add_test(NAME core_physics_integration_kernel_tests
-    COMMAND core_physics_integration_kernel_tests)
+    COMMAND core_physics_integration_kernel_tests --local-capacity)
 set_tests_properties(core_physics_integration_kernel_tests PROPERTIES TIMEOUT 60)

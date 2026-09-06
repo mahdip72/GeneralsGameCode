@@ -20,6 +20,7 @@
 #include "Lib/KernelPerformanceDiagnostics.h"
 #include "Lib/KernelPerformanceReference.h"
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,22 @@ struct PerformanceReceiptPhase
 	JobMetricCounter sampleCount;
 	JobMetricCounter serialNanoseconds;
 	bool serialNanosecondsKnown;
+	JobMetricCounter pureNanoseconds;
+	bool pureNanosecondsKnown;
+};
+
+// Transport for the existing frozen reference/phase snapshots. These fields
+// alone grant no source-selection or execution authority. The runtime fills
+// them from its independently opened source; hashes/counts stay in the ledger.
+struct PerformanceReceiptTraceFiles
+{
+	PerformanceReceiptTraceFiles();
+	std::string tracePath;
+	std::string sourceReceiptPath;
+	std::string sourceRunId;
+	std::string sourceRunNonce;
+	unsigned sourceProcessId;
+	JobMetricCounter sourceProcessCreationTimeUtc100ns;
 };
 
 // Diagnostics sampled after completed simulation frames, never instantaneous
@@ -206,8 +223,20 @@ struct PerformanceReceipt
 	// Mode is requested at Begin, then replaced by the actual frozen ledger.
 	// It derives measurementRole; a host label cannot disguise oracle elapsed.
 	KernelPerformanceReferenceSnapshot kernelReference;
+	PerformanceReceiptTraceFiles traceFiles;
 	PerformanceReceiptRawEvidence rawEvidence;
 };
+
+// Canonical 0x5003 binding of only runId, runNonce, u32 PID and u64 creation
+// FILETIME. Invalid ASCII safe token/UUID or zero PID/time returns no digest.
+// This can precede completion; a digest grants no source or execution authority.
+KernelPerformanceDigest GetPerformanceReceiptRunIdentity(
+	const PerformanceReceipt &receipt);
+
+// Pure bounded reader for a complete V6 throughput RECORD source receipt.
+// It owns no file/path or host-tuple authority. Failure clears the output.
+bool ParsePerformanceReceiptSource(const unsigned char *bytes,
+	std::size_t byteCount, PerformanceReceipt &source, std::string *reason = 0);
 
 // Reads only the explicit performance-run contract from the environment and
 // captures executable-owned process identity. It never fabricates a hash,
@@ -248,8 +277,18 @@ bool ValidatePerformanceReceipt(const PerformanceReceipt &receipt,
 
 // Writes a validated receipt using exclusive temporary creation, flush, and
 // an atomic rename. The destination directory must already exist.
+typedef bool (*PerformanceReceiptPublicationObserver)(void *context,
+	void *nativeHandle, const char *publishedPath, std::string *reason);
+// Testable checked-close boundary. A supplied closer consumes nativeHandle
+// exactly once and reports whether the kernel close qualified.
+typedef bool (*PerformanceReceiptHandleCloser)(void *context,
+	void *nativeHandle);
 bool WritePerformanceReceiptAtomically(PerformanceReceipt &receipt,
 	const char *directory, std::string *writtenPath = 0,
-	std::string *reason = 0);
+	std::string *reason = 0,
+	PerformanceReceiptPublicationObserver observer = 0,
+	void *observerContext = 0,
+	PerformanceReceiptHandleCloser closer = 0,
+	void *closerContext = 0);
 
 } }

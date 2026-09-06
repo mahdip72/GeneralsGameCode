@@ -7,8 +7,8 @@
   "required": ["schemaVersion", "gateName", "sourceCommit", "cohortNonce",
     "cohortCreatedUtc", "artifactSet", "evidence"],
   "properties": {
-    "schemaVersion": { "const": 1 },
-    "gateName": { "const": "final-stage5-acceptance" },
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "gateName": { "type": "string", "const": "final-stage5-acceptance" },
     "sourceCommit": { "type": "string", "pattern": "^[0-9A-Fa-f]{40}$" },
     "cohortNonce": { "type": "string", "format": "uuid" },
     "cohortCreatedUtc": { "type": "string", "format": "date-time" },
@@ -23,6 +23,7 @@
         "required": ["kind", "path", "sha256"],
         "properties": {
           "kind": {
+            "type": "string",
             "enum": [
               "deterministic-runtime",
               "replay-determinism",

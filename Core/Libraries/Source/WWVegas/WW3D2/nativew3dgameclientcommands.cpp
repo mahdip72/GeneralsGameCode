@@ -14,6 +14,7 @@
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/RenderGameClientNative.h"
 #include "Renderer/NativeW3DResources.h"
+#include "Renderer/RenderTexturePublication.h"
 #include "dx8indexbuffer.h"
 #include "dx8vertexbuffer.h"
 #include "nativew3d2.h"
@@ -26,7 +27,6 @@
 #include <float.h>
 #include <limits.h>
 #include <string.h>
-#include <atomic>
 
 #if defined(_WIN64)
 
@@ -35,24 +35,17 @@ namespace
 
 using namespace rts::render;
 
-// Texture bit depth is a legacy logical policy value.  It is intentionally
-// independent from the native D3D11 resource format and therefore must not be
-// sent through the aggregate command path.  Stage4 defaulted this value to
-// 16 and accepted only the historical 16/32 choices.
-std::atomic<int> g_native_texture_bit_depth(16);
-
 bool IsOperationalOwner(IGameRenderClientNativeOwner *owner)
 {
 	return owner != 0 && owner->IsInitialized() && owner->IsOperational();
 }
 
-// Shader handles are logical title resources.  During a device/resource
-// rebuild the owner intentionally closes frame/draw admission, but cleanup
-// callbacks still need to delete old handles and recreate their logical
-// shader entries.  The concrete owner separately verifies that its backend
-// is ready before creating anything; this outer predicate only opens the
-// narrow lifecycle seam and never admits ordinary rendering commands.
-bool IsShaderAdmissionOwner(IGameRenderClientNativeOwner *owner)
+// Title-owned resources may be released/recreated during a device/resource
+// rebuild while the owner intentionally closes frame/draw admission. The
+// concrete owner separately verifies backend readiness before creating
+// anything; this outer predicate opens only the narrow resource lifecycle
+// seam and never admits ordinary rendering commands.
+bool IsResourceAdmissionOwner(IGameRenderClientNativeOwner *owner)
 {
 	return owner != 0 && owner->IsInitialized() &&
 		(owner->IsOperational() || owner->IsRebuildingResources());
@@ -133,16 +126,35 @@ bool AcquireTextureResource(TextureBaseClass *texture, GpuHandle *resource)
 	return resource->isValid();
 }
 
+bool AcquireOutputSurface(TextureBaseClass *texture,
+	NativeW3DSurfaceHandle *surface)
+{
+	if (texture == 0 || surface == 0)
+		return false;
+	*surface = NativeW3DSurfaceHandle();
+	return texture->Acquire_Native_Surface(0, 0, true, surface) &&
+		surface->isValid();
+}
+
+void CopyRenderTargetSubresource(const NativeW3DSurfaceHandle &surface,
+	RenderTargetSubresource *subresource)
+{
+	subresource->resource = surface.texture.resource;
+	subresource->mip = surface.mipLevel;
+	subresource->arraySlice = surface.arraySlice;
+}
+
 void CopyMatrix(const Matrix3D &source, RenderMatrix4 *destination)
 {
+	// WWMath uses column vectors; renderer constants use D3D row vectors.
 	for (unsigned int row = 0; row < 3; ++row)
 	{
 		for (unsigned int column = 0; column < 4; ++column)
-			destination->values[row * 4 + column] = source[row][column];
+			destination->values[column * 4 + row] = source[row][column];
 	}
-	destination->values[12] = 0.0f;
-	destination->values[13] = 0.0f;
-	destination->values[14] = 0.0f;
+	destination->values[3] = 0.0f;
+	destination->values[7] = 0.0f;
+	destination->values[11] = 0.0f;
 	destination->values[15] = 1.0f;
 }
 
@@ -151,7 +163,7 @@ void CopyMatrix(const Matrix4x4 &source, RenderMatrix4 *destination)
 	for (unsigned int row = 0; row < 4; ++row)
 	{
 		for (unsigned int column = 0; column < 4; ++column)
-			destination->values[row * 4 + column] = source[row][column];
+			destination->values[column * 4 + row] = source[row][column];
 	}
 }
 
@@ -191,14 +203,29 @@ bool SetStaticVertexBufferCommand(GameRenderCommand *command,
 		return false;
 	if (buffer == 0)
 		return true;
+	if (buffer->Type() == BUFFER_TYPE_SORTING)
+	{
+		const SortingVertexBufferClass *sorting =
+			static_cast<const SortingVertexBufferClass *>(buffer);
+		const unsigned int count = sorting->Get_Initialized_Vertex_Count();
+		const unsigned int stride = buffer->FVF_Info().Get_FVF_Size();
+		if (count == 0 || count > buffer->Get_Vertex_Count() || stride == 0 ||
+			sorting->Get_Vertex_Data() == 0)
+			return false;
+		command->value0 = buffer->FVF_Info().Get_FVF();
+		command->value1 = stride;
+		command->value3 = count;
+		command->input = sorting->Get_Vertex_Data();
+		command->inputBytes = static_cast<size_t>(count) * stride;
+		return true;
+	}
 	if (buffer->Type() != BUFFER_TYPE_DX8 || buffer->Get_Vertex_Count() == 0)
 		return false;
 	const DX8VertexBufferClass *nativeBuffer =
 		static_cast<const DX8VertexBufferClass *>(buffer);
 	GpuHandle handle;
 	const unsigned int stride = buffer->FVF_Info().Get_FVF_Size();
-	if (stride == 0 || !nativeBuffer->Acquire_Native_Vertex_Buffer(stride,
-		0, 0, buffer->Get_Vertex_Count(), &handle))
+	if (stride == 0 || !nativeBuffer->Acquire_Native_Vertex_Buffer(&handle))
 		return false;
 	command->resource0 = ToGameHandle(handle);
 	command->value0 = buffer->FVF_Info().Get_FVF();
@@ -217,13 +244,25 @@ bool SetStaticIndexBufferCommand(GameRenderCommand *command,
 	command->signedValue0 = indexBaseOffset;
 	if (buffer == 0)
 		return true;
+	if (buffer->Type() == BUFFER_TYPE_SORTING)
+	{
+		const SortingIndexBufferClass *sorting =
+			static_cast<const SortingIndexBufferClass *>(buffer);
+		const unsigned int count = sorting->Get_Initialized_Index_Count();
+		if (count == 0 || count > buffer->Get_Index_Count() ||
+			sorting->Get_Index_Data() == 0)
+			return false;
+		command->value2 = count;
+		command->input = sorting->Get_Index_Data();
+		command->inputBytes = static_cast<size_t>(count) * sizeof(unsigned short);
+		return true;
+	}
 	if (buffer->Type() != BUFFER_TYPE_DX8 || buffer->Get_Index_Count() == 0)
 		return false;
 	const DX8IndexBufferClass *nativeBuffer =
 		static_cast<const DX8IndexBufferClass *>(buffer);
 	GpuHandle handle;
-	if (!nativeBuffer->Acquire_Native_Index_Buffer(0, 0,
-		buffer->Get_Index_Count(), &handle))
+	if (!nativeBuffer->Acquire_Native_Index_Buffer(&handle))
 		return false;
 	command->resource0 = ToGameHandle(handle);
 	return true;
@@ -250,17 +289,38 @@ RenderResult ApplyGameShaderBits(unsigned int shaderBits)
 
 void SetGameTexture(unsigned int stage, TextureBaseClass *texture)
 {
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (!IsOperationalOwner(owner))
+	{
+		if (owner != 0)
+			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
+	if (stage >= LEGACY_TEXTURE_STAGE_COUNT)
+	{
+		owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
+	TextureBaseClass *sampledTexture = texture;
+	if (texture != 0)
+	{
+		// TextureClass::Apply owns lazy loading, stage publication, usage
+		// accounting, and sampler policy. Native binding must consume the
+		// effective published texture because aliases and the global texturing
+		// toggle can deliberately publish a different texture or nullptr.
+		texture->Apply(stage);
+		sampledTexture = GetPublishedTextureStage(stage);
+	}
 	GameRenderCommand command;
 	InitializeCommand(&command, GAME_RENDER_COMMAND_SET_TEXTURE);
 	command.value0 = stage;
-	if (!AcquireTextureHandle(texture, &command.resource0))
+	if (!AcquireTextureHandle(sampledTexture, &command.resource0))
 	{
-		NativeGameRenderOwnerScope scope;
-		if (scope.Get() != 0)
-			scope.Get()->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 		return;
 	}
-	(void)DispatchCommand(command);
+	(void)SubmitCommand(owner, command);
 }
 
 void SetGameTransform(GameRenderTransformSlot slot, const Matrix3D &matrix)
@@ -306,7 +366,7 @@ void SetGameTransform(GameRenderTransformSlot slot, const void *matrix)
 	(void)DispatchCommand(command);
 }
 
-void GetGameTransform(GameRenderTransformSlot slot, void *matrix)
+void GetGameTransform(GameRenderTransformSlot slot, Matrix4x4 *matrix)
 {
 	if (matrix == 0)
 	{
@@ -322,6 +382,31 @@ void GetGameTransform(GameRenderTransformSlot slot, void *matrix)
 	command.output = &converted;
 	command.outputBytes = sizeof(converted);
 	NativeGameRenderOwnerScope scope;
+	if (SubmitCommand(scope.Get(), command) == RENDER_RESULT_OK)
+	{
+		for (unsigned int row = 0; row < 4; ++row)
+		{
+			for (unsigned int column = 0; column < 4; ++column)
+				(*matrix)[row][column] = converted.values[column * 4 + row];
+		}
+	}
+}
+
+void GetGameTransform(GameRenderTransformSlot slot, void *matrix)
+{
+	NativeGameRenderOwnerScope scope;
+	if (matrix == 0)
+	{
+		if (scope.Get() != 0)
+			scope.Get()->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
+	GameRenderCommand command;
+	InitializeCommand(&command, GAME_RENDER_COMMAND_GET_TRANSFORM);
+	RenderMatrix4 converted;
+	command.value0 = static_cast<unsigned int>(slot);
+	command.output = &converted;
+	command.outputBytes = sizeof(converted);
 	if (SubmitCommand(scope.Get(), command) == RENDER_RESULT_OK)
 		memcpy(matrix, converted.values, sizeof(converted.values));
 }
@@ -509,17 +594,23 @@ void SetGamePixelShaderConstant(int reg, const void *data, int count)
 
 void SetGameVertexBuffer(const VertexBufferClass *buffer, unsigned int stream)
 {
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (!IsOperationalOwner(owner))
+	{
+		if (owner != 0)
+			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
 	GameRenderCommand command;
 	InitializeCommand(&command, GAME_RENDER_COMMAND_SET_VERTEX_BUFFER);
 	if (!SetStaticVertexBufferCommand(&command, buffer, stream))
 	{
-		NativeGameRenderOwnerScope scope;
-		if (scope.Get() != 0)
-			scope.Get()->RecordGameFailure(stream != 0U ?
-				RENDER_RESULT_UNSUPPORTED : RENDER_RESULT_INVALID_ARGUMENT);
+		owner->RecordGameFailure(stream != 0U ?
+			RENDER_RESULT_UNSUPPORTED : RENDER_RESULT_INVALID_ARGUMENT);
 		return;
 	}
-	(void)DispatchCommand(command);
+	(void)SubmitCommand(owner, command);
 }
 
 bool SetGameVertexBuffer(const DynamicVBAccessClass &buffer)
@@ -551,11 +642,11 @@ bool SetGameVertexBuffer(const DynamicVBAccessClass &buffer)
 			goto invalid_buffer;
 		command.value0 = fvf;
 		command.value1 = stride;
-		// The native command stores the absolute source vertex minimum and
-		// byte offset separately.  The pointer already addresses that minimum.
-		command.value2 = byteOffset / stride;
+		// The pointer already selects this allocation. Draw indices are relative
+		// to the retained copy, independently of the shared pool's byte offset.
+		command.value2 = 0;
 		command.value3 = count;
-		command.value4 = byteOffset;
+		command.value4 = 0;
 		command.input = data;
 		command.inputBytes = static_cast<size_t>(count) * stride;
 	}
@@ -575,16 +666,22 @@ invalid_buffer:
 void SetGameIndexBuffer(const IndexBufferClass *buffer,
 	unsigned short indexBaseOffset)
 {
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (!IsOperationalOwner(owner))
+	{
+		if (owner != 0)
+			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
 	GameRenderCommand command;
 	InitializeCommand(&command, GAME_RENDER_COMMAND_SET_INDEX_BUFFER);
 	if (!SetStaticIndexBufferCommand(&command, buffer, indexBaseOffset))
 	{
-		NativeGameRenderOwnerScope scope;
-		if (scope.Get() != 0)
-			scope.Get()->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 		return;
 	}
-	(void)DispatchCommand(command);
+	(void)SubmitCommand(owner, command);
 }
 
 bool SetGameIndexBuffer(const DynamicIBAccessClass &buffer,
@@ -612,9 +709,8 @@ bool SetGameIndexBuffer(const DynamicIBAccessClass &buffer,
 		const unsigned int byteOffset = buffer.Get_Index_Buffer_Offset();
 		if (data == 0 || (byteOffset % sizeof(unsigned short)) != 0U)
 			goto invalid_buffer;
-		// The command's source index is the byte offset expressed in R16
-		// elements.  The pointer already addresses that selected element.
-		command.value1 = byteOffset / sizeof(unsigned short);
+		// The retained copy starts at this allocation, not at the pool origin.
+		command.value1 = 0;
 		command.value2 = count;
 		command.input = data;
 		command.inputBytes = static_cast<size_t>(count) *
@@ -646,7 +742,7 @@ bool DeleteGameShader(bool vertexShader, unsigned int handle)
 {
 	NativeGameRenderOwnerScope scope;
 	IGameRenderClientNativeOwner *owner = scope.Get();
-	if (!IsShaderAdmissionOwner(owner) || handle == 0U)
+	if (!IsResourceAdmissionOwner(owner) || handle == 0U)
 	{
 		if (owner != 0)
 			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
@@ -682,7 +778,7 @@ RenderResult CreateGameShaderFromAsset(const char *assetPath,
 	}
 	NativeGameRenderOwnerScope scope;
 	IGameRenderClientNativeOwner *owner = scope.Get();
-	if (!IsShaderAdmissionOwner(owner))
+	if (!IsResourceAdmissionOwner(owner))
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	const RenderResult result = owner->CreateGameShaderFromAsset(assetPath,
 		vertexShader, declarationWords, declarationWordCount, usage, handle);
@@ -818,42 +914,50 @@ RenderResult DrawGamePrimitiveUP(GamePrimitiveTopology topology,
 void SetGameRenderTarget(TextureClass *colorTexture,
 	ZTextureClass *depthTexture, bool useDefaultDepth)
 {
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (!IsOperationalOwner(owner))
+	{
+		if (owner != 0)
+			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return;
+	}
 	GameRenderCommand command;
 	InitializeCommand(&command, GAME_RENDER_COMMAND_SET_RENDER_TARGET);
 	RenderTargetBinding binding;
+	NativeW3DSurfaceHandle colorSurface;
+	NativeW3DSurfaceHandle depthSurface;
 	if (colorTexture == 0)
 	{
 		// A null color target is the historical restore-default operation.  The
 		// neutral binding leaves both default attachments selected.
 		if (depthTexture != 0)
 		{
-			NativeGameRenderOwnerScope scope;
-			if (scope.Get() != 0)
-				scope.Get()->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 			return;
 		}
 	}
 	else
 	{
-		if (!AcquireTextureResource(colorTexture, &binding.color.resource))
+		// Render-target binding is an output operation. Sampling acquisition can
+		// refresh a stale CPU image and leaves the resource table believing that
+		// the old CPU bytes remain authoritative after the GPU writes it.
+		if (!AcquireOutputSurface(colorTexture, &colorSurface))
 		{
-			NativeGameRenderOwnerScope scope;
-			if (scope.Get() != 0)
-				scope.Get()->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 			return;
 		}
+		CopyRenderTargetSubresource(colorSurface, &binding.color);
 		binding.useBackBufferColor = false;
 		binding.hasColor = true;
 		if (depthTexture != 0)
 		{
-			if (!AcquireTextureResource(depthTexture, &binding.depth.resource))
+			if (!AcquireOutputSurface(depthTexture, &depthSurface))
 			{
-				NativeGameRenderOwnerScope scope;
-				if (scope.Get() != 0)
-					scope.Get()->RecordGameFailure(
-						RENDER_RESULT_INVALID_ARGUMENT);
+				owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 				return;
 			}
+			CopyRenderTargetSubresource(depthSurface, &binding.depth);
 			binding.useBackBufferDepth = false;
 			binding.hasDepth = true;
 		}
@@ -865,29 +969,53 @@ void SetGameRenderTarget(TextureClass *colorTexture,
 	}
 	command.input = &binding;
 	command.inputBytes = sizeof(binding);
-	(void)DispatchCommand(command);
+	if (SubmitCommand(owner, command) != RENDER_RESULT_OK)
+		return;
+
+	// Accepted output selection relinquishes CPU recovery authority. A pre-frame
+	// selection is applied by Begin_Render before its clear; publish the exact
+	// subresources now so later sampling uses the texture's GPU lease rather
+	// than refreshing its creation image over a rendered result.
+	bool publicationSucceeded = true;
+	if (colorTexture != 0 &&
+		!colorTexture->Publish_Native_Output(colorSurface))
+		publicationSucceeded = false;
+	if (depthTexture != 0 &&
+		!depthTexture->Publish_Native_Output(depthSurface))
+		publicationSucceeded = false;
+	if (!publicationSucceeded)
+		owner->RecordGameFailure(RENDER_RESULT_FAILED);
 }
 
 RenderResult CopyGameActiveTargetToTexture(TextureClass *destination)
 {
-	GameRenderHandle handle;
-	if (destination == 0 || !AcquireTextureHandle(destination, &handle) ||
-		(handle.index == 0U && handle.generation == 0U))
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (!IsOperationalOwner(owner))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	if (destination == 0)
 	{
-		NativeGameRenderOwnerScope scope;
-		if (scope.Get() != 0)
-			scope.Get()->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	GameRenderCommand command;
-	InitializeCommand(&command,
-		GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE);
-	command.resource0 = handle;
-	return DispatchCommand(command);
+	// Copy is a write-side operation. Do not require a sampling acquisition
+	// first: a retained GPU-authored destination may intentionally reject a
+	// stale sampling lease after recovery, while its owner still has the valid
+	// resource/write identity needed to accept this copy and refresh its cache.
+	if (!destination->Copy_Native_Active_Color_Target())
+	{
+		owner->RecordGameFailure(RENDER_RESULT_FAILED);
+		return RENDER_RESULT_FAILED;
+	}
+	return RENDER_RESULT_OK;
 }
 
 bool AcquireGameCopiedTextureContent(TextureClass *destination)
 {
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (!IsOperationalOwner(owner))
+		return false;
 	if (destination == 0)
 	{
 		NativeGameRenderOwnerScope scope;
@@ -903,7 +1031,13 @@ bool AcquireGameCopiedTextureContent(TextureClass *destination)
 	InitializeCommand(&command,
 		GAME_RENDER_COMMAND_ACQUIRE_COPIED_TEXTURE_CONTENT);
 	command.resource0 = handle;
-	return DispatchCommand(command) == RENDER_RESULT_OK;
+	NativeW3DGpuContentLease lease;
+	command.output = &lease;
+	command.outputBytes = sizeof(lease);
+	if (SubmitCommand(owner, command) != RENDER_RESULT_OK)
+		return false;
+	NativeW3DTextureHandle sampled;
+	return destination->Acquire_Native_Texture(&sampled, &lease);
 }
 
 TextureClass *CreateGameRenderTarget(int width, int height, WW3DFormat format)
@@ -918,22 +1052,22 @@ TextureClass *CreateGameRenderTarget(int width, int height, WW3DFormat format)
 	if (format == WW3D_FORMAT_UNKNOWN)
 		format = WW3D_FORMAT_X8R8G8B8;
 	NativeGameRenderOwnerScope scope;
-	if (!IsOperationalOwner(scope.Get()))
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (!IsResourceAdmissionOwner(owner))
 		return 0;
 	TextureClass *texture = NEW_REF(TextureClass, (width, height, format,
 		MIP_LEVELS_1, TextureBaseClass::POOL_DEFAULT, true, false));
 	if (texture == 0 || !texture->Is_Initialized())
 	{
 		REF_PTR_RELEASE(texture);
-		scope.Get()->RecordGameFailure(RENDER_RESULT_FAILED);
+		owner->RecordGameFailure(RENDER_RESULT_FAILED);
 		return 0;
 	}
 	NativeW3DSurfaceHandle outputSurface;
-	if (!texture->Acquire_Native_Surface(0, 0, true, &outputSurface) ||
-		!outputSurface.isValid())
+	if (!AcquireOutputSurface(texture, &outputSurface))
 	{
 		REF_PTR_RELEASE(texture);
-		scope.Get()->RecordGameFailure(RENDER_RESULT_FAILED);
+		owner->RecordGameFailure(RENDER_RESULT_FAILED);
 		return 0;
 	}
 	return texture;
@@ -958,7 +1092,7 @@ RenderResult CreateGameRenderTargetPair(int width, int height,
 		colorFormat = WW3D_FORMAT_A8R8G8B8;
 	NativeGameRenderOwnerScope scope;
 	IGameRenderClientNativeOwner *owner = scope.Get();
-	if (!IsOperationalOwner(owner))
+	if (!IsResourceAdmissionOwner(owner))
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	TextureClass *color = NEW_REF(TextureClass, (width, height, colorFormat,
 		MIP_LEVELS_1, TextureBaseClass::POOL_DEFAULT, true, false));
@@ -967,10 +1101,8 @@ RenderResult CreateGameRenderTargetPair(int width, int height,
 	NativeW3DSurfaceHandle colorSurface;
 	NativeW3DSurfaceHandle depthSurface;
 	if (color == 0 || depth == 0 || !color->Is_Initialized() ||
-		!depth->Is_Initialized() ||
-		!color->Acquire_Native_Surface(0, 0, true, &colorSurface) ||
-		!depth->Acquire_Native_Surface(0, 0, true, &depthSurface) ||
-		!colorSurface.isValid() || !depthSurface.isValid())
+		!depth->Is_Initialized() || !AcquireOutputSurface(color, &colorSurface) ||
+		!AcquireOutputSurface(depth, &depthSurface))
 	{
 		REF_PTR_RELEASE(color);
 		REF_PTR_RELEASE(depth);
@@ -1046,37 +1178,6 @@ long GetGameRendererSwapInterval()
 	if (DispatchCommand(command) != RENDER_RESULT_OK)
 		return 0;
 	return interval;
-}
-
-RenderResult SetGameTextureBitdepth(int bitDepth)
-{
-	if (bitDepth != 16 && bitDepth != 32)
-		return RENDER_RESULT_INVALID_ARGUMENT;
-	g_native_texture_bit_depth.store(bitDepth, std::memory_order_release);
-	return RENDER_RESULT_OK;
-}
-
-int GetGameTextureBitdepth()
-{
-	return g_native_texture_bit_depth.load(std::memory_order_acquire);
-}
-
-RenderResult SetGameMSAAMode(unsigned int mode)
-{
-	if (mode != GAME_RENDER_MULTISAMPLE_NONE &&
-		mode != GAME_RENDER_MULTISAMPLE_2X &&
-		mode != GAME_RENDER_MULTISAMPLE_4X &&
-		mode != GAME_RENDER_MULTISAMPLE_8X)
-		return RENDER_RESULT_INVALID_ARGUMENT;
-	// The current native D3D11 swap chain is single-sampled.  Match the
-	// accepted Stage4 native behavior by accepting the request but exposing the
-	// effective mode as NONE until a renderer-owned resolve path exists.
-	return RENDER_RESULT_OK;
-}
-
-unsigned int GetGameMSAAMode()
-{
-	return GAME_RENDER_MULTISAMPLE_NONE;
 }
 
 RenderResult SetGameGamma(float gamma, float brightness, float contrast,

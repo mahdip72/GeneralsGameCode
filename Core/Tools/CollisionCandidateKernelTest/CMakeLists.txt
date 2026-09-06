@@ -20,10 +20,39 @@ if(MINGW)
 endif()
 
 add_test(NAME core_collision_candidate_kernel_tests
-    COMMAND core_collision_candidate_kernel_tests)
+    COMMAND core_collision_candidate_kernel_tests --local-capacity)
 set_tests_properties(core_collision_candidate_kernel_tests PROPERTIES TIMEOUT 30)
 
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT IS_VS6_BUILD)
+    function(_collision_native_block _variable _start _end _output)
+        string(FIND "${${_variable}}" "${_start}" _first)
+        if(_first LESS 0)
+            message(FATAL_ERROR "Native collision source boundary is missing: ${_start}")
+        endif()
+        string(LENGTH "${_start}" _start_length)
+        math(EXPR _after_start "${_first} + ${_start_length}")
+        string(SUBSTRING "${${_variable}}" ${_after_start} -1 _after)
+        string(FIND "${_after}" "${_start}" _duplicate)
+        if(NOT _duplicate LESS 0)
+            message(FATAL_ERROR "Native collision source boundary is duplicated: ${_start}")
+        endif()
+        string(SUBSTRING "${${_variable}}" ${_first} -1 _block)
+        string(FIND "${_block}" "${_end}" _last)
+        if(_last LESS 0)
+            message(FATAL_ERROR "Native collision source end is missing: ${_end}")
+        endif()
+        string(SUBSTRING "${_block}" 0 ${_last} _block)
+        set(${_output} "${_block}" PARENT_SCOPE)
+    endfunction()
+    set(_policy_source "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include/GameNetwork/MultiplayerSimulationRuntimePolicy.h")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_policy_source}")
+    file(READ "${_policy_source}" _policy_text)
+    string(REPLACE "\r\n" "\n" _policy_text "${_policy_text}")
+    string(FIND "${_policy_text}" "namespace rts" _policy_start)
+    if(_policy_start LESS 0)
+        message(FATAL_ERROR "Native collision multiplayer policy boundary is missing")
+    endif()
+    string(SUBSTRING "${_policy_text}" ${_policy_start} -1 _native_policy)
     # Compile each title's actual observation statements with the real ledger.
     # Startup can revisit collision traversal ordinal zero within one frame.
     foreach(_title IN ITEMS Generals GeneralsMD)
@@ -69,14 +98,31 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT IS_VS6_BUILD)
             string(SUBSTRING "${_helper}" 0 ${_helper_end} _helper)
         endif()
         set(_generated "${CMAKE_CURRENT_BINARY_DIR}/${_title}")
+        _collision_native_block(_text
+            "class PartitionContactListNode : public MemoryPoolObject"
+            "#ifdef FASTER_GCO" _native_types)
+        _collision_native_block(_text
+            "inline UnsignedInt hash2ints(" "void PartitionContactList::processContactList()"
+            _native_contacts)
+        _collision_native_block(_text
+            "void PartitionData::addPossibleCollisions(" "Bool PartitionData::collidesWith("
+            _native_entry)
+        file(GENERATE OUTPUT "${_generated}/CollisionNativeBypassTitleSource.inc"
+            CONTENT "${_native_types}\n${_native_contacts}\n${_native_entry}\n")
+        file(GENERATE OUTPUT "${_generated}/CollisionNativeBypassTitlePolicy.inc"
+            CONTENT "${_native_policy}\n")
         file(GENERATE OUTPUT "${_generated}/CollisionPerformanceIdentityTitleHelper.inc" CONTENT "${_helper}\n")
         file(GENERATE OUTPUT "${_generated}/CollisionPerformanceIdentityTitleBegin.inc" CONTENT "${_begin}\n")
         file(GENERATE OUTPUT "${_generated}/CollisionPerformanceIdentityTitleDirtyOrder.inc" CONTENT "${_dirty_order}\n")
         string(TOLOWER "${_title}" _title_lower)
         set(_target "core_collision_performance_identity_${_title_lower}_tests")
-        add_executable(${_target} CollisionPerformanceIdentityTitleTest.cpp)
+        add_executable(${_target} CollisionPerformanceIdentityTitleTest.cpp
+            CollisionNativeBypassTitleTest.cpp)
         target_include_directories(${_target} PRIVATE "${_generated}")
         target_compile_definitions(${_target} PRIVATE COLLISION_PERFORMANCE_TITLE="${_title}")
+        if(RTS_BUILD_CORE_EXTRAS)
+            target_compile_definitions(${_target} PRIVATE RTS_BUILD_CORE_EXTRAS)
+        endif()
         target_link_libraries(${_target} PRIVATE core_task_runtime)
         set_target_properties(${_target} PROPERTIES
             CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)

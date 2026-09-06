@@ -17,6 +17,10 @@ namespace render
 // before creating candidates and unbind only after every owner is reset.
 RenderResult BindNativeW3DTextureResources(NativeW3DResources *resources);
 RenderResult UnbindNativeW3DTextureResources(NativeW3DResources *resources);
+// Clears only the exact publication metadata.  This is used by an aggregate
+// destructor while the shared game-owner lifecycle gate is held; it performs
+// no backend work and is safe before the resource facade member is destroyed.
+void InvalidateNativeW3DTextureResources(NativeW3DResources *resources);
 
 // An explicit unpublished ownership token.  A successfully created candidate
 // destroys its typed handle if it leaves scope without being published.  A

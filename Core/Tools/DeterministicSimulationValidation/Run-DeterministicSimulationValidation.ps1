@@ -7,6 +7,9 @@ param(
     [string]$CorpusExportRoot = '',
     [ValidateSet('Replay', 'AI', 'All')][string]$ValidationSet = 'All',
     [ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical',
+    [ValidateSet('serial-1', 'parallel-1', 'parallel-2', 'parallel-4',
+        'parallel-8', 'parallel-auto')]
+    [string]$DiagnosticWorkerConfiguration = '',
     [int]$ReplayMatrixRepeats = 2,
     [int]$StressRepeats = 3,
     [int]$ReplayTimeoutSeconds = 600,
@@ -31,7 +34,11 @@ param(
     [string]$ExecutionCohortNonce = '',
     [string]$ExecutionCohortCreatedUtc = '',
     [string]$AcceptanceRuntimeDependencyManifestSha256 = '',
-    [string]$AcceptanceRuntimeClosureSha256 = ''
+    [string]$AcceptanceRuntimeClosureSha256 = '',
+    [string]$QualificationDataManifestPath = '',
+    [string]$QualificationDataManifestSha256 = '',
+    [string]$QualificationDataClosureSha256 = '',
+    [int]$QualificationDataFileCount = 0
 )
 
 Set-StrictMode -Version 2.0
@@ -39,6 +46,8 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'Stage5ReplayCorpusExporter.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'Stage5ValidationProfileCapability.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'Stage5RegistryRecovery.psm1') -Force
 
 function Get-Sha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -79,47 +88,21 @@ function Get-Sha256Bytes {
 
 function Get-Stage5FileSnapshot {
     param([string]$Path, [string]$Context)
-    $full = [IO.Path]::GetFullPath($Path)
-    Assert-Condition (Test-Path -LiteralPath $full -PathType Leaf) `
-        "$Context file was not found: $full"
-    Assert-ContainedPathNoReparse (Split-Path -Parent $full) $full $Context | Out-Null
-    $before = Get-Item -LiteralPath $full -Force -ErrorAction Stop
-    Assert-Condition (($before -is [IO.FileInfo]) -and
-        (($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0)) `
-        "$Context file is not a regular non-reparse file: $full"
-    $stream = [IO.File]::Open($full, [IO.FileMode]::Open,
-        [IO.FileAccess]::Read, [IO.FileShare]::Read)
-    try {
-        $beforeLength = [Int64]$before.Length
-        Assert-Condition ($stream.Length -eq $beforeLength) `
-            "$Context file changed before its immutable copy began: $full"
-        $memory = New-Object IO.MemoryStream
-        try {
-            $stream.CopyTo($memory)
-            $bytes = $memory.ToArray()
-        }
-        finally { $memory.Dispose() }
-        }
-    finally { $stream.Dispose() }
-    $after = Get-Item -LiteralPath $full -Force -ErrorAction Stop
-    Assert-Condition (($after -is [IO.FileInfo]) -and
-        (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and
-        [Int64]$after.Length -eq $beforeLength -and
-        [Int64]$bytes.LongLength -eq $beforeLength -and
-        [DateTime]$after.CreationTimeUtc -eq [DateTime]$before.CreationTimeUtc -and
-        [DateTime]$after.LastWriteTimeUtc -eq [DateTime]$before.LastWriteTimeUtc) `
-        "$Context file changed or was replaced while it was snapshotted: $full"
-    return [pscustomobject]@{
-        path = $full
-        bytes = $bytes
-        sha256 = Get-Sha256Bytes $bytes
-        length = $beforeLength
-        creationTimeUtc = ([DateTime]$before.CreationTimeUtc).ToString('o')
-        lastWriteTimeUtc = ([DateTime]$before.LastWriteTimeUtc).ToString('o')
-        identity = '{0}|{1}|{2}' -f $beforeLength,
-            ([DateTime]$before.CreationTimeUtc).Ticks,
-            ([DateTime]$before.LastWriteTimeUtc).Ticks
-    }
+    return Get-Stage5FinalAcceptanceFileSnapshot $Path $Context
+}
+
+function Write-Stage5TextFileAtomically {
+    param(
+        [string]$Path,
+        [string]$Text,
+        [string]$Context,
+        [switch]$ReplaceExisting
+    )
+    $encoding = New-Object Text.UTF8Encoding($false)
+    $bytes = $encoding.GetBytes($Text)
+    return Write-Stage5FinalAcceptanceFileAtomically `
+        -Path $Path -Bytes $bytes -Context $Context -EvidenceKind RawLog `
+        -ReplaceExisting:$ReplaceExisting
 }
 
 function Write-Stage5FrozenValidationPlan {
@@ -141,14 +124,8 @@ function Write-Stage5FrozenValidationPlan {
     $bytes = $encoding.GetBytes($json)
     $expectedHash = Get-Sha256Bytes $bytes
     # CreateNew preserves both prior-cohort evidence and any failed partial write.
-    $stream = [IO.File]::Open($full, [IO.FileMode]::CreateNew,
-        [IO.FileAccess]::Write, [IO.FileShare]::Read)
-    try {
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush($true)
-    }
-    finally { $stream.Dispose() }
-    $snapshot = Get-Stage5FileSnapshot $full $context
+    $snapshot = Write-Stage5FinalAcceptanceFileAtomically `
+        -Path $full -Bytes $bytes -Context $context -EvidenceKind JsonReceipt
     Assert-Condition ($snapshot.sha256 -ceq $expectedHash) "$context bytes changed while freezing."
     # Only immutable strings escape; the mutable backing dictionary stays owned here.
     $values = New-Object 'Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
@@ -291,6 +268,7 @@ function Get-NativePerformanceReceiptReference {
         [int]$ProcessId,
         [string]$ProcessCreationUtc,
         [string]$ExpectedExecutablePath,
+        [string[]]$ExpectedArguments,
         [string[]]$ExpectedProducers = @('game-executable-stage5-performance-report-v5'),
         [string]$ExpectedCohortCreatedUtc = ''
     )
@@ -326,40 +304,74 @@ function Get-NativePerformanceReceiptReference {
                 $serializer.DeserializeObject($nativeText)
             }
             if ($native -isnot [Collections.IDictionary]) { continue }
-            $expectedProducer = [string]$native['producer']
+            $expectedProducerValue = $native['producer']
+            if ($expectedProducerValue -isnot [string]) { continue }
+            $expectedProducer = $expectedProducerValue
             if ($ExpectedProducers -notcontains $expectedProducer) { continue }
             $nativeRuntimeClosure = $native['runtimeClosure']
             $nativeProvenance = $native['provenance']
             $nativeRawLogs = $native['rawLogs']
-            if ($native['schemaVersion'] -ne 5 -or
-                [string]$native['role'] -cne 'performance-report' -or
-                [string]$native['title'] -cne $ExpectedTitle -or
-                [string]$native['architecture'] -cne 'x64' -or
-                [string]$native['cohortCreatedUtc'] -notmatch
+            if ($nativeRuntimeClosure -isnot [Collections.IDictionary] -or
+                $nativeProvenance -isnot [Collections.IDictionary] -or
+                $nativeRawLogs -isnot [Array] -or $nativeRawLogs.Count -ne 2) {
+                continue
+            }
+            $nativeIdentityStrings = @('role', 'title', 'architecture',
+                'cohortCreatedUtc', 'recordedUtc', 'producerVersion')
+            $nativeIdentityStringsValid = $true
+            foreach ($field in $nativeIdentityStrings) {
+                if ($native[$field] -isnot [string]) {
+                    $nativeIdentityStringsValid = $false
+                    break
+                }
+            }
+            if (-not $nativeIdentityStringsValid -or
+                $nativeRuntimeClosure['dependencyManifestSha256'] -isnot [string] -or
+                $nativeRuntimeClosure['closureSha256'] -isnot [string]) {
+                continue
+            }
+            $nativeProvenanceStringsValid =
+                $nativeProvenance['kind'] -is [string] -and
+                $nativeProvenance['processCreationUtc'] -is [string] -and
+                $nativeProvenance['executablePath'] -is [string] -and
+                $nativeProvenance['executableSha256'] -is [string] -and
+                $nativeProvenance['commandLine'] -is [string]
+            if (-not $nativeProvenanceStringsValid -or
+                -not (Test-Stage5JsonInteger $nativeProvenance['processId']) -or
+                -not (Test-Stage5JsonInteger $nativeProvenance['exitCode'])) {
+                continue
+            }
+            if (-not (Test-Stage5JsonInteger $native['schemaVersion']) -or
+                $native['schemaVersion'] -ne 5 -or
+                $native['role'] -cne 'performance-report' -or
+                $native['title'] -cne $ExpectedTitle -or
+                $native['architecture'] -cne 'x64' -or
+                $native['cohortCreatedUtc'] -notmatch
                     '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$' -or
-                [string]$native['recordedUtc'] -notmatch
+                $native['recordedUtc'] -notmatch
                     '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$' -or
-                [string]$native['recordedUtc'] -lt [string]$native['cohortCreatedUtc'] -or
-                [string]$native['producerVersion'] -cne '5' -or
-                $null -eq $nativeRuntimeClosure -or
-                [string]$nativeRuntimeClosure['dependencyManifestSha256'].ToUpperInvariant() -cne
-                    [string]$RuntimeClosure['dependencyManifestSha256'].ToUpperInvariant() -or
-                [string]$nativeRuntimeClosure['closureSha256'].ToUpperInvariant() -cne
-                    [string]$RuntimeClosure['closureSha256'].ToUpperInvariant() -or
-                $nativeRawLogs -isnot [Array] -or $nativeRawLogs.Count -ne 2 -or
-                $nativeProvenance -isnot [Collections.IDictionary]) { continue }
-            Assert-Stage5NativePerformanceReceiptProvenance $native 'Native receipt reference' `
-                $ExpectedTitle $ExpectedExecutablePath $ExecutableSha256 $ProcessId `
-                $ProcessCreationUtc $ExpectedCohortCreatedUtc $candidate $OutputRoot
+                $native['recordedUtc'] -lt $native['cohortCreatedUtc'] -or
+                $native['producerVersion'] -cne '5' -or
+                $nativeRuntimeClosure['dependencyManifestSha256'].ToUpperInvariant() -cne
+                    $RuntimeClosure['dependencyManifestSha256'].ToUpperInvariant() -or
+                $nativeRuntimeClosure['closureSha256'].ToUpperInvariant() -cne
+                    $RuntimeClosure['closureSha256'].ToUpperInvariant()) { continue }
             $rawLogsValid = $true
             foreach ($rawLog in $nativeRawLogs) {
                 if ($rawLog -isnot [Collections.IDictionary] -or
-                    [string]$rawLog['sha256'] -notmatch '^[0-9A-Fa-f]{64}$' -or
-                    [string]::IsNullOrWhiteSpace([string]$rawLog['path'])) {
+                    $rawLog['name'] -isnot [string] -or
+                    $rawLog['sha256'] -isnot [string] -or
+                    $rawLog['path'] -isnot [string]) {
+                    $rawLogsValid = $false; break
+                }
+                $rawLogHash = $rawLog['sha256']
+                $rawLogPath = $rawLog['path']
+                if ($rawLogHash -notmatch '^[0-9A-Fa-f]{64}$' -or
+                    [string]::IsNullOrWhiteSpace($rawLogPath)) {
                     $rawLogsValid = $false; break
                 }
                 try {
-                    $rawCandidateText = [string]$rawLog['path']
+                    $rawCandidateText = $rawLogPath
                     $rawCandidate = if ([IO.Path]::IsPathRooted($rawCandidateText)) {
                         [IO.Path]::GetFullPath($rawCandidateText)
                     } else {
@@ -369,32 +381,49 @@ function Get-NativePerformanceReceiptReference {
                         'Native receipt raw evidence' | Out-Null
                     $rawSnapshot = Get-Stage5FileSnapshot $rawCandidate `
                         'Native receipt raw evidence'
-                    if ($rawSnapshot.sha256 -cne ([string]$rawLog['sha256']).ToUpperInvariant()) {
+                    if ($rawSnapshot.sha256 -cne $rawLogHash.ToUpperInvariant()) {
                         $rawLogsValid = $false; break
                     }
                 } catch { $rawLogsValid = $false; break }
             }
             if (-not $rawLogsValid) { continue }
-            if ([string]$nativeProvenance['kind'] -cne 'native-executable-observation' -or
-                [int]$nativeProvenance['processId'] -ne $ProcessId -or
-                [string]$nativeProvenance['processCreationUtc'] -cne $ProcessCreationUtc -or
-                [IO.Path]::GetFullPath([string]$nativeProvenance['executablePath']) -cne
+            if ($nativeProvenance['kind'] -cne 'native-executable-observation' -or
+                $nativeProvenance['processId'] -ne $ProcessId -or
+                $nativeProvenance['processCreationUtc'] -cne $ProcessCreationUtc -or
+                [IO.Path]::GetFullPath($nativeProvenance['executablePath']) -cne
                     [IO.Path]::GetFullPath($ExpectedExecutablePath) -or
-                [string]$nativeProvenance['executableSha256'].ToUpperInvariant() -cne
+                $nativeProvenance['executableSha256'].ToUpperInvariant() -cne
                     $ExecutableSha256.ToUpperInvariant() -or
-                [int]$nativeProvenance['exitCode'] -ne 0 -or
-                [string]::IsNullOrWhiteSpace([string]$nativeProvenance['commandLine'])) { continue }
-            if ($native['schemaVersion'] -ne 5 -or
-                [string]$native['evidenceKind'] -cne 'stage5-executable-originated-receipt' -or
-                [string]$native['status'] -cne 'passed' -or
-                [string]$native['producer'] -notin $ExpectedProducers -or
-                [string]$native['runNonce'] -cne $RunNonce -or
-                [string]$native['sourceCommit'] -cne $SourceCommit -or
-                [string]$native['artifactSetSha256'].ToUpperInvariant() -cne
+                $nativeProvenance['exitCode'] -ne 0 -or
+                [string]::IsNullOrWhiteSpace($nativeProvenance['commandLine'])) { continue }
+            $nativeOutputStringsValid =
+                $native['evidenceKind'] -is [string] -and
+                $native['status'] -is [string] -and
+                $native['producer'] -is [string] -and
+                $native['runNonce'] -is [string] -and
+                $native['sourceCommit'] -is [string] -and
+                $native['artifactSetSha256'] -is [string] -and
+                $native['executableSha256'] -is [string] -and
+                $native['cohortNonce'] -is [string]
+            if (-not $nativeOutputStringsValid) { continue }
+            if (-not (Test-Stage5JsonInteger $native['schemaVersion']) -or
+                $native['schemaVersion'] -ne 5 -or
+                $native['evidenceKind'] -cne 'stage5-executable-originated-receipt' -or
+                $native['status'] -cne 'passed' -or
+                $native['producer'] -notin $ExpectedProducers -or
+                $native['runNonce'] -cne $RunNonce -or
+                $native['sourceCommit'] -cne $SourceCommit -or
+                $native['artifactSetSha256'].ToUpperInvariant() -cne
                     $ArtifactSetSha256.ToUpperInvariant() -or
-                [string]$native['executableSha256'].ToUpperInvariant() -cne
+                $native['executableSha256'].ToUpperInvariant() -cne
                     $ExecutableSha256.ToUpperInvariant() -or
-                [string]$native['cohortNonce'] -cne $CohortNonce) { continue }
+                $native['cohortNonce'] -cne $CohortNonce) { continue }
+            Assert-Stage5NativePerformanceReceiptProvenance $native 'Native receipt reference' `
+                $ExpectedTitle $ExpectedExecutablePath $ExecutableSha256 $ProcessId `
+                $ProcessCreationUtc $ExpectedCohortCreatedUtc $candidate $OutputRoot
+            Assert-Stage5NativeCommandLineMatchesPlan `
+                $nativeProvenance['commandLine'] $ExpectedExecutablePath `
+                $ExpectedArguments 'Native receipt reference' | Out-Null
             return [pscustomobject]@{
                 path = $relative
                 sha256 = $nativeSnapshot.sha256
@@ -463,6 +492,25 @@ function Assert-JsonInteger {
         $Value -is [uint16] -or $Value -is [int32] -or $Value -is [uint32] -or
         $Value -is [int64] -or $Value -is [uint64]
     Assert-Condition $isInteger "$Context must be a JSON integer."
+}
+
+function ConvertTo-Stage5PersistedInteger {
+    param(
+        [Parameter(Mandatory = $true)][object]$Value,
+        [Parameter(Mandatory = $true)][string]$Context,
+        [Parameter(Mandatory = $true)][Int64]$Minimum,
+        [Parameter(Mandatory = $true)][Int64]$Maximum
+    )
+    Assert-JsonInteger $Value $Context
+    $withinRange = $false
+    try {
+        $withinRange = $Value -ge $Minimum -and $Value -le $Maximum
+    }
+    catch {
+        $withinRange = $false
+    }
+    Assert-Condition $withinRange "$Context must be between $Minimum and $Maximum."
+    return [int]$Value
 }
 
 function Test-Sha256Text {
@@ -720,7 +768,8 @@ function Assert-LauncherEquivalenceContract {
         [string]$WorkingDirectory,
         [object[]]$Plan,
         [string]$ProfileLeafName = '',
-        [string]$DocumentsRoot = ''
+        [string]$DocumentsRoot = '',
+        [string]$ProfileRoot = ''
     )
     $executableFull = [IO.Path]::GetFullPath($Executable)
     $workingDirectoryFull = [IO.Path]::GetFullPath($WorkingDirectory)
@@ -767,7 +816,21 @@ function Assert-LauncherEquivalenceContract {
         Assert-Condition ([String]::Equals(
             [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($DocumentsRoot)),
             'H:\', [StringComparison]::OrdinalIgnoreCase)) `
-            'Validation Documents redirection must remain on H:.'
+            'Validation Documents root must remain on H:.'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ProfileRoot)) {
+        $documentsFull = [IO.Path]::GetFullPath($DocumentsRoot)
+        $profileFull = [IO.Path]::GetFullPath($ProfileRoot)
+        Assert-Condition ([String]::Equals(
+            [IO.Path]::GetPathRoot($profileFull),
+            'H:\', [StringComparison]::OrdinalIgnoreCase)) `
+            'Validation profile root must remain on H:.'
+        Assert-Condition (Test-PathWithin $documentsFull $profileFull) `
+            'Validation profile root must remain below the task-owned Documents root.'
+        if (-not [string]::IsNullOrWhiteSpace($ProfileLeafName)) {
+            Assert-Condition ([IO.Path]::GetFileName($profileFull) -ceq $ProfileLeafName) `
+                'Validation profile root must be the complete title profile leaf.'
+        }
     }
     return [pscustomobject]@{
         schemaVersion = 1
@@ -784,13 +847,14 @@ function Assert-LauncherEquivalenceContract {
             '-validationExecutableSha256', '<manifest>')
         directWorkingDirectory = $workingDirectoryFull
         environmentVariables = @('TEMP', 'TMP', 'LOCALAPPDATA', 'APPDATA',
-            'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'RTS_FRAME_TIMING_DIR')
-        profileStrategy = 'known-folder-registry-redirect'
+            'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
+            'RTS_STAGE5_VALIDATION_PROFILE_ROOT', 'RTS_FRAME_TIMING_DIR')
+        profileStrategy = 'process-local-validation-profile-root'
+        profileEnvironmentVariable = 'RTS_STAGE5_VALIDATION_PROFILE_ROOT'
         profileLeafName = $ProfileLeafName
         documentsRoot = if ([string]::IsNullOrWhiteSpace($DocumentsRoot)) { $null } else { [IO.Path]::GetFullPath($DocumentsRoot) }
-        profileRegistryValues = @(
-            'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders\Personal',
-            'HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders\Personal')
+        profileRoot = if ([string]::IsNullOrWhiteSpace($ProfileRoot)) { $null } else { [IO.Path]::GetFullPath($ProfileRoot) }
+        profileRegistryValues = @()
         childExitCodeObserved = $true
     }
 }
@@ -891,6 +955,24 @@ function Get-WorkerConfigurations {
     )
 }
 
+function Get-DiagnosticWorkerConfigurations {
+    param(
+        [ValidateSet('Canonical', 'LocalCapacity')]
+        [string]$CapacityMode = 'Canonical',
+        [string]$DiagnosticWorkerConfiguration = ''
+    )
+    $configurations = @(Get-WorkerConfigurations -CapacityMode $CapacityMode)
+    if ([string]::IsNullOrWhiteSpace($DiagnosticWorkerConfiguration)) {
+        return $configurations
+    }
+    $selected = @($configurations | Where-Object {
+        $_.Id -ieq $DiagnosticWorkerConfiguration
+    })
+    Assert-Condition ($selected.Count -eq 1) `
+        "DiagnosticWorkerConfiguration '$DiagnosticWorkerConfiguration' is unavailable in CapacityMode '$CapacityMode'."
+    return $selected
+}
+
 function Get-CollisionShadowConfiguration {
     param([ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical')
     if ($CapacityMode -ceq 'LocalCapacity') {
@@ -900,6 +982,19 @@ function Get-CollisionShadowConfiguration {
     }
     return [pscustomobject]@{
         Id = 'shadow-16'; Mode = 'shadow'; WorkerCount = 16; HasWorkerCount = $true
+    }
+}
+
+function Assert-LocalCapacityCorpusMatrix {
+    param([Parameter(Mandatory = $true)][object]$Data)
+    $seeds = @($Data.ai.seeds)
+    $scenarios = @($Data.ai.scenarios)
+    Assert-Condition ($seeds.Count -ge 3 -and
+        @($seeds | Sort-Object -Unique).Count -eq $seeds.Count) `
+        'LocalCapacity corpus export requires at least three distinct live-AI seeds.'
+    foreach ($requiredScenario in @('4v3', '4v2', 'hard-ai-2v6')) {
+        Assert-Condition ($scenarios -ccontains $requiredScenario) `
+            "LocalCapacity corpus export requires the '$requiredScenario' live-AI scenario."
     }
 }
 
@@ -930,6 +1025,43 @@ function ConvertTo-DisplayCommand {
         }
     }
     return $display -join ' '
+}
+
+function ConvertTo-ProcessArgumentString {
+    param([string[]]$Arguments)
+    return (($Arguments | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ }
+    }) -join ' ')
+}
+
+function Assert-Stage5NativeCommandLineMatchesPlan {
+    param(
+        [string]$NativeCommandLine,
+        [string]$ExpectedExecutablePath,
+        [string[]]$ExpectedArguments,
+        [string]$Context
+    )
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($NativeCommandLine) -and
+        -not [string]::IsNullOrWhiteSpace($ExpectedExecutablePath) -and
+        @($ExpectedArguments).Count -gt 0) `
+        "$Context command line or expected plan arguments are empty."
+    $argumentString = ConvertTo-ProcessArgumentString $ExpectedArguments
+    $suffix = ' ' + $argumentString
+    Assert-Condition ($NativeCommandLine.EndsWith($suffix,
+        [StringComparison]::Ordinal)) `
+        "$Context native command line arguments differ from the execution plan."
+    $executableToken = $NativeCommandLine.Substring(
+        0, $NativeCommandLine.Length - $suffix.Length)
+    if ($executableToken.Length -ge 2 -and $executableToken[0] -eq '"' -and
+        $executableToken[$executableToken.Length - 1] -eq '"') {
+        $executableToken = $executableToken.Substring(1, $executableToken.Length - 2)
+    }
+    Assert-Condition (-not [string]::IsNullOrWhiteSpace($executableToken) -and
+        [String]::Equals([IO.Path]::GetFullPath($executableToken),
+            [IO.Path]::GetFullPath($ExpectedExecutablePath),
+            [StringComparison]::OrdinalIgnoreCase)) `
+        "$Context native command line executable differs from the execution plan."
+    return $argumentString
 }
 
 function Add-PlanEntry {
@@ -1138,7 +1270,8 @@ function Get-ManifestData {
         Assert-Condition ($seeds.Count -le 32) 'AI manifest accepts at most 32 seeds.'
         foreach ($seed in $seeds) {
             Assert-JsonInteger $seed 'AI manifest seed'
-            Assert-Condition ($seed -gt 0) 'AI manifest seeds must be positive integers.'
+            Assert-Condition ($seed -gt 0 -and $seed -le [Int32]::MaxValue) `
+                'AI manifest seeds must be positive Int32 integers.'
         }
         Assert-Condition (@($seeds | Sort-Object -Unique).Count -eq $seeds.Count) `
             'AI manifest seeds must be distinct.'
@@ -1148,7 +1281,8 @@ function Get-ManifestData {
         Assert-Condition ($scenarios.Count -gt 0) 'AI manifest scenarios must not be empty.'
         foreach ($scenario in $scenarios) {
             Assert-JsonString $scenario 'AI manifest scenario'
-            Assert-Condition ($scenario -ceq '4v3' -or $scenario -ceq '4v2') `
+            Assert-Condition ($scenario -ceq '4v3' -or $scenario -ceq '4v2' -or
+                $scenario -ceq 'hard-ai-2v6') `
                 "AI manifest scenario '$scenario' is invalid."
         }
         Assert-Condition (@($scenarios | Sort-Object -Unique).Count -eq $scenarios.Count) `
@@ -1254,9 +1388,13 @@ function Set-NativePerformanceObservationEnvironment {
 function New-ValidationPlan {
     param([object]$Data, [string]$Set, [int]$ReplayPasses, [int]$StressRunCount,
         [int]$ReplayTimeout, [int]$AiTimeout, [string]$Executable, [string]$OutputDirectory,
-        [ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical')
+        [ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical',
+        [string]$DiagnosticWorkerConfiguration = '')
     $plan = New-Object 'Collections.Generic.List[object]'
-    foreach ($configuration in Get-WorkerConfigurations -CapacityMode $CapacityMode) {
+    $workerConfigurations = @(Get-DiagnosticWorkerConfigurations `
+        -CapacityMode $CapacityMode `
+        -DiagnosticWorkerConfiguration $DiagnosticWorkerConfiguration)
+    foreach ($configuration in $workerConfigurations) {
         $common = @(New-CommonArguments $configuration $Data.executableSha256)
         if ($Set -ne 'AI') {
             for ($matrixRepeat = 1; $matrixRepeat -le $ReplayPasses; ++$matrixRepeat) {
@@ -1275,21 +1413,32 @@ function New-ValidationPlan {
             foreach ($scenario in $Data.ai.scenarios) {
                 foreach ($seed in $Data.ai.seeds) {
                     for ($repeat = 1; $repeat -le $Data.ai.repeats; ++$repeat) {
-                        $runnerFlag = if ($scenario -ceq '4v2') { '-runSkirmishAITest4v2' } else { '-runSkirmishAITest' }
+                        $runnerFlag = if ($scenario -ceq '4v2') {
+                            '-runSkirmishAITest4v2'
+                        }
+                        elseif ($scenario -ceq 'hard-ai-2v6') {
+                            '-runSkirmishAITestHardAI2v6'
+                        }
+                        else {
+                            '-runSkirmishAITest'
+                        }
                         $arguments = @($common) + @($runnerFlag, [string]$seed)
                         Add-PlanEntry $plan 'ai' "$scenario-seed-$seed" $configuration $repeat `
                             $AiTimeout $arguments $Executable $OutputDirectory "$scenario-seed-$seed" `
-                            '' '' ($scenario -ceq '4v2') 0 $seed $scenario
+                            '' '' ($scenario -ceq '4v2' -or $scenario -ceq 'hard-ai-2v6') `
+                            0 $seed $scenario
                     }
                 }
             }
         }
     }
-    if ($Set -ne 'Replay' -and $Data.ai.scenarios -ccontains '4v2') {
+    if ([string]::IsNullOrWhiteSpace($DiagnosticWorkerConfiguration) -and
+        $Set -ne 'Replay' -and $Data.ai.scenarios -ccontains '4v2') {
         # One bounded installed-runtime shadow stress execution proves the
         # post-legacy collision oracle without multiplying the full matrix.
         $shadowConfiguration = Get-CollisionShadowConfiguration -CapacityMode $CapacityMode
-        $shadowSeed = [int]$Data.ai.seeds[0]
+        $shadowSeed = ConvertTo-Stage5PersistedInteger $Data.ai.seeds[0] `
+            'AI shadow seed' 1 ([Int32]::MaxValue)
         $shadowCommon = @(New-CommonArguments $shadowConfiguration $Data.executableSha256)
         $shadowArguments = @($shadowCommon) + @('-runSkirmishAITest4v2', [string]$shadowSeed)
         Add-PlanEntry $plan 'ai' "4v2-shadow-seed-$shadowSeed" $shadowConfiguration 1 `
@@ -1330,6 +1479,201 @@ function New-ValidationPlan {
         Resolve-Stage5LiveValidationRequirements $livePlan $aiEntries[0] | Out-Null
     }
     return $plan.ToArray()
+}
+
+function Get-ValidationRegistryValueState {
+    param([string]$View, [string]$SubKey, [string]$Name)
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser,
+        [Microsoft.Win32.RegistryView]::$View)
+    try {
+        $key = $base.OpenSubKey($SubKey, $false)
+        if ($null -eq $key) {
+            return [pscustomobject]@{ exists = $false; value = $null; kind = $null }
+        }
+        try {
+            if (@($key.GetValueNames()) -notcontains $Name) {
+                return [pscustomobject]@{ exists = $false; value = $null; kind = $null }
+            }
+            return [pscustomobject]@{
+                exists = $true
+                value = $key.GetValue($Name, $null,
+                    [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                kind = $key.GetValueKind($Name)
+            }
+        }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+}
+
+function Get-ValidationRegistryKeyState {
+    param([string]$View, [string]$SubKey)
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser,
+        [Microsoft.Win32.RegistryView]::$View)
+    try {
+        $key = $base.OpenSubKey($SubKey, $false)
+        if ($null -eq $key) { return [pscustomobject]@{ exists = $false; valueNames = @(); subKeyNames = @() } }
+        try {
+            return [pscustomobject]@{
+                exists = $true
+                valueNames = @($key.GetValueNames())
+                subKeyNames = @($key.GetSubKeyNames())
+            }
+        }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+}
+
+function Set-ValidationRegistryValue {
+    param([string]$View, [string]$SubKey, [string]$Name,
+        [object]$Value, [int]$Kind)
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser,
+        [Microsoft.Win32.RegistryView]::$View)
+    try {
+        $key = $base.OpenSubKey($SubKey, $true)
+        Assert-Condition ($null -ne $key) "Recovery could not open registry key '$SubKey'."
+        try { $key.SetValue($Name, $Value, [Microsoft.Win32.RegistryValueKind]$Kind) }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+}
+
+function Remove-ValidationRegistryValue {
+    param([string]$View, [string]$SubKey, [string]$Name)
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser,
+        [Microsoft.Win32.RegistryView]::$View)
+    try {
+        $key = $base.OpenSubKey($SubKey, $true)
+        if ($null -eq $key) { return }
+        try { $key.DeleteValue($Name, $false) }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+}
+
+function Remove-ValidationRegistryKey {
+    param([string]$View, [string]$SubKey)
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser,
+        [Microsoft.Win32.RegistryView]::$View)
+    try {
+        $separator = $SubKey.LastIndexOf('\')
+        if ($separator -lt 0) { return }
+        $parent = $SubKey.Substring(0, $separator)
+        $leaf = $SubKey.Substring($separator + 1)
+        $key = $base.OpenSubKey($parent, $true)
+        if ($null -eq $key) { return }
+        try { $key.DeleteSubKey($leaf, $false) }
+        finally { $key.Dispose() }
+    }
+    finally { $base.Dispose() }
+}
+
+function New-ValidationInstallPathRecoverySnapshot {
+    param([string]$Title, [string]$View, [string]$RuntimeValue)
+    $subKey = if ($Title -ceq 'Generals') {
+        'Software\Electronic Arts\EA Games\Generals'
+    } else {
+        'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour'
+    }
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser,
+        [Microsoft.Win32.RegistryView]::$View)
+    $created = New-Object 'Collections.Generic.List[string]'
+    try {
+        $current = ''
+        foreach ($segment in @($subKey.Split('\'))) {
+            $current = if ([string]::IsNullOrEmpty($current)) { $segment } else { $current + '\' + $segment }
+            $probe = $base.OpenSubKey($current, $false)
+            if ($null -ne $probe) { $probe.Dispose(); continue }
+            $created.Add($current) | Out-Null
+        }
+    }
+    finally { $base.Dispose() }
+    $state = Get-ValidationRegistryValueState $View $subKey 'InstallPath'
+    $snapshot = New-Stage5RegistryRecoverySnapshot -Title $Title -View $View `
+        -SubKey $subKey -Name 'InstallPath' -HadKey ($created.Count -eq 0) `
+        -HadValue ([bool]$state.exists) -OldValue $state.value -OldKind $state.kind `
+        -ExpectedValue $RuntimeValue -ExpectedKind ([Microsoft.Win32.RegistryValueKind]::String) `
+        -CreatedSubKeys @($created.ToArray())
+    return [pscustomobject]@{ snapshot = $snapshot; createdSubKeys = @($created.ToArray()) }
+}
+
+function New-ValidationRegistryRecoveryAdapter {
+    return [ordered]@{
+        GetValue = { param($view, $subKey, $name) Get-ValidationRegistryValueState $view $subKey $name }
+        GetKey = { param($view, $subKey) Get-ValidationRegistryKeyState $view $subKey }
+        SetValue = { param($view, $subKey, $name, $value, $kind) Set-ValidationRegistryValue $view $subKey $name $value $kind }
+        DeleteValue = { param($view, $subKey, $name) Remove-ValidationRegistryValue $view $subKey $name }
+        DeleteKey = { param($view, $subKey) Remove-ValidationRegistryKey $view $subKey }
+    }
+}
+
+function New-ValidationRecoveryPendingIdentity {
+    return [pscustomobject]@{
+        launchPending = $true
+        processId = 0
+        creationTimeUtc100ns = 0
+        executablePath = [IO.Path]::GetFullPath($executableFull)
+        executableSha256 = [string]$manifestData.executableSha256
+        exitProven = $false
+    }
+}
+
+function New-ValidationRecoveryStartedIdentity {
+    param([object]$OriginalIdentity)
+    return [pscustomobject]@{
+        launchPending = $false
+        processId = [int]$OriginalIdentity.processId
+        creationTimeUtc100ns = [Int64]$OriginalIdentity.processCreationTime100ns
+        executablePath = [string]$OriginalIdentity.executablePath
+        executableSha256 = [string]$manifestData.executableSha256
+        exitProven = $false
+    }
+}
+
+function Test-ValidationRecoveryIdentitiesExited {
+    param([object[]]$Identities)
+    return @($Identities | Where-Object {
+        [bool]$_.launchPending -or -not [bool]$_.exitProven
+    }).Count -eq 0
+}
+
+function New-ValidationRecoveryAuthorizationIdentities {
+    param([object[]]$Identities)
+    return @($Identities | ForEach-Object {
+        [pscustomobject]@{
+            launchPending = [bool]$_.launchPending
+            processId = [int]$_.processId
+            creationTimeUtc100ns = [Int64]$_.creationTimeUtc100ns
+            executablePath = [string]$_.executablePath
+            executableSha256 = [string]$_.executableSha256
+            exitProven = [bool]$_.exitProven
+        }
+    })
+}
+
+function Test-ValidationNoActiveTitleProcess {
+    param([string]$Executable)
+    $expected = [IO.Path]::GetFullPath($Executable)
+    $name = [IO.Path]::GetFileNameWithoutExtension($expected)
+    foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
+        try {
+            if ([String]::Equals([IO.Path]::GetFullPath($process.Path),
+                    $expected, [StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+        }
+        catch {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Set-PreservedRegistryValue {
@@ -1651,6 +1995,8 @@ function Invoke-ValidationProcess {
         [string]$EvidenceRoot = '',
         [AllowNull()][object]$NativeObservationBinding = $null,
         [AllowNull()][object]$LivePlanBinding = $null,
+        [AllowNull()][scriptblock]$ProcessStartObserver = $null,
+        [AllowNull()][scriptblock]$ProcessExitObserver = $null,
         [AllowNull()][ref]$LifecycleObservation
     )
     $captureLifecycle = $null -ne $LifecycleObservation
@@ -1698,9 +2044,7 @@ function Invoke-ValidationProcess {
         $startInfo = New-Object Diagnostics.ProcessStartInfo
         $startInfo.FileName = $Executable
         $startInfo.WorkingDirectory = $WorkingDirectory
-        $startInfo.Arguments = (($Entry.arguments | ForEach-Object {
-            if ($_ -match '[\s"]') { '"' + $_.Replace('"', '\"') + '"' } else { $_ }
-        }) -join ' ')
+        $startInfo.Arguments = ConvertTo-ProcessArgumentString $Entry.arguments
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
         $startInfo.RedirectStandardOutput = $true
@@ -1732,6 +2076,8 @@ function Invoke-ValidationProcess {
         $process.StartInfo = $startInfo
         $startedAt = [DateTime]::UtcNow
         $processIdentity = $null
+        $originalIdentity = $null
+        $recoveryProcessIdentity = $null
         $processCreationUtc = ''
         $stdoutTask = $null
         $stderrTask = $null
@@ -1740,7 +2086,7 @@ function Invoke-ValidationProcess {
         $launchAttempted = $true
         Assert-Condition ($process.Start()) "Failed to start installed runtime process."
         $started = $true
-        if ($captureLifecycle) {
+        if ($captureLifecycle -or $null -ne $ProcessStartObserver) {
             try {
                 $originalIdentity = Get-ValidationOriginalHandleIdentity $process
                 $lifecycleProcessId = [UInt32]$originalIdentity.processId
@@ -1750,11 +2096,24 @@ function Invoke-ValidationProcess {
                     [IO.Path]::GetFullPath($Executable), [StringComparison]::OrdinalIgnoreCase)) {
                     'verified'
                 } else { 'mismatch' }
+                if ($null -ne $ProcessStartObserver) {
+                    $recoveryProcessIdentity = [pscustomobject]@{
+                        launchPending = $false
+                        processId = [int]$originalIdentity.processId
+                        creationTimeUtc100ns = [Int64]$originalIdentity.processCreationTime100ns
+                        executablePath = [string]$originalIdentity.executablePath
+                        executableSha256 = [string]$manifestData.executableSha256
+                    }
+                    & $ProcessStartObserver $recoveryProcessIdentity
+                }
             }
             catch {
                 # Optional observation failure withholds cleanup authority; it
                 # does not change the existing process or exception policy.
                 $lifecycleIdentityStatus = 'unavailable'
+                if ($null -ne $ProcessStartObserver) {
+                    throw "Validation process identity could not be published for registry recovery: $($_.Exception.Message)"
+                }
             }
         }
         try {
@@ -1797,6 +2156,17 @@ function Invoke-ValidationProcess {
                 throw "Validation process remained alive after the bounded post-kill wait."
             }
         }
+        if ($null -ne $ProcessExitObserver) {
+            if ($null -eq $recoveryProcessIdentity) {
+                throw 'Validation process exit proof lacks the retained original process identity.'
+            }
+            $recoveryProcessIdentity.exitProven = [bool]$exited
+            & $ProcessExitObserver ([pscustomobject]@{
+                processIdentity = $recoveryProcessIdentity
+                exitCode = if ($exited) { [int]$process.ExitCode } else { -1 }
+                exited = [bool]$exited
+            })
+        }
         if ($null -eq $stdoutTask -or -not $stdoutTask.Wait($postKillWaitMilliseconds)) {
             throw 'Validation stdout did not complete within the bounded post-process wait.'
         }
@@ -1805,8 +2175,10 @@ function Invoke-ValidationProcess {
         }
         $stdout = $stdoutTask.Result
         $stderr = $stderrTask.Result
-        [IO.File]::WriteAllText($Entry.stdout, $stdout)
-        [IO.File]::WriteAllText($Entry.stderr, $stderr)
+        $stdoutSnapshot = Write-Stage5TextFileAtomically $Entry.stdout $stdout `
+            "Validation entry $($Entry.sequence) stdout"
+        $stderrSnapshot = Write-Stage5TextFileAtomically $Entry.stderr $stderr `
+            "Validation entry $($Entry.sequence) stderr"
         $childProcess = $null
         if (-not [string]::IsNullOrWhiteSpace($processCreationUtc)) {
             $childProcess = [pscustomobject]@{
@@ -1815,6 +2187,8 @@ function Invoke-ValidationProcess {
                 processCreationUtc = $processCreationUtc
                 executablePath = [IO.Path]::GetFullPath($Executable)
                 commandLine = [string]$Entry.command
+                stdoutSha256 = [string]$stdoutSnapshot.sha256
+                stderrSha256 = [string]$stderrSnapshot.sha256
                 nativeReceipt = $null
             }
             if (-not [string]::IsNullOrWhiteSpace($EvidenceRoot) -and
@@ -1833,7 +2207,8 @@ function Invoke-ValidationProcess {
                     -ProcessId ([int]$process.Id) `
                     -ProcessCreationUtc $processCreationUtc `
                     -ExpectedCohortCreatedUtc $executionCohortCreatedUtc `
-                    -ExpectedExecutablePath ([IO.Path]::GetFullPath($Executable))
+                    -ExpectedExecutablePath ([IO.Path]::GetFullPath($Executable)) `
+                    -ExpectedArguments ([string[]]@($Entry.arguments))
             }
         }
         $runtimeLogText = New-Object 'Collections.Generic.List[string]'
@@ -1969,18 +2344,210 @@ function Get-Stage5ReceiptRawLogBindings {
     return ,$bindings.ToArray()
 }
 
+function Copy-Stage5SimulationQualificationDataBinding {
+    param(
+        [Collections.IDictionary]$Binding,
+        [ValidateSet('Generals', 'ZeroHour')][string]$ExpectedTitle,
+        [string]$Context
+    )
+    $fields = @('path', 'title', 'manifestSha256', 'closureSha256',
+        'fileCount')
+    Assert-JsonObjectShape $Binding $fields $fields $Context
+    Assert-Condition ([string]$Binding['path'] -ceq 'QualificationData.json' -and
+        [string]$Binding['title'] -ceq $ExpectedTitle -and
+        (Test-Sha256Text ([string]$Binding['manifestSha256'])) -and
+        (Test-Sha256Text ([string]$Binding['closureSha256']))) `
+        "$Context is stale, malformed, or bound to another title."
+    Assert-JsonInteger $Binding['fileCount'] "$Context fileCount"
+    Assert-Condition ([Int64]$Binding['fileCount'] -eq 6) `
+        "$Context must bind the exact six reviewed BIG/Data files."
+    return [ordered]@{
+        path = 'QualificationData.json'
+        title = $ExpectedTitle
+        manifestSha256 = ([string]$Binding['manifestSha256']).ToUpperInvariant()
+        closureSha256 = ([string]$Binding['closureSha256']).ToUpperInvariant()
+        fileCount = [int]$Binding['fileCount']
+    }
+}
+
+function Get-Stage5SimulationQualificationStreamSha256 {
+    param([IO.Stream]$Stream)
+    Assert-Condition ($null -ne $Stream -and $Stream.CanRead -and
+        $Stream.CanSeek) `
+        'Stage 5 simulation qualification-data guard stream is not readable and seekable.'
+    $Stream.Position = 0
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($Stream) | ForEach-Object {
+            $_.ToString('x2')
+        }) -join '').ToUpperInvariant()
+    }
+    finally { $sha.Dispose() }
+}
+
+function Get-Stage5SimulationQualificationRuntimeMembership {
+    param([string]$RuntimeRoot)
+    $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\')
+    Assert-Condition (Test-Path -LiteralPath $runtimeFull -PathType Container) `
+        "Stage 5 simulation qualification runtime was not found: $runtimeFull"
+    Assert-ContainedPathNoReparse $runtimeFull $runtimeFull `
+        'Stage 5 simulation qualification runtime' -AllowBase | Out-Null
+    $paths = New-Object 'Collections.Generic.List[string]'
+    foreach ($item in @(Get-ChildItem -LiteralPath $runtimeFull -File -Force `
+            -ErrorAction Stop | Where-Object { $_.Extension -ieq '.big' })) {
+        Assert-Condition (($item.Attributes -band
+                [IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "Stage 5 simulation qualification runtime contains a reparse point: $($item.FullName)"
+        $alternateStreams = @(Get-Item -LiteralPath $item.FullName -Stream * `
+            -ErrorAction Stop)
+        Assert-Condition ($alternateStreams.Count -eq 1 -and
+            [string]$alternateStreams[0].Stream -ceq ':$DATA') `
+            "Stage 5 simulation qualification runtime contains an alternate data stream: $($item.FullName)"
+        $paths.Add([string]$item.Name) | Out-Null
+    }
+    $dataRoot = Join-Path $runtimeFull 'Data'
+    if (Test-Path -LiteralPath $dataRoot) {
+        Assert-ContainedPathNoReparse $runtimeFull $dataRoot `
+            'Stage 5 simulation qualification Data root' | Out-Null
+        $dataItem = Get-Item -LiteralPath $dataRoot -Force -ErrorAction Stop
+        Assert-Condition ($dataItem -is [IO.DirectoryInfo] -and
+            ($dataItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
+            'Stage 5 simulation qualification Data root is not a regular directory.'
+        foreach ($item in @(Get-ChildItem -LiteralPath $dataRoot -Recurse -Force `
+                -ErrorAction Stop)) {
+            Assert-Condition (($item.Attributes -band
+                    [IO.FileAttributes]::ReparsePoint) -eq 0) `
+                "Stage 5 simulation qualification runtime contains a reparse point: $($item.FullName)"
+            if ($item -isnot [IO.FileInfo]) { continue }
+            $full = Assert-ContainedPathNoReparse $runtimeFull $item.FullName `
+                'Stage 5 simulation qualification runtime file'
+            $alternateStreams = @(Get-Item -LiteralPath $full -Stream * `
+                -ErrorAction Stop)
+            Assert-Condition ($alternateStreams.Count -eq 1 -and
+                [string]$alternateStreams[0].Stream -ceq ':$DATA') `
+                "Stage 5 simulation qualification runtime contains an alternate data stream: $full"
+            $relative = $full.Substring($runtimeFull.Length).TrimStart(
+                [char[]]@('\', '/')).Replace('\', '/')
+            $paths.Add($relative) | Out-Null
+        }
+    }
+    [string[]]$result = @($paths.ToArray())
+    [Array]::Sort($result, [StringComparer]::Ordinal)
+    return $result
+}
+
+function Assert-Stage5SimulationQualificationRuntimeMembership {
+    param([string]$RuntimeRoot, [object]$Evidence)
+    Assert-Condition ($null -ne $Evidence -and $Evidence.files -is [Array]) `
+        'Stage 5 simulation qualification-data evidence has no file closure.'
+    [string[]]$expected = @($Evidence.files | ForEach-Object {
+        [string]$_.path
+    })
+    [Array]::Sort($expected, [StringComparer]::Ordinal)
+    [string[]]$actual = @(Get-Stage5SimulationQualificationRuntimeMembership `
+        $RuntimeRoot)
+    $expectedText = $expected -join "`n"
+    $actualText = $actual -join "`n"
+    Assert-Condition ($actualText -ceq $expectedText) `
+        ("Stage 5 simulation qualification-data membership changed or contains " +
+        "an undeclared file. Expected [$($expected -join ', ')], got " +
+        "[$($actual -join ', ')].")
+}
+
+function Open-Stage5SimulationQualificationRuntimeClosure {
+    param([string]$RuntimeRoot, [object]$Evidence)
+    $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\')
+    Assert-Stage5SimulationQualificationRuntimeMembership $runtimeFull $Evidence
+    $streams = New-Object `
+        'Collections.Generic.Dictionary[string,System.IO.FileStream]' `
+        ([StringComparer]::OrdinalIgnoreCase)
+    try {
+        foreach ($entry in @($Evidence.files)) {
+            $relative = [string]$entry.path
+            Assert-Condition (-not [string]::IsNullOrWhiteSpace($relative) -and
+                -not [IO.Path]::IsPathRooted($relative) -and
+                $relative -cnotmatch '[:\\\x00-\x1F\x7F]' -and
+                $relative -cnotmatch '(^|/)\.\.?(/|$)') `
+                "Stage 5 simulation qualification-data path is unsafe: $relative"
+            $candidate = [IO.Path]::GetFullPath((Join-Path $runtimeFull $relative))
+            Assert-ContainedPathNoReparse $runtimeFull $candidate `
+                "Stage 5 simulation qualification-data '$relative'" | Out-Null
+            Assert-Condition (-not $streams.ContainsKey($relative)) `
+                "Stage 5 simulation qualification-data repeats '$relative'."
+            $stream = [IO.FileStream]::new($candidate, [IO.FileMode]::Open,
+                [IO.FileAccess]::Read, [IO.FileShare]::Read, 1048576,
+                [IO.FileOptions]::SequentialScan)
+            try {
+                $actualSha256 = Get-Stage5SimulationQualificationStreamSha256 `
+                    $stream
+                Assert-Condition ($actualSha256 -ceq
+                    ([string]$entry.sha256).ToUpperInvariant()) `
+                    "Stage 5 simulation qualification-data SHA-256 mismatch or hash changed: $relative"
+                $streams.Add($relative, $stream)
+                $stream = $null
+            }
+            finally { if ($null -ne $stream) { $stream.Dispose() } }
+        }
+        Assert-Stage5SimulationQualificationRuntimeMembership $runtimeFull `
+            $Evidence
+        return [pscustomobject]@{
+            runtimeRoot = $runtimeFull
+            streams = $streams
+        }
+    }
+    catch {
+        foreach ($stream in $streams.Values) { $stream.Dispose() }
+        throw
+    }
+}
+
+function Confirm-Stage5SimulationQualificationRuntimeClosure {
+    param([string]$RuntimeRoot, [object]$Evidence, [object]$Guard)
+    $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot).TrimEnd('\')
+    Assert-Condition ($null -ne $Guard -and
+        [IO.Path]::GetFullPath([string]$Guard.runtimeRoot).TrimEnd('\') -ceq
+            $runtimeFull -and
+        $Guard.streams -is [Collections.IDictionary]) `
+        'Stage 5 simulation qualification-data guard is absent or bound to another runtime.'
+    Assert-Stage5SimulationQualificationRuntimeMembership $runtimeFull $Evidence
+    Assert-Condition ($Guard.streams.Count -eq @($Evidence.files).Count) `
+        'Stage 5 simulation qualification-data guard file count changed.'
+    foreach ($entry in @($Evidence.files)) {
+        $relative = [string]$entry.path
+        Assert-Condition ($Guard.streams.ContainsKey($relative)) `
+            "Stage 5 simulation qualification-data guard omitted '$relative'."
+        $actualSha256 = Get-Stage5SimulationQualificationStreamSha256 `
+            $Guard.streams[$relative]
+        Assert-Condition ($actualSha256 -ceq
+            ([string]$entry.sha256).ToUpperInvariant()) `
+            "Stage 5 simulation qualification-data SHA-256 mismatch or hash changed: $relative"
+    }
+}
+
+function Close-Stage5SimulationQualificationRuntimeClosure {
+    param([object]$Guard)
+    if ($null -eq $Guard -or $null -eq $Guard.streams) { return }
+    foreach ($stream in @($Guard.streams.Values)) {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+    $Guard.streams.Clear()
+}
+
 function New-Stage5HostChildBinding {
     param(
         [object]$ChildRun,
         [string]$Role,
         [string]$Title,
-        [string]$ReceiptNonce,
         [string]$CohortNonce,
         [string]$OutputRoot,
         [string]$ExecutableSha256,
         [Collections.IDictionary]$RuntimeClosure,
-        [string]$Context
+        [string]$Context,
+        [switch]$IncludeExecutionFields,
+        [Collections.IDictionary]$QualificationData
     )
+    $qualificationBinding = Copy-Stage5SimulationQualificationDataBinding `
+        $QualificationData $Title "$Context qualificationData"
     Assert-Condition ($null -ne $ChildRun -and $null -ne $ChildRun.childProcess) `
         "$Context has no retained process provenance."
     $child = $ChildRun.childProcess
@@ -1990,14 +2557,44 @@ function New-Stage5HostChildBinding {
         -not [string]::IsNullOrWhiteSpace([string]$child.commandLine)) `
         "$Context retained process provenance is incomplete."
     $entry = $ChildRun.entry
+    Assert-Condition ($null -ne $entry -and [int]$entry.sequence -gt 0 -and
+        $null -ne $ChildRun.run -and -not [bool]$ChildRun.run.timedOut -and
+        [int]$ChildRun.run.exitCode -eq 0) `
+        "$Context is not a successful sequenced execution."
+    Assert-Condition ([string]$child.runNonce -cmatch
+        '^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$') `
+        "$Context runNonce is not a canonical lowercase UUIDv4."
+    [DateTimeOffset]$childCreated = [DateTimeOffset]::MinValue
+    [DateTimeOffset]$cohortCreated = [DateTimeOffset]::MinValue
+    Assert-Condition ([string]$child.processCreationUtc -cmatch
+        '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z$' -and
+        [DateTimeOffset]::TryParse([string]$child.processCreationUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$childCreated) -and
+        [DateTimeOffset]::TryParse($CohortCreatedUtc,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$cohortCreated) -and
+        $childCreated.ToUniversalTime() -ge $cohortCreated.ToUniversalTime()) `
+        "$Context process creation is not a canonical current-cohort UTC timestamp."
+    Assert-Condition ([string]$child.commandLine -ceq [string]$entry.command) `
+        "$Context command line differs from the execution plan."
+    $entryArguments = @($entry.arguments)
+    Assert-Condition ($entryArguments.Count -gt 0 -and
+        @($entryArguments | Where-Object { $_ -isnot [string] }).Count -eq 0) `
+        "$Context arguments are not the exact string-array execution plan."
     $stdoutPath = [IO.Path]::GetFullPath([string]$entry.stdout)
     $stderrPath = [IO.Path]::GetFullPath([string]$entry.stderr)
     $stdoutSnapshot = Get-Stage5FileSnapshot $stdoutPath "$Context stdout"
     $stderrSnapshot = Get-Stage5FileSnapshot $stderrPath "$Context stderr"
+    Assert-Condition ([string]$child.stdoutSha256 -match '^[0-9A-F]{64}$' -and
+        [string]$child.stderrSha256 -match '^[0-9A-F]{64}$' -and
+        [string]$stdoutSnapshot.sha256 -ceq [string]$child.stdoutSha256 -and
+        [string]$stderrSnapshot.sha256 -ceq [string]$child.stderrSha256) `
+        "$Context stdout/stderr changed after their immutable publication."
     $binding = [ordered]@{
         role = $Role
         title = $Title
-        runNonce = $ReceiptNonce
+        runNonce = [string]$child.runNonce
         processId = [int]$child.processId
         processCreationUtc = [string]$child.processCreationUtc
         executablePath = [IO.Path]::GetFullPath([string]$child.executablePath)
@@ -2013,13 +2610,24 @@ function New-Stage5HostChildBinding {
             sha256 = $stderrSnapshot.sha256
         }
     }
+    if ($IncludeExecutionFields) {
+        $binding.Insert(0, 'sequence', [int]$entry.sequence)
+        $binding.Insert(10, 'arguments', [string[]]$entryArguments)
+    }
     Assert-Condition ($null -ne $child.nativeReceipt -and
-        [string]$child.nativeReceipt.runNonce -ceq $ReceiptNonce -and
+        [string]$child.runNonce -match
+            '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$' -and
+        [string]$child.nativeReceipt.producer -ceq
+            'game-executable-stage5-performance-report-v5' -and
+        [string]$child.nativeReceipt.runNonce -ceq [string]$child.runNonce -and
         [string]$child.nativeReceipt.cohortNonce -ceq $CohortNonce) `
         "$Context lacks a native executable receipt bound to the same run and execution cohort."
     $nativePath = Join-Path $OutputRoot ([string]$child.nativeReceipt.path)
     $nativeSnapshot = Get-Stage5FileSnapshot $nativePath `
         "$Context native v2 receipt"
+    Assert-Condition ([string]$child.nativeReceipt.sha256 -match '^[0-9A-F]{64}$' -and
+        [string]$child.nativeReceipt.sha256 -ceq [string]$nativeSnapshot.sha256) `
+        "$Context native receipt changed after its immutable publication."
     $binding.nativeReceipt = [ordered]@{
         path = ConvertTo-OutputRelativePath $nativePath $OutputRoot "$Context native receipt"
         sha256 = $nativeSnapshot.sha256
@@ -2027,7 +2635,144 @@ function New-Stage5HostChildBinding {
         runNonce = [string]$child.nativeReceipt.runNonce
         cohortNonce = $CohortNonce
     }
+    $binding.qualificationData = $qualificationBinding
     return $binding
+}
+
+function New-Stage5ResultExecutionProvenance {
+    param(
+        [object]$ChildRun,
+        [string]$OutputRoot,
+        [string]$Title,
+        [string]$SourceCommit,
+        [string]$ArtifactSetSha256,
+        [string]$ExecutableSha256,
+        [string]$CohortNonce,
+        [string]$CohortCreatedUtc,
+        [Collections.IDictionary]$RuntimeClosure,
+        [Collections.IDictionary]$QualificationData,
+        [string]$PlanPath,
+        [string]$PlanSha256
+    )
+    Assert-Condition ($SourceCommit -cmatch '^[0-9a-f]{40}$' -and
+        (Test-Sha256Text $ArtifactSetSha256) -and
+        (Test-Sha256Text $ExecutableSha256) -and
+        (Test-Sha256Text $PlanSha256)) `
+        'Validation result provenance source, artifact, executable, or plan binding is invalid.'
+    Assert-CanonicalUuid $CohortNonce 'Validation result provenance cohortNonce' | Out-Null
+    Assert-Condition (($RuntimeClosure -is [Collections.IDictionary]) -and
+        (Test-Sha256Text ([string]$RuntimeClosure['dependencyManifestSha256'])) -and
+        (Test-Sha256Text ([string]$RuntimeClosure['closureSha256']))) `
+        'Validation result provenance runtime closure binding is incomplete.'
+    $planSnapshot = Get-Stage5FileSnapshot $PlanPath 'Validation result frozen plan'
+    Assert-Condition ([string]$planSnapshot.sha256 -ceq $PlanSha256.ToUpperInvariant()) `
+        'Validation result frozen plan changed after publication.'
+    $child = New-Stage5HostChildBinding -ChildRun $ChildRun `
+        -Role 'validation-results' -Title $Title -CohortNonce $CohortNonce `
+        -OutputRoot $OutputRoot -ExecutableSha256 $ExecutableSha256 `
+        -RuntimeClosure $RuntimeClosure -Context 'Validation result execution' `
+        -IncludeExecutionFields -QualificationData $QualificationData
+    return [ordered]@{
+        schemaVersion = 1
+        sequence = [int]$child.sequence
+        role = [string]$child.role
+        title = [string]$child.title
+        runNonce = [string]$child.runNonce
+        processId = [int]$child.processId
+        processCreationUtc = [string]$child.processCreationUtc
+        executablePath = [string]$child.executablePath
+        executableSha256 = [string]$child.executableSha256
+        commandLine = [string]$child.commandLine
+        arguments = [string[]]@($child.arguments)
+        exitCode = [int]$child.exitCode
+        stdout = $child.stdout
+        stderr = $child.stderr
+        nativeReceipt = $child.nativeReceipt
+        plan = [ordered]@{
+            path = ConvertTo-OutputRelativePath $PlanPath $OutputRoot `
+                'Validation result frozen plan'
+            sha256 = $PlanSha256.ToUpperInvariant()
+        }
+        sourceCommit = $SourceCommit
+        artifactSetSha256 = $ArtifactSetSha256.ToUpperInvariant()
+        cohortNonce = $CohortNonce
+        cohortCreatedUtc = $CohortCreatedUtc
+        runtimeClosure = [ordered]@{
+            dependencyManifestSha256 =
+                ([string]$RuntimeClosure['dependencyManifestSha256']).ToUpperInvariant()
+            closureSha256 = ([string]$RuntimeClosure['closureSha256']).ToUpperInvariant()
+        }
+        qualificationData = Copy-Stage5SimulationQualificationDataBinding `
+            $QualificationData $Title `
+            'Validation result execution provenance qualificationData'
+    }
+}
+
+function New-Stage5ValidationResultProjection {
+    param(
+        [Parameter(Mandatory = $true)][object]$Entry,
+        [Parameter(Mandatory = $true)][object]$Run,
+        [AllowNull()][object]$AiEvidence,
+        [AllowNull()][object]$ReplayMetrics,
+        [AllowNull()][object]$ReplayResult,
+        [AllowNull()][object]$TimingEvidence,
+        [AllowNull()][object]$ExecutionProvenance,
+        [AllowNull()][object]$FrozenLiveEntry = $null,
+        [bool]$RequireFrozenLiveIdentity = $false,
+        [Parameter(Mandatory = $true)][string]$Title
+    )
+    $identitySource = $Entry
+    if ($Entry.kind -ceq 'ai' -and $RequireFrozenLiveIdentity) {
+        Assert-Condition ($null -ne $FrozenLiveEntry) `
+            'V2 AI result projection requires its frozen live-plan entry.'
+        foreach ($field in @('entryId', 'kind', 'sequence', 'scenario', 'seed',
+                'configuration', 'repeat', 'simulationMode', 'requestedWorkers',
+                'workerPolicy', 'stress', 'validationRole', 'proofProfileId')) {
+            $entryProperty = $Entry.PSObject.Properties[$field]
+            $frozenProperty = $FrozenLiveEntry.PSObject.Properties[$field]
+            Assert-Condition ($null -ne $entryProperty -and
+                $null -ne $frozenProperty -and
+                $entryProperty.Value -cne $null -and
+                $frozenProperty.Value -cne $null -and
+                $entryProperty.Value -ceq $frozenProperty.Value) `
+                "V2 AI result projection '$field' is not copied from the frozen live-plan identity."
+        }
+        $identitySource = $FrozenLiveEntry
+    }
+    $result = [ordered]@{
+        sequence = $identitySource.sequence
+        title = $Title
+        kind = $identitySource.kind
+        caseId = $identitySource.caseId
+        determinismKey = $identitySource.determinismKey
+        configuration = $identitySource.configuration
+        simulationMode = $identitySource.simulationMode
+        requestedWorkers = $identitySource.requestedWorkers
+        workerPolicy = $identitySource.workerPolicy
+        repeat = $identitySource.repeat
+        matrixRepeat = $identitySource.matrixRepeat
+        replayArgument = $identitySource.replayArgument
+        seed = $identitySource.seed
+        scenario = $identitySource.scenario
+        fixtureSha256 = $identitySource.fixtureSha256
+        stress = $identitySource.stress
+    }
+    if ($Entry.kind -ceq 'ai' -and $RequireFrozenLiveIdentity) {
+        foreach ($field in @('entryId', 'validationRole', 'proofProfileId')) {
+            $result[$field] = [string]$identitySource.$field
+        }
+    }
+    $result.exitCode = $Run.exitCode
+    $result.timedOut = $Run.timedOut
+    $result.wallMilliseconds = $Run.wallMilliseconds
+    $result.stdoutSha256 = [string]$Run.childProcess.stdoutSha256
+    $result.stderrSha256 = [string]$Run.childProcess.stderrSha256
+    $result.aiEvidence = $AiEvidence
+    $result.replayMetrics = $ReplayMetrics
+    $result.replayResult = $ReplayResult
+    $result.timingEvidence = $TimingEvidence
+    $result.executionProvenance = $ExecutionProvenance
+    return [pscustomobject]$result
 }
 
 function Write-Stage5HostRunnerReceipt {
@@ -2041,10 +2786,15 @@ function Write-Stage5HostRunnerReceipt {
         [string]$ExecutableSha256,
         [object[]]$RawLogPaths,
         [object[]]$ChildRuns,
+        [object[]]$Results = @(),
+        [string[]]$ExcludedChildRunNonces = @(),
         [Collections.IDictionary]$Details,
         [string]$CohortNonce,
         [string]$CohortCreatedUtc,
-        [Collections.IDictionary]$RuntimeClosure
+        [Collections.IDictionary]$RuntimeClosure,
+        [Collections.IDictionary]$QualificationData,
+        [string]$PlanPath = '',
+        [string]$PlanSha256 = ''
     )
     Assert-Condition ($Role -in @('validation-plan', 'validation-results',
         'replay-results', 'ai-results', 'performance-report')) `
@@ -2064,6 +2814,8 @@ function Write-Stage5HostRunnerReceipt {
         (Test-Sha256Text ([string]$RuntimeClosure['dependencyManifestSha256'])) -and
         (Test-Sha256Text ([string]$RuntimeClosure['closureSha256']))) `
         'Host-runner receipt runtime closure binding is incomplete.'
+    $qualificationBinding = Copy-Stage5SimulationQualificationDataBinding `
+        $QualificationData $Title "Host-runner '$Role' qualificationData"
     $receiptFull = [IO.Path]::GetFullPath($ReceiptPath)
     Assert-Condition (-not (Test-Path -LiteralPath $receiptFull)) `
         "Host-runner receipt output already exists: $receiptFull"
@@ -2071,7 +2823,62 @@ function Write-Stage5HostRunnerReceipt {
         "Host-runner '$Role' receipt"
     $children = New-Object 'Collections.Generic.List[object]'
     $candidate = $null
-    if ($Role -ne 'validation-plan') {
+    $excludedChildNonceSet = New-Object 'Collections.Generic.HashSet[string]' `
+        ([StringComparer]::Ordinal)
+    foreach ($excludedNonce in @($ExcludedChildRunNonces)) {
+        Assert-CanonicalUuid $excludedNonce `
+            "Host-runner '$Role' excluded child runNonce" | Out-Null
+        [void]$excludedChildNonceSet.Add($excludedNonce)
+    }
+    if ($Role -ceq 'validation-results') {
+        $orderedRuns = @($ChildRuns | Sort-Object { [int]$_.entry.sequence })
+        Assert-Condition ($orderedRuns.Count -gt 0 -and
+            $orderedRuns.Count -eq @($Results).Count) `
+            "Host-runner '$Role' receipt must bind every result to one child execution."
+        $seenSequences = New-Object 'Collections.Generic.HashSet[int]'
+        $seenChildNonces = New-Object 'Collections.Generic.HashSet[string]' `
+            ([StringComparer]::Ordinal)
+        $seenChildProcesses = New-Object 'Collections.Generic.HashSet[string]' `
+            ([StringComparer]::Ordinal)
+        $seenNativePaths = New-Object 'Collections.Generic.HashSet[string]' `
+            ([StringComparer]::OrdinalIgnoreCase)
+        for ($index = 0; $index -lt $orderedRuns.Count; ++$index) {
+            $run = $orderedRuns[$index]
+            $sequence = [int]$run.entry.sequence
+            Assert-Condition ($sequence -eq ($index + 1) -and
+                $seenSequences.Add($sequence)) `
+                "Host-runner '$Role' receipt has a missing, duplicate, or non-contiguous sequence."
+            $binding = New-Stage5HostChildBinding $run $Role $Title `
+                $CohortNonce $OutputRoot $ExecutableSha256 $RuntimeClosure `
+                "Host-runner '$Role' child $sequence" -IncludeExecutionFields `
+                -QualificationData $qualificationBinding
+            Assert-Condition ($seenChildNonces.Add([string]$binding.runNonce)) `
+                "Host-runner '$Role' receipt reuses a child runNonce."
+            $processKey = '{0}|{1}' -f $binding.processId, $binding.processCreationUtc
+            Assert-Condition ($seenChildProcesses.Add($processKey)) `
+                "Host-runner '$Role' receipt reuses a child process identity."
+            Assert-Condition ($seenNativePaths.Add([string]$binding.nativeReceipt.path)) `
+                "Host-runner '$Role' receipt reuses a native receipt path."
+            $result = @($Results)[$index]
+            Assert-Condition ($null -ne $result -and [int]$result.sequence -eq $sequence -and
+                $null -ne $result.executionProvenance) `
+                "Host-runner '$Role' result $sequence lacks sequenced execution provenance."
+            $expectedProvenance = New-Stage5ResultExecutionProvenance `
+                -ChildRun $run -OutputRoot $OutputRoot -Title $Title `
+                -SourceCommit $SourceCommit -ArtifactSetSha256 $ArtifactSetSha256 `
+                -ExecutableSha256 $ExecutableSha256 -CohortNonce $CohortNonce `
+                -CohortCreatedUtc $CohortCreatedUtc -RuntimeClosure $RuntimeClosure `
+                -QualificationData $qualificationBinding `
+                -PlanPath $PlanPath -PlanSha256 $PlanSha256
+            $expectedJson = $expectedProvenance | ConvertTo-Json -Depth 12 -Compress
+            $actualJson = $result.executionProvenance | ConvertTo-Json -Depth 12 -Compress
+            Assert-Condition ($actualJson -ceq $expectedJson) `
+                "Host-runner '$Role' result $sequence provenance differs from its child, plan, or runtime binding."
+            $children.Add($binding) | Out-Null
+        }
+        $candidate = $orderedRuns[0]
+    }
+    elseif ($Role -ne 'validation-plan') {
         # The immutable receipt contract binds one observed child identity to
         # each role receipt.  The complete execution set remains covered by
         # the role's hashed result log; selecting a real child here avoids
@@ -2082,29 +2889,30 @@ function Write-Stage5HostRunnerReceipt {
         $candidate = @($ChildRuns | Where-Object {
             $null -ne $_.childProcess -and
             $null -ne $_.childProcess.nativeReceipt -and
+            -not $excludedChildNonceSet.Contains([string]$_.childProcess.runNonce) -and
             $expectedNativeProducers -ccontains
                 [string]$_.childProcess.nativeReceipt.producer
         }) | Select-Object -First 1
         Assert-Condition ($null -ne $candidate) `
-            "Host-runner '$Role' receipt cannot pass without a retained child process and native receipt from '$($expectedNativeProducers -join ', ')'."
+            "Host-runner '$Role' receipt cannot pass without a unique retained child process and native receipt from '$($expectedNativeProducers -join ', ')'."
         $childTitle = $Title
         Assert-Condition ($childTitle -in @('Generals', 'ZeroHour')) `
             "Host-runner '$Role' receipt must bind a concrete title child."
     }
+    # The wrapper is a separate immutable host observation and therefore owns
+    # a fresh nonce.  The child/native binding below retains the actual process
+    # nonce; conflating these identities made multiple role receipts replay the
+    # same globally registered nonce.
     $receiptNonce = [Guid]::NewGuid().ToString()
-    if ($null -ne $candidate -and $null -ne $candidate.childProcess.nativeReceipt -and
-        [string]$candidate.childProcess.runNonce -match
-            '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$') {
-        # A native v2 receipt is only carried when its producer-bound nonce can
-        # also identify this host child.  If multiple role receipts select the
-        # same process, the host-domain nonce remains fresh and the native
-        # reference is omitted rather than weakening the global replay check.
-        $receiptNonce = [string]$candidate.childProcess.runNonce
+    while ($null -ne $candidate -and $receiptNonce -ceq
+        [string]$candidate.childProcess.runNonce) {
+        $receiptNonce = [Guid]::NewGuid().ToString()
     }
-    if ($null -ne $candidate) {
+    if ($null -ne $candidate -and $Role -cne 'validation-results') {
         $children.Add((New-Stage5HostChildBinding $candidate $Role $childTitle `
-            $receiptNonce $CohortNonce $OutputRoot $ExecutableSha256 $RuntimeClosure `
-            "Host-runner '$Role' child")) | Out-Null
+            $CohortNonce $OutputRoot $ExecutableSha256 $RuntimeClosure `
+            "Host-runner '$Role' child" `
+            -QualificationData $qualificationBinding)) | Out-Null
     }
     $recordedUtc = [DateTimeOffset]::UtcNow
     Assert-Condition ($recordedUtc -ge $cohortCreated) `
@@ -2137,14 +2945,28 @@ function Write-Stage5HostRunnerReceipt {
             childProvenance = if ($Role -eq 'validation-plan') { 'not-applicable' } else { 'bound' }
             children = @($children.ToArray())
         }
-        details = $Details
+        details = $null
     }
-    [IO.File]::WriteAllText($receiptFull, ($document | ConvertTo-Json -Depth 12))
+    $receiptDetails = [ordered]@{}
+    foreach ($detailKey in $Details.Keys) {
+        Assert-Condition ([string]$detailKey -cne 'qualificationData') `
+            "Host-runner '$Role' caller must not replace qualificationData."
+        $receiptDetails[[string]$detailKey] = $Details[$detailKey]
+    }
+    $receiptDetails['qualificationData'] = $qualificationBinding
+    $document['details'] = $receiptDetails
+    $receiptBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(
+        ($document | ConvertTo-Json -Depth 12))
+    $receiptSnapshot = Write-Stage5FinalAcceptanceFileAtomically `
+        $receiptFull $receiptBytes "Host-runner '$Role' receipt"
     return [pscustomobject]@{
         path = $receiptFull
-        sha256 = Get-Sha256 $receiptFull
+        sha256 = [string]$receiptSnapshot.sha256
         role = $Role
         runNonce = $receiptNonce
+        childRunNonce = if ($null -eq $candidate) { $null } else {
+            [string]$candidate.childProcess.runNonce
+        }
         cohortNonce = $CohortNonce
     }
 }
@@ -2191,11 +3013,17 @@ function Write-LocalCapacityReceipt {
             'LocalCapacity artifact index SHA-256 changed before receipt binding.'
         $corpusExportDocument = [ordered]@{
             status = 'passed'
+            corpusExportRoot = [IO.Path]::GetFullPath($CorpusExportRoot)
             artifactIndexPath = $artifactIndexPath
             artifactIndexSha256 = $artifactIndexSha256
             recordCount = [int]$CorpusExport.recordCount
             records = @($CorpusExport.records)
         }
+        Assert-Condition ([String]::Equals(
+                [string]$corpusExportDocument.corpusExportRoot,
+                [IO.Path]::GetFullPath([string]$CorpusExport.corpusExportRoot),
+                [StringComparison]::OrdinalIgnoreCase)) `
+            'LocalCapacity corpus export root differs between the producer and receipt binding.'
     }
     $document = [ordered]@{
         schemaVersion = 1
@@ -2213,7 +3041,11 @@ function Write-LocalCapacityReceipt {
         generatedUtc = [DateTime]::UtcNow.ToString('o')
         topology = $Topology
         regularConfigurations = @($Configurations | ForEach-Object { $_.Id })
-        shadowConfiguration = $ShadowConfiguration.Id
+        shadowConfiguration = if ($null -eq $ShadowConfiguration) {
+            $null
+        } else {
+            $ShadowConfiguration.Id
+        }
         entryCount = $entryArray.Count
         resultCount = $resultArray.Count
         replayResultCount = @($resultArray | Where-Object {
@@ -2238,10 +3070,13 @@ function Write-LocalCapacityReceipt {
             Get-Sha256 $ResultsPath
         } else { $null }
     }
-    [IO.File]::WriteAllText($receiptFull, ($document | ConvertTo-Json -Depth 12))
+    $receiptBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(
+        ($document | ConvertTo-Json -Depth 12))
+    $receiptSnapshot = Write-Stage5FinalAcceptanceFileAtomically `
+        $receiptFull $receiptBytes 'LocalCapacity receipt'
     return [pscustomobject]@{
         path = $receiptFull
-        sha256 = Get-Sha256 $receiptFull
+        sha256 = [string]$receiptSnapshot.sha256
     }
 }
 
@@ -2276,8 +3111,14 @@ function Export-LocalCapacityAiCorpus {
         $null -eq $_ -or $_.kind -cne 'ai'
     }).Count -eq 0) `
         'LocalCapacity corpus export accepts AI-only completed records.'
-    $aiRuns = @($childRunArray | Sort-Object { [int]$_.entry.sequence })
-    $aiResults = @($resultArray | Sort-Object { [int]$_.sequence })
+    $aiRuns = @($childRunArray | Sort-Object {
+        ConvertTo-Stage5PersistedInteger $_.entry.sequence `
+            "LocalCapacity AI sequence" 1 ([Int32]::MaxValue)
+    })
+    $aiResults = @($resultArray | Sort-Object {
+        ConvertTo-Stage5PersistedInteger $_.sequence `
+            "LocalCapacity result sequence" 1 ([Int32]::MaxValue)
+    })
     Assert-Condition ($aiRuns.Count -eq $aiResults.Count) `
         'LocalCapacity corpus export child-run and result counts differ.'
     $seenSequences = New-Object 'Collections.Generic.HashSet[int]'
@@ -2285,19 +3126,27 @@ function Export-LocalCapacityAiCorpus {
     foreach ($child in $aiRuns) {
         $entry = $child.entry
         $run = $child.run
+        $entrySequence = ConvertTo-Stage5PersistedInteger $entry.sequence `
+            "LocalCapacity AI sequence" 1 ([Int32]::MaxValue)
+        $entryRepeat = ConvertTo-Stage5PersistedInteger $entry.repeat `
+            "LocalCapacity AI repeat" 1 10
+        $entrySeed = ConvertTo-Stage5PersistedInteger $entry.seed `
+            "LocalCapacity AI seed" 1 ([Int32]::MaxValue)
         Assert-Condition ($null -ne $run -and $run.exitCode -eq 0 -and
             -not [bool]$run.timedOut) `
             "LocalCapacity corpus export requires a completed AI run at sequence $($entry.sequence)."
-        Assert-Condition $seenSequences.Add([int]$entry.sequence) `
+        Assert-Condition $seenSequences.Add($entrySequence) `
             "LocalCapacity corpus export repeats AI sequence $($entry.sequence)."
         $matchingResults = @($aiResults | Where-Object {
-            [int]$_.sequence -eq [int]$entry.sequence
+            (ConvertTo-Stage5PersistedInteger $_.sequence `
+                "LocalCapacity result sequence" 1 ([Int32]::MaxValue)) -eq $entrySequence
         })
         Assert-Condition ($matchingResults.Count -eq 1 -and
             $null -ne $matchingResults[0].aiEvidence) `
             "LocalCapacity corpus export has no parsed AI result for sequence $($entry.sequence)."
+        $aiEvidence = $matchingResults[0].aiEvidence
         $completion = Get-Stage5ReplayCompletionFields `
-            -Output ([string]$run.stdout) -ExpectedSeed ([int]$entry.seed) `
+            -Output ([string]$run.stdout) -ExpectedSeed $entrySeed `
             -ExpectedScenario ([string]$entry.scenario) -ExpectedTitle $Title `
             -Context "LocalCapacity AI sequence $($entry.sequence) completion"
         $artifact = Export-Stage5FreshReplayArtifact `
@@ -2309,17 +3158,21 @@ function Export-LocalCapacityAiCorpus {
                 title = $Title
                 category = 'local-capacity-ai'
                 scenario = [string]$entry.scenario
-                seed = [string]$entry.seed
+                seed = [string]$entrySeed
+                actualAi = [string]$aiEvidence.fields.actual_ai
+                actualTeams = [string]$aiEvidence.fields.actual_teams
                 runNonce = $completion.runNonce
                 executableSha256 = $ExecutableSha256
                 origin = 'native-fresh-runtime'
             })
         $records.Add([pscustomobject]@{
-            sequence = [int]$entry.sequence
+            sequence = $entrySequence
             configuration = [string]$entry.configuration
-            repeat = [int]$entry.repeat
+            repeat = $entryRepeat
             scenario = [string]$entry.scenario
-            seed = [int]$entry.seed
+            seed = $entrySeed
+            actualAi = $artifact.actualAi
+            actualTeams = $artifact.actualTeams
             runNonce = $completion.runNonce
             replayEpoch = $completion.replayEpoch
             replaySha256 = $completion.replaySha256
@@ -2362,8 +3215,12 @@ function Export-LocalCapacityAiCorpus {
 function Get-Stage5ResultTreeSha256 {
     param([object[]]$Results, [string]$Kind)
     $lines = New-Object 'Collections.Generic.List[string]'
-    foreach ($result in @($Results | Where-Object { $_.kind -ceq $Kind } |
-        Sort-Object sequence)) {
+    $orderedResults = @($Results | Where-Object { $_.kind -ceq $Kind } |
+        Sort-Object -Property @{
+            Expression = { [Int64]$_.sequence }
+            Ascending = $true
+        })
+    foreach ($result in $orderedResults) {
         if ($Kind -ceq 'replay') {
             $lines.Add(('{0}|{1}|{2}|{3}|{4}|{5}' -f
                 $result.sequence, $result.determinismKey, $result.matrixRepeat,
@@ -2386,8 +3243,26 @@ Assert-Condition ($StressRepeats -gt 0 -and $StressRepeats -le 10) `
     'StressRepeats must be between 1 and 10.'
 $localCapacityRequested = $CapacityMode -ceq 'LocalCapacity'
 $corpusExportRequested = -not [string]::IsNullOrWhiteSpace($CorpusExportRoot)
+$diagnosticWorkerConfigurationRequested =
+    -not [string]::IsNullOrWhiteSpace($DiagnosticWorkerConfiguration)
 $diagnosticNonAcceptanceRequested = [bool]$DiagnosticNonAcceptance -or
     $localCapacityRequested
+$diagnosticWorkerContext = 'DiagnosticWorkerConfiguration'
+Assert-Condition (-not $diagnosticWorkerConfigurationRequested -or
+    $localCapacityRequested) `
+    "$diagnosticWorkerContext is available only with CapacityMode LocalCapacity."
+Assert-Condition (-not $diagnosticWorkerConfigurationRequested -or
+    [bool]$DiagnosticNonAcceptance) `
+    "$diagnosticWorkerContext requires the explicit DiagnosticNonAcceptance switch."
+Assert-Condition (-not $diagnosticWorkerConfigurationRequested -or
+    $ValidationSet -ceq 'AI') `
+    "$diagnosticWorkerContext is an AI-only seed-screening control."
+Assert-Condition (-not $diagnosticWorkerConfigurationRequested -or
+    -not [bool]$PlanOnly) `
+    "$diagnosticWorkerContext is execution-only and cannot be used with PlanOnly."
+Assert-Condition (-not $diagnosticWorkerConfigurationRequested -or
+    -not $corpusExportRequested) `
+    "$diagnosticWorkerContext screening cannot export a replay corpus."
 $deterministicRuntimeContractRequested = $ValidationSet -ceq 'All' -and
     -not $diagnosticNonAcceptanceRequested -and -not [bool]$AllowNonStandardCorpus
 Assert-Condition (-not $deterministicRuntimeContractRequested -or $ReplayMatrixRepeats -eq 2) `
@@ -2412,6 +3287,11 @@ $acceptanceBindingsRequested = -not [string]::IsNullOrWhiteSpace($AcceptanceSour
     -not [string]::IsNullOrWhiteSpace($AcceptanceArtifactSetSha256) -or
     -not [string]::IsNullOrWhiteSpace($AcceptanceRuntimeDependencyManifestSha256) -or
     -not [string]::IsNullOrWhiteSpace($AcceptanceRuntimeClosureSha256)
+$qualificationDataBindingRequested =
+    -not [string]::IsNullOrWhiteSpace($QualificationDataManifestPath) -or
+    -not [string]::IsNullOrWhiteSpace($QualificationDataManifestSha256) -or
+    -not [string]::IsNullOrWhiteSpace($QualificationDataClosureSha256) -or
+    $QualificationDataFileCount -ne 0
 if ($acceptanceBindingsRequested) {
     Assert-Condition ($AcceptanceSourceCommit -cmatch '^[0-9a-f]{40}$') `
         'AcceptanceSourceCommit must be an independently supplied lowercase 40-hex commit.'
@@ -2421,10 +3301,24 @@ if ($acceptanceBindingsRequested) {
         (Test-Sha256Text $AcceptanceRuntimeClosureSha256)) `
         'Acceptance runtime closure requires independently supplied dependency-manifest and closure SHA-256 values.'
 }
+Assert-Condition (-not $qualificationDataBindingRequested -or
+    $acceptanceBindingsRequested) `
+    'Qualification-data bindings are accepted only with the complete acceptance identity.'
+Assert-Condition (-not $diagnosticWorkerConfigurationRequested -or
+    -not $acceptanceBindingsRequested) `
+    "$diagnosticWorkerContext cannot request canonical acceptance bindings."
 Assert-Condition (-not ($localCapacityRequested -and $EnforcePerformance)) `
     'LocalCapacity cannot request performance enforcement; use the canonical performance lane.'
 Assert-Condition (-not ($localCapacityRequested -and $acceptanceBindingsRequested)) `
     'LocalCapacity cannot request canonical acceptance bindings or receipts.'
+if ($acceptanceBindingsRequested) {
+    Assert-Condition ($qualificationDataBindingRequested -and
+        -not [string]::IsNullOrWhiteSpace($QualificationDataManifestPath) -and
+        (Test-Sha256Text $QualificationDataManifestSha256) -and
+        (Test-Sha256Text $QualificationDataClosureSha256) -and
+        $QualificationDataFileCount -eq 6) `
+        'Acceptance-bound execution requires the complete immutable per-title qualification-data manifest binding.'
+}
 Assert-Condition (-not $corpusExportRequested -or
     ($localCapacityRequested -and $ValidationSet -ceq 'AI' -and -not $PlanOnly)) `
     'CorpusExportRoot requires an executing LocalCapacity AI-only validation.'
@@ -2461,6 +3355,9 @@ $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot)
 $manifestData = Get-ManifestData $FixtureManifestPath $ValidationSet `
     ([bool]$AllowNonStandardCorpus) $ExpectedExecutableSha256 $Title `
     ($localCapacityRequested -and $ValidationSet -ceq 'AI')
+if ($corpusExportRequested) {
+    Assert-LocalCapacityCorpusMatrix $manifestData
+}
 $executableFull = Join-Path $runtimeFull $manifestData.executable
 Assert-Condition (Test-Path -LiteralPath $runtimeFull -PathType Container) "Installed runtime root was not found: $runtimeFull"
 Assert-Condition (Test-Path -LiteralPath (Join-Path $runtimeFull 'launcher.exe') -PathType Leaf) `
@@ -2472,6 +3369,14 @@ Assert-Condition (Test-Path -LiteralPath $executableFull -PathType Leaf) `
 Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable' | Out-Null
 $launcherConfigFull = [IO.Path]::GetFullPath((Join-Path $runtimeFull 'launcher.lcf'))
 $launcherContract = Get-LauncherRunContract $launcherConfigFull $runtimeFull $executableFull
+if (-not $PlanOnly) {
+    # Historical/oracle executables may ignore the profile-root environment
+    # variable and write to the user's live Documents folder. Require the
+    # embedded current-runtime capability marker before any task/output/profile
+    # setup; filename and SHA-256 identity alone do not prove this behavior.
+    Assert-Stage5ProcessLocalProfileCapability $executableFull |
+        Out-Null
+}
 
 $physicalCoreCount = 0
 $logicalProcessorCount = 0
@@ -2515,6 +3420,48 @@ if (-not $PlanOnly) {
 }
 Assert-FreeSpace (Split-Path -Parent $outputFull) $MinimumFreeBytes 'Validation output volume'
 New-Item -ItemType Directory -Path $outputFull | Out-Null
+$qualificationDataBinding = $null
+$qualificationDataEvidence = $null
+if ($acceptanceBindingsRequested) {
+    $qualificationInputFull = [IO.Path]::GetFullPath(
+        $QualificationDataManifestPath)
+    Assert-Condition ([IO.Path]::GetFileName($qualificationInputFull) -ceq
+        'QualificationData.json') `
+        'QualificationDataManifestPath must name QualificationData.json.'
+    if (-not $PlanOnly) {
+        Assert-TaskOwnedPath $qualificationInputFull $taskRootFull `
+            'QualificationDataManifestPath' | Out-Null
+    }
+    $qualificationInputSnapshot = Get-Stage5FileSnapshot `
+        $qualificationInputFull 'Input Stage 5 simulation qualification data'
+    Assert-Condition ([string]$qualificationInputSnapshot.sha256 -ceq
+        $QualificationDataManifestSha256.ToUpperInvariant()) `
+        'Input Stage 5 simulation qualification-data manifest SHA-256 mismatch.'
+    $qualificationEvidencePath = Join-Path $outputFull 'QualificationData.json'
+    $qualificationSnapshot = Write-Stage5FinalAcceptanceFileAtomically `
+        -Path $qualificationEvidencePath `
+        -Bytes ([byte[]]$qualificationInputSnapshot.bytes) `
+        -Context 'Retained Stage 5 simulation qualification data' `
+        -EvidenceKind JsonReceipt
+    Assert-Condition ([string]$qualificationSnapshot.sha256 -ceq
+        $QualificationDataManifestSha256.ToUpperInvariant()) `
+        'Retained Stage 5 simulation qualification-data manifest changed during publication.'
+    $qualificationDataBinding = [ordered]@{
+        path = 'QualificationData.json'
+        title = $Title
+        manifestSha256 = $QualificationDataManifestSha256.ToUpperInvariant()
+        closureSha256 = $QualificationDataClosureSha256.ToUpperInvariant()
+        fileCount = [int]$QualificationDataFileCount
+    }
+    $qualificationDataEvidence =
+        Read-Stage5SimulationQualificationDataEvidence `
+            -Path $qualificationEvidencePath `
+            -Binding $qualificationDataBinding `
+            -ExpectedSourceCommit $AcceptanceSourceCommit `
+            -ExpectedTitle $Title
+    Assert-Stage5SimulationQualificationRuntimeMembership `
+        -RuntimeRoot $runtimeFull -Evidence $qualificationDataEvidence
+}
 if ($null -ne $stage3PerformanceBaseline) {
     $stage3PerformanceBaselineEvidencePath = Join-Path $outputFull 'stage3-performance-baseline.json'
     Copy-Item -LiteralPath $stage3PerformanceBaseline.file -Destination $stage3PerformanceBaselineEvidencePath
@@ -2523,10 +3470,22 @@ if ($null -ne $stage3PerformanceBaseline) {
     $stage3PerformanceBaseline.evidenceFile = $stage3PerformanceBaselineEvidencePath
 }
 
-$workerConfigurations = @(Get-WorkerConfigurations -CapacityMode $CapacityMode)
-$collisionShadowConfiguration = Get-CollisionShadowConfiguration -CapacityMode $CapacityMode
+$workerConfigurations = @(Get-DiagnosticWorkerConfigurations `
+    -CapacityMode $CapacityMode `
+    -DiagnosticWorkerConfiguration $DiagnosticWorkerConfiguration)
+$collisionShadowConfiguration = if ($diagnosticWorkerConfigurationRequested) {
+    $null
+} else {
+    Get-CollisionShadowConfiguration -CapacityMode $CapacityMode
+}
+$collisionShadowConfigurationId = if ($null -eq $collisionShadowConfiguration) {
+    ''
+} else {
+    [string]$collisionShadowConfiguration.Id
+}
 $plan = @(New-ValidationPlan $manifestData $ValidationSet $ReplayMatrixRepeats $StressRepeats `
-    $ReplayTimeoutSeconds $AiTimeoutSeconds $executableFull $outputFull $CapacityMode)
+    $ReplayTimeoutSeconds $AiTimeoutSeconds $executableFull $outputFull $CapacityMode `
+    $DiagnosticWorkerConfiguration)
 Assert-Condition ($plan.Count -gt 0) 'The fixture manifest produced an empty validation plan.'
 Assert-Condition ($plan.Count -le 10000) 'The fixture manifest produced more than 10000 validation entries.'
 $launcherEquivalence = Assert-LauncherEquivalenceContract $launcherContract `
@@ -2553,7 +3512,7 @@ if ($deterministicRuntimeContractRequested) {
 if ($ValidationSet -ne 'Replay') {
     $workerConfigurationCount = $workerConfigurations.Count
     $regularAiPlan = @($plan | Where-Object {
-        $_.kind -ceq 'ai' -and $_.configuration -cne $collisionShadowConfiguration.Id
+        $_.kind -ceq 'ai' -and $_.configuration -cne $collisionShadowConfigurationId
     })
     $expectedRegularAiCount = $workerConfigurationCount * $manifestData.ai.scenarios.Count *
         $manifestData.ai.seeds.Count * $manifestData.ai.repeats
@@ -2573,6 +3532,7 @@ $planDocument = [pscustomobject]@{
     cohortNonce = $executionCohortNonce
     cohortCreatedUtc = $executionCohortCreatedUtc
     runtimeClosure = $hostRunnerRuntimeClosure
+    qualificationData = $qualificationDataBinding
     runtimeRoot = $runtimeFull
     executable = $executableFull
     title = $manifestData.title
@@ -2592,6 +3552,9 @@ $planDocument = [pscustomobject]@{
     performanceMeasurementScope = 'aggregate-stage5-stress-replay-throughput'
     collisionSpecificReplayPerformanceClaim = $false
     diagnosticNonAcceptance = $diagnosticNonAcceptanceRequested
+    diagnosticWorkerConfiguration = if ($diagnosticWorkerConfigurationRequested) {
+        [string]$workerConfigurations[0].Id
+    } else { $null }
     directExecutionExceptionRequested = [bool]$AllowHeadlessDirectExecution
     frameTimingRequired = -not [bool]$DisableFrameTiming
     authoritativeWorkEvidenceRequired = $deterministicRuntimeEligible
@@ -2617,7 +3580,11 @@ $planDocument = [pscustomobject]@{
             maximumPhysicalCoreCount = $localCapacityTopology.maximumPhysicalCoreCount
             maximumLogicalProcessorCount = $localCapacityTopology.maximumLogicalProcessorCount
             regularConfigurations = @($workerConfigurations | ForEach-Object { $_.Id })
-            shadowConfiguration = $collisionShadowConfiguration.Id
+            shadowConfiguration = if ($null -eq $collisionShadowConfiguration) {
+                $null
+            } else {
+                $collisionShadowConfiguration.Id
+            }
             externalAcceptanceEligible = $false
             canonicalFinalAcceptanceEligible = $false
         }
@@ -2648,8 +3615,10 @@ if ($manifestData.schemaVersion -eq 2) {
 }
 $planPath = Join-Path $outputFull 'validation-plan.json'
 $livePlanBinding = $null
-if ($PlanOnly -or $planDocument.schemaVersion -eq 1) {
-    [IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 8))
+$frozenValidationPlan = $null
+if ($PlanOnly) {
+    Write-Stage5TextFileAtomically $planPath `
+        ($planDocument | ConvertTo-Json -Depth 8) 'Validation plan' | Out-Null
     if ($localCapacityRequested) {
         Write-LocalCapacityReceipt `
             -Path (Join-Path $outputFull 'local-capacity-plan-receipt.json') `
@@ -2673,8 +3642,9 @@ if ($EnforcePerformance -and $physicalCoreCount -lt 8) {
         physicalCoreCount = $physicalCoreCount
         failures = @('Performance enforcement requires topology evidence for at least eight physical cores.')
     }
-    [IO.File]::WriteAllText((Join-Path $outputFull 'performance-report.json'),
-        ($unsupportedPerformance | ConvertTo-Json -Depth 4))
+    Write-Stage5TextFileAtomically (Join-Path $outputFull 'performance-report.json') `
+        ($unsupportedPerformance | ConvertTo-Json -Depth 4) `
+        'Unsupported-host performance report' | Out-Null
     throw 'Stage 5 performance validation is unsupported: fewer than eight physical cores were detected.'
 }
 if ($PlanOnly) {
@@ -2688,12 +3658,16 @@ if ($PlanOnly) {
             "cohortNonce=$executionCohortNonce"
             "cohortCreatedUtc=$executionCohortCreatedUtc"
             "runtimeClosureSha256=$($hostRunnerRuntimeClosure.closureSha256)"
+            "qualificationDataManifestSha256=$($qualificationDataBinding.manifestSha256)"
+            "qualificationDataClosureSha256=$($qualificationDataBinding.closureSha256)"
+            "qualificationDataFileCount=$($qualificationDataBinding.fileCount)"
             "title=$($manifestData.title)"
             "validationSet=$ValidationSet"
             "entryCount=$($plan.Count)"
             "planSha256=$(Get-Sha256 $planPath)"
         ) -join "`n"
-        [IO.File]::WriteAllText($planRawPath, $planRawText + "`n")
+        Write-Stage5TextFileAtomically $planRawPath ($planRawText + "`n") `
+            'Validation plan raw binding' | Out-Null
         Write-Stage5HostRunnerReceipt -Role 'validation-plan' `
             -OutputRoot $outputFull `
             -ReceiptPath (Join-Path $outputFull 'validation-plan-receipt.json') `
@@ -2710,7 +3684,8 @@ if ($PlanOnly) {
             }) `
             -CohortNonce $executionCohortNonce `
             -CohortCreatedUtc $executionCohortCreatedUtc `
-            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
+            -RuntimeClosure $hostRunnerRuntimeClosure `
+            -QualificationData $qualificationDataBinding | Out-Null
     }
     if ($planDocument.schemaVersion -eq 2) {
         Write-Output "Stage 5 V2 live plan preview completed: $($plan.Count) planned executions; no installed execution evidence."
@@ -2772,13 +3747,28 @@ $validationEnvironment = @{
 }
 
 $registrySnapshots = New-Object 'Collections.Generic.List[object]'
+$registryRecoverySnapshots = New-Object 'Collections.Generic.List[object]'
+$registryRecoveryPlannedMissing = New-Object 'Collections.Generic.List[string]'
+$registryRecoveryLock = $null
+$registryRecoveryPath = $null
+$registryRecoveryIdentity = $null
+$registryRecoveryProcessIdentities = New-Object 'Collections.Generic.List[object]'
+$registryRecoveryRestored = $false
+$registryRecoveryRunNonce = [Guid]::NewGuid().ToString('D')
 $results = New-Object 'Collections.Generic.List[object]'
+$resultsSnapshot = $null
 $childRuns = New-Object 'Collections.Generic.List[object]'
 $corpusExport = $null
 $localCapacityReceipt = $null
 $resultsPath = Join-Path $outputFull 'validation-results.json'
+$qualificationRuntimeGuard = $null
 $fatalPattern = '(?i)(CRC Mismatch|game thread ownership violation|assertion failed|fatal error|missing map|replay read error|SKIRMISH_AI_TEST_FAIL|SIMULATION_JOB_SYSTEM_FALLBACK|SIMULATION_SHADOW_(?:MISMATCH|FAIL)|SIMULATION_COLLISION_MISMATCH)'
 try {
+    if ($acceptanceBindingsRequested) {
+        $qualificationRuntimeGuard =
+            Open-Stage5SimulationQualificationRuntimeClosure `
+                -RuntimeRoot $runtimeFull -Evidence $qualificationDataEvidence
+    }
     New-Item -ItemType Directory -Path $taskRunRoot -Force | Out-Null
     foreach ($directory in @($documentsRoot, $tempRoot, $tmpRoot, $cacheRoot,
             $localAppDataRoot, $appDataRoot, (Join-Path $profileFull 'Replays\Stage5Validation'))) {
@@ -2823,40 +3813,134 @@ if ([string]::IsNullOrWhiteSpace($GeneralsInstallRoot)) {
     $GeneralsInstallRoot = $runtimeFull
 }
 $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot)
-Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Container) `
-    "GeneralsInstallRoot was not found: $generalsInstallFull"
+    Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Container) `
+        "GeneralsInstallRoot was not found: $generalsInstallFull"
+
+    $registryRecoveryPath = Join-Path $taskRunRoot 'Stage5RegistryRecovery.json'
+    $recoveryUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $recoveryMutexName = Get-Stage5RegistryRecoveryMutexName $recoveryUserSid
+    $recoveryIdentityMode = if ($acceptanceBindingsRequested) { 'acceptance-bound' } else { 'diagnostic' }
+    $registryRecoveryIdentity = [ordered]@{
+        runNonce = $registryRecoveryRunNonce
+        title = $Title
+        taskRoot = $taskRunRoot
+        journalPath = $registryRecoveryPath
+        userSid = $recoveryUserSid
+        mutexName = $recoveryMutexName
+        identityMode = $recoveryIdentityMode
+        runnerScriptSha256 = Get-Sha256 $PSCommandPath
+        executableSha256 = $manifestData.executableSha256
+    }
+    if ($acceptanceBindingsRequested) {
+        $registryRecoveryIdentity.sourceCommit = $AcceptanceSourceCommit
+        $registryRecoveryIdentity.artifactSetSha256 = $AcceptanceArtifactSetSha256.ToUpperInvariant()
+    }
+    $registryRecoveryLock = Enter-Stage5RegistryRecoveryMutex $recoveryUserSid
+    if (-not (Test-ValidationNoActiveTitleProcess $executableFull)) {
+        throw 'The installed title process is already running; refusing registry/profile setup.'
+    }
+    $registryRecoveryInitialized = $false
 
     foreach ($view in @([Microsoft.Win32.RegistryView]::Registry32, [Microsoft.Win32.RegistryView]::Registry64)) {
-        # Both title variants call SHGetKnownFolderPath(FOLDERID_Documents),
-        # but Generals reads its leaf from INI while Zero Hour reads the leaf
-        # from the title registry key. Redirect the known folder itself so no
-        # validation profile is created below the user's live C: Documents.
-        Set-PreservedRegistryValue $view `
-            'Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders' `
-            'Personal' $documentsRoot $registrySnapshots
-        Set-PreservedRegistryValue $view `
-            'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders' `
-            'Personal' $documentsRoot $registrySnapshots
+        # The title runtimes consume RTS_STAGE5_VALIDATION_PROFILE_ROOT as a
+        # process-local complete profile path. Keep Documents known-folder
+        # values untouched; only the title-specific installed-runtime values
+        # below remain registry-backed and are restored by the existing scope.
         if ($Title -ceq 'Generals') {
+            $viewName = [string]$view
+            $planned = New-ValidationInstallPathRecoverySnapshot $Title $viewName `
+                ($generalsInstallFull + '\')
+            $registryRecoverySnapshots.Add($planned.snapshot) | Out-Null
+            foreach ($created in @($planned.createdSubKeys)) {
+                $registryRecoveryPlannedMissing.Add("$viewName|$created") | Out-Null
+            }
+            if (-not $registryRecoveryInitialized) {
+                $registryRecoveryIdentity.snapshotPlanSha256 =
+                    Get-Stage5RegistryRecoverySnapshotPlanSha256 `
+                        -Title $Title `
+                        -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
+                        -Snapshots @($registryRecoverySnapshots.ToArray())
+                New-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+                    -Identity $registryRecoveryIdentity `
+                    -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
+                    -Snapshots @($registryRecoverySnapshots.ToArray()) `
+                    -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
+                $registryRecoveryInitialized = $true
+            }
+            else {
+                Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+                    -ExpectedIdentity $registryRecoveryIdentity -State 'active' `
+                    -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
+                    -Snapshots @($registryRecoverySnapshots.ToArray()) `
+                    -ChildExitProof (Test-ValidationRecoveryIdentitiesExited `
+                        $registryRecoveryProcessIdentities) `
+                    -NoActiveTitleProcesses (Test-ValidationNoActiveTitleProcess `
+                        $executableFull) `
+                    -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
+            }
             Set-PreservedRegistryValue $view `
                 'Software\Electronic Arts\EA Games\Generals' 'InstallPath' `
                 ($generalsInstallFull + '\') $registrySnapshots
         }
         else {
+            $viewName = [string]$view
+            $planned = New-ValidationInstallPathRecoverySnapshot $Title $viewName `
+                ($runtimeFull + '\')
+            $registryRecoverySnapshots.Add($planned.snapshot) | Out-Null
+            foreach ($created in @($planned.createdSubKeys)) {
+                $registryRecoveryPlannedMissing.Add("$viewName|$created") | Out-Null
+            }
+            if (-not $registryRecoveryInitialized) {
+                $registryRecoveryIdentity.snapshotPlanSha256 =
+                    Get-Stage5RegistryRecoverySnapshotPlanSha256 `
+                        -Title $Title `
+                        -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
+                        -Snapshots @($registryRecoverySnapshots.ToArray())
+                New-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+                    -Identity $registryRecoveryIdentity `
+                    -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
+                    -Snapshots @($registryRecoverySnapshots.ToArray()) `
+                    -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
+                $registryRecoveryInitialized = $true
+            }
+            else {
+                Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+                    -ExpectedIdentity $registryRecoveryIdentity -State 'active' `
+                    -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
+                    -Snapshots @($registryRecoverySnapshots.ToArray()) `
+                    -ChildExitProof (Test-ValidationRecoveryIdentitiesExited `
+                        $registryRecoveryProcessIdentities) `
+                    -NoActiveTitleProcesses (Test-ValidationNoActiveTitleProcess `
+                        $executableFull) `
+                    -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
+            }
             Set-PreservedRegistryValue $view `
                 'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour' `
                 'InstallPath' ($runtimeFull + '\') $registrySnapshots
-            Set-PreservedRegistryValue $view `
-                'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour' `
-                'UserDataLeafName' $ProfileLeafName $registrySnapshots
         }
+        Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+            -ExpectedIdentity $registryRecoveryIdentity -State 'active' `
+            -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
+            -Snapshots @($registryRecoverySnapshots.ToArray()) `
+            -ChildExitProof (Test-ValidationRecoveryIdentitiesExited `
+                $registryRecoveryProcessIdentities) `
+            -NoActiveTitleProcesses (Test-ValidationNoActiveTitleProcess `
+                $executableFull) `
+            -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
     }
 
     $launcherEquivalence = Assert-LauncherEquivalenceContract $launcherContract `
-        $executableFull $runtimeFull $plan $ProfileLeafName $documentsRoot
+        $executableFull $runtimeFull $plan $ProfileLeafName $documentsRoot `
+        ([IO.Path]::GetFullPath((Join-Path $documentsRoot $ProfileLeafName)))
     $planDocument.launcherContract = $launcherEquivalence
     if ($planDocument.schemaVersion -eq 2) {
         $livePlanBinding = Write-Stage5FrozenValidationPlan -Plan $planDocument -Path $planPath
+        # Evidence parsing must use the exact plan bytes that were frozen before
+        # the first child launch.  Keep this parsed copy separate from the
+        # mutable planning objects above; the binding remains the authority for
+        # process launch while this object supplies the same V2 role/profile
+        # contract to the completion and aggregate evidence gates.
+        $frozenValidationPlan = $livePlanBinding['planJson'] | ConvertFrom-Json
         if ($localCapacityRequested) {
             Write-LocalCapacityReceipt `
                 -Path (Join-Path $outputFull 'local-capacity-plan-receipt.json') `
@@ -2872,7 +3956,8 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
         }
     }
     else {
-        [IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 8))
+        Write-Stage5TextFileAtomically $planPath `
+            ($planDocument | ConvertTo-Json -Depth 8) 'Validation plan' | Out-Null
     }
 
     if ($deterministicRuntimeEligible -and $acceptanceBindingsRequested) {
@@ -2884,12 +3969,16 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             "cohortNonce=$executionCohortNonce"
             "cohortCreatedUtc=$executionCohortCreatedUtc"
             "runtimeClosureSha256=$($hostRunnerRuntimeClosure.closureSha256)"
+            "qualificationDataManifestSha256=$($qualificationDataBinding.manifestSha256)"
+            "qualificationDataClosureSha256=$($qualificationDataBinding.closureSha256)"
+            "qualificationDataFileCount=$($qualificationDataBinding.fileCount)"
             "title=$($manifestData.title)"
             "validationSet=$ValidationSet"
             "entryCount=$($plan.Count)"
             "planSha256=$(Get-Sha256 $planPath)"
         ) -join "`n"
-        [IO.File]::WriteAllText($planRawPath, $planRawText + "`n")
+        Write-Stage5TextFileAtomically $planRawPath ($planRawText + "`n") `
+            'Validation plan raw binding' | Out-Null
         Write-Stage5HostRunnerReceipt -Role 'validation-plan' `
             -OutputRoot $outputFull `
             -ReceiptPath (Join-Path $outputFull 'validation-plan-receipt.json') `
@@ -2906,25 +3995,89 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             }) `
             -CohortNonce $executionCohortNonce `
             -CohortCreatedUtc $executionCohortCreatedUtc `
-            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
+            -RuntimeClosure $hostRunnerRuntimeClosure `
+            -QualificationData $qualificationDataBinding | Out-Null
     }
 
+    $validationPlanSnapshot = if ($deterministicRuntimeEligible -and
+        $acceptanceBindingsRequested) {
+        Get-Stage5FileSnapshot $planPath 'Execution-bound validation plan'
+    } else { $null }
     foreach ($entry in $plan) {
         Assert-FreeSpace $outputFull $MinimumFreeBytes 'Validation evidence volume'
         Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable before run' | Out-Null
+        if ($acceptanceBindingsRequested) {
+            Assert-Stage5SimulationQualificationRuntimeMembership `
+                -RuntimeRoot $runtimeFull -Evidence $qualificationDataEvidence
+        }
         if ($null -ne $livePlanBinding) {
             Assert-FileHash $livePlanBinding.planPath $livePlanBinding.planSha256 `
                 'Frozen validation plan before run' | Out-Null
         }
+        if ($null -ne $registryRecoveryPath) {
+            $registryRecoveryProcessIdentities.Add(
+                (New-ValidationRecoveryPendingIdentity)) | Out-Null
+            Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+                -ExpectedIdentity $registryRecoveryIdentity -State 'child-running' `
+                -Snapshots @($registryRecoverySnapshots.ToArray()) `
+                -ChildExitProof $false -NoActiveTitleProcesses $false `
+                -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
+        }
         $run = Invoke-ValidationProcess $executableFull $runtimeFull $entry `
             (-not $DisableFrameTiming) $validationEnvironment $outputFull `
             -NativeObservationBinding $nativeObservationBinding `
-            -LivePlanBinding $(if ($entry.kind -ceq 'ai') { $livePlanBinding } else { $null })
-        $childRuns.Add([pscustomobject]@{
+            -LivePlanBinding $(if ($entry.kind -ceq 'ai') { $livePlanBinding } else { $null }) `
+            -ProcessStartObserver {
+                param($startedIdentity)
+                $registryRecoveryProcessIdentities[$registryRecoveryProcessIdentities.Count - 1] =
+                    [pscustomobject]@{
+                        launchPending = $false
+                        processId = [int]$startedIdentity.processId
+                        creationTimeUtc100ns = [Int64]$startedIdentity.creationTimeUtc100ns
+                        executablePath = [string]$startedIdentity.executablePath
+                        executableSha256 = [string]$startedIdentity.executableSha256
+                        exitProven = $false
+                    }
+                Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+                    -ExpectedIdentity $registryRecoveryIdentity -State 'child-running' `
+                    -Snapshots @($registryRecoverySnapshots.ToArray()) `
+                    -ChildExitProof $false -NoActiveTitleProcesses $false `
+                    -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
+            } `
+            -ProcessExitObserver {
+                param($exitObservation)
+                $registryRecoveryProcessIdentities[$registryRecoveryProcessIdentities.Count - 1].exitProven =
+                    [bool]$exitObservation.exited
+                Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+                    -ExpectedIdentity $registryRecoveryIdentity -State 'active' `
+                    -Snapshots @($registryRecoverySnapshots.ToArray()) `
+                    -ChildExitProof (Test-ValidationRecoveryIdentitiesExited $registryRecoveryProcessIdentities) `
+                    -NoActiveTitleProcesses (Test-ValidationNoActiveTitleProcess $executableFull) `
+                    -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
+            }
+        if ($null -ne $registryRecoveryPath -and
+            $registryRecoveryProcessIdentities.Count -gt 0 -and
+            -not [bool]$registryRecoveryProcessIdentities[$registryRecoveryProcessIdentities.Count - 1].exitProven) {
+            throw 'Validation process exit proof was not published for registry recovery.'
+        }
+        if ($null -ne $registryRecoveryPath) {
+            Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+                -ExpectedIdentity $registryRecoveryIdentity -State 'active' `
+                -Snapshots @($registryRecoverySnapshots.ToArray()) `
+                -ChildExitProof (Test-ValidationRecoveryIdentitiesExited $registryRecoveryProcessIdentities) `
+                -NoActiveTitleProcesses (Test-ValidationNoActiveTitleProcess $executableFull) `
+                -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
+        }
+        if ($acceptanceBindingsRequested) {
+            Assert-Stage5SimulationQualificationRuntimeMembership `
+                -RuntimeRoot $runtimeFull -Evidence $qualificationDataEvidence
+        }
+        $childRun = [pscustomobject]@{
             entry = $entry
             run = $run
             childProcess = $run.childProcess
-        }) | Out-Null
+        }
+        $childRuns.Add($childRun) | Out-Null
         $combined = $run.stdout + "`n" + $run.stderr + "`n" + $run.runtimeLogText
         Assert-Condition (-not $run.timedOut) "Validation entry $($entry.sequence) timed out."
         Assert-Condition ($run.exitCode -eq 0) "Validation entry $($entry.sequence) exited with code $($run.exitCode)."
@@ -2941,9 +4094,13 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
         }
         if ($entry.kind -ceq 'ai') {
             $aiEvidence = ConvertFrom-Stage5AiCompletion $run.stdout $entry `
-                $manifestData.executableSha256 $deterministicRuntimeEligible
+                $manifestData.executableSha256 $deterministicRuntimeEligible `
+                -ValidationPlan $frozenValidationPlan
             if (-not $DisableFrameTiming) {
-                Assert-Condition ($timingEvidence.maximumFrameEnd -eq $aiEvidence.endFrame) `
+                # VictoryConditions records the winning frame before the
+                # recorder advances once to write the terminal game-end frame.
+                Assert-Condition ($timingEvidence.maximumFrameEnd -eq
+                    ([UInt64]$aiEvidence.endFrame + 1)) `
                     "AI validation entry $($entry.sequence) timing final frame does not match the completion manifest."
                 Assert-Stage5CollisionTimingEvidence $timingEvidence $aiEvidence `
                     "AI validation entry $($entry.sequence)"
@@ -2959,38 +4116,48 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
                     "Replay validation entry $($entry.sequence)"
             }
         }
-        $results.Add([pscustomobject]@{
-            sequence = $entry.sequence
-            title = $manifestData.title
-            kind = $entry.kind
-            caseId = $entry.caseId
-            determinismKey = $entry.determinismKey
-            configuration = $entry.configuration
-            simulationMode = $entry.simulationMode
-            requestedWorkers = $entry.requestedWorkers
-            workerPolicy = $entry.workerPolicy
-            repeat = $entry.repeat
-            matrixRepeat = $entry.matrixRepeat
-            replayArgument = $entry.replayArgument
-            seed = $entry.seed
-            scenario = $entry.scenario
-            fixtureSha256 = $entry.fixtureSha256
-            stress = $entry.stress
-            exitCode = $run.exitCode
-            timedOut = $run.timedOut
-            wallMilliseconds = $run.wallMilliseconds
-            stdoutSha256 = Get-Sha256 $entry.stdout
-            stderrSha256 = Get-Sha256 $entry.stderr
-            aiEvidence = $aiEvidence
-            replayMetrics = $replayMetrics
-            replayResult = $replayResult
-            timingEvidence = $timingEvidence
-        }) | Out-Null
-        [IO.File]::WriteAllText($resultsPath, ($results.ToArray() | ConvertTo-Json -Depth 5))
+        $executionProvenance = if ($deterministicRuntimeEligible -and
+            $acceptanceBindingsRequested) {
+            New-Stage5ResultExecutionProvenance -ChildRun $childRun `
+                -OutputRoot $outputFull -Title $manifestData.title `
+                -SourceCommit $AcceptanceSourceCommit `
+                -ArtifactSetSha256 $AcceptanceArtifactSetSha256 `
+                -ExecutableSha256 $manifestData.executableSha256 `
+                -CohortNonce $executionCohortNonce `
+                -CohortCreatedUtc $executionCohortCreatedUtc `
+                -RuntimeClosure $hostRunnerRuntimeClosure `
+                -QualificationData $qualificationDataBinding `
+                -PlanPath $planPath -PlanSha256 $validationPlanSnapshot.sha256
+        } else { $null }
+        $frozenLiveEntry = $null
+        if ($entry.kind -ceq 'ai' -and $null -ne $livePlanBinding) {
+            Assert-Condition ($null -ne $frozenValidationPlan) `
+                "Validation AI entry $($entry.sequence) has no frozen live-plan binding."
+            $frozenMatches = @($frozenValidationPlan.entries | Where-Object {
+                (Test-Stage5JsonInteger $_.sequence) -and
+                [int]$_.sequence -eq [int]$entry.sequence -and
+                $_.kind -ceq 'ai'
+            })
+            Assert-Condition ($frozenMatches.Count -eq 1) `
+                "Validation AI entry $($entry.sequence) has no unique frozen live-plan identity."
+            $frozenLiveEntry = $frozenMatches[0]
+        }
+        $results.Add((New-Stage5ValidationResultProjection `
+            -Entry $entry -Run $run -AiEvidence $aiEvidence `
+            -ReplayMetrics $replayMetrics -ReplayResult $replayResult `
+            -TimingEvidence $timingEvidence `
+            -ExecutionProvenance $executionProvenance `
+            -FrozenLiveEntry $frozenLiveEntry `
+            -RequireFrozenLiveIdentity ($null -ne $livePlanBinding) `
+            -Title $manifestData.title)) | Out-Null
+        $resultsSnapshot = Write-Stage5TextFileAtomically $resultsPath `
+            ($results.ToArray() | ConvertTo-Json -Depth 12) `
+            'Validation results checkpoint' -ReplaceExisting
     }
     $workerConfigurationIds = @($workerConfigurations | ForEach-Object { $_.Id })
-    $shadowConfigurationId = if ($manifestData.ai.scenarios -ccontains '4v2') {
-        [string]$collisionShadowConfiguration.Id
+    $shadowConfigurationId = if ($manifestData.ai.scenarios -ccontains '4v2' -and
+        $null -ne $collisionShadowConfiguration) {
+        $collisionShadowConfigurationId
     } else { '' }
     if ($ValidationSet -ne 'Replay') {
         $expectedAiDeterminismKeys = @(
@@ -3004,7 +4171,8 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             $manifestData.ai.repeats $shadowConfigurationId $expectedAiDeterminismKeys
     }
     if ($deterministicRuntimeEligible) {
-        Assert-Stage5AuthoritativeWorkEvidence $results.ToArray()
+        Assert-Stage5AuthoritativeWorkEvidence $results.ToArray() `
+            -ValidationPlan $frozenValidationPlan
     }
     if ($ValidationSet -ne 'AI') {
         Assert-Stage5ReplayDeterminism $results.ToArray()
@@ -3017,11 +4185,18 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
         $performanceReport | Add-Member -NotePropertyName title `
             -NotePropertyValue $manifestData.title -Force
         $performanceReportPath = Join-Path $outputFull 'performance-report.json'
-        [IO.File]::WriteAllText($performanceReportPath, ($performanceReport | ConvertTo-Json -Depth 8))
+        Write-Stage5TextFileAtomically $performanceReportPath `
+            ($performanceReport | ConvertTo-Json -Depth 8) `
+            'Performance report' | Out-Null
         Assert-Condition ($performanceReport.status -ceq 'passed') `
             "Stage 5 performance validation status is '$($performanceReport.status)': $($performanceReport.failures -join ' ')"
     }
     Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable after matrix' | Out-Null
+    if ($acceptanceBindingsRequested) {
+        Confirm-Stage5SimulationQualificationRuntimeClosure `
+            -RuntimeRoot $runtimeFull -Evidence $qualificationDataEvidence `
+            -Guard $qualificationRuntimeGuard
+    }
 
     if ($corpusExportRequested) {
         $corpusExport = Export-LocalCapacityAiCorpus `
@@ -3062,6 +4237,9 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
     }
 
     if ($deterministicRuntimeEligible -and $acceptanceBindingsRequested) {
+        Assert-Condition ($null -ne $resultsSnapshot -and
+            [string]$resultsSnapshot.sha256 -match '^[0-9A-F]{64}$') `
+            'Validation results lack their final immutable publication snapshot.'
         $resultArray = @($results.ToArray())
         $allChildStreamPaths = @($childRuns.ToArray() | ForEach-Object {
             $_.entry.stdout
@@ -3075,7 +4253,9 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
         })
         $replayResults = @($resultArray | Where-Object { $_.kind -ceq 'replay' })
         $aiResults = @($resultArray | Where-Object { $_.kind -ceq 'ai' })
-        Write-Stage5HostRunnerReceipt -Role 'validation-results' `
+        $usedReceiptChildNonces = New-Object 'Collections.Generic.HashSet[string]' `
+            ([StringComparer]::Ordinal)
+        $validationReceipt = Write-Stage5HostRunnerReceipt -Role 'validation-results' `
             -OutputRoot $outputFull `
             -ReceiptPath (Join-Path $outputFull 'validation-results-receipt.json') `
             -Title $manifestData.title `
@@ -3084,15 +4264,21 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             -ExecutableSha256 $manifestData.executableSha256 `
             -RawLogPaths (@($resultsPath) + $allChildStreamPaths) `
             -ChildRuns $childRuns.ToArray() `
+            -Results $resultArray `
+            -ExcludedChildRunNonces @($usedReceiptChildNonces) `
             -Details ([ordered]@{
                 resultCount = $resultArray.Count
                 allExecutionsPassed = $true
-                resultsSha256 = Get-Sha256 $resultsPath
+                resultsSha256 = [string]$resultsSnapshot.sha256
             }) `
             -CohortNonce $executionCohortNonce `
             -CohortCreatedUtc $executionCohortCreatedUtc `
-            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
-        Write-Stage5HostRunnerReceipt -Role 'replay-results' `
+            -RuntimeClosure $hostRunnerRuntimeClosure `
+            -QualificationData $qualificationDataBinding `
+            -PlanPath $planPath `
+            -PlanSha256 $validationPlanSnapshot.sha256
+        [void]$usedReceiptChildNonces.Add([string]$validationReceipt.childRunNonce)
+        $replayReceipt = Write-Stage5HostRunnerReceipt -Role 'replay-results' `
             -OutputRoot $outputFull `
             -ReceiptPath (Join-Path $outputFull 'replay-results-receipt.json') `
             -Title $manifestData.title `
@@ -3101,6 +4287,7 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             -ExecutableSha256 $manifestData.executableSha256 `
             -RawLogPaths (@($resultsPath) + $allChildStreamPaths) `
             -ChildRuns $replayRuns `
+            -ExcludedChildRunNonces @($usedReceiptChildNonces) `
             -Details ([ordered]@{
                 uniqueReplayCount = @($replayResults.determinismKey | Sort-Object -Unique).Count
                 executionCount = $replayResults.Count
@@ -3109,8 +4296,10 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             }) `
             -CohortNonce $executionCohortNonce `
             -CohortCreatedUtc $executionCohortCreatedUtc `
-            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
-        Write-Stage5HostRunnerReceipt -Role 'ai-results' `
+            -RuntimeClosure $hostRunnerRuntimeClosure `
+            -QualificationData $qualificationDataBinding
+        [void]$usedReceiptChildNonces.Add([string]$replayReceipt.childRunNonce)
+        $aiReceipt = Write-Stage5HostRunnerReceipt -Role 'ai-results' `
             -OutputRoot $outputFull `
             -ReceiptPath (Join-Path $outputFull 'ai-results-receipt.json') `
             -Title $manifestData.title `
@@ -3119,6 +4308,7 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             -ExecutableSha256 $manifestData.executableSha256 `
             -RawLogPaths (@($resultsPath) + $allChildStreamPaths) `
             -ChildRuns $aiRuns `
+            -ExcludedChildRunNonces @($usedReceiptChildNonces) `
             -Details ([ordered]@{
                 scenarioCount = @($aiResults.scenario | Sort-Object -Unique).Count
                 distinctSeedCount = @($aiResults.seed | Sort-Object -Unique).Count
@@ -3128,10 +4318,12 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
             }) `
             -CohortNonce $executionCohortNonce `
             -CohortCreatedUtc $executionCohortCreatedUtc `
-            -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
+            -RuntimeClosure $hostRunnerRuntimeClosure `
+            -QualificationData $qualificationDataBinding
+        [void]$usedReceiptChildNonces.Add([string]$aiReceipt.childRunNonce)
         if ($EnforcePerformance) {
             $performanceReportPath = Join-Path $outputFull 'performance-report.json'
-            Write-Stage5HostRunnerReceipt -Role 'performance-report' `
+            $performanceReceipt = Write-Stage5HostRunnerReceipt -Role 'performance-report' `
                 -OutputRoot $outputFull `
                 -ReceiptPath (Join-Path $outputFull 'performance-report-receipt.json') `
                 -Title $manifestData.title `
@@ -3140,29 +4332,101 @@ Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Containe
                 -ExecutableSha256 $manifestData.executableSha256 `
                 -RawLogPaths (@($performanceReportPath, $resultsPath) + $allChildStreamPaths) `
                 -ChildRuns $replayRuns `
+                -ExcludedChildRunNonces @($usedReceiptChildNonces) `
                 -Details ([ordered]@{}) `
                 -CohortNonce $executionCohortNonce `
                 -CohortCreatedUtc $executionCohortCreatedUtc `
-                -RuntimeClosure $hostRunnerRuntimeClosure | Out-Null
+                -RuntimeClosure $hostRunnerRuntimeClosure `
+                -QualificationData $qualificationDataBinding
+            [void]$usedReceiptChildNonces.Add([string]$performanceReceipt.childRunNonce)
         }
     }
 }
 finally {
     $cleanupErrors = New-Object 'Collections.Generic.List[string]'
-    try {
-        Invoke-Stage5RegistryRestore -Snapshots @($registrySnapshots.ToArray()) -RestoreAction {
-            param($snapshot)
-            Restore-RegistryValue $snapshot
+    if ($null -ne $qualificationRuntimeGuard) {
+        try {
+            Confirm-Stage5SimulationQualificationRuntimeClosure `
+                -RuntimeRoot $runtimeFull -Evidence $qualificationDataEvidence `
+                -Guard $qualificationRuntimeGuard
+        }
+        catch {
+            $cleanupErrors.Add("qualification-data final validation: $($_.Exception.Message)") | Out-Null
+        }
+        try {
+            Close-Stage5SimulationQualificationRuntimeClosure `
+                -Guard $qualificationRuntimeGuard
+        }
+        catch {
+            $cleanupErrors.Add("qualification-data lock release: $($_.Exception.Message)") | Out-Null
         }
     }
-    catch {
-        $cleanupErrors.Add("registry restoration: $($_.Exception.Message)") | Out-Null
+    if ($null -ne $registryRecoveryPath -and $null -ne $registryRecoveryLock -and
+        (Test-Path -LiteralPath $registryRecoveryPath -PathType Leaf)) {
+        $noActiveTitleProcesses = Test-ValidationNoActiveTitleProcess $executableFull
+        $childExitProven = (Test-ValidationRecoveryIdentitiesExited `
+            $registryRecoveryProcessIdentities)
+        $hasPendingIdentity = @($registryRecoveryProcessIdentities | Where-Object {
+            [bool]$_.launchPending
+        }).Count -gt 0
+        if ($childExitProven -and -not $hasPendingIdentity -and $noActiveTitleProcesses) {
+            $authorizationIdentities = @(New-ValidationRecoveryAuthorizationIdentities `
+                $registryRecoveryProcessIdentities)
+            foreach ($identity in $authorizationIdentities) {
+                $identity.exitProven = $true
+            }
+            try {
+                Invoke-Stage5RegistryRecovery -Path $registryRecoveryPath `
+                    -ExpectedIdentity $registryRecoveryIdentity `
+                    -Authorization ([pscustomobject]@{
+                        childExitProven = $true
+                        noActiveTitleProcesses = $true
+                        processIdentities = $authorizationIdentities
+                    }) `
+                    -MutexLock $registryRecoveryLock `
+                    -Adapter (New-ValidationRegistryRecoveryAdapter) | Out-Null
+                $registryRecoveryRestored = $true
+                Remove-Item -LiteralPath $registryRecoveryPath -Force
+            }
+            catch {
+                $cleanupErrors.Add("registry recovery: $($_.Exception.Message); journal retained at $registryRecoveryPath") | Out-Null
+            }
+        }
+        else {
+            try {
+                Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
+                    -ExpectedIdentity $registryRecoveryIdentity -State 'child-exit-unproven' `
+                    -Snapshots @($registryRecoverySnapshots.ToArray()) `
+                    -ChildExitProof $false `
+                    -NoActiveTitleProcesses ([bool]($noActiveTitleProcesses -and -not $hasPendingIdentity)) `
+                    -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) `
+                    -FailureMessage 'Registry recovery retained because every child launch/exit identity was not proven.' | Out-Null
+            }
+            catch {
+                $cleanupErrors.Add("registry recovery journal update: $($_.Exception.Message); journal retained at $registryRecoveryPath") | Out-Null
+            }
+            $cleanupErrors.Add("registry recovery was not proven; journal retained at $registryRecoveryPath") | Out-Null
+        }
+        try { Exit-Stage5RegistryRecoveryMutex $registryRecoveryLock }
+        catch { $cleanupErrors.Add("registry recovery mutex cleanup: $($_.Exception.Message)") | Out-Null }
     }
-    try {
-        Remove-TaskOwnedDirectory $taskRunRoot $taskRootFull 'Validation task scratch root'
+    elseif ($null -ne $registryRecoveryPath) {
+        $cleanupErrors.Add("registry recovery journal was not initialized; refusing task-root cleanup: $registryRecoveryPath") | Out-Null
+        if ($null -ne $registryRecoveryLock) {
+            try { Exit-Stage5RegistryRecoveryMutex $registryRecoveryLock }
+            catch { $cleanupErrors.Add("registry recovery mutex cleanup: $($_.Exception.Message)") | Out-Null }
+        }
     }
-    catch {
-        $cleanupErrors.Add("task scratch cleanup: $($_.Exception.Message)") | Out-Null
+    if ($registryRecoveryRestored) {
+        try {
+            Remove-TaskOwnedDirectory $taskRunRoot $taskRootFull 'Validation task scratch root'
+        }
+        catch {
+            $cleanupErrors.Add("task scratch cleanup: $($_.Exception.Message)") | Out-Null
+        }
+    }
+    elseif ($null -ne $registryRecoveryPath) {
+        $cleanupErrors.Add("registry recovery was not proven; preserving task scratch root and journal: $taskRunRoot") | Out-Null
     }
     if ($cleanupErrors.Count -gt 0) {
         throw "Stage 5 validation cleanup failed after attempting every cleanup action: $($cleanupErrors -join ' | ')"

@@ -2271,6 +2271,7 @@ int testD3D11HiddenSwapChain()
 		parameters.window = window;
 		parameters.width = 64;
 		parameters.height = 64;
+		parameters.multisampleCount = 4;
 		parameters.enableVsync = false;
 		parameters.enableDebugLayer = true;
 		result |= check(device->initialize(parameters) ==
@@ -2280,8 +2281,9 @@ int testD3D11HiddenSwapChain()
 	result |= check(device->getBackBufferInfo(&backBufferInfo) ==
 		rts::render::RENDER_RESULT_OK && backBufferInfo.width == 64 &&
 		backBufferInfo.height == 64 &&
+		backBufferInfo.multisampleCount == 4 &&
 		backBufferInfo.format == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM,
-		"D3D11 back-buffer info reports the actual swap-chain texture");
+		"D3D11 back-buffer info reports the effective 4x scene target");
 
 		struct TestVertex
 		{
@@ -2340,6 +2342,17 @@ int testD3D11HiddenSwapChain()
 			sizeof(redVertices), &redVertexBuffer) ==
 			rts::render::RENDER_RESULT_OK,
 			"D3D11 parity probe creates a red vertex buffer");
+		const TestVertex multisampleLineVertices[2] = {
+			{ -0.75f, -0.65f, 0.0f, 0xffff0000U },
+			{ 0.70f, 0.55f, 0.0f, 0xffff0000U }
+		};
+		rts::render::BufferDescriptor multisampleLineDescriptor = vertexDescriptor;
+		multisampleLineDescriptor.byteCount = sizeof(multisampleLineVertices);
+		rts::render::GpuHandle multisampleLineVertexBuffer;
+		result |= check(device->createBuffer(multisampleLineDescriptor,
+			multisampleLineVertices, sizeof(multisampleLineVertices),
+			&multisampleLineVertexBuffer) == rts::render::RENDER_RESULT_OK,
+			"D3D11 MSAA probe creates a non-axis-aligned line vertex buffer");
 
 		rts::render::IRenderContext *context = device->immediateContext();
 		rts::render::LegacyLogicalState logicalState;
@@ -2358,6 +2371,43 @@ int testD3D11HiddenSwapChain()
 		result |= check(unbindFrameStarted &&
 			unbindResult == rts::render::RENDER_RESULT_OK,
 			"D3D11 texture binding accepts an invalid handle as an explicit unbind");
+		std::vector<unsigned char> multisampleLinePixels(64 * 64 * 4);
+		rts::render::RenderFormat multisampleLineFormat =
+			rts::render::RENDER_FORMAT_UNKNOWN;
+		const bool multisampleLineRendered =
+			context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(rts::render::RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f),
+				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyState(logicalState,
+				rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(multisampleLineVertexBuffer,
+				sizeof(TestVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(rts::render::RENDER_PRIMITIVE_LINE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(2, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&multisampleLinePixels[0],
+				multisampleLinePixels.size(), 64 * 4, &multisampleLineFormat) ==
+				rts::render::RENDER_RESULT_OK;
+		bool hasPartialMultisampleLineCoverage = false;
+		for (size_t pixel = 0; multisampleLineRendered &&
+			pixel < multisampleLinePixels.size(); pixel += 4)
+		{
+			const unsigned int red = multisampleLinePixels[pixel + 2];
+			if (red > 16 && red < 239)
+			{
+				hasPartialMultisampleLineCoverage = true;
+				break;
+			}
+		}
+		result |= check(multisampleLineRendered &&
+			multisampleLineFormat ==
+				rts::render::RENDER_FORMAT_B8G8R8A8_UNORM &&
+			hasPartialMultisampleLineCoverage,
+			"D3D11 4x scene target resolves nontrivial line sample coverage");
 		const rts::render::RenderFloat4 selectiveColor(1.0f, 0.0f, 0.0f, 1.0f);
 		const rts::render::RenderFloat4 ignoredColor(0.0f, 1.0f, 0.0f, 1.0f);
 		std::vector<unsigned char> selectivePixels(64 * 64 * 4);
@@ -2465,6 +2515,19 @@ int testD3D11HiddenSwapChain()
 				rts::render::RENDER_RESULT_OK &&
 			context->endFrame() == rts::render::RENDER_RESULT_OK,
 			"D3D11 rejects mismatched color/depth attachment dimensions before binding");
+		rts::render::RenderTargetBinding customColorWithDefaultDepth;
+		customColorWithDefaultDepth.useBackBufferColor = false;
+		customColorWithDefaultDepth.useBackBufferDepth = true;
+		customColorWithDefaultDepth.hasColor = true;
+		customColorWithDefaultDepth.hasDepth = false;
+		customColorWithDefaultDepth.color.resource = copiedColor;
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->setRenderTargets(customColorWithDefaultDepth) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->clear(rts::render::RenderFloat4(), 1.0f, 0) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK,
+			"D3D11 pairs a single-sample custom color target with compatible default depth");
 		rts::render::RenderTargetBinding colorOnlyTarget;
 		colorOnlyTarget.useBackBufferColor = false;
 		colorOnlyTarget.useBackBufferDepth = false;
@@ -3911,6 +3974,113 @@ int testD3D11HiddenSwapChain()
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[2] > 240 && center[0] < 16 && center[1] < 16,
 			"terrain diffuse alpha selects the second base texture exactly");
+		{
+			using namespace rts::render;
+			// Terrain uses a compact unlit stream and an atlas bound twice.
+			// Its zero diffuse alpha blends tiles; it must not erase RGB.
+			struct TerrainVertex
+			{
+				float xyz[3];
+				unsigned int diffuse;
+				float uv0[2];
+				float uv1[2];
+			};
+			const TerrainVertex terrainVertices[4] = {
+				{ {240, -80, 17.5f}, 0x00b4b0a5U, {.306640625f, .06640625f}, {.306640625f, .06640625f} },
+				{ {250, -80, 17.5f}, 0x00b4b0a5U, {.322265625f, .06640625f}, {.322265625f, .06640625f} },
+				{ {250, -70, 17.5f}, 0x00b4b0a5U, {.322265625f, .03515625f}, {.322265625f, .03515625f} },
+				{ {240, -70, 17.5f}, 0x00b4b0a5U, {.306640625f, .03515625f}, {.306640625f, .03515625f} }
+			};
+			const unsigned short terrainIndices[6] = {0, 2, 3, 0, 1, 2};
+			LegacyVertexLayout terrainLayout = texturedLayout;
+			terrainLayout.stride = sizeof(TerrainVertex);
+			terrainLayout.elements[1] = texturedLayout.elements[2];
+			terrainLayout.elements[1].byteOffset = 12;
+			terrainLayout.elements[2] = texturedLayout.elements[3];
+			terrainLayout.elements[2].byteOffset = 16;
+			terrainLayout.elements[3] = texturedLayout.elements[3];
+			terrainLayout.elements[3].semanticIndex = 1;
+			terrainLayout.elements[3].byteOffset = 24;
+			BufferDescriptor terrainBufferDescriptor;
+			terrainBufferDescriptor.byteCount = sizeof(terrainVertices);
+			terrainBufferDescriptor.stride = sizeof(TerrainVertex);
+			GpuHandle terrainBuffer, terrainIndexBuffer, terrainAtlas;
+			result |= check(device->createBuffer(terrainBufferDescriptor,
+				terrainVertices, sizeof(terrainVertices), &terrainBuffer) == RENDER_RESULT_OK,
+				"terrain probe publishes the compact zero-alpha diffuse stream");
+			terrainBufferDescriptor.byteCount = sizeof(terrainIndices);
+			terrainBufferDescriptor.stride = sizeof(unsigned short);
+			terrainBufferDescriptor.binding = RENDER_BUFFER_INDEX;
+			result |= check(device->createBuffer(terrainBufferDescriptor,
+				terrainIndices, sizeof(terrainIndices), &terrainIndexBuffer) == RENDER_RESULT_OK,
+				"terrain probe publishes the production quad winding");
+			TextureDescriptor atlasDescriptor;
+			atlasDescriptor.width = 2048;
+			atlasDescriptor.height = 1024;
+			atlasDescriptor.mipCount = 3;
+			atlasDescriptor.format = RENDER_FORMAT_B8G8R8A8_UNORM;
+			// Procedural A1R5G5B5 terrain locks publish canonical BGRA8.
+			std::vector<unsigned int> atlasPixels[3];
+			TextureSubresourceData atlasData[3];
+			for (unsigned int mip = 0; mip < 3; ++mip)
+			{
+				const unsigned int width = 2048U >> mip;
+				const unsigned int height = 1024U >> mip;
+				atlasPixels[mip].assign(width * height,
+					mip == 0 ? 0xffc08040U : 0xff40c080U);
+				atlasData[mip].data = &atlasPixels[mip][0];
+				atlasData[mip].rowPitch = width * 4;
+				atlasData[mip].slicePitch = width * height * 4;
+			}
+			result |= check(device->createTexture(atlasDescriptor, atlasData, 3,
+				&terrainAtlas) == RENDER_RESULT_OK, "terrain probe publishes all atlas mips");
+			LegacyLogicalState terrainState;
+			terrainState.pipeline.pixelProgram = RENDER_LEGACY_PIXEL_TERRAIN_BASE;
+			terrainState.pipeline.rasterizer.cullMode = RENDER_CULL_BACK;
+			terrainState.pipeline.rasterizer.frontCounterClockwise = true;
+			terrainState.pipeline.textureStages[1].textureCoordinateIndex = 1;
+			terrainState.constants.world.values[0] = .15f;
+			terrainState.constants.world.values[5] = .15f;
+			terrainState.constants.world.values[12] = -36.75f;
+			terrainState.constants.world.values[13] = 11.25f;
+			terrainState.constants.world.values[14] = -17.0f;
+			for (unsigned int mipPass = 0; mipPass < 2; ++mipPass)
+			{
+				for (unsigned int stage = 0; stage < 2; ++stage)
+				{
+					LegacySamplerState &sampler = terrainState.pipeline.textureStages[stage].sampler;
+					sampler.mipmapping = mipPass == 0 ? RENDER_TEXTURE_FILTER_NONE : RENDER_TEXTURE_FILTER_POINT;
+					sampler.mipLodBias = mipPass == 0 ? 0.0f : 8.0f;
+				}
+				result |= check(context->beginFrame() == RENDER_RESULT_OK &&
+					context->clear(clearColor, 1.0f, 0) == RENDER_RESULT_OK &&
+					context->setViewport(0, 0, 64, 64, 0, 1) == RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(terrainState, terrainLayout, 3) == RENDER_RESULT_OK &&
+					context->setVertexBuffer(terrainBuffer, sizeof(TerrainVertex), 0) == RENDER_RESULT_OK &&
+					context->setIndexBuffer(terrainIndexBuffer, RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK &&
+					context->setTexture(0, terrainAtlas) == RENDER_RESULT_OK &&
+					context->setTexture(1, terrainAtlas) == RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) == RENDER_RESULT_OK &&
+					context->drawIndexed(6, 0, 0) == RENDER_RESULT_OK &&
+					context->endFrame() == RENDER_RESULT_OK &&
+					device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4, &captureFormat) == RENDER_RESULT_OK,
+					"terrain compact quad executes with one atlas bound at both UV stages");
+				const unsigned char *terrainPixel = &pixels[4 * (32 * 64 + 32)];
+				const int expected[2][3] = {{41, 88, 136}, {83, 133, 45}};
+				const bool terrainColorMatches = abs(static_cast<int>(terrainPixel[0]) - expected[mipPass][0]) <= 2 &&
+					abs(static_cast<int>(terrainPixel[1]) - expected[mipPass][1]) <= 2 &&
+					abs(static_cast<int>(terrainPixel[2]) - expected[mipPass][2]) <= 2;
+				if (!terrainColorMatches)
+					fprintf(stderr, "terrain mip pass %u: BGRA=%u,%u,%u,%u expected BGR=%d,%d,%d\n",
+						mipPass, terrainPixel[0], terrainPixel[1], terrainPixel[2], terrainPixel[3],
+						expected[mipPass][0], expected[mipPass][1], expected[mipPass][2]);
+				result |= check(terrainColorMatches,
+					"terrain RGB survives zero blend alpha and selects the requested atlas mip");
+			}
+			device->destroyResource(terrainAtlas);
+			device->destroyResource(terrainIndexBuffer);
+			device->destroyResource(terrainBuffer);
+		}
 		logicalState.pipeline.pixelProgram =
 			rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION;
 		logicalState.pipeline.textureStages[1].colorOperation =
@@ -5520,6 +5690,7 @@ int testD3D11HiddenSwapChain()
 			device->getBackBufferInfo(&resizeRecoveryInfo) ==
 				rts::render::RENDER_RESULT_OK &&
 			resizeRecoveryInfo.width == 80 && resizeRecoveryInfo.height == 72 &&
+			resizeRecoveryInfo.multisampleCount == 4 &&
 			context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->updateBuffer(resizeRecoveryBuffer, &resizeRecoveryValue,
 				sizeof(resizeRecoveryValue), 0) ==
@@ -5527,6 +5698,12 @@ int testD3D11HiddenSwapChain()
 			context->endFrame() == rts::render::RENDER_RESULT_OK &&
 			device->destroyResource(resizeRecoveryBuffer),
 			"D3D11 recovery preserves logical handles before applying a requested resize");
+		result |= check(device->setGamma(2.0f, 0.1f, 1.25f, true, true) ==
+			rts::render::RENDER_RESULT_OK &&
+			device->present() == rts::render::RENDER_RESULT_OK &&
+			device->setGamma(1.0f, 0.0f, 1.0f, false, true) ==
+				rts::render::RENDER_RESULT_OK,
+			"D3D11 resolves the multisampled scene through gamma presentation");
 		unsigned int debugErrorCount = 0xffffffffU;
 		const rts::render::RenderResult debugValidationResult =
 			device->getDebugValidationErrorCount(&debugErrorCount);
@@ -5574,6 +5751,7 @@ int testD3D11HiddenSwapChain()
 			device->destroyResource(seaReflectionTexture) &&
 			device->destroyResource(secondTexture) &&
 			device->destroyResource(uvSelectionTexture) &&
+			device->destroyResource(multisampleLineVertexBuffer) &&
 			device->destroyResource(offscreenColor) &&
 			device->destroyResource(offscreenDepth) &&
 			device->destroyResource(offscreenCopyColor) &&
@@ -5597,13 +5775,15 @@ int testD3D11HiddenSwapChain()
 		result |= check(device->getBackBufferInfo(&backBufferInfo) ==
 			rts::render::RENDER_RESULT_OK && backBufferInfo.width == 96 &&
 			backBufferInfo.height == 80 &&
+			backBufferInfo.multisampleCount == 4 &&
 			backBufferInfo.format == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM,
 			"D3D11 back-buffer info follows the resized swap-chain texture");
 		result |= check(device->resize(0, 0) ==
 			rts::render::RENDER_RESULT_OK &&
 			device->getBackBufferInfo(&backBufferInfo) ==
 				rts::render::RENDER_RESULT_OK && backBufferInfo.width == 96 &&
-			backBufferInfo.height == 80,
+			backBufferInfo.height == 80 &&
+			backBufferInfo.multisampleCount == 4,
 			"D3D11 minimized resize preserves the last valid swap-chain targets");
 		unsigned char captureProbe = 0;
 		result |= check(device->captureBackBuffer(&captureProbe,

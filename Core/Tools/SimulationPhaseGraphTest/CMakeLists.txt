@@ -83,7 +83,7 @@ add_test(NAME simulation_phase_graph_legacy_compile_test
 )
 if(TARGET simulation_phase_graph_tests)
     add_test(NAME simulation_phase_graph_tests
-        COMMAND simulation_phase_graph_tests
+        COMMAND simulation_phase_graph_tests --local-capacity
     )
     set_tests_properties(simulation_phase_graph_tests PROPERTIES TIMEOUT 30)
 endif()

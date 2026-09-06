@@ -30,6 +30,10 @@ enum DeterministicDirectPathExecutionState
 	DIRECT_PATH_EXECUTION_WORKER,
 	DIRECT_PATH_EXECUTION_OWNER,
 	DIRECT_PATH_EXECUTION_FAILURE
+#if defined(_WIN64)
+	// Authenticated native ordinary body; neither worker execution nor owner-help.
+	, DIRECT_PATH_EXECUTION_INLINE
+#endif
 };
 
 struct DeterministicDirectPathExecutionSnapshot
@@ -54,6 +58,7 @@ struct DeterministicDirectPathBatchExecutionSnapshot
 	std::size_t failedJobCount;
 	unsigned distinctPhysicalWorkerCount;
 	unsigned peakActiveWorkers;
+	bool referenceAdmissionAccepted;
 	bool completed;
 	bool timedOut;
 };
@@ -64,6 +69,36 @@ inline bool IsDeterministicDirectPathConcurrentMultiWorkerBatch(
 	return execution.distinctPhysicalWorkerCount > 1 &&
 		execution.peakActiveWorkers > 1;
 }
+
+#if defined(_WIN64)
+// Owner-only completion accounting shared by direct and ordinary path lanes.
+// A batch is authoritative only when every captured request commits. Fallback
+// flags describe an actual legacy path invocation, not merely discarded or
+// deferred native work.
+class DeterministicPathOwnerCompletion
+{
+public:
+	DeterministicPathOwnerCompletion() noexcept;
+	void reset(std::size_t expectedOperations) noexcept;
+	void beginOperation() noexcept;
+	void finishOperation(bool committed, bool materializationBegan) noexcept;
+	void expectLegacyFallback() noexcept;
+	bool beginLegacyFallback() noexcept;
+	void completeLegacyFallback(bool entered) noexcept;
+	bool committed() const noexcept;
+	bool fallbackEntered() const noexcept;
+	bool fallbackCompleted() const noexcept;
+
+private:
+	std::size_t m_expectedOperations;
+	std::size_t m_completedOperations;
+	bool m_allOperationsCommitted;
+	bool m_activeOperationNeedsLegacyFallback;
+	bool m_batchNeedsLegacyFallback;
+	bool m_fallbackEntered;
+	bool m_fallbackCompleted;
+};
+#endif
 
 // One bounded immutable request set is admitted as one JobGroup.  Every job
 // owns one request-local snapshot/result, workers never wait, and the owner
@@ -82,8 +117,13 @@ public:
 		, performance::KernelPerformanceBatch *performanceBatch = nullptr
 		, performance::KernelPerformanceReferenceLedger *performanceReferenceLedger = nullptr
 		, performance::KernelPerformanceReferenceBatch *performanceReferenceBatch = nullptr
+		, performance::KernelPerformanceAttempt performanceReferenceAttempt =
+			performance::KernelPerformanceAttempt()
 #endif
 		);
+	#if defined(_WIN64)
+	bool collectPerformanceReference(JobSystem &jobs);
+	#endif
 	DeterministicDirectPathBatchExecutionSnapshot executionSnapshot() const;
 	DeterministicDirectPathExecutionSnapshot requestExecutionSnapshot(
 		std::size_t requestIndex) const;
@@ -153,6 +193,7 @@ struct DeterministicOrdinaryPathBatchExecutionSnapshot
 	// the fixed-width diagnostic mask.  Authority uses the explicit count.
 	bool physicalWorkerMaskComplete;
 	unsigned peakActiveWorkers;
+	bool referenceAdmissionAccepted;
 	bool completed;
 	bool timedOut;
 };
@@ -163,6 +204,59 @@ inline bool IsDeterministicOrdinaryPathConcurrentMultiWorkerBatch(
 	return execution.distinctPhysicalWorkerCount > 1 &&
 		execution.peakActiveWorkers > 1;
 }
+
+#if defined(_WIN64)
+// Optional native-site observations. Null hooks leave native behavior unchanged.
+// The range-planned callback is owner-call-borrowed. Request/release callback
+// values are copied into native work; their context must outlive real drain and
+// reference collection, including when executeSynchronously times out.
+enum DeterministicOrdinaryPathTestEvent
+{
+	DETERMINISTIC_ORDINARY_PATH_TEST_RANGE_PLANNED = 0,
+	// Reference-serial entry has no request/range coordinates (both are zero).
+	DETERMINISTIC_ORDINARY_PATH_TEST_REFERENCE_SERIAL_ENTER,
+	DETERMINISTIC_ORDINARY_PATH_TEST_SEARCH_ENTER,
+	DETERMINISTIC_ORDINARY_PATH_TEST_SEARCH_EXIT,
+	DETERMINISTIC_ORDINARY_PATH_TEST_MATERIALIZATION_ENTER,
+	DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_DISCOVERED_ALLOCATION,
+	DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_SORT,
+	DETERMINISTIC_ORDINARY_PATH_TEST_AFTER_SORT,
+	DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_BYTE_ARITHMETIC,
+	DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_GRANT,
+	DETERMINISTIC_ORDINARY_PATH_TEST_PHYSICAL_RESERVE,
+	DETERMINISTIC_ORDINARY_PATH_TEST_GRANT_RETURNED,
+	// May inject allocation failure inside the existing output-allocation try.
+	DETERMINISTIC_ORDINARY_PATH_TEST_FIRST_OUTPUT_ALLOCATION,
+	DETERMINISTIC_ORDINARY_PATH_TEST_REFUND_COMPLETED,
+	DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_FINAL_VALIDATION,
+	DETERMINISTIC_ORDINARY_PATH_TEST_BEFORE_HASH,
+	DETERMINISTIC_ORDINARY_PATH_TEST_AFTER_HASH,
+	DETERMINISTIC_ORDINARY_PATH_TEST_MATERIALIZATION_EXIT,
+	DETERMINISTIC_ORDINARY_PATH_TEST_BODY_EXIT
+};
+
+struct DeterministicOrdinaryPathTestHooks
+{
+	DeterministicOrdinaryPathTestHooks() : context(0), observe(0),
+		observeRequest(0), observeReleasedBudget(0), observeReleasedRange(0),
+		observeReferenceResult(0) {}
+	void *context;
+	void (*observe)(void *, DeterministicOrdinaryPathTestEvent,
+		unsigned rangeIndex, std::size_t begin, std::size_t end);
+	void (*observeRequest)(void *, DeterministicOrdinaryPathTestEvent,
+		unsigned rangeIndex, std::size_t requestIndex, std::size_t actualBytes,
+		bool actualGranted);
+	void (*observeReleasedBudget)(void *, const performance::KernelPerformanceRangePlan &,
+		const performance::KernelPerformanceRequestBudget &);
+	void (*observeReleasedRange)(void *, const performance::KernelPerformanceRangePlan &,
+		const performance::KernelPerformanceRangeProgress &);
+	// Read-only values from the actual production view after native completion.
+	void (*observeReferenceResult)(void *, std::size_t requestIndex,
+		DeterministicPathSearchStatus actualStatus, std::size_t actualSearchPointCount,
+		std::size_t actualMaterializedPointCount, std::size_t actualCanonicalPointCount,
+		bool actualCanonicalHasPoints);
+};
+#endif
 
 // Adaptive, memory-bounded independent-request A*. One immutable navigation
 // generation and one JobGroup are shared by the batch; each contiguous range
@@ -184,8 +278,14 @@ public:
 		, performance::KernelPerformanceBatch *performanceBatch = nullptr
 		, performance::KernelPerformanceReferenceLedger *performanceReferenceLedger = nullptr
 		, performance::KernelPerformanceReferenceBatch *performanceReferenceBatch = nullptr
+		, const DeterministicOrdinaryPathTestHooks *testHooks = nullptr
+		, performance::KernelPerformanceAttempt performanceReferenceAttempt =
+			performance::KernelPerformanceAttempt()
 #endif
 		);
+#if defined(_WIN64)
+	bool collectPerformanceReference(JobSystem &jobs);
+#endif
 	DeterministicOrdinaryPathBatchExecutionSnapshot executionSnapshot() const;
 	DeterministicDirectPathExecutionSnapshot requestExecutionSnapshot(
 		std::size_t requestIndex) const;

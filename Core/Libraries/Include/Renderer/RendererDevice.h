@@ -112,6 +112,7 @@ struct RenderDeviceParameters
 	bool enableDebugLayer;
 	bool enableVsync;
 	bool allowSoftwareFallback;
+	unsigned int multisampleCount;
 };
 
 struct BufferDescriptor
@@ -239,11 +240,12 @@ struct RenderResourceStatistics
 struct RenderBackBufferInfo
 {
 	RenderBackBufferInfo() : width(0), height(0),
-		format(RENDER_FORMAT_UNKNOWN) {}
+		format(RENDER_FORMAT_UNKNOWN), multisampleCount(1) {}
 
 	unsigned int width;
 	unsigned int height;
 	RenderFormat format;
+	unsigned int multisampleCount;
 };
 
 // Texture filtering is queried from the live backend rather than inferred

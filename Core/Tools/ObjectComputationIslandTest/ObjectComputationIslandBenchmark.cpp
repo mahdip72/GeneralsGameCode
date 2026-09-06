@@ -231,7 +231,7 @@ int main(int argc, char **argv)
 	{
 		std::fprintf(stderr,
 			"Usage: core_object_computation_island_benchmark "
-			"[--local-capacity] "
+			"[--local-capacity|--external-qualification] "
 			"[--strict-scaling|--allow-serial-fallback]\n");
 		return 2;
 	}

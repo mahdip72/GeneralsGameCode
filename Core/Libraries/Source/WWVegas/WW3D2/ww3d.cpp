@@ -115,6 +115,14 @@
 #include "static_sort_list.h"
 #include "shdlib.h"
 #include "framgrab.h"
+#if defined(_WIN64)
+#include "missingtexture.h"
+#include "texturefilter.h"
+#include "dx8renderer.h"
+#include "sortingrenderer.h"
+#include "dx8vertexbuffer.h"
+#include "dx8indexbuffer.h"
+#endif
 
 #include <vector>
 #include <limits>
@@ -736,6 +744,29 @@ WW3DErrorType WW3D::Init(void *hwnd, char *defaultpal, bool lite)
 	}
 	s_gameDeviceDescriptions.clear();
 	WWDEBUG_SAY(("Allocate Debug Resources"));
+#if defined(_WIN64)
+	// The native device does not own title resources. Initialize them before
+	// terrain, particles, or debug geometry can request material presets.
+	MissingTexture::_Init();
+	TextureFilterClass::_Init_Filters(
+		(TextureFilterClass::TextureFilterMode)Get_Texture_Filter(),
+		(TextureFilterClass::AnisotropicFilterMode)Get_Anisotropy_Level());
+	TheDX8MeshRenderer.Init();
+	SHD_INIT;
+	BoxRenderObjClass::Init();
+	VertexMaterialClass::Init();
+	if (!PointGroupClass::_Init()) {
+		VertexMaterialClass::Shutdown();
+		BoxRenderObjClass::Shutdown();
+		SHD_SHUTDOWN;
+		TheDX8MeshRenderer.Shutdown();
+		MissingTexture::_Deinit();
+		rts::render::ShutdownGameRenderer();
+		return WW3D_ERROR_INITIALIZATION_FAILED;
+	}
+	ShatterSystem::Init();
+	TextureLoader::Init();
+#endif
 	Allocate_Debug_Resources();
 
 	MAYBE_UNUSED MMRESULT r=timeBeginPeriod(1);
@@ -820,6 +851,19 @@ WW3DErrorType WW3D::Shutdown()
 		WW3DAssetManager::Get_Instance()->Free_Assets();
 	}
 
+#if defined(_WIN64)
+	TextureLoader::Deinit();
+	SortingRendererClass::Deinit();
+	DynamicVBAccessClass::_Deinit();
+	DynamicIBAccessClass::_Deinit();
+	ShatterSystem::Shutdown();
+	PointGroupClass::_Shutdown();
+	VertexMaterialClass::Shutdown();
+	BoxRenderObjClass::Shutdown();
+	SHD_SHUTDOWN;
+	TheDX8MeshRenderer.Shutdown();
+	MissingTexture::_Deinit();
+#endif
 	const rts::render::RenderResult rendererResult =
 		rts::render::ShutdownGameRenderer();
 

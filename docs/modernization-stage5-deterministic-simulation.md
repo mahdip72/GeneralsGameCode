@@ -274,8 +274,9 @@ repeats and worker configurations; timing maximum frame must also match the
 structured result. A forced one-worker simulation may report its expected
 serial kernel fallback; fallback in another parallel configuration fails.
 
-The existing optimized VC6 replay job remains the retail compatibility oracle.
-It does not validate a native x64 candidate; both gates are required.
+The final optimized VC6 differential oracle was captured before cutover. It is
+not a continuing product or CI lane. Replay qualification now runs only against
+the exact installed native x64 candidate.
 
 ### Live AI gate
 
@@ -412,15 +413,83 @@ scoped validation mode and provide 40 hashed raw peer-process outputs with an
 independently observed executable and artifact-set hash for every peer. Only
 after full validation does the command create an external diagnostic
 `MultiplayerSimulationRuntimeProof.txt` for the exact prebuilt executable. A
-runtime sibling file cannot grant multiplayer authority: ordinary builds embed
-a zero trusted mask, and the v1 resolver rejects this diagnostic schema even if
-a caller supplies a nonzero mask. `RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY=ON`
-is intentionally rejected by CMake with a lockstep-v2 prerequisite error; no
-v1 evidence can be promoted into live multiplayer authority. A future
-lockstep-v2 contract must define its own schema, trust root, and complete gate
-before any product build can advertise worker kernels. Invalid or absent
-evidence, or a forged sibling bundle beside a default build, keeps the mask at
-zero.
+runtime sibling file cannot grant multiplayer authority: the v1 trusted cap is
+zero in every build, and the v1 resolver rejects this diagnostic producer even
+if a caller supplies a nonzero mask and source revision. Invalid or absent v1
+evidence, or a forged sibling bundle, therefore remains non-authorizing.
+
+Live product authority has a separately namespaced lockstep-v2 trust root in
+`LockstepV2Promotion.h`. The native x64 Release product presets enable
+`RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY` and compile exactly the six
+qualified bits (`0x3f`) into the product. CMake rejects promotion for non-x64,
+non-product, Debug, Profile, and ASan configurations; the Win32/VC6 oracle and
+unpromoted custom builds remain serial. The header binds the embedded authority
+to the current lockstep-v2 schema and protocol epoch and accepts only the exact
+complete live-integrated mask. A later seventh kernel cannot be enabled by the
+old six-bit promotion. The build-owned authority is immutable at runtime and
+does not parse, import, or reinterpret any v1 evidence field.
+
+An ordinary `ConnectionManager` resolves this embedded v2 authority before
+constructing its NET3 policy identity. If the build is unpromoted, it may still
+inspect the unchanged diagnostic-v1 bundle, whose resolver returns zero. The
+installed lockstep-v2 qualifier retains its explicit local-process override so
+it can gather fresh review evidence without granting an unpromoted ordinary
+session authority. Each ordinary peer advertises only its compiled mask; policy
+resolution intersects those masks after exact build, content, map, roster,
+endpoint, and session-challenge validation. A mixed promoted/unpromoted session
+or any peer missing a bit leaves that kernel serial.
+
+The lockstep-v2 qualification uses two authenticated network peers and four
+local AI participants (`2v4`) through the common stop frame 4096. It records
+production command-origin contributions, frame/CRC checkpoints, clean transport
+shutdown, and executable-origin physical-worker telemetry for all six kernels.
+The receipts prove the release decision but are never loaded by ordinary
+gameplay. Focused contract coverage verifies both fail-closed promotion metadata
+and the positive ordinary NET3 Hello/session-policy path; the mixed-worker
+source audit prevents the v2 build root from being replaced by v1 files,
+free-form source state, or a known-kernel constant.
+
+Weekly publication is also fail-closed. It accepts only artifacts downloaded
+from a successful manual `GenCI` run in the same repository at the exact release
+commit. Its default-false `stage5_lockstep_v2_qualification` input is the only
+producer opt-in; a qualifying dispatch must also supply the reviewed
+`stage5_lockstep_v2_map_name` plus nonzero decimal
+`stage5_lockstep_v2_generals_map_crc` and
+`stage5_lockstep_v2_zerohour_map_crc`. Push and pull-request runs skip the producer. The
+manual job downloads both exact same-run x64 product artifacts, builds
+`Stage5ArtifactSet.json` and `Stage5RuntimeDependencies.json` from every runtime
+file, then downloads the two fixed-SHA-256 R2 trimmed-data archives into a
+separate `QualificationData` staging directory. It admits only root `.big`
+files and the `Data` subtree, verifies the exact copied-file closure in the
+disposable runtime copies, binds that closure to the common reviewed map name
+and each title's independently reviewed CRC in
+`Stage5QualificationData.json`, and only then invokes the installed qualifier.
+The resulting `Stage5-LockstepV2-Qualification` bundle contains the three
+metadata manifests and the complete `Evidence` subtree,
+including the native v2 evidence, raw receipts/logs/negative proofs, and its
+`mixed-worker-multiplayer.json` host attestation. It never contains the
+downloaded archives, staged retail data, or either runtime tree. The qualifier
+copies the qualification-data metadata into `Evidence\QualificationData.json`
+and finishes that subtree with an ordinal, self-excluding
+`Stage5LockstepV2EvidenceClosure.json` manifest that declares every evidence
+path and SHA-256 plus the canonical root, source, artifact set, and cohort.
+Qualification and publication
+both stage this layout at `<stage5-qualification-root>`, with the two
+runtime trees at `GeneralsRuntime`/`ZeroHourRuntime` and qualifier output at
+`Evidence`; the qualification artifact must not contain either runtime tree.
+The publication validator independently matches the supplied sidecar hash,
+rehashes the artifact-set manifest, every declared runtime and evidence file,
+the complete runtime/evidence-tree membership, both x64 executables, and the
+attached native evidence before handing the exact validated directories to the
+release job. It also validates the fixed archive identities, map binding, and
+deterministic qualification-data closure and requires the root and Evidence
+metadata copies to be byte-identical. It reconciles the sidecar against the aggregate-declared
+peer/receipt/log/negative-probe file set, invokes the full raw-evidence reader,
+and rejects any missing, changed, aliased, redirected, or undeclared file. An
+absent external qualification run or independent
+attestation hash makes scheduled/manual publication skip; a same-source rebuild
+is not treated as the qualified artifact. The external qualification execution
+remains a release prerequisite rather than an ordinary PR check.
 
 Run the installed peer matrix from a fresh task-owned evidence directory. This
 uses a dedicated local-only process mode and the exact already-installed
@@ -548,12 +617,18 @@ the candidate result; do not tune them after observing the matrix.
 
 ## CI and final candidate
 
-Ordinary pull requests retain the bounded VC6 compatibility workflow. A manual
-`GenCI` dispatch may provide the Zero Hour-specific `stage5_fixture_manifest`,
+Ordinary pull requests build only the native x64 products plus explicitly
+non-product Win32 authoring tools. A manual `GenCI` dispatch may provide the Zero Hour-specific `stage5_fixture_manifest`,
 `stage5_performance_baseline`, and executable hash, or the corresponding
 `stage5_generals_*` inputs for Generals. Each opt-in job downloads its
 title-specific native x64 installed artifact and runs the full replay matrix;
 title-specific evidence is uploaded even when the matrix fails.
+
+Extras-enabled CI installs the title contract executables beneath
+`Validation/Generals` or `Validation/ZeroHour` and runs them with the matching
+product runtime as the working directory. Artifact collection starts at only
+the `Generals` or `ZeroHour` title directory, so validation executables and
+their PDBs never enter qualified or weekly game packages.
 
 After focused tests, faults, shadow, replay, AI, mixed-peer, combined-policy,
 and performance gates pass, manually test the exact installed candidate in both intended
@@ -564,23 +639,34 @@ device reset, return to shell, a second match, quit during load/combat, shutdown
 with work active, and relaunch. Manual acceptance is not automated and cannot
 be replaced by headless evidence.
 
-## Final acceptance evidence aggregation
+## Pre-manual development-readiness aggregation
 
 `Run-DeterministicSimulationValidation.ps1` is the deterministic-runtime gate.
 Its isolated replay/AI/performance result is necessary but deliberately
-insufficient for final acceptance. The final gate is
+insufficient for handoff. The local readiness gate is
 `Invoke-Stage5FinalAcceptance.ps1`, which consumes a reviewed request matching
 `FinalAcceptanceManifest.schema.json` and fails closed unless all of these
-independent evidence manifests exist:
+six local evidence manifests exist:
 
 1. deterministic-runtime matrix;
 2. replay determinism and its fixture manifest;
 3. fresh 4v3/4v2 AI games;
 4. performance scaling plus the independently identified Stage 3 baseline;
 5. mixed-worker multiplayer soak;
-6. the combined Stage 4 plus Stage 5 installed-runtime lane;
-7. complete-diff premium review with zero open P0, P1, or P2 findings; and
-8. the user's final installed-runtime manual acceptance.
+6. the combined Stage 4 plus Stage 5 installed-runtime lane.
+
+Complete-diff premium review with zero open P0, P1, or P2 findings and the
+user's installed-runtime manual acceptance remain required external decisions.
+They are deliberately out-of-band: neither is accepted as an entry in the
+local manifest, and writable local JSON cannot assert either authority.
+
+When external dense or large-physical-core qualification is unavailable for a
+pre-manual development-readiness run, pass `-ExternalQualificationExempt` to
+the readiness bundle assembler, final-acceptance aggregator, and seal step.
+The resulting installed-kernel disposition must remain `status=skipped` and
+`claim=false`; the readiness report must still retain
+`finalAcceptanceClaim=false`. This is an explicit exemption, not a
+qualification pass or release authority.
 
 The request, artifact-set manifest, evidence envelopes, and attachments use
 manifest-relative paths. The aggregator independently computes every SHA-256,
@@ -598,16 +684,20 @@ report `pipelineMode=parallel`, `simulationMode=parallel`, `workerPolicy=auto`,
 Stage 4/5 execution passing. This lane complements rather than replaces the
 serial-pipeline isolation matrix.
 
-Run the aggregator only after the user has actually approved the exact final
-candidate:
+Run the aggregator after the six local evidence kinds have been assembled and
+before handing the exact candidate to the user for manual testing:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass `
   -File Core/Tools/DeterministicSimulationValidation/Invoke-Stage5FinalAcceptance.ps1 `
   -AcceptanceManifestPath <final-acceptance-request.json> `
-  -OutputPath <fresh-final-acceptance-report.json>
+  -OutputPath <fresh-development-readiness-report.json> `
+  -DevelopmentReadiness
 ```
 
-The output path must be new. A missing manual manifest, stale commit, changed
-binary, tampered attachment, serial combined-policy lane, unsupported topology,
-open premium finding, or any non-passing evidence prevents report creation.
+The output path must be new. A stale commit, changed binary, tampered attachment,
+serial combined-policy lane, unsupported topology, or any non-passing local
+evidence prevents report creation. A successful output is intentionally
+non-final: it reports `stage5-development-readiness`,
+`ready-for-manual-approval`, `premiumReviewRequired=true`,
+`manualApprovalRequired=true`, and `finalAcceptanceClaim=false`.

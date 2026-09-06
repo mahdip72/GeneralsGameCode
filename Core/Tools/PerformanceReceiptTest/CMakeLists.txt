@@ -20,7 +20,12 @@ endif()
 
 add_test(NAME core_performance_receipt_tests
     COMMAND core_performance_receipt_tests)
-set_tests_properties(core_performance_receipt_tests PROPERTIES TIMEOUT 30)
+set_tests_properties(core_performance_receipt_tests PROPERTIES
+    TIMEOUT 30
+    # The atomic-publication fixture deliberately reserves room for the
+    # production receipt leaf below MAX_PATH. Keep its fresh directory at the
+    # short, task-owned build root rather than this nested target directory.
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")
 
 if(WIN32)
     # This graph audit is intentionally colocated with the native-only test:

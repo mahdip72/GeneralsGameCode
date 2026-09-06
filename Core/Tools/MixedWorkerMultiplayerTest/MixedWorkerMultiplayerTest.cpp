@@ -1047,7 +1047,7 @@ int main(int argc, char **argv)
 	{
 		fprintf(stderr,
 			"Usage: core_mixed_worker_multiplayer_policy_tests "
-			"[--local-capacity]\n");
+			"[--local-capacity|--external-qualification]\n");
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);

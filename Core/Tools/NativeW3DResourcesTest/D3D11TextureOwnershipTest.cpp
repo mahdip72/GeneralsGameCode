@@ -470,6 +470,25 @@ int TestNativeD3D11Ownership()
 		resources.AcquireGpuContentLease(depthTarget.resource, &depthLease) ==
 			RENDER_RESULT_OK,
 		"accepted real D3D11 color and depth outputs publish exact GPU authority leases");
+	// Copy destinations need a writable sampled resource, not a render-target
+	// view. Immutable asset resources remain non-writable even at matching size.
+	TextureDescriptor assetDescriptor = colorTargetDescriptor;
+	assetDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+	assetDescriptor.usage = RENDER_USAGE_IMMUTABLE;
+	unsigned char assetPixels[64] = {};
+	TextureSubresourceData assetData;
+	assetData.data = assetPixels;
+	assetData.rowPitch = 16;
+	assetData.slicePitch = sizeof(assetPixels);
+	NativeW3DTextureHandle immutableAsset;
+	result |= Check(resources.CreateTexture(assetDescriptor, &assetData, 1,
+		&immutableAsset) == RENDER_RESULT_OK &&
+		context->beginFrame() == RENDER_RESULT_OK &&
+		context->setRenderTargets(targetBinding) == RENDER_RESULT_OK &&
+		device->copyActiveColorTargetToTexture(immutableAsset.resource) ==
+			RENDER_RESULT_UNSUPPORTED && context->endFrame() == RENDER_RESULT_OK &&
+		resources.DestroyTexture(immutableAsset),
+		"ordinary immutable asset textures remain rejected as GPU copy destinations");
 	const NativeW3DSurfaceHandle staleColorSurface = colorSurface;
 	const NativeW3DSurfaceHandle staleDepthSurface = depthSurface;
 	const NativeW3DGpuContentLease staleColorLease = colorLease;

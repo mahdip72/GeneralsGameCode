@@ -200,7 +200,36 @@ typedef bool (*ImmutableSpatialDispatchFunction)(void *context,
 	ImmutableSpatialRangeFunction rangeFunction,
 	void *rangeContext);
 
+enum ImmutableSpatialStatus
+{
+	IMMUTABLE_SPATIAL_SUCCESS = 0,
+	IMMUTABLE_SPATIAL_INVALID_ARGUMENT,
+	IMMUTABLE_SPATIAL_MALFORMED_ARENA,
+	IMMUTABLE_SPATIAL_STALE_GENERATION,
+	IMMUTABLE_SPATIAL_CANCELLED,
+	IMMUTABLE_SPATIAL_DISPATCH_FAILURE,
+	IMMUTABLE_SPATIAL_INSUFFICIENT_CAPACITY,
+	IMMUTABLE_SPATIAL_OVERFLOW,
+	IMMUTABLE_SPATIAL_GENERATION_MISMATCH
+};
+
 typedef bool (*ImmutableSpatialCancellationFunction)(void *context);
+#if defined(_WIN64)
+enum ImmutableSpatialCheckpointSite
+{
+	IMMUTABLE_SPATIAL_CHECKPOINT_QUERY_ENTRY = 1,
+	IMMUTABLE_SPATIAL_CHECKPOINT_RADIUS
+};
+// Explicit range-local identity at the two existing cancellation checks.
+// A null callback preserves the original cancellation policy; no TLS/global
+// current-range state or additional member-loop polling is introduced.
+typedef bool (*ImmutableSpatialCheckpointFunction)(void *context,
+	unsigned pass, unsigned range, unsigned query,
+	ImmutableSpatialCheckpointSite site, unsigned radius, bool actualCancelled);
+typedef void (*ImmutableSpatialRangeObservation)(void *context,
+	unsigned pass, unsigned range, unsigned begin, unsigned end,
+	bool entry, ImmutableSpatialStatus status);
+#endif
 typedef bool (*ImmutableSpatialArenaGenerationResolver)(
 	const ImmutableSpatialGeneration *expected, void *context);
 typedef bool (*ImmutableSpatialObjectGenerationResolver)(
@@ -219,6 +248,11 @@ struct ImmutableSpatialExecutionOptions
 	ImmutableSpatialArenaGenerationResolver resolveArenaGeneration;
 	ImmutableSpatialObjectGenerationResolver resolveObjectGeneration;
 	void *generationContext;
+#if defined(_WIN64)
+	ImmutableSpatialCheckpointFunction checkpoint;
+	ImmutableSpatialRangeObservation observeRange;
+	void *checkpointContext;
+#endif
 };
 
 // All storage is caller-owned. visitStamps needs rangeCount*objectCount slots,
@@ -250,19 +284,6 @@ struct ImmutableSpatialExecutionMetrics
 	ImmutableSpatialUInt32 countPassQueries;
 	ImmutableSpatialUInt32 fillPassQueries;
 	ImmutableSpatialUInt32 resultCount;
-};
-
-enum ImmutableSpatialStatus
-{
-	IMMUTABLE_SPATIAL_SUCCESS = 0,
-	IMMUTABLE_SPATIAL_INVALID_ARGUMENT,
-	IMMUTABLE_SPATIAL_MALFORMED_ARENA,
-	IMMUTABLE_SPATIAL_STALE_GENERATION,
-	IMMUTABLE_SPATIAL_CANCELLED,
-	IMMUTABLE_SPATIAL_DISPATCH_FAILURE,
-	IMMUTABLE_SPATIAL_INSUFFICIENT_CAPACITY,
-	IMMUTABLE_SPATIAL_OVERFLOW,
-	IMMUTABLE_SPATIAL_GENERATION_MISMATCH
 };
 
 // Both functions perform the complete linear canonical-content validation

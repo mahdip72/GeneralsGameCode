@@ -29,6 +29,9 @@ enum
 {
 	SKIRMISH_AI_TEST_SLOT_COUNT = 8,
 	SKIRMISH_AI_TEST_MAX_FRAME = 108000,
+	// Immutable replay evidence is intentionally bounded independently of the
+	// filesystem so hashing cannot consume an attacker-controlled extent.
+	SKIRMISH_AI_TEST_MAX_REPLAY_BYTES = 256 * 1024 * 1024,
 	SKIRMISH_AI_TEST_MAX_STARTUP_MILLISECONDS = 300000,
 	SKIRMISH_AI_TEST_MAX_STALLED_MILLISECONDS = 30000,
 	SKIRMISH_AI_TEST_MAX_SHUTDOWN_MILLISECONDS = 30000
@@ -141,16 +144,19 @@ Bool IsSkirmishAITestPracticalControllerScenario(SkirmishAITestScenario scenario
 Bool IsValidSkirmishAITestPracticalControllerPlan(
 	const SkirmishAITestPlan &plan);
 
-// Narrow per-invocation seam for retention commit-policy tests. Production
-// callers use the ordinary three-argument wrapper below.
+// Narrow per-invocation seams for retention commit/final-close policy tests.
+// Production callers use the ordinary three-argument wrapper below.
 namespace SkirmishAITestDetail
 {
 typedef Bool (*ReplayCommitCallback)(
 	const char *temporaryPath, const char *destinationPath, void *context);
+typedef Bool (*ReplayFinalHandleCloseCallback)(void *nativeHandle, void *context);
 Bool RetainSkirmishAITestReplayAtomically(
 	const char *sourcePath, const char *destinationPath,
 	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1],
-	ReplayCommitCallback commitCallback, void *context);
+	ReplayCommitCallback commitCallback, void *context,
+	ReplayFinalHandleCloseCallback finalCloseCallback = 0,
+	void *finalCloseContext = 0);
 }
 
 Bool SetSkirmishAITestExecutableHashInput(const char *sha256);
@@ -158,6 +164,12 @@ Bool SetSkirmishAITestExecutableHashInput(const char *sha256);
 Bool HashSkirmishAITestBytes(const void *bytes, size_t byteCount,
 	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1]);
 Bool HashSkirmishAITestContentFile(const char *path,
+	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1]);
+// Hash an already-open native file handle without reopening its pathname.
+// The handle remains owned by the caller and its file position is restored.
+// The opaque handle type keeps this shared declaration portable to non-Windows
+// title fixtures; native callers pass the Win32 HANDLE value as void*.
+Bool HashSkirmishAITestContentHandle(void *handle,
 	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1]);
 Bool CaptureSkirmishAITestValidatedExecutableHash(
 	char sha256[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1]);
@@ -172,6 +184,9 @@ void UpdateSkirmishAITestRunner();
 Int FinalizeSkirmishAITestRunner(Int engineExitCode);
 #if defined(_WIN64)
 void ObserveSkirmishAITestCompletedFrame(unsigned previousFrame);
+// Release the exact existing borrow while GameLogic is still alive, even if
+// runner reporting has been disarmed. Runtime storage remains through drain.
+void ReleaseSkirmishAITestPerformanceReceiptOwner();
 // Call only after the real engine has drained and been destroyed. This uses
 // retained diagnostic snapshots, never reset/destroyed game globals.
 void FinalizeSkirmishAITestPerformanceReceipt(Int engineExitCode);

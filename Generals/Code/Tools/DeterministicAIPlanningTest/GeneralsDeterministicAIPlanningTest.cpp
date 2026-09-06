@@ -22,6 +22,10 @@
 #include <iostream>
 #include <limits>
 #include <type_traits>
+#if defined(_WIN64)
+#include <chrono>
+#include "../../../../Core/Tools/TestSupport/NativeKernelSourceConsumerTest.h"
+#endif
 
 #if defined(_MSC_VER)
 #include <crtdbg.h>
@@ -446,6 +450,273 @@ void TestCanonicalBatchAcrossTopologiesAndFailure()
 	assert(status.committedMode == rts::AI_PLANNING_EXECUTION_SERIAL);
 	assert(status.usedSerialFallback == 1U);
 }
+
+#if defined(_WIN64)
+int g_generalsPhaseFailures = 0;
+unsigned g_generalsPhaseVariant = 0;
+bool g_generalsPhaseBaseline = false;
+unsigned g_generalsDetachedCalls = 0;
+void GeneralsPhaseExpect(bool condition, const char *message)
+{
+	if (!condition)
+	{
+		++g_generalsPhaseFailures;
+		std::cerr << "FAIL [Generals AI " << (g_generalsPhaseBaseline ? "consumer" : "source") <<
+			" variant=" << g_generalsPhaseVariant << "]: " << message << '\n';
+	}
+}
+bool CountGeneralsDetached(const void *input, void *output)
+{
+	++g_generalsDetachedCalls;
+	return ComputeGeneralsAIEnemyReferenceSerial(input, output);
+}
+bool WriteGeneralsAIEnemyReferenceOutputWithInjectedDigestFailure(
+	rts::performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const GeneralsAIEnemyReferenceView *view =
+		static_cast<const GeneralsAIEnemyReferenceView *>(context);
+	if (view == 0 || view->results == 0 || view->count == 0U)
+		return false;
+	GeneralsAIEnemyPlanningResult *results =
+		const_cast<GeneralsAIEnemyPlanningResult *>(view->results);
+	const GeneralsAIEnemyPlanningResult saved = results[0];
+	// Keep the authoritative result unchanged while making the observer's
+	// canonical digest disagree with the recorded source output.
+	results[0].selectedPlayerIndex = saved.selectedPlayerIndex == -1 ?
+		0 : saved.selectedPlayerIndex + 1;
+	const bool wrote = WriteGeneralsAIEnemyReferenceOutput(writer, context);
+	results[0] = saved;
+	return wrote;
+}
+struct GeneralsPhaseObservations
+{
+	std::atomic<unsigned> entries[4]{}, bodies[4]{}, validations[4]{};
+	std::atomic<bool> wrongOwner{false};
+	std::atomic<unsigned> held{0};
+	std::atomic<bool> releaseHeld{false}, waitExpired{false};
+	unsigned cancelNotifications = 0, releaseNotifications = 0, releasedCompleted = 0, releasedSubmitted = 0;
+	unsigned releasedReason = 0;
+	bool releasedCancelled = false, lateCancel = false;
+	rts_test::NativeKernelClock *clock = 0;
+	bool baseline = false;
+	~GeneralsPhaseObservations() { releaseHeld.store(true, std::memory_order_release); }
+	static void beforeWait(void *opaque)
+	{
+		auto &self = *static_cast<GeneralsPhaseObservations *>(opaque);
+		if (self.baseline || !rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME)) self.wrongOwner = true;
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+		while (self.held.load(std::memory_order_acquire) != 4 && std::chrono::steady_clock::now() < deadline)
+			std::this_thread::yield();
+		if (self.held.load(std::memory_order_acquire) != 4)
+		{ self.waitExpired = true; self.releaseHeld.store(true, std::memory_order_release); }
+	}
+	static void afterCancel(void *opaque)
+	{
+		auto &self = *static_cast<GeneralsPhaseObservations *>(opaque);
+		if (self.baseline || !rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME)) self.wrongOwner = true;
+		++self.cancelNotifications; self.releaseHeld.store(true, std::memory_order_release);
+	}
+	static void releasedGroup(void *opaque, bool cancelled, unsigned completed, unsigned submitted, unsigned reason)
+	{
+		auto &self = *static_cast<GeneralsPhaseObservations *>(opaque);
+		if (self.baseline || !rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME)) self.wrongOwner = true;
+		++self.releaseNotifications; self.releasedCancelled = cancelled;
+		self.releasedCompleted = completed; self.releasedSubmitted = submitted; self.releasedReason = reason;
+	}
+	static void observe(void *opaque, rts::AIPlanningTestEvent event, uint32_t ordinal,
+		uint32_t begin, uint32_t end, rts::AIProductionCandidateFact *)
+	{
+		auto &self = *static_cast<GeneralsPhaseObservations *>(opaque);
+		const bool owner = rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME);
+		const bool validation = event == rts::AI_PLANNING_TEST_OWNER_VALIDATION;
+		if (ordinal >= 4 || begin != 0 || end != 1 || owner != (validation || self.baseline))
+		{ self.wrongOwner = true; return; }
+		if (event == rts::AI_PLANNING_TEST_RANGE_ENTRY) { ++self.entries[ordinal]; self.clock->now.fetch_add(7); }
+		else if (event == rts::AI_PLANNING_TEST_PLAYER_BODY) { ++self.bodies[ordinal]; self.clock->now.fetch_add(13); }
+		else if (validation) { ++self.validations[ordinal]; self.clock->now.fetch_add(41); }
+		if (!self.baseline && self.lateCancel && event == rts::AI_PLANNING_TEST_PLAYER_BODY)
+		{
+			// The actual entry poll is behind us; the native planner has no later
+			// cancellation poll and must complete after the real group cancel.
+			self.held.fetch_add(1, std::memory_order_release);
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+			while (!self.releaseHeld.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+				std::this_thread::yield();
+			if (!self.releaseHeld.load(std::memory_order_acquire))
+			{ self.waitExpired = true; self.releaseHeld.store(true, std::memory_order_release); }
+		}
+	}
+	static bool cancel(void *opaque, uint32_t, uint32_t, uint32_t)
+	{ return static_cast<GeneralsPhaseObservations *>(opaque)->baseline; }
+};
+
+bool RunGeneralsNativePhaseRole(rts_test::NativeKernelTrace &trace, bool baseline, unsigned variant)
+{
+	using namespace rts::performance;
+	const bool injectFailure = variant == 1, lateCancel = variant == 2;
+	const bool observerFailure = baseline && variant == 3;
+	const bool abortExpected = injectFailure || lateCancel || observerFailure;
+	g_generalsPhaseVariant = static_cast<int>(variant); g_generalsPhaseBaseline = baseline;
+	const int failuresBefore = g_generalsPhaseFailures;
+	std::cerr << "BEGIN [Generals AI " << (baseline ? "consumer" : "source") <<
+		" variant=" << g_generalsPhaseVariant << "]\n";
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 4; config.queueCapacity = 64; config.scratchBytesPerWorker = 4096; config.pinWorkers = false;
+	if (!jobs.start(config) || !jobs.registerCurrentThread(rts::JOB_OWNER_GAME))
+	{ GeneralsPhaseExpect(false, "Generals phase fixture starts four real workers"); return false; }
+	rts_test::NativeKernelOwnerRun run;
+	const bool started = run.begin(trace, baseline, 500, KERNEL_PHASE_OWNER_INTAKE);
+	GeneralsPhaseExpect(started, "Generals native role accepts its real ledger and immutable source");
+	if (!started) { jobs.shutdown(); jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME); return false; }
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_AI, 0);
+	GeneralsPhaseExpect(attempt.valid(), "Generals core owner opens authentic attempt before capture");
+	auto timingBatch = run.timing.beginBatch(KERNEL_PERFORMANCE_AI, 0, 500, 1);
+	const auto capture = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_CAPTURE);
+	GeneralsAIEnemyPlanningSnapshot snapshots[4];
+	GeneralsAIEnemyPlanningResult results[4] = {}, detached[4] = {};
+	for (unsigned index = 0; index != 4; ++index)
+	{
+		MakeEnemySnapshot(&snapshots[index], index + 1, 0, 10);
+		snapshots[index].candidateCount = 2;
+		snapshots[index].candidates[1] = snapshots[index].candidates[0];
+		snapshots[index].candidates[1].sourceOrdinal = 1;
+		snapshots[index].candidates[1].playerIndex = 11;
+	}
+	run.clock.now.fetch_add(5);
+	GeneralsPhaseExpect(run.timing.endInterval(capture), "Generals capture precedes the actual title-specific executor");
+	GeneralsAIEnemyReferenceView input = {snapshots, 0, 4};
+	GeneralsAIEnemyReferenceView output = {snapshots, results, 4};
+	GeneralsAIEnemyReferenceView oracle = {snapshots, detached, 4};
+	KernelPerformanceReferenceBatch validated;
+	rts::AIPlanningReferenceBatchTransport transport;
+	transport.referenceLedger = &run.reference; transport.referenceAttempt = attempt; transport.referenceBatch = &validated;
+	transport.writeInput = WriteGeneralsAIEnemyReferenceInput; transport.immutableInput = &input;
+	transport.writeOutput = observerFailure ?
+		WriteGeneralsAIEnemyReferenceOutputWithInjectedDigestFailure :
+		WriteGeneralsAIEnemyReferenceOutput; transport.productionOutput = &output;
+	transport.serialCompute = CountGeneralsDetached; transport.detachedSerialOutput = &oracle; transport.operationCount = 4;
+	GeneralsPhaseObservations observations; observations.clock = &run.clock; observations.baseline = baseline;
+	observations.lateCancel = lateCancel;
+	rts::AIPlanningTestHooks hooks; hooks.context = &observations;
+	hooks.observe = GeneralsPhaseObservations::observe; hooks.cancelAtEntry = GeneralsPhaseObservations::cancel;
+	if (lateCancel)
+	{
+		hooks.beforeWait = GeneralsPhaseObservations::beforeWait;
+		hooks.afterCancel = GeneralsPhaseObservations::afterCancel;
+		hooks.releasedGroup = GeneralsPhaseObservations::releasedGroup;
+	}
+	transport.testHooks = &hooks;
+	std::atomic<UnsignedInt> rendezvous(0);
+	rts::AIPlanningBatchStatus status;
+	const unsigned detachedBefore = g_generalsDetachedCalls;
+	const bool executed = ExecuteGeneralsAIEnemyPlanningBatch(rts::AI_PLANNING_EXECUTION_PARALLEL, false,
+		snapshots, 4, results, injectFailure ? 1 : rts::AI_PLANNING_INVALID_ORDINAL, &status,
+		baseline || lateCancel ? 0 : &rendezvous, &timingBatch, &transport);
+	GeneralsPhaseExpect(executed && status.usedSerialFallback == (abortExpected ? 1U : 0U),
+		"Generals source success or injected failure keeps its predeclared native outcome");
+	for (unsigned index = 0; index != 4; ++index)
+	{
+		GeneralsPhaseExpect(results[index].valid == 1 && results[index].selectedPlayerIndex == 10 &&
+			results[index].selectedDistanceSquared == 1000.0f && results[index].orderKey.sourceOrdinal == 0,
+			"actual Generals strict tie selects literal first candidate ten, not shared ZH scoring");
+		GeneralsPhaseExpect(observations.entries[index] == 1 &&
+			observations.bodies[index] == (injectFailure && index == 1 ? 0U : 1U) &&
+			observations.validations[index] == (abortExpected && !observerFailure ? 0U : 1U),
+			"Generals enters four ranges once and retains distinct serial owner validations");
+	}
+	GeneralsPhaseExpect(!observations.wrongOwner && g_generalsDetachedCalls == detachedBefore,
+		"Generals body provenance is real and no detached planner supplies baseline output");
+	if (lateCancel && !baseline)
+	{
+		GeneralsPhaseExpect(!observations.waitExpired && observations.held == 4 && observations.cancelNotifications == 1 &&
+			observations.releaseNotifications == 1 && observations.releasedCancelled &&
+			observations.releasedCompleted == 4 && observations.releasedSubmitted == 4,
+			"Generals native timeout cancels a real group then drains four late-completed planners");
+		GeneralsPhaseExpect(observations.releasedReason == 3,
+			"Generals source reason records actual group cancellation independently of completed checkpoints");
+	}
+	if (lateCancel && baseline)
+		GeneralsPhaseExpect(observations.held == 0 && observations.cancelNotifications == 0 && observations.releaseNotifications == 0,
+			"Generals baseline replays late disposal without a wait or a new physical cancellation");
+	const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+	if (baseline)
+		GeneralsPhaseExpect(scheduler.submittedJobs == 0 && scheduler.executedJobs == 0 && scheduler.ownerHelpJobs == 0 &&
+			status.physicalWorkerMask == 0 && status.distinctPhysicalWorkers == 0 &&
+			status.peakConcurrentPhysicalWorkers == 0 && status.parallelSucceeded == 0,
+			"Generals baseline executes no physical or owner-help jobs and fabricates no worker authority");
+	else GeneralsPhaseExpect(scheduler.submittedJobs == 4 && scheduler.executedJobs == 4 &&
+		status.ownerHelpedJobs == 0 && (abortExpected || status.parallelSucceeded == 1),
+		"Generals controlled source uses its own actual four-job executor");
+	const bool accepted = executed && status.usedSerialFallback == 0;
+	const auto linked = validated;
+	rts::RecordAIPlanningOwnerCommit(executed, &status);
+	if (linked.valid()) GeneralsPhaseExpect(rts::FinishAIPlanningReferenceBatch(&transport, accepted),
+		"Generals owner completes canonical publication before source attempt finish");
+	GeneralsPhaseExpect(linked.valid() == accepted, "Generals native executor links only independently validated output");
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = accepted ? KERNEL_PERFORMANCE_COMMITTED : KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION;
+	finish.reasonSchema = 1; finish.reason = accepted ? 1 : 2;
+	finish.fallbackEntered = finish.fallbackCompleted = executed && status.usedSerialFallback != 0;
+	finish.validatedBatch = linked;
+	GeneralsPhaseExpect(run.reference.finishAttempt(attempt, finish) == !observerFailure,
+		"Generals records observer failure before attempting receipt closure");
+	KernelPerformanceAttemptReap reap = {}; reap.reasonSchema = 1; reap.reason = 1;
+	reap.pendingJobs = scheduler.pendingJobs; reap.outstandingJobs = scheduler.outstandingJobs;
+	GeneralsPhaseExpect(run.reference.reapAttempt(attempt, reap) == !observerFailure,
+		"Generals does not silently reap a poisoned observer attempt");
+	if (accepted)
+	{
+		const auto commit = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_COMMIT);
+		run.clock.now.fetch_add(11); run.timing.endInterval(commit);
+	}
+	GeneralsPhaseExpect(run.timing.endBatch(timingBatch, finish.disposition), "Generals timing retains native outcome");
+	const bool sealed = run.reference.sealObservationWindow() && run.reference.sealExecutionClosure();
+	const auto snapshot = run.reference.freeze();
+	const bool timingClosed = run.closeTiming(scheduler);
+	GeneralsPhaseExpect(timingClosed, "Generals whole owner phase and scheduler close");
+	if (baseline && timingClosed && !observerFailure)
+	{
+		const auto &phase = run.timingSnapshot.phaseAccounting.phases[KERNEL_PHASE_OWNER_INTAKE];
+		GeneralsPhaseExpect(phase.pureNanoseconds == (abortExpected ? 0U : 80U) &&
+			phase.serialNanoseconds >= (abortExpected ? 5U : 180U),
+			"Generals four planner bodies are pure only on success; canonical owner validations remain serial");
+	}
+	const bool canonicalState = observerFailure ?
+		!snapshot.complete && snapshot.streamCount == 0 : abortExpected ?
+		!snapshot.complete && snapshot.streamCount == 0 :
+		snapshot.complete && snapshot.streamCount == 1;
+	if (observerFailure)
+		GeneralsPhaseExpect(!sealed && canonicalState && snapshot.errors != 0 && !snapshot.trace.complete,
+			"Generals rejects a mismatched observer digest before owner publication and leaves no valid receipt");
+	else
+		GeneralsPhaseExpect(sealed && canonicalState && snapshot.errors == 0 && snapshot.trace.complete && snapshot.trace.attemptCount == 1 &&
+			snapshot.trace.capturedOperationCount == 4 && snapshot.trace.dispatchCount == 1 &&
+			snapshot.trace.rangeCount == 4 && snapshot.trace.releasedRangeCount == 4 && snapshot.trace.reapCount == 1,
+			"actual Generals enemy executor supplies complete source and consumed attempt evidence");
+	if (!baseline) trace.source = snapshot;
+	else if (snapshot.complete && !abortExpected)
+		GeneralsPhaseExpect(snapshot.streams[0].outputDigest.equals(trace.source.streams[0].outputDigest),
+			"Generals same native canonical serializer binds once-only consumer output to source");
+	jobs.shutdown(); jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME);
+	std::cerr << "END [Generals AI " << (baseline ? "consumer" : "source") <<
+		" variant=" << g_generalsPhaseVariant << "] failures=" << g_generalsPhaseFailures - failuresBefore <<
+		" traceComplete=" << snapshot.trace.complete << '\n';
+	return observerFailure ? canonicalState && snapshot.errors != 0 && !snapshot.trace.complete :
+		canonicalState && snapshot.errors == 0 && snapshot.trace.complete &&
+		(!lateCancel || baseline || observations.releasedReason == 3);
+}
+void TestGeneralsActualNativeSourceConsumer()
+{
+	for (unsigned variant = 0; variant != 4; ++variant)
+	{
+		rts_test::NativeKernelTrace trace(30 + variant);
+		if (RunGeneralsNativePhaseRole(trace, false, variant))
+			RunGeneralsNativePhaseRole(trace, true, variant);
+	}
+}
+#endif
 }
 
 int main()
@@ -462,6 +733,10 @@ int main()
 	TestTopologyAndReplayGates();
 	TestGeneralsScoringAndUntrustedResults();
 	TestCanonicalBatchAcrossTopologiesAndFailure();
+#if defined(_WIN64)
+	TestGeneralsActualNativeSourceConsumer();
+	if (g_generalsPhaseFailures != 0) return 1;
+#endif
 	std::cout << "Generals deterministic AI planning tests passed.\n";
 	return 0;
 }

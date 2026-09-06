@@ -174,10 +174,11 @@ function Assert-ProductRuntimeSelector([string]$Content)
         (Test-DependencyToken $nativeBranch 'rts_legacy_product_runtime')) {
         throw 'Native x64 product selection does not resolve exclusively through rts_native_product_runtime.'
     }
-    if ($legacyBranch -notmatch '(?i)include\s*\([^\)]*legacy-product-runtime\.cmake' -or
-        $legacyBranch -notmatch '(?is)target_link_libraries\s*\(\s*rts_product_runtime\s+INTERFACE\s+rts_legacy_product_runtime\s*\)' -or
+    if ($legacyBranch -notmatch '(?is)target_link_libraries\s*\(\s*rts_product_runtime\s+INTERFACE\s+rts_legacy_tool_runtime\s*\)' -or
+        $legacyBranch -match '(?i)include\s*\([^\)]*legacy-product-runtime\.cmake' -or
+        (Test-DependencyToken $legacyBranch 'rts_legacy_product_runtime') -or
         (Test-DependencyToken $legacyBranch 'rts_native_product_runtime')) {
-        throw 'The 32-bit product selection does not resolve exclusively through rts_legacy_product_runtime.'
+        throw 'The 32-bit non-product selector must resolve only the historical tool runtime after product retirement.'
     }
 
     $outsideSelection = $selection.OutsideSelection
@@ -185,7 +186,8 @@ function Assert-ProductRuntimeSelector([string]$Content)
         'native-product-runtime.cmake',
         'legacy-product-runtime.cmake',
         'rts_native_product_runtime',
-        'rts_legacy_product_runtime'
+        'rts_legacy_product_runtime',
+        'rts_legacy_tool_runtime'
     )) {
         if (Test-DependencyToken $outsideSelection $architectureSpecificToken) {
             throw "Architecture-specific product runtime token '$architectureSpecificToken' appears outside the selected architecture branches."
@@ -782,8 +784,7 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     include("${CMAKE_CURRENT_LIST_DIR}/native-product-runtime.cmake")
     target_link_libraries(rts_product_runtime INTERFACE rts_native_product_runtime)
 elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
-    include("${CMAKE_CURRENT_LIST_DIR}/legacy-product-runtime.cmake")
-    target_link_libraries(rts_product_runtime INTERFACE rts_legacy_product_runtime)
+    target_link_libraries(rts_product_runtime INTERFACE rts_legacy_tool_runtime)
 elseif(RTS_BUILD_PRODUCT)
 endif()
 '@
@@ -794,8 +795,7 @@ endif()
       include ( "${CMAKE_CURRENT_LIST_DIR}/native-product-runtime.cmake" )
       target_link_libraries ( rts_product_runtime INTERFACE rts_native_product_runtime )
   ELSEIF ( CMAKE_SIZEOF_VOID_P EQUAL 4 )
-      include ( "${CMAKE_CURRENT_LIST_DIR}/legacy-product-runtime.cmake" )
-      target_link_libraries ( rts_product_runtime INTERFACE rts_legacy_product_runtime )
+      target_link_libraries ( rts_product_runtime INTERFACE rts_legacy_tool_runtime )
   ELSEIF ( RTS_BUILD_PRODUCT )
   ENDIF()
 '@
@@ -1316,6 +1316,7 @@ $runtimeModules = @{
     Selector = Join-Path $SourceRoot 'cmake/product-runtime.cmake'
     Native = Join-Path $SourceRoot 'cmake/native-product-runtime.cmake'
     Legacy = Join-Path $SourceRoot 'cmake/legacy-product-runtime.cmake'
+    Tool = Join-Path $SourceRoot 'cmake/legacy-tool-runtime.cmake'
 }
 foreach ($runtimeModule in $runtimeModules.Values) {
     if (-not (Test-Path -LiteralPath $runtimeModule)) {
@@ -1326,6 +1327,7 @@ foreach ($runtimeModule in $runtimeModules.Values) {
 $selectorModule = Get-Content -LiteralPath $runtimeModules.Selector -Raw
 $nativeModule = Get-Content -LiteralPath $runtimeModules.Native -Raw
 $legacyModule = Get-Content -LiteralPath $runtimeModules.Legacy -Raw
+$toolModule = Get-Content -LiteralPath $runtimeModules.Tool -Raw
 Assert-ProductRuntimeSelector $selectorModule
 
 $rootCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'CMakeLists.txt') -Raw
@@ -1334,6 +1336,13 @@ if (-not (Test-ExactCMakeLine $rootCMake 'include(cmake/product-runtime.cmake)')
     (Test-ExactCMakeLine $rootCMake 'include(cmake/legacy-product-runtime.cmake)') -or
     $rootCMake -match '(?i)native-d3d8-compat\.cmake') {
     throw 'The root graph must register only the architecture-selected product runtime module.'
+}
+if ($rootCMake -notmatch '(?is)if\s*\(\s*RTS_BUILD_PRODUCT\s+AND\s*\(\s*NOT\s+WIN32\s+OR\s+NOT\s+CMAKE_SIZEOF_VOID_P\s+EQUAL\s+8\s*\)\s*\).*?message\s*\(\s*FATAL_ERROR[^\)]*native x64-only') {
+    throw 'The root graph must reject every non-Windows-x64 product configuration before dependency selection.'
+}
+if ($rootCMake -notmatch '(?is)if\s*\(\s*CMAKE_SIZEOF_VOID_P\s+EQUAL\s+4\s+AND\s+NOT\s+RTS_BUILD_PRODUCT\s*\).*?include\s*\(\s*cmake/miles\.cmake\s*\).*?include\s*\(\s*cmake/bink\.cmake\s*\).*?include\s*\(\s*cmake/dx8\.cmake\s*\).*?include\s*\(\s*cmake/legacy-tool-runtime\.cmake\s*\)' -or
+    $rootCMake -match '(?is)RTS_BUILD_PRODUCT\s+OR\s+RTS_BUILD_CORE_TOOLS') {
+    throw 'D3D8, Miles, and Bink dependency discovery must be confined to an explicit non-product 32-bit graph.'
 }
 foreach ($titleSubtree in @(
     @{ Directory = 'Generals'; Option = 'RTS_BUILD_GENERALS' },
@@ -1344,12 +1353,30 @@ foreach ($titleSubtree in @(
         throw "The root graph must select $($titleSubtree.Directory) from $($titleSubtree.Option) independently of RTS_BUILD_PRODUCT."
     }
 }
-if ($legacyModule -notmatch 'CMAKE_SIZEOF_VOID_P EQUAL 4') {
-    throw 'The legacy product runtime module is not restricted to 32-bit builds.'
+if ($legacyModule -notmatch '(?is)message\s*\(\s*FATAL_ERROR[^\)]*Legacy Win32 product runtime has been retired') {
+    throw 'The legacy product runtime tombstone must fail closed.'
 }
-foreach ($forbidden in @('rts_native_product_runtime', 'rts_xaudio2', 'bcrypt', 'd3d11', 'dxgi')) {
+if ($toolModule -notmatch '(?is)if\s*\(\s*RTS_BUILD_PRODUCT\s+OR\s+NOT\s+CMAKE_SIZEOF_VOID_P\s+EQUAL\s+4\s*\)' -or
+    -not (Test-DependencyToken $toolModule 'milesstub') -or
+    -not (Test-DependencyToken $toolModule 'binkstub') -or
+    (Test-DependencyToken $toolModule 'rts_d3d8lib')) {
+    throw 'The historical tool runtime must be x86 non-product-only and may own Miles/Bink but not the D3D8 renderer.'
+}
+foreach ($forbidden in @(
+    'add_library',
+    'target_link_libraries',
+    'rts_legacy_product_runtime',
+    'rts_native_product_runtime',
+    'rts_xaudio2',
+    'bcrypt',
+    'd3d11',
+    'dxgi',
+    'milesstub',
+    'binkstub',
+    'rts_d3d8lib'
+)) {
     if (Test-DependencyToken $legacyModule $forbidden) {
-        throw "The 32-bit legacy runtime module leaks native dependency '$forbidden'."
+        throw "The retired legacy product runtime tombstone retains active token '$forbidden'."
     }
 }
 foreach ($required in @('rts_xaudio2', 'bcrypt', 'd3d11', 'dxgi')) {
@@ -1369,25 +1396,20 @@ if (-not (Test-ExactCMakeLine $nativeModule `
 
 $presets = Get-Content -LiteralPath (Join-Path $SourceRoot 'CMakePresets.json') -Raw |
     ConvertFrom-Json
-Assert-PresetCacheContract $presets 'vc6-generals-oracle' @{
-    RTS_BUILD_CORE_TOOLS = 'OFF'
-    RTS_BUILD_CORE_EXTRAS = 'OFF'
-    RTS_BUILD_PRODUCT = 'ON'
-    RTS_BUILD_GENERALS = 'ON'
-    RTS_BUILD_ZEROHOUR = 'OFF'
-    RTS_BUILD_GENERALS_PRODUCT = 'ON'
-    RTS_BUILD_GENERALS_TOOLS = 'OFF'
-    RTS_BUILD_OPTION_FFMPEG = 'OFF'
+foreach ($retiredPreset in @('vc6-generals-oracle', 'vc6-zerohour-oracle', 'vc6-weekly')) {
+    if (@($presets.configurePresets | Where-Object { $_.name -eq $retiredPreset }).Count -ne 0 -or
+        @($presets.buildPresets | Where-Object { $_.name -eq $retiredPreset }).Count -ne 0 -or
+        @($presets.workflowPresets | Where-Object { $_.name -eq $retiredPreset }).Count -ne 0) {
+        throw "Retired 32-bit product preset '$retiredPreset' remains active."
+    }
 }
-Assert-PresetCacheContract $presets 'vc6-zerohour-oracle' @{
-    RTS_BUILD_CORE_TOOLS = 'OFF'
-    RTS_BUILD_CORE_EXTRAS = 'OFF'
-    RTS_BUILD_PRODUCT = 'ON'
-    RTS_BUILD_GENERALS = 'OFF'
-    RTS_BUILD_ZEROHOUR = 'ON'
-    RTS_BUILD_ZEROHOUR_PRODUCT = 'ON'
-    RTS_BUILD_ZEROHOUR_TOOLS = 'OFF'
-    RTS_BUILD_OPTION_FFMPEG = 'OFF'
+Assert-PresetCacheContract $presets 'vc6' @{ RTS_BUILD_PRODUCT = 'OFF' }
+Assert-PresetCacheContract $presets 'win32' @{ RTS_BUILD_PRODUCT = 'OFF' }
+foreach ($preset in @($presets.configurePresets | Where-Object { $_.name -match '^(?:vc6|win32|mingw-w64-i686)' })) {
+    $product = $preset.cacheVariables.PSObject.Properties['RTS_BUILD_PRODUCT']
+    if ($null -ne $product -and $product.Value -eq 'ON') {
+        throw "32-bit preset '$($preset.name)' may not enable the retired product runtime."
+    }
 }
 Assert-PresetCacheContract $presets 'win32-generals-authoring' @{
     RTS_BUILD_PRODUCT = 'OFF'
@@ -1413,6 +1435,28 @@ if (-not (Test-Path -LiteralPath $ciWorkflowPath -PathType Leaf) -or
 Assert-AuthoringWorkflowProductContract `
     (Get-Content -LiteralPath $ciWorkflowPath -Raw) `
     (Get-Content -LiteralPath $buildWorkflowPath -Raw)
+
+$ciWorkflow = Get-Content -LiteralPath $ciWorkflowPath -Raw
+foreach ($retiredProductLane in @(
+    'vc6-generals-oracle',
+    'vc6-zerohour-oracle',
+    'vc6-weekly',
+    'replaycheck-generalsmd:',
+    'product: true'
+)) {
+    if ($ciWorkflow -match [regex]::Escape($retiredProductLane)) {
+        throw "CI retains retired 32-bit product lane '$retiredProductLane'."
+    }
+}
+
+$toolsCMake = Get-Content -LiteralPath (Join-Path $SourceRoot 'Core/Tools/CMakeLists.txt') -Raw
+foreach ($strictGate in @('PortabilityAudit/PortabilityAudit.ps1', 'NativeRendererGraphAudit/NativeRendererGraphAudit.ps1')) {
+    $gatePattern = '(?is)-File\s+"\$\{CMAKE_CURRENT_SOURCE_DIR\}/' +
+        [regex]::Escape($strictGate) + '".*?-StrictFinal'
+    if ($toolsCMake -notmatch $gatePattern) {
+        throw "Final native audit '$strictGate' is not registered with -StrictFinal."
+    }
+}
 
 foreach ($title in @(
     @{ Path = 'Generals/Code/CMakeLists.txt'; ProductOption = 'RTS_BUILD_GENERALS_PRODUCT' },

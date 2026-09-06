@@ -26,6 +26,6 @@ else()
 endif()
 
 add_test(NAME immutable_spatial_query_tests
-    COMMAND immutable_spatial_query_tests
+    COMMAND immutable_spatial_query_tests --local-capacity
 )
 set_tests_properties(immutable_spatial_query_tests PROPERTIES TIMEOUT 30)

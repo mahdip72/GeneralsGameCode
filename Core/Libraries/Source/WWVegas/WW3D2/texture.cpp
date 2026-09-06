@@ -70,7 +70,7 @@ struct NativeTextureStorage
 {
 	NativeTextureStorage() : owner(), descriptor(), pixels(), rowPitches(),
 		slicePitches(), gpuLease(), sourceFormat(WW3D_FORMAT_UNKNOWN),
-		missing(false) {}
+		missing(false), gpuAuthored(false) {}
 
 	rts::render::NativeW3DTextureOwner owner;
 	rts::render::TextureDescriptor descriptor;
@@ -80,6 +80,7 @@ struct NativeTextureStorage
 	mutable rts::render::NativeW3DGpuContentLease gpuLease;
 	WW3DFormat sourceFormat;
 	bool missing;
+	mutable bool gpuAuthored;
 };
 
 static bool Apply_Native_Empty_Texture(TextureBaseClass *texture,
@@ -120,10 +121,12 @@ static bool Apply_Native_Empty_Texture(TextureBaseClass *texture,
 	if (!upload.Prepare(format, width, height, mip_count, array_count, views,
 		array_count * mip_count)) return false;
 	rts::render::TextureDescriptor descriptor = upload.Descriptor();
+	// Explicitly empty textures are procedural destinations (including copied
+	// projected shadows). Asset uploads retain the immutable upload descriptor.
+	descriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
 	if (render_target)
 	{
 		descriptor.binding |= rts::render::RENDER_TEXTURE_RENDER_TARGET;
-		descriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
 	}
 	return texture->Apply_Native_Texture(descriptor, upload.Subresources(),
 		upload.SubresourceCount(), format, true);
@@ -287,6 +290,7 @@ bool TextureBaseClass::Apply_Native_Texture(
 	storage->rowPitches.swap(row_pitches);
 	storage->slicePitches.swap(slice_pitches);
 	storage->gpuLease = rts::render::NativeW3DGpuContentLease();
+	storage->gpuAuthored = false;
 	storage->sourceFormat = source_format;
 	storage->missing = missing_texture;
 	NativeTexture = storage;
@@ -332,8 +336,26 @@ bool TextureBaseClass::Acquire_Native_Texture(
 	const bool caller_requested_generation = handle->isValid() ||
 		(gpu_lease != nullptr && gpu_lease->isValid());
 	if (NativeTexture->owner.AcquireForSampling(handle, lease) ==
-		rts::render::RENDER_RESULT_OK) return true;
+		rts::render::RENDER_RESULT_OK)
+	{
+		if (lease->isValid())
+		{
+			NativeTexture->gpuAuthored = true;
+			NativeTexture->gpuLease = *lease;
+		}
+		return true;
+	}
 	if (caller_requested_generation) return false;
+	if (NativeTexture->gpuAuthored)
+	{
+		// A newer GPU write may invalidate the cached lease, but its retained
+		// creation pixels must never replace rendered content. Reacquire only
+		// a current GPU/registry lease; failed recovery remains unsampleable.
+		*handle = rts::render::NativeW3DTextureHandle();
+		*lease = rts::render::NativeW3DGpuContentLease();
+		return NativeTexture->owner.AcquireForSampling(handle, lease) ==
+			rts::render::RENDER_RESULT_OK;
+	}
 	if (!Refresh_Native_CPU_Content()) return false;
 	*handle = rts::render::NativeW3DTextureHandle();
 	*lease = rts::render::NativeW3DGpuContentLease();
@@ -361,8 +383,23 @@ bool TextureBaseClass::Acquire_Native_Surface(unsigned int mip_level,
 	const bool caller_requested_generation = surface->isValid() ||
 		(gpu_lease != nullptr && gpu_lease->isValid());
 	if (NativeTexture->owner.AcquireSurface(mip_level, array_slice, surface,
-		lease) == rts::render::RENDER_RESULT_OK) return true;
+		lease) == rts::render::RENDER_RESULT_OK)
+	{
+		if (lease->isValid())
+		{
+			NativeTexture->gpuAuthored = true;
+			NativeTexture->gpuLease = *lease;
+		}
+		return true;
+	}
 	if (caller_requested_generation) return false;
+	if (NativeTexture->gpuAuthored)
+	{
+		*surface = rts::render::NativeW3DSurfaceHandle();
+		*lease = rts::render::NativeW3DGpuContentLease();
+		return NativeTexture->owner.AcquireSurface(mip_level, array_slice,
+			surface, lease) == rts::render::RENDER_RESULT_OK;
+	}
 	if (!Refresh_Native_CPU_Content()) return false;
 	*surface = rts::render::NativeW3DSurfaceHandle();
 	*lease = rts::render::NativeW3DGpuContentLease();
@@ -377,15 +414,19 @@ bool TextureBaseClass::Publish_Native_Output(
 	if (NativeTexture == nullptr) return false;
 	rts::render::NativeW3DGpuContentLease *lease = gpu_lease == nullptr ?
 		&NativeTexture->gpuLease : gpu_lease;
-	return NativeTexture->owner.PublishOutputWrite(surface, lease) ==
+	const bool published = NativeTexture->owner.PublishOutputWrite(surface, lease) ==
 		rts::render::RENDER_RESULT_OK;
+	if (published) NativeTexture->gpuAuthored = true;
+	return published;
 }
 
 bool TextureBaseClass::Copy_Native_Active_Color_Target()
 {
 	if (NativeTexture == nullptr) return false;
-	return NativeTexture->owner.CopyActiveColorTarget(
+	const bool copied = NativeTexture->owner.CopyActiveColorTarget(
 		&NativeTexture->gpuLease) == rts::render::RENDER_RESULT_OK;
+	if (copied) NativeTexture->gpuAuthored = true;
+	return copied;
 }
 
 bool TextureBaseClass::Publish_Native_BGRA8(const void *data,
@@ -468,7 +509,7 @@ bool TextureBaseClass::Generate_Native_Mip_Levels()
 
 bool TextureBaseClass::Refresh_Native_CPU_Content() const
 {
-	if (NativeTexture == nullptr) return false;
+	if (NativeTexture == nullptr || NativeTexture->gpuAuthored) return false;
 	const unsigned int count = NativeTexture->descriptor.mipCount *
 		NativeTexture->descriptor.arrayCount;
 	if (count == 0 || count != NativeTexture->pixels.size() ||
@@ -564,6 +605,7 @@ bool TextureBaseClass::Update_Native_Subresource_Data(unsigned int mip_level,
 		return false;
 	}
 	NativeTexture->gpuLease = rts::render::NativeW3DGpuContentLease();
+	NativeTexture->gpuAuthored = false;
 	return true;
 }
 

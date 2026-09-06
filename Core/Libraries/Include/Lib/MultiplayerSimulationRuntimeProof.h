@@ -17,8 +17,8 @@ enum
 
 // This is a diagnostic-only v1 record.  It deliberately has no product trust
 // authority; ResolveMultiplayerSimulationRuntimeProofMask rejects the v1
-// runner/mode even when a caller supplies a nonzero mask.  Live authority must
-// use a separately reviewed lockstep-v2 contract.
+// runner/mode even when a caller supplies a nonzero mask.  Live authority uses
+// the separately embedded lockstep-v2 product promotion contract.
 struct MultiplayerSimulationRuntimeProof
 {
 	unsigned schema;
@@ -155,9 +155,9 @@ inline unsigned ResolveMultiplayerSimulationRuntimeProofMask(
 		MULTIPLAYER_SIMULATION_KERNEL_KNOWN_MASK);
 	// InstalledNet3Validation v1 records useful diagnostic evidence, but it is
 	// not a trust root.  Even a caller that supplies a nonzero build mask must
-	// not turn a mutable v1 proof bundle into live lockstep authority.  A future
-	// lockstep-v2 contract must use a separate schema and resolver with an
-	// independently reviewed trust mechanism.
+	// not turn a mutable v1 proof bundle into live lockstep authority.  The
+	// lockstep-v2 product path uses a separate schema, resolver, and embedded
+	// Release trust root.
 	if (proof.schema == MULTIPLAYER_SIMULATION_RUNTIME_PROOF_SCHEMA &&
 		proof.producer == "installed-runtime-runner-v1" &&
 		proof.validationMode == "scoped-net3-loopback-release-proof")

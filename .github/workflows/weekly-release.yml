@@ -1,6 +1,7 @@
 name: Weekly Release
 
 permissions:
+  actions: read
   contents: write
   pull-requests: write
 
@@ -33,6 +34,16 @@ on:
         options:
           - 'false'
           - 'true'
+      stage5_qualified_run_id:
+        description: 'Successful manual GenCI run containing the exact lockstep-v2-qualified x64 artifacts'
+        required: false
+        default: ''
+        type: string
+      stage5_lockstep_v2_attestation_sha256:
+        description: 'Independently reviewed SHA-256 of Stage5LockstepV2EvidenceClosure.json from that run'
+        required: false
+        default: ''
+        type: string
 
   schedule:
     - cron: '0 9 * * 5'
@@ -85,14 +96,21 @@ jobs:
 
   build-generals:
     needs: [detect-scm-changes, get-date]
-    if: needs.detect-scm-changes.outputs.changed == 'true'
+    if: >-
+      ${{ needs.detect-scm-changes.outputs.changed == 'true' &&
+          ((github.event_name == 'workflow_dispatch' &&
+            inputs.stage5_qualified_run_id != '' &&
+            inputs.stage5_lockstep_v2_attestation_sha256 != '') ||
+           (github.event_name == 'schedule' &&
+            vars.STAGE5_LOCKSTEP_V2_QUALIFIED_RUN_ID != '' &&
+            vars.STAGE5_LOCKSTEP_V2_ATTESTATION_SHA256 != '')) }}
     name: Build Generals${{ matrix.preset && '' }}
     strategy:
       matrix:
         include:
-          - preset: "vc6-weekly"
-            tools: true
-            extras: false
+          - preset: "x64-generals-vcpkg-product"
+            tools: false
+            extras: true
             release: true
       fail-fast: false
     uses: ./.github/workflows/build-toolchain.yml
@@ -101,18 +119,26 @@ jobs:
       preset: ${{ matrix.preset }}
       tools: ${{ matrix.tools }}
       extras: ${{ matrix.extras }}
+      product: true
     secrets: inherit
 
   build-generalsmd:
     needs: [detect-scm-changes, get-date]
-    if: needs.detect-scm-changes.outputs.changed == 'true'
+    if: >-
+      ${{ needs.detect-scm-changes.outputs.changed == 'true' &&
+          ((github.event_name == 'workflow_dispatch' &&
+            inputs.stage5_qualified_run_id != '' &&
+            inputs.stage5_lockstep_v2_attestation_sha256 != '') ||
+           (github.event_name == 'schedule' &&
+            vars.STAGE5_LOCKSTEP_V2_QUALIFIED_RUN_ID != '' &&
+            vars.STAGE5_LOCKSTEP_V2_ATTESTATION_SHA256 != '')) }}
     name: Build GeneralsMD${{ matrix.preset && '' }}
     strategy:
       matrix:
         include:
-          - preset: "vc6-weekly"
-            tools: true
-            extras: false
+          - preset: "x64-zerohour-vcpkg-product"
+            tools: false
+            extras: true
             release: true
       fail-fast: false
     uses: ./.github/workflows/build-toolchain.yml
@@ -121,11 +147,135 @@ jobs:
       preset: ${{ matrix.preset }}
       tools: ${{ matrix.tools }}
       extras: ${{ matrix.extras }}
+      product: true
     secrets: inherit
+
+  validate-promotion-attestation:
+    name: Validate installed lockstep-v2 promotion attestation
+    needs: [build-generals, build-generalsmd, get-date]
+    if: >-
+      ${{ always() &&
+          needs.build-generals.result == 'success' &&
+          needs.build-generalsmd.result == 'success' &&
+          ((github.event_name == 'workflow_dispatch' &&
+            inputs.stage5_qualified_run_id != '' &&
+            inputs.stage5_lockstep_v2_attestation_sha256 != '') ||
+           (github.event_name == 'schedule' &&
+            vars.STAGE5_LOCKSTEP_V2_QUALIFIED_RUN_ID != '' &&
+            vars.STAGE5_LOCKSTEP_V2_ATTESTATION_SHA256 != '')) }}
+    runs-on: windows-2022
+    env:
+      QUALIFIED_RUN_ID: ${{ inputs.stage5_qualified_run_id || vars.STAGE5_LOCKSTEP_V2_QUALIFIED_RUN_ID }}
+      EXPECTED_ATTESTATION_SHA256: ${{ inputs.stage5_lockstep_v2_attestation_sha256 || vars.STAGE5_LOCKSTEP_V2_ATTESTATION_SHA256 }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PROMOTION_BUNDLE_ROOT: 'H:\Stage5WeeklyPromotionQualification'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate qualification run provenance
+        shell: pwsh
+        run: |
+          if ($env:QUALIFIED_RUN_ID -notmatch '^[1-9][0-9]*$') {
+            throw 'The Stage 5 qualified run id must be a positive decimal GitHub Actions run id.'
+          }
+          $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:QUALIFIED_RUN_ID" |
+            ConvertFrom-Json
+          if ([string]$run.head_sha -cne $env:GITHUB_SHA -or
+              [string]$run.conclusion -cne 'success' -or
+              [string]$run.event -cne 'workflow_dispatch' -or
+              [string]$run.path -cne '.github/workflows/ci.yml' -or
+              [string]$run.head_repository.full_name -cne $env:GITHUB_REPOSITORY) {
+            throw 'The supplied qualification run is not a successful same-repository, same-commit manual GenCI run.'
+          }
+
+      - name: Provision canonical qualification root
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'H:\')) {
+            & subst.exe H: $env:RUNNER_TEMP
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) {
+              throw 'The weekly promotion gate could not provision its isolated H: volume.'
+            }
+          }
+          if (Test-Path -LiteralPath $env:PROMOTION_BUNDLE_ROOT) {
+            throw "The canonical weekly promotion root must be fresh: $env:PROMOTION_BUNDLE_ROOT"
+          }
+          New-Item -ItemType Directory -Path $env:PROMOTION_BUNDLE_ROOT | Out-Null
+
+      - name: Download qualified Generals x64 artifact
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Generals-x64-generals-vcpkg-product+e
+          path: H:\Stage5WeeklyPromotionQualification\GeneralsRuntime
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.stage5_qualified_run_id || vars.STAGE5_LOCKSTEP_V2_QUALIFIED_RUN_ID }}
+
+      - name: Download qualified GeneralsMD x64 artifact
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: GeneralsMD-x64-zerohour-vcpkg-product+e
+          path: H:\Stage5WeeklyPromotionQualification\ZeroHourRuntime
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.stage5_qualified_run_id || vars.STAGE5_LOCKSTEP_V2_QUALIFIED_RUN_ID }}
+
+      - name: Download installed lockstep-v2 qualification attestation
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-LockstepV2-Qualification
+          path: promotion-attestation
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.stage5_qualified_run_id || vars.STAGE5_LOCKSTEP_V2_QUALIFIED_RUN_ID }}
+
+      - name: Stage isolated qualification evidence
+        shell: pwsh
+        run: |
+          $attestationRoot = "$env:GITHUB_WORKSPACE/promotion-attestation"
+          $bundleRoot = $env:PROMOTION_BUNDLE_ROOT
+          foreach ($forbiddenPayload in @('GeneralsRuntime', 'ZeroHourRuntime',
+              'QualificationData')) {
+            if (Test-Path -LiteralPath (Join-Path $attestationRoot $forbiddenPayload)) {
+              throw "Qualification evidence contains forbidden runtime/data payload $forbiddenPayload."
+            }
+          }
+          $redirected = @(Get-ChildItem -LiteralPath $attestationRoot -Recurse -Force |
+            Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
+          if ($redirected.Count -ne 0) {
+            throw 'Qualification evidence contains a reparse point.'
+          }
+          Copy-Item -Path (Join-Path $attestationRoot '*') -Destination $bundleRoot `
+            -Recurse -Force
+
+      - name: Revalidate exact promoted artifact closure and attestation
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Validate-Stage5WeeklyPromotionAttestation.ps1" `
+            -BundleRoot $env:PROMOTION_BUNDLE_ROOT `
+            -ExpectedSourceCommit $env:GITHUB_SHA `
+            -ExpectedAttestationSha256 $env:EXPECTED_ATTESTATION_SHA256 `
+            -ExpectedQualificationRunId $env:QUALIFIED_RUN_ID
+          if (-not $?) { throw 'The installed lockstep-v2 weekly publication gate failed.' }
+
+      - name: Upload validated Generals x64 artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: Weekly-Qualified-Generals-x64
+          path: H:\Stage5WeeklyPromotionQualification\GeneralsRuntime
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Upload validated GeneralsMD x64 artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: Weekly-Qualified-GeneralsMD-x64
+          path: H:\Stage5WeeklyPromotionQualification\ZeroHourRuntime
+          retention-days: 1
+          if-no-files-found: error
 
   create-release:
     name: Create Release
-    needs: [build-generals, build-generalsmd, get-date]
+    needs: [validate-promotion-attestation, get-date]
+    if: ${{ needs.validate-promotion-attestation.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -152,27 +302,25 @@ jobs:
             echo 'CHANGELOG_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      # Generals vc6
-      - name: Download Generals VC6 Artifacts
+      - name: Download Generals x64 Artifacts
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
-          name: Generals-vc6-weekly+t
-          path: generals-vc6-artifacts
+          name: Weekly-Qualified-Generals-x64
+          path: generals-x64-artifacts
 
-      - name: Prepare and Zip Generals VC6
+      - name: Prepare and Zip Generals x64
         run: |
-          zip -jr generals-weekly-${{ needs.get-date.outputs.date }}.zip generals-vc6-artifacts/*
+          (cd generals-x64-artifacts && zip -r ../generals-x64-weekly-${{ needs.get-date.outputs.date }}.zip .)
 
-      # GeneralsMD vc6
-      - name: Download GeneralsMD VC6 Artifacts
+      - name: Download GeneralsMD x64 Artifacts
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
-          name: GeneralsMD-vc6-weekly+t
-          path: generalsmd-vc6-artifacts
+          name: Weekly-Qualified-GeneralsMD-x64
+          path: generalsmd-x64-artifacts
 
-      - name: Prepare and Zip GeneralsMD VC6
+      - name: Prepare and Zip GeneralsMD x64
         run: |
-          zip -jr generalszh-weekly-${{ needs.get-date.outputs.date }}.zip generalsmd-vc6-artifacts/*
+          (cd generalsmd-x64-artifacts && zip -r ../generalszh-x64-weekly-${{ needs.get-date.outputs.date }}.zip .)
 
       - name: Generate release notes
         id: release_body
@@ -197,14 +345,14 @@ jobs:
           prerelease: ${{ github.event.inputs.pre-release == 'true' }}
           body: ${{ steps.release_body.outputs.body }}
           files: |
-            generals-weekly-${{ needs.get-date.outputs.date }}.zip
-            generalszh-weekly-${{ needs.get-date.outputs.date }}.zip
+            generals-x64-weekly-${{ needs.get-date.outputs.date }}.zip
+            generalszh-x64-weekly-${{ needs.get-date.outputs.date }}.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Clean up release folders
         if: always()
         run: |
-          rm -rf generals-vc6-artifacts generalsmd-vc6-artifacts
-          rm -f generals-weekly-${{ needs.get-date.outputs.date }}.zip
-          rm -f generalszh-weekly-${{ needs.get-date.outputs.date }}.zip
+          rm -rf generals-x64-artifacts generalsmd-x64-artifacts
+          rm -f generals-x64-weekly-${{ needs.get-date.outputs.date }}.zip
+          rm -f generalszh-x64-weekly-${{ needs.get-date.outputs.date }}.zip

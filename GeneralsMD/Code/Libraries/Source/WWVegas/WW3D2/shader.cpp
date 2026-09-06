@@ -369,6 +369,12 @@ void ShaderClass::Apply()
 {
 	unsigned long diff;
 
+#if defined(_WIN64)
+	// The native owner can reset its logical pipeline between scene passes.
+	// Its state is authoritative; the title's legacy cache cannot suppress
+	// restoring shader-owned fields after those resets.
+	diff = 0xffffffffUL;
+#else
 	if (ShaderDirty)
 	{
 		diff = 0xffffffffUL;
@@ -377,6 +383,7 @@ void ShaderClass::Apply()
 	{
 		diff = CurrentShader ^ ShaderBits;
 	}
+#endif
 
 	if (!diff)
 	{

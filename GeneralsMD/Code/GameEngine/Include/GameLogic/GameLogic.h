@@ -38,6 +38,9 @@
 #include "GameLogic/AI.h"
 #include "GameLogic/Module/UpdateModule.h"	// needed for DIRECT_UPDATEMODULE_ACCESS
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
+#if defined(_WIN64)
+#include "Lib/KernelPerformanceDiagnostics.h"
+#endif
 
 /*
 	At one time, we distinguished between sleepy and nonsleepy
@@ -66,6 +69,10 @@ class GhostObjectManager;
 class CommandButton;
 #if defined(_WIN64)
 class PerformanceReceiptRuntime;
+namespace rts { namespace performance {
+class KernelPerformanceAttempt;
+struct KernelPerformanceReferenceBatch;
+} }
 #endif
 enum BuildableStatus CPP_11(: Int);
 
@@ -155,6 +162,13 @@ public:
 #if defined(_WIN64)
 	bool attachPerformanceReceiptRuntime(PerformanceReceiptRuntime *runtime);
 	bool detachPerformanceReceiptRuntime(PerformanceReceiptRuntime *expectedRuntime);
+	rts::performance::KernelPerformanceAttempt beginPerformanceReceiptAttempt(
+		unsigned workKind, unsigned subtype) noexcept;
+	bool finishPerformanceReceiptAttempt(
+		rts::performance::KernelPerformanceAttempt attempt,
+		rts::performance::KernelPerformanceReferenceBatch validatedBatch,
+		rts::performance::KernelPerformanceDisposition disposition,
+		bool fallbackEntered, bool fallbackCompleted) noexcept;
 #endif
 	const rts::LiveSimulationPhaseRuntimeMetrics &getStage5PhaseRuntimeMetrics() const
 	{

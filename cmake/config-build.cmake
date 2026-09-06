@@ -11,14 +11,27 @@ option(RTS_BUILD_OPTION_ASAN "Build code with Address Sanitizer." OFF)
 option(RTS_BUILD_OPTION_VC6_FULL_DEBUG "Build VC6 with full debug info." OFF)
 option(RTS_BUILD_OPTION_FFMPEG "Enable FFmpeg support" OFF)
 option(RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY
-    "Embed Stage 5 multiplayer authority in a clean, post-gate x64 Release product build"
+    "Embed reviewed lockstep-v2 Stage 5 authority in an x64 Release product build"
     OFF)
 
-set(RTS_MULTIPLAYER_SIMULATION_TRUSTED_PROMOTED_KERNEL_MASK 0)
-set(RTS_MULTIPLAYER_SIMULATION_TRUSTED_SOURCE_REVISION "")
+set(RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK 0)
 if(RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY)
-    message(FATAL_ERROR
-        "RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY=ON is unavailable: InstalledNet3Validation v1 is diagnostic-only; a reviewed lockstep-v2 authority contract is required before live multiplayer kernels can be promoted")
+    if(NOT WIN32 OR IS_VS6_BUILD OR NOT RTS_BUILD_PRODUCT)
+        message(FATAL_ERROR
+            "Stage 5 multiplayer promotion requires a native Windows product build")
+    endif()
+    if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR
+            "Stage 5 multiplayer promotion requires a native x64 product build")
+    endif()
+    if(RTS_BUILD_OPTION_DEBUG OR RTS_BUILD_OPTION_PROFILE OR
+            RTS_BUILD_OPTION_PROFILE_TRACY OR RTS_BUILD_OPTION_ASAN)
+        message(FATAL_ERROR
+            "Stage 5 multiplayer promotion is available only to the normal Release product")
+    endif()
+    # Six kernels completed the separate installed lockstep-v2 qualification:
+    # physics, status, collision, AI planning, immutable spatial, and path.
+    set(RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK 63)
 endif()
 
 # A VC6 product install must be rooted in a task-owned disposable subtree.
@@ -127,3 +140,8 @@ if(RTS_BUILD_OPTION_PROFILE_TRACY)
 else()
     add_library(core_profile_tracy INTERFACE)
 endif()
+
+# The generator expression also keeps an accidentally selected Debug
+# configuration from inheriting authority from a Release-configured build tree.
+target_compile_definitions(core_config INTERFACE
+    "$<$<CONFIG:Release>:RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK=${RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK}>")

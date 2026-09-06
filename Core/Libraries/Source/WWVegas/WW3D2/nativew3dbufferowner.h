@@ -13,6 +13,10 @@ namespace render
 // shutdown. No backend object or COM interface crosses this boundary.
 RenderResult BindNativeW3DBufferResources(NativeW3DResources *resources);
 RenderResult UnbindNativeW3DBufferResources(NativeW3DResources *resources);
+// Clears only the exact publication metadata.  This is used by an aggregate
+// destructor while the shared game-owner lifecycle gate is held; it performs
+// no backend work and is safe before the resource facade member is destroyed.
+void InvalidateNativeW3DBufferResources(NativeW3DResources *resources);
 // All buffer facade calls are render-owner operations.  This query is used by
 // the compatibility-shaped lock wrappers before they touch either a native
 // resource or a sorting allocation.
@@ -32,9 +36,15 @@ public:
 	RenderResult AcquireVertexRange(unsigned int stride, unsigned int offset,
 		unsigned int startVertex, unsigned int vertexCount,
 		GpuHandle *validated) const;
+	// Binding admission validates only owner identity, live generation, and
+	// buffer kind. Exact initialized-byte proof remains at draw-range
+	// acquisition/submission, because legacy callers bind larger capacities than
+	// the prefix they draw (for example shadow decal batches).
+	RenderResult AcquireVertexBinding(GpuHandle *validated) const;
 	RenderResult AcquireIndexRange(RenderFormat format, unsigned int offset,
 		unsigned int startIndex, unsigned int indexCount,
 		GpuHandle *validated) const;
+	RenderResult AcquireIndexBinding(GpuHandle *validated) const;
 
 	bool IsLocked() const;
 	bool HasFailedMutation() const;

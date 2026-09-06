@@ -368,7 +368,8 @@ struct NativeW3DResources::Impl
 {
 	Impl(unsigned int capacity) : references(1), state(0), generation(0),
 		stateGeneration(0),
-		nextAuthorityEpoch(0), lastThreadedCompletionSequence(0), slots(capacity),
+		nextAuthorityEpoch(0), lastThreadedCompletionSequence(0),
+		completionFence(0), completionOwner(0), slots(capacity),
 		bufferCleanupTicketPool(new (std::nothrow)
 			NativeW3DBufferCleanupTicket[capacity]),
 		bufferCleanupTicketCapacity(capacity), cleanupTickets(0),
@@ -382,6 +383,8 @@ struct NativeW3DResources::Impl
 	unsigned int stateGeneration;
 	unsigned int nextAuthorityEpoch;
 	NativeW3DSubmissionSequence lastThreadedCompletionSequence;
+	ThreadedCompletionFence completionFence;
+	void *completionOwner;
 	std::vector<Slot> slots;
 	// Buffer owners draw tickets from this fixed-size pool.  The pool is sized
 	// with the resource slots, so a live buffer slot always has room for its
@@ -672,6 +675,16 @@ RenderResult NativeW3DResources::BindHost(NativeW3DResourceHost *host)
 		BindState(host->State());
 }
 
+RenderResult NativeW3DResources::SetThreadedCompletionFence(
+	ThreadedCompletionFence fence, void *owner)
+{
+	if (!IsOwnerThread() || (fence == 0 && owner != 0))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	m_impl->completionFence = fence;
+	m_impl->completionOwner = owner;
+	return RENDER_RESULT_OK;
+}
+
 RenderResult NativeW3DResources::BindState(NativeW3DRenderState *state)
 {
 	if (m_impl == 0)
@@ -718,6 +731,8 @@ RenderResult NativeW3DResources::BindState(NativeW3DRenderState *state)
 		++m_impl->generation;
 		m_impl->stateGeneration = stateGeneration;
 		m_impl->lastThreadedCompletionSequence = 0;
+		m_impl->completionFence = 0;
+		m_impl->completionOwner = 0;
 	}
 	return RENDER_RESULT_OK;
 }
@@ -790,6 +805,8 @@ RenderResult NativeW3DResources::Shutdown()
 		m_impl->state = 0;
 		m_impl->stateGeneration = 0;
 		m_impl->lastThreadedCompletionSequence = 0;
+		m_impl->completionFence = 0;
+		m_impl->completionOwner = 0;
 	}
 	releasedState->UnregisterResourceTable();
 	releasedState->Release();
@@ -1255,9 +1272,24 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 	const bool asynchronousPublication = submissionSequence != 0;
 	if (!asynchronousPublication && !slot->pendingBufferPublications.empty())
 	{
-		// A resource-only update cannot be ordered after an unconsumed frame
-		// completion without losing the exact publication boundary.
-		return RENDER_RESULT_INVALID_ARGUMENT;
+		// Terrain lighting can update before the next Begin_Render boundary.
+		// Preserve the previous frame's exact completion before publishing this
+		// synchronous write; a queued frame alone is not a failed mutation.
+		if (m_impl->completionFence != 0)
+		{
+			const RenderResult fenced = m_impl->completionFence(
+				m_impl->completionOwner);
+			if (fenced != RENDER_RESULT_OK)
+				return fenced;
+			slot = Find(handle);
+			if (slot == 0 || slot->authorityFailure)
+				return RENDER_RESULT_FAILED;
+		}
+		if (!slot->pendingBufferPublications.empty())
+		{
+			// A missing or incomplete owner fence cannot establish ordering.
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
 	}
 
 	std::vector<InitializedByteRange> nextSubmissionRanges;

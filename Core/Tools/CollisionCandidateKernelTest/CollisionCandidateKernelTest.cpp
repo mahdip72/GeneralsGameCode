@@ -7,11 +7,18 @@
 #if defined(_WIN64)
 #include "Lib/KernelPerformanceDiagnostics.h"
 #include "Lib/KernelPerformanceReference.h"
+#include "../TestSupport/NativeKernelSourceConsumerTest.h"
+#include <chrono>
+#include <thread>
 #endif
 #include "../TestSupport/LocalCapacityTestLane.h"
 
 #include <limits.h>
 #include <stdio.h>
+#if defined(_WIN64)
+#include <string.h>
+#include <vector>
+#endif
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 #include <atomic>
@@ -23,6 +30,10 @@
 	(!defined(_MSC_VER) || _MSC_VER >= 1300)
 extern "C" void rts_job_system_set_test_fault(unsigned fault,
 	unsigned occurrence);
+extern "C" void rts_job_system_set_test_pause_mask(unsigned pauseMask);
+extern "C" bool rts_job_system_wait_for_test_pause(unsigned pausePoint,
+	unsigned timeoutMilliseconds);
+extern "C" void rts_job_system_release_test_pause(unsigned pausePoint);
 extern "C" void rts_collision_candidate_set_test_allocation_failure(
 	unsigned occurrence);
 #endif
@@ -476,6 +487,7 @@ void testOneWorkerFallbackAndCancellation()
 		"cancellation leaves publication untouched");
 	stopJobSystem();
 }
+
 
 struct GenerationState
 {
@@ -1126,6 +1138,396 @@ void testReferenceSerialOracleUsesDetachedPartitionStorage()
 			"serial collision reference records one detached sample and pair count");
 	stopJobSystem();
 }
+
+// These tests enter the real public native kernel. They do not implement a
+// dispatcher, range body, checkpoint probe, canonical serializer or oracle.
+struct ActualNativeCollisionObservations
+{
+	std::atomic<unsigned> entries[2]{}, finishes[2]{}, items[1536]{}, polls[2][4]{};
+	std::atomic<unsigned> units[2]{}, completed[2]{}, releases[2]{};
+	std::atomic<unsigned> validations{0}, reductions{0}, publications{0};
+	std::atomic<bool> wrongIdentity{false};
+	std::atomic<unsigned> truePredicates[2]{};
+	std::atomic<unsigned> sorts[2]{}; bool partition = false;
+	rts::JobGroup *ownerCancellation = 0;
+	rts_test::NativeKernelClock *clock = 0;
+	bool baseline = false;
+	unsigned variant = 0;
+
+	static void observe(void *opaque, rts::CollisionCandidateTestEvent event,
+		unsigned rangeIndex, unsigned begin, unsigned end, unsigned workUnits,
+		bool complete, rts::CollisionCandidate *mutableStorage)
+	{
+		auto &self = *static_cast<ActualNativeCollisionObservations *>(opaque);
+		const bool body = event <= rts::COLLISION_CANDIDATE_TEST_RANGE_FINISHED;
+		if (rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) !=
+			(body ? self.baseline : true)) self.wrongIdentity = true;
+		if (body || event == rts::COLLISION_CANDIDATE_TEST_RANGE_RELEASED)
+		{
+			if (rangeIndex >= 2 || begin != rangeIndex * 768 || end != begin + 768)
+			{ self.wrongIdentity = true; return; }
+		}
+		if (event == rts::COLLISION_CANDIDATE_TEST_RANGE_ENTERED)
+		{
+			++self.entries[rangeIndex];
+			if (!self.baseline && self.variant != 5)
+			{
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+				while ((self.entries[0] == 0 || self.entries[1] == 0) && std::chrono::steady_clock::now() < deadline)
+					std::this_thread::yield();
+				if (self.entries[0] != 1 || self.entries[1] != 1) self.wrongIdentity = true;
+			}
+		}
+		else if (event == rts::COLLISION_CANDIDATE_TEST_GENERIC_NORMALIZED || event == rts::COLLISION_CANDIDATE_TEST_PARTITION_NORMALIZED)
+		{
+			if ((event == rts::COLLISION_CANDIDATE_TEST_PARTITION_NORMALIZED) != self.partition) self.wrongIdentity = true;
+			if (workUnits >= 768) self.wrongIdentity = true;
+			else ++self.items[begin + workUnits];
+			++self.clock->now;
+		}
+		else if (event == rts::COLLISION_CANDIDATE_TEST_LOCAL_SORT) { ++self.sorts[rangeIndex]; self.clock->now.fetch_add(31); }
+		else if (event == rts::COLLISION_CANDIDATE_TEST_RANGE_FINISHED)
+		{
+			++self.finishes[rangeIndex]; self.units[rangeIndex] = workUnits;
+			self.completed[rangeIndex] = complete ? 1 : 0;
+		}
+		else if (event == rts::COLLISION_CANDIDATE_TEST_RANGE_RELEASED)
+		{
+			++self.releases[rangeIndex];
+			const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+			if (scheduler.pendingJobs != 0 || scheduler.outstandingJobs != 0) self.wrongIdentity = true;
+			self.clock->now.fetch_add(13);
+		}
+		else
+		{
+			if (event == rts::COLLISION_CANDIDATE_TEST_OWNER_VALIDATION)
+			{
+				++self.validations;
+				if (self.variant == 4 && (self.ownerCancellation == 0 ||
+					!rts::JobSystem::instance().cancel(*self.ownerCancellation))) self.wrongIdentity = true;
+			}
+			else if (event == rts::COLLISION_CANDIDATE_TEST_OWNER_REDUCTION) ++self.reductions;
+			else if (event == rts::COLLISION_CANDIDATE_TEST_PUBLICATION) ++self.publications;
+			else self.wrongIdentity = true;
+			self.clock->now.fetch_add(17);
+		}
+	}
+
+	static bool checkpoint(void *opaque, unsigned rangeIndex,
+		rts::CollisionCandidateTestCheckpoint site, unsigned workUnits, bool actual)
+	{
+		auto &self = *static_cast<ActualNativeCollisionObservations *>(opaque);
+		if (rangeIndex >= 2 || static_cast<unsigned>(site) >= 4 ||
+			rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) != self.baseline)
+		{ self.wrongIdentity = true; return true; }
+		++self.polls[rangeIndex][static_cast<unsigned>(site)];
+		if ((site == rts::COLLISION_CANDIDATE_TEST_CHECKPOINT_ENTRY && workUnits != 0) ||
+			(site == rts::COLLISION_CANDIDATE_TEST_CHECKPOINT_BLOCK && (workUnits % 256 != 0 || workUnits >= 768)) ||
+			(site >= rts::COLLISION_CANDIDATE_TEST_CHECKPOINT_POST_NORMALIZE && workUnits != 768))
+			self.wrongIdentity = true;
+		const bool cut = rangeIndex == 0 && (
+			(self.variant == 1 && site == rts::COLLISION_CANDIDATE_TEST_CHECKPOINT_ENTRY) ||
+			(self.variant == 2 && site == rts::COLLISION_CANDIDATE_TEST_CHECKPOINT_BLOCK && workUnits == 512) ||
+			(self.variant == 3 && site == rts::COLLISION_CANDIDATE_TEST_CHECKPOINT_POST_SORT));
+		// A current deadline is deliberately the opposite of the source cut.
+		// Only the authenticated native replay probe may select baseline work.
+		if (!self.baseline && (actual || cut)) ++self.truePredicates[rangeIndex];
+		return self.baseline ? !cut : actual || cut;
+	}
+};
+
+#if defined(RTS_BUILD_CORE_EXTRAS)
+// The controller only observes the real first job retiring while the owner is
+// paused at its second queue-push failure. It never executes a kernel body.
+class ActualNativeCollisionPartialSubmission
+{
+public:
+	explicit ActualNativeCollisionPartialSubmission(ActualNativeCollisionObservations &observed, bool enabled)
+		: pauseReached(false), firstRetired(false), m_enabled(enabled)
+	{
+		if (!m_enabled) return;
+		rts_job_system_set_test_pause_mask(4);
+		rts_job_system_set_test_fault(6, 2);
+		try
+		{
+			m_controller = std::thread([this, &observed]()
+			{
+				pauseReached = rts_job_system_wait_for_test_pause(4, 1000);
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+				while (pauseReached && std::chrono::steady_clock::now() < deadline)
+				{
+					if (observed.finishes[0] == 1 && observed.completed[0] == 1 && observed.units[0] == 768 &&
+						rts::JobSystem::instance().outstandingJobCount() == 1)
+					{ firstRetired = true; break; }
+					std::this_thread::yield();
+				}
+				// The remaining outstanding record is the paused, provisional second
+				// submission. Its real rollback and the native cancel/drain follow.
+				rts_job_system_release_test_pause(4);
+			});
+		}
+		catch (...)
+		{
+			rts_job_system_set_test_fault(0, 0);
+			rts_job_system_set_test_pause_mask(0);
+		}
+	}
+	~ActualNativeCollisionPartialSubmission() { finish(); }
+	void finish()
+	{
+		if (!m_enabled) return;
+		rts_job_system_release_test_pause(4);
+		if (m_controller.joinable()) m_controller.join();
+		rts_job_system_set_test_fault(0, 0);
+		rts_job_system_set_test_pause_mask(0);
+		m_enabled = false;
+	}
+	bool pauseReached, firstRetired;
+private:
+	bool m_enabled;
+	std::thread m_controller;
+};
+#endif
+
+bool runActualNativeCollisionRole(rts_test::NativeKernelTrace &trace, bool baseline, unsigned variant, bool partition)
+{
+	using namespace rts::performance;
+	printf("B_NATIVE Collision BEGIN role=%s variant=%u path=%s\n",
+		baseline ? "consumer" : "source", variant, partition ? "partition" : "generic");
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = baseline ? 1 : 2; config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096; config.pinWorkers = false;
+	if (!jobs.start(config) || !jobs.registerCurrentThread(rts::JOB_OWNER_GAME))
+	{ expect(false, "Collision source fixture starts its declared native worker policy"); return false; }
+	rts_test::NativeKernelOwnerRun run;
+	const bool started = run.begin(trace, baseline, 900, KERNEL_PHASE_SPATIAL_WORK);
+	expect(started, "Collision owner validates real source artifact binding before native entry");
+	if (!started) { jobs.shutdown(); jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME); return false; }
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_COLLISION, 0);
+	expect(attempt.valid(), "Collision owner opens the authentic attempt before native capture");
+	auto timingBatch = run.timing.beginBatch(KERNEL_PERFORMANCE_COLLISION, 0, 900, 1);
+	const auto capture = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_CAPTURE);
+	std::vector<rts::CollisionCandidateInput> input(1536);
+	std::vector<rts::PartitionCollisionOccupantSnapshot> occupants(1536);
+	rts::PartitionCollisionObjectSnapshot owner;
+	rts::PartitionCollisionCellSnapshot cells[2];
+	makePerformancePartition(owner, cells, occupants.data(), 1536);
+	for (unsigned index = 0; index != 1536; ++index)
+		input[index] = {10, 20 + index % 300, 1, 2, index};
+	std::vector<rts::CollisionCandidate> output(1536), scratch(1536), untouched(1536), detached(1536);
+	memset(output.data(), 0xcd, output.size() * sizeof(output[0])); untouched = output; detached = output;
+	unsigned outputCount = 0xdeadbeefu;
+	auto ownerCancellation = jobs.createGroup();
+	run.clock.now.fetch_add(5);
+	expect(run.timing.endInterval(capture), "Collision immutable owner capture closes before native work");
+	KernelPerformanceReferenceBatch validated;
+	ActualNativeCollisionObservations observed;
+	observed.clock = &run.clock; observed.baseline = baseline; observed.variant = variant;
+	rts::CollisionCandidateTestHooks hooks;
+	hooks.context = &observed; hooks.observe = ActualNativeCollisionObservations::observe;
+	hooks.checkpoint = ActualNativeCollisionObservations::checkpoint;
+	hooks.physicalWaitMilliseconds = 1000;
+	rts::CollisionCandidateOptions options; options.parallel = true;
+	options.order = rts::COLLISION_CANDIDATE_REVERSE_DISCOVERY;
+	options.cancellationGroup = &ownerCancellation; options.performanceLedger = &run.timing;
+	observed.partition = partition; observed.ownerCancellation = &ownerCancellation;
+	options.minimumGrain = 768; options.testHooks = &hooks;
+	options.performanceBatch = timingBatch; options.performanceReferenceLedger = &run.reference;
+	options.performanceReferenceAttempt = attempt; options.performanceReferenceBatch = &validated;
+	options.performanceReferenceOutput = detached.data(); options.performanceReferenceOutputCapacity = 1536;
+	if (variant == 5 && baseline)
+	{
+		KernelPerformanceDispatchPlan admitted = {};
+		KernelPerformanceRangePlan range = {};
+		expect(run.reference.readSourceDispatch(attempt, 1, admitted) && admitted.rangeCount == 1 &&
+			admitted.operationCount == 768 && admitted.sourceGrain == 768 &&
+			run.reference.readSourceRange(attempt, 1, 0, range) && range.begin == 0 && range.end == 768 &&
+			range.operationCount == 768 && range.bodyKind == (partition ? 2U : 1U),
+			"Collision partial wave authenticates only the actual first admitted range, not the failed second submission");
+	}
+	rts::CollisionCandidateMetrics metrics;
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	ActualNativeCollisionPartialSubmission partialSubmission(observed, !baseline && variant == 5);
+#endif
+	const auto result = partition ?
+		rts::PreparePartitionCollisionCandidates(owner, cells, 2, occupants.data(), 1536,
+			output.data(), 1536, scratch.data(), 1536, options, &outputCount, &metrics) :
+		rts::PrepareCollisionCandidates(input.data(), 1536, output.data(), 1536,
+			scratch.data(), 1536, options, &outputCount, &metrics);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	partialSubmission.finish();
+	if (variant == 5 && !baseline)
+		expect(partialSubmission.pauseReached && partialSubmission.firstRetired &&
+			observed.truePredicates[0] == 0 && observed.truePredicates[1] == 0,
+			"Collision real second queue-push failure follows the first completed job retiring without a true body poll");
+#endif
+	const bool validatedOwnerAbort = variant == 6;
+	const bool published = result == rts::COLLISION_CANDIDATE_PARALLEL;
+	const bool committed = published && !validatedOwnerAbort;
+	// The public collision kernel leaves live owner validation to its caller.
+	// These actual literal-output/sentinel checks occupy that owner interval.
+	const auto ownerValidation = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_VALIDATE);
+	expect(published == (variant == 0 || (validatedOwnerAbort && !baseline)),
+		"Collision native outcome matches the predeclared source case without retries");
+	if (validatedOwnerAbort && baseline)
+		expect(result == rts::COLLISION_CANDIDATE_SERIAL_FALLBACK,
+			"Collision baseline reconstructs validated-aborted output without publishing it to gameplay");
+	if (variant == 5)
+		expect(result == rts::COLLISION_CANDIDATE_SERIAL_FALLBACK,
+			"Collision actual partial-submission failure retains the exact native serial fallback result in both roles");
+	if (published)
+	{
+		const unsigned expectedCount = partition ? 1536 : 300;
+		expect(outputCount == expectedCount && metrics.ownerMergeComparisons > 0,
+			"actual native collision performs owner reduction to literal unique count");
+		for (unsigned index = 0; index != expectedCount; ++index)
+		{
+			const auto &candidate = output[index];
+			expect(candidate.key.lowID == 10 && candidate.key.highID == (partition ? 1555 : 319) - index &&
+				candidate.firstID == 10 && candidate.secondID == candidate.key.highID &&
+				candidate.firstGeneration == (partition ? 7U : 1U) &&
+				candidate.secondGeneration == (partition ? 1537 - index : 2U) &&
+				candidate.discoveryOrder == (partition ? 1535 : 299) - index,
+				"actual native generic and partition reducers preserve literal orientation, generation and first-discovery order");
+		}
+	}
+	else expect(outputCount == 0xdeadbeefu && memcmp(output.data(), untouched.data(), output.size() * sizeof(output[0])) == 0,
+		"actual native collision abort preserves count and every output byte");
+	expect(memcmp(detached.data(), untouched.data(), detached.size() * sizeof(detached[0])) == 0,
+		"Collision source and baseline do not execute detached serial-reference storage");
+	run.clock.now.fetch_add(19);
+	expect(run.timing.endInterval(ownerValidation), "Collision owner output validation closes outside native bodies");
+	const unsigned targetUnits = variant == 1 ? 0 : variant == 2 ? 512 : 768;
+	for (unsigned range = 0; range != 2; ++range)
+	{
+		if (variant == 5 && range == 1)
+		{
+			expect(observed.entries[range] == 0 && observed.finishes[range] == 0 &&
+				observed.units[range] == 0 && observed.completed[range] == 0 &&
+				observed.releases[range] == (baseline ? 0U : 1U) && observed.sorts[range] == 0 &&
+				observed.polls[range][0] == 0 && observed.polls[range][1] == 0 &&
+				observed.polls[range][2] == 0 && observed.polls[range][3] == 0,
+				"Collision unadmitted second body never enters; only the actual source allocation releases its unused slot");
+			for (unsigned index = 0; index != 768; ++index)
+				expect(observed.items[768 + index] == 0,
+					"Collision failed second submission executes none of its input items");
+			continue;
+		}
+		const unsigned units = range == 0 ? targetUnits : 768;
+		expect(observed.entries[range] == 1 && observed.finishes[range] == 1 && observed.releases[range] == 1 &&
+			observed.units[range] == units && observed.completed[range] == ((range == 0 && variant >= 1 && variant <= 3) ? 0U : 1U),
+			"Collision real admitted range enters once, retains its exact terminal prefix and releases after drain");
+		for (unsigned index = 0; index != 768; ++index)
+			expect(observed.items[range * 768 + index] == (index < units ? 1U : 0U),
+				"Collision actual compiled item helper executes precisely the recorded prefix once");
+		expect(observed.polls[range][0] == 1 &&
+			observed.polls[range][1] == ((range == 0 && variant == 1) ? 0U : 3U) &&
+			observed.polls[range][2] == ((range == 0 && (variant == 1 || variant == 2)) ? 0U : 1U) &&
+			observed.polls[range][3] == ((range == 0 && (variant == 1 || variant == 2)) ? 0U : 1U),
+			"Collision exact native entry, 256-item and post-body checkpoint sites are reached");
+		expect(observed.sorts[range] == ((range == 0 && (variant == 1 || variant == 2)) ? 0U : 1U),
+			"both actual collision normalizers reach local sort only after their full input prefix");
+	}
+	expect(!observed.wrongIdentity && observed.publications ==
+		((variant == 0 || (validatedOwnerAbort && !baseline)) ? 1U : 0U) &&
+		observed.validations == ((variant == 0 || variant == 4 || validatedOwnerAbort) ? 1U : 0U) &&
+		observed.reductions == ((variant == 0 || validatedOwnerAbort) ? 1U : 0U),
+		"Collision owner-only validation/reduction rejects finished-discarded bodies before publication");
+	const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+	expect(scheduler.pendingJobs == 0 && scheduler.outstandingJobs == 0 && scheduler.ownerHelpJobs == 0,
+		"Collision native return follows actual release/acquire and scheduler drain");
+	if (baseline)
+		expect(scheduler.submittedJobs == 0 && scheduler.executedJobs == 0 && metrics.submittedJobs == 0 &&
+			metrics.physicalWorkerJobs == 0 && metrics.ownerHelpedJobs == 0 && metrics.physicalWorkerMask == 0 &&
+			metrics.distinctPhysicalWorkers == 0 && metrics.peakConcurrentPhysicalWorkers == 0,
+			"Collision source-shaped baseline bodies manufacture no worker or owner-help authority");
+	else
+		expect(scheduler.submittedJobs == (variant == 5 ? 1U : 2U) &&
+			scheduler.executedJobs == (variant == 5 ? 1U : 2U) && metrics.submittedJobs == (variant == 5 ? 1U : 2U),
+			"Collision source dispatch counts only the real admitted native jobs");
+	expect(validated.valid() == (variant == 0 || validatedOwnerAbort),
+		"Collision kernel links committed and owner-discarded validated output to its attempt");
+	if (validated.valid()) expect(run.reference.finishBatch(validated, committed),
+		"Collision owner closes the actual validated batch before attempt finish");
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = committed ? KERNEL_PERFORMANCE_COMMITTED : KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION;
+	finish.reasonSchema = 1; finish.reason = committed ? 1 : 2; finish.validatedBatch = validated;
+	expect(run.reference.finishAttempt(attempt, finish), "Collision authentic native attempt closes its actual outcome");
+	KernelPerformanceAttemptReap reap = {}; reap.reasonSchema = 1; reap.reason = 1;
+	reap.pendingJobs = scheduler.pendingJobs; reap.outstandingJobs = scheduler.outstandingJobs;
+	expect(run.reference.reapAttempt(attempt, reap), "Collision native owner reaps only after real storage release and drain");
+	if (committed)
+	{
+		const auto commit = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_COMMIT);
+		run.clock.now.fetch_add(11); run.timing.endInterval(commit);
+	}
+	expect(run.timing.endBatch(timingBatch, finish.disposition), "Collision timing records actual native outcome");
+	const bool sealed = run.reference.sealObservationWindow() && run.reference.sealExecutionClosure();
+	const auto snapshot = run.reference.freeze();
+	const bool timingClosed = run.closeTiming(scheduler);
+	expect(timingClosed, "Collision actual scheduler and owner phase timing reconcile");
+	if (baseline && timingClosed)
+	{
+		const auto &phase = run.timingSnapshot.phaseAccounting.phases[KERNEL_PHASE_SPATIAL_WORK];
+		expect(phase.pureNanoseconds == (variant == 0 ? 1598U : 0U) && phase.serialNanoseconds >= 31,
+			"Collision only committed actual native bodies are pure; reduction and all discarded work stay serial");
+	}
+	const bool canonicalState = variant == 0 ? snapshot.complete && snapshot.streamCount == 1 :
+		validatedOwnerAbort ? snapshot.complete && snapshot.streamCount == 1 &&
+			snapshot.streams[0].validatedBatchCount == 1 &&
+			snapshot.streams[0].committedBatchCount == 0 &&
+			snapshot.streams[0].abortedBatchCount == 1 :
+		!snapshot.complete && snapshot.streamCount == 0;
+	const bool sourceComplete = sealed && canonicalState && snapshot.errors == 0 && snapshot.trace.complete &&
+		snapshot.trace.attemptCount == 1 && snapshot.trace.admittedAttemptCount == 1 &&
+		snapshot.trace.capturedAttemptCount == 1 && snapshot.trace.capturedOperationCount == 1536 &&
+		snapshot.trace.dispatchCount == 1 && snapshot.trace.rangeCount == (variant == 5 ? 1U : 2U) &&
+		snapshot.trace.releasedRangeCount == (variant == 5 ? 1U : 2U) && snapshot.trace.reapCount == 1;
+	expect(sourceComplete, "Collision actual native entry supplies capture, dispatch, exact released bodies and attempt closure");
+	if (!baseline) trace.source = snapshot;
+	else if (sourceComplete && (committed || validatedOwnerAbort))
+		expect(snapshot.streams[0].inputDigest.equals(trace.source.streams[0].inputDigest) &&
+			snapshot.streams[0].outputDigest.equals(trace.source.streams[0].outputDigest) &&
+			snapshot.streams[0].commitDigest.equals(trace.source.streams[0].commitDigest),
+			"Collision once-only native consumer binds every canonical input/output/commit byte to source");
+	printf("B_NATIVE Collision END role=%s variant=%u path=%s source_closure=%u\n",
+		baseline ? "consumer" : "source", variant, partition ? "partition" : "generic", static_cast<unsigned>(sourceComplete));
+	jobs.shutdown(); jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME);
+	return sourceComplete;
+}
+
+void testActualNativeCollisionSourceConsumer()
+{
+	// Breaks caught: missing native integration, copied/detached executor,
+	// recomputed baseline range shape, changed polling, partial publication,
+	// premature release, or treating completed-discarded bodies as pure.
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	const unsigned variantCount = 6;
+#else
+	const unsigned variantCount = 5;
+#endif
+	for (unsigned path = 0; path != 2; ++path)
+	for (unsigned variant = 0; variant != variantCount; ++variant)
+	{
+		// Variant five catches a real failed second submission after the first
+		// native job retired: disposal must not change SERIAL_FALLBACK to CANCELLED.
+		rts_test::NativeKernelTrace trace(variant == 5 ? 90 + path : 80 + variant + 5 * path);
+		// A real source failure is not repaired by synthesizing trace records.
+		// All source buffers leave scope before the authenticated consumer call.
+		if (runActualNativeCollisionRole(trace, false, variant, path != 0))
+			runActualNativeCollisionRole(trace, true, variant, path != 0);
+	}
+	for (unsigned path = 0; path != 2; ++path)
+	{
+		// A fully validated native batch may still be rejected by live owner
+		// identity checks. The source token must survive that abort so the
+		// baseline can reconstruct, validate and discard the same canonical bytes.
+		rts_test::NativeKernelTrace trace(100 + path);
+		if (runActualNativeCollisionRole(trace, false, 6, path != 0))
+			runActualNativeCollisionRole(trace, true, 6, path != 0);
+	}
+}
 #endif
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
@@ -1520,7 +1922,7 @@ int main(int argc, char **argv)
 	{
 		fprintf(stderr,
 			"Usage: core_collision_candidate_kernel_tests "
-			"[--local-capacity]\n");
+			"[--local-capacity|--external-qualification]\n");
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);
@@ -1538,6 +1940,7 @@ int main(int argc, char **argv)
 	testPerformanceAbortedAndDisabledPaths();
 	testReferenceTokenHandoffFromAdmittedPartition();
 	testReferenceSerialOracleUsesDetachedPartitionStorage();
+	testActualNativeCollisionSourceConsumer();
 #endif
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
 	testActualWorkerMatrixParity(localCapacity);

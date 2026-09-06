@@ -23,6 +23,15 @@ function Assert-NativeRuntimeIsLegacyFree([string] $ProductRoot, [string] $Descr
     }
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $ProductRoot 'licenses/native-d3d8-compat'))) `
         "$Description incorrectly contains the retired D3D8 compatibility license package."
+    foreach ($validationExecutable in @('g_skirmish_ai_runner_contract_tests.exe',
+        'z_runtime_regression_tests.exe')) {
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $ProductRoot `
+                    $validationExecutable))) `
+            "$Description incorrectly contains test-only executable $validationExecutable."
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $ProductRoot `
+                    ([IO.Path]::ChangeExtension($validationExecutable, '.pdb'))))) `
+            "$Description incorrectly contains a test-only validation PDB."
+    }
 }
 
 function Get-Sha256([string] $Path) {
@@ -158,6 +167,26 @@ try {
         $negativeLicenseRejected = $true
     }
     Assert-True $negativeLicenseRejected 'The packaging audit accepted the retired D3D8 compatibility license package.'
+
+    foreach ($validationExecutable in @('g_skirmish_ai_runner_contract_tests.exe',
+        'z_runtime_regression_tests.exe')) {
+        $negativeValidationFixture = Join-Path $testRoot `
+            ('negative-' + $validationExecutable)
+        New-Item -ItemType Directory -Path $negativeValidationFixture -Force |
+            Out-Null
+        [IO.File]::WriteAllText((Join-Path $negativeValidationFixture `
+                $validationExecutable), 'fixture')
+        $negativeValidationRejected = $false
+        try {
+            Assert-NativeRuntimeIsLegacyFree $negativeValidationFixture `
+                "The $validationExecutable negative fixture"
+        }
+        catch {
+            $negativeValidationRejected = $true
+        }
+        Assert-True $negativeValidationRejected `
+            "The packaging audit accepted test-only product payload $validationExecutable."
+    }
 
     Write-Output 'Native product runtime packaging configure/install fixture passed.'
 }

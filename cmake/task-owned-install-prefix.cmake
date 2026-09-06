@@ -1,4 +1,5 @@
-# Validation helpers for disposable VC6 product install destinations.
+# Historical validation helpers retained for non-product scripts that inspect
+# pre-Stage-5 VC6 install safety. No supported product target calls them.
 #
 # VC6 install destinations are deliberately separate from registry discovery.
 # The caller must provide an install root that is either the build's dedicated

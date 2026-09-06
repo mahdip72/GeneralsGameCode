@@ -17,8 +17,11 @@
 #endif
 
 #if defined(_WIN64)
+#include <chrono>
+#include <thread>
 #include "Lib/KernelPerformanceDiagnostics.h"
 #include "Lib/KernelPerformanceReference.h"
+#include "../TestSupport/NativeKernelSourceConsumerTest.h"
 #endif
 
 namespace
@@ -854,6 +857,276 @@ void TestAIPlanningPerformanceTransport()
 	jobs.shutdown();
 	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
 }
+
+int g_nativeAIPhaseFailures = 0;
+unsigned g_nativeAIPhaseVariant = 0;
+bool g_nativeAIPhaseBaseline = false;
+void NativeAIExpect(bool condition, const char *message)
+{
+	if (!condition)
+	{
+		++g_nativeAIPhaseFailures;
+		std::cerr << "FAIL [AI " << (g_nativeAIPhaseBaseline ? "consumer" : "source") <<
+			" variant=" << g_nativeAIPhaseVariant << "]: " << message << '\n';
+	}
+}
+
+struct NativeAIObservations
+{
+	std::atomic<unsigned> entries[3]{};
+	std::atomic<unsigned> prepared[33]{};
+	std::atomic<unsigned> verification[33]{};
+	std::atomic<unsigned> comparisons{0}, winners{0}, fallbacks{0};
+	std::atomic<bool> wrongOwner{false};
+	std::atomic<unsigned> held{0};
+	std::atomic<bool> releaseHeld{false}, waitExpired{false};
+	unsigned cancelNotifications = 0, releaseNotifications = 0, releasedCompleted = 0, releasedSubmitted = 0;
+	unsigned releasedReason = 0;
+	bool releasedCancelled = false;
+	rts_test::NativeKernelClock *clock = 0;
+	unsigned variant = 0;
+	bool baseline = false;
+	~NativeAIObservations() { releaseHeld.store(true, std::memory_order_release); }
+	static void beforeWait(void *opaque)
+	{
+		auto &self = *static_cast<NativeAIObservations *>(opaque);
+		if (self.baseline || !rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME)) self.wrongOwner = true;
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+		while (self.held.load(std::memory_order_acquire) != 3 && std::chrono::steady_clock::now() < deadline)
+			std::this_thread::yield();
+		if (self.held.load(std::memory_order_acquire) != 3)
+		{ self.waitExpired = true; self.releaseHeld.store(true, std::memory_order_release); }
+	}
+	static void afterCancel(void *opaque)
+	{
+		auto &self = *static_cast<NativeAIObservations *>(opaque);
+		if (self.baseline || !rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME)) self.wrongOwner = true;
+		++self.cancelNotifications;
+		self.releaseHeld.store(true, std::memory_order_release);
+	}
+	static void releasedGroup(void *opaque, bool cancelled, unsigned completed, unsigned submitted, unsigned reason)
+	{
+		auto &self = *static_cast<NativeAIObservations *>(opaque);
+		if (self.baseline || !rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME)) self.wrongOwner = true;
+		++self.releaseNotifications; self.releasedCancelled = cancelled;
+		self.releasedCompleted = completed; self.releasedSubmitted = submitted; self.releasedReason = reason;
+	}
+	static void observe(void *opaque, rts::AIPlanningTestEvent event,
+		uint32_t player, uint32_t begin, uint32_t end,
+		rts::AIProductionCandidateFact *verificationFact)
+	{
+		auto &self = *static_cast<NativeAIObservations *>(opaque);
+		const bool owner = rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME);
+		const bool body = event <= rts::AI_PLANNING_TEST_VERIFICATION_FACT;
+		if (owner != (body ? self.baseline : true) || player != 0) self.wrongOwner = true;
+		unsigned ticks = 41;
+		if (event == rts::AI_PLANNING_TEST_RANGE_ENTRY)
+		{
+			if (begin % 16 != 0 || begin > 32 || end != (begin == 32 ? 33 : begin + 16))
+				self.wrongOwner = true;
+			else ++self.entries[begin / 16];
+			ticks = 7;
+		}
+		else if (event == rts::AI_PLANNING_TEST_PREPARED_FACT || event == rts::AI_PLANNING_TEST_VERIFICATION_FACT)
+		{
+			if (begin >= 33 || end != begin + 1) self.wrongOwner = true;
+			else if (event == rts::AI_PLANNING_TEST_PREPARED_FACT) ++self.prepared[begin];
+			else
+			{
+				++self.verification[begin];
+				if (self.variant == 2 && begin == 17 && verificationFact != 0)
+					++verificationFact->minimumCost;
+			}
+			ticks = 3;
+		}
+		else if (event == rts::AI_PLANNING_TEST_OWNER_FACT_COMPARISON) ++self.comparisons;
+		else if (event == rts::AI_PLANNING_TEST_OWNER_WINNER) ++self.winners;
+		else if (event == rts::AI_PLANNING_TEST_SERIAL_FALLBACK) ++self.fallbacks;
+		self.clock->now.fetch_add(ticks);
+		if (!self.baseline && self.variant == 3 && event == rts::AI_PLANNING_TEST_VERIFICATION_FACT &&
+			(end == 16 || end == 32 || end == 33))
+		{
+			// All original entry polls already happened. Hold the final real fact
+			// derivation until the owner has actually cancelled the group.
+			self.held.fetch_add(1, std::memory_order_release);
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+			while (!self.releaseHeld.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+				std::this_thread::yield();
+			if (!self.releaseHeld.load(std::memory_order_acquire))
+			{ self.waitExpired = true; self.releaseHeld.store(true, std::memory_order_release); }
+		}
+	}
+	static bool cancel(void *opaque, uint32_t, uint32_t begin, uint32_t)
+	{
+		const auto &self = *static_cast<NativeAIObservations *>(opaque);
+		// The baseline's current predicate is deliberately opposite. Only the
+		// authenticated source checkpoint, not a new deadline, selects its cut.
+		return self.baseline ? self.variant != 1 : self.variant == 1 && begin == 16;
+	}
+};
+
+bool RunNativeAIPhaseRole(rts_test::NativeKernelTrace &trace, bool baseline, unsigned variant)
+{
+	using namespace rts::performance;
+	g_nativeAIPhaseVariant = variant; g_nativeAIPhaseBaseline = baseline;
+	const int failuresBefore = g_nativeAIPhaseFailures;
+	std::cerr << "BEGIN [AI " << (baseline ? "consumer" : "source") << " variant=" << variant << "]\n";
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 4; config.queueCapacity = 64;
+	config.scratchBytesPerWorker = 4096; config.pinWorkers = false;
+	if (!jobs.start(config) || !jobs.registerCurrentThread(rts::JOB_OWNER_GAME))
+	{ NativeAIExpect(false, "native AI phase fixture starts four workers"); return false; }
+	rts_test::NativeKernelOwnerRun run;
+	const bool started = run.begin(trace, baseline, 904, KERNEL_PHASE_OWNER_INTAKE);
+	NativeAIExpect(started, "native AI role validates its real ledger and source binding");
+	if (!started) { jobs.shutdown(); jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME); return false; }
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_AI, 1);
+	NativeAIExpect(attempt.valid(), "AI core owner opens authentic attempt before capture");
+	auto timingBatch = run.timing.beginBatch(KERNEL_PERFORMANCE_AI, 1, 904, 1);
+	const auto capture = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_CAPTURE);
+	std::vector<rts::AIPlayerPlanningSnapshot> snapshots(1);
+	std::vector<rts::AIPlayerPlanningResult> committed(1), serial(1), parallel(1), detached(1);
+	InitializeSinglePlayerSourceShardBatch(snapshots.data());
+	snapshots[0].production.candidateCount = 33;
+	for (unsigned index = 0; index != 33; ++index)
+		snapshots[0].production.candidates[index].configuredPriority = index == 0 ? 200 : 100;
+	run.clock.now.fetch_add(5);
+	NativeAIExpect(run.timing.endInterval(capture), "AI capture closes before native executor");
+	rts::AIPlanningReferencePlayerInputView input = {snapshots.data(), 1, 1};
+	rts::AIPlanningReferencePlayerOutputView output = {parallel.data(), 1, 1};
+	rts::AIPlanningReferencePlayerOutputView oracle = {detached.data(), 1, 1};
+	KernelPerformanceReferenceBatch validated;
+	rts::AIPlanningReferenceBatchTransport transport;
+	transport.referenceLedger = &run.reference; transport.referenceAttempt = attempt;
+	transport.referenceBatch = &validated; transport.writeInput = rts::WriteAIPlanningReferenceInput;
+	transport.immutableInput = &input; transport.writeOutput = rts::WriteAIPlanningReferenceOutput;
+	transport.productionOutput = &output; transport.serialCompute = ComputeTestAIPlanningReferenceSerial;
+	transport.detachedSerialOutput = &oracle; transport.operationCount = 1;
+	NativeAIObservations observed;
+	observed.clock = &run.clock; observed.variant = variant; observed.baseline = baseline;
+	std::atomic<uint32_t> rendezvous(0);
+	rts::AIPlanningTestHooks hooks;
+	hooks.context = &observed; hooks.observe = NativeAIObservations::observe;
+	hooks.cancelAtEntry = NativeAIObservations::cancel;
+	// This controlled source proves body semantics, not ordinary 8-ms admission.
+	hooks.rendezvous = baseline || variant == 3 ? 0 : &rendezvous; hooks.rendezvousTarget = 3;
+	if (variant == 3)
+	{
+		hooks.beforeWait = NativeAIObservations::beforeWait;
+		hooks.afterCancel = NativeAIObservations::afterCancel;
+		hooks.releasedGroup = NativeAIObservations::releasedGroup;
+	}
+	transport.testHooks = &hooks;
+	const unsigned detachedBefore = g_aiReferenceSerialComputes;
+	rts::AIPlanningBatchStatus status;
+	const bool executed = rts::ExecuteAIPlanningBatchOnJobSystem(rts::AI_PLANNING_EXECUTION_PARALLEL,
+		snapshots.data(), 1, committed.data(), serial.data(), parallel.data(), &status,
+		&timingBatch, &transport);
+	NativeAIExpect(executed && committed[0].production.valid == 1 &&
+		committed[0].production.selectedSourceOrdinal == 0 && committed[0].production.selectedStableId == 1000 &&
+		committed[0].production.tieCount == 1 && committed[0].production.candidateScoreCount == 33,
+		"real shared AI publishes literal unique winner zero even after serial fallback");
+	NativeAIExpect(status.usedSerialFallback == (variant == 0 ? 0U : 1U),
+		"predeclared AI success or abort is retained without retry");
+	NativeAIExpect(status.nativeAdmissionAccepted == 1U,
+		"AI status preserves authentic accepted-range admission for owner disposition");
+	for (unsigned range = 0; range != 3; ++range)
+		NativeAIExpect(observed.entries[range] == 1, "native AI enters each source-shaped shard once");
+	for (unsigned index = 0; index != 33; ++index)
+	{
+		const unsigned expected = variant == 1 && index >= 16 && index < 32 ? 0 : 1;
+		NativeAIExpect(observed.prepared[index] == expected && observed.verification[index] == expected,
+			"native AI builds both distinct fact-table entries once at the recorded prefix");
+	}
+	NativeAIExpect(observed.comparisons == (variant == 1 || variant == 3 ? 0U : 1U) &&
+		observed.winners == (variant == 0 ? 1U : 0U) &&
+		observed.fallbacks == (variant == 0 ? 0U : 1U) && !observed.wrongOwner,
+		"AI owner comparison rejects corrupted verification before winner reduction");
+	NativeAIExpect(g_aiReferenceSerialComputes == detachedBefore, "native source and baseline never invoke detached AI oracle");
+	if (variant == 3 && !baseline)
+	{
+		NativeAIExpect(!observed.waitExpired && observed.held == 3 && observed.cancelNotifications == 1 &&
+			observed.releaseNotifications == 1 && observed.releasedCancelled &&
+			observed.releasedCompleted == 3 && observed.releasedSubmitted == 3,
+			"AI native timeout cancels a real group then drains three late-completed bodies");
+		NativeAIExpect(observed.releasedReason == 3,
+			"AI source reason records actual group cancellation independently of completed checkpoints");
+	}
+	if (variant == 3 && baseline)
+		NativeAIExpect(observed.held == 0 && observed.cancelNotifications == 0 && observed.releaseNotifications == 0,
+			"AI baseline replays late disposal without waiting or issuing a new group cancellation");
+	const auto actualScheduler = rts_test::NativeKernelSchedulerBoundary();
+	if (baseline)
+		NativeAIExpect(actualScheduler.submittedJobs == 0 && actualScheduler.executedJobs == 0 &&
+			actualScheduler.ownerHelpJobs == 0 && status.physicalWorkerMask == 0 &&
+			status.distinctPhysicalWorkers == 0 && status.peakConcurrentPhysicalWorkers == 0 &&
+			status.parallelSucceeded == 0, "AI baseline publishes no fabricated physical-worker authority");
+	else
+		NativeAIExpect(actualScheduler.submittedJobs == 3 && actualScheduler.executedJobs == 3 &&
+			status.ownerHelpedJobs == 0 && (variant != 0 || status.parallelSucceeded == 1),
+			"AI controlled source is the real three-job native lane");
+	const bool accepted = executed && status.usedSerialFallback == 0;
+	const auto linked = validated;
+	rts::RecordAIPlanningOwnerCommit(executed, &status);
+	if (linked.valid()) NativeAIExpect(rts::FinishAIPlanningReferenceBatch(&transport, accepted),
+		"actual core owner closes canonical AI publication before attempt finish");
+	NativeAIExpect(linked.valid() == accepted, "AI native helper links only actually validated output to its attempt");
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = accepted ? KERNEL_PERFORMANCE_COMMITTED : KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION;
+	finish.reasonSchema = 1; finish.reason = accepted ? 1 : 2;
+	finish.fallbackEntered = finish.fallbackCompleted = executed && status.usedSerialFallback != 0;
+	finish.validatedBatch = linked;
+	NativeAIExpect(run.reference.finishAttempt(attempt, finish), "AI actual outcome closes authentic source attempt");
+	KernelPerformanceAttemptReap reap = {}; reap.reasonSchema = 1; reap.reason = 1;
+	reap.pendingJobs = actualScheduler.pendingJobs; reap.outstandingJobs = actualScheduler.outstandingJobs;
+	NativeAIExpect(run.reference.reapAttempt(attempt, reap), "AI source attempt reaps only after real synchronous drain");
+	if (accepted)
+	{
+		const auto commit = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_COMMIT);
+		run.clock.now.fetch_add(11); run.timing.endInterval(commit);
+	}
+	NativeAIExpect(run.timing.endBatch(timingBatch, finish.disposition), "AI timing records actual admission outcome");
+	const bool sealed = run.reference.sealObservationWindow() && run.reference.sealExecutionClosure();
+	const auto snapshot = run.reference.freeze();
+	const bool timingClosed = run.closeTiming(actualScheduler);
+	NativeAIExpect(timingClosed, "AI owner phase and scheduler closure reconcile");
+	if (baseline && timingClosed)
+	{
+		const auto &phase = run.timingSnapshot.phaseAccounting.phases[KERNEL_PHASE_OWNER_INTAKE];
+		NativeAIExpect(phase.pureNanoseconds == (variant == 0 ? 219U : 0U) && phase.serialNanoseconds >= 16,
+			"only three successful AI shards are pure; comparison winner and aborted work stay serial");
+	}
+	const bool canonicalState = variant == 0 ? snapshot.complete && snapshot.streamCount == 1 :
+		!snapshot.complete && snapshot.streamCount == 0;
+	NativeAIExpect(sealed && canonicalState && snapshot.errors == 0 && snapshot.trace.complete && snapshot.trace.attemptCount == 1 &&
+		snapshot.trace.capturedAttemptCount == 1 && snapshot.trace.dispatchCount == 1 &&
+		snapshot.trace.rangeCount == 3 && snapshot.trace.releasedRangeCount == 3 && snapshot.trace.reapCount == 1,
+		"actual AI native executor records complete admitted dispatch and released-range evidence");
+	if (!baseline) trace.source = snapshot;
+	else if (snapshot.complete && variant == 0)
+		NativeAIExpect(snapshot.streams[0].outputDigest.equals(trace.source.streams[0].outputDigest),
+			"AI baseline binds the output from its once-only native bodies to source");
+	jobs.shutdown(); jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME);
+	std::cerr << "END [AI " << (baseline ? "consumer" : "source") << " variant=" << variant <<
+		"] failures=" << g_nativeAIPhaseFailures - failuresBefore << " traceComplete=" << snapshot.trace.complete << '\n';
+	return canonicalState && snapshot.errors == 0 && snapshot.trace.complete &&
+		(variant != 3 || baseline || observed.releasedReason == 3);
+}
+
+void TestNativeAIActualSourceConsumer()
+{
+	// Breaks caught: omitted attempts, one fact table reused as its own oracle,
+	// detached re-execution, physical baseline jobs, wrong cut, or pure reduction.
+	for (unsigned variant = 0; variant != 4; ++variant)
+	{
+		rts_test::NativeKernelTrace trace(20 + variant);
+		const bool sourceComplete = RunNativeAIPhaseRole(trace, false, variant);
+		// No fabricated source and no favorable retry: missing source evidence is
+		// already a failure above; consumer execution requires its valid bytes.
+		if (sourceComplete) RunNativeAIPhaseRole(trace, true, variant);
+	}
+}
 #endif
 
 void TestBatchSerialParityAndFaults()
@@ -1229,7 +1502,7 @@ int main(int argc, char **argv)
 	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
 	{
 		std::cerr << "Usage: core_deterministic_ai_planning_tests "
-			"[--local-capacity]\n";
+			"[--local-capacity|--external-qualification]\n";
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);
@@ -1249,6 +1522,8 @@ int main(int argc, char **argv)
 #if defined(_WIN64)
 	TestAIPlanningReferenceTransport();
 	TestAIPlanningPerformanceTransport();
+	TestNativeAIActualSourceConsumer();
+	if (g_nativeAIPhaseFailures != 0) return 1;
 #endif
 	std::cout << "Deterministic AI planning tests passed.\n";
 	return 0;

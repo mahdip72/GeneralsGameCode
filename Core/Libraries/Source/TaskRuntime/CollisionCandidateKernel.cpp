@@ -9,6 +9,9 @@
 
 #include <algorithm>
 #include <new>
+#if defined(_WIN64)
+#include <memory>
+#endif
 #include <string.h>
 
 #if !defined(_MSC_VER) || _MSC_VER >= 1300
@@ -24,7 +27,7 @@ CollisionCandidateOptions::CollisionCandidateOptions()
 	  cancellationGroup(0)
 	#if defined(_WIN64)
 	  , performanceLedger(0), performanceBatch(),
-	  performanceReferenceLedger(0), performanceReferenceBatch(0),
+	performanceReferenceLedger(0), performanceReferenceAttempt(), performanceReferenceDecisionOrdinal(0), testHooks(0), performanceReferenceBatch(0),
 	  performanceReferenceOutput(0), performanceReferenceOutputCapacity(0)
 #endif
 {
@@ -335,15 +338,217 @@ bool cancelled(const CollisionCandidateOptions &options)
 		options.cancellationGroup->wasCancelled();
 }
 
+#if defined(_WIN64)
+struct CollisionSourceRange
+{
+	CollisionSourceRange() : plan(), replay(false) {}
+	performance::KernelPerformanceRangePlan plan;
+	performance::KernelPerformanceCheckpointProbe checkpoint;
+	bool replay;
+};
+
+class CollisionSourceBodyScope
+{
+public:
+	CollisionSourceBodyScope(CollisionSourceRange *range, const unsigned &units,
+		const bool &completed) : m_range(range), m_units(units), m_completed(completed)
+	{ if (m_range != 0 && !m_range->replay) m_range->checkpoint.beginRecord(); }
+	~CollisionSourceBodyScope()
+	{
+		if (m_range == 0) return;
+		const performance::KernelPerformanceCheckpoint at = {5, m_units, m_range->plan.end};
+		m_range->checkpoint.finish(at, m_units, m_completed ? performance::KERNEL_RANGE_COMPLETED :
+			m_range->checkpoint.snapshot().firstTruePoll != 0 ? performance::KERNEL_RANGE_CANCELLED :
+			performance::KERNEL_RANGE_FAILED);
+	}
+private:
+	CollisionSourceRange *m_range;
+	const unsigned &m_units;
+	const bool &m_completed;
+};
+
+bool collisionSourceCheckpoint(CollisionSourceRange *range,
+	unsigned site, unsigned units, bool actual)
+{
+	if (range == 0) return actual;
+	const performance::KernelPerformanceCheckpoint at = {site, units, range->plan.end};
+	return range->checkpoint.cancelled(at, actual);
+}
+
+struct GenericCollisionReferenceInput
+{
+	const CollisionCandidateInput *inputs;
+	unsigned count;
+	CollisionCandidateOrder order;
+};
+
+bool writeGenericCollisionReferenceInput(performance::KernelPerformanceCanonicalWriter &writer,
+	const void *context)
+{
+	const GenericCollisionReferenceInput &input = *static_cast<const GenericCollisionReferenceInput *>(context);
+	if (input.inputs == 0 || !writer.sequence(1, input.count)) return false;
+	for (unsigned i = 0; i != input.count; ++i)
+	{
+		const CollisionCandidateInput &value = input.inputs[i];
+		if (!writer.u32(2, value.firstID) || !writer.u32(3, value.secondID) ||
+			!writer.u32(4, value.firstGeneration) || !writer.u32(5, value.secondGeneration) ||
+			!writer.u32(6, value.discoveryOrder)) return false;
+	}
+	return writer.u32(7, static_cast<unsigned>(input.order));
+}
+
+class CollisionSourceAttempt
+{
+public:
+	CollisionSourceAttempt(const CollisionCandidateOptions &options, unsigned count,
+		unsigned grain, unsigned rangeCount, unsigned bodyKind, JobSystem &jobs,
+		performance::KernelPerformanceCanonicalCallback writeInput, const void *input) :
+		m_options(options), m_grain(grain), m_bodyKind(bodyKind), m_workers(jobs.workerCount()),
+		m_pending(jobs.pendingOwnerCompletionCount()), m_outstanding(jobs.outstandingJobCount()),
+		m_ranges(0), m_enabled(false), m_released(false)
+	{
+		if (options.performanceReferenceLedger == 0 || !options.performanceReferenceAttempt.valid()) return;
+		const performance::KernelPerformanceReferenceMode mode = options.performanceReferenceLedger->mode();
+		if (mode != performance::KERNEL_REFERENCE_THROUGHPUT_BINDING &&
+			mode != performance::KERNEL_REFERENCE_SERIAL_ORACLE) return;
+		m_ranges = new (std::nothrow) CollisionSourceRange[rangeCount];
+		if (m_ranges == 0) return;
+		m_enabled = options.performanceReferenceLedger->bindCapturedInput(
+			options.performanceReferenceAttempt, 1, count, writeInput, input);
+		performance::KernelPerformanceCanonicalWriter facts;
+		if (m_enabled && facts.begin(1) && facts.u32(1, count) && facts.u32(2, grain) &&
+			facts.u32(3, bodyKind) && facts.u32(4, static_cast<unsigned>(options.order)))
+			m_facts = facts.finish();
+	}
+	~CollisionSourceAttempt()
+	{
+		release(0, false, false);
+		delete[] m_ranges;
+	}
+	CollisionSourceRange *plan(unsigned ordinal, unsigned begin, unsigned end)
+	{
+		if (!m_enabled) return 0;
+		m_ranges[ordinal].plan = {1, ordinal, m_bodyKind, begin, end, end - begin};
+		return m_ranges + ordinal;
+	}
+	void release(unsigned submitted, bool published, bool cancelled)
+	{
+		if (!m_enabled || m_released) return;
+		m_released = true;
+		performance::KernelPerformanceReferenceLedger &ledger = *m_options.performanceReferenceLedger;
+		const performance::KernelPerformanceAttempt attempt = m_options.performanceReferenceAttempt;
+		performance::KernelPerformanceAttemptDecision decision = {};
+		decision.decisionOrdinal = m_options.performanceReferenceDecisionOrdinal;
+		decision.site = 1; decision.reasonSchema = 1; decision.reason = submitted == 0 ? 2 : cancelled ? 3 : 1;
+		decision.deterministicEligible = true; decision.deterministicFacts = m_facts;
+		decision.admission = submitted != 0 ? performance::KERNEL_ADMISSION_ACCEPTED : performance::KERNEL_ADMISSION_REFUSED;
+		decision.sourceConfiguredWorkers = m_workers; decision.dynamicFactsKnownMask = 3;
+		decision.pendingJobs = m_pending; decision.outstandingJobs = m_outstanding;
+		ledger.observeDecision(attempt, decision);
+		if (submitted == 0) return;
+		performance::KernelPerformanceDispatchPlan dispatch = {1, 1, 1, submitted,
+			0, m_grain, COLLISION_CANDIDATE_MAXIMUM_INPUTS};
+		for (unsigned i = 0; i != submitted; ++i) dispatch.operationCount += m_ranges[i].plan.operationCount;
+		ledger.observeDispatch(attempt, dispatch);
+		for (unsigned i = 0; i != submitted; ++i) ledger.observeRangePlan(attempt, m_ranges[i].plan);
+		for (unsigned i = 0; i != submitted; ++i)
+		{
+			performance::KernelPerformanceRangeProgress progress = {};
+			progress.checkpoint = m_ranges[i].checkpoint.snapshot();
+			progress.publication = !progress.checkpoint.entered ? performance::KERNEL_PUBLICATION_NOT_APPLICABLE :
+				published ? performance::KERNEL_PUBLICATION_PUBLISHED : cancelled ||
+				progress.checkpoint.terminal == performance::KERNEL_RANGE_CANCELLED ?
+				performance::KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL : performance::KERNEL_PUBLICATION_REJECTED;
+			ledger.observeReleasedRange(attempt, m_ranges[i].plan, progress);
+		}
+	}
+	void validated(CollisionCandidate *output, unsigned count)
+	{
+		if (!m_enabled || m_options.performanceReferenceBatch == 0) return;
+		const PartitionCollisionReferenceOutput production = {output, 0, count, count};
+		*m_options.performanceReferenceBatch = m_options.performanceReferenceLedger->observeValidatedAttempt(
+			m_options.performanceReferenceAttempt, WritePartitionCollisionReferenceOutput, &production);
+	}
+private:
+	const CollisionCandidateOptions &m_options;
+	unsigned m_grain, m_bodyKind, m_workers;
+	JobMetricCounter m_pending, m_outstanding;
+	CollisionSourceRange *m_ranges;
+	bool m_enabled, m_released;
+	performance::KernelPerformanceDigest m_facts;
+};
+
+void observeCollisionTest(const CollisionCandidateTestHooks *hooks,
+	CollisionCandidateTestEvent event, unsigned rangeIndex, unsigned begin,
+	unsigned end, unsigned workUnits = 0, bool completed = false)
+{
+	if (hooks != 0 && hooks->observe != 0)
+		hooks->observe(hooks->context, event, rangeIndex, begin, end, workUnits, completed, 0);
+}
+
+bool collisionTestCheckpoint(const CollisionCandidateTestHooks *hooks,
+	unsigned rangeIndex, CollisionCandidateTestCheckpoint site,
+	unsigned workUnits, bool actual)
+{
+	return hooks != 0 && hooks->checkpoint != 0 ?
+		hooks->checkpoint(hooks->context, rangeIndex, site, workUnits, actual) : actual;
+}
+
+void waitForCollisionTestWorkers(const CollisionCandidateOptions &options,
+	JobSystem &jobs, const JobGroup &group)
+{
+	if (options.testHooks != 0 && options.testHooks->physicalWaitMilliseconds != 0)
+	{
+		const unsigned milliseconds = options.testHooks->physicalWaitMilliseconds < 1000 ?
+			options.testHooks->physicalWaitMilliseconds : 1000;
+		if (!jobs.waitWithoutOwnerHelp(group, milliseconds)) jobs.cancel(group);
+	}
+}
+
+void observeCollisionTestRelease(const CollisionCandidateOptions &options,
+	unsigned count, unsigned rangeCount)
+{
+	if (options.testHooks == 0) return;
+	for (unsigned released = 0; released != rangeCount; ++released)
+	{
+		JobRange range;
+		JobSystem::rangeForIndex(count, rangeCount, released, range);
+		observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_RANGE_RELEASED,
+			released, range.begin, range.end);
+	}
+}
+#endif
+
 void normalizeRange(const CollisionCandidateInput *inputs,
 	CollisionCandidate *scratch, unsigned begin, unsigned end,
-	JobContext *context)
+	JobContext *context
+#if defined(_WIN64)
+	, const CollisionCandidateTestHooks *testHooks = 0, unsigned rangeIndex = 0,
+	unsigned *completedUnits = 0, bool *testCancelled = 0, CollisionSourceRange *sourceRange = 0
+#endif
+	)
 {
 	for (unsigned index = begin; index != end; ++index)
 	{
-		if (context != 0 && (index - begin) % 256 == 0 &&
-			context->isCancellationRequested())
-			return;
+		if ((index - begin) % 256 == 0 && (context != 0
+#if defined(_WIN64)
+			|| sourceRange != 0
+#endif
+			))
+		{
+			bool cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+			cancelled = collisionTestCheckpoint(testHooks, rangeIndex,
+				COLLISION_CANDIDATE_TEST_CHECKPOINT_BLOCK, index - begin, cancelled);
+			cancelled = collisionSourceCheckpoint(sourceRange, 2, index - begin, cancelled);
+			if (cancelled && testCancelled != 0) *testCancelled = true;
+#endif
+			if (cancelled) return;
+		}
+#if defined(_WIN64)
+		observeCollisionTest(testHooks, COLLISION_CANDIDATE_TEST_GENERIC_NORMALIZED,
+			rangeIndex, begin, end, index - begin);
+#endif
 		CollisionCandidate &candidate = scratch[index];
 		candidate.firstID = inputs[index].firstID;
 		candidate.secondID = inputs[index].secondID;
@@ -352,6 +557,9 @@ void normalizeRange(const CollisionCandidateInput *inputs,
 		candidate.discoveryOrder = inputs[index].discoveryOrder;
 		MakeCollisionCandidateKey(candidate.firstID, candidate.secondID,
 			candidate.key);
+#if defined(_WIN64)
+		if (completedUnits != 0) *completedUnits = index - begin + 1;
+#endif
 	}
 }
 
@@ -404,7 +612,28 @@ struct CollisionCandidateRangeState
 	bool completed;
 	bool physicalWorker;
 	unsigned physicalWorkerIndex;
+#if defined(_WIN64)
+	CollisionSourceRange *sourceRange;
+#endif
 };
+
+#if defined(_WIN64)
+class CollisionTestBodyScope
+{
+public:
+	CollisionTestBodyScope(const CollisionCandidateTestHooks *hooks, unsigned rangeIndex,
+		const CollisionCandidateRangeState &range, const unsigned &units)
+		: m_hooks(hooks), m_rangeIndex(rangeIndex), m_range(range), m_units(units)
+	{ observeCollisionTest(m_hooks, COLLISION_CANDIDATE_TEST_RANGE_ENTERED, m_rangeIndex, m_range.begin, m_range.end); }
+	~CollisionTestBodyScope()
+	{ observeCollisionTest(m_hooks, COLLISION_CANDIDATE_TEST_RANGE_FINISHED, m_rangeIndex, m_range.begin, m_range.end, m_units, m_range.completed); }
+private:
+	const CollisionCandidateTestHooks *m_hooks;
+	unsigned m_rangeIndex;
+	const CollisionCandidateRangeState &m_range;
+	const unsigned &m_units;
+};
+#endif
 
 unsigned sortAndDeduplicateRange(CollisionCandidate *scratch,
 	unsigned begin, unsigned end)
@@ -655,30 +884,75 @@ public:
 	CollisionCandidateJob(const CollisionCandidateInput *inputs,
 		CollisionCandidate *scratch, CollisionCandidateRangeState *range,
 		CollisionJobAtomicUnsigned *activePhysicalWorkers,
-		CollisionJobAtomicUnsigned *peakPhysicalWorkers)
+		CollisionJobAtomicUnsigned *peakPhysicalWorkers
+#if defined(_WIN64)
+		, const CollisionCandidateTestHooks *testHooks, unsigned rangeIndex
+#endif
+		)
 		: m_inputs(inputs), m_scratch(scratch), m_range(range),
 		  m_activePhysicalWorkers(activePhysicalWorkers),
 		  m_peakPhysicalWorkers(peakPhysicalWorkers)
+#if defined(_WIN64)
+		, m_testHooks(testHooks), m_rangeIndex(rangeIndex)
+#endif
 	{
 	}
 
-	virtual void execute(JobContext &context)
+	virtual void execute(JobContext &context) { executeBody(&context); }
+#if defined(_WIN64)
+	void executeInline() { executeBody(0); }
+#endif
+
+	void executeBody(JobContext *context)
 	{
-		if (context.isCancellationRequested())
-			return;
-		const bool physicalWorker = context.isPhysicalWorkerExecution();
+#if defined(_WIN64)
+		unsigned completedUnits = 0;
+		bool testCancelled = false;
+		CollisionSourceBodyScope sourceScope(m_range->sourceRange, completedUnits, m_range->completed);
+		CollisionTestBodyScope testScope(m_testHooks, m_rangeIndex, *m_range, completedUnits);
+#endif
+		bool cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+		cancelled = collisionTestCheckpoint(m_testHooks, m_rangeIndex,
+			COLLISION_CANDIDATE_TEST_CHECKPOINT_ENTRY, 0, cancelled);
+		cancelled = collisionSourceCheckpoint(m_range->sourceRange, 1, 0, cancelled);
+#endif
+		if (cancelled) return;
+		const bool physicalWorker = context != 0 && context->isPhysicalWorkerExecution();
 		CollisionPhysicalExecutionScope physicalScope(physicalWorker,
 			m_activePhysicalWorkers, m_peakPhysicalWorkers);
 		normalizeRange(m_inputs, m_scratch, m_range->begin, m_range->end,
-			&context);
-		if (context.isCancellationRequested())
-			return;
+			context
+#if defined(_WIN64)
+			, m_testHooks, m_rangeIndex, &completedUnits,
+			(m_testHooks != 0 || m_range->sourceRange != 0) ? &testCancelled : 0, m_range->sourceRange
+#endif
+			);
+#if defined(_WIN64)
+		if (testCancelled) return;
+#endif
+		cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+		cancelled = collisionTestCheckpoint(m_testHooks, m_rangeIndex,
+			COLLISION_CANDIDATE_TEST_CHECKPOINT_POST_NORMALIZE, completedUnits, cancelled);
+		cancelled = collisionSourceCheckpoint(m_range->sourceRange, 3, completedUnits, cancelled);
+#endif
+		if (cancelled) return;
+#if defined(_WIN64)
+		observeCollisionTest(m_testHooks, COLLISION_CANDIDATE_TEST_LOCAL_SORT,
+			m_rangeIndex, m_range->begin, m_range->end, completedUnits);
+#endif
 		m_range->uniqueCount = sortAndDeduplicateRange(m_scratch,
 			m_range->begin, m_range->end);
-		if (context.isCancellationRequested())
-			return;
+		cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+		cancelled = collisionTestCheckpoint(m_testHooks, m_rangeIndex,
+			COLLISION_CANDIDATE_TEST_CHECKPOINT_POST_SORT, completedUnits, cancelled);
+		cancelled = collisionSourceCheckpoint(m_range->sourceRange, 4, completedUnits, cancelled);
+#endif
+		if (cancelled) return;
 		m_range->physicalWorker = physicalWorker;
-		m_range->physicalWorkerIndex = context.physicalWorkerIndex();
+		m_range->physicalWorkerIndex = context != 0 ? context->physicalWorkerIndex() : JOB_INVALID_PHYSICAL_WORKER_INDEX;
 		m_range->completed = true;
 	}
 
@@ -688,19 +962,44 @@ private:
 	CollisionCandidateRangeState *m_range;
 	CollisionJobAtomicUnsigned *m_activePhysicalWorkers;
 	CollisionJobAtomicUnsigned *m_peakPhysicalWorkers;
+#if defined(_WIN64)
+	const CollisionCandidateTestHooks *m_testHooks;
+	unsigned m_rangeIndex;
+#endif
 };
 
 void normalizePartitionRange(
 	const PartitionCollisionObjectSnapshot *owner,
 	const PartitionCollisionOccupantSnapshot *occupants,
 	CollisionCandidate *scratch, unsigned begin, unsigned end,
-	JobContext *context)
+	JobContext *context
+#if defined(_WIN64)
+	, const CollisionCandidateTestHooks *testHooks = 0, unsigned rangeIndex = 0,
+	unsigned *completedUnits = 0, bool *testCancelled = 0, CollisionSourceRange *sourceRange = 0
+#endif
+	)
 {
 	for (unsigned index = begin; index != end; ++index)
 	{
-		if (context != 0 && (index - begin) % 256 == 0 &&
-			context->isCancellationRequested())
-			return;
+		if ((index - begin) % 256 == 0 && (context != 0
+#if defined(_WIN64)
+			|| sourceRange != 0
+#endif
+			))
+		{
+			bool cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+			cancelled = collisionTestCheckpoint(testHooks, rangeIndex,
+				COLLISION_CANDIDATE_TEST_CHECKPOINT_BLOCK, index - begin, cancelled);
+			cancelled = collisionSourceCheckpoint(sourceRange, 2, index - begin, cancelled);
+			if (cancelled && testCancelled != 0) *testCancelled = true;
+#endif
+			if (cancelled) return;
+		}
+#if defined(_WIN64)
+		observeCollisionTest(testHooks, COLLISION_CANDIDATE_TEST_PARTITION_NORMALIZED,
+			rangeIndex, begin, end, index - begin);
+#endif
 		CollisionCandidate &candidate = scratch[index];
 		candidate.firstID = owner->objectID;
 		candidate.secondID = occupants[index].objectID;
@@ -709,6 +1008,9 @@ void normalizePartitionRange(
 		candidate.discoveryOrder = index;
 		MakeCollisionCandidateKey(candidate.firstID, candidate.secondID,
 			candidate.key);
+#if defined(_WIN64)
+		if (completedUnits != 0) *completedUnits = index - begin + 1;
+#endif
 	}
 }
 
@@ -720,30 +1022,75 @@ public:
 		const PartitionCollisionOccupantSnapshot *occupants,
 		CollisionCandidate *scratch, CollisionCandidateRangeState *range,
 		CollisionJobAtomicUnsigned *activePhysicalWorkers,
-		CollisionJobAtomicUnsigned *peakPhysicalWorkers)
+		CollisionJobAtomicUnsigned *peakPhysicalWorkers
+#if defined(_WIN64)
+		, const CollisionCandidateTestHooks *testHooks, unsigned rangeIndex
+#endif
+		)
 		: m_owner(owner), m_occupants(occupants), m_scratch(scratch),
 		  m_range(range), m_activePhysicalWorkers(activePhysicalWorkers),
 		  m_peakPhysicalWorkers(peakPhysicalWorkers)
+#if defined(_WIN64)
+		, m_testHooks(testHooks), m_rangeIndex(rangeIndex)
+#endif
 	{
 	}
 
-	virtual void execute(JobContext &context)
+	virtual void execute(JobContext &context) { executeBody(&context); }
+#if defined(_WIN64)
+	void executeInline() { executeBody(0); }
+#endif
+
+	void executeBody(JobContext *context)
 	{
-		if (context.isCancellationRequested())
-			return;
-		const bool physicalWorker = context.isPhysicalWorkerExecution();
+#if defined(_WIN64)
+		unsigned completedUnits = 0;
+		bool testCancelled = false;
+		CollisionSourceBodyScope sourceScope(m_range->sourceRange, completedUnits, m_range->completed);
+		CollisionTestBodyScope testScope(m_testHooks, m_rangeIndex, *m_range, completedUnits);
+#endif
+		bool cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+		cancelled = collisionTestCheckpoint(m_testHooks, m_rangeIndex,
+			COLLISION_CANDIDATE_TEST_CHECKPOINT_ENTRY, 0, cancelled);
+		cancelled = collisionSourceCheckpoint(m_range->sourceRange, 1, 0, cancelled);
+#endif
+		if (cancelled) return;
+		const bool physicalWorker = context != 0 && context->isPhysicalWorkerExecution();
 		CollisionPhysicalExecutionScope physicalScope(physicalWorker,
 			m_activePhysicalWorkers, m_peakPhysicalWorkers);
 		normalizePartitionRange(m_owner, m_occupants, m_scratch,
-			m_range->begin, m_range->end, &context);
-		if (context.isCancellationRequested())
-			return;
+			m_range->begin, m_range->end, context
+#if defined(_WIN64)
+			, m_testHooks, m_rangeIndex, &completedUnits,
+			(m_testHooks != 0 || m_range->sourceRange != 0) ? &testCancelled : 0, m_range->sourceRange
+#endif
+			);
+#if defined(_WIN64)
+		if (testCancelled) return;
+#endif
+		cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+		cancelled = collisionTestCheckpoint(m_testHooks, m_rangeIndex,
+			COLLISION_CANDIDATE_TEST_CHECKPOINT_POST_NORMALIZE, completedUnits, cancelled);
+		cancelled = collisionSourceCheckpoint(m_range->sourceRange, 3, completedUnits, cancelled);
+#endif
+		if (cancelled) return;
+#if defined(_WIN64)
+		observeCollisionTest(m_testHooks, COLLISION_CANDIDATE_TEST_LOCAL_SORT,
+			m_rangeIndex, m_range->begin, m_range->end, completedUnits);
+#endif
 		m_range->uniqueCount = sortAndDeduplicateRange(m_scratch,
 			m_range->begin, m_range->end);
-		if (context.isCancellationRequested())
-			return;
+		cancelled = context != 0 && context->isCancellationRequested();
+#if defined(_WIN64)
+		cancelled = collisionTestCheckpoint(m_testHooks, m_rangeIndex,
+			COLLISION_CANDIDATE_TEST_CHECKPOINT_POST_SORT, completedUnits, cancelled);
+		cancelled = collisionSourceCheckpoint(m_range->sourceRange, 4, completedUnits, cancelled);
+#endif
+		if (cancelled) return;
 		m_range->physicalWorker = physicalWorker;
-		m_range->physicalWorkerIndex = context.physicalWorkerIndex();
+		m_range->physicalWorkerIndex = context != 0 ? context->physicalWorkerIndex() : JOB_INVALID_PHYSICAL_WORKER_INDEX;
 		m_range->completed = true;
 	}
 
@@ -754,7 +1101,156 @@ private:
 	CollisionCandidateRangeState *m_range;
 	CollisionJobAtomicUnsigned *m_activePhysicalWorkers;
 	CollisionJobAtomicUnsigned *m_peakPhysicalWorkers;
+#if defined(_WIN64)
+	const CollisionCandidateTestHooks *m_testHooks;
+	unsigned m_rangeIndex;
+#endif
 };
+
+
+#if defined(_WIN64)
+CollisionCandidateResult consumeCollisionCandidates(const CollisionCandidateInput *inputs,
+	const PartitionCollisionObjectSnapshot *owner, const PartitionCollisionOccupantSnapshot *occupants,
+	unsigned count, CollisionCandidate *output, CollisionCandidate *scratch,
+	const CollisionCandidateOptions &options, unsigned *outputCount, CollisionCandidateMetrics &metrics,
+	unsigned bodyKind, performance::KernelPerformanceCanonicalCallback writeInput, const void *input)
+{
+	using namespace performance;
+	KernelPerformanceReferenceLedger &ledger = *options.performanceReferenceLedger;
+	const KernelPerformanceAttempt attempt = options.performanceReferenceAttempt;
+	JobSystem &jobs = JobSystem::instance();
+	if (!attempt.valid() || ledger.mode() != KERNEL_REFERENCE_PHASE_BASELINE_BINDING ||
+		options.performanceLedger == 0 || !options.performanceBatch.valid() ||
+		options.performanceReferenceBatch == 0 ||
+		jobs.isWorkerThread() || !jobs.isRunning() || !jobs.isCurrentThread(JOB_OWNER_GAME))
+		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
+	const unsigned grain = options.minimumGrain != 0 ? options.minimumGrain : COLLISION_CANDIDATE_DEFAULT_MINIMUM_GRAIN;
+	KernelPerformanceCanonicalWriter facts;
+	KernelPerformanceAttemptDecision decision = {};
+	if (!facts.begin(1) || !facts.u32(1, count) || !facts.u32(2, grain) ||
+		!facts.u32(3, bodyKind) || !facts.u32(4, static_cast<unsigned>(options.order)) ||
+		!ledger.bindCapturedInput(attempt, 1, count, writeInput, input) ||
+		!ledger.replayDecision(attempt, 1, options.parallel && count >= COLLISION_CANDIDATE_MINIMUM_PARALLEL_INPUTS,
+			facts.finish(), decision) || decision.decisionOrdinal != options.performanceReferenceDecisionOrdinal ||
+			decision.admission != KERNEL_ADMISSION_ACCEPTED ||
+		decision.reasonSchema != 1 || (decision.reason != 1 && decision.reason != 3))
+		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
+	KernelPerformanceDispatchPlan dispatch = {};
+	KernelPerformanceAttemptFinish sourceFinish = {};
+	const unsigned planned = JobSystem::chooseRangeCount(count, grain, decision.sourceConfiguredWorkers);
+	if (!ledger.readSourceDispatch(attempt, 1, dispatch) || !ledger.readSourceFinish(attempt, sourceFinish) ||
+		dispatch.bodySchema != 1 || dispatch.checkpointSchema != 1 || dispatch.sourceGrain != grain ||
+		dispatch.sourceLimit != COLLISION_CANDIDATE_MAXIMUM_INPUTS || dispatch.rangeCount == 0 ||
+		dispatch.rangeCount > planned || planned < 2 ||
+		(decision.reason == 3 && sourceFinish.disposition == KERNEL_PERFORMANCE_COMMITTED) ||
+		(sourceFinish.validationObserved &&
+		 sourceFinish.disposition != KERNEL_PERFORMANCE_COMMITTED &&
+		 sourceFinish.disposition != KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION))
+		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
+	std::unique_ptr<CollisionCandidateRangeState[]> ranges(new (std::nothrow) CollisionCandidateRangeState[dispatch.rangeCount]);
+	std::unique_ptr<CollisionSourceRange[]> sourceRanges(new (std::nothrow) CollisionSourceRange[dispatch.rangeCount]);
+	std::unique_ptr<CollisionCandidate[]> discardedOutput;
+	if (sourceFinish.validationObserved &&
+		sourceFinish.disposition == KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION)
+		discardedOutput.reset(new (std::nothrow) CollisionCandidate[count]);
+	{
+		// Real owner plan setup ends before any authenticated inline body.
+		KernelPerformanceScope schedule(options.performanceLedger, options.performanceBatch, KERNEL_PERFORMANCE_SCHEDULE);
+		if (!ranges || !sourceRanges ||
+			(sourceFinish.validationObserved &&
+			 sourceFinish.disposition == KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION &&
+			 !discardedOutput) || !ledger.observeDispatch(attempt, dispatch))
+			return COLLISION_CANDIDATE_SERIAL_FALLBACK;
+		memset(ranges.get(), 0, sizeof(CollisionCandidateRangeState) * dispatch.rangeCount);
+		JobMetricCounter operations = 0;
+		for (unsigned i = 0; i != dispatch.rangeCount; ++i)
+		{
+			JobRange range;
+			KernelPerformanceRangePlan source = {};
+			if (!JobSystem::rangeForIndex(count, planned, i, range) ||
+				!ledger.readSourceRange(attempt, 1, i, source) || source.bodyKind != bodyKind ||
+				source.begin != range.begin || source.end != range.end || source.operationCount != range.end - range.begin ||
+				!ledger.observeRangePlan(attempt, source)) return COLLISION_CANDIDATE_SERIAL_FALLBACK;
+			sourceRanges[i].plan = source; sourceRanges[i].replay = true; operations += source.operationCount;
+			ranges[i].begin = range.begin; ranges[i].end = range.end;
+			ranges[i].physicalWorkerIndex = JOB_INVALID_PHYSICAL_WORKER_INDEX;
+			ranges[i].sourceRange = &sourceRanges[i];
+		}
+		if (operations != dispatch.operationCount) return COLLISION_CANDIDATE_SERIAL_FALLBACK;
+	}
+	bool complete = dispatch.rangeCount == planned;
+	for (unsigned i = 0; i != dispatch.rangeCount; ++i)
+	{
+		CollisionSourceRange &record = sourceRanges[i];
+		KernelPerformanceInlineBody body;
+		const KernelPerformanceInlineAction action = ledger.beginInlineBody(attempt,
+			record.plan, *options.performanceLedger, body, record.checkpoint);
+		if (action == KERNEL_INLINE_INVALID) return COLLISION_CANDIDATE_SERIAL_FALLBACK;
+		if (action == KERNEL_INLINE_EXECUTE)
+		{
+			if (bodyKind == 1)
+			{
+				CollisionCandidateJob job(inputs, scratch, &ranges[i], 0, 0, options.testHooks, i);
+				job.executeInline();
+			}
+			else
+			{
+				PartitionCollisionCandidateJob job(owner, occupants, scratch, &ranges[i], 0, 0, options.testHooks, i);
+				job.executeInline();
+			}
+		}
+		KernelPerformanceRangeProgress progress = {};
+		progress.checkpoint = record.checkpoint.snapshot();
+		progress.publication = !progress.checkpoint.entered ? KERNEL_PUBLICATION_NOT_APPLICABLE :
+			decision.reason == 3 || progress.checkpoint.terminal == KERNEL_RANGE_CANCELLED ?
+			KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL : sourceFinish.validationObserved ?
+			KERNEL_PUBLICATION_PUBLISHED : KERNEL_PUBLICATION_REJECTED;
+		if ((action == KERNEL_INLINE_EXECUTE && !ledger.finishInlineBody(body, progress)) ||
+			!ledger.observeReleasedRange(attempt, record.plan, progress)) return COLLISION_CANDIDATE_SERIAL_FALLBACK;
+		complete = ranges[i].completed && complete;
+	}
+	bool published = false;
+	if (complete)
+	{
+		observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_OWNER_VALIDATION, 0, 0, count, count, true);
+		if (decision.reason != 3 && sourceFinish.validationObserved)
+		{
+			observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_OWNER_REDUCTION, 0, 0, count, count, true);
+			CollisionCandidate *validatedOutput =
+				sourceFinish.disposition == KERNEL_PERFORMANCE_COMMITTED ?
+					output : discardedOutput.get();
+			const unsigned prepared = mergeSortedRanges(scratch, ranges.get(), planned,
+				validatedOutput, &metrics);
+			orderMergedCandidates(validatedOutput, prepared, scratch, count,
+				options.order);
+			metrics.preparedPairs = count; metrics.uniqueCandidates = prepared;
+			const PartitionCollisionReferenceOutput production = {
+				validatedOutput, 0, prepared, prepared};
+			*options.performanceReferenceBatch = ledger.observeValidatedAttempt(attempt,
+				WritePartitionCollisionReferenceOutput, &production);
+			if (!options.performanceReferenceBatch->valid())
+				return COLLISION_CANDIDATE_SERIAL_FALLBACK;
+			if (sourceFinish.disposition == KERNEL_PERFORMANCE_COMMITTED)
+			{
+				*outputCount = prepared;
+				observeCollisionTest(options.testHooks,
+					COLLISION_CANDIDATE_TEST_PUBLICATION, 0, 0, count,
+					prepared, true);
+				published = true;
+			}
+		}
+	}
+	ranges.reset(); sourceRanges.reset();
+	for (unsigned i = 0; i != dispatch.rangeCount; ++i)
+	{
+		JobRange range; JobSystem::rangeForIndex(count, planned, i, range);
+		observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_RANGE_RELEASED, i, range.begin, range.end);
+	}
+	// A partial admission cancels its cleanup group but retains native fallback.
+	return published ? COLLISION_CANDIDATE_PARALLEL : decision.reason == 3 && dispatch.rangeCount == planned ?
+		COLLISION_CANDIDATE_CANCELLED : COLLISION_CANDIDATE_SERIAL_FALLBACK;
+}
+#endif
 
 CollisionMetricAtomic s_resetEpoch(0);
 CollisionMetricAtomic s_authoritativeCommits(0);
@@ -874,6 +1370,15 @@ CollisionCandidateResult PrepareCollisionCandidates(
 			 inputs[index].secondGeneration == 0))
 			return COLLISION_CANDIDATE_INVALID_INPUT;
 	}
+#if defined(_WIN64)
+	if (options.performanceReferenceLedger != 0 &&
+		options.performanceReferenceLedger->runMode() == performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING)
+	{
+		const GenericCollisionReferenceInput input = {inputs, inputCount, options.order};
+		return consumeCollisionCandidates(inputs, 0, 0, inputCount, output, scratch,
+			options, outputCount, *metrics, 1, writeGenericCollisionReferenceInput, &input);
+	}
+#endif
 	if (cancelled(options))
 		return COLLISION_CANDIDATE_CANCELLED;
 	if (inputCount == 0)
@@ -918,6 +1423,11 @@ CollisionCandidateResult PrepareCollisionCandidates(
 		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
 	}
 
+#if defined(_WIN64)
+	const GenericCollisionReferenceInput sourceInput = {inputs, inputCount, options.order};
+	CollisionSourceAttempt sourceAttempt(options, inputCount, minimumGrain, jobCount,
+		1, jobs, writeGenericCollisionReferenceInput, &sourceInput);
+#endif
 	JobGroup group = jobs.createGroup();
 	if (!group.isValid())
 	{
@@ -957,9 +1467,16 @@ CollisionCandidateResult PrepareCollisionCandidates(
 		ranges[submitted].end = range.end;
 		ranges[submitted].physicalWorkerIndex =
 			JOB_INVALID_PHYSICAL_WORKER_INDEX;
+#if defined(_WIN64)
+		ranges[submitted].sourceRange = sourceAttempt.plan(submitted, range.begin, range.end);
+#endif
 		CollisionCandidateJob *job = new (std::nothrow)
 			CollisionCandidateJob(inputs, scratch, ranges + submitted,
-				&activePhysicalWorkers, &peakPhysicalWorkers);
+				&activePhysicalWorkers, &peakPhysicalWorkers
+#if defined(_WIN64)
+				, options.testHooks, submitted
+#endif
+				);
 		JobHandle handle = job != 0 ? jobs.trySubmit(job,
 			JOB_PRIORITY_FRAME_CRITICAL, group) : JobHandle();
 		if (!handle.isValid())
@@ -986,7 +1503,13 @@ CollisionCandidateResult PrepareCollisionCandidates(
 	#else
 		jobs.wait(group);
 	#endif
+#if defined(_WIN64)
+		sourceAttempt.release(submitted, false, true);
+#endif
 		delete[] ranges;
+#if defined(_WIN64)
+		observeCollisionTestRelease(options, inputCount, jobCount);
+#endif
 		++metrics->serialFallbacks;
 		jobs.recordSerialFallback();
 		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
@@ -997,6 +1520,7 @@ CollisionCandidateResult PrepareCollisionCandidates(
 		performance::KernelPerformanceScope waitTiming(
 			options.performanceLedger, options.performanceBatch,
 			performance::KERNEL_PERFORMANCE_WAIT);
+		waitForCollisionTestWorkers(options, jobs, group);
 		jobs.wait(group);
 	}
 #else
@@ -1005,19 +1529,40 @@ CollisionCandidateResult PrepareCollisionCandidates(
 	collectRangeMetrics(ranges, jobCount, metrics);
 	metrics->peakConcurrentPhysicalWorkers =
 		loadJobCounter(peakPhysicalWorkers);
+#if defined(_WIN64)
+	if (metrics->completedJobs == metrics->submittedJobs)
+		observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_OWNER_VALIDATION,
+			0, 0, inputCount, inputCount, true);
+#endif
 	if (cancelled(options) || group.wasCancelled())
 	{
+#if defined(_WIN64)
+		sourceAttempt.release(submitted, false, true);
+#endif
 		delete[] ranges;
+#if defined(_WIN64)
+		observeCollisionTestRelease(options, inputCount, jobCount);
+#endif
 		return COLLISION_CANDIDATE_CANCELLED;
 	}
 	if (group.failed() || metrics->completedJobs != metrics->submittedJobs)
 	{
+#if defined(_WIN64)
+		sourceAttempt.release(submitted, false, false);
+#endif
 		delete[] ranges;
+#if defined(_WIN64)
+		observeCollisionTestRelease(options, inputCount, jobCount);
+#endif
 		++metrics->serialFallbacks;
 		jobs.recordSerialFallback();
 		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
 	}
 
+#if defined(_WIN64)
+	observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_OWNER_REDUCTION,
+		0, 0, inputCount, inputCount, true);
+#endif
 	const unsigned preparedCount = mergeSortedRanges(scratch, ranges, jobCount,
 		output, metrics);
 	orderMergedCandidates(output, preparedCount, scratch, inputCount,
@@ -1025,7 +1570,16 @@ CollisionCandidateResult PrepareCollisionCandidates(
 	*outputCount = preparedCount;
 	metrics->preparedPairs = inputCount;
 	metrics->uniqueCandidates = preparedCount;
+#if defined(_WIN64)
+	observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_PUBLICATION,
+		0, 0, inputCount, preparedCount, true);
+	sourceAttempt.release(submitted, true, false);
+	sourceAttempt.validated(output, preparedCount);
+#endif
 	delete[] ranges;
+#if defined(_WIN64)
+	observeCollisionTestRelease(options, inputCount, jobCount);
+#endif
 	return COLLISION_CANDIDATE_PARALLEL;
 }
 
@@ -1089,6 +1643,17 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 			occupants[index].generation == 0)
 			return COLLISION_CANDIDATE_INVALID_INPUT;
 	}
+#if defined(_WIN64)
+	if (options.performanceReferenceLedger != 0 &&
+		options.performanceReferenceLedger->runMode() == performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING)
+	{
+		PartitionCollisionReferenceInput input;
+		input.owner = owner; input.cells = cells; input.cellCount = cellCount;
+		input.occupants = occupants; input.occupantCount = occupantCount; input.order = options.order;
+		return consumeCollisionCandidates(0, &owner, occupants, occupantCount, output, scratch,
+			options, outputCount, *metrics, 2, WritePartitionCollisionReferenceInput, &input);
+	}
+#endif
 	if (cancelled(options))
 		return COLLISION_CANDIDATE_CANCELLED;
 	if (occupantCount == 0)
@@ -1132,6 +1697,13 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
 	}
 
+#if defined(_WIN64)
+	PartitionCollisionReferenceInput sourceInput;
+	sourceInput.owner = owner; sourceInput.cells = cells; sourceInput.cellCount = cellCount;
+	sourceInput.occupants = occupants; sourceInput.occupantCount = occupantCount; sourceInput.order = options.order;
+	CollisionSourceAttempt sourceAttempt(options, occupantCount, minimumGrain, jobCount,
+		2, jobs, WritePartitionCollisionReferenceInput, &sourceInput);
+#endif
 	JobGroup group = jobs.createGroup();
 	if (!group.isValid())
 	{
@@ -1171,10 +1743,17 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 		ranges[submitted].end = range.end;
 		ranges[submitted].physicalWorkerIndex =
 			JOB_INVALID_PHYSICAL_WORKER_INDEX;
+#if defined(_WIN64)
+		ranges[submitted].sourceRange = sourceAttempt.plan(submitted, range.begin, range.end);
+#endif
 		PartitionCollisionCandidateJob *job = new (std::nothrow)
 			PartitionCollisionCandidateJob(&owner, occupants, scratch,
 				ranges + submitted, &activePhysicalWorkers,
-				&peakPhysicalWorkers);
+				&peakPhysicalWorkers
+#if defined(_WIN64)
+				, options.testHooks, submitted
+#endif
+				);
 		JobHandle handle = job != 0 ? jobs.trySubmit(job,
 			JOB_PRIORITY_FRAME_CRITICAL, group) : JobHandle();
 		if (!handle.isValid())
@@ -1201,7 +1780,13 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 	#else
 		jobs.wait(group);
 	#endif
+#if defined(_WIN64)
+		sourceAttempt.release(submitted, false, true);
+#endif
 		delete[] ranges;
+#if defined(_WIN64)
+		observeCollisionTestRelease(options, occupantCount, jobCount);
+#endif
 		++metrics->serialFallbacks;
 		jobs.recordSerialFallback();
 		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
@@ -1215,19 +1800,39 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 			options.performanceLedger, options.performanceBatch,
 			performance::KERNEL_PERFORMANCE_WAIT);
 	#endif
+#if defined(_WIN64)
+		waitForCollisionTestWorkers(options, jobs, group);
+#endif
 		jobs.wait(group);
 	}
 	collectRangeMetrics(ranges, jobCount, metrics);
 	metrics->peakConcurrentPhysicalWorkers =
 		loadJobCounter(peakPhysicalWorkers);
+#if defined(_WIN64)
+	if (metrics->completedJobs == metrics->submittedJobs)
+		observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_OWNER_VALIDATION,
+			0, 0, occupantCount, occupantCount, true);
+#endif
 	if (cancelled(options) || group.wasCancelled())
 	{
+#if defined(_WIN64)
+		sourceAttempt.release(submitted, false, true);
+#endif
 		delete[] ranges;
+#if defined(_WIN64)
+		observeCollisionTestRelease(options, occupantCount, jobCount);
+#endif
 		return COLLISION_CANDIDATE_CANCELLED;
 	}
 	if (group.failed() || metrics->completedJobs != metrics->submittedJobs)
 	{
+#if defined(_WIN64)
+		sourceAttempt.release(submitted, false, false);
+#endif
 		delete[] ranges;
+#if defined(_WIN64)
+		observeCollisionTestRelease(options, occupantCount, jobCount);
+#endif
 		++metrics->serialFallbacks;
 		jobs.recordSerialFallback();
 		return COLLISION_CANDIDATE_SERIAL_FALLBACK;
@@ -1237,6 +1842,10 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 	{
 		rts::frame_timing::Scope partitionReduceTiming(
 			rts::frame_timing::SimulationReduce);
+#if defined(_WIN64)
+	observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_OWNER_REDUCTION,
+		0, 0, occupantCount, occupantCount, true);
+#endif
 		preparedCount = mergeSortedRanges(scratch, ranges, jobCount, output,
 			metrics);
 		orderMergedCandidates(output, preparedCount, scratch, occupantCount,
@@ -1245,7 +1854,16 @@ CollisionCandidateResult PreparePartitionCollisionCandidates(
 	*outputCount = preparedCount;
 	metrics->preparedPairs = occupantCount;
 	metrics->uniqueCandidates = preparedCount;
+#if defined(_WIN64)
+	observeCollisionTest(options.testHooks, COLLISION_CANDIDATE_TEST_PUBLICATION,
+		0, 0, occupantCount, preparedCount, true);
+	sourceAttempt.release(submitted, true, false);
+	sourceAttempt.validated(output, preparedCount);
+#endif
 	delete[] ranges;
+#if defined(_WIN64)
+	observeCollisionTestRelease(options, occupantCount, jobCount);
+#endif
 	return COLLISION_CANDIDATE_PARALLEL;
 }
 

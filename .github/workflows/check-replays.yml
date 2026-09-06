@@ -11,19 +11,14 @@ on:
         required: true
         type: string
         description: "Game to check (Generals or GeneralsMD)"
-      userdata:
-        required: true
-        type: string
-        description: "Path to folder with replays and maps"
       preset:
         required: true
         type: string
         description: "CMake preset"
       stage5:
-        required: false
+        required: true
         type: boolean
-        default: false
-        description: "Run the exact installed-runtime Stage 5 worker matrix"
+        description: "Run the exact installed-runtime Stage 5 worker matrix; must be true"
       stage5_fixture_manifest:
         required: false
         type: string
@@ -74,16 +69,27 @@ jobs:
   build:
     name: ${{ inputs.preset }}
     runs-on: windows-2022
-    timeout-minutes: ${{ inputs.stage5 && 240 || 15 }}
-    env:
-      GAME_PATH: C:\GameData
-      GENERALS_PATH: C:\GameData\Generals
-      GENERALSMD_PATH: C:\GameData\GeneralsMD
+    timeout-minutes: 240
     steps:
       - name: Checkout Code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           submodules: true
+
+      - name: Enforce native Stage 5 replay contract
+        shell: pwsh
+        env:
+          STAGE5_GAME: ${{ inputs.game }}
+          STAGE5_PRESET: ${{ inputs.preset }}
+          STAGE5_ENABLED: ${{ inputs.stage5 }}
+          STAGE5_REQUIRE_X64: ${{ inputs.stage5_require_x64 }}
+        run: |
+          if ($env:STAGE5_ENABLED -cne 'true' -or
+              $env:STAGE5_REQUIRE_X64 -cne 'true' -or
+              $env:STAGE5_PRESET -notlike 'x64*' -or
+              @('Generals', 'GeneralsMD') -cnotcontains $env:STAGE5_GAME) {
+            throw 'Replay qualification accepts only a known, explicitly x64-required Stage 5 installed product.'
+          }
 
       - name: Download Game Artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
@@ -91,470 +97,58 @@ jobs:
           name: ${{ inputs.game }}-${{ inputs.preset }}
           path: build
 
-      - name: Cache Game Data
-        id: cache-gamedata
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
-        with:
-          path: ${{ env.GAME_PATH }}
-          key: gamedata-permanent-cache-v4
-
-      - name: Download Game Data from Cloudflare R2
-        if: ${{ steps.cache-gamedata.outputs.cache-hit != 'true' }}
+      - name: Provision immutable Stage 5 simulation qualification data
+        shell: pwsh
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
-          EXPECTED_HASH_GENERALS: "37A351AA430199D1F05DEB9E404857DCE7B461A6AC272C5D4A0B5652CDB06372"
-          EXPECTED_HASH_GENERALSMD: "6837FE1E3009A4C239406C39B1598216C0943EE8ED46BB10626767029AC05E21"
-        shell: pwsh
+          STAGE5_GAME: ${{ inputs.game }}
         run: |
-          # Download trimmed gamedata of both Generals 1.08 and Generals Zero Hour 1.04.
-          # This data cannot be used for playing because it's
-          # missing textures, audio and gui files. But it's enough for replay checking.
-          # It's also encrypted because it's not allowed to distribute these files.
-
-          if (-not $env:AWS_ACCESS_KEY_ID -or -not $env:AWS_SECRET_ACCESS_KEY -or -not $env:AWS_ENDPOINT_URL) {
-              $ok1 = [bool]$env:AWS_ACCESS_KEY_ID
-              $ok2 = [bool]$env:AWS_SECRET_ACCESS_KEY
-              $ok3 = [bool]$env:AWS_ENDPOINT_URL
-              Write-Host "One or more required secrets are not set or are empty. R2_ACCESS_KEY_ID: $ok1, R2_SECRET_ACCESS_KEY: $ok2, R2_ENDPOINT_URL: $ok3"
-              exit 1
-          }
-
-          # Download Generals Game Files
-          # The archive contains these files:
-          # BINKW32.DLL
-          # English.big
-          # INI.big
-          # Maps.big
-          # mss32.dll
-          # W3D.big
-          # Data\Scripts\MultiplayerScripts.scb
-          # Data\Scripts\SkirmishScripts.scb
-
-          Write-Host "Downloading Game Data for Generals" -ForegroundColor Cyan
-          aws s3 cp s3://github-ci/generals108_gamedata_trimmed.7z generals108_gamedata_trimmed.7z --endpoint-url $env:AWS_ENDPOINT_URL
-
-          Write-Host "Verifying File Integrity" -ForegroundColor Cyan
-          $fileHash = (Get-FileHash -Path generals108_gamedata_trimmed.7z -Algorithm SHA256).Hash
-          Write-Host "Downloaded file SHA256: $fileHash"
-          Write-Host "Expected file SHA256: $env:EXPECTED_HASH_GENERALS"
-          if ($fileHash -ne $env:EXPECTED_HASH_GENERALS) {
-              Write-Error "Hash verification failed! File may be corrupted or tampered with."
-              exit 1
-          }
-
-          Write-Host "Extracting Archive" -ForegroundColor Cyan
-          $extractPath = $env:GENERALS_PATH
-          & 7z x generals108_gamedata_trimmed.7z -o"$extractPath"
-          Remove-Item generals108_gamedata_trimmed.7z -Verbose
-
-          # Download GeneralsMD (ZH) Game Files
-          # The archive contains these files:
-          # BINKW32.DLL
-          # INIZH.big
-          # MapsZH.big
-          # mss32.dll
-          # W3DZH.big
-          # Data\Scripts\MultiplayerScripts.scb
-          # Data\Scripts\Scripts.ini
-          # Data\Scripts\SkirmishScripts.scb
-
-          Write-Host "Downloading Game Data for GeneralsMD" -ForegroundColor Cyan
-          aws s3 cp s3://github-ci/zerohour104_gamedata_trimmed.7z zerohour104_gamedata_trimmed.7z --endpoint-url $env:AWS_ENDPOINT_URL
-
-          Write-Host "Verifying File Integrity" -ForegroundColor Cyan
-          $fileHash = (Get-FileHash -Path zerohour104_gamedata_trimmed.7z -Algorithm SHA256).Hash
-          Write-Host "Downloaded file SHA256: $fileHash"
-          Write-Host "Expected file SHA256: $env:EXPECTED_HASH_GENERALSMD"
-          if ($fileHash -ne $env:EXPECTED_HASH_GENERALSMD) {
-              Write-Error "Hash verification failed! File may be corrupted or tampered with."
-              exit 1
-          }
-
-          Write-Host "Extracting Archive" -ForegroundColor Cyan
-          $extractPath = $env:GENERALSMD_PATH
-          & 7z x zerohour104_gamedata_trimmed.7z -o"$extractPath"
-          Remove-Item zerohour104_gamedata_trimmed.7z -Verbose
-
-      - name: Set Up Game Data
-        shell: pwsh
-        run: |
-          $source = "$env:GAME_PATH\${{ inputs.game }}"
-          $destination = "build"
-          if ('${{ inputs.stage5 }}' -eq 'true') {
-            # The native artifact already carries its own runtime closure.  The
-            # trimmed archive is data-only for Stage 5: copying its retired
-            # root DLLs would silently reintroduce Bink/Miles/D3D8 beside the
-            # installed x64 candidate.
-            Get-ChildItem -LiteralPath $source -File |
-              Where-Object { $_.Extension -ieq '.big' } |
-              ForEach-Object {
-                Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
-              }
-            $dataDirectory = Join-Path $source 'Data'
-            if (Test-Path -LiteralPath $dataDirectory -PathType Container) {
-              Copy-Item -LiteralPath $dataDirectory -Destination $destination -Recurse -Force
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath 'H:\')) {
+            & subst.exe H: $env:RUNNER_TEMP
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) {
+              throw 'Stage 5 validation could not provision its isolated H: task volume.'
             }
           }
-          else {
-            Copy-Item -Path $source\* -Destination $destination -Recurse -Force
+          $taskRoot = 'H:\Stage5SimulationValidationTask'
+          if (Test-Path -LiteralPath $taskRoot) {
+            throw "Stage 5 simulation task root is not fresh: $taskRoot"
           }
-
-      - name: Move Replays and Maps to User Dir
-        if: ${{ !inputs.stage5 }}
-        shell: pwsh
-        run: |
-          # These files are expected in the user dir, so we move them here.
-
-          $source = "${{ inputs.userdata }}\Replays"
-          $destination = "$env:USERPROFILE\Documents\Command and Conquer Generals Zero Hour Data\Replays"
-          Write-Host "Move replays to $destination"
-          New-Item -ItemType Directory -Path $destination -Force | Out-Null
-          Move-Item -Path "$source\*" -Destination $destination -Force
-
-          $source = "${{ inputs.userdata }}\Maps"
-          $destination = "$env:USERPROFILE\Documents\Command and Conquer Generals Zero Hour Data\Maps"
-          Write-Host "Move maps to $destination"
-          New-Item -ItemType Directory -Path $destination -Force | Out-Null
-          Move-Item -Path "$source\*" -Destination $destination -Force
-
-      - name: Run Replay Compatibility Tests
-        if: ${{ !inputs.stage5 }}
-        shell: pwsh
-        run: |
-          # The legacy replay executable still needs the retail InstallPath, but
-          # this reusable workflow must leave the hosted runner exactly as it was
-          # found. Snapshot both registry views before setup and restore every
-          # value/key in finally, including when process startup or timeout fails.
-          $installSubKey = 'Software\Electronic Arts\EA Games\Generals'
-          # Snapshot every parent created by CreateSubKey as well as the leaf.
-          # This lets rollback remove only newly-created empty ancestors, in
-          # reverse order, without deleting concurrent user content.
-          $installParentSubKeys = @(
-            'Software',
-            'Software\Electronic Arts',
-            'Software\Electronic Arts\EA Games'
-          )
-          $registrySnapshots = @()
-
-          function Get-InstallPathSnapshot {
-            param([Microsoft.Win32.RegistryView]$View)
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-              [Microsoft.Win32.RegistryHive]::CurrentUser, $View)
-            try {
-              $parentSnapshots = @(
-                foreach ($parentSubKey in $installParentSubKeys) {
-                  $parentKey = $null
-                  try {
-                    $parentKey = $base.OpenSubKey($parentSubKey, $false)
-                    [pscustomobject]@{
-                      subKey = $parentSubKey
-                      hadKey = $null -ne $parentKey
-                    }
-                  }
-                  finally {
-                    if ($null -ne $parentKey) { $parentKey.Dispose() }
-                  }
-                }
-              )
-              $key = $null
-              $key = $base.OpenSubKey($installSubKey, $false)
-              try {
-                $hasValue = $null -ne $key -and ($key.GetValueNames() -contains 'InstallPath')
-                return [pscustomobject]@{
-                  view = $View
-                  hadKey = $null -ne $key
-                  hadValue = $hasValue
-                  parentSnapshots = $parentSnapshots
-                  oldValue = if ($hasValue) {
-                    $key.GetValue('InstallPath', $null,
-                      [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-                  } else { $null }
-                  oldValueKind = if ($hasValue) { $key.GetValueKind('InstallPath') } else { $null }
-                }
-              }
-              finally {
-                if ($null -ne $key) { $key.Dispose() }
-              }
-            }
-            finally { $base.Dispose() }
+          $runtimeRoot = (Resolve-Path -LiteralPath 'build').Path
+          $title = switch ($env:STAGE5_GAME) {
+            'Generals' { 'Generals' }
+            'GeneralsMD' { 'ZeroHour' }
+            default { throw "Unsupported Stage 5 game '$env:STAGE5_GAME'." }
           }
-
-          function Set-InstallPath {
-            param([Microsoft.Win32.RegistryView]$View, [string]$Value)
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-              [Microsoft.Win32.RegistryHive]::CurrentUser, $View)
-            try {
-              $key = $null
-              $key = $base.CreateSubKey($installSubKey)
-              try {
-                $key.SetValue('InstallPath', $Value,
-                  [Microsoft.Win32.RegistryValueKind]::String)
-              }
-              finally { $key.Dispose() }
-            }
-            finally { $base.Dispose() }
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Install-Stage5SimulationQualificationData.ps1" `
+            -RuntimeRoot $runtimeRoot `
+            -TaskRoot $taskRoot `
+            -SourceCommit $env:GITHUB_SHA.ToLowerInvariant() `
+            -Title $title `
+            -AwsEndpointUrl $env:AWS_ENDPOINT_URL `
+            -OutputEnvironmentFile $env:GITHUB_ENV
+          if (-not $?) {
+            throw 'Stage 5 immutable simulation qualification-data provisioning failed.'
           }
-
-          function Restore-InstallPath {
-            param([object]$Snapshot)
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-              [Microsoft.Win32.RegistryHive]::CurrentUser, $Snapshot.view)
-            try {
-              if ($Snapshot.hadValue) {
-                $key = $base.CreateSubKey($installSubKey)
-                try {
-                  $key.SetValue('InstallPath', $Snapshot.oldValue, $Snapshot.oldValueKind)
-                }
-                finally { $key.Dispose() }
-              }
-              else {
-                $key = $null
-                $key = $base.OpenSubKey($installSubKey, $true)
-                if ($null -ne $key) {
-                  try {
-                    if ($key.GetValueNames() -contains 'InstallPath') {
-                      $key.DeleteValue('InstallPath', $false)
-                    }
-                    if (-not $Snapshot.hadKey) {
-                      $remainingValues = @($key.GetValueNames())
-                      $remainingSubKeys = @($key.GetSubKeyNames())
-                      if ($remainingValues.Count -eq 0 -and $remainingSubKeys.Count -eq 0) {
-                        $key.Dispose()
-                        $key = $null
-                        $base.DeleteSubKey($installSubKey, $false)
-                      } else {
-                        throw "Registry key $installSubKey gained concurrent content; refusing to remove it."
-                      }
-                    }
-                  }
-                  finally {
-                    if ($null -ne $key) { $key.Dispose() }
-                  }
-                }
-              }
-
-              # Remove newly-created ancestors only after their children.  A
-              # second read immediately before each deletion makes concurrent
-              # values/subkeys fail closed instead of being removed.
-              foreach ($parentSnapshot in @($Snapshot.parentSnapshots | Sort-Object {
-                @($installParentSubKeys).IndexOf($_.subKey)
-              } -Descending)) {
-                if ($parentSnapshot.hadKey) { continue }
-                $parentKey = $null
-                $parentKey = $base.OpenSubKey($parentSnapshot.subKey, $true)
-                if ($null -eq $parentKey) { continue }
-                try {
-                  $remainingValues = @($parentKey.GetValueNames())
-                  $remainingSubKeys = @($parentKey.GetSubKeyNames())
-                  if ($remainingValues.Count -ne 0 -or $remainingSubKeys.Count -ne 0) {
-                    throw "Registry ancestor $($parentSnapshot.subKey) gained concurrent content; refusing to remove it."
-                  }
-                  $parentKey.Dispose()
-                  $parentKey = $null
-                  $base.DeleteSubKey($parentSnapshot.subKey, $false)
-                }
-                finally {
-                  if ($null -ne $parentKey) { $parentKey.Dispose() }
-                }
-              }
-            }
-            finally { $base.Dispose() }
-          }
-
-          function Get-ReplayProcessIdentity {
-            param([Parameter(Mandatory = $true)][int]$ProcessId)
-            $processInfo = Get-CimInstance -ClassName Win32_Process `
-              -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
-            if ($null -eq $processInfo) { return $null }
-            if ([string]::IsNullOrWhiteSpace([string]$processInfo.ExecutablePath)) {
-              throw "Could not bind replay PID $ProcessId to an executable path."
-            }
-            $parentInfo = Get-CimInstance -ClassName Win32_Process `
-              -Filter ("ProcessId = {0}" -f [int]$processInfo.ParentProcessId) `
-              -ErrorAction SilentlyContinue
-            [pscustomobject]@{
-              processId = [int]$processInfo.ProcessId
-              executablePath = [IO.Path]::GetFullPath([string]$processInfo.ExecutablePath)
-              creationToken = [string]$processInfo.CreationDate
-              parentProcessId = [int]$processInfo.ParentProcessId
-              parentCreationToken = if ($null -eq $parentInfo) { '' } else { [string]$parentInfo.CreationDate }
-            }
-          }
-
-          function Stop-ReplayProcessSafely {
-            param(
-              [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
-              [AllowNull()][object]$ExpectedIdentity = $null,
-              [int]$PostKillWaitMilliseconds = 30000
-            )
-            if ($Process.HasExited) {
-              # The process exited between the timeout check and cleanup.  Do
-              # not issue a second termination against a potentially reused PID.
-              return $false
-            }
-            if ($null -ne $ExpectedIdentity) {
-              $currentIdentity = $null
-              try {
-                $currentIdentity = Get-ReplayProcessIdentity $Process.Id
-              }
-              catch {
-                # CIM is supplementary evidence only.  The Process object
-                # returned by Start-Process remains bound to the original OS
-                # process handle, so retain it when CIM cannot refresh.
-                Write-Warning "Could not refresh replay PID $($Process.Id) identity; terminating through the original Process handle."
-              }
-              if ($null -ne $currentIdentity) {
-                $sameExecutable = [String]::Equals(
-                  $currentIdentity.executablePath, $ExpectedIdentity.executablePath,
-                  [StringComparison]::OrdinalIgnoreCase)
-                $sameCreation = $currentIdentity.creationToken -ceq $ExpectedIdentity.creationToken
-                $sameParent = $currentIdentity.parentProcessId -eq $ExpectedIdentity.parentProcessId -and
-                  $currentIdentity.parentCreationToken -ceq $ExpectedIdentity.parentCreationToken
-                if (-not ($sameExecutable -and $sameCreation -and $sameParent)) {
-                  throw "Refusing to stop replay PID $($Process.Id) because its path or process/parent creation identity changed."
-                }
-              }
-              elseif ($Process.HasExited) {
-                return $false
-              }
-              else {
-                Write-Warning "Replay PID $($Process.Id) identity is unavailable; terminating through the original Process handle."
-              }
-            }
-            try {
-              # Kill only through the Process instance retained immediately
-              # after Start-Process.  Never reacquire by PID: doing so reopens
-              # a PID-reuse TOCTOU window between identity inspection and kill.
-              $Process.Kill()
-            }
-            catch {
-              try {
-                if ($Process.HasExited) { return $false }
-              }
-              catch { }
-              throw "Identity-bound replay process termination failed: $($_.Exception.Message)"
-            }
-            if (-not $Process.WaitForExit($PostKillWaitMilliseconds)) {
-              throw "Replay PID $($Process.Id) did not exit within the bounded post-kill wait."
-            }
-            return $true
-          }
-
-          $exePath = "build/generalszh.exe"
-          $arguments = "-jobs 4 -headless -replay *.rep"
-          $timeoutSeconds = 10*60
-          $stdoutPath = "stdout.log"
-          $stderrPath = "stderr.log"
-
-          if (-not (Test-Path $exePath)) {
-              Write-Host "ERROR: Executable not found at $exePath"
-              exit 1
-          }
-          $expectedExePath = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $exePath).Path)
-          if ($null -eq (Get-ReplayProcessIdentity $PID)) {
-            throw 'Identity-bound replay cleanup is unavailable; refusing to launch the legacy replay job.'
-          }
-
-          # Note that the game is a gui application. That means we need to redirect console output to a file
-          # in order to retrieve it.
-          # Clean previous logs
-          Remove-Item $stdoutPath, $stderrPath -ErrorAction SilentlyContinue
-
-          $exitCode = 1
-          $process = $null
-          $processIdentity = $null
-          try {
-            foreach ($view in @([Microsoft.Win32.RegistryView]::Registry32,
-                                [Microsoft.Win32.RegistryView]::Registry64)) {
-              $registrySnapshots += Get-InstallPathSnapshot $view
-              Set-InstallPath $view ($env:GENERALS_PATH + '\')
-            }
-
-            # Start the process only after both registry views have been captured.
-            Write-Host "Run $exePath $arguments"
-            $process = Start-Process -FilePath $exePath `
-                -ArgumentList $arguments `
-                -RedirectStandardOutput $stdoutPath `
-                -RedirectStandardError $stderrPath `
-                -PassThru
-
-            try {
-              $processIdentity = Get-ReplayProcessIdentity $process.Id
-            }
-            catch {
-              Write-Warning "Could not capture replay PID $($process.Id) identity; retaining the original Process handle for bounded cleanup."
-              $processIdentity = $null
-            }
-            if ($null -eq $processIdentity -and -not $process.HasExited) {
-              Write-Warning "Replay PID $($process.Id) identity is unavailable; retaining the original Process handle for bounded cleanup."
-            }
-            if ($null -ne $processIdentity -and
-                -not [String]::Equals($processIdentity.executablePath, $expectedExePath,
-                    [StringComparison]::OrdinalIgnoreCase)) {
-              throw "Replay process path does not match the requested executable: $($processIdentity.executablePath)"
-            }
-
-            $exited = $process.WaitForExit($timeoutSeconds * 1000)
-            if (-not $exited) {
-                Write-Host "ERROR: Process still running after $timeoutSeconds seconds. Killing process..."
-                $stopped = Stop-ReplayProcessSafely $process $processIdentity
-                $process.Refresh()
-                if (-not $stopped -and $process.HasExited) {
-                  $exitCode = $process.ExitCode
-                } else {
-                  $exitCode = 1
-                }
-            } else {
-                $exitCode = $process.ExitCode
-            }
-
-            Write-Host "=== STDOUT ==="
-            Get-Content $stdoutPath
-            if ((Test-Path $stderrPath) -and (Get-Item $stderrPath).Length -gt 0) {
-                Write-Host "`n=== STDERR ==="
-                Get-Content $stderrPath
-            }
-          }
-          finally {
-            $restoreErrors = @()
-            if ($null -ne $process) {
-              try {
-                $process.Refresh()
-                if (-not $process.HasExited) {
-                  Stop-ReplayProcessSafely $process $processIdentity | Out-Null
-                }
-              }
-              catch { $restoreErrors += $_.Exception.Message }
-              finally { $process.Dispose() }
-            }
-            for ($index = $registrySnapshots.Count - 1; $index -ge 0; --$index) {
-              try { Restore-InstallPath $registrySnapshots[$index] }
-              catch { $restoreErrors += $_.Exception.Message }
-            }
-            if ($restoreErrors.Count -gt 0) {
-              throw "Legacy replay registry restoration failed after every attempt: $($restoreErrors -join ' | ')"
-            }
-          }
-
-          if ($exitCode -ne 0) {
-              Write-Host "ERROR: Process failed with exit code $exitCode"
-              exit $exitCode
-          }
-
-          Write-Host "Success!"
 
       - name: Audit Replay Worker Mode Propagation
         shell: pwsh
         run: |
-          & "Core/Tools/DeterministicSimulationValidation/Audit-ReplayModePropagation.ps1" `
-            -SourceRoot "${{ github.workspace }}"
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Audit-ReplayModePropagation.ps1" `
+            -SourceRoot $env:GITHUB_WORKSPACE
+          if (-not $?) { throw 'Replay worker-mode propagation audit failed.' }
 
       - name: Run Stage 5 Installed-Runtime Replay Matrix
         if: ${{ inputs.stage5 }}
         shell: pwsh
         env:
+          STAGE5_GAME: ${{ inputs.game }}
+          STAGE5_PRESET: ${{ inputs.preset }}
+          STAGE5_REQUIRE_X64: ${{ inputs.stage5_require_x64 }}
+          STAGE5_REPLAY_MATRIX_REPEATS: ${{ inputs.stage5_replay_matrix_repeats }}
+          STAGE5_STRESS_REPEATS: ${{ inputs.stage5_stress_repeats }}
           STAGE5_FIXTURE_MANIFEST: ${{ inputs.stage5_fixture_manifest }}
           STAGE5_PERFORMANCE_BASELINE: ${{ inputs.stage5_performance_baseline }}
           STAGE5_EXPECTED_STAGE3_EXECUTABLE_SHA256: ${{ inputs.stage5_expected_stage3_executable_sha256 }}
@@ -563,142 +157,378 @@ jobs:
           STAGE5_EXECUTION_COHORT_CREATED_UTC: ${{ inputs.stage5_execution_cohort_created_utc }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $workspaceFull = [IO.Path]::GetFullPath("${{ github.workspace }}")
           function Resolve-Stage5RepositoryFile {
-            param([string]$RelativePath, [string]$Context)
+            param([string]$Root, [string]$RelativePath, [string]$Context)
+            $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
             if ([string]::IsNullOrWhiteSpace($RelativePath) -or
-                [IO.Path]::IsPathRooted($RelativePath)) {
-              throw "$Context must be a non-empty repository-relative path."
+                [IO.Path]::IsPathRooted($RelativePath) -or
+                $RelativePath -match ':' -or
+                $RelativePath -match '[\x00-\x1F\x7F]' -or
+                $RelativePath -match '(^|[\\/])\.{1,2}([\\/]|$)') {
+              throw "$Context must be a canonical repository-relative path."
             }
-            $candidate = [IO.Path]::GetFullPath((Join-Path $workspaceFull $RelativePath))
-            $base = $workspaceFull.TrimEnd('\')
-            $baseRoot = [IO.Path]::GetPathRoot($base)
-            $candidateRoot = [IO.Path]::GetPathRoot($candidate)
-            if ($baseRoot -isnot [string] -or $candidateRoot -isnot [string] -or
-                -not $baseRoot.Equals($candidateRoot, [StringComparison]::OrdinalIgnoreCase)) {
-              throw "$Context must stay below the checked-out repository."
+            $rootItem = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+            if (-not $rootItem.PSIsContainer -or
+                ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "$Context trusted root is not a regular directory."
             }
-            $baseParts = @($base.Substring($baseRoot.Length) -split '[\\/]' |
-              Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-            $candidateParts = @($candidate.Substring($candidateRoot.Length) -split '[\\/]' |
-              Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-            if ($candidateParts.Count -le $baseParts.Count) {
-              throw "$Context must stay below the checked-out repository."
+            $candidate = [IO.Path]::GetFullPath((Join-Path $rootFull $RelativePath))
+            if (-not $candidate.StartsWith(
+                  $rootFull + [IO.Path]::DirectorySeparatorChar,
+                  [StringComparison]::OrdinalIgnoreCase) -or
+                -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              throw "$Context must resolve to a file below its trusted root."
             }
-            for ($index = 0; $index -lt $baseParts.Count; ++$index) {
-              if (-not $candidateParts[$index].Equals($baseParts[$index],
-                  [StringComparison]::OrdinalIgnoreCase)) {
-                throw "$Context must stay below the checked-out repository."
-              }
-            }
-            $current = $base
-            foreach ($segment in @($candidateParts[$baseParts.Count..($candidateParts.Count - 1)])) {
+            $current = $rootFull
+            foreach ($segment in @($candidate.Substring($rootFull.Length + 1) -split '[\\/]')) {
               $current = Join-Path $current $segment
-              if (-not (Test-Path -LiteralPath $current)) { break }
               $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
               if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "$Context contains a reparse-point path component: $current"
+                throw "$Context contains a reparse-point path component."
               }
-            }
-            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
-              throw "$Context was not found: $RelativePath"
             }
             return $candidate
           }
 
-          $manifest = [string]$env:STAGE5_FIXTURE_MANIFEST
-          $manifestPath = Resolve-Stage5RepositoryFile $manifest 'Stage 5 fixture manifest'
-          if ([IO.Path]::GetFileName($manifestPath) -match '(?i)\.(?:example|sample)\.') {
-            throw 'Stage 5 requires a reviewed fixture manifest; example/sample manifests are not accepted.'
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\', '/')
+          Import-Module "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/DeterministicSimulationEvidence.psm1" `
+            -Force
+          $expectedTitle = switch ($env:STAGE5_GAME) {
+            'Generals' { 'Generals' }
+            'GeneralsMD' { 'ZeroHour' }
+            default { throw "Unsupported Stage 5 game '$env:STAGE5_GAME'." }
           }
-          $manifestDocument = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-          $expectedTitle = if ('${{ inputs.game }}' -ceq 'Generals') { 'Generals' } else { 'ZeroHour' }
-          if ([int]$manifestDocument.schemaVersion -ne 1 -or
-              [string]$manifestDocument.title -cne $expectedTitle) {
-            throw "Stage 5 fixture manifest must be schema 1 for title $expectedTitle."
-          }
-          $manifestExecutableHash = [string]$manifestDocument.executableSha256
-          if ($manifestExecutableHash -notmatch '^[0-9A-Fa-f]{64}$' -or
-              $manifestExecutableHash -match '^0{64}$') {
-            throw 'Stage 5 fixture manifest must contain a non-placeholder executable SHA-256.'
-          }
-          $fixtures = @($manifestDocument.fixtures)
-          if ($fixtures.Count -ne 10) {
-            throw "Stage 5 requires the reviewed ten-replay corpus; manifest contains $($fixtures.Count) fixtures."
-          }
-          if (@($fixtures | Where-Object { $_.stress -eq $true }).Count -ne 1) {
-            throw 'Stage 5 requires exactly one stress replay in the reviewed ten-replay corpus.'
-          }
-          $fixtureIds = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-          $fixtureHashes = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-          foreach ($fixture in $fixtures) {
-            $fixtureId = [string]$fixture.id
-            $fixtureSource = [string]$fixture.source
-            $fixtureHash = [string]$fixture.sha256
-            if (-not $fixtureIds.Add($fixtureId)) {
-              throw "Stage 5 fixture manifest repeats fixture id '$fixtureId'."
-            }
-            if ([IO.Path]::GetExtension($fixtureSource) -ine '.rep') {
-              throw "Stage 5 fixture '$fixtureId' is not a replay source: $fixtureSource"
-            }
-            $fixturePath = Resolve-Stage5RepositoryFile $fixtureSource "Stage 5 fixture '$fixtureId'"
-            if ($fixtureHash -notmatch '^[0-9A-Fa-f]{64}$' -or $fixtureHash -match '^0{64}$') {
-              throw "Stage 5 fixture '$fixtureId' has a missing or placeholder SHA-256."
-            }
-            $actualFixtureHash = (Get-FileHash -LiteralPath $fixturePath -Algorithm SHA256).Hash
-            if ($actualFixtureHash -cne $fixtureHash.ToUpperInvariant()) {
-              throw "Stage 5 fixture '$fixtureId' SHA-256 does not match its reviewed source."
-            }
-            if (-not $fixtureHashes.Add($fixtureHash.ToUpperInvariant())) {
-              throw "Stage 5 fixture '$fixtureId' reuses another fixture source SHA-256."
-            }
+          $expectedExecutableRole = if ($expectedTitle -ceq 'Generals') {
+            'generals-executable'
+          } else {
+            'zerohour-executable'
           }
 
-          $baseline = [string]$env:STAGE5_PERFORMANCE_BASELINE
-          $expectedStage3Hash = [string]$env:STAGE5_EXPECTED_STAGE3_EXECUTABLE_SHA256
-          if ([string]::IsNullOrWhiteSpace($baseline) -or
-              [string]::IsNullOrWhiteSpace($expectedStage3Hash)) {
-            throw 'Stage 5 full qualification requires stage5_performance_baseline and stage5_expected_stage3_executable_sha256.'
+          $requestedManifestPath = Resolve-Stage5RepositoryFile $workspace `
+            $env:STAGE5_FIXTURE_MANIFEST 'Stage 5 fixture manifest'
+          if ([IO.Path]::GetFileName($requestedManifestPath) -match '(?i)\.(?:example|sample)\.') {
+            throw 'Stage 5 requires a reviewed fixture manifest; example/sample manifests are not accepted.'
           }
+          $baselinePath = Resolve-Stage5RepositoryFile $workspace `
+            $env:STAGE5_PERFORMANCE_BASELINE 'Stage 5 performance baseline'
+          $expectedStage3Hash = [string]$env:STAGE5_EXPECTED_STAGE3_EXECUTABLE_SHA256
           if ($expectedStage3Hash -notmatch '^[0-9A-Fa-f]{64}$' -or
               $expectedStage3Hash -match '^0{64}$') {
             throw 'Stage 5 full qualification requires a non-placeholder Stage 3 executable SHA-256.'
           }
-          $baselinePath = Resolve-Stage5RepositoryFile $baseline 'Stage 5 performance baseline'
-          $acceptance = [string]$env:STAGE5_ACCEPTANCE_MANIFEST
-          $acceptancePath = Resolve-Stage5RepositoryFile $acceptance 'Stage 5 final acceptance manifest'
+
+          $acceptancePath = Resolve-Stage5RepositoryFile $workspace `
+            $env:STAGE5_ACCEPTANCE_MANIFEST 'Stage 5 final acceptance manifest'
           if ([IO.Path]::GetFileName($acceptancePath) -match '(?i)\.(?:example|sample)\.') {
             throw 'Stage 5 final acceptance requires a reviewed manifest; example/sample manifests are not accepted.'
           }
-          $acceptanceDocument = Get-Content -LiteralPath $acceptancePath -Raw | ConvertFrom-Json
-          $acceptanceSourceCommit = ([string]$acceptanceDocument.sourceCommit).ToLowerInvariant()
-          if ([int]$acceptanceDocument.schemaVersion -ne 1 -or
-              [string]$acceptanceDocument.gateName -cne 'final-stage5-acceptance' -or
-              $acceptanceSourceCommit -notmatch '^[0-9a-f]{40}$' -or
+          $acceptanceDocument = ConvertFrom-Stage5JsonDictionary $acceptancePath
+          Assert-Stage5JsonShape $acceptanceDocument @('schemaVersion', 'gateName',
+            'sourceCommit', 'cohortNonce', 'cohortCreatedUtc', 'artifactSet', 'evidence') `
+            'Stage 5 final acceptance manifest'
+          $acceptanceSchemaVersion = Get-Stage5JsonValue $acceptanceDocument `
+            'schemaVersion' 'Stage 5 final acceptance manifest'
+          $acceptanceSourceCommit = [string](Get-Stage5JsonValue `
+            $acceptanceDocument 'sourceCommit' 'Stage 5 final acceptance manifest')
+          if (-not (Test-Stage5JsonInteger $acceptanceSchemaVersion) -or
+              $acceptanceSchemaVersion -ne 1 -or
+              (Get-Stage5JsonValue $acceptanceDocument 'gateName' `
+                'Stage 5 final acceptance manifest') -cne 'final-stage5-acceptance' -or
+              $acceptanceSourceCommit -cnotmatch '^[0-9a-f]{40}$' -or
               $acceptanceSourceCommit -cne $env:GITHUB_SHA.ToLowerInvariant()) {
             throw 'Stage 5 final acceptance manifest is stale or has an unsupported schema.'
           }
-          $acceptanceArtifactReference = $acceptanceDocument.artifactSet
-          if ($null -eq $acceptanceArtifactReference -or
-              [string]::IsNullOrWhiteSpace([string]$acceptanceArtifactReference.path)) {
-            throw 'Stage 5 final acceptance manifest is missing its artifact-set reference.'
+          $acceptanceArtifactReference = Get-Stage5JsonValue $acceptanceDocument `
+            'artifactSet' 'Stage 5 final acceptance manifest'
+          Assert-Stage5JsonShape $acceptanceArtifactReference @('path', 'sha256') `
+            'Stage 5 artifact-set reference'
+          $acceptanceRelativeDirectory = Split-Path -Parent `
+            ([string]$env:STAGE5_ACCEPTANCE_MANIFEST)
+          $artifactSetReference = [string](Get-Stage5JsonValue `
+            $acceptanceArtifactReference 'path' 'Stage 5 artifact-set reference')
+          $artifactSetRelative = if ([string]::IsNullOrWhiteSpace(
+              $acceptanceRelativeDirectory)) {
+            $artifactSetReference
+          } else {
+            Join-Path $acceptanceRelativeDirectory $artifactSetReference
           }
-          $artifactSetPath = Resolve-Stage5RepositoryFile (Join-Path (Split-Path -Parent $acceptancePath) ([string]$acceptanceArtifactReference.path)) 'Stage 5 artifact set'
+          $artifactSetPath = Resolve-Stage5RepositoryFile $workspace `
+            $artifactSetRelative 'Stage 5 artifact set'
           $artifactSetHash = (Get-FileHash -LiteralPath $artifactSetPath -Algorithm SHA256).Hash
-          if ($artifactSetHash -cne ([string]$acceptanceArtifactReference.sha256).ToUpperInvariant()) {
+          $declaredArtifactSetHash = [string](Get-Stage5JsonValue `
+            $acceptanceArtifactReference 'sha256' 'Stage 5 artifact-set reference')
+          if ($declaredArtifactSetHash -cnotmatch '^[0-9A-Fa-f]{64}$' -or
+              $declaredArtifactSetHash -cmatch '^0{64}$' -or
+              $artifactSetHash -cne $declaredArtifactSetHash.ToUpperInvariant()) {
             throw 'Stage 5 artifact-set SHA-256 does not match the reviewed acceptance manifest.'
           }
-          $artifactSetDocument = Get-Content -LiteralPath $artifactSetPath -Raw | ConvertFrom-Json
-          if ([int]$artifactSetDocument.schemaVersion -ne 1 -or
-              [string]$artifactSetDocument.sourceCommit -cne $acceptanceSourceCommit -or
-              [string]$artifactSetDocument.architecture -cne 'x64') {
-            throw 'Stage 5 artifact set is stale or not an x64 artifact set for the checked-out commit.'
+          $artifactSetDocument = ConvertFrom-Stage5JsonDictionary $artifactSetPath
+          $runtimeClosureResult = Get-Stage5RuntimeClosureBinding `
+            -ArtifactSet $artifactSetDocument `
+            -ArtifactDirectory (Split-Path -Parent $artifactSetPath) `
+            -ExpectedSourceCommit $acceptanceSourceCommit `
+            -Context 'Stage 5 artifact set runtime closure'
+          $expectedRuntimeClosure = [ordered]@{
+            dependencyManifestSha256 = [string]$runtimeClosureResult.dependencyManifestSha256
+            closureSha256 = [string]$runtimeClosureResult.closureSha256
           }
-          $runtimeClosure = $artifactSetDocument.runtimeClosure
-          if ($null -eq $runtimeClosure -or $null -eq $runtimeClosure.dependencyManifest -or
-              [string]$runtimeClosure.dependencyManifest.sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or
-              [string]$runtimeClosure.closureSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
-            throw 'Stage 5 artifact set is missing canonical runtime-closure hashes.'
+
+          $requiredArtifactRoles = @('generals-executable', 'generals-launcher',
+            'generals-launcher-config', 'zerohour-executable', 'zerohour-launcher',
+            'zerohour-launcher-config')
+          $artifactHashes = @{}
+          foreach ($artifact in (Get-Stage5JsonValue $artifactSetDocument 'artifacts' `
+              'Stage 5 artifact set')) {
+            Assert-Stage5JsonShape $artifact @('role', 'path', 'sha256') `
+              'Stage 5 artifact entry'
+            $role = [string](Get-Stage5JsonValue $artifact 'role' `
+              'Stage 5 artifact entry')
+            $hash = [string](Get-Stage5JsonValue $artifact 'sha256' `
+              'Stage 5 artifact entry')
+            if ($requiredArtifactRoles -cnotcontains $role -or
+                $artifactHashes.ContainsKey($role) -or
+                $hash -cnotmatch '^[0-9A-Fa-f]{64}$' -or
+                $hash -cmatch '^0{64}$') {
+              throw "Stage 5 artifact role '$role' is missing, repeated, or malformed."
+            }
+            $artifactHashes[$role] = $hash.ToUpperInvariant()
+          }
+          if ($artifactHashes.Count -ne $requiredArtifactRoles.Count) {
+            throw 'Stage 5 artifact set does not bind the exact six core artifacts.'
+          }
+
+          $requiredEvidenceKinds = @('deterministic-runtime', 'replay-determinism',
+            'fresh-ai', 'performance-scaling', 'mixed-worker-multiplayer',
+            'combined-stage4-stage5-installed-runtime')
+          $evidenceEntries = Get-Stage5JsonValue $acceptanceDocument 'evidence' `
+            'Stage 5 final acceptance manifest'
+          if ($evidenceEntries.Count -ne $requiredEvidenceKinds.Count) {
+            throw 'Stage 5 final acceptance manifest must contain the exact six evidence kinds.'
+          }
+          $seenEvidenceKinds = New-Object 'Collections.Generic.HashSet[string]' `
+            ([StringComparer]::Ordinal)
+          $replayEvidenceReference = $null
+          foreach ($entry in $evidenceEntries) {
+            Assert-Stage5JsonShape $entry @('kind', 'path', 'sha256') `
+              'Stage 5 final acceptance evidence reference'
+            $kind = [string](Get-Stage5JsonValue $entry 'kind' `
+              'Stage 5 final acceptance evidence reference')
+            if ($requiredEvidenceKinds -cnotcontains $kind -or
+                -not $seenEvidenceKinds.Add($kind)) {
+              throw "Stage 5 final acceptance evidence kind '$kind' is unknown or repeated."
+            }
+            if ($kind -ceq 'replay-determinism') {
+              $replayEvidenceReference = $entry
+            }
+          }
+          if ($seenEvidenceKinds.Count -ne $requiredEvidenceKinds.Count -or
+              $null -eq $replayEvidenceReference) {
+            throw 'Stage 5 final acceptance manifest lacks replay-determinism evidence.'
+          }
+          $replayEvidenceReferencePath = [string](Get-Stage5JsonValue `
+            $replayEvidenceReference 'path' 'Stage 5 replay-determinism reference')
+          $replayEvidenceRelative = if ([string]::IsNullOrWhiteSpace(
+              $acceptanceRelativeDirectory)) {
+            $replayEvidenceReferencePath
+          } else {
+            Join-Path $acceptanceRelativeDirectory $replayEvidenceReferencePath
+          }
+          $replayEvidencePath = Resolve-Stage5RepositoryFile $workspace `
+            $replayEvidenceRelative 'Stage 5 replay-determinism evidence'
+          $replayEvidenceHash = (Get-FileHash -LiteralPath $replayEvidencePath `
+            -Algorithm SHA256).Hash
+          $declaredReplayEvidenceHash = [string](Get-Stage5JsonValue `
+            $replayEvidenceReference 'sha256' 'Stage 5 replay-determinism reference')
+          if ($declaredReplayEvidenceHash -cnotmatch '^[0-9A-F]{64}$' -or
+              $declaredReplayEvidenceHash -cmatch '^0{64}$' -or
+              $replayEvidenceHash -cne $declaredReplayEvidenceHash) {
+            throw 'Stage 5 replay-determinism evidence hash is stale or substituted.'
+          }
+          $replayEvidenceDocument = ConvertFrom-Stage5JsonDictionary $replayEvidencePath
+          Assert-Stage5JsonShape $replayEvidenceDocument @('schemaVersion',
+            'evidenceKind', 'status', 'sourceCommit', 'title', 'architecture',
+            'artifactSetSha256', 'recordedUtc', 'cohortNonce', 'runtimeClosure',
+            'attachments', 'details') 'Stage 5 replay-determinism evidence'
+          $replayEvidenceSchemaVersion = Get-Stage5JsonValue $replayEvidenceDocument `
+            'schemaVersion' 'Stage 5 replay-determinism evidence'
+          if (-not (Test-Stage5JsonInteger $replayEvidenceSchemaVersion) -or
+              $replayEvidenceSchemaVersion -ne 1 -or
+              (Get-Stage5JsonValue $replayEvidenceDocument 'evidenceKind' `
+                'Stage 5 replay-determinism evidence') -cne 'replay-determinism' -or
+              (Get-Stage5JsonValue $replayEvidenceDocument 'status' `
+                'Stage 5 replay-determinism evidence') -cne 'passed' -or
+              (Get-Stage5JsonValue $replayEvidenceDocument 'sourceCommit' `
+                'Stage 5 replay-determinism evidence') -cne $acceptanceSourceCommit -or
+              (Get-Stage5JsonValue $replayEvidenceDocument 'title' `
+                'Stage 5 replay-determinism evidence') -cne 'Both' -or
+              (Get-Stage5JsonValue $replayEvidenceDocument 'architecture' `
+                'Stage 5 replay-determinism evidence') -cne 'x64' -or
+              (Get-Stage5JsonValue $replayEvidenceDocument 'artifactSetSha256' `
+                'Stage 5 replay-determinism evidence') -cne $artifactSetHash) {
+            throw 'Stage 5 replay-determinism evidence identity is stale or substituted.'
+          }
+          $evidenceRuntimeClosure = Get-Stage5JsonValue $replayEvidenceDocument `
+            'runtimeClosure' 'Stage 5 replay-determinism evidence'
+          Assert-Stage5JsonShape $evidenceRuntimeClosure `
+            @('dependencyManifestSha256', 'closureSha256') `
+            'Stage 5 replay-determinism runtime closure'
+          if ([string](Get-Stage5JsonValue $evidenceRuntimeClosure `
+                'dependencyManifestSha256' 'Stage 5 replay-determinism runtime closure') -cne
+                $expectedRuntimeClosure.dependencyManifestSha256 -or
+              [string](Get-Stage5JsonValue $evidenceRuntimeClosure 'closureSha256' `
+                'Stage 5 replay-determinism runtime closure') -cne
+                $expectedRuntimeClosure.closureSha256) {
+            throw 'Stage 5 replay-determinism evidence runtime closure is substituted.'
+          }
+
+          $expectedReplayAttachmentBindings = [ordered]@{
+            'replay-results|ZeroHour' = 'host-runner'
+            'replay-fixture-manifest|Generals' = 'reviewed-fixture'
+            'replay-fixture-manifest|ZeroHour' = 'reviewed-fixture'
+          }
+          $seenReplayAttachmentBindings = New-Object 'Collections.Generic.HashSet[string]' `
+            ([StringComparer]::Ordinal)
+          $reviewedReceiptsByTitle = @{}
+          $reviewedReceiptPaths = New-Object 'Collections.Generic.HashSet[string]' `
+            ([StringComparer]::OrdinalIgnoreCase)
+          $replayEvidenceRelativeDirectory = Split-Path -Parent $replayEvidenceRelative
+          foreach ($attachment in (Get-Stage5JsonValue $replayEvidenceDocument `
+              'attachments' 'Stage 5 replay-determinism evidence')) {
+            Assert-Stage5JsonShape $attachment @('role', 'title', 'path', 'sha256',
+              'trustDomain') `
+              'Stage 5 replay-determinism attachment'
+            $attachmentRole = [string](Get-Stage5JsonValue $attachment 'role' `
+              'Stage 5 replay-determinism attachment')
+            $attachmentTitle = [string](Get-Stage5JsonValue $attachment 'title' `
+              'Stage 5 replay-determinism attachment')
+            $attachmentBinding = "$attachmentRole|$attachmentTitle"
+            $attachmentTrustDomain = [string](Get-Stage5JsonValue $attachment `
+              'trustDomain' 'Stage 5 replay-determinism attachment')
+            if (-not $expectedReplayAttachmentBindings.Contains($attachmentBinding) -or
+                -not $seenReplayAttachmentBindings.Add($attachmentBinding) -or
+                $attachmentTrustDomain -cne `
+                  [string]$expectedReplayAttachmentBindings[$attachmentBinding]) {
+              throw "Stage 5 replay-determinism attachment '$attachmentBinding' is unknown, repeated, or has the wrong trust domain."
+            }
+            $declaredAttachmentHash = [string](Get-Stage5JsonValue $attachment `
+              'sha256' 'Stage 5 replay-determinism attachment')
+            if ($declaredAttachmentHash -cnotmatch '^[0-9A-F]{64}$' -or
+                $declaredAttachmentHash -cmatch '^0{64}$') {
+              throw "Stage 5 replay-determinism attachment '$attachmentBinding' hash is malformed or a placeholder."
+            }
+            if ($attachmentRole -cne 'replay-fixture-manifest') { continue }
+            if (@('Generals', 'ZeroHour') -cnotcontains $attachmentTitle -or
+                $reviewedReceiptsByTitle.ContainsKey($attachmentTitle)) {
+              throw "Stage 5 reviewed fixture attachment title '$attachmentTitle' is unknown or repeated."
+            }
+            if ((Get-Stage5JsonValue $attachment 'trustDomain' `
+                'Stage 5 replay-determinism attachment') -cne 'reviewed-fixture') {
+              throw 'Stage 5 replay fixture attachment is not protected reviewed-fixture evidence.'
+            }
+            $attachmentReference = [string](Get-Stage5JsonValue $attachment 'path' `
+              'Stage 5 replay-determinism attachment')
+            $attachmentRelative = if ([string]::IsNullOrWhiteSpace(
+                $replayEvidenceRelativeDirectory)) {
+              $attachmentReference
+            } else {
+              Join-Path $replayEvidenceRelativeDirectory $attachmentReference
+            }
+            $attachmentPath = Resolve-Stage5RepositoryFile $workspace `
+              $attachmentRelative 'Stage 5 reviewed fixture receipt'
+            if (-not $reviewedReceiptPaths.Add($attachmentPath)) {
+              throw 'Stage 5 replay fixture attachments alias the same receipt path.'
+            }
+            $attachmentHash = (Get-FileHash -LiteralPath $attachmentPath `
+              -Algorithm SHA256).Hash
+            if ($attachmentHash -cne $declaredAttachmentHash) {
+              throw 'Stage 5 reviewed fixture receipt hash is stale or substituted.'
+            }
+            $receiptDocument = ConvertFrom-Stage5JsonDictionary $attachmentPath
+            $receiptTitle = [string](Get-Stage5JsonValue $receiptDocument 'title' `
+              'Stage 5 reviewed fixture receipt')
+            if ($receiptTitle -cne $attachmentTitle) {
+              throw 'Stage 5 reviewed fixture attachment title does not match its protected receipt title.'
+            }
+            $reviewedReceiptsByTitle[$attachmentTitle] = `
+              Read-Stage5FinalAcceptanceImmutableReceipt `
+                -Path $attachmentPath `
+                -Kind 'replay-determinism' `
+                -Role 'replay-fixture-manifest' `
+                -EvidenceTitle $attachmentTitle `
+                -ExpectedSourceCommit $acceptanceSourceCommit `
+                -ExpectedArtifactSetSha256 $artifactSetHash `
+                -ArtifactHashes $artifactHashes `
+                -ExpectedEvidenceSha256 $attachmentHash `
+                -ExpectedRuntimeClosure $expectedRuntimeClosure
+          }
+          if ($seenReplayAttachmentBindings.Count -ne
+              $expectedReplayAttachmentBindings.Count) {
+            throw 'Stage 5 replay-determinism evidence must bind exactly one replay-results receipt and both reviewed fixture receipts.'
+          }
+          if (-not $reviewedReceiptsByTitle.ContainsKey($expectedTitle)) {
+            throw "Stage 5 replay-determinism evidence lacks the exact $expectedTitle reviewed fixture receipt."
+          }
+          $reviewedReceipt = $reviewedReceiptsByTitle[$expectedTitle]
+          $manifestDocument = $reviewedReceipt.reviewedFixtureManifest
+          $manifestSnapshot = $reviewedReceipt.reviewedFixtureManifestSnapshot
+          if ($null -eq $manifestDocument -or $null -eq $manifestSnapshot) {
+            throw 'Stage 5 reviewed fixture receipt did not produce a validated fixture manifest snapshot.'
+          }
+          $manifestSnapshotPath = [string]$manifestSnapshot.path
+          if ([string]::IsNullOrWhiteSpace($manifestSnapshotPath) -or
+              -not [IO.Path]::IsPathRooted($manifestSnapshotPath)) {
+            throw 'Stage 5 protected reviewed manifest snapshot did not provide an absolute repository path.'
+          }
+          $manifestSnapshotFullPath = [IO.Path]::GetFullPath($manifestSnapshotPath)
+          $workspacePrefix = $workspace + [IO.Path]::DirectorySeparatorChar
+          if (-not $manifestSnapshotFullPath.StartsWith($workspacePrefix,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Stage 5 protected reviewed manifest snapshot escaped the checked-out repository.'
+          }
+          $validatedManifestRelative = $manifestSnapshotFullPath.Substring(
+            $workspacePrefix.Length)
+          $validatedManifestPath = Resolve-Stage5RepositoryFile $workspace `
+            $validatedManifestRelative 'Stage 5 protected reviewed manifest snapshot'
+          $manifestSnapshotHash = [string]$manifestSnapshot.sha256
+          $validatedManifestHash = (Get-FileHash -LiteralPath $validatedManifestPath `
+            -Algorithm SHA256).Hash
+          if ($manifestSnapshotHash -cnotmatch '^[0-9A-F]{64}$' -or
+              $manifestSnapshotHash -cmatch '^0{64}$' -or
+              $validatedManifestHash -cne $manifestSnapshotHash) {
+            throw 'Stage 5 protected reviewed manifest snapshot hash is stale or substituted.'
+          }
+          if (-not $validatedManifestPath.Equals($requestedManifestPath,
+              [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Stage 5 caller fixture manifest is not the protected reviewed manifest selected by title.'
+          }
+          $fixtures = Get-Stage5JsonValue $manifestDocument 'fixtures' `
+            'Stage 5 reviewed fixture manifest'
+          if ($fixtures.Count -ne 10) {
+            throw "Stage 5 requires the reviewed ten-replay corpus; manifest contains $($fixtures.Count) fixtures."
+          }
+          $stressFixtureCount = 0
+          $fixtureHashes = New-Object 'Collections.Generic.HashSet[string]' `
+            ([StringComparer]::OrdinalIgnoreCase)
+          foreach ($fixture in $fixtures) {
+            $fixtureId = [string](Get-Stage5JsonValue $fixture 'id' `
+              'Stage 5 reviewed fixture')
+            $fixtureSource = [string](Get-Stage5JsonValue $fixture 'source' `
+              "Stage 5 reviewed fixture '$fixtureId'")
+            $fixtureHash = [string](Get-Stage5JsonValue $fixture 'sha256' `
+              "Stage 5 reviewed fixture '$fixtureId'")
+            $fixtureStress = Get-Stage5JsonValue $fixture 'stress' `
+              "Stage 5 reviewed fixture '$fixtureId'"
+            if ([IO.Path]::GetExtension($fixtureSource) -ine '.rep' -or
+                $fixtureHash -cnotmatch '^[0-9A-Fa-f]{64}$' -or
+                $fixtureHash -cmatch '^0{64}$' -or
+                -not $fixtureHashes.Add($fixtureHash) -or
+                $fixtureStress -isnot [bool]) {
+              throw "Stage 5 reviewed fixture '$fixtureId' is malformed or aliases another replay hash."
+            }
+            if ([bool]$fixtureStress) { ++$stressFixtureCount }
+          }
+          if ($stressFixtureCount -ne 1) {
+            throw 'Stage 5 requires exactly one stress replay in the reviewed ten-replay corpus.'
           }
           $executionCohortNonce = [string]$env:STAGE5_EXECUTION_COHORT_NONCE
           $executionCohortCreatedUtc = [string]$env:STAGE5_EXECUTION_COHORT_CREATED_UTC
@@ -710,15 +540,17 @@ jobs:
             throw 'Stage 5 requires a valid caller-minted execution cohort creation timestamp.'
           }
 
-          $candidateName = [string]$manifestDocument.executable
+          $candidateName = [string](Get-Stage5JsonValue $manifestDocument 'executable' `
+            'Stage 5 reviewed fixture manifest')
+          $manifestExecutableHash = [string](Get-Stage5JsonValue $manifestDocument `
+            'executableSha256' 'Stage 5 reviewed fixture manifest')
           if ($candidateName -notmatch '^[A-Za-z0-9._-]+\.exe$') {
             throw 'Stage 5 fixture manifest executable must be a leaf .exe name.'
           }
-          $runtimeRoot = (Resolve-Path "build").Path
+          $runtimeRoot = (Resolve-Path -LiteralPath 'build').Path
           $candidatePath = Join-Path $runtimeRoot $candidateName
           if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
-            Write-Error "Stage 5 installed candidate was not found: $candidateName"
-            exit 1
+            throw "Stage 5 installed candidate was not found: $candidateName"
           }
           $retiredRuntimeNames = @(
             'd3d8.dll', 'd3d8d.dll', 'd3dx8.dll', 'd3dx8d.dll',
@@ -734,67 +566,66 @@ jobs:
             })
           if ($retiredRuntimeFiles.Count -gt 0) {
             $retiredPaths = $retiredRuntimeFiles | ForEach-Object { $_.FullName }
-            Write-Error "Stage 5 installed runtime contains retired D3D8/Miles/Bink files: $($retiredPaths -join '; ')"
-            exit 1
+            throw "Stage 5 installed runtime contains retired D3D8/Miles/Bink files: $($retiredPaths -join '; ')"
           }
           $candidateHash = (Get-FileHash -LiteralPath $candidatePath -Algorithm SHA256).Hash
-          if (-not (Test-Path -LiteralPath 'H:\')) {
-            & subst.exe H: "${{ runner.temp }}"
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) {
-              throw 'Stage 5 validation could not provision its isolated H: task volume.'
-            }
+          if ($candidateHash -cne $manifestExecutableHash.ToUpperInvariant() -or
+              $candidateHash -cne [string]$artifactHashes[$expectedExecutableRole]) {
+            throw 'Stage 5 installed candidate hash is not the protected reviewed title executable.'
           }
           $taskRoot = 'H:\Stage5SimulationValidationTask'
-          New-Item -ItemType Directory -Path $taskRoot -Force | Out-Null
-          $outputRoot = Join-Path $taskRoot 'Evidence'
-          $requireX64 = '${{ inputs.stage5_require_x64 }}' -eq 'true'
-          if ('${{ inputs.preset }}' -notlike 'x64*' -or -not $requireX64) {
-            Write-Error 'Stage 5 installed-runtime validation is reserved for an explicitly x64-required job; legacy VC6 replay jobs remain on the compatibility lane.'
-            exit 1
+          if (-not (Test-Path -LiteralPath $taskRoot -PathType Container)) {
+            throw 'The immutable qualification-data producer did not retain the Stage 5 task root.'
           }
-          $validationArguments = @(
-            '-RuntimeRoot', $runtimeRoot,
-            '-FixtureManifestPath', $manifestPath,
-            '-OutputRoot', $outputRoot,
-            '-TaskRoot', $taskRoot,
-            '-AllowHeadlessDirectExecution',
-            '-ValidationSet', 'All',
-            '-ReplayMatrixRepeats', '${{ inputs.stage5_replay_matrix_repeats }}',
-            '-StressRepeats', '${{ inputs.stage5_stress_repeats }}',
-            '-ExpectedExecutableSha256', $candidateHash,
-            '-Title', '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}',
-            '-GeneralsInstallRoot', $env:GENERALS_PATH,
-            '-MinimumFreeBytes', '2147483648',
-            '-EnforcePerformance',
-            '-Stage3PerformanceBaselinePath', $baselinePath,
-            '-ExpectedStage3ExecutableSha256', $expectedStage3Hash,
-            '-AcceptanceSourceCommit', $acceptanceSourceCommit,
-            '-AcceptanceArtifactSetSha256', $artifactSetHash,
-            '-ExecutionCohortNonce', $executionCohortNonce,
-            '-ExecutionCohortCreatedUtc', $executionCohortCreatedUtc,
-            '-AcceptanceRuntimeDependencyManifestSha256', ([string]$runtimeClosure.dependencyManifest.sha256),
-            '-AcceptanceRuntimeClosureSha256', ([string]$runtimeClosure.closureSha256)
-          )
-          if ($requireX64) { $validationArguments += '-RequireX64' }
-          & "Core/Tools/DeterministicSimulationValidation/Run-DeterministicSimulationValidation.ps1" @validationArguments
+          $outputRoot = Join-Path $taskRoot 'Evidence'
+          if ($env:STAGE5_PRESET -notlike 'x64*' -or
+              $env:STAGE5_REQUIRE_X64 -cne 'true') {
+            throw 'Stage 5 installed-runtime validation requires an explicitly x64-required native product job.'
+          }
+          # Keep every retained qualification-data binding explicit at this call site:
+          # '-QualificationDataManifestPath', '-QualificationDataManifestSha256', '-QualificationDataClosureSha256', '-QualificationDataFileCount'.
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Run-DeterministicSimulationValidation.ps1" `
+            -RuntimeRoot $runtimeRoot `
+            -FixtureManifestPath $validatedManifestPath `
+            -OutputRoot $outputRoot `
+            -TaskRoot $taskRoot `
+            -AllowHeadlessDirectExecution `
+            -RequireX64 `
+            -ValidationSet 'All' `
+            -ReplayMatrixRepeats $env:STAGE5_REPLAY_MATRIX_REPEATS `
+            -StressRepeats $env:STAGE5_STRESS_REPEATS `
+            -ExpectedExecutableSha256 $candidateHash `
+            -Title $expectedTitle `
+            -GeneralsInstallRoot $runtimeRoot `
+            -MinimumFreeBytes 2147483648 `
+            -EnforcePerformance `
+            -Stage3PerformanceBaselinePath $baselinePath `
+            -ExpectedStage3ExecutableSha256 $expectedStage3Hash `
+            -AcceptanceSourceCommit $acceptanceSourceCommit `
+            -AcceptanceArtifactSetSha256 $artifactSetHash `
+            -ExecutionCohortNonce $executionCohortNonce `
+            -ExecutionCohortCreatedUtc $executionCohortCreatedUtc `
+            -AcceptanceRuntimeDependencyManifestSha256 $expectedRuntimeClosure.dependencyManifestSha256 `
+            -AcceptanceRuntimeClosureSha256 $expectedRuntimeClosure.closureSha256 `
+            -QualificationDataManifestPath $env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_PATH `
+            -QualificationDataManifestSha256 $env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_SHA256 `
+            -QualificationDataClosureSha256 $env:STAGE5_SIMULATION_QUALIFICATION_DATA_CLOSURE_SHA256 `
+            -QualificationDataFileCount $env:STAGE5_SIMULATION_QUALIFICATION_DATA_FILE_COUNT
           if (-not $?) {
             throw 'Stage 5 ValidationSet All runner failed.'
           }
-          # This title lane produces fresh, host-bound receipts. Cross-title
-          # pre-manual aggregation runs only after both title lanes and the
-          # combined host producer have been assembled; the reviewed
-          # repository manifest is never treated as fresh H: evidence here.
-          # Invoke-Stage5FinalAcceptance.ps1 is reserved for that assembled
-          # cross-title pre-manual step.
           Write-Host 'Stage 5 fresh title receipts are ready for cross-title pre-manual aggregation.'
 
       - name: Normalize Stage 5 Evidence Paths for Upload
         if: ${{ always() && inputs.stage5 }}
         shell: pwsh
+        env:
+          STAGE5_UPLOAD_ROOT: ${{ runner.temp }}\Stage5SimulationValidation-upload
         run: |
           & "$env:GITHUB_WORKSPACE/.github/workflows/Normalize-Stage5EvidenceForUpload.ps1" `
-            -InputRoot "H:\Stage5SimulationValidationTask\Evidence" `
-            -OutputRoot "${{ runner.temp }}\Stage5SimulationValidation-upload"
+            -InputRoot 'H:\Stage5SimulationValidationTask\Evidence' `
+            -OutputRoot $env:STAGE5_UPLOAD_ROOT
+          if (-not $?) { throw 'Stage 5 evidence normalization failed.' }
 
       - name: Upload Debug Log
         if: always()

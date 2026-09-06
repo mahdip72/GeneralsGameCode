@@ -7,6 +7,7 @@
 #include "Lib/ImmutableSpatialQueryRuntime.h"
 #if defined(_WIN64)
 #include "Lib/KernelPerformanceDiagnostics.h"
+#include "../TestSupport/NativeKernelSourceConsumerTest.h"
 #endif
 #include "../TestSupport/LocalCapacityTestLane.h"
 
@@ -30,12 +31,22 @@ namespace
 using namespace rts;
 
 int g_failures = 0;
+#if defined(_WIN64)
+int g_nativeSpatialCase = -1;
+bool g_nativeSpatialBaseline = false;
+#endif
 
 void expect(bool condition, const char *message)
 {
 	if (!condition)
 	{
-		std::cerr << "FAIL: " << message << '\n';
+		std::cerr << "FAIL";
+#if defined(_WIN64)
+		if (g_nativeSpatialCase >= 0)
+			std::cerr << " [spatial " << (g_nativeSpatialBaseline ? "consumer" : "source") <<
+				" cutPass=" << g_nativeSpatialCase << ']';
+#endif
+		std::cerr << ": " << message << '\n';
 		++g_failures;
 	}
 }
@@ -1525,6 +1536,18 @@ void testSpatialCollectionCompletionIdentity()
 		"spatial partial or empty consumer conservatively aborts full batch");
 	expect(!completion.complete(IMMUTABLE_SPATIAL_CONSUMER_POINT_DEFENSE_LASER,
 		second, true), "spatial completed collection cannot finish twice");
+
+	completion.reset(13);
+	completion.expectedConsumers = 1;
+	first.batchEpoch = 13;
+	first.queryOrdinal = 0;
+	expect(ImmutableSpatialConsumerTransactionCommitted(0, true) &&
+		completion.complete(IMMUTABLE_SPATIAL_CONSUMER_HEALING, first,
+			ImmutableSpatialConsumerTransactionCommitted(0, true)) &&
+		completion.finished() && completion.allConsumersCommitted,
+		"validated zero-result consumer commits its successful transaction");
+	expect(!ImmutableSpatialConsumerTransactionCommitted(0, false),
+		"zero-result shadow mismatch remains uncommitted");
 #endif
 }
 
@@ -2202,6 +2225,295 @@ void testDeterministicAdmissionCostInversion()
 		IMMUTABLE_SPATIAL_ADMISSION_POLICY_INELIGIBLE,
 		"forced-one policy rejects before spatial preparation");
 }
+
+#if defined(_WIN64)
+struct NativeSpatialObservations
+{
+	std::atomic<unsigned> entries[2][4]{}, exits[2][4]{};
+	std::atomic<unsigned> queryEntries[2][8]{}, radiusPolls[2][8][2]{};
+	std::atomic<bool> wrongIdentity{false}, cutReached{false};
+	std::atomic<unsigned> held{0};
+	std::atomic<bool> releaseHeld{false}, waitExpired{false};
+	unsigned cancelNotifications = 0, releaseNotifications = 0, releasedCompleted = 0, releasedSubmitted = 0;
+	unsigned releasedReason = 0;
+	bool releasedCancelled = false;
+	rts_test::NativeKernelClock *clock = 0;
+	bool baseline = false;
+	unsigned cutPass = 0;
+	~NativeSpatialObservations() { releaseHeld.store(true, std::memory_order_release); }
+	static void beforeWait(void *opaque)
+	{
+		auto &self = *static_cast<NativeSpatialObservations *>(opaque);
+		if (self.baseline || !JobSystem::instance().isCurrentThread(JOB_OWNER_GAME)) self.wrongIdentity = true;
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+		while (self.held.load(std::memory_order_acquire) != 4 && std::chrono::steady_clock::now() < deadline)
+			std::this_thread::yield();
+		if (self.held.load(std::memory_order_acquire) != 4)
+		{ self.waitExpired = true; self.releaseHeld.store(true, std::memory_order_release); }
+	}
+	static void afterCancel(void *opaque)
+	{
+		auto &self = *static_cast<NativeSpatialObservations *>(opaque);
+		if (self.baseline || !JobSystem::instance().isCurrentThread(JOB_OWNER_GAME)) self.wrongIdentity = true;
+		++self.cancelNotifications; self.releaseHeld.store(true, std::memory_order_release);
+	}
+	static void releasedGroup(void *opaque, unsigned pass, bool cancelled,
+		unsigned completed, unsigned submitted, unsigned reason)
+	{
+		auto &self = *static_cast<NativeSpatialObservations *>(opaque);
+		if (self.baseline || pass != 1 || !JobSystem::instance().isCurrentThread(JOB_OWNER_GAME)) self.wrongIdentity = true;
+		++self.releaseNotifications; self.releasedCancelled = cancelled;
+		self.releasedCompleted = completed; self.releasedSubmitted = submitted; self.releasedReason = reason;
+	}
+	static void range(void *opaque, unsigned pass, unsigned rangeIndex,
+		unsigned begin, unsigned end, bool entry, ImmutableSpatialStatus)
+	{
+		auto &self = *static_cast<NativeSpatialObservations *>(opaque);
+		if (pass < 1 || pass > 2 || rangeIndex >= 4 || begin != 2 * rangeIndex || end != begin + 2 ||
+			rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) != self.baseline)
+		{ self.wrongIdentity = true; return; }
+		if (entry) ++self.entries[pass - 1][rangeIndex];
+		else ++self.exits[pass - 1][rangeIndex];
+		self.clock->now.fetch_add(entry ? 5 : 7);
+		if (!self.baseline && self.cutPass == 3 && pass == 1 && !entry)
+		{
+			// The real COUNT range is complete, with no later query/radius poll.
+			// Only the native owner's after-cancel observation releases this hold.
+			self.held.fetch_add(1, std::memory_order_release);
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+			while (!self.releaseHeld.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+				std::this_thread::yield();
+			if (!self.releaseHeld.load(std::memory_order_acquire))
+			{ self.waitExpired = true; self.releaseHeld.store(true, std::memory_order_release); }
+		}
+	}
+	static bool checkpoint(void *opaque, unsigned pass, unsigned rangeIndex,
+		unsigned query, ImmutableSpatialCheckpointSite site, unsigned radius, bool actual)
+	{
+		auto &self = *static_cast<NativeSpatialObservations *>(opaque);
+		if (pass < 1 || pass > 2 || rangeIndex >= 4 || query >= 8 || query / 2 != rangeIndex ||
+			radius > 1 || rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) != self.baseline)
+		{ self.wrongIdentity = true; return true; }
+		if (site == IMMUTABLE_SPATIAL_CHECKPOINT_QUERY_ENTRY)
+		{ ++self.queryEntries[pass - 1][query]; self.clock->now.fetch_add(2); }
+		else if (site == IMMUTABLE_SPATIAL_CHECKPOINT_RADIUS)
+		{ ++self.radiusPolls[pass - 1][query][radius]; self.clock->now.fetch_add(3); }
+		else { self.wrongIdentity = true; return true; }
+		const bool target = pass == self.cutPass && rangeIndex == 1 && query == 2 &&
+			site == IMMUTABLE_SPATIAL_CHECKPOINT_RADIUS && radius == 1;
+		if (target)
+		{
+			self.cutReached = true;
+			if (!self.baseline)
+			{
+				// The four real workers finish the other ranges before this one
+				// reports its local cut; no fake dispatcher or favorable retry.
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+				while ((self.exits[pass - 1][0] == 0 || self.exits[pass - 1][2] == 0 ||
+					self.exits[pass - 1][3] == 0) && std::chrono::steady_clock::now() < deadline)
+					std::this_thread::yield();
+			}
+		}
+		// Opposite consumer predicate: source records false for the success row,
+		// or its exact range/query/radius cut for failure. Replay must own policy.
+		return self.baseline ? self.cutPass == 0 || self.cutPass == 3 : actual || target;
+	}
+};
+struct NativeSpatialGeneration
+{
+	GenerationContext generations;
+	rts_test::NativeKernelClock *clock = 0;
+	bool wrongOwner = false;
+	static bool arena(const ImmutableSpatialGeneration *expected, void *opaque)
+	{
+		auto &self = *static_cast<NativeSpatialGeneration *>(opaque);
+		self.wrongOwner |= !JobSystem::instance().isCurrentThread(JOB_OWNER_GAME);
+		self.clock->now.fetch_add(41);
+		return resolveArena(expected, &self.generations);
+	}
+	static bool object(ImmutableSpatialUInt32 id, const ImmutableSpatialGeneration *expected, void *opaque)
+	{
+		auto &self = *static_cast<NativeSpatialGeneration *>(opaque);
+		self.wrongOwner |= !JobSystem::instance().isCurrentThread(JOB_OWNER_GAME);
+		++self.clock->now;
+		return resolveObject(id, expected, &self.generations);
+	}
+};
+
+bool runNativeSpatialRole(rts_test::NativeKernelTrace &trace, bool baseline, unsigned cutPass)
+{
+	using namespace rts::performance;
+	g_nativeSpatialCase = static_cast<int>(cutPass); g_nativeSpatialBaseline = baseline;
+	const int failuresBefore = g_failures;
+	std::cerr << "BEGIN [spatial " << (baseline ? "consumer" : "source") << " cutPass=" << cutPass << "]\n";
+	JobSystem &jobs = JobSystem::instance();
+	JobSystemConfig config;
+	config.workerCount = 4; config.queueCapacity = 64; config.scratchBytesPerWorker = 4096; config.pinWorkers = false;
+	if (!jobs.start(config) || !jobs.registerCurrentThread(JOB_OWNER_GAME))
+	{ expect(false, "spatial phase fixture starts four actual workers"); return false; }
+	rts_test::NativeKernelOwnerRun run;
+	const bool started = run.begin(trace, baseline, 901, KERNEL_PHASE_SPATIAL_WORK);
+	expect(started, "spatial native role validates its real source and owner-ledger binding");
+	if (!started) { jobs.shutdown(); jobs.unregisterCurrentThread(JOB_OWNER_GAME); return false; }
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_SPATIAL, 0);
+	expect(attempt.valid(), "spatial core owner opens authentic attempt before arena capture");
+	auto timingBatch = run.timing.beginBatch(KERNEL_PERFORMANCE_SPATIAL, 0, 901, 1);
+	const auto capture = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_CAPTURE);
+	Fixture fixture;
+	std::vector<ImmutableSpatialQuery> queries(8, baseQuery(fixture));
+	for (auto &query : queries) query.maximumRadius = 1;
+	RunStorage output(8, 4, 5, 32);
+	NativeSpatialGeneration generationContext;
+	generationContext.generations.arenaGeneration = fixture.arenaGeneration;
+	generationContext.clock = &run.clock;
+	NativeSpatialObservations observed; observed.clock = &run.clock;
+	observed.baseline = baseline; observed.cutPass = cutPass;
+	ImmutableSpatialQueryOwnerIdentity owners[8];
+	for (unsigned index = 0; index != 8; ++index)
+		owners[index] = {100 + index, IMMUTABLE_SPATIAL_CONSUMER_HEALING, index};
+	run.clock.now.fetch_add(5);
+	expect(run.timing.endInterval(capture), "spatial arena and queries captured before real native collection");
+	KernelPerformanceReferenceBatch validated;
+	ImmutableSpatialJobSystemOptions options;
+	options.performanceLedger = &run.timing; options.performanceBatch = timingBatch;
+	options.referenceLedger = &run.reference; options.referenceAttempt = attempt; options.referenceBatch = &validated;
+	options.queryOwners = owners; options.queryOwnerCount = 8;
+	options.testCheckpoint = NativeSpatialObservations::checkpoint;
+	options.testObserveRange = NativeSpatialObservations::range; options.testCheckpointContext = &observed;
+	if (cutPass == 4)
+	{
+		// Refuse the FILL dispatch before admission. COUNT has already admitted,
+		// so the owner metric and receipt disposition must remain admitted.
+		options.testFault = IMMUTABLE_SPATIAL_JOB_SYSTEM_TEST_GROUP_FAILURE;
+		options.testDispatchOrdinal = 2;
+	}
+	if (cutPass == 3)
+	{
+		options.testBeforeWait = NativeSpatialObservations::beforeWait;
+		options.testAfterCancel = NativeSpatialObservations::afterCancel;
+		options.testReleasedGroup = NativeSpatialObservations::releasedGroup;
+	}
+	ImmutableSpatialJobSystemMetrics jobMetrics;
+	ImmutableSpatialExecutionMetrics execution;
+	ImmutableSpatialStatus kernelStatus = IMMUTABLE_SPATIAL_INVALID_ARGUMENT;
+	const auto result = ExecuteImmutableSpatialQueryBatchOnJobSystem(fixture.arena.data(), fixture.arenaBytes,
+		queries.data(), 8, NativeSpatialGeneration::arena, NativeSpatialGeneration::object, &generationContext,
+		output.scratch(), output.output.data(), 32, output.spans.data(), 8, &output.outputCount,
+		options, &jobMetrics, &execution, &kernelStatus);
+	expect(jobMetrics.referenceAdmissionAccepted,
+		"spatial metrics preserve authentic source admission for owner disposition");
+	const bool accepted = result == IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS;
+	expect(accepted == (cutPass == 0), "spatial COUNT or FILL cut retains the predeclared native outcome");
+	if (accepted)
+	{
+		expect(output.outputCount == 24 && execution.countPassQueries == 8 && execution.fillPassQueries == 8,
+			"actual spatial collection produces literal twenty-four results in two query passes");
+		for (unsigned index = 0; index != 8; ++index)
+			expect(output.spans[index].begin == 3 * index && output.spans[index].count == 3 &&
+				output.output[3 * index].objectID == 102 && output.output[3 * index + 1].objectID == 101 &&
+				output.output[3 * index + 2].objectID == 103,
+				"real spatial FILL preserves literal stable discovery order and disjoint spans");
+	}
+	else expect(outputStillSentinel(output), "spatial inner cancellation publishes no output or spans");
+	for (unsigned pass = 1; pass <= 2; ++pass)
+	{
+		const unsigned expected = (cutPass == 1 || cutPass == 3 || cutPass == 4) && pass == 2 ? 0 : 1;
+		for (unsigned range = 0; range != 4; ++range)
+			expect(observed.entries[pass - 1][range] == expected && observed.exits[pass - 1][range] == expected,
+				"native spatial executes each COUNT and FILL source range exactly once");
+		for (unsigned query = 0; query != 8; ++query)
+		{
+			const unsigned queryExpected = (pass == cutPass && query == 3) ||
+				(cutPass == 4 && pass == 2) ? 0 : expected;
+			expect(observed.queryEntries[pass - 1][query] == queryExpected &&
+				observed.radiusPolls[pass - 1][query][0] == queryExpected &&
+				observed.radiusPolls[pass - 1][query][1] == queryExpected,
+				"spatial exact local cut is after radius zero and before the next query in that range");
+		}
+	}
+	expect(!observed.wrongIdentity && !generationContext.wrongOwner && observed.cutReached == (cutPass == 1 || cutPass == 2),
+		"spatial checkpoints retain explicit local identities while generation validation stays owner-serial");
+	if (cutPass == 3 && !baseline)
+	{
+		expect(!observed.waitExpired && observed.held == 4 && observed.cancelNotifications == 1 &&
+			observed.releaseNotifications == 1 && observed.releasedCancelled &&
+			observed.releasedCompleted == 4 && observed.releasedSubmitted == 4,
+			"spatial native timeout cancels a real group then drains four completed COUNT ranges");
+		expect(observed.releasedReason == 3,
+			"spatial source reason records actual group cancellation independently of completed checkpoints");
+	}
+	if (cutPass == 3 && baseline)
+		expect(observed.held == 0 && observed.cancelNotifications == 0 && observed.releaseNotifications == 0,
+			"spatial baseline replays late COUNT disposal without a wait or new group cancellation");
+	const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+	if (baseline)
+		expect(scheduler.submittedJobs == 0 && scheduler.executedJobs == 0 && scheduler.ownerHelpJobs == 0 &&
+			jobMetrics.submittedJobs == 0 && jobMetrics.physicalWorkerJobs == 0 && jobMetrics.physicalWorkerMask == 0,
+			"spatial baseline dispatch shape does not fabricate physical or owner-help jobs");
+	else expect(scheduler.submittedJobs == (cutPass == 1 || cutPass == 3 || cutPass == 4 ? 4U : 8U) &&
+		scheduler.executedJobs == scheduler.submittedJobs && scheduler.ownerHelpJobs == 0,
+		"spatial source uses only the actual four-worker COUNT and FILL jobs");
+	expect(validated.valid() == accepted, "spatial native helper links only actually published validated output");
+	if (validated.valid()) expect(run.reference.finishBatch(validated, accepted),
+		"spatial core owner records existing native publication before finishing attempt");
+	const bool admitted = jobMetrics.referenceAdmissionAccepted;
+	if (cutPass == 4)
+		expect(admitted, "spatial pre-admission FILL refusal preserves COUNT admission");
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = accepted ? KERNEL_PERFORMANCE_COMMITTED :
+		admitted ? KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+		KERNEL_PERFORMANCE_NOT_ADMITTED;
+	finish.reasonSchema = 1; finish.reason = accepted ? 1 : 2; finish.validatedBatch = validated;
+	expect(run.reference.finishAttempt(attempt, finish), "spatial actual native result closes authentic attempt");
+	if (cutPass == 4)
+		expect(finish.disposition == KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION,
+			"spatial second-pass refusal closes the admitted source as aborted-after-admission");
+	KernelPerformanceAttemptReap reap = {}; reap.reasonSchema = 1; reap.reason = 1;
+	reap.pendingJobs = scheduler.pendingJobs; reap.outstandingJobs = scheduler.outstandingJobs;
+	expect(run.reference.reapAttempt(attempt, reap), "spatial attempt reaps after the native dispatch has drained");
+	if (accepted)
+	{
+		const auto commit = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_COMMIT);
+		run.clock.now.fetch_add(11); run.timing.endInterval(commit);
+	}
+	expect(run.timing.endBatch(timingBatch, finish.disposition), "spatial timing records native outcome");
+	const bool sealed = run.reference.sealObservationWindow() && run.reference.sealExecutionClosure();
+	const auto snapshot = run.reference.freeze();
+	const bool timingClosed = run.closeTiming(scheduler);
+	expect(timingClosed, "spatial owner phase and actual scheduler closure reconcile");
+	if (baseline && timingClosed)
+	{
+		const auto &phase = run.timingSnapshot.phaseAccounting.phases[KERNEL_PHASE_SPATIAL_WORK];
+		expect(phase.pureNanoseconds == (cutPass == 0 ? 224U : 0U) && phase.serialNanoseconds >= 46,
+			"successful spatial bodies alone are pure; generation validation and all aborted work remain serial");
+	}
+	const bool canonicalState = cutPass == 0 ? snapshot.complete && snapshot.streamCount == 1 :
+		!snapshot.complete && snapshot.streamCount == 0;
+	expect(sealed && canonicalState && snapshot.errors == 0 && snapshot.trace.complete && snapshot.trace.attemptCount == 1 &&
+		snapshot.trace.capturedOperationCount == 8 && snapshot.trace.dispatchCount == (cutPass == 1 || cutPass == 3 || cutPass == 4 ? 1U : 2U) &&
+		snapshot.trace.rangeCount == (cutPass == 1 || cutPass == 3 || cutPass == 4 ? 4U : 8U) &&
+		snapshot.trace.releasedRangeCount == snapshot.trace.rangeCount && snapshot.trace.reapCount == 1,
+		"actual spatial runtime supplies every native COUNT/FILL dispatch and released-range record");
+	if (!baseline) trace.source = snapshot;
+	else if (snapshot.complete && accepted)
+		expect(snapshot.streams[0].outputDigest.equals(trace.source.streams[0].outputDigest),
+			"same native spatial serializer binds once-only baseline output to source");
+	jobs.shutdown(); jobs.unregisterCurrentThread(JOB_OWNER_GAME);
+	std::cerr << "END [spatial " << (baseline ? "consumer" : "source") << " cutPass=" << cutPass <<
+		"] failures=" << g_failures - failuresBefore << " traceComplete=" << snapshot.trace.complete << '\n';
+	g_nativeSpatialCase = -1;
+	return canonicalState && snapshot.errors == 0 && snapshot.trace.complete &&
+		(cutPass != 3 || baseline || observed.releasedReason == 3);
+}
+void testActualNativeSpatialSourceConsumer()
+{
+	for (unsigned cutPass = 0; cutPass != 5; ++cutPass)
+	{
+		rts_test::NativeKernelTrace trace(40 + cutPass);
+		if (runNativeSpatialRole(trace, false, cutPass)) runNativeSpatialRole(trace, true, cutPass);
+	}
+}
+#endif
 }
 
 int main(int argc, char **argv)
@@ -2209,7 +2521,8 @@ int main(int argc, char **argv)
 	bool localCapacity = false;
 	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
 	{
-		std::cerr << "usage: immutable_spatial_query_tests [--local-capacity]\n";
+		std::cerr << "usage: immutable_spatial_query_tests "
+			"[--local-capacity|--external-qualification]\n";
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);
@@ -2234,6 +2547,9 @@ int main(int argc, char **argv)
 	testJobSystemWrapperOwnerFloatingPointParityAndFallback(localCapacity);
 	testPersistentArenaRefreshBenchmarks();
 	testDeterministicAdmissionCostInversion();
+#if defined(_WIN64)
+	testActualNativeSpatialSourceConsumer();
+#endif
 
 	if (g_failures != 0)
 	{

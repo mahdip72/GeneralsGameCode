@@ -207,7 +207,15 @@ bool VertexBufferClass::WriteLockClass::Commit()
 		break;
 	}
 	if (changed)
+	{
+		if (VertexBuffer->Type() == BUFFER_TYPE_SORTING)
+		{
+			SortingVertexBufferClass *sorting =
+				static_cast<SortingVertexBufferClass *>(VertexBuffer);
+			sorting->InitializedVertexCount = VertexBuffer->Get_Vertex_Count();
+		}
 		VertexBuffer->Mark_Changed();
+	}
 	Locked = false;
 	Vertices = nullptr;
 	return changed;
@@ -215,7 +223,8 @@ bool VertexBufferClass::WriteLockClass::Commit()
 
 VertexBufferClass::AppendLockClass::AppendLockClass(
 	VertexBufferClass *vertexBuffer, unsigned startIndex, unsigned indexRange)
-	: VertexBufferLockClass(vertexBuffer)
+	: VertexBufferLockClass(vertexBuffer), StartVertex(startIndex),
+	VertexRange(indexRange)
 {
 	if (!rts::render::IsNativeW3DBufferOwnerThread())
 	{
@@ -273,7 +282,18 @@ bool VertexBufferClass::AppendLockClass::Commit()
 		break;
 	}
 	if (changed)
+	{
+		if (VertexBuffer->Type() == BUFFER_TYPE_SORTING)
+		{
+			SortingVertexBufferClass *sorting =
+				static_cast<SortingVertexBufferClass *>(VertexBuffer);
+			const unsigned end = StartVertex + VertexRange;
+			if (end > sorting->InitializedVertexCount)
+				sorting->InitializedVertexCount =
+					static_cast<unsigned short>(end);
+		}
 		VertexBuffer->Mark_Changed();
+	}
 	Locked = false;
 	Vertices = nullptr;
 	return changed;
@@ -281,7 +301,8 @@ bool VertexBufferClass::AppendLockClass::Commit()
 
 SortingVertexBufferClass::SortingVertexBufferClass(unsigned short vertexCount)
 	: VertexBufferClass(BUFFER_TYPE_SORTING, dynamic_fvf_type, vertexCount),
-	VertexBuffer(W3DNEWARRAY VertexFormatXYZNDUV2[vertexCount])
+	VertexBuffer(W3DNEWARRAY VertexFormatXYZNDUV2[vertexCount]),
+	InitializedVertexCount(0)
 {
 	WWMEMLOG(MEM_RENDERER);
 	WWASSERT(vertexCount != 0);
@@ -439,7 +460,18 @@ bool DX8VertexBufferClass::Acquire_Native_Vertex_Buffer(unsigned int stride,
 	*validated = rts::render::GpuHandle();
 	return NativeBuffer != nullptr &&
 		NativeBuffer->AcquireVertexRange(stride, offset, startVertex, vertexCount,
-			validated) == rts::render::RENDER_RESULT_OK;
+		validated) == rts::render::RENDER_RESULT_OK;
+}
+
+bool DX8VertexBufferClass::Acquire_Native_Vertex_Buffer(
+	rts::render::GpuHandle *validated) const
+{
+	if (validated == nullptr)
+		return false;
+	*validated = rts::render::GpuHandle();
+	return NativeBuffer != nullptr &&
+		NativeBuffer->AcquireVertexBinding(validated) ==
+		rts::render::RENDER_RESULT_OK;
 }
 
 bool DX8VertexBufferClass::Lock_Native_Buffer(size_t offset, size_t byteCount,
@@ -1169,7 +1201,15 @@ bool IndexBufferClass::WriteLockClass::Commit()
 		break;
 	}
 	if (changed)
+	{
+		if (index_buffer->Type() == BUFFER_TYPE_SORTING)
+		{
+			SortingIndexBufferClass *sorting =
+				static_cast<SortingIndexBufferClass *>(index_buffer);
+			sorting->initialized_index_count = index_buffer->Get_Index_Count();
+		}
 		index_buffer->Mark_Changed();
+	}
 	locked = false;
 	indices = nullptr;
 	return changed;
@@ -1177,7 +1217,8 @@ bool IndexBufferClass::WriteLockClass::Commit()
 
 IndexBufferClass::AppendLockClass::AppendLockClass(IndexBufferClass *buffer,
 	unsigned startIndex, unsigned indexRange)
-	: index_buffer(buffer), indices(nullptr), locked(false)
+	: index_buffer(buffer), indices(nullptr), start_index(startIndex),
+	index_range(indexRange), locked(false)
 {
 	if (!rts::render::IsNativeW3DBufferOwnerThread())
 	{
@@ -1234,7 +1275,18 @@ bool IndexBufferClass::AppendLockClass::Commit()
 		break;
 	}
 	if (changed)
+	{
+		if (index_buffer->Type() == BUFFER_TYPE_SORTING)
+		{
+			SortingIndexBufferClass *sorting =
+				static_cast<SortingIndexBufferClass *>(index_buffer);
+			const unsigned end = start_index + index_range;
+			if (end > sorting->initialized_index_count)
+				sorting->initialized_index_count =
+					static_cast<unsigned short>(end);
+		}
 		index_buffer->Mark_Changed();
+	}
 	locked = false;
 	indices = nullptr;
 	return changed;
@@ -1318,6 +1370,17 @@ bool DX8IndexBufferClass::Acquire_Native_Index_Buffer(unsigned int offset,
 		rts::render::RENDER_RESULT_OK;
 }
 
+bool DX8IndexBufferClass::Acquire_Native_Index_Buffer(
+	rts::render::GpuHandle *validated) const
+{
+	if (validated == nullptr)
+		return false;
+	*validated = rts::render::GpuHandle();
+	return native_buffer != nullptr &&
+		native_buffer->AcquireIndexBinding(validated) ==
+		rts::render::RENDER_RESULT_OK;
+}
+
 bool DX8IndexBufferClass::Lock_Native_Buffer(size_t offset, size_t byteCount,
 	int flags, void **data)
 {
@@ -1338,7 +1401,8 @@ bool DX8IndexBufferClass::Unlock_Native_Buffer()
 
 SortingIndexBufferClass::SortingIndexBufferClass(unsigned short indexCount)
 	: IndexBufferClass(BUFFER_TYPE_SORTING, indexCount),
-	index_buffer(W3DNEWARRAY unsigned short[indexCount])
+	index_buffer(W3DNEWARRAY unsigned short[indexCount]),
+	initialized_index_count(0)
 {
 	WWMEMLOG(MEM_RENDERER);
 	WWASSERT(indexCount != 0);

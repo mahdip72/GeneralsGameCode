@@ -66,6 +66,40 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
     include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/PerformanceReceiptProducerTitleTest.cmake")
     rts_add_performance_receipt_producer_test(g_skirmish_ai_runner_contract_tests
         Generals g_performance_receipt_producer_tests)
+    rts_add_performance_receipt_fresh_producer_test(g_skirmish_ai_runner_contract_tests
+        Generals g_performance_receipt_fresh_producer_tests)
+    rts_add_performance_receipt_attempt_test(g_skirmish_ai_runner_contract_tests
+        Generals g_performance_receipt_attempt_tests)
+    rts_add_performance_receipt_bootstrap_test(g_skirmish_ai_runner_contract_tests
+        Generals g_performance_receipt_bootstrap_tests)
+    rts_add_performance_receipt_policy_test(g_skirmish_ai_runner_contract_tests
+        g_performance_receipt_policy_tests)
+    rts_add_performance_receipt_mode_test(g_skirmish_ai_runner_contract_tests
+        g_performance_receipt_mode_tests)
+    rts_add_performance_receipt_wide_path_test(g_skirmish_ai_runner_contract_tests
+        g_performance_receipt_wide_path_tests)
+    include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/NativeReceiptTraceFileTest.cmake")
+    rts_add_native_receipt_trace_file_test(g_skirmish_ai_runner_contract_tests)
+    add_test(NAME g_performance_receipt_consume_wide_path_tests
+        COMMAND g_skirmish_ai_runner_contract_tests --performance-receipt-consume-wide-path)
+    set_tests_properties(g_performance_receipt_consume_wide_path_tests PROPERTIES
+        TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-wide-path")
+    add_test(NAME g_performance_receipt_replay_caller_fence_tests
+        COMMAND g_skirmish_ai_runner_contract_tests --performance-receipt-replay-caller-fence)
+    set_tests_properties(g_performance_receipt_replay_caller_fence_tests PROPERTIES
+        TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-producer")
+    add_test(NAME g_performance_receipt_fresh_caller_fence_tests
+        COMMAND g_skirmish_ai_runner_contract_tests --performance-receipt-fresh-caller-fence)
+    set_tests_properties(g_performance_receipt_fresh_caller_fence_tests PROPERTIES
+        TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-fresh-producer")
+    add_test(NAME g_performance_receipt_replay_owner_shape_tests
+        COMMAND g_skirmish_ai_runner_contract_tests --performance-receipt-replay-owner-shape)
+    set_tests_properties(g_performance_receipt_replay_owner_shape_tests PROPERTIES
+        TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-producer")
+    add_test(NAME g_performance_receipt_practical_owner_shape_tests
+        COMMAND g_skirmish_ai_runner_contract_tests --performance-receipt-practical-owner-shape)
+    set_tests_properties(g_performance_receipt_practical_owner_shape_tests PROPERTIES
+        TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-fresh-producer")
     # Exercise the real AudioEventRTS/GameAudio implementations, not the
     # isolated manager fixture's runtime substitutes. The hook only sets
     # deterministic test capacity.

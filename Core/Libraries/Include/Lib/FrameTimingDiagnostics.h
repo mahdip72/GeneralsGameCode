@@ -22,6 +22,8 @@ enum Phase
 #if defined(_WIN64)
 #include <windows.h>
 #include <atomic>
+#include <io.h>
+#include <share.h>
 #include <stdio.h>
 #include <string.h>
 #include <string>
@@ -30,9 +32,10 @@ namespace rts { namespace frame_timing {
 
 struct FinalizedCapture
 {
-	FinalizedCapture() : closed(false), writeSucceeded(false), truncated(false),
+	FinalizedCapture() : nativeHandle(INVALID_HANDLE_VALUE), closed(false), writeSucceeded(false), truncated(false),
 		complete(false), sessionCount(0), frameSamples(0), firstFrame(0), lastFrame(0) {}
 	std::string path;
+	HANDLE nativeHandle;
 	bool closed, writeSucceeded, truncated, complete;
 	unsigned int sessionCount;
 	unsigned __int64 frameSamples;
@@ -42,7 +45,7 @@ struct FinalizedCapture
 class Capture
 {
 public:
-	Capture() : m_file(NULL), m_owner(0), m_frequency(0), m_active(false),
+	Capture() : m_file(NULL), m_finalizedHandle(INVALID_HANDLE_VALUE), m_owner(0), m_frequency(0), m_active(false),
 		m_frameStart(0), m_bucketStart(0), m_rows(0), m_session(0),
 		m_frameBegin(0), m_frameEnd(0), m_logicFrames(0), m_mode("interactive"),
 		m_writeSucceeded(true), m_truncated(false), m_incomplete(false),
@@ -63,7 +66,7 @@ public:
 			GetCurrentProcessId(), GetTickCount());
 		path[sizeof(path) - 1] = '\0';
 		// Exclusive creation never replaces a previous capture.
-		m_file = fopen(path, "wx");
+		m_file = _fsopen(path, "w+x", _SH_DENYWR);
 		if (!m_file)
 			return;
 		m_path = path;
@@ -75,6 +78,8 @@ public:
 	~Capture()
 	{
 		closeCapture();
+		if (m_finalizedHandle != INVALID_HANDLE_VALUE)
+			CloseHandle(m_finalizedHandle);
 	}
 
 	static Capture& instance()
@@ -126,13 +131,15 @@ public:
 
 	// Receipt publication uses this exact producer-owned path only after a
 	// successful close. Ordinary sessions may still share a capture until then.
-	FinalizedCapture finalize()
+	FinalizedCapture finalize(bool retainNativeHandle = false)
 	{
 		if (m_owner.load(std::memory_order_acquire) != GetCurrentThreadId())
 			return FinalizedCapture();
-		closeCapture();
+		closeCapture(retainNativeHandle);
 		FinalizedCapture result;
 		result.path = m_path;
+		result.nativeHandle = m_finalizedHandle;
+		m_finalizedHandle = INVALID_HANDLE_VALUE;
 		result.closed = m_finalized && !m_path.empty() && m_writeSucceeded;
 		result.writeSucceeded = m_writeSucceeded && !m_path.empty();
 		result.truncated = m_truncated;
@@ -229,7 +236,7 @@ public:
 	}
 
 private:
-	void closeCapture()
+	void closeCapture(bool retainNativeHandle = false)
 	{
 		if (m_finalized)
 			return;
@@ -239,9 +246,41 @@ private:
 		flush();
 		if (m_file)
 		{
+			if (fflush(m_file) != 0 || _commit(_fileno(m_file)) != 0)
+				m_writeSucceeded = false;
+			const intptr_t native = _get_osfhandle(_fileno(m_file));
+			HANDLE transitional = INVALID_HANDLE_VALUE;
+			if (retainNativeHandle && native != -1)
+				transitional = ReOpenFile(reinterpret_cast<HANDLE>(native), GENERIC_READ,
+					FILE_SHARE_READ | FILE_SHARE_WRITE,
+					FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+			if (retainNativeHandle &&
+				(transitional == INVALID_HANDLE_VALUE ||
+					!SetHandleInformation(transitional, HANDLE_FLAG_INHERIT, 0)))
+			{
+				if (transitional != INVALID_HANDLE_VALUE) CloseHandle(transitional);
+				transitional = INVALID_HANDLE_VALUE;
+				m_writeSucceeded = false;
+			}
 			if (fclose(m_file) != 0)
 				m_writeSucceeded = false;
 			m_file = NULL;
+			if (retainNativeHandle && transitional != INVALID_HANDLE_VALUE &&
+				m_writeSucceeded)
+			{
+				m_finalizedHandle = ReOpenFile(transitional, GENERIC_READ,
+					FILE_SHARE_READ,
+					FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+				if (m_finalizedHandle == INVALID_HANDLE_VALUE ||
+					!SetHandleInformation(m_finalizedHandle, HANDLE_FLAG_INHERIT, 0))
+				{
+					if (m_finalizedHandle != INVALID_HANDLE_VALUE) CloseHandle(m_finalizedHandle);
+					m_finalizedHandle = INVALID_HANDLE_VALUE;
+					m_writeSucceeded = false;
+				}
+			}
+			if (transitional != INVALID_HANDLE_VALUE && !CloseHandle(transitional))
+				m_writeSucceeded = false;
 		}
 		m_finalized = true;
 	}
@@ -318,6 +357,7 @@ private:
 	}
 
 	FILE* m_file;
+	HANDLE m_finalizedHandle;
 	std::atomic<DWORD> m_owner;
 	__int64 m_frequency;
 	bool m_active;

@@ -1003,6 +1003,60 @@ public:
 };
 
 #if defined(_WIN64)
+enum PartitionCollisionNativeTestEvent
+{
+	PARTITION_COLLISION_TEST_RESERVE_BEGIN,
+	PARTITION_COLLISION_TEST_RESERVE_END,
+	PARTITION_COLLISION_TEST_CAPTURE_COMPLETE,
+	PARTITION_COLLISION_TEST_SPREAD_QUERY,
+	PARTITION_COLLISION_TEST_CLASSIFIED,
+	PARTITION_COLLISION_TEST_FALLBACK_BEGIN,
+	PARTITION_COLLISION_TEST_FALLBACK_CONTACT,
+	PARTITION_COLLISION_TEST_FALLBACK_END,
+	PARTITION_COLLISION_TEST_PREPARE_BEGIN,
+	PARTITION_COLLISION_TEST_PREPARE_END,
+	PARTITION_COLLISION_TEST_LIVE_VALIDATION,
+	PARTITION_COLLISION_TEST_AUTHORITATIVE_COMMIT_END
+};
+
+struct PartitionCollisionNativeTestHooks
+{
+	void (*observe)(void *, PartitionCollisionNativeTestEvent,
+		unsigned, unsigned, unsigned, unsigned, bool);
+	void *context;
+	// Test-only observation forwarding; never supplies cancellation/readiness.
+	void (*observeCore)(void *, rts::CollisionCandidateTestEvent, unsigned,
+		unsigned, unsigned, unsigned, bool, rts::CollisionCandidate *);
+};
+
+// Translation-unit-local, default-inert observation only. Tests compile this
+// actual title path and may inspect real outcomes; these hooks cannot select
+// a classifier result, contact return, source outcome or proof.
+static const PartitionCollisionNativeTestHooks *
+	s_partitionCollisionNativeTestHooks = nullptr;
+
+static void observePartitionCollisionNativeTest(
+	PartitionCollisionNativeTestEvent event, unsigned first = 0,
+	unsigned second = 0, unsigned third = 0, unsigned fourth = 0,
+	bool result = false)
+{
+	if (s_partitionCollisionNativeTestHooks != nullptr &&
+		s_partitionCollisionNativeTestHooks->observe != nullptr)
+		s_partitionCollisionNativeTestHooks->observe(
+			s_partitionCollisionNativeTestHooks->context, event,
+			first, second, third, fourth, result);
+}
+
+static bool hasUsefulPartitionCollisionSpread(
+	rts::CollisionAdmissionSampler &sampler)
+{
+	const bool useful = sampler.hasUsefulSpread();
+	if (s_partitionCollisionNativeTestHooks != nullptr)
+		observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_SPREAD_QUERY,
+			sampler.encounterCount(), sampler.sampleCount(), 0, 0, useful);
+	return useful;
+}
+
 struct LivePartitionCollisionSnapshotContext
 {
 	PartitionData *owner;
@@ -1036,6 +1090,8 @@ public:
 
 	Bool reserve(UnsignedInt requiredCells, UnsignedInt requiredOccupants)
 	{
+		observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_RESERVE_BEGIN,
+			requiredCells, requiredOccupants, cellCapacity, occupantCapacity);
 		if (requiredCells > cellCapacity)
 		{
 			rts::PartitionCollisionCellSnapshot *newCellSnapshots =
@@ -1043,6 +1099,8 @@ public:
 			if (newCellSnapshots == nullptr)
 			{
 				delete[] newCellSnapshots;
+				observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_RESERVE_END,
+					requiredCells, requiredOccupants, cellCapacity, occupantCapacity, false);
 				return FALSE;
 			}
 			delete[] cellSnapshots;
@@ -1071,6 +1129,8 @@ public:
 				delete[] newPrepared;
 				delete[] newParticipants;
 				delete[] newOccupants;
+				observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_RESERVE_END,
+					requiredCells, requiredOccupants, cellCapacity, occupantCapacity, false);
 				return FALSE;
 			}
 			delete[] shadowScratch;
@@ -1085,6 +1145,8 @@ public:
 			shadowScratch = newShadowScratch;
 			occupantCapacity = requiredOccupants;
 		}
+		observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_RESERVE_END,
+			requiredCells, requiredOccupants, cellCapacity, occupantCapacity, true);
 		return TRUE;
 	}
 
@@ -1120,6 +1182,7 @@ public:
 	rts::CollisionCandidate *referenceScratch;
 
 private:
+	friend class rts::PartitionCollisionBypassObserver;
 	UnsignedInt cellCapacity;
 	UnsignedInt occupantCapacity;
 	UnsignedInt referenceCapacity;
@@ -1128,6 +1191,236 @@ private:
 	LivePartitionCollisionWorkspace &operator=(
 		const LivePartitionCollisionWorkspace &);
 };
+
+namespace rts
+{
+// Only this compiled native entry can arm a collision proof. The contact
+// helper can report actual returns, but cannot create or classify an attempt.
+class PartitionCollisionBypassObserver
+{
+public:
+	void observeActualContact(unsigned ownerID, unsigned participantID, bool inserted)
+	{
+		// Class3 continuation contacts use the shared kernel's schema1 capture;
+		// they are not a second native fallback capture.
+		if (m_fullContinuationPending) return;
+		if (m_reference == nullptr || (!m_bypass.valid() && !m_fullFallback)) return;
+		if (m_attempted == ~static_cast<JobMetricCounter>(0) ||
+			(inserted && m_inserted == ~static_cast<JobMetricCounter>(0)))
+		{
+			m_totalsValid = false;
+			return;
+		}
+		++m_attempted;
+		if (inserted) ++m_inserted;
+		if (m_bypass.valid())
+			(void)m_reference->observeBypassFallbackContact(m_bypass, ownerID, participantID, inserted);
+		else
+			(void)m_reference->observeNativeCollisionFullFallbackContact(
+				m_attempt, ownerID, participantID, inserted);
+	}
+
+private:
+	friend class ::PartitionData;
+	PartitionCollisionBypassObserver() : m_reference(nullptr), m_compactEligible(true),
+		m_ordinaryPending(false), m_fullFallback(false), m_fullContinuationPending(false),
+		m_deferredFullContinuation(false), m_totalsValid(true),
+		m_attempted(0), m_inserted(0), m_reserve{} {}
+
+	void begin(performance::KernelPerformanceReferenceLedger &reference,
+		performance::KernelPerformanceLedger &timing,
+		const performance::KernelPerformanceBatch &batch)
+	{
+		const performance::KernelPerformanceReferenceMode role = reference.runMode();
+		if ((role != performance::KERNEL_REFERENCE_THROUGHPUT_BINDING &&
+			role != performance::KERNEL_REFERENCE_SERIAL_ORACLE &&
+			role != performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING) ||
+			TheGameLogic == nullptr) return;
+		m_attempt = TheGameLogic->beginPerformanceReceiptAttempt(
+			performance::KERNEL_PERFORMANCE_COLLISION, 0);
+		if (!m_attempt.valid()) return;
+		m_reference = &reference;
+		m_ordinaryPending = true;
+		(void)m_reference->armNativeCollisionBegin(m_attempt, timing, batch);
+	}
+
+	void policy(const performance::NativeCollisionPolicyFacts &actual)
+	{
+		if (m_reference == nullptr) return;
+		m_compactEligible = !actual.multiplayerPolicyBlocked && actual.schedulerReady;
+		(void)m_reference->observeNativeCollisionPolicy(m_attempt, actual);
+	}
+
+	void count(const performance::NativeCollisionCountFacts &actual)
+	{
+		if (m_reference == nullptr) return;
+		m_compactEligible = m_compactEligible && actual.countValid;
+		(void)m_reference->observeNativeCollisionCount(m_attempt, actual);
+	}
+
+	void beforeReserve(const ::LivePartitionCollisionWorkspace &workspace,
+		unsigned requiredCells, unsigned requiredOccupants)
+	{
+		if (m_reference == nullptr) return;
+		m_reserve.requiredCells = requiredCells;
+		m_reserve.requiredOccupants = requiredOccupants;
+		m_reserve.beforeCellCapacity = workspace.cellCapacity;
+		m_reserve.beforeOccupantCapacity = workspace.occupantCapacity;
+	}
+
+	void afterReserve(const ::LivePartitionCollisionWorkspace &workspace, bool succeeded)
+	{
+		if (m_reference == nullptr) return;
+		m_reserve.afterCellCapacity = workspace.cellCapacity;
+		m_reserve.afterOccupantCapacity = workspace.occupantCapacity;
+		m_reserve.reserveOutcome = !succeeded ? 3 :
+			m_reserve.beforeCellCapacity != m_reserve.afterCellCapacity ||
+			m_reserve.beforeOccupantCapacity != m_reserve.afterOccupantCapacity ? 2 : 1;
+		m_compactEligible = m_compactEligible && m_reserve.reserveOutcome == 1;
+		(void)m_reference->observeNativeCollisionReserve(m_attempt, m_reserve);
+	}
+
+	void capture(const performance::NativeCollisionCaptureFacts &actual)
+	{
+		if (m_reference == nullptr) return;
+		m_compactEligible = m_compactEligible && actual.snapshotValid && actual.ownerPresent &&
+			actual.participantIdentitiesValid && actual.ownerIdentityUnchanged;
+		(void)m_reference->observeNativeCollisionCapture(m_attempt, actual);
+	}
+
+	void beginCapturedFallback(const performance::NativeCollisionClassFacts &actual,
+		const PartitionCollisionReferenceInput &input)
+	{
+		if (m_reference == nullptr) return;
+		m_ordinaryPending = false;
+		if (m_compactEligible)
+		{
+			const performance::KernelPerformanceDeterministicBypassProof proof(
+				*m_reference, m_attempt, actual, input);
+			m_bypass = m_reference->beginDeterministicBypass(m_attempt, proof);
+		}
+		else
+			m_fullFallback = m_reference->beginNativeCollisionFullFallback(m_attempt, actual, input);
+	}
+
+	PartitionCollisionBypassObserver *contactObserver()
+	{
+		return m_bypass.valid() || m_fullFallback || m_fullContinuationPending ? this : nullptr;
+	}
+
+	void finishCapturedFallback()
+	{
+		if (m_reference == nullptr) return;
+		if (!m_totalsValid)
+			(void)m_reference->finishDeterministicBypass(
+				performance::KernelPerformanceDeterministicBypass(), m_attempted, m_inserted);
+		else if (m_bypass.valid())
+			(void)m_reference->finishDeterministicBypass(m_bypass, m_attempted, m_inserted);
+		else if (m_fullFallback)
+			(void)m_reference->finishNativeCollisionFullFallback(m_attempt, m_attempted, m_inserted);
+		m_bypass = performance::KernelPerformanceDeterministicBypass();
+		m_fullFallback = false;
+	}
+
+	void fullClass(const performance::NativeCollisionClassFacts &actual)
+	{
+		if (m_reference == nullptr) return;
+		if (m_reference->observeNativeCollisionFullClass(m_attempt, actual))
+		{
+			m_ordinaryPending = false;
+			m_fullContinuationPending = true;
+		}
+	}
+
+	performance::KernelPerformanceAttempt performanceReferenceAttempt() const
+	{
+		return m_attempt;
+	}
+
+	bool fullContinuationPending() const
+	{
+		return m_fullContinuationPending;
+	}
+
+	bool finishFullContinuation(
+		performance::KernelPerformanceDisposition disposition,
+		performance::KernelPerformanceReferenceBatch &batch,
+		bool fallbackEntered)
+	{
+		if (m_reference == nullptr || !m_fullContinuationPending) return false;
+		const bool committed = disposition == performance::KERNEL_PERFORMANCE_COMMITTED;
+		const performance::KernelPerformanceReferenceBatch validatedBatch = batch;
+		if (batch.valid())
+		{
+			if (!m_reference->finishBatch(batch, committed)) return false;
+			batch = performance::KernelPerformanceReferenceBatch();
+		}
+		else if (committed)
+			return false;
+		performance::KernelPerformanceAttemptFinish finish = {};
+		finish.disposition = disposition;
+		finish.reasonSchema = 1;
+		finish.reason = fallbackEntered ? 3 : committed ? 1 : 2;
+		finish.fallbackEntered = fallbackEntered;
+		finish.fallbackCompleted = fallbackEntered;
+		finish.validatedBatch = validatedBatch;
+		if (!m_reference->finishAttempt(m_attempt, finish)) return false;
+		performance::KernelPerformanceAttemptReap reap = {};
+		reap.reasonSchema = 1;
+		reap.reason = 1;
+		if (!m_reference->reapAttempt(m_attempt, reap)) return false;
+		m_fullContinuationPending = false;
+		m_ordinaryPending = false;
+		return true;
+	}
+
+	void deferFullContinuationFallback(
+		performance::KernelPerformanceReferenceBatch &batch)
+	{
+		if (m_reference == nullptr || !m_fullContinuationPending ||
+			m_deferredFullContinuation)
+			return;
+		m_deferredBatch = batch;
+		batch = performance::KernelPerformanceReferenceBatch();
+		m_deferredFullContinuation = true;
+	}
+
+	void finishDeferredFullContinuationFallback()
+	{
+		if (!m_deferredFullContinuation)
+			return;
+		if (finishFullContinuation(
+			performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION,
+			m_deferredBatch, true))
+			m_deferredFullContinuation = false;
+	}
+
+	void finishUncapturedFallback()
+	{
+		if (m_reference == nullptr || !m_ordinaryPending) return;
+		performance::KernelPerformanceAttemptFinish finish = {};
+		finish.disposition = performance::KERNEL_PERFORMANCE_NOT_ADMITTED;
+		finish.reasonSchema = 1; finish.reason = 1;
+		finish.fallbackEntered = true; finish.fallbackCompleted = true;
+		if (!m_reference->finishAttempt(m_attempt, finish)) return;
+		performance::KernelPerformanceAttemptReap reap = {};
+		reap.reasonSchema = 1; reap.reason = 1;
+		if (!m_reference->reapAttempt(m_attempt, reap)) return;
+		m_ordinaryPending = false;
+	}
+
+	PartitionCollisionBypassObserver(const PartitionCollisionBypassObserver &);
+	PartitionCollisionBypassObserver &operator=(const PartitionCollisionBypassObserver &);
+	performance::KernelPerformanceReferenceLedger *m_reference;
+	performance::KernelPerformanceAttempt m_attempt;
+	performance::KernelPerformanceDeterministicBypass m_bypass;
+	bool m_compactEligible, m_ordinaryPending, m_fullFallback,
+		m_fullContinuationPending, m_deferredFullContinuation, m_totalsValid;
+	performance::KernelPerformanceReferenceBatch m_deferredBatch;
+	JobMetricCounter m_attempted, m_inserted;
+	performance::NativeCollisionReserveFacts m_reserve;
+};
+}
 
 static LivePartitionCollisionWorkspace &livePartitionCollisionWorkspace()
 {
@@ -1282,9 +1575,13 @@ public:
 static UnsignedInt commitCapturedLegacyPossibleCollisions(
 	PartitionData *owner, PartitionContactList *contactList,
 	const rts::PartitionCollisionCellSnapshot *cells, UnsignedInt cellCount,
-	PartitionData *const *participants)
+	PartitionData *const *participants,
+	rts::PartitionCollisionBypassObserver *observer = nullptr)
 {
 	UnsignedInt insertedCount = 0;
+	UnsignedInt observedAttempts = 0;
+	observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_FALLBACK_BEGIN,
+		cellCount, 0, 0, 0, true);
 	for (UnsignedInt cellIndex = 0; cellIndex != cellCount; ++cellIndex)
 	{
 		const rts::PartitionCollisionCellSnapshot &cell = cells[cellIndex];
@@ -1294,11 +1591,29 @@ static UnsignedInt commitCapturedLegacyPossibleCollisions(
 		for (UnsignedInt index = cell.occupantBegin; index != end; ++index)
 		{
 			PartitionData *participant = participants[index];
-			if (owner != participant &&
-				contactList->addToContactList(owner, participant))
-				++insertedCount;
+			if (owner != participant)
+			{
+				const bool observeContact = observer != nullptr || s_partitionCollisionNativeTestHooks != nullptr;
+				Object *ownerObject = observeContact && owner != nullptr ? owner->getObject() : nullptr;
+				Object *participantObject = observeContact && participant != nullptr ? participant->getObject() : nullptr;
+				const UnsignedInt ownerID = ownerObject != nullptr ? static_cast<UnsignedInt>(ownerObject->getID()) : 0;
+				const UnsignedInt participantID = participantObject != nullptr ? static_cast<UnsignedInt>(participantObject->getID()) : 0;
+				const Bool inserted = contactList->addToContactList(owner, participant);
+				if (inserted) ++insertedCount;
+				if (observer != nullptr)
+					observer->observeActualContact(ownerID, participantID, inserted != FALSE);
+				if (s_partitionCollisionNativeTestHooks != nullptr)
+				{
+					++observedAttempts;
+					observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_FALLBACK_CONTACT,
+						ownerID, participantID,
+						0, 0, inserted != FALSE);
+				}
+			}
 		}
 	}
+	observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_FALLBACK_END,
+		observedAttempts, insertedCount, 0, 0, true);
 	return insertedCount;
 }
 #endif
@@ -2315,6 +2630,7 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 	//DEBUG_LOG(("adding possible collision for %s",getObject()->getTemplate()->getName().str()));
 
 #if defined(_WIN64)
+	rts::PartitionCollisionBypassObserver nativeObserver;
 	const Bool authoritativeRequested = rts::UseParallelSimulation();
 	const Bool shadowRequested = rts::UseSimulationShadowOracle();
 	if (authoritativeRequested || shadowRequested)
@@ -2331,6 +2647,7 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 		&rts::performance::KernelPerformanceReferenceLedger::instance();
 	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
 	rts::CollisionCandidateReferenceBatchTransport referenceTransport;
+		nativeObserver.begin(*referenceLedger, *performanceLedger, performanceBatch);
 		rts::JobSystem &jobs = rts::JobSystem::instance();
 		const Bool schedulerReady = jobs.isRunning() &&
 			!jobs.isWorkerThread() && jobs.isCurrentThread(rts::JOB_OWNER_GAME) &&
@@ -2340,6 +2657,10 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 			(TheNetwork == nullptr ||
 			 !rts::ShouldPrepareLiveSimulationKernelOffThread(
 				rts::MULTIPLAYER_SIMULATION_KERNEL_COLLISION));
+		const rts::performance::NativeCollisionPolicyFacts policyFacts = {
+			authoritativeRequested != FALSE, shadowRequested != FALSE,
+			multiplayerPolicyBlocked != FALSE, schedulerReady != FALSE, jobs.workerCount()};
+		nativeObserver.policy(policyFacts);
 		if (multiplayerPolicyBlocked || !schedulerReady)
 		{
 			rts::RecordCollisionCandidateOwnerFallback(false);
@@ -2376,6 +2697,9 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 				}
 			}
 
+			const rts::performance::NativeCollisionCountFacts countFacts = {
+				admissionOwnerID, static_cast<UnsignedInt>(m_coiInUseCount), occupantCount, countValid != FALSE};
+			nativeObserver.count(countFacts);
 			if (!countValid)
 			{
 				rts::RecordCollisionCandidateOwnerFallback(false, true);
@@ -2387,6 +2711,8 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 				LivePartitionCollisionWorkspace &workspace =
 					livePartitionCollisionWorkspace();
 				Bool workspaceReady = FALSE;
+				nativeObserver.beforeReserve(workspace,
+					static_cast<UnsignedInt>(m_coiInUseCount), occupantCount);
 				{
 					rts::frame_timing::Scope snapshotReserveTiming(
 						rts::frame_timing::SimulationSnapshot);
@@ -2396,6 +2722,7 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 					workspaceReady = workspace.reserve(
 						static_cast<UnsignedInt>(m_coiInUseCount), occupantCount);
 				}
+				nativeObserver.afterReserve(workspace, workspaceReady != FALSE);
 				rts::PartitionCollisionCellSnapshot *cellSnapshots =
 					workspace.cellSnapshots;
 				rts::PartitionCollisionOccupantSnapshot *occupants =
@@ -2419,6 +2746,7 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 					rts::CollisionAdmissionSampler admissionSampler;
 					UnsignedInt flatIndex = 0;
 					Bool snapshotValid = TRUE;
+					bool participantIdentitiesValid = true;
 					{
 						rts::frame_timing::Scope snapshotTiming(
 							rts::frame_timing::SimulationSnapshot);
@@ -2448,6 +2776,8 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 									participantObject != nullptr ?
 									static_cast<UnsignedInt>(participantObject->getID()) : 0;
 								occupants[flatIndex].generation = flatIndex + 2;
+								participantIdentitiesValid = participantIdentitiesValid &&
+									participantObject != nullptr && occupants[flatIndex].objectID != 0;
 								if (occupants[flatIndex].objectID != 0 &&
 									occupants[flatIndex].objectID != admissionOwnerID)
 									admissionSampler.observe(
@@ -2461,13 +2791,18 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 					snapshotValid = snapshotValid && flatIndex == occupantCount;
 
 					Object *ownerObject = getObject();
+					const UnsignedInt capturedOwnerID = ownerObject != nullptr ?
+						static_cast<UnsignedInt>(ownerObject->getID()) : 0;
+					const rts::performance::NativeCollisionCaptureFacts captureFacts = {
+						flatIndex, snapshotValid != FALSE, ownerObject != nullptr, capturedOwnerID,
+						participantIdentitiesValid, ownerObject == admissionOwner && capturedOwnerID == admissionOwnerID};
+					nativeObserver.capture(captureFacts);
 					rts::PartitionCollisionObjectSnapshot ownerSnapshot;
 					if (snapshotValid && ownerObject != nullptr)
 					{
 						const Coord3D *position = ownerObject->getPosition();
 						const GeometryInfo &geometry = ownerObject->getGeometryInfo();
-						ownerSnapshot.objectID =
-							static_cast<UnsignedInt>(ownerObject->getID());
+						ownerSnapshot.objectID = capturedOwnerID;
 						ownerSnapshot.generation = 1;
 						// Preserve the outer dirty-loop ordinal in the diagnostic
 						// identity; it is never used for gameplay ordering.
@@ -2483,34 +2818,71 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 						ownerSnapshot.smallGeometry =
 							geometry.getIsSmall() != FALSE;
 
-						if (occupantCount <
-								rts::COLLISION_CANDIDATE_MINIMUM_PARALLEL_INPUTS ||
-							!admissionSampler.hasUsefulSpread())
+						if (s_partitionCollisionNativeTestHooks != nullptr)
+							observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_CAPTURE_COMPLETE,
+								flatIndex, static_cast<UnsignedInt>(m_coiInUseCount),
+								admissionSampler.encounterCount(), admissionSampler.sampleCount(), true);
+
+						const bool belowMinimum = occupantCount <
+							rts::COLLISION_CANDIDATE_MINIMUM_PARALLEL_INPUTS;
+						const bool usefulSpread = !belowMinimum && hasUsefulPartitionCollisionSpread(admissionSampler);
+						const rts::performance::NativeCollisionClassFacts classFacts = {
+							occupantCount, rts::COLLISION_CANDIDATE_MINIMUM_PARALLEL_INPUTS,
+							admissionSampler.encounterCount(), admissionSampler.sampleCount(), !belowMinimum, usefulSpread};
+						if (belowMinimum || !usefulSpread)
 						{
+							if (s_partitionCollisionNativeTestHooks != nullptr)
+								observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_CLASSIFIED,
+									occupantCount < rts::COLLISION_CANDIDATE_MINIMUM_PARALLEL_INPUTS ? 1 : 2,
+									occupantCount, admissionSampler.encounterCount(), admissionSampler.sampleCount(), false);
 							rts::RecordCollisionCandidateIneligibleSlice();
+							referenceInput.owner = ownerSnapshot;
+							referenceInput.cells = cellSnapshots;
+							referenceInput.cellCount = static_cast<UnsignedInt>(m_coiInUseCount);
+							referenceInput.occupants = occupants;
+							referenceInput.occupantCount = occupantCount;
+							referenceInput.order = rts::COLLISION_CANDIDATE_REVERSE_DISCOVERY;
+							nativeObserver.beginCapturedFallback(classFacts, referenceInput);
 							commitCapturedLegacyPossibleCollisions(this, ctList,
 								cellSnapshots,
 								static_cast<UnsignedInt>(m_coiInUseCount),
-								participants);
+								participants, nativeObserver.contactObserver());
+							nativeObserver.finishCapturedFallback();
 							finishCollisionPerformanceBatch(performanceLedger,
 								performanceBatch,
 								rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
 							return;
 						}
 
+						if (s_partitionCollisionNativeTestHooks != nullptr)
+							observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_CLASSIFIED,
+								3, occupantCount, admissionSampler.encounterCount(), admissionSampler.sampleCount(), true);
+						nativeObserver.fullClass(classFacts);
 						rts::CollisionCandidateOptions options;
 						options.parallel = true;
 						options.order = rts::COLLISION_CANDIDATE_REVERSE_DISCOVERY;
 						options.performanceLedger = performanceLedger;
 						options.performanceBatch = performanceBatch;
 						options.performanceReferenceLedger = referenceLedger;
+						options.performanceReferenceAttempt = nativeObserver.performanceReferenceAttempt();
+						options.performanceReferenceDecisionOrdinal = 5;
 						options.performanceReferenceBatch = &referenceBatch;
+						rts::CollisionCandidateTestHooks nativeCoreTestHooks;
+						if (s_partitionCollisionNativeTestHooks != nullptr &&
+							s_partitionCollisionNativeTestHooks->observeCore != nullptr)
+						{
+							nativeCoreTestHooks.context = s_partitionCollisionNativeTestHooks->context;
+							nativeCoreTestHooks.observe = s_partitionCollisionNativeTestHooks->observeCore;
+							options.testHooks = &nativeCoreTestHooks;
+						}
 						UnsignedInt preparedCount = 0;
 						rts::CollisionCandidateMetrics preparationMetrics;
 						rts::CollisionCandidateResult result;
 						{
 							rts::frame_timing::Scope parallelTiming(
 								rts::frame_timing::SimulationParallel);
+							observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_PREPARE_BEGIN,
+								occupantCount);
 							result = rts::PreparePartitionCollisionCandidates(
 								ownerSnapshot, cellSnapshots,
 								static_cast<UnsignedInt>(m_coiInUseCount), occupants,
@@ -2518,6 +2890,9 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 								occupantCount, options, &preparedCount,
 								&preparationMetrics);
 						}
+						observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_PREPARE_END,
+							static_cast<unsigned>(result), preparationMetrics.submittedJobs,
+							preparationMetrics.completedJobs, preparedCount, true);
 						if (result == rts::COLLISION_CANDIDATE_PARALLEL)
 						{
 							performanceAdmitted = TRUE;
@@ -2539,7 +2914,9 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 										preparedCount,
 										resolveLivePartitionCollisionGeneration, &context,
 										&firstStale);
-				if (liveValid && referenceLedger->mode() !=
+								observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_LIVE_VALIDATION,
+									preparedCount, 0, 0, 0, liveValid != FALSE);
+								if (liveValid && !nativeObserver.fullContinuationPending() && referenceLedger->mode() !=
 					rts::performance::KERNEL_REFERENCE_DISABLED)
 				{
 					referenceInput.owner = ownerSnapshot;
@@ -2725,6 +3102,10 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 											&referenceTransport, false);
 										referenceObserved = FALSE;
 									}
+									else if (nativeObserver.fullContinuationPending())
+										(void)nativeObserver.finishFullContinuation(
+											rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION,
+											referenceBatch, false);
 									// The real legacy prefix is already published in either
 									// case, so callbacks and destruction stay on legacy data.
 									shadowExecution = TRUE;
@@ -2753,31 +3134,46 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 									rts::RecordCollisionCandidateAcceptedParallelWork(
 										preparationMetrics);
 										rts::RecordCollisionCandidateOwnerCommit(true,
-											false, committedCount);
+										false, committedCount);
+									observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_AUTHORITATIVE_COMMIT_END,
+										committedCount, 0, 0, 0, true);
 									if (referenceObserved)
 									{
 										(void)rts::FinishCollisionCandidateReferenceBatch(
 											&referenceTransport, true);
 										referenceObserved = FALSE;
 									}
+									else if (nativeObserver.fullContinuationPending())
+										(void)nativeObserver.finishFullContinuation(
+											rts::performance::KERNEL_PERFORMANCE_COMMITTED,
+										referenceBatch, false);
 									authoritativeCommit = TRUE;
 								}
 							}
 							else
 							{
 								stale = TRUE;
+								if (nativeObserver.fullContinuationPending())
+									nativeObserver.deferFullContinuationFallback(
+										referenceBatch);
 							}
 						}
 						else
 						{
-							performanceAdmitted =
+							// Baseline replay executes the authenticated source ranges
+							// inline, so physical submission count is intentionally zero.
+							performanceAdmitted = nativeObserver.fullContinuationPending() ||
 								preparationMetrics.submittedJobs != 0 ? TRUE : FALSE;
 							rts::RecordCollisionCandidateOwnerFallback(false,
 								true);
 							commitCapturedLegacyPossibleCollisions(this, ctList,
 								cellSnapshots,
 								static_cast<UnsignedInt>(m_coiInUseCount),
-								participants);
+								participants, nativeObserver.contactObserver());
+							if (nativeObserver.fullContinuationPending())
+								(void)nativeObserver.finishFullContinuation(
+									rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION,
+									referenceBatch, true);
 							finishCollisionPerformanceBatch(performanceLedger,
 								performanceBatch,
 								performanceAdmitted ?
@@ -2808,6 +3204,16 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 	}
 #endif
 
+	#if defined(_WIN64)
+	const Bool observeDeferredFullFallback =
+		nativeObserver.fullContinuationPending() ? TRUE : FALSE;
+	UnsignedInt observedFallbackAttempts = 0;
+	UnsignedInt observedFallbackInsertions = 0;
+	if (observeDeferredFullFallback)
+		observePartitionCollisionNativeTest(
+			PARTITION_COLLISION_TEST_FALLBACK_BEGIN,
+			static_cast<UnsignedInt>(m_coiInUseCount), 0, 0, 0, true);
+	#endif
 	CellAndObjectIntersection *myCoi = m_coiArray;
 	for (Int i = m_coiInUseCount; i > 0; --i, ++myCoi)
 	{
@@ -2820,10 +3226,36 @@ void PartitionData::addPossibleCollisions(PartitionContactList *ctList,
 			PartitionData *that = coi->getModule();
 			if (this != that)
 			{
+				#if defined(_WIN64)
+				Object *ownerObject = observeDeferredFullFallback ? getObject() : nullptr;
+				Object *participantObject = observeDeferredFullFallback && that != nullptr ?
+					that->getObject() : nullptr;
+				const UnsignedInt ownerID = ownerObject != nullptr ?
+					static_cast<UnsignedInt>(ownerObject->getID()) : 0;
+				const UnsignedInt participantID = participantObject != nullptr ?
+					static_cast<UnsignedInt>(participantObject->getID()) : 0;
+				const Bool inserted = ctList->addToContactList(this, that);
+				if (observeDeferredFullFallback)
+				{
+					++observedFallbackAttempts;
+					if (inserted) ++observedFallbackInsertions;
+					observePartitionCollisionNativeTest(
+						PARTITION_COLLISION_TEST_FALLBACK_CONTACT,
+						ownerID, participantID, 0, 0, inserted != FALSE);
+				}
+				#else
 				ctList->addToContactList(this, that);
+				#endif
 			}
 		}
 	}
+#if defined(_WIN64)
+	if (observeDeferredFullFallback)
+		observePartitionCollisionNativeTest(PARTITION_COLLISION_TEST_FALLBACK_END,
+			observedFallbackAttempts, observedFallbackInsertions, 0, 0, true);
+	nativeObserver.finishDeferredFullContinuationFallback();
+	nativeObserver.finishUncapturedFallback();
+#endif
 }
 
 //-----------------------------------------------------------------------------

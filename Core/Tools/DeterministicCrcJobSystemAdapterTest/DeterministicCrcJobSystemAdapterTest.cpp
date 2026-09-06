@@ -144,7 +144,8 @@ int main(int argc, char **argv)
 	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
 	{
 		fprintf(stderr,
-			"Usage: core_crc_job_adapter_tests [--local-capacity]\n");
+			"Usage: core_crc_job_adapter_tests "
+			"[--local-capacity|--external-qualification]\n");
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);

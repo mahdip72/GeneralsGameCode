@@ -8,16 +8,38 @@
 #include "Renderer/LegacyBridgeValidation.h"
 #include "dx8indexbuffer.h"
 #include "nativew3dbufferowner.h"
+#include "nativew3dtextureowner.h"
 
 #include <float.h>
 #include <limits.h>
 #include <new>
 #include <string.h>
-#include <assert.h>
 #include <stdio.h>
 
 namespace
 {
+
+rts::render::RenderResult BindNativeResourceOwners(
+	rts::render::NativeW3DResources *resources)
+{
+	using namespace rts::render;
+	RenderResult result = BindNativeW3DBufferResources(resources);
+	if (result != RENDER_RESULT_OK) return result;
+	result = BindNativeW3DTextureResources(resources);
+	if (result != RENDER_RESULT_OK) UnbindNativeW3DBufferResources(resources);
+	return result;
+}
+
+rts::render::RenderResult UnbindNativeResourceOwners(
+	rts::render::NativeW3DResources *resources)
+{
+	using namespace rts::render;
+	RenderResult result = UnbindNativeW3DTextureResources(resources);
+	if (result != RENDER_RESULT_OK) return result;
+	result = UnbindNativeW3DBufferResources(resources);
+	if (result != RENDER_RESULT_OK) BindNativeW3DTextureResources(resources);
+	return result;
+}
 
 bool IsFiniteGameFloat(float value)
 {
@@ -99,14 +121,17 @@ bool GameShaderPathEquals(const char *path, const char *expected)
 rts::render::GpuHandle ToGameGpuHandle(
 	const rts::render::GameRenderHandle &handle)
 {
-	return handle.index == 0 || handle.generation == 0 ?
+	return handle.generation == 0 ?
 		rts::render::GpuHandle() :
 	rts::render::GpuHandle(handle.index, handle.generation);
 }
 
 bool IsWellFormedGameHandle(const rts::render::GameRenderHandle &handle)
 {
-	return (handle.index == 0U) == (handle.generation == 0U);
+	// Slot zero is a valid native allocation. Only the all-zero game tuple
+	// denotes null; UINT_MAX is the native invalid-index sentinel.
+	return handle.generation == 0U ? handle.index == 0U :
+		handle.index != UINT_MAX;
 }
 
 bool IsValidGameTopology(unsigned int value)
@@ -158,6 +183,104 @@ bool CheckedGameSizeMultiply(size_t left, size_t right, size_t *result)
 	if (result == 0 || (left != 0 && right > static_cast<size_t>(-1) / left))
 		return false;
 	*result = left * right;
+	return true;
+}
+
+const char *const kNativeGameCaptureFile = "D3D11RendererCapture.tga";
+const unsigned int kNativeGameCaptureMaxDimension = 65535;
+
+bool WriteNativeGameCaptureTga(unsigned int width, unsigned int height,
+	size_t rowPitch, rts::render::RenderFormat format, const void *pixels,
+	size_t pixelBytes)
+{
+	if (pixels == 0 || width == 0 || height == 0 ||
+		width > kNativeGameCaptureMaxDimension ||
+		height > kNativeGameCaptureMaxDimension ||
+		(format != rts::render::RENDER_FORMAT_B8G8R8A8_UNORM &&
+			format != rts::render::RENDER_FORMAT_R8G8B8A8_UNORM))
+	{
+		remove(kNativeGameCaptureFile);
+		return false;
+	}
+	size_t sourceRowBytes = 0;
+	size_t requiredBytes = 0;
+	size_t outputRowBytes = 0;
+	if (!CheckedGameSizeMultiply(static_cast<size_t>(width), 4,
+		&sourceRowBytes) || rowPitch < sourceRowBytes ||
+		!CheckedGameSizeMultiply(rowPitch, static_cast<size_t>(height),
+		&requiredBytes) || pixelBytes < requiredBytes ||
+		!CheckedGameSizeMultiply(static_cast<size_t>(width), 3,
+		&outputRowBytes))
+	{
+		remove(kNativeGameCaptureFile);
+		return false;
+	}
+
+	FILE *file = fopen(kNativeGameCaptureFile, "wb");
+	if (file == 0)
+	{
+		remove(kNativeGameCaptureFile);
+		return false;
+	}
+	unsigned char header[18];
+	memset(header, 0, sizeof(header));
+	header[2] = 2; // uncompressed true-color image
+	header[12] = static_cast<unsigned char>(width & 0xff);
+	header[13] = static_cast<unsigned char>((width >> 8) & 0xff);
+	header[14] = static_cast<unsigned char>(height & 0xff);
+	header[15] = static_cast<unsigned char>((height >> 8) & 0xff);
+	header[16] = 24;
+	bool wroteFile = fwrite(header, 1, sizeof(header), file) ==
+		sizeof(header);
+	std::vector<unsigned char> outputRow;
+	if (wroteFile)
+	{
+		try
+		{
+			outputRow.resize(outputRowBytes);
+		}
+		catch (...)
+		{
+			wroteFile = false;
+		}
+	}
+	const unsigned char *sourcePixels =
+		static_cast<const unsigned char *>(pixels);
+	for (unsigned int row = height; wroteFile && row != 0; --row)
+	{
+		const unsigned char *source = sourcePixels +
+			static_cast<size_t>(row - 1) * rowPitch;
+		for (unsigned int column = 0; column < width; ++column)
+		{
+			const unsigned char *sourcePixel = source +
+				static_cast<size_t>(column) * 4;
+			unsigned char *outputPixel = &outputRow[
+				static_cast<size_t>(column) * 3];
+			if (format == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM)
+			{
+				outputPixel[0] = sourcePixel[0];
+				outputPixel[1] = sourcePixel[1];
+				outputPixel[2] = sourcePixel[2];
+			}
+			else
+			{
+				outputPixel[0] = sourcePixel[2];
+				outputPixel[1] = sourcePixel[1];
+				outputPixel[2] = sourcePixel[0];
+			}
+		}
+		wroteFile = fwrite(&outputRow[0], 1, outputRowBytes, file) ==
+			outputRowBytes;
+	}
+	if (wroteFile && fflush(file) != 0)
+		wroteFile = false;
+	if (fclose(file) != 0)
+		wroteFile = false;
+	if (!wroteFile)
+	{
+		remove(kNativeGameCaptureFile);
+		return false;
+	}
 	return true;
 }
 
@@ -214,10 +337,14 @@ NativeW3D2::NativeW3D2() : m_resourceHost(256), m_resources(4096),
 	m_borrowedBackend(false), m_gameResourcesOperational(false),
 	m_line3DContext(&m_renderer, &m_resources),
 	m_activeRenderTargetKind(rts::render::GAME_RENDER_TARGET_UNKNOWN),
+	m_gameRenderTargetBinding(),
 	m_debugConsoleDisabled(false), m_gameFailure(), m_deferredFailure(),
 	m_deferredFailureSequence(0), m_recoveredFailureSequence(0),
 	m_asyncResourceFailure(false), m_rebuildingResources(false),
+	m_reacquiringResources(false), m_reacquireFailure(),
 	m_gameCaptureQueue(8), m_gameCaptureRequest(),
+	m_gameCaptureDescriptorQueued(false), m_gameCaptureCompleted(false),
+	m_gameCaptureResult(rts::render::RENDER_RESULT_OK),
 	m_displayIterationEpoch(1), m_nativeSortingRenderer(),
 	m_gameShaderCullInverted(false), m_gameCleanupHook(0),
 	m_gameCameraValid(false),
@@ -244,13 +371,45 @@ NativeW3D2::NativeW3D2() : m_resourceHost(256), m_resources(4096),
 
 NativeW3D2::~NativeW3D2()
 {
+	// A failed owned recovery can detach the renderer facade while the resource
+	// table still retains the terminal render state. Use whichever state still
+	// exists to determine affinity; otherwise an off-owner destructor would
+	// fall through to Shutdown, reject after partially entering teardown, and
+	// leave publication metadata pointing at a dead aggregate.
+	const bool ownerThread = m_renderer.HasBackendState() ?
+		m_renderer.IsOwnerThread() : m_resources.IsOwnerThread();
+	if (!ownerThread)
+	{
+		// Publication must be removed before the aggregate's members start
+		// tearing down. NativeW3DRenderer (last member) transfers its owned
+		// state reference to the render-owner fallback queue; the queue callback
+		// is the only place allowed to stop a ThreadedRenderDevice.
+		{
+			rts::render::NativeGameRenderOwnerLifecycleScope ownerLifecycleScope;
+			if (ownerLifecycleScope.IsAcquired() &&
+				ownerLifecycleScope.Get() == this)
+			{
+				ownerLifecycleScope.Publish(0);
+			}
+			// The shared lifecycle gate remains held while these exact publication
+			// records are cleared.  The helpers perform metadata-only invalidation;
+			// no GPU operation is legal from this foreign destructor thread.
+			rts::render::InvalidateNativeW3DBufferResources(&m_resources);
+			rts::render::InvalidateNativeW3DTextureResources(&m_resources);
+		}
+		{
+			rts::render::NativeLine3DSubmitterLifecycleScope lineLifecycleScope;
+			if (lineLifecycleScope.Get() == &m_line3DContext)
+				lineLifecycleScope.Publish(0);
+		}
+		rts::render::ClearGameRendererStateForDestroyedOwner(this);
+		return;
+	}
 	const rts::render::RenderResult shutdownResult = Shutdown();
-	assert(shutdownResult == rts::render::RENDER_RESULT_OK);
 	if (shutdownResult != rts::render::RENDER_RESULT_OK)
 	{
-		// An off-owner destructor cannot safely release the shared backend.  The
-		// owner-thread contract makes this a programmer/lifecycle error; leave the
-		// publication and resource state untouched in release builds as well.
+		// Owner-thread shutdown failures remain fail-closed; the resource table
+		// retains its exact state for the caller's explicit retry path.
 		return;
 	}
 	if (rts::render::Get_Native_Line3D_Submitter() == &m_line3DContext)
@@ -267,6 +426,9 @@ rts::render::RenderResult NativeW3D2::Initialize(void *window,
 	{
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	m_gameRenderTargetBinding = rts::render::RenderTargetBinding();
+	m_reacquiringResources = false;
+	m_reacquireFailure.reset();
 	const rts::render::RenderResult result = m_renderer.Initialize(window,
 		descriptor);
 	if (result != rts::render::RENDER_RESULT_OK)
@@ -279,8 +441,10 @@ rts::render::RenderResult NativeW3D2::Initialize(void *window,
 		m_renderer.Shutdown();
 		return bindResult;
 	}
-	const rts::render::RenderResult bufferBindResult =
-		rts::render::BindNativeW3DBufferResources(&m_resources);
+	rts::render::RenderResult bufferBindResult =
+		m_resources.SetThreadedCompletionFence(FenceBufferPublications, this);
+	if (bufferBindResult == rts::render::RENDER_RESULT_OK)
+		bufferBindResult = BindNativeResourceOwners(&m_resources);
 	if (bufferBindResult != rts::render::RENDER_RESULT_OK)
 	{
 		m_resources.Shutdown();
@@ -289,7 +453,7 @@ rts::render::RenderResult NativeW3D2::Initialize(void *window,
 	}
 	if (!m_gameCaptureQueue.bindOwnerThread())
 	{
-		rts::render::UnbindNativeW3DBufferResources(&m_resources);
+		UnbindNativeResourceOwners(&m_resources);
 		m_resources.Shutdown();
 		m_renderer.Shutdown();
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
@@ -308,7 +472,7 @@ rts::render::RenderResult NativeW3D2::Initialize(void *window,
 	rts::render::NativeGameRenderOwnerLifecycleScope ownerLifecycleScope;
 	if (!ownerLifecycleScope.IsAcquired())
 	{
-		rts::render::UnbindNativeW3DBufferResources(&m_resources);
+		UnbindNativeResourceOwners(&m_resources);
 		m_resources.Shutdown();
 		m_renderer.Shutdown();
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
@@ -327,6 +491,9 @@ rts::render::RenderResult NativeW3D2::AttachBackend(
 	{
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	m_gameRenderTargetBinding = rts::render::RenderTargetBinding();
+	m_reacquiringResources = false;
+	m_reacquireFailure.reset();
 	rts::render::RenderResult result = m_resourceHost.Attach(device, context);
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
@@ -345,7 +512,9 @@ rts::render::RenderResult NativeW3D2::AttachBackend(
 		m_resourceHost.Detach();
 		return result;
 	}
-	result = rts::render::BindNativeW3DBufferResources(&m_resources);
+	result = m_resources.SetThreadedCompletionFence(FenceBufferPublications, this);
+	if (result == rts::render::RENDER_RESULT_OK)
+		result = BindNativeResourceOwners(&m_resources);
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
 		m_resources.Shutdown();
@@ -355,7 +524,7 @@ rts::render::RenderResult NativeW3D2::AttachBackend(
 	}
 	if (!m_gameCaptureQueue.bindOwnerThread())
 	{
-		rts::render::UnbindNativeW3DBufferResources(&m_resources);
+		UnbindNativeResourceOwners(&m_resources);
 		m_resources.Shutdown();
 		m_renderer.DetachBorrowedState();
 		m_resourceHost.Detach();
@@ -374,7 +543,7 @@ rts::render::RenderResult NativeW3D2::AttachBackend(
 	rts::render::NativeGameRenderOwnerLifecycleScope ownerLifecycleScope;
 	if (!ownerLifecycleScope.IsAcquired())
 	{
-		rts::render::UnbindNativeW3DBufferResources(&m_resources);
+		UnbindNativeResourceOwners(&m_resources);
 		m_resources.Shutdown();
 		m_renderer.DetachBorrowedState();
 		m_resourceHost.Detach();
@@ -425,6 +594,15 @@ rts::render::RenderResult NativeW3D2::ReplaceBackendContext(
 	}
 	if (wasOwnerPublished)
 		ownerLifecycleScope.Publish(this);
+	if (result == rts::render::RENDER_RESULT_OK)
+	{
+		// A borrowed context replacement is the bridge's recovery boundary. The
+		// old output views no longer describe the new context, so only the default
+		// swap-chain binding may be carried into the next owner frame.
+		m_gameRenderTargetBinding = rts::render::RenderTargetBinding();
+		m_activeRenderTargetKind =
+			rts::render::GAME_RENDER_TARGET_BACK_BUFFER;
+	}
 	return result;
 }
 
@@ -501,6 +679,11 @@ rts::render::RenderResult NativeW3D2::PollThreadedCompletions(
 			RememberThreadedFailure(completed.outcome, completed.sequence);
 	}
 	return result;
+}
+
+rts::render::RenderResult NativeW3D2::FenceBufferPublications(void *owner)
+{
+	return static_cast<NativeW3D2 *>(owner)->FenceThreadedRender();
 }
 
 rts::render::RenderResult NativeW3D2::FenceThreadedRender()
@@ -650,6 +833,22 @@ rts::render::RenderResult NativeW3D2::RecoverDevice()
 	return RecoverOwnedDevice();
 }
 
+rts::render::RenderResult NativeW3D2::ReAcquireGameResources()
+{
+	// GameRenderCleanupHook has a void callback, so resource factories report
+	// their failures through RecordGameFailure. Isolate that callback result
+	// from the ordinary frame latch and inspect it after the callback returns.
+	m_reacquireFailure.reset();
+	m_reacquiringResources = true;
+	const bool callbackResult = InvokeGameCleanupReAcquire(m_gameCleanupHook);
+	m_reacquiringResources = false;
+	if (!callbackResult)
+		return m_reacquireFailure.hasFailure() ? m_reacquireFailure.result() :
+			rts::render::RENDER_RESULT_FAILED;
+	return m_reacquireFailure.hasFailure() ? m_reacquireFailure.result() :
+		rts::render::RENDER_RESULT_OK;
+}
+
 rts::render::RenderResult NativeW3D2::RecoverOwnedDevice()
 {
 	if (m_borrowedBackend || !m_resources.IsOwnerThread() ||
@@ -657,6 +856,9 @@ rts::render::RenderResult NativeW3D2::RecoverOwnedDevice()
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	m_gameResourcesOperational = false;
 	m_activeRenderTargetKind = rts::render::GAME_RENDER_TARGET_UNKNOWN;
+	m_gameRenderTargetBinding = rts::render::RenderTargetBinding();
+	m_reacquiringResources = false;
+	m_reacquireFailure.reset();
 	m_rebuildingResources = true;
 	if (m_gameCaptureQueue.bindOwnerThread())
 	{
@@ -676,19 +878,24 @@ rts::render::RenderResult NativeW3D2::RecoverOwnedDevice()
 	// into a retained game resource hook at that point would recreate objects
 	// against a dead device. The rebuild flag admits only resource recreation;
 	// frame/draw entry points still require m_gameResourcesOperational.
-	if (result == rts::render::RENDER_RESULT_OK &&
-		!InvokeGameCleanupReAcquire(m_gameCleanupHook))
+	if (result == rts::render::RENDER_RESULT_OK)
 	{
-		m_rebuildingResources = false;
-		m_gameResourcesOperational = false;
-		m_activeRenderTargetKind = rts::render::GAME_RENDER_TARGET_UNKNOWN;
-		if (m_gameCaptureQueue.bindOwnerThread())
+		const rts::render::RenderResult reacquireResult =
+			ReAcquireGameResources();
+		if (reacquireResult != rts::render::RENDER_RESULT_OK)
 		{
-			m_gameCaptureQueue.cancelCurrent(rts::render::RENDER_RESULT_FAILED);
-			m_gameCaptureRequest.clear();
+			m_rebuildingResources = false;
+			m_gameResourcesOperational = false;
+			m_activeRenderTargetKind =
+				rts::render::GAME_RENDER_TARGET_UNKNOWN;
+			if (m_gameCaptureQueue.bindOwnerThread())
+			{
+				m_gameCaptureQueue.cancelCurrent(reacquireResult);
+				m_gameCaptureRequest.clear();
+			}
+			RecordGameFailure(reacquireResult);
+			return reacquireResult;
 		}
-		RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
-		return rts::render::RENDER_RESULT_FAILED;
 	}
 	m_rebuildingResources = false;
 	if (result == rts::render::RENDER_RESULT_OK)
@@ -762,7 +969,10 @@ rts::render::RenderResult NativeW3D2::Shutdown()
 	if (ownerLifecycleScope.Get() == this)
 		ownerLifecycleScope.Publish(0);
 	m_activeRenderTargetKind = rts::render::GAME_RENDER_TARGET_UNKNOWN;
+	m_gameRenderTargetBinding = rts::render::RenderTargetBinding();
 	m_gameResourcesOperational = false;
+	m_reacquiringResources = false;
+	m_reacquireFailure.reset();
 	m_nativeSortingRenderer.Clear();
 	m_gameFailure.reset();
 	m_deferredFailure = rts::render::RenderFrameOutcome();
@@ -783,7 +993,7 @@ rts::render::RenderResult NativeW3D2::Shutdown()
 	}
 	m_line3DContext.DrainLine3D();
 	const rts::render::RenderResult unbindResult =
-		rts::render::UnbindNativeW3DBufferResources(&m_resources);
+		UnbindNativeResourceOwners(&m_resources);
 	if (unbindResult != rts::render::RENDER_RESULT_OK)
 		return unbindResult;
 	const rts::render::RenderResult resourcesResult = m_resources.Shutdown();
@@ -792,7 +1002,7 @@ rts::render::RenderResult NativeW3D2::Shutdown()
 		// The table is still live after a failed shutdown. Restore the binding so
 		// dynamic-buffer owners retain a valid retry path, while keeping the
 		// public owner unpublished until the caller retries teardown.
-		rts::render::BindNativeW3DBufferResources(&m_resources);
+		BindNativeResourceOwners(&m_resources);
 		return resourcesResult;
 	}
 	m_renderer.m_recoveryResources = 0;
@@ -1078,7 +1288,15 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				{
 					LegacyTextureStageState &stageState =
 						logical.pipeline.textureStages[stage];
-					stageState = LegacyTextureStageState();
+					// A material without a mapper resets coordinate generation only.
+					// Combiners and samplers belong to shader/texture state and must
+					// survive consecutive draws using the same cached ShaderClass.
+					stageState.cameraSpacePosition = false;
+					stageState.cameraSpaceNormal = false;
+					stageState.cameraSpaceReflectionVector = false;
+					stageState.textureTransformEnable = false;
+					stageState.projectedCoordinates = false;
+					stageState.textureTransformCount = 0;
 					stageState.textureCoordinateIndex =
 						material.textureCoordinateIndex[stage];
 				}
@@ -1304,13 +1522,17 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				if ((command.value2 & ~0x000300ffU) != 0U ||
 					(command.value2 & 0xffU) >= LEGACY_TEXTURE_STAGE_COUNT)
 					goto invalid_command;
-				stage.textureCoordinateIndex = command.value2 & 0xffU;
-				stage.cameraSpaceNormal = (command.value2 &
-					GAME_TEXTURE_COORDINATE_CAMERA_NORMAL) != 0U;
-				stage.cameraSpacePosition = (command.value2 &
-					GAME_TEXTURE_COORDINATE_CAMERA_POSITION) != 0U;
-				stage.cameraSpaceReflectionVector = (command.value2 &
-					GAME_TEXTURE_COORDINATE_CAMERA_REFLECTION) != 0U;
+				{
+					const unsigned int coordinateMode = command.value2 &
+						0x00030000U;
+					stage.textureCoordinateIndex = command.value2 & 0xffU;
+					stage.cameraSpaceNormal = coordinateMode ==
+						GAME_TEXTURE_COORDINATE_CAMERA_NORMAL;
+					stage.cameraSpacePosition = coordinateMode ==
+						GAME_TEXTURE_COORDINATE_CAMERA_POSITION;
+					stage.cameraSpaceReflectionVector = coordinateMode ==
+						GAME_TEXTURE_COORDINATE_CAMERA_REFLECTION;
+				}
 				break;
 			case GAME_TEXTURE_STAGE_TRANSFORM_FLAGS:
 				if ((command.value2 & ~0x000001ffU) != 0U ||
@@ -1507,7 +1729,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				m_gameIndexBuffer = GpuHandle();
 				m_gameIndexBound = false;
 				m_gameIndexOffset = 0;
-				m_gameIndexBaseVertex = 0;
+				m_gameIndexBaseVertex = command.signedValue0;
 				m_gameIndexFormat = RENDER_FORMAT_R16_UINT;
 				return RENDER_RESULT_OK;
 			}
@@ -1601,8 +1823,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			command.value3 == 0U)
 			goto invalid_command;
 		{
-			unsigned int indexCount = command.type ==
-				GAME_RENDER_COMMAND_DRAW_TRIANGLES ? 0U : command.value1;
+			unsigned int indexCount = 0U;
 			if (command.type == GAME_RENDER_COMMAND_DRAW_TRIANGLES)
 			{
 				size_t indexCountSize = 0;
@@ -1610,6 +1831,14 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					3U, &indexCountSize) || indexCountSize > UINT_MAX)
 					goto invalid_command;
 				indexCount = static_cast<unsigned int>(indexCountSize);
+			}
+			else
+			{
+				// The facade follows DrawIndexedPrimitive's primitive-count
+				// contract: a strip consumes primitiveCount + 2 indices.
+				if (command.value1 == 0U || command.value1 > UINT_MAX - 2U)
+					goto invalid_command;
+				indexCount = command.value1 + 2U;
 			}
 			if (indexCount == 0U)
 				goto invalid_command;
@@ -1653,11 +1882,6 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			m_gameSortedVertexCount == 0U ||
 			m_gameSortedVertexMinimum >
 				65536U - m_gameSortedVertexCount ||
-			command.value2 < m_gameSortedVertexMinimum ||
-			command.value2 - m_gameSortedVertexMinimum >
-				m_gameSortedVertexCount ||
-			command.value3 > m_gameSortedVertexCount -
-				(command.value2 - m_gameSortedVertexMinimum) ||
 			m_gameVertexStride == 0U)
 			goto invalid_command;
 		{
@@ -1666,8 +1890,16 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			size_t requestedSourceOffset = 0;
 			size_t boundSourceOffset = 0;
 			unsigned int relativeIndexStart = 0;
-			const unsigned int relativeVertexStart = command.value2 -
-				m_gameSortedVertexMinimum;
+			const long long physicalVertexStart =
+				static_cast<long long>(command.value2) + m_gameIndexBaseVertex;
+			if (physicalVertexStart < m_gameSortedVertexMinimum ||
+				physicalVertexStart > UINT_MAX)
+				goto invalid_command;
+			const unsigned int relativeVertexStart =
+				static_cast<unsigned int>(physicalVertexStart) - m_gameSortedVertexMinimum;
+			if (relativeVertexStart > m_gameSortedVertexCount ||
+				command.value3 > m_gameSortedVertexCount - relativeVertexStart)
+				goto invalid_command;
 			if (!CheckedGameSizeMultiply(static_cast<size_t>(command.value1),
 				3U, &indexCountSize) || indexCountSize == 0U ||
 				indexCountSize > 65535U || indexCountSize >
@@ -1679,7 +1911,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				indexCountSize > m_gameSortedIndexCount - relativeIndexStart ||
 				!CheckedGameSizeMultiply(static_cast<size_t>(relativeVertexStart),
 					static_cast<size_t>(m_gameVertexStride), &vertexByteOffset) ||
-				!CheckedGameSizeMultiply(static_cast<size_t>(command.value2),
+				!CheckedGameSizeMultiply(static_cast<size_t>(physicalVertexStart),
 					static_cast<size_t>(m_gameVertexStride),
 					&requestedSourceOffset) ||
 				!CheckedGameSizeMultiply(static_cast<size_t>(
@@ -1803,25 +2035,33 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			sizeof(RenderTargetBinding))
 			goto invalid_command;
 		{
-			const RenderTargetBinding &binding =
+			const RenderTargetBinding &requestedBinding =
 				*static_cast<const RenderTargetBinding *>(command.input);
-			if (binding.hasColor && !binding.useBackBufferColor &&
-				(!binding.color.resource.isValid() ||
-					!m_resources.IsValid(binding.color.resource)))
-				goto invalid_command;
-			if (binding.hasDepth && !binding.useBackBufferDepth &&
-				(!binding.depth.resource.isValid() ||
-					!m_resources.IsValid(binding.depth.resource)))
-				goto invalid_command;
-			const RenderResult result = m_renderer.SetRenderTargetsExternal(binding);
-			if (result != RENDER_RESULT_OK)
+			const RenderResult validationResult =
+				ValidateGameRenderTargetBinding(requestedBinding, 0);
+			if (validationResult != RENDER_RESULT_OK)
 			{
-				RecordGameFailure(result);
-				return result;
+				RecordGameFailure(validationResult);
+				return validationResult;
 			}
-			m_activeRenderTargetKind = binding.hasColor &&
-				!binding.useBackBufferColor ? GAME_RENDER_TARGET_TEXTURE :
-				GAME_RENDER_TARGET_BACK_BUFFER;
+			if (m_renderer.IsFrameOpen())
+			{
+				const RenderResult result =
+					m_renderer.SetRenderTargetsExternal(requestedBinding);
+				if (result != RENDER_RESULT_OK)
+				{
+					RecordGameFailure(result);
+					return result;
+				}
+			}
+			// Update the logical state only after descriptor validation and, when a
+			// frame is open, after the backend transition succeeded. A failed request
+			// therefore leaves the previous target available for the next BeginFrame.
+			m_gameRenderTargetBinding = requestedBinding;
+			m_activeRenderTargetKind =
+				(!requestedBinding.useBackBufferColor ||
+				 !requestedBinding.useBackBufferDepth) ?
+				GAME_RENDER_TARGET_TEXTURE : GAME_RENDER_TARGET_BACK_BUFFER;
 			return RENDER_RESULT_OK;
 		}
 
@@ -1859,6 +2099,24 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			{
 				RecordGameFailure(result);
 				return result;
+			}
+			// D3D11 beginFrame restores the swap-chain attachments. Reapply the last
+			// validated logical binding before any clear so a pre-frame target request
+			// becomes the actual output for this frame. This is an owner-local backend
+			// operation; it must not publish another facade/texture authority epoch.
+			const RenderResult targetResult = m_renderer.SetRenderTargetsExternal(
+				m_gameRenderTargetBinding);
+			if (targetResult != RENDER_RESULT_OK)
+			{
+				m_renderer.RecordFrameFailure(targetResult);
+				// EndFrame closes and seals a failed threaded recording. Do not
+				// finalize a second time here; that would enqueue an empty packet
+				// and replace the target failure with INVALID_ARGUMENT.
+				const RenderResult endResult = m_renderer.EndFrame(false);
+				if (endResult != RENDER_RESULT_OK)
+					RecordGameFailure(endResult);
+				RecordGameFailure(targetResult);
+				return targetResult;
 			}
 			if (command.value0 != 0U)
 			{
@@ -1944,6 +2202,9 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			m_rebuildingResources = true;
 			m_gameResourcesOperational = false;
 			m_activeRenderTargetKind = GAME_RENDER_TARGET_UNKNOWN;
+			m_gameRenderTargetBinding = RenderTargetBinding();
+			m_reacquiringResources = false;
+			m_reacquireFailure.reset();
 			if (m_gameCaptureQueue.bindOwnerThread())
 			{
 				m_gameCaptureQueue.cancelCurrent(RENDER_RESULT_DEVICE_REMOVED);
@@ -1958,19 +2219,21 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			}
 			RenderResult result = m_renderer.Resize(command.value0,
 				command.value1);
-			if (result == RENDER_RESULT_OK &&
-				!InvokeGameCleanupReAcquire(m_gameCleanupHook))
+			if (result == RENDER_RESULT_OK)
 			{
-				result = RENDER_RESULT_FAILED;
-				m_gameResourcesOperational = false;
-				m_activeRenderTargetKind = GAME_RENDER_TARGET_UNKNOWN;
-				if (m_gameCaptureQueue.bindOwnerThread())
+				result = ReAcquireGameResources();
+				if (result != RENDER_RESULT_OK)
 				{
-					m_gameCaptureQueue.cancelCurrent(result);
-					m_gameCaptureRequest.clear();
+					m_gameResourcesOperational = false;
+					m_activeRenderTargetKind = GAME_RENDER_TARGET_UNKNOWN;
+					if (m_gameCaptureQueue.bindOwnerThread())
+					{
+						m_gameCaptureQueue.cancelCurrent(result);
+						m_gameCaptureRequest.clear();
+					}
 				}
 			}
-			else if (result == RENDER_RESULT_OK)
+			if (result == RENDER_RESULT_OK)
 			{
 				// Resize rebinds the native swap-chain back buffer. A previous
 				// texture target cannot remain active across that backend transition;
@@ -2233,6 +2496,29 @@ rts::render::RenderResult NativeW3D2::ApplyGameShaderBits(
 		RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
 		return rts::render::RENDER_RESULT_FAILED;
 	}
+	// The legacy adapter publishes combiners separately after shader bits.
+	// Native ShaderClass delegates the whole operation here, including the
+	// primary/detail stages that must replace scene-specific shroud effects.
+	// Keep material coordinate generation and texture-owned samplers intact.
+	for (unsigned int stage = 0; stage < 2; ++stage)
+	{
+		rts::render::LegacyTextureStageState &target = current.textureStages[stage];
+		const rts::render::LegacyTextureStageState &source = decoded.textureStages[stage];
+		target.colorOperation = source.colorOperation;
+		target.colorArgument1 = source.colorArgument1;
+		target.colorArgument2 = source.colorArgument2;
+		target.colorArgument1Complement = source.colorArgument1Complement;
+		target.colorArgument1AlphaReplicate = source.colorArgument1AlphaReplicate;
+		target.colorArgument2Complement = source.colorArgument2Complement;
+		target.colorArgument2AlphaReplicate = source.colorArgument2AlphaReplicate;
+		target.alphaOperation = source.alphaOperation;
+		target.alphaArgument1 = source.alphaArgument1;
+		target.alphaArgument2 = source.alphaArgument2;
+		target.alphaArgument1Complement = source.alphaArgument1Complement;
+		target.alphaArgument1AlphaReplicate = source.alphaArgument1AlphaReplicate;
+		target.alphaArgument2Complement = source.alphaArgument2Complement;
+		target.alphaArgument2AlphaReplicate = source.alphaArgument2AlphaReplicate;
+	}
 	// D3D11's front-face convention is the inverse of ShaderClass's legacy
 	// culling-inversion bit.  The title adapter publishes that bit before this
 	// call; Core remains independent of title headers.
@@ -2384,12 +2670,14 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 		case rts::render::GAME_RENDER_CULL_CLOCKWISE:
 			logical.pipeline.rasterizer.cullMode =
 				rts::render::RENDER_CULL_BACK;
-			logical.pipeline.rasterizer.frontCounterClockwise = false;
+			// The legacy value names the discarded winding. D3D11 names
+			// the surviving front faces when back-face culling is enabled.
+			logical.pipeline.rasterizer.frontCounterClockwise = true;
 			break;
 		case rts::render::GAME_RENDER_CULL_COUNTER_CLOCKWISE:
 			logical.pipeline.rasterizer.cullMode =
 				rts::render::RENDER_CULL_BACK;
-			logical.pipeline.rasterizer.frontCounterClockwise = true;
+			logical.pipeline.rasterizer.frontCounterClockwise = false;
 			break;
 		default:
 			goto invalid_state;
@@ -2639,9 +2927,14 @@ void NativeW3D2::SetGameVertexShader(unsigned int shaderOrFormat)
 	if (shaderOrFormat <= 0xffffU)
 	{
 		if (rts::render::LegacyFvfVertexSize(shaderOrFormat) == 0)
+		{
 			RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
-		// FVF selection is consumed by NativeDrawPacket's declaration. The
-		// owner validates it here but leaves the logical vertex program fixed.
+			return;
+		}
+		// Selecting an FVF replaces the programmable vertex shader. Water
+		// and tree passes explicitly use this call to restore normal geometry.
+		rts::render::TrackLegacyVertexProgram(
+			rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
 		return;
 	}
 	const NativeShaderEntry *entry = 0;
@@ -2714,10 +3007,13 @@ rts::render::RenderResult NativeW3D2::SubmitGamePacket(
 	const rts::render::LegacyLogicalState &state,
 	const rts::render::NativeDrawPacket &packet)
 {
-	if (!IsOperational())
+	// Logical state and target selection may be prepared between frames, but a
+	// draw is only valid inside the frame that owns the backend command stream.
+	// SubmitExternal is reserved for the legacy bridge and must not let this
+	// owner write to an indeterminate target.
+	if (!IsOperational() || !m_renderer.IsFrameOpen())
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
-	return m_renderer.IsFrameOpen() ? m_renderer.Submit(m_resources, state,
-		packet) : m_renderer.SubmitExternal(m_resources, state, packet);
+	return m_renderer.Submit(m_resources, state, packet);
 }
 
 rts::render::RenderResult NativeW3D2::SubmitGameTriangles(
@@ -3041,6 +3337,147 @@ rts::render::RenderResult NativeW3D2::GetGameBackBufferInfo(
 	return m_renderer.GetBackBufferInfo(info);
 }
 
+rts::render::RenderResult NativeW3D2::ValidateGameRenderTargetBinding(
+	const rts::render::RenderTargetBinding &binding,
+	rts::render::RenderBackBufferInfo *info) const
+{
+	using namespace rts::render;
+	if (info != 0)
+		*info = RenderBackBufferInfo();
+	if (!IsOperational() || !m_resources.IsOwnerThread())
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	if ((binding.useBackBufferColor && binding.hasColor) ||
+		(binding.useBackBufferDepth && binding.hasDepth))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	if (binding.hasColor && binding.hasDepth &&
+		binding.color.resource == binding.depth.resource)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+
+	NativeW3DTextureDescription colorDescription;
+	NativeW3DTextureDescription depthDescription;
+	if (binding.hasColor)
+	{
+		if (binding.useBackBufferColor || !binding.color.resource.isValid() ||
+			!m_resources.IsValid(binding.color.resource))
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		RenderResult result = m_resources.DescribeTexture(
+			binding.color.resource, &colorDescription);
+		if (result != RENDER_RESULT_OK)
+			return result;
+		if (binding.color.mip >= colorDescription.descriptor.mipCount ||
+			binding.color.arraySlice >= colorDescription.descriptor.arrayCount)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		// D3D11RenderDevice creates one RTV for mip zero of a single 2D
+		// subresource. Do not cache a binding that the backend cannot reapply on
+		// the next BeginFrame.
+		if (binding.color.mip != 0 || binding.color.arraySlice != 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		if ((colorDescription.descriptor.binding &
+			RENDER_TEXTURE_RENDER_TARGET) == 0 ||
+			colorDescription.descriptor.width == 0 ||
+			colorDescription.descriptor.height == 0 ||
+			colorDescription.descriptor.format == RENDER_FORMAT_UNKNOWN ||
+			colorDescription.descriptor.dimension != RENDER_TEXTURE_2D ||
+			colorDescription.descriptor.mipCount != 1 ||
+			colorDescription.descriptor.arrayCount != 1)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (binding.hasDepth)
+	{
+		if (binding.useBackBufferDepth || !binding.depth.resource.isValid() ||
+			!m_resources.IsValid(binding.depth.resource))
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		RenderResult result = m_resources.DescribeTexture(
+			binding.depth.resource, &depthDescription);
+		if (result != RENDER_RESULT_OK)
+			return result;
+		if (binding.depth.mip >= depthDescription.descriptor.mipCount ||
+			binding.depth.arraySlice >= depthDescription.descriptor.arrayCount)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (binding.depth.mip != 0 || binding.depth.arraySlice != 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		if ((depthDescription.descriptor.binding &
+			RENDER_TEXTURE_DEPTH_STENCIL) == 0 ||
+			depthDescription.descriptor.width == 0 ||
+			depthDescription.descriptor.height == 0 ||
+			depthDescription.descriptor.format == RENDER_FORMAT_UNKNOWN ||
+			depthDescription.descriptor.dimension != RENDER_TEXTURE_2D ||
+			depthDescription.descriptor.mipCount != 1 ||
+			depthDescription.descriptor.arrayCount != 1)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+
+	RenderBackBufferInfo backBufferInfo;
+	bool haveBackBufferInfo = false;
+	const bool customColor = binding.hasColor &&
+		!binding.useBackBufferColor;
+	const bool customDepth = binding.hasDepth &&
+		!binding.useBackBufferDepth;
+	// A default color/depth attachment is still a real backend resource. Query
+	// it when it participates in compatibility validation or when it is the
+	// only target whose dimensions can describe an otherwise empty binding.
+	if ((!customColor && binding.useBackBufferColor) ||
+		(customDepth && binding.useBackBufferColor) ||
+		(customColor && binding.useBackBufferDepth))
+	{
+		const RenderResult result = m_renderer.GetBackBufferInfo(
+			&backBufferInfo);
+		if (result != RENDER_RESULT_OK)
+			return result;
+		haveBackBufferInfo = true;
+	}
+	if (customColor && customDepth &&
+		(colorDescription.descriptor.width != depthDescription.descriptor.width ||
+		 colorDescription.descriptor.height != depthDescription.descriptor.height))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	if (!customColor && customDepth && binding.useBackBufferColor &&
+		(backBufferInfo.width != depthDescription.descriptor.width ||
+		 backBufferInfo.height != depthDescription.descriptor.height ||
+		 backBufferInfo.multisampleCount != 1U))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	if (customColor && binding.useBackBufferDepth &&
+		(backBufferInfo.width != colorDescription.descriptor.width ||
+		 backBufferInfo.height != colorDescription.descriptor.height))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+
+	if (info != 0)
+	{
+		if (customColor)
+		{
+			info->width = colorDescription.descriptor.width;
+			info->height = colorDescription.descriptor.height;
+			info->format = colorDescription.descriptor.format;
+			info->multisampleCount = 1;
+		}
+		else if (customDepth && !binding.useBackBufferColor)
+		{
+			info->width = depthDescription.descriptor.width;
+			info->height = depthDescription.descriptor.height;
+			info->format = depthDescription.descriptor.format;
+			info->multisampleCount = 1;
+		}
+		else if (haveBackBufferInfo)
+		{
+			*info = backBufferInfo;
+		}
+		else
+		{
+			const RenderResult result = m_renderer.GetBackBufferInfo(info);
+			if (result != RENDER_RESULT_OK)
+				return result;
+		}
+	}
+	return RENDER_RESULT_OK;
+}
+
+rts::render::RenderResult NativeW3D2::GetGameRenderTargetInfo(
+	rts::render::RenderBackBufferInfo *info) const
+{
+	if (info == 0)
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	return ValidateGameRenderTargetBinding(m_gameRenderTargetBinding, info);
+}
+
 rts::render::RenderResult NativeW3D2::QueueGameBackBufferCapture(
 	const rts::render::RenderCaptureRequestDescriptor &descriptor,
 	rts::render::RenderCaptureHandle *handle)
@@ -3077,10 +3514,83 @@ void NativeW3D2::RequestGameBackBufferCapture()
 {
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
+		m_gameCaptureCompleted = true;
+		m_gameCaptureResult = rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+		m_gameCaptureDescriptorQueued = false;
 		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
 		return;
 	}
-	m_gameCaptureRequest.request();
+	if (!m_gameCaptureRequest.isRequested())
+		m_gameCaptureRequest.request();
+	if (m_gameCaptureDescriptorQueued)
+		return;
+
+	// The installed-runtime command has one stable output. Remove a stale file
+	// before admission so a failed render can never be mistaken for this frame's
+	// capture by an external harness.
+	remove(kNativeGameCaptureFile);
+	m_gameCaptureCompleted = false;
+	m_gameCaptureResult = rts::render::RENDER_RESULT_OK;
+	rts::render::RenderCaptureRequestDescriptor descriptor;
+	descriptor.kind = rts::render::RENDER_CAPTURE_VISUAL_SMOKE;
+	descriptor.consumer = this;
+	descriptor.completed = CompleteGameCaptureFile;
+	descriptor.cancelled = CancelGameCaptureFile;
+	rts::render::RenderCaptureHandle handle;
+	const rts::render::RenderResult result = m_gameCaptureQueue.enqueue(
+		descriptor, &handle);
+	if (result != rts::render::RENDER_RESULT_OK)
+	{
+		m_gameCaptureCompleted = true;
+		m_gameCaptureResult = result;
+		RecordGameFailure(result);
+		return;
+	}
+	m_gameCaptureDescriptorQueued = true;
+}
+
+bool NativeW3D2::ConsumeGameBackBufferCaptureSuccess()
+{
+	if (!m_gameCaptureCompleted)
+		return false;
+	const bool succeeded = m_gameCaptureResult ==
+		rts::render::RENDER_RESULT_OK;
+	m_gameCaptureCompleted = false;
+	m_gameCaptureResult = rts::render::RENDER_RESULT_OK;
+	if (succeeded)
+		m_gameCaptureRequest.clear();
+	return succeeded;
+}
+
+void NativeW3D2::CompleteGameCaptureFile(void *consumer,
+	const rts::render::RenderCaptureHandle *handle, unsigned int width,
+	unsigned int height, size_t rowPitch, rts::render::RenderFormat format,
+	const void *pixels, size_t pixelBytes)
+{
+	(void)handle;
+	NativeW3D2 *owner = static_cast<NativeW3D2 *>(consumer);
+	if (owner == 0)
+		return;
+	owner->m_gameCaptureDescriptorQueued = false;
+	owner->m_gameCaptureCompleted = true;
+	owner->m_gameCaptureResult = WriteNativeGameCaptureTga(width, height,
+		rowPitch, format, pixels, pixelBytes) ?
+		rts::render::RENDER_RESULT_OK : rts::render::RENDER_RESULT_FAILED;
+}
+
+void NativeW3D2::CancelGameCaptureFile(void *consumer,
+	const rts::render::RenderCaptureHandle *handle,
+	rts::render::RenderResult reason)
+{
+	(void)handle;
+	NativeW3D2 *owner = static_cast<NativeW3D2 *>(consumer);
+	if (owner == 0)
+		return;
+	remove(kNativeGameCaptureFile);
+	owner->m_gameCaptureDescriptorQueued = false;
+	owner->m_gameCaptureCompleted = true;
+	owner->m_gameCaptureResult = reason == rts::render::RENDER_RESULT_OK ?
+		rts::render::RENDER_RESULT_FAILED : reason;
 }
 
 rts::render::RenderResult NativeW3D2::PrepareGameBackBufferCapture(
@@ -3186,8 +3696,18 @@ rts::render::RenderResult NativeW3D2::CompleteGameBackBufferCaptures(
 		info.height, rowPitch, format, pixels.data(), pixels.size());
 	if (result != RENDER_RESULT_OK)
 		m_gameCaptureQueue.cancelCurrent(result);
-	m_gameCaptureRequest.clear();
-	return result;
+	if (result != RENDER_RESULT_OK)
+		return result;
+	if (m_gameCaptureCompleted && !m_gameCaptureDescriptorQueued &&
+		m_gameCaptureResult != RENDER_RESULT_OK)
+	{
+		// The descriptor callback owns the file-write result. Keep the request
+		// pending so the title gate can retry on a later visible frame.
+		return m_gameCaptureResult;
+	}
+	if (m_gameCaptureCompleted && !m_gameCaptureDescriptorQueued)
+		m_gameCaptureRequest.clear();
+	return RENDER_RESULT_OK;
 }
 
 void NativeW3D2::SetActiveRenderTargetKind(
@@ -3240,6 +3760,8 @@ void NativeW3D2::RecordGameFailure(rts::render::RenderResult result)
 {
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
+		if (m_reacquiringResources)
+			m_reacquireFailure.record(result);
 		m_gameFailure.record(result);
 		m_renderer.RecordFrameFailure(result);
 	}

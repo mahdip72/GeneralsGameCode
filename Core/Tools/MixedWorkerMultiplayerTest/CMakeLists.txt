@@ -15,7 +15,7 @@ if(MINGW)
 endif()
 
 add_test(NAME core_mixed_worker_multiplayer_policy_test
-    COMMAND core_mixed_worker_multiplayer_policy_tests
+    COMMAND core_mixed_worker_multiplayer_policy_tests --local-capacity
 )
 set_tests_properties(core_mixed_worker_multiplayer_policy_test PROPERTIES TIMEOUT 120)
 

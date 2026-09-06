@@ -13,7 +13,8 @@ if(NOT IS_VS6_BUILD)
         CXX_EXTENSIONS NO
     )
     add_test(NAME core_object_computation_island_tests
-        COMMAND core_object_computation_island_tests --allow-serial-fallback
+        COMMAND core_object_computation_island_tests --local-capacity
+            --allow-serial-fallback
     )
     set_tests_properties(core_object_computation_island_tests PROPERTIES
         TIMEOUT 30
@@ -32,7 +33,8 @@ if(NOT IS_VS6_BUILD)
         CXX_EXTENSIONS NO
     )
     add_test(NAME core_object_computation_island_benchmark
-        COMMAND core_object_computation_island_benchmark --allow-serial-fallback
+        COMMAND core_object_computation_island_benchmark --local-capacity
+            --allow-serial-fallback
     )
     set_tests_properties(core_object_computation_island_benchmark PROPERTIES
         TIMEOUT 120

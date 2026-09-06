@@ -385,7 +385,8 @@ int main(int argc, char **argv)
 	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity,
 		&serialPipelines, "--serial"))
 	{
-		fprintf(stderr, "Usage: projected_terrain_grid_tests [--local-capacity] [--serial]\n");
+		fprintf(stderr, "Usage: projected_terrain_grid_tests "
+			"[--local-capacity|--external-qualification] [--serial]\n");
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);

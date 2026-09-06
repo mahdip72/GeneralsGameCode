@@ -907,6 +907,10 @@ void W3DDisplay::init()
 		{
 			SortingRendererClass::SetMinVertexBufferSize(1);
 		}
+		// The native renderer creates its D3D11 device during WW3D::Init.
+		// Publish the saved MSAA request before that bootstrap; the later
+		// Set_Render_Device transaction only selects the final presentation size.
+		WW3D::Set_MSAA_Mode((WW3D::MultiSampleModeEnum)TheWritableGlobalData->m_antiAliasLevel);
 		if (WW3D::Init( ApplicationHWnd ) != WW3D_ERROR_OK)
 			throw ERROR_INVALID_D3D;	//failed to initialize.  User probably doesn't have DX 8.1
 
@@ -968,9 +972,6 @@ void W3DDisplay::init()
 				break;
 			}
 			}
-
-			// TheSuperHackers @feature Mauller 13/03/2026 Add native MSAA support, must be set before creating render device
-			WW3D::Set_MSAA_Mode((WW3D::MultiSampleModeEnum)TheWritableGlobalData->m_antiAliasLevel);
 
 			renderDeviceError = WW3D::Set_Render_Device(
 				0,
@@ -2138,14 +2139,13 @@ AGAIN:
 						TheMouse->draw();	//keep applying the current cursor style so it remains hidden if needed.
 					const bool captureArmed = rendererCaptureFrameGate.arm(
 						rts::render::IsNativeGameRendererActive());
-					const unsigned long captureFrameCount = captureArmed ?
-						static_cast<unsigned long>(WW3D::Get_Frame_Count()) : 0;
 					if (captureArmed)
 						rts::render::RequestGameBackBufferCapture();
-					WW3D::End_Render();
+					const WW3DErrorType endRenderResult = WW3D::End_Render();
+					const bool captureCompleted = captureArmed &&
+						rts::render::ConsumeGameBackBufferCaptureSuccess();
 					if (captureArmed && rendererCaptureFrameGate.complete(
-						static_cast<unsigned long>(WW3D::Get_Frame_Count()) !=
-						captureFrameCount))
+						endRenderResult == WW3D_ERROR_OK && captureCompleted))
 					{
 						TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
 					}
@@ -2241,14 +2241,13 @@ AGAIN:
 				// render is all done!
 				const bool captureArmed = rendererCaptureFrameGate.arm(
 					rts::render::IsNativeGameRendererActive());
-				const unsigned long captureFrameCount = captureArmed ?
-					static_cast<unsigned long>(WW3D::Get_Frame_Count()) : 0;
 				if (captureArmed)
 					rts::render::RequestGameBackBufferCapture();
-				WW3D::End_Render();
+				const WW3DErrorType endRenderResult = WW3D::End_Render();
+				const bool captureCompleted = captureArmed &&
+					rts::render::ConsumeGameBackBufferCaptureSuccess();
 				if (captureArmed && rendererCaptureFrameGate.complete(
-					static_cast<unsigned long>(WW3D::Get_Frame_Count()) !=
-					captureFrameCount))
+					endRenderResult == WW3D_ERROR_OK && captureCompleted))
 				{
 					TheWritableGlobalData->m_rendererCaptureFrame = FALSE;
 				}

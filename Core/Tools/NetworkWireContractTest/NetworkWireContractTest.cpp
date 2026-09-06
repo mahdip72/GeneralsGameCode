@@ -1,6 +1,7 @@
 #include "Lib/NetworkWireContract.h"
 #include "Lib/NetworkCommandOriginPolicy.h"
 #include "Lib/NetworkEpochHandshake.h"
+#include "Lib/LockstepV2Promotion.h"
 #include "Lib/MultiplayerSimulationRuntimeProof.h"
 #include "Lib/NetworkNatPolicy.h"
 
@@ -201,6 +202,64 @@ int TestExternalRuntimeReleaseProof()
 	return result;
 }
 
+int TestLockstepV2ProductPromotion()
+{
+	const unsigned liveIntegratedMask = static_cast<unsigned>(
+		rts::MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK);
+	rts::lockstep_v2::ProductPromotionAuthority promotion =
+		rts::lockstep_v2::MakeProductPromotionAuthority(liveIntegratedMask);
+	int result = 0;
+	result |= Check(
+		rts::lockstep_v2::ResolveProductPromotionKernelMask(
+			promotion, liveIntegratedMask) == liveIntegratedMask,
+		"reviewed lockstep-v2 promotion unlocks every qualified product kernel");
+
+	rts::lockstep_v2::ProductPromotionAuthority invalid = promotion;
+	invalid.promotionSchemaVersion = 1U;
+	result |= Check(
+		rts::lockstep_v2::ResolveProductPromotionKernelMask(
+			invalid, liveIntegratedMask) == 0U,
+		"wrong lockstep-v2 promotion schema stays serial");
+	invalid = promotion;
+	invalid.lockstepSchemaVersion = rts::lockstep_v2::kSchemaVersion - 1U;
+	result |= Check(
+		rts::lockstep_v2::ResolveProductPromotionKernelMask(
+			invalid, liveIntegratedMask) == 0U,
+		"promotion for another lockstep schema stays serial");
+	invalid = promotion;
+	invalid.protocolEpoch = rts::lockstep_v2::kProtocolEpoch - 1U;
+	result |= Check(
+		rts::lockstep_v2::ResolveProductPromotionKernelMask(
+			invalid, liveIntegratedMask) == 0U,
+		"promotion for another lockstep protocol epoch stays serial");
+	invalid = promotion;
+	invalid.promotedKernelMask &= ~static_cast<unsigned>(
+		rts::MULTIPLAYER_SIMULATION_KERNEL_PATH);
+	result |= Check(
+		rts::lockstep_v2::ResolveProductPromotionKernelMask(
+			invalid, liveIntegratedMask) == 0U,
+		"incomplete lockstep-v2 product promotion stays serial");
+	invalid = promotion;
+	invalid.promotedKernelMask |= 1U << 31;
+	result |= Check(
+		rts::lockstep_v2::ResolveProductPromotionKernelMask(
+			invalid, liveIntegratedMask) == 0U,
+		"unknown lockstep-v2 product promotion bits stay serial");
+
+#if RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK == 63
+	result |= Check(
+		rts::lockstep_v2::ResolveEmbeddedProductPromotionKernelMask(
+			liveIntegratedMask) == liveIntegratedMask,
+		"native x64 Release test binary embeds all promoted product kernels");
+#else
+	result |= Check(
+		rts::lockstep_v2::ResolveEmbeddedProductPromotionKernelMask(
+			liveIntegratedMask) == 0U,
+		"non-promoted test binary embeds no multiplayer worker authority");
+#endif
+	return result;
+}
+
 int TestNetworkHelloContract()
 {
 	using namespace rts::network_epoch;
@@ -214,6 +273,11 @@ int TestNetworkHelloContract()
 	const unsigned nonProductTestMask =
 		rts::SelectMultiplayerSimulationNonProductTestOverrideMask(
 			liveIntegratedMask, liveIntegratedMask);
+	const rts::lockstep_v2::ProductPromotionAuthority productPromotion =
+		rts::lockstep_v2::MakeProductPromotionAuthority(liveIntegratedMask);
+	const unsigned ordinaryProductMask =
+		rts::lockstep_v2::ResolveProductPromotionKernelMask(
+			productPromotion, liveIntegratedMask);
 	const NetworkSimulationPolicyIdentity simulationPolicy =
 		MakeNetworkSimulationPolicyIdentity(executableCrc, iniCrc,
 			0x10203040U, 0xa5U, nonProductTestMask);
@@ -230,6 +294,8 @@ int TestNetworkHelloContract()
 		"default product transport advertises no merely implemented kernel");
 	result |= Check(nonProductTestMask == liveIntegratedMask,
 		"wire fixture uses an explicit non-product release-proof override");
+	result |= Check(ordinaryProductMask == liveIntegratedMask,
+		"reviewed lockstep-v2 promotion grants ordinary product authority");
 	result |= Check(kNetworkHelloWireSize == 80U, "NET3 policy hello uses the fixed 80-byte wire size");
 	result |= Check(HasNetworkHelloMagic(encoded.data(), encoded.size()),
 		"NET3 hello carries its independent wire magic");
@@ -343,6 +409,40 @@ int TestNetworkHelloContract()
 		&decodedDefaultProductPolicy).ok() &&
 		decodedDefaultProductPolicy.provenKernelMask == 0,
 		"compatible default peers negotiate serial without release evidence");
+	const NetworkSimulationPolicyIdentity ordinaryProductPolicy =
+		MakeNetworkSimulationPolicyIdentity(executableCrc, iniCrc,
+			0x10203040U, 0xa5U, ordinaryProductMask);
+	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize>
+		ordinaryProductEncoded = EncodeNetworkHello(executableCrc, iniCrc,
+			2U, 5U, sessionToken, NetworkHelloKind::Hello,
+			ordinaryProductPolicy);
+	NetworkSimulationPolicyIdentity decodedOrdinaryProductPolicy;
+	result |= Check(DecodeAndValidateNetworkHelloRecord(
+		ordinaryProductEncoded.data(), ordinaryProductEncoded.size(),
+		executableCrc, iniCrc, &decoded, &decodedKind,
+		&decodedRecordIdentity, &decodedSessionToken,
+		&decodedOrdinaryProductPolicy).ok() &&
+		decodedOrdinaryProductPolicy.provenKernelMask == liveIntegratedMask,
+		"ordinary NET3 hello advertises the reviewed lockstep-v2 product mask");
+	rts::MultiplayerSimulationPeerPolicy localProductPeer;
+	localProductPeer.schema = decodedOrdinaryProductPolicy.schema;
+	localProductPeer.engineEpoch = decodedOrdinaryProductPolicy.engineEpoch;
+	localProductPeer.determinismEpoch =
+		decodedOrdinaryProductPolicy.determinismEpoch;
+	localProductPeer.buildCompatibilityCrc =
+		decodedOrdinaryProductPolicy.buildCompatibilityCrc;
+	localProductPeer.contentCrc = decodedOrdinaryProductPolicy.contentCrc;
+	localProductPeer.mapCrc = decodedOrdinaryProductPolicy.mapCrc;
+	localProductPeer.provenKernelMask =
+		decodedOrdinaryProductPolicy.provenKernelMask;
+	rts::MultiplayerSimulationPeerPolicy remoteProductPeer = localProductPeer;
+	rts::MultiplayerSimulationSessionPolicy ordinarySessionPolicy;
+	result |= Check(rts::ResolveMultiplayerSimulationSessionPolicy(
+		localProductPeer, &remoteProductPeer, 1U, liveIntegratedMask,
+		ordinarySessionPolicy) && ordinarySessionPolicy.status ==
+			rts::MULTIPLAYER_SIMULATION_POLICY_READY &&
+		ordinarySessionPolicy.enabledKernelMask == liveIntegratedMask,
+		"matching ordinary promoted peers resolve all six worker kernels");
 
 	rts::network_epoch::NetworkHelloIdentity identity;
 	result |= Check(DecodeAndValidateNetworkHello(encoded.data(), encoded.size(),
@@ -1081,6 +1181,7 @@ int main()
 #endif
 	return TestFixedSizes() | TestSizeConversion() | TestWrapperCapacity() |
 		TestWrappedCommandOriginPolicy() | TestExternalRuntimeReleaseProof() |
+		TestLockstepV2ProductPromotion() |
 		TestLockstepV2ReceiptContract() |
 		TestNetworkHelloContract() | TestNetworkFramePublicationGate() |
 		TestNetworkHelloFailureHandlingPolicy() | TestNetworkIngressPolicy() |

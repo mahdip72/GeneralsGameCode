@@ -47,6 +47,7 @@
 #include "WW3D2/nativew3dsampledtexture.h"
 #endif
 #include "Renderer/RenderGameClient.h"
+#include "Renderer/RenderGameTexturePass.h"
 #include "Renderer/RenderTexturePublication.h"
 #include "Renderer/RenderMatrixMath.h"
 #include "WW3D2/nativew3dbuffercompat.h"
@@ -1748,11 +1749,10 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	Matrix3D reflectedTransform(rRight,rUp,rN,rPos);
 
 
-	rts::render::SetGameRenderTarget(m_pReflectionTexture,
+	rts::render::GameTextureRenderPass reflectionPass(m_pReflectionTexture,
 		m_pReflectionDepthTexture, !rts::render::IsNativeGameRendererActive());
-	if (!rts::render::IsGameRenderingToTexture())
+	if (!reflectionPass.IsReady())
 	{
-		rts::render::SetGameRenderTarget(nullptr, nullptr, true);
 		return;
 	}
 
@@ -1762,7 +1762,6 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	if (rts::render::ClearGameRenderTargets(false, true, clearColor, 0.0f) !=
 		rts::render::RENDER_RESULT_OK)
 	{
-		rts::render::SetGameRenderTarget(nullptr, nullptr, true);
 		return;
 	}	//clearing only z-buffer since background always filled with clouds
 
@@ -1778,6 +1777,7 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	cam->Apply();	//force an update of all the camera dependent parameters like frustum clip planes
 
 	//flip the winding order of polygons to draw the reflected back sides.
+	const bool oldCullInverted = ShaderClass::Is_Backface_Culling_Inverted();
 	ShaderClass::Invert_Backface_Culling(true);
 
 	// Render the scene
@@ -1790,12 +1790,12 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	cam->Set_Transform(OldCameraMatrix);	//restore original non-reflected matrix
  	cam->Set_Viewport(vOldMin,vOldMax);
 
-	cam->Apply();	//force an update of all the camera dependent parameters like frustum clip planes
-
-	ShaderClass::Invert_Backface_Culling(false);
-
-	// Change the rendertarget back to the main backbuffer
-	rts::render::SetGameRenderTarget(nullptr, nullptr, true);
+	ShaderClass::Invert_Backface_Culling(oldCullInverted);
+	// Restore the output before applying the original camera so its pixel
+	// viewport uses the back buffer dimensions, not the reflection texture.
+	reflectionPass.RestoreTarget();
+	cam->Apply();
+	reflectionPass.Finish();
 }
 
 //-------------------------------------------------------------------------------------------------

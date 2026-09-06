@@ -170,7 +170,8 @@ function Invoke-LifecycleReceiptFault {
             [string]$ExecutableSha256, [string]$RunNonce, [string]$CohortNonce,
             [Collections.IDictionary]$RuntimeClosure, [string]$ExpectedTitle,
             [int]$ProcessId, [string]$ProcessCreationUtc,
-            [string]$ExpectedExecutablePath, [string[]]$ExpectedProducers,
+            [string]$ExpectedExecutablePath, [string[]]$ExpectedArguments,
+            [string[]]$ExpectedProducers,
             [string]$ExpectedCohortCreatedUtc)
         throw 'lifecycle-fixture-post-wait-receipt-fault'
     }
@@ -311,6 +312,11 @@ Invoke-LifecycleTestCase 'omitted observation preserves the existing nonzero-exi
     Assert-LifecycleTest ($identity.requestedExitCode -eq 17 -and $null -ne $run.childProcess -and
         $run.childProcess.processId -eq $identity.processId -and
         $run.childProcess.runNonce -ceq $identity.runNonce) 'the unchanged run must retain its existing child provenance'
+    Assert-LifecycleTest ($run.childProcess.stdoutSha256 -is [string] -and
+        $run.childProcess.stdoutSha256 -ceq (Get-Sha256 $entry.stdout) -and
+        $run.childProcess.stderrSha256 -is [string] -and
+        $run.childProcess.stderrSha256 -ceq (Get-Sha256 $entry.stderr)) `
+        'atomic stdout and stderr bindings must remain available under child provenance'
     Assert-LifecycleTest ((@($run.PSObject.Properties.Name | Sort-Object) -join '|') -ceq
         (@('timedOut','exitCode','wallMilliseconds','stdout','stderr','runtimeLogText','childProcess' |
             Sort-Object) -join '|')) 'lifecycle observation must not widen the existing returned run shape'

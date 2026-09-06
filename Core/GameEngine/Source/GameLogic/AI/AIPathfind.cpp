@@ -237,54 +237,55 @@ GetPathPerformanceReferenceLedger()
 static void FinishPathPerformanceReferenceBatch(
 	rts::performance::KernelPerformanceReferenceLedger *ledger,
 	rts::performance::KernelPerformanceReferenceBatch &batch,
-	std::size_t expectedOperations, std::size_t completedOperations,
-	Bool allOperationsCommitted)
+	rts::performance::KernelPerformanceAttempt &attempt,
+	Bool admitted, Bool committed, Bool fallbackEntered,
+	Bool fallbackCompleted)
 {
-	if (ledger != nullptr && batch.valid())
+	const rts::performance::KernelPerformanceDisposition disposition =
+		committed ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
+		admitted ? rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+			rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED;
+	if (ledger != nullptr && (batch.valid() || attempt.valid()))
 	{
-		const Bool committed = expectedOperations != 0 &&
-			completedOperations == expectedOperations &&
-			allOperationsCommitted;
-		ledger->finishBatch(batch, committed != FALSE);
+		if (TheGameLogic != nullptr)
+			TheGameLogic->finishPerformanceReceiptAttempt(attempt, batch,
+				disposition, fallbackEntered != FALSE,
+				fallbackCompleted != FALSE);
+		else if (batch.valid())
+			ledger->finishBatch(batch, committed != FALSE);
 	}
 	batch = rts::performance::KernelPerformanceReferenceBatch();
+	attempt = rts::performance::KernelPerformanceAttempt();
 }
 
 class PathPerformanceReferenceOperationGuard
 {
 public:
 	PathPerformanceReferenceOperationGuard(
-		rts::performance::KernelPerformanceReferenceLedger *ledger,
-		rts::performance::KernelPerformanceReferenceBatch *batch,
-		std::size_t *completedOperations, Bool *allOperationsCommitted,
-		Bool *operationCompleted, Bool *operationCommitted) :
-		m_ledger(ledger), m_batch(batch),
-		m_completedOperations(completedOperations),
-		m_allOperationsCommitted(allOperationsCommitted),
+		rts::DeterministicPathOwnerCompletion *completion,
+		Bool *operationCompleted, Bool *operationCommitted,
+		Bool *materializationBegan) :
+		m_completion(completion),
 		m_operationCompleted(operationCompleted),
-		m_operationCommitted(operationCommitted) {}
+		m_operationCommitted(operationCommitted),
+		m_materializationBegan(materializationBegan) {}
 
 	~PathPerformanceReferenceOperationGuard()
 	{
-		if (m_ledger == nullptr || m_batch == nullptr ||
-			!m_batch->valid() || m_completedOperations == nullptr ||
-			m_allOperationsCommitted == nullptr ||
-			m_operationCompleted == nullptr || m_operationCommitted == nullptr ||
+		if (m_completion == nullptr || m_operationCompleted == nullptr ||
+			m_operationCommitted == nullptr || m_materializationBegan == nullptr ||
 			*m_operationCompleted)
 			return;
 		*m_operationCompleted = TRUE;
-		++*m_completedOperations;
-		if (!*m_operationCommitted)
-			*m_allOperationsCommitted = FALSE;
+		m_completion->finishOperation(*m_operationCommitted != FALSE,
+			*m_materializationBegan != FALSE);
 	}
 
 private:
-	rts::performance::KernelPerformanceReferenceLedger *m_ledger;
-	rts::performance::KernelPerformanceReferenceBatch *m_batch;
-	std::size_t *m_completedOperations;
-	Bool *m_allOperationsCommitted;
+	rts::DeterministicPathOwnerCompletion *m_completion;
 	Bool *m_operationCompleted;
 	Bool *m_operationCommitted;
+	Bool *m_materializationBegan;
 	PathPerformanceReferenceOperationGuard(
 		const PathPerformanceReferenceOperationGuard &);
 	PathPerformanceReferenceOperationGuard &operator=(
@@ -332,23 +333,23 @@ struct DirectPathQueueBatchContext
 		multiWorkerExecution(FALSE), activeQueueOrder(-1),
 		activeObjectId(INVALID_ID)
 #if defined(_WIN64)
-		, performanceAdmitted(FALSE), performanceCommitted(FALSE),
+		, performanceAdmitted(FALSE),
 		performanceReferenceLedger(nullptr),
-		performanceReferenceExpectedOperations(0),
-		performanceReferenceCompletedOperations(0),
-		performanceReferenceAllOperationsCommitted(TRUE)
+		performanceReferenceAttempt()
 #endif
 	{}
 
 	~DirectPathQueueBatchContext()
 	{
 #if defined(_WIN64)
+		const Bool committed = performanceCompletion.committed() ? TRUE : FALSE;
 		FinishPathPerformanceReferenceBatch(performanceReferenceLedger,
-			performanceReferenceBatch, performanceReferenceExpectedOperations,
-			performanceReferenceCompletedOperations,
-			performanceReferenceAllOperationsCommitted);
+			performanceReferenceBatch, performanceReferenceAttempt,
+			performanceAdmitted, committed,
+			performanceCompletion.fallbackEntered() ? TRUE : FALSE,
+			performanceCompletion.fallbackCompleted() ? TRUE : FALSE);
 		FinishPathPerformanceBatch(performanceBatch, performanceAdmitted,
-			performanceCommitted);
+			committed);
 #endif
 	}
 
@@ -362,12 +363,10 @@ struct DirectPathQueueBatchContext
 #if defined(_WIN64)
 	rts::performance::KernelPerformanceBatch performanceBatch;
 	Bool performanceAdmitted;
-	Bool performanceCommitted;
+	rts::DeterministicPathOwnerCompletion performanceCompletion;
 	rts::performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	rts::performance::KernelPerformanceAttempt performanceReferenceAttempt;
 	rts::performance::KernelPerformanceReferenceBatch performanceReferenceBatch;
-	std::size_t performanceReferenceExpectedOperations;
-	std::size_t performanceReferenceCompletedOperations;
-	Bool performanceReferenceAllOperationsCommitted;
 #endif
 };
 
@@ -411,11 +410,9 @@ struct OrdinaryPathQueueBatchContext
 		activeObjectId(INVALID_ID), pendingShadowEntry(
 			std::numeric_limits<std::size_t>::max())
 #if defined(_WIN64)
-		, performanceAdmitted(FALSE), performanceCommitted(FALSE),
+		, performanceAdmitted(FALSE),
 		performanceReferenceLedger(nullptr),
-		performanceReferenceExpectedOperations(0),
-		performanceReferenceCompletedOperations(0),
-		performanceReferenceAllOperationsCommitted(TRUE)
+		performanceReferenceAttempt()
 #endif
 	{
 		grid = {};
@@ -424,12 +421,14 @@ struct OrdinaryPathQueueBatchContext
 	~OrdinaryPathQueueBatchContext()
 	{
 #if defined(_WIN64)
+		const Bool committed = performanceCompletion.committed() ? TRUE : FALSE;
 		FinishPathPerformanceReferenceBatch(performanceReferenceLedger,
-			performanceReferenceBatch, performanceReferenceExpectedOperations,
-			performanceReferenceCompletedOperations,
-			performanceReferenceAllOperationsCommitted);
+			performanceReferenceBatch, performanceReferenceAttempt,
+			performanceAdmitted, committed,
+			performanceCompletion.fallbackEntered() ? TRUE : FALSE,
+			performanceCompletion.fallbackCompleted() ? TRUE : FALSE);
 		FinishPathPerformanceBatch(performanceBatch, performanceAdmitted,
-			performanceCommitted);
+			committed);
 #endif
 	}
 
@@ -447,14 +446,38 @@ struct OrdinaryPathQueueBatchContext
 #if defined(_WIN64)
 	rts::performance::KernelPerformanceBatch performanceBatch;
 	Bool performanceAdmitted;
-	Bool performanceCommitted;
+	rts::DeterministicPathOwnerCompletion performanceCompletion;
 	rts::performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	rts::performance::KernelPerformanceAttempt performanceReferenceAttempt;
 	rts::performance::KernelPerformanceReferenceBatch performanceReferenceBatch;
-	std::size_t performanceReferenceExpectedOperations;
-	std::size_t performanceReferenceCompletedOperations;
-	Bool performanceReferenceAllOperationsCommitted;
 #endif
 };
+
+#if defined(_WIN64)
+template <typename Context>
+Bool BeginPathPerformanceLegacyFallback(Context *context)
+{
+	if (context == nullptr)
+		return FALSE;
+	for (std::size_t index = 0; index != context->entries.size(); ++index)
+	{
+		if (context->entries[index].queueOrder == context->activeQueueOrder &&
+			context->entries[index].objectId == context->activeObjectId)
+		{
+			return context->performanceCompletion.beginLegacyFallback() ?
+				TRUE : FALSE;
+		}
+	}
+	return FALSE;
+}
+
+template <typename Context>
+void CompletePathPerformanceLegacyFallback(Context *context, Bool entered)
+{
+	if (context != nullptr)
+		context->performanceCompletion.completeLegacyFallback(entered != FALSE);
+}
+#endif
 
 namespace
 {
@@ -7026,10 +7049,13 @@ void Pathfinder::processPathfindQueue()
 							TheGameLogic ? TheGameLogic->getFrame() : 0u);
 					directPathBatchContext.performanceReferenceLedger =
 						GetPathPerformanceReferenceLedger();
-					directPathBatchContext.performanceReferenceExpectedOperations =
-						requestCount;
-					directPathBatchContext.performanceReferenceCompletedOperations = 0;
-					directPathBatchContext.performanceReferenceAllOperationsCommitted = TRUE;
+					if (directPathBatchContext.performanceReferenceLedger != nullptr &&
+						directPathBatchContext.performanceReferenceLedger->traceRequested() &&
+						TheGameLogic != nullptr)
+					directPathBatchContext.performanceReferenceAttempt =
+							TheGameLogic->beginPerformanceReceiptAttempt(
+								rts::performance::KERNEL_PERFORMANCE_PATH, 1);
+					directPathBatchContext.performanceCompletion.reset(requestCount);
 					#endif
 					const Bool completed = directPathBatchContext.batch.executeSynchronously(
 						jobs, snapshots.data(), requestCount, 50
@@ -7037,12 +7063,14 @@ void Pathfinder::processPathfindQueue()
 						, &directPathBatchContext.performanceBatch
 						, directPathBatchContext.performanceReferenceLedger
 						, &directPathBatchContext.performanceReferenceBatch
+						, directPathBatchContext.performanceReferenceAttempt
 						#endif
 						) ? TRUE : FALSE;
 					const rts::DeterministicDirectPathBatchExecutionSnapshot execution =
 						directPathBatchContext.batch.executionSnapshot();
 					#if defined(_WIN64)
 					directPathBatchContext.performanceAdmitted =
+						execution.referenceAdmissionAccepted ||
 						execution.submittedJobCount != 0 ? TRUE : FALSE;
 					#endif
 					s_directPathSubmittedCount += static_cast<UnsignedInt>(
@@ -7160,11 +7188,15 @@ void Pathfinder::processPathfindQueue()
 						TheGameLogic ? TheGameLogic->getFrame() : 0u);
 				ordinaryPathBatchContext.performanceReferenceLedger =
 					GetPathPerformanceReferenceLedger();
-				ordinaryPathBatchContext.performanceReferenceExpectedOperations =
-					requestCount;
-				ordinaryPathBatchContext.performanceReferenceCompletedOperations = 0;
-				ordinaryPathBatchContext.performanceReferenceAllOperationsCommitted = TRUE;
+				if (ordinaryPathBatchContext.performanceReferenceLedger != nullptr &&
+					ordinaryPathBatchContext.performanceReferenceLedger->traceRequested() &&
+					TheGameLogic != nullptr)
+				ordinaryPathBatchContext.performanceReferenceAttempt =
+						TheGameLogic->beginPerformanceReceiptAttempt(
+							rts::performance::KERNEL_PERFORMANCE_PATH, 0);
+				ordinaryPathBatchContext.performanceCompletion.reset(requestCount);
 				#endif
+				m_ordinaryPathBatchContext = &ordinaryPathBatchContext;
 				const Bool completed = ordinaryPathBatchContext.batch.executeSynchronously(
 					jobs, ordinaryPathBatchContext.grid,
 					ordinaryPathBatchContext.requests.data(), requestCount, 100
@@ -7172,6 +7204,8 @@ void Pathfinder::processPathfindQueue()
 					, &ordinaryPathBatchContext.performanceBatch
 					, ordinaryPathBatchContext.performanceReferenceLedger
 					, &ordinaryPathBatchContext.performanceReferenceBatch
+					, nullptr
+					, ordinaryPathBatchContext.performanceReferenceAttempt
 					#endif
 					) ?
 					TRUE : FALSE;
@@ -7179,6 +7213,7 @@ void Pathfinder::processPathfindQueue()
 					ordinaryPathBatchContext.batch.executionSnapshot();
 				#if defined(_WIN64)
 				ordinaryPathBatchContext.performanceAdmitted =
+					execution.referenceAdmissionAccepted ||
 					execution.submittedRangeJobCount != 0 ? TRUE : FALSE;
 				#endif
 				if (execution.submittedRangeJobCount != 0)
@@ -7232,7 +7267,6 @@ void Pathfinder::processPathfindQueue()
 					m_navigationRevision == ordinaryPathBatchContext.generation)
 				{
 					ordinaryPathBatchContext.ready = TRUE;
-					m_ordinaryPathBatchContext = &ordinaryPathBatchContext;
 				}
 				else if (completed && execution.completed)
 				{
@@ -7245,6 +7279,10 @@ void Pathfinder::processPathfindQueue()
 					s_ordinaryPathValidationFailureCount +=
 						static_cast<UnsignedInt>(requestCount);
 				}
+				#if defined(_WIN64)
+				if (!ordinaryPathBatchContext.ready)
+					ordinaryPathBatchContext.performanceCompletion.expectLegacyFallback();
+				#endif
 			}
 		}
 	}
@@ -8337,13 +8375,12 @@ Path *Pathfinder::tryDirectPathBatchResult(Object *obj,
 		return nullptr;
 	entry->consumed = TRUE;
 	#if defined(_WIN64)
+	context->performanceCompletion.beginOperation();
 	PathPerformanceReferenceOperationGuard referenceOperation(
-		context->performanceReferenceLedger,
-		&context->performanceReferenceBatch,
-		&context->performanceReferenceCompletedOperations,
-		&context->performanceReferenceAllOperationsCommitted,
+		&context->performanceCompletion,
 		&entry->performanceReferenceOperationCompleted,
-		&entry->performanceReferenceOperationCommitted);
+		&entry->performanceReferenceOperationCommitted,
+		&materializationBegan);
 	PathPerformanceInterval validate(&context->performanceBatch,
 		rts::performance::KERNEL_PERFORMANCE_VALIDATE);
 	PathPerformanceInterval commit;
@@ -8605,7 +8642,6 @@ Path *Pathfinder::tryDirectPathBatchResult(Object *obj,
 			!malformedAuthority)
 		{
 			#if defined(_WIN64)
-			context->performanceCommitted = TRUE;
 			entry->performanceReferenceOperationCommitted = TRUE;
 			#endif
 			++s_directPathAuthoritativeCommitCount;
@@ -8647,13 +8683,12 @@ Path *Pathfinder::tryOrdinaryPathBatchResult(Object *obj,
 		return nullptr;
 	entry->consumed = TRUE;
 	#if defined(_WIN64)
+	context->performanceCompletion.beginOperation();
 	PathPerformanceReferenceOperationGuard referenceOperation(
-		context->performanceReferenceLedger,
-		&context->performanceReferenceBatch,
-		&context->performanceReferenceCompletedOperations,
-		&context->performanceReferenceAllOperationsCommitted,
+		&context->performanceCompletion,
 		&entry->performanceReferenceOperationCompleted,
-		&entry->performanceReferenceOperationCommitted);
+		&entry->performanceReferenceOperationCommitted,
+		&materializationBegan);
 	PathPerformanceInterval validate(&context->performanceBatch,
 		rts::performance::KERNEL_PERFORMANCE_VALIDATE);
 	PathPerformanceInterval commit;
@@ -9140,7 +9175,6 @@ Path *Pathfinder::tryOrdinaryPathBatchResult(Object *obj,
 	if (path)
 	{
 		#if defined(_WIN64)
-		context->performanceCommitted = TRUE;
 		entry->performanceReferenceOperationCommitted = TRUE;
 		#endif
 		++s_ordinaryPathAuthoritativeCommitCount;
@@ -9269,7 +9303,19 @@ Path *Pathfinder::findPath( Object *obj, const LocomotorSet& locomotorSet, const
 	(void)hierarchyUnrestricted;
 #endif
 
+	#if defined(_WIN64) && (!defined(_MSC_VER) || _MSC_VER >= 1300)
+	const Bool directLegacyFallback =
+		BeginPathPerformanceLegacyFallback(m_directPathBatchContext);
+	const Bool ordinaryLegacyFallback =
+		BeginPathPerformanceLegacyFallback(m_ordinaryPathBatchContext);
+	#endif
 	Path *pat = internalFindPath(obj, locomotorSet, from, rawTo);
+	#if defined(_WIN64) && (!defined(_MSC_VER) || _MSC_VER >= 1300)
+	CompletePathPerformanceLegacyFallback(m_directPathBatchContext,
+		directLegacyFallback);
+	CompletePathPerformanceLegacyFallback(m_ordinaryPathBatchContext,
+		ordinaryLegacyFallback);
+	#endif
 	#if !defined(_MSC_VER) || _MSC_VER >= 1300
 	if (pat == nullptr)
 		completeOrdinaryPathShadowComparison(obj, nullptr);

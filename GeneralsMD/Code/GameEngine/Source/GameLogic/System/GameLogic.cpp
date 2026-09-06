@@ -154,14 +154,63 @@ rts::JobMetricCounter nextKernelPerformanceOrdinal()
 	return s_kernelPerformanceOrdinal;
 }
 
+struct DeferredKernelPerformanceFallback
+{
+	DeferredKernelPerformanceFallback()
+		: logic(0), ledger(0), attempt(), batch(),
+		  disposition(rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED)
+	{
+	}
+
+	void capture(GameLogic *owner,
+		rts::performance::KernelPerformanceReferenceLedger *referenceLedger,
+		rts::performance::KernelPerformanceAttempt referenceAttempt,
+		rts::performance::KernelPerformanceReferenceBatch referenceBatch,
+		rts::performance::KernelPerformanceDisposition referenceDisposition)
+	{
+		logic = owner;
+		ledger = referenceLedger;
+		attempt = referenceAttempt;
+		batch = referenceBatch;
+		disposition = referenceDisposition;
+	}
+
+	void finish()
+	{
+		if (ledger == 0 || (!attempt.valid() && !batch.valid()))
+			return;
+		const rts::performance::KernelPerformanceReferenceBatch closingBatch = batch;
+		batch = rts::performance::KernelPerformanceReferenceBatch();
+		if (logic != 0)
+			logic->finishPerformanceReceiptAttempt(attempt, closingBatch,
+				disposition, true, true);
+		else if (closingBatch.valid())
+			ledger->finishBatch(closingBatch, false);
+		attempt = rts::performance::KernelPerformanceAttempt();
+	}
+
+	~DeferredKernelPerformanceFallback()
+	{
+		finish();
+	}
+
+	GameLogic *logic;
+	rts::performance::KernelPerformanceReferenceLedger *ledger;
+	rts::performance::KernelPerformanceAttempt attempt;
+	rts::performance::KernelPerformanceReferenceBatch batch;
+	rts::performance::KernelPerformanceDisposition disposition;
+};
+
 struct KernelPerformanceBatchGuard
 {
 	KernelPerformanceBatchGuard(rts::performance::KernelPerformanceKernel kernel,
-		unsigned subtype, unsigned frame, rts::JobMetricCounter ordinal)
+		unsigned subtype, unsigned frame, rts::JobMetricCounter ordinal,
+		DeferredKernelPerformanceFallback *deferredFallbackOwner = 0)
 		: ledger(&rts::performance::KernelPerformanceLedger::instance()),
 		  token(ledger->beginBatch(kernel, subtype, frame, ordinal)),
 		  active(token.valid()), admitted(FALSE),
-		  performanceReferenceLedger(0), performanceReferenceBatch()
+		  performanceReferenceLedger(0), performanceReferenceAttempt(),
+		  performanceReferenceBatch(), deferredFallback(deferredFallbackOwner)
 	{
 	}
 
@@ -172,29 +221,55 @@ struct KernelPerformanceBatchGuard
 
 	void finish(Bool committed)
 	{
+		const rts::performance::KernelPerformanceDisposition disposition =
+			committed ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
+			(admitted ? rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+				rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
 		if (performanceReferenceLedger != 0 &&
-			performanceReferenceBatch.valid())
+			(performanceReferenceBatch.valid() || performanceReferenceAttempt.valid()))
 		{
 			const rts::performance::KernelPerformanceReferenceBatch referenceBatch =
 				performanceReferenceBatch;
 			performanceReferenceBatch =
 				rts::performance::KernelPerformanceReferenceBatch();
-			performanceReferenceLedger->finishBatch(referenceBatch,
-				committed != FALSE);
+			if (TheGameLogic != 0)
+				TheGameLogic->finishPerformanceReceiptAttempt(
+					performanceReferenceAttempt, referenceBatch, disposition,
+					false, false);
+			else if (referenceBatch.valid())
+				performanceReferenceLedger->finishBatch(referenceBatch,
+					committed != FALSE);
+			performanceReferenceAttempt =
+				rts::performance::KernelPerformanceAttempt();
 		}
 		if (!active)
 			return;
 		active = FALSE;
-		const rts::performance::KernelPerformanceDisposition disposition =
-			committed ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
-			(admitted ? rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
-				rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
 		ledger->endBatch(token, disposition);
 	}
 
 	~KernelPerformanceBatchGuard()
 	{
-		finish(FALSE);
+		const rts::performance::KernelPerformanceDisposition disposition = admitted ?
+			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+			rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED;
+		if (deferredFallback != 0 && performanceReferenceLedger != 0 &&
+			(performanceReferenceBatch.valid() || performanceReferenceAttempt.valid()))
+		{
+			deferredFallback->capture(TheGameLogic, performanceReferenceLedger,
+				performanceReferenceAttempt, performanceReferenceBatch, disposition);
+			performanceReferenceAttempt =
+				rts::performance::KernelPerformanceAttempt();
+			performanceReferenceBatch =
+				rts::performance::KernelPerformanceReferenceBatch();
+		}
+		else
+			finish(FALSE);
+		if (active)
+		{
+			active = FALSE;
+			ledger->endBatch(token, disposition);
+		}
 	}
 
 	rts::performance::KernelPerformanceLedger *ledger;
@@ -202,7 +277,9 @@ struct KernelPerformanceBatchGuard
 	Bool active;
 	Bool admitted;
 	rts::performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	rts::performance::KernelPerformanceAttempt performanceReferenceAttempt;
 	rts::performance::KernelPerformanceReferenceBatch performanceReferenceBatch;
+	DeferredKernelPerformanceFallback *deferredFallback;
 };
 
 struct KernelPerformanceIntervalGuard
@@ -497,7 +574,8 @@ struct PreparedPhysicsIntegrationBatch
 #if defined(_WIN64)
 		  , performanceBatch(), performanceBatchActive(FALSE),
 		  performanceBatchAdmitted(FALSE), performanceReferenceLedger(0),
-		  performanceReferenceBatch(), performanceReferenceOutput(0),
+		  performanceReferenceAttempt(), performanceReferenceBatch(),
+		  performanceReferenceOutput(0),
 		  performanceReferenceOutputCapacity(0)
 #endif
 	{
@@ -513,24 +591,31 @@ struct PreparedPhysicsIntegrationBatch
 #if defined(_WIN64)
 	void finishPerformanceBatch(Bool committedBatch)
 	{
-		if (performanceReferenceLedger != 0 &&
-			performanceReferenceBatch.valid())
-		{
-			const rts::performance::KernelPerformanceReferenceBatch referenceBatch =
-				performanceReferenceBatch;
-			performanceReferenceBatch =
-				rts::performance::KernelPerformanceReferenceBatch();
-			performanceReferenceLedger->finishBatch(referenceBatch,
-				committedBatch != FALSE);
-		}
-		if (!performanceBatchActive)
-			return;
-		performanceBatchActive = FALSE;
 		const rts::performance::KernelPerformanceDisposition disposition =
 			committedBatch ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
 			(performanceBatchAdmitted ?
 				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
 				rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
+		if (performanceReferenceLedger != 0 &&
+			(performanceReferenceBatch.valid() || performanceReferenceAttempt.valid()))
+		{
+			const rts::performance::KernelPerformanceReferenceBatch referenceBatch =
+				performanceReferenceBatch;
+			performanceReferenceBatch =
+				rts::performance::KernelPerformanceReferenceBatch();
+			if (TheGameLogic != 0)
+				TheGameLogic->finishPerformanceReceiptAttempt(
+					performanceReferenceAttempt, referenceBatch, disposition,
+					committedBatch == FALSE, committedBatch == FALSE);
+			else if (referenceBatch.valid())
+				performanceReferenceLedger->finishBatch(referenceBatch,
+					committedBatch != FALSE);
+			performanceReferenceAttempt =
+				rts::performance::KernelPerformanceAttempt();
+		}
+		if (!performanceBatchActive)
+			return;
+		performanceBatchActive = FALSE;
 		rts::performance::KernelPerformanceLedger::instance().endBatch(
 			performanceBatch, disposition);
 	}
@@ -553,6 +638,7 @@ struct PreparedPhysicsIntegrationBatch
 	Bool performanceBatchActive;
 	Bool performanceBatchAdmitted;
 	rts::performance::KernelPerformanceReferenceLedger *performanceReferenceLedger;
+	rts::performance::KernelPerformanceAttempt performanceReferenceAttempt;
 	rts::performance::KernelPerformanceReferenceBatch performanceReferenceBatch;
 	rts::PhysicsIntegrationOutput *performanceReferenceOutput;
 	UnsignedInt performanceReferenceOutputCapacity;
@@ -698,8 +784,16 @@ Bool preparePhysicsIntegrationBatch(GameLogic *logic,
 
 	rts::PhysicsIntegrationOptions options;
 #if defined(_WIN64)
+	if (batch.performanceReferenceLedger != 0 &&
+		batch.performanceReferenceLedger->traceRequested() &&
+		rts::JobSystem::chooseRangeCount(batch.count,
+			rts::PHYSICS_INTEGRATION_DEFAULT_MINIMUM_GRAIN,
+			rts::JobSystem::instance().workerCount()) > 1)
+		batch.performanceReferenceAttempt = logic->beginPerformanceReceiptAttempt(
+			rts::performance::KERNEL_PERFORMANCE_PHYSICS, 0);
 	options.performanceBatch = batch.performanceBatch;
 	options.performanceReferenceLedger = batch.performanceReferenceLedger;
+	options.performanceReferenceAttempt = batch.performanceReferenceAttempt;
 	options.performanceReferenceBatch = &batch.performanceReferenceBatch;
 	options.performanceReferenceOutput = batch.performanceReferenceOutput;
 	options.performanceReferenceOutputCapacity =
@@ -715,7 +809,8 @@ Bool preparePhysicsIntegrationBatch(GameLogic *logic,
 	if (batch.storageAllocations != 0)
 		batch.metrics.allocatedBytes += batch.storageCapacityBytes;
 	#if defined(_WIN64)
-	batch.performanceBatchAdmitted = batch.metrics.submittedJobs != 0;
+	batch.performanceBatchAdmitted = batch.metrics.referenceAdmissionAccepted ||
+		batch.metrics.submittedJobs != 0;
 	#endif
 	if (result != rts::PHYSICS_INTEGRATION_PARALLEL)
 	{
@@ -1982,6 +2077,11 @@ void GameLogic::tryStartNewGame( Bool loadingSaveGame )
 			}
 
 			m_startNewGame = TRUE;
+#if defined(_WIN64)
+			if (m_performanceReceiptRuntime != 0)
+				m_performanceReceiptRuntime->observeControlTransition(
+					rts::performance::KERNEL_CONTROL_DEFERRED_START_DECLARED, this, m_frame);
+#endif
 			return;
 
 		}
@@ -4624,6 +4724,50 @@ void GameLogic::runLegacyStage5Phases()
 }
 
 // ------------------------------------------------------------------------------------------------
+#if defined(_WIN64)
+rts::performance::KernelPerformanceAttempt GameLogic::beginPerformanceReceiptAttempt(
+	unsigned workKind, unsigned subtype) noexcept
+{
+	if (!isStage5PhaseGraphOwner(this) || this != TheGameLogic ||
+		!isInGameLogicUpdate() || m_performanceReceiptRuntime == 0)
+		return rts::performance::KernelPerformanceAttempt();
+	return m_performanceReceiptRuntime->beginAttempt(workKind, subtype);
+}
+
+bool GameLogic::finishPerformanceReceiptAttempt(
+	rts::performance::KernelPerformanceAttempt attempt,
+	rts::performance::KernelPerformanceReferenceBatch validatedBatch,
+	rts::performance::KernelPerformanceDisposition disposition,
+	bool fallbackEntered, bool fallbackCompleted) noexcept
+{
+	rts::performance::KernelPerformanceReferenceLedger &ledger =
+		rts::performance::KernelPerformanceReferenceLedger::instance();
+	bool batchClosed = true;
+	if (validatedBatch.valid())
+		batchClosed = ledger.finishBatch(validatedBatch,
+			disposition == rts::performance::KERNEL_PERFORMANCE_COMMITTED);
+	if (!attempt.valid())
+		return batchClosed;
+	rts::performance::KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = disposition;
+	finish.reasonSchema = 1;
+	finish.reason = disposition == rts::performance::KERNEL_PERFORMANCE_COMMITTED ? 1 : 2;
+	finish.fallbackEntered = fallbackEntered;
+	finish.fallbackCompleted = fallbackCompleted;
+	finish.validatedBatch = validatedBatch;
+	const bool attemptClosed = ledger.finishAttempt(attempt, finish);
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::performance::KernelPerformanceAttemptReap reap = {};
+	reap.reasonSchema = 1;
+	reap.reason = 1;
+	reap.dynamicFactsKnownMask = 3;
+	reap.pendingJobs = jobs.pendingOwnerCompletionCount();
+	reap.outstandingJobs = jobs.outstandingJobCount();
+	const bool attemptReaped = ledger.reapAttempt(attempt, reap);
+	return batchClosed && attemptClosed && attemptReaped;
+}
+#endif
+
 rts::LiveSimulationPhaseOwnerCallbacks GameLogic::makeStage5PhaseGraphCallbacks()
 {
 	rts::LiveSimulationPhaseOwnerCallbacks callbacks;
@@ -4689,7 +4833,7 @@ void GameLogic::observeStage5PhaseGraphBoundary(
 	// runtime latches its qualification failure without affecting dispatch.
 	const unsigned actualFrame = isStage5PhaseGraphOwner(logic) ? logic->getFrame() : 0;
 	logic->m_performanceReceiptRuntime->observePhaseBoundary(
-		boundary, phaseId, generation, frame, actualFrame);
+		boundary, phaseId, generation, frame, actualFrame, logic);
 }
 #endif
 
@@ -4798,6 +4942,11 @@ Bool GameLogic::runOwnerIntakePhase( UnsignedInt &now )
     Profile::StopRange("map_load");
 #endif
 		m_startNewGame = FALSE;
+#if defined(_WIN64)
+		if (m_performanceReceiptRuntime != 0)
+			m_performanceReceiptRuntime->observeControlTransition(
+				rts::performance::KERNEL_CONTROL_DEFERRED_START_CONSUMED, this, m_frame);
+#endif
 
 	#ifdef DUMP_PERF_STATS
 		char Buf[1024];
@@ -5169,7 +5318,11 @@ static void runLegacyDisabledStatusSweep( GameLogic *logic )
 }
 
 // ------------------------------------------------------------------------------------------------
-static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
+static Bool runPreparedDisabledStatusSweep( GameLogic *logic
+#if defined(_WIN64)
+	, DeferredKernelPerformanceFallback *deferredFallback
+#endif
+	)
 {
 	if( DISABLED_COUNT > rts::OBJECT_STATUS_TIMER_MAX_TYPES )
 		return FALSE;
@@ -5184,7 +5337,7 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 #if defined(_WIN64)
 	KernelPerformanceBatchGuard performanceBatch(
 		rts::performance::KERNEL_PERFORMANCE_STATUS, 0,
-		logic->getFrame(), nextKernelPerformanceOrdinal());
+		logic->getFrame(), nextKernelPerformanceOrdinal(), deferredFallback);
 	rts::performance::KernelPerformanceReferenceMode referenceMode =
 		rts::performance::KERNEL_REFERENCE_DISABLED;
 	if( performanceBatch.active )
@@ -5307,9 +5460,19 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 	rts::ObjectStatusTimerOptions parallelOptions;
 	parallelOptions.parallel = true;
 #if defined(_WIN64)
+	if (performanceBatch.performanceReferenceLedger != 0 &&
+		performanceBatch.performanceReferenceLedger->traceRequested() &&
+		rts::JobSystem::chooseRangeCount(snapshotCount,
+			rts::OBJECT_STATUS_TIMER_DEFAULT_MINIMUM_GRAIN,
+			jobs.workerCount()) > 1)
+		performanceBatch.performanceReferenceAttempt =
+			logic->beginPerformanceReceiptAttempt(
+				rts::performance::KERNEL_PERFORMANCE_STATUS, 0);
 	parallelOptions.performanceBatch = performanceBatch.token;
 	parallelOptions.performanceReferenceLedger =
 		performanceBatch.performanceReferenceLedger;
+	parallelOptions.performanceReferenceAttempt =
+		performanceBatch.performanceReferenceAttempt;
 	parallelOptions.performanceReferenceBatch =
 		&performanceBatch.performanceReferenceBatch;
 	parallelOptions.performanceReferenceOutput = referenceOutput;
@@ -5323,7 +5486,8 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 			logic->getFrame(), DISABLED_COUNT, preparedCommands, snapshotCount,
 			parallelOptions, &preparedCount, &parallelMetrics);
 #if defined(_WIN64)
-	if( parallelMetrics.submittedJobs != 0 )
+	if( parallelMetrics.referenceAdmissionAccepted ||
+		parallelMetrics.submittedJobs != 0 )
 		performanceBatch.markAdmitted();
 #endif
 
@@ -5388,8 +5552,7 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic )
 #if defined(_WIN64)
 	Bool allCommandsResolved = TRUE;
 	const Bool authoritativePerformanceBatch = !shadow &&
-		preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL &&
-		preparedCount != 0;
+		preparedResult == rts::OBJECT_STATUS_TIMER_PARALLEL;
 	KernelPerformanceIntervalGuard commitScope(
 		authoritativePerformanceBatch ? performanceBatch.ledger : 0,
 		performanceBatch.token, rts::performance::KERNEL_PERFORMANCE_COMMIT);
@@ -5464,8 +5627,15 @@ void GameLogic::runOwnerTailPhase()
 	// parallel/shadow prepare only pointer-free expiry decisions and commit them
 	// in the same owner-captured object order. Network sessions require the
 	// exact-roster mixed-worker policy before this prepared lane is eligible.
+	#if defined(_WIN64)
+	DeferredKernelPerformanceFallback statusFallback;
+	if( !runPreparedDisabledStatusSweep(this, &statusFallback) )
+		runLegacyDisabledStatusSweep(this);
+	statusFallback.finish();
+	#else
 	if( !runPreparedDisabledStatusSweep(this) )
 		runLegacyDisabledStatusSweep(this);
+	#endif
 
 }
 

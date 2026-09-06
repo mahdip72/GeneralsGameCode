@@ -57,7 +57,7 @@ void CopyMatrix(const Matrix4x4 &source, RenderMatrix4 *destination)
 	for (unsigned int row = 0; row < 4; ++row)
 	{
 		for (unsigned int column = 0; column < 4; ++column)
-			destination->values[row * 4 + column] = source[row][column];
+			destination->values[column * 4 + row] = source[row][column];
 	}
 }
 
@@ -66,11 +66,11 @@ void CopyMatrix(const Matrix3D &source, RenderMatrix4 *destination)
 	for (unsigned int row = 0; row < 3; ++row)
 	{
 		for (unsigned int column = 0; column < 4; ++column)
-			destination->values[row * 4 + column] = source[row][column];
+			destination->values[column * 4 + row] = source[row][column];
 	}
-	destination->values[12] = 0.0f;
-	destination->values[13] = 0.0f;
-	destination->values[14] = 0.0f;
+	destination->values[3] = 0.0f;
+	destination->values[7] = 0.0f;
+	destination->values[11] = 0.0f;
 	destination->values[15] = 1.0f;
 }
 
@@ -153,7 +153,21 @@ void SetGameMaterial(const VertexMaterialClass *material)
 	command.type = GAME_RENDER_COMMAND_SET_MATERIAL;
 	command.input = &state;
 	command.inputBytes = sizeof(state);
-	SubmitCommand(owner, command);
+	if (SubmitCommand(owner, command) != RENDER_RESULT_OK)
+		return;
+	// Direct mesh submissions use this facade without VertexMaterial::Apply.
+	// Publish mapper state after the base material has reset unmapped stages.
+	if (material != 0)
+	{
+		VertexMaterialClass *mutableMaterial =
+			const_cast<VertexMaterialClass *>(material);
+		for (unsigned int stage = 0; stage < MeshBuilderClass::MAX_STAGES; ++stage)
+		{
+			TextureMapperClass *mapper = mutableMaterial->Peek_Mapper(stage);
+			if (mapper != 0)
+				mapper->Apply(mutableMaterial->Get_UV_Source(stage));
+		}
+	}
 }
 
 void SetGameLightEnvironment(LightEnvironmentClass *lightEnvironment)
@@ -260,18 +274,21 @@ void SetGameRenderCamera(void *cameraOpaque)
 	if (camera == 0)
 		return;
 
-	// Query before pinning the owner: the query itself acquires the owner gate,
-	// and taking it twice would deadlock the lifecycle mutex.
-	int width = 0;
-	int height = 0;
-	int bitDepth = 0;
-	bool windowed = false;
-	const RenderResult resolutionResult = GetGameRendererTargetResolution(
-		&width, &height, &bitDepth, &windowed);
-	if (resolutionResult != RENDER_RESULT_OK || width <= 0 || height <= 0)
+	// Camera pixels follow the active render target, which can be a smaller
+	// offscreen texture than the swap-chain back buffer. Keep the owner pin
+	// across the metadata query and snapshot submission so target selection
+	// cannot change between the two operations.
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	RenderBackBufferInfo targetInfo;
+	const RenderResult resolutionResult = owner != 0 &&
+		owner->IsInitialized() && owner->IsOperational() ?
+		owner->GetGameRenderTargetInfo(&targetInfo) :
+		RENDER_RESULT_INVALID_ARGUMENT;
+	const unsigned int width = targetInfo.width;
+	const unsigned int height = targetInfo.height;
+	if (resolutionResult != RENDER_RESULT_OK || width == 0 || height == 0)
 	{
-		NativeGameRenderOwnerScope scope;
-		IGameRenderClientNativeOwner *owner = scope.Get();
 		if (owner != 0)
 		{
 			owner->RecordGameFailure(resolutionResult != RENDER_RESULT_OK ?
@@ -301,8 +318,6 @@ void SetGameRenderCamera(void *cameraOpaque)
 		minimumDepth > maximumDepth || zNear < 0.0f || zFar <= zNear ||
 		(camera->Get_Projection_Type() == CameraClass::PERSPECTIVE && zNear == 0.0f))
 	{
-		NativeGameRenderOwnerScope scope;
-		IGameRenderClientNativeOwner *owner = scope.Get();
 		if (owner != 0)
 			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 		return;
@@ -318,8 +333,6 @@ void SetGameRenderCamera(void *cameraOpaque)
 		(viewport.Max.Y - viewport.Min.Y) * static_cast<float>(height));
 	if (viewportWidth == 0 || viewportHeight == 0)
 	{
-		NativeGameRenderOwnerScope scope;
-		IGameRenderClientNativeOwner *owner = scope.Get();
 		if (owner != 0)
 			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 		return;
@@ -339,8 +352,6 @@ void SetGameRenderCamera(void *cameraOpaque)
 	snapshot.zNear = zNear;
 	snapshot.zFar = zFar;
 
-	NativeGameRenderOwnerScope scope;
-	IGameRenderClientNativeOwner *owner = scope.Get();
 	if (!IsOperationalOwner(owner))
 		return;
 	const RenderResult result = owner->SetGameRenderCameraSnapshot(snapshot);

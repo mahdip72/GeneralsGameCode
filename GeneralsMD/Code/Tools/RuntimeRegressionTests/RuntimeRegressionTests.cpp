@@ -1712,14 +1712,14 @@ struct SkirmishAITestReplayCommitProbe
 	Bool persistentSharing;
 	DWORD terminalError;
 	Bool temporaryMissingDuringFailure;
+	const char *substitutionPath;
 };
 
 static Bool SkirmishAITestReplayFileExists(const char *path)
 {
-	FILE *file = fopen(path, "rb");
-	if (file == nullptr)
-		return FALSE;
-	return fclose(file) == 0;
+	const DWORD attributes = GetFileAttributesA(path);
+	return attributes != INVALID_FILE_ATTRIBUTES &&
+		(attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
 static Bool WriteSkirmishAITestReplayFile(const char *path,
@@ -1780,8 +1780,32 @@ static Bool CommitSkirmishAITestReplayUsingProbe(const char *temporaryPath,
 		SetLastError(probe->terminalError);
 		return FALSE;
 	}
-	return MoveFileExA(temporaryPath, destinationPath,
-		MOVEFILE_WRITE_THROUGH) ? TRUE : FALSE;
+	if (!MoveFileExA(temporaryPath, destinationPath, MOVEFILE_WRITE_THROUGH))
+		return FALSE;
+	if (probe->substitutionPath != nullptr)
+	{
+		if (!MoveFileExA(destinationPath, probe->substitutionPath, MOVEFILE_WRITE_THROUGH) ||
+			!WriteSkirmishAITestReplayFile(destinationPath, "replacement-bytes"))
+			return FALSE;
+	}
+	return TRUE;
+}
+
+struct SkirmishAITestReplayFinalCloseProbe
+{
+	Int callCount;
+	Bool fail;
+};
+
+static Bool CloseSkirmishAITestReplayUsingProbe(void *nativeHandle, void *context)
+{
+	SkirmishAITestReplayFinalCloseProbe *probe =
+		static_cast<SkirmishAITestReplayFinalCloseProbe *>(context);
+	if (probe == nullptr || nativeHandle == nullptr)
+		return FALSE;
+	++probe->callCount;
+	const Bool closed = CloseHandle(static_cast<HANDLE>(nativeHandle)) ? TRUE : FALSE;
+	return closed && !probe->fail;
 }
 
 static void TestSkirmishAITestReplayRetentionCommitPolicy()
@@ -1797,6 +1821,7 @@ static void TestSkirmishAITestReplayRetentionCommitPolicy()
 	char sourcePath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
 	char destinationPath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
 	char temporaryPath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
+	char substitutionPath[SKIRMISH_AI_TEST_RECEIPT_PATH_LENGTH];
 	_snprintf(sourcePath, sizeof(sourcePath),
 		"%s\\SkirmishAITestRetentionPolicy-%lu-source.rep",
 		currentDirectory, processId);
@@ -1809,14 +1834,19 @@ static void TestSkirmishAITestReplayRetentionCommitPolicy()
 	sourcePath[sizeof(sourcePath) - 1] = '\0';
 	destinationPath[sizeof(destinationPath) - 1] = '\0';
 	temporaryPath[sizeof(temporaryPath) - 1] = '\0';
+	_snprintf(substitutionPath, sizeof(substitutionPath),
+		"%s\\SkirmishAITestRetentionPolicy-%lu-substituted.rep",
+		currentDirectory, processId);
+	substitutionPath[sizeof(substitutionPath) - 1] = '\0';
 
 	remove(sourcePath);
 	remove(destinationPath);
 	remove(temporaryPath);
+	remove(substitutionPath);
 	char digest[SKIRMISH_AI_TEST_RECEIPT_SHA256_LENGTH + 1];
 	strcpy(digest, "unchanged");
 	SkirmishAITestReplayCommitProbe sourceFailure =
-		{ 0, 0, TRUE, ERROR_SUCCESS, FALSE };
+		{ 0, 0, TRUE, ERROR_SUCCESS, FALSE, nullptr };
 	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
 		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
 		&sourceFailure));
@@ -1825,7 +1855,7 @@ static void TestSkirmishAITestReplayRetentionCommitPolicy()
 
 	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
 	SkirmishAITestReplayCommitProbe sharingThenSuccess =
-		{ 0, 1, FALSE, ERROR_SUCCESS, FALSE };
+		{ 0, 1, FALSE, ERROR_SUCCESS, FALSE, nullptr };
 	strcpy(digest, "unchanged");
 	CHECK(SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
 		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
@@ -1842,7 +1872,7 @@ static void TestSkirmishAITestReplayRetentionCommitPolicy()
 	remove(temporaryPath);
 	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
 	SkirmishAITestReplayCommitProbe persistentSharing =
-		{ 0, 0, TRUE, ERROR_SUCCESS, FALSE };
+		{ 0, 0, TRUE, ERROR_SUCCESS, FALSE, nullptr };
 	strcpy(digest, "unchanged");
 	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
 		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
@@ -1860,7 +1890,7 @@ static void TestSkirmishAITestReplayRetentionCommitPolicy()
 	remove(temporaryPath);
 	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
 	SkirmishAITestReplayCommitProbe nonSharingFailure =
-		{ 0, 0, FALSE, ERROR_ACCESS_DENIED, FALSE };
+		{ 0, 0, FALSE, ERROR_ACCESS_DENIED, FALSE, nullptr };
 	strcpy(digest, "unchanged");
 	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
 		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
@@ -1878,7 +1908,7 @@ static void TestSkirmishAITestReplayRetentionCommitPolicy()
 	CHECK(WriteSkirmishAITestReplayFile(destinationPath,
 		"destination-sentinel"));
 	SkirmishAITestReplayCommitProbe existingDestination =
-		{ 0, 0, FALSE, ERROR_SUCCESS, FALSE };
+		{ 0, 0, FALSE, ERROR_SUCCESS, FALSE, nullptr };
 	strcpy(digest, "unchanged");
 	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
 		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
@@ -1893,6 +1923,38 @@ static void TestSkirmishAITestReplayRetentionCommitPolicy()
 	remove(sourcePath);
 	remove(destinationPath);
 	remove(temporaryPath);
+	remove(substitutionPath);
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	SkirmishAITestReplayCommitProbe substitutedAfterCommit =
+		{ 0, 0, FALSE, ERROR_SUCCESS, FALSE, substitutionPath };
+	strcpy(digest, "unchanged");
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&substitutedAfterCommit));
+	CHECK(strcmp(digest, "unchanged") == 0);
+	CHECK(SkirmishAITestReplayFileHasContents(destinationPath, "replacement-bytes"));
+	CHECK(!SkirmishAITestReplayFileExists(substitutionPath));
+
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	CHECK(WriteSkirmishAITestReplayFile(sourcePath, "replay-fixture"));
+	SkirmishAITestReplayCommitProbe finalCloseCommit =
+		{ 0, 0, FALSE, ERROR_SUCCESS, FALSE, nullptr };
+	SkirmishAITestReplayFinalCloseProbe finalClose = { 0, TRUE };
+	strcpy(digest, "unchanged");
+	CHECK(!SkirmishAITestDetail::RetainSkirmishAITestReplayAtomically(sourcePath,
+		destinationPath, digest, CommitSkirmishAITestReplayUsingProbe,
+		&finalCloseCommit, CloseSkirmishAITestReplayUsingProbe, &finalClose));
+	CHECK(finalCloseCommit.callCount == 1 && finalClose.callCount == 1);
+	CHECK(strcmp(digest, "unchanged") == 0);
+	CHECK(SkirmishAITestReplayFileExists(sourcePath));
+	CHECK(!SkirmishAITestReplayFileExists(destinationPath));
+	CHECK(!SkirmishAITestReplayFileExists(temporaryPath));
+	remove(sourcePath);
+	remove(destinationPath);
+	remove(temporaryPath);
+	remove(substitutionPath);
 }
 #endif
 
@@ -2596,17 +2658,75 @@ static void TestSkirmishAITestRunnerContract()
 int RunHeadlessMetricStartupTitleTests();
 int RunPerformanceReceiptOwnerBridgeTitleTests();
 int RunPerformanceReceiptProducerTitleTests();
+int RunPerformanceReceiptFreshProducerTitleTests();
+int RunPerformanceReceiptAttemptTitleTests();
+int RunPerformanceReceiptBootstrapTitleTests();
+int RunPerformanceReceiptPolicyTitleTests();
+int RunPerformanceReceiptModeTitleTests();
+int RunPerformanceReceiptWidePathTitleTests();
+int RunPerformanceReceiptConsumeWidePathTitleTests();
+int RunPerformanceReceiptReplayOwnerShapeTitleTests();
+int RunPerformanceReceiptPracticalOwnerShapeTitleTests();
+int RunPerformanceReceiptReplayCallerFenceTitleTests();
+int RunPerformanceReceiptFreshCallerFenceTitleTests();
+int RunPerformanceReceiptTraceFileTests(const wchar_t *freshRoot, bool reparseAliasOnly);
 #endif
 
 int main(int argc, char **argv)
 {
 #if defined(_WIN64)
+	if (argc >= 2 && (strcmp(argv[1], "--performance-receipt-files") == 0 ||
+		strcmp(argv[1], "--performance-receipt-file-aliases") == 0))
+	{
+		if (argc != 3)
+		{
+			fprintf(stderr, "PREREQUISITE: held-file selector requires one exact fresh scratch root.\n");
+			return 2;
+		}
+		wchar_t root[MAX_PATH];
+		unsigned index = 0;
+		for (; argv[2][index] != '\0'; ++index)
+		{
+			const unsigned char byte = static_cast<unsigned char>(argv[2][index]);
+			if (index >= MAX_PATH - 1 || byte > 0x7f)
+			{
+				fprintf(stderr, "PREREQUISITE: held-file scratch root must be bounded ASCII.\n");
+				return 2;
+			}
+			root[index] = static_cast<wchar_t>(byte);
+		}
+		root[index] = L'\0';
+		return RunPerformanceReceiptTraceFileTests(root,
+			strcmp(argv[1], "--performance-receipt-file-aliases") == 0);
+	}
 	if (argc == 2 && strcmp(argv[1], "--headless-metric-startup") == 0)
 		return RunHeadlessMetricStartupTitleTests();
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-owner-bridge") == 0)
 		return RunPerformanceReceiptOwnerBridgeTitleTests();
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-producer") == 0)
 		return RunPerformanceReceiptProducerTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-fresh-producer") == 0)
+		return RunPerformanceReceiptFreshProducerTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-attempt") == 0)
+		return RunPerformanceReceiptAttemptTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-bootstrap") == 0)
+		return RunPerformanceReceiptBootstrapTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-policy") == 0)
+		return RunPerformanceReceiptPolicyTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-mode") == 0)
+		return RunPerformanceReceiptModeTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-wide-path") == 0)
+		return RunPerformanceReceiptWidePathTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-consume-wide-path") == 0)
+		return RunPerformanceReceiptConsumeWidePathTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-replay-owner-shape") == 0)
+		return RunPerformanceReceiptReplayOwnerShapeTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-practical-owner-shape") == 0)
+		return RunPerformanceReceiptPracticalOwnerShapeTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-replay-caller-fence") == 0)
+		return RunPerformanceReceiptReplayCallerFenceTitleTests();
+	if (argc == 2 && strcmp(argv[1], "--performance-receipt-fresh-caller-fence") == 0)
+		return RunPerformanceReceiptFreshCallerFenceTitleTests();
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-lifecycle") == 0)
 	{
 		TestPerformanceReceiptOwnerLifecycle();

@@ -147,6 +147,12 @@ function Test-NativeX64CIWorkflow {
     Assert-Contains $BuildWorkflow `
         "timeout-minutes: \$\{\{ startsWith\(inputs\.preset, 'x64'\) && 90 \|\| 30 \}\}" `
         'native dependency builds retain the legacy 30-minute timeout'
+    Assert-Contains $BuildWorkflow `
+        '\$buildProduct = ''\$\{\{ inputs\.product \}\}'' -eq ''true''' `
+        'the reusable workflow does not resolve its product-build predicate'
+    Assert-Contains $BuildWorkflow `
+        'if \(\$buildProduct -and ''\$\{\{ inputs\.preset \}\}'' -notlike ''x64\*''\)' `
+        'the reusable workflow permits a retired non-x64 product build'
     Assert-Contains $BuildWorkflow "hashFiles\([^\r\n]*'cmake/patches/\*\.patch'" `
         'native D3D8 patch contents do not invalidate the CMake dependency cache'
 
@@ -157,9 +163,17 @@ function Test-NativeX64CIWorkflow {
         'the CTest step is not x64 multi-config aware'
     Assert-Contains $testStep "'--no-tests=error'" `
         'CTest can succeed without registering tests'
+    Assert-Contains $testStep '\$originalPsModulePath = \$env:PSModulePath' `
+        'the CTest launcher does not save its inherited PowerShell module path'
+    Assert-Contains $testStep 'Remove-Item Env:PSModulePath' `
+        'the CTest launcher leaks pwsh''s module path to child PowerShell tests'
+    Assert-Contains $testStep '\$ctestExitCode = \$LASTEXITCODE' `
+        'the CTest launcher does not capture the native exit status before restoring its environment'
+    Assert-Contains $testStep '\$env:PSModulePath = \$originalPsModulePath' `
+        'the CTest launcher does not restore its PowerShell module path'
     Assert-Contains $testStep '& ctest @arguments' `
         'the CTest step does not invoke CTest'
-    Assert-Contains $testStep 'exit \$LASTEXITCODE' `
+    Assert-Contains $testStep 'exit \$ctestExitCode' `
         'CTest failures are not propagated to the workflow result'
 
     $installStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Install native runtime'
@@ -187,7 +201,10 @@ function Test-NativeX64CIWorkflow {
         '(?ms)\$installedRuntime = \[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed" \$titleDirectory\)\)' `
         'the contract gate does not resolve an absolute installed title runtime'
     Assert-Contains $runtimeContractStep `
-        '\$test = Join-Path \$installedRuntime \$testName' `
+        '(?ms)\$validationRoot = \[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed\\Validation" \$titleDirectory\)\)' `
+        'the contract gate does not resolve an absolute installed validation root'
+    Assert-Contains $runtimeContractStep `
+        '\$test = Join-Path \$validationRoot \$testName' `
         'the contract gate does not resolve the selected installed utility'
     Assert-Contains $runtimeContractStep 'Test-Path -LiteralPath \$test -PathType Leaf' `
         'the contract gate does not reject a missing installed utility'
@@ -213,8 +230,9 @@ function Test-NativeX64CIWorkflow {
         'the installed contract launch, replay epoch check, cleanup, and exit sequence is not structurally ordered'
 
     $artifactStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Collect '
-    Assert-Contains $artifactStep "-like 'x64\*'" `
-        'the artifact collector has no native x64 installed-runtime branch'
+    Assert-Contains $artifactStep `
+        '(?m)^        if: \$\{\{ inputs\.product \}\}\r?$' `
+        'the artifact collector is not limited to product builds'
     Assert-Contains $artifactStep '\$installedRuntime' `
         'the native x64 artifact is collected from build outputs instead of the installed runtime'
     Assert-Contains $artifactStep 'Copy-Item -Path \(Join-Path \$installedRuntime ''\*''\)' `
@@ -414,13 +432,30 @@ arch: ${{ startsWith(inputs.preset, 'x64') && 'x64' || 'x86' }}
 timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && 90 || 30 }}
 key: cmake-deps-${{ hashFiles('cmake/patches/*.patch') }}
 if: inputs.game == 'Generals' && inputs.preset == 'x64-generals-vcpkg-product'
+$buildProduct = '${{ inputs.product }}' -eq 'true'
+if ($buildProduct -and '${{ inputs.preset }}' -notlike 'x64*') {
+  exit 1
+}
       - name: Run Core extras tests for game
         if: inputs.extras
         run: |
           $arguments = @('--no-tests=error')
           if ('preset' -like 'win32*' -or 'preset' -like 'x64*') {}
-          & ctest @arguments
-          exit $LASTEXITCODE
+          $originalPsModulePath = $env:PSModulePath
+          $ctestExitCode = 1
+          try {
+            Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+            & ctest @arguments
+            $ctestExitCode = $LASTEXITCODE
+          }
+          finally {
+            if ($null -eq $originalPsModulePath) {
+              Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+            } else {
+              $env:PSModulePath = $originalPsModulePath
+            }
+          }
+          exit $ctestExitCode
       - name: Install native runtime for game
         if: ${{ inputs.product && startsWith(inputs.preset, 'x64') }}
         run: |
@@ -432,7 +467,9 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-generals-vcpkg-product'
           $testName = '${{ inputs.game == 'Generals' && 'g_skirmish_ai_runner_contract_tests.exe' || 'z_runtime_regression_tests.exe' }}'
           $installedRuntime = [IO.Path]::GetFullPath(
             (Join-Path "build\${{ inputs.preset }}\installed" $titleDirectory))
-          $test = Join-Path $installedRuntime $testName
+          $validationRoot = [IO.Path]::GetFullPath(
+            (Join-Path "build\${{ inputs.preset }}\installed\Validation" $titleDirectory))
+          $test = Join-Path $validationRoot $testName
           if (-not (Test-Path -LiteralPath $test -PathType Leaf)) { exit 1 }
           $testExitCode = 1
           Push-Location $installedRuntime
@@ -449,11 +486,10 @@ if: inputs.game == 'Generals' && inputs.preset == 'x64-generals-vcpkg-product'
           }
           exit $testExitCode
       - name: Collect game Artifact
+        if: ${{ inputs.product }}
         run: |
-          if ('preset' -like 'x64*') {
-            $installedRuntime = 'installed'
-            Copy-Item -Path (Join-Path $installedRuntime '*') -Destination artifacts
-          }
+          $installedRuntime = 'installed'
+          Copy-Item -Path (Join-Path $installedRuntime '*') -Destination artifacts
       - name: Upload game Artifact
         uses: actions/upload-artifact@sha
         with:
@@ -554,6 +590,18 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
         throw 'Native x64 CI workflow audit self-test failed to reject zero-test success'
     }
 
+    $caughtLeakedPsModulePath = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace 'PSModulePath', 'ChildModulePath')
+    } catch {
+        $caughtLeakedPsModulePath = $true
+    }
+    if (-not $caughtLeakedPsModulePath) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a leaked PowerShell module path'
+    }
+
     $caughtBranchFilter = $false
     try {
         Test-NativeX64CIWorkflow `
@@ -576,6 +624,18 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     }
     if (-not $caughtWin32Only) {
         throw 'Native x64 CI workflow audit self-test failed to reject Win32-only handling'
+    }
+
+    $caughtNonX64Product = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace '(?ms)\$buildProduct = ''\$\{\{ inputs\.product \}\}'' -eq ''true''\s*if \(\$buildProduct -and ''\$\{\{ inputs\.preset \}\}'' -notlike ''x64\*''\) \{\s*exit 1\s*\}', '')
+    } catch {
+        $caughtNonX64Product = $true
+    }
+    if (-not $caughtNonX64Product) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a non-x64 product path'
     }
 
     $caughtMissingPatchHash = $false
@@ -636,6 +696,30 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     }
     if (-not $caughtRelativeInstalledRuntime) {
         throw 'Native x64 CI workflow audit self-test failed to reject a relative installed runtime path'
+    }
+
+    $caughtRelativeValidationRoot = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace '\[IO\.Path\]::GetFullPath\(\s*\(Join-Path "build\\\$\{\{ inputs\.preset \}\}\\installed\\Validation" \$titleDirectory\)\)', 'Join-Path "build\${{ inputs.preset }}\installed\Validation" $titleDirectory')
+    } catch {
+        $caughtRelativeValidationRoot = $true
+    }
+    if (-not $caughtRelativeValidationRoot) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a relative installed validation root'
+    }
+
+    $caughtProductRootUtility = $false
+    try {
+        Test-NativeX64CIWorkflow `
+            -CIWorkflow $goodCI `
+            -BuildWorkflow ($goodBuild -replace '\$test = Join-Path \$validationRoot \$testName', '$test = Join-Path $installedRuntime $testName')
+    } catch {
+        $caughtProductRootUtility = $true
+    }
+    if (-not $caughtProductRootUtility) {
+        throw 'Native x64 CI workflow audit self-test failed to reject a contract utility inside the product runtime'
     }
 
     $caughtWrongRuntimeStepOrder = $false

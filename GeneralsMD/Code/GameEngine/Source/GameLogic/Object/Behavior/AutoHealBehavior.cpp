@@ -497,8 +497,10 @@ Bool AutoHealBehavior::tryImmutableRadiusHeal()
 		CommitLiveImmutableSpatialObjectSequence( commitObjects, commitCount,
 			&AutoHealBehavior::commitImmutableRadiusHealObject, this );
 		performanceGuard.endCommit();
-		performanceGuard.markCommitted(referenceMatched);
 	}
+	performanceGuard.markCommitted(
+		rts::ImmutableSpatialConsumerTransactionCommitted(
+			commitCount, referenceMatched != FALSE) );
 	if( !rts::UseSimulationShadowOracle() )
 	{
 		RecordLiveImmutableSpatialAuthoritativeQuery(

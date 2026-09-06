@@ -12,11 +12,11 @@
     "fixedSeeds", "matches"
   ],
   "properties": {
-    "schemaVersion": { "const": 1 },
-    "evidenceKind": { "const": "installed-net3-loopback" },
-    "status": { "const": "passed" },
-    "producer": { "const": "installed-runtime-runner-v1" },
-    "validationMode": { "const": "scoped-net3-loopback-release-proof" },
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "evidenceKind": { "type": "string", "const": "installed-net3-loopback" },
+    "status": { "type": "string", "const": "passed" },
+    "producer": { "type": "string", "const": "installed-runtime-runner-v1" },
+    "validationMode": { "type": "string", "const": "scoped-net3-loopback-release-proof" },
     "installedRuntime": { "const": true },
     "independentProcessHashing": { "const": true },
     "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
@@ -65,10 +65,11 @@
       "properties": {
         "recordId": { "type": "string", "minLength": 1 },
         "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
-        "title": { "enum": ["Generals", "ZeroHour"] },
+        "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
         "executableSha256": { "$ref": "#/$defs/sha256" },
         "artifactSetSha256": { "$ref": "#/$defs/sha256" },
         "topologyId": {
+          "type": "string",
           "enum": ["two-peer-1-v-16", "two-peer-2-v-auto", "two-peer-4-v-8", "four-peer-mixed-workers"]
         },
         "seed": { "enum": [23063, 49374] },
@@ -93,7 +94,7 @@
         "observedArtifactSetSha256": { "$ref": "#/$defs/sha256" },
         "rawOutputPath": { "type": "string", "pattern": "^Net3Raw\\\\[^:|]+$" },
         "rawOutputSha256": { "$ref": "#/$defs/sha256" },
-        "requestedWorkers": { "enum": ["1", "2", "4", "8", "16", "auto"] },
+        "requestedWorkers": { "type": "string", "enum": ["1", "2", "4", "8", "16", "auto"] },
         "effectiveWorkers": { "type": "integer", "minimum": 1 },
         "networkHelloReady": { "const": true },
         "rosterExact": { "const": true },
@@ -114,7 +115,7 @@
         "physicalWorkerMaskComplete", "peakConcurrentPhysicalWorkers"
       ],
       "properties": {
-        "name": { "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
+        "name": { "type": "string", "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
         "bit": { "enum": [1, 2, 4, 8, 16, 32] },
         "submitted": { "type": "integer", "minimum": 0 },
         "completed": { "type": "integer", "minimum": 0 },

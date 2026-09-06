@@ -527,7 +527,8 @@ int main(int argc, char **argv)
 	bool localCapacity = false;
 	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
 	{
-		fprintf(stderr, "Usage: core_sorting_triangle_kernel_tests [--local-capacity]\n");
+		fprintf(stderr, "Usage: core_sorting_triangle_kernel_tests "
+			"[--local-capacity|--external-qualification]\n");
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);

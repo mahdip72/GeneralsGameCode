@@ -7,13 +7,18 @@
 #endif
 #include "Lib/KernelPerformanceDiagnostics.h"
 
+namespace rts { class PartitionCollisionBypassObserver; struct PartitionCollisionReferenceInput; }
+
 namespace rts { namespace performance {
+
+class KernelPerformanceReferenceLedger;
 
 enum KernelPerformanceReferenceMode
 {
 	KERNEL_REFERENCE_DISABLED = 0,
 	KERNEL_REFERENCE_THROUGHPUT_BINDING,
-	KERNEL_REFERENCE_SERIAL_ORACLE
+	KERNEL_REFERENCE_SERIAL_ORACLE,
+	KERNEL_REFERENCE_PHASE_BASELINE_BINDING
 };
 
 enum
@@ -21,6 +26,7 @@ enum
 	KERNEL_REFERENCE_ERROR_HASH = 256,
 	KERNEL_REFERENCE_ERROR_CALLBACK = 512,
 	KERNEL_REFERENCE_ERROR_MISMATCH = 1024,
+	KERNEL_REFERENCE_ERROR_TRACE_ENCODING = 2048,
 	KERNEL_REFERENCE_ERROR_TRACE_IO = 4096,
 	KERNEL_REFERENCE_ERROR_TRACE_BINDING = 8192,
 	KERNEL_REFERENCE_ERROR_CHECKPOINT = 16384
@@ -84,6 +90,10 @@ struct KernelPerformanceDigest
 // The context and bytes are borrowed. Callbacks must not reenter the writer.
 typedef bool (*KernelPerformanceTraceAppend)(void *context,
 	const unsigned char *bytes, unsigned count);
+// Borrowed immutable source transport: exact read or failure. The native
+// runtime owns the source handle and selection of its matching receipt.
+typedef bool (*KernelPerformanceTraceReadAt)(void *context, JobMetricCounter offset,
+	unsigned char *bytes, unsigned count);
 
 // No raw object-representation hashing. Each field encodes a type byte,
 // little-endian tag, and canonical value. sequence() records collection count;
@@ -110,6 +120,8 @@ public:
 	bool sequence(unsigned tag, unsigned count);
 	KernelPerformanceDigest finish();
 private:
+	friend class KernelPerformanceReferenceLedger;
+	JobMetricCounter bytesWritten() const noexcept;
 	struct State;
 	State *m_state;
 	bool field(unsigned type, unsigned tag, JobMetricCounter value, unsigned width);
@@ -126,6 +138,9 @@ struct KernelPerformanceReferenceBatch
 	bool valid() const;
 	JobMetricCounter generation, serial;
 	unsigned slot;
+private:
+	friend class KernelPerformanceReferenceLedger;
+	const KernelPerformanceReferenceLedger *m_owner;
 };
 
 enum KernelPerformanceTraceMode
@@ -146,6 +161,26 @@ struct KernelPerformanceTraceBinding
 	KernelPerformanceDigest nativeRunIdentity, executable, fixture, sourcePolicy;
 };
 
+enum KernelPerformanceWindowBoundaryKind
+{
+	KERNEL_WINDOW_INVALID = 0,
+	KERNEL_WINDOW_BEGIN = 3,
+	KERNEL_WINDOW_PHASE_BEGIN,
+	KERNEL_WINDOW_PHASE_END,
+	KERNEL_WINDOW_WORLD_END,
+	KERNEL_WINDOW_CONTROL_END,
+	KERNEL_WINDOW_DEFERRED_START_DECLARED,
+	KERNEL_WINDOW_DEFERRED_START_CONSUMED
+};
+struct KernelPerformanceWindowBoundary
+{
+	KernelPerformanceWindowBoundary();
+	KernelPerformanceWindowBoundaryKind kind;
+	JobMetricCounter sampleOrdinal;
+	KernelPerformancePhase phase;
+	unsigned ownerFrameAtEntry, authorityFrame, actualOwnerFrame;
+};
+
 struct KernelPerformanceTraceOptions
 {
 	KernelPerformanceTraceOptions();
@@ -157,6 +192,9 @@ struct KernelPerformanceTraceOptions
 	JobMetricCounter residentAttemptCapacity, residentRangeCapacity;
 	KernelPerformanceTraceAppend append;
 	void *context;
+	KernelPerformanceTraceReadAt readAt;
+	JobMetricCounter sourceByteCount;
+	KernelPerformanceDigest sourceTraceDigest, sourceReceiptDigest;
 };
 
 struct KernelPerformanceReferenceRunOptions
@@ -168,7 +206,6 @@ struct KernelPerformanceReferenceRunOptions
 	KernelPerformanceTraceOptions trace;
 };
 
-class KernelPerformanceReferenceLedger;
 class KernelPerformanceAttempt
 {
 public:
@@ -179,6 +216,92 @@ private:
 	const KernelPerformanceReferenceLedger *m_owner;
 	JobMetricCounter m_generation, m_serial;
 	unsigned m_slot;
+};
+
+// Fixed native collision facts. Only the compiled title observer may submit
+// these through the ledger's private bridge; POD values alone grant no proof.
+struct NativeCollisionPolicyFacts
+{
+	bool authoritativeRequested, shadowRequested, multiplayerPolicyBlocked, schedulerReady;
+	unsigned configuredWorkers;
+};
+struct NativeCollisionCountFacts
+{
+	unsigned admissionOwnerID, cellCount, occupantCount;
+	bool countValid;
+};
+struct NativeCollisionReserveFacts
+{
+	unsigned requiredCells, requiredOccupants, beforeCellCapacity, beforeOccupantCapacity;
+	unsigned afterCellCapacity, afterOccupantCapacity, reserveOutcome;
+};
+struct NativeCollisionCaptureFacts
+{
+	unsigned flatIndex;
+	bool snapshotValid, ownerPresent;
+	unsigned capturedOwnerID;
+	bool participantIdentitiesValid, ownerIdentityUnchanged;
+};
+struct NativeCollisionClassFacts
+{
+	unsigned occupantCount, minimumInputs, samplerEncounterCount, samplerSampleCount;
+	bool spreadEvaluated, usefulSpread;
+};
+class KernelPerformanceDeterministicBypassProof
+{
+public:
+	KernelPerformanceDeterministicBypassProof();
+private:
+	friend class rts::PartitionCollisionBypassObserver;
+	friend class KernelPerformanceReferenceLedger;
+	KernelPerformanceDeterministicBypassProof(KernelPerformanceReferenceLedger &ledger,
+		KernelPerformanceAttempt attempt, const NativeCollisionClassFacts &actualClass,
+		const rts::PartitionCollisionReferenceInput &actualInput);
+	const KernelPerformanceReferenceLedger *m_owner;
+	KernelPerformanceAttempt m_attempt;
+	NativeCollisionClassFacts m_class;
+	const rts::PartitionCollisionReferenceInput *m_input;
+};
+class KernelPerformanceDeterministicBypass
+{
+public:
+	KernelPerformanceDeterministicBypass();
+	bool valid() const;
+private:
+	friend class KernelPerformanceReferenceLedger;
+	const KernelPerformanceReferenceLedger *m_owner;
+	JobMetricCounter m_generation, m_serial;
+};
+
+enum KernelPerformanceInlineAction
+{
+	KERNEL_INLINE_INVALID = 0,
+	KERNEL_INLINE_SKIP_SOURCE_NEVER_ENTERED,
+	KERNEL_INLINE_EXECUTE
+};
+enum KernelPerformanceInlineOwnerSerialKind
+{
+	KERNEL_INLINE_SERIAL_ORDINARY_PATH_MATERIALIZATION = 1
+};
+class KernelPerformanceInlineBody
+{
+public:
+	KernelPerformanceInlineBody();
+	bool valid() const;
+private:
+	friend class KernelPerformanceReferenceLedger;
+	const KernelPerformanceReferenceLedger *m_owner;
+	JobMetricCounter m_generation, m_serial;
+};
+class KernelPerformanceInlineOwnerSerial
+{
+public:
+	KernelPerformanceInlineOwnerSerial();
+	bool valid() const;
+private:
+	friend class KernelPerformanceReferenceLedger;
+	const KernelPerformanceReferenceLedger *m_owner;
+	JobMetricCounter m_generation, m_serial;
 };
 
 struct KernelPerformanceAttemptIdentity
@@ -235,11 +358,32 @@ struct KernelPerformanceRangeProgress
 	KernelPerformancePublication publication;
 };
 
+enum KernelPerformanceRequestBudgetDisposition
+{
+	KERNEL_REQUEST_BUDGET_NOT_REACHED = 0,
+	KERNEL_REQUEST_BUDGET_REFUSED,
+	KERNEL_REQUEST_BUDGET_RETAINED,
+	KERNEL_REQUEST_BUDGET_REFUNDED
+};
+struct KernelPerformanceRequestBudget
+{
+	KernelPerformanceRequestBudget();
+	JobMetricCounter requestOrdinal;
+	KernelPerformanceRequestBudgetDisposition disposition;
+	unsigned grantSite;
+	JobMetricCounter localGrantOrdinal, requestedBytes, grantedBytes;
+	unsigned refundSite;
+	JobMetricCounter localRefundOrdinal, refundedBytes, consumedBytes;
+};
+
 struct KernelPerformanceAttemptFinish
 {
 	KernelPerformanceDisposition disposition;
 	unsigned reasonSchema, reason;
 	bool fallbackEntered, fallbackCompleted;
+	// Source finish metadata: true when the admitted body was fully validated,
+	// even if the owner subsequently discarded it instead of committing.
+	bool validationObserved;
 	KernelPerformanceReferenceBatch validatedBatch;
 };
 
@@ -263,9 +407,11 @@ struct KernelPerformanceTraceSnapshot
 	JobMetricCounter abortedAfterAdmissionAttemptCount, reapCount;
 	JobMetricCounter capturedAttemptCount, capturedOperationCount, dispatchCount, rangeCount, releasedRangeCount;
 	JobMetricCounter residentRangeCount, residentRangeHighWater;
+	JobMetricCounter windowBoundaryCount, completedWindowCount, controlWindowCount;
 	JobMetricCounter recordCount, logicalEventCount, coalescedSpanCount, coalescedAttemptCount;
 	JobMetricCounter byteCount;
 	KernelPerformanceDigest digest;
+	KernelPerformanceDigest sourceReceiptDigest;
 };
 
 struct KernelPerformanceReferenceStream
@@ -303,12 +449,25 @@ public:
 	// Latched identity across diagnostic failure/freeze; does not reactivate
 	// collection or grant permission to dispatch work after an error.
 	KernelPerformanceReferenceMode runMode() const noexcept;
+	// True only while the owner has an active trace-backed run.  Native
+	// integrations use this to fail closed when an authenticated attempt is
+	// required, while preserving the legacy untraced oracle path.
+	bool traceRequested() const noexcept;
 	bool beginRun(KernelPerformanceReferenceMode mode,
 		KernelPerformanceClock clock = 0, void *clockContext = 0) noexcept;
 	bool beginRun(const KernelPerformanceReferenceRunOptions &options) noexcept;
 	KernelPerformanceAttempt beginAttempt(const KernelPerformanceAttemptIdentity &identity) noexcept;
+	KernelPerformanceDeterministicBypass beginDeterministicBypass(KernelPerformanceAttempt attempt,
+		const KernelPerformanceDeterministicBypassProof &proof) noexcept;
+	bool observeBypassFallbackContact(KernelPerformanceDeterministicBypass token,
+		unsigned actualOwnerID, unsigned actualParticipantID, bool actualInsertionResult) noexcept;
+	bool finishDeterministicBypass(KernelPerformanceDeterministicBypass token,
+		JobMetricCounter actualAttemptedContacts, JobMetricCounter actualInsertedContacts) noexcept;
 	bool observeDecision(KernelPerformanceAttempt attempt,
 		const KernelPerformanceAttemptDecision &decision) noexcept;
+	bool replayDecision(KernelPerformanceAttempt attempt, unsigned site,
+		bool actualDeterministicEligibility, const KernelPerformanceDigest &actualFacts,
+		KernelPerformanceAttemptDecision &sourceDecision) noexcept;
 	bool bindCapturedInput(KernelPerformanceAttempt attempt, unsigned fieldSchema,
 		JobMetricCounter operationCount, KernelPerformanceCanonicalCallback writeInput,
 		const void *immutableInput) noexcept;
@@ -320,6 +479,32 @@ public:
 	// or a request to release storage. Group-terminal reap remains separate.
 	bool observeReleasedRange(KernelPerformanceAttempt attempt,
 		const KernelPerformanceRangePlan &range, const KernelPerformanceRangeProgress &progress) noexcept;
+	bool observeReleasedRequestBudget(KernelPerformanceAttempt attempt,
+		const KernelPerformanceRangePlan &range, const KernelPerformanceRequestBudget &actual) noexcept;
+	// Owner-only non-consuming lookahead cannot issue a local validated token.
+	bool readSourceDispatch(KernelPerformanceAttempt attempt, JobMetricCounter dispatchOrdinal,
+		KernelPerformanceDispatchPlan &plan) const noexcept;
+	bool readSourceRange(KernelPerformanceAttempt attempt, JobMetricCounter dispatchOrdinal,
+		unsigned rangeOrdinal, KernelPerformanceRangePlan &plan) const noexcept;
+	bool readSourceFinish(KernelPerformanceAttempt attempt, KernelPerformanceAttemptFinish &finish) const noexcept;
+	KernelPerformanceInlineAction beginInlineBody(KernelPerformanceAttempt attempt,
+		const KernelPerformanceRangePlan &range, KernelPerformanceLedger &timing,
+		KernelPerformanceInlineBody &body, KernelPerformanceCheckpointProbe &probe) noexcept;
+	bool finishInlineBody(KernelPerformanceInlineBody body,
+		const KernelPerformanceRangeProgress &actualProgress) noexcept;
+	KernelPerformanceInlineOwnerSerial beginInlineOwnerSerial(KernelPerformanceInlineBody body,
+		KernelPerformanceInlineOwnerSerialKind kind) noexcept;
+	bool endInlineOwnerSerial(KernelPerformanceInlineOwnerSerial extent) noexcept;
+	bool replayRequestBudgetGrant(KernelPerformanceInlineOwnerSerial extent,
+		JobMetricCounter requestOrdinal, unsigned grantSite,
+		JobMetricCounter localGrantOrdinal, JobMetricCounter actualRequestedBytes,
+		bool &sourceGranted) noexcept;
+	bool finishInlineRequestBudget(KernelPerformanceInlineOwnerSerial extent,
+		const KernelPerformanceRequestBudget &actual) noexcept;
+	KernelPerformanceReferenceBatch observeValidatedAttempt(KernelPerformanceAttempt attempt,
+		KernelPerformanceCanonicalCallback writeOutput, const void *productionOutput,
+		KernelPerformanceSerialCallback serialCompute = 0, const void *immutableInput = 0,
+		void *detachedSerialOutput = 0) noexcept;
 	bool finishAttempt(KernelPerformanceAttempt attempt,
 		const KernelPerformanceAttemptFinish &finish) noexcept;
 	// Records actual owner cleanup after all planned ranges were acknowledged.
@@ -327,6 +512,9 @@ public:
 	// active-slot release alone does not establish that boundary.
 	bool reapAttempt(KernelPerformanceAttempt attempt,
 		const KernelPerformanceAttemptReap &reap) noexcept;
+	// Preserve actual phase/window observations; borrowed authority is not the
+	// mutable world frame, and a boundary does not release retained attempts.
+	bool observeWindowBoundary(const KernelPerformanceWindowBoundary &boundary) noexcept;
 	bool sealObservationWindow() noexcept;
 	// Reference retained-attempt closure only, never a scheduler-idle claim.
 	bool sealExecutionClosure() noexcept;
@@ -346,6 +534,24 @@ public:
 	bool finishBatch(KernelPerformanceReferenceBatch batch, bool committed) noexcept;
 	KernelPerformanceReferenceSnapshot freeze() noexcept;
 private:
+	friend class rts::PartitionCollisionBypassObserver;
+	bool armNativeCollisionBegin(KernelPerformanceAttempt attempt,
+		KernelPerformanceLedger &actualTiming, const KernelPerformanceBatch &actualTimingBatch) noexcept;
+	bool observeNativeCollisionPolicy(KernelPerformanceAttempt attempt, const NativeCollisionPolicyFacts &actual) noexcept;
+	bool observeNativeCollisionCount(KernelPerformanceAttempt attempt, const NativeCollisionCountFacts &actual) noexcept;
+	bool observeNativeCollisionReserve(KernelPerformanceAttempt attempt, const NativeCollisionReserveFacts &actual) noexcept;
+	bool observeNativeCollisionCapture(KernelPerformanceAttempt attempt, const NativeCollisionCaptureFacts &actual) noexcept;
+	bool observeNativeCollisionFullClass(KernelPerformanceAttempt attempt, const NativeCollisionClassFacts &actual) noexcept;
+	bool beginNativeCollisionFullFallback(KernelPerformanceAttempt attempt, const NativeCollisionClassFacts &actualClass,
+		const rts::PartitionCollisionReferenceInput &actualInput) noexcept;
+	bool observeNativeCollisionFullFallbackContact(KernelPerformanceAttempt attempt,
+		unsigned actualOwnerID, unsigned actualParticipantID, bool actualInsertionResult) noexcept;
+	bool finishNativeCollisionFullFallback(KernelPerformanceAttempt attempt,
+		JobMetricCounter actualAttemptedContacts, JobMetricCounter actualInsertedContacts) noexcept;
+	bool observeNativeCollisionFacts(KernelPerformanceAttempt attempt, unsigned site, const void *actual) noexcept;
+	bool nativeCollisionReady(KernelPerformanceAttempt attempt, unsigned stage, unsigned &slot) noexcept;
+	bool beginCollisionFallback(KernelPerformanceAttempt attempt, const NativeCollisionClassFacts &actualClass,
+		const rts::PartitionCollisionReferenceInput &actualInput, bool compact) noexcept;
 	struct State;
 	State *m_state;
 	std::atomic<unsigned long> m_owner;
@@ -355,6 +561,12 @@ private:
 	bool failTrace(unsigned error) noexcept;
 	bool traceReady() noexcept;
 	unsigned traceAttemptSlot(KernelPerformanceAttempt attempt) noexcept;
+	bool prepareTrace(const KernelPerformanceReferenceRunOptions &options) noexcept;
+	bool validateSource() noexcept;
+	bool bindCapturedDigest(KernelPerformanceAttempt attempt, unsigned schema,
+		JobMetricCounter operations, const KernelPerformanceDigest &digest) noexcept;
+	KernelPerformanceReferenceBatch linkValidatedDigest(KernelPerformanceAttempt attempt,
+		const KernelPerformanceDigest &digest) noexcept;
 	KernelPerformanceReferenceSnapshot m_snapshot;
 	KernelPerformanceReferenceLedger(const KernelPerformanceReferenceLedger &);
 	KernelPerformanceReferenceLedger &operator=(const KernelPerformanceReferenceLedger &);

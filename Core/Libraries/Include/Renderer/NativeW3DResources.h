@@ -155,6 +155,12 @@ public:
 
 	RenderResult Bind(NativeW3DRenderer *renderer);
 	RenderResult BindHost(NativeW3DResourceHost *host);
+	// The product owns completion consumption and frame failure reporting.
+	// A resource-only update may request that owner to fence and publish older
+	// frame writes. The callback must not rebuild or detach this resource table.
+	typedef RenderResult (*ThreadedCompletionFence)(void *owner);
+	RenderResult SetThreadedCompletionFence(ThreadedCompletionFence fence,
+		void *owner);
 	RenderResult Shutdown();
 	// Publish render-owner completion in strictly increasing submission order.
 	// A successful completion publishes accepted in-frame buffer ranges.

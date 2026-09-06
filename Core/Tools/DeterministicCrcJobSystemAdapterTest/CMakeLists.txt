@@ -28,6 +28,6 @@ if(MINGW)
 endif()
 
 add_test(NAME core_deterministic_crc_job_system_adapter_tests
-    COMMAND core_crc_job_adapter_tests
+    COMMAND core_crc_job_adapter_tests --local-capacity
 )
 set_tests_properties(core_deterministic_crc_job_system_adapter_tests PROPERTIES TIMEOUT 30)

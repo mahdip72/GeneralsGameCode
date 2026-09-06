@@ -1,9 +1,9 @@
-# The compatibility renderer is an x86/VC6-only build lane.  Keeping this
-# topology outside the product source prefixes makes the native x64 graph
-# unable to inherit the old device headers, PCH, or import libraries.
+# The compatibility renderer is an x86/VC6-only, non-product authoring lane.
+# Keeping this topology outside the product source prefixes makes every
+# supported product graph unable to inherit old device headers or libraries.
 
 function(rts_add_legacy_renderer_targets)
-    if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4 OR
+    if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4 OR RTS_BUILD_PRODUCT OR
             RTS_VIDEO_BACKEND_GRAPH_AUDIT)
         return()
     endif()
@@ -211,7 +211,7 @@ endfunction()
 
 # The W3DView authoring tools are Win32-only consumers of the historical
 # renderer ABI.  Keep their include precedence and library selection in the
-# same architecture-owned helper as the game targets; this prevents a moved
+# same architecture-owned helper as other historical targets; this prevents a
 # compatibility header from being found through a product include path.
 function(rts_attach_title_legacy_renderer target title)
     if(CMAKE_SIZEOF_VOID_P EQUAL 4)

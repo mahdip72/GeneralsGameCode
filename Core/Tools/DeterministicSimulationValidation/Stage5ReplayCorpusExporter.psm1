@@ -1,10 +1,158 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+$script:Stage5ExporterMaximumReplayBytes = [Int64](256 * 1024 * 1024)
+$script:Stage5ExporterMaximumJsonBytes = [Int64](64 * 1024 * 1024)
+$script:Stage5ExporterCommitObserver = $null
+
+if ($null -eq ('Stage5ReplayExporterNative.FileIdentityNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+
+namespace Stage5ReplayExporterNative
+{
+    public static class FileIdentityNative
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct ByHandleFileInformation
+        {
+            public UInt32 FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+            public UInt32 VolumeSerialNumber;
+            public UInt32 FileSizeHigh;
+            public UInt32 FileSizeLow;
+            public UInt32 NumberOfLinks;
+            public UInt32 FileIndexHigh;
+            public UInt32 FileIndexLow;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern SafeFileHandle CreateFileW(
+            string path, UInt32 desiredAccess, UInt32 shareMode, IntPtr securityAttributes,
+            UInt32 creationDisposition, UInt32 flagsAndAttributes, IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetFileInformationByHandle(
+            SafeFileHandle handle, out ByHandleFileInformation information);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern UInt32 GetFinalPathNameByHandleW(
+            SafeFileHandle handle, StringBuilder path, UInt32 pathLength, UInt32 flags);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileDispositionInformation
+        {
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool DeleteFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool SetFileInformationByHandle(
+            SafeFileHandle handle, Int32 informationClass,
+            ref FileDispositionInformation information, UInt32 bufferSize);
+
+        public static bool MarkFileForDeletion(SafeFileHandle handle)
+        {
+            FileDispositionInformation information = new FileDispositionInformation();
+            information.DeleteFile = true;
+            return SetFileInformationByHandle(handle, 4, ref information,
+                (UInt32)Marshal.SizeOf(information));
+        }
+    }
+}
+'@
+}
+
 function Assert-Stage5ExporterCondition {
     param([bool]$Condition, [string]$Message)
     if (-not $Condition) {
         throw $Message
+    }
+}
+
+function Test-Stage5ExporterInteger {
+    param([object]$Value)
+    if ($null -eq $Value) { return $false }
+    return $Value -is [byte] -or $Value -is [sbyte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+}
+
+function Get-Stage5ExporterMetadataInteger {
+    param(
+        [Parameter(Mandatory = $true)][Collections.IDictionary]$Metadata,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][Int64]$Minimum,
+        [Parameter(Mandatory = $true)][Int64]$Maximum
+    )
+    $raw = $Metadata[$Name]
+    Assert-Stage5ExporterCondition ($null -ne $raw) `
+        "Fresh replay metadata is missing '$Name'."
+    if ($raw -isnot [string]) {
+        Assert-Stage5ExporterCondition (Test-Stage5ExporterInteger $raw) `
+            "Fresh replay metadata '$Name' must be an integer."
+    }
+    [Int64]$value = 0
+    Assert-Stage5ExporterCondition ([Int64]::TryParse([string]$raw, [ref]$value) -and
+        $value -ge $Minimum -and $value -le $Maximum) `
+        "Fresh replay metadata '$Name' must be an integer between $Minimum and $Maximum."
+    return $value
+}
+
+function Get-Stage5ExporterRecordInteger {
+    param(
+        [Parameter(Mandatory = $true)][object]$Record,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][Int64]$Minimum,
+        [Parameter(Mandatory = $true)][Int64]$Maximum,
+        [switch]$Optional
+    )
+    $property = $Record.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        if ($Optional) { return $null }
+        throw "Corpus manifest record is missing '$Name'."
+    }
+    $value = $property.Value
+    Assert-Stage5ExporterCondition (Test-Stage5ExporterInteger $value) `
+        "Corpus manifest record '$Name' must be an integer."
+    $withinRange = $false
+    try {
+        $withinRange = $value -ge $Minimum -and $value -le $Maximum
+    }
+    catch {
+        $withinRange = $false
+    }
+    Assert-Stage5ExporterCondition $withinRange `
+        "Corpus manifest record '$Name' must be between $Minimum and $Maximum."
+    return [Int64]$value
+}
+
+function Get-Stage5ExporterAiContract {
+    param(
+        [Parameter(Mandatory = $true)][string]$Scenario,
+        [string]$Context = 'AI scenario'
+    )
+    switch ($Scenario) {
+        '4v2' {
+            return [pscustomobject]@{ actualAi = 6; actualTeams = '4v2' }
+        }
+        '4v3' {
+            return [pscustomobject]@{ actualAi = 7; actualTeams = '4v3' }
+        }
+        'hard-ai-2v6' {
+            return [pscustomobject]@{ actualAi = 8; actualTeams = '2v6' }
+        }
+        default {
+            throw "$Context '$Scenario' is unsupported."
+        }
     }
 }
 
@@ -52,6 +200,372 @@ function Get-Stage5ExporterFullPath {
     catch {
         throw "$Context path is invalid: $($_.Exception.Message)"
     }
+}
+
+function ConvertTo-Stage5ExporterNativePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    Assert-Stage5ExporterCondition (-not [string]::IsNullOrWhiteSpace($Path)) `
+        "$Context native path is required."
+    if ($Path.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $Path
+    }
+    if ($Path.StartsWith('\\', [StringComparison]::Ordinal)) {
+        return '\\?\UNC\' + $Path.Substring(2)
+    }
+    Assert-Stage5ExporterCondition ($Path -match '^[A-Za-z]:\\') `
+        "$Context native path must be drive-rooted or UNC."
+    return '\\?\' + $Path
+}
+
+function ConvertFrom-Stage5ExporterHandlePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if ($Path.StartsWith('\\?\UNC\', [StringComparison]::OrdinalIgnoreCase)) {
+        return '\\' + $Path.Substring(8)
+    }
+    if ($Path.StartsWith('\\?\', [StringComparison]::OrdinalIgnoreCase)) {
+        return $Path.Substring(4)
+    }
+    return $Path
+}
+
+function Get-Stage5ExporterHandleIdentity {
+    param(
+        [Parameter(Mandatory = $true)][Microsoft.Win32.SafeHandles.SafeFileHandle]$Handle,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    Assert-Stage5ExporterCondition (-not $Handle.IsInvalid -and -not $Handle.IsClosed) `
+        "$Context handle is invalid or closed."
+    $pathBuilder = New-Object Text.StringBuilder 32768
+    $pathLength = [Stage5ReplayExporterNative.FileIdentityNative]::GetFinalPathNameByHandleW(
+        $Handle, $pathBuilder, [UInt32]$pathBuilder.Capacity, 0)
+    Assert-Stage5ExporterCondition ($pathLength -gt 0 -and
+        $pathLength -lt [UInt32]$pathBuilder.Capacity) `
+        "$Context opened-handle canonical path is unavailable."
+    $information = New-Object `
+        'Stage5ReplayExporterNative.FileIdentityNative+ByHandleFileInformation'
+    Assert-Stage5ExporterCondition (
+        [Stage5ReplayExporterNative.FileIdentityNative]::GetFileInformationByHandle(
+            $Handle, [ref]$information)) `
+        "$Context opened-handle file identity is unavailable."
+    $fileSize = ([UInt64]$information.FileSizeHigh * [UInt64]4294967296) +
+        [UInt64]$information.FileSizeLow
+    return [pscustomobject]@{
+        canonicalPath = [IO.Path]::GetFullPath(
+            (ConvertFrom-Stage5ExporterHandlePath $pathBuilder.ToString()))
+        volumeSerialNumber = [UInt32]$information.VolumeSerialNumber
+        fileIndexHigh = [UInt32]$information.FileIndexHigh
+        fileIndexLow = [UInt32]$information.FileIndexLow
+        fileId = ('{0:X8}:{1:X8}{2:X8}' -f $information.VolumeSerialNumber,
+            $information.FileIndexHigh, $information.FileIndexLow)
+        linkCount = [UInt32]$information.NumberOfLinks
+        attributes = [UInt32]$information.FileAttributes
+        length = [UInt64]$fileSize
+    }
+}
+
+function Open-Stage5ExporterAncestorHandles {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    $full = Get-Stage5ExporterFullPath $FilePath $Context
+    $directory = Split-Path -Parent $full
+    $root = [IO.Path]::GetPathRoot($directory)
+    $paths = New-Object 'Collections.Generic.List[string]'
+    Assert-Stage5ExporterCondition (-not [string]::IsNullOrWhiteSpace($root)) `
+        "$Context path must have a local filesystem root."
+    $paths.Add([IO.Path]::GetFullPath($root)) | Out-Null
+    $current = [IO.Path]::GetFullPath($root)
+    $relativeDirectory = $directory.Substring($root.Length)
+    foreach ($segment in @($relativeDirectory.Split(
+        [char[]]@('\', '/'), [StringSplitOptions]::RemoveEmptyEntries))) {
+        $current = [IO.Path]::GetFullPath((Join-Path $current $segment))
+        $paths.Add($current) | Out-Null
+    }
+    $handles = New-Object 'Collections.Generic.List[object]'
+    try {
+        for ($index = 0; $index -lt $paths.Count; ++$index) {
+            $ancestorPath = [IO.Path]::GetFullPath($paths[$index])
+            $nativeAncestorPath = ConvertTo-Stage5ExporterNativePath $ancestorPath `
+                "$Context ancestor"
+            $handle = [Stage5ReplayExporterNative.FileIdentityNative]::CreateFileW(
+                $nativeAncestorPath, 0, 3, [IntPtr]::Zero, 3, 0x02200000,
+                [IntPtr]::Zero)
+            $openError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            Assert-Stage5ExporterCondition (-not $handle.IsInvalid) `
+                ("$Context ancestor handle could not be opened: " +
+                    "$ancestorPath (Win32 error $openError).")
+            $identity = Get-Stage5ExporterHandleIdentity $handle `
+                "$Context ancestor '$ancestorPath'"
+            Assert-Stage5ExporterCondition (
+                [String]::Equals($identity.canonicalPath, $ancestorPath,
+                    [StringComparison]::OrdinalIgnoreCase) -and
+                ($identity.attributes -band [UInt32][IO.FileAttributes]::Directory) -ne 0 -and
+                ($identity.attributes -band [UInt32][IO.FileAttributes]::ReparsePoint) -eq 0) `
+                "$Context ancestor is redirected, replaced, or a reparse point: $ancestorPath"
+            $handles.Add([pscustomobject]@{
+                handle = $handle
+                path = $ancestorPath
+                identity = $identity
+            }) | Out-Null
+        }
+        return $handles.ToArray()
+    }
+    catch {
+        foreach ($heldAncestor in @($handles.ToArray())) {
+            $heldAncestor.handle.Dispose()
+        }
+        throw
+    }
+}
+
+function Assert-Stage5ExporterAncestorHandlesUnchanged {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$HeldAncestors,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    foreach ($heldAncestor in @($HeldAncestors)) {
+        $after = Get-Stage5ExporterHandleIdentity $heldAncestor.handle `
+            "$Context ancestor '$($heldAncestor.path)'"
+        Assert-Stage5ExporterCondition ($after.fileId -ceq
+            $heldAncestor.identity.fileId -and
+            $after.volumeSerialNumber -eq $heldAncestor.identity.volumeSerialNumber -and
+            [String]::Equals($after.canonicalPath, $heldAncestor.path,
+                [StringComparison]::OrdinalIgnoreCase) -and
+            ($after.attributes -band [UInt32][IO.FileAttributes]::Directory) -ne 0 -and
+            ($after.attributes -band [UInt32][IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context ancestor changed identity, canonical path, or type while held."
+    }
+}
+
+function Close-Stage5ExporterHeldFile {
+    param([object]$HeldFile)
+    if ($null -eq $HeldFile) { return }
+    if ($null -ne $HeldFile.stream) { $HeldFile.stream.Dispose() }
+    foreach ($heldAncestor in @($HeldFile.ancestorHandles)) {
+        $heldAncestor.handle.Dispose()
+    }
+}
+
+function New-Stage5ExporterHeldCommitFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    $full = Get-Stage5ExporterFullPath $Path $Context
+    $ancestorHandles = @(Open-Stage5ExporterAncestorHandles $full $Context)
+    $nativeHandle = $null
+    $stream = $null
+    try {
+        # GENERIC_READ | GENERIC_WRITE | DELETE, share-delete, CREATE_NEW,
+        # FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT.  DELETE access
+        # lets failure cleanup target the exact opened object, even if its path
+        # is concurrently replaced.
+        $nativeFull = ConvertTo-Stage5ExporterNativePath $full $Context
+        $nativeHandle = [Stage5ReplayExporterNative.FileIdentityNative]::CreateFileW(
+            $nativeFull, [UInt32]3221291008, [UInt32]4, [IntPtr]::Zero,
+            [UInt32]1, [UInt32]0x00200080, [IntPtr]::Zero)
+        $createError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Assert-Stage5ExporterCondition (-not $nativeHandle.IsInvalid) `
+            ("$Context could not create its identity-bound temporary file " +
+                "'$full' (Win32 error $createError).")
+        $stream = [IO.FileStream]::new($nativeHandle, [IO.FileAccess]::ReadWrite,
+            1048576, $false)
+        $identity = Get-Stage5ExporterHandleIdentity $stream.SafeFileHandle $Context
+        Assert-Stage5ExporterCondition (
+            [String]::Equals($identity.canonicalPath, $full,
+                [StringComparison]::OrdinalIgnoreCase) -and
+            $identity.linkCount -eq 1 -and $identity.length -eq 0 -and
+            ($identity.attributes -band
+                [UInt32][IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context is redirected, hard-linked, or replaced."
+        return [pscustomobject]@{
+            path = $full
+            stream = $stream
+            ancestorHandles = $ancestorHandles
+            identity = $identity
+            length = [Int64]0
+        }
+    }
+    catch {
+        if ($null -ne $stream) {
+            try {
+                [void][Stage5ReplayExporterNative.FileIdentityNative]::MarkFileForDeletion(
+                    $stream.SafeFileHandle)
+            }
+            finally { $stream.Dispose() }
+        }
+        elseif ($null -ne $nativeHandle) {
+            try {
+                if (-not $nativeHandle.IsInvalid -and -not $nativeHandle.IsClosed) {
+                    [void][Stage5ReplayExporterNative.FileIdentityNative]::MarkFileForDeletion(
+                        $nativeHandle)
+                }
+            }
+            finally { $nativeHandle.Dispose() }
+        }
+        foreach ($heldAncestor in @($ancestorHandles)) {
+            $heldAncestor.handle.Dispose()
+        }
+        throw
+    }
+}
+
+function Remove-Stage5ExporterOwnedHeldFile {
+    param(
+        [Parameter(Mandatory = $true)][object]$HeldFile,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    $after = Get-Stage5ExporterHandleIdentity $HeldFile.stream.SafeFileHandle $Context
+    Assert-Stage5ExporterCondition ($after.fileId -ceq $HeldFile.identity.fileId -and
+        $after.volumeSerialNumber -eq $HeldFile.identity.volumeSerialNumber -and
+        $after.linkCount -eq 1 -and
+        ($after.attributes -band [UInt32][IO.FileAttributes]::ReparsePoint) -eq 0) `
+        "$Context cleanup refused an object whose identity or link count changed."
+    Assert-Stage5ExporterCondition (
+        [Stage5ReplayExporterNative.FileIdentityNative]::MarkFileForDeletion(
+            $HeldFile.stream.SafeFileHandle)) `
+        "$Context cleanup could not mark the exact opened object for deletion."
+}
+
+function Invoke-Stage5ExporterCommitObserver {
+    param(
+        [Parameter(Mandatory = $true)][string]$Stage,
+        [Parameter(Mandatory = $true)][string]$Kind,
+        [Parameter(Mandatory = $true)][string]$TemporaryPath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath
+    )
+    if ($null -ne $script:Stage5ExporterCommitObserver) {
+        & $script:Stage5ExporterCommitObserver $Stage $Kind $TemporaryPath `
+            $DestinationPath
+    }
+}
+
+function Open-Stage5ExporterHeldFile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Context,
+        [Parameter(Mandatory = $true)][Int64]$MaximumLength,
+        [Int64]$MinimumLength = 0,
+        [IO.FileShare]$Share = [IO.FileShare]::Read
+    )
+    $full = Get-Stage5ExporterFullPath $Path $Context
+    $ancestorHandles = @(Open-Stage5ExporterAncestorHandles $full $Context)
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($full, [IO.FileMode]::Open,
+            [IO.FileAccess]::Read, $Share)
+        $identity = Get-Stage5ExporterHandleIdentity $stream.SafeFileHandle $Context
+        $length = [Int64]$stream.Length
+        Assert-Stage5ExporterCondition (
+            [String]::Equals($identity.canonicalPath, $full,
+                [StringComparison]::OrdinalIgnoreCase)) `
+            "$Context opened handle resolves to a different canonical path."
+        Assert-Stage5ExporterCondition (
+            ($identity.attributes -band [UInt32][IO.FileAttributes]::Directory) -eq 0 -and
+            ($identity.attributes -band [UInt32][IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context opened file is a directory or reparse point."
+        Assert-Stage5ExporterCondition ($identity.linkCount -eq 1) `
+            "$Context opened file has $($identity.linkCount) hard links; exactly one is required."
+        Assert-Stage5ExporterCondition ([UInt64]$length -eq $identity.length) `
+            "$Context opened-handle extent differs from its file identity."
+        Assert-Stage5ExporterCondition ($length -ge $MinimumLength -and
+            $length -le $MaximumLength) `
+            "$Context length $length is outside the allowed $MinimumLength..$MaximumLength byte range."
+        return [pscustomobject]@{
+            path = $full
+            stream = $stream
+            ancestorHandles = $ancestorHandles
+            identity = $identity
+            length = $length
+        }
+    }
+    catch {
+        if ($null -ne $stream) { $stream.Dispose() }
+        foreach ($heldAncestor in @($ancestorHandles)) {
+            $heldAncestor.handle.Dispose()
+        }
+        throw
+    }
+}
+
+function Assert-Stage5ExporterHeldFileUnchanged {
+    param(
+        [Parameter(Mandatory = $true)][object]$HeldFile,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    $after = Get-Stage5ExporterHandleIdentity $HeldFile.stream.SafeFileHandle $Context
+    Assert-Stage5ExporterCondition ($HeldFile.stream.Length -eq $HeldFile.length -and
+        $after.length -eq [UInt64]$HeldFile.length -and
+        $after.fileId -ceq $HeldFile.identity.fileId -and
+        $after.volumeSerialNumber -eq $HeldFile.identity.volumeSerialNumber -and
+        $after.linkCount -eq 1 -and
+        [String]::Equals($after.canonicalPath, $HeldFile.path,
+            [StringComparison]::OrdinalIgnoreCase) -and
+        ($after.attributes -band [UInt32][IO.FileAttributes]::ReparsePoint) -eq 0) `
+        "$Context changed identity, extent, link count, or canonical path while held."
+    Assert-Stage5ExporterAncestorHandlesUnchanged $HeldFile.ancestorHandles $Context
+}
+
+function Get-Stage5ExporterFixedStreamSha256 {
+    param(
+        [Parameter(Mandatory = $true)][IO.Stream]$Stream,
+        [Parameter(Mandatory = $true)][Int64]$Length,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    Assert-Stage5ExporterCondition $Stream.CanSeek `
+        "$Context hashing requires a seekable held stream."
+    $originalPosition = $Stream.Position
+    try {
+        $Stream.Position = 0
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            $buffer = New-Object byte[] 1048576
+            [Int64]$remaining = $Length
+            while ($remaining -gt 0) {
+                $requested = [int][Math]::Min([Int64]$buffer.Length, $remaining)
+                $read = $Stream.Read($buffer, 0, $requested)
+                Assert-Stage5ExporterCondition ($read -gt 0) `
+                    "$Context ended before its admitted extent."
+                [void]$sha.TransformBlock($buffer, 0, $read, $buffer, 0)
+                $remaining -= $read
+            }
+            $extra = $Stream.ReadByte()
+            Assert-Stage5ExporterCondition ($extra -eq -1 -and
+                $Stream.Length -eq $Length) `
+                "$Context grew or changed after its admitted extent."
+            [void]$sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+            return (($sha.Hash | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
+        }
+        finally { $sha.Dispose() }
+    }
+    finally { $Stream.Position = $originalPosition }
+}
+
+function Read-Stage5ExporterFixedBytes {
+    param(
+        [Parameter(Mandatory = $true)][IO.Stream]$Stream,
+        [Parameter(Mandatory = $true)][Int64]$Length,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    Assert-Stage5ExporterCondition ($Length -le [Int32]::MaxValue) `
+        "$Context is too large for an in-memory bounded snapshot."
+    $bytes = New-Object byte[] ([int]$Length)
+    $Stream.Position = 0
+    $offset = 0
+    while ($offset -lt $bytes.Length) {
+        $read = $Stream.Read($bytes, $offset, $bytes.Length - $offset)
+        Assert-Stage5ExporterCondition ($read -gt 0) `
+            "$Context ended before its admitted extent."
+        $offset += $read
+    }
+    Assert-Stage5ExporterCondition ($Stream.ReadByte() -eq -1 -and
+        $Stream.Length -eq $Length) `
+        "$Context grew or changed after its admitted extent."
+    return ,$bytes
 }
 
 function Assert-Stage5ExporterRegularDirectory {
@@ -186,18 +700,23 @@ function Assert-Stage5ExporterPathAbsent {
 
 function Get-Stage5ExporterSha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
-    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open,
-        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $held = Open-Stage5ExporterHeldFile $Path 'Exporter JSON/hash input' `
+        $script:Stage5ExporterMaximumJsonBytes
     try {
-        $sha = [Security.Cryptography.SHA256]::Create()
-        try {
-            return (($sha.ComputeHash($stream) | ForEach-Object {
-                $_.ToString('x2')
-            }) -join '').ToUpperInvariant()
-        }
-        finally { $sha.Dispose() }
+        $digest = Get-Stage5ExporterFixedStreamSha256 $held.stream $held.length `
+            'Exporter JSON/hash input'
+        Assert-Stage5ExporterHeldFileUnchanged $held 'Exporter JSON/hash input'
+        return $digest
     }
-    finally { $stream.Dispose() }
+    finally { Close-Stage5ExporterHeldFile $held }
+}
+
+function Get-Stage5ExporterStreamSha256 {
+    param([Parameter(Mandatory = $true)][IO.Stream]$Stream)
+    Assert-Stage5ExporterCondition $Stream.CanSeek `
+        'Exporter hashing requires a seekable held file stream.'
+    return Get-Stage5ExporterFixedStreamSha256 $Stream ([Int64]$Stream.Length) `
+        'Exporter held-stream input'
 }
 
 function Get-Stage5ExporterUtf16String {
@@ -310,16 +829,28 @@ function Assert-Stage5ReplayFreshQualification {
 function Read-Stage5ReplayContainer {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$ExpectedTitle
+        [Parameter(Mandatory = $true)][string]$ExpectedTitle,
+        [IO.Stream]$Stream
     )
     $replayContract = Get-Stage5ReplayTitleContract $ExpectedTitle
     $full = Get-Stage5ExporterFullPath $Path 'Replay file'
-    $stream = [IO.File]::Open($full, [IO.FileMode]::Open,
-        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $ownsStream = $null -eq $Stream
+    $held = $null
+    if ($ownsStream) {
+        $held = Open-Stage5ExporterHeldFile $full 'Replay file' `
+            $script:Stage5ExporterMaximumReplayBytes 46
+        $Stream = $held.stream
+        [void](Get-Stage5ExporterFixedStreamSha256 $Stream $held.length `
+            'Replay file')
+    }
     try {
-        Assert-Stage5ExporterCondition ($stream.Length -ge 46) `
+        $Stream.Position = 0
+        Assert-Stage5ExporterCondition ($Stream.Length -ge 46) `
             "Replay file is shorter than the RPL3/GENREP prefix: $full"
-        $reader = New-Object IO.BinaryReader($stream)
+        Assert-Stage5ExporterCondition ($Stream.Length -le
+            $script:Stage5ExporterMaximumReplayBytes) `
+            "Replay file exceeds the 256 MiB exporter limit: $full"
+        $reader = [IO.BinaryReader]::new($Stream, [Text.Encoding]::UTF8, $true)
         try {
             $magic = [Text.Encoding]::ASCII.GetString($reader.ReadBytes(4))
             Assert-Stage5ExporterCondition ($magic -ceq 'RPL3') `
@@ -335,10 +866,10 @@ function Read-Stage5ReplayContainer {
             Assert-Stage5ExporterCondition ($engineEpoch -eq 1) `
                 "Replay file has unsupported runtime engine epoch ${engineEpoch}: $full"
             Assert-Stage5ExporterCondition ($payloadByteCount -ne [UInt64]::MaxValue -and
-                $payloadByteCount -eq [UInt64]($stream.Length - 40)) `
+                $payloadByteCount -eq [UInt64]($Stream.Length - 40)) `
                 "Replay file has an incomplete or inconsistent RPL3 payload length: $full"
 
-            $stream.Position = 40
+            $Stream.Position = 40
             $genrep = [Text.Encoding]::ASCII.GetString($reader.ReadBytes(6))
             Assert-Stage5ExporterCondition ($genrep -ceq 'GENREP') `
                 "Replay file does not contain GENREP at the native payload start: $full"
@@ -361,7 +892,7 @@ function Read-Stage5ReplayContainer {
             $versionTime = Get-Stage5ExporterUtf16String $reader 'Replay version-time'
             $qualification = Get-Stage5ReplayQualification $versionTime `
                 $replayContract "Replay file '$full'"
-            return [pscustomobject]@{
+            $result = [pscustomobject]@{
                 magic = $magic
                 schemaVersion = [int]$schemaVersion
                 engineEpoch = [int]$engineEpoch
@@ -374,10 +905,53 @@ function Read-Stage5ReplayContainer {
                 replayQualificationVersion = $qualification.replayQualificationVersion
                 replayQualification = $qualification.replayQualification
             }
+            if ($ownsStream) {
+                Assert-Stage5ExporterHeldFileUnchanged $held 'Replay file'
+            }
+            return $result
         }
         finally { $reader.Dispose() }
     }
-    finally { $stream.Dispose() }
+    finally {
+        if ($ownsStream) { Close-Stage5ExporterHeldFile $held }
+    }
+}
+
+function Get-Stage5ExporterReplaySnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedTitle,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    $held = Open-Stage5ExporterHeldFile $Path $Context `
+        $script:Stage5ExporterMaximumReplayBytes 46
+    try {
+        return Get-Stage5ExporterHeldReplaySnapshot $held $ExpectedTitle $Context
+    }
+    finally { Close-Stage5ExporterHeldFile $held }
+}
+
+function Get-Stage5ExporterHeldReplaySnapshot {
+    param(
+        [Parameter(Mandatory = $true)][object]$HeldFile,
+        [Parameter(Mandatory = $true)][string]$ExpectedTitle,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    $sha256 = Get-Stage5ExporterFixedStreamSha256 $HeldFile.stream `
+        $HeldFile.length $Context
+    $header = Read-Stage5ReplayContainer -Path $HeldFile.path `
+        -ExpectedTitle $ExpectedTitle -Stream $HeldFile.stream
+    Assert-Stage5ExporterHeldFileUnchanged $HeldFile $Context
+    $identity = Get-Stage5ExporterHandleIdentity $HeldFile.stream.SafeFileHandle $Context
+    return [pscustomobject]@{
+        path = $HeldFile.path
+        canonicalPath = $identity.canonicalPath
+        fileId = $identity.fileId
+        linkCount = $identity.linkCount
+        length = $HeldFile.length
+        sha256 = $sha256
+        header = $header
+    }
 }
 
 function Get-Stage5ReplayCompletionFields {
@@ -467,10 +1041,8 @@ function Assert-Stage5ExporterMetadata {
     $scenario = Get-Stage5ExporterMetadataValue $Metadata 'scenario'
     Assert-Stage5ExporterCondition ($scenario -match '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$') `
         'Fresh replay metadata scenario contains unsupported path characters.'
-    [int]$seed = 0
-    Assert-Stage5ExporterCondition ([int]::TryParse(
-        (Get-Stage5ExporterMetadataValue $Metadata 'seed'), [ref]$seed) -and $seed -gt 0) `
-        'Fresh replay metadata seed must be a positive integer.'
+    $seed = Get-Stage5ExporterMetadataInteger $Metadata 'seed' 1 `
+        ([Int32]::MaxValue)
     $runNonce = Get-Stage5ExporterMetadataValue $Metadata 'runNonce'
     Assert-Stage5ExporterCondition ($runNonce -match '^[0-9A-Fa-f-]{1,64}$') `
         'Fresh replay metadata runNonce is invalid.'
@@ -480,6 +1052,15 @@ function Assert-Stage5ExporterMetadata {
     $origin = Get-Stage5ExporterMetadataValue $Metadata 'origin'
     Assert-Stage5ExporterCondition ($origin -ceq 'native-fresh-runtime') `
         "Fresh replay metadata origin must be 'native-fresh-runtime'."
+    if ($category -ceq 'local-capacity-ai') {
+        $contract = Get-Stage5ExporterAiContract $scenario 'Fresh replay metadata scenario'
+        $actualAi = Get-Stage5ExporterMetadataInteger $Metadata 'actualAi' 0 $contract.actualAi
+        Assert-Stage5ExporterCondition ($actualAi -eq $contract.actualAi) `
+            'Fresh replay metadata actualAi does not match its scenario.'
+        $actualTeams = Get-Stage5ExporterMetadataValue $Metadata 'actualTeams'
+        Assert-Stage5ExporterCondition ($actualTeams -ceq $contract.actualTeams) `
+            'Fresh replay metadata actualTeams does not match its scenario.'
+    }
 }
 
 function ConvertTo-Stage5ExporterPathComponent {
@@ -492,44 +1073,61 @@ function Copy-Stage5ReplayWithStableSource {
         [Parameter(Mandatory = $true)][string]$SourcePath,
         [Parameter(Mandatory = $true)][string]$TemporaryPath
     )
-    $source = [IO.File]::Open($SourcePath, [IO.FileMode]::Open,
-        [IO.FileAccess]::Read, [IO.FileShare]::None)
+    $sourceHeld = Open-Stage5ExporterHeldFile $SourcePath 'Replay source' `
+        $script:Stage5ExporterMaximumReplayBytes 46 ([IO.FileShare]::None)
+    $temporaryHeld = $null
+    $ownershipTransferred = $false
     try {
-        $sourceLength = [Int64]$source.Length
-        $temporary = [IO.File]::Open($TemporaryPath, [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $source = $sourceHeld.stream
+        $sourceLength = $sourceHeld.length
+        $temporaryHeld = New-Stage5ExporterHeldCommitFile $TemporaryPath `
+            'Replay temporary destination'
+        $temporary = $temporaryHeld.stream
+        $sha = [Security.Cryptography.SHA256]::Create()
         try {
-            $sha = [Security.Cryptography.SHA256]::Create()
-            try {
-                $buffer = New-Object byte[] 1048576
-                $hashBuffer = New-Object byte[] 1048576
-                while ($true) {
-                    $read = $source.Read($buffer, 0, $buffer.Length)
-                    if ($read -eq 0) { break }
-                    $temporary.Write($buffer, 0, $read)
-                    [void]$sha.TransformBlock($buffer, 0, $read, $hashBuffer, 0)
-                }
-                [void]$sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
-                $sourceSha256 = (($sha.Hash | ForEach-Object {
-                    $_.ToString('x2')
-                }) -join '').ToUpperInvariant()
+            $buffer = New-Object byte[] 1048576
+            [Int64]$remaining = $sourceLength
+            while ($remaining -gt 0) {
+                $requested = [int][Math]::Min([Int64]$buffer.Length, $remaining)
+                $read = $source.Read($buffer, 0, $requested)
+                Assert-Stage5ExporterCondition ($read -gt 0) `
+                    'Replay source ended before its admitted extent.'
+                $temporary.Write($buffer, 0, $read)
+                [void]$sha.TransformBlock($buffer, 0, $read, $buffer, 0)
+                $remaining -= $read
             }
-            finally { $sha.Dispose() }
-            $temporary.Flush($true)
+            Assert-Stage5ExporterCondition ($source.ReadByte() -eq -1 -and
+                $source.Length -eq $sourceLength) `
+                'Replay source grew or changed after its admitted extent.'
+            [void]$sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+            $sourceSha256 = (($sha.Hash | ForEach-Object {
+                $_.ToString('x2')
+            }) -join '').ToUpperInvariant()
         }
-        finally { $temporary.Dispose() }
-        Assert-Stage5ExporterCondition ($source.Position -eq $sourceLength) `
-            "Replay source changed while it was copied: $SourcePath"
-        $after = Get-Item -LiteralPath $SourcePath -Force -ErrorAction Stop
-        Assert-Stage5ExporterCondition ([Int64]$after.Length -eq $sourceLength -and
-            ($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
-            "Replay source changed or became a reparse point while it was copied: $SourcePath"
+        finally { $sha.Dispose() }
+        $temporary.Flush($true)
+        $temporaryHeld.length = $sourceLength
+        Assert-Stage5ExporterHeldFileUnchanged $temporaryHeld `
+            'Replay temporary destination'
+        Assert-Stage5ExporterHeldFileUnchanged $sourceHeld 'Replay source'
+        $ownershipTransferred = $true
         return [pscustomobject]@{
             sha256 = $sourceSha256
             length = $sourceLength
+            sourceFileId = $sourceHeld.identity.fileId
+            temporaryHeld = $temporaryHeld
         }
     }
-    finally { $source.Dispose() }
+    finally {
+        if ($null -ne $temporaryHeld -and -not $ownershipTransferred) {
+            try {
+                Remove-Stage5ExporterOwnedHeldFile $temporaryHeld `
+                    'Replay temporary destination'
+            }
+            finally { Close-Stage5ExporterHeldFile $temporaryHeld }
+        }
+        Close-Stage5ExporterHeldFile $sourceHeld
+    }
 }
 
 function Export-Stage5FreshReplayArtifact {
@@ -573,9 +1171,18 @@ function Export-Stage5FreshReplayArtifact {
         (Get-Stage5ExporterMetadataValue $Metadata 'title')
     $categoryComponent = Get-Stage5ExporterMetadataValue $Metadata 'category'
     $scenarioComponent = Get-Stage5ExporterMetadataValue $Metadata 'scenario'
-    [int]$seed = 0
-    [void][int]::TryParse((Get-Stage5ExporterMetadataValue $Metadata 'seed'), [ref]$seed)
+    $seed = Get-Stage5ExporterMetadataInteger $Metadata 'seed' 1 `
+        ([Int32]::MaxValue)
     $runNonce = Get-Stage5ExporterMetadataValue $Metadata 'runNonce'
+    $actualAi = $null
+    $actualTeams = $null
+    if ($categoryComponent -ceq 'local-capacity-ai') {
+        $contract = Get-Stage5ExporterAiContract $scenarioComponent `
+            'Fresh replay metadata scenario'
+        $actualAi = Get-Stage5ExporterMetadataInteger $Metadata 'actualAi' 0 `
+            $contract.actualAi
+        $actualTeams = Get-Stage5ExporterMetadataValue $Metadata 'actualTeams'
+    }
     $destinationDirectory = Join-Path (Join-Path $corpusRootFull $titleComponent) $categoryComponent
     Ensure-Stage5ExporterDirectory $destinationDirectory 'Replay export directory' | Out-Null
     Assert-Stage5ExporterContainedPathNoReparse $corpusRootFull $destinationDirectory `
@@ -590,27 +1197,51 @@ function Export-Stage5FreshReplayArtifact {
     $temporaryFull = '{0}.tmp-{1}' -f $destinationFull, [Guid]::NewGuid().ToString('N')
     Assert-Stage5ExporterContainedPathNoReparse $corpusRootFull $temporaryFull `
         'Replay export temporary file' | Out-Null
-    $temporaryOwned = $true
+    $temporaryHeld = $null
+    $commitAccepted = $false
     try {
         $copy = Copy-Stage5ReplayWithStableSource $sourceFull $temporaryFull
+        $temporaryHeld = $copy.temporaryHeld
         Assert-Stage5ExporterCondition ($copy.sha256 -ceq $ExpectedSha256.ToUpperInvariant()) `
             "Retained replay source SHA-256 mismatch. Expected $ExpectedSha256, got $($copy.sha256)."
-        $header = Read-Stage5ReplayContainer -Path $temporaryFull -ExpectedTitle $title
+        $temporarySnapshot = Get-Stage5ExporterHeldReplaySnapshot $temporaryHeld $title `
+            'Fresh replay temporary copy'
+        $header = $temporarySnapshot.header
         Assert-Stage5ReplayFreshQualification $header $title `
             'Fresh replay export' | Out-Null
-        Assert-Stage5ExporterCondition ((Get-Stage5ExporterSha256 $temporaryFull) -ceq $copy.sha256) `
+        Assert-Stage5ExporterCondition ($temporarySnapshot.sha256 -ceq $copy.sha256 -and
+            $temporarySnapshot.length -eq $copy.length) `
             'Temporary replay copy SHA-256 differs from the stable source snapshot.'
+        Invoke-Stage5ExporterCommitObserver 'before-commit' 'replay' `
+            $temporaryFull $destinationFull
+        Assert-Stage5ExporterHeldFileUnchanged $temporaryHeld `
+            'Fresh replay temporary copy before commit'
         [IO.File]::Move($temporaryFull, $destinationFull)
-        $temporaryOwned = $false
-        Assert-Stage5ExporterContainedPathNoReparse $corpusRootFull $destinationFull `
-            'Replay export destination' | Out-Null
-        $destinationItem = Get-Item -LiteralPath $destinationFull -Force -ErrorAction Stop
-        Assert-Stage5ExporterCondition (($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
-            "Replay export destination is a reparse point: $destinationFull"
-        $destinationSha256 = Get-Stage5ExporterSha256 $destinationFull
-        Assert-Stage5ExporterCondition ($destinationSha256 -ceq $copy.sha256) `
+        Invoke-Stage5ExporterCommitObserver 'after-commit' 'replay' `
+            $temporaryFull $destinationFull
+        $committedIdentity = Get-Stage5ExporterHandleIdentity `
+            $temporaryHeld.stream.SafeFileHandle 'Fresh replay export destination'
+        Assert-Stage5ExporterCondition ($committedIdentity.fileId -ceq
+            $temporaryHeld.identity.fileId -and
+            $committedIdentity.volumeSerialNumber -eq
+                $temporaryHeld.identity.volumeSerialNumber -and
+            $committedIdentity.linkCount -eq 1 -and
+            $committedIdentity.length -eq [UInt64]$copy.length -and
+            [String]::Equals($committedIdentity.canonicalPath, $destinationFull,
+                [StringComparison]::OrdinalIgnoreCase) -and
+            ($committedIdentity.attributes -band
+                [UInt32][IO.FileAttributes]::ReparsePoint) -eq 0) `
+            'Replay export commit changed file identity, canonical destination, extent, or link count.'
+        $temporaryHeld.path = $destinationFull
+        $temporaryHeld.identity = $committedIdentity
+        $destinationSnapshot = Get-Stage5ExporterHeldReplaySnapshot `
+            $temporaryHeld $title `
+            'Fresh replay export destination'
+        $destinationSha256 = $destinationSnapshot.sha256
+        Assert-Stage5ExporterCondition ($destinationSha256 -ceq $copy.sha256 -and
+            $destinationSnapshot.length -eq $copy.length) `
             'Replay export destination SHA-256 differs from the source snapshot.'
-        $destinationHeader = Read-Stage5ReplayContainer -Path $destinationFull -ExpectedTitle $title
+        $destinationHeader = $destinationSnapshot.header
         Assert-Stage5ReplayFreshQualification $destinationHeader $title `
             'Fresh replay export destination' | Out-Null
         Assert-Stage5ExporterCondition ($destinationHeader.magic -ceq $header.magic -and
@@ -623,12 +1254,14 @@ function Export-Stage5FreshReplayArtifact {
             $destinationHeader.replayQualification -ceq
                 $header.replayQualification) `
             'Replay export destination header differs from the validated source snapshot.'
-        return [pscustomobject]@{
+        $result = [pscustomobject]@{
             origin = Get-Stage5ExporterMetadataValue $Metadata 'origin'
             title = Get-Stage5ExporterMetadataValue $Metadata 'title'
             category = $categoryComponent
             scenario = $scenarioComponent
             seed = $seed
+            actualAi = $actualAi
+            actualTeams = $actualTeams
             runNonce = $runNonce
             executableSha256 = (Get-Stage5ExporterMetadataValue $Metadata 'executableSha256').ToUpperInvariant()
             sourceProfileRoot = $profileRootFull
@@ -648,10 +1281,18 @@ function Export-Stage5FreshReplayArtifact {
             replayQualification = $destinationHeader.replayQualification
             exportedUtc = ([DateTime]::UtcNow).ToString('o')
         }
+        $commitAccepted = $true
+        return $result
     }
     finally {
-        if ($temporaryOwned -and (Test-Path -LiteralPath $temporaryFull)) {
-            Remove-Item -LiteralPath $temporaryFull -Force -ErrorAction SilentlyContinue
+        if ($null -ne $temporaryHeld) {
+            try {
+                if (-not $commitAccepted) {
+                    Remove-Stage5ExporterOwnedHeldFile $temporaryHeld `
+                        'Replay export failed commit'
+                }
+            }
+            finally { Close-Stage5ExporterHeldFile $temporaryHeld }
         }
     }
 }
@@ -668,11 +1309,15 @@ function Assert-Stage5ExporterRecord {
     $requiredNames = @('origin', 'title', 'category', 'scenario', 'seed',
         'runNonce', 'executableSha256', 'sourceProfileRoot', 'sourcePath',
         'destinationPath', 'sourceSha256', 'destinationSha256',
-        'containerMagic', 'containerSchemaVersion', 'containerEngineEpoch',
+        'length', 'containerMagic', 'containerSchemaVersion', 'containerEngineEpoch',
         'payloadMagic', 'skirmishAiReplayEpoch')
     if ($Title -ceq 'Generals') {
         $requiredNames += @('pathfindingReplayEpoch',
             'replayQualificationVersion', 'replayQualification')
+    }
+    if ([string]$Record.category -ceq 'local-capacity-ai') {
+        $requiredNames += @('actualAi', 'actualTeams', 'sequence',
+            'configuration', 'repeat', 'replayEpoch', 'replaySha256')
     }
     foreach ($name in $requiredNames) {
         Assert-Stage5ExporterCondition ($null -ne $Record.PSObject.Properties[$name]) `
@@ -685,6 +1330,22 @@ function Assert-Stage5ExporterRecord {
         'Corpus manifest record title does not match the manifest title.'
     Assert-Stage5ExporterCondition ([string]$Record.executableSha256 -ceq $ExecutableSha256.ToUpperInvariant()) `
         'Corpus manifest record executable SHA-256 does not match the manifest executable.'
+    $recordSeed = Get-Stage5ExporterRecordInteger $Record 'seed' 1 ([Int32]::MaxValue)
+    $recordSequence = Get-Stage5ExporterRecordInteger $Record 'sequence' 1 `
+        ([Int32]::MaxValue) -Optional
+    $recordRepeat = Get-Stage5ExporterRecordInteger $Record 'repeat' 1 10 -Optional
+    if ([string]$Record.category -ceq 'local-capacity-ai') {
+        $contract = Get-Stage5ExporterAiContract ([string]$Record.scenario) `
+            'Corpus manifest record scenario'
+        $actualAi = Get-Stage5ExporterRecordInteger $Record 'actualAi' 0 $contract.actualAi
+        Assert-Stage5ExporterCondition ($actualAi -eq $contract.actualAi) `
+            'Corpus manifest record actualAi does not match its scenario.'
+        $actualTeamsProperty = $Record.PSObject.Properties['actualTeams']
+        Assert-Stage5ExporterCondition ($null -ne $actualTeamsProperty -and
+            $actualTeamsProperty.Value -is [string] -and
+            $actualTeamsProperty.Value -ceq $contract.actualTeams) `
+            'Corpus manifest record actualTeams does not match its scenario.'
+    }
     $taskRootFull = Assert-Stage5ExporterExplicitTaskRoot $TaskRoot 'TaskRoot'
     $corpusRootFull = Assert-Stage5ExporterRegularDirectory $CorpusRoot 'CorpusExportRoot'
     $profileRootCandidate = [IO.Path]::GetFullPath([string]$Record.sourceProfileRoot)
@@ -716,18 +1377,27 @@ function Assert-Stage5ExporterRecord {
     $destinationItem = Get-Item -LiteralPath $destinationFull -Force -ErrorAction Stop
     Assert-Stage5ExporterCondition (($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
         'Corpus manifest record references a reparse-point artifact.'
+    $recordLength = Get-Stage5ExporterRecordInteger $Record 'length' 46 `
+        $script:Stage5ExporterMaximumReplayBytes
+    $destinationSnapshot = Get-Stage5ExporterReplaySnapshot $destinationFull `
+        $Title 'Corpus record destination'
+    Assert-Stage5ExporterCondition ($recordLength -eq $destinationSnapshot.length) `
+        'Corpus manifest record length does not match its destination file.'
     Assert-Stage5ExporterCondition ([string]$Record.sourceSha256 -match '^[0-9A-Fa-f]{64}$' -and
         [string]$Record.destinationSha256 -match '^[0-9A-Fa-f]{64}$') `
         'Corpus manifest record contains an invalid artifact SHA-256.'
-    $destinationSha256 = Get-Stage5ExporterSha256 $destinationFull
-    Assert-Stage5ExporterCondition ($destinationSha256 -ceq
+    Assert-Stage5ExporterCondition ($destinationSnapshot.sha256 -ceq
         ([string]$Record.destinationSha256).ToUpperInvariant()) `
         'Corpus manifest record artifact SHA-256 does not match its files.'
+    Assert-Stage5ExporterCondition ([string]$Record.sourceSha256 -ceq
+        [string]$Record.destinationSha256) `
+        'Corpus manifest record source/destination SHA-256 values differ.'
     if ($sourceExists) {
-        $sourceItem = Get-Item -LiteralPath $sourceFull -Force -ErrorAction Stop
-        Assert-Stage5ExporterCondition (($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
-            'Corpus manifest record references a reparse-point artifact.'
-        Assert-Stage5ExporterCondition ((Get-Stage5ExporterSha256 $sourceFull) -ceq
+        $sourceSnapshot = Get-Stage5ExporterReplaySnapshot $sourceFull $Title `
+            'Corpus record source'
+        Assert-Stage5ExporterCondition ($recordLength -eq $sourceSnapshot.length) `
+            'Corpus manifest record length does not match its source file.'
+        Assert-Stage5ExporterCondition ($sourceSnapshot.sha256 -ceq
             ([string]$Record.sourceSha256).ToUpperInvariant()) `
             'Corpus manifest record source SHA-256 does not match its file.'
     }
@@ -736,27 +1406,50 @@ function Assert-Stage5ExporterRecord {
             [string]$Record.sourceSha256 -ceq ([string]$Record.destinationSha256)) `
             'Corpus manifest record source is unavailable and cannot be provenance-matched.'
     }
+    $containerSchemaVersion = Get-Stage5ExporterRecordInteger $Record `
+        'containerSchemaVersion' 2 2
+    $containerEngineEpoch = Get-Stage5ExporterRecordInteger $Record `
+        'containerEngineEpoch' 1 1
+    $skirmishAiReplayEpoch = Get-Stage5ExporterRecordInteger $Record `
+        'skirmishAiReplayEpoch' $replayContract.epoch $replayContract.epoch
     Assert-Stage5ExporterCondition ([string]$Record.containerMagic -ceq 'RPL3' -and
-        [int]$Record.containerSchemaVersion -eq 2 -and
-        [int]$Record.containerEngineEpoch -eq 1 -and
         [string]$Record.payloadMagic -ceq 'GENREP' -and
-        [int]$Record.skirmishAiReplayEpoch -eq $replayContract.epoch) `
+        $containerSchemaVersion -eq 2 -and $containerEngineEpoch -eq 1 -and
+        $skirmishAiReplayEpoch -eq $replayContract.epoch) `
         'Corpus manifest record has an invalid native replay container contract.'
     if ($Title -ceq 'Generals') {
-        Assert-Stage5ExporterCondition ([int]$Record.pathfindingReplayEpoch -eq
-            [int]$replayContract.pathfindingEpoch -and
-            [int]$Record.replayQualificationVersion -eq
-                [int]$replayContract.qualificationVersion -and
+        $pathfindingReplayEpoch = Get-Stage5ExporterRecordInteger $Record `
+            'pathfindingReplayEpoch' $replayContract.pathfindingEpoch `
+            $replayContract.pathfindingEpoch
+        $replayQualificationVersion = Get-Stage5ExporterRecordInteger $Record `
+            'replayQualificationVersion' $replayContract.qualificationVersion `
+            $replayContract.qualificationVersion
+        Assert-Stage5ExporterCondition ($pathfindingReplayEpoch -eq
+            $replayContract.pathfindingEpoch -and
+            $replayQualificationVersion -eq $replayContract.qualificationVersion -and
             [string]$Record.replayQualification -ceq
                 [string]$replayContract.qualification) `
             'Corpus manifest record has invalid current Generals path qualification metadata.'
     }
+    elseif ($null -ne $Record.PSObject.Properties['replayQualificationVersion']) {
+        [void](Get-Stage5ExporterRecordInteger $Record 'replayQualificationVersion' `
+            $replayContract.qualificationVersion $replayContract.qualificationVersion)
+    }
     $replayEpochProperty = $Record.PSObject.Properties['replayEpoch']
     if ($null -ne $replayEpochProperty) {
-        Assert-Stage5ExporterCondition ([int]$replayEpochProperty.Value -eq $replayContract.epoch) `
+        $replayEpoch = Get-Stage5ExporterRecordInteger $Record 'replayEpoch' `
+            $replayContract.epoch $replayContract.epoch
+        Assert-Stage5ExporterCondition ($replayEpoch -eq $replayContract.epoch) `
             'Corpus manifest record completion epoch does not match its title.'
     }
-    $header = Read-Stage5ReplayContainer -Path $destinationFull -ExpectedTitle $Title
+    $replayShaProperty = $Record.PSObject.Properties['replaySha256']
+    if ($null -ne $replayShaProperty) {
+        Assert-Stage5ExporterCondition ([string]$replayShaProperty.Value -match
+            '^[0-9A-Fa-f]{64}$' -and [string]$replayShaProperty.Value -ceq
+            [string]$Record.destinationSha256) `
+            'Corpus manifest record completion replay SHA-256 differs from its artifact.'
+    }
+    $header = $destinationSnapshot.header
     Assert-Stage5ReplayFreshQualification $header $Title `
         'Corpus manifest record destination' | Out-Null
     $headerMatchesRecord = ($header.magic -ceq 'RPL3' -and
@@ -788,26 +1481,84 @@ function Get-Stage5ExporterJsonProperty {
     return $property.Value
 }
 
-function Get-Stage5ExporterJsonDocument {
+function Get-Stage5ExporterJsonInteger {
+    param(
+        [Parameter(Mandatory = $true)][object]$Object,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Context,
+        [Parameter(Mandatory = $true)][Int64]$Minimum,
+        [Parameter(Mandatory = $true)][Int64]$Maximum,
+        [switch]$Optional
+    )
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        if ($Optional) { return $null }
+        throw "$Context is missing required property '$Name'."
+    }
+    Assert-Stage5ExporterCondition (Test-Stage5ExporterInteger $property.Value) `
+        "$Context property '$Name' must be an integer."
+    Assert-Stage5ExporterCondition ($property.Value -ge $Minimum -and
+        $property.Value -le $Maximum) `
+        "$Context property '$Name' must be between $Minimum and $Maximum."
+    return [Int64]$property.Value
+}
+
+function Get-Stage5ExporterJsonSnapshot {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Context
+        [Parameter(Mandatory = $true)][string]$Context,
+        [string]$ExpectedSha256
     )
-    $full = Get-Stage5ExporterFullPath $Path $Context
-    Assert-Stage5ExporterCondition (Test-Path -LiteralPath $full -PathType Leaf) `
-        "$Context file was not found: $full"
-    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
-    Assert-Stage5ExporterCondition (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) `
-        "$Context file is a reparse point: $full"
+    $held = Open-Stage5ExporterHeldFile $Path $Context `
+        $script:Stage5ExporterMaximumJsonBytes 1
     try {
-        return ([IO.File]::ReadAllText($full) | ConvertFrom-Json)
+        return Get-Stage5ExporterHeldJsonSnapshot $held $Context $ExpectedSha256
     }
-    catch {
-        throw "$Context is not valid JSON: $($_.Exception.Message)"
+    finally { Close-Stage5ExporterHeldFile $held }
+}
+
+function Get-Stage5ExporterHeldJsonSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][object]$HeldFile,
+        [Parameter(Mandatory = $true)][string]$Context,
+        [string]$ExpectedSha256
+    )
+    $bytes = Read-Stage5ExporterFixedBytes $HeldFile.stream $HeldFile.length $Context
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actualSha256 = (($sha.ComputeHash($bytes) | ForEach-Object {
+            $_.ToString('x2')
+        }) -join '').ToUpperInvariant()
+    }
+    finally { $sha.Dispose() }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        Assert-Stage5ExporterCondition ($ExpectedSha256 -match
+            '^[0-9A-Fa-f]{64}$') "$Context SHA-256 is invalid."
+        Assert-Stage5ExporterCondition ($actualSha256 -ceq
+            $ExpectedSha256.ToUpperInvariant()) `
+            "$Context SHA-256 mismatch. Expected $ExpectedSha256, got $actualSha256."
+    }
+    $offset = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 3 } else { 0 }
+    $encoding = New-Object Text.UTF8Encoding($false, $true)
+    try { $json = $encoding.GetString($bytes, $offset, $bytes.Length - $offset) }
+    catch { throw "$Context is not valid UTF-8: $($_.Exception.Message)" }
+    try { $document = $json | ConvertFrom-Json }
+    catch { throw "$Context is not valid JSON: $($_.Exception.Message)" }
+    Assert-Stage5ExporterHeldFileUnchanged $HeldFile $Context
+    $identity = Get-Stage5ExporterHandleIdentity $HeldFile.stream.SafeFileHandle $Context
+    return [pscustomobject]@{
+        path = $HeldFile.path
+        canonicalPath = $identity.canonicalPath
+        fileId = $identity.fileId
+        linkCount = $identity.linkCount
+        sha256 = $actualSha256
+        length = $HeldFile.length
+        document = $document
     }
 }
 
-function Get-Stage5ExporterBoundFile {
+function Get-Stage5ExporterBoundJsonFile {
     param(
         [Parameter(Mandatory = $true)][object]$Binding,
         [Parameter(Mandatory = $true)][string]$BaseDirectory,
@@ -815,20 +1566,14 @@ function Get-Stage5ExporterBoundFile {
     )
     $path = [string](Get-Stage5ExporterJsonProperty $Binding 'path' $Context)
     $expectedSha256 = [string](Get-Stage5ExporterJsonProperty $Binding 'sha256' $Context)
-    Assert-Stage5ExporterCondition ($expectedSha256 -match '^[0-9A-Fa-f]{64}$') `
-        "$Context SHA-256 is invalid."
     $full = Assert-Stage5ExporterContainedPathNoReparse $BaseDirectory $path $Context
-    Assert-Stage5ExporterCondition (Test-Path -LiteralPath $full -PathType Leaf) `
-        "$Context file was not found: $full"
-    $actualSha256 = Get-Stage5ExporterSha256 $full
-    Assert-Stage5ExporterCondition ($actualSha256 -ceq $expectedSha256.ToUpperInvariant()) `
-        "$Context SHA-256 mismatch. Expected $expectedSha256, got $actualSha256."
-    return [pscustomobject]@{ path = $full; sha256 = $actualSha256 }
+    return Get-Stage5ExporterJsonSnapshot $full $Context $expectedSha256
 }
 
 function Get-Stage5ExporterRecordIdentity {
     param([Parameter(Mandatory = $true)][object]$Record)
-    $names = @('origin', 'title', 'category', 'scenario', 'seed', 'runNonce',
+    $names = @('origin', 'title', 'category', 'scenario', 'seed', 'actualAi',
+        'actualTeams', 'runNonce',
         'executableSha256', 'sourceProfileRoot', 'sourcePath', 'sourceSha256',
         'destinationPath', 'destinationSha256', 'length', 'containerMagic',
         'containerSchemaVersion', 'containerEngineEpoch', 'payloadMagic',
@@ -864,6 +1609,110 @@ function Assert-Stage5ExporterRecordSetsEqual {
     }
 }
 
+function Assert-Stage5ExporterValidationResults {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Records,
+        [Parameter(Mandatory = $true)][object]$ResultsDocument
+    )
+    $results = @($ResultsDocument)
+    Assert-Stage5ExporterCondition ($results.Count -gt 0) `
+        'Validation-results document must contain a non-empty result array.'
+    foreach ($record in @($Records | Where-Object {
+        [string]$_.category -ceq 'local-capacity-ai'
+    })) {
+        $sequence = Get-Stage5ExporterRecordInteger $record 'sequence' 1 `
+            ([Int32]::MaxValue)
+        $matches = @($results | Where-Object {
+            $sequenceProperty = $_.PSObject.Properties['sequence']
+            $null -ne $sequenceProperty -and
+                (Test-Stage5ExporterInteger $sequenceProperty.Value) -and
+                [Int64]$sequenceProperty.Value -eq $sequence
+        })
+        Assert-Stage5ExporterCondition ($matches.Count -eq 1) `
+            "Corpus record sequence $sequence must bind uniquely to validation-results."
+        $result = $matches[0]
+        [void](Get-Stage5ExporterJsonInteger $result 'sequence' `
+            "Validation result sequence $sequence" $sequence $sequence)
+        $resultSeed = Get-Stage5ExporterJsonInteger $result 'seed' `
+            "Validation result sequence $sequence" 1 ([Int32]::MaxValue)
+        $resultRepeat = Get-Stage5ExporterJsonInteger $result 'repeat' `
+            "Validation result sequence $sequence" 1 10
+        Assert-Stage5ExporterCondition ($resultSeed -eq
+            (Get-Stage5ExporterRecordInteger $record 'seed' 1 ([Int32]::MaxValue)) -and
+            $resultRepeat -eq (Get-Stage5ExporterRecordInteger $record 'repeat' 1 10) -and
+            [string](Get-Stage5ExporterJsonProperty $result 'kind' `
+                "Validation result sequence $sequence") -ceq 'ai' -and
+            [string](Get-Stage5ExporterJsonProperty $result 'title' `
+                "Validation result sequence $sequence") -ceq [string]$record.title -and
+            [string](Get-Stage5ExporterJsonProperty $result 'scenario' `
+                "Validation result sequence $sequence") -ceq [string]$record.scenario -and
+            [string](Get-Stage5ExporterJsonProperty $result 'configuration' `
+                "Validation result sequence $sequence") -ceq
+                [string]$record.configuration) `
+            "Corpus record sequence $sequence disagrees with its validation-results provenance."
+        [void](Get-Stage5ExporterJsonInteger $result 'exitCode' `
+            "Validation result sequence $sequence" 0 0)
+        $timedOut = Get-Stage5ExporterJsonProperty $result 'timedOut' `
+            "Validation result sequence $sequence"
+        Assert-Stage5ExporterCondition ($timedOut -is [bool] -and -not $timedOut) `
+            "Validation result sequence $sequence did not complete successfully."
+        $aiEvidence = Get-Stage5ExporterJsonProperty $result 'aiEvidence' `
+            "Validation result sequence $sequence"
+        $fields = Get-Stage5ExporterJsonProperty $aiEvidence 'fields' `
+            "Validation result sequence $sequence AI evidence"
+        $actualAiRaw = Get-Stage5ExporterJsonProperty $fields 'actual_ai' `
+            "Validation result sequence $sequence AI evidence fields"
+        [Int64]$actualAi = 0
+        $actualAiValid = if ($actualAiRaw -is [string]) {
+            $actualAiRaw -match '^(?:0|[1-9][0-9]*)$' -and
+                [Int64]::TryParse($actualAiRaw, [ref]$actualAi)
+        }
+        else {
+            (Test-Stage5ExporterInteger $actualAiRaw) -and
+                (($actualAi = [Int64]$actualAiRaw) -ge 0)
+        }
+        $evidenceRunNonce = [string](Get-Stage5ExporterJsonProperty $fields `
+            'run_nonce' "Validation result sequence $sequence AI evidence fields")
+        $evidenceReplayEpochRaw = Get-Stage5ExporterJsonProperty $fields `
+            'replay_epoch' "Validation result sequence $sequence AI evidence fields"
+        [Int64]$evidenceReplayEpoch = 0
+        $evidenceReplayEpochValid = if ($evidenceReplayEpochRaw -is [string]) {
+            $evidenceReplayEpochRaw -match '^(?:0|[1-9][0-9]*)$' -and
+                [Int64]::TryParse($evidenceReplayEpochRaw,
+                    [ref]$evidenceReplayEpoch)
+        }
+        else {
+            (Test-Stage5ExporterInteger $evidenceReplayEpochRaw) -and
+                (($evidenceReplayEpoch = [Int64]$evidenceReplayEpochRaw) -ge 0)
+        }
+        $evidenceReplaySha256 = [string](Get-Stage5ExporterJsonProperty $fields `
+            'replay_sha256' "Validation result sequence $sequence AI evidence fields")
+        $evidenceReplayRetained = [string](Get-Stage5ExporterJsonProperty $fields `
+            'replay_retained' "Validation result sequence $sequence AI evidence fields")
+        $evidenceReplayRetainedFull = Get-Stage5ExporterFullPath `
+            $evidenceReplayRetained `
+            "Validation result sequence $sequence replay_retained"
+        Assert-Stage5ExporterCondition ($actualAiValid -and
+            $actualAi -eq (Get-Stage5ExporterRecordInteger $record 'actualAi' 0 8) -and
+            [string](Get-Stage5ExporterJsonProperty $fields 'actual_teams' `
+                "Validation result sequence $sequence AI evidence fields") -ceq
+                [string]$record.actualTeams -and
+            $evidenceRunNonce -match '^[0-9A-Fa-f-]{1,64}$' -and
+            $evidenceRunNonce -ceq [string]$record.runNonce -and
+            $evidenceReplayEpochValid -and $evidenceReplayEpoch -eq
+                (Get-Stage5ExporterRecordInteger $record 'replayEpoch' 1 3) -and
+            $evidenceReplaySha256 -match '^[0-9A-Fa-f]{64}$' -and
+            $evidenceReplaySha256.ToUpperInvariant() -ceq
+                ([string]$record.replaySha256).ToUpperInvariant() -and
+            [string]$record.replaySha256 -ceq
+                [string]$record.destinationSha256 -and
+            [String]::Equals($evidenceReplayRetainedFull,
+                [IO.Path]::GetFullPath([string]$record.sourcePath),
+                [StringComparison]::OrdinalIgnoreCase)) `
+            "Corpus record sequence $sequence lacks matching live-AI and replay-hash provenance."
+    }
+}
+
 function Write-Stage5ExporterJsonAtomically {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -876,28 +1725,74 @@ function Write-Stage5ExporterJsonAtomically {
     $temporaryFull = '{0}.tmp-{1}' -f $full, [Guid]::NewGuid().ToString('N')
     Assert-Stage5ExporterContainedPathNoReparse $BaseDirectory $temporaryFull `
         "$Context temporary path" | Out-Null
-    $temporaryOwned = $true
+    $temporaryHeld = $null
+    $commitAccepted = $false
     try {
         $json = $Document | ConvertTo-Json -Depth 24
-        $stream = [IO.File]::Open($temporaryFull, [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+        Assert-Stage5ExporterCondition ($bytes.LongLength -gt 0 -and
+            $bytes.LongLength -le $script:Stage5ExporterMaximumJsonBytes) `
+            "$Context JSON exceeds the 64 MiB exporter limit."
+        $sha = [Security.Cryptography.SHA256]::Create()
         try {
-            $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush($true)
+            $expectedSha256 = (($sha.ComputeHash($bytes) | ForEach-Object {
+                $_.ToString('x2')
+            }) -join '').ToUpperInvariant()
         }
-        finally { $stream.Dispose() }
+        finally { $sha.Dispose() }
+        $temporaryHeld = New-Stage5ExporterHeldCommitFile $temporaryFull `
+            "$Context temporary path"
+        $temporaryHeld.stream.Write($bytes, 0, $bytes.Length)
+        $temporaryHeld.stream.Flush($true)
+        $temporaryHeld.length = [Int64]$bytes.LongLength
+        $temporarySnapshot = Get-Stage5ExporterHeldJsonSnapshot $temporaryHeld `
+            "$Context temporary path" $expectedSha256
+        Assert-Stage5ExporterCondition ($temporarySnapshot.length -eq
+            $bytes.LongLength) `
+            "$Context temporary JSON extent differs from the admitted output."
+        Invoke-Stage5ExporterCommitObserver 'before-commit' 'json' `
+            $temporaryFull $full
+        Assert-Stage5ExporterHeldFileUnchanged $temporaryHeld `
+            "$Context temporary path before commit"
         [IO.File]::Move($temporaryFull, $full)
-        $temporaryOwned = $false
-        Assert-Stage5ExporterContainedPathNoReparse $BaseDirectory $full $Context | Out-Null
-        return [pscustomobject]@{
+        Invoke-Stage5ExporterCommitObserver 'after-commit' 'json' `
+            $temporaryFull $full
+        $committedIdentity = Get-Stage5ExporterHandleIdentity `
+            $temporaryHeld.stream.SafeFileHandle $Context
+        Assert-Stage5ExporterCondition ($committedIdentity.fileId -ceq
+            $temporaryHeld.identity.fileId -and
+            $committedIdentity.volumeSerialNumber -eq
+                $temporaryHeld.identity.volumeSerialNumber -and
+            $committedIdentity.linkCount -eq 1 -and
+            $committedIdentity.length -eq [UInt64]$bytes.LongLength -and
+            [String]::Equals($committedIdentity.canonicalPath, $full,
+                [StringComparison]::OrdinalIgnoreCase) -and
+            ($committedIdentity.attributes -band
+                [UInt32][IO.FileAttributes]::ReparsePoint) -eq 0) `
+            "$Context commit changed file identity, canonical destination, extent, or link count."
+        $temporaryHeld.path = $full
+        $temporaryHeld.identity = $committedIdentity
+        $snapshot = Get-Stage5ExporterHeldJsonSnapshot $temporaryHeld $Context `
+            $expectedSha256
+        Assert-Stage5ExporterCondition ($snapshot.sha256 -ceq $expectedSha256 -and
+            $snapshot.length -eq $bytes.LongLength) `
+            "$Context final JSON bytes differ from the admitted output."
+        $result = [pscustomobject]@{
             path = $full
-            sha256 = Get-Stage5ExporterSha256 $full
+            sha256 = $snapshot.sha256
         }
+        $commitAccepted = $true
+        return $result
     }
     finally {
-        if ($temporaryOwned -and (Test-Path -LiteralPath $temporaryFull)) {
-            Remove-Item -LiteralPath $temporaryFull -Force -ErrorAction SilentlyContinue
+        if ($null -ne $temporaryHeld) {
+            try {
+                if (-not $commitAccepted) {
+                    Remove-Stage5ExporterOwnedHeldFile $temporaryHeld `
+                        "$Context failed commit"
+                }
+            }
+            finally { Close-Stage5ExporterHeldFile $temporaryHeld }
         }
     }
 }
@@ -905,10 +1800,10 @@ function Write-Stage5ExporterJsonAtomically {
 function Read-Stage5FreshReplayCorpusBundle {
     param([Parameter(Mandatory = $true)][string]$CorpusManifestPath)
     $manifestFull = Get-Stage5ExporterFullPath $CorpusManifestPath 'Corpus manifest'
-    $manifest = Get-Stage5ExporterJsonDocument $manifestFull 'Corpus manifest'
-    Assert-Stage5ExporterCondition ([int](Get-Stage5ExporterJsonProperty $manifest `
-        'schemaVersion' 'Corpus manifest') -eq 1) `
-        'Corpus manifest schemaVersion must be 1.'
+    $manifestSnapshot = Get-Stage5ExporterJsonSnapshot $manifestFull 'Corpus manifest'
+    $manifest = $manifestSnapshot.document
+    [void](Get-Stage5ExporterJsonInteger $manifest 'schemaVersion' `
+        'Corpus manifest' 1 1)
     Assert-Stage5ExporterCondition ([string](Get-Stage5ExporterJsonProperty $manifest `
         'kind' 'Corpus manifest') -ceq 'stage5-native-replay-corpus') `
         'Corpus manifest kind is not stage5-native-replay-corpus.'
@@ -931,13 +1826,15 @@ function Read-Stage5FreshReplayCorpusBundle {
         'Corpus manifest corpusExportRoot' | Out-Null
     Assert-Stage5ExporterContainedPathNoReparse $corpusRootFull $manifestFull `
         'Corpus manifest path' | Out-Null
-    $resultsBinding = Get-Stage5ExporterBoundFile `
+    $resultsBinding = Get-Stage5ExporterBoundJsonFile `
         (Get-Stage5ExporterJsonProperty $manifest 'validationResults' 'Corpus manifest') `
         $taskRootFull 'Corpus manifest validation results'
-    $receiptBinding = Get-Stage5ExporterBoundFile `
+    $receiptBinding = Get-Stage5ExporterBoundJsonFile `
         (Get-Stage5ExporterJsonProperty $manifest 'validationReceipt' 'Corpus manifest') `
         $taskRootFull 'Corpus manifest validation receipt'
-    $receipt = Get-Stage5ExporterJsonDocument $receiptBinding.path 'Validation receipt'
+    $receipt = $receiptBinding.document
+    [void](Get-Stage5ExporterJsonInteger $receipt 'schemaVersion' `
+        'Validation receipt' 1 1)
     Assert-Stage5ExporterCondition ([string](Get-Stage5ExporterJsonProperty $receipt `
         'receiptKind' 'Validation receipt') -ceq 'stage5-local-capacity-receipt') `
         'Corpus manifest validation receipt has an unexpected kind.'
@@ -954,20 +1851,31 @@ function Read-Stage5FreshReplayCorpusBundle {
         -not [bool](Get-Stage5ExporterJsonProperty $receipt 'finalAcceptanceEligible' `
             'Validation receipt')) `
         'Corpus manifest validation receipt unexpectedly claims final acceptance.'
+    Assert-Stage5ExporterCondition ([string](Get-Stage5ExporterJsonProperty $receipt `
+        'validationMode' 'Validation receipt') -ceq 'LocalCapacity' -and
+        [string](Get-Stage5ExporterJsonProperty $receipt 'capacityMode' `
+            'Validation receipt') -ceq 'LocalCapacity') `
+        'Validation receipt is not a LocalCapacity result.'
+    Assert-Stage5ExporterCondition ((Get-Stage5ExporterJsonProperty $receipt `
+        'corpusExportRequested' 'Validation receipt') -is [bool] -and
+        [bool](Get-Stage5ExporterJsonProperty $receipt 'corpusExportRequested' `
+            'Validation receipt')) `
+        'Validation receipt does not confirm that corpus export was requested.'
+    Assert-Stage5ExporterCondition ([string](Get-Stage5ExporterJsonProperty $receipt `
+        'resultsSha256' 'Validation receipt') -ceq $resultsBinding.sha256) `
+        'Validation receipt results SHA-256 differs from the corpus manifest binding.'
     $receiptExport = Get-Stage5ExporterJsonProperty $receipt 'corpusExport' `
         'Validation receipt'
-    $artifactIndexBinding = Get-Stage5ExporterBoundFile `
+    $artifactIndexBinding = Get-Stage5ExporterBoundJsonFile `
         ([pscustomobject]@{
             path = Get-Stage5ExporterJsonProperty $receiptExport 'artifactIndexPath' `
                 'Validation receipt corpusExport'
             sha256 = Get-Stage5ExporterJsonProperty $receiptExport 'artifactIndexSha256' `
                 'Validation receipt corpusExport'
         }) $taskRootFull 'Validation receipt artifact index'
-    $artifactIndex = Get-Stage5ExporterJsonDocument $artifactIndexBinding.path `
-        'Artifact index'
-    Assert-Stage5ExporterCondition ([int](Get-Stage5ExporterJsonProperty $artifactIndex `
-        'schemaVersion' 'Artifact index') -eq 1) `
-        'Artifact index schemaVersion must be 1.'
+    $artifactIndex = $artifactIndexBinding.document
+    [void](Get-Stage5ExporterJsonInteger $artifactIndex 'schemaVersion' `
+        'Artifact index' 1 1)
     Assert-Stage5ExporterCondition ([string](Get-Stage5ExporterJsonProperty $artifactIndex `
         'kind' 'Artifact index') -ceq 'stage5-native-replay-artifact-index') `
         'Artifact index kind is invalid.'
@@ -980,11 +1888,15 @@ function Read-Stage5FreshReplayCorpusBundle {
     Assert-Stage5ExporterCondition ([string](Get-Stage5ExporterJsonProperty $artifactIndex `
         'executableSha256' 'Artifact index') -ceq $executableSha256.ToUpperInvariant()) `
         'Artifact index executable SHA-256 does not match the corpus manifest.'
-    $indexResultsBinding = Get-Stage5ExporterBoundFile `
-        (Get-Stage5ExporterJsonProperty $artifactIndex 'validationResults' 'Artifact index') `
-        $taskRootFull 'Artifact index validation results'
-    Assert-Stage5ExporterCondition ($indexResultsBinding.sha256 -ceq $resultsBinding.sha256 -and
-        [String]::Equals($indexResultsBinding.path, $resultsBinding.path,
+    $indexResults = Get-Stage5ExporterJsonProperty $artifactIndex `
+        'validationResults' 'Artifact index'
+    $indexResultsPath = Assert-Stage5ExporterContainedPathNoReparse $taskRootFull `
+        ([string](Get-Stage5ExporterJsonProperty $indexResults 'path' `
+            'Artifact index validation results')) 'Artifact index validation results'
+    $indexResultsSha256 = [string](Get-Stage5ExporterJsonProperty $indexResults `
+        'sha256' 'Artifact index validation results')
+    Assert-Stage5ExporterCondition ($indexResultsSha256 -ceq $resultsBinding.sha256 -and
+        [String]::Equals($indexResultsPath, $resultsBinding.path,
             [StringComparison]::OrdinalIgnoreCase)) `
         'Artifact index validation-results binding differs from the corpus manifest.'
     $expectedManifestFull = [IO.Path]::GetFullPath((Join-Path $corpusRootFull `
@@ -996,11 +1908,20 @@ function Read-Stage5FreshReplayCorpusBundle {
         'status' 'Validation receipt corpusExport') -ceq 'passed') `
         'Validation receipt corpusExport status is not passed.'
     $receiptCorpusRoot = Get-Stage5ExporterFullPath `
-        ([string](Get-Stage5ExporterJsonProperty $receiptExport 'corpusExportRoot' `
-            'Validation receipt corpusExport')) 'Validation receipt corpusExportRoot'
+        ([string](Get-Stage5ExporterJsonProperty $receipt 'corpusExportRoot' `
+            'Validation receipt')) 'Validation receipt corpusExportRoot'
     Assert-Stage5ExporterCondition ([String]::Equals($receiptCorpusRoot, $corpusRootFull,
         [StringComparison]::OrdinalIgnoreCase)) `
         'Validation receipt corpusExportRoot differs from the corpus manifest.'
+    $nestedReceiptRootFull = Get-Stage5ExporterFullPath `
+        ([string](Get-Stage5ExporterJsonProperty $receiptExport `
+            'corpusExportRoot' 'Validation receipt corpusExport')) `
+        'Validation receipt nested corpusExportRoot'
+    Assert-Stage5ExporterCondition ([String]::Equals($nestedReceiptRootFull,
+        $receiptCorpusRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        [String]::Equals($nestedReceiptRootFull, $corpusRootFull,
+            [StringComparison]::OrdinalIgnoreCase)) `
+        'Validation receipt top-level, nested, and manifest corpusExportRoot values differ.'
     Assert-Stage5ExporterCondition ([String]::Equals(
         [string](Get-Stage5ExporterJsonProperty $artifactIndex 'taskRoot' 'Artifact index'),
         $taskRootFull, [StringComparison]::OrdinalIgnoreCase)) `
@@ -1018,10 +1939,10 @@ function Read-Stage5FreshReplayCorpusBundle {
     $indexRecords = @((Get-Stage5ExporterJsonProperty $artifactIndex 'records' 'Artifact index'))
     $receiptRecords = @((Get-Stage5ExporterJsonProperty $receiptExport 'records' `
         'Validation receipt corpusExport'))
-    $receiptRecordCount = [int](Get-Stage5ExporterJsonProperty $receiptExport 'recordCount' `
-        'Validation receipt corpusExport')
-    $indexRecordCount = [int](Get-Stage5ExporterJsonProperty $artifactIndex 'recordCount' `
-        'Artifact index')
+    $receiptRecordCount = Get-Stage5ExporterJsonInteger $receiptExport 'recordCount' `
+        'Validation receipt corpusExport' 1 ([Int32]::MaxValue)
+    $indexRecordCount = Get-Stage5ExporterJsonInteger $artifactIndex 'recordCount' `
+        'Artifact index' 1 ([Int32]::MaxValue)
     Assert-Stage5ExporterCondition ($records.Count -gt 0 -and
         $records.Count -eq $indexRecords.Count -and
         $records.Count -eq $receiptRecords.Count -and
@@ -1044,9 +1965,10 @@ function Read-Stage5FreshReplayCorpusBundle {
         'Corpus manifest and artifact index'
     Assert-Stage5ExporterRecordSetsEqual $records $receiptRecords `
         'Corpus manifest and validation receipt'
+    Assert-Stage5ExporterValidationResults $records $resultsBinding.document
     return [pscustomobject]@{
         manifestPath = $manifestFull
-        manifestSha256 = Get-Stage5ExporterSha256 $manifestFull
+        manifestSha256 = $manifestSnapshot.sha256
         manifest = $manifest
         taskRoot = $taskRootFull
         corpusRoot = $corpusRootFull
@@ -1177,34 +2099,12 @@ function Write-Stage5FreshReplayCorpusManifest {
         validationReceipt = $receiptBinding
         records = @($Records)
     }
-    $temporaryFull = '{0}.tmp-{1}' -f $manifestFull, [Guid]::NewGuid().ToString('N')
-    Assert-Stage5ExporterContainedPathNoReparse $corpusRootFull $temporaryFull `
-        'Corpus manifest temporary path' | Out-Null
-    $temporaryOwned = $true
-    try {
-        $json = $document | ConvertTo-Json -Depth 16
-        $stream = [IO.File]::Open($temporaryFull, [IO.FileMode]::CreateNew,
-            [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try {
-            $bytes = [Text.Encoding]::UTF8.GetBytes($json)
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush($true)
-        }
-        finally { $stream.Dispose() }
-        [IO.File]::Move($temporaryFull, $manifestFull)
-        $temporaryOwned = $false
-        Assert-Stage5ExporterContainedPathNoReparse $corpusRootFull $manifestFull `
-            'Corpus manifest path' | Out-Null
-        return [pscustomobject]@{
-            path = $manifestFull
-            sha256 = Get-Stage5ExporterSha256 $manifestFull
-            recordCount = $Records.Count
-        }
-    }
-    finally {
-        if ($temporaryOwned -and (Test-Path -LiteralPath $temporaryFull)) {
-            Remove-Item -LiteralPath $temporaryFull -Force -ErrorAction SilentlyContinue
-        }
+    $written = Write-Stage5ExporterJsonAtomically $manifestFull $document `
+        $corpusRootFull 'Corpus manifest'
+    return [pscustomobject]@{
+        path = $written.path
+        sha256 = $written.sha256
+        recordCount = $Records.Count
     }
 }
 
@@ -1212,17 +2112,53 @@ function Get-Stage5ExporterSelectionKey {
     param([Parameter(Mandatory = $true)][object]$Record)
     $sequence = 0
     $sequenceProperty = $Record.PSObject.Properties['sequence']
-    if ($null -ne $sequenceProperty) { $sequence = [int]$sequenceProperty.Value }
+    if ($null -ne $sequenceProperty) {
+        $sequence = Get-Stage5ExporterRecordInteger $Record 'sequence' 1 `
+            ([Int32]::MaxValue)
+    }
     $repeat = 0
     $repeatProperty = $Record.PSObject.Properties['repeat']
-    if ($null -ne $repeatProperty) { $repeat = [int]$repeatProperty.Value }
+    if ($null -ne $repeatProperty) {
+        $repeat = Get-Stage5ExporterRecordInteger $Record 'repeat' 1 10
+    }
     $configuration = ''
     $configurationProperty = $Record.PSObject.Properties['configuration']
     if ($null -ne $configurationProperty) { $configuration = [string]$configurationProperty.Value }
+    $seed = Get-Stage5ExporterRecordInteger $Record 'seed' 1 ([Int32]::MaxValue)
     return ('{0:D10}|{1}|{2:D10}|{3:D10}|{4}|{5}|{6}|{7}' -f `
-        $sequence, [string]$Record.scenario, [int]$Record.seed, $repeat,
+        $sequence, [string]$Record.scenario, $seed, $repeat,
         $configuration, [string]$Record.runNonce,
         [string]$Record.sourceSha256, [string]$Record.destinationSha256)
+}
+
+function Assert-Stage5ExporterFullAiSeedMatrix {
+    param([Parameter(Mandatory = $true)][object[]]$Records)
+    $requiredScenarios = @('4v3', '4v2', 'hard-ai-2v6')
+    $seedSets = @{}
+    foreach ($scenario in $requiredScenarios) {
+        $scenarioSeeds = @($Records | Where-Object {
+            [string]$_.scenario -ceq $scenario
+        } | ForEach-Object {
+            Get-Stage5ExporterRecordInteger $_ 'seed' 1 ([Int32]::MaxValue)
+        } | Sort-Object -Unique)
+        Assert-Stage5ExporterCondition ($scenarioSeeds.Count -ge 3) `
+            "Native fixture conversion requires at least three distinct seeds for scenario '$scenario'."
+        $seedSets[$scenario] = $scenarioSeeds
+    }
+    $referenceSeeds = @($seedSets['4v3'])
+    foreach ($scenario in @('4v2', 'hard-ai-2v6')) {
+        $scenarioSeeds = @($seedSets[$scenario])
+        $sameSeeds = $scenarioSeeds.Count -eq $referenceSeeds.Count
+        for ($index = 0; $sameSeeds -and $index -lt $referenceSeeds.Count; ++$index) {
+            $sameSeeds = [Int64]$scenarioSeeds[$index] -eq [Int64]$referenceSeeds[$index]
+        }
+        Assert-Stage5ExporterCondition $sameSeeds `
+            'Native fixture conversion requires the full scenario-by-seed cross-product with the same seed set for 4v3, 4v2, and hard-ai-2v6.'
+    }
+    return [pscustomobject]@{
+        seeds = $referenceSeeds
+        scenarios = $requiredScenarios
+    }
 }
 
 function Convert-Stage5FreshReplayCorpusManifestToFixtures {
@@ -1267,22 +2203,33 @@ function Convert-Stage5FreshReplayCorpusManifestToFixtures {
     Assert-Stage5ExporterPathAbsent $provenanceFull 'Native fixture provenance'
 
     $records = @($bundle.records)
+    $aiRecords = @($records | Where-Object {
+        [string]$_.category -ceq 'local-capacity-ai'
+    })
+    Assert-Stage5ExporterCondition ($aiRecords.Count -eq $records.Count) `
+        'Native fixture conversion accepts only local-capacity-ai corpus records.'
+    $aiMatrix = Assert-Stage5ExporterFullAiSeedMatrix $aiRecords
+    $aiSeeds = @($aiMatrix.seeds)
+    $aiScenarios = @($aiMatrix.scenarios)
     $groups = @($records | Group-Object -Property {
         ([string]$_.destinationSha256).ToUpperInvariant()
     } | Sort-Object Name)
     Assert-Stage5ExporterCondition ($groups.Count -ge 10) `
         'Native fixture conversion requires at least 10 unique replay SHA-256 values.'
     $stressGroups = @($groups | Where-Object {
-        @($_.Group | Where-Object { [string]$_.scenario -ceq '4v2' }).Count -gt 0
+        @($_.Group | Where-Object {
+            [string]$_.scenario -ceq 'hard-ai-2v6'
+        }).Count -gt 0
     })
     Assert-Stage5ExporterCondition ($stressGroups.Count -gt 0) `
-        'Native fixture conversion requires a 4v2 replay for the single stress fixture.'
+        'Native fixture conversion requires a hard-ai-2v6 replay for the single stress fixture.'
     $stressGroup = @($stressGroups | Sort-Object Name | Select-Object -First 1)[0]
     $stressRecord = @($stressGroup.Group | Where-Object {
-        [string]$_.scenario -ceq '4v2'
+        [string]$_.scenario -ceq 'hard-ai-2v6'
     } | Sort-Object @{ Expression = { Get-Stage5ExporterSelectionKey $_ } } |
         Select-Object -First 1)[0]
-    $normalRecords = @($groups | Where-Object { $_.Name -cne $stressGroup.Name } |
+    $stressGroupNames = @($stressGroups | ForEach-Object { $_.Name })
+    $normalRecords = @($groups | Where-Object { $stressGroupNames -notcontains $_.Name } |
         ForEach-Object {
             @($_.Group | Sort-Object @{
                 Expression = { Get-Stage5ExporterSelectionKey $_ }
@@ -1311,9 +2258,10 @@ function Convert-Stage5FreshReplayCorpusManifestToFixtures {
         Assert-Stage5ExporterCondition ([string]$record.origin -ceq 'native-fresh-runtime') `
             'Native fixture conversion accepts only native-fresh-runtime records.'
         Assert-Stage5ExporterCondition ([string]$record.scenario -ceq '4v2' -or
-            [string]$record.scenario -ceq '4v3') `
+            [string]$record.scenario -ceq '4v3' -or
+            [string]$record.scenario -ceq 'hard-ai-2v6') `
             'Native fixture conversion found an unsupported AI scenario.'
-        Assert-Stage5ExporterCondition ([int]$record.seed -gt 0) `
+        Assert-Stage5ExporterCondition ($record.seed -gt 0) `
             'Native fixture conversion found a non-positive AI seed.'
         Assert-Stage5ExporterCondition ([string]$record.sourceSha256 -ceq
             [string]$record.destinationSha256) `
@@ -1329,7 +2277,7 @@ function Convert-Stage5FreshReplayCorpusManifestToFixtures {
             'Native fixture source path must remain relative to CorpusExportRoot.'
         $relative = $relative.Replace('/', '\')
         $id = if ($selectedRecord.stress) {
-            'native-stress-4v2'
+            'native-stress-hard-ai-2v6'
         }
         else {
             'native-{0:D2}' -f $normalIndex++
@@ -1348,7 +2296,9 @@ function Convert-Stage5FreshReplayCorpusManifestToFixtures {
             stress = [bool]$selectedRecord.stress
             category = [string]$record.category
             scenario = [string]$record.scenario
-            seed = [int]$record.seed
+            seed = $record.seed
+            actualAi = $record.actualAi
+            actualTeams = $record.actualTeams
             runNonce = [string]$record.runNonce
             origin = [string]$record.origin
             title = [string]$record.title
@@ -1374,13 +2324,13 @@ function Convert-Stage5FreshReplayCorpusManifestToFixtures {
                 [string]$record.replayQualification
             } else { $null }
             sequence = if ($null -ne $record.PSObject.Properties['sequence']) {
-                [int]$record.sequence
+                $record.sequence
             } else { $null }
             configuration = if ($null -ne $record.PSObject.Properties['configuration']) {
                 [string]$record.configuration
             } else { $null }
             repeat = if ($null -ne $record.PSObject.Properties['repeat']) {
-                [int]$record.repeat
+                $record.repeat
             } else { $null }
             replayEpoch = if ($null -ne $record.PSObject.Properties['replayEpoch']) {
                 [int]$record.replayEpoch
@@ -1401,10 +2351,8 @@ function Convert-Stage5FreshReplayCorpusManifestToFixtures {
         executableSha256 = [string]$bundle.executableSha256
         fixtures = $fixtureEntries.ToArray()
         ai = [ordered]@{
-            seeds = @($selected | ForEach-Object { [int]$_.record.seed } |
-                Sort-Object -Unique)
-            scenarios = @($selected | ForEach-Object { [string]$_.record.scenario } |
-                Sort-Object -Unique)
+            seeds = $aiSeeds
+            scenarios = $aiScenarios
             repeats = 1
         }
     }

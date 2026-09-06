@@ -431,87 +431,136 @@ Bool ShouldUseCanonicalEnemyPlanning()
 		IsGeneralsAICanonicalRuntimeEpoch());
 }
 
-struct GeneralsAIEnemyReferenceView
+void ConfigureSharedAIPlanningReferenceTransport(
+	const std::vector<rts::AIPlayerPlanningSnapshot> &snapshots,
+	std::vector<rts::AIPlayerPlanningResult> &parallelResults,
+	rts::AIPlayerPlanningResult *serialScratch, UnsignedInt subtype,
+	rts::AIPlanningReferenceBatchTransport *transport,
+	rts::performance::KernelPerformanceReferenceBatch *referenceBatch,
+	rts::AIPlanningReferencePlayerInputView *inputView,
+	rts::AIPlanningReferencePlayerOutputView *outputView,
+	rts::AIPlanningReferencePlayerOutputView *detachedOutputView)
 {
-	const GeneralsAIEnemyPlanningSnapshot *snapshots;
-	GeneralsAIEnemyPlanningResult *results;
-	UnsignedInt count;
+	if (!transport || !referenceBatch || !inputView || !outputView ||
+		!detachedOutputView || snapshots.empty() ||
+		parallelResults.size() != snapshots.size())
+		return;
+	rts::performance::KernelPerformanceReferenceLedger &referenceLedger =
+		rts::performance::KernelPerformanceReferenceLedger::instance();
+	transport->referenceLedger = &referenceLedger;
+	transport->referenceBatch = referenceBatch;
+	transport->writeInput = rts::WriteAIPlanningReferenceInput;
+	transport->immutableInput = inputView;
+	transport->writeOutput = rts::WriteAIPlanningReferenceOutput;
+	transport->productionOutput = outputView;
+	transport->operationCount =
+		static_cast<rts::JobMetricCounter>(snapshots.size());
+	transport->fieldSchema = 1U;
+	inputView->snapshots = &snapshots[0];
+	inputView->count = static_cast<uint32_t>(snapshots.size());
+	inputView->subtype = subtype;
+	outputView->results = &parallelResults[0];
+	outputView->count = static_cast<uint32_t>(parallelResults.size());
+	outputView->subtype = subtype;
+	detachedOutputView->results = serialScratch;
+	detachedOutputView->count = static_cast<uint32_t>(snapshots.size());
+	detachedOutputView->subtype = subtype;
+	if (referenceLedger.mode() ==
+		rts::performance::KERNEL_REFERENCE_SERIAL_ORACLE)
+	{
+		transport->serialCompute = rts::ComputeAIPlanningReferenceSerial;
+		transport->detachedSerialOutput = detachedOutputView;
+	}
+}
+
+void BeginLiveAIPlanningReferenceAttempt(
+	rts::AIPlanningReferenceBatchTransport *transport,
+	rts::AIPlanningExecutionMode executionMode, UnsignedInt subtype,
+	UnsignedInt nativeJobCount)
+{
+	if (!transport || !transport->referenceLedger || !TheGameLogic ||
+		executionMode != rts::AI_PLANNING_EXECUTION_PARALLEL ||
+		nativeJobCount < 2U || !transport->referenceLedger->traceRequested())
+		return;
+	transport->referenceAttempt = TheGameLogic->beginPerformanceReceiptAttempt(
+		rts::performance::KERNEL_PERFORMANCE_AI, subtype);
+}
+
+struct DeferredAIPlanningReferenceFinish
+{
+	DeferredAIPlanningReferenceFinish() : disposition(
+		rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED), active(FALSE) {}
+	rts::performance::KernelPerformanceAttempt attempt;
+	rts::performance::KernelPerformanceReferenceBatch batch;
+	rts::performance::KernelPerformanceDisposition disposition;
+	Bool active;
 };
 
-Bool WriteGeneralsAIEnemyReferenceInput(
-	rts::performance::KernelPerformanceCanonicalWriter &writer,
-	const void *context)
+DeferredAIPlanningReferenceFinish s_deferredAIPlanningReferenceFinish;
+
+Bool CompleteDeferredAIPlanningReferenceFinish()
 {
-	const GeneralsAIEnemyReferenceView *view =
-		static_cast<const GeneralsAIEnemyReferenceView *>(context);
-	if (!view || !view->snapshots || view->count == 0U ||
-		view->count > GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS ||
-		!writer.u32(1U, 0U) || !writer.sequence(2U, view->count))
-		return false;
-	for (UnsignedInt i = 0U; i < view->count; ++i)
+	if (!s_deferredAIPlanningReferenceFinish.active)
+		return TRUE;
+	const Bool closed = TheGameLogic != 0 &&
+		TheGameLogic->finishPerformanceReceiptAttempt(
+			s_deferredAIPlanningReferenceFinish.attempt,
+			s_deferredAIPlanningReferenceFinish.batch,
+			s_deferredAIPlanningReferenceFinish.disposition, true, true);
+	s_deferredAIPlanningReferenceFinish = DeferredAIPlanningReferenceFinish();
+	return closed;
+}
+
+Bool FinishLiveAIPlanningReferenceAttempt(
+	rts::AIPlanningReferenceBatchTransport *transport,
+	const rts::AIPlanningBatchStatus *status, Bool ownerCommitted)
+{
+	if (!transport || !transport->referenceLedger ||
+		!transport->referenceBatch)
+		return FALSE;
+	const rts::performance::KernelPerformanceReferenceBatch linked =
+		*transport->referenceBatch;
+	const Bool fallbackCompleted = ownerCommitted && status &&
+		status->usedSerialFallback != 0U;
+	const Bool attemptCommitted = ownerCommitted && linked.valid() &&
+		!fallbackCompleted;
+	const rts::performance::KernelPerformanceDisposition disposition =
+		attemptCommitted ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
+		(status && status->nativeAdmissionAccepted != 0U ?
+			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+			rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
+	if (transport->referenceAttempt.valid())
 	{
-		const GeneralsAIEnemyPlanningSnapshot &snapshot = view->snapshots[i];
-		if (snapshot.candidateCount > GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS ||
-			!writer.u32(3U, snapshot.frame) ||
-			!writer.u32(4U, snapshot.ownerPlayerIndex) ||
-			!writer.f32(5U, snapshot.initialBestDistanceSquared) ||
-			!writer.sequence(6U, snapshot.candidateCount))
-			return false;
-		for (UnsignedInt candidateIndex = 0U;
-			candidateIndex < snapshot.candidateCount; ++candidateIndex)
+		if (!TheGameLogic)
+			return FALSE;
+		if (!ownerCommitted)
 		{
-			const GeneralsAIEnemyCandidateFact &candidate =
-				snapshot.candidates[candidateIndex];
-			if (!writer.u32(7U, candidate.sourceOrdinal) ||
-				!writer.i32(8U, candidate.playerIndex) ||
-				!writer.f32(9U, candidate.baseDistanceSquared) ||
-				!writer.u32(10U, candidate.targetingCandidateMask) ||
-				!writer.u32(11U, candidate.targetingOwnerMask))
-				return false;
+			s_deferredAIPlanningReferenceFinish.attempt =
+				transport->referenceAttempt;
+			s_deferredAIPlanningReferenceFinish.batch = linked;
+			s_deferredAIPlanningReferenceFinish.disposition = disposition;
+			s_deferredAIPlanningReferenceFinish.active = TRUE;
+			*transport->referenceBatch =
+				rts::performance::KernelPerformanceReferenceBatch();
+			transport->referenceAttempt =
+				rts::performance::KernelPerformanceAttempt();
+			return TRUE;
 		}
+		const Bool closed = TheGameLogic->finishPerformanceReceiptAttempt(
+			transport->referenceAttempt, linked, disposition,
+			fallbackCompleted != FALSE, fallbackCompleted != FALSE);
+		*transport->referenceBatch =
+			rts::performance::KernelPerformanceReferenceBatch();
+		transport->referenceAttempt =
+			rts::performance::KernelPerformanceAttempt();
+		return closed;
 	}
-	return true;
-}
-
-Bool WriteGeneralsAIEnemyReferenceOutput(
-	rts::performance::KernelPerformanceCanonicalWriter &writer,
-	const void *context)
-{
-	const GeneralsAIEnemyReferenceView *view =
-		static_cast<const GeneralsAIEnemyReferenceView *>(context);
-	if (!view || !view->results || view->count == 0U ||
-		view->count > GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS ||
-		!writer.u32(1U, 0U) || !writer.sequence(2U, view->count))
-		return false;
-	for (UnsignedInt i = 0U; i < view->count; ++i)
+	if (linked.valid())
 	{
-		const GeneralsAIEnemyPlanningResult &result = view->results[i];
-		if (!writer.u32(3U, result.valid) ||
-			!writer.i32(4U, result.selectedPlayerIndex) ||
-			!writer.f32(5U, result.selectedDistanceSquared) ||
-			!writer.u32(6U, result.orderKey.frame) ||
-			!writer.u32(7U, result.orderKey.playerIndex) ||
-			!writer.u32(8U, result.orderKey.subphase) ||
-			!writer.u32(9U, result.orderKey.sourceOrdinal) ||
-			!writer.u32(10U, result.orderKey.emissionOrdinal))
-			return false;
+		return rts::FinishAIPlanningReferenceBatch(transport,
+			attemptCommitted != FALSE);
 	}
-	return true;
-}
-
-Bool ComputeGeneralsAIEnemyReferenceSerial(const void *immutableInput,
-	void *detachedOutput)
-{
-	const GeneralsAIEnemyReferenceView *inputView =
-		static_cast<const GeneralsAIEnemyReferenceView *>(immutableInput);
-	GeneralsAIEnemyReferenceView *outputView =
-		static_cast<GeneralsAIEnemyReferenceView *>(detachedOutput);
-	return inputView != 0 && outputView != 0 && inputView->snapshots != 0 &&
-		outputView->results != 0 && inputView->count != 0U &&
-		inputView->count <= GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS &&
-		outputView->count == inputView->count &&
-		PlanGeneralsAIEnemyPlanningBatchSerial(inputView->snapshots,
-			inputView->count, outputView->results);
+	return TRUE;
 }
 
 Bool RunSkirmishEnemyPlanningBatch()
@@ -600,6 +649,8 @@ Bool RunSkirmishEnemyPlanningBatch()
 		referenceTransport.detachedSerialOutput =
 			&referenceDetachedOutputView;
 	}
+	BeginLiveAIPlanningReferenceAttempt(&referenceTransport, executionMode, 0U,
+		ownerCount);
 	rts::AIPlanningBatchStatus status;
 	if (!ExecuteGeneralsAIEnemyPlanningBatch(executionMode,
 		IsEnemyPlanningMultiplayerPolicyBlocked(), snapshots, ownerCount, committed,
@@ -607,7 +658,7 @@ Bool RunSkirmishEnemyPlanningBatch()
 		performanceBatch.token(), &referenceTransport))
 	{
 		performanceBatch.abort();
-		rts::FinishAIPlanningReferenceBatch(&referenceTransport, false);
+		FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
 	}
@@ -621,7 +672,7 @@ Bool RunSkirmishEnemyPlanningBatch()
 			 snapshots[i], committed[i], &resolved[i]))
 		{
 			performanceBatch.abort();
-			rts::FinishAIPlanningReferenceBatch(&referenceTransport, false);
+			FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 			rts::RecordAIPlanningOwnerCommit(false);
 			return false;
 		}
@@ -630,15 +681,21 @@ Bool RunSkirmishEnemyPlanningBatch()
 	{
 		owners[i]->applyEnemyPlanningCommit(resolved[i]);
 	}
-	rts::RecordAIPlanningOwnerCommit(true, &status);
 	performanceBatch.end();
 	const Bool referenceCommitted =
 		executionMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.parallelSucceeded != 0U &&
 		status.committedMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.usedSerialFallback == 0U;
-	rts::FinishAIPlanningReferenceBatch(&referenceTransport,
-		referenceCommitted);
+	const Bool referenceClosed = FinishLiveAIPlanningReferenceAttempt(
+		&referenceTransport, &status, true);
+	if (!referenceClosed)
+	{
+		performanceBatch.abort();
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+	rts::RecordAIPlanningOwnerCommit(true, &status);
 	if (referenceCommitted)
 		performanceBatch.commit();
 	else
@@ -658,6 +715,12 @@ Bool RunSkirmishProductionPlanningBatch()
 		rts::performance::KERNEL_PERFORMANCE_AI, 1U, planningFrame,
 		NextAIPlanningPerformanceOrdinal());
 	performanceBatch.begin(rts::performance::KERNEL_PERFORMANCE_CAPTURE);
+	rts::AIPlanningReferenceBatchTransport referenceTransport;
+	rts::performance::KernelPerformanceReferenceBatch referenceBatch;
+	rts::AIPlanningReferencePlayerInputView referenceInput;
+	rts::AIPlanningReferencePlayerOutputView referenceOutput;
+	rts::AIPlanningReferencePlayerOutputView referenceDetachedOutput;
+	rts::AIPlanningBatchStatus status = {};
 
 	try
 	{
@@ -714,13 +777,19 @@ Bool RunSkirmishProductionPlanningBatch()
 	std::vector<rts::AIPlayerPlanningResult> committed(snapshots.size());
 	std::vector<rts::AIPlayerPlanningResult> serialScratch(snapshots.size());
 	std::vector<rts::AIPlayerPlanningResult> parallelScratch(snapshots.size());
-	rts::AIPlanningBatchStatus status;
+	ConfigureSharedAIPlanningReferenceTransport(snapshots, parallelScratch,
+		&serialScratch[0], 1U, &referenceTransport, &referenceBatch,
+		&referenceInput, &referenceOutput, &referenceDetachedOutput);
+	BeginLiveAIPlanningReferenceAttempt(&referenceTransport, executionMode, 1U,
+		rts::CountAIPlanningBatchJobs(&snapshots[0],
+			static_cast<uint32_t>(snapshots.size())));
 	if (!rts::ExecuteAIPlanningBatchOnJobSystem(executionMode,
 		&snapshots[0], (UnsignedInt)snapshots.size(), &committed[0],
 		&serialScratch[0], &parallelScratch[0], &status,
-		performanceBatch.token()))
+		performanceBatch.token(), &referenceTransport))
 	{
 		performanceBatch.abort();
+		FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
 	}
@@ -735,6 +804,7 @@ Bool RunSkirmishProductionPlanningBatch()
 			snapshots[i].production, committed[i].production))
 		{
 			performanceBatch.abort();
+			FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 			rts::RecordAIPlanningOwnerCommit(false);
 			return false;
 		}
@@ -747,16 +817,27 @@ Bool RunSkirmishProductionPlanningBatch()
 			for (UnsignedInt prior = 0; prior < i; ++prior)
 				owners[prior]->discardStagedProductionPlanningResult();
 			performanceBatch.abort();
+			FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 			rts::RecordAIPlanningOwnerCommit(false);
 			return false;
 		}
 	}
-	rts::RecordAIPlanningOwnerCommit(true, &status);
 	performanceBatch.end();
-	if (executionMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
+	const Bool referenceCommitted =
+		executionMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.parallelSucceeded != 0U &&
 		status.committedMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
-		status.usedSerialFallback == 0U)
+		status.usedSerialFallback == 0U;
+	const Bool referenceClosed = FinishLiveAIPlanningReferenceAttempt(
+		&referenceTransport, &status, true);
+	if (!referenceClosed)
+	{
+		performanceBatch.abort();
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+	rts::RecordAIPlanningOwnerCommit(true, &status);
+	if (referenceCommitted)
 		performanceBatch.commit();
 	else
 		performanceBatch.abort();
@@ -768,6 +849,7 @@ Bool RunSkirmishProductionPlanningBatch()
 		// partial batched result is visible, so allocation failure falls back to
 		// the deterministic owner-side selector.
 		performanceBatch.abort();
+		FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
 	}
@@ -792,6 +874,10 @@ void AI::update()
 	{
 		ThePlayerList->UPDATE();
 	}
+#if defined(_WIN64)
+	if (!CompleteDeferredAIPlanningReferenceFinish())
+		rts::RecordAIPlanningOwnerCommit(false);
+#endif
 
 }
 

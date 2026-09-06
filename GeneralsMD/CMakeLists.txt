@@ -55,11 +55,6 @@ if("${CMAKE_HOST_SYSTEM}" MATCHES "Windows" AND "${CMAKE_SYSTEM}" MATCHES "Windo
 
 endif()
 
-if(IS_VS6_BUILD AND RTS_BUILD_ZEROHOUR_PRODUCT)
-    rts_validate_task_owned_vc6_install_prefix(
-        "${RTS_INSTALL_PREFIX_ZEROHOUR}" "RTS_INSTALL_PREFIX_ZEROHOUR")
-endif()
-
 # Native products have no compatible retail registry location.  Keep an
 # explicit title prefix authoritative, otherwise install below the standard
 # CMake prefix so presets and --prefix remain portable.
@@ -110,12 +105,11 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR AND TARGET z_generals)
             DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
     endif()
 
-    # Keep the native runtime-test utility with the disposable x64 product
-    # install.  It is a test-only target and must not change the legacy Win32
-    # install contents.
+    # Keep the native runtime-test utility beside the disposable x64 product
+    # install. Validation-only binaries must not enter the promoted title tree.
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET z_runtime_regression_tests)
-        install(TARGETS z_runtime_regression_tests RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}")
-        install(FILES $<TARGET_PDB_FILE:z_runtime_regression_tests> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_ZEROHOUR}" OPTIONAL)
+        install(TARGETS z_runtime_regression_tests RUNTIME DESTINATION "Validation/ZeroHour")
+        install(FILES $<TARGET_PDB_FILE:z_runtime_regression_tests> DESTINATION "Validation/ZeroHour" OPTIONAL)
     endif()
 endif()
 

@@ -17,7 +17,8 @@ inline bool ParseTestCapacityLane(int argc, char **argv, bool *localCapacity,
 		(serialPipelines != 0 && serialSelector == 0))
 		return false;
 
-	bool parsedLocalCapacity = false;
+	bool parsedLocalCapacity = true;
+	bool parsedCapacitySelector = false;
 	bool parsedSerialPipelines = false;
 	for (int index = 1; index < argc; ++index)
 	{
@@ -25,9 +26,17 @@ inline bool ParseTestCapacityLane(int argc, char **argv, bool *localCapacity,
 			return false;
 		if (strcmp(argv[index], "--local-capacity") == 0)
 		{
-			if (parsedLocalCapacity)
+			if (parsedCapacitySelector)
 				return false;
+			parsedCapacitySelector = true;
 			parsedLocalCapacity = true;
+		}
+		else if (strcmp(argv[index], "--external-qualification") == 0)
+		{
+			if (parsedCapacitySelector)
+				return false;
+			parsedCapacitySelector = true;
+			parsedLocalCapacity = false;
 		}
 		else if (serialPipelines != 0 &&
 			serialSelector != 0 &&
@@ -76,6 +85,9 @@ inline void PrintTestCapacityLane(bool localCapacity)
 		printf("Test lane: local-capacity diagnostic (maximum workers=%u; "
 			"external qualification excluded).\n",
 			kLocalCapacityWorkerLimit);
+	else
+		printf("Test lane: explicit external qualification (unrestricted "
+			"high-core and automatic worker requests).\n");
 }
 
 } // namespace rts_test

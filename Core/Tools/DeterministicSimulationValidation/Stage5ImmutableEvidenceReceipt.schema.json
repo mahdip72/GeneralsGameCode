@@ -11,8 +11,9 @@
     "details", "provenance"
   ],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "type": "integer", "const": 1 },
     "evidenceKind": {
+      "type": "string",
       "enum": [
         "stage5-executable-originated-receipt",
         "stage5-host-runner-receipt",
@@ -21,8 +22,9 @@
         "stage5-manual-approval-receipt"
       ]
     },
-    "status": { "const": "passed" },
+    "status": { "type": "string", "const": "passed" },
     "role": {
+      "type": "string",
       "enum": [
         "validation-plan", "validation-results", "replay-results",
         "replay-fixture-manifest", "ai-results", "performance-report",
@@ -30,12 +32,14 @@
       ]
     },
     "trustDomain": {
+      "type": "string",
       "enum": [
         "executable", "host-runner", "reviewed-fixture", "premium-review",
         "manual-approval"
       ]
     },
     "producer": {
+      "type": "string",
       "enum": [
         "installed-runtime-validation-plan-v2",
         "installed-runtime-validation-results-v2",
@@ -49,7 +53,7 @@
         "game-executable-stage5-performance-report-v5"
       ]
     },
-    "producerVersion": { "enum": ["2", "5"] },
+    "producerVersion": { "type": "string", "enum": ["2", "5"] },
     "runNonce": {
       "type": "string",
       "format": "uuid"
@@ -58,8 +62,8 @@
       "type": "string",
       "pattern": "^[0-9a-f]{40}$"
     },
-    "title": { "enum": ["Generals", "ZeroHour", "Both"] },
-    "architecture": { "const": "x64" },
+    "title": { "type": "string", "enum": ["Generals", "ZeroHour", "Both"] },
+    "architecture": { "type": "string", "const": "x64" },
     "artifactSetSha256": { "$ref": "#/$defs/sha256" },
     "executableSha256": {
       "oneOf": [
@@ -96,9 +100,19 @@
   ],
   "allOf": [
     {
-      "if": { "properties": { "trustDomain": { "const": "executable" } } },
-      "then": { "properties": { "producerVersion": { "const": "5" } } },
-      "else": { "properties": { "producerVersion": { "const": "2" } } }
+      "if": { "properties": { "trustDomain": { "type": "string", "const": "executable" } } },
+      "then": {
+        "properties": {
+          "schemaVersion": { "type": "integer", "const": 1 },
+          "producerVersion": { "type": "string", "const": "5" }
+        }
+      },
+      "else": {
+        "properties": {
+          "schemaVersion": { "type": "integer", "const": 1 },
+          "producerVersion": { "type": "string", "const": "2" }
+        }
+      }
     }
   ],
   "$defs": {
@@ -109,8 +123,12 @@
     "relativePath": {
       "type": "string",
       "minLength": 1,
-      "not": { "pattern": "^(?:[A-Za-z]:|[\\\\/])" },
-      "pattern": "^(?!.*(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)).+$"
+      "pattern": "^(?!.*:)(?!\\.{1,2}(?:[\\\\/]|$))(?!.*[\\\\/]\\.{1,2}(?:[\\\\/]|$))(?!.*[ .](?:[\\\\/]|$))[^\\\\/\\u0000-\\u001F\\u007F]+(?:[\\\\/][^\\\\/\\u0000-\\u001F\\u007F]+)*$"
+    },
+    "absoluteWindowsPath": {
+      "type": "string",
+      "minLength": 4,
+      "pattern": "^[A-Za-z]:[\\\\/](?!\\.\\.(?:[\\\\/]|$))(?!.*[\\\\/]\\.\\.(?:[\\\\/]|$))(?!.*:).+$"
     },
     "rawLog": {
       "type": "object",
@@ -155,6 +173,22 @@
         "cohortNonce": { "type": "string", "format": "uuid" }
       }
     },
+    "nativeRawBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sourcePath", "path", "sha256"],
+      "properties": {
+        "name": { "type": "string", "enum": ["raw-log", "timing"] },
+        "sourcePath": {
+          "oneOf": [
+            { "$ref": "#/$defs/relativePath" },
+            { "$ref": "#/$defs/absoluteWindowsPath" }
+          ]
+        },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "hostChild": {
       "type": "object",
       "additionalProperties": false,
@@ -164,34 +198,198 @@
         "stdout", "stderr", "nativeReceipt"
       ],
       "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "sourceSequence": { "type": "integer", "minimum": 1 },
         "role": { "type": "string", "minLength": 1 },
-        "title": { "enum": ["Generals", "ZeroHour"] },
+        "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
         "runNonce": { "type": "string", "format": "uuid" },
         "processId": { "type": "integer", "minimum": 1 },
         "processCreationUtc": { "type": "string", "format": "date-time" },
         "executablePath": { "type": "string", "minLength": 1 },
         "executableSha256": { "$ref": "#/$defs/sha256" },
         "commandLine": { "type": "string", "minLength": 1 },
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
         "exitCode": { "const": 0 },
+        "qualificationData": {
+          "$ref": "#/$defs/simulationQualificationDataBinding"
+        },
         "stdout": { "$ref": "#/$defs/childStream" },
         "stderr": { "$ref": "#/$defs/childStream" },
-        "nativeReceipt": { "$ref": "#/$defs/nativeReceiptReference" }
+        "nativeReceipt": { "$ref": "#/$defs/nativeReceiptReference" },
+        "nativeReceiptSourcePath": { "type": "string", "minLength": 1 },
+        "nativeRawBindings": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/nativeRawBinding" },
+          "allOf": [
+            {
+              "contains": {
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "type": "string", "const": "raw-log" } }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            },
+            {
+              "contains": {
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "type": "string", "const": "timing" } }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          ]
+        }
       }
+    },
+    "validationResultHostChild": {
+      "allOf": [
+        { "$ref": "#/$defs/hostChild" },
+        { "required": ["sequence", "arguments", "qualificationData"] }
+      ]
+    },
+    "combinedHostChild": {
+      "allOf": [
+        { "$ref": "#/$defs/hostChild" },
+        {
+          "required": [
+            "sourceSequence", "qualificationData", "nativeReceiptSourcePath",
+            "nativeRawBindings"
+          ],
+          "properties": {
+            "role": { "type": "string", "const": "combined-results" },
+            "sourceSequence": { "const": 1 },
+            "nativeReceiptSourcePath": {
+              "oneOf": [
+                { "$ref": "#/$defs/relativePath" },
+                { "$ref": "#/$defs/absoluteWindowsPath" }
+              ]
+            }
+          }
+        }
+      ]
     },
     "hostProvenance": {
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "runner", "runnerVersion", "childProvenance", "children"],
       "properties": {
-        "kind": { "const": "host-runner-observation" },
+        "kind": { "type": "string", "const": "host-runner-observation" },
         "runner": { "type": "string", "minLength": 1 },
-        "runnerVersion": { "const": "1" },
-        "childProvenance": { "enum": ["bound", "not-applicable"] },
+        "runnerVersion": { "type": "string", "const": "1" },
+        "childProvenance": { "type": "string", "enum": ["bound", "not-applicable"] },
         "children": {
           "type": "array",
           "items": { "$ref": "#/$defs/hostChild" }
         }
       }
+    },
+    "boundHostProvenance": {
+      "allOf": [
+        { "$ref": "#/$defs/hostProvenance" },
+        {
+          "properties": {
+            "childProvenance": { "type": "string", "const": "bound" },
+            "children": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": {
+                "allOf": [
+                  { "$ref": "#/$defs/hostChild" },
+                  {
+                    "required": ["qualificationData"],
+                    "not": {
+                      "anyOf": [
+                        { "required": ["nativeReceiptSourcePath"] },
+                        { "required": ["nativeRawBindings"] }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "validationResultsHostProvenance": {
+      "allOf": [
+        { "$ref": "#/$defs/hostProvenance" },
+        {
+          "properties": {
+            "childProvenance": { "type": "string", "const": "bound" },
+            "children": {
+              "type": "array",
+              "minItems": 253,
+              "maxItems": 253,
+              "items": { "$ref": "#/$defs/validationResultHostChild" }
+            }
+          }
+        }
+      ]
+    },
+    "planHostProvenance": {
+      "allOf": [
+        { "$ref": "#/$defs/hostProvenance" },
+        {
+          "properties": {
+            "childProvenance": { "type": "string", "const": "not-applicable" },
+            "children": { "type": "array", "maxItems": 0 }
+          }
+        }
+      ]
+    },
+    "combinedHostProvenance": {
+      "allOf": [
+        { "$ref": "#/$defs/hostProvenance" },
+        {
+          "properties": {
+            "childProvenance": { "type": "string", "const": "bound" },
+            "children": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "allOf": [
+                    { "$ref": "#/$defs/combinedHostChild" },
+                    {
+                      "properties": {
+                        "title": { "type": "string", "const": "Generals" },
+                        "qualificationData": {
+                          "properties": { "title": { "type": "string", "const": "Generals" } }
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "allOf": [
+                    { "$ref": "#/$defs/combinedHostChild" },
+                    {
+                      "properties": {
+                        "title": { "type": "string", "const": "ZeroHour" },
+                        "qualificationData": {
+                          "properties": { "title": { "type": "string", "const": "ZeroHour" } }
+                        }
+                      }
+                    }
+                  ]
+                }
+              ],
+              "items": false
+            }
+          }
+        }
+      ]
     },
     "nativeProvenance": {
       "type": "object",
@@ -202,8 +400,13 @@
         "commandLine", "exitCode"
       ],
       "properties": {
-        "kind": { "const": "native-executable-observation" },
-        "receiptPath": { "$ref": "#/$defs/relativePath" },
+        "kind": { "type": "string", "const": "native-executable-observation" },
+        "receiptPath": {
+          "oneOf": [
+            { "$ref": "#/$defs/relativePath" },
+            { "$ref": "#/$defs/absoluteWindowsPath" }
+          ]
+        },
         "receiptSha256": { "$ref": "#/$defs/sha256" },
         "processId": { "type": "integer", "minimum": 1 },
         "processCreationUtc": { "type": "string", "format": "date-time" },
@@ -218,7 +421,7 @@
       "additionalProperties": false,
       "required": ["kind", "reviewedBy", "reviewedUtc", "fixtureManifest"],
       "properties": {
-        "kind": { "const": "reviewed-fixture" },
+        "kind": { "type": "string", "const": "reviewed-fixture" },
         "reviewedBy": { "type": "string", "minLength": 1 },
         "reviewedUtc": { "type": "string", "format": "date-time" },
         "fixtureManifest": {
@@ -237,7 +440,7 @@
       "additionalProperties": false,
       "required": ["kind", "reviewedBy", "reviewedUtc"],
       "properties": {
-        "kind": { "enum": ["premium-review", "manual-approval"] },
+        "kind": { "type": "string", "enum": ["premium-review", "manual-approval"] },
         "reviewedBy": { "type": "string", "minLength": 1 },
         "reviewedUtc": { "type": "string", "format": "date-time" }
       }
@@ -248,6 +451,7 @@
       "required": ["kind", "path", "sha256"],
       "properties": {
         "kind": {
+          "type": "string",
           "enum": [
             "external-reviewed-fixture-attestation",
             "external-premium-review-attestation",
@@ -261,43 +465,188 @@
     "combinedSourceReceipt": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["title", "path", "sha256", "runNonce", "cohortNonce"],
+      "required": [
+        "role", "path", "sha256", "runNonce", "cohortNonce"
+      ],
       "properties": {
-        "title": { "enum": ["Generals", "ZeroHour"] },
+        "role": {
+          "type": "string",
+          "enum": [
+            "validation-plan", "validation-results", "replay-results",
+            "ai-results"
+          ]
+        },
         "path": { "$ref": "#/$defs/relativePath" },
         "sha256": { "$ref": "#/$defs/sha256" },
         "runNonce": { "type": "string", "format": "uuid" },
         "cohortNonce": { "type": "string", "format": "uuid" }
       }
     },
+    "simulationQualificationDataBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path", "title", "manifestSha256", "closureSha256", "fileCount"
+      ],
+      "properties": {
+        "path": { "type": "string", "const": "QualificationData.json" },
+        "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+        "manifestSha256": {
+          "type": "string",
+          "pattern": "^[0-9A-F]{64}$"
+        },
+        "closureSha256": {
+          "type": "string",
+          "pattern": "^[0-9A-F]{64}$"
+        },
+        "fileCount": { "const": 6 }
+      }
+    },
+    "qualifiedHostDetails": {
+      "type": "object",
+      "required": ["qualificationData"],
+      "properties": {
+        "qualificationData": {
+          "$ref": "#/$defs/simulationQualificationDataBinding"
+        }
+      }
+    },
+    "combinedSourceCorpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title", "sourceChildCount", "reviewedFixture", "qualificationData",
+        "receipts"
+      ],
+      "properties": {
+        "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+        "sourceChildCount": { "const": 253 },
+        "reviewedFixture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "receipt", "protection", "manifest", "fileCount", "closureSha256"
+          ],
+          "properties": {
+            "receipt": { "$ref": "#/$defs/childStream" },
+            "protection": { "$ref": "#/$defs/childStream" },
+            "manifest": { "$ref": "#/$defs/childStream" },
+            "fileCount": { "const": 13 },
+            "closureSha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "qualificationData": {
+          "$ref": "#/$defs/simulationQualificationDataBinding"
+        },
+        "receipts": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceReceipt" },
+                { "properties": { "role": { "type": "string", "const": "validation-plan" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceReceipt" },
+                { "properties": { "role": { "type": "string", "const": "validation-results" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceReceipt" },
+                { "properties": { "role": { "type": "string", "const": "replay-results" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceReceipt" },
+                { "properties": { "role": { "type": "string", "const": "ai-results" } } }
+              ]
+            }
+          ],
+          "items": false
+        }
+      }
+    },
     "combinedDetails": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "pipelineMode", "simulationMode", "workerPolicy", "renderer",
-        "renderThread", "bothTitlesPassed", "sourceReceipts"
+        "pipelineMode", "simulationMode", "requestedWorkers", "workerPolicy",
+        "projectionSequence", "projectionSemantics", "sourceChildCount",
+        "bothTitlesPassed", "sourceCorpora"
       ],
       "properties": {
-        "pipelineMode": { "const": "parallel" },
-        "simulationMode": { "const": "parallel" },
-        "workerPolicy": { "const": "auto" },
-        "renderer": { "const": "d3d11" },
-        "renderThread": { "const": "dedicated" },
+        "pipelineMode": { "type": "string", "const": "serial" },
+        "simulationMode": { "type": "string", "const": "serial" },
+        "requestedWorkers": { "type": "string", "const": "1" },
+        "workerPolicy": { "type": "string", "const": "auto" },
+        "projectionSequence": { "const": 1 },
+        "projectionSemantics": { "type": "string", "const": "deterministic-lineage-pointer" },
+        "sourceChildCount": { "const": 253 },
         "bothTitlesPassed": { "const": true },
-        "sourceReceipts": {
+        "sourceCorpora": {
           "type": "array",
           "minItems": 2,
           "maxItems": 2,
-          "items": { "$ref": "#/$defs/combinedSourceReceipt" }
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceCorpus" },
+                {
+                  "properties": {
+                    "title": { "type": "string", "const": "Generals" },
+                    "qualificationData": {
+                      "properties": { "title": { "type": "string", "const": "Generals" } }
+                    },
+                    "receipts": {
+                      "prefixItems": [
+                        { "properties": { "path": { "type": "string", "const": "sources\\Generals\\validation-plan-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\Generals\\validation-results-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\Generals\\replay-results-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\Generals\\ai-results-receipt.json" } } }
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceCorpus" },
+                {
+                  "properties": {
+                    "title": { "type": "string", "const": "ZeroHour" },
+                    "qualificationData": {
+                      "properties": { "title": { "type": "string", "const": "ZeroHour" } }
+                    },
+                    "receipts": {
+                      "prefixItems": [
+                        { "properties": { "path": { "type": "string", "const": "sources\\ZeroHour\\validation-plan-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\ZeroHour\\validation-results-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\ZeroHour\\replay-results-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\ZeroHour\\ai-results-receipt.json" } } }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "items": false
         }
       }
     },
     "commonHostProperties": {
       "type": "object",
       "properties": {
-        "trustDomain": { "const": "host-runner" },
-        "evidenceKind": { "const": "stage5-host-runner-receipt" },
-        "producerVersion": { "const": "2" },
+        "trustDomain": { "type": "string", "const": "host-runner" },
+        "evidenceKind": { "type": "string", "const": "stage5-host-runner-receipt" },
+        "producerVersion": { "type": "string", "const": "2" },
         "provenance": { "$ref": "#/$defs/hostProvenance" }
       }
     },
@@ -313,44 +662,55 @@
             {
               "required": ["role", "producer"],
               "properties": {
-                "role": { "const": "validation-plan" },
-                "producer": { "const": "installed-runtime-validation-plan-v2" }
+                "role": { "type": "string", "const": "validation-plan" },
+                "producer": { "type": "string", "const": "installed-runtime-validation-plan-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/planHostProvenance" }
               }
             },
             {
               "required": ["role", "producer"],
               "properties": {
-                "role": { "const": "validation-results" },
-                "producer": { "const": "installed-runtime-validation-results-v2" }
+                "role": { "type": "string", "const": "validation-results" },
+                "producer": { "type": "string", "const": "installed-runtime-validation-results-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/validationResultsHostProvenance" }
               }
             },
             {
               "required": ["role", "producer"],
               "properties": {
-                "role": { "const": "replay-results" },
-                "producer": { "const": "installed-runtime-replay-results-v2" }
+                "role": { "type": "string", "const": "replay-results" },
+                "producer": { "type": "string", "const": "installed-runtime-replay-results-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/boundHostProvenance" }
               }
             },
             {
               "required": ["role", "producer"],
               "properties": {
-                "role": { "const": "ai-results" },
-                "producer": { "const": "installed-runtime-ai-results-v2" }
+                "role": { "type": "string", "const": "ai-results" },
+                "producer": { "type": "string", "const": "installed-runtime-ai-results-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/boundHostProvenance" }
               }
             },
             {
               "required": ["role", "producer"],
               "properties": {
-                "role": { "const": "performance-report" },
-                "producer": { "const": "installed-runtime-performance-report-v2" }
+                "role": { "type": "string", "const": "performance-report" },
+                "producer": { "type": "string", "const": "installed-runtime-performance-report-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/boundHostProvenance" }
               }
             },
             {
               "required": ["role", "producer"],
               "properties": {
-                "role": { "const": "combined-results" },
-                "producer": { "const": "installed-runtime-combined-results-v2" },
-                "details": { "$ref": "#/$defs/combinedDetails" }
+                "role": { "type": "string", "const": "combined-results" },
+                "producer": { "type": "string", "const": "installed-runtime-combined-results-v2" },
+                "details": { "$ref": "#/$defs/combinedDetails" },
+                "provenance": { "$ref": "#/$defs/combinedHostProvenance" }
               }
             }
           ]
@@ -363,15 +723,17 @@
         "runNonce", "executableSha256", "rawLogs", "provenance"
       ],
       "properties": {
-        "trustDomain": { "const": "executable" },
-        "evidenceKind": { "const": "stage5-executable-originated-receipt" },
+        "trustDomain": { "type": "string", "const": "executable" },
+        "evidenceKind": { "type": "string", "const": "stage5-executable-originated-receipt" },
         "role": {
+          "type": "string",
           "enum": [
             "validation-results", "replay-results", "ai-results",
             "performance-report"
           ]
         },
         "producer": {
+          "type": "string",
           "const": "game-executable-stage5-performance-report-v5"
         },
         "provenance": { "$ref": "#/$defs/nativeProvenance" }
@@ -381,26 +743,26 @@
           "oneOf": [
             {
               "properties": {
-                "role": { "const": "validation-results" },
-                "producer": { "const": "game-executable-stage5-performance-report-v5" }
+                "role": { "type": "string", "const": "validation-results" },
+                "producer": { "type": "string", "const": "game-executable-stage5-performance-report-v5" }
               }
             },
             {
               "properties": {
-                "role": { "const": "replay-results" },
-                "producer": { "const": "game-executable-stage5-performance-report-v5" }
+                "role": { "type": "string", "const": "replay-results" },
+                "producer": { "type": "string", "const": "game-executable-stage5-performance-report-v5" }
               }
             },
             {
               "properties": {
-                "role": { "const": "ai-results" },
-                "producer": { "const": "game-executable-stage5-performance-report-v5" }
+                "role": { "type": "string", "const": "ai-results" },
+                "producer": { "type": "string", "const": "game-executable-stage5-performance-report-v5" }
               }
             },
             {
               "properties": {
-                "role": { "const": "performance-report" },
-                "producer": { "const": "game-executable-stage5-performance-report-v5" }
+                "role": { "type": "string", "const": "performance-report" },
+                "producer": { "type": "string", "const": "game-executable-stage5-performance-report-v5" }
               }
             }
           ]
@@ -411,15 +773,15 @@
       "type": "object",
       "required": ["provenance", "protection"],
       "properties": {
-        "trustDomain": { "const": "reviewed-fixture" },
-        "evidenceKind": { "const": "stage5-reviewed-fixture-receipt" },
-        "role": { "const": "replay-fixture-manifest" },
-        "producer": { "const": "reviewed-replay-fixture-manifest-v2" },
+        "trustDomain": { "type": "string", "const": "reviewed-fixture" },
+        "evidenceKind": { "type": "string", "const": "stage5-reviewed-fixture-receipt" },
+        "role": { "type": "string", "const": "replay-fixture-manifest" },
+        "producer": { "type": "string", "const": "reviewed-replay-fixture-manifest-v2" },
         "provenance": { "$ref": "#/$defs/reviewedFixtureProvenance" },
         "protection": {
           "allOf": [
             { "$ref": "#/$defs/protection" },
-            { "properties": { "kind": { "const": "external-reviewed-fixture-attestation" } } }
+            { "properties": { "kind": { "type": "string", "const": "external-reviewed-fixture-attestation" } } }
           ]
         }
       }
@@ -428,15 +790,15 @@
       "type": "object",
       "required": ["provenance", "protection"],
       "properties": {
-        "trustDomain": { "const": "premium-review" },
-        "evidenceKind": { "const": "stage5-premium-review-receipt" },
-        "role": { "const": "premium-review-results" },
-        "producer": { "const": "stage5-premium-review-receipt-v2" },
+        "trustDomain": { "type": "string", "const": "premium-review" },
+        "evidenceKind": { "type": "string", "const": "stage5-premium-review-receipt" },
+        "role": { "type": "string", "const": "premium-review-results" },
+        "producer": { "type": "string", "const": "stage5-premium-review-receipt-v2" },
         "provenance": { "$ref": "#/$defs/externalProvenance" },
         "protection": {
           "allOf": [
             { "$ref": "#/$defs/protection" },
-            { "properties": { "kind": { "const": "external-premium-review-attestation" } } }
+            { "properties": { "kind": { "type": "string", "const": "external-premium-review-attestation" } } }
           ]
         }
       }
@@ -445,15 +807,15 @@
       "type": "object",
       "required": ["provenance", "protection"],
       "properties": {
-        "trustDomain": { "const": "manual-approval" },
-        "evidenceKind": { "const": "stage5-manual-approval-receipt" },
-        "role": { "const": "manual-checklist" },
-        "producer": { "const": "installed-runtime-manual-acceptance-v2" },
+        "trustDomain": { "type": "string", "const": "manual-approval" },
+        "evidenceKind": { "type": "string", "const": "stage5-manual-approval-receipt" },
+        "role": { "type": "string", "const": "manual-checklist" },
+        "producer": { "type": "string", "const": "installed-runtime-manual-acceptance-v2" },
         "provenance": { "$ref": "#/$defs/externalProvenance" },
         "protection": {
           "allOf": [
             { "$ref": "#/$defs/protection" },
-            { "properties": { "kind": { "const": "external-user-manual-approval-attestation" } } }
+            { "properties": { "kind": { "type": "string", "const": "external-user-manual-approval-attestation" } } }
           ]
         }
       }

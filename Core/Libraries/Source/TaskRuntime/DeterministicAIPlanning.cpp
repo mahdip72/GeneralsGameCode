@@ -6,11 +6,39 @@
 #include <memory>
 #include <new>
 #include <string.h>
+#if defined(_WIN64)
+#include <thread>
+#endif
 
 namespace rts
 {
 namespace
 {
+#if defined(_WIN64)
+void ObserveAIPlanningTest(AIPlanningTestHooks *hooks, AIPlanningTestEvent event,
+	uint32_t player, uint32_t begin, uint32_t end,
+	AIProductionCandidateFact *verification = 0)
+{
+	if (hooks != 0 && hooks->observe != 0)
+		hooks->observe(hooks->context, event, player, begin, end, verification);
+}
+
+bool AIPlanningTestEntryCancelled(AIPlanningTestHooks *hooks,
+	uint32_t player, uint32_t begin, uint32_t end)
+{
+	return hooks != 0 && hooks->cancelAtEntry != 0 &&
+		hooks->cancelAtEntry(hooks->context, player, begin, end);
+}
+
+void AIPlanningTestRendezvous(AIPlanningTestHooks *hooks, JobContext &context)
+{
+	if (hooks == 0 || hooks->rendezvous == 0 || hooks->rendezvousTarget < 2U ||
+		!context.isPhysicalWorkerExecution()) return;
+	hooks->rendezvous->fetch_add(1U, std::memory_order_acq_rel);
+	while (hooks->rendezvous->load(std::memory_order_acquire) < hooks->rendezvousTarget &&
+		!context.isCancellationRequested()) std::this_thread::yield();
+}
+#endif
 std::atomic<uint64_t> s_capturedSnapshots(0U);
 std::atomic<uint64_t> s_capturedCandidates(0U);
 std::atomic<uint64_t> s_requestedBatches(0U);
@@ -483,22 +511,38 @@ public:
 		bool physicalWorker;
 		unsigned physicalWorkerIndex;
 		bool ownerHelped;
+#if defined(_WIN64)
+		bool traceSource = false;
+		performance::KernelPerformanceRangePlan range = {};
+		performance::KernelPerformanceCheckpointProbe checkpoint;
+#endif
 	};
 
 	AIPlayerPlanningJob(const AIPlayerPlanningSnapshot *snapshot,
 		AIPlayerPlanningResult *result, ExecutionRecord *execution,
 		std::atomic<uint32_t> *activePhysicalWorkers,
 		std::atomic<uint32_t> *peakPhysicalWorkers,
-		const JobFloatingPointState &floatingPointState) :
+		const JobFloatingPointState &floatingPointState
+#if defined(_WIN64)
+		, AIPlanningTestHooks *testHooks = 0, uint32_t playerOrdinal = 0
+#endif
+		) :
 		m_snapshot(snapshot), m_result(result), m_execution(execution),
 		m_activePhysicalWorkers(activePhysicalWorkers),
 		m_peakPhysicalWorkers(peakPhysicalWorkers),
-		m_floatingPointState(floatingPointState) {}
+		m_floatingPointState(floatingPointState)
+#if defined(_WIN64)
+		, m_testHooks(testHooks), m_playerOrdinal(playerOrdinal)
+#endif
+		{}
 
 	void execute(JobContext &context) override
 	{
 		const JobFloatingPointScope floatingPointScope(m_floatingPointState);
-		if (context.isCancellationRequested())
+#if defined(_WIN64)
+		if (m_execution->traceSource) m_execution->checkpoint.beginRecord();
+#endif
+		if (!enterBody(context.isCancellationRequested()))
 		{
 			context.fail();
 			return;
@@ -516,20 +560,71 @@ public:
 			while (observed < activePhysicalWorkers &&
 				!m_peakPhysicalWorkers->compare_exchange_weak(observed,
 					activePhysicalWorkers, std::memory_order_relaxed,
-					std::memory_order_relaxed))
-			{
-			}
+					std::memory_order_relaxed)) {}
 		}
-		const bool planned = PlanAIPlayer(*m_snapshot, m_result);
+#if defined(_WIN64)
+		AIPlanningTestRendezvous(m_testHooks, context);
+#endif
+		const bool planned = planBody();
 		if (m_execution->physicalWorker)
 			m_activePhysicalWorkers->fetch_sub(1U, std::memory_order_acq_rel);
-		if (!planned)
+		if (!planned) context.fail();
+		else s_completedJobs.fetch_add(1U, std::memory_order_relaxed);
+	}
+
+#if defined(_WIN64)
+	// Called only after the reference ledger authenticates this exact range.
+	// No JobContext, submission, physical-worker identity, or rendezvous exists
+	// on this path; both modes execute the same entry and planning body below.
+	bool executeInline()
+	{
+		const JobFloatingPointScope floatingPointScope(m_floatingPointState);
+		return enterBody(false) && planBody();
+	}
+#endif
+
+private:
+	bool enterBody(bool cancellationRequested)
+	{
+#if defined(_WIN64)
+		ObserveAIPlanningTest(m_testHooks, AI_PLANNING_TEST_RANGE_ENTRY, m_playerOrdinal, 0, 1);
+#endif
+		bool cancelled = cancellationRequested
+#if defined(_WIN64)
+			|| AIPlanningTestEntryCancelled(m_testHooks, m_playerOrdinal, 0, 1)
+#endif
+			;
+#if defined(_WIN64)
+		const performance::KernelPerformanceCheckpoint entry = {1, m_playerOrdinal, 0};
+		if (m_execution->traceSource)
+			cancelled = m_execution->checkpoint.cancelled(entry, cancelled);
+#endif
+		if (cancelled)
 		{
-			context.fail();
-			return;
+#if defined(_WIN64)
+			if (m_execution->traceSource)
+				m_execution->checkpoint.finish(entry, 0, performance::KERNEL_RANGE_CANCELLED);
+#endif
+			return false;
 		}
-		m_execution->completed = true;
-		s_completedJobs.fetch_add(1U, std::memory_order_relaxed);
+		return true;
+	}
+	bool planBody()
+	{
+#if defined(_WIN64)
+		ObserveAIPlanningTest(m_testHooks, AI_PLANNING_TEST_PLAYER_BODY, m_playerOrdinal, 0, 1);
+#endif
+		const bool planned = PlanAIPlayer(*m_snapshot, m_result);
+#if defined(_WIN64)
+		if (m_execution->traceSource)
+		{
+			const performance::KernelPerformanceCheckpoint end = {2, m_playerOrdinal, 1};
+			m_execution->checkpoint.finish(end, planned ? 1 : 0,
+				planned ? performance::KERNEL_RANGE_COMPLETED : performance::KERNEL_RANGE_FAILED);
+		}
+#endif
+		m_execution->completed = planned;
+		return planned;
 	}
 
 private:
@@ -539,6 +634,10 @@ private:
 	std::atomic<uint32_t> *m_activePhysicalWorkers;
 	std::atomic<uint32_t> *m_peakPhysicalWorkers;
 	const JobFloatingPointState m_floatingPointState;
+#if defined(_WIN64)
+	AIPlanningTestHooks *m_testHooks;
+	uint32_t m_playerOrdinal;
+#endif
 };
 
 // Large current-epoch production snapshots are split into deterministic,
@@ -555,12 +654,20 @@ public:
 		AIPlayerPlanningJob::ExecutionRecord *execution,
 		std::atomic<uint32_t> *activePhysicalWorkers,
 		std::atomic<uint32_t> *peakPhysicalWorkers,
-		const JobFloatingPointState &floatingPointState) :
+		const JobFloatingPointState &floatingPointState
+#if defined(_WIN64)
+		, AIPlanningTestHooks *testHooks = 0, uint32_t playerOrdinal = 0
+#endif
+		) :
 		m_snapshot(snapshot), m_facts(facts),
 		m_verificationFacts(verificationFacts), m_begin(begin), m_end(end),
 		m_execution(execution), m_activePhysicalWorkers(activePhysicalWorkers),
 		m_peakPhysicalWorkers(peakPhysicalWorkers),
-		m_floatingPointState(floatingPointState) {}
+		m_floatingPointState(floatingPointState)
+#if defined(_WIN64)
+		, m_testHooks(testHooks), m_playerOrdinal(playerOrdinal)
+#endif
+		{}
 
 	void execute(JobContext &context) override
 	{
@@ -578,25 +685,73 @@ public:
 				!m_peakPhysicalWorkers->compare_exchange_weak(observed, active,
 					std::memory_order_relaxed, std::memory_order_relaxed)) {}
 		}
-		bool planned = !context.isCancellationRequested();
+#if defined(_WIN64)
+		AIPlanningTestRendezvous(m_testHooks, context);
+		if (m_execution->traceSource) m_execution->checkpoint.beginRecord();
+#endif
+		const bool planned = planBody(context.isCancellationRequested());
+		if (m_execution->physicalWorker)
+			m_activePhysicalWorkers->fetch_sub(1U, std::memory_order_acq_rel);
+		if (!planned) context.fail();
+		else s_completedJobs.fetch_add(1U, std::memory_order_relaxed);
+	}
+
+#if defined(_WIN64)
+	bool executeInline()
+	{
+		const JobFloatingPointScope floatingPointScope(m_floatingPointState);
+		return planBody(false);
+	}
+#endif
+
+private:
+	bool planBody(bool cancellationRequested)
+	{
+#if defined(_WIN64)
+		ObserveAIPlanningTest(m_testHooks, AI_PLANNING_TEST_RANGE_ENTRY,
+			m_playerOrdinal, m_begin, m_end);
+#endif
+		bool cancelled = cancellationRequested
+#if defined(_WIN64)
+			|| AIPlanningTestEntryCancelled(m_testHooks, m_playerOrdinal, m_begin, m_end)
+#endif
+			;
+#if defined(_WIN64)
+		const performance::KernelPerformanceCheckpoint entry = {1, m_playerOrdinal, m_begin};
+		if (m_execution->traceSource)
+			cancelled = m_execution->checkpoint.cancelled(entry, cancelled);
+		uint32_t completedCandidates = 0;
+#endif
+		bool planned = !cancelled;
 		for (uint32_t i = m_begin; planned && i < m_end; ++i)
 		{
 			// Derive two disjoint outputs from the immutable owner snapshot. The
 			// owner compares them before accepting either one, so a corrupted
 			// worker-prepared fact cannot redefine its own validation oracle.
-			planned = BuildSourceCandidateFact(*m_snapshot, i, &m_facts[i]) &&
-				BuildSourceCandidateFact(*m_snapshot, i,
-					&m_verificationFacts[i]);
+			planned = BuildSourceCandidateFact(*m_snapshot, i, &m_facts[i]);
+#if defined(_WIN64)
+			if (planned) ObserveAIPlanningTest(m_testHooks, AI_PLANNING_TEST_PREPARED_FACT,
+				m_playerOrdinal, i, i + 1);
+#endif
+			if (planned) planned = BuildSourceCandidateFact(*m_snapshot, i, &m_verificationFacts[i]);
+#if defined(_WIN64)
+			if (planned) ObserveAIPlanningTest(m_testHooks, AI_PLANNING_TEST_VERIFICATION_FACT,
+				m_playerOrdinal, i, i + 1, &m_verificationFacts[i]);
+			if (planned) ++completedCandidates;
+#endif
 		}
-		if (m_execution->physicalWorker)
-			m_activePhysicalWorkers->fetch_sub(1U, std::memory_order_acq_rel);
-		if (!planned)
+#if defined(_WIN64)
+		if (m_execution->traceSource)
 		{
-			context.fail();
-			return;
+			const performance::KernelPerformanceCheckpoint end = {2, m_playerOrdinal,
+				m_begin + completedCandidates};
+			m_execution->checkpoint.finish(cancelled ? entry : end, completedCandidates,
+				cancelled ? performance::KERNEL_RANGE_CANCELLED :
+				planned ? performance::KERNEL_RANGE_COMPLETED : performance::KERNEL_RANGE_FAILED);
 		}
-		m_execution->completed = true;
-		s_completedJobs.fetch_add(1U, std::memory_order_relaxed);
+#endif
+		m_execution->completed = planned;
+		return planned;
 	}
 
 private:
@@ -609,6 +764,10 @@ private:
 	std::atomic<uint32_t> *m_activePhysicalWorkers;
 	std::atomic<uint32_t> *m_peakPhysicalWorkers;
 	const JobFloatingPointState m_floatingPointState;
+#if defined(_WIN64)
+	AIPlanningTestHooks *m_testHooks;
+	uint32_t m_playerOrdinal;
+#endif
 };
 
 struct AIPlanningJobSystemEvidence
@@ -616,9 +775,10 @@ struct AIPlanningJobSystemEvidence
 	AIPlanningJobSystemEvidence() : physicalWorkerMask(0U),
 		distinctPhysicalWorkers(0U), peakConcurrentPhysicalWorkers(0U),
 		physicalWorkerExecutions(0U), ownerHelpedJobs(0U),
-		resultsValidated(false)
+		resultsValidated(false), nativeAdmissionAccepted(false)
 #if defined(_WIN64)
-		, performanceBatch(0), referenceBatch(0)
+		, performanceBatch(0), referenceBatch(0), sourceBoundInline(false),
+		sourceOwnerCommitAllowed(false)
 #endif
 	{}
 
@@ -661,9 +821,12 @@ struct AIPlanningJobSystemEvidence
 	// every result is either owner-produced from those facts or canonically
 	// validated against its original immutable snapshot.
 	bool resultsValidated;
+	bool nativeAdmissionAccepted;
 #if defined(_WIN64)
 	performance::KernelPerformanceBatch *performanceBatch;
 	AIPlanningReferenceBatchTransport *referenceBatch;
+	bool sourceBoundInline;
+	bool sourceOwnerCommitAllowed;
 #endif
 };
 
@@ -689,6 +852,199 @@ uint32_t CountAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 	return jobCount;
 }
 
+#if defined(_WIN64)
+performance::KernelPerformanceDigest AIPlanningDecisionFacts(uint32_t playerCount,
+	uint32_t requestedJobs)
+{
+	performance::KernelPerformanceCanonicalWriter facts;
+	if (!facts.begin(1) || !facts.u32(1, playerCount) || !facts.u32(2, requestedJobs) ||
+		!facts.u32(3, AI_PLANNING_PRODUCTION_SHARD_SIZE))
+		return performance::KernelPerformanceDigest();
+	return facts.finish();
+}
+
+// This owner-side recorder never dispatches, reruns, cancels, or publishes work.
+// Its range POD is imported only after the existing native group fence.
+class AIPlanningSourceAttempt
+{
+public:
+	AIPlanningSourceAttempt(AIPlanningReferenceBatchTransport *transport,
+		AIPlayerPlanningJob::ExecutionRecord *execution, uint32_t playerCount,
+		uint32_t requestedJobs, JobSystem &jobs) : m_transport(transport),
+		m_execution(execution), m_requestedJobs(requestedJobs), m_workers(0),
+		m_pending(0), m_outstanding(0),
+		m_enabled(false), m_released(false)
+	{
+		if (transport == 0 || transport->referenceLedger == 0 || !transport->referenceAttempt.valid()) return;
+		const performance::KernelPerformanceReferenceMode mode = transport->referenceLedger->mode();
+		if (mode != performance::KERNEL_REFERENCE_THROUGHPUT_BINDING &&
+			mode != performance::KERNEL_REFERENCE_SERIAL_ORACLE) return;
+		m_workers = jobs.workerCount(); m_pending = jobs.pendingOwnerCompletionCount();
+		m_outstanding = jobs.outstandingJobCount();
+		m_enabled = transport->referenceLedger->bindCapturedInput(transport->referenceAttempt,
+			transport->fieldSchema, transport->operationCount, transport->writeInput, transport->immutableInput);
+		if (m_enabled) m_facts = AIPlanningDecisionFacts(playerCount, requestedJobs);
+	}
+	~AIPlanningSourceAttempt() { release(0, false); }
+	void plan(uint32_t ordinal, unsigned kind, uint32_t begin, uint32_t end)
+	{
+		m_execution[ordinal].traceSource = m_enabled;
+		m_execution[ordinal].range = {1, ordinal, kind, begin, end, end - begin};
+	}
+	void release(uint32_t submitted, bool cancelled)
+	{
+		if (!m_enabled || m_released) return;
+		m_released = true;
+		performance::KernelPerformanceReferenceLedger &ledger = *m_transport->referenceLedger;
+		const performance::KernelPerformanceAttempt attempt = m_transport->referenceAttempt;
+		performance::KernelPerformanceAttemptDecision decision = {};
+		decision.site = 1; decision.reasonSchema = 1;
+		decision.reason = submitted != 0 ? (cancelled ? 3 : 1) : 2;
+		decision.deterministicEligible = m_requestedJobs >= 2;
+		decision.deterministicFacts = m_facts;
+		decision.admission = submitted != 0 ? performance::KERNEL_ADMISSION_ACCEPTED :
+			performance::KERNEL_ADMISSION_REFUSED;
+		decision.sourceConfiguredWorkers = m_workers;
+		decision.dynamicFactsKnownMask = 3; decision.pendingJobs = m_pending;
+		decision.outstandingJobs = m_outstanding;
+		AIPlanningTestHooks *hooks = m_transport->testHooks;
+		if (hooks != 0 && hooks->releasedGroup != 0)
+		{
+			unsigned completed = 0;
+			for (uint32_t i = 0; i != submitted; ++i) if (m_execution[i].completed) ++completed;
+			hooks->releasedGroup(hooks->context, cancelled, completed, submitted, decision.reason);
+		}
+		ledger.observeDecision(attempt, decision);
+		if (submitted == 0) return;
+		performance::KernelPerformanceDispatchPlan dispatch = {1, 1, 1, submitted, 0,
+			AI_PLANNING_PRODUCTION_SHARD_SIZE, AI_PLANNING_MAX_JOB_EXECUTIONS};
+		for (uint32_t i = 0; i != submitted; ++i) dispatch.operationCount += m_execution[i].range.operationCount;
+		ledger.observeDispatch(attempt, dispatch);
+		for (uint32_t i = 0; i != submitted; ++i) ledger.observeRangePlan(attempt, m_execution[i].range);
+		for (uint32_t i = 0; i != submitted; ++i)
+		{
+			performance::KernelPerformanceRangeProgress progress = {};
+			progress.checkpoint = m_execution[i].checkpoint.snapshot();
+			progress.publication = !progress.checkpoint.entered ? performance::KERNEL_PUBLICATION_NOT_APPLICABLE :
+				cancelled || progress.checkpoint.terminal == performance::KERNEL_RANGE_CANCELLED ?
+				performance::KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL : m_execution[i].completed ?
+				performance::KERNEL_PUBLICATION_PUBLISHED : performance::KERNEL_PUBLICATION_REJECTED;
+			ledger.observeReleasedRange(attempt, m_execution[i].range, progress);
+		}
+	}
+private:
+	AIPlanningReferenceBatchTransport *m_transport;
+	AIPlayerPlanningJob::ExecutionRecord *m_execution;
+	uint32_t m_requestedJobs;
+	unsigned m_workers;
+	JobMetricCounter m_pending, m_outstanding;
+	bool m_enabled, m_released;
+	performance::KernelPerformanceDigest m_facts;
+};
+
+bool ConsumeAIPlanningRanges(AIPlanningReferenceBatchTransport *transport,
+	const AIPlayerPlanningSnapshot *snapshots, uint32_t snapshotCount,
+	AIPlayerPlanningResult *results,
+	AIProductionCandidateFact (*shardedFacts)[AI_PLANNING_MAX_PRODUCTION_CANDIDATES],
+	AIProductionCandidateFact (*verificationFacts)[AI_PLANNING_MAX_PRODUCTION_CANDIDATES],
+	AIPlayerPlanningJob::ExecutionRecord *execution,
+	const JobFloatingPointState &floatingPointState, bool *admissionAccepted)
+{
+	if (admissionAccepted != 0) *admissionAccepted = false;
+	if (transport == 0 || transport->referenceLedger == 0 || !transport->referenceAttempt.valid())
+		return false;
+	performance::KernelPerformanceReferenceLedger &ledger = *transport->referenceLedger;
+	const performance::KernelPerformanceAttempt attempt = transport->referenceAttempt;
+	const uint32_t requested = CountAIPlanningJobs(snapshots, snapshotCount);
+	performance::KernelPerformanceAttemptDecision decision = {};
+	if (!ledger.bindCapturedInput(attempt, transport->fieldSchema, transport->operationCount,
+		transport->writeInput, transport->immutableInput) ||
+		!ledger.replayDecision(attempt, 1, requested >= 2,
+			AIPlanningDecisionFacts(snapshotCount, requested), decision) ||
+		decision.admission != performance::KERNEL_ADMISSION_ACCEPTED)
+		return false;
+	if (admissionAccepted != 0) *admissionAccepted = true;
+	if (decision.reasonSchema != 1 || (decision.reason != 1 && decision.reason != 3)) return false;
+	const bool sourceCancelled = decision.reason == 3;
+	performance::KernelPerformanceDispatchPlan source = {};
+	if (!ledger.readSourceDispatch(attempt, 1, source) || source.rangeCount == 0 ||
+		source.rangeCount > requested || requested > AI_PLANNING_MAX_JOB_EXECUTIONS)
+		return false;
+	uint32_t ordinal = 0;
+	for (uint32_t player = 0; player != snapshotCount; ++player)
+	{
+		const AIProductionPlanningSnapshot &production = snapshots[player].production;
+		if (snapshots[player].planProduction != 0 && production.sourceFacts.valid != 0)
+		{
+			for (uint32_t begin = 0; begin < production.candidateCount;
+				begin += AI_PLANNING_PRODUCTION_SHARD_SIZE, ++ordinal)
+			{
+				const uint32_t end = begin + AI_PLANNING_PRODUCTION_SHARD_SIZE < production.candidateCount ?
+					begin + AI_PLANNING_PRODUCTION_SHARD_SIZE : production.candidateCount;
+				execution[ordinal].range = {1, ordinal, 2,
+					player * AI_PLANNING_MAX_PRODUCTION_CANDIDATES + begin,
+					player * AI_PLANNING_MAX_PRODUCTION_CANDIDATES + end, end - begin};
+			}
+		}
+		else
+		{
+			execution[ordinal].range = {1, ordinal, 1, player, player + 1, 1};
+			++ordinal;
+		}
+	}
+	performance::KernelPerformanceDispatchPlan dispatch = {1, 1, 1, source.rangeCount, 0,
+		AI_PLANNING_PRODUCTION_SHARD_SIZE, AI_PLANNING_MAX_JOB_EXECUTIONS};
+	for (uint32_t i = 0; i != dispatch.rangeCount; ++i)
+		dispatch.operationCount += execution[i].range.operationCount;
+	if (!ledger.observeDispatch(attempt, dispatch)) return false;
+	for (uint32_t i = 0; i != dispatch.rangeCount; ++i)
+		if (!ledger.observeRangePlan(attempt, execution[i].range)) return false;
+	bool completed = dispatch.rangeCount == requested && !sourceCancelled;
+	for (uint32_t i = 0; i != dispatch.rangeCount; ++i)
+	{
+		AIPlayerPlanningJob::ExecutionRecord &record = execution[i];
+		performance::KernelPerformanceInlineBody body;
+		const performance::KernelPerformanceInlineAction action = ledger.beginInlineBody(attempt,
+			record.range, performance::KernelPerformanceLedger::instance(), body, record.checkpoint);
+		if (action == performance::KERNEL_INLINE_INVALID) return false;
+		if (action == performance::KERNEL_INLINE_EXECUTE)
+		{
+			record.traceSource = true;
+			if (record.range.bodyKind == 1)
+			{
+				const uint32_t player = static_cast<uint32_t>(record.range.begin);
+				AIPlayerPlanningJob job(snapshots + player, results + player, &record,
+					0, 0, floatingPointState, transport->testHooks, player);
+				job.executeInline();
+			}
+			else
+			{
+				const uint32_t player = static_cast<uint32_t>(record.range.begin /
+					AI_PLANNING_MAX_PRODUCTION_CANDIDATES);
+				const uint32_t begin = static_cast<uint32_t>(record.range.begin %
+					AI_PLANNING_MAX_PRODUCTION_CANDIDATES);
+				AIProductionCandidateShardJob job(&snapshots[player].production,
+					shardedFacts[player], verificationFacts[player], begin,
+					begin + static_cast<uint32_t>(record.range.operationCount), &record,
+					0, 0, floatingPointState, transport->testHooks, player);
+				job.executeInline();
+			}
+		}
+		performance::KernelPerformanceRangeProgress progress = {};
+		progress.checkpoint = record.checkpoint.snapshot();
+		progress.publication = !progress.checkpoint.entered ? performance::KERNEL_PUBLICATION_NOT_APPLICABLE :
+			sourceCancelled || progress.checkpoint.terminal == performance::KERNEL_RANGE_CANCELLED ?
+			performance::KERNEL_PUBLICATION_DISCARDED_AFTER_CANCEL : record.completed ?
+			performance::KERNEL_PUBLICATION_PUBLISHED : performance::KERNEL_PUBLICATION_REJECTED;
+		if (action == performance::KERNEL_INLINE_EXECUTE && !ledger.finishInlineBody(body, progress))
+			return false;
+		if (!ledger.observeReleasedRange(attempt, record.range, progress)) return false;
+		completed = record.completed && completed;
+	}
+	return completed;
+}
+#endif
+
 bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 	uint32_t snapshotCount, AIPlayerPlanningResult *results, void *userData)
 {
@@ -699,6 +1055,9 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 		evidence != 0 ? evidence->performanceBatch : 0;
 	AIPlanningReferenceBatchTransport *referenceBatch =
 		evidence != 0 ? evidence->referenceBatch : 0;
+	AIPlanningTestHooks *testHooks = referenceBatch != 0 ? referenceBatch->testHooks : 0;
+	const bool sourceBoundInline = referenceBatch != 0 && referenceBatch->referenceLedger != 0 &&
+		referenceBatch->referenceLedger->runMode() == performance::KERNEL_REFERENCE_PHASE_BASELINE_BINDING;
 	#endif
 	if (evidence != 0) *evidence = AIPlanningJobSystemEvidence();
 	#if defined(_WIN64)
@@ -711,8 +1070,19 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 	if (CountAIPlanningJobs(snapshots, snapshotCount) < 2U)
 		return false;
 	JobSystem &jobs = JobSystem::instance();
-	if (!jobs.isRunning() || jobs.isWorkerThread() ||
+#if defined(_WIN64)
+	AIPlayerPlanningJob::ExecutionRecord execution[
+		AI_PLANNING_MAX_JOB_EXECUTIONS];
+	AIPlanningSourceAttempt source(referenceBatch, execution, snapshotCount,
+		CountAIPlanningJobs(snapshots, snapshotCount), jobs);
+#endif
+	if (
+#if defined(_WIN64)
+		!sourceBoundInline &&
+#endif
+		(!jobs.isRunning() || jobs.isWorkerThread() ||
 		!jobs.isCurrentThread(JOB_OWNER_GAME) || jobs.workerCount() == 0U)
+		)
 		return false;
 
 #if defined(_WIN64)
@@ -720,11 +1090,21 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 		evidence != 0 ? evidence->performanceBatch : 0,
 		performance::KERNEL_PERFORMANCE_SCHEDULE);
 #endif
-	JobGroup group = jobs.createGroup();
-	if (!group.isValid())
+#if !defined(_WIN64)
+	AIPlayerPlanningJob::ExecutionRecord execution[
+		AI_PLANNING_MAX_JOB_EXECUTIONS];
+#endif
+	JobGroup group =
+#if defined(_WIN64)
+		sourceBoundInline ? JobGroup() :
+#endif
+		jobs.createGroup();
+	if (
+#if defined(_WIN64)
+		!sourceBoundInline &&
+#endif
+		!group.isValid())
 		return false;
-
-	AIPlayerPlanningJob::ExecutionRecord execution[AI_PLANNING_MAX_JOB_EXECUTIONS];
 	std::atomic<uint32_t> activePhysicalWorkers(0U);
 	std::atomic<uint32_t> peakPhysicalWorkers(0U);
 	const JobFloatingPointState floatingPointState;
@@ -749,6 +1129,32 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 	bool sourceSharded[AI_PLANNING_MAX_PLAYERS] = { false };
 	uint32_t submitted = 0U;
 	bool submissionFailed = false;
+#if defined(_WIN64)
+	if (sourceBoundInline)
+	{
+		schedule.end();
+		bool admissionAccepted = false;
+		if (!ConsumeAIPlanningRanges(referenceBatch, snapshots, snapshotCount, results,
+			shardedFacts.get(), verificationFacts.get(), execution,
+			floatingPointState, &admissionAccepted))
+		{
+			if (evidence != 0)
+				evidence->nativeAdmissionAccepted = admissionAccepted;
+			return false;
+		}
+		submitted = CountAIPlanningJobs(snapshots, snapshotCount);
+		for (uint32_t player = 0; player != snapshotCount; ++player)
+			sourceSharded[player] = snapshots[player].planProduction != 0 &&
+				snapshots[player].production.sourceFacts.valid != 0;
+		if (evidence != 0)
+		{
+			evidence->sourceBoundInline = true;
+			evidence->nativeAdmissionAccepted = admissionAccepted;
+		}
+	}
+	else
+	{
+#endif
 	for (uint32_t player = 0U; player < snapshotCount && !submissionFailed;
 		++player)
 	{
@@ -768,12 +1174,20 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 				const uint32_t end = begin + AI_PLANNING_PRODUCTION_SHARD_SIZE <
 					production.candidateCount ? begin +
 					AI_PLANNING_PRODUCTION_SHARD_SIZE : production.candidateCount;
+#if defined(_WIN64)
+				source.plan(submitted, 2, player * AI_PLANNING_MAX_PRODUCTION_CANDIDATES + begin,
+					player * AI_PLANNING_MAX_PRODUCTION_CANDIDATES + end);
+#endif
 				AIProductionCandidateShardJob *job = new (std::nothrow)
 					AIProductionCandidateShardJob(&production,
 						shardedFacts[player], verificationFacts[player], begin,
 						end, execution + submitted,
 						&activePhysicalWorkers, &peakPhysicalWorkers,
-						floatingPointState);
+						floatingPointState
+#if defined(_WIN64)
+						, testHooks, player
+#endif
+						);
 				JobHandle handle = job != 0 ? jobs.trySubmit(job,
 					JOB_PRIORITY_FRAME_CRITICAL, group) : JobHandle();
 				if (!handle.isValid())
@@ -783,6 +1197,7 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 					break;
 				}
 				++submitted;
+				if (evidence != 0) evidence->nativeAdmissionAccepted = true;
 				s_submittedJobs.fetch_add(1U, std::memory_order_relaxed);
 			}
 		}
@@ -793,10 +1208,17 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 				submissionFailed = true;
 				break;
 			}
+#if defined(_WIN64)
+			source.plan(submitted, 1, player, player + 1);
+#endif
 			AIPlayerPlanningJob *job = new (std::nothrow) AIPlayerPlanningJob(
 				snapshots + player, results + player, execution + submitted,
 				&activePhysicalWorkers, &peakPhysicalWorkers,
-				floatingPointState);
+				floatingPointState
+#if defined(_WIN64)
+				, testHooks, player
+#endif
+				);
 			JobHandle handle = job != 0 ? jobs.trySubmit(job,
 				JOB_PRIORITY_FRAME_CRITICAL, group) : JobHandle();
 			if (!handle.isValid())
@@ -806,6 +1228,7 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 				break;
 			}
 			++submitted;
+			if (evidence != 0) evidence->nativeAdmissionAccepted = true;
 			s_submittedJobs.fetch_add(1U, std::memory_order_relaxed);
 		}
 	}
@@ -817,6 +1240,9 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 	{
 		jobs.cancel(group);
 		jobs.wait(group);
+#if defined(_WIN64)
+		source.release(submitted, group.wasCancelled());
+#endif
 		if (evidence != 0) evidence->collect(execution, submitted,
 			peakPhysicalWorkers.load(std::memory_order_relaxed));
 		return false;
@@ -824,8 +1250,15 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 	// Do not manufacture a parallel result by letting the owner execute every
 	// job. A short passive fence either proves physical-worker progress or
 	// cancels and falls back to the serial oracle.
-	const unsigned physicalCompletionTimeoutMilliseconds = 8U;
+	const unsigned physicalCompletionTimeoutMilliseconds =
 #if defined(_WIN64)
+		// This bounded rendezvous is a focused-test control, not evidence of
+		// ordinary eight-millisecond admission or installed qualification.
+		testHooks != 0 && testHooks->rendezvous != 0 ? 1000U :
+#endif
+		8U;
+#if defined(_WIN64)
+	if (testHooks != 0 && testHooks->beforeWait != 0) testHooks->beforeWait(testHooks->context);
 	AIPlanningPerformanceInterval wait(
 		evidence != 0 ? evidence->performanceBatch : 0,
 		performance::KERNEL_PERFORMANCE_WAIT);
@@ -838,17 +1271,29 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 	if (!passiveWaitCompleted)
 	{
 		jobs.cancel(group);
+#if defined(_WIN64)
+		if (testHooks != 0 && testHooks->afterCancel != 0) testHooks->afterCancel(testHooks->context);
+#endif
 		jobs.wait(group);
+#if defined(_WIN64)
+		source.release(submitted, group.wasCancelled());
+#endif
 		if (evidence != 0) evidence->collect(execution, submitted,
 			peakPhysicalWorkers.load(std::memory_order_relaxed));
 		return false;
 	}
+#if defined(_WIN64)
+	source.release(submitted, group.wasCancelled());
+#endif
 	if (group.failed() || group.wasCancelled())
 	{
 		if (evidence != 0) evidence->collect(execution, submitted,
 			peakPhysicalWorkers.load(std::memory_order_relaxed));
 		return false;
 	}
+#if defined(_WIN64)
+	}
+#endif
 	for (uint32_t i = 0U; i < submitted; ++i)
 	{
 		if (!execution[i].completed)
@@ -872,6 +1317,10 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 		{
 			AIPlayerPlanningSnapshot prepared = snapshots[player];
 			prepared.production.sourceFacts.valid = 0U;
+#if defined(_WIN64)
+			ObserveAIPlanningTest(testHooks, AI_PLANNING_TEST_OWNER_FACT_COMPARISON,
+				player, 0, prepared.production.candidateCount);
+#endif
 			if (!ValidateAIProductionPreparedFacts(shardedFacts[player],
 				verificationFacts[player], prepared.production.candidateCount))
 				return false;
@@ -879,24 +1328,64 @@ bool RunAIPlanningJobs(const AIPlayerPlanningSnapshot *snapshots,
 			{
 				prepared.production.candidates[i] = shardedFacts[player][i];
 			}
+#if defined(_WIN64)
+			ObserveAIPlanningTest(testHooks, AI_PLANNING_TEST_OWNER_WINNER,
+				player, 0, prepared.production.candidateCount);
+#endif
 			if (!PlanAIPlayer(prepared, &results[player]))
 				return false;
 		}
-		else if (!ValidateAIPlayerPlanningResult(snapshots[player],
-			results[player]))
-			return false;
+		else
+		{
+#if defined(_WIN64)
+			ObserveAIPlanningTest(testHooks, AI_PLANNING_TEST_OWNER_VALIDATION, player, 0, 1);
+#endif
+			if (!ValidateAIPlayerPlanningResult(snapshots[player], results[player])) return false;
+		}
 	}
 #if defined(_WIN64)
-	ObserveAIPlanningReferenceBatch(performanceBatch, referenceBatch);
+	const bool referenceObserved = ObserveAIPlanningReferenceBatch(
+		performanceBatch, referenceBatch);
 	validate.end();
+	if (referenceBatch != 0 && referenceBatch->referenceAttempt.valid() &&
+		!referenceObserved)
+		return false;
+	if (sourceBoundInline)
+	{
+		performance::KernelPerformanceAttemptFinish sourceFinish = {};
+		if (!referenceObserved || referenceBatch == 0 ||
+			referenceBatch->referenceLedger == 0 ||
+			!referenceBatch->referenceLedger->readSourceFinish(
+				referenceBatch->referenceAttempt, sourceFinish) ||
+			!sourceFinish.validationObserved ||
+			(sourceFinish.disposition != performance::KERNEL_PERFORMANCE_COMMITTED &&
+			 sourceFinish.disposition != performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION))
+			return false;
+		evidence->sourceOwnerCommitAllowed = sourceFinish.disposition ==
+			performance::KERNEL_PERFORMANCE_COMMITTED;
+	}
 #endif
 	if (evidence != 0) evidence->collect(execution, submitted,
 		peakPhysicalWorkers.load(std::memory_order_relaxed));
 	if (evidence != 0) evidence->resultsValidated = true;
-	return evidence != 0 && evidence->ownerHelpedJobs == 0U &&
+	return evidence != 0 &&
+#if defined(_WIN64)
+		(evidence->sourceBoundInline ||
+#endif
+		(evidence->ownerHelpedJobs == 0U &&
 		evidence->distinctPhysicalWorkers > 1U &&
-		evidence->peakConcurrentPhysicalWorkers > 1U;
+		evidence->peakConcurrentPhysicalWorkers > 1U)
+#if defined(_WIN64)
+		)
+#endif
+		;
 }
+}
+
+uint32_t CountAIPlanningBatchJobs(const AIPlayerPlanningSnapshot *snapshots,
+	uint32_t snapshotCount)
+{
+	return snapshots != 0 ? CountAIPlanningJobs(snapshots, snapshotCount) : 0U;
 }
 
 #if defined(_WIN64)
@@ -1000,7 +1489,8 @@ void AIPlanningPerformanceBatchScope::commit()
 AIPlanningReferenceBatchTransport::AIPlanningReferenceBatchTransport() :
 	referenceLedger(0), referenceBatch(0), writeInput(0), immutableInput(0),
 	writeOutput(0), productionOutput(0), serialCompute(0),
-	detachedSerialOutput(0), operationCount(0), fieldSchema(1U)
+		detachedSerialOutput(0), operationCount(0), fieldSchema(1U),
+	referenceAttempt(), testHooks(0)
 {
 }
 
@@ -1340,7 +1830,9 @@ bool ObserveAIPlanningReferenceBatch(
 	if (!performance::KernelPerformanceLedger::instance().describeBatch(
 		*timingBatch, identity))
 		return false;
-	const performance::KernelPerformanceReferenceBatch observed =
+	const performance::KernelPerformanceReferenceBatch observed = transport->referenceAttempt.valid() ?
+		transport->referenceLedger->observeValidatedAttempt(transport->referenceAttempt,
+			transport->writeOutput, transport->productionOutput) :
 		transport->referenceLedger->observeValidatedBatch(identity.kernel,
 			identity.subtype, identity.frame, identity.ordinal,
 			transport->fieldSchema, transport->operationCount,
@@ -2024,8 +2516,24 @@ bool ExecuteAIPlanningBatch(AIPlanningExecutionMode mode,
 			 ArePlayerResultsComplete(snapshots, parallelScratch, snapshotCount));
 		if (complete)
 		{
+#if defined(_WIN64)
+			// An authenticated owner-inline result follows the same single output
+			// copy, but can never claim physical-worker or parallel authority.
+			if (jobEvidence != 0 && jobEvidence->sourceBoundInline &&
+				mode == AI_PLANNING_EXECUTION_PARALLEL)
+			{
+				if (!jobEvidence->sourceOwnerCommitAllowed)
+					return false;
+				CopyPlayerResults(parallelScratch, snapshotCount, committedResults);
+				return true;
+			}
+#endif
 			if (status != 0)
-				status->parallelSucceeded = 1U;
+				status->parallelSucceeded =
+#if defined(_WIN64)
+					jobEvidence != 0 && jobEvidence->sourceBoundInline ? 0U :
+#endif
+					1U;
 			if (mode == AI_PLANNING_EXECUTION_PARALLEL)
 			{
 				CopyPlayerResults(parallelScratch, snapshotCount, committedResults);
@@ -2051,7 +2559,11 @@ bool ExecuteAIPlanningBatch(AIPlanningExecutionMode mode,
 					CopyPlayerResults(parallelScratch, snapshotCount, committedResults);
 					if (status != 0)
 					{
-						status->committedMode = AI_PLANNING_EXECUTION_PARALLEL;
+						status->committedMode =
+#if defined(_WIN64)
+							jobEvidence != 0 && jobEvidence->sourceBoundInline ? AI_PLANNING_EXECUTION_SERIAL :
+#endif
+							AI_PLANNING_EXECUTION_PARALLEL;
 						status->shadowMatched = 1U;
 					}
 					return true;
@@ -2108,6 +2620,8 @@ bool ExecuteAIPlanningBatchOnJobSystem(AIPlanningExecutionMode mode,
 		status->peakConcurrentPhysicalWorkers =
 			evidence.peakConcurrentPhysicalWorkers;
 		status->ownerHelpedJobs = evidence.ownerHelpedJobs;
+		status->nativeAdmissionAccepted =
+			evidence.nativeAdmissionAccepted ? 1U : 0U;
 	}
 	s_physicalWorkerExecutions.fetch_add(evidence.physicalWorkerExecutions,
 		std::memory_order_relaxed);
@@ -2132,6 +2646,10 @@ bool ExecuteAIPlanningBatchOnJobSystem(AIPlanningExecutionMode mode,
 	{
 		if (status->usedSerialFallback != 0U)
 		{
+#if defined(_WIN64)
+			ObserveAIPlanningTest(referenceBatch != 0 ? referenceBatch->testHooks : 0,
+				AI_PLANNING_TEST_SERIAL_FALLBACK, 0, 0, snapshotCount);
+#endif
 			s_serialFallbacks.fetch_add(1U, std::memory_order_relaxed);
 			JobSystem::instance().recordSerialFallback();
 		}

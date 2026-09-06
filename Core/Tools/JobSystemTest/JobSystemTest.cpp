@@ -34,7 +34,8 @@ enum JobSystemTestFault
 	JOB_SYSTEM_TEST_FAIL_COMPLETION_PUSH = 7,
 	JOB_SYSTEM_TEST_FAIL_PROMOTION_PUSH = 8,
 	JOB_SYSTEM_TEST_COMPETING_FINALIZER = 9,
-	JOB_SYSTEM_TEST_FAIL_AFTER_QUEUE_PUSH = 10
+	JOB_SYSTEM_TEST_FAIL_AFTER_QUEUE_PUSH = 10,
+	JOB_SYSTEM_TEST_FAIL_GROUP_ASSIGNMENT_ALLOCATION = 11
 };
 
 enum JobSystemTestPause
@@ -76,20 +77,26 @@ enum JobSystemTestLane
 };
 
 const unsigned kLocalCapacityWorkerLimit = 12;
-JobSystemTestLane g_testLane = JOB_SYSTEM_TEST_LANE_FULL;
+JobSystemTestLane g_testLane = JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
 
 bool parseJobSystemTestLane(int argc, const char *selector,
 	JobSystemTestLane *lane)
 {
 	if (lane == 0 || argc < 1)
 		return false;
-	*lane = JOB_SYSTEM_TEST_LANE_FULL;
+	*lane = JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
 	if (argc == 1)
 		return true;
-	if (argc == 2 && selector != 0 &&
-		strcmp(selector, "--local-capacity") == 0)
+	if (argc != 2 || selector == 0)
+		return false;
+	if (strcmp(selector, "--local-capacity") == 0)
 	{
 		*lane = JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
+		return true;
+	}
+	if (strcmp(selector, "--external-qualification") == 0)
+	{
+		*lane = JOB_SYSTEM_TEST_LANE_FULL;
 		return true;
 	}
 	return false;
@@ -131,13 +138,16 @@ int runTest(const char *name, int (*test)())
 int testJobSystemTestLaneSelection()
 {
 	int result = 0;
-	JobSystemTestLane lane = JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
+	JobSystemTestLane lane = JOB_SYSTEM_TEST_LANE_FULL;
 	result |= check(parseJobSystemTestLane(1, 0, &lane) &&
-		lane == JOB_SYSTEM_TEST_LANE_FULL,
-		"test lane defaults to the full high-core qualification lane");
+		lane == JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY,
+		"test lane defaults to the fail-safe local-capacity lane");
 	result |= check(parseJobSystemTestLane(2, "--local-capacity", &lane) &&
 		lane == JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY,
 		"local capacity selector chooses the bounded test lane explicitly");
+	result |= check(parseJobSystemTestLane(2, "--external-qualification",
+		&lane) && lane == JOB_SYSTEM_TEST_LANE_FULL,
+		"external selector explicitly unlocks high-core qualification");
 	result |= check(!parseJobSystemTestLane(3, "--local-capacity", &lane),
 		"unknown test lane arguments are rejected");
 	result |= check(workerCountForTest(16, false) == 16 &&
@@ -2597,11 +2607,12 @@ int main(int argc, char **argv)
 	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
 	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
-	JobSystemTestLane selectedLane = JOB_SYSTEM_TEST_LANE_FULL;
+	JobSystemTestLane selectedLane = JOB_SYSTEM_TEST_LANE_LOCAL_CAPACITY;
 	const char *selector = argv != 0 && argc > 1 ? argv[1] : 0;
 	if (!parseJobSystemTestLane(argc, selector, &selectedLane))
 	{
-		fprintf(stderr, "Usage: %s [--local-capacity]\n",
+		fprintf(stderr, "Usage: %s "
+			"[--local-capacity|--external-qualification]\n",
 			argv != 0 && argc > 0 && argv[0] != 0 ? argv[0] :
 				"core_job_system_tests");
 		return 2;
@@ -2612,7 +2623,8 @@ int main(int argc, char **argv)
 		printf("JobSystem test lane: local-capacity (maximum test-created "
 			"workers=%u).\n", kLocalCapacityWorkerLimit);
 		printf("External high-core throughput lane explicitly excluded: "
-			"worker counts 16 and 32; the no-argument lane retains it.\n");
+			"worker counts 16 and 32; select --external-qualification "
+			"to run it.\n");
 		printf("Local priority-throughput worker counts: 4, 8 and 12.\n");
 		printf("Local deterministic and flat-range starts above 12, including "
 			"automatic requests, use explicit 12-worker requests.\n");
@@ -2621,8 +2633,8 @@ int main(int argc, char **argv)
 	}
 	else
 	{
-		printf("JobSystem test lane: full (includes high-core throughput "
-			"worker counts 16 and 32).\n");
+		printf("JobSystem test lane: explicit external qualification "
+			"(includes high-core throughput worker counts 16 and 32).\n");
 	}
 	int result = 0;
 	result |= runTest("testJobSystemTestLaneSelection", testJobSystemTestLaneSelection);

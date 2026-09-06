@@ -8,6 +8,8 @@
 
 #include <assert.h>
 #include <limits.h>
+#include <new>
+#include <stdio.h>
 
 namespace rts
 {
@@ -46,11 +48,61 @@ bool IsCompactPositionColorLayout(const RenderVertexLayout &layout,
 		layout.elements[1].format == RENDER_VERTEX_DATA_COLOR_BGRA8 &&
 		layout.elements[1].byteOffset == sizeof(float) * 3;
 }
+
+bool ComputeDeclaredVertexStart(const NativeDrawPacket &packet,
+	unsigned int *declaredStart)
+{
+	if (declaredStart == 0)
+	{
+		return false;
+	}
+	if (!packet.indexed)
+	{
+		*declaredStart = packet.startVertex;
+		return true;
+	}
+
+	// Indexed draws address vertexBuffer[baseVertex + index].  The legacy
+	// minimumVertexIndex is the minimum raw index declared by the caller; keep
+	// the signed base offset legal while rejecting negative or overflowing
+	// effective ranges before consulting the initialized-byte proof.
+	if (packet.baseVertex >= 0)
+	{
+		const unsigned int base = static_cast<unsigned int>(packet.baseVertex);
+		if (base > UINT_MAX - packet.minimumVertexIndex)
+		{
+			return false;
+		}
+		*declaredStart = base + packet.minimumVertexIndex;
+		return true;
+	}
+	const unsigned int magnitude = static_cast<unsigned int>(
+		-(packet.baseVertex + 1)) + 1U;
+	if (magnitude > packet.minimumVertexIndex)
+	{
+		return false;
+	}
+	*declaredStart = packet.minimumVertexIndex - magnitude;
+	return true;
 }
+}
+
+struct NativeW3DRenderer::DeferredShutdown
+{
+	explicit DeferredShutdown(NativeW3DRenderState *requestedState) :
+		state(requestedState), device(0), detached(false), entry()
+	{
+	}
+
+	NativeW3DRenderState *state;
+	IRenderDevice *device;
+	bool detached;
+	NativeW3DOwnerFallbackEntry entry;
+};
 
 NativeW3DRendererDescriptor::NativeW3DRendererDescriptor() :
 	width(0), height(0), adapterIndex(UINT_MAX), enableDebugLayer(false),
-	enableVsync(true), allowSoftwareFallback(true)
+	enableVsync(true), allowSoftwareFallback(true), multisampleCount(1)
 {
 }
 
@@ -76,9 +128,17 @@ NativeW3DRenderer::~NativeW3DRenderer()
 {
 	if (m_state != 0)
 	{
-		assert(IsOwnerThread());
 		if (!IsOwnerThread())
 		{
+			const RenderResult deferredResult = DeferShutdownOnOwner();
+			if (deferredResult != RENDER_RESULT_OK)
+			{
+				// The queue is the only safe handoff for a threaded backend. A
+				// closed/unbound owner is terminally abandoned rather than
+				// invoking ThreadedRenderDevice::shutdown from this thread.
+				fputs("NativeW3DRenderer off-owner shutdown deferred/retained\n",
+					stderr);
+			}
 			return;
 		}
 		if (m_ownsBackend)
@@ -128,6 +188,7 @@ RenderResult NativeW3DRenderer::Initialize(void *window,
 	parameters.width = descriptor.width;
 	parameters.height = descriptor.height;
 	parameters.adapterIndex = descriptor.adapterIndex;
+	parameters.multisampleCount = descriptor.multisampleCount;
 	parameters.enableDebugLayer = descriptor.enableDebugLayer;
 	parameters.enableVsync = descriptor.enableVsync;
 	parameters.allowSoftwareFallback = descriptor.allowSoftwareFallback;
@@ -322,9 +383,12 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	if (!resources.IsVertexRangeValidForSubmission(packet.vertexBuffer,
+	unsigned int declaredVertexStart = 0;
+	if (!ComputeDeclaredVertexStart(packet, &declaredVertexStart) ||
+		packet.vertexCount > UINT_MAX - declaredVertexStart ||
+		!resources.IsVertexRangeValidForSubmission(packet.vertexBuffer,
 		packet.vertexStride,
-		packet.vertexOffset, packet.startVertex, packet.vertexCount) ||
+		packet.vertexOffset, declaredVertexStart, packet.vertexCount) ||
 		(packet.indexed && (!resources.IsIndexRangeValidForSubmission(
 		packet.indexBuffer,
 		packet.indexFormat, packet.indexOffset, packet.startIndex,
@@ -771,6 +835,90 @@ void NativeW3DRenderer::RecordFrameFailure(RenderResult result)
 	{
 		m_frameFailure = result;
 	}
+}
+
+RenderResult NativeW3DRenderer::DeferShutdownOnOwner()
+{
+	if (m_state == 0)
+		return RENDER_RESULT_OK;
+	if (IsOwnerThread())
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	if (!m_ownsBackend)
+	{
+		// Borrowed backends are owned by the bridge. Releasing this facade's
+		// state reference is thread-safe; detaching the borrowed device is not
+		// and remains the bridge owner's responsibility.
+		m_state->Release();
+		m_state = 0;
+		m_recoveryResources = 0;
+		m_frameOpen = false;
+		m_frameFailure = RENDER_RESULT_OK;
+		m_borrowedMode = false;
+		return RENDER_RESULT_OK;
+	}
+
+	DeferredShutdown *deferred = new (std::nothrow) DeferredShutdown(m_state);
+	if (deferred == 0)
+		return RENDER_RESULT_OUT_OF_MEMORY;
+	const RenderResult enqueueResult = m_state->EnqueueFallbackCleanup(
+		CompleteDeferredShutdown, deferred, ReleaseDeferredShutdown,
+		&deferred->entry);
+	if (enqueueResult != RENDER_RESULT_OK)
+	{
+		delete deferred;
+		return enqueueResult;
+	}
+
+	// The deferred context now owns the renderer's final state reference. It
+	// will close the owner queue, detach the backend, and delete the device on
+	// the producer before releasing that reference.
+	m_state = 0;
+	m_recoveryResources = 0;
+	m_frameOpen = false;
+	m_frameFailure = RENDER_RESULT_OK;
+	m_ownsBackend = false;
+	m_borrowedMode = false;
+	return RENDER_RESULT_OK;
+}
+
+void NativeW3DRenderer::CompleteDeferredShutdown(void *context)
+{
+	DeferredShutdown *deferred = static_cast<DeferredShutdown *>(context);
+	if (deferred == 0 || deferred->state == 0 ||
+		!deferred->state->IsOwnerThread())
+		throw 1;
+	NativeW3DRenderState *state = deferred->state;
+	if (!deferred->detached)
+	{
+		// NativeW3D2's resource-table fallback is queued before this renderer
+		// fallback (the renderer is destroyed last), so a non-zero count means a
+		// terminal resource callback still needs an owner retry.
+		if (state->BoundResourceTables() != 0)
+			throw 1;
+		const RenderResult closeResult = state->BeginShutdown();
+		if (closeResult != RENDER_RESULT_OK)
+			throw 1;
+		deferred->device = state->m_device;
+		if (state->DetachBackend() != RENDER_RESULT_OK)
+			throw 1;
+		deferred->detached = true;
+	}
+	if (deferred->device != 0)
+	{
+		deferred->device->shutdown();
+		delete deferred->device;
+		deferred->device = 0;
+	}
+}
+
+void NativeW3DRenderer::ReleaseDeferredShutdown(void *context)
+{
+	DeferredShutdown *deferred = static_cast<DeferredShutdown *>(context);
+	if (deferred == 0)
+		return;
+	if (deferred->state != 0)
+		deferred->state->Release();
+	delete deferred;
 }
 
 RenderResult NativeW3DRenderer::AttachBorrowedState(

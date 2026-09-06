@@ -29,6 +29,7 @@ struct NativeW3DRendererDescriptor
 	bool enableDebugLayer;
 	bool enableVsync;
 	bool allowSoftwareFallback;
+	unsigned int multisampleCount;
 };
 
 struct NativeDrawPacket
@@ -63,11 +64,10 @@ struct NativeDrawPacket
 class NativeW3DRenderer
 {
 public:
-	// This facade is an owner-thread object in Stage 2.  Every method, query,
-	// and destruction must run on the thread that successfully initialized it.
-	// Worker threads may only submit detached cleanup packets through resource
-	// destruction; Stage 4 replaces this contract with a dedicated render-owner
-	// service rather than permitting concurrent facade access.
+	// This facade is an owner-thread object in Stage 2. Every method and query
+	// must run on the thread that successfully initialized it. Destruction may
+	// arrive from a worker; owned backend shutdown is then transferred to the
+	// owner cleanup queue, while borrowed state is only reference-released.
 	NativeW3DRenderer();
 	~NativeW3DRenderer();
 
@@ -163,6 +163,13 @@ private:
 		bool requireFacadeFrame);
 	RenderResult AttachBorrowedState(NativeW3DRenderState *state);
 	RenderResult DetachBorrowedState();
+	// Destruction can be initiated by a worker, but the backend and its
+	// ThreadedRenderDevice remain producer-owned. Transfer the final state
+	// reference to the owner queue instead of calling Shutdown cross-thread.
+	RenderResult DeferShutdownOnOwner();
+	struct DeferredShutdown;
+	static void CompleteDeferredShutdown(void *context);
+	static void ReleaseDeferredShutdown(void *context);
 	static RenderResult DrainFailedRecoveryCleanup(
 		NativeW3DRenderState *state, unsigned int *drained);
 };

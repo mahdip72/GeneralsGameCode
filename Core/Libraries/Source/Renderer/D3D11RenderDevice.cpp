@@ -552,8 +552,11 @@ public:
 	D3D11RenderDevice() : m_device(0), m_context(0),
 		m_featureLevel(D3D_FEATURE_LEVEL_9_1), m_debugLayer(0),
 		m_debugLayerActive(false), m_swapChain(0),
-		m_renderTarget(0), m_renderTargetResource(0), m_depthTexture(0), m_depthStencil(0),
+		m_renderTarget(0), m_renderTargetResource(0),
+		m_multisampleColorTexture(0), m_multisampleRenderTarget(0),
 		m_presentationSource(0), m_presentationSourceView(0),
+		m_depthTexture(0), m_depthStencil(0),
+		m_multisampleDepthTexture(0), m_multisampleDepthStencil(0),
 		m_activeRenderTarget(0), m_activeDepthStencil(0),
 		m_activeColorResource(0), m_activeDepthResource(0),
 		m_vertexShader(0), m_pixelShader(0), m_positionColorLayout(0),
@@ -573,6 +576,7 @@ public:
 		m_swapInterval(1), m_gamma(1.0f), m_brightness(0.0f),
 		m_contrast(1.0f), m_gammaCalibrate(false), m_gammaUseLimit(true),
 		m_transformConstantCursor(0), m_width(0), m_height(0),
+		m_multisampleCount(1),
 		m_viewportX(0.0f), m_viewportY(0.0f), m_viewportWidth(0.0f),
 		m_viewportHeight(0.0f), m_hasVertexLayoutFlagsOverride(false),
 		m_vertexLayoutFlagsOverride(0), m_parameters(),
@@ -664,6 +668,7 @@ public:
 		m_swapInterval = parameters.enableVsync ? 1 : 0;
 		m_width = parameters.width;
 		m_height = parameters.height;
+		m_parameters = parameters;
 		if (parameters.window != 0)
 		{
 			result = createSwapChain(static_cast<HWND>(parameters.window));
@@ -686,7 +691,6 @@ public:
 			return TranslateResult(result);
 		}
 		m_initialized = true;
-		m_parameters = parameters;
 		return RENDER_RESULT_OK;
 	}
 
@@ -1197,7 +1201,6 @@ public:
 		ResourceSlot &destination = m_resources[texture.index()];
 		if (destination.kind != RESOURCE_TEXTURE || destination.resource == 0 ||
 			(destination.binding & RENDER_TEXTURE_SHADER_RESOURCE) == 0 ||
-			(destination.binding & RENDER_TEXTURE_RENDER_TARGET) == 0 ||
 			destination.textureDescriptor.mipCount != 1 ||
 			destination.textureDescriptor.arrayCount != 1 ||
 			destination.textureDescriptor.usage == RENDER_USAGE_IMMUTABLE)
@@ -1241,14 +1244,18 @@ public:
 		D3D11_TEXTURE2D_DESC destinationDescriptor;
 		sourceTexture->GetDesc(&sourceDescriptor);
 		destinationTexture->GetDesc(&destinationDescriptor);
-		const bool compatible = sourceDescriptor.Width == destinationDescriptor.Width &&
+		const bool matchingShape = sourceDescriptor.Width == destinationDescriptor.Width &&
 			sourceDescriptor.Height == destinationDescriptor.Height &&
 			sourceDescriptor.MipLevels == 1 && destinationDescriptor.MipLevels == 1 &&
 			sourceDescriptor.ArraySize == 1 && destinationDescriptor.ArraySize == 1 &&
-			sourceDescriptor.Format == destinationDescriptor.Format &&
+			sourceDescriptor.Format == destinationDescriptor.Format;
+		const bool copyCompatible = matchingShape &&
 			sourceDescriptor.SampleDesc.Count == destinationDescriptor.SampleDesc.Count &&
 			sourceDescriptor.SampleDesc.Quality == destinationDescriptor.SampleDesc.Quality;
-		if (!compatible)
+		const bool resolveCompatible = matchingShape &&
+			sourceDescriptor.SampleDesc.Count > 1 &&
+			destinationDescriptor.SampleDesc.Count == 1;
+		if (!copyCompatible && !resolveCompatible)
 		{
 			destinationTexture->Release();
 			sourceTexture->Release();
@@ -1259,7 +1266,15 @@ public:
 		// Preserve every unrelated stage and restore the destination stages after
 		// the copy completes.
 		const unsigned int reboundStages = unbindTextureResource(texture);
-		m_context->CopyResource(destinationTexture, sourceTexture);
+		if (resolveCompatible)
+		{
+			m_context->ResolveSubresource(destinationTexture, 0, sourceTexture, 0,
+				sourceDescriptor.Format);
+		}
+		else
+		{
+			m_context->CopyResource(destinationTexture, sourceTexture);
+		}
 		const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
 		destinationTexture->Release();
 		sourceTexture->Release();
@@ -1302,20 +1317,7 @@ public:
 			if (slot.renderTarget == m_activeRenderTarget ||
 				slot.depthStencil == m_activeDepthStencil)
 			{
-				if (m_renderTarget != 0)
-				{
-					m_context->OMSetRenderTargets(1, &m_renderTarget,
-						m_depthStencil);
-				}
-				else
-				{
-					m_context->OMSetRenderTargets(0, 0, 0);
-				}
-				m_activeRenderTarget = m_renderTarget;
-				m_activeDepthStencil = m_depthStencil;
-				m_activeColorResource = m_renderTargetResource;
-				m_activeDepthResource = m_depthTexture;
-				m_renderTargetsBound = true;
+				bindDefaultRenderTargets();
 			}
 		}
 		else if (slot.kind == RESOURCE_BUFFER)
@@ -1416,28 +1418,14 @@ public:
 			shutdownInternal();
 			return TranslateResult(result);
 		}
-		m_activeRenderTarget = m_renderTarget;
-		m_activeDepthStencil = m_depthStencil;
-		m_activeColorResource = m_renderTargetResource;
-		m_activeDepthResource = m_depthTexture;
-		if (m_renderTarget != 0)
-		{
-			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
-		}
-		else
-		{
-			// A headless device can still render to logical targets.  Ensure the
-			// recreated context starts with no output when there is no swap-chain
-			// target to restore.
-			m_context->OMSetRenderTargets(0, 0, 0);
-		}
+		bindDefaultRenderTargets();
 		m_pipelineBound = false;
 		m_vertexBufferBound = false;
 		m_indexBufferBound = false;
 		m_topologyBound = false;
-		m_renderTargetsBound = m_renderTarget != 0;
+		m_renderTargetsBound = defaultRenderTarget() != 0;
 		markTextureBindingsEmpty();
-		m_viewportBound = m_renderTarget != 0;
+		m_viewportBound = defaultRenderTarget() != 0;
 		return RENDER_RESULT_OK;
 	}
 
@@ -1493,13 +1481,7 @@ public:
 				if (SUCCEEDED(createBackBufferTargets(previousWidth,
 					previousHeight)))
 				{
-					m_activeRenderTarget = m_renderTarget;
-					m_activeDepthStencil = m_depthStencil;
-					m_activeColorResource = m_renderTargetResource;
-					m_activeDepthResource = m_depthTexture;
-					m_renderTargetsBound = true;
-					m_context->OMSetRenderTargets(1, &m_renderTarget,
-						m_depthStencil);
+					bindDefaultRenderTargets();
 				}
 				else
 				{
@@ -1524,13 +1506,7 @@ public:
 					m_height = previousHeight;
 					m_parameters.width = previousWidth;
 					m_parameters.height = previousHeight;
-					m_activeRenderTarget = m_renderTarget;
-					m_activeDepthStencil = m_depthStencil;
-					m_activeColorResource = m_renderTargetResource;
-					m_activeDepthResource = m_depthTexture;
-					m_renderTargetsBound = true;
-					m_context->OMSetRenderTargets(1, &m_renderTarget,
-						m_depthStencil);
+					bindDefaultRenderTargets();
 				}
 				else
 				{
@@ -1540,12 +1516,7 @@ public:
 			}
 			m_width = width;
 			m_height = height;
-			m_activeRenderTarget = m_renderTarget;
-			m_activeDepthStencil = m_depthStencil;
-			m_activeColorResource = m_renderTargetResource;
-			m_activeDepthResource = m_depthTexture;
-			m_renderTargetsBound = true;
-			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
+			bindDefaultRenderTargets();
 			m_parameters.width = width;
 			m_parameters.height = height;
 		}
@@ -1577,6 +1548,9 @@ public:
 			// silently reporting success after a lost GPU.
 			return TranslateResult(m_device->GetDeviceRemovedReason());
 		}
+		const RenderResult resolveResult = resolveBackBuffer();
+		if (resolveResult != RENDER_RESULT_OK)
+			return resolveResult;
 		if (!isPresentationIdentity() && isDefaultBackBufferTarget())
 		{
 			const RenderResult transformResult = applyPresentationGamma();
@@ -1679,6 +1653,7 @@ public:
 		}
 		info->width = descriptor.Width;
 		info->height = descriptor.Height;
+		info->multisampleCount = m_multisampleCount;
 		info->format = format;
 		return RENDER_RESULT_OK;
 	}
@@ -1689,22 +1664,7 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		if (m_renderTarget != 0)
-		{
-			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
-		}
-		else
-		{
-			// A headless device may have used a logical target in the previous
-			// frame.  Do not leave that native RTV bound when the neutral frame
-			// begins without a swap-chain output.
-			m_context->OMSetRenderTargets(0, 0, 0);
-		}
-		m_activeRenderTarget = m_renderTarget;
-		m_activeDepthStencil = m_depthStencil;
-		m_activeColorResource = m_renderTargetResource;
-		m_activeDepthResource = m_depthTexture;
-		m_renderTargetsBound = m_renderTarget != 0;
+		bindDefaultRenderTargets();
 		bool needsTextureReset = !m_textureBindingsValid;
 		for (unsigned int stage = 0; !needsTextureReset &&
 			stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
@@ -1931,12 +1891,12 @@ public:
 		ID3D11Resource *colorResource = 0;
 		if (binding.useBackBufferColor)
 		{
-			if (m_renderTarget == 0)
+			if (defaultRenderTarget() == 0)
 			{
 				return RENDER_RESULT_UNSUPPORTED;
 			}
-			colorView = m_renderTarget;
-			colorResource = m_renderTargetResource;
+			colorView = defaultRenderTarget();
+			colorResource = defaultColorResource();
 		}
 		else if (binding.hasColor)
 		{
@@ -1959,12 +1919,17 @@ public:
 		ID3D11Resource *depthResource = 0;
 		if (binding.useBackBufferDepth)
 		{
-			if (m_depthStencil == 0)
+			const bool customSingleSampleColor = colorResource != 0 &&
+				colorResource != defaultColorResource();
+			depthView = customSingleSampleColor ? m_depthStencil :
+				defaultDepthStencil();
+			depthResource = customSingleSampleColor ?
+				static_cast<ID3D11Resource *>(m_depthTexture) :
+				defaultDepthResource();
+			if (depthView == 0)
 			{
 				return RENDER_RESULT_UNSUPPORTED;
 			}
-			depthView = m_depthStencil;
-			depthResource = m_depthTexture;
 		}
 		else if (binding.hasDepth)
 		{
@@ -2353,6 +2318,12 @@ public:
 		rasterizerDescriptor.DepthClipEnable = true;
 		rasterizerDescriptor.ScissorEnable =
 			state.pipeline.rasterizer.scissorEnable;
+		// MultisampleEnable controls the line rasterization algorithm even on
+		// feature level 11.  Key it to the negotiated device sample count rather
+		// than the request; D3D11 ignores this flag on the single-sample RTTs used
+		// by the legacy render-to-texture passes, while cached pipeline state stays
+		// valid when those passes switch back to the multisampled scene target.
+		rasterizerDescriptor.MultisampleEnable = m_multisampleCount > 1;
 		ID3D11RasterizerState *rasterizerState = 0;
 		result = findOrCreateRasterizerState(rasterizerDescriptor, &rasterizerState);
 		if (FAILED(result))
@@ -2877,6 +2848,9 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		const RenderResult resolveResult = resolveBackBuffer();
+		if (resolveResult != RENDER_RESULT_OK)
+			return resolveResult;
 		ID3D11Texture2D *backBuffer = 0;
 		HRESULT result = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
 			reinterpret_cast<void **>(&backBuffer));
@@ -3114,6 +3088,61 @@ public:
 	}
 
 private:
+	ID3D11RenderTargetView *defaultRenderTarget() const
+	{
+		return m_multisampleRenderTarget != 0 ?
+			m_multisampleRenderTarget : m_renderTarget;
+	}
+
+	ID3D11Resource *defaultColorResource() const
+	{
+		return m_multisampleColorTexture != 0 ?
+			static_cast<ID3D11Resource *>(m_multisampleColorTexture) :
+			m_renderTargetResource;
+	}
+
+	ID3D11DepthStencilView *defaultDepthStencil() const
+	{
+		return m_multisampleDepthStencil != 0 ?
+			m_multisampleDepthStencil : m_depthStencil;
+	}
+
+	ID3D11Resource *defaultDepthResource() const
+	{
+		return m_multisampleDepthTexture != 0 ?
+			static_cast<ID3D11Resource *>(m_multisampleDepthTexture) :
+			static_cast<ID3D11Resource *>(m_depthTexture);
+	}
+
+	void bindDefaultRenderTargets()
+	{
+		ID3D11RenderTargetView *colorView = defaultRenderTarget();
+		ID3D11DepthStencilView *depthView = defaultDepthStencil();
+		if (colorView != 0)
+			m_context->OMSetRenderTargets(1, &colorView, depthView);
+		else
+			m_context->OMSetRenderTargets(0, 0, 0);
+		m_activeRenderTarget = colorView;
+		m_activeDepthStencil = depthView;
+		m_activeColorResource = defaultColorResource();
+		m_activeDepthResource = defaultDepthResource();
+		m_renderTargetsBound = colorView != 0;
+	}
+
+	RenderResult resolveBackBuffer()
+	{
+		if (m_multisampleCount == 1)
+			return RENDER_RESULT_OK;
+		if (m_context == 0 || m_device == 0 ||
+			m_multisampleColorTexture == 0 || m_renderTargetResource == 0)
+		{
+			return RENDER_RESULT_FAILED;
+		}
+		m_context->ResolveSubresource(m_renderTargetResource, 0,
+			m_multisampleColorTexture, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+		return TranslateResult(m_device->GetDeviceRemovedReason());
+	}
+
 	bool isPresentationIdentity() const
 	{
 		return m_gamma == 1.0f && m_brightness == 0.0f &&
@@ -3122,9 +3151,9 @@ private:
 
 	bool isDefaultBackBufferTarget() const
 	{
-		return m_renderTarget != 0 && m_renderTargetResource != 0 &&
-			m_activeRenderTarget == m_renderTarget &&
-			m_activeColorResource == m_renderTargetResource;
+		return defaultRenderTarget() != 0 && defaultColorResource() != 0 &&
+			m_activeRenderTarget == defaultRenderTarget() &&
+			m_activeColorResource == defaultColorResource();
 	}
 
 	HRESULT createPresentationResources()
@@ -4384,6 +4413,7 @@ private:
 		{
 			return result;
 		}
+		m_multisampleCount = 1;
 
 		D3D11_TEXTURE2D_DESC depthDescriptor;
 		memset(&depthDescriptor, 0, sizeof(depthDescriptor));
@@ -4400,6 +4430,98 @@ private:
 		{
 			result = m_device->CreateDepthStencilView(m_depthTexture, 0,
 				&m_depthStencil);
+		}
+		unsigned int requestedMultisampleCount = m_parameters.multisampleCount;
+		if (requestedMultisampleCount != 2 && requestedMultisampleCount != 4 &&
+			requestedMultisampleCount != 8)
+		{
+			requestedMultisampleCount = 1;
+		}
+		for (unsigned int sampleCount = requestedMultisampleCount;
+			SUCCEEDED(result) && sampleCount >= 2; sampleCount /= 2)
+		{
+			UINT colorQualityLevels = 0;
+			UINT depthQualityLevels = 0;
+			HRESULT colorQualityResult = m_device->CheckMultisampleQualityLevels(
+				DXGI_FORMAT_B8G8R8A8_UNORM, sampleCount, &colorQualityLevels);
+			HRESULT depthQualityResult = m_device->CheckMultisampleQualityLevels(
+				DXGI_FORMAT_D24_UNORM_S8_UINT, sampleCount, &depthQualityLevels);
+			if (FAILED(colorQualityResult) || FAILED(depthQualityResult))
+			{
+				const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+				if (FAILED(deviceResult))
+				{
+					result = deviceResult;
+					break;
+				}
+				continue;
+			}
+			const UINT commonQualityLevels = colorQualityLevels < depthQualityLevels ?
+				colorQualityLevels : depthQualityLevels;
+			if (commonQualityLevels == 0)
+				continue;
+
+			D3D11_TEXTURE2D_DESC colorDescriptor;
+			memset(&colorDescriptor, 0, sizeof(colorDescriptor));
+			colorDescriptor.Width = width;
+			colorDescriptor.Height = height;
+			colorDescriptor.MipLevels = 1;
+			colorDescriptor.ArraySize = 1;
+			colorDescriptor.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			colorDescriptor.SampleDesc.Count = sampleCount;
+			colorDescriptor.SampleDesc.Quality = commonQualityLevels - 1;
+			colorDescriptor.Usage = D3D11_USAGE_DEFAULT;
+			colorDescriptor.BindFlags = D3D11_BIND_RENDER_TARGET;
+			HRESULT multisampleResult = m_device->CreateTexture2D(&colorDescriptor,
+				0, &m_multisampleColorTexture);
+			if (SUCCEEDED(multisampleResult))
+			{
+				multisampleResult = m_device->CreateRenderTargetView(
+					m_multisampleColorTexture, 0, &m_multisampleRenderTarget);
+			}
+			D3D11_TEXTURE2D_DESC multisampleDepthDescriptor = depthDescriptor;
+			multisampleDepthDescriptor.SampleDesc = colorDescriptor.SampleDesc;
+			if (SUCCEEDED(multisampleResult))
+			{
+				multisampleResult = m_device->CreateTexture2D(
+					&multisampleDepthDescriptor, 0, &m_multisampleDepthTexture);
+			}
+			if (SUCCEEDED(multisampleResult))
+			{
+				multisampleResult = m_device->CreateDepthStencilView(
+					m_multisampleDepthTexture, 0, &m_multisampleDepthStencil);
+			}
+			if (SUCCEEDED(multisampleResult))
+			{
+				m_multisampleCount = sampleCount;
+				break;
+			}
+			if (m_multisampleDepthStencil != 0)
+			{
+				m_multisampleDepthStencil->Release();
+				m_multisampleDepthStencil = 0;
+			}
+			if (m_multisampleDepthTexture != 0)
+			{
+				m_multisampleDepthTexture->Release();
+				m_multisampleDepthTexture = 0;
+			}
+			if (m_multisampleRenderTarget != 0)
+			{
+				m_multisampleRenderTarget->Release();
+				m_multisampleRenderTarget = 0;
+			}
+			if (m_multisampleColorTexture != 0)
+			{
+				m_multisampleColorTexture->Release();
+				m_multisampleColorTexture = 0;
+			}
+			const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+			if (FAILED(deviceResult))
+			{
+				result = deviceResult;
+				break;
+			}
 		}
 		if (FAILED(result))
 		{
@@ -4448,6 +4570,26 @@ private:
 			m_depthTexture->Release();
 			m_depthTexture = 0;
 		}
+		if (m_multisampleDepthStencil != 0)
+		{
+			m_multisampleDepthStencil->Release();
+			m_multisampleDepthStencil = 0;
+		}
+		if (m_multisampleDepthTexture != 0)
+		{
+			m_multisampleDepthTexture->Release();
+			m_multisampleDepthTexture = 0;
+		}
+		if (m_multisampleRenderTarget != 0)
+		{
+			m_multisampleRenderTarget->Release();
+			m_multisampleRenderTarget = 0;
+		}
+		if (m_multisampleColorTexture != 0)
+		{
+			m_multisampleColorTexture->Release();
+			m_multisampleColorTexture = 0;
+		}
 		if (m_renderTarget != 0)
 		{
 			m_renderTarget->Release();
@@ -4458,6 +4600,7 @@ private:
 			m_renderTargetResource->Release();
 			m_renderTargetResource = 0;
 		}
+		m_multisampleCount = 1;
 	}
 
 	unsigned int nextStateUseSerial()
@@ -5528,10 +5671,14 @@ private:
 	IDXGISwapChain1 *m_swapChain;
 	ID3D11RenderTargetView *m_renderTarget;
 	ID3D11Resource *m_renderTargetResource;
+	ID3D11Texture2D *m_multisampleColorTexture;
+	ID3D11RenderTargetView *m_multisampleRenderTarget;
 	ID3D11Texture2D *m_presentationSource;
 	ID3D11ShaderResourceView *m_presentationSourceView;
 	ID3D11Texture2D *m_depthTexture;
 	ID3D11DepthStencilView *m_depthStencil;
+	ID3D11Texture2D *m_multisampleDepthTexture;
+	ID3D11DepthStencilView *m_multisampleDepthStencil;
 	ID3D11RenderTargetView *m_activeRenderTarget;
 	ID3D11DepthStencilView *m_activeDepthStencil;
 	ID3D11Resource *m_activeColorResource;
@@ -5582,6 +5729,7 @@ private:
 	unsigned int m_transformConstantCursor;
 	unsigned int m_width;
 	unsigned int m_height;
+	unsigned int m_multisampleCount;
 	float m_viewportX;
 	float m_viewportY;
 	float m_viewportWidth;

@@ -411,7 +411,9 @@ bool SurfaceClass::Unlock_Native_Surface()
 		return true;
 	}
 	NativeSurface->locked = false;
-	return Publish_Native_Surface(NativeSurface);
+	// A standalone surface is CPU-owned staging data (including the shroud
+	// source). Unlocking it commits those bytes without a texture publication.
+	return NativeSurface->texture == nullptr || Publish_Native_Surface(NativeSurface);
 }
 
 void SurfaceClass::Unlock_Read_Only()

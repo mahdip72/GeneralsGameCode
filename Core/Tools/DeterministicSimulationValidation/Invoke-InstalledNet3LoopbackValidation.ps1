@@ -54,7 +54,9 @@ function Read-AndValidateArtifactSet {
     $document = ConvertFrom-Stage5JsonDictionary $full
     Assert-Stage5JsonShape $document @('schemaVersion', 'sourceCommit',
         'productSet', 'architecture', 'artifacts') 'Artifact set manifest'
-    if ((Get-Stage5JsonValue $document 'schemaVersion' 'Artifact set manifest') -ne 1 -or
+    if (-not (Test-Stage5JsonInteger (Get-Stage5JsonValue $document `
+            'schemaVersion' 'Artifact set manifest')) -or
+        (Get-Stage5JsonValue $document 'schemaVersion' 'Artifact set manifest') -ne 1 -or
         (Get-Stage5JsonValue $document 'sourceCommit' 'Artifact set manifest') -cne
             $ExpectedSourceCommit -or
         (Get-Stage5JsonValue $document 'architecture' 'Artifact set manifest') -cne 'x64') {
@@ -292,7 +294,8 @@ foreach ($title in @('Generals', 'ZeroHour')) {
                         'rosterExact', 'rosterSha256', 'policyMask', 'finalFrame',
                         'finalCRC', 'cleanShutdown', 'kernels')
                     Assert-Stage5JsonShape $raw $requiredRaw "Raw NET3 peer $recordId/$($entry.peerIndex)"
-                    if ($raw.schemaVersion -ne 1 -or
+                    if (-not (Test-Stage5JsonInteger $raw.schemaVersion) -or
+                        $raw.schemaVersion -ne 1 -or
                         $raw.producer -cne 'installed-runtime-net3-peer-v1' -or
                         $raw.validationMode -cne 'scoped-net3-loopback-release-proof' -or
                         $raw.kernelFixture -cne 'actual-stage5-kernels-v1' -or

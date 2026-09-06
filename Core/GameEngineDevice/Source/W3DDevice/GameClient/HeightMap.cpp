@@ -631,6 +631,11 @@ Int HeightMapRenderObjClass::updateVBWithTerrainPreparation(
 	{
 		DX8VertexBufferClass::WriteLockClass lockVtxBuffer(pVB);
 		void *hardware = lockVtxBuffer.Get_Vertex_Array();
+		if (!hardware)
+		{
+			m_needFullUpdate = true;
+			return -1;
+		}
 		if (hardware)
 		{
 			hardwareReady = ScatterPreparedHeightMapTerrainRows(
@@ -641,6 +646,11 @@ Int HeightMapRenderObjClass::updateVBWithTerrainPreparation(
 					static_cast<unsigned>(sizeof(VERTEX_FORMAT)),
 				destinationRowStrideBytes, data, destinationCapacityBytes,
 				hardware, destinationCapacityBytes);
+		}
+		if (hardwareReady && !lockVtxBuffer.Commit())
+		{
+			m_needFullUpdate = true;
+			return -1;
 		}
 	}
 	if (!hardwareReady)
@@ -674,6 +684,11 @@ Int HeightMapRenderObjClass::updateVBSerial(DX8VertexBufferClass	*pVB, VERTEX_FO
 
 		DX8VertexBufferClass::WriteLockClass lockVtxBuffer(pVB);
 		VERTEX_FORMAT *vbHardware = (VERTEX_FORMAT*)lockVtxBuffer.Get_Vertex_Array();
+		if (!vbHardware)
+		{
+			m_needFullUpdate = true;
+			return -1;
+		}
 		VERTEX_FORMAT *vBase = data;
 		// Note that we are building the vertex buffer data in the memory buffer, data.
 		// At the bottom, we will copy the final vertex data for one cell into the
@@ -882,6 +897,11 @@ Int HeightMapRenderObjClass::updateVBSerial(DX8VertexBufferClass	*pVB, VERTEX_FO
 				memcpy(vbHardware+offset, pCurVertices, 4*sizeof(VERTEX_FORMAT));
 			}
 		}
+		if (!lockVtxBuffer.Commit())
+		{
+			m_needFullUpdate = true;
+			return -1;
+		}
 		return 0; //success.
 	}
 	return -1;
@@ -913,6 +933,11 @@ Int HeightMapRenderObjClass::updateVBForLight(DX8VertexBufferClass	*pVB, VERTEX_
 
 		DX8VertexBufferClass::WriteLockClass lockVtxBuffer(pVB);
 		VERTEX_FORMAT *vBase = (VERTEX_FORMAT*)lockVtxBuffer.Get_Vertex_Array();
+		if (!vBase)
+		{
+			m_needFullUpdate = true;
+			return -1;
+		}
 		VERTEX_FORMAT *vb;
 
 		for (j=y0; j<y1; j++)
@@ -1032,6 +1057,11 @@ Int HeightMapRenderObjClass::updateVBForLight(DX8VertexBufferClass	*pVB, VERTEX_
 				vb++;	vbMirror++;
 			}
 		}
+		if (!lockVtxBuffer.Commit())
+		{
+			m_needFullUpdate = true;
+			return -1;
+		}
 		return 0; //success.
 	}
 	return -1;
@@ -1053,6 +1083,11 @@ Int HeightMapRenderObjClass::updateVBForLightOptimized(DX8VertexBufferClass	*pVB
 
 		DX8VertexBufferClass::WriteLockClass lockVtxBuffer(pVB);
 		VERTEX_FORMAT *vBase = (VERTEX_FORMAT*)lockVtxBuffer.Get_Vertex_Array();
+		if (!vBase)
+		{
+			m_needFullUpdate = true;
+			return -1;
+		}
 		VERTEX_FORMAT *vb;
 
 		//
@@ -1205,6 +1240,11 @@ Int HeightMapRenderObjClass::updateVBForLightOptimized(DX8VertexBufferClass	*pVB
 				}
 				vb++;	vbMirror++;
 			}
+		}
+		if (!lockVtxBuffer.Commit())
+		{
+			m_needFullUpdate = true;
+			return -1;
 		}
 		return 0; //success.
 	}
@@ -1412,6 +1452,11 @@ Int HeightMapRenderObjClass::updateVBForLightWithPreparation(
 	{
 		DX8VertexBufferClass::WriteLockClass lockVtxBuffer(pVB);
 		VERTEX_FORMAT *hardware = (VERTEX_FORMAT *)lockVtxBuffer.Get_Vertex_Array();
+		if (!hardware)
+		{
+			m_needFullUpdate = true;
+			return -1;
+		}
 		const unsigned verticesPerRow = VERTEX_BUFFER_TILE_LENGTH * 4;
 		if (hardware)
 		{
@@ -1433,12 +1478,14 @@ Int HeightMapRenderObjClass::updateVBForLightWithPreparation(
 					}
 				}
 			}
-			published = true;
+			published = lockVtxBuffer.Commit();
 		}
 	}
 	if (!published)
-		return updateVBForLight(pVB, data, x0, y0, x1, y1, originX,
-			originY, pLights, numLights);
+	{
+		m_needFullUpdate = true;
+		return -1;
+	}
 	return 0;
 }
 

@@ -128,7 +128,7 @@ public:
 		endInterval(m_captureInterval);
 		if (m_ledger != nullptr && m_batch.valid())
 			m_ledger->endBatch(m_batch,
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+				rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
 		if (m_active != nullptr)
 			*m_active = FALSE;
 	}
@@ -198,14 +198,15 @@ public:
 		m_performanceCommitInterval =
 			rts::performance::KernelPerformanceInterval();
 		m_performanceOrdinal = 0;
+		m_referenceAttempt = rts::performance::KernelPerformanceAttempt();
+		m_referenceBatch = rts::performance::KernelPerformanceReferenceBatch();
 		m_performanceCompletion.reset(m_batchEpoch);
 		m_performanceBatchActive = FALSE;
 	}
 
 	~ImmutableSpatialQueryRuntime()
 	{
-		finishPerformanceBatch(
-			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+		finishPerformanceBatch(fallbackPerformanceDisposition());
 		delete[] m_storage;
 		delete[] m_commitObjects;
 		delete[] m_queryStorage;
@@ -214,8 +215,7 @@ public:
 
 	void reset()
 	{
-		finishPerformanceBatch(
-			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+		finishPerformanceBatch(fallbackPerformanceDisposition());
 		advance(m_generation.lifecycle);
 		advance(m_generation.topology);
 		advance(m_generation.facts);
@@ -229,8 +229,7 @@ public:
 
 	void invalidateLifecycle()
 	{
-		finishPerformanceBatch(
-			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+		finishPerformanceBatch(fallbackPerformanceDisposition());
 		advance(m_generation.lifecycle);
 		advance(m_generation.topology);
 		advance(m_generation.facts);
@@ -241,8 +240,7 @@ public:
 
 	void invalidateTopology()
 	{
-		finishPerformanceBatch(
-			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+		finishPerformanceBatch(fallbackPerformanceDisposition());
 		advance(m_generation.topology);
 		m_ready = FALSE;
 		clearCollection();
@@ -250,8 +248,7 @@ public:
 
 	void invalidateFacts()
 	{
-		finishPerformanceBatch(
-			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+		finishPerformanceBatch(fallbackPerformanceDisposition());
 		advance(m_generation.facts);
 		m_ready = FALSE;
 		clearCollection();
@@ -259,8 +256,7 @@ public:
 
 	Bool capture(PartitionManager *manager, UnsignedInt frame)
 	{
-		finishPerformanceBatch(
-			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+		finishPerformanceBatch(fallbackPerformanceDisposition());
 		m_ready = FALSE;
 		clearCollection();
 		if (manager == nullptr || manager->m_cells == nullptr ||
@@ -590,8 +586,7 @@ public:
 			!ensureQueryStorage(maximumQueryCount))
 		{
 			m_collectionState = LIVE_SPATIAL_COLLECTION_FAILED;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+			finishPerformanceBatch(fallbackPerformanceDisposition());
 			return FALSE;
 		}
 
@@ -614,9 +609,9 @@ public:
 
 	void endCollection()
 	{
-		if (m_performanceBatchActive || m_referenceBatch.valid())
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+		if (m_performanceBatchActive || m_referenceBatch.valid() ||
+			m_referenceAttempt.valid())
+			finishPerformanceBatch(fallbackPerformanceDisposition());
 	}
 
 	Bool canQueueConsumer(LiveImmutableSpatialConsumer consumer) const
@@ -791,8 +786,7 @@ public:
 		LiveImmutableSpatialCollectionPreflightResult result,
 		PartitionManager *manager, UnsignedInt frame)
 	{
-		finishPerformanceBatch(
-			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+		finishPerformanceBatch(fallbackPerformanceDisposition());
 		m_ready = FALSE;
 		clearCollection();
 		m_captureManager = manager;
@@ -814,8 +808,7 @@ public:
 			frame != m_captureFrame || m_queryCount >= m_queryCapacity)
 		{
 			m_collectionState = LIVE_SPATIAL_COLLECTION_FAILED;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+			finishPerformanceBatch(fallbackPerformanceDisposition());
 			return FALSE;
 		}
 		Object *object = const_cast<Object *>(owner->friend_getObject());
@@ -824,8 +817,7 @@ public:
 				object)
 		{
 			m_collectionState = LIVE_SPATIAL_COLLECTION_FAILED;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+			finishPerformanceBatch(fallbackPerformanceDisposition());
 			return FALSE;
 		}
 
@@ -871,8 +863,7 @@ public:
 		if (m_queryCount < 2)
 		{
 			m_collectionState = LIVE_SPATIAL_COLLECTION_POLICY_FALLBACK;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+			finishPerformanceBatch(fallbackPerformanceDisposition());
 			return;
 		}
 
@@ -886,8 +877,7 @@ public:
 			!jobs.isCurrentThread(rts::JOB_OWNER_GAME))
 		{
 			m_collectionState = LIVE_SPATIAL_COLLECTION_POLICY_FALLBACK;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+			finishPerformanceBatch(fallbackPerformanceDisposition());
 			return;
 		}
 
@@ -896,8 +886,7 @@ public:
 				m_objectCount)
 		{
 			m_collectionState = LIVE_SPATIAL_COLLECTION_FAILED;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+			finishPerformanceBatch(fallbackPerformanceDisposition());
 			return;
 		}
 		m_resultCapacity = m_queryCount * m_objectCount;
@@ -906,8 +895,7 @@ public:
 		if (!ensureWorkStorage(rangeCount, m_resultCapacity))
 		{
 			m_collectionState = LIVE_SPATIAL_COLLECTION_FAILED;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+			finishPerformanceBatch(fallbackPerformanceDisposition());
 			return;
 		}
 
@@ -946,6 +934,10 @@ public:
 		rts::ImmutableSpatialJobSystemOptions options;
 		options.performanceLedger = m_performanceLedger;
 		options.performanceBatch = m_performanceBatch;
+		if (m_performanceBatchActive && m_referenceLedger->traceRequested() &&
+			TheGameLogic != nullptr)
+			m_referenceAttempt = TheGameLogic->beginPerformanceReceiptAttempt(
+				rts::performance::KERNEL_PERFORMANCE_SPATIAL, 0);
 		rts::ImmutableSpatialQueryOwnerIdentity referenceOwners[
 			rts::ImmutableSpatialCollectionCompletion::MAXIMUM_QUERIES];
 		if (m_referenceLedger->mode() != rts::performance::KERNEL_REFERENCE_DISABLED)
@@ -957,6 +949,7 @@ public:
 				referenceOwners[index].wakePriority = m_owners[index].wakePriority;
 			}
 			options.referenceLedger = m_referenceLedger;
+			options.referenceAttempt = m_referenceAttempt;
 			options.referenceBatch = &m_referenceBatch;
 			options.queryOwners = referenceOwners;
 			options.queryOwnerCount = m_queryCount;
@@ -976,8 +969,6 @@ public:
 		if (result == rts::IMMUTABLE_SPATIAL_JOB_SYSTEM_INELIGIBLE)
 		{
 			m_collectionState = LIVE_SPATIAL_COLLECTION_POLICY_FALLBACK;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
 			return;
 		}
 		if (result != rts::IMMUTABLE_SPATIAL_JOB_SYSTEM_SUCCESS)
@@ -986,8 +977,6 @@ public:
 				kernelStatus == rts::IMMUTABLE_SPATIAL_STALE_GENERATION ||
 				kernelStatus == rts::IMMUTABLE_SPATIAL_GENERATION_MISMATCH;
 			m_collectionState = LIVE_SPATIAL_COLLECTION_FAILED;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
 			return;
 		}
 		Bool validSpans = FALSE;
@@ -1001,8 +990,6 @@ public:
 		{
 			m_batchFailureStale = FALSE;
 			m_collectionState = LIVE_SPATIAL_COLLECTION_FAILED;
-			finishPerformanceBatch(
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
 			return;
 		}
 
@@ -1219,12 +1206,14 @@ public:
 			return;
 		if (!m_performanceCompletion.complete(mapConsumer(consumer), token, committed != FALSE))
 			return;
-		if (m_performanceCompletion.finished())
-		{
-			finishPerformanceBatch(m_performanceCompletion.allConsumersCommitted ?
-				rts::performance::KERNEL_PERFORMANCE_COMMITTED :
-				rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
-		}
+		// A rejected consumer returns to its module before that module runs the
+		// legacy query. Keep the receipt alive through that fallback; the owner
+		// closes it at EndLiveImmutableSpatialQueryCollection(). Fully committed
+		// collections have no fallback boundary to await and may close now.
+		if (m_performanceCompletion.finished() &&
+			m_performanceCompletion.allConsumersCommitted)
+			finishPerformanceBatch(
+				rts::performance::KERNEL_PERFORMANCE_COMMITTED);
 	}
 
 	void recordAuthoritative(LiveImmutableSpatialConsumer consumer,
@@ -1261,6 +1250,14 @@ public:
 	}
 
 private:
+	rts::performance::KernelPerformanceDisposition
+	fallbackPerformanceDisposition() const
+	{
+		return m_lastJobMetrics.referenceAdmissionAccepted ?
+			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+			rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED;
+	}
+
 	void beginPerformanceBatch(UnsignedInt frame)
 	{
 		m_performanceLedger =
@@ -1271,6 +1268,8 @@ private:
 		m_performanceCommitInterval =
 			rts::performance::KernelPerformanceInterval();
 		m_performanceBatchActive = FALSE;
+		m_referenceAttempt = rts::performance::KernelPerformanceAttempt();
+		m_referenceBatch = rts::performance::KernelPerformanceReferenceBatch();
 		m_performanceCompletion.reset(m_batchEpoch);
 		if (m_performanceOrdinal ==
 			~static_cast<rts::JobMetricCounter>(0))
@@ -1318,16 +1317,25 @@ private:
 	{
 		endPerformanceCommit();
 		endPerformanceCapture();
+		bool timingClosed = false;
 		if (m_performanceLedger != nullptr && m_performanceBatchActive &&
 			m_performanceBatch.valid())
-		{
-			const bool closed = m_performanceLedger->endBatch(m_performanceBatch, disposition);
-			if (m_referenceBatch.valid())
-				m_referenceLedger->finishBatch(m_referenceBatch, closed &&
-					disposition == rts::performance::KERNEL_PERFORMANCE_COMMITTED);
-		}
+			timingClosed = m_performanceLedger->endBatch(m_performanceBatch,
+				disposition);
+		const bool committed = timingClosed &&
+			disposition == rts::performance::KERNEL_PERFORMANCE_COMMITTED;
+		const rts::performance::KernelPerformanceDisposition referenceDisposition =
+			committed ? rts::performance::KERNEL_PERFORMANCE_COMMITTED :
+				m_lastJobMetrics.referenceAdmissionAccepted ?
+					rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
+					rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED;
+		if ((m_referenceBatch.valid() || m_referenceAttempt.valid()) &&
+			TheGameLogic != nullptr)
+			TheGameLogic->finishPerformanceReceiptAttempt(m_referenceAttempt,
+				m_referenceBatch, referenceDisposition, !committed, !committed);
 		else if (m_referenceBatch.valid())
-			m_referenceLedger->finishBatch(m_referenceBatch, false);
+			m_referenceLedger->finishBatch(m_referenceBatch, committed);
+		m_referenceAttempt = rts::performance::KernelPerformanceAttempt();
 		m_referenceBatch = rts::performance::KernelPerformanceReferenceBatch();
 		m_performanceBatch = rts::performance::KernelPerformanceBatch();
 		m_performanceBatchActive = FALSE;
@@ -1408,8 +1416,9 @@ private:
 
 	void clearCollection()
 	{
-		if (m_performanceCompletion.expectedConsumers != 0 || m_referenceBatch.valid())
-			finishPerformanceBatch(rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION);
+		if (m_performanceCompletion.expectedConsumers != 0 ||
+			m_referenceBatch.valid() || m_referenceAttempt.valid())
+			finishPerformanceBatch(fallbackPerformanceDisposition());
 		advance(m_batchEpoch);
 		m_collectionState = LIVE_SPATIAL_COLLECTION_IDLE;
 		m_queryCount = 0;
@@ -1775,6 +1784,7 @@ private:
 	rts::ImmutableSpatialCollectionCompletion m_performanceCompletion;
 	rts::ImmutableSpatialConsumerCompletionToken m_performanceCommitOwner;
 	rts::performance::KernelPerformanceReferenceLedger *m_referenceLedger;
+	rts::performance::KernelPerformanceAttempt m_referenceAttempt;
 	rts::performance::KernelPerformanceReferenceBatch m_referenceBatch;
 	Bool m_performanceBatchActive;
 };

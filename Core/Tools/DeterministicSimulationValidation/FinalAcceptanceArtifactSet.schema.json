@@ -7,16 +7,16 @@
   "required": ["schemaVersion", "sourceCommit", "productSet", "architecture",
     "artifacts", "runtimeClosure"],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "type": "integer", "const": 1 },
     "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
     "productSet": {
       "type": "array",
       "minItems": 2,
       "maxItems": 2,
       "uniqueItems": true,
-      "items": { "enum": ["Generals", "ZeroHour"] }
+      "items": { "type": "string", "enum": ["Generals", "ZeroHour"] }
     },
-    "architecture": { "const": "x64" },
+    "architecture": { "type": "string", "const": "x64" },
     "runtimeClosure": { "$ref": "#/$defs/runtimeClosure" },
     "artifacts": {
       "type": "array",
@@ -28,6 +28,7 @@
         "required": ["role", "path", "sha256"],
         "properties": {
           "role": {
+            "type": "string",
             "enum": [
               "generals-executable", "generals-launcher", "generals-launcher-config",
               "zerohour-executable", "zerohour-launcher", "zerohour-launcher-config"

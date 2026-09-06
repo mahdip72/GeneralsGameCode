@@ -104,6 +104,7 @@ unsigned s_startupWorkerCountLegacy = 0;
 JobWorkerPolicy s_startupWorkerPolicyLegacy = JOB_WORKER_POLICY_AUTO;
 
 #if defined(RTS_BUILD_CORE_EXTRAS)
+const unsigned JOB_SYSTEM_TEST_FAIL_GROUP_ASSIGNMENT_ALLOCATION = 11;
 unsigned s_jobSystemTestFaultLegacy = 0;
 unsigned s_jobSystemTestFaultOccurrenceLegacy = 0;
 
@@ -312,6 +313,12 @@ JobGroup &JobGroup::operator=(const JobGroup &other)
 {
 	if (this != &other)
 	{
+#if defined(RTS_BUILD_CORE_EXTRAS)
+		if (other.m_state != 0 &&
+			consumeJobSystemTestFaultLegacy(
+				JOB_SYSTEM_TEST_FAIL_GROUP_ASSIGNMENT_ALLOCATION))
+			throw std::bad_alloc();
+#endif
 		State *replacement = other.m_state != 0 ?
 			new State(other.m_state->record) : 0;
 		delete m_state;

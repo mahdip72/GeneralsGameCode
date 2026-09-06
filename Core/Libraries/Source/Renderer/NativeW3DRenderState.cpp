@@ -227,7 +227,13 @@ RenderResult NativeW3DRenderState::EnqueueFallbackCleanup(
 RenderResult NativeW3DRenderState::DrainCleanup(unsigned int maxCommands,
 	unsigned int *drained)
 {
-	return m_cleanup.Drain(maxCommands, drained);
+	// A deferred terminal callback may release the renderer's final state
+	// reference while NativeW3DOwnerQueue::Drain is still unwinding. Keep the
+	// queue object alive until its owner-side dispatch has fully returned.
+	AddRef();
+	const RenderResult result = m_cleanup.Drain(maxCommands, drained);
+	Release();
+	return result;
 }
 
 bool NativeW3DRenderState::IsOwnerThread() const

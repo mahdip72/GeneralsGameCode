@@ -28,7 +28,8 @@ inline bool ParseObjectComputationTestMode(int argc, char **argv,
 		(argc > 1 && argv == 0))
 		return false;
 
-	bool parsedLocalCapacity = false;
+	bool parsedLocalCapacity = true;
+	bool parsedCapacitySelector = false;
 	bool parsedStrictScaling = false;
 	bool parsedSerialFallback = false;
 	for (int index = 1; index < argc; ++index)
@@ -36,8 +37,15 @@ inline bool ParseObjectComputationTestMode(int argc, char **argv,
 		if (argv[index] == 0) return false;
 		if (strcmp(argv[index], "--local-capacity") == 0)
 		{
-			if (parsedLocalCapacity) return false;
+			if (parsedCapacitySelector) return false;
+			parsedCapacitySelector = true;
 			parsedLocalCapacity = true;
+		}
+		else if (strcmp(argv[index], "--external-qualification") == 0)
+		{
+			if (parsedCapacitySelector) return false;
+			parsedCapacitySelector = true;
+			parsedLocalCapacity = false;
 		}
 		else if (strcmp(argv[index], "--strict-scaling") == 0)
 		{

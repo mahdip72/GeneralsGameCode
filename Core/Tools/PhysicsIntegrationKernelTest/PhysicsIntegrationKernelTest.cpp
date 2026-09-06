@@ -9,6 +9,9 @@
 #if defined(_WIN64)
 #include "Lib/KernelPerformanceDiagnostics.h"
 #include "Lib/KernelPerformanceReference.h"
+#include "../TestSupport/NativeKernelSourceConsumerTest.h"
+#include <chrono>
+#include <thread>
 #endif
 #include "../TestSupport/LocalCapacityTestLane.h"
 
@@ -30,6 +33,11 @@
 
 #if defined(_WIN32) && (!defined(_MSC_VER) || _MSC_VER >= 1300)
 #include <xmmintrin.h>
+#endif
+
+#if defined(RTS_BUILD_CORE_EXTRAS)
+extern "C" void rts_job_system_set_test_fault(unsigned fault,
+	unsigned occurrence);
 #endif
 
 namespace
@@ -838,6 +846,43 @@ void ExpectTransactionalFailure(rts::PhysicsIntegrationTestFault fault,
 		count * sizeof(rts::PhysicsIntegrationOutput)));
 }
 
+#if defined(RTS_BUILD_CORE_EXTRAS)
+void ExpectGroupAssignmentAllocationFailure()
+{
+	const unsigned count = 129;
+	const unsigned groupAssignmentAllocationFault = 11;
+	std::vector<rts::PhysicsIntegrationSnapshot> snapshots(count);
+	std::vector<rts::PhysicsIntegrationOutput> outputs(count);
+	std::vector<rts::PhysicsIntegrationOutput> scratch(count);
+	for (unsigned index = 0; index != count; ++index)
+		snapshots[index] = MakeSnapshot(index);
+	FillSentinel(outputs);
+	const std::vector<rts::PhysicsIntegrationOutput> sentinel = outputs;
+	rts::PhysicsIntegrationOptions options;
+	options.minimumGrain = 1;
+	rts::PhysicsIntegrationMetrics metrics;
+	rts::PhysicsIntegrationBatchResult result =
+		rts::PHYSICS_INTEGRATION_INVALID_INPUT;
+	bool exceptionEscaped = false;
+	rts_job_system_set_test_fault(groupAssignmentAllocationFault, 1);
+	try
+	{
+		result = rts::PreparePhysicsIntegrationPrefixes(&snapshots[0], count,
+			&outputs[0], count, &scratch[0], count, options, &metrics);
+	}
+	catch (...)
+	{
+		exceptionEscaped = true;
+	}
+	rts_job_system_set_test_fault(0, 0);
+	assert(!exceptionEscaped);
+	assert(result == rts::PHYSICS_INTEGRATION_SERIAL_FALLBACK);
+	assert(metrics.serialFallbacks == 1);
+	assert(SameBytes(&outputs[0], &sentinel[0],
+		count * sizeof(rts::PhysicsIntegrationOutput)));
+}
+#endif
+
 void TestTransactionalFailurePaths()
 {
 	rts::JobSystem &jobs = rts::JobSystem::instance();
@@ -877,6 +922,9 @@ void TestTransactionalFailurePaths()
 	ExpectTransactionalFailure(
 		rts::PHYSICS_INTEGRATION_TEST_PHYSICAL_WAIT_TIMEOUT,
 		0, rts::PHYSICS_INTEGRATION_CANCELLED);
+#if defined(RTS_BUILD_CORE_EXTRAS)
+	ExpectGroupAssignmentAllocationFailure();
+#endif
 
 	jobs.shutdown();
 	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
@@ -1435,6 +1483,338 @@ void TestKernelPerformanceReferenceSerialPhysicsUsesDedicatedOutput()
 	jobs.shutdown();
 	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
 }
+
+// These tests enter the real public native kernel. They do not implement a
+// dispatcher, range body, checkpoint probe, canonical serializer or oracle.
+int g_actualNativePhysicsFailures = 0;
+void NativePhysicsExpect(bool condition, const char *message)
+{
+	if (!condition) { ++g_actualNativePhysicsFailures; printf("FAIL: %s\n", message); }
+}
+
+struct ActualNativePhysicsObservations
+{
+	std::atomic<unsigned> entries[2]{}, finishes[2]{}, items[384]{}, polls[2][4]{};
+	std::atomic<unsigned> units[2]{}, completed[2]{}, releases[2]{};
+	std::atomic<unsigned> validations{0}, reductions{0}, publications{0};
+	std::atomic<bool> wrongIdentity{false};
+	std::atomic<unsigned> held{0}, truePredicates[2]{};
+	std::atomic<bool> releaseHeld{false}, waitExpired{false};
+	unsigned waitNotifications = 0, cancelNotifications = 0, releaseNotifications = 0;
+	unsigned releasedCompleted = 0, releasedSubmitted = 0, releasedReason = 0;
+	bool releasedCancelled = false;
+
+	rts_test::NativeKernelClock *clock = 0;
+	bool baseline = false;
+	unsigned variant = 0;
+	~ActualNativePhysicsObservations() { releaseHeld.store(true, std::memory_order_release); }
+
+	static void beforeWait(void *opaque)
+	{
+		auto &self = *static_cast<ActualNativePhysicsObservations *>(opaque);
+		if (self.baseline || !rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME)) self.wrongIdentity = true;
+		++self.waitNotifications;
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+		while (self.held.load(std::memory_order_acquire) != 2 && std::chrono::steady_clock::now() < deadline)
+			std::this_thread::yield();
+		if (self.held.load(std::memory_order_acquire) != 2)
+		{ self.waitExpired = true; self.releaseHeld.store(true, std::memory_order_release); }
+	}
+	static void afterCancel(void *opaque)
+	{
+		auto &self = *static_cast<ActualNativePhysicsObservations *>(opaque);
+		if (self.baseline || !rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME)) self.wrongIdentity = true;
+		++self.cancelNotifications;
+		self.releaseHeld.store(true, std::memory_order_release);
+	}
+	static void releasedGroup(void *opaque, bool cancelled, unsigned completedBodies, unsigned submitted, unsigned reason)
+	{
+		auto &self = *static_cast<ActualNativePhysicsObservations *>(opaque);
+		if (self.baseline || !rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) ||
+			rts::JobSystem::instance().outstandingJobCount() != 0 ||
+			rts::JobSystem::instance().pendingOwnerCompletionCount() != 0) self.wrongIdentity = true;
+		++self.releaseNotifications; self.releasedCancelled = cancelled;
+		self.releasedCompleted = completedBodies; self.releasedSubmitted = submitted; self.releasedReason = reason;
+	}
+
+	static void observe(void *opaque, rts::PhysicsIntegrationTestEvent event,
+		unsigned rangeIndex, unsigned begin, unsigned end, unsigned workUnits,
+		bool complete, rts::PhysicsIntegrationOutput *mutableStorage)
+	{
+		auto &self = *static_cast<ActualNativePhysicsObservations *>(opaque);
+		const bool body = event <= rts::PHYSICS_INTEGRATION_TEST_RANGE_FINISHED;
+		if (rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) !=
+			(body ? self.baseline : true)) self.wrongIdentity = true;
+		if (body || event == rts::PHYSICS_INTEGRATION_TEST_RANGE_RELEASED)
+		{
+			if (rangeIndex >= 2 || begin != rangeIndex * 192 || end != begin + 192)
+			{ self.wrongIdentity = true; return; }
+		}
+		if (event == rts::PHYSICS_INTEGRATION_TEST_RANGE_ENTERED)
+		{
+			++self.entries[rangeIndex];
+			if (!self.baseline)
+			{
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+				while ((self.entries[0] == 0 || self.entries[1] == 0) && std::chrono::steady_clock::now() < deadline)
+					std::this_thread::yield();
+				if (self.entries[0] != 1 || self.entries[1] != 1) self.wrongIdentity = true;
+			}
+		}
+		else if (event == rts::PHYSICS_INTEGRATION_TEST_ITEM_EVALUATED)
+		{
+			if (workUnits >= 192) self.wrongIdentity = true;
+			else ++self.items[begin + workUnits];
+			++self.clock->now;
+		}
+		else if (event == rts::PHYSICS_INTEGRATION_TEST_RANGE_FINISHED)
+		{
+			++self.finishes[rangeIndex]; self.units[rangeIndex] = workUnits;
+			self.completed[rangeIndex] = complete ? 1 : 0;
+			if (self.variant == 5 && !self.baseline)
+			{
+				if (!complete || workUnits != 192) self.wrongIdentity = true;
+				self.held.fetch_add(1, std::memory_order_release);
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
+				while (!self.releaseHeld.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline)
+					std::this_thread::yield();
+				if (!self.releaseHeld.load(std::memory_order_acquire)) self.waitExpired = true;
+			}
+		}
+		else if (event == rts::PHYSICS_INTEGRATION_TEST_RANGE_RELEASED)
+		{
+			++self.releases[rangeIndex];
+			const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+			if (scheduler.pendingJobs != 0 || scheduler.outstandingJobs != 0) self.wrongIdentity = true;
+			self.clock->now.fetch_add(13);
+		}
+		else
+		{
+			if (event == rts::PHYSICS_INTEGRATION_TEST_OWNER_VALIDATION)
+			{
+				++self.validations;
+				if (self.variant == 4) { if (mutableStorage == 0) self.wrongIdentity = true; else mutableStorage[0].objectID = 0; }
+			}
+			else if (event == rts::PHYSICS_INTEGRATION_TEST_PUBLICATION) ++self.publications;
+			else self.wrongIdentity = true;
+			self.clock->now.fetch_add(17);
+		}
+	}
+
+	static bool checkpoint(void *opaque, unsigned rangeIndex,
+		rts::PhysicsIntegrationTestCheckpoint site, unsigned workUnits, bool actual)
+	{
+		auto &self = *static_cast<ActualNativePhysicsObservations *>(opaque);
+		if (rangeIndex >= 2 || static_cast<unsigned>(site) >= 4 ||
+			rts::JobSystem::instance().isCurrentThread(rts::JOB_OWNER_GAME) != self.baseline)
+		{ self.wrongIdentity = true; return true; }
+		++self.polls[rangeIndex][static_cast<unsigned>(site)];
+		if ((site == rts::PHYSICS_INTEGRATION_TEST_CHECKPOINT_ENTRY && workUnits != 0) ||
+			(site == rts::PHYSICS_INTEGRATION_TEST_CHECKPOINT_BLOCK && (workUnits % 64 != 0 || workUnits >= 192)) ||
+			(site >= rts::PHYSICS_INTEGRATION_TEST_CHECKPOINT_POST_BODY && workUnits != 192))
+			self.wrongIdentity = true;
+		const bool cut = rangeIndex == 0 && (
+			(self.variant == 1 && site == rts::PHYSICS_INTEGRATION_TEST_CHECKPOINT_ENTRY) ||
+			(self.variant == 2 && site == rts::PHYSICS_INTEGRATION_TEST_CHECKPOINT_BLOCK && workUnits == 128) ||
+			(self.variant == 3 && site == rts::PHYSICS_INTEGRATION_TEST_CHECKPOINT_POST_BODY));
+		// A current deadline is deliberately the opposite of the source cut.
+		// Only the authenticated native replay probe may select baseline work.
+		if (!self.baseline && (actual || cut)) ++self.truePredicates[rangeIndex];
+		return self.baseline ? !cut : actual || cut;
+	}
+};
+
+bool RunActualNativePhysicsRole(rts_test::NativeKernelTrace &trace, bool baseline, unsigned variant)
+{
+	using namespace rts::performance;
+	printf("B_NATIVE Physics BEGIN role=%s variant=%u\n",
+		baseline ? "consumer" : "source", variant);
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = baseline ? 1 : 2; config.queueCapacity = 16;
+	config.scratchBytesPerWorker = 4096; config.pinWorkers = false;
+	if (!jobs.start(config) || !jobs.registerCurrentThread(rts::JOB_OWNER_GAME))
+	{ NativePhysicsExpect(false, "Physics source fixture starts its declared native worker policy"); return false; }
+	rts_test::NativeKernelOwnerRun run;
+	const bool started = run.begin(trace, baseline, 900, KERNEL_PHASE_LEGACY_MUTABLE_ISLAND);
+	NativePhysicsExpect(started, "Physics owner validates real source artifact binding before native entry");
+	if (!started) { jobs.shutdown(); jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME); return false; }
+	const auto attempt = run.beginAttempt(KERNEL_PERFORMANCE_PHYSICS, 0);
+	NativePhysicsExpect(attempt.valid(), "Physics owner opens the authentic attempt before native capture");
+	auto timingBatch = run.timing.beginBatch(KERNEL_PERFORMANCE_PHYSICS, 0, 900, 1);
+	const auto capture = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_CAPTURE);
+	std::vector<rts::PhysicsIntegrationSnapshot> input(384);
+	std::vector<rts::PhysicsIntegrationOutput> output(384), scratch(384), untouched(384), detached(384);
+	memset(output.data(), 0xcd, output.size() * sizeof(output[0])); untouched = output; detached = output;
+	for (unsigned index = 0; index != 384; ++index)
+	{
+		auto &value = input[index];
+		value.frame = 900; value.worldEpoch = 7; value.objectID = index + 1;
+		value.motionGeneration = 10; value.physicsGeneration = 20; value.wakePriority = 1; value.heapOrdinal = index;
+		value.flags = rts::PHYSICS_INTEGRATION_SIGNIFICANTLY_ABOVE_TERRAIN;
+		value.matrix[0] = value.matrix[5] = value.matrix[10] = 1;
+		value.matrix[3] = value.position[0] = static_cast<float>(index);
+		value.matrix[7] = value.position[1] = 2; value.matrix[11] = value.position[2] = 4;
+		value.acceleration[0] = 1; value.acceleration[1] = .5f; value.acceleration[2] = .25f;
+		value.velocity[0] = 2; value.velocity[1] = -1; value.velocity[2] = 1;
+		value.gravity = -.125f; value.mass = 1;
+	}
+	run.clock.now.fetch_add(5);
+	NativePhysicsExpect(run.timing.endInterval(capture), "Physics immutable owner capture closes before native work");
+	KernelPerformanceReferenceBatch validated;
+	ActualNativePhysicsObservations observed;
+	observed.clock = &run.clock; observed.baseline = baseline; observed.variant = variant;
+	rts::PhysicsIntegrationTestHooks hooks;
+	hooks.context = &observed; hooks.observe = ActualNativePhysicsObservations::observe;
+	hooks.checkpoint = ActualNativePhysicsObservations::checkpoint;
+	hooks.physicalWaitMilliseconds = 1000;
+	if (variant == 5)
+	{
+		hooks.beforeWait = ActualNativePhysicsObservations::beforeWait;
+		hooks.afterCancel = ActualNativePhysicsObservations::afterCancel;
+		hooks.releasedGroup = ActualNativePhysicsObservations::releasedGroup;
+		hooks.physicalWaitMilliseconds = 1;
+	}
+	rts::PhysicsIntegrationOptions options;
+	options.minimumGrain = 192; options.testHooks = &hooks;
+	options.performanceBatch = timingBatch; options.performanceReferenceLedger = &run.reference;
+	options.performanceReferenceAttempt = attempt; options.performanceReferenceBatch = &validated;
+	options.performanceReferenceOutput = detached.data(); options.performanceReferenceOutputCapacity = 384;
+	rts::PhysicsIntegrationMetrics metrics;
+	const auto result = rts::PreparePhysicsIntegrationPrefixes(input.data(), 384,
+		output.data(), 384, scratch.data(), 384, options, &metrics);
+	const bool accepted = result == rts::PHYSICS_INTEGRATION_PARALLEL;
+	NativePhysicsExpect(accepted == (variant == 0), "Physics native outcome matches the predeclared source case without retries");
+	if (variant == 5)
+		NativePhysicsExpect(result == rts::PHYSICS_INTEGRATION_CANCELLED,
+			"Physics late real group cancellation retains the exact native cancelled result");
+	if (accepted)
+	{
+		for (unsigned index = 0; index != 384; ++index)
+		{
+			rts::PhysicsIntegrationOutput expected = {};
+			expected.frame = 900; expected.worldEpoch = 7; expected.objectID = index + 1;
+			expected.motionGeneration = 10; expected.physicsGeneration = 20; expected.wakePriority = 1; expected.heapOrdinal = index;
+			expected.flags = rts::PHYSICS_INTEGRATION_SIGNIFICANTLY_ABOVE_TERRAIN;
+			expected.matrix[0] = expected.matrix[5] = expected.matrix[10] = 1;
+			expected.matrix[3] = static_cast<float>(index) + 3; expected.matrix[7] = 1.5f; expected.matrix[11] = 5.125f;
+			expected.acceleration[0] = 1; expected.acceleration[1] = .5f; expected.acceleration[2] = .125f;
+			expected.velocity[0] = 3; expected.velocity[1] = -.5f; expected.velocity[2] = 1.125f;
+			NativePhysicsExpect(rts::PhysicsIntegrationOutputsEqual(output[index], expected),
+				"actual native physics matches hand-derived gravity/velocity/translation bytes");
+		}
+	}
+	else NativePhysicsExpect(memcmp(output.data(), untouched.data(), output.size() * sizeof(output[0])) == 0,
+		"actual native physics abort preserves every output byte");
+	NativePhysicsExpect(memcmp(detached.data(), untouched.data(), detached.size() * sizeof(detached[0])) == 0,
+		"Physics source and baseline do not execute detached serial-reference storage");
+	const unsigned targetUnits = variant == 1 ? 0 : variant == 2 ? 128 : 192;
+	for (unsigned range = 0; range != 2; ++range)
+	{
+		const unsigned units = range == 0 ? targetUnits : 192;
+		NativePhysicsExpect(observed.entries[range] == 1 && observed.finishes[range] == 1 && observed.releases[range] == 1 &&
+			observed.units[range] == units && observed.completed[range] == ((range == 0 && variant >= 1 && variant <= 3) ? 0U : 1U),
+			"Physics real admitted range enters once, retains its exact terminal prefix and releases after drain");
+		for (unsigned index = 0; index != 192; ++index)
+			NativePhysicsExpect(observed.items[range * 192 + index] == (index < units ? 1U : 0U),
+				"Physics actual compiled item helper executes precisely the recorded prefix once");
+		NativePhysicsExpect(observed.polls[range][0] == 1 &&
+			observed.polls[range][1] == ((range == 0 && variant == 1) ? 0U : 2U) &&
+			observed.polls[range][2] == ((range == 0 && (variant == 1 || variant == 2)) ? 0U : 1U),
+			"Physics exact native entry, 64-item and post-body checkpoint sites are reached");
+	}
+	NativePhysicsExpect(!observed.wrongIdentity && observed.publications == (variant == 0 ? 1U : 0U) &&
+		observed.validations == ((variant == 0 || variant == 4) ? 1U : 0U),
+		"Physics owner-only validation/reduction rejects finished-discarded bodies before publication");
+	if (variant == 5 && !baseline)
+	{
+		NativePhysicsExpect(!observed.waitExpired && observed.held == 2 && observed.waitNotifications == 1 &&
+			observed.cancelNotifications == 1 && observed.releaseNotifications == 1 && observed.releasedCancelled &&
+			observed.releasedCompleted == 2 && observed.releasedSubmitted == 2 &&
+			observed.truePredicates[0] == 0 && observed.truePredicates[1] == 0 && metrics.completedJobs == 0,
+			"Physics real owner timeout cancels and drains two completed bodies without inventing a true body poll or successful handle");
+		NativePhysicsExpect(observed.releasedReason == 3,
+			"Physics source reason records actual late group cancellation independently of completed checkpoints");
+	}
+	if (variant == 5 && baseline)
+		NativePhysicsExpect(!observed.waitExpired && observed.held == 0 && observed.waitNotifications == 0 &&
+			observed.cancelNotifications == 0 && observed.releaseNotifications == 0,
+			"Physics baseline replays late disposal without a physical wait, cancellation or source release callback");
+	const auto scheduler = rts_test::NativeKernelSchedulerBoundary();
+	NativePhysicsExpect(scheduler.pendingJobs == 0 && scheduler.outstandingJobs == 0 && scheduler.ownerHelpJobs == 0,
+		"Physics native return follows actual release/acquire and scheduler drain");
+	NativePhysicsExpect(metrics.referenceAdmissionAccepted,
+		"Physics metrics retain authenticated admission for physical and baseline-inline execution");
+	if (baseline)
+		NativePhysicsExpect(scheduler.submittedJobs == 0 && scheduler.executedJobs == 0 && metrics.submittedJobs == 0 &&
+			metrics.physicalWorkerJobs == 0 && metrics.ownerHelpedJobs == 0 && metrics.physicalWorkerMask == 0 &&
+			metrics.distinctPhysicalWorkers == 0 && metrics.peakConcurrentPhysicalWorkers == 0,
+			"Physics source-shaped baseline bodies manufacture no worker or owner-help authority");
+	else
+		NativePhysicsExpect(scheduler.submittedJobs == 2 && scheduler.executedJobs == 2 && metrics.submittedJobs == 2,
+			"Physics source dispatch is the two real admitted native jobs");
+	NativePhysicsExpect(validated.valid() == accepted, "Physics kernel links only actually published output to its attempt");
+	if (validated.valid()) NativePhysicsExpect(run.reference.finishBatch(validated, accepted),
+		"Physics owner closes the actual validated batch before attempt finish");
+	KernelPerformanceAttemptFinish finish = {};
+	finish.disposition = accepted ? KERNEL_PERFORMANCE_COMMITTED : KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION;
+	finish.reasonSchema = 1; finish.reason = accepted ? 1 : 2; finish.validatedBatch = validated;
+	NativePhysicsExpect(run.reference.finishAttempt(attempt, finish), "Physics authentic native attempt closes its actual outcome");
+	KernelPerformanceAttemptReap reap = {}; reap.reasonSchema = 1; reap.reason = 1;
+	reap.pendingJobs = scheduler.pendingJobs; reap.outstandingJobs = scheduler.outstandingJobs;
+	NativePhysicsExpect(run.reference.reapAttempt(attempt, reap), "Physics native owner reaps only after real storage release and drain");
+	if (accepted)
+	{
+		const auto commit = run.timing.beginInterval(timingBatch, KERNEL_PERFORMANCE_COMMIT);
+		run.clock.now.fetch_add(11); run.timing.endInterval(commit);
+	}
+	NativePhysicsExpect(run.timing.endBatch(timingBatch, finish.disposition), "Physics timing records actual native outcome");
+	const bool sealed = run.reference.sealObservationWindow() && run.reference.sealExecutionClosure();
+	const auto snapshot = run.reference.freeze();
+	const bool timingClosed = run.closeTiming(scheduler);
+	NativePhysicsExpect(timingClosed, "Physics actual scheduler and owner phase timing reconcile");
+	if (baseline && timingClosed)
+	{
+		const auto &phase = run.timingSnapshot.phaseAccounting.phases[KERNEL_PHASE_LEGACY_MUTABLE_ISLAND];
+		NativePhysicsExpect(phase.pureNanoseconds == (variant == 0 ? 384U : 0U) && phase.serialNanoseconds >= 31,
+			"Physics only committed actual native bodies are pure; reduction and all discarded work stay serial");
+	}
+	const bool canonicalState = variant == 0 ? snapshot.complete && snapshot.streamCount == 1 :
+		!snapshot.complete && snapshot.streamCount == 0;
+	const bool sourceComplete = sealed && canonicalState && snapshot.errors == 0 && snapshot.trace.complete &&
+		snapshot.trace.attemptCount == 1 && snapshot.trace.admittedAttemptCount == 1 &&
+		snapshot.trace.capturedAttemptCount == 1 && snapshot.trace.capturedOperationCount == 384 &&
+		snapshot.trace.dispatchCount == 1 && snapshot.trace.rangeCount == 2 &&
+		snapshot.trace.releasedRangeCount == 2 && snapshot.trace.reapCount == 1;
+	NativePhysicsExpect(sourceComplete, "Physics actual native entry supplies capture, dispatch, exact released bodies and attempt closure");
+	if (!baseline) trace.source = snapshot;
+	else if (sourceComplete && accepted)
+		NativePhysicsExpect(snapshot.streams[0].inputDigest.equals(trace.source.streams[0].inputDigest) &&
+			snapshot.streams[0].outputDigest.equals(trace.source.streams[0].outputDigest) &&
+			snapshot.streams[0].commitDigest.equals(trace.source.streams[0].commitDigest),
+			"Physics once-only native consumer binds every canonical input/output/commit byte to source");
+	printf("B_NATIVE Physics END role=%s variant=%u source_closure=%u\n",
+		baseline ? "consumer" : "source", variant, static_cast<unsigned>(sourceComplete));
+	jobs.shutdown(); jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME);
+	return sourceComplete && (variant != 5 || baseline || observed.releasedReason == 3);
+}
+
+void TestActualNativePhysicsSourceConsumer()
+{
+	// Breaks caught: missing native integration, copied/detached executor,
+	// recomputed baseline range shape, changed polling, partial publication,
+	// premature release, or treating completed-discarded bodies as pure.
+	// Variant five catches a real owner cancellation after every body poll and
+	// body completion, while the native jobs are still awaiting retirement.
+	for (unsigned variant = 0; variant != 6; ++variant)
+	{
+		rts_test::NativeKernelTrace trace(60 + variant);
+		// A real source failure is not repaired by synthesizing trace records.
+		// All source buffers leave scope before the authenticated consumer call.
+		if (RunActualNativePhysicsRole(trace, false, variant))
+			RunActualNativePhysicsRole(trace, true, variant);
+	}
+}
 #endif
 }
 
@@ -1444,7 +1824,8 @@ int main(int argc, char **argv)
 	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
 	{
 		fprintf(stderr,
-			"Usage: core_physics_integration_kernel_tests [--local-capacity]\n");
+			"Usage: core_physics_integration_kernel_tests "
+			"[--local-capacity|--external-qualification]\n");
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);
@@ -1479,6 +1860,10 @@ int main(int argc, char **argv)
 	TestKernelPerformanceTokenReachesPhysicsStages();
 	TestKernelPerformanceReferenceTransportReachesPhysicsParallelPath();
 	TestKernelPerformanceReferenceSerialPhysicsUsesDedicatedOutput();
+	TestActualNativePhysicsSourceConsumer();
+#endif
+#if defined(_WIN64)
+	if (g_actualNativePhysicsFailures != 0) return 1;
 #endif
 	printf("Physics integration kernel tests passed.\n");
 	return 0;

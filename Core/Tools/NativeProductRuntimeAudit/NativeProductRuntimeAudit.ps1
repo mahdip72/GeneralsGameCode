@@ -294,8 +294,8 @@ function Assert-SameFile([string] $ExpectedPath, [string] $InstalledPath,
 }
 
 foreach ($product in @(
-    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; Targets = @('g_generals', 'g_launcher', 'g_skirmish_ai_runner_contract_tests'); Executables = @("generalsv$OutputSuffix.exe", 'launcher.exe', 'g_skirmish_ai_runner_contract_tests.exe'); ContractExecutable = 'g_skirmish_ai_runner_contract_tests.exe'; ContractArguments = @(); LauncherCommand = "generalsv$OutputSuffix.exe" },
-    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; Targets = @('z_generals', 'z_launcher', 'z_runtime_regression_tests'); Executables = @("generalszh$OutputSuffix.exe", 'launcher.exe', 'z_runtime_regression_tests.exe'); ContractExecutable = 'z_runtime_regression_tests.exe'; ContractArguments = @('--skirmish-ai-replay-epoch'); LauncherCommand = "generalszh$OutputSuffix.exe" }
+    @{ Name = 'Generals'; Generals = 'ON'; ZeroHour = 'OFF'; TitleDirectory = 'Generals'; InstallDirectory = 'Generals'; ContractInstallDirectory = 'Validation/Generals'; Targets = @('g_generals', 'g_launcher', 'g_skirmish_ai_runner_contract_tests'); Executables = @("generalsv$OutputSuffix.exe", 'launcher.exe'); ContractExecutable = 'g_skirmish_ai_runner_contract_tests.exe'; ContractArguments = @(); LauncherCommand = "generalsv$OutputSuffix.exe" },
+    @{ Name = 'ZeroHour'; Generals = 'OFF'; ZeroHour = 'ON'; TitleDirectory = 'GeneralsMD'; InstallDirectory = 'ZeroHour'; ContractInstallDirectory = 'Validation/ZeroHour'; Targets = @('z_generals', 'z_launcher', 'z_runtime_regression_tests'); Executables = @("generalszh$OutputSuffix.exe", 'launcher.exe'); ContractExecutable = 'z_runtime_regression_tests.exe'; ContractArguments = @('--skirmish-ai-replay-epoch'); LauncherCommand = "generalszh$OutputSuffix.exe" }
 )) {
     $productBuildRoot = Join-Path $BuildRoot $product.Name
     $installRoot = Join-Path $productBuildRoot 'InstallRoot'
@@ -539,6 +539,22 @@ foreach ($product in @(
             throw "Native x64 $($product.Name) installed executable $executable directly imports a forbidden legacy D3D8/D3DX/Miles/Bink runtime."
         }
     }
+    $expectedValidationDestination = '${CMAKE_INSTALL_PREFIX}/' +
+        $product.ContractInstallDirectory
+    $contractInstallPattern = 'file\(INSTALL DESTINATION "' +
+        [regex]::Escape($expectedValidationDestination) +
+        '" TYPE EXECUTABLE FILES "[^"]*/' +
+        [regex]::Escape($product.ContractExecutable) + '"\)'
+    if ($installScript -notmatch $contractInstallPattern) {
+        throw "Native x64 $($product.Name) install script does not isolate $($product.ContractExecutable) below CMAKE_INSTALL_PREFIX/$($product.ContractInstallDirectory)."
+    }
+    $contractInProductPattern = 'file\(INSTALL DESTINATION "' +
+        [regex]::Escape($expectedDestination) +
+        '" TYPE EXECUTABLE FILES "[^"]*/' +
+        [regex]::Escape($product.ContractExecutable) + '"\)'
+    if ($installScript -match $contractInProductPattern) {
+        throw "Native x64 $($product.Name) install script puts validation executable $($product.ContractExecutable) in the product runtime."
+    }
 
     # An executable-only check misses forbidden legacy dependencies imported
     # by an app-local helper or codec DLL. Audit every installed PE image so
@@ -632,7 +648,32 @@ foreach ($product in @(
         }
     }
 
-    $installedContract = Join-Path $installedTitleRoot $product.ContractExecutable
+    $installedContractInProduct = Join-Path $installedTitleRoot `
+        $product.ContractExecutable
+    if (Test-Path -LiteralPath $installedContractInProduct) {
+        throw "Native x64 $($product.Name) product runtime contains validation executable $($product.ContractExecutable)."
+    }
+    $installedContractPdbInProduct = [IO.Path]::ChangeExtension(
+        $installedContractInProduct, '.pdb')
+    if (Test-Path -LiteralPath $installedContractPdbInProduct) {
+        throw "Native x64 $($product.Name) product runtime contains a validation PDB."
+    }
+    $installedContractRoot = Join-Path $installRoot `
+        $product.ContractInstallDirectory
+    $installedContract = Join-Path $installedContractRoot `
+        $product.ContractExecutable
+    if (-not (Test-Path -LiteralPath $installedContract -PathType Leaf)) {
+        throw "Native x64 $($product.Name) audit did not produce isolated validation executable $($product.ContractExecutable)."
+    }
+    $builtContract = Resolve-ConfigurationArtifact $productBuildRoot `
+        (Join-Path $product.TitleDirectory $product.ContractExecutable) `
+        $selectedConfiguration `
+        "Native x64 $($product.Name) built validation executable"
+    Assert-SameFile $builtContract $installedContract `
+        "Native x64 $($product.Name) isolated validation executable"
+    if ((Get-PeMachine $installedContract) -ne 0x8664) {
+        throw "Native x64 $($product.Name) isolated validation executable is not an AMD64 PE image."
+    }
     Push-Location $installedTitleRoot
     try {
         & $installedContract

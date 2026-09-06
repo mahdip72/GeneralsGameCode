@@ -1,5 +1,7 @@
 #include "Utility/CppMacros.h"
 #include "nativew3d2.h"
+#include "nativew3dbufferowner.h"
+#include "nativew3dtextureowner.h"
 #include "Renderer/LegacyRenderState.h"
 #include "Renderer/NativeW3DRenderState.h"
 #include "Renderer/ThreadedRenderDevice.h"
@@ -53,6 +55,16 @@ public:
 	{
 		return renderer != 0 && renderer->m_state != 0 &&
 			IsThreadedRenderDevice(renderer->m_state->Device());
+	}
+
+	static NativeW3DRenderState *RetainState(NativeW3DRenderer *renderer)
+	{
+		NativeW3DRenderState *state = renderer == 0 ? 0 : renderer->m_state;
+		if (state != 0)
+		{
+			state->AddRef();
+		}
+		return state;
 	}
 };
 }
@@ -120,6 +132,8 @@ struct CaptureProbe
 	bool frameWasOpen;
 	unsigned int *presentCalls;
 	unsigned int presentCallsAtCompletion;
+	bool inspectFirstPixel;
+	bool firstPixelIsOpaqueRed;
 };
 
 struct ThreadedCaptureFactoryContext
@@ -501,6 +515,20 @@ DWORD WINAPI DestroyResourcesFromWorker(void *parameter)
 	return 0;
 }
 
+struct DestroyAggregateRequest
+{
+	NativeW3D2 *owner;
+};
+
+DWORD WINAPI DestroyAggregateFromWorker(void *parameter)
+{
+	DestroyAggregateRequest *request =
+		static_cast<DestroyAggregateRequest *>(parameter);
+	delete request->owner;
+	request->owner = 0;
+	return 0;
+}
+
 DWORD WINAPI ShutdownFromWorker(void *parameter)
 {
 	ShutdownRequest *request = static_cast<ShutdownRequest *>(parameter);
@@ -509,14 +537,23 @@ DWORD WINAPI ShutdownFromWorker(void *parameter)
 }
 
 void CaptureCompleted(void *consumer, const rts::render::RenderCaptureHandle *,
-	unsigned int, unsigned int, size_t, rts::render::RenderFormat,
-	const void *, size_t)
+	unsigned int width, unsigned int height, size_t rowPitch,
+	rts::render::RenderFormat format, const void *pixels, size_t bytes)
 {
 	CaptureProbe *probe = static_cast<CaptureProbe *>(consumer);
 	++probe->completed;
 	probe->frameWasOpen = probe->owner->Renderer().IsFrameOpen();
 	if (probe->presentCalls != 0)
 		probe->presentCallsAtCompletion = *probe->presentCalls;
+	if (probe->inspectFirstPixel)
+	{
+		const unsigned char *pixel = static_cast<const unsigned char *>(pixels);
+		probe->firstPixelIsOpaqueRed = width != 0 && height != 0 &&
+			rowPitch >= 4 && bytes >= 4 && pixel != 0 &&
+			format == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM &&
+			pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 255 &&
+			pixel[3] == 255;
+	}
 }
 
 void CaptureCancelled(void *consumer, const rts::render::RenderCaptureHandle *,
@@ -530,6 +567,87 @@ void CaptureCancelled(void *consumer, const rts::render::RenderCaptureHandle *,
 		(void)rts::render::IsNativeGameRendererActive();
 		probe->shutdownResult = probe->owner->Shutdown();
 	}
+}
+
+bool HasNativeCaptureTga(unsigned int width, unsigned int height)
+{
+	std::FILE *file = std::fopen("D3D11RendererCapture.tga", "rb");
+	if (file == 0)
+		return false;
+	unsigned char header[18] = {};
+	const bool readHeader = std::fread(header, 1, sizeof(header), file) ==
+		sizeof(header);
+	std::fclose(file);
+	return readHeader && header[2] == 2 && header[16] == 24 &&
+		((static_cast<unsigned int>(header[12]) |
+			(static_cast<unsigned int>(header[13]) << 8)) == width) &&
+		((static_cast<unsigned int>(header[14]) |
+			(static_cast<unsigned int>(header[15]) << 8)) == height);
+}
+
+int TestNativeOneShotCapture(NativeW3D2 *owner)
+{
+	int result = 0;
+	rts::render::GameRenderCommand clearCommand = {};
+	clearCommand.type = rts::render::GAME_RENDER_COMMAND_CLEAR_RENDER_TARGETS;
+	clearCommand.value0 = rts::render::RENDER_CLEAR_COLOR;
+	clearCommand.float3 = 1.0f;
+	clearCommand.float4 = 1.0f;
+	rts::render::GameRenderCommand endCommand = {};
+	endCommand.type = rts::render::GAME_RENDER_COMMAND_END_RENDER;
+	endCommand.value0 = 1;
+	const rts::render::GameRenderCommand invalidCommand = {};
+
+	std::remove("D3D11RendererCapture.tga");
+	owner->RequestGameBackBufferCapture();
+	const rts::render::RenderResult successBegin = owner->Renderer().BeginFrame();
+	const rts::render::RenderResult successEnd = successBegin ==
+		rts::render::RENDER_RESULT_OK &&
+		owner->ExecuteGameRenderCommand(clearCommand) ==
+			rts::render::RENDER_RESULT_OK ?
+		owner->ExecuteGameRenderCommand(endCommand) :
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	const bool successAck = owner->ConsumeGameBackBufferCaptureSuccess();
+	result |= Check(successBegin ==
+		rts::render::RENDER_RESULT_OK,
+		"native one-shot capture begins its owner frame");
+	result |= Check(successEnd == rts::render::RENDER_RESULT_OK && successAck &&
+		!owner->ConsumeGameBackBufferCaptureSuccess() &&
+		HasNativeCaptureTga(64, 64),
+		"native one-shot capture writes and acknowledges a deterministic TGA once");
+
+	std::remove("D3D11RendererCapture.tga");
+	owner->RequestGameBackBufferCapture();
+	const rts::render::RenderResult failedBegin = owner->Renderer().BeginFrame();
+	const rts::render::RenderResult failedCommand = failedBegin ==
+		rts::render::RENDER_RESULT_OK ?
+		owner->ExecuteGameRenderCommand(invalidCommand) :
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	const rts::render::RenderResult failedEnd = failedBegin ==
+		rts::render::RENDER_RESULT_OK ?
+		owner->ExecuteGameRenderCommand(endCommand) :
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	const bool failedAck = owner->ConsumeGameBackBufferCaptureSuccess();
+	result |= Check(failedCommand == rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		failedEnd == rts::render::RENDER_RESULT_INVALID_ARGUMENT && !failedAck &&
+		!HasNativeCaptureTga(64, 64),
+		"native one-shot capture does not acknowledge a failed frame or stale file");
+
+	std::remove("D3D11RendererCapture.tga");
+	owner->RequestGameBackBufferCapture();
+	const rts::render::RenderResult retryBegin = owner->Renderer().BeginFrame();
+	const rts::render::RenderResult retryEnd = retryBegin ==
+		rts::render::RENDER_RESULT_OK &&
+		owner->ExecuteGameRenderCommand(clearCommand) ==
+			rts::render::RENDER_RESULT_OK ?
+		owner->ExecuteGameRenderCommand(endCommand) :
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	const bool retryAck = owner->ConsumeGameBackBufferCaptureSuccess();
+	result |= Check(retryEnd == rts::render::RENDER_RESULT_OK && retryAck &&
+		HasNativeCaptureTga(64, 64),
+		"native one-shot capture retries after a failed frame");
+	std::remove("D3D11RendererCapture.tga");
+	return result;
 }
 
 void ConfigurePacket(rts::render::NativeDrawPacket *packet,
@@ -612,6 +730,8 @@ int TestBorrowedThreadedCapture(HWND window)
 	capture.frameWasOpen = true;
 	capture.presentCalls = &factoryContext.presentCalls;
 	capture.presentCallsAtCompletion = 0;
+	capture.inspectFirstPixel = false;
+	capture.firstPixelIsOpaqueRed = false;
 	captureDescriptor.kind = rts::render::RENDER_CAPTURE_WW3D_SCREENSHOT;
 	captureDescriptor.consumer = &capture;
 	captureDescriptor.completed = CaptureCompleted;
@@ -653,6 +773,8 @@ int TestBorrowedThreadedCapture(HWND window)
 	failedCapture.frameWasOpen = true;
 	failedCapture.presentCalls = 0;
 	failedCapture.presentCallsAtCompletion = 0;
+	failedCapture.inspectFirstPixel = false;
+	failedCapture.firstPixelIsOpaqueRed = false;
 	captureDescriptor.consumer = &failedCapture;
 	factoryContext.failCapture = true;
 	endCommand.value0 = 1;
@@ -1222,6 +1344,123 @@ int TestStencilStateEncoding(NativeW3D2 *owner)
 }
 }
 
+int TestOffOwnerAggregatePublication(HWND window)
+{
+	int result = 0;
+	rts::render::NativeW3DRendererDescriptor descriptor;
+	descriptor.width = 64;
+	descriptor.height = 64;
+	descriptor.enableVsync = false;
+	descriptor.allowSoftwareFallback = true;
+
+	NativeW3D2 *aggregate = new (std::nothrow) NativeW3D2();
+	result |= Check(aggregate != 0,
+		"off-owner aggregate fixture allocates its owner");
+	if (aggregate == 0)
+	{
+		return result;
+	}
+	const rts::render::RenderResult initializeResult = aggregate->Initialize(
+		window, descriptor);
+	result |= Check(initializeResult == rts::render::RENDER_RESULT_OK,
+		"off-owner aggregate fixture initializes its renderer");
+	if (initializeResult != rts::render::RENDER_RESULT_OK)
+	{
+		delete aggregate;
+		return result;
+	}
+	rts::render::NativeW3DRenderState *state =
+		rts::render::NativeW3DRecoveryTestAccess::RetainState(
+		&aggregate->Renderer());
+	result |= Check(state != 0,
+		"off-owner aggregate fixture retains its owner state for drain");
+
+	{
+		rts::render::BufferDescriptor bufferDescriptor;
+		bufferDescriptor.byteCount = 16;
+		bufferDescriptor.stride = 4;
+		bufferDescriptor.binding = rts::render::RENDER_BUFFER_VERTEX;
+		bufferDescriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+		rts::render::NativeW3DBufferOwner buffer;
+		result |= Check(buffer.Create(bufferDescriptor) ==
+			rts::render::RENDER_RESULT_OK,
+			"off-owner fixture creates a surviving native buffer");
+
+		rts::render::TextureDescriptor textureDescriptor;
+		textureDescriptor.width = 2;
+		textureDescriptor.height = 2;
+		textureDescriptor.mipCount = 1;
+		textureDescriptor.arrayCount = 1;
+		textureDescriptor.dimension = rts::render::RENDER_TEXTURE_2D;
+		textureDescriptor.format = rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
+		textureDescriptor.binding = rts::render::RENDER_TEXTURE_SHADER_RESOURCE;
+		textureDescriptor.usage = rts::render::RENDER_USAGE_DEFAULT;
+		static const unsigned char texturePixels[16] = {
+			0xff, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0xff,
+			0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0xff, 0xff };
+		rts::render::TextureSubresourceData subresource;
+		subresource.data = texturePixels;
+		subresource.rowPitch = 8;
+		subresource.slicePitch = sizeof(texturePixels);
+		rts::render::NativeW3DTextureOwner texture;
+		rts::render::NativeW3DTextureCandidate candidate;
+		result |= Check(texture.CreateCandidate(textureDescriptor, &subresource,
+			1, &candidate) == rts::render::RENDER_RESULT_OK &&
+			texture.PublishCandidate(&candidate, texture.PublicationGeneration()) ==
+				rts::render::RENDER_RESULT_OK,
+			"off-owner fixture creates a surviving native texture");
+
+		DestroyAggregateRequest request;
+		request.owner = aggregate;
+		HANDLE destroyThread = CreateThread(0, 0, DestroyAggregateFromWorker,
+			&request, 0, 0);
+		result |= Check(destroyThread != 0,
+			"off-owner aggregate fixture starts worker destruction");
+		if (destroyThread != 0)
+		{
+			WaitForSingleObject(destroyThread, INFINITE);
+			CloseHandle(destroyThread);
+		}
+		result |= Check(request.owner == 0,
+			"off-owner aggregate fixture destroys on the worker");
+
+		void *lockedBytes = 0;
+		const rts::render::RenderResult lockResult = buffer.Lock(0, 4,
+			rts::render::RENDER_BUFFER_UPDATE_PRESERVE, &lockedBytes);
+		rts::render::NativeW3DTextureHandle sampledTexture;
+		const rts::render::RenderResult sampleResult =
+			texture.AcquireForSampling(&sampledTexture);
+		result |= Check(lockResult == rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			lockedBytes == 0 &&
+			sampleResult != rts::render::RENDER_RESULT_OK &&
+			!sampledTexture.isValid(),
+			"surviving native owners fail closed after aggregate destruction");
+		result |= Check(buffer.Reset() == rts::render::RENDER_RESULT_OK,
+			"surviving native buffer releases its transferred ticket");
+	}
+
+	if (state != 0)
+	{
+		unsigned int drained = 0;
+		result |= Check(state->DrainCleanup(0, &drained) ==
+			rts::render::RENDER_RESULT_OK && drained != 0,
+			"off-owner aggregate fallback cleanup drains on its owner");
+		state->Release();
+	}
+
+	NativeW3D2 replacement;
+	const rts::render::RenderResult replacementResult = replacement.Initialize(
+		window, descriptor);
+	result |= Check(replacementResult == rts::render::RENDER_RESULT_OK,
+		"native resource publications rebind after off-owner destruction");
+	if (replacementResult == rts::render::RENDER_RESULT_OK)
+	{
+		result |= Check(replacement.Shutdown() == rts::render::RENDER_RESULT_OK,
+			"replacement aggregate shuts down after publication rebind");
+	}
+	return result;
+}
+
 int main()
 {
 	int result = 0;
@@ -1231,6 +1470,7 @@ int main()
 	descriptor.height = 64;
 	descriptor.enableVsync = false;
 	descriptor.allowSoftwareFallback = true;
+	descriptor.multisampleCount = 4;
 	if (w3d.Initialize(0, descriptor) != rts::render::RENDER_RESULT_INVALID_ARGUMENT)
 	{
 		std::fprintf(stderr, "FAIL: native WW3D2 accepted an invalid window\n");
@@ -1264,9 +1504,170 @@ int main()
 		"native WW3D2 initializes a hidden D3D11 swap chain");
 	if (initializeResult == rts::render::RENDER_RESULT_OK)
 	{
+		rts::render::RenderBackBufferInfo multisampleInfo;
+		result |= Check(w3d.Renderer().GetBackBufferInfo(&multisampleInfo) ==
+			rts::render::RENDER_RESULT_OK &&
+			multisampleInfo.multisampleCount == 4,
+			"native WW3D2 publishes its effective 4x scene sample count");
+		result |= Check(w3d.Renderer().Resize(80, 72) ==
+			rts::render::RENDER_RESULT_OK &&
+			w3d.Renderer().GetBackBufferInfo(&multisampleInfo) ==
+				rts::render::RENDER_RESULT_OK &&
+			multisampleInfo.width == 80 && multisampleInfo.height == 72 &&
+			multisampleInfo.multisampleCount == 4,
+			"native WW3D2 preserves 4x scene targets across resize");
+		result |= Check(w3d.Renderer().Resize(64, 64) ==
+			rts::render::RENDER_RESULT_OK,
+			"native WW3D2 restores the fixture resolution after MSAA resize");
 		result |= TestNativeHardwareZBias(&w3d);
 		result |= TestNativeCameraBiasSequences(&w3d);
 		result |= TestNativeCommandsPreservePipelineState(&w3d);
+		{
+			using namespace rts::render;
+			LegacyPipelineState saved;
+			GetTrackedLegacyPipelineState(&saved);
+			LegacyPipelineState actual;
+			result |= Check(w3d.SetGameRenderState(GAME_RENDER_STATE_CULL_MODE,
+				GAME_RENDER_CULL_CLOCKWISE) == RENDER_RESULT_OK &&
+				GetTrackedLegacyPipelineState(&actual) &&
+				actual.rasterizer.cullMode == RENDER_CULL_BACK &&
+				actual.rasterizer.frontCounterClockwise,
+				"legacy clockwise culling preserves counter-clockwise front faces");
+			result |= Check(w3d.SetGameRenderState(GAME_RENDER_STATE_CULL_MODE,
+				GAME_RENDER_CULL_COUNTER_CLOCKWISE) == RENDER_RESULT_OK &&
+				GetTrackedLegacyPipelineState(&actual) &&
+				actual.rasterizer.cullMode == RENDER_CULL_BACK &&
+				!actual.rasterizer.frontCounterClockwise,
+				"legacy counter-clockwise culling preserves clockwise front faces");
+			result |= Check(w3d.SetGameRenderState(GAME_RENDER_STATE_CULL_MODE,
+				GAME_RENDER_CULL_NONE) == RENDER_RESULT_OK &&
+				GetTrackedLegacyPipelineState(&actual) &&
+				actual.rasterizer.cullMode == RENDER_CULL_NONE,
+				"legacy no-cull mode preserves both windings");
+			TrackLegacyPipelineState(saved);
+		}
+		{
+			using namespace rts::render;
+			LegacyPipelineState saved;
+			GetTrackedLegacyPipelineState(&saved);
+			LegacyPipelineState scene = saved;
+			scene.textureStages[0].colorOperation = RENDER_TEXTURE_OP_ADD;
+			scene.textureStages[0].alphaOperation = RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+			scene.textureStages[0].colorArgument1Complement = true;
+			scene.textureStages[1].colorOperation = RENDER_TEXTURE_OP_MODULATE;
+			scene.textureStages[1].alphaOperation = RENDER_TEXTURE_OP_MODULATE;
+			scene.textureStages[0].sampler.addressU = RENDER_TEXTURE_ADDRESS_CLAMP;
+			scene.textureStages[0].textureCoordinateIndex = 1;
+			scene.textureStages[0].textureTransformEnable = true;
+			TrackLegacyPipelineState(scene);
+			// Texturing + diffuse modulation, with no detail stage.
+			result |= Check(w3d.ApplyGameShaderBits((1U << 16) | (1U << 10)) ==
+				RENDER_RESULT_OK, "native UI shader publication succeeds");
+			LegacyPipelineState ui;
+			result |= Check(GetTrackedLegacyPipelineState(&ui) &&
+				ui.textureStages[0].colorOperation == RENDER_TEXTURE_OP_MODULATE &&
+				ui.textureStages[0].alphaOperation == RENDER_TEXTURE_OP_MODULATE &&
+				!ui.textureStages[0].colorArgument1Complement &&
+				ui.textureStages[1].colorOperation == RENDER_TEXTURE_OP_DISABLE &&
+				ui.textureStages[1].alphaOperation == RENDER_TEXTURE_OP_DISABLE &&
+				ui.textureStages[0].sampler.addressU == RENDER_TEXTURE_ADDRESS_CLAMP &&
+				ui.textureStages[0].textureCoordinateIndex == 1 &&
+				ui.textureStages[0].textureTransformEnable,
+				"native UI shader replaces scene combiners while preserving sampler and UV mapping");
+			TrackLegacyPipelineState(saved);
+		}
+		{
+			using namespace rts::render;
+			LegacyPipelineState saved;
+			GetTrackedLegacyPipelineState(&saved);
+			const RenderLegacyVertexProgram programs[] = {
+				RENDER_LEGACY_VERTEX_TREES, RENDER_LEGACY_VERTEX_WATER_SEA };
+			for (unsigned int pass = 0; pass < 2; ++pass)
+			{
+				w3d.SetGameLegacyVertexProgram(programs[pass]);
+				LegacyPipelineState active;
+				result |= Check(GetTrackedLegacyPipelineState(&active) &&
+					active.vertexProgram == programs[pass],
+					"native scene pass can deliberately select its vertex program");
+				w3d.SetGameVertexShader(GAME_VERTEX_XYZDUV1);
+				result |= Check(GetTrackedLegacyPipelineState(&active) &&
+					active.vertexProgram == RENDER_LEGACY_VERTEX_FIXED_FUNCTION,
+					"FVF restore disables the prior water or tree vertex program");
+			}
+			TrackLegacyPipelineState(saved);
+		}
+		{
+			using namespace rts::render;
+			LegacyPipelineState savedPipeline;
+			GetTrackedLegacyPipelineState(&savedPipeline);
+			LegacyPipelineState uiPipeline = savedPipeline;
+			LegacyTextureStageState &stage = uiPipeline.textureStages[0];
+			stage.colorOperation = RENDER_TEXTURE_OP_MODULATE;
+			stage.alphaOperation = RENDER_TEXTURE_OP_MODULATE;
+			stage.cameraSpacePosition = true;
+			stage.textureTransformEnable = true;
+			stage.projectedCoordinates = true;
+			stage.textureTransformCount = 3;
+			TrackLegacyPipelineState(uiPipeline);
+			LegacyVertexMaterialState material;
+			material.textureStageResetMask = 1U;
+			material.textureCoordinateIndex[0] = 1U;
+			GameRenderCommand command;
+			memset(&command, 0, sizeof(command));
+			command.type = GAME_RENDER_COMMAND_SET_MATERIAL;
+			command.input = &material;
+			command.inputBytes = sizeof(material);
+			// Render2D submits its prelit material for each batch, while an
+			// unchanged ShaderClass may skip reapplying its combiners.
+			for (unsigned int batch = 0; batch < 2; ++batch)
+			{
+				result |= Check(w3d.ExecuteGameRenderCommand(command) ==
+					RENDER_RESULT_OK, "native UI material command succeeds");
+				LegacyPipelineState actual;
+				result |= Check(GetTrackedLegacyPipelineState(&actual) &&
+					actual.textureStages[0].colorOperation == RENDER_TEXTURE_OP_MODULATE &&
+					actual.textureStages[0].alphaOperation == RENDER_TEXTURE_OP_MODULATE &&
+					actual.textureStages[0].textureCoordinateIndex == 1U &&
+					!actual.textureStages[0].cameraSpacePosition &&
+					!actual.textureStages[0].textureTransformEnable &&
+					!actual.textureStages[0].projectedCoordinates &&
+					actual.textureStages[0].textureTransformCount == 0U,
+					"repeated UI material preserves shader combiners and resets mapping");
+			}
+			TrackLegacyPipelineState(savedPipeline);
+		}
+		{
+			using namespace rts::render;
+			LegacyPipelineState saved;
+			GetTrackedLegacyPipelineState(&saved);
+			const unsigned int modes[] = {
+				GAME_TEXTURE_COORDINATE_CAMERA_REFLECTION,
+				GAME_TEXTURE_COORDINATE_CAMERA_POSITION,
+				GAME_TEXTURE_COORDINATE_CAMERA_NORMAL,
+				GAME_TEXTURE_COORDINATE_PASSTHROUGH };
+			const bool normal[] = { false, false, true, false };
+			const bool position[] = { false, true, false, false };
+			const bool reflection[] = { true, false, false, false };
+			for (unsigned int mode = 0; mode < 4; ++mode)
+			{
+				GameRenderCommand command;
+				memset(&command, 0, sizeof(command));
+				command.type = GAME_RENDER_COMMAND_SET_TEXTURE_STAGE_STATE;
+				command.value0 = 0;
+				command.value1 = GAME_TEXTURE_STAGE_COORDINATE_INDEX;
+				command.value2 = modes[mode] | 3U;
+				LegacyPipelineState actual;
+				result |= Check(w3d.ExecuteGameRenderCommand(command) ==
+					RENDER_RESULT_OK && GetTrackedLegacyPipelineState(&actual) &&
+					actual.textureStages[0].textureCoordinateIndex == 3U &&
+					actual.textureStages[0].cameraSpaceNormal == normal[mode] &&
+					actual.textureStages[0].cameraSpacePosition == position[mode] &&
+					actual.textureStages[0].cameraSpaceReflectionVector ==
+						reflection[mode],
+					"coordinate-generation mode decodes as one exclusive legacy mode");
+			}
+			TrackLegacyPipelineState(saved);
+		}
 		result |= TestPlainTransformRejectsNonfiniteValues(&w3d);
 		result |= TestStencilStateEncoding(&w3d);
 		const bool usesDedicatedThreadedOwner =
@@ -1587,6 +1988,10 @@ int main()
 			"native WW3D2 presents a hidden D3D11 frame");
 		result |= Check(w3d.RecoverDevice() == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 recovers a hidden D3D11 device");
+		result |= Check(w3d.Renderer().GetBackBufferInfo(&multisampleInfo) ==
+			rts::render::RENDER_RESULT_OK &&
+			multisampleInfo.multisampleCount == 4,
+			"native WW3D2 preserves 4x scene targets through device recovery");
 		result |= Check(w3d.Renderer().BeginFrame() == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 begins a frame after device recovery");
 		result |= Check(w3d.Renderer().Submit(w3d.Resources(), state, packet) ==
@@ -1647,6 +2052,7 @@ int main()
 			}
 		}
 	}
+	result |= TestNativeOneShotCapture(&w3d);
 	CaptureProbe completedCapture;
 	completedCapture.owner = &w3d;
 	completedCapture.completed = 0;
@@ -1657,6 +2063,8 @@ int main()
 	completedCapture.frameWasOpen = true;
 	completedCapture.presentCalls = 0;
 	completedCapture.presentCallsAtCompletion = 0;
+	completedCapture.inspectFirstPixel = true;
+	completedCapture.firstPixelIsOpaqueRed = false;
 	rts::render::RenderCaptureRequestDescriptor captureDescriptor;
 	captureDescriptor.kind = rts::render::RENDER_CAPTURE_WW3D_SCREENSHOT;
 	captureDescriptor.consumer = &completedCapture;
@@ -1669,13 +2077,26 @@ int main()
 	result |= Check(w3d.Renderer().BeginFrame() ==
 		rts::render::RENDER_RESULT_OK,
 		"native WW3D2 begins a frame for ordered capture");
+	rts::render::GameRenderCommand clearCaptureCommand = {};
+	clearCaptureCommand.type =
+		rts::render::GAME_RENDER_COMMAND_CLEAR_RENDER_TARGETS;
+	clearCaptureCommand.value0 = rts::render::RENDER_CLEAR_COLOR;
+	clearCaptureCommand.float0 = 1.0f;
+	clearCaptureCommand.float1 = 0.0f;
+	clearCaptureCommand.float2 = 0.0f;
+	clearCaptureCommand.float3 = 1.0f;
+	clearCaptureCommand.float4 = 1.0f;
+	result |= Check(w3d.ExecuteGameRenderCommand(clearCaptureCommand) ==
+		rts::render::RENDER_RESULT_OK,
+		"native WW3D2 clears the multisampled scene for capture");
 	rts::render::GameRenderCommand endRenderCommand = {};
 	endRenderCommand.type = rts::render::GAME_RENDER_COMMAND_END_RENDER;
 	endRenderCommand.value0 = 1;
 	result |= Check(w3d.ExecuteGameRenderCommand(endRenderCommand) ==
 		rts::render::RENDER_RESULT_OK && completedCapture.completed == 1 &&
-		completedCapture.cancelled == 0 && !completedCapture.frameWasOpen,
-		"END_RENDER ends before capture and presents after readback");
+		completedCapture.cancelled == 0 && !completedCapture.frameWasOpen &&
+		completedCapture.firstPixelIsOpaqueRed,
+		"END_RENDER resolves MSAA before capture and presents after readback");
 
 	CaptureProbe cancelledCapture;
 	cancelledCapture.owner = &w3d;
@@ -1687,6 +2108,8 @@ int main()
 	cancelledCapture.frameWasOpen = true;
 	cancelledCapture.presentCalls = 0;
 	cancelledCapture.presentCallsAtCompletion = 0;
+	cancelledCapture.inspectFirstPixel = false;
+	cancelledCapture.firstPixelIsOpaqueRed = false;
 	captureDescriptor.consumer = &cancelledCapture;
 	result |= Check(w3d.QueueGameBackBufferCapture(captureDescriptor,
 		&captureHandle) == rts::render::RENDER_RESULT_OK,
@@ -1717,6 +2140,8 @@ int main()
 	flippedCapture.frameWasOpen = true;
 	flippedCapture.presentCalls = 0;
 	flippedCapture.presentCallsAtCompletion = 0;
+	flippedCapture.inspectFirstPixel = false;
+	flippedCapture.firstPixelIsOpaqueRed = false;
 	captureDescriptor.consumer = &flippedCapture;
 	result |= Check(w3d.QueueGameBackBufferCapture(captureDescriptor,
 		&captureHandle) == rts::render::RENDER_RESULT_OK &&
@@ -1731,6 +2156,7 @@ int main()
 
 	result |= Check(w3d.Shutdown() == rts::render::RENDER_RESULT_OK,
 		"native WW3D2 shuts down after a presented frame");
+	result |= TestOffOwnerAggregatePublication(window);
 	DestroyWindow(window);
 	if (result != 0)
 	{

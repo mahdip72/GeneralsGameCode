@@ -11,5 +11,5 @@ if(MINGW)
 endif()
 
 add_test(NAME core_deterministic_ai_planning_tests
-    COMMAND core_deterministic_ai_planning_tests)
+    COMMAND core_deterministic_ai_planning_tests --local-capacity)
 set_tests_properties(core_deterministic_ai_planning_tests PROPERTIES TIMEOUT 30)

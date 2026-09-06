@@ -280,9 +280,11 @@ void TextureFilterClass::Set_Mip_Mapping(FilterType mipmap)
 */
 void TextureFilterClass::_Set_Max_Anisotropy(AnisotropicFilterMode mode)
 {
+	// The disabled preference is zero; sampler state represents it as 1x.
+	const unsigned int maximum = mode < 1 ? 1U : static_cast<unsigned int>(mode);
 	for (int stage = 0; stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 		rts::render::SetGameTextureStageState(stage,
-			rts::render::GAME_TEXTURE_STAGE_MAX_ANISOTROPY, mode);
+			rts::render::GAME_TEXTURE_STAGE_MAX_ANISOTROPY, maximum);
 }
 
 //**********************************************************************************************

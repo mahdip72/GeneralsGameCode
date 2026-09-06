@@ -50,6 +50,7 @@
 #if defined(_WIN64)
 #include "GameNetwork/InstalledLockstepV2Validation.h"
 #include "Lib/LockstepV2Contract.h"
+#include "Lib/LockstepV2Promotion.h"
 #include "Lib/NetworkCommandOriginPolicy.h"
 #include "Lib/NetworkEpochHandshake.h"
 #include "Lib/MultiplayerSimulationRuntimeProof.h"
@@ -1215,8 +1216,18 @@ void ConnectionManager::beginNetworkHello()
 	m_networkSimulationRosterMask = m_networkHelloExpectedSlots |
 		(1U << m_localSlot);
 	unsigned candidateKernelMask =
-		getRuntimeMultiplayerSimulationReleaseProvenKernelMask(
-			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC);
+		rts::lockstep_v2::ResolveEmbeddedProductPromotionKernelMask(
+			static_cast<unsigned>(
+				rts::MULTIPLAYER_SIMULATION_KERNEL_LIVE_INTEGRATED_MASK));
+	if (candidateKernelMask ==
+		rts::MULTIPLAYER_SIMULATION_KERNEL_RELEASE_PROVEN_DEFAULT_MASK)
+	{
+		// InstalledNet3Validation v1 stays a diagnostic-only serial fallback.
+		// It cannot contribute to or widen the separately embedded v2 trust root.
+		candidateKernelMask =
+			getRuntimeMultiplayerSimulationReleaseProvenKernelMask(
+				TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC);
+	}
 #if defined(_WIN64)
 	// The installed v2 qualifier refreshes this hello only after its local
 	// scheduler prerequisites are ready.  This mask is permission for the
