@@ -304,6 +304,11 @@ struct DirectPathBatchWork
 #endif
 };
 
+// Defined below the worker body; source execution can publish cancellation
+// from either a physical worker or an authenticated owner-inline body.
+void publishDirectPathCancellation(DirectPathWork &work);
+void publishPeak(std::atomic<unsigned> &peak, unsigned value);
+
 #if defined(_WIN64)
 bool InlineBodyReadiness::direct(const DirectPathSourceRecord &source,
 	const JobSystem &jobs)
@@ -478,11 +483,6 @@ bool SerialComputeDirectPathReference(const void *immutableInput,
 	}
 	return true;
 }
-
-// Defined below the job body; source execution can publish cancellation from
-// either a physical worker or an authenticated owner-inline body.
-void publishDirectPathCancellation(DirectPathWork &work);
-void publishPeak(std::atomic<unsigned> &peak, unsigned value);
 
 bool PrepareDirectPathSourceRecord(DirectPathBatchWork &batch,
 	JobSystem &jobs, performance::KernelPerformanceReferenceLedger *ledger,
@@ -666,6 +666,8 @@ private:
 	bool m_cancelled, m_succeeded;
 };
 
+#endif
+
 bool ExecuteDirectPathBody(const std::shared_ptr<DirectPathBatchWork> &batch,
 	std::size_t requestIndex, JobContext *context)
 {
@@ -754,6 +756,7 @@ bool ExecuteDirectPathBody(const std::shared_ptr<DirectPathBatchWork> &batch,
 	return succeeded;
 }
 
+#if defined(_WIN64)
 void ObserveDirectPathReference(const DirectPathBatchWork &batch,
 	std::size_t requestCount, performance::KernelPerformanceBatch *timingBatch,
 	performance::KernelPerformanceReferenceLedger *referenceLedger,

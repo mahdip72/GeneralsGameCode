@@ -165,6 +165,11 @@ function Get-Stage5IndentedBlock {
     return ($blockLines -join "`n")
 }
 
+function ConvertTo-Stage5SelfTestLf {
+    param([string]$Content)
+    return [regex]::Replace($Content, "`r`n|`r", "`n")
+}
+
 function Get-Stage5WorkflowEffectiveContent {
     param([string]$Content)
 
@@ -351,7 +356,7 @@ function Assert-Stage5ExactJobStepSequence {
     Assert-Stage5WorkflowNotContains $Job '(?m)^ {6}- (?!name:)' `
         "$Context anonymous step"
     $stepNames = @([regex]::Matches($Job,
-            '(?m)^ {6}- name:\s*(?<Name>[^\r\n]+)$') |
+            '(?m)^ {6}- name:[ \t]*(?<Name>[^\r\n]+)\r?$') |
         ForEach-Object { $_.Groups['Name'].Value })
     Assert-Stage5WorkflowCondition ($stepNames.Count -eq
         $ExpectedNames.Count) "$Context has an unexpected step count."
@@ -1205,7 +1210,7 @@ function Invoke-Stage5CheckReplaysContractSelfTest {
     $path = Join-Path $PSScriptRoot 'check-replays.yml'
     Assert-Stage5WorkflowCondition (Test-Path -LiteralPath $path -PathType Leaf) `
         'check-replays workflow contract self-test fixture is missing.'
-    $fixture = Get-Content -LiteralPath $path -Raw
+    $fixture = (Get-Content -LiteralPath $path -Raw) -replace "`r`n|`r", "`n"
     Assert-Stage5CheckReplaysContract $fixture `
         'self-test reusable Stage 5 replay workflow fixture'
 
@@ -1234,9 +1239,9 @@ function Invoke-Stage5CheckReplaysContractSelfTest {
             '  build:', "  build:`n  build:")
         'action-input-order' = $fixture.Replace(
             ('          name: ${{ inputs.game }}-${{ inputs.preset }}' +
-                [Environment]::NewLine +
+                "`n" +
                 '          path: build'),
-            ('          path: build' + [Environment]::NewLine +
+            ('          path: build' + "`n" +
                 '          name: ${{ inputs.game }}-${{ inputs.preset }}'))
         tamper = $fixture.Replace(
             "-Role 'replay-fixture-manifest'", "-Role 'replay-results'")
@@ -2742,6 +2747,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 '@
+    $qualificationProducerFixture = ConvertTo-Stage5SelfTestLf $qualificationProducerFixture
     Assert-Stage5LockstepV2QualificationProducer `
         $qualificationProducerFixture 'self-test qualification producer fixture'
     foreach ($negativeProducerFixture in @(
@@ -2880,6 +2886,7 @@ jobs:
           & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Invoke-Stage5FinalAcceptance.ps1" `
             -AcceptanceManifestPath $manifest
 '@
+    $executableAcceptanceFixture = ConvertTo-Stage5SelfTestLf $executableAcceptanceFixture
     $executableAcceptanceStep = Get-Stage5IndentedBlock `
         $executableAcceptanceFixture `
         '- name: Run Stage 5 final pre-manual acceptance' 6
@@ -3135,6 +3142,7 @@ jobs:
           "nonce=$nonce" >> $env:GITHUB_OUTPUT
           "created_utc=$created" >> $env:GITHUB_OUTPUT
 '@
+    $cohortMintFixture = ConvertTo-Stage5SelfTestLf $cohortMintFixture
     $cohortMintStep = Get-Stage5IndentedBlock $cohortMintFixture `
         '- name: Mint fresh execution cohort' 6
     $cohortStatements = @(
@@ -3169,6 +3177,7 @@ jobs:
           & 'trusted.ps1' -OutputPath $env:OUTPUT
           if (-not $?) { throw 'failed' }
 '@
+    $closedProgramFixture = ConvertTo-Stage5SelfTestLf $closedProgramFixture
     $closedProgramStep = Get-Stage5IndentedBlock $closedProgramFixture `
         '- name: Trusted producer' 6
     Assert-Stage5ExactPowerShellStepMetadata -Step $closedProgramStep `
@@ -3251,10 +3260,17 @@ jobs:
       - name: Upload evidence
         uses: action/upload@0000000000000000000000000000000000000000
 '@
+    $closedStepSequenceFixture = ConvertTo-Stage5SelfTestLf $closedStepSequenceFixture
     Assert-Stage5ExactJobStepSequence $closedStepSequenceFixture @(
         'Download evidence', 'Assemble evidence', 'Validate evidence',
         'Upload evidence') @('uses', 'run', 'run', 'uses') `
         'self-test exact closed job sequence fixture'
+    $closedStepSequenceCrlfFixture = [regex]::Replace(
+        $closedStepSequenceFixture, "`r`n|`r|`n", "`r`n")
+    Assert-Stage5ExactJobStepSequence $closedStepSequenceCrlfFixture @(
+        'Download evidence', 'Assemble evidence', 'Validate evidence',
+        'Upload evidence') @('uses', 'run', 'run', 'uses') `
+        'self-test CRLF closed job sequence fixture'
     foreach ($invalidClosedSequenceFixture in @(
         $closedStepSequenceFixture.Replace(
             '      - name: Assemble evidence',
@@ -3283,6 +3299,7 @@ jobs:
       - name: Validate
         run: Write-Output validate
 '@
+    $jobEnvironmentFixture = ConvertTo-Stage5SelfTestLf $jobEnvironmentFixture
     $expectedJobEnvironment = [ordered]@{
         STAGE5_COHORT_NONCE = 'current-cohort'
         STAGE5_READINESS_ROOT = "'H:\Stage5WeeklyPromotionQualification'"
@@ -3336,6 +3353,7 @@ jobs:
           name: Stage5-Exact-Evidence
           path: H:\Stage5ExactEvidence
 '@
+    $currentRunDownloadFixture = ConvertTo-Stage5SelfTestLf $currentRunDownloadFixture
     $currentRunDownloadStep = Get-Stage5IndentedBlock `
         $currentRunDownloadFixture '- name: Download exact evidence' 6
     Assert-Stage5CurrentRunArtifactDownload $currentRunDownloadStep `
@@ -3411,6 +3429,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 '@
+    $sealedUploadFixture = ConvertTo-Stage5SelfTestLf $sealedUploadFixture
     $sealedUploadStep = Get-Stage5IndentedBlock $sealedUploadFixture `
         '- name: Upload Stage 5 development-readiness evidence' 6
     Assert-Stage5SealedReadinessUpload $sealedUploadStep `
@@ -3446,6 +3465,7 @@ jobs:
       - name: Seal Stage 5 development-readiness bundle
       - name: Upload Stage 5 development-readiness evidence
 '@
+    $terminalOrderFixture = ConvertTo-Stage5SelfTestLf $terminalOrderFixture
     Assert-Stage5ReadinessTerminalStepOrder $terminalOrderFixture `
         'self-test readiness terminal order fixture'
     foreach ($invalidTerminalOrderFixture in @(
