@@ -5115,6 +5115,109 @@ function Assert-Stage5LivePlanCallerRouting {
         'changed final plan cannot prepare a child or launch the nonexistent fixture executable'
 }
 
+function Assert-Stage5SerialBaselineCorpusCaptureContract {
+    $runnerPath = Join-Path $PSScriptRoot 'Run-DeterministicSimulationValidation.ps1'
+    $runnerSource = Get-Content -LiteralPath $runnerPath -Raw
+    Assert-True ($runnerSource -match '\[switch\]\$CaptureSerialBaselineCorpus') `
+        'runner exposes the explicit serial-baseline corpus-capture switch'
+    Assert-True ($runnerSource -match 'serial-baseline-ai') `
+        'runner exposes an explicit serial-baseline capture provenance value'
+    Assert-True ($runnerSource -match
+        'CaptureSerialBaselineCorpus.*CorpusExportRoot|CorpusExportRoot.*CaptureSerialBaselineCorpus') `
+        'serial-baseline capture remains coupled to durable corpus export'
+    Assert-True ($runnerSource -match
+        'CaptureSerialBaselineCorpus.*(?:ValidationSet|AI)|(?:ValidationSet|AI).*CaptureSerialBaselineCorpus') `
+        'serial-baseline capture is restricted to the AI validation set'
+    Assert-True ($runnerSource -match
+        'CaptureSerialBaselineCorpus.*schemaVersion|schemaVersion.*CaptureSerialBaselineCorpus') `
+        'serial-baseline capture rejects non-V1 manifests before execution'
+    Assert-True ($runnerSource -match
+        'CaptureSerialBaselineCorpus requires an empty replay-fixture list') `
+        'serial-baseline capture rejects declared replay fixtures'
+    Assert-True ($runnerSource -match
+        'CaptureSerialBaselineCorpus requires the explicit -AllowHeadlessDirectExecution exception') `
+        'serial-baseline capture requires the direct-execution exception'
+    Assert-True ($runnerSource -match
+        'CaptureSerialBaselineCorpus cannot request performance enforcement') `
+        'serial-baseline capture rejects performance enforcement'
+    Assert-True ($runnerSource -match
+        'CaptureSerialBaselineCorpus cannot request canonical acceptance bindings') `
+        'serial-baseline capture rejects canonical acceptance bindings'
+    Assert-True ($runnerSource -match
+        'CaptureSerialBaselineCorpus requires at least ten declared AI captures') `
+        'serial-baseline capture rejects fewer than ten declared capture records'
+
+    $parseTokens = $null; $parseErrors = $null
+    $tree = [System.Management.Automation.Language.Parser]::ParseFile(
+        $runnerPath, [ref]$parseTokens, [ref]$parseErrors)
+    Assert-True (@($parseErrors).Count -eq 0) `
+        'runner parses before the serial-baseline plan is constructed'
+    foreach ($definition in $tree.EndBlock.Statements) {
+        if ($definition -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+            Invoke-Expression $definition.Extent.Text
+        }
+    }
+
+    $captureData = [pscustomobject]@{
+        schemaVersion = 1
+        executableSha256 = ('A' * 64)
+        fixtures = @()
+        ai = [pscustomobject]@{
+            seeds = @(1729, 1730, 1731)
+            scenarios = @('4v3', '4v2', 'hard-ai-2v6')
+            repeats = 2
+        }
+    }
+    Assert-SerialBaselineCorpusCaptureManifest $captureData
+    $tooSmallCaptureData = $captureData | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    $tooSmallCaptureData.ai.repeats = 1
+    Assert-Throws {
+        Assert-SerialBaselineCorpusCaptureManifest $tooSmallCaptureData
+    } 'at least ten declared AI captures' `
+        'serial-baseline capture rejects a manifest that cannot supply ten replay inputs'
+    $selected = @(Get-ValidationWorkerConfigurations `
+        -CapacityMode LocalCapacity -DiagnosticWorkerConfiguration '' `
+        -CaptureSerialBaselineCorpus)
+    Assert-True ($selected.Count -eq 1 -and $selected[0].Id -ceq 'serial-1' -and
+        $selected[0].Mode -ceq 'serial' -and
+        [int]$selected[0].WorkerCount -eq 1) `
+        'serial-baseline capture selects only the existing serial-1 configuration'
+
+    $plan = @(New-ValidationPlan -Data $captureData -Set 'AI' `
+        -ReplayPasses 2 -StressRunCount 3 -ReplayTimeout 600 -AiTimeout 1800 `
+        -Executable 'H:\Stage5SerialCapture\generalsv.exe' `
+        -OutputDirectory 'H:\Stage5SerialCapture\output' `
+        -CapacityMode LocalCapacity -DiagnosticWorkerConfiguration '' `
+        -CaptureSerialBaselineCorpus)
+    $expectedKeys = @(
+        foreach ($scenario in $captureData.ai.scenarios) {
+            foreach ($seed in $captureData.ai.seeds) {
+                foreach ($repeat in 1..$captureData.ai.repeats) {
+                    "$scenario|$seed|serial-1|$repeat"
+                }
+            }
+        }
+    )
+    $actualKeys = @($plan | ForEach-Object {
+        "$($_.scenario)|$($_.seed)|$($_.configuration)|$($_.repeat)"
+    })
+    Assert-True ($plan.Count -eq $expectedKeys.Count -and
+        @($plan | Where-Object {
+            $_.kind -cne 'ai' -or $_.configuration -cne 'serial-1' -or
+            $_.simulationMode -cne 'serial' -or $_.requestedWorkers -cne '1' -or
+            $null -ne $_.PSObject.Properties['validationRole']
+        }).Count -eq 0 -and
+        @($actualKeys | Sort-Object -Unique).Count -eq $expectedKeys.Count -and
+        @($expectedKeys | Where-Object { $actualKeys -notcontains $_ }).Count -eq 0) `
+        'serial-baseline capture preserves every declared scenario/seed/repeat without a shadow or parallel entry'
+
+    Assert-Throws {
+        Get-ValidationWorkerConfigurations -CapacityMode LocalCapacity `
+            -DiagnosticWorkerConfiguration 'parallel-4' -CaptureSerialBaselineCorpus | Out-Null
+    } 'serial.*baseline|DiagnosticWorkerConfiguration' `
+        'serial-baseline capture rejects an explicit diagnostic worker selector'
+}
+
 function New-Stage5LiveRoleTestOutput {
     param([object]$Entry, [switch]$UnusedStatus,
         [string]$ExecutableHash = ('A' * 64))
@@ -6159,6 +6262,7 @@ New-Item -ItemType Directory -Path $root | Out-Null
 try {
     if ($runPlan) {
         Assert-InstalledNet3ModuleBoundary (Join-Path $root 'installed-net3-module-fixture.json')
+        Assert-Stage5SerialBaselineCorpusCaptureContract
         Assert-Stage5LiveRoleContract
         Assert-Stage5HardAi2v6CompletionContract
         Assert-Stage5LivePlanPrelaunchBinding
@@ -6618,7 +6722,8 @@ try {
             ('replay_retained="' + $mockReplayPath + '"')
         $mockEntry = [pscustomobject]@{
             kind = 'ai'; sequence = 1; scenario = '4v3'; seed = 1729
-            configuration = 'serial-1'; repeat = 1
+            configuration = 'serial-1'; simulationMode = 'serial'
+            requestedWorkers = '1'; repeat = 1
         }
         $mockChildRuns = @(
             [pscustomobject]@{
@@ -6656,6 +6761,78 @@ try {
             -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
             -ChildRuns $mockChildRuns -Results $mockResults `
             -ValidationResultsPath $mockResultsPath
+        $serialCaptureExportRoot = Join-Path $corpusTaskRoot 'serial-baseline-corpus'
+        $serialCaptureExport = Export-LocalCapacityAiCorpus `
+            -TaskRoot $corpusTaskRoot -TaskRunRoot $corpusTaskRunRoot `
+            -ProfileRoot $corpusProfileRoot -CorpusExportRoot $serialCaptureExportRoot `
+            -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
+            -ChildRuns $mockChildRuns -Results $mockResults `
+            -ValidationResultsPath $mockResultsPath `
+            -CaptureMode 'serial-baseline-ai'
+        Assert-True ($serialCaptureExport.status -ceq 'passed' -and
+            $serialCaptureExport.captureMode -ceq 'serial-baseline-ai' -and
+            @($serialCaptureExport.records | Where-Object {
+                $_.configuration -cne 'serial-1'
+            }).Count -eq 0) `
+            'serial-baseline export records its mode and retains only serial-1 records'
+        $serialCaptureUpper = Export-LocalCapacityAiCorpus `
+            -TaskRoot $corpusTaskRoot -TaskRunRoot $corpusTaskRunRoot `
+            -ProfileRoot $corpusProfileRoot `
+            -CorpusExportRoot (Join-Path $corpusTaskRoot 'serial-baseline-upper') `
+            -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
+            -ChildRuns $mockChildRuns -Results $mockResults `
+            -ValidationResultsPath $mockResultsPath `
+            -CaptureMode 'SERIAL-BASELINE-AI'
+        Assert-True ($serialCaptureUpper.captureMode -ceq 'serial-baseline-ai') `
+            'serial-baseline export canonicalizes an uppercase capture mode before gating records'
+        $parallelEntry = $mockEntry | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+        $parallelEntry.configuration = 'parallel-2'
+        $parallelEntry.simulationMode = 'parallel'
+        $parallelEntry.requestedWorkers = '2'
+        Assert-Throws {
+            Export-LocalCapacityAiCorpus `
+                -TaskRoot $corpusTaskRoot -TaskRunRoot $corpusTaskRunRoot `
+                -ProfileRoot $corpusProfileRoot `
+                -CorpusExportRoot (Join-Path $corpusTaskRoot 'serial-baseline-parallel-rejected') `
+                -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
+                -ChildRuns @([pscustomobject]@{
+                    entry = $parallelEntry; run = $mockChildRuns[0].run
+                }) -Results $mockResults `
+                -ValidationResultsPath $mockResultsPath `
+                -CaptureMode 'serial-baseline-ai' | Out-Null
+        } 'serial-1|serial-baseline' `
+            'serial-baseline export rejects parallel child records before copying replay bytes'
+        $serialCaptureReceiptPath = Join-Path $corpusTaskRoot `
+            'serial-baseline-local-capacity-receipt.json'
+        Write-LocalCapacityReceipt -Path $serialCaptureReceiptPath `
+            -Status 'passed-non-acceptance' -ValidationSet 'AI' `
+            -Entries @($mockEntry) -Results $mockResults `
+            -Configurations @([pscustomobject]@{ Id = 'serial-1' }) `
+            -ShadowConfiguration $null `
+            -Topology ([pscustomobject]@{
+                source = 'Win32_Processor'; physicalCoreCount = 6; logicalProcessorCount = 12
+            }) -PlanPath $mockResultsPath -ResultsPath $mockResultsPath `
+            -CorpusExportRoot $serialCaptureExportRoot `
+            -CorpusExport $serialCaptureExport | Out-Null
+        $serialCaptureReceipt = Get-Content -LiteralPath $serialCaptureReceiptPath -Raw |
+            ConvertFrom-Json
+        Assert-True ($serialCaptureReceipt.corpusExport.captureMode -ceq
+            'serial-baseline-ai' -and
+            $serialCaptureReceipt.corpusExportMode -ceq 'serial-baseline-ai' -and
+            $serialCaptureReceipt.serialBaselineCorpusCapture -and
+            -not $serialCaptureReceipt.finalAcceptanceEligible) `
+            'serial-baseline receipt remains non-accepting and records its capture mode'
+        $serialCaptureManifest = Write-Stage5FreshReplayCorpusManifest `
+            -TaskRoot $corpusTaskRoot -CorpusExportRoot $serialCaptureExportRoot `
+            -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
+            -Records $serialCaptureExport.records -ValidationResultsPath $mockResultsPath `
+            -ValidationReceiptPath $serialCaptureReceiptPath `
+            -CaptureMode 'serial-baseline-ai'
+        $serialCaptureManifestDocument = Get-Content -LiteralPath `
+            $serialCaptureManifest.path -Raw | ConvertFrom-Json
+        Assert-True ($serialCaptureManifestDocument.captureMode -ceq
+            'serial-baseline-ai') `
+            'serial-baseline corpus manifest records its distinct capture mode'
         $mockReceiptPath = Join-Path $corpusTaskRoot 'local-capacity-receipt.json'
         Write-LocalCapacityReceipt -Path $mockReceiptPath `
             -Status 'passed-non-acceptance' -ValidationSet 'AI' `

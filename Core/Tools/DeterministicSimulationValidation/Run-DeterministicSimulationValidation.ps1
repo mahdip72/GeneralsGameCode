@@ -22,6 +22,7 @@ param(
     [switch]$PlanOnly,
     [switch]$DisableFrameTiming,
     [switch]$DiagnosticNonAcceptance,
+    [switch]$CaptureSerialBaselineCorpus,
     [Alias('HeadlessDirectExecutionException')]
     [switch]$AllowHeadlessDirectExecution,
     [switch]$RequireX64,
@@ -973,6 +974,27 @@ function Get-DiagnosticWorkerConfigurations {
     return $selected
 }
 
+function Get-ValidationWorkerConfigurations {
+    param(
+        [ValidateSet('Canonical', 'LocalCapacity')]
+        [string]$CapacityMode = 'Canonical',
+        [string]$DiagnosticWorkerConfiguration = '',
+        [switch]$CaptureSerialBaselineCorpus
+    )
+    if ($CaptureSerialBaselineCorpus) {
+        Assert-Condition ($CapacityMode -ceq 'LocalCapacity' -and
+            [string]::IsNullOrWhiteSpace($DiagnosticWorkerConfiguration)) `
+            'Serial-baseline corpus capture cannot use DiagnosticWorkerConfiguration or another capacity mode.'
+        $serial = @(Get-WorkerConfigurations -CapacityMode LocalCapacity |
+            Where-Object { $_.Id -ceq 'serial-1' })
+        Assert-Condition ($serial.Count -eq 1) `
+            'Serial-baseline corpus capture requires the existing serial-1 worker configuration.'
+        return $serial
+    }
+    return @(Get-DiagnosticWorkerConfigurations -CapacityMode $CapacityMode `
+        -DiagnosticWorkerConfiguration $DiagnosticWorkerConfiguration)
+}
+
 function Get-CollisionShadowConfiguration {
     param([ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical')
     if ($CapacityMode -ceq 'LocalCapacity') {
@@ -996,6 +1018,19 @@ function Assert-LocalCapacityCorpusMatrix {
         Assert-Condition ($scenarios -ccontains $requiredScenario) `
             "LocalCapacity corpus export requires the '$requiredScenario' live-AI scenario."
     }
+}
+
+function Assert-SerialBaselineCorpusCaptureManifest {
+    param([Parameter(Mandatory = $true)][object]$Data)
+    Assert-Condition ($Data.schemaVersion -eq 1) `
+        'CaptureSerialBaselineCorpus requires a schemaVersion 1 AI manifest.'
+    Assert-Condition (@($Data.fixtures).Count -eq 0) `
+        'CaptureSerialBaselineCorpus requires an empty replay-fixture list; it captures fresh AI replays only.'
+    Assert-LocalCapacityCorpusMatrix $Data
+    $declaredCaptureCount = @($Data.ai.scenarios).Count *
+        @($Data.ai.seeds).Count * [int]$Data.ai.repeats
+    Assert-Condition ($declaredCaptureCount -ge 10) `
+        "CaptureSerialBaselineCorpus requires at least ten declared AI captures before launch; manifest declares $declaredCaptureCount."
 }
 
 function New-CommonArguments {
@@ -1389,11 +1424,13 @@ function New-ValidationPlan {
     param([object]$Data, [string]$Set, [int]$ReplayPasses, [int]$StressRunCount,
         [int]$ReplayTimeout, [int]$AiTimeout, [string]$Executable, [string]$OutputDirectory,
         [ValidateSet('Canonical', 'LocalCapacity')][string]$CapacityMode = 'Canonical',
-        [string]$DiagnosticWorkerConfiguration = '')
+        [string]$DiagnosticWorkerConfiguration = '',
+        [switch]$CaptureSerialBaselineCorpus)
     $plan = New-Object 'Collections.Generic.List[object]'
-    $workerConfigurations = @(Get-DiagnosticWorkerConfigurations `
+    $workerConfigurations = @(Get-ValidationWorkerConfigurations `
         -CapacityMode $CapacityMode `
-        -DiagnosticWorkerConfiguration $DiagnosticWorkerConfiguration)
+        -DiagnosticWorkerConfiguration $DiagnosticWorkerConfiguration `
+        -CaptureSerialBaselineCorpus:$CaptureSerialBaselineCorpus)
     foreach ($configuration in $workerConfigurations) {
         $common = @(New-CommonArguments $configuration $Data.executableSha256)
         if ($Set -ne 'AI') {
@@ -1432,7 +1469,8 @@ function New-ValidationPlan {
             }
         }
     }
-    if ([string]::IsNullOrWhiteSpace($DiagnosticWorkerConfiguration) -and
+    if (-not $CaptureSerialBaselineCorpus -and
+        [string]::IsNullOrWhiteSpace($DiagnosticWorkerConfiguration) -and
         $Set -ne 'Replay' -and $Data.ai.scenarios -ccontains '4v2') {
         # One bounded installed-runtime shadow stress execution proves the
         # post-legacy collision oracle without multiplying the full matrix.
@@ -3012,6 +3050,9 @@ function Write-LocalCapacityReceipt {
             'LocalCapacity artifact index SHA-256 changed before receipt binding.'
         $corpusExportDocument = [ordered]@{
             status = 'passed'
+            captureMode = if ($null -ne $CorpusExport.PSObject.Properties['captureMode']) {
+                [string]$CorpusExport.captureMode
+            } else { 'local-capacity-ai' }
             corpusExportRoot = [IO.Path]::GetFullPath($CorpusExportRoot)
             artifactIndexPath = $artifactIndexPath
             artifactIndexSha256 = $artifactIndexSha256
@@ -3054,6 +3095,11 @@ function Write-LocalCapacityReceipt {
             $_.kind -ceq 'ai'
         }).Count
         corpusExportRequested = $corpusExportRequested
+        corpusExportMode = if ($corpusExportRequested) {
+            [string]$corpusExportDocument.captureMode
+        } else { $null }
+        serialBaselineCorpusCapture = $corpusExportRequested -and
+            [string]$corpusExportDocument.captureMode -ceq 'serial-baseline-ai'
         corpusExportRoot = if ($corpusExportRequested) {
             [IO.Path]::GetFullPath($CorpusExportRoot)
         } else { $null }
@@ -3090,8 +3136,11 @@ function Export-LocalCapacityAiCorpus {
         [Parameter(Mandatory = $true)][string]$ExecutableSha256,
         [Parameter(Mandatory = $true)][object[]]$ChildRuns,
         [Parameter(Mandatory = $true)][object[]]$Results,
-        [Parameter(Mandatory = $true)][string]$ValidationResultsPath
+        [Parameter(Mandatory = $true)][string]$ValidationResultsPath,
+        [ValidateSet('local-capacity-ai', 'serial-baseline-ai')]
+        [string]$CaptureMode = 'local-capacity-ai'
     )
+    $CaptureMode = $CaptureMode.ToLowerInvariant()
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($TaskRoot) -and
         -not [string]::IsNullOrWhiteSpace($TaskRunRoot) -and
         -not [string]::IsNullOrWhiteSpace($ProfileRoot) -and
@@ -3110,6 +3159,14 @@ function Export-LocalCapacityAiCorpus {
         $null -eq $_ -or $_.kind -cne 'ai'
     }).Count -eq 0) `
         'LocalCapacity corpus export accepts AI-only completed records.'
+    if ($CaptureMode -ceq 'serial-baseline-ai') {
+        Assert-Condition (@($childRunArray | Where-Object {
+            $_.entry.configuration -cne 'serial-1' -or
+            $_.entry.simulationMode -cne 'serial' -or
+            [string]$_.entry.requestedWorkers -cne '1'
+        }).Count -eq 0) `
+            'Serial-baseline corpus export accepts only serial-1 AI child records.'
+    }
     $aiRuns = @($childRunArray | Sort-Object {
         ConvertTo-Stage5PersistedInteger $_.entry.sequence `
             "LocalCapacity AI sequence" 1 ([Int32]::MaxValue)
@@ -3201,9 +3258,11 @@ function Export-LocalCapacityAiCorpus {
     $artifactIndex = Write-Stage5FreshReplayArtifactIndex `
         -TaskRoot $TaskRoot -CorpusExportRoot $CorpusExportRoot `
         -Title $Title -ExecutableSha256 $ExecutableSha256 `
-        -Records $records.ToArray() -ValidationResultsPath $ValidationResultsPath
+        -Records $records.ToArray() -ValidationResultsPath $ValidationResultsPath `
+        -CaptureMode $CaptureMode
     return [pscustomobject]@{
         status = 'passed'
+        captureMode = $CaptureMode
         corpusExportRoot = [IO.Path]::GetFullPath($CorpusExportRoot)
         artifactIndex = $artifactIndex
         recordCount = $records.Count
@@ -3244,6 +3303,7 @@ $localCapacityRequested = $CapacityMode -ceq 'LocalCapacity'
 $corpusExportRequested = -not [string]::IsNullOrWhiteSpace($CorpusExportRoot)
 $diagnosticWorkerConfigurationRequested =
     -not [string]::IsNullOrWhiteSpace($DiagnosticWorkerConfiguration)
+$serialBaselineCorpusCaptureRequested = [bool]$CaptureSerialBaselineCorpus
 $diagnosticNonAcceptanceRequested = [bool]$DiagnosticNonAcceptance -or
     $localCapacityRequested
 $diagnosticWorkerContext = 'DiagnosticWorkerConfiguration'
@@ -3262,6 +3322,16 @@ Assert-Condition (-not $diagnosticWorkerConfigurationRequested -or
 Assert-Condition (-not $diagnosticWorkerConfigurationRequested -or
     -not $corpusExportRequested) `
     "$diagnosticWorkerContext screening cannot export a replay corpus."
+Assert-Condition (-not $serialBaselineCorpusCaptureRequested -or
+    ($localCapacityRequested -and $ValidationSet -ceq 'AI' -and
+        $corpusExportRequested -and -not [bool]$PlanOnly)) `
+    'CaptureSerialBaselineCorpus requires executing LocalCapacity AI validation with CorpusExportRoot.'
+Assert-Condition (-not $serialBaselineCorpusCaptureRequested -or
+    -not $diagnosticWorkerConfigurationRequested) `
+    'CaptureSerialBaselineCorpus cannot be combined with DiagnosticWorkerConfiguration.'
+Assert-Condition (-not $serialBaselineCorpusCaptureRequested -or
+    -not [bool]$DisableFrameTiming) `
+    'CaptureSerialBaselineCorpus requires frame timing for the native baseline evidence.'
 $deterministicRuntimeContractRequested = $ValidationSet -ceq 'All' -and
     -not $diagnosticNonAcceptanceRequested -and -not [bool]$AllowNonStandardCorpus
 Assert-Condition (-not $deterministicRuntimeContractRequested -or $ReplayMatrixRepeats -eq 2) `
@@ -3300,6 +3370,15 @@ if ($acceptanceBindingsRequested) {
         (Test-Sha256Text $AcceptanceRuntimeClosureSha256)) `
         'Acceptance runtime closure requires independently supplied dependency-manifest and closure SHA-256 values.'
 }
+Assert-Condition (-not $serialBaselineCorpusCaptureRequested -or
+    [bool]$AllowHeadlessDirectExecution) `
+    'CaptureSerialBaselineCorpus requires the explicit -AllowHeadlessDirectExecution exception.'
+Assert-Condition (-not $serialBaselineCorpusCaptureRequested -or
+    -not [bool]$EnforcePerformance) `
+    'CaptureSerialBaselineCorpus cannot request performance enforcement.'
+Assert-Condition (-not $serialBaselineCorpusCaptureRequested -or
+    -not $acceptanceBindingsRequested) `
+    'CaptureSerialBaselineCorpus cannot request canonical acceptance bindings.'
 Assert-Condition (-not $qualificationDataBindingRequested -or
     $acceptanceBindingsRequested) `
     'Qualification-data bindings are accepted only with the complete acceptance identity.'
@@ -3354,7 +3433,9 @@ $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot)
 $manifestData = Get-ManifestData $FixtureManifestPath $ValidationSet `
     ([bool]$AllowNonStandardCorpus) $ExpectedExecutableSha256 $Title `
     ($localCapacityRequested -and $ValidationSet -ceq 'AI')
-if ($corpusExportRequested) {
+if ($serialBaselineCorpusCaptureRequested) {
+    Assert-SerialBaselineCorpusCaptureManifest $manifestData
+} elseif ($corpusExportRequested) {
     Assert-LocalCapacityCorpusMatrix $manifestData
 }
 $executableFull = Join-Path $runtimeFull $manifestData.executable
@@ -3469,10 +3550,12 @@ if ($null -ne $stage3PerformanceBaseline) {
     $stage3PerformanceBaseline.evidenceFile = $stage3PerformanceBaselineEvidencePath
 }
 
-$workerConfigurations = @(Get-DiagnosticWorkerConfigurations `
+$workerConfigurations = @(Get-ValidationWorkerConfigurations `
     -CapacityMode $CapacityMode `
-    -DiagnosticWorkerConfiguration $DiagnosticWorkerConfiguration)
-$collisionShadowConfiguration = if ($diagnosticWorkerConfigurationRequested) {
+    -DiagnosticWorkerConfiguration $DiagnosticWorkerConfiguration `
+    -CaptureSerialBaselineCorpus:$serialBaselineCorpusCaptureRequested)
+$collisionShadowConfiguration = if ($diagnosticWorkerConfigurationRequested -or
+    $serialBaselineCorpusCaptureRequested) {
     $null
 } else {
     Get-CollisionShadowConfiguration -CapacityMode $CapacityMode
@@ -3484,7 +3567,8 @@ $collisionShadowConfigurationId = if ($null -eq $collisionShadowConfiguration) {
 }
 $plan = @(New-ValidationPlan $manifestData $ValidationSet $ReplayMatrixRepeats $StressRepeats `
     $ReplayTimeoutSeconds $AiTimeoutSeconds $executableFull $outputFull $CapacityMode `
-    $DiagnosticWorkerConfiguration)
+    $DiagnosticWorkerConfiguration `
+    -CaptureSerialBaselineCorpus:$serialBaselineCorpusCaptureRequested)
 Assert-Condition ($plan.Count -gt 0) 'The fixture manifest produced an empty validation plan.'
 Assert-Condition ($plan.Count -le 10000) 'The fixture manifest produced more than 10000 validation entries.'
 $launcherEquivalence = Assert-LauncherEquivalenceContract $launcherContract `
@@ -3551,6 +3635,7 @@ $planDocument = [pscustomobject]@{
     performanceMeasurementScope = 'aggregate-stage5-stress-replay-throughput'
     collisionSpecificReplayPerformanceClaim = $false
     diagnosticNonAcceptance = $diagnosticNonAcceptanceRequested
+    serialBaselineCorpusCapture = $serialBaselineCorpusCaptureRequested
     diagnosticWorkerConfiguration = if ($diagnosticWorkerConfigurationRequested) {
         [string]$workerConfigurations[0].Id
     } else { $null }
@@ -3590,7 +3675,11 @@ $planDocument = [pscustomobject]@{
     } else { $null }
     corpusExportRequested = [bool]$corpusExportRequested
     corpusExportRoot = $corpusExportRootFull
-    corpusExportMode = if ($corpusExportRequested) { 'local-capacity-ai' } else { $null }
+    corpusExportMode = if ($serialBaselineCorpusCaptureRequested) {
+        'serial-baseline-ai'
+    } elseif ($corpusExportRequested) {
+        'local-capacity-ai'
+    } else { $null }
     stage3PerformanceBaseline = $(if ($null -ne $stage3PerformanceBaseline) {
         [pscustomobject]@{
             file = $stage3PerformanceBaseline.file
@@ -4204,7 +4293,10 @@ $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot)
             -ProfileRoot $profileFull -CorpusExportRoot $corpusExportRootFull `
             -Title $manifestData.title -ExecutableSha256 $manifestData.executableSha256 `
             -ChildRuns $childRuns.ToArray() -Results $results.ToArray() `
-            -ValidationResultsPath $resultsPath
+            -ValidationResultsPath $resultsPath `
+            -CaptureMode $(if ($serialBaselineCorpusCaptureRequested) {
+                'serial-baseline-ai'
+            } else { 'local-capacity-ai' })
     }
 
     if ($localCapacityRequested) {
@@ -4231,7 +4323,8 @@ $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot)
             -TaskRoot $taskRootFull -CorpusExportRoot $corpusExportRootFull `
             -Title $manifestData.title -ExecutableSha256 $manifestData.executableSha256 `
             -Records $corpusExport.records -ValidationResultsPath $resultsPath `
-            -ValidationReceiptPath $localCapacityReceipt.path
+            -ValidationReceiptPath $localCapacityReceipt.path `
+            -CaptureMode $corpusExport.captureMode
         $corpusExport | Add-Member -NotePropertyName manifest `
             -NotePropertyValue $corpusManifest -Force
     }

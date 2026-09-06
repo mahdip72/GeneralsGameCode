@@ -107,6 +107,23 @@ function Get-Stage5ExporterMetadataInteger {
     return $value
 }
 
+function Get-Stage5ExporterRecordPropertyValue {
+    param(
+        [Parameter(Mandatory = $true)][object]$Record,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+    if ($Record -is [Collections.IDictionary]) {
+        Assert-Stage5ExporterCondition ($Record.Contains($Name)) `
+            "$Context is missing '$Name'."
+        return $Record[$Name]
+    }
+    $property = $Record.PSObject.Properties[$Name]
+    Assert-Stage5ExporterCondition ($null -ne $property) `
+        "$Context is missing '$Name'."
+    return $property.Value
+}
+
 function Get-Stage5ExporterRecordInteger {
     param(
         [Parameter(Mandatory = $true)][object]$Record,
@@ -115,12 +132,20 @@ function Get-Stage5ExporterRecordInteger {
         [Parameter(Mandatory = $true)][Int64]$Maximum,
         [switch]$Optional
     )
-    $property = $Record.PSObject.Properties[$Name]
-    if ($null -eq $property) {
+    $hasProperty = $false
+    $value = $null
+    if ($Record -is [Collections.IDictionary]) {
+        $hasProperty = $Record.Contains($Name)
+        if ($hasProperty) { $value = $Record[$Name] }
+    } else {
+        $property = $Record.PSObject.Properties[$Name]
+        $hasProperty = $null -ne $property
+        if ($hasProperty) { $value = $property.Value }
+    }
+    if (-not $hasProperty) {
         if ($Optional) { return $null }
         throw "Corpus manifest record is missing '$Name'."
     }
-    $value = $property.Value
     Assert-Stage5ExporterCondition (Test-Stage5ExporterInteger $value) `
         "Corpus manifest record '$Name' must be an integer."
     $withinRange = $false
@@ -1816,6 +1841,14 @@ function Read-Stage5FreshReplayCorpusBundle {
         'executableSha256' 'Corpus manifest')
     Assert-Stage5ExporterCondition ($executableSha256 -match '^[0-9A-Fa-f]{64}$') `
         'Corpus manifest executable SHA-256 is invalid.'
+    $captureModeProperty = $manifest.PSObject.Properties['captureMode']
+    $captureMode = if ($null -eq $captureModeProperty) {
+        'local-capacity-ai'
+    } else { [string]$captureModeProperty.Value }
+    $captureMode = $captureMode.ToLowerInvariant()
+    Assert-Stage5ExporterCondition ($captureMode -in @(
+            'local-capacity-ai', 'serial-baseline-ai')) `
+        "Corpus manifest captureMode '$captureMode' is unsupported."
     $taskRootFull = Assert-Stage5ExporterExplicitTaskRoot `
         ([string](Get-Stage5ExporterJsonProperty $manifest 'taskRoot' 'Corpus manifest')) `
         'Corpus manifest taskRoot'
@@ -1866,6 +1899,12 @@ function Read-Stage5FreshReplayCorpusBundle {
         'Validation receipt results SHA-256 differs from the corpus manifest binding.'
     $receiptExport = Get-Stage5ExporterJsonProperty $receipt 'corpusExport' `
         'Validation receipt'
+    $receiptCaptureModeProperty = $receiptExport.PSObject.Properties['captureMode']
+    $receiptCaptureMode = if ($null -eq $receiptCaptureModeProperty) {
+        'local-capacity-ai'
+    } else { [string]$receiptCaptureModeProperty.Value }
+    Assert-Stage5ExporterCondition ($receiptCaptureMode -ceq $captureMode) `
+        'Validation receipt corpusExport captureMode differs from the corpus manifest.'
     $artifactIndexBinding = Get-Stage5ExporterBoundJsonFile `
         ([pscustomobject]@{
             path = Get-Stage5ExporterJsonProperty $receiptExport 'artifactIndexPath' `
@@ -1888,6 +1927,12 @@ function Read-Stage5FreshReplayCorpusBundle {
     Assert-Stage5ExporterCondition ([string](Get-Stage5ExporterJsonProperty $artifactIndex `
         'executableSha256' 'Artifact index') -ceq $executableSha256.ToUpperInvariant()) `
         'Artifact index executable SHA-256 does not match the corpus manifest.'
+    $indexCaptureModeProperty = $artifactIndex.PSObject.Properties['captureMode']
+    $indexCaptureMode = if ($null -eq $indexCaptureModeProperty) {
+        'local-capacity-ai'
+    } else { [string]$indexCaptureModeProperty.Value }
+    Assert-Stage5ExporterCondition ($indexCaptureMode -ceq $captureMode) `
+        'Artifact index captureMode differs from the corpus manifest.'
     $indexResults = Get-Stage5ExporterJsonProperty $artifactIndex `
         'validationResults' 'Artifact index'
     $indexResultsPath = Assert-Stage5ExporterContainedPathNoReparse $taskRootFull `
@@ -1939,6 +1984,18 @@ function Read-Stage5FreshReplayCorpusBundle {
     $indexRecords = @((Get-Stage5ExporterJsonProperty $artifactIndex 'records' 'Artifact index'))
     $receiptRecords = @((Get-Stage5ExporterJsonProperty $receiptExport 'records' `
         'Validation receipt corpusExport'))
+    if ($captureMode -ceq 'serial-baseline-ai') {
+        foreach ($record in $records) {
+            Assert-Stage5ExporterCondition (([string](Get-Stage5ExporterRecordPropertyValue `
+                    $record 'configuration' 'Serial-baseline corpus manifest record')) -ceq
+                'serial-1' -and
+                ([string](Get-Stage5ExporterRecordPropertyValue $record 'category' `
+                    'Serial-baseline corpus manifest record')) -ceq 'local-capacity-ai' -and
+                ([string](Get-Stage5ExporterRecordPropertyValue $record 'origin' `
+                    'Serial-baseline corpus manifest record')) -ceq 'native-fresh-runtime') `
+                'Serial-baseline corpus manifest contains a non-serial or non-native capture record.'
+        }
+    }
     $receiptRecordCount = Get-Stage5ExporterJsonInteger $receiptExport 'recordCount' `
         'Validation receipt corpusExport' 1 ([Int32]::MaxValue)
     $indexRecordCount = Get-Stage5ExporterJsonInteger $artifactIndex 'recordCount' `
@@ -1973,6 +2030,7 @@ function Read-Stage5FreshReplayCorpusBundle {
         taskRoot = $taskRootFull
         corpusRoot = $corpusRootFull
         title = $title
+        captureMode = $captureMode
         executableSha256 = $executableSha256.ToUpperInvariant()
         results = $resultsBinding
         receipt = $receiptBinding
@@ -1989,8 +2047,11 @@ function Write-Stage5FreshReplayArtifactIndex {
         [Parameter(Mandatory = $true)][string]$Title,
         [Parameter(Mandatory = $true)][string]$ExecutableSha256,
         [Parameter(Mandatory = $true)][object[]]$Records,
-        [Parameter(Mandatory = $true)][string]$ValidationResultsPath
+        [Parameter(Mandatory = $true)][string]$ValidationResultsPath,
+        [ValidateSet('local-capacity-ai', 'serial-baseline-ai')]
+        [string]$CaptureMode = 'local-capacity-ai'
     )
+    $CaptureMode = $CaptureMode.ToLowerInvariant()
     Assert-Stage5ExporterCondition ($Title -match '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$') `
         'Artifact index title is invalid.'
     Get-Stage5ReplayTitleContract $Title 'Artifact index title' | Out-Null
@@ -1998,6 +2059,13 @@ function Write-Stage5FreshReplayArtifactIndex {
         'Artifact index executable SHA-256 is invalid.'
     Assert-Stage5ExporterCondition ($null -ne $Records -and $Records.Count -gt 0) `
         'Artifact index requires at least one exported replay record.'
+    if ($CaptureMode -ceq 'serial-baseline-ai') {
+        Assert-Stage5ExporterCondition (@($Records | Where-Object {
+            $null -eq $_.PSObject.Properties['configuration'] -or
+            [string]$_.configuration -cne 'serial-1'
+        }).Count -eq 0) `
+            'Serial-baseline artifact index accepts only serial-1 capture records.'
+    }
     $taskRootFull = Assert-Stage5ExporterExplicitTaskRoot $TaskRoot 'TaskRoot'
     $corpusRootFull = Assert-Stage5ExporterRegularDirectory $CorpusExportRoot 'CorpusExportRoot'
     Assert-Stage5ExporterContainedPathNoReparse $taskRootFull $corpusRootFull `
@@ -2020,6 +2088,7 @@ function Write-Stage5FreshReplayArtifactIndex {
         taskRoot = $taskRootFull
         corpusExportRoot = $corpusRootFull
         title = $Title
+        captureMode = $CaptureMode
         executableSha256 = $ExecutableSha256.ToUpperInvariant()
         validationResults = [ordered]@{
             path = $resultsFull
@@ -2033,6 +2102,7 @@ function Write-Stage5FreshReplayArtifactIndex {
     return [pscustomobject]@{
         path = $written.path
         sha256 = $written.sha256
+        captureMode = $CaptureMode
         recordCount = $Records.Count
     }
 }
@@ -2046,8 +2116,11 @@ function Write-Stage5FreshReplayCorpusManifest {
         [Parameter(Mandatory = $true)][string]$ExecutableSha256,
         [Parameter(Mandatory = $true)][object[]]$Records,
         [Parameter(Mandatory = $true)][string]$ValidationResultsPath,
-        [string]$ValidationReceiptPath = ''
+        [string]$ValidationReceiptPath = '',
+        [ValidateSet('local-capacity-ai', 'serial-baseline-ai')]
+        [string]$CaptureMode = 'local-capacity-ai'
     )
+    $CaptureMode = $CaptureMode.ToLowerInvariant()
     Assert-Stage5ExporterCondition ($Title -match '^[A-Za-z0-9][A-Za-z0-9 ._-]{0,79}$') `
         'Corpus manifest title is invalid.'
     Get-Stage5ReplayTitleContract $Title 'Corpus manifest title' | Out-Null
@@ -2055,6 +2128,13 @@ function Write-Stage5FreshReplayCorpusManifest {
         'Corpus manifest executable SHA-256 is invalid.'
     Assert-Stage5ExporterCondition ($null -ne $Records -and $Records.Count -gt 0) `
         'Corpus manifest requires at least one exported replay record.'
+    if ($CaptureMode -ceq 'serial-baseline-ai') {
+        Assert-Stage5ExporterCondition (@($Records | Where-Object {
+            $null -eq $_.PSObject.Properties['configuration'] -or
+            [string]$_.configuration -cne 'serial-1'
+        }).Count -eq 0) `
+            'Serial-baseline corpus manifest accepts only serial-1 capture records.'
+    }
     $taskRootFull = Assert-Stage5ExporterExplicitTaskRoot $TaskRoot 'TaskRoot'
     $corpusRootFull = Assert-Stage5ExporterRegularDirectory $CorpusExportRoot 'CorpusExportRoot'
     Assert-Stage5ExporterContainedPathNoReparse $taskRootFull $corpusRootFull `
@@ -2091,6 +2171,7 @@ function Write-Stage5FreshReplayCorpusManifest {
         taskRoot = $taskRootFull
         corpusExportRoot = $corpusRootFull
         title = $Title
+        captureMode = $CaptureMode
         executableSha256 = $ExecutableSha256.ToUpperInvariant()
         validationResults = [ordered]@{
             path = $resultsFull
@@ -2104,6 +2185,7 @@ function Write-Stage5FreshReplayCorpusManifest {
     return [pscustomobject]@{
         path = $written.path
         sha256 = $written.sha256
+        captureMode = $CaptureMode
         recordCount = $Records.Count
     }
 }
@@ -2366,6 +2448,7 @@ function Convert-Stage5FreshReplayCorpusManifestToFixtures {
         origin = 'native-fresh-runtime'
         generatedUtc = ([DateTime]::UtcNow).ToString('o')
         title = [string]$bundle.title
+        captureMode = [string]$bundle.captureMode
         executable = $Executable
         executableSha256 = [string]$bundle.executableSha256
         corpusManifest = [ordered]@{

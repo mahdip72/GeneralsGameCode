@@ -1083,6 +1083,9 @@ try {
             -Metadata (New-TestMetadata $nonce $scenario $seed 'local-capacity-ai'))) | Out-Null
     }
     Complete-TestCorpusRecords $conversionRecords.ToArray()
+    foreach ($record in $conversionRecords.ToArray()) {
+        $record.configuration = 'serial-1'
+    }
     $hard2v6Record = @($conversionRecords.ToArray() | Where-Object {
         $_.scenario -ceq 'hard-ai-2v6'
     } | Sort-Object destinationSha256 | Select-Object -First 1)[0]
@@ -1106,7 +1109,8 @@ try {
     $artifactIndex = Write-Stage5FreshReplayArtifactIndex `
         -TaskRoot $conversionTaskRoot -CorpusExportRoot $conversionCorpusRoot `
         -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
-        -Records $conversionRecords.ToArray() -ValidationResultsPath $conversionResults
+        -Records $conversionRecords.ToArray() -ValidationResultsPath $conversionResults `
+        -CaptureMode 'serial-baseline-ai'
     $conversionReceiptPath = Join-Path $conversionTaskRoot 'local-capacity-receipt.json'
     $conversionReceipt = [ordered]@{
         schemaVersion = 1
@@ -1121,6 +1125,7 @@ try {
         resultsSha256 = Get-TestSha256 $conversionResults
         corpusExport = [ordered]@{
             status = 'passed'
+            captureMode = 'serial-baseline-ai'
             corpusExportRoot = $conversionCorpusRoot
             artifactIndexPath = $artifactIndex.path
             artifactIndexSha256 = $artifactIndex.sha256
@@ -1134,7 +1139,22 @@ try {
         -TaskRoot $conversionTaskRoot -CorpusExportRoot $conversionCorpusRoot `
         -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
         -Records $conversionRecords.ToArray() -ValidationResultsPath $conversionResults `
-        -ValidationReceiptPath $conversionReceiptPath
+        -ValidationReceiptPath $conversionReceiptPath `
+        -CaptureMode 'serial-baseline-ai'
+    $originalConversionManifestText = Get-Content -LiteralPath $conversionManifest.path -Raw
+    $parallelCaptureManifest = $originalConversionManifestText | ConvertFrom-Json
+    $parallelCaptureManifest.records[0].configuration = 'parallel-2'
+    [IO.File]::WriteAllText($conversionManifest.path,
+        ($parallelCaptureManifest | ConvertTo-Json -Depth 16))
+    Assert-Throws {
+        Convert-Stage5FreshReplayCorpusManifestToFixtures `
+            -CorpusManifestPath $conversionManifest.path `
+            -FixtureManifestPath (Join-Path $conversionCorpusRoot 'parallel-capture-fixtures.json') `
+            -ProvenancePath (Join-Path $conversionCorpusRoot 'parallel-capture-provenance.json') `
+            -Executable 'generalszh.exe' | Out-Null
+    } 'serial-1|serial-baseline|non-serial' `
+        'serial-baseline corpus read rejects a parallel record relabeled as capture input'
+    [IO.File]::WriteAllText($conversionManifest.path, $originalConversionManifestText)
     $fixtureManifestPath = Join-Path $conversionCorpusRoot 'native-fixture-manifest.json'
     $provenancePath = Join-Path $conversionCorpusRoot 'native-fixture-provenance.json'
     $conversion = Convert-Stage5FreshReplayCorpusManifestToFixtures `
@@ -1156,6 +1176,7 @@ try {
         (@($selectedShas | Sort-Object -Unique).Count -eq 10) -and
         $stressFixtures[0].id -ceq 'native-stress-hard-ai-2v6' -and
         $richRecords[0].category -ceq 'local-capacity-ai' -and
+        $provenanceDocument.captureMode -ceq 'serial-baseline-ai' -and
         (@($richRecords | Where-Object { $_.category -cne 'local-capacity-ai' }).Count -eq 0) -and
         (@($richRecords | Where-Object {
             $_.scenario -notin @('4v2', '4v3', 'hard-ai-2v6')
