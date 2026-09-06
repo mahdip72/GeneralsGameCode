@@ -269,7 +269,7 @@ int testAtomicPublicationFaultClosure()
 	char current[MAX_PATH] = {};
 	const DWORD currentLength = GetCurrentDirectoryA(sizeof(current), current);
 	char leaf[96] = {};
-	_snprintf(leaf, sizeof(leaf), "PerformanceReceiptAtomic-%lu-%lu",
+	_snprintf(leaf, sizeof(leaf), "pra-%lu-%lu",
 		static_cast<unsigned long>(GetCurrentProcessId()),
 		static_cast<unsigned long>(GetTickCount()));
 	const std::string directory = currentLength != 0 && currentLength < sizeof(current) ?

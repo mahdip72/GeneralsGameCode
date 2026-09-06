@@ -774,6 +774,7 @@ function New-LockstepTitleSessionContract {
         profileLeaf = $profileLeaf
         profileRoot = $profileRoot
         peerRoot = $peerRoot
+        profileStrategy = 'process-local-validation-profile-root'
         profileConcurrency = 'shared-title-profile-read-only'
         environmentValues = $environmentValues
         environmentVariableNames = @($environmentValues.Keys)

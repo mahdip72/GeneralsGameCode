@@ -1108,7 +1108,9 @@ function Invoke-SelfTest {
         $adapterSessions = @(
             [pscustomobject]@{
                 title = 'Generals'; mapCrc = $canonicalMapCrcs.Generals
-                peerCount = 2; sessionNonce = [string]::new('1', 32)
+                peerCount = 2; networkRosterMask = 3; simulationRosterMask = 63
+                aiRosterMask = 60; aiPlayerCount = 4
+                sessionNonce = [string]::new('1', 32)
                 peers = @(
                     [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
                         simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4
@@ -1125,7 +1127,9 @@ function Invoke-SelfTest {
             },
             [pscustomobject]@{
                 title = 'ZeroHour'; mapCrc = $canonicalMapCrcs.ZeroHour
-                peerCount = 2; sessionNonce = [string]::new('2', 32)
+                peerCount = 2; networkRosterMask = 3; simulationRosterMask = 63
+                aiRosterMask = 60; aiPlayerCount = 4
+                sessionNonce = [string]::new('2', 32)
                 peers = @(
                     [pscustomobject]@{ peerCount = 2; networkRosterMask = 3
                         simulationRosterMask = 63; aiRosterMask = 60; aiPlayerCount = 4
