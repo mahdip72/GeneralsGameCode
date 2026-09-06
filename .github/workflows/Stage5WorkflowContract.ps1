@@ -147,7 +147,8 @@ function Assert-Stage5ValidationVolumeHelper {
         'RTS_STAGE5_VALIDATION_VHD_PATH=',
         'RTS_STAGE5_VALIDATION_VHD_TOKEN=',
         'RTS_STAGE5_VALIDATION_VHD_MARKER=',
-        'H:\Stage5CiScratch',
+        '[IO.Path]::Combine',
+        'Stage5CiScratch',
         '.stage5-vhd-owner',
         'Remove-Item -LiteralPath $Paths.ScratchRoot -Recurse -Force',
         'remainingImage.Attached')) {
@@ -155,6 +156,9 @@ function Assert-Stage5ValidationVolumeHelper {
     }
     Assert-Stage5WorkflowNotContains $Content 'subst\.exe\s+H:' `
         "$Context must not mutate subst mappings."
+    Assert-Stage5WorkflowNotContains $Content `
+        ([regex]::Escape("Join-Path 'H:\Stage5CiScratch'")) `
+        "$Context must not require a provider drive while planning future H:."
     $cleanupStart = $Content.IndexOf(
         'function Invoke-Stage5ValidationVolumeCleanup',
         [StringComparison]::Ordinal)
@@ -2753,6 +2757,10 @@ if ($SelfTest) {
         -LiteralPath $validationVolumeHelperPath -Raw)
     Assert-Stage5ValidationVolumeHelper $validationVolumeHelper `
         'self-test Stage 5 validation-volume helper'
+    & pwsh -NoProfile -File $validationVolumeHelperPath `
+        -Mode Cleanup -Token 'path-plan-selftest' -SelfTest
+    Assert-Stage5WorkflowCondition ($LASTEXITCODE -eq 0) `
+        'Stage 5 validation-volume path planning self-test failed.'
     $validationVolumeHelperCrlf = [regex]::Replace(
         $validationVolumeHelper, "`r`n|`r|`n", "`r`n")
     Assert-Stage5ValidationVolumeHelper $validationVolumeHelperCrlf `

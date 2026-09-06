@@ -4,7 +4,8 @@ param(
     [ValidateSet('Provision', 'Cleanup')]
     [string]$Mode,
     [Parameter(Mandatory)]
-    [string]$Token
+    [string]$Token,
+    [switch]$SelfTest
 )
 
 Set-StrictMode -Version 2.0
@@ -45,22 +46,27 @@ function Assert-Stage5RegularLeaf {
 }
 
 function Get-Stage5ValidationVolumePaths {
-    param([string]$ValidationToken)
+    param(
+        [string]$ValidationToken,
+        [string]$DriveRoot = 'H:\',
+        [string]$RunnerTemp = $env:RUNNER_TEMP
+    )
 
-    if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
+    if ([string]::IsNullOrWhiteSpace($RunnerTemp)) {
         throw 'RUNNER_TEMP is unavailable for Stage 5 validation volume backing.'
     }
-    $runnerTemp = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\', '/')
+    $runnerTemp = [IO.Path]::GetFullPath($RunnerTemp).TrimEnd('\', '/')
     Assert-Stage5RegularDirectory $runnerTemp 'RUNNER_TEMP'
     $baseName = 'Stage5ValidationH-' + $ValidationToken
+    $scratchNamespace = [IO.Path]::Combine($DriveRoot, 'Stage5CiScratch')
+    $scratchRoot = [IO.Path]::Combine($scratchNamespace, $ValidationToken)
     return [pscustomobject]@{
         RunnerTemp = $runnerTemp
         BackingFile = Join-Path $runnerTemp ($baseName + '.vhdx')
         DiskpartScript = Join-Path $runnerTemp ($baseName + '-provision.txt')
         DetachScript = Join-Path $runnerTemp ($baseName + '-detach.txt')
-        ScratchRoot = Join-Path 'H:\Stage5CiScratch' $ValidationToken
-        MarkerPath = Join-Path (Join-Path 'H:\Stage5CiScratch' $ValidationToken) `
-            '.stage5-vhd-owner'
+        ScratchRoot = $scratchRoot
+        MarkerPath = [IO.Path]::Combine($scratchRoot, '.stage5-vhd-owner')
     }
 }
 
@@ -280,6 +286,51 @@ function Invoke-Stage5ValidationVolumeCleanup {
 }
 
 $validationToken = Get-Stage5SafeValidationToken $Token
+if ($SelfTest) {
+    $selfTestDriveLetter = $null
+    foreach ($candidateDriveLetter in @(
+        'Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q', 'P', 'O', 'N',
+        'M', 'L', 'K', 'J', 'I', 'G', 'F', 'E', 'D', 'C')) {
+        if ($null -ne (Get-PSDrive -Name $candidateDriveLetter `
+                -ErrorAction SilentlyContinue)) {
+            continue
+        }
+        if (Test-Path -LiteralPath ($candidateDriveLetter + ':\')) {
+            continue
+        }
+        $selfTestDriveLetter = $candidateDriveLetter
+        break
+    }
+    if ([string]::IsNullOrWhiteSpace($selfTestDriveLetter)) {
+        throw 'Stage 5 validation-volume path planning self-test requires an unmapped drive letter.'
+    }
+    $selfTestDriveRoot = $selfTestDriveLetter + ':\'
+    $legacyPlanningFailed = $false
+    try {
+        [void](Join-Path ([IO.Path]::Combine($selfTestDriveRoot, 'Stage5CiScratch')) `
+            'path-plan-selftest')
+    }
+    catch {
+        $legacyPlanningFailed = $true
+    }
+    if (-not $legacyPlanningFailed) {
+        throw 'Stage 5 validation-volume path planning self-test did not reproduce the provider failure.'
+    }
+    $plannedPaths = Get-Stage5ValidationVolumePaths `
+        -ValidationToken 'path-plan-selftest' `
+        -DriveRoot $selfTestDriveRoot `
+        -RunnerTemp ([IO.Path]::GetTempPath())
+    $expectedScratchRoot = [IO.Path]::Combine($selfTestDriveRoot,
+        'Stage5CiScratch', 'path-plan-selftest')
+    $expectedMarkerPath = [IO.Path]::Combine($expectedScratchRoot,
+        '.stage5-vhd-owner')
+    if ([string]$plannedPaths.ScratchRoot -cne $expectedScratchRoot -or
+        [string]$plannedPaths.MarkerPath -cne $expectedMarkerPath) {
+        throw 'Stage 5 validation-volume path planning did not preserve an unmapped drive root.'
+    }
+    Write-Host "Stage 5 validation-volume path planning self-test passed for unmapped $selfTestDriveRoot."
+    exit 0
+}
 if ($Mode -ceq 'Cleanup' -and
     $env:RTS_STAGE5_VALIDATION_VHD_OWNED -cne 'true') {
     Write-Host 'No task-owned Stage 5 validation VHDX was published; nothing to clean.'
