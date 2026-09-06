@@ -261,6 +261,20 @@ Invoke-LifecycleTestCase 'runner preserves primary error beside cleanup error' {
         'top-level runner must retain the primary exception and report cleanup failure alongside it'
 }
 
+# Break caught: a primary validation failure must retain the task evidence even
+# after registry recovery succeeds.  The branch is source-connected here
+# because executing it would require a full installed game and registry setup.
+Invoke-LifecycleTestCase 'runner retains task evidence after primary failure' {
+    $runnerText = Get-Content -LiteralPath $runnerPath -Raw
+    $retentionBranch = [regex]::Match($runnerText,
+        '(?s)if\s*\(\s*\$registryRecoveryRestored\s*-and\s*\$null\s*-ne\s*\$primaryError\s*\)\s*\{.*?\}\s*elseif\s*\(\s*\$registryRecoveryRestored\s*\)\s*\{.*?Remove-TaskOwnedDirectory')
+    Assert-LifecycleTest ($retentionBranch.Success -and
+        $retentionBranch.Value -match 'Write-Verbose' -and
+        $retentionBranch.Value -match 'taskRunRoot' -and
+        $retentionBranch.Value -notmatch 'cleanupErrors\.Add') `
+        'primary failure must preserve task evidence without converting retention into a cleanup failure'
+}
+
 # Break caught: post-wait errors must not erase the original child exit proof or
 # get swallowed merely because the cleanup-safe observation is available.
 Invoke-LifecycleTestCase 'post-wait receipt error preserves exit evidence and the original exception' {

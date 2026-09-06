@@ -192,6 +192,112 @@ try {
     Assert-RecoveryTest ([string]$value64.value -ceq 'before64' -and
         [int]$value64.kind -eq [int]$kind.String) 'Appended InstallPath did not restore exactly.'
 
+    # The runner's recovery authorization contains one or more retained
+    # process identities.  ConvertTo-Stage5RecoveryProcessIdentities returns
+    # an array of ordered dictionaries; keep one and two identity cases here
+    # so a single-item pipeline unroll cannot turn authProcesses[0] into the
+    # first Boolean value (launchPending) instead of an identity object.
+    $authorizationProcessIdentity = [ordered]@{
+        launchPending = $false; processId = 58460
+        creationTimeUtc100ns = [Int64]134331680251836257
+        executablePath = 'H:\Installed\generalsv.exe'
+        executableSha256 = ('A' * 64); exitProven = $true
+    }
+    $oneRoot = Join-Path $root 'authorization-one-process'
+    New-Item -ItemType Directory -Path $oneRoot -Force | Out-Null
+    $oneIdentity = Copy-RecoveryIdentity $identity
+    $oneIdentity.taskRoot = $oneRoot
+    $oneIdentity.journalPath = Join-Path $oneRoot 'Stage5RegistryRecovery.json'
+    $state.Clear()
+    $state["Registry32|$installKey"] = @{ values = @{ InstallPath = @{
+        value = 'H:\Task\OneBefore'; kind = [int]$kind.String
+    } } }
+    $oneSnapshot = New-Stage5RegistryRecoverySnapshot -Title Generals `
+        -View Registry32 -SubKey $installKey -Name InstallPath -HadKey $true `
+        -HadValue $true -OldValue 'H:\Task\OneBefore' -OldKind $kind.String `
+        -ExpectedValue 'H:\Task\OneRuntime' -ExpectedKind $kind.String
+    $oneIdentity.snapshotPlanSha256 = Get-Stage5RegistryRecoverySnapshotPlanSha256 `
+        -Title Generals -PlannedMissingSubKeys @() -Snapshots @($oneSnapshot)
+    New-Stage5RegistryRecoveryJournal -Path $oneIdentity.journalPath `
+        -Identity $oneIdentity -PlannedMissingSubKeys @() `
+        -Snapshots @($oneSnapshot) -ProcessIdentities @($authorizationProcessIdentity) | Out-Null
+    $oneAuthorization = [ordered]@{
+        childExitProven = $true; noActiveTitleProcesses = $true
+        processIdentities = @([ordered]@{
+            launchPending = $false; processId = 58460
+            creationTimeUtc100ns = [Int64]134331680251836257
+            executablePath = 'H:\Installed\generalsv.exe'
+            executableSha256 = ('A' * 64); exitProven = $true
+        })
+    }
+    $oneRestored = Invoke-Stage5RegistryRecovery -Path $oneIdentity.journalPath `
+        -ExpectedIdentity $oneIdentity -Authorization $oneAuthorization `
+        -MutexLock $mutexLock -Adapter $adapter
+    $oneValue = & $adapter['GetValue'] 'Registry32' $installKey 'InstallPath'
+    Assert-RecoveryTest ($oneRestored.state -ceq 'restored' -and
+        [string]$oneValue.value -ceq 'H:\Task\OneBefore' -and
+        [int]$oneValue.kind -eq [int]$kind.String) `
+        'One-process recovery authorization did not preserve the complete identity schema.'
+
+    $twoRoot = Join-Path $root 'authorization-two-processes'
+    New-Item -ItemType Directory -Path $twoRoot -Force | Out-Null
+    $twoIdentity = Copy-RecoveryIdentity $identity
+    $twoIdentity.taskRoot = $twoRoot
+    $twoIdentity.journalPath = Join-Path $twoRoot 'Stage5RegistryRecovery.json'
+    $secondAuthorizationProcessIdentity = [ordered]@{
+        launchPending = $false; processId = 58461
+        creationTimeUtc100ns = [Int64]134331680251836258
+        executablePath = 'H:\Installed\generalsv.exe'
+        executableSha256 = ('A' * 64); exitProven = $true
+    }
+    $state.Clear()
+    foreach ($view in @('Registry32', 'Registry64')) {
+        $state["$view|$installKey"] = @{ values = @{ InstallPath = @{
+            value = "H:\Task\TwoBefore-$view"; kind = [int]$kind.String
+        } } }
+    }
+    $twoSnapshots = @(
+        (New-Stage5RegistryRecoverySnapshot -Title Generals -View Registry32 `
+            -SubKey $installKey -Name InstallPath -HadKey $true -HadValue $true `
+            -OldValue 'H:\Task\TwoBefore-Registry32' -OldKind $kind.String `
+            -ExpectedValue 'H:\Task\TwoRuntime' -ExpectedKind $kind.String),
+        (New-Stage5RegistryRecoverySnapshot -Title Generals -View Registry64 `
+            -SubKey $installKey -Name InstallPath -HadKey $true -HadValue $true `
+            -OldValue 'H:\Task\TwoBefore-Registry64' -OldKind $kind.String `
+            -ExpectedValue 'H:\Task\TwoRuntime' -ExpectedKind $kind.String)
+    )
+    $twoIdentity.snapshotPlanSha256 = Get-Stage5RegistryRecoverySnapshotPlanSha256 `
+        -Title Generals -PlannedMissingSubKeys @() -Snapshots $twoSnapshots
+    New-Stage5RegistryRecoveryJournal -Path $twoIdentity.journalPath `
+        -Identity $twoIdentity -PlannedMissingSubKeys @() -Snapshots $twoSnapshots `
+        -ProcessIdentities @($authorizationProcessIdentity, $secondAuthorizationProcessIdentity) | Out-Null
+    $twoAuthorization = [ordered]@{
+        childExitProven = $true; noActiveTitleProcesses = $true
+        processIdentities = @(
+            [ordered]@{
+                launchPending = $false; processId = 58460
+                creationTimeUtc100ns = [Int64]134331680251836257
+                executablePath = 'H:\Installed\generalsv.exe'
+                executableSha256 = ('A' * 64); exitProven = $true
+            },
+            [ordered]@{
+                launchPending = $false; processId = 58461
+                creationTimeUtc100ns = [Int64]134331680251836258
+                executablePath = 'H:\Installed\generalsv.exe'
+                executableSha256 = ('A' * 64); exitProven = $true
+            }
+        )
+    }
+    $twoRestored = Invoke-Stage5RegistryRecovery -Path $twoIdentity.journalPath `
+        -ExpectedIdentity $twoIdentity -Authorization $twoAuthorization `
+        -MutexLock $mutexLock -Adapter $adapter
+    $twoValue32 = & $adapter['GetValue'] 'Registry32' $installKey 'InstallPath'
+    $twoValue64 = & $adapter['GetValue'] 'Registry64' $installKey 'InstallPath'
+    Assert-RecoveryTest ($twoRestored.state -ceq 'restored' -and
+        [string]$twoValue32.value -ceq 'H:\Task\TwoBefore-Registry32' -and
+        [string]$twoValue64.value -ceq 'H:\Task\TwoBefore-Registry64') `
+        'Two-process recovery authorization did not preserve both complete identities.'
+
     $diagnosticRoot = Join-Path $root 'diagnostic'
     New-Item -ItemType Directory -Path $diagnosticRoot -Force | Out-Null
     $diagnosticIdentity = Copy-RecoveryIdentity $identity

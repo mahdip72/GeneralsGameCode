@@ -4420,7 +4420,10 @@ finally {
             catch { $cleanupErrors.Add("registry recovery mutex cleanup: $($_.Exception.Message)") | Out-Null }
         }
     }
-    if ($registryRecoveryRestored) {
+    if ($registryRecoveryRestored -and $null -ne $primaryError) {
+        Write-Verbose "Stage 5 validation failed after registry recovery; preserving task scratch root and evidence: $taskRunRoot"
+    }
+    elseif ($registryRecoveryRestored) {
         try {
             Remove-TaskOwnedDirectory $taskRunRoot $taskRootFull 'Validation task scratch root'
         }

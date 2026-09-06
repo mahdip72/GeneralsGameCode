@@ -1020,8 +1020,8 @@ function Invoke-Stage5RegistryRecovery {
     $authProcessInputs = @(Get-Stage5RecoveryAuthorizationProcessIdentities $Authorization)
     Assert-Stage5RecoveryCondition ($authProcessInputs.Count -eq $journalProcesses.Count) `
         'Recovery authorization must account for every journaled process identity.'
-    $authProcesses = ConvertTo-Stage5RecoveryProcessIdentities `
-        -ProcessIdentities $authProcessInputs -UseProcessIdentities $true
+    $authProcesses = @(ConvertTo-Stage5RecoveryProcessIdentities `
+        -ProcessIdentities $authProcessInputs -UseProcessIdentities $true)
     for ($processIndex = 0; $processIndex -lt $journalProcesses.Count; ++$processIndex) {
         $journalProcess = $journalProcesses[$processIndex]
         $authProcess = $authProcesses[$processIndex]
