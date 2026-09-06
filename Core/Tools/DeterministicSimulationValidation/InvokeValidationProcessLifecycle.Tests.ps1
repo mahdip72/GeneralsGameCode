@@ -208,6 +208,59 @@ Invoke-LifecycleTestCase 'normal exit retains exact immutable original-handle ev
     Assert-LifecycleTest $additionRejected 'the published observation cannot gain caller-attested fields'
 }
 
+# Break caught: a caller-owned observer must receive the natural exit proof
+# from the same original Process handle before stdout/result publication.  This
+# reaches the production observer seam with the harmless native fixture; it
+# never launches a Generals runtime or uses registry state.
+Invoke-LifecycleTestCase 'exit observer receives retained original identity after natural exit' {
+    $entry = New-LifecycleFixtureEntry 'exit-observer' -SleepMilliseconds 100
+    $observations = [ordered]@{ started = $null; exited = $null }
+    $run = Invoke-ValidationProcess -Executable $fixturePath -WorkingDirectory $fixtureRuntime `
+        -Entry $entry -CaptureTiming $false -Environment @{} `
+        -ProcessStartObserver {
+            param($identity)
+            $observations['started'] = [pscustomobject]@{
+                processId = [int]$identity.processId
+                creationTimeUtc100ns = [Int64]$identity.creationTimeUtc100ns
+                executablePath = [string]$identity.executablePath
+            }
+        } `
+        -ProcessExitObserver {
+            param($exitObservation)
+            $observations['exited'] = $exitObservation
+        }
+    Assert-LifecycleTest ($run.exitCode -eq 0 -and -not $run.timedOut -and
+        $null -ne $observations['started'] -and $null -ne $observations['exited']) `
+        'natural exit must reach the caller-owned exit observer and return the existing run'
+    Assert-LifecycleTest ($observations['exited'].exited -is [bool] -and
+        $observations['exited'].exited -and
+        $observations['exited'].processIdentity.processId -eq
+            $observations['started'].processId -and
+        $observations['exited'].processIdentity.creationTimeUtc100ns -eq
+            $observations['started'].creationTimeUtc100ns -and
+        [String]::Equals($observations['exited'].processIdentity.executablePath,
+            $observations['started'].executablePath,
+            [StringComparison]::OrdinalIgnoreCase)) `
+        'exit observer must retain the original process identity and truthful natural-exit proof'
+    Assert-LifecycleTest ($run.stdout -match 'STAGE5_LIFECYCLE_FIXTURE' -and
+        (Test-Path -LiteralPath $entry.stdout -PathType Leaf) -and
+        (Test-Path -LiteralPath $entry.stderr -PathType Leaf)) `
+        'exit observation must complete before the existing stdout/stderr publication'
+}
+
+# Break caught: top-level cleanup must not replace the primary validation
+# exception when both the body and recovery cleanup fail.  Keep this contract
+# source-connected because exercising the top-level runner would require an
+# installed game and registry mutation; the real child/observer behavior above
+# remains an actual process test.
+Invoke-LifecycleTestCase 'runner preserves primary error beside cleanup error' {
+    $runnerText = Get-Content -LiteralPath $runnerPath -Raw
+    Assert-LifecycleTest ($runnerText -match '\$primaryError\s*=\s*\$null' -and
+        $runnerText -match '(?s)catch\s*\{\s*\$primaryError\s*=\s*\$_\s*\}.*cleanup also failed' -and
+        $runnerText -match 'throw\s+\$primaryError') `
+        'top-level runner must retain the primary exception and report cleanup failure alongside it'
+}
+
 # Break caught: post-wait errors must not erase the original child exit proof or
 # get swallowed merely because the cleanup-safe observation is available.
 Invoke-LifecycleTestCase 'post-wait receipt error preserves exit evidence and the original exception' {

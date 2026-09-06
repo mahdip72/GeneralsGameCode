@@ -2160,7 +2160,6 @@ function Invoke-ValidationProcess {
             if ($null -eq $recoveryProcessIdentity) {
                 throw 'Validation process exit proof lacks the retained original process identity.'
             }
-            $recoveryProcessIdentity.exitProven = [bool]$exited
             & $ProcessExitObserver ([pscustomobject]@{
                 processIdentity = $recoveryProcessIdentity
                 exitCode = if ($exited) { [int]$process.ExitCode } else { -1 }
@@ -3763,6 +3762,7 @@ $localCapacityReceipt = $null
 $resultsPath = Join-Path $outputFull 'validation-results.json'
 $qualificationRuntimeGuard = $null
 $fatalPattern = '(?i)(CRC Mismatch|game thread ownership violation|assertion failed|fatal error|missing map|replay read error|SKIRMISH_AI_TEST_FAIL|SIMULATION_JOB_SYSTEM_FALLBACK|SIMULATION_SHADOW_(?:MISMATCH|FAIL)|SIMULATION_COLLISION_MISMATCH)'
+$primaryError = $null
 try {
     if ($acceptanceBindingsRequested) {
         $qualificationRuntimeGuard =
@@ -4342,6 +4342,9 @@ $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot)
         }
     }
 }
+catch {
+    $primaryError = $_
+}
 finally {
     $cleanupErrors = New-Object 'Collections.Generic.List[string]'
     if ($null -ne $qualificationRuntimeGuard) {
@@ -4427,6 +4430,12 @@ finally {
     }
     elseif ($null -ne $registryRecoveryPath) {
         $cleanupErrors.Add("registry recovery was not proven; preserving task scratch root and journal: $taskRunRoot") | Out-Null
+    }
+    if ($null -ne $primaryError) {
+        if ($cleanupErrors.Count -gt 0) {
+            throw "Stage 5 validation failed: $($primaryError.Exception.Message); cleanup also failed: $($cleanupErrors -join ' | ')"
+        }
+        throw $primaryError
     }
     if ($cleanupErrors.Count -gt 0) {
         throw "Stage 5 validation cleanup failed after attempting every cleanup action: $($cleanupErrors -join ' | ')"

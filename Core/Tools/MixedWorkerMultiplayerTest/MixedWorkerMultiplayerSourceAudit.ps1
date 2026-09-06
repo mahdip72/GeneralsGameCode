@@ -7,7 +7,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $failures = [System.Collections.Generic.List[string]]::new()
 $lockstepV2NamespaceDeclarationPattern =
-    '(?m)^[ \t]*namespace[ \t]+lockstep_v2[ \t]*$'
+    '(?m)^[ \t]*namespace[ \t]+lockstep_v2[ \t]*\r?$'
 
 function Read-Source([string]$relativePath) {
     $path = Join-Path $SourceRoot $relativePath

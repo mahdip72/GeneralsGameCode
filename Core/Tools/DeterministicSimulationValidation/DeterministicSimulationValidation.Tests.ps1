@@ -8870,6 +8870,7 @@ try {
             'ZeroHour' $sourceCommit $artifactSetHash $artifactTestHashes
         $focusedRelocation = Get-Stage5FinalAcceptanceNativeRelocationBinding `
             -Path $focusedPath -EvidenceDirectory $attachmentRoot
+        $focusedDocument = ConvertFrom-Stage5TestJsonDictionary $focusedPath
         $focusedArguments = @{
             Path = $focusedPath
             Kind = 'deterministic-runtime'
@@ -8881,11 +8882,16 @@ try {
             ExpectedCohortNonce = $script:TestCohortNonce
             ExpectedCohortCreatedUtc = $script:TestCohortCreatedUtc
             ExpectedRuntimeClosure = $script:TestRuntimeClosure
+            # Exercise the production expected-binding path: the immutable
+            # receipt reader must compare the binding without replacing its
+            # raw JSON dictionary with the typed comparison proof.
+            ExpectedQualificationData = $focusedDocument['details']['qualificationData']
             NativeRelocationBindings = @($focusedRelocation.children)
         }
         $focusedRead = Read-Stage5FinalAcceptanceImmutableReceipt `
             @focusedArguments
-        Assert-True ($null -ne $focusedRead.qualificationDataEvidence -and
+        Assert-True ($focusedRead.qualificationData -is [Collections.IDictionary] -and
+            $null -ne $focusedRead.qualificationDataEvidence -and
             [string]$focusedRead.qualificationDataEvidence.manifestSha256 -ceq
                 [string]$focusedRead.qualificationData.manifestSha256 -and
             [string]$focusedRead.qualificationDataEvidence.closureSha256 -ceq

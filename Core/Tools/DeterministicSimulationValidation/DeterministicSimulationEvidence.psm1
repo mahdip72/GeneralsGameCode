@@ -6126,9 +6126,13 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
                 [int]$qualificationDataFileCount -eq 6) `
                 "$context qualificationData is malformed, title-swapped, or incomplete."
             if ($null -ne $ExpectedQualificationData) {
-                $qualificationData = Assert-Stage5SimulationQualificationBindingEqual `
+                # Keep the receipt's raw JSON binding for the strict manifest
+                # reader.  Assert-Stage5SimulationQualificationBindingEqual
+                # returns a typed proof object, which is not a JSON dictionary
+                # and must not replace the validated receipt binding.
+                [void](Assert-Stage5SimulationQualificationBindingEqual `
                     $qualificationData $ExpectedQualificationData `
-                    "$context qualificationData"
+                    "$context qualificationData")
             }
             $qualificationPath = Resolve-Stage5FinalAcceptanceFile `
                 (Split-Path -Parent $Path) $qualificationDataPath `
