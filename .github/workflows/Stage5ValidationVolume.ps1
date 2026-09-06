@@ -96,7 +96,7 @@ function Write-Stage5ValidationEnvironment {
     if ([string]::IsNullOrWhiteSpace($env:GITHUB_ENV)) {
         throw 'GITHUB_ENV is unavailable for Stage 5 validation volume ownership bindings.'
     }
-    $environmentLines = @(
+    [string[]]$environmentLines = @(
         'RTS_STAGE5_VALIDATION_VHD_OWNED=true',
         "RTS_STAGE5_VALIDATION_VHD_PATH=$($Paths.BackingFile)",
         "RTS_STAGE5_VALIDATION_VHD_TOKEN=$ValidationToken",
@@ -104,6 +104,38 @@ function Write-Stage5ValidationEnvironment {
         "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=$($Paths.ScratchRoot)"
     )
     [IO.File]::AppendAllLines($env:GITHUB_ENV, $environmentLines,
+        [Text.UTF8Encoding]::new($false))
+}
+
+function Get-Stage5ValidationVolumeProvisionCommands {
+    param([pscustomobject]$Paths)
+
+    return [string[]]@(
+        "create vdisk file=`"$($Paths.BackingFile)`" maximum=32768 type=expandable",
+        "select vdisk file=`"$($Paths.BackingFile)`"",
+        'attach vdisk',
+        'create partition primary',
+        'format fs=ntfs quick label=Stage5Validation',
+        'assign letter=H'
+    )
+}
+
+function Get-Stage5ValidationVolumeDetachCommands {
+    param([pscustomobject]$Paths)
+
+    return [string[]]@(
+        "select vdisk file=`"$($Paths.BackingFile)`"",
+        'detach vdisk'
+    )
+}
+
+function Write-Stage5ValidationCommandFile {
+    param(
+        [string]$Path,
+        [string[]]$Commands
+    )
+
+    [IO.File]::WriteAllLines($Path, $Commands,
         [Text.UTF8Encoding]::new($false))
 }
 
@@ -131,16 +163,9 @@ function Invoke-Stage5ValidationVolumeProvision {
     # Publish ownership before diskpart mutates the runner. Cleanup can then
     # detach an image even when provisioning fails after creation or attach.
     Write-Stage5ValidationEnvironment $ValidationToken $Paths
-    $diskpartCommands = @(
-        "create vdisk file=`"$($Paths.BackingFile)`" maximum=32768 type=expandable",
-        "select vdisk file=`"$($Paths.BackingFile)`"",
-        'attach vdisk',
-        'create partition primary',
-        'format fs=ntfs quick label=Stage5Validation',
-        'assign letter=H'
-    )
-    [IO.File]::WriteAllLines($Paths.DiskpartScript, $diskpartCommands,
-        [Text.UTF8Encoding]::new($false))
+    [string[]]$diskpartCommands =
+        Get-Stage5ValidationVolumeProvisionCommands $Paths
+    Write-Stage5ValidationCommandFile $Paths.DiskpartScript $diskpartCommands
     & diskpart.exe /s $Paths.DiskpartScript
     if ($LASTEXITCODE -ne 0) {
         throw "Could not create and attach the unique Stage 5 validation VHDX: $($Paths.BackingFile)"
@@ -249,12 +274,9 @@ function Invoke-Stage5ValidationVolumeCleanup {
         if (Test-Path -LiteralPath $Paths.DetachScript) {
             throw "Stage 5 cleanup detach script path already exists: $($Paths.DetachScript)"
         }
-        $detachCommands = @(
-            "select vdisk file=`"$($Paths.BackingFile)`"",
-            'detach vdisk'
-        )
-        [IO.File]::WriteAllLines($Paths.DetachScript, $detachCommands,
-            [Text.UTF8Encoding]::new($false))
+        [string[]]$detachCommands =
+            Get-Stage5ValidationVolumeDetachCommands $Paths
+        Write-Stage5ValidationCommandFile $Paths.DetachScript $detachCommands
         & diskpart.exe /s $Paths.DetachScript
         if ($LASTEXITCODE -ne 0) {
             throw "Could not detach the task-owned Stage 5 validation VHDX: $($Paths.BackingFile)"
@@ -316,10 +338,14 @@ if ($SelfTest) {
     if (-not $legacyPlanningFailed) {
         throw 'Stage 5 validation-volume path planning self-test did not reproduce the provider failure.'
     }
+    $writerScratchRoot = [IO.Path]::Combine([IO.Path]::GetTempPath(),
+        'Stage5ValidationVolumeSelfTest-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($writerScratchRoot) | Out-Null
+    try {
     $plannedPaths = Get-Stage5ValidationVolumePaths `
         -ValidationToken 'path-plan-selftest' `
         -DriveRoot $selfTestDriveRoot `
-        -RunnerTemp ([IO.Path]::GetTempPath())
+        -RunnerTemp $writerScratchRoot
     $expectedScratchRoot = [IO.Path]::Combine($selfTestDriveRoot,
         'Stage5CiScratch', 'path-plan-selftest')
     $expectedMarkerPath = [IO.Path]::Combine($expectedScratchRoot,
@@ -328,7 +354,68 @@ if ($SelfTest) {
         [string]$plannedPaths.MarkerPath -cne $expectedMarkerPath) {
         throw 'Stage 5 validation-volume path planning did not preserve an unmapped drive root.'
     }
-    Write-Host "Stage 5 validation-volume path planning self-test passed for unmapped $selfTestDriveRoot."
+    $environmentFile = [IO.Path]::Combine($writerScratchRoot, 'github.env')
+    $hadOriginalGithubEnv = Test-Path Env:GITHUB_ENV
+    $originalGithubEnv = if ($hadOriginalGithubEnv) { $env:GITHUB_ENV } else { $null }
+    try {
+        $env:GITHUB_ENV = $environmentFile
+        Write-Stage5ValidationEnvironment 'path-plan-selftest' $plannedPaths
+        [string[]]$expectedEnvironmentLines = @(
+            'RTS_STAGE5_VALIDATION_VHD_OWNED=true',
+            "RTS_STAGE5_VALIDATION_VHD_PATH=$($plannedPaths.BackingFile)",
+            'RTS_STAGE5_VALIDATION_VHD_TOKEN=path-plan-selftest',
+            "RTS_STAGE5_VALIDATION_VHD_MARKER=$($plannedPaths.MarkerPath)",
+            "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=$($plannedPaths.ScratchRoot)"
+        )
+        [string[]]$actualEnvironmentLines = [IO.File]::ReadAllLines($environmentFile)
+        if ($actualEnvironmentLines.Count -ne $expectedEnvironmentLines.Count) {
+            throw 'Stage 5 validation-volume environment writer emitted the wrong line count.'
+        }
+        for ($lineIndex = 0; $lineIndex -lt $expectedEnvironmentLines.Count; ++$lineIndex) {
+            if ($actualEnvironmentLines[$lineIndex] -cne $expectedEnvironmentLines[$lineIndex]) {
+                throw 'Stage 5 validation-volume environment writer emitted an unexpected binding.'
+            }
+        }
+    }
+    finally {
+        if ($hadOriginalGithubEnv) {
+            $env:GITHUB_ENV = $originalGithubEnv
+        }
+        else {
+            Remove-Item Env:GITHUB_ENV -ErrorAction SilentlyContinue
+        }
+    }
+    [string[]]$provisionCommands =
+        Get-Stage5ValidationVolumeProvisionCommands $plannedPaths
+    Write-Stage5ValidationCommandFile $plannedPaths.DiskpartScript $provisionCommands
+    [string[]]$actualProvisionCommands =
+        [IO.File]::ReadAllLines($plannedPaths.DiskpartScript)
+    if ($actualProvisionCommands.Count -ne $provisionCommands.Count) {
+        throw 'Stage 5 validation-volume provision script writer emitted the wrong line count.'
+    }
+    for ($lineIndex = 0; $lineIndex -lt $provisionCommands.Count; ++$lineIndex) {
+        if ($actualProvisionCommands[$lineIndex] -cne $provisionCommands[$lineIndex]) {
+            throw 'Stage 5 validation-volume provision script writer emitted an unexpected command.'
+        }
+    }
+    [string[]]$detachCommands =
+        Get-Stage5ValidationVolumeDetachCommands $plannedPaths
+    Write-Stage5ValidationCommandFile $plannedPaths.DetachScript $detachCommands
+    [string[]]$actualDetachCommands =
+        [IO.File]::ReadAllLines($plannedPaths.DetachScript)
+    if ($actualDetachCommands.Count -ne $detachCommands.Count) {
+        throw 'Stage 5 validation-volume detach script writer emitted the wrong line count.'
+    }
+    for ($lineIndex = 0; $lineIndex -lt $detachCommands.Count; ++$lineIndex) {
+        if ($actualDetachCommands[$lineIndex] -cne $detachCommands[$lineIndex]) {
+            throw 'Stage 5 validation-volume detach script writer emitted an unexpected command.'
+        }
+    }
+    Write-Host "Stage 5 validation-volume self-test passed for unmapped $selfTestDriveRoot."
+    }
+    finally {
+        [IO.Directory]::Delete($writerScratchRoot, $true)
+    }
     exit 0
 }
 if ($Mode -ceq 'Cleanup' -and

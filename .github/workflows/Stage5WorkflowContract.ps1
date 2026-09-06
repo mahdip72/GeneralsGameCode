@@ -143,6 +143,14 @@ function Assert-Stage5ValidationVolumeHelper {
         '$partition.DiskNumber',
         'Get-Volume -Partition $partition',
         '[IO.DriveType]::Fixed',
+        '[string[]]$environmentLines',
+        '[string[]]$diskpartCommands',
+        '[string[]]$detachCommands',
+        'AppendAllLines',
+        'WriteAllLines',
+        'ReadAllLines',
+        'Write-Stage5ValidationCommandFile',
+        'Stage5ValidationVolumeSelfTest-',
         'RTS_STAGE5_VALIDATION_VHD_OWNED=true',
         'RTS_STAGE5_VALIDATION_VHD_PATH=',
         'RTS_STAGE5_VALIDATION_VHD_TOKEN=',
@@ -175,7 +183,7 @@ function Assert-Stage5ValidationVolumeHelper {
         'Remove-Item -LiteralPath $Paths.ScratchRoot -Recurse -Force',
         [StringComparison]::Ordinal)
     $cleanupDetachIndex = $cleanupContent.IndexOf(
-        'detach vdisk', [StringComparison]::Ordinal)
+        '& diskpart.exe /s $Paths.DetachScript', [StringComparison]::Ordinal)
     Assert-Stage5WorkflowCondition ($cleanupImageQueryIndex -ge 0 -and
         $cleanupPartitionQueryIndex -ge 0 -and $cleanupScratchRemovalIndex -ge 0 -and
         $cleanupDetachIndex -ge 0 -and
