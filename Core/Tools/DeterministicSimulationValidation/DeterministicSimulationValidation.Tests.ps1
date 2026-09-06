@@ -1155,6 +1155,8 @@ function Write-ImmutableReceiptTestDocument {
     $rawLeaf = [IO.Path]::GetFileNameWithoutExtension($Path) + '.raw.log'
     $rawPath = Join-Path $directory $rawLeaf
     [IO.File]::WriteAllText($rawPath, 'unregistered executable receipt test log')
+    $qualificationData = New-Stage5SyntheticQualificationData `
+        -Root $directory -Title 'ZeroHour' -SourceCommit $SourceCommit
     Write-JsonDocument $Path ([ordered]@{
         schemaVersion = 1
         evidenceKind = 'stage5-host-runner-receipt'
@@ -1171,7 +1173,7 @@ function Write-ImmutableReceiptTestDocument {
         cohortNonce = $script:TestCohortNonce
         runtimeClosure = $script:TestRuntimeClosure
         executableSha256 = $ExecutableSha256
-        recordedUtc = '2026-09-01T00:00:00Z'
+        recordedUtc = '2026-09-01T00:00:00.0000000Z'
         rawLogs = @([ordered]@{
             name = 'stdout'; path = $rawLeaf; sha256 = Get-Sha256 $rawPath
         })
@@ -1184,6 +1186,11 @@ function Write-ImmutableReceiptTestDocument {
         }
         details = [ordered]@{
             gateName = 'deterministic-runtime'; validationSet = 'All'; entryCount = 1
+            qualificationData = [ordered]@{
+                path = 'QualificationData.json'; title = 'ZeroHour'
+                manifestSha256 = [string]$qualificationData.manifestSha256
+                closureSha256 = [string]$qualificationData.closureSha256; fileCount = 6
+            }
         }
     })
 }
@@ -1244,7 +1251,7 @@ function Write-Stage5HostReceiptTestDocument {
     }
     $runNonce = $RunNonce
     $qualificationData = $null
-    if ($Role -cne 'validation-plan' -and $Role -cne 'combined-results') {
+    if ($Role -cne 'combined-results') {
         # Keep host-runner result fixtures bound to the real retained
         # qualification-data reader. The reader returns a typed proof object;
         # final acceptance must not treat that proof as raw JSON.
@@ -1302,7 +1309,7 @@ function Write-Stage5HostReceiptTestDocument {
                 title = $childTitle
                 architecture = 'x64'
                 cohortCreatedUtc = $script:TestCohortCreatedUtc
-                recordedUtc = '2026-09-01T00:00:00Z'
+                recordedUtc = '2026-09-01T00:00:00.0000000Z'
                 rawLogs = @(
                     [ordered]@{ name = 'raw-log'; path = $nativeRawLeaf; sha256 = Get-Sha256 $nativeRawPath }
                     [ordered]@{ name = 'timing'; path = $nativeTimingLeaf; sha256 = Get-Sha256 $nativeTimingPath }
@@ -1311,7 +1318,7 @@ function Write-Stage5HostReceiptTestDocument {
                     kind = 'native-executable-observation'
                     receiptPath = $nativeLeaf
                     processId = $processId
-                    processCreationUtc = '2026-09-01T00:00:00Z'
+                    processCreationUtc = '2026-09-01T00:00:00.0000000Z'
                     executablePath = "installed\$childTitle.exe"
                     executableSha256 = $executableHash
                     commandLine = $childCommandLine
@@ -1322,7 +1329,7 @@ function Write-Stage5HostReceiptTestDocument {
             Write-JsonDocument $nativePath $nativeDocument
             $child = [ordered]@{
                 role = $Role; title = $childTitle; runNonce = $childRunNonce
-                processId = $processId; processCreationUtc = '2026-09-01T00:00:00Z'
+                processId = $processId; processCreationUtc = '2026-09-01T00:00:00.0000000Z'
                 executablePath = "installed\$childTitle.exe"
                 executableSha256 = $executableHash
                 commandLine = $childCommandLine
@@ -1408,7 +1415,7 @@ function Write-Stage5HostReceiptTestDocument {
         }
         elseif ($Title -ceq 'Generals') { [string]$ArtifactHashes['generals-executable'] }
         else { [string]$ArtifactHashes['zerohour-executable'] }
-        recordedUtc = '2026-09-01T00:00:00Z'
+        recordedUtc = '2026-09-01T00:00:00.0000000Z'
         rawLogs = $rawLogs
         provenance = [ordered]@{
             kind = 'host-runner-observation'
@@ -1486,7 +1493,7 @@ function Write-Stage5ExecutableReceiptTestDocument {
         title = $Title
         architecture = 'x64'
         cohortCreatedUtc = $script:TestCohortCreatedUtc
-        recordedUtc = '2026-09-01T00:00:00Z'
+        recordedUtc = '2026-09-01T00:00:00.0000000Z'
         rawLogs = @(
             [ordered]@{ name = 'raw-log'; path = $nativeRawLeaf; sha256 = Get-Sha256 $nativeRawPath }
             [ordered]@{ name = 'timing'; path = $nativeTimingLeaf; sha256 = Get-Sha256 $nativeTimingPath }
@@ -1495,7 +1502,7 @@ function Write-Stage5ExecutableReceiptTestDocument {
             kind = 'native-executable-observation'
             receiptPath = $nativeLeaf
             processId = 33000
-            processCreationUtc = '2026-09-01T00:00:00Z'
+            processCreationUtc = '2026-09-01T00:00:00.0000000Z'
             executablePath = "installed\$Title.exe"
             executableSha256 = $executableHash
             commandLine = "$Title.exe -headless -stage5-validation"
@@ -1525,7 +1532,7 @@ function Write-Stage5ExecutableReceiptTestDocument {
         cohortNonce = $script:TestCohortNonce
         runtimeClosure = $script:TestRuntimeClosure
         executableSha256 = $executableHash
-        recordedUtc = '2026-09-01T00:00:00Z'
+        recordedUtc = '2026-09-01T00:00:00.0000000Z'
         rawLogs = @(
             [ordered]@{ name = 'stdout'; path = $stdoutLeaf; sha256 = Get-Sha256 $stdoutPath }
             [ordered]@{ name = 'stderr'; path = $stderrLeaf; sha256 = Get-Sha256 $stderrPath }
@@ -1533,7 +1540,7 @@ function Write-Stage5ExecutableReceiptTestDocument {
         provenance = [ordered]@{
             kind = 'native-executable-observation'
             receiptPath = $nativeLeaf; receiptSha256 = $nativeHash
-            processId = 33000; processCreationUtc = '2026-09-01T00:00:00Z'
+            processId = 33000; processCreationUtc = '2026-09-01T00:00:00.0000000Z'
             executablePath = "installed\$Title.exe"
             executableSha256 = $executableHash
             commandLine = "$Title.exe -headless -stage5-validation"
@@ -2311,7 +2318,7 @@ function Assert-NativeObservationProcessBinding {
     $secondNonce = '22222222-2222-4222-8222-222222222222'
     $arguments = @{Environment=$environment;Binding=$binding;Entry=$entry
         EvidenceRoot=$observationEvidenceRoot;RunNonce=$firstNonce
-        CohortNonce=$cohort;CohortCreatedUtc='2026-09-01T00:00:00Z'}
+        CohortNonce=$cohort;CohortCreatedUtc='2026-09-01T00:00:00.0000000Z'}
     $directories = @(Set-NativePerformanceObservationEnvironment @arguments)
     $observationReceiptRoot = Join-Path $observationEvidenceRoot 'native-performance-receipts'
     $expectedReceiptDirectory = Join-Path $observationReceiptRoot $firstNonce
@@ -2613,7 +2620,7 @@ function Write-Stage5ProtectedAttestationTestDocument {
             'premium-review-authority'
         }
         else { 'fixture-review-authority' }
-        issuedUtc = '2026-09-01T00:00:00Z'
+        issuedUtc = '2026-09-01T00:00:00.0000000Z'
     })
     return [ordered]@{
         kind = $protectionKind; path = $attestationLeaf
@@ -2743,13 +2750,13 @@ function Write-Stage5ExternalReceiptTestDocument {
         architecture = 'x64'; artifactSetSha256 = $ArtifactSetSha256
         cohortNonce = $script:TestCohortNonce
         runtimeClosure = $script:TestRuntimeClosure
-        recordedUtc = '2026-09-01T00:00:00Z'
+        recordedUtc = '2026-09-01T00:00:00.0000000Z'
         provenance = [ordered]@{
             kind = $TrustDomain; reviewedBy = if ($TrustDomain -ceq 'manual-approval') {
                 'manual-tester'
             }
             else { 'premium-reviewer' }
-            reviewedUtc = '2026-09-01T00:00:00Z'
+            reviewedUtc = '2026-09-01T00:00:00.0000000Z'
         }
         protection = $protection; details = $details
     })
@@ -3109,7 +3116,7 @@ function New-LockstepFixtureNegativeProbe {
     return [ordered]@{
         title = $Title; mode = $Mode; producer = 'installed-lockstep-v2'
         processId = $ProcessId
-        processCreationUtc = '2026-09-01T00:00:00Z'
+        processCreationUtc = '2026-09-01T00:00:00.0000000Z'
         executablePath = [IO.Path]::GetFullPath((Join-Path $Root $executableRelative))
         runNonce = $RunNonce; sessionNonce = $SessionNonce
         executableSha256 = $ExecutableSha256.ToUpperInvariant(); sourceCommit = $SourceCommit
@@ -3379,7 +3386,7 @@ function New-LockstepFixtureEvidence {
         schemaVersion = 2; evidenceKind = 'lockstep-v2-multiplayer'; status = 'passed'
         producer = 'installed-lockstep-v2'; validationMode = 'installed-lockstep-v2-production'
         architecture = 'x64'; sourceCommit = $SourceCommit
-        artifactSetSha256 = $ArtifactSetSha256; recordedUtc = '2026-09-01T00:00:00Z'
+        artifactSetSha256 = $ArtifactSetSha256; recordedUtc = '2026-09-01T00:00:00.0000000Z'
         cohortNonce = $script:TestCohortNonce
         runtimeClosure = $script:TestRuntimeClosure
         qualificationData = $qualificationData
@@ -9313,7 +9320,7 @@ try {
         $document = [ordered]@{
             schemaVersion = 1; evidenceKind = $kind; status = 'passed'
             sourceCommit = $sourceCommit; title = $title; architecture = 'x64'
-            artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-01T00:00:00Z'
+            artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-01T00:00:00.0000000Z'
             cohortNonce = $script:TestCohortNonce
             runtimeClosure = $script:TestRuntimeClosure
             attachments = $attachments; details = $detailsByKind[$kind]
@@ -9510,20 +9517,33 @@ try {
     function Set-CombinedNativeRawPathFixture {
         param([string]$CaseRoot, [ValidateSet('absolute', 'upload-rebase', 'traversal', 'ads', 'drive-relative')][string]$Mode)
         foreach ($title in @('Generals', 'ZeroHour')) {
-            $sourcePath = Join-Path $CaseRoot ("combined-source-receipts\$title\validation-results-receipt.json")
-            $sourceDocument = Get-Content -LiteralPath $sourcePath -Raw | ConvertFrom-Json
+            $receiptDirectory = Join-Path $CaseRoot "combined-source-receipts\$title"
+            $sourcePath = Join-Path $receiptDirectory 'validation-results-receipt.json'
+            $receiptDocuments = [ordered]@{}
+            foreach ($receiptName in @('validation-results-receipt.json',
+                    'replay-results-receipt.json', 'ai-results-receipt.json')) {
+                $receiptPath = Join-Path $receiptDirectory $receiptName
+                $receiptDocuments[$receiptName] =
+                    Get-Content -LiteralPath $receiptPath -Raw | ConvertFrom-Json
+            }
+            $sourceDocument = $receiptDocuments['validation-results-receipt.json']
             $nativeReference = $sourceDocument.provenance.children[0].nativeReceipt
-            $nativePath = Join-Path (Split-Path -Parent $sourcePath) ([string]$nativeReference.path)
+            $nativePath = Join-Path $receiptDirectory ([string]$nativeReference.path)
             $nativeDocument = Get-Content -LiteralPath $nativePath -Raw | ConvertFrom-Json
             $nativeReceiptAbsolute = [IO.Path]::GetFullPath($nativePath)
             if ($Mode -eq 'absolute' -or $Mode -eq 'upload-rebase') {
                 $nativeDocument.provenance.receiptPath = if ($Mode -eq 'upload-rebase') {
-                    "H:\uploaded-stage5\$title\$([IO.Path]::GetFileName($nativePath))"
+                    $nativeReferenceSuffix = ([string]$nativeReference.path).Replace('/', '\').TrimStart('\')
+                    "H:\uploaded-stage5\$title\$nativeReferenceSuffix"
                 } else { $nativeReceiptAbsolute }
                 foreach ($raw in @($nativeDocument.rawLogs)) {
                     $rawAbsolute = [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $nativePath) ([string]$raw.path)))
                     $raw.path = if ($Mode -eq 'upload-rebase') {
-                        "H:\uploaded-stage5\$title\$([IO.Path]::GetFileName($rawAbsolute))"
+                        $receiptDirectoryFull = [IO.Path]::GetFullPath(
+                            $receiptDirectory).TrimEnd('\')
+                        $rawRelativeSuffix = $rawAbsolute.Substring(
+                            $receiptDirectoryFull.Length).TrimStart('\', '/')
+                        "H:\uploaded-stage5\$title\$rawRelativeSuffix"
                     } else { $rawAbsolute }
                     if ([string]$raw.name -ceq 'raw-log') {
                         $nativeDocument.rawEvidence.rawLogPath = [string]$raw.path
@@ -9544,8 +9564,46 @@ try {
                 $nativeDocument.rawEvidence.rawLogPath = 'C:relative.raw.log'
             }
             Write-JsonDocument $nativePath $nativeDocument
-            $nativeReference.sha256 = Get-Sha256 $nativePath
-            Write-JsonDocument $sourcePath $sourceDocument
+            $nativeHash = Get-Sha256 $nativePath
+            $nativeReference.sha256 = $nativeHash
+            foreach ($receiptDocument in @($receiptDocuments.Values)) {
+                foreach ($child in @($receiptDocument.provenance.children)) {
+                    if ($null -ne $child.nativeReceipt -and
+                        [string]$child.nativeReceipt.path -ceq [string]$nativeReference.path) {
+                        $child.nativeReceipt.sha256 = $nativeHash
+                    }
+                }
+                foreach ($rawBinding in @($receiptDocument.rawLogs)) {
+                    if ([string]$rawBinding.path -ceq [string]$nativeReference.path -and
+                        $null -ne $rawBinding.PSObject.Properties['sha256']) {
+                        $rawBinding.sha256 = $nativeHash
+                    }
+                }
+            }
+            $resultsPath = Join-Path $receiptDirectory 'validation-results.json'
+            $resultsDocument = Get-Content -LiteralPath $resultsPath -Raw | ConvertFrom-Json
+            foreach ($result in @($resultsDocument)) {
+                if ($null -ne $result.executionProvenance -and
+                    $null -ne $result.executionProvenance.nativeReceipt -and
+                    [string]$result.executionProvenance.nativeReceipt.path -ceq
+                        [string]$nativeReference.path) {
+                    $result.executionProvenance.nativeReceipt.sha256 = $nativeHash
+                }
+            }
+            Write-JsonDocument $resultsPath $resultsDocument
+            $resultsHash = Get-Sha256 $resultsPath
+            foreach ($receiptName in @($receiptDocuments.Keys)) {
+                $receiptDocument = $receiptDocuments[$receiptName]
+                foreach ($rawBinding in @($receiptDocument.rawLogs)) {
+                    if ([string]$rawBinding.path -ceq 'validation-results.json') {
+                        $rawBinding.sha256 = $resultsHash
+                    }
+                }
+                if ($null -ne $receiptDocument.details.PSObject.Properties['resultsSha256']) {
+                    $receiptDocument.details.resultsSha256 = $resultsHash
+                }
+                Write-JsonDocument (Join-Path $receiptDirectory $receiptName) $receiptDocument
+            }
         }
     }
 
@@ -9619,7 +9677,7 @@ try {
     $deterministicDocument = [ordered]@{
         schemaVersion = 1; evidenceKind = $deterministicKind; status = 'passed'
         sourceCommit = $sourceCommit; title = 'ZeroHour'; architecture = 'x64'
-        artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-01T00:00:00Z'
+        artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-01T00:00:00.0000000Z'
         cohortNonce = $script:TestCohortNonce
         runtimeClosure = $script:TestRuntimeClosure
         attachments = $deterministicAttachments
@@ -9698,7 +9756,7 @@ try {
         schemaVersion = 2; evidenceKind = 'lockstep-v2-multiplayer'; status = 'passed'
         producer = 'installed-lockstep-v2'; validationMode = 'installed-lockstep-v2-production'
         architecture = 'x64'; sourceCommit = $sourceCommit
-        artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-01T00:00:00Z'
+        artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-01T00:00:00.0000000Z'
         cohortNonce = $script:TestCohortNonce
         runtimeClosure = $script:TestRuntimeClosure
         qualificationData = [ordered]@{
@@ -9727,39 +9785,59 @@ try {
         sessions = @()
         negativeProbes = [ordered]@{ crossEpoch = @(); contentMismatch = @() }
     }
-    $lockstepProbePath = Join-Path $acceptanceRoot 'lockstep-v2-probe.json'
-    Write-JsonDocument $lockstepProbePath $lockstepProbe
-    $lockstepReadArgs = @{
-        Path = $lockstepProbePath; ExpectedSourceCommit = $sourceCommit
-        ExpectedArtifactSetSha256 = $artifactSetHash; ArtifactHashes = $artifactTestHashes
+    $lockstepProbeTemplatePath = Join-Path $acceptanceRoot 'lockstep-v2-probe-template.json'
+    Write-JsonDocument $lockstepProbeTemplatePath $lockstepProbe
+    function New-LockstepProbeCasePath {
+        param([string]$Name)
+        $path = Join-Path $acceptanceRoot "lockstep-v2-probe-$Name.json"
+        Copy-Item -LiteralPath $lockstepProbeTemplatePath -Destination $path
+        return $path
     }
-    $lockstepProbe.Remove('evidenceKind')
-    Write-JsonDocument $lockstepProbePath $lockstepProbe
+    function New-LockstepProbeReadArgs {
+        param([string]$Path)
+        return @{
+            Path = $Path; ExpectedSourceCommit = $sourceCommit
+            ExpectedArtifactSetSha256 = $artifactSetHash; ArtifactHashes = $artifactTestHashes
+        }
+    }
+    $lockstepMissingKindPath = New-LockstepProbeCasePath 'missing-kind'
+    $lockstepMissingKindProbe = ConvertFrom-Stage5TestJsonDictionary $lockstepMissingKindPath
+    [void]$lockstepMissingKindProbe.Remove('evidenceKind')
+    Write-JsonDocument $lockstepMissingKindPath $lockstepMissingKindProbe
+    $lockstepMissingKindArgs = New-LockstepProbeReadArgs $lockstepMissingKindPath
     Assert-Throws {
-        Read-Stage5LockstepV2Evidence @lockstepReadArgs | Out-Null
+        Read-Stage5LockstepV2Evidence @lockstepMissingKindArgs | Out-Null
     } 'missing property ''evidenceKind''' `
         'lockstep-v2 evidence rejects an envelope without its explicit evidence kind'
-    $lockstepProbe.evidenceKind = 'lockstep-v2-multiplayer'
-    $lockstepProbe.producer = 'installed-runtime-lockstep-v2'
-    $lockstepProbe.validationMode = 'production-lockstep-v2'
-    Write-JsonDocument $lockstepProbePath $lockstepProbe
+
+    $lockstepBoundaryPath = New-LockstepProbeCasePath 'boundary'
+    $lockstepBoundaryProbe = ConvertFrom-Stage5TestJsonDictionary $lockstepBoundaryPath
+    $lockstepBoundaryProbe.producer = 'installed-runtime-lockstep-v2'
+    $lockstepBoundaryProbe.validationMode = 'production-lockstep-v2'
+    Write-JsonDocument $lockstepBoundaryPath $lockstepBoundaryProbe
+    $lockstepBoundaryArgs = New-LockstepProbeReadArgs $lockstepBoundaryPath
     Assert-Throws {
-        Read-Stage5LockstepV2Evidence @lockstepReadArgs | Out-Null
+        Read-Stage5LockstepV2Evidence @lockstepBoundaryArgs | Out-Null
     } 'invalid schema/producer/mode boundary' `
         'lockstep-v2 evidence rejects a substituted producer and validation mode'
-    $lockstepProbe.producer = 'installed-lockstep-v2'
-    $lockstepProbe.validationMode = 'installed-lockstep-v2-production'
-    $lockstepProbe.sourceCommit = 'b' * 40
-    Write-JsonDocument $lockstepProbePath $lockstepProbe
+
+    $lockstepStalePath = New-LockstepProbeCasePath 'stale-commit'
+    $lockstepStaleProbe = ConvertFrom-Stage5TestJsonDictionary $lockstepStalePath
+    $lockstepStaleProbe.sourceCommit = 'b' * 40
+    Write-JsonDocument $lockstepStalePath $lockstepStaleProbe
+    $lockstepStaleArgs = New-LockstepProbeReadArgs $lockstepStalePath
     Assert-Throws {
-        Read-Stage5LockstepV2Evidence @lockstepReadArgs | Out-Null
+        Read-Stage5LockstepV2Evidence @lockstepStaleArgs | Out-Null
     } 'stale or substituted' `
         'lockstep-v2 evidence rejects a stale source revision before session acceptance'
-    $lockstepProbe.sourceCommit = $sourceCommit
-    $lockstepProbe.artifactSetSha256 = 'B' * 64
-    Write-JsonDocument $lockstepProbePath $lockstepProbe
+
+    $lockstepArtifactPath = New-LockstepProbeCasePath 'artifact-hash'
+    $lockstepArtifactProbe = ConvertFrom-Stage5TestJsonDictionary $lockstepArtifactPath
+    $lockstepArtifactProbe.artifactSetSha256 = 'B' * 64
+    Write-JsonDocument $lockstepArtifactPath $lockstepArtifactProbe
+    $lockstepArtifactArgs = New-LockstepProbeReadArgs $lockstepArtifactPath
     Assert-Throws {
-        Read-Stage5LockstepV2Evidence @lockstepReadArgs | Out-Null
+        Read-Stage5LockstepV2Evidence @lockstepArtifactArgs | Out-Null
     } 'does not match the independently hashed artifact set' `
         'lockstep-v2 evidence rejects a substituted artifact-set hash'
 
@@ -10026,7 +10104,7 @@ try {
     $lockstepAdapterDocument = [ordered]@{
         schemaVersion = 1; evidenceKind = 'mixed-worker-multiplayer'; status = 'passed'
         sourceCommit = $sourceCommit; title = 'Both'; architecture = 'x64'
-        artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-02T00:00:00Z'
+        artifactSetSha256 = $artifactSetHash; recordedUtc = '2026-09-02T00:00:00.0000000Z'
         cohortNonce = $script:TestCohortNonce
         runtimeClosure = $script:TestRuntimeClosure
         attachments = @([ordered]@{
@@ -10379,11 +10457,16 @@ try {
             [string]$resultsBindingRead.qualificationData.closureSha256 -and
         [int]$resultsBindingRead.qualificationDataEvidence.fileCount -eq 6) `
         'validation-results host receipt retains typed qualification-data proof through final acceptance'
-    $resultsBindingDocument = Read-TestJson $resultsBindingPath
+    $resultsBindingMutationPath = Join-Path $attachmentRoot `
+        'immutable-validation-results-hash-binding-mutated.json'
+    Copy-Item -LiteralPath $resultsBindingPath -Destination $resultsBindingMutationPath
+    $resultsBindingMutationArgs = @{} + $resultsBindingArgs
+    $resultsBindingMutationArgs.Path = $resultsBindingMutationPath
+    $resultsBindingDocument = Read-TestJson $resultsBindingMutationPath
     $resultsBindingDocument.details.resultsSha256 = '0' * 64
-    Write-JsonDocument $resultsBindingPath $resultsBindingDocument
+    Write-JsonDocument $resultsBindingMutationPath $resultsBindingDocument
     Assert-Throws {
-        Read-Stage5FinalAcceptanceImmutableReceipt @resultsBindingArgs | Out-Null
+        Read-Stage5FinalAcceptanceImmutableReceipt @resultsBindingMutationArgs | Out-Null
     } 'bind exactly one retained validation-results log' `
         'validation-results details cannot detach their aggregate hash from the retained raw-log snapshot'
 
@@ -10448,13 +10531,17 @@ try {
     $relocationPositive = New-Stage5RelocationTestCase 'positive'
     try {
         $relocationBinding = Get-Stage5RelocationTestBinding $relocationPositive
-        Assert-True (@($relocationBinding.nativeRawBindings).Count -eq 2 -and
-            @($relocationBinding.nativeRawBindings | Where-Object {
+        $relocationChild = @($relocationBinding.children | Where-Object {
+            [int]$_.sequence -eq 1
+        })[0]
+        Assert-True (@($relocationBinding.children).Count -eq 253 -and
+            @($relocationChild.nativeRawBindings).Count -eq 2 -and
+            @($relocationChild.nativeRawBindings | Where-Object {
                 [string]$_.sourcePath -match '^H:\\Stage5SimulationValidationTask\\Evidence\\' -and
                 [string]$_.path -match '^uploaded-native[\\/]' -and
                 [string]$_.path -notmatch '^[A-Za-z]:|^[\\/]'
             }).Count -eq 2 -and
-            [string]$relocationBinding.nativeReceiptSourcePath -match
+            [string]$relocationChild.nativeReceiptSourcePath -match
                 '^H:\\Stage5SimulationValidationTask\\Evidence\\') `
             'acceptance derives exact relative bindings for immutable uploaded native paths'
         $relocationReadArgs = @{
@@ -10467,8 +10554,7 @@ try {
             ExpectedCohortCreatedUtc = $script:TestCohortCreatedUtc
             ExpectedRuntimeClosure = $script:TestRuntimeClosure
             ExpectedEvidenceDirectory = $relocationBinding.evidenceDirectory
-            NativeRawBindings = $relocationBinding.nativeRawBindings
-            NativeReceiptSourcePath = $relocationBinding.nativeReceiptSourcePath
+            NativeRelocationBindings = @($relocationBinding.children)
         }
         Read-Stage5FinalAcceptanceImmutableReceipt @relocationReadArgs | Out-Null
     }
@@ -10573,39 +10659,49 @@ try {
         $receiptRead.trustDomain -ceq 'host-runner' -and
         $receiptRead.producer -ceq 'installed-runtime-validation-plan-v2') `
         'a host-runner receipt passes only after its exact producer and trust domain are validated'
+
+    function Assert-ImmutableReceiptMutationRejected {
+        param(
+            [string]$Name, [object]$Document, [string]$Pattern,
+            [string]$Context, [hashtable]$BaseArguments
+        )
+        $mutationPath = Join-Path $attachmentRoot "immutable-receipt-$Name.json"
+        Write-JsonDocument $mutationPath $Document
+        $mutationArguments = @{} + $BaseArguments
+        $mutationArguments.Path = $mutationPath
+        Assert-Throws {
+            Read-Stage5FinalAcceptanceImmutableReceipt @mutationArguments | Out-Null
+        } $Pattern $Context
+        return $mutationPath
+    }
+
     $immutableReceipt.sourceCommit = 'b' * 40
-    Write-JsonDocument $immutableReceiptPath $immutableReceipt
-    Assert-Throws {
-        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
-    } 'stale or does not match' `
-        'a stale receipt from another source commit is rejected'
+    Assert-ImmutableReceiptMutationRejected 'stale-source' $immutableReceipt `
+        'stale or does not match' 'a stale receipt from another source commit is rejected' `
+        $receiptContractArgs | Out-Null
     $immutableReceipt.sourceCommit = $sourceCommit
     $immutableReceipt.role = 'validation-results'
-    Write-JsonDocument $immutableReceiptPath $immutableReceipt
-    Assert-Throws {
-        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
-    } 'role is substituted' `
-        'a receipt substituted from another role is rejected'
+    Assert-ImmutableReceiptMutationRejected 'wrong-role' $immutableReceipt `
+        'role is substituted' 'a receipt substituted from another role is rejected' `
+        $receiptContractArgs | Out-Null
     $immutableReceipt.role = 'validation-plan'
     $immutableReceipt.executableSha256 = '0' * 64
-    Write-JsonDocument $immutableReceiptPath $immutableReceipt
-    Assert-Throws {
-        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
-    } 'executable SHA-256 binding' `
-        'a receipt bound to the wrong executable hash is rejected'
+    Assert-ImmutableReceiptMutationRejected 'wrong-executable' $immutableReceipt `
+        'executable SHA-256 binding' 'a receipt bound to the wrong executable hash is rejected' `
+        $receiptContractArgs | Out-Null
     $immutableReceipt.executableSha256 = $artifactTestHashes['zerohour-executable']
     $immutableReceipt.rawLogs[0].sha256 = '0' * 64
-    Write-JsonDocument $immutableReceiptPath $immutableReceipt
-    Assert-Throws {
-        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
-    } 'raw log.*SHA-256 mismatch' `
-        'a receipt with a substituted raw log hash is rejected'
+    Assert-ImmutableReceiptMutationRejected 'wrong-raw-hash' $immutableReceipt `
+        'raw log.*SHA-256 mismatch' 'a receipt with a substituted raw log hash is rejected' `
+        $receiptContractArgs | Out-Null
     $immutableReceipt.rawLogs[0].sha256 = Get-Sha256 (Join-Path $attachmentRoot `
         'immutable-receipt-validation-plan.raw.log')
-    Write-JsonDocument $immutableReceiptPath $immutableReceipt
     $replayedNonces = @{}
     $replayArgs = @{} + $receiptContractArgs
     $replayArgs['SeenRunNonces'] = $replayedNonces
+    $replayPath = Join-Path $attachmentRoot 'immutable-receipt-replayed.json'
+    Write-JsonDocument $replayPath $immutableReceipt
+    $replayArgs.Path = $replayPath
     Read-Stage5FinalAcceptanceImmutableReceipt @replayArgs | Out-Null
     Assert-Throws {
         Read-Stage5FinalAcceptanceImmutableReceipt @replayArgs | Out-Null
@@ -10613,22 +10709,19 @@ try {
         'a replayed receipt nonce is rejected even when its bytes are unchanged'
 
     $immutableReceipt.trustDomain = 'executable'
-    Write-JsonDocument $immutableReceiptPath $immutableReceipt
-    Assert-Throws {
-        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
-    } 'trustDomain is substituted' `
-        'a receipt cannot cross from the host-runner domain into the executable domain'
+    Assert-ImmutableReceiptMutationRejected 'wrong-trust-domain' $immutableReceipt `
+        'trustDomain is substituted' `
+        'a receipt cannot cross from the host-runner domain into the executable domain' `
+        $receiptContractArgs | Out-Null
     $immutableReceipt.trustDomain = 'host-runner'
     $immutableReceipt.provenance.childProvenance = 'bound'
     $immutableReceipt.provenance.children = @()
-    Write-JsonDocument $immutableReceiptPath $immutableReceipt
-    Assert-Throws {
-        Read-Stage5FinalAcceptanceImmutableReceipt @receiptContractArgs | Out-Null
-    } 'claims child provenance' `
-        'a host-runner plan cannot claim child provenance that it did not bind'
+    Assert-ImmutableReceiptMutationRejected 'forged-child-provenance' $immutableReceipt `
+        'claims child provenance' `
+        'a host-runner plan cannot claim child provenance that it did not bind' `
+        $receiptContractArgs | Out-Null
     $immutableReceipt.provenance.childProvenance = 'not-applicable'
     $immutableReceipt.provenance.children = @()
-    Write-JsonDocument $immutableReceiptPath $immutableReceipt
 
     Assert-CurrentNativeReceiptCatalog $attachmentRoot $sourceCommit $artifactSetHash $artifactTestHashes
 
