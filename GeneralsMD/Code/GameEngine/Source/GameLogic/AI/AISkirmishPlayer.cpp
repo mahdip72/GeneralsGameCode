@@ -1620,11 +1620,15 @@ Bool AISkirmishPlayer::selectTeamToBuildCounterSerialFallback(
 	rts::AIProductionSelectionResult result;
 	if (!rts::PlanAIProductionSelectionOwnerSerial(context,
 		&candidateFacts[0], (UnsignedInt)candidateFacts.size(), &result) ||
-		!result.valid || !result.hasSelection)
+		!result.valid)
 	{
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
 	}
+	// A valid planner result with no affordable/admitted selection is a normal
+	// no-production outcome; no owner mutation was attempted to reject.
+	if (!result.hasSelection)
+		return false;
 
 	TeamPrototype *selectedPrototype = NULL;
 	for (std::vector<SkirmishProductionCandidate>::const_iterator candidateIt = candidates.begin();

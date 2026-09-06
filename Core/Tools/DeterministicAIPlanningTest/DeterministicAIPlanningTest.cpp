@@ -24,6 +24,21 @@
 #include "../TestSupport/NativeKernelSourceConsumerTest.h"
 #endif
 
+namespace rts
+{
+bool AIOwnerPrefixInvalidResultPlanner(
+	const AIProductionPlanningSnapshot &context,
+	const AIProductionCandidateFact *candidates, uint32_t candidateCount,
+	AIProductionSelectionResult *result)
+{
+	const bool planned = PlanAIProductionSelectionOwnerSerial(
+		context, candidates, candidateCount, result);
+	if (result != 0)
+		result->valid = 0U;
+	return planned;
+}
+}
+
 namespace
 {
 rts::AICounterRngKey MakeTestRandomKey()
@@ -38,6 +53,57 @@ rts::AICounterRngKey MakeTestRandomKey()
 	key.ownerStableId = 3U;
 	key.eventKind = rts::AI_COUNTER_RNG_EVENT_PRODUCTION_TIE;
 	return key;
+}
+
+bool RunExtractedAIOwnerProductionPrefix(
+	const rts::AIProductionPlanningSnapshot &context,
+	const std::vector<rts::AIProductionCandidateFact> &candidateFacts)
+{
+typedef uint32_t UnsignedInt;
+#include "AIOwnerProductionPrefix.inc"
+	return true;
+}
+
+bool RunExtractedAIOwnerProductionPrefixWithInvalidResult(
+	const rts::AIProductionPlanningSnapshot &context,
+	const std::vector<rts::AIProductionCandidateFact> &candidateFacts)
+{
+typedef uint32_t UnsignedInt;
+#define PlanAIProductionSelectionOwnerSerial AIOwnerPrefixInvalidResultPlanner
+#include "AIOwnerProductionPrefix.inc"
+#undef PlanAIProductionSelectionOwnerSerial
+	return true;
+}
+
+rts::AIProductionPlanningSnapshot MakeAIOwnerPrefixContext(int resources)
+{
+	rts::AIProductionPlanningSnapshot context;
+	rts::ClearAIProductionPlanningSnapshot(&context);
+	context.frame = 901U;
+	context.ownerPlayerIndex = 3U;
+	context.resources = resources;
+	context.logicFramesPerSecond = 30;
+	context.initialReserve = 0;
+	context.retryReserve = 0;
+	context.difficulty = rts::AI_PLANNING_DIFFICULTY_HARD;
+	context.contextInfluencePercent = 100;
+	context.tieBreakKey = MakeTestRandomKey();
+	return context;
+}
+
+std::vector<rts::AIProductionCandidateFact> MakeAIOwnerPrefixCandidates(
+	int minimumCost)
+{
+	std::vector<rts::AIProductionCandidateFact> candidates(1U);
+	candidates[0].sourceOrdinal = 4U;
+	candidates[0].candidateStableId = 44U;
+	candidates[0].configuredPriority = 100;
+	candidates[0].minimumCost = minimumCost;
+	candidates[0].plannedCost = minimumCost;
+	candidates[0].factoryWaitFrames = 1;
+	candidates[0].counterFitScore = 100;
+	candidates[0].eligible = 1U;
+	return candidates;
 }
 
 void TestCounterRngGoldenVector()
@@ -278,6 +344,47 @@ void TestProductionOwnerSerialOverflowBoundary()
 	assert(selection257.randomLedger.selectedIndex < 257U);
 	assert(selection257.selectedSourceOrdinal ==
 		selection257.randomLedger.selectedIndex);
+}
+
+void TestAIOwnerProductionBookkeeping()
+{
+	const rts::AIProductionPlanningSnapshot noSelectionContext =
+		MakeAIOwnerPrefixContext(0);
+	const std::vector<rts::AIProductionCandidateFact> noSelectionCandidates =
+		MakeAIOwnerPrefixCandidates(100);
+	rts::ResetAIPlanningRuntimeMetrics();
+	assert(!RunExtractedAIOwnerProductionPrefix(
+		noSelectionContext, noSelectionCandidates));
+	rts::AIPlanningRuntimeMetrics metrics =
+		rts::GetAIPlanningRuntimeMetrics();
+	assert(metrics.capturedSnapshots == 1U);
+	assert(metrics.rejectedCommits == 0U);
+	assert(metrics.committedBatches == 0U);
+
+	const rts::AIProductionPlanningSnapshot selectedContext =
+		MakeAIOwnerPrefixContext(1000);
+	const std::vector<rts::AIProductionCandidateFact> selectedCandidates =
+		MakeAIOwnerPrefixCandidates(10);
+	rts::ResetAIPlanningRuntimeMetrics();
+	assert(RunExtractedAIOwnerProductionPrefix(
+		selectedContext, selectedCandidates));
+	metrics = rts::GetAIPlanningRuntimeMetrics();
+	assert(metrics.capturedSnapshots == 1U);
+	assert(metrics.rejectedCommits == 0U);
+	// The extracted prefix reaches the live selected-prototype continuation;
+	// it must not invent an accepted owner commit before that continuation.
+	assert(metrics.committedBatches == 0U);
+
+	// Drive the actual extracted owner prefix through its invalid-result branch
+	// using a test-only forwarding shim; no production API or owner logic is
+	// duplicated, and the real planner still supplies the result shape first.
+	rts::ResetAIPlanningRuntimeMetrics();
+	assert(!RunExtractedAIOwnerProductionPrefixWithInvalidResult(
+		selectedContext, selectedCandidates));
+	metrics = rts::GetAIPlanningRuntimeMetrics();
+	assert(metrics.capturedSnapshots == 1U);
+	assert(metrics.rejectedCommits == 1U);
+	assert(metrics.committedBatches == 0U);
 }
 
 void TestProductionDueExpiryBoundary()
@@ -1511,6 +1618,7 @@ int main(int argc, char **argv)
 	TestProductionScoringTieAndRetry();
 	TestProductionWinnerAndTieForgeryRejection();
 	TestProductionOwnerSerialOverflowBoundary();
+	TestAIOwnerProductionBookkeeping();
 	TestProductionDueExpiryBoundary();
 	TestProductionSourceViewParity();
 	TestTransactionalShadowFallback();
