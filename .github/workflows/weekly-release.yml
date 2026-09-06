@@ -192,12 +192,12 @@ jobs:
       - name: Provision canonical qualification root
         shell: pwsh
         run: |
-          if (-not (Test-Path -LiteralPath 'H:\')) {
-            & subst.exe H: $env:RUNNER_TEMP
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) {
-              throw 'The weekly promotion gate could not provision its isolated H: volume.'
-            }
-          }
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token ('{0}-{1}-weekly-promotion' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'The weekly promotion validation volume provisioning failed.' }
           if (Test-Path -LiteralPath $env:PROMOTION_BUNDLE_ROOT) {
             throw "The canonical weekly promotion root must be fresh: $env:PROMOTION_BUNDLE_ROOT"
           }
@@ -271,6 +271,16 @@ jobs:
           path: H:\Stage5WeeklyPromotionQualification\ZeroHourRuntime
           retention-days: 1
           if-no-files-found: error
+
+      - name: Clean Stage 5 weekly promotion validation volume
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token ('{0}-{1}-weekly-promotion' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'The weekly promotion validation volume cleanup failed.' }
 
   create-release:
     name: Create Release

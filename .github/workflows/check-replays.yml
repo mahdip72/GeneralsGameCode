@@ -106,12 +106,10 @@ jobs:
           STAGE5_GAME: ${{ inputs.game }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not (Test-Path -LiteralPath 'H:\')) {
-            & subst.exe H: $env:RUNNER_TEMP
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) {
-              throw 'Stage 5 validation could not provision its isolated H: task volume.'
-            }
-          }
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.game }}-${{ inputs.preset }}"
+          if (-not $?) { throw 'Stage 5 validation volume provisioning failed.' }
           $taskRoot = 'H:\Stage5SimulationValidationTask'
           if (Test-Path -LiteralPath $taskRoot) {
             throw "Stage 5 simulation task root is not fresh: $taskRoot"
@@ -644,3 +642,12 @@ jobs:
           path: ${{ runner.temp }}\Stage5SimulationValidation-upload
           retention-days: 30
           if-no-files-found: error
+
+      - name: Clean Stage 5 validation volume
+        if: ${{ always() && inputs.stage5 }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.game }}-${{ inputs.preset }}"
+          if (-not $?) { throw 'Stage 5 validation volume cleanup failed.' }

@@ -268,12 +268,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not (Test-Path -LiteralPath 'H:\')) {
-            & subst.exe H: "$env:RUNNER_TEMP"
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) {
-              throw 'Stage 5 lockstep-v2 qualification could not provision H:.'
-            }
-          }
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token ('{0}-{1}-lockstep-v2' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 lockstep-v2 validation volume provisioning failed.' }
           if (Test-Path -LiteralPath $env:STAGE5_QUALIFICATION_ROOT) {
             throw "Stage 5 lockstep-v2 qualification root is not fresh: $env:STAGE5_QUALIFICATION_ROOT"
           }
@@ -380,6 +379,16 @@ jobs:
             H:\Stage5WeeklyPromotionQualification\Evidence
           retention-days: 30
           if-no-files-found: error
+
+      - name: Clean Stage 5 lockstep-v2 validation volume
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token ('{0}-{1}-lockstep-v2' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 lockstep-v2 validation volume cleanup failed.' }
 
   stage5-performance-scaling-qualification:
     name: Stage 5 External 16-Core Performance Qualification
@@ -723,10 +732,12 @@ jobs:
       - name: Provision isolated Stage 5 volume
         shell: pwsh
         run: |
-          if (-not (Test-Path -LiteralPath 'H:\')) {
-            & subst.exe H: "$env:RUNNER_TEMP"
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) { throw 'Stage 5 could not provision H:.' }
-          }
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token ('{0}-{1}-combined-host-runner' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 combined host-runner validation volume provisioning failed.' }
 
       - name: Download Generals Stage 5 evidence
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
@@ -842,6 +853,16 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      - name: Clean Stage 5 combined host-runner validation volume
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token ('{0}-{1}-combined-host-runner' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 combined host-runner validation volume cleanup failed.' }
+
   stage5-development-readiness:
     name: Stage 5 Development Readiness
     needs: [stage5-execution-cohort, stage5-replaycheck-generalsmd-x64, stage5-replaycheck-generals-x64, stage5-combined-host-runner, stage5-lockstep-v2-qualification, stage5-performance-scaling-qualification]
@@ -876,12 +897,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not (Test-Path -LiteralPath 'H:\')) {
-            & subst.exe H: "$env:RUNNER_TEMP"
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) {
-              throw 'Stage 5 readiness could not provision H:.'
-            }
-          }
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token ('{0}-{1}-development-readiness' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 development-readiness validation volume provisioning failed.' }
           foreach ($freshRoot in @($env:STAGE5_READINESS_ROOT,
               $env:STAGE5_PERFORMANCE_ROOT, $env:STAGE5_SOURCE_ROOT)) {
             if (Test-Path -LiteralPath $freshRoot) {
@@ -1009,6 +1029,16 @@ jobs:
           path: H:\Stage5WeeklyPromotionQualification\Stage5DevelopmentReadinessBundle.zip
           retention-days: 30
           if-no-files-found: error
+
+      - name: Clean Stage 5 development-readiness validation volume
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token ('{0}-{1}-development-readiness' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 development-readiness validation volume cleanup failed.' }
 
   build-native-x64-focused-runtime:
     name: Native x64 ${{ matrix.preset }} Shared Runtime Focus

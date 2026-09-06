@@ -178,41 +178,10 @@ jobs:
         if: ${{ inputs.extras }}
         shell: pwsh
         run: |
-          $scratchToken = "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.preset }}"
-          $scratchToken = [regex]::Replace($scratchToken, '[^A-Za-z0-9._-]', '-')
-          if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
-            throw 'RUNNER_TEMP is unavailable for Stage 5 scratch backing.'
-          }
-
-          $backingRoot = Join-Path $env:RUNNER_TEMP `
-            ('Stage5ValidationH-' + $scratchToken)
-          $hDrive = Get-PSDrive -Name H -ErrorAction SilentlyContinue
-          $hExists = $null -ne $hDrive -or
-            (Test-Path -LiteralPath 'H:\' -PathType Container)
-          if (-not $hExists) {
-            if (Test-Path -LiteralPath $backingRoot) {
-              throw "Stage 5 scratch backing path already exists: $backingRoot"
-            }
-            New-Item -ItemType Directory -Path $backingRoot -Force | Out-Null
-            & subst H: $backingRoot
-            if ($LASTEXITCODE -ne 0) {
-              throw "Could not map H: to the unique Stage 5 scratch backing path: $backingRoot"
-            }
-            if (-not (Test-Path -LiteralPath 'H:\' -PathType Container)) {
-              throw 'H: was not available after mapping the Stage 5 scratch backing path.'
-            }
-          }
-
-          $scratchRoot = Join-Path 'H:\Stage5CiScratch' $scratchToken
-          if (Test-Path -LiteralPath $scratchRoot) {
-            throw "Stage 5 validation scratch path already exists: $scratchRoot"
-          }
-          New-Item -ItemType Directory -Path $scratchRoot -Force | Out-Null
-          if (-not (Test-Path -LiteralPath $scratchRoot -PathType Container)) {
-            throw "Stage 5 validation scratch path was not created: $scratchRoot"
-          }
-          "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=$scratchRoot" >> $env:GITHUB_ENV
-          Write-Host "Stage 5 validation scratch: $scratchRoot"
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.preset }}"
+          if (-not $?) { throw 'Stage 5 validation scratch volume provisioning failed.' }
 
       - name: Configure ${{ inputs.game }} with CMake Using ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Preset
         shell: pwsh
@@ -405,3 +374,12 @@ jobs:
           path: build\${{ inputs.preset }}\${{ inputs.game }}\artifacts
           retention-days: 30
           if-no-files-found: error
+
+      - name: Clean Stage 5 validation scratch volume
+        if: ${{ always() && inputs.extras }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.preset }}"
+          if (-not $?) { throw 'Stage 5 validation scratch volume cleanup failed.' }

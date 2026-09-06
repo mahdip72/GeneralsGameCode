@@ -123,6 +123,169 @@ function Assert-Stage5ProductArtifactIsolation {
         "$Context test-only artifact payload"
 }
 
+function Assert-Stage5ValidationVolumeHelper {
+    param([string]$Content, [string]$Context)
+
+    $tokens = $null
+    $parseErrors = $null
+    [void][Management.Automation.Language.Parser]::ParseInput(
+        $Content, [ref]$tokens, [ref]$parseErrors)
+    Assert-Stage5WorkflowCondition (@($parseErrors).Count -eq 0) `
+        "$Context PowerShell helper does not parse."
+    foreach ($requiredLiteral in @(
+        "[ValidateSet('Provision', 'Cleanup')]",
+        'Stage5ValidationH-',
+        'maximum=32768 type=expandable',
+        'attach vdisk',
+        'detach vdisk',
+        'Get-DiskImage -ImagePath $Paths.BackingFile',
+        'Get-Partition -DriveLetter H',
+        '$partition.DiskNumber',
+        'Get-Volume -Partition $partition',
+        '[IO.DriveType]::Fixed',
+        'RTS_STAGE5_VALIDATION_VHD_OWNED=true',
+        'RTS_STAGE5_VALIDATION_VHD_PATH=',
+        'RTS_STAGE5_VALIDATION_VHD_TOKEN=',
+        'RTS_STAGE5_VALIDATION_VHD_MARKER=',
+        'H:\Stage5CiScratch',
+        '.stage5-vhd-owner',
+        'Remove-Item -LiteralPath $Paths.ScratchRoot -Recurse -Force',
+        'remainingImage.Attached')) {
+        Assert-Stage5WorkflowLiteral $Content $requiredLiteral $Context
+    }
+    Assert-Stage5WorkflowNotContains $Content 'subst\.exe\s+H:' `
+        "$Context must not mutate subst mappings."
+    $cleanupStart = $Content.IndexOf(
+        'function Invoke-Stage5ValidationVolumeCleanup',
+        [StringComparison]::Ordinal)
+    Assert-Stage5WorkflowCondition ($cleanupStart -ge 0) `
+        "$Context cleanup function is missing."
+    $cleanupContent = $Content.Substring($cleanupStart)
+    $cleanupImageQueryIndex = $cleanupContent.IndexOf(
+        '$diskImage = Get-DiskImage -ImagePath $Paths.BackingFile',
+        [StringComparison]::Ordinal)
+    $cleanupPartitionQueryIndex = $cleanupContent.IndexOf(
+        '$partition = Get-Partition -DriveLetter H',
+        [StringComparison]::Ordinal)
+    $cleanupScratchRemovalIndex = $cleanupContent.IndexOf(
+        'Remove-Item -LiteralPath $Paths.ScratchRoot -Recurse -Force',
+        [StringComparison]::Ordinal)
+    $cleanupDetachIndex = $cleanupContent.IndexOf(
+        'detach vdisk', [StringComparison]::Ordinal)
+    Assert-Stage5WorkflowCondition ($cleanupImageQueryIndex -ge 0 -and
+        $cleanupPartitionQueryIndex -ge 0 -and $cleanupScratchRemovalIndex -ge 0 -and
+        $cleanupDetachIndex -ge 0 -and
+        $cleanupImageQueryIndex -lt $cleanupScratchRemovalIndex -and
+        $cleanupPartitionQueryIndex -lt $cleanupScratchRemovalIndex -and
+        $cleanupScratchRemovalIndex -lt $cleanupDetachIndex) `
+        "$Context must validate image/partition identity before scratch removal and detach."
+}
+
+function Assert-Stage5ValidationVolumeInvocation {
+    param(
+        [string]$Step,
+        [ValidateSet('Provision', 'Cleanup')]
+        [string]$Mode,
+        [string]$TokenPattern,
+        [string]$Context
+    )
+
+    $ast = Get-Stage5WorkflowPowerShellRunAst $Step $Context
+    $matchingCalls = @($ast.FindAll({
+        param($node)
+        if ($node -isnot [Management.Automation.Language.CommandAst] -or
+            $node.InvocationOperator -ne
+                [Management.Automation.Language.TokenKind]::Ampersand -or
+            $node.CommandElements.Count -eq 0 -or
+            $node.Parent -isnot [Management.Automation.Language.PipelineAst] -or
+            $node.Parent.PipelineElements.Count -ne 1 -or
+            $node.Parent.Parent -isnot
+                [Management.Automation.Language.NamedBlockAst] -or
+            $node.Parent.Parent.Parent -ne $ast) {
+            return $false
+        }
+        $command = $node.CommandElements[0]
+        return ($command.PSObject.Properties.Name -contains 'Value' -and
+            [string]$command.Value -ceq
+            '$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1')
+    }, $true))
+    Assert-Stage5WorkflowCondition ($matchingCalls.Count -eq 1) `
+        "$Context must execute exactly one direct validation-volume helper call."
+    $elements = @($matchingCalls[0].CommandElements)
+    $arguments = [ordered]@{}
+    $consumedArgumentIndex = -1
+    for ($index = 1; $index -lt $elements.Count; ++$index) {
+        if ($index -eq $consumedArgumentIndex) { continue }
+        $element = $elements[$index]
+        Assert-Stage5WorkflowCondition `
+            ($element -is [Management.Automation.Language.CommandParameterAst]) `
+            "$Context helper call contains an unbound positional argument."
+        $name = [string]$element.ParameterName
+        Assert-Stage5WorkflowCondition (-not $arguments.Contains($name)) `
+            "$Context helper call repeats -$name."
+        $argument = $null
+        if ($null -ne $element.Argument) {
+            $argument = [string]$element.Argument.Extent.Text
+        }
+        elseif ($index + 1 -lt $elements.Count -and
+            $elements[$index + 1] -isnot
+                [Management.Automation.Language.CommandParameterAst]) {
+            $argument = [string]$elements[$index + 1].Extent.Text
+            $consumedArgumentIndex = $index + 1
+        }
+        $arguments[$name] = $argument
+    }
+    Assert-Stage5WorkflowCondition ($arguments.Count -eq 2 -and
+        $arguments.Contains('Mode') -and $arguments.Contains('Token')) `
+        "$Context helper call must bind exactly -Mode and -Token."
+    Assert-Stage5WorkflowCondition ([string]$arguments['Mode'] -ceq $Mode) `
+        "$Context helper call mode is not exactly '$Mode'."
+    Assert-Stage5WorkflowCondition ([string]$arguments['Token'] -match $TokenPattern) `
+        "$Context helper call token is not lane-unique and run-bound."
+}
+
+function Assert-Stage5ValidationVolumeBinding {
+    param(
+        [string]$Content,
+        [string]$ProvisionStepName,
+        [string]$CleanupStepName,
+        [string]$ProvisionIf,
+        [string]$CleanupIf,
+        [string]$TokenPattern,
+        [string[]]$UploadStepNames,
+        [AllowNull()][Collections.IDictionary]$ProvisionEnvironment = $null,
+        [string]$Context
+    )
+
+    $provisionStep = Get-Stage5IndentedBlock $Content `
+        ('- name: ' + $ProvisionStepName) 6
+    $cleanupStep = Get-Stage5IndentedBlock $Content `
+        ('- name: ' + $CleanupStepName) 6
+    Assert-Stage5ExactPowerShellStepMetadata $provisionStep `
+        $ProvisionEnvironment $ProvisionIf `
+        "$Context exact volume-provisioning step"
+    Assert-Stage5ExactPowerShellStepMetadata $cleanupStep $null $CleanupIf `
+        "$Context exact volume-cleanup step"
+    Assert-Stage5ValidationVolumeInvocation $provisionStep 'Provision' `
+        $TokenPattern "$Context volume-provisioning helper binding"
+    Assert-Stage5ValidationVolumeInvocation $cleanupStep 'Cleanup' `
+        $TokenPattern "$Context volume-cleanup helper binding"
+    Assert-Stage5WorkflowNotContains $Content 'subst\.exe\s+H:' `
+        "$Context live subst H: mutation"
+    $cleanupIndex = $Content.IndexOf(
+        ('- name: ' + $CleanupStepName), [StringComparison]::Ordinal)
+    $lastUploadIndex = -1
+    foreach ($uploadStepName in $UploadStepNames) {
+        $uploadIndex = $Content.IndexOf(
+            ('- name: ' + $uploadStepName), [StringComparison]::Ordinal)
+        Assert-Stage5WorkflowCondition ($uploadIndex -ge 0) `
+            "$Context required upload step is missing: $uploadStepName"
+        if ($uploadIndex -gt $lastUploadIndex) { $lastUploadIndex = $uploadIndex }
+    }
+    Assert-Stage5WorkflowCondition ($cleanupIndex -gt $lastUploadIndex) `
+        "$Context must clean the volume only after all lane artifacts upload."
+}
+
 function Get-Stage5WorkflowFile {
     param([string]$Root, [string]$RelativePath)
     $path = Join-Path $Root $RelativePath
@@ -1033,8 +1196,9 @@ function Assert-Stage5CheckReplaysContract {
         'Run Stage 5 Installed-Runtime Replay Matrix',
         'Normalize Stage 5 Evidence Paths for Upload',
         'Upload Debug Log',
-        'Upload Stage 5 Validation Evidence') @(
-        'uses', 'run', 'uses', 'run', 'run', 'run', 'run', 'uses', 'uses') `
+        'Upload Stage 5 Validation Evidence',
+        'Clean Stage 5 validation volume') @(
+        'uses', 'run', 'uses', 'run', 'run', 'run', 'run', 'uses', 'uses', 'run') `
         "$Context exact closed step sequence"
 
     $checkoutStep = Get-Stage5IndentedBlock $job '- name: Checkout Code' 6
@@ -1082,8 +1246,11 @@ function Assert-Stage5CheckReplaysContract {
             AwsEndpointUrl = '$env:AWS_ENDPOINT_URL'
             OutputEnvironmentFile = '$env:GITHUB_ENV'
         })
+    Assert-Stage5ValidationVolumeInvocation $provisionStep 'Provision' `
+        '(?s)__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__' `
+        "$Context validation-volume provision helper"
     Assert-Stage5ClosedPowerShellRunBlock $provisionStep `
-        'F7EB2A0DB52FD53B3DE323495CCD10BB168AACF7B2F5D405D6D6FAB3529AD278' 8 `
+        'BAABDB06C2FDD5862165D27CC0D7AF42B3024D5337302157C791DECBA4BCA810' 9 `
         "$Context sealed qualification-data provision program"
 
     $auditStep = Get-Stage5IndentedBlock $job `
@@ -1204,6 +1371,17 @@ function Assert-Stage5CheckReplaysContract {
             'if-no-files-found' = 'error'
         }) '${{ always() && inputs.stage5 }}' `
         "$Context exact validation-evidence upload"
+    $cleanupStep = Get-Stage5IndentedBlock $job `
+        '- name: Clean Stage 5 validation volume' 6
+    Assert-Stage5ValidationVolumeInvocation $cleanupStep 'Cleanup' `
+        '(?s)__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__' `
+        "$Context validation-volume cleanup helper"
+    $cleanupIndex = $job.IndexOf(
+        '- name: Clean Stage 5 validation volume', [StringComparison]::Ordinal)
+    $evidenceUploadIndex = $job.IndexOf(
+        '- name: Upload Stage 5 Validation Evidence', [StringComparison]::Ordinal)
+    Assert-Stage5WorkflowCondition ($cleanupIndex -gt $evidenceUploadIndex) `
+        "$Context must clean the validation volume after evidence upload."
 }
 
 function Invoke-Stage5CheckReplaysContractSelfTest {
@@ -1230,6 +1408,9 @@ function Invoke-Stage5CheckReplaysContractSelfTest {
         action = $fixture.Replace(
             'actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3',
             'actions/download-artifact@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+        'validation-volume-token' = $fixture.Replace(
+            '-Token "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.game }}-${{ inputs.preset }}"',
+            '-Token "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.game }}"')
         args = $fixture.Replace("-ValidationSet 'All'", "-ValidationSet 'Replay'")
         swap = $swap
         duplicate = $fixture.Replace(
@@ -1374,8 +1555,9 @@ function Assert-Stage5CombinedHostRunnerProducer {
         'Download Generals Stage 5 evidence',
         'Download Zero Hour Stage 5 evidence',
         'Produce combined host-runner receipt',
-        'Upload combined Stage 5 evidence') @(
-        'uses', 'run', 'uses', 'uses', 'run', 'uses') `
+        'Upload combined Stage 5 evidence',
+        'Clean Stage 5 combined host-runner validation volume') @(
+        'uses', 'run', 'uses', 'uses', 'run', 'uses', 'run') `
         "$Context exact closed step sequence"
     Assert-Stage5NoJobRunDefaults $job "$Context job metadata"
     Assert-Stage5ExactJobEnvironment $job ([ordered]@{
@@ -1419,8 +1601,11 @@ function Assert-Stage5CombinedHostRunnerProducer {
         "$Context exact isolated-volume step metadata"
     Assert-Stage5WorkflowFailClosedStep $provisionStep `
         "$Context unconditional isolated-volume provisioning"
+    Assert-Stage5ValidationVolumeInvocation $provisionStep 'Provision' `
+        '(?s)combined-host-runner.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+        "$Context validation-volume provision helper"
     Assert-Stage5ClosedPowerShellRunBlock $provisionStep `
-        '151EDA6B1E35AECF8CC1B60EEB1F9424A6AA897392ACECC20987A30687F21277' 1 `
+        '67DE779213B539E2CAAAFC2BBFC1C8F9E06539CF78AAC56BA71143B3C1BA1901' 3 `
         "$Context exact isolated-volume provisioning program"
     $producerStep = Get-Stage5IndentedBlock $job `
         '- name: Produce combined host-runner receipt' 6
@@ -1483,6 +1668,18 @@ function Assert-Stage5CombinedHostRunnerProducer {
             'retention-days' = '30'
             'if-no-files-found' = 'error'
         }) "$Context exact combined evidence upload"
+    $cleanupStep = Get-Stage5IndentedBlock $job `
+        '- name: Clean Stage 5 combined host-runner validation volume' 6
+    Assert-Stage5ValidationVolumeInvocation $cleanupStep 'Cleanup' `
+        '(?s)combined-host-runner.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+        "$Context validation-volume cleanup helper"
+    $cleanupIndex = $job.IndexOf(
+        '- name: Clean Stage 5 combined host-runner validation volume',
+        [StringComparison]::Ordinal)
+    $uploadIndex = $job.IndexOf(
+        '- name: Upload combined Stage 5 evidence', [StringComparison]::Ordinal)
+    Assert-Stage5WorkflowCondition ($cleanupIndex -gt $uploadIndex) `
+        "$Context must clean the validation volume after evidence upload."
 }
 
 function Assert-Stage5LockstepV2QualificationProducer {
@@ -1512,8 +1709,9 @@ function Assert-Stage5LockstepV2QualificationProducer {
         'Produce exact Stage 5 runtime manifests',
         'Provision verified trimmed qualification data',
         'Run installed lockstep-v2 qualification',
-        'Upload installed lockstep-v2 qualification') @(
-        'uses', 'run', 'uses', 'uses', 'run', 'run', 'run', 'uses') `
+        'Upload installed lockstep-v2 qualification',
+        'Clean Stage 5 lockstep-v2 validation volume') @(
+        'uses', 'run', 'uses', 'uses', 'run', 'run', 'run', 'uses', 'run') `
         "$Context exact closed step sequence"
     Assert-Stage5NoJobRunDefaults $job "$Context job metadata"
     Assert-Stage5ExactJobEnvironment $job ([ordered]@{
@@ -1572,8 +1770,11 @@ function Assert-Stage5LockstepV2QualificationProducer {
         "$Context unconditional canonical-root provisioning"
     Assert-Stage5NoStepEnvironment $provisionStep `
         "$Context inherited canonical-root identity"
+    Assert-Stage5ValidationVolumeInvocation $provisionStep 'Provision' `
+        '(?s)lockstep-v2.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+        "$Context validation-volume provision helper"
     Assert-Stage5ClosedPowerShellRunBlock $provisionStep `
-        '87F0CC69457B64EF9F717590B42D1D0D8A1FCCFDF7825804DAA2A78EDD1A0E77' 4 `
+        '4F9DBE7162E2C8B829FBD34115590CC44875A27B71A564EE6B761110D19000CC' 5 `
         "$Context exact canonical-root provisioning program"
 
     $manifestStep = Get-Stage5IndentedBlock $job `
@@ -1737,6 +1938,11 @@ function Assert-Stage5LockstepV2QualificationProducer {
     Assert-Stage5WorkflowNotContains $effectiveUploadStep `
         'H:\\Stage5WeeklyPromotionQualification\\(?:GeneralsRuntime|ZeroHourRuntime|QualificationData)(?:\\|\s|$)' `
         "$Context attestation-only qualification upload"
+    $cleanupStep = Get-Stage5IndentedBlock $job `
+        '- name: Clean Stage 5 lockstep-v2 validation volume' 6
+    Assert-Stage5ValidationVolumeInvocation $cleanupStep 'Cleanup' `
+        '(?s)lockstep-v2.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+        "$Context validation-volume cleanup helper"
 
     $manifestIndex = $job.IndexOf(
         '- name: Produce exact Stage 5 runtime manifests',
@@ -1755,6 +1961,11 @@ function Assert-Stage5LockstepV2QualificationProducer {
         $qualificationIndex -gt $qualificationDataIndex -and
         $uploadIndex -gt $qualificationIndex) `
         "$Context must produce runtime/data manifests, qualify, and only then upload evidence."
+    $cleanupIndex = $job.IndexOf(
+        '- name: Clean Stage 5 lockstep-v2 validation volume',
+        [StringComparison]::Ordinal)
+    Assert-Stage5WorkflowCondition ($cleanupIndex -gt $uploadIndex) `
+        "$Context must clean the validation volume after evidence upload."
 }
 
 function Assert-Stage5ExternalPerformanceQualificationProducer {
@@ -2184,9 +2395,10 @@ function Assert-Stage5DevelopmentReadinessProducer {
         'Assemble trusted Stage 5 development-readiness bundle',
         'Run Stage 5 final pre-manual acceptance',
         'Seal Stage 5 development-readiness bundle',
-        'Upload Stage 5 development-readiness evidence') @(
+        'Upload Stage 5 development-readiness evidence',
+        'Clean Stage 5 development-readiness validation volume') @(
         'uses', 'run', 'uses', 'uses', 'uses', 'uses', 'uses', 'uses', 'uses',
-        'run', 'run', 'run', 'uses') "$Context exact closed step sequence"
+        'run', 'run', 'run', 'uses', 'run') "$Context exact closed step sequence"
     Assert-Stage5NoJobRunDefaults $job "$Context job metadata"
     Assert-Stage5ExactJobEnvironment $job ([ordered]@{
             STAGE5_ACCEPTANCE_TEMPLATE = '${{ inputs.stage5_acceptance_manifest }}'
@@ -2255,8 +2467,11 @@ function Assert-Stage5DevelopmentReadinessProducer {
         "$Context exact readiness-volume step metadata"
     Assert-Stage5WorkflowFailClosedStep $provisionStep `
         "$Context unconditional isolated-volume provisioning"
+    Assert-Stage5ValidationVolumeInvocation $provisionStep 'Provision' `
+        '(?s)development-readiness.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+        "$Context validation-volume provision helper"
     Assert-Stage5ClosedPowerShellRunBlock $provisionStep `
-        '5B6867483D67390ACC5077FD211C94CD46BCDB04235ADF0AC36852F0D05F1EBC' 5 `
+        '6656222449DC5A3DA686DBC6CC65C1AE2FE829B9A94303D55F4B4FE12FE3E384' 6 `
         "$Context exact isolated-volume provisioning program"
 
     $assemblyStep = Get-Stage5IndentedBlock $job `
@@ -2370,6 +2585,11 @@ function Assert-Stage5DevelopmentReadinessProducer {
         "$Context final readiness upload"
     Assert-Stage5SealedReadinessUpload $uploadStep `
         "$Context final readiness upload"
+    $cleanupStep = Get-Stage5IndentedBlock $job `
+        '- name: Clean Stage 5 development-readiness validation volume' 6
+    Assert-Stage5ValidationVolumeInvocation $cleanupStep 'Cleanup' `
+        '(?s)development-readiness.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+        "$Context validation-volume cleanup helper"
 
     $assemblyIndex = $job.IndexOf(
         '- name: Assemble trusted Stage 5 development-readiness bundle',
@@ -2387,6 +2607,11 @@ function Assert-Stage5DevelopmentReadinessProducer {
         $acceptanceIndex -gt $assemblyIndex -and $sealIndex -gt $acceptanceIndex -and
         $uploadIndex -gt $sealIndex) `
         "$Context must adjacently assemble, validate, seal, and only then publish readiness."
+    $cleanupIndex = $job.IndexOf(
+        '- name: Clean Stage 5 development-readiness validation volume',
+        [StringComparison]::Ordinal)
+    Assert-Stage5WorkflowCondition ($cleanupIndex -gt $uploadIndex) `
+        "$Context must clean the validation volume after evidence upload."
     Assert-Stage5ReadinessTerminalStepOrder $job `
         "$Context terminal readiness steps"
 }
@@ -2519,6 +2744,49 @@ function Assert-Stage5WeeklyPromotionGate {
 }
 
 if ($SelfTest) {
+    $validationVolumeHelperPath = Join-Path $PSScriptRoot `
+        'Stage5ValidationVolume.ps1'
+    Assert-Stage5WorkflowCondition `
+        (Test-Path -LiteralPath $validationVolumeHelperPath -PathType Leaf) `
+        'Stage 5 validation-volume helper self-test file is missing.'
+    $validationVolumeHelper = ConvertTo-Stage5SelfTestLf (Get-Content `
+        -LiteralPath $validationVolumeHelperPath -Raw)
+    Assert-Stage5ValidationVolumeHelper $validationVolumeHelper `
+        'self-test Stage 5 validation-volume helper'
+    $validationVolumeHelperCrlf = [regex]::Replace(
+        $validationVolumeHelper, "`r`n|`r|`n", "`r`n")
+    Assert-Stage5ValidationVolumeHelper $validationVolumeHelperCrlf `
+        'self-test CRLF Stage 5 validation-volume helper'
+    $cleanupQuery = ConvertTo-Stage5SelfTestLf ([string]::Join("`n", @(
+        '    $diskImage = Get-DiskImage -ImagePath $Paths.BackingFile `',
+        '        -ErrorAction SilentlyContinue')))
+    $cleanupEarlyRemoval = ConvertTo-Stage5SelfTestLf ([string]::Join("`n", @(
+        '    Remove-Item -LiteralPath $Paths.ScratchRoot -Recurse -Force',
+        '    $diskImage = Get-DiskImage -ImagePath $Paths.BackingFile `',
+        '        -ErrorAction SilentlyContinue')))
+    foreach ($invalidValidationVolumeHelper in @(
+        $validationVolumeHelper.Replace(
+            'maximum=32768 type=expandable',
+            'maximum=32768 type=fixed'),
+        $validationVolumeHelper.Replace('detach vdisk', 'attach vdisk'),
+        $validationVolumeHelper.Replace(
+            'Get-Partition -DriveLetter H',
+            'Get-Partition -DriveLetter G'),
+        $validationVolumeHelper.Replace(
+            $cleanupQuery, $cleanupEarlyRemoval))) {
+        Assert-Stage5WorkflowCondition `
+            ($invalidValidationVolumeHelper -cne $validationVolumeHelper) `
+            'Stage 5 validation-volume helper self-test mutation did not apply.'
+        $caught = $false
+        try {
+            Assert-Stage5ValidationVolumeHelper $invalidValidationVolumeHelper `
+                'self-test invalid Stage 5 validation-volume helper'
+        }
+        catch { $caught = $true }
+        Assert-Stage5WorkflowCondition $caught `
+            'workflow contract self-test accepted an unsafe or reordered validation-volume helper.'
+    }
+
     $reviewedMapNameGuard = '(^[\\/]|:|\.\.|[;"]|[\x00-\x1F\x7F]|[^\S ])'
     Assert-Stage5WorkflowCondition `
         ('Maps\Twilight Flame\Twilight Flame.map' -notmatch $reviewedMapNameGuard) `
@@ -2604,6 +2872,7 @@ jobs:
     catch { $caught = $true }
     Assert-Stage5WorkflowCondition $caught `
         'workflow contract self-test accepted a contract utility inside the product artifact root.'
+
     $qualificationProducerFixture = @'
 on:
   workflow_dispatch:
@@ -2640,12 +2909,11 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not (Test-Path -LiteralPath 'H:\')) {
-            & subst.exe H: "$env:RUNNER_TEMP"
-            if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath 'H:\')) {
-              throw 'Stage 5 lockstep-v2 qualification could not provision H:.'
-            }
-          }
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token ('{0}-{1}-lockstep-v2' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 lockstep-v2 validation volume provisioning failed.' }
           if (Test-Path -LiteralPath $env:STAGE5_QUALIFICATION_ROOT) {
             throw "Stage 5 lockstep-v2 qualification root is not fresh: $env:STAGE5_QUALIFICATION_ROOT"
           }
@@ -2746,6 +3014,15 @@ jobs:
             H:\Stage5WeeklyPromotionQualification\Evidence
           retention-days: 30
           if-no-files-found: error
+      - name: Clean Stage 5 lockstep-v2 validation volume
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token ('{0}-{1}-lockstep-v2' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 lockstep-v2 validation volume cleanup failed.' }
 '@
     $qualificationProducerFixture = ConvertTo-Stage5SelfTestLf $qualificationProducerFixture
     Assert-Stage5LockstepV2QualificationProducer `
@@ -3499,6 +3776,10 @@ $check = Get-Stage5WorkflowFile $root '.github/workflows/check-replays.yml'
 $buildToolchain = Get-Stage5WorkflowFile $root `
     '.github/workflows/build-toolchain.yml'
 $weekly = Get-Stage5WorkflowFile $root '.github/workflows/weekly-release.yml'
+$validationVolumeHelper = Get-Stage5WorkflowFile $root `
+    '.github/workflows/Stage5ValidationVolume.ps1'
+Assert-Stage5ValidationVolumeHelper $validationVolumeHelper `
+    'Stage 5 shared validation-volume helper'
 $weeklyPromotionValidator = Join-Path $root `
     '.github/workflows/Validate-Stage5WeeklyPromotionAttestation.ps1'
 Assert-Stage5WorkflowCondition `
@@ -3624,8 +3905,33 @@ Assert-Stage5ExternalPerformanceQualificationProducer $ci `
     'CI external performance qualification producer'
 Assert-Stage5DevelopmentReadinessProducer $ci `
     'CI Stage 5 development-readiness producer'
+Assert-Stage5ValidationVolumeBinding $exactLockstepJob `
+    'Provision canonical Stage 5 qualification root' `
+    'Clean Stage 5 lockstep-v2 validation volume' '' '${{ always() }}' `
+    '(?s)lockstep-v2.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+    @('Upload installed lockstep-v2 qualification') $null `
+    'CI Stage 5 lockstep-v2 task-owned validation volume'
+Assert-Stage5ValidationVolumeBinding $exactCombinedJob `
+    'Provision isolated Stage 5 volume' `
+    'Clean Stage 5 combined host-runner validation volume' '' '${{ always() }}' `
+    '(?s)combined-host-runner.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+    @('Upload combined Stage 5 evidence') $null `
+    'CI Stage 5 combined task-owned validation volume'
+Assert-Stage5ValidationVolumeBinding $exactReadinessJob `
+    'Provision isolated Stage 5 readiness volume' `
+    'Clean Stage 5 development-readiness validation volume' '' '${{ always() }}' `
+    '(?s)development-readiness.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+    @('Upload Stage 5 development-readiness evidence') $null `
+    'CI Stage 5 readiness task-owned validation volume'
 Assert-Stage5ProductArtifactIsolation $buildToolchain `
     'reusable native product build workflow'
+Assert-Stage5ValidationVolumeBinding $buildToolchain `
+    'Provision Stage 5 validation scratch' `
+    'Clean Stage 5 validation scratch volume' '${{ inputs.extras }}' `
+    '${{ always() && inputs.extras }}' `
+    '__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__' `
+    @('Upload ${{ inputs.game }} ${{ inputs.preset }}${{ inputs.tools && ''+t'' || '''' }}${{ inputs.extras && ''+e'' || '''' }} Artifact') `
+    $null 'reusable native product build workflow'
 Assert-Stage5WorkflowLiteral $workflowContractJob `
     'Validate-Stage5WeeklyPromotionAttestation.ps1' `
     'CI weekly promotion validator self-test'
@@ -3701,6 +4007,19 @@ foreach ($retiredLane in @(
 
 Assert-Stage5CheckReplaysContract $check `
     'reusable Stage 5 installed-runtime replay workflow'
+$checkJob = Get-Stage5IndentedBlock $check 'build:' 2
+$checkVolumeProvisionEnvironment = [ordered]@{
+    AWS_ACCESS_KEY_ID = '${{ secrets.R2_ACCESS_KEY_ID }}'
+    AWS_SECRET_ACCESS_KEY = '${{ secrets.R2_SECRET_ACCESS_KEY }}'
+    AWS_ENDPOINT_URL = '${{ secrets.R2_ENDPOINT_URL }}'
+    STAGE5_GAME = '${{ inputs.game }}'
+}
+Assert-Stage5ValidationVolumeBinding $checkJob `
+    'Provision immutable Stage 5 simulation qualification data' `
+    'Clean Stage 5 validation volume' '' '${{ always() && inputs.stage5 }}' `
+    '(?s)__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__' `
+    @('Upload Debug Log', 'Upload Stage 5 Validation Evidence') `
+    $checkVolumeProvisionEnvironment 'reusable Stage 5 replay validation volume'
 Assert-Stage5WorkflowContains $check 'stage5_acceptance_manifest:' `
     'reusable Stage 5 final acceptance input'
 $stage5Input = Get-Stage5IndentedBlock $check 'stage5:' 6
@@ -3789,6 +4108,14 @@ Assert-Stage5WorkflowNotContains $normalizerContent 'ConvertFrom-Json|WriteAllTe
 Assert-Stage5CanonicalDownloadArtifactPins $weekly 5 `
     'weekly release artifact downloads'
 Assert-Stage5WeeklyPromotionGate $weekly 'weekly release'
+$weeklyPromotionJob = Get-Stage5IndentedBlock $weekly `
+    'validate-promotion-attestation:' 2
+Assert-Stage5ValidationVolumeBinding $weeklyPromotionJob `
+    'Provision canonical qualification root' `
+    'Clean Stage 5 weekly promotion validation volume' '' '${{ always() }}' `
+    '(?s)weekly-promotion.*GITHUB_RUN_ID.*GITHUB_RUN_ATTEMPT' `
+    @('Upload validated Generals x64 artifact',
+      'Upload validated GeneralsMD x64 artifact') $null 'weekly release task-owned validation volume'
 foreach ($fullEvidenceBinding in @(
     "'H:\Stage5WeeklyPromotionQualification'",
     "'Stage5QualificationData.json'",
