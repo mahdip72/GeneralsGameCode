@@ -9196,14 +9196,68 @@ try {
         $caseRoot = Join-Path $acceptanceRoot "combined-producer-negative-$Name"
         $caseSourceRoot = Join-Path $caseRoot 'combined-source-receipts'
         New-Item -ItemType Directory -Path $caseSourceRoot -Force | Out-Null
-        New-Stage5SyntheticAcceptanceCorpus `
-            (Join-Path $caseSourceRoot 'Generals') 'Generals' $sourceCommit `
-            $artifactSetHash $artifactTestHashes `
-            $artifactTestPaths['generals-executable'] | Out-Null
-        New-Stage5SyntheticAcceptanceCorpus `
-            (Join-Path $caseSourceRoot 'ZeroHour') 'ZeroHour' $sourceCommit `
-            $artifactSetHash $artifactTestHashes `
-            $artifactTestPaths['zerohour-executable'] | Out-Null
+        foreach ($template in @(
+            [pscustomobject]@{
+                title = 'Generals'
+                sourceRoot = [IO.Path]::GetFullPath(
+                    (Join-Path $syntheticCorpusRoot 'Generals'))
+                corpus = $syntheticGenerals
+            }
+            [pscustomobject]@{
+                title = 'ZeroHour'
+                sourceRoot = [IO.Path]::GetFullPath(
+                    (Join-Path $syntheticCorpusRoot 'ZeroHour'))
+                corpus = $syntheticZeroHour
+            }
+        )) {
+            if (-not (Test-Path -LiteralPath $template.sourceRoot -PathType Container)) {
+                throw "Pristine $($template.title) synthetic corpus template is missing."
+            }
+            $templateItem = Get-Item -LiteralPath $template.sourceRoot -Force
+            if (($templateItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Pristine $($template.title) synthetic corpus template is a reparse point."
+            }
+            if (-not [String]::Equals(
+                    [IO.Path]::GetFullPath([string]$template.corpus.sourceRoot),
+                    $template.sourceRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                @($template.corpus.children).Count -ne 253 -or
+                [int]$template.corpus.rawLogCount -ne 507) {
+                throw "Pristine $($template.title) synthetic corpus template identity or cardinality changed before copying."
+            }
+            if ((Get-Sha256 ([string]$template.corpus.validationReceiptPath)) -cne
+                    [string]$template.corpus.validationReceiptSha256) {
+                throw "Pristine $($template.title) synthetic corpus template receipt changed before copying."
+            }
+            $destinationRoot = Join-Path $caseSourceRoot $template.title
+            if (Test-Path -LiteralPath $destinationRoot) {
+                throw "Combined producer test destination is not fresh: $destinationRoot"
+            }
+            Copy-Item -LiteralPath $template.sourceRoot -Destination $destinationRoot `
+                -Recurse -Force
+            $destinationItem = Get-Item -LiteralPath $destinationRoot -Force
+            if (($destinationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Copied $($template.title) synthetic corpus destination became a reparse point."
+            }
+            $sourceFiles = @(Get-ChildItem -LiteralPath $template.sourceRoot `
+                -Recurse -File -Force | ForEach-Object {
+                $_.FullName.Substring($template.sourceRoot.Length + 1).Replace('/', '\')
+            } | Sort-Object)
+            $destinationFiles = @(Get-ChildItem -LiteralPath $destinationRoot `
+                -Recurse -File -Force | ForEach-Object {
+                $_.FullName.Substring($destinationRoot.Length + 1).Replace('/', '\')
+            } | Sort-Object)
+            if ($sourceFiles.Count -ne $destinationFiles.Count -or
+                @((Compare-Object $sourceFiles $destinationFiles)).Count -ne 0) {
+                throw "Copied $($template.title) synthetic corpus paths differ from the pristine template."
+            }
+            foreach ($relativePath in $sourceFiles) {
+                $sourceFile = Get-Item -LiteralPath (Join-Path $template.sourceRoot $relativePath) -Force
+                $destinationFile = Get-Item -LiteralPath (Join-Path $destinationRoot $relativePath) -Force
+                if ($sourceFile.Length -ne $destinationFile.Length) {
+                    throw "Copied $($template.title) synthetic corpus file length changed: $relativePath"
+                }
+            }
+        }
         return $caseRoot
     }
     $combinedForgedRoot = New-CombinedHostProducerTestCase 'forged'
