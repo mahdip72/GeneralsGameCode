@@ -216,7 +216,7 @@ function New-TestNativeOutput {
     for ($slot = 0; $slot -lt 8; ++$slot) {
         $lines.Add(('STAGE5_PERFORMANCE_FIXTURE_PLAYER_UNITS slot={0} initial_units=1000 peak_units=1500' -f $slot)) | Out-Null
     }
-    $lines.Add(('STAGE5_PERFORMANCE_FIXTURE_COMPLETE category=native-performance-fixture title={0} map="{1}" seed=1729 frame_budget=3600 map_crc=1234ABCD map_size=16384 map_sha256={2} actual_players=8 initial_units=8000 peak_units=12000 initial_unrostered_units=0 peak_unrostered_units=0 observed_first_frame=1 observed_last_frame=1200 observed_frame_samples=1200 winner_team=0 end_frame=1200 final_crc=12345678 replay_epoch={3} ai_epoch_marker="{4}" replay_frame_count=1201 executable_sha256={5} run_nonce={6} replay_sha256={7} retained_replay="{8}"' -f
+    $lines.Add(('STAGE5_PERFORMANCE_FIXTURE_COMPLETE category=native-performance-fixture title={0} map="{1}" seed=1729 frame_budget=3600 map_crc=1234ABCD map_size=16384 map_sha256={2} actual_players=8 initial_units=8000 peak_units=12000 initial_unrostered_units=0 peak_unrostered_units=0 observed_first_frame=1 observed_last_frame=1201 observed_frame_samples=1201 winner_team=0 end_frame=1200 final_crc=12345678 replay_epoch={3} ai_epoch_marker="{4}" replay_frame_count=1201 executable_sha256={5} run_nonce={6} replay_sha256={7} retained_replay="{8}"' -f
         $title, $map, $Fixture.mapSha256, $Fixture.epoch, $Fixture.marker,
         $Fixture.executableSha256, $nativeNonce, $ReplaySha256, $ReplayPath)) | Out-Null
     return $lines.ToArray() -join "`r`n"
@@ -302,7 +302,7 @@ try {
     Assert-True ($completion.nativeRunNonce -ceq
         '00000384-12345678-000006C1' -and
         $completion.replaySha256 -ceq $replaySha256 -and
-        $completion.observedFrameSamples -eq 1200) `
+        $completion.observedFrameSamples -eq 1201) `
         'The native log reader must close process, map, roster, workload, and replay identity.'
 
     $manifestSchema = Join-Path $PSScriptRoot `
@@ -412,6 +412,17 @@ try {
         'The closed fixture-production receipt must satisfy its schema.'
     Assert-Stage5NativePerformanceFixtureProductionReceipt $receipt |
         Out-Null
+    foreach ($edit in @(
+        { param($d) $d.completion.peakUnitCount = 12001 },
+        { param($d) $d.completion.playerUnits[0].peakUnitCount = 12001 },
+        { param($d) $d.completion.observedLastFrame = 1200; $d.completion.observedFrameSamples = 1200 },
+        { param($d) $d.completion.observedFrameSamples = 1200 }
+    )) {
+        $badClosure = Copy-TestValue $receipt
+        & $edit $badClosure
+        Assert-ThrowsLike { Assert-Stage5NativePerformanceFixtureProductionReceipt $badClosure | Out-Null } `
+            'workload|closure|frame' 'Receipt semantic validation accepted inconsistent global peaks or completed-frame coverage.'
+    }
     $receiptPath = Join-Path $bundleRoot 'Stage5NativePerformanceFixture.json'
     Write-TestJson $receiptPath $receipt
     $receiptSha256 = Get-TestSha256 $receiptPath

@@ -678,7 +678,7 @@ function ConvertFrom-Stage5NativeFixtureObservation {
     $initialUnrostered = Get-Stage5NativeFixtureUInt32 `
         $observed.initial_unrostered_units `
         'Native fixture initial unrostered unit count'
-    Assert-Stage5NativeFixtureCondition ($firstFrame -ge 1 -and
+    Assert-Stage5NativeFixtureCondition ($firstFrame -eq 1 -and
         $players -eq 8 -and
         $initialUnrostered -eq 0) `
         'Native fixture first observation is not an exact eight-player workload.'
@@ -686,6 +686,7 @@ function ConvertFrom-Stage5NativeFixtureObservation {
     $playerUnits = New-Object 'Collections.Generic.List[object]'
     [UInt64]$initialSum = 0
     [UInt64]$peakSum = 0
+    [UInt64]$peakMaximum = 0
     for ($index = 0; $index -lt 8; ++$index) {
         $fields = ConvertFrom-Stage5NativeFixtureFields $unitLines[$index] `
             'STAGE5_PERFORMANCE_FIXTURE_PLAYER_UNITS' @('slot',
@@ -701,6 +702,7 @@ function ConvertFrom-Stage5NativeFixtureObservation {
             "Native fixture unit row $index is missing, empty, or regressed."
         $initialSum += $initial
         $peakSum += $peak
+        if ([UInt64]$peak -gt $peakMaximum) { $peakMaximum = [UInt64]$peak }
         $playerUnits.Add([pscustomobject][ordered]@{
             slot = $index
             initialUnitCount = [Int64]$initial
@@ -744,16 +746,22 @@ function ConvertFrom-Stage5NativeFixtureObservation {
     Assert-Stage5NativeFixtureCondition (
         $actualPlayers -eq 8 -and $completedInitial -eq $initialUnits -and
         [UInt64]$completedInitial -eq $initialSum -and
-        [UInt64]$peakUnits -eq $peakSum -and
-        $completedInitialUnrostered -eq 0 -and $peakUnrostered -eq 0 -and
-        $observedFirst -eq $firstFrame -and $observedLast -eq $endFrame -and
+        [UInt64]$peakUnits -ge $initialSum -and
+        [UInt64]$peakUnits -ge $peakMaximum -and [UInt64]$peakUnits -le $peakSum -and
+        $completedInitialUnrostered -eq 0 -and $peakUnrostered -eq 0) `
+        'Native fixture workload or global/per-player peak bounds are invalid.'
+    # Samples use the post-update completed-frame counter. Victory records the
+    # winning tick before GameLogic increments it; Recorder closes at N + 1.
+    # Player maxima may occur on different ticks; their sum is only an upper bound.
+    Assert-Stage5NativeFixtureCondition (
+        $observedFirst -eq $firstFrame -and $observedLast -eq $replayFrames -and
         $observedSamples -eq ([UInt64]$observedLast - [UInt64]$observedFirst + 1) -and
         ($winner -eq 0 -or $winner -eq 1) -and
         $endFrame -gt 0 -and $endFrame -le $frameBudget -and
         $replayFrames -eq ($endFrame + 1) -and
         $replayEpoch -eq $expectedEpoch -and
         $complete.ai_epoch_marker -ceq $expectedMarker) `
-        'Native fixture workload, natural-victory, contiguous-frame, or replay-epoch closure is invalid.'
+        'Native fixture natural-victory, completed-frame, or replay-epoch closure is invalid.'
 
     Assert-Stage5NativeFixtureSha256 ([string]$complete.replay_sha256) `
         'Native fixture retained replay SHA-256'
@@ -1298,6 +1306,14 @@ function Assert-Stage5NativePerformanceFixtureProductionReceipt {
     $expectedMarker = if ($Receipt.title -ceq 'Generals') {
         ' [GeneralsAIPlanningEpoch=1]'
     } else { ' [SkirmishAIEpoch=3]' }
+    [UInt64]$initialSum = 0; [UInt64]$peakSum = 0; [UInt64]$peakMaximum = 0
+    foreach ($row in $completion.playerUnits) {
+        Assert-Stage5NativeFixtureCondition ([UInt64]$row.peakUnitCount -ge [UInt64]$row.initialUnitCount) `
+            'Fixture receipt player peak is below its initial population.'
+        $initialSum += [UInt64]$row.initialUnitCount
+        $peakSum += [UInt64]$row.peakUnitCount
+        if ([UInt64]$row.peakUnitCount -gt $peakMaximum) { $peakMaximum = [UInt64]$row.peakUnitCount }
+    }
     Assert-Stage5NativeFixtureCondition (
         [UInt64]$noncePid -eq [UInt64]$Receipt.process.id -and
         $nonceSeed -eq [UInt32]$completion.seed -and
@@ -1305,6 +1321,12 @@ function Assert-Stage5NativePerformanceFixtureProductionReceipt {
         $completion.aiEpochMarker -ceq $expectedMarker -and
         [Int64]$completion.initialUnitCount -ge 8000 -and
         [Int64]$completion.peakUnitCount -ge 8000 -and
+        [UInt64]$completion.initialUnitCount -eq $initialSum -and
+        [UInt64]$completion.peakUnitCount -ge $initialSum -and
+        [UInt64]$completion.peakUnitCount -ge $peakMaximum -and
+        [UInt64]$completion.peakUnitCount -le $peakSum -and
+        [Int64]$completion.observedFirstFrame -eq 1 -and
+        [Int64]$completion.observedLastFrame -eq [Int64]$completion.replayFrameCount -and
         [Int64]$completion.observedFrameSamples -eq
             ([Int64]$completion.observedLastFrame -
                 [Int64]$completion.observedFirstFrame + 1) -and

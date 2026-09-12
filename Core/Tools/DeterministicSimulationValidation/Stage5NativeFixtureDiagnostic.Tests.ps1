@@ -41,6 +41,37 @@ $observation = ConvertFrom-Stage5NativeFixtureObservation -Text $output `
     -MapBinding $inputBinding -ExpectedProcessId 4660 -ProfileRoot $profile
 Assert-True ($observation.initialUnitCount -eq 1000 -and $observation.peakUnitCount -eq 1000 -and
     $observation.diagnosticOnly) 'Actual1k observation must parse without dense qualification.'
+$staggered = $output.Replace('peak_units=1000', 'peak_units=1100').Replace('peak_units=125', 'peak_units=150')
+$staggeredObservation = ConvertFrom-Stage5NativeFixtureObservation -Text $staggered `
+    -MapBinding $inputBinding -ExpectedProcessId 4660 -ProfileRoot $profile
+Assert-True ($staggeredObservation.peakUnitCount -eq 1100 -and
+    ($staggeredObservation.playerUnits | Measure-Object peakUnitCount -Sum).Sum -eq 1200) `
+    'Global peak must retain its independently observed value when player peaks occur on different frames.'
+$invalidClosures = @(
+    $staggered.Replace('peak_units=1100', 'peak_units=999'),
+    $staggered.Replace('peak_units=1100', 'peak_units=1201'),
+    $staggered.Replace('slot=0 initial_units=125 peak_units=150', 'slot=0 initial_units=125 peak_units=1101'),
+    $staggered.Replace('observed_last_frame=1201 observed_frame_samples=1201', 'observed_last_frame=1200 observed_frame_samples=1200'),
+    $staggered.Replace('observed_last_frame=1201 observed_frame_samples=1201', 'observed_last_frame=1202 observed_frame_samples=1202'),
+    $staggered.Replace('observed_frame_samples=1201', 'observed_frame_samples=1200'),
+    $staggered.Replace('first_frame=1', 'first_frame=2').Replace('observed_frame_samples=1201', 'observed_frame_samples=1200'),
+    $staggered.Replace('replay_frame_count=1201', 'replay_frame_count=1202')
+)
+foreach ($invalidClosure in $invalidClosures) {
+    Assert-ThrowsLike { ConvertFrom-Stage5NativeFixtureObservation -Text $invalidClosure `
+        -MapBinding $inputBinding -ExpectedProcessId 4660 -ProfileRoot $profile } 'workload|frame|closure|replay' `
+        'Invalid global-peak bounds or incomplete/late completed-frame coverage was accepted.'
+}
+$maximumArguments = @{} + $argsForMap
+$maximumArguments.FrameBudget = 108000
+$maximumBinding = Read-Stage5NativeFixtureDiagnosticInput @maximumArguments
+$maximumOutput = $staggered.Replace('frame_budget=3600','frame_budget=108000').Replace(
+    'end_frame=1200','end_frame=108000').Replace('observed_last_frame=1201','observed_last_frame=108001').Replace(
+    'observed_frame_samples=1201','observed_frame_samples=108001').Replace('replay_frame_count=1201','replay_frame_count=108001')
+$maximumObservation = ConvertFrom-Stage5NativeFixtureObservation -Text $maximumOutput `
+    -MapBinding $maximumBinding -ExpectedProcessId 4660 -ProfileRoot $profile
+Assert-True ($maximumObservation.endFrame -eq 108000 -and $maximumObservation.observedFrameSamples -eq 108001) `
+    'Victory at the existing final budgeted tick must include its post-update sample.'
 # The unchanged reviewed input still rejects these same1k counts.
 $reviewed = Read-Stage5ReviewedNativeKernelFixture -Path $fixture.manifestPath `
     -ExpectedSha256 (Get-TestSha256 $fixture.manifestPath) -ExpectedTitle 'ZeroHour' `
