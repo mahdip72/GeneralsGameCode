@@ -18,6 +18,9 @@ param(
     [string]$ExpectedExecutableSha256 = '',
     [string]$ProfileLeafName = '',
     [string]$GeneralsInstallRoot = '',
+    [string]$AcceptanceArtifactSetPath = '',
+    [string]$GeneralsQualificationDataManifestPath = '',
+    [string]$GeneralsQualificationDataManifestSha256 = '',
     [switch]$AllowNonStandardCorpus,
     [switch]$PlanOnly,
     [switch]$DisableFrameTiming,
@@ -49,6 +52,7 @@ Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') -
 Import-Module (Join-Path $PSScriptRoot 'Stage5ReplayCorpusExporter.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'Stage5ValidationProfileCapability.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'Stage5RegistryRecovery.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'Stage5BaseGeneralsBinding.psm1') -Force
 
 function Get-Sha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -1698,25 +1702,14 @@ function New-ValidationRecoveryAuthorizationIdentities {
 
 function Test-ValidationNoActiveTitleProcess {
     param([string]$Executable)
-    $expected = [IO.Path]::GetFullPath($Executable)
-    $name = [IO.Path]::GetFileNameWithoutExtension($expected)
-    foreach ($process in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
-        try {
-            if ([String]::Equals([IO.Path]::GetFullPath($process.Path),
-                    $expected, [StringComparison]::OrdinalIgnoreCase)) {
-                return $false
-            }
-        }
-        catch {
-            return $false
-        }
-    }
-    return $true
+    return Test-Stage5RegistryScopeInactive -ExecutablePaths @($Executable)
 }
 
 function Set-PreservedRegistryValue {
     param([Microsoft.Win32.RegistryView]$View, [string]$SubKey, [string]$Name,
-        [string]$Value, [Collections.Generic.List[object]]$Snapshots)
+        [string]$Value, [Collections.Generic.List[object]]$Snapshots,
+        [object]$PlannedSnapshot = $null, [object[]]$WrittenSnapshots = @())
+    $ownedWrite = @{ performed = $false }
     Assert-Condition ($null -ne $Snapshots) `
         'Registry snapshot destination is required before setup can mutate state.'
     $subKeys = New-Object 'Collections.Generic.List[string]'
@@ -1766,6 +1759,12 @@ function Set-PreservedRegistryValue {
                         [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
                     $oldKind = $key.GetValueKind($Name)
                 }
+                if ($null -ne $PlannedSnapshot) {
+                    Assert-Stage5RegistryRecoveryWriteState -Snapshot $PlannedSnapshot `
+                        -CurrentKeyExists (-not ($createdSubKeys -ccontains $SubKey)) `
+                        -CurrentValue ([pscustomobject]@{ exists=$hadValue; value=$oldValue; kind=$oldKind }) `
+                        -WrittenSnapshots $WrittenSnapshots
+                }
                 return [pscustomobject]@{
                     view = $View; subKey = $SubKey; name = $Name
                     hadKey = -not ($createdSubKeys -ccontains $SubKey)
@@ -1780,8 +1779,19 @@ function Set-PreservedRegistryValue {
             Assert-Condition ($null -ne $key) `
                 "Failed to reopen registry key '$($snapshot.subKey)' for validation."
             try {
+                if ($null -ne $PlannedSnapshot) {
+                    $exists = @($key.GetValueNames()) -contains $snapshot.name
+                    $currentValue = if ($exists) { $key.GetValue($snapshot.name, $null,
+                        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { $null }
+                    $currentKind = if ($exists) { $key.GetValueKind($snapshot.name) } else { $null }
+                    Assert-Stage5RegistryRecoveryWriteState -Snapshot $PlannedSnapshot `
+                        -CurrentKeyExists ([bool]$snapshot.hadKey) `
+                        -CurrentValue ([pscustomobject]@{ exists=$exists; value=$currentValue; kind=$currentKind }) `
+                        -WrittenSnapshots $WrittenSnapshots
+                }
                 $key.SetValue($snapshot.name, $Value,
                     [Microsoft.Win32.RegistryValueKind]::String)
+                $ownedWrite.performed = $true
             }
             finally { $key.Dispose() }
         } -RegisterSnapshotAction {
@@ -1789,6 +1799,7 @@ function Set-PreservedRegistryValue {
             $Snapshots.Add($snapshot) | Out-Null
         } -RestoreValueAction {
             param($snapshot, $registryBase)
+            if ($null -ne $PlannedSnapshot -and -not $ownedWrite.performed) { return }
             $key = $registryBase.OpenSubKey($snapshot.subKey, $true)
             if ($null -eq $key) {
                 Assert-Condition (-not $snapshot.hadKey) `
@@ -1796,6 +1807,12 @@ function Set-PreservedRegistryValue {
                 return
             }
             try {
+                if ($null -ne $PlannedSnapshot) {
+                    Assert-Condition (@($key.GetValueNames()) -contains $snapshot.name -and
+                        $key.GetValueKind($snapshot.name) -eq [Microsoft.Win32.RegistryValueKind]::String -and
+                        [string]$key.GetValue($snapshot.name) -ceq $Value) `
+                        'Registry setup rollback no longer owns the written value.'
+                }
                 if ($snapshot.hadValue) {
                     $key.SetValue($snapshot.name, $snapshot.oldValue, $snapshot.oldKind)
                 }
@@ -3850,9 +3867,38 @@ $corpusExport = $null
 $localCapacityReceipt = $null
 $resultsPath = Join-Path $outputFull 'validation-results.json'
 $qualificationRuntimeGuard = $null
+$baseGeneralsRuntimeGuard = $null
+$baseGeneralsBinding = $null
 $fatalPattern = '(?i)(CRC Mismatch|game thread ownership violation|assertion failed|fatal error|missing map|replay read error|SKIRMISH_AI_TEST_FAIL|SIMULATION_JOB_SYSTEM_FALLBACK|SIMULATION_SHADOW_(?:MISMATCH|FAIL)|SIMULATION_COLLISION_MISMATCH)'
 $primaryError = $null
 try {
+    if ($Title -ceq 'ZeroHour') {
+        $baseArguments = @{ RuntimeRoot = $runtimeFull; GeneralsInstallRoot = $GeneralsInstallRoot }
+        if ($acceptanceBindingsRequested) {
+            $baseArguments.AcceptanceSourceCommit = $AcceptanceSourceCommit
+            $baseArguments.AcceptanceArtifactSetPath = $AcceptanceArtifactSetPath
+            $baseArguments.AcceptanceArtifactSetSha256 = $AcceptanceArtifactSetSha256
+            $baseArguments.AcceptanceRuntimeDependencyManifestSha256 = $AcceptanceRuntimeDependencyManifestSha256
+            $baseArguments.AcceptanceRuntimeClosureSha256 = $AcceptanceRuntimeClosureSha256
+            $baseArguments.GeneralsQualificationDataManifestPath = $GeneralsQualificationDataManifestPath
+            $baseArguments.GeneralsQualificationDataManifestSha256 = $GeneralsQualificationDataManifestSha256
+        }
+        $baseGeneralsBinding = Get-Stage5BaseGeneralsBinding @baseArguments
+        if ($acceptanceBindingsRequested) {
+            $baseEvidenceRoot = Join-Path $outputFull 'BaseGenerals'
+            New-Item -ItemType Directory -Path $baseEvidenceRoot | Out-Null
+            $baseManifestCopy = Join-Path $baseEvidenceRoot 'QualificationData.json'
+            Copy-Item -LiteralPath $GeneralsQualificationDataManifestPath -Destination $baseManifestCopy
+            Assert-FileHash $baseManifestCopy $GeneralsQualificationDataManifestSha256 `
+                'Retained base Generals qualification manifest' | Out-Null
+            $baseGeneralsBinding.retainedQualificationData = [ordered]@{
+                path='BaseGenerals/QualificationData.json'; sha256=$GeneralsQualificationDataManifestSha256.ToUpperInvariant()
+            }
+            $baseGeneralsRuntimeGuard = Open-Stage5SimulationQualificationRuntimeClosure `
+                -RuntimeRoot $baseGeneralsBinding.runtimeRoot -Evidence $baseGeneralsBinding
+        }
+        $planDocument | Add-Member -NotePropertyName baseGeneralsBinding -NotePropertyValue $baseGeneralsBinding
+    }
     if ($acceptanceBindingsRequested) {
         $qualificationRuntimeGuard =
             Open-Stage5SimulationQualificationRuntimeClosure `
@@ -3901,7 +3947,7 @@ foreach ($fixture in $manifestData.fixtures) {
 if ([string]::IsNullOrWhiteSpace($GeneralsInstallRoot)) {
     $GeneralsInstallRoot = $runtimeFull
 }
-$generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot)
+$generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot).TrimEnd('\', '/')
     Assert-Condition (Test-Path -LiteralPath $generalsInstallFull -PathType Container) `
         "GeneralsInstallRoot was not found: $generalsInstallFull"
 
@@ -3920,6 +3966,7 @@ $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot)
         runnerScriptSha256 = Get-Sha256 $PSCommandPath
         executableSha256 = $manifestData.executableSha256
     }
+    if ($Title -ceq 'ZeroHour') { $registryRecoveryIdentity.registryScope = 'ZeroHourWithGeneralsBase' }
     if ($acceptanceBindingsRequested) {
         $registryRecoveryIdentity.sourceCommit = $AcceptanceSourceCommit
         $registryRecoveryIdentity.artifactSetSha256 = $AcceptanceArtifactSetSha256.ToUpperInvariant()
@@ -3930,7 +3977,41 @@ $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot)
     }
     $registryRecoveryInitialized = $false
 
-    foreach ($view in @([Microsoft.Win32.RegistryView]::Registry32, [Microsoft.Win32.RegistryView]::Registry64)) {
+    if ($Title -ceq 'ZeroHour') {
+        # Journal the complete dependency scope before the first side effect.
+        # This also snapshots aliased registry views before either is written.
+        foreach ($bindingTitle in @('Generals', 'ZeroHour')) {
+            $bindingRoot = if ($bindingTitle -ceq 'Generals') { $generalsInstallFull } else { $runtimeFull }
+            foreach ($viewName in @('Registry32', 'Registry64')) {
+                $planned = New-ValidationInstallPathRecoverySnapshot $bindingTitle $viewName ($bindingRoot + '\')
+                $registryRecoverySnapshots.Add($planned.snapshot) | Out-Null
+                foreach ($created in @($planned.createdSubKeys)) {
+                    $registryRecoveryPlannedMissing.Add("$viewName|$created") | Out-Null
+                }
+            }
+        }
+        $registryRecoveryIdentity.snapshotPlanSha256 = Get-Stage5RegistryRecoverySnapshotPlanSha256 `
+            -Title ZeroHour -RegistryScope ZeroHourWithGeneralsBase `
+            -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
+            -Snapshots @($registryRecoverySnapshots.ToArray())
+        New-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath -Identity $registryRecoveryIdentity `
+            -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
+            -Snapshots @($registryRecoverySnapshots.ToArray()) -ProcessIdentities @() | Out-Null
+        $registryRecoveryInitialized = $true
+        $writtenRegistryPlan = New-Object 'Collections.Generic.List[object]'
+        foreach ($snapshot in $registryRecoverySnapshots) {
+            Set-PreservedRegistryValue ([Microsoft.Win32.RegistryView]::$($snapshot.view)) `
+                $snapshot.subKey InstallPath $snapshot.expectedValue.value $registrySnapshots `
+                -PlannedSnapshot $snapshot -WrittenSnapshots @($writtenRegistryPlan.ToArray())
+            $writtenRegistryPlan.Add($snapshot) | Out-Null
+        }
+        Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath -ExpectedIdentity $registryRecoveryIdentity `
+            -State active -Snapshots @($registryRecoverySnapshots.ToArray()) -ChildExitProof $true `
+            -NoActiveTitleProcesses (Test-ValidationNoActiveTitleProcess $executableFull) -ProcessIdentities @() | Out-Null
+    }
+    foreach ($view in $(if ($Title -ceq 'Generals') {
+        @([Microsoft.Win32.RegistryView]::Registry32, [Microsoft.Win32.RegistryView]::Registry64)
+    } else { @() })) {
         # The title runtimes consume RTS_STAGE5_VALIDATION_PROFILE_ROOT as a
         # process-local complete profile path. Keep Documents known-folder
         # values untouched; only the title-specific installed-runtime values
@@ -3970,42 +4051,6 @@ $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot)
             Set-PreservedRegistryValue $view `
                 'Software\Electronic Arts\EA Games\Generals' 'InstallPath' `
                 ($generalsInstallFull + '\') $registrySnapshots
-        }
-        else {
-            $viewName = [string]$view
-            $planned = New-ValidationInstallPathRecoverySnapshot $Title $viewName `
-                ($runtimeFull + '\')
-            $registryRecoverySnapshots.Add($planned.snapshot) | Out-Null
-            foreach ($created in @($planned.createdSubKeys)) {
-                $registryRecoveryPlannedMissing.Add("$viewName|$created") | Out-Null
-            }
-            if (-not $registryRecoveryInitialized) {
-                $registryRecoveryIdentity.snapshotPlanSha256 =
-                    Get-Stage5RegistryRecoverySnapshotPlanSha256 `
-                        -Title $Title `
-                        -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
-                        -Snapshots @($registryRecoverySnapshots.ToArray())
-                New-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
-                    -Identity $registryRecoveryIdentity `
-                    -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
-                    -Snapshots @($registryRecoverySnapshots.ToArray()) `
-                    -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
-                $registryRecoveryInitialized = $true
-            }
-            else {
-                Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
-                    -ExpectedIdentity $registryRecoveryIdentity -State 'active' `
-                    -PlannedMissingSubKeys @($registryRecoveryPlannedMissing.ToArray()) `
-                    -Snapshots @($registryRecoverySnapshots.ToArray()) `
-                    -ChildExitProof (Test-ValidationRecoveryIdentitiesExited `
-                        $registryRecoveryProcessIdentities) `
-                    -NoActiveTitleProcesses (Test-ValidationNoActiveTitleProcess `
-                        $executableFull) `
-                    -ProcessIdentities @($registryRecoveryProcessIdentities.ToArray()) | Out-Null
-            }
-            Set-PreservedRegistryValue $view `
-                'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour' `
-                'InstallPath' ($runtimeFull + '\') $registrySnapshots
         }
         Update-Stage5RegistryRecoveryJournal -Path $registryRecoveryPath `
             -ExpectedIdentity $registryRecoveryIdentity -State 'active' `
@@ -4440,6 +4485,15 @@ catch {
 }
 finally {
     $cleanupErrors = New-Object 'Collections.Generic.List[string]'
+    if ($null -ne $baseGeneralsRuntimeGuard) {
+        try {
+            Confirm-Stage5SimulationQualificationRuntimeClosure `
+                -RuntimeRoot $baseGeneralsBinding.runtimeRoot -Evidence $baseGeneralsBinding `
+                -Guard $baseGeneralsRuntimeGuard
+        }
+        catch { $cleanupErrors.Add("base Generals qualification-data final validation: $($_.Exception.Message)") | Out-Null }
+        finally { Close-Stage5SimulationQualificationRuntimeClosure -Guard $baseGeneralsRuntimeGuard }
+    }
     if ($null -ne $qualificationRuntimeGuard) {
         try {
             Confirm-Stage5SimulationQualificationRuntimeClosure `

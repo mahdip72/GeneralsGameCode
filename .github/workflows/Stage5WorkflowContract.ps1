@@ -1202,15 +1202,20 @@ function Assert-Stage5CheckReplaysContract {
     Assert-Stage5ExactJobStepSequence $job @(
         'Checkout Code',
         'Enforce native Stage 5 replay contract',
+        'Resolve paired artifact runtime directories',
         'Download Game Artifact',
+        'Download paired Generals Artifact',
+        'Download paired Zero Hour Artifact',
         'Provision immutable Stage 5 simulation qualification data',
+        'Provision paired Generals qualification data',
+        'Provision paired Zero Hour qualification data',
         'Audit Replay Worker Mode Propagation',
         'Run Stage 5 Installed-Runtime Replay Matrix',
         'Normalize Stage 5 Evidence Paths for Upload',
         'Upload Debug Log',
         'Upload Stage 5 Validation Evidence',
         'Clean Stage 5 validation volume') @(
-        'uses', 'run', 'uses', 'run', 'run', 'run', 'run', 'uses', 'uses', 'run') `
+        'uses', 'run', 'run', 'uses', 'uses', 'uses', 'run', 'run', 'run', 'run', 'run', 'run', 'uses', 'uses', 'run') `
         "$Context exact closed step sequence"
 
     $checkoutStep = Get-Stage5IndentedBlock $job '- name: Checkout Code' 6
@@ -1231,13 +1236,32 @@ function Assert-Stage5CheckReplaysContract {
         '612400DEBD5C92A55EB1FB2F1CA66D54D57D41EA447FC4CFD501B04A356122EB' 1 `
         "$Context sealed native-contract program"
 
+    $layoutStep = Get-Stage5IndentedBlock $job '- name: Resolve paired artifact runtime directories' 6
+    Assert-Stage5ExactPowerShellStepMetadata $layoutStep ([ordered]@{
+        STAGE5_GAME = '${{ inputs.game }}'
+        STAGE5_ACCEPTANCE_MANIFEST = '${{ inputs.stage5_acceptance_manifest }}'
+    }) '' "$Context paired runtime layout step"
+    Assert-Stage5ClosedPowerShellRunBlock $layoutStep `
+        'AC1B95BAAF174C522FF799C329DA62AAE0BFB87CACAF171F140BF708F003A109' 7 `
+        "$Context sealed paired runtime layout program"
+    $pairedDownloadStep = Get-Stage5IndentedBlock $job '- name: Download paired Generals Artifact' 6
+    Assert-Stage5ExactConditionalActionStep $pairedDownloadStep `
+        'actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3' `
+        ([ordered]@{ name = 'Generals-x64-generals-vcpkg-product+e'; path = '${{ env.STAGE5_GENERALS_RUNTIME_ROOT }}' }) `
+        '${{ inputs.game == ''GeneralsMD'' }}' "$Context same-run paired Generals download"
+
     $downloadStep = Get-Stage5IndentedBlock $job `
         '- name: Download Game Artifact' 6
+    $pairedZeroHourDownload = Get-Stage5IndentedBlock $job '- name: Download paired Zero Hour Artifact' 6
+    Assert-Stage5ExactConditionalActionStep $pairedZeroHourDownload `
+        'actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3' `
+        ([ordered]@{ name = 'GeneralsMD-x64-zerohour-vcpkg-product+e'; path = '${{ env.STAGE5_ZEROHOUR_RUNTIME_ROOT }}' }) `
+        '${{ inputs.game == ''Generals'' }}' "$Context same-run paired Zero Hour download"
     Assert-Stage5ExactConditionalActionStep $downloadStep `
         'actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3' `
         ([ordered]@{
             name = '${{ inputs.game }}-${{ inputs.preset }}'
-            path = 'build'
+            path = '${{ env.STAGE5_RUNTIME_ROOT }}'
         }) '' "$Context exact current-run product download"
 
     $provisionStep = Get-Stage5IndentedBlock $job `
@@ -1262,8 +1286,50 @@ function Assert-Stage5CheckReplaysContract {
         '(?s)__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__' `
         "$Context validation-volume provision helper"
     Assert-Stage5ClosedPowerShellRunBlock $provisionStep `
-        'BAABDB06C2FDD5862165D27CC0D7AF42B3024D5337302157C791DECBA4BCA810' 9 `
+        'BE1CE3D25F986DA77E47036C897CD00BF0D6867EDC457EDCC1DB4942B3FA7C08' 9 `
         "$Context sealed qualification-data provision program"
+
+    $pairedProvision = Get-Stage5IndentedBlock $job '- name: Provision paired Generals qualification data' 6
+    Assert-Stage5ExactPowerShellStepMetadata $pairedProvision ([ordered]@{
+        AWS_ACCESS_KEY_ID = '${{ secrets.R2_ACCESS_KEY_ID }}'
+        AWS_SECRET_ACCESS_KEY = '${{ secrets.R2_SECRET_ACCESS_KEY }}'
+        AWS_ENDPOINT_URL = '${{ secrets.R2_ENDPOINT_URL }}'
+    }) '${{ inputs.game == ''GeneralsMD'' }}' "$Context paired data provision step"
+    Assert-Stage5WorkflowExecutablePowerShellCall $pairedProvision `
+        '$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Install-Stage5SimulationQualificationData.ps1' `
+        "$Context paired data producer call" ([ordered]@{
+            RuntimeRoot = '$env:STAGE5_GENERALS_RUNTIME_ROOT'
+            TaskRoot = '$taskRoot'
+            ProvisioningRole = 'GeneralsBase'
+            SourceCommit = '$env:GITHUB_SHA.ToLowerInvariant()'
+            Title = "'Generals'"
+            AwsEndpointUrl = '$env:AWS_ENDPOINT_URL'
+            OutputEnvironmentFile = '$env:GITHUB_ENV'
+        })
+    Assert-Stage5ClosedPowerShellRunBlock $pairedProvision `
+        '2D9EE962D9FF53FE544482DEDED88F98505FE556517A10DE535DBFEC70F15506' 4 `
+        "$Context sealed paired data provision program"
+
+    $pairedZeroHourProvision = Get-Stage5IndentedBlock $job '- name: Provision paired Zero Hour qualification data' 6
+    Assert-Stage5ExactPowerShellStepMetadata $pairedZeroHourProvision ([ordered]@{
+        AWS_ACCESS_KEY_ID = '${{ secrets.R2_ACCESS_KEY_ID }}'
+        AWS_SECRET_ACCESS_KEY = '${{ secrets.R2_SECRET_ACCESS_KEY }}'
+        AWS_ENDPOINT_URL = '${{ secrets.R2_ENDPOINT_URL }}'
+    }) '${{ inputs.game == ''Generals'' }}' "$Context paired Zero Hour data step"
+    Assert-Stage5WorkflowExecutablePowerShellCall $pairedZeroHourProvision `
+        '$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Install-Stage5SimulationQualificationData.ps1' `
+        "$Context paired Zero Hour data producer" ([ordered]@{
+            RuntimeRoot = '$env:STAGE5_ZEROHOUR_RUNTIME_ROOT'
+            TaskRoot = "'H:\Stage5SimulationValidationTask'"
+            ProvisioningRole = 'ZeroHourBase'
+            SourceCommit = '$env:GITHUB_SHA.ToLowerInvariant()'
+            Title = "'ZeroHour'"
+            AwsEndpointUrl = '$env:AWS_ENDPOINT_URL'
+            OutputEnvironmentFile = '$env:GITHUB_ENV'
+        })
+    Assert-Stage5ClosedPowerShellRunBlock $pairedZeroHourProvision `
+        '499203CFD3A08C33C88515E9435383AFDD98192ACE53F3BF07FD26A55066CA85' 3 `
+        "$Context sealed paired Zero Hour data program"
 
     $auditStep = Get-Stage5IndentedBlock $job `
         '- name: Audit Replay Worker Mode Propagation' 6
@@ -1322,7 +1388,10 @@ function Assert-Stage5CheckReplaysContract {
             StressRepeats = '$env:STAGE5_STRESS_REPEATS'
             ExpectedExecutableSha256 = '$candidateHash'
             Title = '$expectedTitle'
-            GeneralsInstallRoot = '$runtimeRoot'
+            GeneralsInstallRoot = '$generalsRuntimeRoot'
+            AcceptanceArtifactSetPath = '$artifactSetPath'
+            GeneralsQualificationDataManifestPath = '$env:STAGE5_GENERALS_QUALIFICATION_DATA_MANIFEST_PATH'
+            GeneralsQualificationDataManifestSha256 = '$env:STAGE5_GENERALS_QUALIFICATION_DATA_MANIFEST_SHA256'
             MinimumFreeBytes = '2147483648'
             EnforcePerformance = $null
             Stage3PerformanceBaselinePath = '$baselinePath'
@@ -1343,7 +1412,7 @@ function Assert-Stage5CheckReplaysContract {
     Assert-Stage5CheckReplaysCardinalityAndArrayContracts $matrixStep `
         "$Context replay-matrix JSON array cardinality"
     Assert-Stage5ClosedPowerShellRunBlock $matrixStep `
-        'FEEB1F1E1A8CB9B4DA247817C65B0CE843145168A661A34B86240ED315B8FB9E' 106 `
+        '682211EE77ACC6497072FBA9EF067446A1F13591A61356F0FA3F2A9AC816D4FD' 107 `
         "$Context sealed installed-runtime validation program"
 
     $normalizerStep = Get-Stage5IndentedBlock $job `
@@ -1367,7 +1436,7 @@ function Assert-Stage5CheckReplaysContract {
         'actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f' `
         ([ordered]@{
             name = 'Replay-Debug-Log-${{ inputs.preset }}'
-            path = 'build/DebugLogFile*.txt'
+            path = '${{ env.STAGE5_RUNTIME_ROOT }}/DebugLogFile*.txt'
             'retention-days' = '30'
             'if-no-files-found' = 'ignore'
         }) 'always()' "$Context exact debug-log upload"
@@ -1433,8 +1502,8 @@ function Invoke-Stage5CheckReplaysContractSelfTest {
         'action-input-order' = $fixture.Replace(
             ('          name: ${{ inputs.game }}-${{ inputs.preset }}' +
                 "`n" +
-                '          path: build'),
-            ('          path: build' + "`n" +
+                '          path: ${{ env.STAGE5_RUNTIME_ROOT }}'),
+            ('          path: ${{ env.STAGE5_RUNTIME_ROOT }}' + "`n" +
                 '          name: ${{ inputs.game }}-${{ inputs.preset }}'))
         tamper = $fixture.Replace(
             "-Role 'replay-fixture-manifest'", "-Role 'replay-results'")
@@ -2011,10 +2080,11 @@ function Assert-Stage5ExternalPerformanceQualificationProducer {
         'Download exact Generals x64 product',
         'Download exact Zero Hour x64 product',
         'Provision verified Zero Hour performance data',
+        'Provision verified Generals base data',
         'Run external Stage 5 performance qualification',
         'Upload external Stage 5 performance qualification',
         'Clean dedicated external qualification roots') @(
-        'uses', 'run', 'uses', 'uses', 'uses', 'run', 'run', 'uses', 'run') `
+        'uses', 'run', 'uses', 'uses', 'uses', 'run', 'run', 'run', 'uses', 'run') `
         "$Context exact closed step sequence"
     Assert-Stage5NoJobRunDefaults $job "$Context job metadata"
     Assert-Stage5ExactJobEnvironment $job ([ordered]@{
@@ -2150,6 +2220,26 @@ function Assert-Stage5ExternalPerformanceQualificationProducer {
         '4B33624ED5AC55568853DCCA478C2C0A3C07562536921BE9D2C60D6199AAAC9A' 16 `
         "$Context exact closed performance-data program"
 
+    $baseDataStep = Get-Stage5IndentedBlock $job '- name: Provision verified Generals base data' 6
+    Assert-Stage5ExactPowerShellStepMetadata $baseDataStep ([ordered]@{
+        AWS_ACCESS_KEY_ID = '${{ secrets.R2_ACCESS_KEY_ID }}'
+        AWS_SECRET_ACCESS_KEY = '${{ secrets.R2_SECRET_ACCESS_KEY }}'
+        AWS_ENDPOINT_URL = '${{ secrets.R2_ENDPOINT_URL }}'
+    }) '' "$Context exact base Generals data step"
+    Assert-Stage5WorkflowExecutablePowerShellCall $baseDataStep `
+        '$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Install-Stage5SimulationQualificationData.ps1' `
+        "$Context exact base Generals data producer" ([ordered]@{
+            RuntimeRoot = '(Join-Path $env:STAGE5_QUALIFICATION_ROOT ''GeneralsRuntime'')'
+            TaskRoot = "'H:\Stage5SimulationValidationTask'"
+            SourceCommit = '$env:GITHUB_SHA.ToLowerInvariant()'
+            Title = "'Generals'"
+            AwsEndpointUrl = '$env:AWS_ENDPOINT_URL'
+            OutputEnvironmentFile = '$env:GITHUB_ENV'
+        })
+    Assert-Stage5ClosedPowerShellRunBlock $baseDataStep `
+        '69A63389C595DF5A6115D937413DD3122FA7564C594C6292547E149100E9E04C' 4 `
+        "$Context closed base Generals data program"
+
     $runStep = Get-Stage5IndentedBlock $job `
         '- name: Run external Stage 5 performance qualification' 6
     Assert-Stage5ExactPowerShellStepMetadata -Step $runStep `
@@ -2181,6 +2271,8 @@ function Assert-Stage5ExternalPerformanceQualificationProducer {
             ExpectedSourceCommit = '$env:GITHUB_SHA.ToLowerInvariant()'
             ExpectedArtifactSetSha256 = '$artifactSetSha256'
             ArtifactSetManifestPath = '$artifactSetPath'
+            GeneralsQualificationDataManifestPath = '$env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_PATH'
+            GeneralsQualificationDataManifestSha256 = '$env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_SHA256'
             AllowHeadlessDirectExecution = $null
             FixtureManifestPath = '$fixtureManifest'
             ExpectedFixtureManifestSha256 = '$env:STAGE5_EXPECTED_PERFORMANCE_FIXTURE_MANIFEST_SHA256'
@@ -2240,7 +2332,7 @@ function Assert-Stage5ExternalPerformanceQualificationProducer {
             "$Context reviewed serial-oracle profile binding"
     }
     Assert-Stage5ClosedPowerShellRunBlock $runStep `
-        '8906BF1DAF9EB9FD4F2E9C4BD1AEBA84E83B7576147E6B0D6B3837F05E8D3BE5' 26 `
+        'AECFA42240538FA82ECAE4C6349564B21F8DDE6211FFF11518ACFAFBC8C82EC9' 26 `
         "$Context exact closed external performance program"
 
     $uploadStep = Get-Stage5IndentedBlock $job `
@@ -2267,7 +2359,7 @@ function Assert-Stage5ExternalPerformanceQualificationProducer {
     $cleanupStep = Get-Stage5IndentedBlock $job `
         '- name: Clean dedicated external qualification roots' 6
     Assert-Stage5ExactPowerShellStepMetadata -Step $cleanupStep `
-        -ExpectedEnvironment $null -ExpectedIf '${{ always() }}' -Context `
+        -ExpectedEnvironment ([ordered]@{ STAGE5_BASE_CONSUMERS_STATUS = '${{ job.status }}' }) -ExpectedIf '${{ always() }}' -Context `
         "$Context exact guarded-cleanup step metadata"
     Assert-Stage5WorkflowLiteral $cleanupStep 'if: ${{ always() }}' `
         "$Context unconditional owned-root cleanup"
@@ -2287,7 +2379,7 @@ function Assert-Stage5ExternalPerformanceQualificationProducer {
             "$Context guarded owned-root cleanup"
     }
     Assert-Stage5ClosedPowerShellRunBlock $cleanupStep `
-        '4CBE3790DA6AF09BBBF2F9D36C52093203C5E38077C78888F0CE94907EAB2810' 12 `
+        '3BF5589EB86AA67F01D34C41810B83C17E01B2B7773BBFD4820144E337701C0C' 13 `
         "$Context exact closed owned-root cleanup program"
 
     $provisionIndex = $job.IndexOf(
@@ -3983,7 +4075,7 @@ foreach ($cohortBinding in @(
         'Zero Hour Stage 5 exact fresh cohort binding'
 }
 $generalsStage5Job = Get-Stage5IndentedBlock $ci 'stage5-replaycheck-generals-x64:' 2
-Assert-Stage5WorkflowLiteral $generalsStage5Job 'needs: [detect-changes, build-generals-x64, stage5-execution-cohort]' `
+Assert-Stage5WorkflowLiteral $generalsStage5Job 'needs: [detect-changes, build-generals-x64, build-generalsmd-x64, stage5-execution-cohort]' `
     'Generals Stage 5 build dependency'
 $generalsCondition = Get-Stage5IndentedBlock $generalsStage5Job 'if: >-' 4
 Assert-Stage5ExactFoldedJobCondition $generalsCondition `

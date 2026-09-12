@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('Generals', 'ZeroHour')][string]$Title,
     [Parameter(Mandatory = $true)][string]$AwsEndpointUrl,
-    [Parameter(Mandatory = $true)][string]$OutputEnvironmentFile
+    [Parameter(Mandatory = $true)][string]$OutputEnvironmentFile,
+    [ValidateSet('Primary','GeneralsBase','ZeroHourBase')][string]$ProvisioningRole = 'Primary'
 )
 
 Set-StrictMode -Version 2.0
@@ -151,6 +152,42 @@ function Assert-Stage5FreshSimulationRuntimeData {
     return $runtimeFull
 }
 
+function Get-Stage5SimulationProvisioningLayout {
+    param([string]$TaskRoot, [ValidateSet('Generals','ZeroHour')][string]$Title,
+        [ValidateSet('Primary','GeneralsBase','ZeroHourBase')][string]$ProvisioningRole = 'Primary')
+    $canonical = Get-Stage5SimulationNormalizedPath $TaskRoot 'Stage 5 simulation task root'
+    Assert-Stage5SimulationCondition ($canonical -ceq 'H:\Stage5SimulationValidationTask') `
+        'TaskRoot must be the canonical H:\Stage5SimulationValidationTask path.'
+    $child = switch ($ProvisioningRole) {
+        'Primary' { '' }
+        'GeneralsBase' {
+            Assert-Stage5SimulationCondition ($Title -ceq 'Generals') 'GeneralsBase requires the Generals title.'
+            'BaseGenerals'
+        }
+        'ZeroHourBase' {
+            Assert-Stage5SimulationCondition ($Title -ceq 'ZeroHour') 'ZeroHourBase requires the ZeroHour title.'
+            'BaseZeroHour'
+        }
+    }
+    return [pscustomobject]@{
+        canonicalRoot = $canonical
+        taskRoot = if ($child) { Join-Path $canonical $child } else { $canonical }
+        role = $ProvisioningRole
+    }
+}
+
+function Assert-Stage5SimulationProvisioningFresh {
+    param([object]$Layout)
+    if ($Layout.role -cne 'Primary') {
+        [void](Assert-Stage5SimulationNoReparsePath $Layout.canonicalRoot `
+            'Companion simulation task parent' -PathType Container)
+    }
+    $full = Assert-Stage5SimulationNoReparsePath $Layout.taskRoot 'Stage 5 simulation task root'
+    Assert-Stage5SimulationCondition (-not (Test-Path -LiteralPath $full)) `
+        'Stage 5 simulation task root must be fresh.'
+    return $full
+}
+
 function Open-Stage5SimulationEnvironmentFile {
     param([string]$Path)
     Assert-Stage5SimulationCondition (-not [string]::IsNullOrWhiteSpace(
@@ -168,7 +205,13 @@ function Open-Stage5SimulationEnvironmentFile {
 }
 
 function Write-Stage5SimulationEnvironmentBindings {
-    param([IO.FileStream]$Stream, [Collections.IDictionary]$Bindings)
+    param([IO.FileStream]$Stream, [Collections.IDictionary]$Bindings,
+        [ValidateSet('Primary','GeneralsBase','ZeroHourBase')][string]$ProvisioningRole = 'Primary')
+    $environmentPrefix = switch ($ProvisioningRole) {
+        'Primary' { 'STAGE5_SIMULATION_QUALIFICATION_DATA_' }
+        'GeneralsBase' { 'STAGE5_GENERALS_QUALIFICATION_DATA_' }
+        'ZeroHourBase' { 'STAGE5_ZEROHOUR_QUALIFICATION_DATA_' }
+    }
     $prefix = ''
     if ($Stream.Length -gt 0) {
         $Stream.Position = $Stream.Length - 1
@@ -183,6 +226,7 @@ function Write-Stage5SimulationEnvironmentBindings {
                 '^STAGE5_SIMULATION_QUALIFICATION_DATA_[A-Z0-9_]+$' -and
             $value -notmatch '[\x00-\x1F\x7F]') `
             'Stage 5 simulation environment bindings must be canonical single-line values.'
+        $name = $environmentPrefix + $name.Substring('STAGE5_SIMULATION_QUALIFICATION_DATA_'.Length)
         [void]$builder.Append($name).Append('=').Append($value).Append("`n")
     }
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($builder.ToString())
@@ -322,13 +366,8 @@ foreach ($secretName in @('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY')) {
 }
 
 $runtimeFull = Assert-Stage5FreshSimulationRuntimeData $RuntimeRoot
-$taskFull = Get-Stage5SimulationNormalizedPath $TaskRoot `
-    'Stage 5 simulation task root'
-Assert-Stage5SimulationCondition ($taskFull -ceq
-        'H:\Stage5SimulationValidationTask') `
-    'TaskRoot must be the canonical H:\Stage5SimulationValidationTask path.'
-Assert-Stage5SimulationCondition (-not (Test-Path -LiteralPath $taskFull)) `
-    'Stage 5 simulation task root must be fresh.'
+$provisioningLayout = Get-Stage5SimulationProvisioningLayout $TaskRoot $Title $ProvisioningRole
+$taskFull = Assert-Stage5SimulationProvisioningFresh $provisioningLayout
 $awsExecutable = Resolve-Stage5SimulationApplication @('aws.exe', 'aws') `
     'AWS CLI executable'
 $sevenZipExecutable = Resolve-Stage5SimulationApplication @('7z.exe', '7za.exe',
@@ -542,7 +581,7 @@ try {
         STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_SHA256 = $manifestSha256
         STAGE5_SIMULATION_QUALIFICATION_DATA_CLOSURE_SHA256 = $closureSha256
         STAGE5_SIMULATION_QUALIFICATION_DATA_FILE_COUNT = $manifestFiles.Count
-    })
+    }) -ProvisioningRole $ProvisioningRole
     $completed = $true
 }
 finally {

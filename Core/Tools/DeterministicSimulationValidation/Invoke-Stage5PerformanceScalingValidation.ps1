@@ -25,6 +25,10 @@ param(
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
     [string]$ArtifactSetManifestPath,
 
+    [string]$GeneralsInstallRoot = '',
+    [string]$GeneralsQualificationDataManifestPath = '',
+    [string]$GeneralsQualificationDataManifestSha256 = '',
+
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
     [switch]$AllowHeadlessDirectExecution,
@@ -120,6 +124,7 @@ Import-Module (Join-Path $PSScriptRoot `
     'Stage5ValidationProfileCapability.psm1')
 Import-Module (Join-Path $PSScriptRoot `
     'Stage5RegistryRecovery.psm1')
+Import-Module (Join-Path $PSScriptRoot 'Stage5BaseGeneralsBinding.psm1')
 
 $script:Stage5RunnerScriptSha256 = $null
 try {
@@ -283,11 +288,32 @@ function Release-Stage5ValidationMutex {
 }
 
 function Assert-Stage5NoInstalledTitleProcesses {
-    $running = @(Get-Process -Name generalsv, generalszh -ErrorAction SilentlyContinue)
-    if ($running.Count -gt 0) {
-        $details = @($running | ForEach-Object { "$($_.ProcessName) (PID $($_.Id))" })
-        throw "Cannot swap the title-session registry contract while an installed title is running: $($details -join ', ')."
+    if (-not (Test-Stage5RegistryScopeInactive -ExecutablePaths @())) {
+        throw 'Cannot swap the title-session registry contract while either installed title is active or its state is unreadable.'
     }
+}
+
+function Get-Stage5PerformanceBaseBinding {
+    param([string]$Title, [string]$RuntimeRoot, [object]$ArtifactBinding,
+        [string]$RequestedRoot = '', [bool]$RequireQualification = $false,
+        [string]$QualificationManifestPath = '', [string]$QualificationManifestSha256 = '')
+    if ($Title -ceq 'Generals') { return $null }
+    $roleRoot = Split-Path -Parent $ArtifactBinding.artifacts['generals-executable'].path
+    $baseRoot = if ([string]::IsNullOrWhiteSpace($RequestedRoot)) { $roleRoot } else { [IO.Path]::GetFullPath($RequestedRoot).TrimEnd('\') }
+    Assert-Stage5PerformanceCondition ([string]::Equals($baseRoot, $roleRoot,
+        [StringComparison]::OrdinalIgnoreCase)) 'Performance base root differs from the bound Generals artifact role.'
+    $arguments = @{ RuntimeRoot=$RuntimeRoot; GeneralsInstallRoot=$baseRoot }
+    if ($RequireQualification) {
+        $artifactDocument = ConvertFrom-Stage5JsonDictionary $ArtifactBinding.path
+        $arguments.AcceptanceSourceCommit = $artifactDocument.sourceCommit
+        $arguments.AcceptanceArtifactSetPath = $ArtifactBinding.path
+        $arguments.AcceptanceArtifactSetSha256 = $ArtifactBinding.sha256
+        $arguments.AcceptanceRuntimeDependencyManifestSha256 = $ArtifactBinding.runtimeClosure.dependencyManifestSha256
+        $arguments.AcceptanceRuntimeClosureSha256 = $ArtifactBinding.runtimeClosure.closureSha256
+        $arguments.GeneralsQualificationDataManifestPath = $QualificationManifestPath
+        $arguments.GeneralsQualificationDataManifestSha256 = $QualificationManifestSha256
+    }
+    return Get-Stage5BaseGeneralsBinding @arguments
 }
 
 function Get-Stage5PerformanceSha256 {
@@ -1633,7 +1659,7 @@ function Test-Stage5SafeTitleSessionPath {
 
 function New-Stage5TitleSessionContract {
     param([string]$Title, [string]$SessionRoot, [string]$RuntimeDirectory,
-        [string]$TaskRootPath)
+        [string]$TaskRootPath, [string]$GeneralsRuntimeRoot = '')
     Assert-Stage5PerformanceCondition ($Title -ceq 'Generals' -or
         $Title -ceq 'ZeroHour') `
         "Unsupported installed title for Stage 5 profile setup: $Title"
@@ -1673,6 +1699,13 @@ function New-Stage5TitleSessionContract {
         RTS_STAGE5_VALIDATION_TITLE_SESSION_ROOT = $sessionFull
     }
     $registryValues = New-Object 'Collections.Generic.List[object]'
+    if ($Title -ceq 'ZeroHour' -and -not [string]::IsNullOrWhiteSpace($GeneralsRuntimeRoot)) {
+        $registryValues.Add([pscustomobject]@{
+            subKey = 'Software\Electronic Arts\EA Games\Generals'
+            name = 'InstallPath'; value = [IO.Path]::GetFullPath($GeneralsRuntimeRoot).TrimEnd('\') + '\'
+            purpose = 'base-generals-runtime-binding'
+        }) | Out-Null
+    }
     if ($Title -ceq 'Generals') {
         $registryValues.Add([pscustomobject]@{
             subKey = 'Software\Electronic Arts\EA Games\Generals'
@@ -1801,7 +1834,8 @@ function Set-Stage5RegistryValue {
     param([Microsoft.Win32.RegistryView]$View, [string]$SubKey,
         [string]$Name, [string]$Value,
         [Collections.Generic.List[object]]$Snapshots,
-        [Collections.IDictionary]$SnapshotKeys)
+        [Collections.IDictionary]$SnapshotKeys,
+        [object[]]$WrittenSnapshots = $null)
     $snapshotKey = "$View|$SubKey|$Name"
     Assert-Stage5PerformanceCondition ($SnapshotKeys.Contains($snapshotKey)) `
         "Registry mutation '$snapshotKey' was not preceded by a published recovery snapshot."
@@ -1815,6 +1849,7 @@ function Set-Stage5RegistryValue {
         [Microsoft.Win32.RegistryHive]::CurrentUser, $View)
     try {
         $target = $base.OpenSubKey($SubKey, $true)
+        $targetExisted = $null -ne $target
         $createdSubKeys = New-Object 'Collections.Generic.List[string]'
         if ($null -eq $target) {
             $readOnlyTarget = $base.OpenSubKey($SubKey, $false)
@@ -1829,6 +1864,16 @@ function Set-Stage5RegistryValue {
                 { param($paths) Remove-Stage5EmptyRegistryKeys $base $paths }
         }
         try {
+            if ($null -ne $WrittenSnapshots) {
+                $exists = @($target.GetValueNames()) -contains $Name
+                $currentValue = if ($exists) { $target.GetValue($Name, $null,
+                    [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { $null }
+                $currentKind = if ($exists) { $target.GetValueKind($Name) } else { $null }
+                Assert-Stage5RegistryRecoveryWriteState -Snapshot $publishedSnapshot[0] `
+                    -CurrentKeyExists $targetExisted `
+                    -CurrentValue ([pscustomobject]@{ exists=$exists; value=$currentValue; kind=$currentKind }) `
+                    -WrittenSnapshots $WrittenSnapshots
+            }
             $target.SetValue($Name, $Value,
                 [Microsoft.Win32.RegistryValueKind]::String)
         }
@@ -2006,20 +2051,21 @@ function New-Stage5RegistryRecoveryMutationSnapshot {
     $value = & $Recovery.adapter['GetValue'] $viewName $subKey $name
     $hadKey = $null -ne $key -and [bool]$key.exists
     $hadValue = $null -ne $value -and [bool]$value.exists
-    $createdSubKeys = if ($hadKey) {
+    $createdSubKeys = @(if ($hadKey) {
         @()
     } else {
         @(Get-Stage5RegistryInstallPathAncestors $subKey | Where-Object {
             @($Recovery.plannedMissingSubKeys) -contains "$viewName|$_"
         })
-    }
+    })
     Assert-Stage5PerformanceCondition ($hadKey -or $createdSubKeys.Count -gt 0) `
         "Registry recovery plan no longer covers missing key '$viewName|$subKey'."
-    return (New-Stage5RegistryRecoverySnapshot -Title $Recovery.identity.title `
+    $snapshotTitle = if ($subKey -ceq 'Software\Electronic Arts\EA Games\Generals') { 'Generals' } else { $Recovery.identity.title }
+    return (New-Stage5RegistryRecoverySnapshot -Title $snapshotTitle `
         -View $viewName -SubKey $subKey -Name $name `
         -HadKey $hadKey -HadValue $hadValue `
-        -OldValue (if ($hadValue) { $value.value } else { $null }) `
-        -OldKind (if ($hadValue) { $value.kind } else { $null }) `
+        -OldValue $(if ($hadValue) { $value.value } else { $null }) `
+        -OldKind $(if ($hadValue) { $value.kind } else { $null }) `
         -ExpectedValue ([string]$RegistryValue.value) `
         -ExpectedKind ([Microsoft.Win32.RegistryValueKind]::String) `
         -CreatedSubKeys $createdSubKeys)
@@ -2124,6 +2170,23 @@ function Add-Stage5RegistryRecoveryMutation {
         [object]$RegistryValue
     )
     $viewName = ConvertTo-Stage5RecoveryRegistryView $View
+    if ($Recovery.identity.Contains('registryScope')) {
+        $snapshot = @($Recovery.snapshots | Where-Object {
+            $_.view -ceq $viewName -and $_.subKey -ceq $RegistryValue.subKey -and $_.name -ceq $RegistryValue.name
+        })
+        Assert-Stage5PerformanceCondition ($snapshot.Count -eq 1) 'Paired mutation was not in the frozen registry plan.'
+        $key = & $Recovery.adapter.GetKey $viewName $RegistryValue.subKey
+        $value = & $Recovery.adapter.GetValue $viewName $RegistryValue.subKey $RegistryValue.name
+        Assert-Stage5RegistryRecoveryWriteState -Snapshot $snapshot[0] `
+            -CurrentKeyExists ($null -ne $key -and [bool]$key.exists) -CurrentValue $value `
+            -WrittenSnapshots @($Recovery.writtenSnapshots.ToArray())
+        Set-Stage5RegistryValue $View $RegistryValue.subKey $RegistryValue.name `
+            $RegistryValue.value $Recovery.snapshots $Recovery.snapshotKeys `
+            -WrittenSnapshots @($Recovery.writtenSnapshots.ToArray())
+        $Recovery.writtenSnapshots.Add($snapshot[0]) | Out-Null
+        Update-Stage5RegistryRecoveryState $Recovery active $true $true
+        return
+    }
     foreach ($planned in @(Get-Stage5RegistryRecoveryMissingSubKeys `
             $Recovery.adapter $viewName ([string]$RegistryValue.subKey))) {
         if (@($Recovery.plannedMissingSubKeys) -notcontains $planned) {
@@ -2153,7 +2216,8 @@ function New-Stage5RegistryRecoveryContext {
         [string]$SourceCommit,
         [string]$ArtifactSetSha256,
         [string]$ExecutablePath,
-        [string]$ExecutableSha256
+        [string]$ExecutableSha256,
+        [object[]]$RegistryValues = @()
     )
     $adapter = New-Stage5RegistryRecoveryAdapter
     $identity = [ordered]@{
@@ -2169,13 +2233,7 @@ function New-Stage5RegistryRecoveryContext {
         sourceCommit = $SourceCommit
         artifactSetSha256 = $ArtifactSetSha256
     }
-    $emptySnapshotPlanSha256 = Get-Stage5RegistryRecoverySnapshotPlanSha256 `
-        -Title $Title -PlannedMissingSubKeys @() -Snapshots @()
-    $identity.snapshotPlanSha256 = $emptySnapshotPlanSha256
-    $journal = New-Stage5RegistryRecoveryJournal -Path $JournalPath `
-        -Identity $identity -PlannedMissingSubKeys @() -Snapshots @() `
-        -ProcessIdentities @()
-    return [pscustomobject]@{
+    $recovery = [pscustomobject]@{
         path = $JournalPath
         identity = $identity
         adapter = $adapter
@@ -2184,7 +2242,31 @@ function New-Stage5RegistryRecoveryContext {
         snapshotKeys = @{}
         processIdentities = New-Object 'Collections.Generic.List[object]'
         currentProcessIdentityIndex = -1
+        writtenSnapshots = New-Object 'Collections.Generic.List[object]'
     }
+    $scope = 'SingleTitle'
+    if ($Title -ceq 'ZeroHour' -and @($RegistryValues).Count -gt 0) {
+        Assert-Stage5PerformanceCondition (@($RegistryValues).Count -eq 2) 'Paired performance registry scope must bind two titles.'
+        $scope = 'ZeroHourWithGeneralsBase'
+        $identity.registryScope = $scope
+        foreach ($view in @([Microsoft.Win32.RegistryView]::Registry32, [Microsoft.Win32.RegistryView]::Registry64)) {
+            foreach ($value in $RegistryValues) {
+                foreach ($missing in @(Get-Stage5RegistryRecoveryMissingSubKeys $adapter ([string]$view) $value.subKey)) {
+                    if (-not $recovery.plannedMissingSubKeys.Contains($missing)) { $recovery.plannedMissingSubKeys.Add($missing) | Out-Null }
+                }
+                $snapshot = New-Stage5RegistryRecoveryMutationSnapshot $recovery $view $value
+                $recovery.snapshots.Add($snapshot) | Out-Null
+                $recovery.snapshotKeys["$view|$($value.subKey)|$($value.name)"] = $true
+            }
+        }
+    }
+    $identity.snapshotPlanSha256 = Get-Stage5RegistryRecoverySnapshotPlanSha256 -Title $Title `
+        -RegistryScope $scope -PlannedMissingSubKeys @($recovery.plannedMissingSubKeys.ToArray()) `
+        -Snapshots @($recovery.snapshots.ToArray())
+    New-Stage5RegistryRecoveryJournal -Path $JournalPath -Identity $identity `
+        -PlannedMissingSubKeys @($recovery.plannedMissingSubKeys.ToArray()) `
+        -Snapshots @($recovery.snapshots.ToArray()) -ProcessIdentities @() | Out-Null
+    return $recovery
 }
 
 function Add-Stage5RegistryRecoveryPendingProcess {
@@ -5733,7 +5815,8 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         [string]$CohortNonce,
         [string]$CohortCreatedUtc,
         [string]$OutputRoot,
-        [int]$Timeout
+        [int]$Timeout,
+        [string]$GeneralsRuntimeRoot = ''
     )
     Assert-Stage5PerformanceCondition ([bool]$ProduceNativeFixture -and
         [bool]$AllowHeadlessDirectExecution) `
@@ -5770,6 +5853,11 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         $ArtifactSetSha256 $SourceCommit $FixtureTitle $executableFull `
         $ExecutableSha256
     Assert-Stage5PerformanceLauncherBinding $artifact $launcher $FixtureTitle
+    $baseBinding = Get-Stage5PerformanceBaseBinding $FixtureTitle $runtimeFull $artifact $GeneralsRuntimeRoot
+    $baseImmutablePaths = @()
+    if ($null -ne $baseBinding) {
+        $baseImmutablePaths = @($baseBinding.files | ForEach-Object { Join-Path $baseBinding.runtimeRoot $_.path })
+    }
     $reviewed = Read-Stage5ReviewedNativeKernelFixture `
         -Path $ReviewedManifestPath `
         -ExpectedSha256 $ReviewedManifestSha256 `
@@ -5881,6 +5969,11 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         performanceScalingClaim = $false
     }
     Write-Stage5JsonAtomically $planPath $plan -CreateNew
+    if ($null -ne $baseBinding) {
+        $baseBindingPath = Join-Path $taskFull 'BaseGeneralsBinding.json'
+        Write-Stage5JsonAtomically $baseBindingPath $baseBinding -CreateNew
+        $baseImmutablePaths += $baseBindingPath
+    }
     $planSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $planPath `
         'Native fixture immutable prelaunch plan'
 
@@ -5900,7 +5993,8 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
     $script:Stage5ActiveRegistryRecovery = $null
     try {
         $titleSession = New-Stage5TitleSessionContract $FixtureTitle `
-            $titleSessionRoot $runtimeFull $taskFull
+            $titleSessionRoot $runtimeFull $taskFull `
+            -GeneralsRuntimeRoot $(if ($null -ne $baseBinding) { $baseBinding.runtimeRoot } else { '' })
         Assert-Stage5PerformanceCondition (
             $titleSession.profileRoot -ceq $plannedProfileRoot) `
             'Native fixture title profile differs from the immutable plan.'
@@ -5916,7 +6010,7 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
             -SourceCommit $SourceCommit `
             -ArtifactSetSha256 $ArtifactSetSha256 `
             -ExecutablePath $executableFull `
-            -ExecutableSha256 $ExecutableSha256
+            -ExecutableSha256 $ExecutableSha256 -RegistryValues $titleSession.registryValues
         $registrySnapshots = $registryRecovery.snapshots
         $registrySnapshotKeys = $registryRecovery.snapshotKeys
         $script:Stage5ActiveRegistryRecovery = $registryRecovery
@@ -5942,7 +6036,8 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
             @([pscustomobject]@{
                 path = $reviewed.fixture.sourcePath
                 sha256 = $reviewed.fixture.sha256
-            }) $reviewed.path @($planPath)
+            }) $reviewed.path (@($planPath) + $baseImmutablePaths)
+        if ($null -ne $baseBinding) { Assert-Stage5BaseGeneralsBindingCurrent $baseBinding }
         $start = [pscustomobject][ordered]@{
             schemaVersion = 1
             event = 'native-fixture-production-start'
@@ -6288,6 +6383,7 @@ if ($PSCmdlet.ParameterSetName -ceq 'FixtureProduction') {
         -FixtureTitle $Title `
         -ExecutablePath $InstalledExecutablePath `
         -ExecutableSha256 $ExpectedExecutableSha256 `
+        -GeneralsRuntimeRoot $GeneralsInstallRoot `
         -SourceCommit $ExpectedSourceCommit `
         -ArtifactSetSha256 $ExpectedArtifactSetSha256 `
         -ArtifactManifestPath $ArtifactSetManifestPath `
@@ -6415,6 +6511,10 @@ $artifactBinding = Read-Stage5PerformanceArtifactSet $ArtifactSetManifestPath `
     $ExpectedArtifactSetSha256 $ExpectedSourceCommit $Title $executableFull `
     $ExpectedExecutableSha256
 Assert-Stage5PerformanceLauncherBinding $artifactBinding $launcherContract $Title
+$baseBinding = Get-Stage5PerformanceBaseBinding $Title $runtimeFull $artifactBinding $GeneralsInstallRoot `
+    -RequireQualification $isExternalQualification `
+    -QualificationManifestPath $GeneralsQualificationDataManifestPath `
+    -QualificationManifestSha256 $GeneralsQualificationDataManifestSha256
 $taskFull = [IO.Path]::GetFullPath($TaskRoot).TrimEnd('\', '/')
 Assert-Stage5PerformanceCondition ($taskFull.StartsWith('H:\',
     [StringComparison]::OrdinalIgnoreCase)) `
@@ -6525,6 +6625,20 @@ if ($isExternalQualification) {
         'Stage 3 baseline physical/logical topology does not match the qualification host.'
 }
 New-Item -ItemType Directory -Path $taskFull | Out-Null
+if ($null -ne $baseBinding) {
+    if ($baseBinding.identityMode -ceq 'acceptance-bound') {
+        $baseEvidenceRoot = Join-Path $taskFull 'BaseGenerals'
+        New-Item -ItemType Directory -Path $baseEvidenceRoot | Out-Null
+        $baseManifestCopy = Join-Path $baseEvidenceRoot 'QualificationData.json'
+        Copy-Item -LiteralPath $GeneralsQualificationDataManifestPath -Destination $baseManifestCopy
+        Assert-Stage5PerformanceFileHash $baseManifestCopy $GeneralsQualificationDataManifestSha256 `
+            'Retained base Generals qualification data' | Out-Null
+        $baseBinding.retainedQualificationData = [ordered]@{
+            path='BaseGenerals/QualificationData.json';sha256=$GeneralsQualificationDataManifestSha256.ToUpperInvariant()
+        }
+    }
+    Write-Stage5JsonAtomically (Join-Path $taskFull 'BaseGeneralsBinding.json') $baseBinding -CreateNew
+}
 $stagedFixtureManifestPath = $fixtureManifest.path
 if ($isExternalQualification) {
     $stagedFixtureDirectory = Join-Path $taskFull 'ReviewedFixtures'
@@ -6707,7 +6821,8 @@ $registryRecovery = $null
 $script:Stage5ActiveRegistryRecovery = $null
 try {
     $titleSession = New-Stage5TitleSessionContract $Title $titleSessionRoot `
-        $runtimeFull $taskFull
+        $runtimeFull $taskFull `
+        -GeneralsRuntimeRoot $(if ($null -ne $baseBinding) { $baseBinding.runtimeRoot } else { '' })
     $validationMutex = Acquire-Stage5ValidationMutex
     Assert-Stage5NoInstalledTitleProcesses
     Initialize-Stage5TitleSessionDirectories $titleSession
@@ -6718,7 +6833,7 @@ try {
         -SourceCommit $ExpectedSourceCommit `
         -ArtifactSetSha256 $ExpectedArtifactSetSha256 `
         -ExecutablePath $executableFull `
-        -ExecutableSha256 $ExpectedExecutableSha256
+        -ExecutableSha256 $ExpectedExecutableSha256 -RegistryValues $titleSession.registryValues
     $registrySnapshots = $registryRecovery.snapshots
     $registrySnapshotKeys = $registryRecovery.snapshotKeys
     $script:Stage5ActiveRegistryRecovery = $registryRecovery
@@ -6738,9 +6853,15 @@ try {
         @($fixtureProduction.filePaths)
     }
     else { @() }
+    if ($null -ne $baseBinding) {
+        $additionalImmutablePaths += @($baseBinding.files | ForEach-Object { Join-Path $baseBinding.runtimeRoot $_.path })
+        $additionalImmutablePaths += (Join-Path $taskFull 'BaseGeneralsBinding.json')
+        if ($baseBinding.identityMode -ceq 'acceptance-bound') { $additionalImmutablePaths += $baseManifestCopy }
+    }
     $readOnlyLocks = Open-Stage5PerformanceReadOnlyLocks `
         $artifactBinding $fixtureManifest.fixtures $fixtureManifest.path `
         $additionalImmutablePaths
+    if ($null -ne $baseBinding) { Assert-Stage5BaseGeneralsBindingCurrent $baseBinding }
     $runPlanBinding = New-Stage5PerformanceRunPlan $context $TimeoutSeconds `
         $titleSession @($PhaseBaselineProfiles)
     $runPlanExecution = Invoke-Stage5PerformanceRunPlan $context $runPlanBinding $titleSession

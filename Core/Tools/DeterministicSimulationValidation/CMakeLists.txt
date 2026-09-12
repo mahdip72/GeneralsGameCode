@@ -222,6 +222,14 @@ if(WIN32)
             -ScratchRoot "${_stage5_validation_test_scratch_root}/registry-recovery")
     set_tests_properties(core_stage5_registry_recovery_tests
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 120)
+    foreach(_stage5_binding_test IN ITEMS BaseGeneralsBinding PairedPerformanceBinding SimulationProvisioningRoles)
+        add_test(NAME core_stage5_${_stage5_binding_test}_tests
+            COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5${_stage5_binding_test}.Tests.ps1"
+                -ScratchRoot "${_stage5_validation_test_scratch_root}/base-generals-binding")
+        set_tests_properties(core_stage5_${_stage5_binding_test}_tests
+            PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 120)
+    endforeach()
     add_test(NAME core_stage5_performance_scaling_host_validation_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5PerformanceScalingValidation.Tests.ps1"

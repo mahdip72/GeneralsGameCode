@@ -171,7 +171,7 @@ try {
     $producerParameters = @($producerAst.ParamBlock.Parameters |
         ForEach-Object { $_.Name.VariablePath.UserPath })
     Assert-Test (($producerParameters -join '|') -ceq
-        'RuntimeRoot|TaskRoot|SourceCommit|Title|AwsEndpointUrl|OutputEnvironmentFile') `
+        'RuntimeRoot|TaskRoot|SourceCommit|Title|AwsEndpointUrl|OutputEnvironmentFile|ProvisioningRole') `
         "Producer parameter contract changed: $($producerParameters -join ', ')"
 
     $workflowText = [IO.File]::ReadAllText($workflowPath)
@@ -180,8 +180,8 @@ try {
         $workflowText -notmatch 'cache-gamedata|cache-hit') `
         'Stage 5 replay qualification must never consume mutable game-data cache state.'
     Assert-Test (@([regex]::Matches($workflowText,
-        'Install-Stage5SimulationQualificationData\.ps1')).Count -eq 1) `
-        'check-replays must invoke the checked-in qualification-data producer exactly once.'
+        'Install-Stage5SimulationQualificationData\.ps1')).Count -eq 3) `
+        'check-replays must declare the primary producer and two title-matched companion branches.'
     foreach ($runnerParameter in @(
         'QualificationDataManifestPath',
         'QualificationDataManifestSha256',

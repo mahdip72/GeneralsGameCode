@@ -677,6 +677,99 @@ try {
             -MutexLock $mutexLock `
             -Adapter $adapter | Out-Null
     } 'Recovery accepted missing child-exit proof.'
+    # A Zero Hour child reads both title bindings. Plan both views before any
+    # write, and recover the complete scope without granting arbitrary keys.
+    $paired = Copy-RecoveryIdentity $identity
+    $paired.title = 'ZeroHour'
+    $paired.registryScope = 'ZeroHourWithGeneralsBase'
+    $paired.journalPath = Join-Path $root 'PairedRegistryRecovery.json'
+    $pairedSnapshots = @(
+        foreach ($pairedTitle in @('Generals', 'ZeroHour')) {
+            $pairedKey = if ($pairedTitle -ceq 'Generals') { $installKey } else {
+                'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour'
+            }
+            foreach ($pairedView in @('Registry32', 'Registry64')) {
+                New-Stage5RegistryRecoverySnapshot -Title $pairedTitle -View $pairedView `
+                    -SubKey $pairedKey -Name InstallPath -HadKey $true -HadValue $true `
+                    -OldValue "old-$pairedTitle-$pairedView" -OldKind $kind.String `
+                    -ExpectedValue "H:\Task\$pairedTitle" -ExpectedKind $kind.String
+            }
+        }
+    )
+    $paired.snapshotPlanSha256 = Get-Stage5RegistryRecoverySnapshotPlanSha256 `
+        -Title ZeroHour -RegistryScope ZeroHourWithGeneralsBase `
+        -Snapshots $pairedSnapshots -PlannedMissingSubKeys @()
+    $pairedDocument = New-Stage5RegistryRecoveryJournal -Path $paired.journalPath `
+        -Identity $paired -Snapshots $pairedSnapshots -PlannedMissingSubKeys @() `
+        -ProcessIdentities @()
+    Assert-RecoveryTest ($pairedDocument.schemaVersion -eq 2 -and
+        $pairedDocument.snapshots.Count -eq 4) 'Paired journal must bind exactly four snapshots.'
+    Assert-RecoveryThrows {
+        Get-Stage5RegistryRecoverySnapshotPlanSha256 -Title ZeroHour `
+            -RegistryScope ZeroHourWithGeneralsBase -Snapshots @($pairedSnapshots[0])
+    } 'Paired scope accepted an incomplete pre-write snapshot plan.'
+    Assert-RecoveryThrows {
+        Get-Stage5RegistryRecoverySnapshotPlanSha256 -Title ZeroHour -Snapshots $pairedSnapshots
+    } 'Legacy single-title scope accepted a paired plan.'
+    $wrongScope = Copy-RecoveryIdentity $paired
+    $wrongScope.Remove('registryScope')
+    Assert-RecoveryThrows {
+        Read-Stage5RegistryRecoveryJournal $paired.journalPath $wrongScope
+    } 'Paired journal was readable without its explicit scope binding.'
+    $state.Clear()
+    foreach ($snapshot in $pairedSnapshots) {
+        $state["$($snapshot.view)|$($snapshot.subKey)"] = @{ values = @{
+            InstallPath = @{ value = "H:\Task\$(if ($snapshot.subKey -ceq $installKey) {'Generals'} else {'ZeroHour'})";
+                kind = [int]$kind.String }
+        } }
+    }
+    Invoke-Stage5RegistryRecovery -Path $paired.journalPath -ExpectedIdentity $paired `
+        -Authorization ([ordered]@{ childExitProven = $true; noActiveTitleProcesses = $true; processIdentities = @() }) `
+        -MutexLock $mutexLock -Adapter $baseFixtureRegistryAdapter | Out-Null
+    foreach ($snapshot in $pairedSnapshots) {
+        $restoredPair = & $baseFixtureRegistryAdapter.GetValue $snapshot.view $snapshot.subKey InstallPath
+        Assert-RecoveryTest ($restoredPair.value -ceq $snapshot.oldValue.value) `
+            'Paired recovery did not restore an exact original title/view value.'
+    }
+    $plannedWrite = $pairedSnapshots[0]
+    $originalState = & $baseFixtureRegistryAdapter.GetValue $plannedWrite.view $plannedWrite.subKey InstallPath
+    Assert-Stage5RegistryRecoveryWriteState -Snapshot $plannedWrite -CurrentKeyExists $true `
+        -CurrentValue $originalState -WrittenSnapshots @()
+    Assert-RecoveryThrows {
+        Assert-Stage5RegistryRecoveryWriteState -Snapshot $plannedWrite -CurrentKeyExists $true `
+            -CurrentValue ([pscustomobject]@{ exists=$true; value='foreign-after-plan'; kind=$kind.String }) `
+            -WrittenSnapshots @()
+    } 'Setup accepted a concurrent change after the journal plan was frozen.'
+    Assert-RecoveryThrows {
+        Assert-Stage5RegistryRecoveryWriteState -Snapshot $plannedWrite -CurrentKeyExists $true `
+            -CurrentValue ([pscustomobject]@{ exists=$true; value='H:\Task\Generals'; kind=$kind.String }) `
+            -WrittenSnapshots @()
+    } 'An expected value without an owned prior write was treated as an alias.'
+    $aliasWrite = New-Stage5RegistryRecoverySnapshot -Title Generals -View Registry64 `
+        -SubKey $installKey -Name InstallPath -HadKey $true -HadValue $true `
+        -OldValue $plannedWrite.oldValue.value -OldKind $kind.String `
+        -ExpectedValue 'H:\Task\Generals' -ExpectedKind $kind.String
+    Assert-Stage5RegistryRecoveryWriteState -Snapshot $aliasWrite -CurrentKeyExists $true `
+        -CurrentValue ([pscustomobject]@{exists=$true;value='H:\Task\Generals';kind=$kind.String}) `
+        -WrittenSnapshots @($plannedWrite)
+    Assert-RecoveryThrows {
+        Assert-Stage5RegistryRecoveryWriteState -Snapshot $aliasWrite -CurrentKeyExists $true `
+            -CurrentValue ([pscustomobject]@{exists=$true;value='H:\Task\Generals';kind=$kind.ExpandString}) `
+            -WrittenSnapshots @($plannedWrite)
+    } 'Aliased setup accepted a concurrent registry kind change.'
+    $partial = Copy-RecoveryIdentity $paired
+    $partial.journalPath = Join-Path $root 'PartialPair.json'
+    New-Stage5RegistryRecoveryJournal -Path $partial.journalPath -Identity $partial `
+        -Snapshots $pairedSnapshots -PlannedMissingSubKeys @() -ProcessIdentities @() | Out-Null
+    & $baseFixtureRegistryAdapter.SetValue $plannedWrite.view $plannedWrite.subKey InstallPath `
+        'H:\Task\Generals' $kind.String
+    Invoke-Stage5RegistryRecovery -Path $partial.journalPath -ExpectedIdentity $partial `
+        -Authorization ([ordered]@{childExitProven=$true;noActiveTitleProcesses=$true;processIdentities=@()}) `
+        -MutexLock $mutexLock -Adapter $baseFixtureRegistryAdapter | Out-Null
+    foreach ($snapshot in $pairedSnapshots) {
+        Assert-RecoveryTest ((& $baseFixtureRegistryAdapter.GetValue $snapshot.view $snapshot.subKey InstallPath).value -ceq
+            $snapshot.oldValue.value) 'Crash before later paired writes did not preserve original values.'
+    }
 }
 finally {
     if (Test-Path -LiteralPath $root) {

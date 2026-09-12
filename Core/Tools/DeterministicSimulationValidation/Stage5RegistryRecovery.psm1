@@ -331,6 +331,38 @@ function Get-Stage5RecoveryInstallPathKey {
     return 'Software\Electronic Arts\EA Games\Command and Conquer Generals Zero Hour'
 }
 
+function Get-Stage5RecoveryRegistryScope {
+    param([object]$Identity)
+    if (-not (Test-Stage5RecoveryProperty $Identity 'registryScope')) { return 'SingleTitle' }
+    $scope = [string](Get-Stage5RecoveryProperty $Identity 'registryScope' 'Recovery identity')
+    Assert-Stage5RecoveryCondition ($scope -ceq 'ZeroHourWithGeneralsBase' -and
+        [string]$Identity.title -ceq 'ZeroHour') 'Recovery paired scope requires the ZeroHour title.'
+    return $scope
+}
+
+function Assert-Stage5RegistryRecoveryWriteState {
+    param([object]$Snapshot, [bool]$CurrentKeyExists, [object]$CurrentValue,
+        [AllowEmptyCollection()][object[]]$WrittenSnapshots = @())
+    if ($CurrentKeyExists -eq [bool]$Snapshot.hadKey -and
+        (Test-Stage5RecoverySnapshotAlreadyRestored $CurrentValue $Snapshot)) { return }
+    foreach ($written in $WrittenSnapshots) {
+        if ([string]$written.subKey -cne [string]$Snapshot.subKey -or
+            [string]$written.name -cne [string]$Snapshot.name -or
+            [string]$written.view -ceq [string]$Snapshot.view) { continue }
+        if ([bool]$written.hadKey -ne [bool]$Snapshot.hadKey -or
+            [bool]$written.hadValue -ne [bool]$Snapshot.hadValue) { continue }
+        if ([bool]$Snapshot.hadValue -and -not (Test-Stage5RecoveryEncodedValueEqual `
+            $written.oldValue $Snapshot.oldValue 'Aliased setup original')) { continue }
+        if ($CurrentKeyExists -and $null -ne $CurrentValue -and [bool]$CurrentValue.exists -and
+            (Test-Stage5RecoveryEncodedValueEqual (ConvertTo-Stage5RecoveryEncodedValue `
+                $CurrentValue.value $CurrentValue.kind 'Setup alias current') `
+                $written.expectedValue 'Setup alias expected') -and
+            (Test-Stage5RecoveryEncodedValueEqual $written.expectedValue `
+                $Snapshot.expectedValue 'Setup alias plan')) { return }
+    }
+    throw "Registry setup ownership changed after planning: $($Snapshot.view)/$($Snapshot.subKey)/$($Snapshot.name)"
+}
+
 function Get-Stage5RecoveryInstallPathAncestors {
     param([string]$InstallPathKey)
     $result = New-Object 'Collections.Generic.List[string]'
@@ -406,11 +438,17 @@ function Assert-Stage5RecoveryPlanBindings {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('Generals', 'ZeroHour')][string]$Title,
         [AllowEmptyCollection()][string[]]$PlannedMissingSubKeys = @(),
-        [AllowEmptyCollection()][object[]]$Snapshots = @()
+        [AllowEmptyCollection()][object[]]$Snapshots = @(),
+        [ValidateSet('SingleTitle', 'ZeroHourWithGeneralsBase')][string]$RegistryScope = 'SingleTitle'
     )
+    $paired = $RegistryScope -ceq 'ZeroHourWithGeneralsBase'
+    Assert-Stage5RecoveryCondition (-not $paired -or
+        ($Title -ceq 'ZeroHour' -and @($Snapshots).Count -eq 4)) `
+        'Paired recovery requires ZeroHour and exactly four pre-write snapshots.'
     $planned = @($PlannedMissingSubKeys | ForEach-Object { [string]$_ })
     $allowed = @(Get-Stage5RecoveryInstallPathAncestors (
         Get-Stage5RecoveryInstallPathKey $Title))
+    if ($paired) { $allowed += @(Get-Stage5RecoveryInstallPathAncestors (Get-Stage5RecoveryInstallPathKey Generals)) }
     foreach ($plannedIdentity in $planned) {
         $separator = $plannedIdentity.IndexOf('|')
         Assert-Stage5RecoveryCondition ($separator -gt 0) `
@@ -424,7 +462,9 @@ function Assert-Stage5RecoveryPlanBindings {
     $snapshotKeys = New-Object 'Collections.Generic.List[string]'
     $seenSnapshotKeys = @{}
     foreach ($snapshot in @($Snapshots)) {
-        Assert-Stage5RecoveryAllowedSnapshot $snapshot $Title $planned
+        $snapshotTitle = if ($paired -and [string]$snapshot.subKey -ceq
+            (Get-Stage5RecoveryInstallPathKey Generals)) { 'Generals' } else { $Title }
+        Assert-Stage5RecoveryAllowedSnapshot $snapshot $snapshotTitle $planned
         $snapshotKey = "$($snapshot.view)|$($snapshot.subKey)|$($snapshot.name)"
         Assert-Stage5RecoveryCondition (-not $seenSnapshotKeys.ContainsKey($snapshotKey)) `
             "Recovery plan contains duplicate snapshot identity: $snapshotKey"
@@ -445,6 +485,7 @@ function Assert-Stage5RecoveryPlanBindings {
 function Assert-Stage5RecoveryDocumentBindings {
     param([object]$Document)
     Assert-Stage5RecoveryPlanBindings -Title ([string]$Document.identity.title) `
+        -RegistryScope (Get-Stage5RecoveryRegistryScope $Document.identity) `
         -PlannedMissingSubKeys @($Document.plannedMissingSubKeys | ForEach-Object { [string]$_ }) `
         -Snapshots @($Document.snapshots)
 }
@@ -476,9 +517,11 @@ function Get-Stage5RecoveryCanonicalSnapshotPlan {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('Generals', 'ZeroHour')][string]$Title,
         [AllowEmptyCollection()][string[]]$PlannedMissingSubKeys = @(),
-        [AllowEmptyCollection()][object[]]$Snapshots = @()
+        [AllowEmptyCollection()][object[]]$Snapshots = @(),
+        [ValidateSet('SingleTitle', 'ZeroHourWithGeneralsBase')][string]$RegistryScope = 'SingleTitle'
     )
     Assert-Stage5RecoveryPlanBindings -Title $Title `
+        -RegistryScope $RegistryScope `
         -PlannedMissingSubKeys $PlannedMissingSubKeys -Snapshots $Snapshots
     $canonicalSnapshots = @(
         @($Snapshots) | ForEach-Object {
@@ -496,20 +539,25 @@ function Get-Stage5RecoveryCanonicalSnapshotPlan {
                 }
             }
     )
-    return [ordered]@{
+    $plan = [ordered]@{
         title = $Title
         plannedMissingSubKeys = @($PlannedMissingSubKeys | ForEach-Object { [string]$_ } | Sort-Object -Unique)
         snapshots = $canonicalSnapshots
     }
+    # Preserve schema-1 canonical bytes; paired plans explicitly bind authority.
+    if ($RegistryScope -cne 'SingleTitle') { $plan.registryScope = $RegistryScope }
+    return $plan
 }
 
 function Get-Stage5RegistryRecoverySnapshotPlanSha256 {
     param(
         [Parameter(Mandatory = $true)][ValidateSet('Generals', 'ZeroHour')][string]$Title,
         [AllowEmptyCollection()][string[]]$PlannedMissingSubKeys = @(),
-        [AllowEmptyCollection()][object[]]$Snapshots = @()
+        [AllowEmptyCollection()][object[]]$Snapshots = @(),
+        [ValidateSet('SingleTitle', 'ZeroHourWithGeneralsBase')][string]$RegistryScope = 'SingleTitle'
     )
     $canonicalPlan = Get-Stage5RecoveryCanonicalSnapshotPlan -Title $Title `
+        -RegistryScope $RegistryScope `
         -PlannedMissingSubKeys $PlannedMissingSubKeys -Snapshots $Snapshots
     $json = $canonicalPlan | ConvertTo-Json -Depth 32 -Compress
     $sha = New-Object Security.Cryptography.SHA256Managed
@@ -714,6 +762,7 @@ function Assert-Stage5RecoveryIdentity {
     }
     Assert-Stage5RecoveryUuid ([string](Get-Stage5RecoveryProperty $Identity 'runNonce' 'Recovery identity')) 'Recovery identity runNonce'
     $title = [string](Get-Stage5RecoveryProperty $Identity 'title' 'Recovery identity')
+    [void](Get-Stage5RecoveryRegistryScope $Identity)
     Assert-Stage5RecoveryCondition (@('Generals', 'ZeroHour') -ccontains $title) `
         "Recovery identity title is unsupported: $title"
     Assert-Stage5RecoveryCondition ([IO.Path]::GetFullPath([string](Get-Stage5RecoveryProperty $Identity 'taskRoot' 'Recovery identity')).TrimEnd('\') -ceq $root) `
@@ -792,6 +841,7 @@ function New-Stage5RegistryRecoveryJournal {
     }
     $computedSnapshotPlanSha256 = Get-Stage5RegistryRecoverySnapshotPlanSha256 `
         -Title ([string]$Identity.title) `
+        -RegistryScope (Get-Stage5RecoveryRegistryScope $Identity) `
         -PlannedMissingSubKeys $PlannedMissingSubKeys -Snapshots $snapshotArray
     Assert-Stage5RecoveryCondition (
         [string]$Identity.snapshotPlanSha256 -ceq $computedSnapshotPlanSha256) `
@@ -819,8 +869,10 @@ function New-Stage5RegistryRecoveryJournal {
         $journalIdentity.artifactSetSha256 = [string](Get-Stage5RecoveryProperty $Identity `
             'artifactSetSha256' 'Recovery identity')
     }
+    $pairedScope = Get-Stage5RecoveryRegistryScope $Identity
+    if ($pairedScope -cne 'SingleTitle') { $journalIdentity.registryScope = $pairedScope }
     $document = [ordered]@{
-        schemaVersion = $script:Stage5RegistryRecoverySchemaVersion
+        schemaVersion = if ($pairedScope -ceq 'SingleTitle') { 1 } else { 2 }
         evidenceKind = 'stage5-registry-recovery'
         state = 'planned'
         identity = $journalIdentity
@@ -846,7 +898,9 @@ function Read-Stage5RegistryRecoveryJournal {
     Assert-Stage5RecoveryCondition (Test-Path -LiteralPath $journal -PathType Leaf) `
         "Recovery journal is missing: $journal"
     $document = Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json
-    Assert-Stage5RecoveryCondition ([int]$document.schemaVersion -eq $script:Stage5RegistryRecoverySchemaVersion -and
+    $expectedScope = Get-Stage5RecoveryRegistryScope $ExpectedIdentity
+    $expectedSchema = if ($expectedScope -ceq 'SingleTitle') { 1 } else { 2 }
+    Assert-Stage5RecoveryCondition ([int]$document.schemaVersion -eq $expectedSchema -and
         [string]$document.evidenceKind -ceq 'stage5-registry-recovery') `
         'Recovery journal schema or evidence kind is unsupported.'
     Assert-Stage5RecoveryAllowedProperties $document @(
@@ -871,8 +925,11 @@ function Read-Stage5RegistryRecoveryJournal {
     Assert-Stage5RecoveryAllowedProperties $identity @(
         'runNonce', 'title', 'taskRoot', 'journalPath', 'userSid',
         'mutexName', 'identityMode', 'runnerScriptSha256',
-        'executableSha256', 'snapshotPlanSha256', 'sourceCommit', 'artifactSetSha256') `
+        'executableSha256', 'snapshotPlanSha256', 'sourceCommit', 'artifactSetSha256', 'registryScope') `
         'Recovery journal identity'
+    Assert-Stage5RecoveryCondition ((Get-Stage5RecoveryRegistryScope $identity) -ceq $expectedScope -and
+        (([int]$document.schemaVersion -eq 2) -eq (Test-Stage5RecoveryProperty $identity 'registryScope'))) `
+        'Recovery journal registry scope differs from its schema or explicit identity.'
     Assert-Stage5RecoveryProcessIdentities @($document.processIdentities)
     foreach ($snapshot in @($document.snapshots)) {
         Assert-Stage5RecoveryAllowedProperties $snapshot @(
@@ -916,6 +973,7 @@ function Read-Stage5RegistryRecoveryJournal {
     Assert-Stage5RecoveryDocumentBindings $document
     $computedSnapshotPlanSha256 = Get-Stage5RegistryRecoverySnapshotPlanSha256 `
         -Title ([string]$identity.title) `
+        -RegistryScope (Get-Stage5RecoveryRegistryScope $identity) `
         -PlannedMissingSubKeys @($document.plannedMissingSubKeys) `
         -Snapshots @($document.snapshots)
     Assert-Stage5RecoveryCondition (
@@ -950,15 +1008,18 @@ function Update-Stage5RegistryRecoveryJournal {
     else { $newPlannedMissingSubKeys = @($document.plannedMissingSubKeys) }
     $existingPlan = Get-Stage5RecoveryCanonicalSnapshotPlan `
         -Title ([string]$document.identity.title) `
+        -RegistryScope (Get-Stage5RecoveryRegistryScope $document.identity) `
         -PlannedMissingSubKeys @($document.plannedMissingSubKeys) `
         -Snapshots @($document.snapshots)
     $proposedPlan = Get-Stage5RecoveryCanonicalSnapshotPlan `
         -Title ([string]$document.identity.title) `
+        -RegistryScope (Get-Stage5RecoveryRegistryScope $document.identity) `
         -PlannedMissingSubKeys $newPlannedMissingSubKeys -Snapshots $Snapshots
     Assert-Stage5RecoverySnapshotPlanAppend -ExistingPlan $existingPlan `
         -ProposedPlan $proposedPlan
     $computedSnapshotPlanSha256 = Get-Stage5RegistryRecoverySnapshotPlanSha256 `
         -Title ([string]$document.identity.title) `
+        -RegistryScope (Get-Stage5RecoveryRegistryScope $document.identity) `
         -PlannedMissingSubKeys $newPlannedMissingSubKeys -Snapshots $Snapshots
     $processIdentities = @(ConvertTo-Stage5RecoveryProcessIdentities `
         -ProcessIdentities $ProcessIdentities -ProcessIdentity $ProcessIdentity `
@@ -1167,6 +1228,7 @@ function Invoke-Stage5RegistryRecovery {
 }
 
 Export-ModuleMember -Function Get-Stage5RegistryRecoveryMutexName, `
+    Assert-Stage5RegistryRecoveryWriteState, `
     Enter-Stage5RegistryRecoveryMutex, Exit-Stage5RegistryRecoveryMutex, `
     Get-Stage5RegistryRecoverySnapshotPlanSha256, `
     New-Stage5RegistryRecoverySnapshot, New-Stage5RegistryRecoveryJournal, `

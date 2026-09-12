@@ -91,11 +91,41 @@ jobs:
             throw 'Replay qualification accepts only a known, explicitly x64-required Stage 5 installed product.'
           }
 
+      - name: Resolve paired artifact runtime directories
+        shell: pwsh
+        env:
+          STAGE5_GAME: ${{ inputs.game }}
+          STAGE5_ACCEPTANCE_MANIFEST: ${{ inputs.stage5_acceptance_manifest }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Stage5BaseGeneralsBinding.psm1" -Force
+          $title = if ($env:STAGE5_GAME -ceq 'Generals') { 'Generals' } else { 'ZeroHour' }
+          $layout = Get-Stage5ReplayRuntimeLayout -SourceRoot $env:GITHUB_WORKSPACE `
+            -AcceptanceManifestPath (Join-Path $env:GITHUB_WORKSPACE $env:STAGE5_ACCEPTANCE_MANIFEST) `
+            -SourceCommit $env:GITHUB_SHA.ToLowerInvariant() -Title $title
+          "STAGE5_RUNTIME_ROOT=$($layout.runtimeRoot)" >> $env:GITHUB_ENV
+          "STAGE5_GENERALS_RUNTIME_ROOT=$($layout.generalsRuntimeRoot)" >> $env:GITHUB_ENV
+          "STAGE5_ZEROHOUR_RUNTIME_ROOT=$($layout.zeroHourRuntimeRoot)" >> $env:GITHUB_ENV
+
       - name: Download Game Artifact
         uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
         with:
           name: ${{ inputs.game }}-${{ inputs.preset }}
-          path: build
+          path: ${{ env.STAGE5_RUNTIME_ROOT }}
+
+      - name: Download paired Generals Artifact
+        if: ${{ inputs.game == 'GeneralsMD' }}
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Generals-x64-generals-vcpkg-product+e
+          path: ${{ env.STAGE5_GENERALS_RUNTIME_ROOT }}
+
+      - name: Download paired Zero Hour Artifact
+        if: ${{ inputs.game == 'Generals' }}
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: GeneralsMD-x64-zerohour-vcpkg-product+e
+          path: ${{ env.STAGE5_ZEROHOUR_RUNTIME_ROOT }}
 
       - name: Provision immutable Stage 5 simulation qualification data
         shell: pwsh
@@ -114,7 +144,7 @@ jobs:
           if (Test-Path -LiteralPath $taskRoot) {
             throw "Stage 5 simulation task root is not fresh: $taskRoot"
           }
-          $runtimeRoot = (Resolve-Path -LiteralPath 'build').Path
+          $runtimeRoot = (Resolve-Path -LiteralPath $env:STAGE5_RUNTIME_ROOT).Path
           $title = switch ($env:STAGE5_GAME) {
             'Generals' { 'Generals' }
             'GeneralsMD' { 'ZeroHour' }
@@ -130,6 +160,40 @@ jobs:
           if (-not $?) {
             throw 'Stage 5 immutable simulation qualification-data provisioning failed.'
           }
+
+      - name: Provision paired Generals qualification data
+        if: ${{ inputs.game == 'GeneralsMD' }}
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $taskRoot = 'H:\Stage5SimulationValidationTask'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Install-Stage5SimulationQualificationData.ps1" `
+            -RuntimeRoot $env:STAGE5_GENERALS_RUNTIME_ROOT `
+            -TaskRoot $taskRoot -ProvisioningRole GeneralsBase `
+            -SourceCommit $env:GITHUB_SHA.ToLowerInvariant() -Title 'Generals' `
+            -AwsEndpointUrl $env:AWS_ENDPOINT_URL -OutputEnvironmentFile $env:GITHUB_ENV
+          if (-not $?) { throw 'Paired Generals qualification-data provisioning failed.' }
+
+      - name: Provision paired Zero Hour qualification data
+        if: ${{ inputs.game == 'Generals' }}
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Install-Stage5SimulationQualificationData.ps1" `
+            -RuntimeRoot $env:STAGE5_ZEROHOUR_RUNTIME_ROOT `
+            -TaskRoot 'H:\Stage5SimulationValidationTask' -ProvisioningRole ZeroHourBase `
+            -SourceCommit $env:GITHUB_SHA.ToLowerInvariant() -Title 'ZeroHour' `
+            -AwsEndpointUrl $env:AWS_ENDPOINT_URL `
+            -OutputEnvironmentFile $env:GITHUB_ENV
+          if (-not $?) { throw 'Paired Zero Hour qualification-data provisioning failed.' }
 
       - name: Audit Replay Worker Mode Propagation
         shell: pwsh
@@ -545,7 +609,8 @@ jobs:
           if ($candidateName -notmatch '^[A-Za-z0-9._-]+\.exe$') {
             throw 'Stage 5 fixture manifest executable must be a leaf .exe name.'
           }
-          $runtimeRoot = (Resolve-Path -LiteralPath 'build').Path
+          $runtimeRoot = (Resolve-Path -LiteralPath $env:STAGE5_RUNTIME_ROOT).Path
+          $generalsRuntimeRoot = (Resolve-Path -LiteralPath $env:STAGE5_GENERALS_RUNTIME_ROOT).Path
           $candidatePath = Join-Path $runtimeRoot $candidateName
           if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
             throw "Stage 5 installed candidate was not found: $candidateName"
@@ -594,7 +659,10 @@ jobs:
             -StressRepeats $env:STAGE5_STRESS_REPEATS `
             -ExpectedExecutableSha256 $candidateHash `
             -Title $expectedTitle `
-            -GeneralsInstallRoot $runtimeRoot `
+            -GeneralsInstallRoot $generalsRuntimeRoot `
+            -AcceptanceArtifactSetPath $artifactSetPath `
+            -GeneralsQualificationDataManifestPath $env:STAGE5_GENERALS_QUALIFICATION_DATA_MANIFEST_PATH `
+            -GeneralsQualificationDataManifestSha256 $env:STAGE5_GENERALS_QUALIFICATION_DATA_MANIFEST_SHA256 `
             -MinimumFreeBytes 2147483648 `
             -EnforcePerformance `
             -Stage3PerformanceBaselinePath $baselinePath `
@@ -630,7 +698,7 @@ jobs:
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: Replay-Debug-Log-${{ inputs.preset }}
-          path: build/DebugLogFile*.txt
+          path: ${{ env.STAGE5_RUNTIME_ROOT }}/DebugLogFile*.txt
           retention-days: 30
           if-no-files-found: ignore
 

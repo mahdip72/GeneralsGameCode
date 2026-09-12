@@ -517,6 +517,22 @@ jobs:
           "STAGE5_PERFORMANCE_DATA_MANIFEST_SHA256=$manifestSha256" >> $env:GITHUB_ENV
           "STAGE5_PERFORMANCE_DATA_CLOSURE_SHA256=$closureSha256" >> $env:GITHUB_ENV
 
+      - name: Provision verified Generals base data
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Install-Stage5SimulationQualificationData.ps1" `
+            -RuntimeRoot (Join-Path $env:STAGE5_QUALIFICATION_ROOT 'GeneralsRuntime') `
+            -TaskRoot 'H:\Stage5SimulationValidationTask' `
+            -SourceCommit $env:GITHUB_SHA.ToLowerInvariant() -Title 'Generals' `
+            -AwsEndpointUrl $env:AWS_ENDPOINT_URL -OutputEnvironmentFile $env:GITHUB_ENV
+          if (-not $?) { throw 'External performance base data provisioning failed.' }
+          "STAGE5_BASE_SIMULATION_CLEANUP_OWNER=$env:GITHUB_RUN_ID`:$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_ENV
+
       - name: Run external Stage 5 performance qualification
         shell: pwsh
         run: |
@@ -606,6 +622,8 @@ jobs:
             -ExpectedSourceCommit $env:GITHUB_SHA.ToLowerInvariant() `
             -ExpectedArtifactSetSha256 $artifactSetSha256 `
             -ArtifactSetManifestPath $artifactSetPath `
+            -GeneralsQualificationDataManifestPath $env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_PATH `
+            -GeneralsQualificationDataManifestSha256 $env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_SHA256 `
             -AllowHeadlessDirectExecution `
             -FixtureManifestPath $fixtureManifest `
             -ExpectedFixtureManifestSha256 $env:STAGE5_EXPECTED_PERFORMANCE_FIXTURE_MANIFEST_SHA256 `
@@ -658,6 +676,8 @@ jobs:
       - name: Clean dedicated external qualification roots
         if: ${{ always() }}
         shell: pwsh
+        env:
+          STAGE5_BASE_CONSUMERS_STATUS: ${{ job.status }}
         run: |
           $ErrorActionPreference = 'Stop'
           $expectedOwner = "$env:GITHUB_RUN_ID`:$env:GITHUB_RUN_ATTEMPT"
@@ -706,6 +726,26 @@ jobs:
             if (Test-Path -LiteralPath $ownedRoot) {
               throw "External qualification cleanup did not remove: $ownedRoot"
             }
+          }
+          if ($env:STAGE5_BASE_CONSUMERS_STATUS -ceq 'success' -and
+              $env:STAGE5_BASE_SIMULATION_CLEANUP_OWNER -ceq $expectedOwner) {
+            $simulationRoot = 'H:\Stage5SimulationValidationTask'
+            $simulationManifest = Join-Path $simulationRoot 'QualificationData.json'
+            if ([IO.Path]::GetFullPath($env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_PATH) -cne $simulationManifest) {
+              throw 'Base simulation cleanup manifest path differs from its successful producer binding.'
+            }
+            $simulationItem = Get-Item -LiteralPath $simulationRoot -Force
+            $simulationFiles = @(Get-ChildItem -LiteralPath $simulationRoot -Force)
+            if (-not $simulationItem.PSIsContainer -or
+                ($simulationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $simulationFiles.Count -ne 1 -or $simulationFiles[0].PSIsContainer -or
+                ($simulationFiles[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $simulationFiles[0].FullName -cne $simulationManifest -or
+                (Get-FileHash -LiteralPath $simulationManifest -Algorithm SHA256).Hash -cne $env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_SHA256) {
+              throw 'Base simulation cleanup no longer owns the exact retained manifest.'
+            }
+            Remove-Item -LiteralPath $simulationManifest -Force
+            [IO.Directory]::Delete($simulationRoot, $false)
           }
 
   stage5-combined-host-runner:
@@ -1139,7 +1179,7 @@ jobs:
 
   stage5-replaycheck-generals-x64:
     name: Stage 5 Installed Runtime Replay Matrix Generals x64
-    needs: [detect-changes, build-generals-x64, stage5-execution-cohort]
+    needs: [detect-changes, build-generals-x64, build-generalsmd-x64, stage5-execution-cohort]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&
           inputs.stage5_generals_fixture_manifest != '' &&
