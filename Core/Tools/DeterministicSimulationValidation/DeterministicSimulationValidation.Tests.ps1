@@ -9690,6 +9690,11 @@ try {
             replayEvidenceSha256 = $evidenceHashes['replay-determinism']
             freshAiEvidenceSha256 = $evidenceHashes['fresh-ai']
             performanceEvidenceSha256 = $evidenceHashes['performance-scaling']
+            installedKernelExecution = [ordered]@{
+                status = 'skipped'; claim = $false
+                reason = 'external-qualification-exempt-and-reviewed-native-fixture-unavailable'
+                sha256 = $null
+            }
         }
     }
     $deterministicPath = Join-Path $acceptanceRoot "$deterministicKind.json"

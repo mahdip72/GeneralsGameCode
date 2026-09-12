@@ -200,6 +200,7 @@ try {
         'Assert-Condition',
         'Get-WorkerConfigurations',
         'Get-DiagnosticWorkerConfigurations',
+        'Get-ValidationWorkerConfigurations',
         'Get-CollisionShadowConfiguration',
         'New-CommonArguments',
         'ConvertTo-DisplayCommand',
