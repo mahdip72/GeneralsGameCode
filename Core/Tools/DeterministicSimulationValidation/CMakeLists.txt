@@ -91,6 +91,13 @@ if(WIN32)
     )
     set_tests_properties(core_stage5_final_acceptance_native_relocation_tests
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
+    add_test(NAME core_stage5_development_readiness_raw_index_tests
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5DevelopmentReadinessRawLog.Tests.ps1"
+            -ScratchRoot "${_stage5_validation_test_scratch_root}/raw-index"
+    )
+    set_tests_properties(core_stage5_development_readiness_raw_index_tests
+        PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
     add_test(NAME core_stage5_schema_version_type_contract_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5SchemaVersionTypeContract.Tests.ps1"

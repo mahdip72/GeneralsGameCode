@@ -7167,7 +7167,8 @@ function Assert-Stage5DevelopmentReadinessExecutionStreamEvidence {
         [object]$Entry,
         [object]$Result,
         [object[]]$ValidatedRawLogs,
-        [string]$Context
+        [string]$Context,
+        [Collections.Generic.IDictionary[string,object]]$RawLogIndex = $null
     )
     $stdoutPathText = Get-Stage5JsonValue $Entry 'stdout' "$Context plan entry"
     $stderrPathText = Get-Stage5JsonValue $Entry 'stderr' "$Context plan entry"
@@ -7181,9 +7182,9 @@ function Assert-Stage5DevelopmentReadinessExecutionStreamEvidence {
         $stdoutLeaf -cne $stderrLeaf) `
         "$Context stream paths must have distinct canonical leaves."
     $stdout = Get-Stage5DevelopmentReadinessRawLog $ValidatedRawLogs $stdoutLeaf `
-        "$Context stdout"
+        "$Context stdout" $RawLogIndex
     $stderr = Get-Stage5DevelopmentReadinessRawLog $ValidatedRawLogs $stderrLeaf `
-        "$Context stderr"
+        "$Context stderr" $RawLogIndex
     $stdoutResultSha256 = Get-Stage5JsonValue $Result 'stdoutSha256' $Context
     $stderrResultSha256 = Get-Stage5JsonValue $Result 'stderrSha256' $Context
     Assert-Stage5Condition ($stdoutResultSha256 -is [string] -and
@@ -7214,14 +7215,47 @@ function Assert-Stage5DevelopmentReadinessExecutionStreamEvidence {
     }
 }
 
+function New-Stage5DevelopmentReadinessRawLogIndex {
+    param([object[]]$RawLogs)
+    $buckets = New-Object 'Collections.Generic.Dictionary[string,object]' `
+        ([StringComparer]::Ordinal)
+    foreach ($record in $RawLogs) {
+        $name = [string]$record.name
+        if (-not $buckets.ContainsKey($name)) {
+            $buckets[$name] = New-Object 'Collections.Generic.List[object]'
+        }
+        ([Collections.Generic.List[object]]$buckets[$name]).Add($record) |
+            Out-Null
+    }
+    $index = New-Object 'Collections.Generic.Dictionary[string,object]' `
+        ([StringComparer]::Ordinal)
+    foreach ($name in $buckets.Keys) {
+        $index[$name] =
+            ([Collections.Generic.List[object]]$buckets[$name]).ToArray()
+    }
+    return $index
+}
+
 function Get-Stage5DevelopmentReadinessRawLog {
-    param([object[]]$RawLogs, [string]$LeafName, [string]$Context)
+    param(
+        [object[]]$RawLogs,
+        [string]$LeafName,
+        [string]$Context,
+        [Collections.Generic.IDictionary[string,object]]$RawLogIndex = $null
+    )
     Assert-Stage5Condition (-not [string]::IsNullOrWhiteSpace($LeafName) -and
         [IO.Path]::GetFileName($LeafName) -ceq $LeafName) `
         "$Context requires a canonical raw-log leaf name."
-    $matches = @($RawLogs | Where-Object {
-        [string]$_.name -ceq $LeafName
-    })
+    $matches = @(
+        if ($null -eq $RawLogIndex) {
+            $RawLogs | Where-Object {
+                [string]$_.name -ceq $LeafName
+            }
+        }
+        elseif ($RawLogIndex.ContainsKey($LeafName)) {
+            $RawLogIndex[$LeafName]
+        }
+    )
     Assert-Stage5Condition ($matches.Count -eq 1) `
         "$Context requires exactly one retained raw log named '$LeafName'."
     $record = $matches[0]
@@ -7916,6 +7950,7 @@ function Assert-Stage5DevelopmentReadinessExecutionEvidence {
 
     Assert-Stage5Condition ($ValidatedRawLogs.Count -eq 507) `
         "$context validation receipt must retain exactly one result file and 253 stdout/stderr pairs."
+    $rawLogIndex = New-Stage5DevelopmentReadinessRawLogIndex $ValidatedRawLogs
     $stdoutLeaves = New-Object 'Collections.Generic.HashSet[string]' `
         ([StringComparer]::OrdinalIgnoreCase)
     $stderrLeaves = New-Object 'Collections.Generic.HashSet[string]' `
@@ -7946,6 +7981,7 @@ function Assert-Stage5DevelopmentReadinessExecutionEvidence {
             "$context plan aliases or duplicates child stream leaf names."
         $streamEvidence = Assert-Stage5DevelopmentReadinessExecutionStreamEvidence `
             -Entry $entry -Result $result -ValidatedRawLogs $ValidatedRawLogs `
+            -RawLogIndex $rawLogIndex `
             -Context "$context result $sequence"
         $stdout = $streamEvidence.stdout
         $stderr = $streamEvidence.stderr
