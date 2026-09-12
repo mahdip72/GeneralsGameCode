@@ -1470,6 +1470,8 @@ function Invoke-Stage5CheckReplaysContractSelfTest {
     Assert-Stage5WorkflowCondition (Test-Path -LiteralPath $path -PathType Leaf) `
         'check-replays workflow contract self-test fixture is missing.'
     $fixture = (Get-Content -LiteralPath $path -Raw) -replace "`r`n|`r", "`n"
+    Assert-Stage5CanonicalDownloadArtifactPins $fixture 3 `
+        'self-test reusable Stage 5 replay artifact download assembly'
     Assert-Stage5CheckReplaysContract $fixture `
         'self-test reusable Stage 5 replay workflow fixture'
 
@@ -2928,12 +2930,26 @@ H:\Stage5SimulationValidationTask
         'self-test positive fixture'
     Assert-Stage5WorkflowNotContains $fixture 'ReplayFixtureManifest\.example\.json' `
         'self-test positive fixture'
-    $downloadFixture = @"
-      uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3
-      uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3
-"@
-    Assert-Stage5CanonicalDownloadArtifactPins $downloadFixture 2 `
-        'self-test canonical action fixture'
+    $downloadReference =
+        '      uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3'
+    $downloadFixture = [string]::Join("`n", @(
+        $downloadReference, $downloadReference, $downloadReference))
+    Assert-Stage5CanonicalDownloadArtifactPins $downloadFixture 3 `
+        'self-test three-source canonical action fixture'
+    foreach ($invalidDownloadFixture in @(
+        [string]::Join("`n", @($downloadReference, $downloadReference)),
+        [string]::Join("`n", @(
+            $downloadReference, $downloadReference, $downloadReference,
+            $downloadReference)))) {
+        $caught = $false
+        try {
+            Assert-Stage5CanonicalDownloadArtifactPins $invalidDownloadFixture 3 `
+                'self-test missing-or-extra canonical action fixture'
+        }
+        catch { $caught = $true }
+        Assert-Stage5WorkflowCondition $caught `
+            'workflow contract self-test accepted a missing or extra artifact download.'
+    }
     $caught = $false
     try {
         Assert-Stage5WorkflowContains $fixture 'missing-contract' 'self-test negative fixture'
@@ -4148,7 +4164,7 @@ foreach ($retiredReplayMarker in @(
     Assert-Stage5WorkflowNotContains $check ([regex]::Escape($retiredReplayMarker)) `
         "retired legacy replay branch marker $retiredReplayMarker"
 }
-Assert-Stage5CanonicalDownloadArtifactPins $check 1 `
+Assert-Stage5CanonicalDownloadArtifactPins $check 3 `
     'reusable Stage 5 installed-runtime artifact download'
 Assert-Stage5WorkflowContains $check 'stage5_execution_cohort_nonce:' `
     'reusable Stage 5 fresh execution cohort nonce input'
