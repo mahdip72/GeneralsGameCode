@@ -40,11 +40,9 @@ inline bool ParseMapRequest(int argc, const char *const *argv, bool native,
             option = i;
         }
         if (rts::fixture::SameToken(argv[i], "-runSkirmishAITest4v2")) ++scenarios;
-        const char *conflicts[] = { "-runSkirmishAITest", "-runSkirmishAITestHardAI2v6",
-            "-runSkirmishAITestPractical1v7", "-runStage5PerformanceFixture", "-replay", "-jobs",
-            "-installedNet3Validation", "-installedLockstepV2Validation", "-loadsave", "-map", "-file" };
-        for (unsigned k = 0; k < sizeof(conflicts) / sizeof(conflicts[0]); ++k)
-            if (rts::fixture::SameToken(argv[i], conflicts[k])) conflict = true;
+        if (!rts::fixture::SameToken(argv[i], "-runSkirmishAITest4v2") &&
+            (rts::fixture::IsConflictingOption(argv[i]) ||
+             rts::fixture::SameToken(argv[i], "-runStage5PerformanceFixture"))) conflict = true;
     }
     if (option == -1) return true;
     if (!native || conflict || scenarios != 1) return rts::fixture::Fail(error, "reviewed_map_requires_native_4v2");

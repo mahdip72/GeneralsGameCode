@@ -2808,6 +2808,7 @@ function New-Stage5ValidationResultProjection {
                 $entryProperty.Value -ceq $frozenProperty.Value) `
                 "V2 AI result projection '$field' is not copied from the frozen live-plan identity."
         }
+        Assert-Stage5ReviewedAiMapEntryIdentity -Entry $Entry -FrozenEntry $FrozenLiveEntry
         $identitySource = $FrozenLiveEntry
     }
     $result = [ordered]@{
@@ -2827,6 +2828,11 @@ function New-Stage5ValidationResultProjection {
         scenario = $identitySource.scenario
         fixtureSha256 = $identitySource.fixtureSha256
         stress = $identitySource.stress
+    }
+    if ($identitySource.PSObject.Properties.Name -ccontains 'reviewedMap') {
+        # Copy the actual frozen binding, not its private requirements-map
+        # digest; aggregate validation needs the complete portable identity.
+        $result.reviewedMap = $identitySource.reviewedMap | ConvertTo-Json -Depth 4 | ConvertFrom-Json
     }
     if ($Entry.kind -ceq 'ai' -and $RequireFrozenLiveIdentity) {
         foreach ($field in @('entryId', 'validationRole', 'proofProfileId')) {

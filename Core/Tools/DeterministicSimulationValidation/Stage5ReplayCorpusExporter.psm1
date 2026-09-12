@@ -1647,6 +1647,21 @@ function Get-Stage5ExporterRecordIdentity {
         if ($null -ne $property) { $value = [string]$property.Value }
         $values.Add($value) | Out-Null
     }
+    $mapIdentities = @()
+    if ($null -ne $Record.PSObject.Properties['maps']) {
+        foreach ($map in $Record.maps) {
+            $mapIdentities += [ordered]@{
+                source = Get-Stage5ExporterRecordPropertyValue $map 'source' 'Replay map identity'
+                profileRelativePath = Get-Stage5ExporterRecordPropertyValue $map 'profileRelativePath' 'Replay map identity'
+                sha256 = Get-Stage5ExporterRecordPropertyValue $map 'sha256' 'Replay map identity'
+                byteCount = [Int64](Get-Stage5ExporterRecordPropertyValue $map 'byteCount' 'Replay map identity')
+                crc = Get-Stage5ExporterRecordPropertyValue $map 'crc' 'Replay map identity'
+            }
+        }
+    }
+    # Explicit empty and historical absent maps are equivalent, but every
+    # field of a present dependency participates in all three view comparisons.
+    $values.Add((ConvertTo-Json -InputObject @($mapIdentities) -Depth 4 -Compress)) | Out-Null
     return [string]::Join('|', $values.ToArray())
 }
 

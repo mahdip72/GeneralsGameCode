@@ -513,6 +513,53 @@ function New-TestCorpusBundle {
     }
 }
 
+function Assert-ReviewedMapCorpusViewBinding {
+    param([string]$Root,[object]$ReviewedMap)
+    $run=Join-Path $Root 'run';$profile=Join-Path $run 'Documents/Profile'
+    $corpus=Join-Path $Root 'corpus';$replay=Join-Path $profile 'Replays/test.rep'
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $replay))|Out-Null
+    [IO.Directory]::CreateDirectory($corpus)|Out-Null
+    [IO.File]::WriteAllBytes($replay,(New-TestReplayBytes))
+    $record=Export-Stage5FreshReplayArtifact -SourcePath $replay -ExpectedSha256 (Get-TestSha256 $replay) `
+        -TaskRoot $Root -TaskRunRoot $run -ProfileRoot $profile -CorpusExportRoot $corpus `
+        -ReviewedMap $ReviewedMap -Metadata (New-TestMetadata '00AC-000006-00000001' '4v2' 1729 'local-capacity-ai')
+    $bundle=New-TestCorpusBundle -TaskRoot $Root -CorpusRoot $corpus -Records @($record)
+    $originalManifest=Get-Content $bundle.manifest.path -Raw
+    $originalIndex=Get-Content $bundle.artifactIndex.path -Raw
+    $originalReceipt=Get-Content $bundle.receiptPath -Raw
+    $module=Get-Module Stage5ReplayCorpusExporter
+    $jsonOptions=@{}
+    if((Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')){$jsonOptions.DateKind='String'}
+    try {
+        foreach($view in @('control','manifest','index','receipt')) {
+            $manifest=$originalManifest|ConvertFrom-Json @jsonOptions
+            $index=$originalIndex|ConvertFrom-Json @jsonOptions
+            $receipt=$originalReceipt|ConvertFrom-Json @jsonOptions
+            if($view-eq'manifest'){$manifest.records[0].PSObject.Properties.Remove('maps')}
+            if($view-eq'index'){$index.records[0].PSObject.Properties.Remove('maps')}
+            if($view-eq'receipt'){$receipt.corpusExport.records[0].PSObject.Properties.Remove('maps')}
+            # Rebind every upstream hash so the check reaches record identity,
+            # not an earlier detached-JSON hash failure.
+            [IO.File]::WriteAllText($bundle.artifactIndex.path,($index|ConvertTo-Json -Depth 30))
+            $receipt.corpusExport.artifactIndexSha256=Get-TestSha256 $bundle.artifactIndex.path
+            [IO.File]::WriteAllText($bundle.receiptPath,($receipt|ConvertTo-Json -Depth 30))
+            $manifest.validationReceipt.sha256=Get-TestSha256 $bundle.receiptPath
+            [IO.File]::WriteAllText($bundle.manifest.path,($manifest|ConvertTo-Json -Depth 30))
+            if($view-eq'control') {
+                & $module { param($path) Read-Stage5FreshReplayCorpusBundle -CorpusManifestPath $path } $bundle.manifest.path|Out-Null
+            } else {
+                Assert-Throws {& $module { param($path) Read-Stage5FreshReplayCorpusBundle -CorpusManifestPath $path } $bundle.manifest.path|Out-Null} `
+                    'Corpus manifest and (artifact index|validation receipt) records differ' `
+                    "Stripped $view map dependency with rebound hashes"
+            }
+        }
+    } finally {
+        [IO.File]::WriteAllText($bundle.manifest.path,$originalManifest)
+        [IO.File]::WriteAllText($bundle.artifactIndex.path,$originalIndex)
+        [IO.File]::WriteAllText($bundle.receiptPath,$originalReceipt)
+    }
+}
+
 Assert-LocalCapacityRunnerPreservesReplayQualification
 
 $exporterModule = Get-Module -Name Stage5ReplayCorpusExporter |
@@ -651,6 +698,7 @@ try {
         $mappedRecord.maps[0].profileRelativePath -ceq 'Maps\AiProof\AiProof.map' -and
         (Get-FileHash (Join-Path $corpusRoot $mappedRecord.maps[0].source) -Algorithm SHA256).Hash -ceq $mapHash) `
         'Exported replay lost its immutable reviewed map bytes or portable key.'
+    Assert-ReviewedMapCorpusViewBinding -Root (Join-Path $taskRoot 'map-view-binding') -ReviewedMap $reviewedMap
     $mapResultsPath = Join-Path $taskRoot 'map-results.json'
     Write-TestValidationResults $mapResultsPath @($mappedRecord)
     $mapResults = Get-Content -LiteralPath $mapResultsPath -Raw | ConvertFrom-Json

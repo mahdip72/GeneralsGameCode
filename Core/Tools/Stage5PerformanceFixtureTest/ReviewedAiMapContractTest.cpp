@@ -4,7 +4,10 @@
 #undef NDEBUG
 #endif
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
+#undef assert
+#define assert(condition) do { if (!(condition)) { fprintf(stderr, "contract assertion failed at line %d: %s\n", __LINE__, #condition); return 1; } } while (0)
 
 int main()
 {
@@ -28,6 +31,14 @@ int main()
     assert(!rts::ai_fixture::ParseMapRequest(8, args, true, &request, &error));
     args[4] = "Maps\\AiProof\\different.map";
     assert(!rts::ai_fixture::ParseMapRequest(8, args, true, &request, &error));
+    const char *benchmarkFirst[] = { "game", "-benchmark", "-runSkirmishAITest4v2", "1729",
+        "-skirmishAITestReviewedMap", "Maps\\AiProof\\AiProof.map",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "16384", "1234ABCD" };
+    const char *benchmarkLast[] = { "game", "-runSkirmishAITest4v2", "1729",
+        "-skirmishAITestReviewedMap", "Maps\\AiProof\\AiProof.map",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "16384", "1234ABCD", "-benchmark" };
+    assert(!rts::ai_fixture::ParseMapRequest(9, benchmarkFirst, true, &request, &error));
+    assert(!rts::ai_fixture::ParseMapRequest(9, benchmarkLast, true, &request, &error));
     const char *legacy[] = { "game", "-runSkirmishAITest", "1729" };
     assert(rts::ai_fixture::ParseMapRequest(3, legacy, false, &request, &error));
     assert(!request.requested);

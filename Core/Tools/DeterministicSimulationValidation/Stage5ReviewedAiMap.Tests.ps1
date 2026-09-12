@@ -97,3 +97,32 @@ $tampered=$authority|ConvertTo-Json -Depth 8|ConvertFrom-Json
 $tampered.reviewedMap.sha256='FF'*32
 Reject {Resolve-Stage5LiveValidationRequirements $v2Plan $tampered} 'map.*binding|plan'
 Write-Output 'PASS: JSON schema and V2 authority identity preserve reviewed map binding'
+# Exercise the real aggregate preflight and result projection, not just a
+# direct resolver call. Existing complete metric fixtures supply all roles.
+$fixtureAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot 'DeterministicSimulationValidation.Tests.ps1'),[ref]$tokens,[ref]$errors)
+foreach($fn in $fixtureAst.FindAll({param($a)$a -is [Management.Automation.Language.FunctionDefinitionAst]},$false)){
+    . ([scriptblock]::Create($fn.Extent.Text))
+}
+$pipelinePlan=New-Stage5LiveRoleTestPlan
+$run=[pscustomobject]@{exitCode=0;timedOut=$false;wallMilliseconds=1;childProcess=[pscustomobject]@{stdoutSha256=('A'*64);stderrSha256=('B'*64)}}
+$projected=@(foreach($planned in $pipelinePlan.entries){
+    $planned|Add-Member -NotePropertyMembers @{reviewedMap=$bound.binding;caseId=$planned.determinismKey;matrixRepeat=0;replayArgument='';fixtureSha256=''}
+    $output=New-Stage5LiveRoleTestOutput $planned
+    $output=$output.Replace('SKIRMISH_AI_TEST_COMPLETE ',('SKIRMISH_AI_TEST_COMPLETE map="{0}" map_sha256={1} map_crc={2} map_size={3} ' -f $map.mapKey,$sha,$map.crc,$map.byteCount))
+    $evidence=ConvertFrom-Stage5AiCompletion $output $planned ('A'*64) $true -ValidationPlan $pipelinePlan
+    New-Stage5ValidationResultProjection -Entry $planned -Run $run -AiEvidence $evidence `
+        -ReplayMetrics $null -ReplayResult $null -TimingEvidence $null -ExecutionProvenance $null `
+        -FrozenLiveEntry $planned -RequireFrozenLiveIdentity $true -Title ZeroHour
+})
+Assert-Stage5AuthoritativeWorkEvidence -Results $projected -ValidationPlan $pipelinePlan
+foreach($change in @('strip','mutate')){
+    $badResults=@($projected|ConvertTo-Json -Depth 30|ConvertFrom-Json)
+    if($change-eq'strip'){$badResults[0].PSObject.Properties.Remove('reviewedMap')}else{$badResults[0].reviewedMap.sha256='F'*64}
+    Reject {Assert-Stage5AuthoritativeWorkEvidence -Results $badResults -ValidationPlan $pipelinePlan} 'map.*binding|plan'
+}
+$wrongEntry=$pipelinePlan.entries[0]|ConvertTo-Json -Depth 8|ConvertFrom-Json
+$wrongEntry.reviewedMap.crc='FFFFFFFF'
+Reject {New-Stage5ValidationResultProjection -Entry $wrongEntry -Run $run -AiEvidence $projected[0].aiEvidence `
+    -ReplayMetrics $null -ReplayResult $null -TimingEvidence $null -ExecutionProvenance $null `
+    -FrozenLiveEntry $pipelinePlan.entries[0] -RequireFrozenLiveIdentity $true -Title ZeroHour} 'map.*binding|plan'
+Write-Output 'PASS: actual V2 preflight to projected results to aggregate validation'

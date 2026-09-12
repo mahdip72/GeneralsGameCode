@@ -2984,7 +2984,9 @@ function Assert-Stage5PlannedLiveWorkEvidence {
         "$context frozen plan requirements map does not cover every planned AI entry."
     Get-Stage5LiveValidationRequirementsFromMap `
         -RequirementsMap $requirementsMap `
-        -Entry $requirementsMap[$requiredEntryIds[0]] | Out-Null
+        -Entry (@($planObject.entries | Where-Object {
+            $_.kind -ceq 'ai' -and $_.entryId -ceq $requiredEntryIds[0]
+        })[0]) | Out-Null
     & $writePlannedLiveDiagnostic 'preflight-resolver' 'complete'
     $seen = @{}
     $verifiedOutcomes = @{}
