@@ -84,6 +84,13 @@ if(WIN32)
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5ValidationResultsProvenance.Tests.ps1"
             -ScratchRoot "${_stage5_validation_test_scratch_root}/results-provenance"
     )
+    add_test(NAME core_stage5_final_acceptance_native_relocation_tests
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5FinalAcceptanceNativeRelocation.Tests.ps1"
+            -ScratchRoot "${_stage5_validation_test_scratch_root}/native-relocation"
+    )
+    set_tests_properties(core_stage5_final_acceptance_native_relocation_tests
+        PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
     add_test(NAME core_stage5_schema_version_type_contract_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5SchemaVersionTypeContract.Tests.ps1"

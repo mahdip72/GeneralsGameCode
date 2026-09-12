@@ -4797,6 +4797,9 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
         ([StringComparer]::OrdinalIgnoreCase)
     $allNativePaths = New-Object 'Collections.Generic.HashSet[string]' `
         ([StringComparer]::OrdinalIgnoreCase)
+    # Candidate normalization depends only on this invocation's root and file
+    # list; defer it until the first absolute source path.
+    $candidatePathRecords = $null
     $childBindings = New-Object 'Collections.Generic.List[object]'
     foreach ($child in $children) {
         $childNonce = [string](Get-Stage5JsonValue $child 'runNonce' `
@@ -4886,16 +4889,26 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
             }
             else {
                 $sourceSegments = @(Get-Stage5FinalAcceptancePathSegments $sourcePath)
+                if ($null -eq $candidatePathRecords) {
+                    $candidatePathRecords = New-Object 'Collections.Generic.List[object]'
+                    foreach ($file in $files) {
+                        $relative = Get-Stage5FinalAcceptanceRelativePath $relocationRoot `
+                            $file "$childContext candidate"
+                        $candidatePathRecords.Add([pscustomobject]@{
+                            path = $file
+                            relative = $relative
+                            segments = @(Get-Stage5FinalAcceptancePathSegments $relative)
+                        }) | Out-Null
+                    }
+                }
                 $matches = New-Object 'Collections.Generic.List[object]'
-                foreach ($file in $files) {
-                    $relative = Get-Stage5FinalAcceptanceRelativePath $relocationRoot `
-                        $file "$childContext candidate"
-                    $candidateSegments = @(Get-Stage5FinalAcceptancePathSegments $relative)
-                    $maximum = [Math]::Min($sourceSegments.Count, $candidateSegments.Count)
+                foreach ($candidate in $candidatePathRecords) {
+                    $maximum = [Math]::Min($sourceSegments.Count,
+                        $candidate.segments.Count)
                     $suffixLength = 0
                     for ($count = 1; $count -le $maximum; ++$count) {
                         if ($sourceSegments[$sourceSegments.Count - $count].Equals(
-                                $candidateSegments[$candidateSegments.Count - $count],
+                                $candidate.segments[$candidate.segments.Count - $count],
                                 [StringComparison]::OrdinalIgnoreCase)) {
                             $suffixLength = $count
                         }
@@ -4903,7 +4916,7 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
                     }
                     if ($suffixLength -ge 2) {
                         $matches.Add([pscustomobject]@{
-                            path = $file; suffixLength = $suffixLength
+                            path = $candidate.path; suffixLength = $suffixLength
                         }) | Out-Null
                     }
                 }
