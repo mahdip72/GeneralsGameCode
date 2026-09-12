@@ -6106,7 +6106,11 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
             @([pscustomobject]@{
                 path = $fixtureInput.fixture.sourcePath
                 sha256 = $fixtureInput.fixture.sha256
-            }) $fixtureInput.path (@($planPath) + $baseImmutablePaths)
+            }) $fixtureInput.path (@($planPath) + $baseImmutablePaths + @($plannedMapPath))
+        Assert-Stage5PerformanceFileHash $plannedMapPath `
+            $fixtureInput.fixture.sha256 `
+            'Native fixture staged map SHA-256 after read-only lock acquisition' |
+            Out-Null
         if ($null -ne $baseBinding) { Assert-Stage5BaseGeneralsBindingCurrent $baseBinding }
         $start = [pscustomobject][ordered]@{
             schemaVersion = 1

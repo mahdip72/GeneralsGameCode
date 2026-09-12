@@ -36,7 +36,82 @@ function Set-Stage5RegistryRecoveryObservedProcess { param($Context,$Identity) f
 function Update-Stage5RegistryRecoveryState {}
 function New-Stage5RegistryRecoveryAuthorization { return 'test-only' }
 function Invoke-Stage5RegistryRecovery {}
-function Open-Stage5PerformanceReadOnlyLocks { return $null }
+function Test-Stage5StagedMapFileShare {
+    param([string]$Path, [bool]$ExpectBlocked)
+    Assert-True (-not [string]::IsNullOrWhiteSpace($Path) -and
+        (Test-Path -LiteralPath $Path -PathType Leaf)) `
+        'Staged map share probe received no existing map path.'
+    $probeBytes = New-Object byte[] 1
+    $probeBytes[0] = 0x7F
+    $writeBlocked = $false
+    try { [IO.File]::WriteAllBytes($Path, $probeBytes) }
+    catch { $writeBlocked = $true }
+    $deleteBlocked = $false
+    try { [IO.File]::Delete($Path) }
+    catch { $deleteBlocked = $true }
+    if ($ExpectBlocked) {
+        Assert-True ($writeBlocked -and $deleteBlocked -and
+            (Test-Path -LiteralPath $Path -PathType Leaf)) `
+            'Staged map write/delete was not blocked while the child ran.'
+    }
+    else {
+        Assert-True ((-not $writeBlocked) -and (-not $deleteBlocked) -and
+            (-not (Test-Path -LiteralPath $Path -PathType Leaf))) `
+            'Staged map write/delete remained blocked after lock disposal.'
+    }
+}
+function Open-Stage5PerformanceReadOnlyLocks {
+    param($ArtifactBinding, $Fixtures, [string]$FixtureManifestPath = '',
+        [string[]]$AdditionalPaths = @())
+    $script:observedLockFixtureManifestPath = $FixtureManifestPath
+    $script:observedLockAdditionalPaths = @($AdditionalPaths)
+    $mapLeaf = [IO.Path]::GetFileName($script:fixture.mapPath)
+    $stagedCandidates = @($AdditionalPaths | Where-Object {
+        [string]::Equals([IO.Path]::GetFileName([string]$_), $mapLeaf,
+            [StringComparison]::OrdinalIgnoreCase) -and
+        ([string]$_ -like '*\TitleSession\*')
+    })
+    $script:stagedMapPath = if ($stagedCandidates.Count -eq 1) {
+        [IO.Path]::GetFullPath([string]$stagedCandidates[0])
+    } else { $null }
+    $script:lockObservedStagedMap = ($stagedCandidates.Count -eq 1)
+    if ($script:case -eq 'tamper-before-lock' -and $null -ne $script:stagedMapPath) {
+        $tamperedBytes = [IO.File]::ReadAllBytes($script:stagedMapPath)
+        $tamperedBytes[0] = [byte](($tamperedBytes[0] + 1) % 251)
+        [IO.File]::WriteAllBytes($script:stagedMapPath, $tamperedBytes)
+        $script:tamperApplied = $true
+    }
+    $paths = New-Object 'Collections.Generic.List[string]'
+    $seen = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in @($Fixtures | ForEach-Object { $_.path }) +
+        @($FixtureManifestPath) + @($AdditionalPaths)) {
+        if ([string]::IsNullOrWhiteSpace([string]$path)) { continue }
+        $full = [IO.Path]::GetFullPath([string]$path)
+        if ($seen.Add($full)) { $paths.Add($full) | Out-Null }
+    }
+    $streams = New-Object 'Collections.Generic.List[IO.FileStream]'
+    try {
+        foreach ($path in $paths) {
+            $streams.Add([IO.File]::Open($path, [IO.FileMode]::Open,
+                [IO.FileAccess]::Read, [IO.FileShare]::Read)) | Out-Null
+        }
+        return ,$streams.ToArray()
+    }
+    catch {
+        foreach ($stream in $streams) { try { $stream.Dispose() } catch {} }
+        throw
+    }
+}
+function Dispose-Stage5PerformanceReadOnlyLocks {
+    param([object[]]$Locks)
+    foreach ($stream in @($Locks)) {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+    if ($null -ne $script:stagedMapPath) {
+        Test-Stage5StagedMapFileShare $script:stagedMapPath $false
+        $script:mapLockReleasedBeforeProfileCleanup = $true
+    }
+}
 function New-Stage5NativeFixtureProcess {
     param($Info)
     $script:fakeInfo=$Info
@@ -48,7 +123,14 @@ function New-Stage5NativeFixtureProcess {
     $text=$text.Replace('initial_units=8000','initial_units=1000').Replace('peak_units=12000','peak_units=1000').Replace('initial_units=1000 peak_units=1500','initial_units=125 peak_units=125')
     $script:fakeStdout=[Text.Encoding]::UTF8.GetBytes($text)
     $p=[pscustomobject]@{StartInfo=$Info;ExitCode=$(if($script:case -eq 'exit-failure'){1}else{0});StandardOutput=[pscustomobject]@{BaseStream='stdout'};StandardError=[pscustomobject]@{BaseStream='stderr'}}
-    $p|Add-Member ScriptMethod Start {return $true}
+    $p|Add-Member ScriptMethod Start {
+        Assert-True $script:lockObservedStagedMap `
+            'The staged map was not supplied to the read-only lock helper.'
+        Test-Stage5StagedMapFileShare $script:stagedMapPath $true
+        $script:childMapShareBlocked = $true
+        $script:fakeProcessStarted = $true
+        return $true
+    }
     $p|Add-Member ScriptMethod WaitForExit {param($Milliseconds) return $true}
     $p|Add-Member ScriptMethod Dispose {}
     return $p
@@ -82,8 +164,12 @@ $script:fixture.executableSha256=Get-TestSha256 $script:exe
 $DiagnosticMapPath=$script:fixture.mapPath;$ExpectedDiagnosticMapSha256=$script:fixture.mapSha256
 $DiagnosticMapKey='Maps\Stage5Dense\Stage5Dense.map'
 $sourceCommit = (& git -C $PSScriptRoot rev-parse HEAD).Trim()
-foreach($script:case in @('success','exit-failure','capture-failure','foreign-child')) {
+foreach($script:case in @('success','exit-failure','capture-failure','foreign-child','tamper-before-lock')) {
     $out=Join-Path $ScratchRoot $script:case
+    $script:lockObservedStagedMap=$false;$script:stagedMapPath=$null
+    $script:observedLockFixtureManifestPath=$null;$script:observedLockAdditionalPaths=@()
+    $script:childMapShareBlocked=$false;$script:mapLockReleasedBeforeProfileCleanup=$false
+    $script:fakeProcessStarted=$false;$script:tamperApplied=$false
     $caught=$null
     try {
         Invoke-Stage5NativePerformanceFixtureProduction -Diagnostic -FixtureTitle ZeroHour `
@@ -100,6 +186,14 @@ foreach($script:case in @('success','exit-failure','capture-failure','foreign-ch
     Assert-True (Test-Path (Join-Path $out 'inputs/Stage5Dense.map')) 'Input map was lost.'
     $hasObservedExitEvidence = $result.PSObject.Properties.Name -contains 'exitCode' -and
         $result.PSObject.Properties.Name -contains 'identityBoundExitProven'
+    if($script:case -eq 'tamper-before-lock') {
+        Assert-True ($null -ne $caught -and $result.status -eq 'failed' -and
+            $script:tamperApplied -and $script:lockObservedStagedMap -and
+            (-not $script:fakeProcessStarted) -and
+            ([string]$result.error -match 'staged map SHA-256')) `
+            'A staged-map tamper after the pre-lock hash was allowed to launch the child.'
+        continue
+    }
     if($script:case -eq 'success') {
         Assert-True ($null -eq $caught -and $result.status -eq 'observed' -and $result.expectedPopulationObserved -and
             $hasObservedExitEvidence -and (Test-Stage5JsonInteger $result.exitCode) -and
@@ -107,6 +201,9 @@ foreach($script:case in @('success','exit-failure','capture-failure','foreign-ch
             $result.lifecycle.childExitProven) "Successful diagnostic failed: $caught"
         Assert-True (Test-Path (Join-Path $out 'replays/Stage5Performance.rep')) 'Replay was lost during cleanup.'
         Assert-True (-not(Test-Path (Join-Path $out 'TitleSession'))) 'Completed profile not cleaned.'
+        Assert-True ($script:childMapShareBlocked -and
+            $script:mapLockReleasedBeforeProfileCleanup) `
+            'Staged map lock lifetime was not proven around child/profile cleanup.'
     }else{
         Assert-True ($null -ne $caught -and $result.status -eq 'failed' -and $null -eq $result.observation) "Failure became success: $script:case"
         if($script:case -eq 'exit-failure') {
