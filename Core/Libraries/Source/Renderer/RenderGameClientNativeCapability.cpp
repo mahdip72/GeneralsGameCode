@@ -357,7 +357,11 @@ RenderResult ResetGameRenderFrameResources(bool frameChanged)
 {
 	NativeGameRenderOwnerScope scope;
 	IGameRenderClientNativeOwner *owner = scope.Get();
-	if (owner == 0 || !owner->IsInitialized() || !owner->IsOperational())
+	// WW3D resets frame resources before its display-iteration boundary. An
+	// asynchronous device removal makes both readiness queries false, but the
+	// concrete reset services completions and recovery before admitting resource
+	// work. Keep its owner-thread/lifecycle validation reachable under this pin.
+	if (owner == 0)
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	const RenderResult result =
 		owner->ResetGameRenderFrameResources(frameChanged);

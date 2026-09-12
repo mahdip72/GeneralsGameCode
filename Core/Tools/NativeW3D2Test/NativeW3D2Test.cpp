@@ -853,6 +853,63 @@ int TestBorrowedThreadedCapture(HWND window)
 	return result;
 }
 
+int TestPublicFrameResetRecoversRemovedDevice(HWND window)
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3DRendererDescriptor descriptor;
+	descriptor.width = 64;
+	descriptor.height = 64;
+	descriptor.enableVsync = false;
+	descriptor.allowSoftwareFallback = true;
+	NativeW3D2 owner;
+	result |= Check(owner.Initialize(window, descriptor) == RENDER_RESULT_OK,
+		"public frame recovery fixture initializes");
+	if (!owner.IsInitialized()) return result;
+	result |= Check(owner.Renderer().IsThreaded(),
+		"public frame recovery exercises asynchronous rendering");
+	result |= Check(owner.Renderer().SetGamma(1.1f, 0.0f, 1.0f, false, true) ==
+		RENDER_RESULT_OK, "public frame recovery enables the presentation pass");
+	result |= Check(NativeW3DRecoveryTestAccess::ConfigureResourceFault(
+		&owner.Renderer(), RENDER_RESOURCE_FAULT_PRESENTATION_PASS, 1,
+		RENDER_RESULT_DEVICE_REMOVED) == RENDER_RESULT_OK,
+		"public frame recovery arms device removal during presentation");
+	BeginGameDisplayIteration();
+	GameRenderCommand begin = {};
+	begin.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+	begin.value0 = RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH;
+	begin.float3 = 1.0f;
+	begin.float4 = 1.0f;
+	GameRenderCommand end = {};
+	end.type = GAME_RENDER_COMMAND_END_RENDER;
+	end.value0 = 1;
+	result |= Check(owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
+		owner.ExecuteGameRenderCommand(end) == RENDER_RESULT_OK,
+		"public frame recovery admits the frame before asynchronous removal");
+	(void)owner.Renderer().DrainThreaded();
+	result |= Check(!owner.IsInitialized() && !owner.IsOperational(),
+		"asynchronous removal is published before the next public frame entry");
+	// WW3D::Begin_Render resets resources before BeginGameDisplayIteration.
+	// Calling the concrete owner's display method first hides this regression.
+	const RenderResult reset = ResetGameRenderFrameResources(true);
+	result |= Check(reset == RENDER_RESULT_OK && owner.IsOperational(),
+		"public frame resource reset reaches recovery while the device is removed");
+	if (reset == RENDER_RESULT_OK)
+	{
+		BeginGameDisplayIteration();
+		// Consume the failed prior frame at its display boundary, then prove a
+		// subsequent normal public frame can draw and present after recovery.
+		BeginGameDisplayIteration();
+		result |= Check(owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
+			owner.ExecuteGameRenderCommand(end) == RENDER_RESULT_OK &&
+			owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
+			"public frame rendering resumes after device recovery");
+	}
+	result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
+		"public frame recovery fixture shuts down");
+	return result;
+}
+
 int TestReacquireFailureFailClosed(HWND window)
 {
 	int result = 0;
@@ -897,6 +954,8 @@ int TestReacquireFailureFailClosed(HWND window)
 			"resize ReAcquire exception leaves the native owner published but unavailable");
 		result |= Check(resizeOwner.BeginGameDisplayIteration() ==
 			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			rts::render::ResetGameRenderFrameResources(true) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
 			resizeOwner.DisplayIterationEpoch() == resizeEpoch &&
 			resizeOwner.SetGameViewport(rts::render::RenderViewport(
 				0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f)) ==
@@ -933,6 +992,8 @@ int TestReacquireFailureFailClosed(HWND window)
 			"device-recovery ReAcquire exception leaves the native owner unavailable");
 		result |= Check(recoverOwner.BeginGameDisplayIteration() ==
 			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			rts::render::ResetGameRenderFrameResources(true) ==
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
 			recoverOwner.DisplayIterationEpoch() == recoverEpoch &&
 			recoverOwner.SetGameViewport(rts::render::RenderViewport(
 				0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f)) ==
@@ -1493,6 +1554,7 @@ int main()
 		return 77;
 	}
 	result |= threadedResult;
+	result |= TestPublicFrameResetRecoversRemovedDevice(window);
 	result |= TestReacquireFailureFailClosed(window);
 	const rts::render::RenderResult initializeResult = w3d.Initialize(window, descriptor);
 	if (initializeResult == rts::render::RENDER_RESULT_UNSUPPORTED)
