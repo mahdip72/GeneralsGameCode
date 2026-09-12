@@ -1788,8 +1788,10 @@ int main(int argc, char **argv)
 
 	CHECK(EvaluateSkirmishAITestProgress(0, 0) == SKIRMISH_AI_TEST_RUNNING);
 	CHECK(EvaluateSkirmishAITestProgress(0, 107999) == SKIRMISH_AI_TEST_RUNNING);
+	CHECK(EvaluateSkirmishAITestProgress(0, 108000) == SKIRMISH_AI_TEST_RUNNING);
+	CHECK(EvaluateSkirmishAITestProgress(0, 215999) == SKIRMISH_AI_TEST_RUNNING);
 	CHECK(EvaluateSkirmishAITestProgress(42000, 42001) == SKIRMISH_AI_TEST_COMPLETE);
-	CHECK(EvaluateSkirmishAITestProgress(0, 108000) == SKIRMISH_AI_TEST_TIMED_OUT);
+	CHECK(EvaluateSkirmishAITestProgress(0, 216000) == SKIRMISH_AI_TEST_TIMED_OUT);
 	CHECK(!IsSkirmishAITestStartupTimedOut(299999));
 	CHECK(IsSkirmishAITestStartupTimedOut(300000));
 	CHECK(!IsSkirmishAITestProgressStalled(29999));

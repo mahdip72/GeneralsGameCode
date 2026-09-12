@@ -28,7 +28,9 @@ struct PhysicsIntegrationRuntimeMetrics;
 enum
 {
 	SKIRMISH_AI_TEST_SLOT_COUNT = 8,
-	SKIRMISH_AI_TEST_MAX_FRAME = 108000,
+	// Legitimate long AI games can exceed 108000 frames; independent wall and
+	// stall guards remain the liveness limits.
+	SKIRMISH_AI_TEST_MAX_FRAME = 216000,
 	// Immutable replay evidence is intentionally bounded independently of the
 	// filesystem so hashing cannot consume an attacker-controlled extent.
 	SKIRMISH_AI_TEST_MAX_REPLAY_BYTES = 256 * 1024 * 1024,
