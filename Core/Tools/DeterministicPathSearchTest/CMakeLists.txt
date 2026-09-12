@@ -18,3 +18,10 @@ endif()
 add_test(NAME core_deterministic_path_search_tests
     COMMAND core_deterministic_path_search_tests)
 set_tests_properties(core_deterministic_path_search_tests PROPERTIES TIMEOUT 30)
+
+set(COLD_CELL_SOURCE_ROOT "${CMAKE_SOURCE_DIR}")
+set(COLD_CELL_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/cold-cell")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Source/GameLogic/AI/AIPathfind.cpp"
+    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include/GameLogic/AIPathfind.h")
+include(ColdCellAdmission.cmake)

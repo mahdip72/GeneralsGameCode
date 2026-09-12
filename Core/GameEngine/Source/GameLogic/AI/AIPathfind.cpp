@@ -8029,9 +8029,12 @@ Bool Pathfinder::captureOrdinaryPathBatchEntry(Object *obj,
 	}
 	PathfindCell *startCell = getClippedCell(LAYER_GROUND, &clippedFrom);
 	PathfindCell *goalCell = getCell(LAYER_GROUND, goalIndex.x, goalIndex.y);
+	// Grid identity exists even when this cell has never needed A-star info.
+	// Preserve the warm-info consistency check without allocating search state.
 	if (!startCell || !goalCell ||
-		startCell->getXIndex() != startIndex.x ||
-		startCell->getYIndex() != startIndex.y ||
+		startCell != getCell(LAYER_GROUND, startIndex.x, startIndex.y) ||
+		(startCell->hasInfo() && (startCell->getXIndex() != startIndex.x ||
+			startCell->getYIndex() != startIndex.y)) ||
 		startCell->getType() != PathfindCell::CELL_CLEAR ||
 		goalCell->getType() != PathfindCell::CELL_CLEAR ||
 		startCell->getZone() == PathfindZoneManager::UNINITIALIZED_ZONE ||
@@ -8235,9 +8238,11 @@ Bool Pathfinder::captureDirectPathBatchEntry(Object *obj,
 	}
 	PathfindCell *startCell = getClippedCell(LAYER_GROUND, &clippedFrom);
 	PathfindCell *goalCell = getCell(LAYER_GROUND, goalIndex.x, goalIndex.y);
+	// Cold cells have valid grid identity but no optional A-star coordinates.
 	if (!startCell || !goalCell ||
-		startCell->getXIndex() != startIndex.x ||
-		startCell->getYIndex() != startIndex.y ||
+		startCell != getCell(LAYER_GROUND, startIndex.x, startIndex.y) ||
+		(startCell->hasInfo() && (startCell->getXIndex() != startIndex.x ||
+			startCell->getYIndex() != startIndex.y)) ||
 		startCell->getType() != PathfindCell::CELL_CLEAR ||
 		goalCell->getType() != PathfindCell::CELL_CLEAR ||
 		startCell->getZone() == PathfindZoneManager::UNINITIALIZED_ZONE ||
