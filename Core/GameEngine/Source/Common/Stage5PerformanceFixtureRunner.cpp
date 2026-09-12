@@ -11,6 +11,8 @@
 #include "Common/FileSystem.h"
 #include "Common/GameEngine.h"
 #include "Common/GlobalData.h"
+#include "Common/GameState.h"
+#include "Common/Stage5MapResolution.h"
 #include "Common/MessageStream.h"
 #include "Common/NameKeyGenerator.h"
 #include "Common/Player.h"
@@ -48,6 +50,7 @@ struct RunnerState
 	rts::performance::PerformanceReceiptWorkload workload;
 	unsigned initialPlayerUnits[8], peakPlayerUnits[8];
 	unsigned initialUnrosteredUnits, peakUnrosteredUnits;
+	rts::fixture::ResolvedMapIdentity mapIdentity;
 	char mapSha256[65], executableSha256[65], replayFileName[1024], nonce[65];
 };
 RunnerState s_runner = {};
@@ -100,7 +103,7 @@ bool HashVirtualMap(unsigned *crc, unsigned *size, char sha256[65])
 {
 	if (!TheFileSystem) return false;
 	std::unique_ptr<File, CloseFixtureFile> file(TheFileSystem->openFile(
-		s_request.mapKey, File::READ | File::BINARY | File::STREAMING));
+		s_runner.mapIdentity.runtimePath, File::READ | File::BINARY | File::STREAMING));
 	if (!file) return false;
 	const Int length = file->size();
 	// Fixture maps are deliberately bounded; never allocate an untrusted map size.
@@ -188,7 +191,7 @@ bool VerifyLoadedMap()
 	const AsciiString globalMap = TheGlobalData->m_mapName;
 	const AsciiString terrainMap = TheTerrainLogic->getSourceFilename();
 	SkirmishAITestPlan expected = {};
-	expected.mapName = s_request.mapKey;
+	expected.mapName = s_runner.mapIdentity.runtimePath;
 	expected.seed = s_request.seed;
 	SkirmishAITestLoadedState actual = { gameMap.str(), globalMap.str(), terrainMap.str(),
 		TheGameInfo->getMapCRC(), TheGameInfo->getMapSize(), TheGameInfo->getSeed() };
@@ -242,7 +245,9 @@ bool VerifyReplaySetup(const RecorderClass::ReplayHeader &header)
 	recorded.reset();
 	recorded.enterGame();
 	if (!ParseAsciiStringToGameInfo(&recorded, header.gameOptions) || header.localPlayerIndex != 0 ||
-		!rts::fixture::SameToken(recorded.getMap().str(), s_request.mapKey) ||
+		!rts::fixture::SameMapPath(recorded.getMap().str(), s_runner.mapIdentity.runtimePath) ||
+		!rts::fixture::SameMapPath(TheGameState->realMapPathToPortableMapPath(recorded.getMap()).str(),
+			s_runner.mapIdentity.portablePath) ||
 		recorded.getSeed() != s_request.seed || recorded.getMapCRC() != s_runner.mapCrc ||
 		recorded.getMapSize() != s_runner.mapSize) return false;
 	for (int i = 0; i < 8; ++i)
@@ -255,6 +260,33 @@ bool VerifyReplaySetup(const RecorderClass::ReplayHeader &header)
 	}
 	return true;
 }
+}
+
+bool ResolveStage5MapIdentity(const char *logicalKey, rts::fixture::ResolvedMapIdentity *out)
+{
+	if (!out) return false;
+	*out = rts::fixture::ResolvedMapIdentity();
+	if (!TheGameState || !TheMapCache || !TheFileSystem) return false;
+	struct Adapter {
+		bool ExpandPortable(const char *key, char *path, size_t capacity) {
+			const AsciiString resolved = TheGameState->portableMapPathToRealMapPath(key);
+			return !resolved.isEmpty() && rts::fixture::CopyMapPath(resolved.str(), path, capacity);
+		}
+		bool MakePortable(const char *path, char *key, size_t capacity) {
+			const AsciiString portable = TheGameState->realMapPathToPortableMapPath(path);
+			return !portable.isEmpty() && rts::fixture::CopyMapPath(portable.str(), key, capacity);
+		}
+		bool ProfileCandidatePresent(const char *path) {
+			if (TheMapCache->findMap(path) || TheFileSystem->doesFileExist(path)) return true;
+			char directory[rts::fixture::MapPathCapacity];
+			if (!rts::fixture::CopyMapPath(path, directory, sizeof(directory))) return true;
+			char *last = strrchr(directory, '\\');
+			if (!last) return true;
+			*last = '\0';
+			return TheFileSystem->doesFileExist(directory) != FALSE;
+		}
+	} adapter;
+	return rts::fixture::ResolveMapIdentity(logicalKey, adapter, out);
 }
 
 Bool ConfigureStage5PerformanceFixture(const rts::fixture::Request &request)
@@ -288,7 +320,10 @@ Bool StartStage5PerformanceFixtureRunner()
 		if (candidate && candidate->getName() == AsciiString("FactionAmerica")) { americaIndex = i; break; }
 	}
 	if (!rts::fixture::BuildPlan(americaIndex, &s_runner.plan)) { FailFixture("america_template_unavailable"); return FALSE; }
-	const MapMetaData *map = TheMapCache->findMap(s_request.mapKey);
+	// Map identity and content gate (also exercised by the standalone contract test).
+	if (!ResolveStage5MapIdentity(s_request.mapKey, &s_runner.mapIdentity))
+		{ FailFixture("map_identity_unavailable"); return FALSE; }
+	const MapMetaData *map = TheMapCache->findMap(s_runner.mapIdentity.runtimePath);
 	if (!map || !map->m_doesExist || !map->m_isMultiplayer || map->m_numPlayers != 8)
 		{ FailFixture("eight_start_map_unavailable"); return FALSE; }
 	if (!HashVirtualMap(&s_runner.mapCrc, &s_runner.mapSize, s_runner.mapSha256) ||
@@ -314,12 +349,12 @@ Bool StartStage5PerformanceFixtureRunner()
 		slot->setTeamNumber(expected.team);
 		if (expected.human) { slot->setAccept(); slot->setMapAvailability(TRUE); }
 	}
-	TheSkirmishGameInfo->setMap(s_request.mapKey);
+	TheSkirmishGameInfo->setMap(s_runner.mapIdentity.runtimePath);
 	TheSkirmishGameInfo->setMapCRC(s_runner.mapCrc);
 	TheSkirmishGameInfo->setMapSize(s_runner.mapSize);
 	TheSkirmishGameInfo->setSeed(s_request.seed);
 	TheSkirmishGameInfo->startGame(0);
-	TheWritableGlobalData->m_mapName = s_request.mapKey;
+	TheWritableGlobalData->m_mapName = s_runner.mapIdentity.runtimePath;
 	TheWritableGlobalData->m_useFpsLimit = FALSE;
 	TheWritableGlobalData->m_shellMapOn = FALSE;
 	TheRecorder->setArchiveEnabled(FALSE);

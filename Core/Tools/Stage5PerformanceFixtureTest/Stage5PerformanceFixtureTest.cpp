@@ -5,10 +5,15 @@
 */
 
 #include "Common/Stage5PerformanceFixtureContract.h"
+#include "Common/Stage5MapResolution.h"
 
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <string>
+#include <memory>
+#include <vector>
+#include <algorithm>
 
 namespace {
 unsigned failures = 0;
@@ -238,6 +243,175 @@ void TestNaturalCompletionAndBudget()
 }
 }
 
+namespace map_resolution_test {
+typedef int Int;
+const bool TRUE = true, FALSE = false;
+struct AsciiString {
+    std::string value;
+    AsciiString(const char *text = "") : value(text) {}
+    const char *str() const { return value.c_str(); }
+    int getLength() const { return static_cast<int>(value.size()); }
+    bool isEmpty() const { return value.empty(); }
+    bool startsWithNoCase(const AsciiString &prefix) const {
+        if (value.size() < prefix.value.size()) return false;
+        for (size_t i=0;i<prefix.value.size();++i)
+            if (rts::fixture::LowerAscii(value[i]) != rts::fixture::LowerAscii(prefix.value[i])) return false;
+        return true;
+    }
+    void concat(const AsciiString &text) { value += text.value; }
+    void concat(char text) { value += text; }
+    void toLower() { for(size_t i=0;i<value.size();++i) value[i]=rts::fixture::LowerAscii(value[i]); }
+    const char *find(char c) const { return strchr(str(),c); }
+    bool nextToken(AsciiString *out, const char *separators) {
+        size_t first=value.find_first_not_of(separators);
+        if(first==std::string::npos) { out->value.clear(); value.clear(); return false; }
+        size_t end=value.find_first_of(separators,first);
+        out->value=value.substr(first,end==std::string::npos?end:end-first);
+        value=end==std::string::npos?"":value.substr(end); return true;
+    }
+    static AsciiString TheEmptyString;
+};
+AsciiString AsciiString::TheEmptyString;
+struct MapMetaData { bool m_doesExist, m_isMultiplayer; unsigned m_numPlayers, m_CRC, m_filesize; };
+struct MapCache {
+    std::string profile, selected, lastLookup;
+    bool indexed, filePresent, directoryPresent, officialPresent;
+    MapMetaData metadata;
+    MapCache() : profile("H:\\Producer\\Profile\\Maps"), selected(profile+"\\S5P1000v2\\S5P1000v2.map"), indexed(true), filePresent(true), directoryPresent(true), officialPresent(false) {
+        metadata.m_doesExist=metadata.m_isMultiplayer=true; metadata.m_numPlayers=8; metadata.m_CRC=17; metadata.m_filesize=11;
+    }
+    AsciiString getMapDir() const { return "Maps"; }
+    AsciiString getUserMapDir() const { return profile.c_str(); }
+    const MapMetaData *findMap(const char *path) {
+        lastLookup=path;
+        return ((indexed && rts::fixture::SameMapPath(path,selected.c_str())) ||
+            (officialPresent && rts::fixture::SameMapPath(path,"Maps\\S5P1000v2\\S5P1000v2.map"))) ? &metadata : 0;
+    }
+} mapCache;
+MapCache *TheMapCache=&mapCache;
+struct File {
+    enum { READ=1, BINARY=2, STREAMING=4 };
+    size_t offset;
+    File() : offset(0) {}
+    Int size() const { return 11; }
+    Int read(void *out, Int count) {
+        size_t amount=std::min(static_cast<size_t>(count),11-offset);
+        memcpy(out,"fixture-map"+offset,amount);offset+=amount;return static_cast<Int>(amount);
+    }
+    void close() { delete this; }
+};
+struct FileSystem {
+    std::string lastOpen;
+    static bool isPathInDirectory(const AsciiString &path,const AsciiString &parent) { return path.startsWithNoCase(parent) && path.value.find("..") == std::string::npos; }
+    bool doesFileExist(const char *path) const {
+        return (mapCache.filePresent && rts::fixture::SameMapPath(path,mapCache.selected.c_str())) ||
+            (mapCache.directoryPresent && rts::fixture::SameMapPath(path,mapCache.selected.substr(0,mapCache.selected.find_last_of('\\')).c_str()));
+    }
+    File *openFile(const char *path,int) {
+        lastOpen=path;
+        return (doesFileExist(path) || (mapCache.officialPresent && rts::fixture::SameMapPath(path,"Maps\\S5P1000v2\\S5P1000v2.map"))) ? new File : 0;
+    }
+} fileSystem;
+FileSystem *TheFileSystem=&fileSystem;
+struct GameState {
+    AsciiString getSaveDirectory() const { return "H:\\Producer\\Profile\\Save\\"; }
+    AsciiString getMapLeafName(const AsciiString &name) const { const char *last=strrchr(name.str(),'\\'); return last?last+1:name.str(); }
+    AsciiString realMapPathToPortableMapPath(const AsciiString &) const;
+    AsciiString portableMapPathToRealMapPath(const AsciiString &) const;
+} gameState;
+GameState *TheGameState=&gameState;
+#define DEBUG_CRASH(x) ((void)0)
+#define DEBUG_LOG(x) ((void)0)
+#include "Stage5MapPathCodeUnderTest.inc"
+#undef DEBUG_CRASH
+#undef DEBUG_LOG
+struct GameInfo {
+    AsciiString map; unsigned crc,size; int seed;
+    AsciiString getMap() const { return map; }
+    void setMap(const char *path) { map=path; }
+    void setMapCRC(unsigned value) { crc=value; }
+    void setMapSize(unsigned value) { size=value; }
+    void setSeed(int value) { seed=value; }
+    void startGame(int) {}
+} gameInfo;
+GameInfo *TheSkirmishGameInfo=&gameInfo;
+struct GlobalData { AsciiString m_mapName; } globalData;
+GlobalData *TheWritableGlobalData=&globalData;
+AsciiString EncodeRecorderMap(GameInfo *game) {
+#define DEBUG_LOG(x) ((void)0)
+#include "Stage5MapOptionsCodeUnderTest.inc"
+#undef DEBUG_LOG
+    return newMapName;
+}
+rts::fixture::Request s_request;
+struct Runner { unsigned mapCrc,mapSize; char mapSha256[65]; rts::fixture::ResolvedMapIdentity mapIdentity; } s_runner;
+const char *failure=0;
+void FailFixture(const char *reason) { failure=reason; }
+struct CloseFixtureFile { void operator()(File *file) const { if(file) file->close(); } };
+struct CRC { void computeCRC(const void*,Int) {} unsigned get() const { return 17; } };
+bool HashSkirmishAITestBytes(const void *bytes,size_t count,char sha[65]) {
+    if(count!=11 || memcmp(bytes,"fixture-map",11)!=0) return false;
+    strcpy(sha,"fixture-sha");return true;
+}
+#include "Stage5MapResolverUnderTest.inc"
+#include "Stage5MapHashUnderTest.inc"
+bool StartMapGate() {
+#include "Stage5MapGateUnderTest.inc"
+    return true;
+}
+void ApplyMapForLoad() {
+#include "Stage5MapLoadUnderTest.inc"
+}
+void TestProfileMapGate() {
+    strcpy(s_request.mapKey,"Maps\\S5P1000v2\\S5P1000v2.map");
+    s_request.seed=24101;
+    Check(StartMapGate(),"profile map discovered under its absolute cache key reaches the unchanged eight-start/content gate");
+    Check(strcmp(s_request.mapKey,"Maps\\S5P1000v2\\S5P1000v2.map")==0,"resolving a profile map does not mutate its portable request key");
+    ApplyMapForLoad();
+    Check(rts::fixture::SameMapPath(mapCache.lastLookup.c_str(),fileSystem.lastOpen.c_str()) &&
+        rts::fixture::SameMapPath(gameInfo.map.str(),fileSystem.lastOpen.c_str()) &&
+        rts::fixture::SameMapPath(globalData.m_mapName.str(),fileSystem.lastOpen.c_str()),
+        "cache, exact-byte hash, GameInfo and game-load path use one resolved identity");
+    Check(gameInfo.crc==17 && gameInfo.size==11 && gameInfo.seed==24101,"resolution preserves exact CRC, byte size and seed");
+    Check(rts::fixture::SameMapPath(EncodeRecorderMap(&gameInfo).str(),"userdata/maps/S5P1000v2"),
+        "actual recorder map-options encoder stores a portable custom-map directory, not the producing profile");
+    const AsciiString portable=gameState.realMapPathToPortableMapPath(gameInfo.map);
+    mapCache.profile="H:\\Consumer\\Different Profile\\Maps";
+    Check(rts::fixture::SameMapPath(gameState.portableMapPathToRealMapPath(portable).str(),
+        "H:\\Consumer\\Different Profile\\Maps\\S5P1000v2\\S5P1000v2.map"),
+        "actual portable replay map is rebound against the consuming profile");
+    mapCache.profile="H:\\Producer\\Profile\\Maps";
+    mapCache.indexed=false; mapCache.officialPresent=true;
+    Check(!StartMapGate() && strcmp(failure,"eight_start_map_unavailable")==0,
+        "staged profile file without metadata cannot fall back to an installed map");
+    mapCache.filePresent=false;
+    Check(!StartMapGate(),"staged directory with missing map cannot fall back to an installed map");
+    mapCache.directoryPresent=false;
+    Check(StartMapGate() && !s_runner.mapIdentity.profileMap,"original installed-map path remains supported when no staged profile candidate exists");
+    mapCache.indexed=mapCache.filePresent=mapCache.directoryPresent=true;
+    mapCache.metadata.m_numPlayers=7;
+    Check(!StartMapGate(),"resolved profile map still requires eight-player metadata");
+    mapCache.metadata.m_numPlayers=8; mapCache.metadata.m_CRC=18;
+    Check(!StartMapGate() && strcmp(failure,"map_content_metadata_mismatch")==0,"resolved bytes must still match metadata CRC");
+    mapCache.metadata.m_CRC=17; mapCache.metadata.m_filesize=12;
+    Check(!StartMapGate(),"resolved bytes must still match metadata size");
+    mapCache.metadata.m_filesize=11;
+    mapCache.metadata.m_isMultiplayer=false;
+    Check(!StartMapGate(),"resolved profile map still requires multiplayer metadata");
+    mapCache.metadata.m_isMultiplayer=true; mapCache.metadata.m_doesExist=false;
+    Check(!StartMapGate(),"resolved profile map still requires existing-map metadata");
+    mapCache.metadata.m_doesExist=true;
+    rts::fixture::ResolvedMapIdentity identity;
+    Check(!ResolveStage5MapIdentity("Maps\\nested\\S5P1000v2\\S5P1000v2.map",&identity),"keys flattened by existing replay serialization are rejected");
+    Check(!ResolveStage5MapIdentity("Maps\\S5P1000v2\\other.map",&identity),"directory/file mismatches cannot produce an unreplayable recording");
+    mapCache.profile.assign(1100,'x');
+    Check(!ResolveStage5MapIdentity(s_request.mapKey,&identity),"overlong physical profile paths fail without truncation");
+    strcpy(identity.runtimePath,"stale"); TheGameState=0;
+    Check(!ResolveStage5MapIdentity(s_request.mapKey,&identity) && !identity.runtimePath[0],"unavailable engine owner clears a stale map identity");
+    TheGameState=&gameState;
+}
+}
+
 int main()
 {
 	TestOptInAndNormalization();
@@ -245,6 +419,7 @@ int main()
 	TestNumericAndConflictingOptions();
 	TestFixedEightPlayerRoster();
 	TestNaturalCompletionAndBudget();
+    map_resolution_test::TestProfileMapGate();
 	if (failures != 0) { fprintf(stderr, "%u fixture contract checks failed\n", failures); return 1; }
 	puts("PASS: stage-five performance fixture contracts");
 	return 0;

@@ -1,7 +1,50 @@
 add_executable(core_stage5_performance_fixture_tests Stage5PerformanceFixtureTest.cpp)
 target_include_directories(core_stage5_performance_fixture_tests PRIVATE
     "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include"
+    "${CMAKE_CURRENT_BINARY_DIR}"
 )
+
+# Compile the real map portability and startup gate code against bounded stores.
+function(stage5_map_test_extract source start_marker end_marker output)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${source}")
+    file(READ "${source}" body)
+    string(REPLACE "\r\n" "\n" body "${body}")
+    string(FIND "${body}" "${start_marker}" begin)
+    if(begin LESS 0)
+        message(FATAL_ERROR "Stage 5 map test start boundary is missing: ${source}")
+    endif()
+    string(SUBSTRING "${body}" ${begin} -1 body)
+    string(FIND "${body}" "${end_marker}" end)
+    if(end LESS 0)
+        message(FATAL_ERROR "Stage 5 map test end boundary is missing: ${source}")
+    endif()
+    string(SUBSTRING "${body}" 0 ${end} body)
+    file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/${output}" CONTENT "${body}")
+endfunction()
+stage5_map_test_extract(
+    "${CMAKE_SOURCE_DIR}/GeneralsMD/Code/GameEngine/Source/Common/System/SaveGame/GameState.cpp"
+    "static const char* findLastBackslashInRangeInclusive" "Bool GameState::doesSaveGameExist"
+    "Stage5MapPathCodeUnderTest.inc")
+stage5_map_test_extract(
+    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Source/GameNetwork/GameInfo.cpp"
+    "AsciiString mapName = game->getMap();" "AsciiString optionsString;"
+    "Stage5MapOptionsCodeUnderTest.inc")
+stage5_map_test_extract(
+    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Source/Common/Stage5PerformanceFixtureRunner.cpp"
+    "// Map identity and content gate" "delete TheSkirmishGameInfo;"
+    "Stage5MapGateUnderTest.inc")
+stage5_map_test_extract(
+    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Source/Common/Stage5PerformanceFixtureRunner.cpp"
+    "bool ResolveStage5MapIdentity(" "Bool ConfigureStage5PerformanceFixture("
+    "Stage5MapResolverUnderTest.inc")
+stage5_map_test_extract(
+    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Source/Common/Stage5PerformanceFixtureRunner.cpp"
+    "bool HashVirtualMap(" "unsigned CountRosterPlayers("
+    "Stage5MapHashUnderTest.inc")
+stage5_map_test_extract(
+    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Source/Common/Stage5PerformanceFixtureRunner.cpp"
+    "TheSkirmishGameInfo->setMap(" "TheWritableGlobalData->m_useFpsLimit"
+    "Stage5MapLoadUnderTest.inc")
 set_target_properties(core_stage5_performance_fixture_tests PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO
 )
