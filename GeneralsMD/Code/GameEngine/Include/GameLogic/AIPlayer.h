@@ -30,6 +30,9 @@
 
 #include "Common/GameMemory.h"
 #include "Common/Snapshot.h"
+#if defined(_WIN64)
+#include "Lib/DeterministicAIPlanning.h"
+#endif
 
 enum { INVALID_SKILLSET_SELECTION = -1 };
 
@@ -186,6 +189,25 @@ public: // AIPlayer interface, may be overridden by AISkirmishPlayer.  jba.
 
 	virtual void selectSkillset(Int skillset);
 
+#if defined(_WIN64)
+	// The owner captures and stages a result before PlayerList::UPDATE.  The
+	// existing update path consumes it at its normal team-building boundary,
+	// preserving timer and queue ordering while allowing one frame batch.
+	Bool isProductionPlanningDue() const;
+	void prepareProductionPlanningQueue();
+	Bool consumeProductionPlanningQueue();
+	Bool stageProductionPlanningResult(
+		const rts::AIProductionPlanningSnapshot &snapshot,
+		const rts::AIProductionPlanningResult &result);
+	Bool hasStagedProductionPlanningResult() const;
+	Bool takeStagedProductionPlanningResult(
+		rts::AIProductionPlanningSnapshot *snapshot,
+		rts::AIProductionPlanningResult *result);
+	void discardStagedProductionPlanningResult();
+	void markProductionPlanningHandled();
+	Bool consumeProductionPlanningHandled();
+#endif
+
 public:
 	Bool getBaseCenter(Coord3D *pos) const {*pos = m_baseCenter; return m_baseCenterSet;}
 	/// Difficulty level for this player.
@@ -242,6 +264,15 @@ protected:
 protected:
 	Bool isPossibleToBuildTeam( TeamPrototype *proto, Bool requireIdleFactory, Bool &needMoney );		///< return true if team can be considered for building
 	Bool queueSelectedTeam( TeamPrototype *teamProto ); ///< Queue an automatically selected team and reset production timers.
+#if defined(RTS_ENABLE_STAGE5_AI_PLANNING_ADAPTERS)
+	// Owner-thread adapter only. The returned snapshot is immutable worker input;
+	// result commit must occur later in PlayerList/subphase order.
+	Bool captureLegacyProductionPlanningSnapshot(
+		rts::AIProductionPlanningSnapshot *snapshot,
+		const rts::AICounterRngKey &baseRandomKey );
+	Bool commitProductionPlanningResult(
+		const rts::AIProductionPlanningResult &result );
+#endif
 	Object *buildStructureNow(const ThingTemplate *bldgPlan, BuildListInfo *info );		///< Build a base buiding.
 	Object *buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildListInfo *info );		///< Build a base buiding.
 	void clearTeamsInQueue();			///< Delete all teams in the build queue.
@@ -292,4 +323,11 @@ protected:
 	ObjectID m_attackedSupplyCenter;
 
 	ObjectID m_curWarehouseID;
+
+#if defined(_WIN64)
+	rts::AIProductionPlanningSnapshot *m_stagedProductionPlanningSnapshot;
+	rts::AIProductionPlanningResult *m_stagedProductionPlanningResult;
+	UnsignedInt m_productionPlanningHandledFrame;
+	UnsignedInt m_productionPlanningQueueUpdatedFrame;
+#endif
 };

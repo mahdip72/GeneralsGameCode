@@ -29,11 +29,11 @@
 #include "WW3D2/w3d_file.h"
 #include "WW3D2/dx8vertexbuffer.h"
 #include "WW3D2/dx8indexbuffer.h"
-#include "WW3D2/dx8wrapper.h"
 #include "WW3D2/shader.h"
 #include "WW3D2/vertmaterial.h"
 #include "Lib/BaseType.h"
 #include "Common/GameType.h"
+#include "Renderer/RenderGameClient.h"
 #include "W3DDevice/GameClient/WorldHeightMap.h"
 
 #define MAX_ENABLED_DYNAMIC_LIGHTS 20
@@ -72,7 +72,7 @@ class W3DDynamicLight;
 #define DO_ROADS 1
 
 #define VERTEX_FORMAT VertexFormatXYZDUV2
-#define DX8_VERTEX_FORMAT DX8_FVF_XYZDUV2
+#define GAME_VERTEX_FORMAT rts::render::GAME_VERTEX_XYZDUV2
 
 /// Custom render object that draws the heightmap and handles intersection tests.
 /**
@@ -80,7 +80,8 @@ Custom W3D render object that's used to process the terrain.  It handles
 virtually everything to do with the terrain, including: drawing, lighting,
 scorchmarks and intersection tests.
 */
-class BaseHeightMapRenderObjClass : public RenderObjClass, public DX8_CleanupHook, public Snapshot
+class BaseHeightMapRenderObjClass : public RenderObjClass,
+	public rts::render::GameRenderCleanupHook, public Snapshot
 {
 
 public:
@@ -88,8 +89,8 @@ public:
 	BaseHeightMapRenderObjClass();
 	virtual ~BaseHeightMapRenderObjClass() override;
 
-	// DX8_CleanupHook methods
-	virtual void ReleaseResources() override;	///< Release all dx8 resources so the device can be reset.
+	// Renderer cleanup-hook methods.
+	virtual void ReleaseResources() override;	///< Release all renderer resources so the device can be reset.
 	virtual void ReAcquireResources() override;  ///< Reacquire all resources after device reset.
 
 

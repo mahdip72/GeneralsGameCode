@@ -140,6 +140,7 @@ class DX8Wrapper
 {
 public:
 	static bool IsInitted;
+	static bool IsDeviceLost;
 	static FakeDevice *D3DDevice;
 	static CleanupHook *m_pCleanupHook;
 	static IDirect3DVertexBuffer8 *RawVertexBuffer;
@@ -167,6 +168,7 @@ public:
 	static HRESULT Set_DX8_Index_Buffer(IDirect3DIndexBuffer8 *, UINT);
 };
 bool DX8Wrapper::IsInitted = true;
+bool DX8Wrapper::IsDeviceLost = false;
 FakeDevice *DX8Wrapper::D3DDevice = nullptr;
 CleanupHook *DX8Wrapper::m_pCleanupHook = nullptr;
 IDirect3DVertexBuffer8 *DX8Wrapper::RawVertexBuffer = nullptr;
@@ -226,19 +228,52 @@ class TextureBaseClass
 public:
 	IDirect3DBaseTexture8 *D3DTexture;
 	unsigned LastAccessed;
-	TextureBaseClass() : D3DTexture(nullptr), LastAccessed(7) {}
+	bool Initialized;
+	bool NativeTexturePresent;
+	bool NativeMissingResult;
+	bool InitializedAtNativeRelease;
+	bool InitializedAtNativeMissing;
+	int NativeLifecycleSequence;
+	int NativeReleaseOrder;
+	int NativeMissingOrder;
+	int NativeReleaseCalls;
+	int NativeMissingCalls;
+	TextureBaseClass() : D3DTexture(nullptr), LastAccessed(7),
+		Initialized(false), NativeTexturePresent(false),
+		NativeMissingResult(true), InitializedAtNativeRelease(false),
+		InitializedAtNativeMissing(false), NativeLifecycleSequence(0),
+		NativeReleaseOrder(0), NativeMissingOrder(0), NativeReleaseCalls(0),
+		NativeMissingCalls(0) {}
 	void Release_D3D_Texture();
 	void Set_D3D_Base_Texture(IDirect3DBaseTexture8 *);
+	void Release_Native_Texture()
+	{
+		++NativeReleaseCalls;
+		NativeReleaseOrder = ++NativeLifecycleSequence;
+		InitializedAtNativeRelease = Initialized;
+		NativeTexturePresent = false;
+	}
+	bool Apply_Native_Missing_Texture()
+	{
+		++NativeMissingCalls;
+		NativeMissingOrder = ++NativeLifecycleSequence;
+		InitializedAtNativeMissing = Initialized;
+		if (NativeMissingResult)
+		{
+			NativeTexturePresent = true;
+			Initialized = true;
+		}
+		return NativeMissingResult;
+	}
 };
 class TextureClass : public TextureBaseClass
 {
 public:
-	bool Initialized;
 	unsigned InactivationTime;
 	unsigned TextureFormat;
 	unsigned Width;
 	unsigned Height;
-	TextureClass() : Initialized(false), InactivationTime(100),
+	TextureClass() : InactivationTime(100),
 		TextureFormat(0), Width(8), Height(4) {}
 	IDirect3DTexture8 *Peek_D3D_Texture()
 	{
@@ -260,6 +295,7 @@ int testReset(bool nativeBackend, bool failStream, bool failIndices,
 	DX8Wrapper::D3DDevice = &device;
 	DX8Wrapper::m_pCleanupHook = &cleanup;
 	_UseD3D11Backend = nativeBackend;
+	DX8Wrapper::IsDeviceLost = true;
 	_D3D11Bridge = FakeBridge();
 	DX8Wrapper::Set_DX8_Vertex_Buffer(&vertex, 12, 2);
 	DX8Wrapper::Set_DX8_Index_Buffer(&index, 2788);
@@ -272,6 +308,8 @@ int testReset(bool nativeBackend, bool failStream, bool failIndices,
 	const bool reset = DX8Wrapper::Reset_Device(reloadAssets, &requiresReacquire);
 	result |= check(reset == !failReset && requiresReacquire,
 		"reset reaches the device with all DEFAULT-pool application references released");
+	result |= check(DX8Wrapper::IsDeviceLost == !reset,
+		"successful legacy reset clears the device-lost publication latch");
 	result |= check(device.resetCalls == 1 && vertex.references == 0 && index.references == 0,
 		"both raw references are released before Reset, including rejected unbinds");
 	result |= check(device.streamCalls == 2 && device.indicesCalls == 2,
@@ -288,6 +326,8 @@ int testReset(bool nativeBackend, bool failStream, bool failIndices,
 		device.resetResult = D3D_OK;
 		result |= check(DX8Wrapper::Reset_Device(reloadAssets, &requiresReacquire),
 			"a failed reset can be retried without stale raw references");
+		result |= check(!DX8Wrapper::IsDeviceLost,
+			"a successful reset retry also clears the device-lost publication latch");
 	}
 	DX8Wrapper::Release_DX8_Buffer_Bindings();
 	result |= check(vertex.references == 0 && index.references == 0,
@@ -388,6 +428,58 @@ int testTextureSuccess()
 		"null publication retains the existing explicit-clear contract");
 	return result;
 }
+
+#if defined(_WIN64)
+int testNativeTexturePublicationLifecycle()
+{
+	int result = 0;
+	IDirect3DTexture8 incoming;
+
+	TextureClass cleared;
+	cleared.NativeTexturePresent = true;
+	cleared.Initialized = true;
+	cleared.Apply_New_Surface(nullptr, true, true);
+	result |= check(cleared.NativeReleaseCalls == 1 &&
+		cleared.NativeMissingCalls == 0 && cleared.NativeReleaseOrder == 1 &&
+		cleared.InitializedAtNativeRelease &&
+		!cleared.NativeTexturePresent && !cleared.Initialized,
+		"x64 null publication retires native ownership before clearing initialization");
+	result |= check(cleared.D3DTexture == nullptr,
+		"x64 null publication never creates or retains a D3D8 texture");
+
+	TextureClass published;
+	published.Apply_New_Surface(&incoming, true, true);
+	result |= check(published.NativeReleaseCalls == 0 &&
+		published.NativeMissingCalls == 1 && published.NativeMissingOrder == 1 &&
+		!published.InitializedAtNativeMissing &&
+		published.NativeTexturePresent && published.Initialized,
+		"x64 residual raw publication deterministically publishes the native missing texture");
+	result |= check(published.D3DTexture == nullptr && incoming.references == 1 &&
+		incoming.surface.references == 1 && incoming.surface.descCalls == 0 &&
+		published.InactivationTime == 100,
+		"x64 fallback neither retains nor queries the raw candidate and preserves invalidation policy");
+
+	TextureClass deferred;
+	deferred.Apply_New_Surface(&incoming, false, true);
+	result |= check(deferred.NativeMissingCalls == 1 &&
+		deferred.NativeMissingOrder == 1 &&
+		!deferred.InitializedAtNativeMissing && deferred.NativeTexturePresent &&
+		!deferred.Initialized,
+		"x64 deferred publication installs deterministic fallback content before leaving initialization pending");
+
+	TextureClass failed;
+	failed.NativeTexturePresent = true;
+	failed.Initialized = true;
+	failed.NativeMissingResult = false;
+	failed.Apply_New_Surface(&incoming, true, true);
+	result |= check(failed.NativeMissingCalls == 1 &&
+		failed.NativeReleaseCalls == 0 && failed.InitializedAtNativeMissing &&
+		failed.NativeTexturePresent && !failed.Initialized &&
+		failed.D3DTexture == nullptr,
+		"x64 fallback failure preserves prior native ownership but fails initialization closed");
+	return result;
+}
+#endif
 }
 
 int TestLegacyResetResources()
@@ -402,11 +494,15 @@ int TestLegacyResetResources()
 		result |= testReset(backend != 0, false, false, false, false);
 	}
 	result |= testResetPreflight();
+#if defined(_WIN64)
+	result |= testNativeTexturePublicationLifecycle();
+#else
 	for (int failure = 0; failure != 4; ++failure)
 	{
 		result |= testTextureFailure(failure, false);
 		result |= testTextureFailure(failure, true);
 	}
 	result |= testTextureSuccess();
+#endif
 	return result;
 }

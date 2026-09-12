@@ -24,7 +24,13 @@
 #include "GameClient/InGameUI.h"
 #include "Lib/JobSystem.h"
 #include "Lib/PipelineExecutionPolicy.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
+
+// Keep the source-level contract explicit without importing the renderer namespace.
+using rts::render::RENDER_CAPTURE_COMPRESSED_SCREENSHOT;
+using rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
+using rts::render::RENDER_RESULT_OK;
+
 #include "WW3D2/ww3d.h"
 #include "WW3D2/surfaceclass.h"
 #include "WWLib/mpsc_intrusive_queue.h"
@@ -549,7 +555,6 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 	strlcpy(outputPath, outputDirectory, ARRAY_SIZE(outputPath));
 	strlcat(outputPath, leafname, ARRAY_SIZE(outputPath));
 
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
 	{
 		if (!reserveD3D11ScreenshotName(outputDirectory, leafname, leafname,
 			ARRAY_SIZE(leafname), outputPath, ARRAY_SIZE(outputPath)))
@@ -559,7 +564,7 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 		}
 		rts::render::RenderBackBufferInfo backBufferInfo;
 		const rts::render::RenderResult infoResult =
-			DX8Wrapper::Get_D3D11_Back_Buffer_Info(&backBufferInfo);
+			rts::render::GetGameBackBufferInfo(&backBufferInfo);
 		const unsigned width = backBufferInfo.width;
 		const unsigned height = backBufferInfo.height;
 		size_t pitchSize = 0;
@@ -645,7 +650,7 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 		descriptor.cancelled = cancelD3D11CompressedScreenshot;
 		rts::render::RenderCaptureHandle handle;
 		const rts::render::RenderResult queueResult =
-			DX8Wrapper::Queue_D3D11_Back_Buffer_Capture(descriptor, &handle);
+			rts::render::QueueGameBackBufferCapture(descriptor, &handle);
 		if (queueResult != rts::render::RENDER_RESULT_OK)
 		{
 			DEBUG_LOG(("D3D11 screenshot queue rejected %s: result=%d",
@@ -655,120 +660,4 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 		return;
 	}
 
-	// TheSuperHackers @bugfix xezon 21/05/2025 Get the back buffer and create a copy of the surface.
-	// Originally this code took the front buffer and tried to lock it. This does not work when the
-	// render view clips outside the desktop boundaries. It crashed the game.
-	SurfaceClass* surface = DX8Wrapper::_Get_DX8_Back_Buffer();
-	SurfaceClass::SurfaceDescription surfaceDesc;
-	surface->Get_Description(surfaceDesc);
-
-	// TheSuperHackers @bugfix bobtista 08/07/2026 Support the 16 bit back buffer format that the
-	// game uses when running in 16 bit color mode. Reading it with the 32 bit stride read garbage.
-	const bool is32Bit = surfaceDesc.Format == WW3D_FORMAT_A8R8G8B8 || surfaceDesc.Format == WW3D_FORMAT_X8R8G8B8;
-	const bool is16Bit = surfaceDesc.Format == WW3D_FORMAT_R5G6B5;
-
-	if (!is32Bit && !is16Bit)
-	{
-		DEBUG_LOG(("Screenshot does not support back buffer format %d", (int)surfaceDesc.Format));
-		surface->Release_Ref();
-		return;
-	}
-
-	const unsigned bytesPerPixel = is16Bit ? 2 : 4;
-	if (surfaceDesc.Width == 0 || surfaceDesc.Height == 0 ||
-		surfaceDesc.Width > (unsigned)INT_MAX / 3 ||
-		surfaceDesc.Height > (unsigned)INT_MAX ||
-		surfaceDesc.Width > UINT_MAX / bytesPerPixel)
-	{
-		DEBUG_LOG(("Screenshot dimensions %u x %u are invalid", surfaceDesc.Width, surfaceDesc.Height));
-		surface->Release_Ref();
-		return;
-	}
-
-	SurfaceClass* surfaceCopy = NEW_REF(SurfaceClass, (DX8Wrapper::_Create_DX8_Surface(surfaceDesc.Width, surfaceDesc.Height, surfaceDesc.Format)));
-	DX8Wrapper::_Copy_DX8_Rects(surface->Peek_D3D_Surface(), nullptr, 0, surfaceCopy->Peek_D3D_Surface(), nullptr);
-
-	surface->Release_Ref();
-	surface = nullptr;
-
-	struct Rect
-	{
-		int Pitch;
-		void* pBits;
-	} lrect;
-
-	lrect.pBits = surfaceCopy->Lock(&lrect.Pitch);
-	if (lrect.pBits == 0)
-	{
-		surfaceCopy->Release_Ref();
-		return;
-	}
-
-	const unsigned pitch = (unsigned)lrect.Pitch;
-	const size_t maxAllocation = (size_t)-1;
-	const size_t width = (size_t)surfaceDesc.Width;
-	const size_t height = (size_t)surfaceDesc.Height;
-	if (lrect.Pitch <= 0 || pitch < surfaceDesc.Width * bytesPerPixel ||
-		height > maxAllocation / pitch || width > maxAllocation / height ||
-		width * height > maxAllocation / 3)
-	{
-		DEBUG_LOG(("Screenshot surface dimensions or pitch overflow an allocation"));
-		surfaceCopy->Unlock();
-		surfaceCopy->Release_Ref();
-		return;
-	}
-
-	const size_t pixelDataSize = (size_t)pitch * height;
-	const size_t imageSize = 3 * width * height;
-	unsigned char* pixelData = allocateScreenshotBuffer(pixelDataSize);
-	unsigned char* image = allocateScreenshotBuffer(imageSize);
-	ScreenshotWrittenMessage* completion = 0;
-	try
-	{
-		completion = new ScreenshotWrittenMessage;
-	}
-	catch (...)
-	{
-		completion = 0;
-	}
-
-	if (pixelData == 0 || image == 0 || completion == 0)
-	{
-		DEBUG_LOG(("Dropped screenshot %s because its buffers could not be allocated", leafname));
-		delete[] pixelData;
-		delete[] image;
-		delete completion;
-		surfaceCopy->Unlock();
-		surfaceCopy->Release_Ref();
-		return;
-	}
-
-	memcpy(pixelData, lrect.pBits, pixelDataSize);
-
-	surfaceCopy->Unlock();
-	surfaceCopy->Release_Ref();
-	surfaceCopy = 0;
-
-	ScreenshotBatch* batch = 0;
-	try
-	{
-		batch = new ScreenshotBatch(pixelData, image, completion,
-			surfaceDesc.Width, surfaceDesc.Height, pitch,
-			is16Bit ? SCREENSHOT_SOURCE_RGB565 : SCREENSHOT_SOURCE_ARGB32,
-			outputDirectory, outputPath, leafname, jpegQuality, format);
-	}
-	catch (...)
-	{
-		batch = 0;
-	}
-	if (batch == 0)
-	{
-		DEBUG_LOG(("Dropped screenshot %s because its batch could not be allocated", leafname));
-		delete[] pixelData;
-		delete[] image;
-		delete completion;
-		return;
-	}
-
-	s_screenshotTaskService.submit(batch);
 }

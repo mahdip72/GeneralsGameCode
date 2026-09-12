@@ -68,9 +68,11 @@ protected:
 public:
 		// Create texture for a height map.
 		AlphaTerrainTextureClass(TextureClass *pBaseTex );
+		virtual ~AlphaTerrainTextureClass() override;
 
-		// just use default destructor. ~TerrainTextureClass();
-
+#if defined(_WIN64)
+		TextureClass *m_baseTexture;
+#endif
 };
 
 /** ***********************************************************************

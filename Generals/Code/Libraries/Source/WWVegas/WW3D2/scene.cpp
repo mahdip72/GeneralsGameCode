@@ -63,10 +63,12 @@
 #include "ww3d.h"
 #include "rinfo.h"
 #include "WWLib/chunkio.h"
-#include "dx8renderer.h"
-#include "dx8wrapper.h"
-#include "sortingrenderer.h"
+#include "light.h"
+#include "shader.h"
 #include "coltest.h"
+#include "Renderer/RenderGameClient.h"
+
+#include <math.h>
 
 
 /*
@@ -83,6 +85,81 @@ enum
 	SCENECLASS_VARIABLE_FOGSTART,
 	SCENECLASS_VARIABLE_FOGEND,
 };
+
+static void PublishSceneFog(bool enabled, const Vector3 &color,
+	float start, float end)
+{
+	rts::render::LegacyFogConstants fog;
+	fog.enabled = enabled;
+	fog.color = rts::render::RenderFloat4(color.X, color.Y, color.Z, 1.0f);
+	fog.start = start;
+	fog.end = end;
+	if (rts::render::SetGameFogState(fog) != rts::render::RENDER_RESULT_OK)
+	{
+		rts::render::MarkLegacyStatePublicationFailure();
+	}
+	// ShaderClass::Apply consumes the global fog state when publishing a
+	// shader.  Keep the old invalidation boundary without exposing backend
+	// render-state calls to this title translation unit.
+	ShaderClass::Invalidate();
+}
+
+static void PublishSceneLight(unsigned int index, const LightClass *light)
+{
+	rts::render::LegacyLightState state;
+	if (light != nullptr)
+	{
+		state.enabled = true;
+		switch (light->Get_Type())
+		{
+		case LightClass::POINT:
+			state.type = rts::render::RENDER_LIGHT_POINT;
+			break;
+		case LightClass::SPOT:
+			state.type = rts::render::RENDER_LIGHT_SPOT;
+			break;
+		case LightClass::DIRECTIONAL:
+		default:
+			state.type = rts::render::RENDER_LIGHT_DIRECTIONAL;
+			break;
+		}
+
+		Vector3 value;
+		const float intensity = light->Get_Intensity();
+		light->Get_Diffuse(&value);
+		value *= intensity;
+		state.diffuse = rts::render::RenderFloat4(value.X, value.Y, value.Z, 1.0f);
+		light->Get_Specular(&value);
+		value *= intensity;
+		state.specular = rts::render::RenderFloat4(value.X, value.Y, value.Z, 1.0f);
+		light->Get_Ambient(&value);
+		value *= intensity;
+		state.ambient = rts::render::RenderFloat4(value.X, value.Y, value.Z, 1.0f);
+
+		value = light->Get_Position();
+		state.position = rts::render::RenderFloat4(value.X, value.Y, value.Z, 1.0f);
+		light->Get_Spot_Direction(value);
+		state.direction = rts::render::RenderFloat4(value.X, value.Y, value.Z, 0.0f);
+		state.range = light->Get_Attenuation_Range();
+		state.falloff = light->Get_Spot_Exponent();
+		state.theta = light->Get_Spot_Angle();
+		state.phi = light->Get_Spot_Angle();
+
+		// Match the legacy Set_Light inverse-linear attenuation policy.
+		double near_start;
+		double far_start;
+		light->Get_Far_Attenuation_Range(near_start, far_start);
+		state.attenuation0 = 1.0f;
+		state.attenuation1 = fabs(near_start - far_start) < 1e-5 ?
+			0.0f : static_cast<float>(1.0 / near_start);
+		state.attenuation2 = 0.0f;
+	}
+	if (rts::render::SetGameLightState(index, state) !=
+		rts::render::RENDER_RESULT_OK)
+	{
+		rts::render::MarkLegacyStatePublicationFailure();
+	}
+}
 
 /*
 ** SimpleSceneIterator
@@ -208,7 +285,7 @@ void SceneClass::Remove_Render_Object(RenderObjClass * obj)
  *=============================================================================================*/
 void SceneClass::Render(RenderInfoClass & rinfo)
 {
-	DX8Wrapper::Set_Fog(FogEnabled, FogColor, FogStart, FogEnd);
+	PublishSceneFog(FogEnabled, FogColor, FogStart, FogEnd);
 
 	if (Get_Extra_Pass_Polygon_Mode()==EXTRA_PASS_DISABLE) {
 		Customized_Render(rinfo);
@@ -216,20 +293,39 @@ void SceneClass::Render(RenderInfoClass & rinfo)
 	else {
 		bool old_enable=WW3D::Is_Texturing_Enabled();
 
-		DX8Wrapper::Set_DX8_Render_State (D3DRS_ZBIAS, 0);
+		rts::render::SetGameRenderState(
+			rts::render::GAME_RENDER_STATE_Z_BIAS, 0);
 		Customized_Render(rinfo);
 		switch (Get_Extra_Pass_Polygon_Mode()) {
 		case EXTRA_PASS_LINE:
 			WW3D::Enable_Texturing(false);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_FILLMODE,D3DFILL_WIREFRAME);
-			DX8Wrapper::Set_DX8_Render_State (D3DRS_ZBIAS, 7);
+			rts::render::SetGameRenderState(
+				rts::render::GAME_RENDER_STATE_FILL_MODE,
+				rts::render::GAME_RENDER_FILL_WIREFRAME);
+			rts::render::SetGameRenderState(
+				rts::render::GAME_RENDER_STATE_Z_BIAS, 7);
 			Customized_Render(rinfo);
 			break;
 		case EXTRA_PASS_CLEAR_LINE:
-			DX8Wrapper::Clear(true, false, Vector3(0.0f,0.0f,0.0f));	// Clear color but not z
+			{
+				rts::render::GameRenderColor clear_color;
+				clear_color.red = 0.0f;
+				clear_color.green = 0.0f;
+				clear_color.blue = 0.0f;
+				clear_color.alpha = 0.0f;
+				if (rts::render::ClearGameRenderTargets(
+					true, false, clear_color, 0.0f) !=
+					rts::render::RENDER_RESULT_OK)
+				{
+					rts::render::MarkLegacyStatePublicationFailure();
+				}
+			}
 			WW3D::Enable_Texturing(false);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_FILLMODE,D3DFILL_WIREFRAME);
-			DX8Wrapper::Set_DX8_Render_State (D3DRS_ZBIAS, 7);
+			rts::render::SetGameRenderState(
+				rts::render::GAME_RENDER_STATE_FILL_MODE,
+				rts::render::GAME_RENDER_FILL_WIREFRAME);
+			rts::render::SetGameRenderState(
+				rts::render::GAME_RENDER_STATE_Z_BIAS, 7);
 			Customized_Render(rinfo);
 			break;
 		}
@@ -546,15 +642,15 @@ void SimpleSceneClass::Customized_Render(RenderInfoClass & rinfo)
 	WWASSERT(rinfo.light_environment==nullptr);
 	int count=0;
 	// Turn off lights in case we have none
-	DX8Wrapper::Set_Light(0,nullptr);
-	DX8Wrapper::Set_Light(1,nullptr);
-	DX8Wrapper::Set_Light(2,nullptr);
-	DX8Wrapper::Set_Light(3,nullptr);
+	PublishSceneLight(0, nullptr);
+	PublishSceneLight(1, nullptr);
+	PublishSceneLight(2, nullptr);
+	PublishSceneLight(3, nullptr);
 	for (it.First(&LightList); !it.Is_Done(); it.Next())
 	{
 		if (count<4)
 		{
-			DX8Wrapper::Set_Light(count,*(LightClass*)it.Peek_Obj());
+			PublishSceneLight(count, static_cast<LightClass *>(it.Peek_Obj()));
 		} else
 		{
 			// Simple scene only supports 4 global lights

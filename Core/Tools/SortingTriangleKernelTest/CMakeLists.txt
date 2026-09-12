@@ -23,5 +23,5 @@ if(MINGW)
 endif()
 
 add_test(NAME core_sorting_triangle_kernel_tests
-    COMMAND core_sorting_triangle_kernel_tests)
+    COMMAND core_sorting_triangle_kernel_tests --local-capacity)
 set_tests_properties(core_sorting_triangle_kernel_tests PROPERTIES TIMEOUT 90)

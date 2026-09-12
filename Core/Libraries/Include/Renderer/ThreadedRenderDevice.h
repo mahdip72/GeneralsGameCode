@@ -2,7 +2,7 @@
 #define RTS_RENDERER_THREADEDRENDERDEVICE_H
 
 #include "Renderer/RendererDevice.h"
-#include <stdint.h>
+#include <Utility/stdint_adapter.h>
 
 namespace rts
 {
@@ -66,6 +66,11 @@ bool IsThreadedRenderDevice(const IRenderDevice *device);
 // bounded completion mailbox rejects admission if the consumer stops polling.
 RenderResult SubmitThreadedRenderFrame(IRenderDevice *device, bool presentFrame);
 uint64_t LastThreadedRenderFrameSequence(const IRenderDevice *device);
+// Returns the producer's currently open frame sequence, or zero when resource
+// commands are being recorded outside a frame. A nonzero sequence lets a
+// resource registry defer publication to the matching completion without a
+// per-upload render-owner fence.
+uint64_t CurrentThreadedRenderFrameSequence(const IRenderDevice *device);
 bool PollThreadedRenderCompletion(IRenderDevice *device,
 	ThreadedRenderFrameCompletion *completion);
 
@@ -73,6 +78,12 @@ bool PollThreadedRenderCompletion(IRenderDevice *device,
 // idle fence. Readback supplies its own GPU synchronization. Drain also flushes
 // pending resource commands, but never implicitly presents an open frame.
 RenderResult DrainThreadedRenderDevice(IRenderDevice *device);
+// Roll back one unpublished logical resource transaction. The render owner
+// destroys any native allocation first; only then is the producer handle
+// released for reuse. This reports the rollback itself, independently of an
+// earlier aggregate resource failure retained by Drain.
+RenderResult RollbackThreadedRenderResource(IRenderDevice *device,
+	GpuHandle handle);
 bool GetThreadedRenderMetrics(const IRenderDevice *device,
 	ThreadedRenderMetrics *metrics);
 

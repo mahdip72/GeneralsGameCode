@@ -20,7 +20,7 @@
  ***              C O N F I D E N T I A L  ---  W E S T W O O D  S T U D I O S               ***
  ***********************************************************************************************
  *                                                                                             *
- *                 Project Name : DX8 Texture Manager                                          *
+ *                 Project Name : Native texture loader                                          *
  *                                                                                             *
  *                     $Archive:: /Commando/Code/ww3d2/textureloader.h                            $*
  *                                                                                             *
@@ -39,13 +39,13 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "textureloader.h"
+#include "nativew3dsampledtexture.h"
+#include "Renderer/NativeW3DResources.h"
 #include "Lib/JobSystem.h"
 #include "Lib/PipelineExecutionPolicy.h"
-#if !defined(_MSC_VER) || _MSC_VER >= 1300
 #define RTS_ASYNC_RESOURCE_IO 1
 #include "Lib/ResourceIoPipeline.h"
 #include "Lib/ModelAssetBytes.h"
-#endif
 #include "WWLib/mutex.h"
 #include "WWLib/thread.h"
 #include "WWDebug/wwdebug.h"
@@ -55,9 +55,6 @@
 #include	"WWLib/bufffile.h"
 #include "ww3d.h"
 #include "assetmgr.h"
-#include "dx8wrapper.h"
-#include "dx8caps.h"
-#include "missingtexture.h"
 #include "WWLib/TARGA.h"
 #include "WWDebug/wwmemlog.h"
 #include "formconv.h"
@@ -66,8 +63,11 @@
 #include "bitmaphandler.h"
 #include "WWDebug/wwprofile.h"
 
+
 bool TextureLoader::TextureLoadSuspended;
 int TextureLoader::TextureInactiveOverrideTime = 0;
+
+static unsigned _TextureOwnerThreadID = 0;
 
 #define USE_MANAGED_TEXTURES
 
@@ -328,13 +328,11 @@ static TextureLoadTaskListClass					_VolTexLoadFreeList;
 
 
 static rts::JobGroup _TexturePrepareGroup;
-#if RTS_ASYNC_RESOURCE_IO
 static rts::ResourceIoPipeline _TextureResourcePipeline;
 static rts::ModelAssetReadQueue _ModelResourceQueue;
 static TextureLoadTaskListClass _ResourceQueue;
 static bool _ResourcePipelineStarted = false;
 static rts::JobMetricCounter _ResourceOwnerFallbacks = 0;
-#endif
 static TexturePrepareMemoryBudget _TexturePrepareMemoryBudget(64u * 1024u * 1024u);
 static const unsigned long _TextureForegroundSliceMilliseconds = 4;
 static const unsigned _TextureForegroundMaximumTasksPerUpdate = 8;
@@ -342,9 +340,7 @@ static const unsigned _TextureForegroundMaximumTasksPerUpdate = 8;
 static void Record_Texture_Reference_Fallback()
 {
 	rts::JobSystem::instance().recordSerialFallback();
-#if RTS_ASYNC_RESOURCE_IO
 	++_ResourceOwnerFallbacks;
-#endif
 }
 
 static bool Try_Load_For_Owner(TextureLoadTaskClass *task)
@@ -364,85 +360,18 @@ static bool Try_Load_For_Owner(TextureLoadTaskClass *task)
 	}
 }
 
-// TODO: Legacy - remove this call!
-IDirect3DTexture8* Load_Compressed_Texture(
-	const StringClass& filename,
-	unsigned reduction_factor,
-	MipCountType mip_level_count,
-	WW3DFormat dest_format)
+static bool Is_Format_Compressed(WW3DFormat texture_format, bool allow_compression)
 {
-	// If DDS file isn't available, use TGA file to convert to DDS.
-
-	DDSFileClass dds_file(filename,reduction_factor);
-	if (!dds_file.Is_Available()) return nullptr;
-	if (!dds_file.Load()) return nullptr;
-
-	unsigned width=dds_file.Get_Width(0);
-	unsigned height=dds_file.Get_Height(0);
-	unsigned mips=dds_file.Get_Mip_Level_Count();
-
-	// If format isn't defined get the nearest valid texture format to the compressed file format
-	// Note that the nearest valid format could be anything, even uncompressed.
-	if (dest_format==WW3D_FORMAT_UNKNOWN) dest_format=Get_Valid_Texture_Format(dds_file.Get_Format(),true);
-
-	IDirect3DTexture8* d3d_texture = DX8Wrapper::_Create_DX8_Texture
-	(
-		width,
-		height,
-		dest_format,
-		(MipCountType)mips
-	);
-	if (d3d_texture == nullptr)
+	if (!allow_compression)
 	{
-		return nullptr;
+		return false;
 	}
-
-	for (unsigned level=0;level<mips;++level) {
-		IDirect3DSurface8* d3d_surface=nullptr;
-		const HRESULT surface_result = d3d_texture->GetSurfaceLevel(
-			level/*-reduction_factor*/, &d3d_surface);
-		DX8_ErrorCode(surface_result);
-		if (FAILED(surface_result) || d3d_surface == nullptr)
-		{
-			d3d_texture->Release();
-			return nullptr;
-		}
-		dds_file.Copy_Level_To_Surface(level,d3d_surface);
-		d3d_surface->Release();
-	}
-	return d3d_texture;
-}
-
-static bool Is_Format_Compressed(WW3DFormat texture_format,bool allow_compression)
-{
-	// Verify that the user isn't requesting compressed texture without hardware support
-
-	bool compressed=false;
-	if (texture_format!=WW3D_FORMAT_UNKNOWN) {
-		if (!DX8Wrapper::Get_Current_Caps()->Support_DXTC() || !allow_compression) {
-			WWASSERT(texture_format!=WW3D_FORMAT_DXT1);
-			WWASSERT(texture_format!=WW3D_FORMAT_DXT2);
-			WWASSERT(texture_format!=WW3D_FORMAT_DXT3);
-			WWASSERT(texture_format!=WW3D_FORMAT_DXT4);
-			WWASSERT(texture_format!=WW3D_FORMAT_DXT5);
-		}
-		if (texture_format==WW3D_FORMAT_DXT1 ||
-			texture_format==WW3D_FORMAT_DXT2 ||
-			texture_format==WW3D_FORMAT_DXT3 ||
-			texture_format==WW3D_FORMAT_DXT4 ||
-			texture_format==WW3D_FORMAT_DXT5) {
-			compressed=true;
-		}
-	}
-
-	// If hardware supports DXTC compression, load a compressed texture. Proceed only if the texture format hasn't been
-	// defined as non-compressed.
-	compressed|=(
-		texture_format==WW3D_FORMAT_UNKNOWN &&
-		DX8Wrapper::Get_Current_Caps()->Support_DXTC() &&
-		allow_compression);
-
-	return compressed;
+	return texture_format == WW3D_FORMAT_UNKNOWN ||
+		texture_format == WW3D_FORMAT_DXT1 ||
+		texture_format == WW3D_FORMAT_DXT2 ||
+		texture_format == WW3D_FORMAT_DXT3 ||
+		texture_format == WW3D_FORMAT_DXT4 ||
+		texture_format == WW3D_FORMAT_DXT5;
 }
 
 
@@ -454,6 +383,7 @@ static bool Is_Format_Compressed(WW3DFormat texture_format,bool allow_compressio
 
 void TextureLoader::Init()
 {
+	_TextureOwnerThreadID = ThreadClass::_Get_Current_Thread_ID();
 	ThumbnailManagerClass::Init();
 
 	rts::JobSystem &system = rts::JobSystem::instance();
@@ -461,10 +391,8 @@ void TextureLoader::Init()
 	{
 		_TexturePrepareGroup = system.createGroup();
 	}
-#if RTS_ASYNC_RESOURCE_IO
 	_ResourcePipelineStarted = rts::UseParallelPipelines() &&
 		_TextureResourcePipeline.start(rts::ResourceIoConfig(), _TexturePrepareGroup);
-#endif
 	{
 		FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
 		_AcceptingTextureRequests = true;
@@ -507,12 +435,15 @@ void TextureLoader::Deinit()
 
 	ThumbnailManagerClass::Deinit();
 	TextureLoadTaskClass::Delete_Free_Pool();
+	_TextureOwnerThreadID = 0;
 }
 
 
 bool TextureLoader::Is_DX8_Thread()
 {
-	return (ThreadClass::_Get_Current_Thread_ID() == DX8Wrapper::_Get_Main_Thread_ID());
+	const unsigned owner_thread = _TextureOwnerThreadID;
+	return owner_thread == 0 ||
+		owner_thread == ThreadClass::_Get_Current_Thread_ID();
 }
 
 
@@ -522,6 +453,16 @@ bool TextureLoader::Is_DX8_Thread()
 //
 // ----------------------------------------------------------------------------
 
+static unsigned Native_Next_Power_Of_Two(unsigned value, unsigned maximum)
+{
+	unsigned result = 1;
+	while (result < value && result < maximum)
+	{
+		result <<= 1;
+	}
+	return result > maximum ? maximum : result;
+}
+
 void TextureLoader::Validate_Texture_Size
 (
 	unsigned& width,
@@ -529,179 +470,24 @@ void TextureLoader::Validate_Texture_Size
 	unsigned& depth
 )
 {
-	const D3DCAPS8& dx8caps=DX8Wrapper::Get_Current_Caps()->Get_DX8_Caps();
-
-	unsigned poweroftwowidth = 1;
-	while (poweroftwowidth < width)
-	{
-		poweroftwowidth <<= 1;
-	}
-
-	unsigned poweroftwoheight = 1;
-	while (poweroftwoheight < height)
-	{
-		poweroftwoheight <<= 1;
-	}
-
-	unsigned poweroftwodepth = 1;
-	while (poweroftwodepth < depth)
-	{
-		poweroftwodepth <<= 1;
-	}
-
-	if (poweroftwowidth>dx8caps.MaxTextureWidth)
-	{
-		poweroftwowidth=dx8caps.MaxTextureWidth;
-	}
-	if (poweroftwoheight>dx8caps.MaxTextureHeight)
-	{
-		poweroftwoheight=dx8caps.MaxTextureHeight;
-	}
-	if (poweroftwodepth>dx8caps.MaxVolumeExtent)
-	{
-		poweroftwodepth=dx8caps.MaxVolumeExtent;
-	}
-
-	const unsigned maxTextureAspectRatio = dx8caps.MaxTextureAspectRatio;
-	if (maxTextureAspectRatio != 0)
-	{
-		if (poweroftwowidth>poweroftwoheight)
-		{
-			while (poweroftwowidth/poweroftwoheight > maxTextureAspectRatio)
-			{
-				poweroftwoheight*=2;
-			}
-		}
-		else
-		{
-			while (poweroftwoheight/poweroftwowidth > maxTextureAspectRatio)
-			{
-				poweroftwowidth*=2;
-			}
-		}
-	}
-
-	width=poweroftwowidth;
-	height=poweroftwoheight;
-	depth=poweroftwodepth;
+	// Native sampled textures retain the legacy power-of-two sizing policy,
+	// while using native resource limits instead of querying a legacy device.
+	const unsigned max_texture_dimension = 16384u;
+	const unsigned max_volume_extent = 2048u;
+	width = Native_Next_Power_Of_Two(width, max_texture_dimension);
+	height = Native_Next_Power_Of_Two(height, max_texture_dimension);
+	depth = Native_Next_Power_Of_Two(depth, max_volume_extent);
 }
 
-IDirect3DTexture8* TextureLoader::Load_Thumbnail(const StringClass& filename, const Vector3& hsv_shift)//,WW3DFormat texture_format)
+
+void *TextureLoader::Load_Thumbnail(const StringClass& filename, const Vector3& hsv_shift)
 {
 	WWASSERT(Is_DX8_Thread());
-
-	ThumbnailClass* thumb=nullptr;
-	thumb=ThumbnailManagerClass::Peek_Thumbnail_Instance_From_Any_Manager(filename);
-
-	// If no thumb is found return a missing texture
-	if (!thumb) {
-		return MissingTexture::_Get_Missing_Texture();
-	}
-
-	WWASSERT(thumb->Get_Format()==WW3D_FORMAT_A4R4G4B4);
-	unsigned src_pitch=thumb->Get_Width()*2;	// Thumbs are always 16 bits
-	WW3DFormat dest_format;
-	WW3DFormat texture_format=WW3D_FORMAT_UNKNOWN;
-	if (texture_format==WW3D_FORMAT_UNKNOWN) {
-		dest_format=Get_Valid_Texture_Format(WW3D_FORMAT_A4R4G4B4,false); // no compressed formats please
-	}
-	else {
-		dest_format=Get_Valid_Texture_Format(texture_format,false);	// no compressed formats please
-		WWASSERT(dest_format==texture_format);
-	}
-
-	IDirect3DTexture8* sysmem_texture = DX8Wrapper::_Create_DX8_Texture(
-		thumb->Get_Width(),
-		thumb->Get_Height(),
-		dest_format,
-		MIP_LEVELS_ALL,
-#ifdef USE_MANAGED_TEXTURES
-		D3DPOOL_MANAGED);
-#else
-	D3DPOOL_SYSTEMMEM);
-#endif
-	if (sysmem_texture == nullptr)
-	{
-		return MissingTexture::_Get_Missing_Texture();
-	}
-
-	unsigned level=0;
-	D3DLOCKED_RECT locked_rects[12]={0};
-	const unsigned levelCount = sysmem_texture->GetLevelCount();
-	if (levelCount == 0 || levelCount > 12)
-	{
-		sysmem_texture->Release();
-		return MissingTexture::_Get_Missing_Texture();
-	}
-
-	// Lock all surfaces
-	for (level=0; level<levelCount; ++level) {
-		const HRESULT lock_result = sysmem_texture->LockRect(
-			level, &locked_rects[level], nullptr, 0);
-		DX8_ErrorCode(lock_result);
-		if (FAILED(lock_result) || locked_rects[level].pBits == nullptr ||
-			locked_rects[level].Pitch <= 0)
-		{
-			if (SUCCEEDED(lock_result))
-			{
-				DX8_ErrorCode(sysmem_texture->UnlockRect(level));
-			}
-			for (unsigned unlockLevel = 0; unlockLevel < level; ++unlockLevel)
-			{
-				DX8_ErrorCode(sysmem_texture->UnlockRect(unlockLevel));
-			}
-			sysmem_texture->Release();
-			return MissingTexture::_Get_Missing_Texture();
-		}
-	}
-
-	unsigned char* src_surface=thumb->Peek_Bitmap();
-	WW3DFormat src_format=thumb->Get_Format();
-	unsigned width=thumb->Get_Width();
-	unsigned height=thumb->Get_Height();
-
-	Vector3 hsv=hsv_shift;
-	for (level=0; level + 1 < levelCount; ++level) {
-		BitmapHandlerClass::Copy_Image_Generate_Mipmap(
-			width,
-			height,
-			(unsigned char*)locked_rects[level].pBits,
-			locked_rects[level].Pitch,
-			dest_format,
-			src_surface,
-			src_pitch,
-			src_format,
-			(unsigned char*)locked_rects[level+1].pBits,	// mipmap
-			locked_rects[level+1].Pitch,
-			hsv);
-		hsv=Vector3(0.0f,0.0f,0.0f);	// Only do the shift for the first level, as the mipmaps are based on it.
-
-		src_format=dest_format;
-		src_surface=(unsigned char*)locked_rects[level].pBits;
-		src_pitch=locked_rects[level].Pitch;
-		width = width > 1 ? width >> 1 : 1;
-		height = height > 1 ? height >> 1 : 1;
-	}
-
-	// Unlock all surfaces
-	for (level=0; level < levelCount; ++level) {
-		DX8_ErrorCode(sysmem_texture->UnlockRect(level));
-	}
-#ifdef USE_MANAGED_TEXTURES
-	return sysmem_texture;
-#else
-	IDirect3DTexture8* d3d_texture = DX8Wrapper::_Create_DX8_Texture(
-		thumb->Get_Width(),
-		thumb->Get_Height(),
-		dest_format,
-		TextureBaseClass::MIP_LEVELS_ALL,
-		D3DPOOL_DEFAULT);
-	DX8CALL(UpdateTexture(sysmem_texture,d3d_texture));
-	sysmem_texture->Release();
-
-	WWDEBUG_SAY(("Created non-managed texture (%s)",filename));
-	return d3d_texture;
-#endif
+	(void)filename;
+	(void)hsv_shift;
+	// Native thumbnails are represented by the regular prepared-mip
+	// publication; there is no separate graphics object to return.
+	return nullptr;
 }
 
 
@@ -712,174 +498,29 @@ IDirect3DTexture8* TextureLoader::Load_Thumbnail(const StringClass& filename, co
 // format and performs color space conversion.
 //
 // ----------------------------------------------------------------------------
-IDirect3DSurface8* TextureLoader::Load_Surface_Immediate(
+void *TextureLoader::Load_Surface_Immediate(
 	const StringClass& filename,
 	WW3DFormat texture_format,
 	bool allow_compression)
 {
 	WWASSERT(Is_DX8_Thread());
-
-	bool compressed=Is_Format_Compressed(texture_format,allow_compression);
-
-	if (compressed) {
-		IDirect3DTexture8* comp_tex=Load_Compressed_Texture(filename,0,MIP_LEVELS_1,WW3D_FORMAT_UNKNOWN);
-		if (comp_tex) {
-			IDirect3DSurface8* d3d_surface=nullptr;
-			const HRESULT surface_result = comp_tex->GetSurfaceLevel(
-				0, &d3d_surface);
-			DX8_ErrorCode(surface_result);
-			comp_tex->Release();
-			if (SUCCEEDED(surface_result) && d3d_surface != nullptr)
-			{
-				return d3d_surface;
-			}
-		}
-	}
-
-	// Make sure the file can be opened. If not, return missing texture.
-	Targa targa;
-	if (TARGA_ERROR_HANDLER(targa.Open(filename, TGA_READMODE),filename)) return MissingTexture::_Create_Missing_Surface();
-
-	// DX8 uses image upside down compared to TGA
-	targa.Header.ImageDescriptor ^= TGAIDF_YORIGIN;
-
-	WW3DFormat src_format,dest_format;
-	unsigned src_bpp=0;
-	Get_WW3D_Format(dest_format,src_format,src_bpp,targa);
-
-	if (texture_format!=WW3D_FORMAT_UNKNOWN) {
-		dest_format=texture_format;
-	}
-
-	// Destination size will be the next power of two square from the larger width and height...
-	unsigned width, height;
-	width=targa.Header.Width;
-	height=targa.Header.Height;
-	unsigned src_width=targa.Header.Width;
-	unsigned src_height=targa.Header.Height;
-
-	// NOTE: We load the palette but we do not yet support paletted textures!
-	char palette[256*4];
-	targa.SetPalette(palette);
-	if (TARGA_ERROR_HANDLER(targa.Load(filename, TGAF_IMAGE, false),filename)) return MissingTexture::_Create_Missing_Surface();
-
-	unsigned char* src_surface=(unsigned char*)targa.GetImage();
-
-	// No paletted destination format allowed
-	unsigned char* converted_surface=nullptr;
-	if (src_format==WW3D_FORMAT_A1R5G5B5 || src_format==WW3D_FORMAT_R5G6B5 || src_format==WW3D_FORMAT_A4R4G4B4 ||
-		src_format==WW3D_FORMAT_P8 || src_format==WW3D_FORMAT_L8 || src_width!=width || src_height!=height) {
-		converted_surface=W3DNEWARRAY unsigned char[width*height*4];
-		dest_format=Get_Valid_Texture_Format(WW3D_FORMAT_A8R8G8B8,false);
-		BitmapHandlerClass::Copy_Image(
-			converted_surface,
-			width,
-			height,
-			width*4,
-			WW3D_FORMAT_A8R8G8B8,//dest_format,
-			src_surface,
-			src_width,
-			src_height,
-			src_width*src_bpp,
-			src_format,
-			(unsigned char*)targa.GetPalette(),
-			targa.Header.CMapDepth>>3,
-			false);
-		src_surface=converted_surface;
-		src_format=WW3D_FORMAT_A8R8G8B8;//dest_format;
-		src_width=width;
-		src_height=height;
-		src_bpp=Get_Bytes_Per_Pixel(src_format);
-	}
-
-	unsigned src_pitch=src_width*src_bpp;
-
-	IDirect3DSurface8* d3d_surface = DX8Wrapper::_Create_DX8_Surface(width,height,dest_format);
-	if (d3d_surface == nullptr)
-	{
-		delete[] converted_surface;
-		return MissingTexture::_Create_Missing_Surface();
-	}
-	D3DLOCKED_RECT locked_rect = {0};
-	const HRESULT lock_result = d3d_surface->LockRect(
-		&locked_rect, nullptr, 0);
-	DX8_ErrorCode(lock_result);
-	if (FAILED(lock_result) || locked_rect.pBits == nullptr ||
-		locked_rect.Pitch <= 0)
-	{
-		if (SUCCEEDED(lock_result))
-		{
-			DX8_ErrorCode(d3d_surface->UnlockRect());
-		}
-		d3d_surface->Release();
-		delete[] converted_surface;
-		return MissingTexture::_Create_Missing_Surface();
-	}
-
-	BitmapHandlerClass::Copy_Image(
-		(unsigned char*)locked_rect.pBits,
-		width,
-		height,
-		locked_rect.Pitch,
-		dest_format,
-		src_surface,
-		src_width,
-		src_height,
-		src_pitch,
-		src_format,
-		(unsigned char*)targa.GetPalette(),
-		targa.Header.CMapDepth>>3,
-		false);	// No mipmap
-
-	DX8_ErrorCode(d3d_surface->UnlockRect());
-
-	delete[] converted_surface;
-
-	return d3d_surface;
+	(void)filename;
+	(void)texture_format;
+	(void)allow_compression;
+	// Native callers publish prepared mip memory through TextureBaseClass.
+	return nullptr;
 }
 
 
 void TextureLoader::Request_Thumbnail(TextureBaseClass *tc)
 {
-	// Grab the foreground lock. This prevents the foreground thread
-	// from retiring any tasks related to this texture. It also
-	// serializes calls to Request_Thumbnail from multiple threads.
-	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
-	if (!_AcceptingTextureRequests)
-	{
-		return;
-	}
-
-	// Has a Direct3D texture already been loaded?
-	if (tc->Peek_D3D_Base_Texture()) {
-		return;
-	}
-
-	TextureLoadTaskClass *task = tc->ThumbnailLoadTask;
-
-	if (Is_DX8_Thread()) {
-		// load the thumbnail immediately
-		TextureLoader::Load_Thumbnail(tc);
-
-		// clear any pending thumbnail load
-		if (task) {
-			_ForegroundQueue.Remove(task);
-			task->Destroy();
-		}
-
-	} else {
-		TextureLoadTaskClass *load_task = tc->TextureLoadTask;
-
-		// If a full load completes concurrently, Publish_Thumbnail marks this
-		// task complete under the same queue lock used for full-load publication.
-		// Otherwise the thumbnail stays ahead of the eventual full texture.
-		if (!task) {
-
-			// create a thumbnail load task and add to foreground queue.
-			task = TextureLoadTaskClass::Create(tc, TextureLoadTaskClass::TASK_THUMBNAIL, TextureLoadTaskClass::PRIORITY_LOW);
-			_ForegroundQueue.Publish_Thumbnail(task, load_task);
-		}
-	}
+	// A thumbnail request promotes the same prepared-mip pipeline used by the
+	// full typed texture publication.
+	if (tc == nullptr) return;
+	rts::render::NativeW3DTextureHandle native_handle;
+	if (!tc->Acquire_Native_Texture(&native_handle))
+		Request_Foreground_Loading(tc);
+	return;
 }
 
 
@@ -941,7 +582,7 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 
 	if (Is_DX8_Thread()) {
 
-		// since we're in the DX8 thread, we can load the entire
+		// since we're in the render-owner thread, we can load the entire
 		// texture right now.
 
 		// if we have a thumbnail task waiting, kill it.
@@ -977,7 +618,7 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 		task->Destroy();
 
 	} else {
-		// we are not in the DX8 thread. We need to add a high-priority loading
+		// we are not in the render-owner thread. We need to add a high-priority loading
 		// task to the foreground queue.
 
 		// if we have a thumbnail task, we should cancel it. Since we are not
@@ -991,10 +632,8 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 			// Promote queued preparation ahead of streaming work. If a worker
 			// already owns it, publication proceeds normally.
 			_ForegroundQueue.Promote_Prepare_Job(task);
-#if RTS_ASYNC_RESOURCE_IO
 			if (task->ResourceRequest != nullptr)
 				_TextureResourcePipeline.promote(*static_cast<rts::ResourceIoTicket*>(task->ResourceRequest));
-#endif
 
 		} else {
 			// allocate high priority load task
@@ -1010,32 +649,26 @@ void TextureLoader::Request_Foreground_Loading(TextureBaseClass *tc)
 void TextureLoader::Flush_Pending_Load_Tasks()
 {
 	// This function can only be called from the main thread.
-	// (Only the main thread can make the DX8 calls necessary
+	// (Only the main thread can make the render-thread calls necessary
 	// to complete texture loading. If we wanted to flush
 	// the pending tasks from another thread, we'd probably
 	// want to set a bool that is checked by Update().
 	WWASSERT(Is_DX8_Thread());
 
 	for (;;) {
-#if RTS_ASYNC_RESOURCE_IO
 		Pump_Resource_Loads();
-#endif
 		if (_TexturePrepareGroup.isValid())
 		{
 			rts::JobSystem::instance().wait(_TexturePrepareGroup);
 		}
 		if (_ForegroundQueue.Is_Empty()
-#if RTS_ASYNC_RESOURCE_IO
 			&& _ResourceQueue.Is_Empty()
-#endif
 		) {
 			break;
 		}
 		Update();
-#if RTS_ASYNC_RESOURCE_IO
 		if (TextureLoadTaskClass *pending = _ResourceQueue.Peek_Front())
 			_TextureResourcePipeline.wait(*static_cast<rts::ResourceIoTicket*>(pending->ResourceRequest));
-#endif
 	}
 }
 
@@ -1044,7 +677,6 @@ void TextureLoader::Discard_Pending_Background_Load_Tasks()
 {
 	WWASSERT(Is_DX8_Thread());
 	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
-#if RTS_ASYNC_RESOURCE_IO
 	// A generation boundary rejects every old read/decode before factories,
 	// archive catalogs, or the device can be reset. Keep foreground intent,
 	// but resolve its source again in the new generation.
@@ -1057,7 +689,6 @@ void TextureLoader::Discard_Pending_Background_Load_Tasks()
 			resourceTask->Destroy();
 		else _ForegroundQueue.Push_Back(resourceTask);
 	}
-#endif
 	// A prepare job temporarily owns its task outside the foreground queue.
 	// Drain the group before filtering so an outgoing-map task cannot publish
 	// after reset and upload its prepared surfaces into the next map.
@@ -1156,11 +787,12 @@ void TextureLoader::Continue_Texture_Load()
 
 void TextureLoader::Process_Foreground_Thumbnail(TextureLoadTaskClass *task)
 {
+	rts::render::NativeW3DTextureHandle native_handle;
 	switch (task->Get_State()) {
 		case TextureLoadTaskClass::STATE_NONE:
 			// A full load can complete inline if worker admission fails after this
 			// thumbnail was queued. Do not replace that full texture afterward.
-			if (task->Peek_Texture()->Peek_D3D_Base_Texture())
+			if (task->Peek_Texture()->Acquire_Native_Texture(&native_handle))
 			{
 				task->Destroy();
 				break;
@@ -1220,21 +852,13 @@ void TextureLoader::Begin_Load_And_Queue(TextureLoadTaskClass *task)
 
 void TextureLoader::Load_Thumbnail(TextureBaseClass *tc)
 {
-	// All D3D operations must run from main thread
+	// Thumbnail requests use the same native prepared-mip pipeline as full
+	// loads.  Keep this owner-side entry point for source compatibility.
 	WWASSERT(Is_DX8_Thread());
-
-	// load thumbnail texture
-	IDirect3DTexture8 *d3d_texture = Load_Thumbnail(tc->Get_Full_Path(),tc->Get_HSV_Shift());
-
-	// apply thumbnail to texture
-	if (tc->Get_Asset_Type()==TextureBaseClass::TEX_REGULAR)
+	if (tc != nullptr && !tc->Is_Initialized())
 	{
-		tc->Apply_New_Surface(d3d_texture, false);
+		Request_Foreground_Loading(tc);
 	}
-
-	// release our reference to thumbnail texture
-	d3d_texture->Release();
-	d3d_texture = nullptr;
 }
 
 
@@ -1246,7 +870,7 @@ void TextureLoader::Load_Thumbnail(TextureBaseClass *tc)
 
 TextureLoadTaskClass::TextureLoadTaskClass()
 :	Texture			(nullptr),
-	D3DTexture		(nullptr),
+	LoadedTextureHandle		(nullptr),
 	Format			(WW3D_FORMAT_UNKNOWN),
 	Width				(0),
 	Height			(0),
@@ -1323,10 +947,8 @@ void TextureLoadTaskClass::Fail_Async_Prepare()
 
 bool TextureLoadTaskClass::Is_Async_Prepare_Complete()
 {
-#if RTS_ASYNC_RESOURCE_IO
 	if (ResourceRequest != nullptr)
 		return _TextureResourcePipeline.isComplete(*static_cast<rts::ResourceIoTicket*>(ResourceRequest));
-#endif
 	return PrepareCompleteEvent != nullptr &&
 		WaitForSingleObject((HANDLE)PrepareCompleteEvent, 0) == WAIT_OBJECT_0;
 }
@@ -1334,7 +956,6 @@ bool TextureLoadTaskClass::Is_Async_Prepare_Complete()
 
 void TextureLoadTaskClass::Wait_For_Async_Prepare()
 {
-#if RTS_ASYNC_RESOURCE_IO
 	if (ResourceRequest != nullptr)
 	{
 		WWASSERT(TextureLoader::Is_DX8_Thread());
@@ -1350,7 +971,6 @@ void TextureLoadTaskClass::Wait_For_Async_Prepare()
 		}
 		return;
 	}
-#endif
 	if (PrepareCompleteEvent != nullptr)
 	{
 		WaitForSingleObject((HANDLE)PrepareCompleteEvent, INFINITE);
@@ -1427,7 +1047,7 @@ void TextureLoadTaskClass::Init(TextureBaseClass* tc, TaskType type, PriorityTyp
 	Priority			= priority;
 	State				= STATE_NONE;
 
-	D3DTexture		= nullptr;
+	LoadedTextureHandle		= nullptr;
 
 	TextureClass* tex=Texture->As_TextureClass();
 
@@ -1489,7 +1109,7 @@ void TextureLoadTaskClass::Deinit()
 	WWASSERT(Next == nullptr);
 	WWASSERT(Prev == nullptr);
 
-	WWASSERT(D3DTexture == nullptr);
+	WWASSERT(LoadedTextureHandle == nullptr);
 	Release_Prepared_Surfaces();
 	delete DDSFile;
 	DDSFile = nullptr;
@@ -1675,23 +1295,9 @@ void TextureLoadTaskClass::End_Load()
 {
 	WWASSERT(TextureLoader::Is_DX8_Thread());
 
-	if (LoadSucceeded && Create_D3D_Texture())
+	if (LoadSucceeded && Publish_Native_Prepared_Texture())
 	{
-		PROFILER_SECTION_NAME("Texture.Upload");
-
-		const bool locked = Lock_Surfaces();
-		const bool uploaded = locked && Upload_Prepared_Surfaces();
-		Unlock_Surfaces();
-		if (uploaded)
-		{
-			Apply(true);
-		}
-		else
-		{
-			D3DTexture->Release();
-			D3DTexture = nullptr;
-			Apply_Missing_Texture();
-		}
+		PROFILER_SECTION_NAME("Texture.Upload.Native");
 	}
 	else
 	{
@@ -1737,26 +1343,20 @@ void TextureLoadTaskClass::Finish_Load()
 void TextureLoadTaskClass::Apply_Missing_Texture()
 {
 	WWASSERT(TextureLoader::Is_DX8_Thread());
-	WWASSERT(!D3DTexture);
+	WWASSERT(!LoadedTextureHandle);
 
-	D3DTexture = MissingTexture::_Get_Missing_Texture();
-	Apply(true);
+	if (!Texture->Apply_Native_Missing_Texture())
+	{
+		Texture->Apply_New_Surface(nullptr, false);
+	}
 }
 
 
 void TextureLoadTaskClass::Apply(bool initialize)
 {
-	WWASSERT(D3DTexture);
-
-	// Verify that none of the mip levels are locked
-	for (unsigned i=0;i<MipLevelCount;++i) {
-		WWASSERT(LockedSurfacePtr[i]==nullptr);
-	}
-
-	Texture->Apply_New_Surface(D3DTexture, initialize);
-
-	D3DTexture->Release();
-	D3DTexture = nullptr;
+	(void)initialize;
+	WWASSERT(!LoadedTextureHandle);
+	return;
 }
 
 
@@ -1942,7 +1542,6 @@ static void Apply_Mip_Reduction(unsigned& mip_level_count, unsigned reduction, u
 }
 
 
-#if RTS_ASYNC_RESOURCE_IO
 // No texture, COM interface, FileClass, global factory, or pooled task is
 // reachable from this operation. prepare is owner-only; decode sees only this
 // captured descriptor, bounded encoded bytes, and its private output buffers.
@@ -2088,7 +1687,7 @@ public:
 						Surface[face][level].data(), (unsigned)Surface[face][level].layout().rowPitch, HSV);
 					else DDS->Copy_Level_To_Surface(level, Format, w, h,
 						Surface[face][level].data(), (unsigned)Surface[face][level].layout().rowPitch, HSV);
-					w >>= 1; h >>= 1;
+					ReduceTextureMipDimensions(w, h);
 				}
 			}
 			return !cancel.isCancelled();
@@ -2144,11 +1743,9 @@ private:
 	bool Prepared;
 	size_t Workspace;
 };
-#endif
 
 bool TextureLoadTaskClass::Begin_Resource_Read(bool tryCompressed)
 {
-#if RTS_ASYNC_RESOURCE_IO
 	if (!_ResourcePipelineStarted || !_AcceptingTextureRequests ||
 		Texture->Get_Asset_Type() == TextureBaseClass::TEX_VOLUME || ResourceRequest != nullptr) return false;
 	WWASSERT(TextureLoader::Is_DX8_Thread());
@@ -2189,15 +1786,10 @@ bool TextureLoadTaskClass::Begin_Resource_Read(bool tryCompressed)
 	State = STATE_LOAD_BEGUN;
 	_ResourceQueue.Push_Back(this);
 	return true;
-#else
-	(void)tryCompressed;
-	return false;
-#endif
 }
 
 bool TextureLoadTaskClass::Complete_Resource_Read()
 {
-#if RTS_ASYNC_RESOURCE_IO
 	if (ResourceRequest == nullptr) return true;
 	rts::ResourceIoStatus status;
 	rts::ResourceDecodeOperation *operation = nullptr;
@@ -2237,13 +1829,11 @@ bool TextureLoadTaskClass::Complete_Resource_Read()
 		return true;
 	}
 	Fail_Async_Prepare();
-#endif
 	return true;
 }
 
 void TextureLoadTaskClass::Cancel_Resource_Read()
 {
-#if RTS_ASYNC_RESOURCE_IO
 	if (ResourceRequest == nullptr) return;
 	const rts::ResourceIoTicket ticket = *static_cast<rts::ResourceIoTicket*>(ResourceRequest);
 	_TextureResourcePipeline.cancel(ticket);
@@ -2256,12 +1846,10 @@ void TextureLoadTaskClass::Cancel_Resource_Read()
 	ResourceRequest = nullptr;
 	State = STATE_NONE;
 	LoadSucceeded = false;
-#endif
 }
 
 void TextureLoader::Pump_Resource_Loads()
 {
-#if RTS_ASYNC_RESOURCE_IO
 	_TextureResourcePipeline.pump();
 	_ModelResourceQueue.pump(_TextureResourcePipeline);
 	unsigned count = 0;
@@ -2279,12 +1867,10 @@ void TextureLoader::Pump_Resource_Loads()
 		}
 		if (++count >= _TextureForegroundMaximumTasksPerUpdate) break;
 	}
-#endif
 }
 
 void TextureLoader::Stop_Async_Resource_Loading()
 {
-#if RTS_ASYNC_RESOURCE_IO
 	WWASSERT(Is_DX8_Thread());
 	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
 	if (!_ResourcePipelineStarted) return;
@@ -2297,10 +1883,8 @@ void TextureLoader::Stop_Async_Resource_Loading()
 	}
 	_TextureResourcePipeline.shutdown();
 	_ResourcePipelineStarted = false;
-#endif
 }
 
-#if RTS_ASYNC_RESOURCE_IO
 bool TextureLoader::Request_Model_Read(const char *filename, rts::ResourceIoTicket &ticket)
 {
 	WWASSERT(Is_DX8_Thread());
@@ -2358,7 +1942,6 @@ rts::ResourceIoMetrics TextureLoader::Get_Resource_Load_Metrics()
 	metrics.serialFallbacks += _ResourceOwnerFallbacks;
 	return metrics;
 }
-#endif
 
 bool TextureLoadTaskClass::Begin_Compressed_Load()
 {
@@ -2534,21 +2117,11 @@ bool TextureLoadTaskClass::Allocate_Prepared_Surfaces()
 }
 
 
-bool TextureLoadTaskClass::Create_D3D_Texture()
+bool TextureLoadTaskClass::Create_Texture_Handle()
 {
-	D3DTexture = DX8Wrapper::_Create_DX8_Texture
-	(
-		Width,
-		Height,
-		Format,
-		(MipCountType)MipLevelCount,
-#ifdef USE_MANAGED_TEXTURES
-		D3DPOOL_MANAGED
-#else
-		D3DPOOL_SYSTEMMEM
-#endif
-	);
-	return D3DTexture != nullptr;
+	// Native publication does not create an intermediate graphics object.
+	LoadedTextureHandle = nullptr;
+	return false;
 }
 
 
@@ -2580,33 +2153,40 @@ static bool Build_Upload_Layout(const TextureMipLayout& source, size_t rowPitch,
 
 bool TextureLoadTaskClass::Upload_Prepared_Surfaces()
 {
+	// Prepared buffers are handed directly to NativeW3DSampledTextureUpload.
+	return false;
+}
+
+
+bool TextureLoadTaskClass::Publish_Native_Prepared_Texture()
+{
+	if (Texture == nullptr || MipLevelCount == 0 ||
+		MipLevelCount > MIP_LEVELS_MAX) return false;
+	rts::render::NativeW3DSampledTextureMipView views[MIP_LEVELS_MAX];
 	for (unsigned int level = 0; level < MipLevelCount; ++level)
 	{
-		const TextureMipBuffer& source =
-#if RTS_ASYNC_RESOURCE_IO
-			ResourceResult != nullptr ? static_cast<TextureResourceDecode*>(ResourceResult)->Surface[0][level] :
-#endif
+		const TextureMipBuffer &source =
+			ResourceResult != nullptr ?
+				static_cast<TextureResourceDecode *>(ResourceResult)->Surface[0][level] :
 			PreparedSurface[level];
-		const TextureMipLayout& sourceLayout = source.layout();
-		TextureMipLayout destinationLayout;
-		if (!Build_Upload_Layout(sourceLayout, LockedSurfacePitch[level],
-			0, 1, destinationLayout) ||
-			!CopyTextureMipData(source.data(), sourceLayout,
-				LockedSurfacePtr[level], destinationLayout, 1))
-		{
-			return false;
-		}
+		if (source.data() == nullptr || source.layout().dataSize == 0 ||
+			source.layout().rowPitch == 0) return false;
+		views[level].data = source.data();
+		views[level].dataSize = source.layout().dataSize;
+		views[level].rowPitch = source.layout().rowPitch;
 	}
-	return true;
+	rts::render::NativeW3DSampledTextureUpload upload;
+	if (!upload.Prepare(Format, Width, Height, MipLevelCount, 1, views,
+		MipLevelCount)) return false;
+	return Texture->Apply_Native_Texture(upload.Descriptor(),
+		upload.Subresources(), upload.SubresourceCount(), Format, true);
 }
 
 
 void TextureLoadTaskClass::Release_Prepared_Surfaces()
 {
-#if RTS_ASYNC_RESOURCE_IO
 	delete static_cast<TextureResourceDecode*>(ResourceResult);
 	ResourceResult = nullptr;
-#endif
 	for (unsigned int level = 0; level < MIP_LEVELS_MAX; ++level)
 	{
 		PreparedSurface[level].reset();
@@ -2617,70 +2197,18 @@ void TextureLoadTaskClass::Release_Prepared_Surfaces()
 
 bool TextureLoadTaskClass::Lock_Surfaces()
 {
-	WWASSERT(MipLevelCount == D3DTexture->GetLevelCount());
-	bool locked_all = true;
-
-	for (unsigned int i = 0; i < MipLevelCount; ++i)
-	{
-		D3DLOCKED_RECT locked_rect = {0};
-		const HRESULT result = Peek_D3D_Texture()->LockRect(
-			i, &locked_rect, nullptr, 0);
-		DX8_ErrorCode(result);
-		if (FAILED(result) || locked_rect.pBits == nullptr ||
-			locked_rect.Pitch <= 0)
-		{
-			locked_all = false;
-			LockedSurfacePtr[i] = nullptr;
-			LockedSurfacePitch[i] = 0;
-			break;
-		}
-		LockedSurfacePtr[i] = (unsigned char *)locked_rect.pBits;
-		LockedSurfacePitch[i] = locked_rect.Pitch;
-	}
-	if (!locked_all)
-	{
-		// Unlock any earlier levels before the failed upload is published.  A
-		// failed LockRect must never leave a stale pointer in the task object.
-		for (unsigned int i = 0; i < MipLevelCount; ++i)
-		{
-			if (LockedSurfacePtr[i] != nullptr)
-			{
-				DX8_ErrorCode(Peek_D3D_Texture()->UnlockRect(i));
-				LockedSurfacePtr[i] = nullptr;
-				LockedSurfacePitch[i] = 0;
-			}
-		}
-	}
-	return locked_all;
+	// The native path never exposes lockable graphics surfaces.
+	return false;
 }
 
 
 void TextureLoadTaskClass::Unlock_Surfaces()
 {
-	for (unsigned int i = 0; i < MipLevelCount; ++i)
+	for (unsigned int i = 0; i < MIP_LEVELS_MAX; ++i)
 	{
-		if (LockedSurfacePtr[i])
-		{
-			WWASSERT(ThreadClass::_Get_Current_Thread_ID() == DX8Wrapper::_Get_Main_Thread_ID());
-			DX8_ErrorCode(Peek_D3D_Texture()->UnlockRect(i));
-		}
 		LockedSurfacePtr[i] = nullptr;
+		LockedSurfacePitch[i] = 0;
 	}
-	// Managed texture uploads are performed through the legacy API object.
-	// Publish the write to the compatibility bridge before the texture is
-	// attached to its TextureClass, so a previously cached source cannot be
-	// reused if the resource address is recycled.
-	Notify_Render_Texture_Changed(Peek_D3D_Texture());
-
-#ifndef USE_MANAGED_TEXTURES
-	IDirect3DTexture8* tex = DX8Wrapper::_Create_DX8_Texture(Width, Height, Format, Texture->MipLevelCount,D3DPOOL_DEFAULT);
-	DX8CALL(UpdateTexture(Peek_D3D_Texture(),tex));
-	Peek_D3D_Texture()->Release();
-	D3DTexture=tex;
-	Notify_Render_Texture_Changed(Peek_D3D_Texture());
-	WWDEBUG_SAY(("Created non-managed texture (%s)",Texture->Get_Full_Path()));
-#endif
-
 }
 
 
@@ -2711,8 +2239,7 @@ bool TextureLoadTaskClass::Load_Compressed_Mipmap()
 			HSVShift
 		);
 
-		width >>= 1;
-		height >>= 1;
+		ReduceTextureMipDimensions(width, height);
 	}
 
 	return true;
@@ -2922,7 +2449,7 @@ void CubeTextureLoadTaskClass::Init(TextureBaseClass* tc, TaskType type, Priorit
 	Priority			= priority;
 	State				= STATE_NONE;
 
-	D3DTexture		= nullptr;
+	LoadedTextureHandle		= nullptr;
 
 	CubeTextureClass* tex=Texture->As_CubeTextureClass();
 
@@ -2983,7 +2510,7 @@ void CubeTextureLoadTaskClass::Deinit()
 	WWASSERT(Next == nullptr);
 	WWASSERT(Prev == nullptr);
 
-	WWASSERT(D3DTexture == nullptr);
+	WWASSERT(LoadedTextureHandle == nullptr);
 	Release_Prepared_Surfaces();
 	delete DDSFile;
 	DDSFile = nullptr;
@@ -3023,87 +2550,22 @@ void CubeTextureLoadTaskClass::Deinit()
 
 bool CubeTextureLoadTaskClass::Lock_Surfaces()
 {
-	bool locked_all = true;
-	for (unsigned int f=0; f<6; f++)
-	{
-		for (unsigned int i=0; i<MipLevelCount; i++)
-		{
-			D3DLOCKED_RECT locked_rect = {0};
-			const HRESULT result = Peek_D3D_Cube_Texture()->LockRect(
-				(D3DCUBEMAP_FACES)f, i, &locked_rect, nullptr, 0);
-			DX8_ErrorCode(result);
-			if (FAILED(result) || locked_rect.pBits == nullptr ||
-				locked_rect.Pitch <= 0)
-			{
-				locked_all = false;
-				LockedCubeSurfacePtr[f][i] = nullptr;
-				LockedCubeSurfacePitch[f][i] = 0;
-				break;
-			}
-			LockedCubeSurfacePtr[f][i] = (unsigned char *)locked_rect.pBits;
-			LockedCubeSurfacePitch[f][i] = locked_rect.Pitch;
-		}
-		if (!locked_all)
-		{
-			break;
-		}
-	}
-	if (!locked_all)
-	{
-		for (unsigned int f = 0; f < 6; ++f)
-		{
-			for (unsigned int i = 0; i < MipLevelCount; ++i)
-			{
-				if (LockedCubeSurfacePtr[f][i] != nullptr)
-				{
-					DX8_ErrorCode(Peek_D3D_Cube_Texture()->UnlockRect(
-						(D3DCUBEMAP_FACES)f, i));
-					LockedCubeSurfacePtr[f][i] = nullptr;
-					LockedCubeSurfacePitch[f][i] = 0;
-				}
-			}
-		}
-	}
-	return locked_all;
+	// The native path publishes cube faces from prepared CPU memory.
+	return false;
 }
+
 
 void CubeTextureLoadTaskClass::Unlock_Surfaces()
 {
-	for (unsigned int f=0; f<6; f++)
+	for (unsigned int face = 0; face < 6; ++face)
 	{
-		for (unsigned int i = 0; i < MipLevelCount; ++i)
+		for (unsigned int level = 0; level < MIP_LEVELS_MAX; ++level)
 		{
-			if (LockedCubeSurfacePtr[f][i])
-			{
-				WWASSERT(ThreadClass::_Get_Current_Thread_ID() == DX8Wrapper::_Get_Main_Thread_ID());
-				DX8_ErrorCode
-				(
-					Peek_D3D_Cube_Texture()->UnlockRect((D3DCUBEMAP_FACES)f,i)
-				);
-			}
-			LockedCubeSurfacePtr[f][i] = nullptr;
+			LockedCubeSurfacePtr[face][level] = nullptr;
+			LockedCubeSurfacePitch[face][level] = 0;
 		}
 	}
-	Notify_Render_Texture_Changed(Peek_D3D_Cube_Texture());
-
-#ifndef USE_MANAGED_TEXTURES
-	IDirect3DCubeTexture8* tex = DX8Wrapper::_Create_DX8_Cube_Texture
-	(
-		Width,
-		Height,
-		Format,
-		Texture->MipLevelCount,
-		D3DPOOL_DEFAULT
-	);
-	DX8Wrapper::_Update_Texture(Peek_D3D_Cube_Texture(), tex);
-	Peek_D3D_Cube_Texture()->Release();
-	D3DTexture=tex;
-	Notify_Render_Texture_Changed(Peek_D3D_Cube_Texture());
-	WWDEBUG_SAY(("Created non-managed texture (%s)",Texture->Get_Full_Path()));
-#endif
-
 }
-
 
 
 bool CubeTextureLoadTaskClass::Begin_Compressed_Load()
@@ -3199,8 +2661,7 @@ bool CubeTextureLoadTaskClass::Load_Compressed_Mipmap()
 				HSVShift
 			);
 
-			width >>= 1;
-			height >>= 1;
+			ReduceTextureMipDimensions(width, height);
 		}
 	}
 
@@ -3257,56 +2718,53 @@ size_t CubeTextureLoadTaskClass::Get_Prepare_Memory_Byte_Count() const
 }
 
 
-bool CubeTextureLoadTaskClass::Create_D3D_Texture()
+bool CubeTextureLoadTaskClass::Create_Texture_Handle()
 {
-	D3DTexture = DX8Wrapper::_Create_DX8_Cube_Texture
-	(
-		Width,
-		Height,
-		Format,
-		(MipCountType)MipLevelCount,
-#ifdef USE_MANAGED_TEXTURES
-		D3DPOOL_MANAGED
-#else
-		D3DPOOL_SYSTEMMEM
-#endif
-	);
-	return D3DTexture != nullptr;
+	LoadedTextureHandle = nullptr;
+	return false;
 }
 
 
 bool CubeTextureLoadTaskClass::Upload_Prepared_Surfaces()
 {
+	// Native publication consumes prepared face/mip buffers directly.
+	return false;
+}
+
+
+bool CubeTextureLoadTaskClass::Publish_Native_Prepared_Texture()
+{
+	if (Texture == nullptr || Width == 0 || Width != Height ||
+		MipLevelCount == 0 || MipLevelCount > MIP_LEVELS_MAX) return false;
+	rts::render::NativeW3DSampledTextureMipView views[6 * MIP_LEVELS_MAX];
 	for (unsigned int face = 0; face < 6; ++face)
 	{
 		for (unsigned int level = 0; level < MipLevelCount; ++level)
 		{
-			const TextureMipBuffer& source =
-#if RTS_ASYNC_RESOURCE_IO
-				ResourceResult != nullptr ? static_cast<TextureResourceDecode*>(ResourceResult)->Surface[face][level] :
-#endif
+			const unsigned int index = face * MipLevelCount + level;
+			const TextureMipBuffer &source =
+				ResourceResult != nullptr ?
+					static_cast<TextureResourceDecode *>(ResourceResult)->Surface[face][level] :
 				PreparedCubeSurface[face][level];
-			const TextureMipLayout& sourceLayout = source.layout();
-			TextureMipLayout destinationLayout;
-			if (!Build_Upload_Layout(sourceLayout, LockedCubeSurfacePitch[face][level],
-				0, 1, destinationLayout) ||
-				!CopyTextureMipData(source.data(), sourceLayout,
-					LockedCubeSurfacePtr[face][level], destinationLayout, 1))
-			{
-				return false;
-			}
+			if (source.data() == nullptr || source.layout().dataSize == 0 ||
+				source.layout().rowPitch == 0) return false;
+			views[index].data = source.data();
+			views[index].dataSize = source.layout().dataSize;
+			views[index].rowPitch = source.layout().rowPitch;
 		}
 	}
-	return true;
+	rts::render::NativeW3DSampledTextureUpload upload;
+	if (!upload.Prepare(Format, Width, Height, MipLevelCount, 6, views,
+		6 * MipLevelCount)) return false;
+	return Texture->Apply_Native_Texture(upload.Descriptor(),
+		upload.Subresources(), upload.SubresourceCount(), Format, true);
 }
 
 
 void CubeTextureLoadTaskClass::Release_Prepared_Surfaces()
 {
-#if RTS_ASYNC_RESOURCE_IO
 	delete static_cast<TextureResourceDecode*>(ResourceResult);
 	ResourceResult = nullptr;
-#endif
 	for (unsigned int face = 0; face < 6; ++face)
 	{
 		for (unsigned int level = 0; level < MIP_LEVELS_MAX; ++level)
@@ -3356,5 +2814,12 @@ bool VolumeTextureLoadTaskClass::Begin_Compressed_Load()
 bool VolumeTextureLoadTaskClass::Begin_Uncompressed_Load()
 {
 	// The legacy loader has no defined TGA-to-volume source layout.
+	return false;
+}
+
+bool VolumeTextureLoadTaskClass::Publish_Native_Prepared_Texture()
+{
+	// The neutral renderer does not expose a volume-texture descriptor. Never
+	// reinterpret a volume load as a sampleable 2D texture on the x64 product.
 	return false;
 }

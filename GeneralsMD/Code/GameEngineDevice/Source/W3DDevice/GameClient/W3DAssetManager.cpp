@@ -48,13 +48,14 @@
 #include "WW3D2/proto.h"
 #include "WW3D2/rendobj.h"
 #include <WWMath/vector3.h>
+#include <WWMath/vector4.h>
+#include "Renderer/LegacyColorPacking.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/hlod.h"
 #include "WW3D2/matinfo.h"
 #include "WW3D2/meshmdl.h"
 #include "WW3D2/part_emt.h"
 #include "WW3D2/vertmaterial.h"
-#include "WW3D2/dx8wrapper.h"
 #include "WW3D2/texture.h"
 #include "WW3D2/surfaceclass.h"
 #include "WW3D2/textureloader.h"
@@ -1506,9 +1507,10 @@ void W3DAssetManager::Recolor_Vertices(unsigned int *color, int count, const Vec
 
 	for (i=0; i<count; i++)
 	{
-		rgba=DX8Wrapper::Convert_Color(color[i]);
+		const rts::render::LegacyPackedColor unpacked = rts::render::UnpackLegacyARGB(color[i]);
+		rgba.Set(unpacked.red, unpacked.green, unpacked.blue, unpacked.alpha);
 		Recolor(reinterpret_cast<Vector3&>(rgba),hsv_shift);
-		color[i]=DX8Wrapper::Convert_Color_Clamp(rgba);
+		color[i]=rts::render::PackLegacyARGB(rgba.X, rgba.Y, rgba.Z, rgba.W);
 	}
 }
 

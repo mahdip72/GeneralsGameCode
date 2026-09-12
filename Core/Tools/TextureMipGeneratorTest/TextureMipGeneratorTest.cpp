@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <limits.h>
+#include <string.h>
 
 #include "WWVegas/WW3D2/texturemipgenerator.h"
 
@@ -150,6 +151,39 @@ static void testProductionFormatAlphaRules()
         "A1R5G5B5 rounds alpha down below two opaque samples like D3DX8");
 }
 
+static void testByteExactMipChain()
+{
+    unsigned char level0[4 * 4 * 4];
+    unsigned char level1[2 * 2 * 4];
+    unsigned char level2[4];
+    static const unsigned char expectedLevel1[2 * 2 * 4] = {
+        3, 3, 3, 3, 5, 5, 5, 5,
+        11, 11, 11, 11, 13, 13, 13, 13
+    };
+    static const unsigned char expectedLevel2[4] = { 8, 8, 8, 8 };
+    unsigned pixel;
+
+    for (pixel = 0; pixel < 16; ++pixel)
+    {
+        level0[pixel * 4] = (unsigned char)pixel;
+        level0[pixel * 4 + 1] = (unsigned char)pixel;
+        level0[pixel * 4 + 2] = (unsigned char)pixel;
+        level0[pixel * 4 + 3] = (unsigned char)pixel;
+    }
+    fillBytes(level1, sizeof(level1), 0xcd);
+    fillBytes(level2, sizeof(level2), 0xcd);
+    expectTrue(Generate_Texture_Mip_Level_Box(level0, 16, 4, 4,
+        level1, 8, WW3D_FORMAT_A8R8G8B8),
+        "first byte-image mip level generates without a texture object");
+    expectTrue(memcmp(level1, expectedLevel1, sizeof(level1)) == 0,
+        "first mip level matches the byte-exact legacy box averages");
+    expectTrue(Generate_Texture_Mip_Level_Box(level1, 8, 2, 2,
+        level2, 4, WW3D_FORMAT_A8R8G8B8),
+        "second byte-image mip level generates without a texture object");
+    expectTrue(memcmp(level2, expectedLevel2, sizeof(level2)) == 0,
+        "second mip level preserves the legacy rounding across the chain");
+}
+
 static void testRejectsUnsupportedFormatsAndOverflow()
 {
     static const unsigned char source[4] = { 0, 0, 0, 0 };
@@ -170,6 +204,7 @@ int main()
     testBoxFilterHonorsPitchAndAlpha();
     testBoxFilterHandlesOddAndOneDimensionalLevels();
     testProductionFormatAlphaRules();
+    testByteExactMipChain();
     testRejectsUnsupportedFormatsAndOverflow();
 
     if (s_failures != 0)

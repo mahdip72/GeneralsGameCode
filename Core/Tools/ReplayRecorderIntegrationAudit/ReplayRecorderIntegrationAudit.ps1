@@ -56,6 +56,60 @@ function Get-FunctionBody {
     throw "missing closing brace for recorder function '$Signature'"
 }
 
+function Test-NativeReplayPathHeader {
+    param([Parameter(Mandatory = $true)][string]$Header)
+    $violations = New-Object 'System.Collections.Generic.List[string]'
+    $gate = 'if (header.forPlayback && TheGlobalData != 0 && TheGlobalData->m_headless)'
+    $gateIndex = $Header.IndexOf($gate, [StringComparison]::Ordinal)
+    $nativeIndex = $Header.IndexOf('#if defined(_WIN64)', [StringComparison]::Ordinal)
+    $openIndex = $Header.IndexOf('TheFileSystem->openFile(filepath.str()', [StringComparison]::Ordinal)
+    if ($nativeIndex -lt 0 -or $gateIndex -le $nativeIndex -or $openIndex -le $gateIndex) {
+        $violations.Add('concrete replay path resolution must be gated to native headless playback before open')
+        return @($violations)
+    }
+    $branch = Get-FunctionBody $Header $gate
+    if (-not [regex]::IsMatch($branch,
+        'if\s*\(!rts::replay::ResolveReplayPlaybackPath\(filepath\.str\(\),\s*header\.filename\.str\(\),\s*true,\s*resolvedPath,\s*sizeof\(resolvedPath\)\)\)\s*\{[^}]*return FALSE;') -or
+        $branch.IndexOf('filepath = resolvedPath;', [StringComparison]::Ordinal) -lt 0) {
+        $violations.Add('native replay file open must consume a fail-closed shared resolved path')
+    }
+    $nativeEnd = $Header.IndexOf('#endif', $gateIndex, [StringComparison]::Ordinal)
+    $legacyConcat = $Header.IndexOf('filepath.concat(header.filename.str());', [StringComparison]::Ordinal)
+    if ($nativeEnd -le $gateIndex -or $legacyConcat -le $nativeEnd -or $legacyConcat -ge $openIndex) {
+        $violations.Add('interactive and legacy replay paths must retain their original concatenation')
+    }
+    return @($violations)
+}
+
+function Test-ReplaySimulationPathContent {
+    param([Parameter(Mandatory = $true)][string]$Content)
+    $violations = New-Object 'System.Collections.Generic.List[string]'
+    $body = Get-FunctionBody $Content 'int ReplaySimulation::simulateReplaysInThisProcess('
+    $resolver = [regex]::Match($body,
+        'rts::replay::ResolveReplayPlaybackPath\([^;]*performanceSourcePath,\s*sizeof\(performanceSourcePath\)\)')
+    $beginIndex = $body.IndexOf('performanceReceipt.begin("replay", performanceSourcePath)', [StringComparison]::Ordinal)
+    $openIndex = $body.IndexOf('performanceSource.open(performanceSourcePath)', [StringComparison]::Ordinal)
+    if (-not $resolver.Success -or $beginIndex -le $resolver.Index -or $openIndex -le $beginIndex) {
+        $violations.Add('receipt begin and immutable source must use the concrete path resolved before either operation')
+    }
+    if (-not [regex]::IsMatch($body, 'performanceReceipt\.bindFixture\("replay",\s*performanceSourcePath,') -or
+        $body.IndexOf('playbackFilename = performanceSourcePath;', [StringComparison]::Ordinal) -lt 0 -or
+        $body.IndexOf('TheRecorder->simulateReplay(playbackFilename)', [StringComparison]::Ordinal) -lt 0) {
+        $violations.Add('playback, immutable hashing and observed receipt identity must share the concrete source path')
+    }
+    $dispatch = Get-FunctionBody $Content 'int ReplaySimulation::simulateReplays('
+    $guardIndex = $dispatch.IndexOf('if (TheGlobalData->m_headless)', [StringComparison]::Ordinal)
+    $nativeIndex = $dispatch.IndexOf('#if defined(_WIN64)', [StringComparison]::Ordinal)
+    $resolveIndex = $dispatch.IndexOf('rts::replay::ResolveReplayPlaybackPath(', [StringComparison]::Ordinal)
+    $wildcardIndex = $dispatch.IndexOf('resolveFilenameWildcards(filenames)', [StringComparison]::Ordinal)
+    if ($nativeIndex -lt 0 -or $guardIndex -le $nativeIndex -or $resolveIndex -le $guardIndex -or
+        $wildcardIndex -le $resolveIndex -or
+        -not [regex]::IsMatch($dispatch, 'if\s*\(!rts::replay::ResolveReplayPlaybackPath\([^;]*\)\)\s*\{[^}]*return 1;')) {
+        $violations.Add('native malformed or absolute wildcard arguments must fail before wildcard expansion')
+    }
+    return @($violations)
+}
+
 function Test-RecorderContent {
     param([Parameter(Mandatory = $true)][string]$Content)
 
@@ -64,6 +118,9 @@ function Test-RecorderContent {
     $stop = Get-FunctionBody $Content 'void RecorderClass::stopRecording()'
     $validator = Get-FunctionBody $Content 'static Bool validateNativeReplayContainer('
     $header = Get-FunctionBody $Content 'Bool RecorderClass::readReplayHeader('
+    foreach ($violation in (Test-NativeReplayPathHeader $header)) {
+        $violations.Add($violation)
+    }
     $playback = Get-FunctionBody $Content 'Bool RecorderClass::playbackFile('
     $playbackUpdate = Get-FunctionBody $Content 'void RecorderClass::updatePlayback()'
     $readers = (Get-FunctionBody $Content 'Bool RecorderClass::readExact(') +
@@ -282,6 +339,19 @@ void RecorderClass::updatePlayback() {
 #endif
 }
 Bool RecorderClass::readReplayHeader() {
+  AsciiString filepath = getReplayDir();
+#if defined(_WIN64)
+  if (header.forPlayback && TheGlobalData != 0 && TheGlobalData->m_headless) {
+    char resolvedPath[MAX_PATH];
+    if (!rts::replay::ResolveReplayPlaybackPath(filepath.str(),
+        header.filename.str(), true, resolvedPath, sizeof(resolvedPath))) {
+      return FALSE;
+    }
+    filepath = resolvedPath;
+  } else
+#endif
+  { filepath.concat(header.filename.str()); }
+  m_file = TheFileSystem->openFile(filepath.str(), File::READ | File::BINARY, buffersize);
   if (!validateNativeReplayContainer(m_file, &m_nativeReplayPayloadEnd)) { return FALSE; }
   m_nativeReplayContainer = TRUE;
   readNativeReplayU32Field(m_file, value);
@@ -331,6 +401,56 @@ void RecorderClass::readArgument() {}
 '@
     if ((Test-RecorderContent $good).Count -ne 0) {
         throw 'known-good recorder fixture failed'
+    }
+    $unsafePath = $good.Replace('filepath = resolvedPath;', 'filepath = header.filename;')
+    if (-not ((Test-RecorderContent $unsafePath) -match 'fail-closed shared resolved path')) {
+        throw 'recorder bypassing the shared resolved path was not rejected'
+    }
+    $ungatedPath = $good.Replace(
+        'if (header.forPlayback && TheGlobalData != 0 && TheGlobalData->m_headless)', 'if (TRUE)')
+    if (-not ((Test-RecorderContent $ungatedPath) -match 'gated to native headless playback')) {
+        throw 'recorder changing interactive path semantics was not rejected'
+    }
+    $goodSimulation = @'
+int ReplaySimulation::simulateReplaysInThisProcess() {
+  const bool performanceSourcePathValid = filenames.size() == 1 &&
+    rts::replay::ResolveReplayPlaybackPath(RecorderClass::getReplayDir().str(),
+      filenames[0].str(), true, performanceSourcePath, sizeof(performanceSourcePath));
+  const bool performanceReceiptRequested = performanceSourcePathValid &&
+    performanceReceipt.begin("replay", performanceSourcePath);
+  if (!performanceSource.open(performanceSourcePath)) { return 1; }
+  playbackFilename = performanceSourcePath;
+  TheRecorder->simulateReplay(playbackFilename);
+  performanceReceipt.bindFixture("replay", performanceSourcePath, hash, seed);
+}
+int ReplaySimulation::simulateReplays() {
+#if defined(_WIN64)
+  if (TheGlobalData->m_headless) {
+    if (!rts::replay::ResolveReplayPlaybackPath(directory, filename, true, output, sizeof(output))) {
+      return 1;
+    }
+  }
+#endif
+  resolveFilenameWildcards(filenames);
+}
+'@
+    if ((Test-ReplaySimulationPathContent $goodSimulation).Count -ne 0) {
+        throw 'known-good shared replay identity fixture failed'
+    }
+    foreach ($mutation in @(
+        @('performanceReceipt.begin("replay", performanceSourcePath)', 'performanceReceipt.begin("replay", filenames[0].str())'),
+        @('performanceSource.open(performanceSourcePath)', 'performanceSource.open(filenames[0].str())'),
+        @('performanceReceipt.bindFixture("replay", performanceSourcePath,', 'performanceReceipt.bindFixture("replay", filenames[0].str(),'),
+        @('TheRecorder->simulateReplay(playbackFilename)', 'TheRecorder->simulateReplay(filename)'),
+        @('playbackFilename = performanceSourcePath;', 'playbackFilename = filename;'))) {
+        $mutatedSimulation = $goodSimulation.Replace($mutation[0], $mutation[1])
+        if ((Test-ReplaySimulationPathContent $mutatedSimulation).Count -eq 0) {
+            throw "split replay path identity was not rejected: $($mutation[0])"
+        }
+    }
+    $unguardedWildcard = $goodSimulation.Replace('if (TheGlobalData->m_headless)', 'if (TRUE)')
+    if (-not ((Test-ReplaySimulationPathContent $unguardedWildcard) -match 'before wildcard expansion')) {
+        throw 'ungated wildcard path validation was not rejected'
     }
     $unsafeArchive = $good.Replace('if (replayFinalized && m_archiveReplays)',
         'if (m_archiveReplays)')
@@ -417,6 +537,11 @@ foreach ($relativePath in $paths) {
     foreach ($violation in (Test-RecorderContent $content)) {
         $allViolations.Add("${relativePath}: $violation")
     }
+}
+$simulationRelativePath = 'Core/GameEngine/Source/Common/ReplaySimulation.cpp'
+$simulationContent = [IO.File]::ReadAllText((Join-Path $root $simulationRelativePath))
+foreach ($violation in (Test-ReplaySimulationPathContent $simulationContent)) {
+    $allViolations.Add("${simulationRelativePath}: $violation")
 }
 if ($allViolations.Count -ne 0) {
     $allViolations | Write-Output

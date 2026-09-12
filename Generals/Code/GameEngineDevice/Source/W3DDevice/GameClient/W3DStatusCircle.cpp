@@ -32,8 +32,8 @@
 #include <WW3D2/coltest.h>
 #include <WW3D2/rinfo.h>
 #include <WW3D2/camera.h>
-#include "WW3D2/dx8wrapper.h"
 #include "WW3D2/shader.h"
+#include "Renderer/RenderGameClient.h"
 #include "Common/GlobalData.h"
 #include "Common/MapObject.h"
 #include "GameLogic/GameLogic.h"
@@ -69,6 +69,21 @@
 static ShaderClass detailOpaqueShader(SC_ALPHA);
 Bool W3DStatusCircle::m_needUpdate;
 Int W3DStatusCircle::m_diffuse=255; // blue.
+
+// The fade path temporarily changes the color blend operation. Publish it
+// through the neutral facade so both the active native renderer and the
+// compatibility renderer apply the same operation.
+static bool setGameBlendOperation(rts::render::RenderBlendOperation operation)
+{
+	if (rts::render::HasLegacyStatePublicationFailure())
+	{
+		return false;
+	}
+	rts::render::SetGameRenderState(
+		rts::render::GAME_RENDER_STATE_BLEND_OPERATION,
+		static_cast<unsigned int>(operation));
+	return !rts::render::HasLegacyStatePublicationFailure();
+}
 
 W3DStatusCircle::~W3DStatusCircle()
 {
@@ -166,8 +181,8 @@ Int W3DStatusCircle::initData()
 		ib+=3;	//skip the 3 indices we just filled
 	}
 
-	m_vertexBufferCircle=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZDUV1,m_numTriangles*3,DX8VertexBufferClass::USAGE_DEFAULT));
-	m_vertexBufferScreen=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZDUV1,2*3,DX8VertexBufferClass::USAGE_DEFAULT));
+	m_vertexBufferCircle=NEW_REF(DX8VertexBufferClass,(rts::render::GAME_VERTEX_XYZDUV1,m_numTriangles*3,DX8VertexBufferClass::USAGE_DEFAULT));
+	m_vertexBufferScreen=NEW_REF(DX8VertexBufferClass,(rts::render::GAME_VERTEX_XYZDUV1,2*3,DX8VertexBufferClass::USAGE_DEFAULT));
 
 	//go with a preset material for now.
 	m_vertexMaterialClass=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
@@ -318,11 +333,11 @@ void W3DStatusCircle::Render(RenderInfoClass & rinfo)
 			updateCircleVB();
 		}
 		//Apply the shader and material
-		DX8Wrapper::Set_Material(m_vertexMaterialClass);
-		DX8Wrapper::Set_Shader(m_shaderClass);
-		DX8Wrapper::Set_Texture(0, nullptr);
-		DX8Wrapper::Set_Index_Buffer(m_indexBuffer,0);
-		DX8Wrapper::Set_Vertex_Buffer(m_vertexBufferCircle);
+		rts::render::SetGameMaterial(m_vertexMaterialClass);
+		rts::render::SetGameShader(m_shaderClass);
+		rts::render::SetGameTexture(0, nullptr);
+		rts::render::SetGameIndexBuffer(m_indexBuffer,0);
+		rts::render::SetGameVertexBuffer(m_vertexBufferCircle);
 		setIndex = true;
 
 		Vector3 vec(0.95f, 0.67f, 0);
@@ -330,8 +345,8 @@ void W3DStatusCircle::Render(RenderInfoClass & rinfo)
 
 		tm.Set_Translation(vec);
 
-		DX8Wrapper::Set_Transform(D3DTS_WORLD,tm);
-		DX8Wrapper::Draw_Triangles(	0,NUM_TRI, 0,	(m_numTriangles*3));
+		rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,tm);
+		rts::render::DrawGameTriangles(	0,NUM_TRI, 0,	(m_numTriangles*3));
 	}
 
 
@@ -341,9 +356,9 @@ void W3DStatusCircle::Render(RenderInfoClass & rinfo)
 	}
 
 	if (!setIndex) {
-		DX8Wrapper::Set_Material(m_vertexMaterialClass);
-		DX8Wrapper::Set_Index_Buffer(m_indexBuffer,0);
-		DX8Wrapper::Set_Texture(0, nullptr);
+		rts::render::SetGameMaterial(m_vertexMaterialClass);
+		rts::render::SetGameIndexBuffer(m_indexBuffer,0);
+		rts::render::SetGameTexture(0, nullptr);
 	}
 
 	tm.Make_Identity();
@@ -351,32 +366,45 @@ void W3DStatusCircle::Render(RenderInfoClass & rinfo)
 	Int clr = 255*intensity;
 	Int diffuse = (0xff<<24)|(clr<<16)|(clr<<8)|clr;	 // b g<<8 r<<16 a<<24.
 	updateScreenVB(diffuse);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,tm);
-	DX8Wrapper::Set_Shader(ShaderClass(SC_ADD));
-	DX8Wrapper::Set_Vertex_Buffer(m_vertexBufferScreen);
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,tm);
+	rts::render::SetGameShader(ShaderClass(SC_ADD));
+	rts::render::SetGameVertexBuffer(m_vertexBufferScreen);
+	rts::render::ApplyGameRenderStateChanges();
 	switch (fade) {
-		default:
-		case ScriptEngine::FADE_ADD:
-			DX8Wrapper::Draw_Triangles(	0,2, 0,	(2*3));
+	default:
+	case ScriptEngine::FADE_ADD:
+			rts::render::DrawGameTriangles(	0,2, 0,	(2*3));
 			break;
 		case ScriptEngine::FADE_SUBTRACT:
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_BLENDOP, D3DBLENDOP_REVSUBTRACT );
-			DX8Wrapper::Draw_Triangles(	0,2, 0,	(2*3));
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_BLENDOP, D3DBLENDOP_ADD );
+			if (setGameBlendOperation(rts::render::RENDER_BLEND_REVERSE_SUBTRACT))
+			{
+				rts::render::ApplyGameRenderStateChanges();
+				if (!rts::render::HasLegacyStatePublicationFailure())
+				{
+					rts::render::DrawGameTriangles(	0,2, 0,	(2*3));
+				}
+				if (setGameBlendOperation(rts::render::RENDER_BLEND_ADD))
+				{
+					rts::render::ApplyGameRenderStateChanges();
+				}
+			}
 			break;
 		case ScriptEngine::FADE_SATURATE:
 			// 4x multiply
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_DESTCOLOR);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_SRCCOLOR);
-			DX8Wrapper::Draw_Triangles(	0,2, 0,	(2*3));
-			DX8Wrapper::Draw_Triangles(	0,2, 0,	(2*3));
+			rts::render::SetGameRenderState(rts::render::GAME_RENDER_STATE_SOURCE_BLEND,
+				rts::render::RENDER_BLEND_DESTINATION_COLOR);
+			rts::render::SetGameRenderState(rts::render::GAME_RENDER_STATE_DESTINATION_BLEND,
+				rts::render::RENDER_BLEND_SOURCE_COLOR);
+			rts::render::DrawGameTriangles(	0,2, 0,	(2*3));
+			rts::render::DrawGameTriangles(	0,2, 0,	(2*3));
 			break;
 		case ScriptEngine::FADE_MULTIPLY:
 			// Straight multiply
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_ZERO);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_SRCCOLOR);
-			DX8Wrapper::Draw_Triangles(	0,2, 0,	(2*3));
+			rts::render::SetGameRenderState(rts::render::GAME_RENDER_STATE_SOURCE_BLEND,
+				rts::render::RENDER_BLEND_ZERO);
+			rts::render::SetGameRenderState(rts::render::GAME_RENDER_STATE_DESTINATION_BLEND,
+				rts::render::RENDER_BLEND_SOURCE_COLOR);
+			rts::render::DrawGameTriangles(	0,2, 0,	(2*3));
 			break;
 	}
 	ShaderClass::Invalidate();

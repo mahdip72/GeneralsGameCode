@@ -42,7 +42,16 @@ function(rts_generate_launcher_lcf target output_path)
     if(NOT TARGET "${target}")
         message(FATAL_ERROR "Cannot generate a launcher for unknown target '${target}'.")
     endif()
+
+    set(_rts_launcher_arguments "")
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        # Native product launches select the final Stage 5 policy. The launcher
+        # appends its own command-line arguments after these defaults, so
+        # `launcher.exe -simulationMode serial` remains an explicit fallback.
+        set(_rts_launcher_arguments
+            " -simulationMode parallel -workerPolicy auto")
+    endif()
     file(GENERATE
         OUTPUT "${output_path}"
-        CONTENT "RUN = . $<TARGET_FILE_NAME:${target}>\n")
+        CONTENT "RUN = . $<TARGET_FILE_NAME:${target}>${_rts_launcher_arguments}\n")
 endfunction()

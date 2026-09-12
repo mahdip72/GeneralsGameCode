@@ -153,6 +153,20 @@ long DecrementTokenReference(volatile long *references)
 #endif
 }
 
+NativeW3DOwnerFallbackEntry::NativeW3DOwnerFallbackEntry() :
+	m_command(0), m_release(0), m_context(0), m_next(0), m_queued(false)
+{
+}
+
+NativeW3DOwnerFallbackEntry::~NativeW3DOwnerFallbackEntry()
+{
+}
+
+bool NativeW3DOwnerFallbackEntry::IsQueued() const
+{
+	return m_queued;
+}
+
 struct NativeW3DOwnerToken::Impl
 {
 	Impl(void *requestedContext, NativeW3DOwnerContextRelease requestedRelease) :
@@ -245,6 +259,9 @@ struct NativeW3DOwnerQueue::Impl
 		head(0),
 		tail(0),
 		count(0),
+		fallbackHead(0),
+		fallbackTail(0),
+		fallbackCount(0),
 		ownerBound(false),
 		accepting(true),
 		owner()
@@ -269,6 +286,9 @@ struct NativeW3DOwnerQueue::Impl
 	unsigned int head;
 	unsigned int tail;
 	unsigned int count;
+	NativeW3DOwnerFallbackEntry *fallbackHead;
+	NativeW3DOwnerFallbackEntry *fallbackTail;
+	unsigned int fallbackCount;
 	bool ownerBound;
 	bool accepting;
 	QueueThreadId owner;
@@ -364,6 +384,43 @@ RenderResult NativeW3DOwnerQueue::Enqueue(NativeW3DOwnerCommand command,
 	return RENDER_RESULT_OK;
 }
 
+RenderResult NativeW3DOwnerQueue::EnqueueFallback(
+	NativeW3DOwnerCommand command, void *context,
+	NativeW3DOwnerContextRelease release,
+	NativeW3DOwnerFallbackEntry *entry)
+{
+	if (command == 0 || context == 0 || entry == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (m_impl == 0 || !m_impl->lock.IsInitialized())
+	{
+		return RENDER_RESULT_OUT_OF_MEMORY;
+	}
+
+	ScopedQueueLock lock(m_impl->lock);
+	if (!m_impl->ownerBound || !m_impl->accepting || entry->m_queued)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	entry->m_command = command;
+	entry->m_release = release;
+	entry->m_context = context;
+	entry->m_next = 0;
+	entry->m_queued = true;
+	if (m_impl->fallbackTail != 0)
+	{
+		m_impl->fallbackTail->m_next = entry;
+	}
+	else
+	{
+		m_impl->fallbackHead = entry;
+	}
+	m_impl->fallbackTail = entry;
+	++m_impl->fallbackCount;
+	return RENDER_RESULT_OK;
+}
+
 RenderResult NativeW3DOwnerQueue::Close()
 {
 	if (m_impl == 0 || !m_impl->lock.IsInitialized())
@@ -394,7 +451,8 @@ RenderResult NativeW3DOwnerQueue::Drain(unsigned int maxCommands,
 	}
 
 	const QueueThreadId currentThread = CurrentQueueThreadId();
-	unsigned int budget = 0;
+	unsigned int normalBudget = 0;
+	unsigned int fallbackBudget = 0;
 	{
 		ScopedQueueLock lock(m_impl->lock);
 		if (!m_impl->ownerBound ||
@@ -402,15 +460,23 @@ RenderResult NativeW3DOwnerQueue::Drain(unsigned int maxCommands,
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		budget = m_impl->count;
-		if (maxCommands != 0 && maxCommands < budget)
+		normalBudget = m_impl->count;
+		if (maxCommands != 0 && maxCommands < normalBudget)
 		{
-			budget = maxCommands;
+			normalBudget = maxCommands;
+		}
+		const unsigned int remaining = maxCommands == 0 ?
+			m_impl->fallbackCount : maxCommands - normalBudget;
+		fallbackBudget = m_impl->fallbackCount;
+		if (maxCommands != 0 && remaining < fallbackBudget)
+		{
+			fallbackBudget = remaining;
 		}
 	}
 
 	RenderResult result = RENDER_RESULT_OK;
-	while (*drained < budget)
+	unsigned int normalDrained = 0;
+	while (normalDrained < normalBudget)
 	{
 		NativeW3DOwnerCommand command = 0;
 		NativeW3DOwnerToken *token = 0;
@@ -437,6 +503,68 @@ RenderResult NativeW3DOwnerQueue::Drain(unsigned int maxCommands,
 			result = RENDER_RESULT_FAILED;
 		}
 		token->Release();
+		++normalDrained;
+		++*drained;
+	}
+
+	unsigned int fallbackDrained = 0;
+	while (fallbackDrained < fallbackBudget)
+	{
+		NativeW3DOwnerFallbackEntry *entry = 0;
+		{
+			ScopedQueueLock lock(m_impl->lock);
+			entry = m_impl->fallbackHead;
+		}
+		if (entry == 0)
+		{
+			break;
+		}
+
+		try
+		{
+			entry->m_command(entry->m_context);
+		}
+		catch (...)
+		{
+			// Unlike ordinary packets, this entry owns the last path to live
+			// backend handles.  Retain it for a later owner retry.
+			result = RENDER_RESULT_FAILED;
+			break;
+		}
+
+		NativeW3DOwnerContextRelease release = entry->m_release;
+		void *context = entry->m_context;
+		{
+			ScopedQueueLock lock(m_impl->lock);
+			if (m_impl->fallbackHead != entry)
+			{
+				result = RENDER_RESULT_FAILED;
+				break;
+			}
+			m_impl->fallbackHead = entry->m_next;
+			if (m_impl->fallbackHead == 0)
+			{
+				m_impl->fallbackTail = 0;
+			}
+			--m_impl->fallbackCount;
+			entry->m_command = 0;
+			entry->m_release = 0;
+			entry->m_context = 0;
+			entry->m_next = 0;
+			entry->m_queued = false;
+		}
+		if (release != 0)
+		{
+			try
+			{
+				release(context);
+			}
+			catch (...)
+			{
+				result = RENDER_RESULT_FAILED;
+			}
+		}
+		++fallbackDrained;
 		++*drained;
 	}
 	return result;
@@ -485,7 +613,7 @@ unsigned int NativeW3DOwnerQueue::Size() const
 		return 0;
 	}
 	ScopedQueueLock lock(m_impl->lock);
-	return m_impl->count;
+	return m_impl->count + m_impl->fallbackCount;
 }
 }
 }

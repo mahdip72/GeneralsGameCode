@@ -54,7 +54,12 @@
 #include "WW3D2/rinfo.h"
 #include "WW3D2/camera.h"
 #include "WW3D2/assetmgr.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
+
+// Keep the source-level contract explicit without importing the renderer namespace.
+using rts::render::GAME_TRANSFORM_WORLD;
+using rts::render::GAME_VERTEX_XYZDUV1;
+
 #include "WW3D2/scene.h"
 #include "GameLogic/TerrainLogic.h"
 #include "GameLogic/Object.h"
@@ -613,7 +618,7 @@ void TerrainTracksRenderObjClassSystem::ReAcquireResources()
 
 	DEBUG_ASSERTCRASH(numModules*m_maxTankTrackEdges*2 < 65535, ("Too many terrain track edges"));
 
-	m_vertexBuffer=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZDUV1,numModules*m_maxTankTrackEdges*2,DX8VertexBufferClass::USAGE_DYNAMIC));
+	m_vertexBuffer=NEW_REF(DX8VertexBufferClass,(GAME_VERTEX_XYZDUV1,numModules*m_maxTankTrackEdges*2,DX8VertexBufferClass::USAGE_DYNAMIC));
 }
 
 //=============================================================================
@@ -888,21 +893,21 @@ Try improving the fit to vertical surfaces like cliffs.
 	if (m_edgesToFlush >= 2)
 	{
 		ShaderClass::Invalidate();
-		DX8Wrapper::Set_Material(m_vertexMaterialClass);
-		DX8Wrapper::Set_Shader(m_shaderClass);
-		DX8Wrapper::Set_Index_Buffer(m_indexBuffer,0);
-		DX8Wrapper::Set_Vertex_Buffer(m_vertexBuffer);
+		rts::render::SetGameMaterial(m_vertexMaterialClass);
+		rts::render::SetGameShader(m_shaderClass);
+		rts::render::SetGameIndexBuffer(m_indexBuffer,0);
+		rts::render::SetGameVertexBuffer(m_vertexBuffer);
 
 		trackStartIndex=0;
 		mod=m_usedModules;
-		DX8Wrapper::Set_Transform(D3DTS_WORLD,mod->Transform);
+		rts::render::SetGameTransform(GAME_TRANSFORM_WORLD,mod->Transform);
 		while (mod)
 		{
 			if (mod->m_activeEdgeCount >= 2 && mod->Is_Really_Visible())
 			{
-				DX8Wrapper::Set_Texture(0,mod->m_stageZeroTexture);
-				DX8Wrapper::Set_Index_Buffer_Index_Offset(trackStartIndex);
-				DX8Wrapper::Draw_Triangles(	0,(mod->m_activeEdgeCount-1)*2, 0, mod->m_activeEdgeCount*2);
+				rts::render::SetGameTexture(0,mod->m_stageZeroTexture);
+				rts::render::SetGameIndexBufferOffset(trackStartIndex);
+				rts::render::DrawGameTriangles(	0,(mod->m_activeEdgeCount-1)*2, 0, mod->m_activeEdgeCount*2);
 
 				trackStartIndex += mod->m_activeEdgeCount*2;
 			}

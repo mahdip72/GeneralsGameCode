@@ -29,8 +29,11 @@
 
 #pragma once
 
+#include "Lib/MultiplayerSimulationPolicy.h"
+
 #if defined(_WIN64)
 #include <cstdint>
+#include "Lib/LockstepV2Contract.h"
 #include "Lib/NetworkEpochHandshake.h"
 #endif
 
@@ -44,6 +47,7 @@
 
 class GameInfo;
 class NetCommandWrapperList;
+class NetCommandRef;
 
 typedef std::map<UnsignedShort, AsciiString> FileCommandMap;
 typedef std::map<UnsignedShort, UnsignedByte> FileMaskMap;
@@ -71,6 +75,28 @@ public:
 	// reports ready and retains its existing wire behavior.
 	Bool isNetworkHelloReady() const;
 	Bool hasNetworkHelloFailure() const;
+	Bool isNetworkSimulationPolicyUsable() const;
+	// Re-advertise the executable-owned v2 worker authority after the isolated
+	// qualification preflight has observed real worker executions.
+	Bool refreshNetworkSimulationPolicyForLockstepV2();
+	Bool isMultiplayerSimulationKernelEnabled(
+		rts::MultiplayerSimulationKernel kernel) const;
+	UnsignedInt getMultiplayerSimulationEnabledKernelMask() const;
+	rts::MultiplayerSimulationPolicyStatus
+		getMultiplayerSimulationPolicyStatus() const;
+#if defined(_WIN64)
+	// A v2 proof is opt-in and remains inactive until the caller supplies the
+	// exact session contract.  The recorder is fed from the production command
+	// and frame/CRC boundaries; it never drives simulation or grants policy.
+	Bool beginLockstepV2Proof(const rts::lockstep_v2::SessionContract &session);
+	Bool recordLockstepV2Command(UnsignedInt frame, UnsignedInt originSlot,
+		UnsignedShort commandId, std::uint64_t commandDigest);
+	Bool recordLockstepV2Frame(UnsignedInt frame, UnsignedInt crc,
+		std::uint64_t commandDigest);
+	Bool finalizeLockstepV2Proof(Bool cleanShutdown,
+		rts::lockstep_v2::Receipt *receipt);
+	Bool isLockstepV2ProofActive() const;
+#endif
 	void sendChat(UnicodeString text, Int playerMask, UnsignedInt executionFrame);
 	void sendDisconnectChat(UnicodeString text);
 	void sendLocalCommand(NetCommandMsg *msg, UnsignedByte relay = 0xff);		///< Send command to the players specified in the relay, goes through packet router.
@@ -189,11 +215,18 @@ private:
 	Bool sendNetworkHello(Int slot);
 	Bool sendNetworkHelloAck(Int slot);
 	Bool processNetworkHello(const TransportMessage &message, Bool enforceFailure);
+	void clearNetworkSimulationPolicy();
+	void revokeNetworkSimulationPolicy();
+	Bool resolveNetworkSimulationPolicy();
+	Bool acceptNetworkSimulationPolicy(Int slot,
+		const rts::network_epoch::NetworkSimulationPolicyIdentity &identity);
 	Bool isNetworkHelloCandidate(const TransportMessage &message) const;
 	Bool matchesNetworkPeerEndpoint(const TransportMessage &message, Int slot) const;
 	Int findNetworkPeerEndpoint(const TransportMessage &message) const;
 	Bool isKnownNetworkPeerEndpoint(const TransportMessage &message) const;
 	Bool isNetworkCommandSourceAuthorized(const NetCommandMsg *msg, Int sourceSlot) const;
+	Bool getLockstepV2CommandDigest(const NetCommandRef *ref,
+		std::uint64_t *digest) const;
 	void clearNetworkFrameResendRequest();
 	void clearNetworkFrameRecovery();
 	Bool isNetworkFrameRecoveryAuthorized(const NetCommandMsg *command, Int sourceSlot, Bool wrapper) const;
@@ -266,6 +299,15 @@ private:
 	UnsignedInt m_networkHelloStartTime;
 	UnsignedInt m_networkHelloLastSend;
 	UnsignedInt m_networkHelloAttempts;
+	UnsignedInt m_networkSimulationMapCrc;
+	UnsignedInt m_networkSimulationRosterMask;
+	Bool m_networkSimulationPolicyResolved;
+	rts::network_epoch::NetworkSimulationPolicyIdentity
+		m_networkSimulationLocalIdentity;
+	rts::network_epoch::NetworkSimulationPolicyIdentity
+		m_networkSimulationRemoteIdentity[MAX_SLOTS];
+	Bool m_networkSimulationRemoteIdentityReceived[MAX_SLOTS];
+	rts::MultiplayerSimulationSessionPolicy m_networkSimulationSessionPolicy;
 	Bool m_frameResendRequestOutstanding;
 	UnsignedInt m_frameResendRequestResponder;
 	UnsignedInt m_frameResendRequestFrame;
@@ -279,5 +321,8 @@ private:
 	UnsignedInt m_networkHelloDeferredCount;
 	NetCommandList *m_networkHelloPendingCommands;
 	UnsignedInt m_networkHelloPendingCommandCount;
+	rts::lockstep_v2::ReceiptRecorder m_lockstepV2ReceiptRecorder;
+	rts::lockstep_v2::SessionContract m_lockstepV2Session;
+	Bool m_lockstepV2TransportInitialized;
 #endif
 };

@@ -29,7 +29,8 @@ enum Event
 	CREATED, INITIALIZED, CONTEXT, BEGIN, BUFFER, TEXTURE, REFRESH, COPY,
 	DESTROY_RESOURCE, UPDATE, CLEAR, TARGETS, VIEWPORT, STATE, LAYOUT,
 	VERTEX, INDEX, BIND_TEXTURE, TOPOLOGY, DRAW, DRAW_INDEXED, END, PRESENT,
-	CAPTURE, INFO, RESIZE, RECOVER, DEBUG_COUNT, REPORT, SHUTDOWN, DELETED
+	CAPTURE, INFO, RESIZE, RECOVER, DEBUG_COUNT, REPORT, SWAP_SET, SWAP_GET,
+	GAMMA_SET, GAMMA_GET, FAULT_CONFIG, RESOURCE_STATS, SHUTDOWN, DELETED
 };
 
 struct Fixture
@@ -40,6 +41,9 @@ struct Fixture
 		createFailureResult(RENDER_RESULT_OUT_OF_MEMORY), updateFailureResult(RENDER_RESULT_DEVICE_REMOVED),
 		factoryCalls(0), draws(0), presents(0), infos(0), destroys(0), failEndFrames(0),
 		stateValue(0), layoutStride(0), layoutOffset(0), window(0), proxy(0),
+		swapIntervalSetCalls(0), swapIntervalGetCalls(0),
+		gammaSetCalls(0), gammaGetCalls(0), faultConfigCalls(0),
+		resourceStatisticsCalls(0),
 		sentMessages(0), postedMessages(0), reentrantRejected(true)
 	{ events.reserve(4096); }
 	std::mutex mutex;
@@ -53,6 +57,9 @@ struct Fixture
 	unsigned int failEndFrames;
 	float stateValue;
 	unsigned int layoutStride, layoutOffset;
+	unsigned int swapIntervalSetCalls, swapIntervalGetCalls;
+	unsigned int gammaSetCalls, gammaGetCalls;
+	unsigned int faultConfigCalls, resourceStatisticsCalls;
 	RenderTargetBinding targets;
 	void *window;
 	IRenderDevice *proxy;
@@ -101,17 +108,30 @@ struct ReleaseGate
 class FakeBackend final : public IRenderDevice, public IRenderContext
 {
 public:
-	explicit FakeBackend(Fixture &fixture) : f(fixture), handles(64), operational(false), open(false)
+	explicit FakeBackend(Fixture &fixture) : f(fixture), handles(64), operational(false), open(false),
+		gammaValue(1.0f), brightnessValue(0.0f), contrastValue(1.0f),
+		calibrateValue(false), useLimitValue(true),
+		faultPointValue(RENDER_RESOURCE_FAULT_NONE),
+		faultFailOnInvocationValue(0), faultResultValue(RENDER_RESULT_FAILED),
+		statisticsValue()
 	{
 		f.owner = std::this_thread::get_id();
 		++f.factoryCalls; f.event(CREATED);
 		info.width = info.height = 4; info.format = RENDER_FORMAT_B8G8R8A8_UNORM;
+		statisticsValue.liveHandles = 11;
+		statisticsValue.bufferCount = 3;
+		statisticsValue.textureCount = 5;
+		statisticsValue.nativeResourceCount = 7;
+		statisticsValue.shaderResourceViewCount = 9;
+		statisticsValue.renderTargetViewCount = 13;
+		statisticsValue.depthStencilViewCount = 15;
+		statisticsValue.recoveryShadowBytes = 17;
 	}
 	~FakeBackend() override { f.event(DELETED); ++f.destroys; }
 	RenderBackend backend() const override { return RENDER_BACKEND_D3D11; }
 	bool isOperational() const override { return operational; }
-	RenderResult initialize(const RenderDeviceParameters &) override
-	{ f.event(INITIALIZED); f.sendWindowMessage(); operational = !f.failInitialize; return operational ? RENDER_RESULT_OK : RENDER_RESULT_FAILED; }
+	RenderResult initialize(const RenderDeviceParameters &parameters) override
+	{ f.event(INITIALIZED); f.sendWindowMessage(); swapInterval = parameters.enableVsync ? 1 : 0; operational = !f.failInitialize; return operational ? RENDER_RESULT_OK : RENDER_RESULT_FAILED; }
 	void shutdown() override { f.event(SHUTDOWN); f.sendWindowMessage(); operational = false; }
 	IRenderContext *immediateContext() override { f.event(CONTEXT); return this; }
 	RenderResult createBuffer(const BufferDescriptor &, const void *data, size_t bytes, GpuHandle *out) override
@@ -166,6 +186,68 @@ public:
 	}
 	RenderResult getBackBufferInfo(RenderBackBufferInfo *output) const override
 	{ f.event(INFO); ++f.infos; *output = info; return RENDER_RESULT_OK; }
+	RenderResult setSwapInterval(unsigned int interval) override
+	{
+		f.event(SWAP_SET);
+		CHECK(!open && interval <= RENDER_SWAP_INTERVAL_MAX);
+		++f.swapIntervalSetCalls;
+		swapInterval = interval;
+		return RENDER_RESULT_OK;
+	}
+	RenderResult getSwapInterval(unsigned int *interval) const override
+	{
+		f.event(SWAP_GET);
+		CHECK(!open && interval != 0);
+		++f.swapIntervalGetCalls;
+		*interval = swapInterval;
+		return RENDER_RESULT_OK;
+	}
+	RenderResult setGamma(float gamma, float brightness, float contrast,
+		bool calibrate, bool useLimit) override
+	{
+		f.event(GAMMA_SET);
+		CHECK(!open && gamma >= 0.6f && gamma <= 6.0f &&
+			brightness >= -0.5f && brightness <= 0.5f &&
+			contrast >= 0.5f && contrast <= 2.0f);
+		++f.gammaSetCalls;
+		gammaValue = gamma; brightnessValue = brightness;
+		contrastValue = contrast; calibrateValue = calibrate;
+		useLimitValue = useLimit;
+		return RENDER_RESULT_OK;
+	}
+	RenderResult getGamma(float *gamma, float *brightness, float *contrast,
+		bool *calibrate, bool *useLimit) const override
+	{
+		f.event(GAMMA_GET);
+		CHECK(!open && gamma != 0 && brightness != 0 && contrast != 0 &&
+			calibrate != 0 && useLimit != 0);
+		++f.gammaGetCalls;
+		*gamma = gammaValue; *brightness = brightnessValue;
+		*contrast = contrastValue; *calibrate = calibrateValue;
+		*useLimit = useLimitValue;
+		return RENDER_RESULT_OK;
+	}
+	RenderResult configureResourceFaultInjection(
+		RenderResourceFaultPoint point, unsigned int failOnInvocation,
+		RenderResult result) override
+	{
+		f.event(FAULT_CONFIG);
+		CHECK(!open);
+		++f.faultConfigCalls;
+		faultPointValue = point;
+		faultFailOnInvocationValue = failOnInvocation;
+		faultResultValue = result;
+		return RENDER_RESULT_OK;
+	}
+	RenderResult getDebugResourceStatistics(
+		RenderResourceStatistics *statistics) const override
+	{
+		f.event(RESOURCE_STATS);
+		CHECK(statistics != 0);
+		++f.resourceStatisticsCalls;
+		*statistics = statisticsValue;
+		return RENDER_RESULT_OK;
+	}
 	RenderResult captureBackBuffer(void *destination, size_t bytes, size_t rowPitch, RenderFormat *format) override
 	{
 		f.event(CAPTURE); CHECK(!open && bytes >= rowPitch * info.height);
@@ -228,6 +310,13 @@ private:
 	Fixture &f;
 	GpuHandleAllocator handles;
 	bool operational, open;
+	unsigned int swapInterval;
+	float gammaValue, brightnessValue, contrastValue;
+	bool calibrateValue, useLimitValue;
+	RenderResourceFaultPoint faultPointValue;
+	unsigned int faultFailOnInvocationValue;
+	RenderResult faultResultValue;
+	RenderResourceStatistics statisticsValue;
 	RenderBackBufferInfo info;
 };
 
@@ -255,6 +344,152 @@ void EmptyFrame(IRenderDevice *device, bool visible = true)
 	CHECK(context->beginFrame() == RENDER_RESULT_OK);
 	CHECK(context->endFrame() == RENDER_RESULT_OK);
 	CHECK(SubmitThreadedRenderFrame(device, visible) == RENDER_RESULT_OK);
+}
+
+void SwapIntervalOwnerTransport()
+{
+	Fixture f;
+	std::unique_ptr<IRenderDevice> device = Device(f);
+	unsigned int interval = 0xffffffffU;
+	CHECK(device->getSwapInterval(&interval) == RENDER_RESULT_OK && interval == 1);
+	CHECK(device->setSwapInterval(0) == RENDER_RESULT_OK);
+	CHECK(device->getSwapInterval(&interval) == RENDER_RESULT_OK && interval == 0);
+	CHECK(device->setSwapInterval(3) == RENDER_RESULT_OK);
+	CHECK(device->getSwapInterval(&interval) == RENDER_RESULT_OK && interval == 3);
+	CHECK(device->setSwapInterval(4) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(device->getSwapInterval(0) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(f.swapIntervalSetCalls == 2 && f.swapIntervalGetCalls == 3);
+
+	IRenderContext *context = device->immediateContext();
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(device->setSwapInterval(2) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(device->getSwapInterval(&interval) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	CHECK(!Complete(device.get()).presented);
+	CHECK(device->setSwapInterval(2) == RENDER_RESULT_OK);
+	CHECK(device->getSwapInterval(&interval) == RENDER_RESULT_OK && interval == 2);
+
+	RenderResult offOwnerSet = RENDER_RESULT_OK;
+	RenderResult offOwnerGet = RENDER_RESULT_OK;
+	std::thread offOwner([&]
+	{
+		offOwnerSet = device->setSwapInterval(1);
+		offOwnerGet = device->getSwapInterval(&interval);
+	});
+	offOwner.join();
+	CHECK(offOwnerSet == RENDER_RESULT_INVALID_ARGUMENT &&
+		offOwnerGet == RENDER_RESULT_INVALID_ARGUMENT && interval == 2);
+	CHECK(f.swapIntervalSetCalls == 3 && f.swapIntervalGetCalls == 4);
+}
+
+void GammaOwnerTransport()
+{
+	Fixture f;
+	std::unique_ptr<IRenderDevice> device = Device(f);
+	float gamma = 0.0f, brightness = 0.0f, contrast = 0.0f;
+	bool calibrate = true, useLimit = false;
+	CHECK(device->getGamma(&gamma, &brightness, &contrast, &calibrate,
+		&useLimit) == RENDER_RESULT_OK && gamma == 1.0f &&
+		brightness == 0.0f && contrast == 1.0f && !calibrate && useLimit);
+	CHECK(device->setGamma(2.0f, 0.125f, 1.5f, true, false) == RENDER_RESULT_OK);
+	CHECK(device->getGamma(&gamma, &brightness, &contrast, &calibrate,
+		&useLimit) == RENDER_RESULT_OK && gamma == 2.0f &&
+		brightness == 0.125f && contrast == 1.5f && calibrate && !useLimit);
+	CHECK(f.gammaSetCalls == 1 && f.gammaGetCalls == 2);
+
+	IRenderContext *context = device->immediateContext();
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(device->setGamma(1.5f, 0.0f, 1.0f, false, true) ==
+		RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(device->getGamma(&gamma, &brightness, &contrast, &calibrate,
+		&useLimit) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	CHECK(!Complete(device.get()).presented);
+	CHECK(device->setGamma(1.5f, 0.0f, 1.0f, false, true) == RENDER_RESULT_OK);
+
+	RenderResult offOwnerSet = RENDER_RESULT_OK;
+	RenderResult offOwnerGet = RENDER_RESULT_OK;
+	std::thread offOwner([&]
+	{
+		offOwnerSet = device->setGamma(1.0f, 0.0f, 1.0f, false, true);
+		offOwnerGet = device->getGamma(&gamma, &brightness, &contrast,
+			&calibrate, &useLimit);
+	});
+	offOwner.join();
+	CHECK(offOwnerSet == RENDER_RESULT_INVALID_ARGUMENT &&
+		offOwnerGet == RENDER_RESULT_INVALID_ARGUMENT &&
+		f.gammaSetCalls == 2 && f.gammaGetCalls == 2);
+}
+
+void DebugResourceOwnerTransport()
+{
+	Fixture f;
+	std::unique_ptr<IRenderDevice> device = Device(f);
+	RenderResourceStatistics statistics;
+	CHECK(device->getDebugResourceStatistics(&statistics) ==
+		RENDER_RESULT_OK && statistics.liveHandles == 11 &&
+		statistics.bufferCount == 3 && statistics.textureCount == 5 &&
+		statistics.nativeResourceCount == 7 &&
+		statistics.shaderResourceViewCount == 9 &&
+		statistics.renderTargetViewCount == 13 &&
+		statistics.depthStencilViewCount == 15 &&
+		statistics.recoveryShadowBytes == 17);
+	CHECK(f.resourceStatisticsCalls == 1);
+	CHECK(device->getDebugResourceStatistics(0) ==
+		RENDER_RESULT_INVALID_ARGUMENT && f.resourceStatisticsCalls == 1);
+
+	// Match the direct backend's validation: NONE clears a pending fault even
+	// with unused invocation/result values, while every real point requires a
+	// positive invocation and an injected failure result.
+	CHECK(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION, 0,
+		RENDER_RESULT_FAILED) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION, 1,
+		RENDER_RESULT_OK) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(f.faultConfigCalls == 0);
+	CHECK(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_NONE, 0, RENDER_RESULT_OK) ==
+		RENDER_RESULT_OK);
+	CHECK(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION, 2,
+		RENDER_RESULT_FAILED) == RENDER_RESULT_OK &&
+		f.faultConfigCalls == 2);
+
+	IRenderContext *context = device->immediateContext();
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	// Statistics are read-only owner controls and the direct D3D11 backend
+	// permits them while a frame is open; sync must therefore fence the accepted
+	// packet without touching a producer-owned backend pointer.
+	CHECK(device->getDebugResourceStatistics(&statistics) ==
+		RENDER_RESULT_OK && statistics.liveHandles == 11 &&
+		f.resourceStatisticsCalls == 2);
+	CHECK(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_NONE, 0, RENDER_RESULT_OK) ==
+		RENDER_RESULT_INVALID_ARGUMENT && f.faultConfigCalls == 2);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	CHECK(!Complete(device.get()).presented);
+	CHECK(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_NONE, 0, RENDER_RESULT_OK) ==
+		RENDER_RESULT_OK && f.faultConfigCalls == 3);
+
+	RenderResourceStatistics offOwnerStatistics;
+	RenderResult offOwnerFault = RENDER_RESULT_OK;
+	RenderResult offOwnerStatisticsResult = RENDER_RESULT_OK;
+	std::thread offOwner([&]
+	{
+		offOwnerFault = device->configureResourceFaultInjection(
+			RENDER_RESOURCE_FAULT_NONE, 0, RENDER_RESULT_OK);
+		offOwnerStatisticsResult = device->getDebugResourceStatistics(
+			&offOwnerStatistics);
+	});
+	offOwner.join();
+	CHECK(offOwnerFault == RENDER_RESULT_INVALID_ARGUMENT &&
+		offOwnerStatisticsResult == RENDER_RESULT_INVALID_ARGUMENT &&
+		f.faultConfigCalls == 3 && f.resourceStatisticsCalls == 2);
 }
 
 void OwnershipAndDeepCopy()
@@ -294,7 +529,7 @@ void OwnershipAndDeepCopy()
 	CHECK(context->setLegacyState(state, RENDER_VERTEX_POSITION3_COLOR, 0) == RENDER_RESULT_OK);
 	LegacyVertexLayout layout; layout.stride = 24; layout.elementCount = 1; layout.elements[0].byteOffset = 12;
 	CHECK(context->setLegacyStateForLayout(state, layout, 0) == RENDER_RESULT_OK);
-	CHECK(context->setVertexBuffer(vertex, 24, 0) == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(vertex, sizeof(unsigned int), 0) == RENDER_RESULT_OK);
 	CHECK(context->setIndexBuffer(index, RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK);
 	CHECK(context->setTexture(0, texture) == RENDER_RESULT_OK);
 	CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) == RENDER_RESULT_OK);
@@ -458,14 +693,102 @@ void BufferUpdateFailureRecoveryRestoresBinding()
 	// Explicit recovery recreates the device after a failed buffer map/update.
 	CHECK(device->recoverDevice() == RENDER_RESULT_OK && device->isOperational());
 	f.failUpdate = false;
+	// Aggregate mutation failure cleared initialized-range authority. Republish
+	// bytes before the resource can be bound again after recovery.
 	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, bytes, sizeof(bytes), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK);
 	CHECK(context->setVertexBuffer(buffer, 16, 0) == RENDER_RESULT_OK);
 	CHECK(context->endFrame() == RENDER_RESULT_OK);
 	CHECK(device->present() == RENDER_RESULT_OK);
 	const ThreadedRenderFrameCompletion recovered = Complete(device.get());
-	// The recovered durable CPU buffer binds without a replacement upload.
+	// The recovered buffer binds only after a replacement upload republishes it.
 	CHECK(recovered.result == RENDER_RESULT_OK && recovered.presented
-		&& static_cast<std::size_t>(std::count(f.events.begin(), f.events.end(), UPDATE)) == updates);
+		&& static_cast<std::size_t>(std::count(f.events.begin(), f.events.end(), UPDATE)) == updates + 1);
+}
+
+void BufferMutationFailureIsIsolated()
+{
+	Fixture f;
+	auto device = Device(f);
+	IRenderContext *context = device->immediateContext();
+	BufferDescriptor failedDescriptor;
+	failedDescriptor.byteCount = 16;
+	failedDescriptor.stride = 16;
+	failedDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	failedDescriptor.binding = RENDER_BUFFER_VERTEX;
+	BufferDescriptor stableDescriptor = failedDescriptor;
+	stableDescriptor.usage = RENDER_USAGE_DEFAULT;
+	unsigned char failedBytes[16]; std::memset(failedBytes, 31, sizeof(failedBytes));
+	unsigned char stableBytes[16]; std::memset(stableBytes, 47, sizeof(stableBytes));
+	GpuHandle failedBuffer, stableBuffer;
+	CHECK(device->createBuffer(failedDescriptor, failedBytes,
+		sizeof(failedBytes), &failedBuffer) == RENDER_RESULT_OK);
+	CHECK(device->createBuffer(stableDescriptor, stableBytes,
+		sizeof(stableBytes), &stableBuffer) == RENDER_RESULT_OK);
+	f.failUpdate = true;
+	f.updateFailureResult = RENDER_RESULT_FAILED;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(failedBuffer, failedBytes,
+		sizeof(failedBytes), 0, RENDER_BUFFER_UPDATE_DISCARD) ==
+		RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	const ThreadedRenderFrameCompletion failed = Complete(device.get(),
+		RENDER_RESULT_FAILED);
+	CHECK(failed.resourceFailure && device->isOperational());
+	f.failUpdate = false;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(stableBuffer, 16, 0) == RENDER_RESULT_OK);
+	CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+		RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get()).presented);
+	CHECK(device->destroyResource(failedBuffer));
+	CHECK(device->destroyResource(stableBuffer));
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+}
+
+void SuccessfulCpuUploadSurvivesUnrelatedFrameFailure()
+{
+	Fixture f;
+	auto device = Device(f);
+	IRenderContext *context = device->immediateContext();
+	BufferDescriptor descriptor;
+	descriptor.byteCount = 16;
+	descriptor.stride = 16;
+	descriptor.usage = RENDER_USAGE_DYNAMIC;
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	unsigned char bytes[16]; std::memset(bytes, 61, sizeof(bytes));
+	GpuHandle buffer;
+	CHECK(device->createBuffer(descriptor, bytes, sizeof(bytes), &buffer) ==
+		RENDER_RESULT_OK);
+	f.failDraw = true;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, bytes, sizeof(bytes), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK);
+	// This deliberately failing draw does not consume the uploaded buffer.
+	CHECK(context->draw(3, 0) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	const ThreadedRenderFrameCompletion failed = Complete(device.get(),
+		RENDER_RESULT_FAILED);
+	CHECK(failed.outcome.hasCommandFailure() && !failed.presented &&
+		!failed.resourceFailure);
+	f.failDraw = false;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(buffer, descriptor.stride, 0) ==
+		RENDER_RESULT_OK);
+	CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+		RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get()).presented);
+	CHECK(device->destroyResource(buffer));
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
 }
 
 void ResourcePreambleRemovalRemainsObservable()
@@ -488,7 +811,7 @@ void ResourcePreambleRemovalRemainsObservable()
 	CHECK(Complete(device.get()).presented);
 }
 
-void RecoveryPreservesPreambleResourceFailure()
+void RecoveryClearsPreambleResourceFailure()
 {
 	Fixture f;
 	auto device = Device(f);
@@ -501,8 +824,10 @@ void RecoveryPreservesPreambleResourceFailure()
 	f.failCreate = false;
 	EmptyFrame(device.get());
 	const ThreadedRenderFrameCompletion completion = Complete(device.get());
-	// Recovery preserves the failed preamble resource flag on the next successful frame.
-	CHECK(completion.result == RENDER_RESULT_OK && completion.presented && completion.resourceFailure);
+	// Successful recovery consumes the failed preamble resource latch; a later
+	// successful frame must not invalidate newly republished resources.
+	CHECK(completion.result == RENDER_RESULT_OK && completion.presented &&
+		!completion.resourceFailure);
 	CHECK(device->destroyResource(handle));
 	// Reclaim the failed preamble handle after its resource failure is observed.
 	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
@@ -807,13 +1132,18 @@ int main()
 	try
 	{
 		CHECK(rts::JobSystem::instance().registerCurrentThread(rts::JOB_OWNER_GAME));
+		SwapIntervalOwnerTransport();
+		GammaOwnerTransport();
+		DebugResourceOwnerTransport();
 		OwnershipAndDeepCopy();
 		SynchronousProducerRejectionsDoNotPoisonNextFrame();
 		GenerationsAndResourceFailure();
 		FailurePublicationAndRecovery();
 		BufferUpdateFailureRecoveryRestoresBinding();
+		BufferMutationFailureIsIsolated();
+		SuccessfulCpuUploadSurvivesUnrelatedFrameFailure();
 		ResourcePreambleRemovalRemainsObservable();
-		RecoveryPreservesPreambleResourceFailure();
+		RecoveryClearsPreambleResourceFailure();
 		CaptureResizeAndNonVisibleOrdering();
 		OpenFrameReportIsRejectedBeforeExecution();
 		FailedGpuCopyDependencies();

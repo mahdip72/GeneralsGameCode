@@ -203,7 +203,7 @@ protected:
 	// arrays, and the Shutdown function (which is called by WW3D::Shutdown()
 	// releases them.
 public:
-	static void				_Init();
+	static bool				_Init();
 	static void				_Shutdown();
 
 private:

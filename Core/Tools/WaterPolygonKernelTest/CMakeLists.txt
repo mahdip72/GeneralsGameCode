@@ -18,8 +18,9 @@ if(MINGW)
     target_link_options(core_water_polygon_kernel_tests PRIVATE -mconsole)
 endif()
 
-add_test(NAME core_water_polygon_kernel_tests COMMAND core_water_polygon_kernel_tests)
+add_test(NAME core_water_polygon_kernel_tests COMMAND core_water_polygon_kernel_tests
+    --local-capacity)
 set_tests_properties(core_water_polygon_kernel_tests PROPERTIES TIMEOUT 60)
 add_test(NAME core_water_polygon_kernel_serial_policy_test
-    COMMAND core_water_polygon_kernel_tests --serial-policy)
+    COMMAND core_water_polygon_kernel_tests --local-capacity --serial-policy)
 set_tests_properties(core_water_polygon_kernel_serial_policy_test PROPERTIES TIMEOUT 30)

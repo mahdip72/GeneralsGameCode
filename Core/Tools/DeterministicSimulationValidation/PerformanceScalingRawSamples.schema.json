@@ -1,0 +1,190 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "PerformanceScalingRawSamples.schema.json",
+  "title": "Installed Stage 5 performance raw-sample manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "evidenceKind", "producer", "recordedUtc", "cohortNonce", "cohortCreatedUtc", "qualificationMode", "referencePolicy", "sourceCommit", "artifactSetSha256", "runtimeClosure", "title", "executableSha256", "stage3SourceCommit", "stage3ExecutableSha256", "stage3BaselineSha256", "measurementMode", "installedRuntime", "recordedTaskRoot", "relocationManifest", "hostQualification", "phaseBaselineProfile", "performanceData", "stage3Baseline", "topologyReceipt", "stage3Samples", "fixtureSamples", "phaseSamples", "phaseAccountingSamples", "kernelSamples"],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 3 },
+    "evidenceKind": { "type": "string", "const": "stage5-performance-scaling-raw-samples" },
+    "producer": { "type": "string", "const": "installed-runtime-scaling-runner-v3" },
+    "recordedUtc": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{7}Z$" },
+    "cohortNonce": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "cohortCreatedUtc": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{7}Z$" },
+    "qualificationMode": { "type": "string", "const": "External16Core" },
+    "referencePolicy": { "type": "string", "const": "paired-serial-oracle-v1" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "runtimeClosure": { "$ref": "#/$defs/runtimeClosure" },
+    "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+    "executableSha256": { "$ref": "#/$defs/sha256" },
+    "stage3SourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "stage3ExecutableSha256": { "$ref": "#/$defs/sha256" },
+    "stage3BaselineSha256": { "$ref": "#/$defs/sha256" },
+    "measurementMode": { "type": "string", "const": "headless-throughput" },
+    "installedRuntime": { "const": true },
+    "recordedTaskRoot": { "type": "string", "pattern": "^[A-Za-z]:[\\\\/].+" },
+    "relocationManifest": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/relocationEntry" } },
+    "hostQualification": { "$ref": "#/$defs/evidenceFile" },
+    "phaseBaselineProfile": { "$ref": "#/$defs/evidenceFile" },
+    "performanceData": { "$ref": "#/$defs/performanceData" },
+    "stage3Baseline": { "$ref": "#/$defs/evidenceFile" },
+    "topologyReceipt": { "$ref": "#/$defs/evidenceFile" },
+    "stage3Samples": { "type": "array", "minItems": 12, "items": { "$ref": "#/$defs/stage3Sample" } },
+    "fixtureSamples": { "type": "array", "minItems": 36, "items": { "$ref": "#/$defs/fixtureSample" } },
+    "phaseSamples": { "type": "array", "minItems": 30, "items": { "$ref": "#/$defs/phaseSample" } },
+    "phaseAccountingSamples": { "type": "array", "minItems": 3, "items": { "$ref": "#/$defs/phaseAccountingSample" } },
+    "kernelSamples": { "type": "array", "minItems": 18, "items": { "$ref": "#/$defs/kernelSample" } }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+    "runtimeClosure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dependencyManifestSha256", "closureSha256"],
+      "properties": {
+        "dependencyManifestSha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "evidenceFile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "performanceData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "closureSha256", "fileCount"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" },
+        "fileCount": { "type": "integer", "minimum": 6 }
+      }
+    },
+    "relocationEntry": {
+      "type": "object", "additionalProperties": false,
+      "required": ["recordedPath", "path", "sha256", "length", "evidenceKind"],
+      "properties": {
+        "recordedPath": { "type": "string", "pattern": "^[A-Za-z]:[\\\\/].+" },
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "length": { "type": "integer", "minimum": 1 },
+        "evidenceKind": { "type": "string", "enum": ["JsonReceipt", "Replay", "RawLog", "Trace"] }
+      }
+    },
+    "stage3Sample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fixture", "fixtureSha256", "playerCount", "peakUnitCount", "lane", "repeat", "baselineSampleIndex", "executableSha256", "elapsedMilliseconds"],
+      "properties": {
+        "fixture": { "type": "string", "enum": ["one-thousand-units", "four-thousand-units", "eight-thousand-units", "dense-eight-player"] },
+        "fixtureSha256": { "$ref": "#/$defs/sha256" },
+        "playerCount": { "const": 8 },
+        "peakUnitCount": { "type": "integer", "minimum": 1000 },
+        "lane": { "type": "string", "const": "stage3-forced-one" },
+        "repeat": { "type": "integer", "minimum": 0 },
+        "baselineSampleIndex": { "type": "integer", "minimum": 1 },
+        "executableSha256": { "$ref": "#/$defs/sha256" },
+        "elapsedMilliseconds": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "fixtureSample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fixture", "fixtureSha256", "playerCount", "peakUnitCount", "requestedMinimumUnitCount", "initialUnitCount", "lane", "repeat", "runId", "processId", "processCreationTimeUtc100ns", "executableSha256", "argumentString", "commandLine", "elapsedMilliseconds"],
+      "properties": {
+        "fixture": { "type": "string", "enum": ["one-thousand-units", "four-thousand-units", "eight-thousand-units", "dense-eight-player"] },
+        "fixtureSha256": { "$ref": "#/$defs/sha256" },
+        "playerCount": { "const": 8 },
+        "peakUnitCount": { "type": "integer", "minimum": 1000 },
+        "requestedMinimumUnitCount": { "type": "integer", "minimum": 1000 },
+        "initialUnitCount": { "type": "integer", "minimum": 1000 },
+        "lane": { "type": "string", "enum": ["forced-one", "physical-8", "physical-16"] },
+        "repeat": { "type": "integer", "minimum": 0 },
+        "runId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
+        "processId": { "type": "integer", "minimum": 1 },
+        "processCreationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "executableSha256": { "$ref": "#/$defs/sha256" },
+        "argumentString": { "type": "string", "minLength": 1 },
+        "commandLine": { "type": "string", "minLength": 1 },
+        "elapsedMilliseconds": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "phaseSample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scope", "phase", "repeat", "sourceRunId", "sourceProcessId", "sourceProcessCreationTimeUtc100ns", "sourceArgumentString", "sourceCommandLine", "baselineRunId", "baselineProcessId", "baselineProcessCreationTimeUtc100ns", "baselineArgumentString", "baselineCommandLine", "elapsedMilliseconds", "serialMilliseconds", "serialMillisecondsKnown"],
+      "properties": {
+        "scope": { "type": "string", "enum": ["world", "control"] },
+        "phase": { "type": "string", "enum": ["owner-intake", "legacy-mutable-island", "spatial-work", "owner-tail", "verification-publication"] },
+        "repeat": { "type": "integer", "minimum": 0 },
+        "sourceRunId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
+        "sourceProcessId": { "type": "integer", "minimum": 1 },
+        "sourceProcessCreationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "sourceArgumentString": { "type": "string", "minLength": 1 },
+        "sourceCommandLine": { "type": "string", "minLength": 1 },
+        "baselineRunId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
+        "baselineProcessId": { "type": "integer", "minimum": 1 },
+        "baselineProcessCreationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "baselineArgumentString": { "type": "string", "minLength": 1 },
+        "baselineCommandLine": { "type": "string", "minLength": 1 },
+        "elapsedMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "serialMilliseconds": { "type": "number", "minimum": 0 },
+        "serialMillisecondsKnown": { "const": true }
+      }
+    },
+    "phaseAccountingSample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["repeat", "sourceRunId", "sourceProcessId", "sourceProcessCreationTimeUtc100ns", "sourceArgumentString", "sourceCommandLine", "baselineRunId", "baselineProcessId", "baselineProcessCreationTimeUtc100ns", "baselineArgumentString", "baselineCommandLine", "accountingOrigin", "worldMilliseconds", "controlMilliseconds", "completionSerialMilliseconds", "worldUnscopedSerialMilliseconds", "controlUnscopedSerialMilliseconds", "totalOneWorkerMilliseconds", "totalSerialMilliseconds"],
+      "properties": {
+        "repeat": { "type": "integer", "minimum": 0 },
+        "sourceRunId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
+        "sourceProcessId": { "type": "integer", "minimum": 1 },
+        "sourceProcessCreationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "sourceArgumentString": { "type": "string", "minLength": 1 },
+        "sourceCommandLine": { "type": "string", "minLength": 1 },
+        "baselineRunId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
+        "baselineProcessId": { "type": "integer", "minimum": 1 },
+        "baselineProcessCreationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "baselineArgumentString": { "type": "string", "minLength": 1 },
+        "baselineCommandLine": { "type": "string", "minLength": 1 },
+        "accountingOrigin": { "type": "string", "const": "kernel-performance-ledger-whole-frame-v1" },
+        "worldMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "controlMilliseconds": { "type": "number", "minimum": 0 },
+        "completionSerialMilliseconds": { "type": "number", "minimum": 0 },
+        "worldUnscopedSerialMilliseconds": { "type": "number", "minimum": 0 },
+        "controlUnscopedSerialMilliseconds": { "type": "number", "minimum": 0 },
+        "totalOneWorkerMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "totalSerialMilliseconds": { "type": "number", "minimum": 0 }
+      }
+    },
+    "kernelSample": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kernel", "repeat", "runId", "processId", "processCreationTimeUtc100ns", "argumentString", "commandLine", "oracleRunId", "oracleProcessId", "oracleProcessCreationTimeUtc100ns", "oracleArgumentString", "oracleCommandLine", "admittedSlices", "captureMilliseconds", "scheduleMilliseconds", "waitMilliseconds", "validateMilliseconds", "commitMilliseconds", "exactSerialOperationMilliseconds", "exactSerialOperationMillisecondsKnown", "timingAttribution"],
+      "properties": {
+        "kernel": { "type": "string", "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
+        "repeat": { "type": "integer", "minimum": 0 },
+        "runId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
+        "processId": { "type": "integer", "minimum": 1 },
+        "processCreationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "argumentString": { "type": "string", "minLength": 1 },
+        "commandLine": { "type": "string", "minLength": 1 },
+        "oracleRunId": { "type": "string", "pattern": "^[A-Za-z0-9_.-]{1,256}$" },
+        "oracleProcessId": { "type": "integer", "minimum": 1 },
+        "oracleProcessCreationTimeUtc100ns": { "type": "integer", "minimum": 1 },
+        "oracleArgumentString": { "type": "string", "minLength": 1 },
+        "oracleCommandLine": { "type": "string", "minLength": 1 },
+        "admittedSlices": { "type": "integer", "minimum": 1 },
+        "captureMilliseconds": { "type": "number", "minimum": 0 },
+        "scheduleMilliseconds": { "type": "number", "minimum": 0 },
+        "waitMilliseconds": { "type": "number", "minimum": 0 },
+        "validateMilliseconds": { "type": "number", "minimum": 0 },
+        "commitMilliseconds": { "type": "number", "minimum": 0 },
+        "exactSerialOperationMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "exactSerialOperationMillisecondsKnown": { "const": true },
+        "timingAttribution": { "type": "string", "const": "owner-stack-exclusive-v1" }
+      }
+    }
+  }
+}

@@ -357,7 +357,8 @@ void GameLogic::prepareNewGame( GameMode gameMode, GameDifficulty diff, Int rank
 void GameLogic::logicMessageDispatcher( GameMessage *msg, void *userData )
 {
 #ifdef RTS_DEBUG
-	DEBUG_ASSERTCRASH(msg != nullptr && msg != (GameMessage*)0xdeadbeef, ("bad msg"));
+	DEBUG_ASSERTCRASH(msg != nullptr && msg != reinterpret_cast<GameMessage *>(
+		static_cast<uintptr_t>(0xdeadbeef)), ("bad msg"));
 #endif
 
 	Player *msgPlayer = getMessagePlayer(msg);

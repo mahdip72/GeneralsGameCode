@@ -34,12 +34,14 @@
  * Functions:                                                                                  *
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+#include "Utility/CppMacros.h"
 #include "render2dsentence.h"
-#include "surfaceclass.h"
-#include "texture.h"
+#include "ww3d.h"
+#include "WW3D2/surfaceclass.h"
+#include "WW3D2/texture.h"
 #include "WWDebug/wwprofile.h"
 #include "WWDebug/wwmemlog.h"
-#include "dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
 
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -358,8 +360,16 @@ Render2DSentenceClass::Build_Textures ()
 		//
 		//	Create the new texture
 		//
+#if defined(_WIN64)
+		// Native sampled textures use BGRA8 storage. Upload through the surface
+		// constructor so the glyph atlas's A4R4G4B4 alpha is converted; an exact
+		// surface copy rejects these different CPU/GPU formats.
+		TextureClass *new_texture = W3DNEW TextureClass(curr_surface, MIP_LEVELS_1);
+		bool copy_succeeded = new_texture->Is_Initialized();
+#else
 		TextureClass *new_texture = W3DNEW TextureClass (desc.Width, desc.Width, WW3D_FORMAT_A4R4G4B4, MIP_LEVELS_1);
 		SurfaceClass *texture_surface = new_texture->Get_Surface_Level ();
+#endif
 
 		new_texture->Get_Filter().Set_U_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
 		new_texture->Get_Filter().Set_V_Addr_Mode(TextureFilterClass::TEXTURE_ADDRESS_CLAMP);
@@ -370,8 +380,22 @@ Render2DSentenceClass::Build_Textures ()
 		//
 		//	Copy the contents of the texture from the surface
 		//
-		DX8Wrapper::_Copy_DX8_Rects (curr_surface->Peek_D3D_Surface (), nullptr, 0, texture_surface->Peek_D3D_Surface (), nullptr);
+#if !defined(_WIN64)
+		bool copy_succeeded = texture_surface != nullptr;
+		if (copy_succeeded) {
+			texture_surface->Copy(
+				0, 0, 0, 0, desc.Width, desc.Height, curr_surface);
+		}
 		REF_PTR_RELEASE (texture_surface);
+#endif
+		if (!copy_succeeded) {
+			// A native publication failure must not install a texture whose
+			// contents are stale or undefined.  Keep the pending renderer
+			// untouched and continue building independent sentence surfaces.
+			REF_PTR_RELEASE (new_texture);
+			REF_PTR_RELEASE (curr_surface);
+			continue;
+		}
 
 		//
 		//	Assign this texture to any renderers that need it

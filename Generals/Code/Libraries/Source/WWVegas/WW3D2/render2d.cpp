@@ -37,16 +37,15 @@
 #include "ww3d.h"
 #include "font3d.h"
 #include "WWMath/rect.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "WWMath/matrix4.h"
 #include "WWMath/matrix3d.h"
-#include "dx8wrapper.h"
-#include "dx8indexbuffer.h"
-#include "dx8vertexbuffer.h"
+#include "Renderer/RenderGameClient.h"
+#include "WW3D2/dx8indexbuffer.h"
+#include "WW3D2/dx8vertexbuffer.h"
 #include "sortingrenderer.h"
 #include "vertmaterial.h"
-#include "dx8fvf.h"
-#include "dx8caps.h"
+#include "WW3D2/dx8fvf.h"
 #include "WWDebug/wwprofile.h"
 #include "WWDebug/wwmemlog.h"
 #include "assetmgr.h"
@@ -533,33 +532,31 @@ void Render2DClass::Render()
 	Matrix4x4 view,proj;
 	Matrix4x4 identity(true);
 
-	DX8Wrapper::Get_Transform(D3DTS_VIEW,view);
-	DX8Wrapper::Get_Transform(D3DTS_PROJECTION,proj);
+	rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_VIEW,&view);
+	rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_PROJECTION,&proj);
 
 	//
 	//	Configure the viewport for entire screen
 	//
-	D3DVIEWPORT8 vp = { 0 };
-	vp.X			= (DWORD)ScreenResolution.Left;
-	vp.Y			= (DWORD)ScreenResolution.Top;
-	vp.Width		= (DWORD)ScreenResolution.Width ();
-	vp.Height	= (DWORD)ScreenResolution.Height ();
-	vp.MinZ		= 0;
-	vp.MaxZ		= 1;
-	DX8Wrapper::Set_Viewport(&vp);
+	rts::render::SetGameViewport(
+		static_cast<unsigned int>(ScreenResolution.Left),
+		static_cast<unsigned int>(ScreenResolution.Top),
+		static_cast<unsigned int>(ScreenResolution.Width()),
+		static_cast<unsigned int>(ScreenResolution.Height()),
+		0.0f,1.0f);
 
 
-	DX8Wrapper::Set_Texture(0,Texture);
+	rts::render::SetGameTexture(0,Texture);
 
 	VertexMaterialClass *vm=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(vm);
+	rts::render::SetGameMaterial(vm);
 	REF_PTR_RELEASE(vm);
 
-	DX8Wrapper::Set_World_Identity();
-	DX8Wrapper::Set_View_Identity();
-	DX8Wrapper::Set_Transform(D3DTS_PROJECTION,identity);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,Matrix3D(true));
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW,Matrix3D(true));
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_PROJECTION,identity);
 
-	DynamicVBAccessClass vb(BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,Vertices.Count());
+	DynamicVBAccessClass vb(rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,dynamic_fvf_type,Vertices.Count());
 	{
 		DynamicVBAccessClass::WriteLockClass Lock(&vb);
 		const FVFInfoClass &fi=vb.FVF_Info();
@@ -578,7 +575,7 @@ void Render2DClass::Render()
 		}
 	}
 
-	DynamicIBAccessClass ib(BUFFER_TYPE_DYNAMIC_DX8,Indices.Count());
+	DynamicIBAccessClass ib(rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,Indices.Count());
 	{
 		DynamicIBAccessClass::WriteLockClass Lock(&ib);
 		unsigned short *mem=Lock.Get_Index_Array();
@@ -586,45 +583,45 @@ void Render2DClass::Render()
 			mem[i]=Indices[i];
 	}
 
-	DX8Wrapper::Set_Vertex_Buffer(vb);
-	DX8Wrapper::Set_Index_Buffer(ib,0);
+	rts::render::SetGameVertexBuffer(vb);
+	rts::render::SetGameIndexBuffer(ib,0);
 
 	if (IsGrayScale)
 	{	//special case added to draw grayscale non-alpha blended images.
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of all regular W3D states.
-		if (DX8Wrapper::Get_Current_Caps()->Support_Dot3())
+		rts::render::SetGameShader(ShaderClass::_PresetOpaqueShader);
+		rts::render::ApplyGameRenderStateChanges();	//force update of all regular W3D states.
+		if (rts::render::GameRendererSupportsDot3())
 		{	//Override W3D states with customizations for grayscale
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_TEXTUREFACTOR, 0x80A5CA8E);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG0, D3DTA_TFACTOR | D3DTA_ALPHAREPLICATE);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_TFACTOR | D3DTA_ALPHAREPLICATE);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP, D3DTOP_MULTIPLYADD);
+			rts::render::SetGameRenderState(rts::render::GAME_RENDER_STATE_TEXTURE_FACTOR, 0x80A5CA8E);
+			rts::render::SetGameTextureStageState( 0, rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT0, rts::render::GAME_TEXTURE_ARGUMENT_FACTOR | rts::render::GAME_TEXTURE_ARGUMENT_ALPHA_REPLICATE);
+			rts::render::SetGameTextureStageState( 0, rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, rts::render::GAME_TEXTURE_ARGUMENT_TEXTURE);
+			rts::render::SetGameTextureStageState( 0, rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, rts::render::GAME_TEXTURE_ARGUMENT_FACTOR | rts::render::GAME_TEXTURE_ARGUMENT_ALPHA_REPLICATE);
+			rts::render::SetGameTextureStageState( 0, rts::render::GAME_TEXTURE_STAGE_COLOR_OPERATION, rts::render::RENDER_TEXTURE_OP_MULTIPLY_ADD);
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_CURRENT);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP, D3DTOP_DOTPRODUCT3);
+			rts::render::SetGameTextureStageState( 1, rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, rts::render::GAME_TEXTURE_ARGUMENT_CURRENT);
+			rts::render::SetGameTextureStageState( 1, rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, rts::render::GAME_TEXTURE_ARGUMENT_FACTOR);
+			rts::render::SetGameTextureStageState( 1, rts::render::GAME_TEXTURE_STAGE_COLOR_OPERATION, rts::render::RENDER_TEXTURE_OP_DOT_PRODUCT_3);
 		}
 		else
 		{	//doesn't have DOT3 blend mode so fake it another way.
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_TEXTUREFACTOR, 0x60606060);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+			rts::render::SetGameRenderState(rts::render::GAME_RENDER_STATE_TEXTURE_FACTOR, 0x60606060);
+			rts::render::SetGameTextureStageState( 0, rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, rts::render::GAME_TEXTURE_ARGUMENT_TEXTURE);
+			rts::render::SetGameTextureStageState( 0, rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, rts::render::GAME_TEXTURE_ARGUMENT_FACTOR);
+			rts::render::SetGameTextureStageState( 0, rts::render::GAME_TEXTURE_STAGE_COLOR_OPERATION, rts::render::RENDER_TEXTURE_OP_MODULATE);
 
 			// TheSuperHackers @bugfix Stubbjax 08/01/2026 Fix possible greyscale rendering issues on hardware without DOT3 support.
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+			rts::render::SetGameTextureStageState( 1, rts::render::GAME_TEXTURE_STAGE_COLOR_OPERATION, rts::render::RENDER_TEXTURE_OP_DISABLE);
 		}
 	}
 	else
-		DX8Wrapper::Set_Shader(Shader);
+		rts::render::SetGameShader(Shader);
 
-	DX8Wrapper::Draw_Triangles(0,Indices.Count()/3,0,Vertices.Count());
+	rts::render::DrawGameTriangles(0,Indices.Count()/3,0,Vertices.Count());
 //	SphereClass sphere(Vector3(0.0f,0.0f,0.0f),0.0f);
 //	SortingRendererClass::Insert_Triangles(sphere,0,Indices.Count()/3,0,Vertices.Count());
 
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
-	DX8Wrapper::Set_Transform(D3DTS_PROJECTION,proj);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW,view);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_PROJECTION,proj);
 	if (IsGrayScale)
 		ShaderClass::Invalidate();	//force both stages to be reset.
 

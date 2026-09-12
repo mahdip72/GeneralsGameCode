@@ -7,6 +7,10 @@ namespace rts { namespace frame_timing {
 enum Phase
 {
 	FrameTotal, Radar, Audio, Client, Messages, Network, Logic, ClientStep, Wait,
+	SimulationSnapshot, SimulationSerial, SimulationParallel, SimulationWait,
+	SimulationReduce, SimulationShadowCompare, SimulationCommit,
+	CollisionAdmission, CollisionLiveValidation, CollisionExistingFilter,
+	CollisionCommitPrepare,
 	RecorderUpdate, RecorderEncode, RecorderFlush,
 	AudioVoiceCreate, AudioVoiceDestroy, AudioDecodeOpen, AudioDecodeRead,
 	RendererPresent, RendererTextureCollect, RendererTexturePrune,
@@ -18,17 +22,34 @@ enum Phase
 #if defined(_WIN64)
 #include <windows.h>
 #include <atomic>
+#include <io.h>
+#include <share.h>
 #include <stdio.h>
 #include <string.h>
+#include <string>
 
 namespace rts { namespace frame_timing {
+
+struct FinalizedCapture
+{
+	FinalizedCapture() : nativeHandle(INVALID_HANDLE_VALUE), closed(false), writeSucceeded(false), truncated(false),
+		complete(false), sessionCount(0), frameSamples(0), firstFrame(0), lastFrame(0) {}
+	std::string path;
+	HANDLE nativeHandle;
+	bool closed, writeSucceeded, truncated, complete;
+	unsigned int sessionCount;
+	unsigned __int64 frameSamples;
+	unsigned int firstFrame, lastFrame;
+};
 
 class Capture
 {
 public:
-	Capture() : m_file(NULL), m_owner(0), m_frequency(0), m_active(false),
+	Capture() : m_file(NULL), m_finalizedHandle(INVALID_HANDLE_VALUE), m_owner(0), m_frequency(0), m_active(false),
 		m_frameStart(0), m_bucketStart(0), m_rows(0), m_session(0),
-		m_frameBegin(0), m_frameEnd(0), m_logicFrames(0), m_mode("interactive")
+		m_frameBegin(0), m_frameEnd(0), m_logicFrames(0), m_mode("interactive"),
+		m_writeSucceeded(true), m_truncated(false), m_incomplete(false),
+		m_finalized(false), m_frameSamples(0), m_firstFrame(0), m_lastFrame(0)
 	{
 		memset(m_stats, 0, sizeof(m_stats));
 		char directory[MAX_PATH];
@@ -45,9 +66,10 @@ public:
 			GetCurrentProcessId(), GetTickCount());
 		path[sizeof(path) - 1] = '\0';
 		// Exclusive creation never replaces a previous capture.
-		m_file = fopen(path, "wx");
+		m_file = _fsopen(path, "w+x", _SH_DENYWR);
 		if (!m_file)
 			return;
+		m_path = path;
 		m_frequency = frequency.QuadPart;
 		setvbuf(m_file, NULL, _IOFBF, 16384);
 		fprintf(m_file, "session,mode,frame_begin,frame_end,logic_frames,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms\n");
@@ -55,9 +77,9 @@ public:
 
 	~Capture()
 	{
-		flush();
-		if (m_file)
-			fclose(m_file);
+		closeCapture();
+		if (m_finalizedHandle != INVALID_HANDLE_VALUE)
+			CloseHandle(m_finalizedHandle);
 	}
 
 	static Capture& instance()
@@ -68,20 +90,66 @@ public:
 
 	void beginSession(const char* mode)
 	{
+		const DWORD current = GetCurrentThreadId();
+		DWORD owner = m_owner.load(std::memory_order_acquire);
+		bool claimed = false;
+		if (owner != 0 && owner != current)
+			return;
+		if (owner == 0)
+		{
+			if (!m_owner.compare_exchange_strong(owner, current,
+				std::memory_order_acq_rel, std::memory_order_acquire))
+			{
+				if (owner != current)
+					return;
+			}
+			else
+				claimed = true;
+		}
+		if (!m_file)
+		{
+			if (claimed)
+				m_owner.store(0, std::memory_order_release);
+			return;
+		}
+		flush();
 		if (!m_file)
 			return;
-		flush();
 		++m_session;
 		m_mode = mode != NULL && mode[0] == 'h' ? "headless" : "interactive";
-		m_owner.store(GetCurrentThreadId(), std::memory_order_release);
 	}
 
 	void endSession()
 	{
-		if (!m_file)
+		if (m_owner.load(std::memory_order_acquire) != GetCurrentThreadId() || !m_file)
 			return;
+		if (m_active)
+			m_incomplete = true;
 		m_active = false;
 		flush();
+	}
+
+	// Receipt publication uses this exact producer-owned path only after a
+	// successful close. Ordinary sessions may still share a capture until then.
+	FinalizedCapture finalize(bool retainNativeHandle = false)
+	{
+		if (m_owner.load(std::memory_order_acquire) != GetCurrentThreadId())
+			return FinalizedCapture();
+		closeCapture(retainNativeHandle);
+		FinalizedCapture result;
+		result.path = m_path;
+		result.nativeHandle = m_finalizedHandle;
+		m_finalizedHandle = INVALID_HANDLE_VALUE;
+		result.closed = m_finalized && !m_path.empty() && m_writeSucceeded;
+		result.writeSucceeded = m_writeSucceeded && !m_path.empty();
+		result.truncated = m_truncated;
+		result.complete = result.closed && !m_truncated && !m_incomplete &&
+			m_frameSamples != 0;
+		result.sessionCount = m_session;
+		result.frameSamples = m_frameSamples;
+		result.firstFrame = m_firstFrame;
+		result.lastFrame = m_lastFrame;
+		return result;
 	}
 
 	void beginFrame(unsigned int frame)
@@ -89,7 +157,18 @@ public:
 		const DWORD owner = m_owner.load(std::memory_order_acquire);
 		if (owner != GetCurrentThreadId() || !m_file)
 			return;
+		if (m_active)
+			m_incomplete = true;
 		m_frameStart = clock();
+		if (m_frameStart <= 0)
+		{
+			m_incomplete = true;
+			return;
+		}
+		if (m_frameSamples == 0)
+			m_firstFrame = frame;
+		if (frame > m_lastFrame)
+			m_lastFrame = frame;
 		if (!m_bucketStart)
 		{
 			m_bucketStart = m_frameStart;
@@ -104,10 +183,17 @@ public:
 		if (!isActive())
 			return;
 		const __int64 end = clock();
+		if (end < m_frameStart)
+			m_incomplete = true;
 		add(FrameTotal, end - m_frameStart);
+		++m_frameSamples;
+		if (frame > m_lastFrame)
+			m_lastFrame = frame;
 		if (frame >= m_frameEnd)
+		{
 			m_logicFrames += frame - m_frameEnd;
-		m_frameEnd = frame;
+			m_frameEnd = frame;
+		}
 		m_active = false;
 		// Headless buckets are simulation-time based for early/late comparison.
 		if ((m_mode[0] == 'h' && m_logicFrames >= 900) ||
@@ -150,6 +236,55 @@ public:
 	}
 
 private:
+	void closeCapture(bool retainNativeHandle = false)
+	{
+		if (m_finalized)
+			return;
+		if (m_active)
+			m_incomplete = true;
+		m_active = false;
+		flush();
+		if (m_file)
+		{
+			if (fflush(m_file) != 0 || _commit(_fileno(m_file)) != 0)
+				m_writeSucceeded = false;
+			const intptr_t native = _get_osfhandle(_fileno(m_file));
+			HANDLE transitional = INVALID_HANDLE_VALUE;
+			if (retainNativeHandle && native != -1)
+				transitional = ReOpenFile(reinterpret_cast<HANDLE>(native), GENERIC_READ,
+					FILE_SHARE_READ | FILE_SHARE_WRITE,
+					FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+			if (retainNativeHandle &&
+				(transitional == INVALID_HANDLE_VALUE ||
+					!SetHandleInformation(transitional, HANDLE_FLAG_INHERIT, 0)))
+			{
+				if (transitional != INVALID_HANDLE_VALUE) CloseHandle(transitional);
+				transitional = INVALID_HANDLE_VALUE;
+				m_writeSucceeded = false;
+			}
+			if (fclose(m_file) != 0)
+				m_writeSucceeded = false;
+			m_file = NULL;
+			if (retainNativeHandle && transitional != INVALID_HANDLE_VALUE &&
+				m_writeSucceeded)
+			{
+				m_finalizedHandle = ReOpenFile(transitional, GENERIC_READ,
+					FILE_SHARE_READ,
+					FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN);
+				if (m_finalizedHandle == INVALID_HANDLE_VALUE ||
+					!SetHandleInformation(m_finalizedHandle, HANDLE_FLAG_INHERIT, 0))
+				{
+					if (m_finalizedHandle != INVALID_HANDLE_VALUE) CloseHandle(m_finalizedHandle);
+					m_finalizedHandle = INVALID_HANDLE_VALUE;
+					m_writeSucceeded = false;
+				}
+			}
+			if (transitional != INVALID_HANDLE_VALUE && !CloseHandle(transitional))
+				m_writeSucceeded = false;
+		}
+		m_finalized = true;
+	}
+
 	enum { BucketCount = 17, MaxRows = 16384 };
 	struct Stats
 	{
@@ -186,6 +321,10 @@ private:
 		static const char* names[PhaseCount] =
 		{
 			"frame", "radar", "audio", "client", "messages", "network", "logic", "client_step", "wait",
+			"simulation_snapshot", "simulation_serial", "simulation_parallel", "simulation_wait",
+			"simulation_reduce", "simulation_shadow_compare", "simulation_commit",
+			"collision_admission", "collision_live_validation", "collision_existing_filter",
+			"collision_commit_prepare",
 			"recorder_update", "recorder_encode", "recorder_flush",
 			"audio_voice_create", "audio_voice_destroy", "audio_decode_open", "audio_decode_read",
 			"renderer_present", "renderer_texture_collect", "renderer_texture_prune"
@@ -208,13 +347,17 @@ private:
 		m_logicFrames = 0;
 		if (failed || m_rows >= MaxRows)
 		{
-			fclose(m_file);
+			m_writeSucceeded = m_writeSucceeded && !failed;
+			m_truncated = m_rows >= MaxRows;
+			if (fclose(m_file) != 0)
+				m_writeSucceeded = false;
 			m_file = NULL;
 			m_active = false;
 		}
 	}
 
 	FILE* m_file;
+	HANDLE m_finalizedHandle;
 	std::atomic<DWORD> m_owner;
 	__int64 m_frequency;
 	bool m_active;
@@ -222,6 +365,10 @@ private:
 	unsigned int m_rows, m_session, m_frameBegin, m_frameEnd, m_logicFrames;
 	const char* m_mode;
 	Stats m_stats[PhaseCount];
+	std::string m_path;
+	bool m_writeSucceeded, m_truncated, m_incomplete, m_finalized;
+	unsigned __int64 m_frameSamples;
+	unsigned int m_firstFrame, m_lastFrame;
 	Capture(const Capture&);
 	Capture& operator=(const Capture&);
 };

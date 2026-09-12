@@ -83,6 +83,8 @@ void disabled(const std::string& directory)
 		capture.endFrame(900);
 		capture.endSession();
 		check(!capture.isActive(), "disabled capture remains inactive");
+		check(!capture.finalize().complete,
+			"disabled capture cannot provide complete receipt evidence");
 	}
 	check(files(directory).empty(), "disabled capture creates no output");
 }
@@ -97,10 +99,25 @@ void enabled(const std::string& directory, __int64 frequency)
 		for (int i = 0; i < 19; ++i)
 			capture.add(rts::frame_timing::Logic, frequency / 1000);
 		capture.add(rts::frame_timing::Logic, frequency / 10);
+		const rts::frame_timing::Phase simulationPhases[] = {
+			rts::frame_timing::SimulationSnapshot,
+			rts::frame_timing::SimulationSerial,
+			rts::frame_timing::SimulationParallel,
+			rts::frame_timing::SimulationWait,
+			rts::frame_timing::SimulationReduce,
+			rts::frame_timing::SimulationShadowCompare,
+			rts::frame_timing::SimulationCommit,
+			rts::frame_timing::CollisionAdmission,
+			rts::frame_timing::CollisionLiveValidation,
+			rts::frame_timing::CollisionExistingFilter,
+			rts::frame_timing::CollisionCommitPrepare
+		};
+		for (std::size_t phase = 0; phase < sizeof(simulationPhases) / sizeof(simulationPhases[0]); ++phase)
+			capture.add(simulationPhases[phase], frequency / 2000);
 		capture.endFrame(1000); // Forces the headless periodic bucket without sleeping.
 		std::vector<Row> data = rows(directory);
-		check(data.size() == 2, "periodic flush writes frame and logic before session ends");
-		if (data.size() == 2)
+		check(data.size() == 13, "periodic flush writes frame, logic, and simulation phases before session ends");
+		if (data.size() == 13)
 		{
 			const Row& logic = data[1];
 			check(strcmp(logic.phase, "logic") == 0 && logic.samples == 20, "logic sample count");
@@ -109,19 +126,34 @@ void enabled(const std::string& directory, __int64 frequency)
 				"histogram percentile upper bounds retain the tail");
 			check(logic.maximum >= 99.0 && logic.over33 == 1, "max and stall threshold counter");
 			check(logic.total > 118.0 && logic.total < 120.0, "sample totals");
+			const char *simulationNames[] = {
+				"simulation_snapshot", "simulation_serial", "simulation_parallel", "simulation_wait",
+				"simulation_reduce", "simulation_shadow_compare", "simulation_commit",
+				"collision_admission", "collision_live_validation", "collision_existing_filter",
+				"collision_commit_prepare"
+			};
+			for (std::size_t phase = 0; phase < sizeof(simulationNames) / sizeof(simulationNames[0]); ++phase)
+			{
+				check(strcmp(data[phase + 2].phase, simulationNames[phase]) == 0 &&
+					data[phase + 2].samples == 1, "simulation phase name and sample count");
+			}
 		}
 		capture.beginFrame(1000);
 		capture.endFrame(1005);
+		capture.beginFrame(1005);
+		capture.endFrame(0); // Game teardown can reset GameLogic before EndFrame.
 		capture.endSession();
 		data = rows(directory);
-		check(data.size() == 3 && data.back().frames == 5, "session end flushes partial bucket");
+		check(data.size() == 14 && data.back().frames == 5 &&
+			data.back().first == 1000 && data.back().last == 1005,
+			"session end preserves the final pre-reset frame range");
 		capture.beginSession("interactive");
 		capture.beginFrame(0);
 		capture.endFrame(1);
 		// Destructor must retain this final partial bucket without endSession.
 	}
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 4 && data.back().session == 2 && data.back().frames == 1 &&
+	check(data.size() == 15 && data.back().session == 2 && data.back().frames == 1 &&
 		strcmp(data.back().mode, "interactive") == 0, "destructor/session reset retains only new frame counts");
 }
 
@@ -137,8 +169,59 @@ void bounded(const std::string& directory)
 			capture.endFrame((i + 1) * 900);
 		}
 		check(!capture.isActive(), "row limit leaves capture inactive");
+		const rts::frame_timing::FinalizedCapture final = capture.finalize();
+		check(final.closed && final.truncated && !final.complete,
+			"row-limited capture is closed but cannot qualify as complete evidence");
 	}
 	check(rows(directory).size() == 16384, "capture stops at the fixed row bound");
+}
+
+void finalized(const std::string& directory)
+{
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	rts::frame_timing::Capture capture;
+	capture.beginSession("headless");
+	capture.beginFrame(0);
+	capture.endFrame(1);
+	capture.beginFrame(1);
+	capture.endFrame(2);
+	capture.beginFrame(2);
+	capture.endFrame(0);
+	capture.endSession();
+	const rts::frame_timing::FinalizedCapture final = capture.finalize();
+	const std::vector<std::string> paths = files(directory);
+	check(paths.size() == 1 && final.path == paths[0],
+		"finalization identifies the exact producer-owned file");
+	check(final.closed && final.writeSucceeded && !final.truncated && final.complete,
+		"complete finalization proves successful file close");
+	check(final.sessionCount == 1 && final.frameSamples == 3 &&
+		final.firstFrame == 0 && final.lastFrame == 2,
+		"finalization retains pre-reset frame coverage");
+	HANDLE exclusive = CreateFileA(final.path.c_str(), GENERIC_READ | GENERIC_WRITE,
+		0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	check(exclusive != INVALID_HANDLE_VALUE,
+		"receipt file is physically closed, not merely flushed");
+	if (exclusive != INVALID_HANDLE_VALUE) CloseHandle(exclusive);
+	capture.beginSession("headless");
+	capture.beginFrame(100);
+	capture.endFrame(101);
+	const rts::frame_timing::FinalizedCapture again = capture.finalize();
+	check(again.path == final.path && again.frameSamples == 3 && again.complete,
+		"finalization is idempotent and prevents later session writes");
+}
+
+void incomplete(const std::string& directory)
+{
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	rts::frame_timing::Capture capture;
+	capture.beginSession("headless");
+	capture.beginFrame(0);
+	capture.endFrame(1);
+	capture.beginFrame(1);
+	capture.endSession();
+	const rts::frame_timing::FinalizedCapture final = capture.finalize();
+	check(final.closed && final.writeSucceeded && !final.complete,
+		"unfinished frame fails coverage despite a successful close");
 }
 }
 
@@ -154,19 +237,26 @@ int main()
 	if (!CreateDirectoryA(root.c_str(), NULL))
 		return 1; // Never reuse or remove a directory owned by another run.
 	const std::string disabledDir = root + "\\disabled", enabledDir = root + "\\enabled", boundedDir = root + "\\bounded";
+	const std::string finalizedDir = root + "\\finalized", incompleteDir = root + "\\incomplete";
 	check(CreateDirectoryA(disabledDir.c_str(), NULL) != FALSE, "create disabled case");
 	check(CreateDirectoryA(enabledDir.c_str(), NULL) != FALSE, "create enabled case");
 	check(CreateDirectoryA(boundedDir.c_str(), NULL) != FALSE, "create bounded case");
+	check(CreateDirectoryA(finalizedDir.c_str(), NULL) != FALSE, "create finalized case");
+	check(CreateDirectoryA(incompleteDir.c_str(), NULL) != FALSE, "create incomplete case");
 	LARGE_INTEGER frequency;
 	if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
 		return 1;
 	disabled(disabledDir);
 	enabled(enabledDir, frequency.QuadPart);
 	bounded(boundedDir);
+	finalized(finalizedDir);
+	incomplete(incompleteDir);
 	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL);
 	removeCase(disabledDir);
 	removeCase(enabledDir);
 	removeCase(boundedDir);
+	removeCase(finalizedDir);
+	removeCase(incompleteDir);
 	check(RemoveDirectoryA(root.c_str()) != FALSE, "remove empty test root");
 	return failures ? 1 : 0;
 }

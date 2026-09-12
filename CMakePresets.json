@@ -8,7 +8,7 @@
     "configurePresets": [
         {
             "name": "vc6",
-            "displayName": "Windows 32bit VC6 Release",
+            "displayName": "Windows 32bit VC6 Non-Product Tools",
             "generator": "Ninja",
             "hidden": false,
             "binaryDir": "${sourceDir}/build/${presetName}",
@@ -17,7 +17,8 @@
                 "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL",
                 "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT": "",
                 "CMAKE_BUILD_TYPE": "Release",
-                "RTS_FLAGS": "/W3"
+                "RTS_FLAGS": "/W3",
+                "RTS_BUILD_PRODUCT": "OFF"
             },
             "vendor": {
                 "jetbrains.com/clion": {
@@ -55,14 +56,6 @@
             }
         },
         {
-            "name": "vc6-weekly",
-            "displayName": "Windows 32bit VC6 Weekly Release",
-            "inherits": "vc6",
-            "cacheVariables": {
-                "RTS_BUILD_OPTION_VC6_FULL_DEBUG": "ON"
-            }
-        },
-        {
             "name": "default",
             "displayName": "Default Config (don't use directly!)",
             "generator": "Ninja Multi-Config",
@@ -92,13 +85,14 @@
             "name": "win32",
             "inherits": "default",
             "hidden": false,
-            "displayName": "Windows 32bit Release",
+            "displayName": "Windows 32bit Non-Product Tools",
             "architecture": {
                 "value": "Win32",
                 "strategy": "external"
             },
             "cacheVariables": {
-                "RTS_FLAGS": "/W3"
+                "RTS_FLAGS": "/W3",
+                "RTS_BUILD_PRODUCT": "OFF"
             },
             "vendor": {
                 "jetbrains.com/clion": {
@@ -124,6 +118,38 @@
             }
         },
         {
+            "name": "win32-generals-authoring",
+            "inherits": "win32",
+            "displayName": "Windows 32bit Generals Authoring Tools",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_TOOLS": "ON",
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "ON",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS_TOOLS": "ON",
+                "RTS_BUILD_GENERALS_EXTRAS": "OFF",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
+            }
+        },
+        {
+            "name": "win32-zerohour-authoring",
+            "inherits": "win32",
+            "displayName": "Windows 32bit Zero Hour Authoring Tools",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_TOOLS": "ON",
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "ON",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
+                "RTS_BUILD_ZEROHOUR_TOOLS": "ON",
+                "RTS_BUILD_ZEROHOUR_EXTRAS": "OFF",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
+            }
+        },
+        {
             "name": "x64",
             "inherits": "default",
             "hidden": false,
@@ -143,7 +169,8 @@
                 "RTS_BUILD_ZEROHOUR_TOOLS": "OFF",
                 "RTS_BUILD_GENERALS_EXTRAS": "ON",
                 "RTS_BUILD_ZEROHOUR_EXTRAS": "ON",
-                "RTS_BUILD_OPTION_FFMPEG": "ON"
+                "RTS_BUILD_OPTION_FFMPEG": "ON",
+                "RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY": "ON"
             }
         },
         {
@@ -153,12 +180,55 @@
             "displayName": "Windows x64 VCPKG Release Product"
         },
         {
+            "name": "x64-generals-product",
+            "inherits": "x64",
+            "hidden": false,
+            "displayName": "Windows x64 Generals Release Product",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS": "ON",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS_TOOLS": "OFF",
+                "RTS_BUILD_GENERALS_EXTRAS": "OFF"
+            }
+        },
+        {
+            "name": "x64-generals-vcpkg-product",
+            "inherits": ["x64-generals-product", "default-vcpkg"],
+            "hidden": false,
+            "displayName": "Windows x64 Generals VCPKG Release Product"
+        },
+        {
+            "name": "x64-zerohour-product",
+            "inherits": "x64",
+            "hidden": false,
+            "displayName": "Windows x64 Zero Hour Release Product",
+            "cacheVariables": {
+                "RTS_BUILD_CORE_EXTRAS": "OFF",
+                "RTS_BUILD_PRODUCT": "ON",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "ON",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "ON",
+                "RTS_BUILD_ZEROHOUR_TOOLS": "OFF",
+                "RTS_BUILD_ZEROHOUR_EXTRAS": "OFF"
+            }
+        },
+        {
+            "name": "x64-zerohour-vcpkg-product",
+            "inherits": ["x64-zerohour-product", "default-vcpkg"],
+            "hidden": false,
+            "displayName": "Windows x64 Zero Hour VCPKG Release Product"
+        },
+        {
             "name": "x64-debug",
             "inherits": "x64",
             "hidden": false,
             "displayName": "Windows x64 Debug Product",
             "cacheVariables": {
-                "RTS_BUILD_OPTION_DEBUG": "ON"
+                "RTS_BUILD_OPTION_DEBUG": "ON",
+                "RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY": "OFF"
             }
         },
         {
@@ -168,7 +238,8 @@
             "displayName": "Windows x64 Profile Product",
             "cacheVariables": {
                 "RTS_BUILD_OPTION_PROFILE": "ON",
-                "RTS_BUILD_OPTION_PROFILE_TRACY": "ON"
+                "RTS_BUILD_OPTION_PROFILE_TRACY": "ON",
+                "RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY": "OFF"
             }
         },
         {
@@ -181,16 +252,65 @@
             }
         },
         {
+            "name": "x64-debug-core",
+            "inherits": "x64-debug",
+            "hidden": false,
+            "displayName": "Windows x64 Debug Core Focus",
+            "cacheVariables": {
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "OFF",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "ON",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
+            }
+        },
+        {
+            "name": "x64-profile-core",
+            "inherits": "x64-profile",
+            "hidden": false,
+            "displayName": "Windows x64 Profile Core Focus",
+            "cacheVariables": {
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "OFF",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "ON",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
+            }
+        },
+        {
+            "name": "x64-asan-core",
+            "inherits": "x64-asan",
+            "hidden": false,
+            "displayName": "Windows x64 Address Sanitizer Core Focus",
+            "cacheVariables": {
+                "RTS_BUILD_PRODUCT": "OFF",
+                "RTS_BUILD_GENERALS": "OFF",
+                "RTS_BUILD_ZEROHOUR": "OFF",
+                "RTS_BUILD_GENERALS_PRODUCT": "OFF",
+                "RTS_BUILD_ZEROHOUR_PRODUCT": "OFF",
+                "RTS_BUILD_CORE_TOOLS": "OFF",
+                "RTS_BUILD_CORE_EXTRAS": "ON",
+                "RTS_BUILD_OPTION_FFMPEG": "OFF"
+            }
+        },
+        {
             "name": "win32-vcpkg",
             "inherits": "default-vcpkg",
             "hidden": false,
-            "displayName": "Windows 32bit VCPKG Release",
+            "displayName": "Windows 32bit VCPKG Non-Product Tools",
             "architecture": {
                 "value": "Win32",
                 "strategy": "external"
             },
             "cacheVariables": {
-                "RTS_FLAGS": "/W3"
+                "RTS_FLAGS": "/W3",
+                "RTS_BUILD_PRODUCT": "OFF"
             },
             "vendor": {
                 "jetbrains.com/clion": {
@@ -236,7 +356,8 @@
             "toolchainFile": "${sourceDir}/cmake/toolchains/mingw-w64-i686.cmake",
             "cacheVariables": {
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "CMAKE_BUILD_TYPE": "Release"
+                "CMAKE_BUILD_TYPE": "Release",
+                "RTS_BUILD_PRODUCT": "OFF"
             }
         },
         {
@@ -263,8 +384,8 @@
         {
             "name": "vc6",
             "configurePreset": "vc6",
-            "displayName": "Build Windows 32bit VC6 Release",
-            "description": "Build Windows 32bit VC6 Release"
+            "displayName": "Build Windows 32bit VC6 Non-Product Tools",
+            "description": "Build historical VC6 authoring and diagnostic tools only"
         },
         {
             "name": "vc6-profile",
@@ -285,16 +406,10 @@
             "description": "Build Windows 32bit VC6 Release Logging"
         },
         {
-            "name": "vc6-weekly",
-            "configurePreset": "vc6-weekly",
-            "displayName": "Build Windows 32bit VC6 Weekly Release",
-            "description": "Build Windows 32bit VC6 Weekly Release"
-        },
-        {
             "name": "win32",
             "configurePreset": "win32",
-            "displayName": "Build Windows 32bit Release",
-            "description": "Build Windows 32bit Release",
+            "displayName": "Build Windows 32bit Non-Product Tools",
+            "description": "Build historical Win32 authoring and diagnostic tools only",
             "configuration": "Release"
         },
         {
@@ -312,10 +427,24 @@
             "configuration": "Debug"
         },
         {
+            "name": "win32-generals-authoring",
+            "configurePreset": "win32-generals-authoring",
+            "displayName": "Build Windows 32bit Generals Authoring Tools",
+            "description": "Build Generals authoring tools without the game executable",
+            "configuration": "Release"
+        },
+        {
+            "name": "win32-zerohour-authoring",
+            "configurePreset": "win32-zerohour-authoring",
+            "displayName": "Build Windows 32bit Zero Hour Authoring Tools",
+            "description": "Build Zero Hour authoring tools without the game executable",
+            "configuration": "Release"
+        },
+        {
             "name": "win32-vcpkg",
             "configurePreset": "win32-vcpkg",
-            "displayName": "Build Windows 32bit VCPKG Release",
-            "description": "Build Windows 32bit VCPKG Release",
+            "displayName": "Build Windows 32bit VCPKG Non-Product Tools",
+            "description": "Build historical Win32 VCPKG authoring and diagnostic tools only",
             "configuration": "Release"
         },
         {
@@ -347,6 +476,34 @@
             "configuration": "Release"
         },
         {
+            "name": "x64-generals-product",
+            "configurePreset": "x64-generals-product",
+            "displayName": "Build Windows x64 Generals Release Product",
+            "description": "Build the isolated Generals native product",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-generals-vcpkg-product",
+            "configurePreset": "x64-generals-vcpkg-product",
+            "displayName": "Build Windows x64 Generals VCPKG Release Product",
+            "description": "Build the isolated Generals native VCPKG product",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-zerohour-product",
+            "configurePreset": "x64-zerohour-product",
+            "displayName": "Build Windows x64 Zero Hour Release Product",
+            "description": "Build the isolated Zero Hour native product",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-zerohour-vcpkg-product",
+            "configurePreset": "x64-zerohour-vcpkg-product",
+            "displayName": "Build Windows x64 Zero Hour VCPKG Release Product",
+            "description": "Build the isolated Zero Hour native VCPKG product",
+            "configuration": "Release"
+        },
+        {
             "name": "x64-debug",
             "configurePreset": "x64-debug",
             "displayName": "Build Windows x64 Debug Product",
@@ -365,6 +522,27 @@
             "configurePreset": "x64-asan",
             "displayName": "Build Windows x64 Address Sanitizer Product",
             "description": "Build Windows x64 Address Sanitizer Product",
+            "configuration": "Debug"
+        },
+        {
+            "name": "x64-debug-core",
+            "configurePreset": "x64-debug-core",
+            "displayName": "Build Windows x64 Debug Core Focus",
+            "description": "Build only focused shared runtime tests for x64 Debug",
+            "configuration": "Debug"
+        },
+        {
+            "name": "x64-profile-core",
+            "configurePreset": "x64-profile-core",
+            "displayName": "Build Windows x64 Profile Core Focus",
+            "description": "Build only focused shared runtime tests for x64 Profile",
+            "configuration": "Release"
+        },
+        {
+            "name": "x64-asan-core",
+            "configurePreset": "x64-asan-core",
+            "displayName": "Build Windows x64 Address Sanitizer Core Focus",
+            "description": "Build only focused shared runtime tests for x64 ASan",
             "configuration": "Debug"
         },
         {
@@ -453,6 +631,42 @@
             "execution": {
                 "noTestsAction": "error"
             }
+        },
+        {
+            "name": "x64-debug-core",
+            "configurePreset": "x64-debug-core",
+            "displayName": "Test Windows x64 Debug Core Focus",
+            "configuration": "Debug",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-profile-core",
+            "configurePreset": "x64-profile-core",
+            "displayName": "Test Windows x64 Profile Core Focus",
+            "configuration": "Release",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
+        },
+        {
+            "name": "x64-asan-core",
+            "configurePreset": "x64-asan-core",
+            "displayName": "Test Windows x64 Address Sanitizer Core Focus",
+            "configuration": "Debug",
+            "output": {
+                "outputOnFailure": true
+            },
+            "execution": {
+                "noTestsAction": "error"
+            }
         }
     ],
     "workflowPresets": [
@@ -505,19 +719,6 @@
                 {
                     "type": "build",
                     "name": "vc6-releaselog"
-                }
-            ]
-        },
-        {
-            "name": "vc6-weekly",
-            "steps": [
-                {
-                    "type": "configure",
-                    "name": "vc6-weekly"
-                },
-                {
-                    "type": "build",
-                    "name": "vc6-weekly"
                 }
             ]
         },

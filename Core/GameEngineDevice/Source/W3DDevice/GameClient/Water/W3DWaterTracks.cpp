@@ -61,7 +61,27 @@
 #include "WW3D2/rinfo.h"
 #include "WW3D2/camera.h"
 #include "WW3D2/assetmgr.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
+
+// Keep the source-level contract explicit without importing the renderer namespace.
+using rts::render::GAME_RENDER_STATE_DEPTH_FUNCTION;
+using rts::render::GAME_RENDER_STATE_Z_BIAS;
+using rts::render::GAME_TEXTURE_ARGUMENT_CURRENT;
+using rts::render::GAME_TEXTURE_ARGUMENT_TEXTURE;
+using rts::render::GAME_TEXTURE_STAGE_ALPHA_OPERATION;
+using rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT1;
+using rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT2;
+using rts::render::GAME_TEXTURE_STAGE_COLOR_OPERATION;
+using rts::render::GAME_TRANSFORM_WORLD;
+using rts::render::GAME_VERTEX_XYZDUV1;
+using rts::render::RENDER_BUFFER_UPDATE_DISCARD;
+using rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
+using rts::render::RENDER_BUFFER_VERTEX;
+using rts::render::RENDER_COMPARE_EQUAL;
+using rts::render::RENDER_COMPARE_LESS_EQUAL;
+using rts::render::RENDER_TEXTURE_OP_MODULATE;
+
+#include "WW3D2/nativew3dbuffercompat.h"
 
 //number of vertex pages allocated - allows double buffering of vertex updates.
 //while one is being rendered, another is being updated.  Improves HW parallelism.
@@ -312,16 +332,21 @@ Int WaterTracksObj::render(DX8VertexBufferClass	*vertexBuffer, Int batchStart)
 
 	if (batchStart < (WATER_VB_PAGES*WATER_STRIP_X*WATER_STRIP_Y-m_x*m_y))
 	{	//we have room in current VB, append new verts
-		lockFlags = D3DLOCK_NOOVERWRITE;
+		lockFlags = NATIVE_BUFFER_LOCK_NO_OVERWRITE;
 		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE;
-		if(vertexBuffer->Get_DX8_Vertex_Buffer()->Lock(batchStart*vertexBuffer->FVF_Info().Get_FVF_Size(),m_x*m_y*vertexBuffer->FVF_Info().Get_FVF_Size(),(unsigned char**)&vb,lockFlags) != D3D_OK)
+		if (!vertexBuffer->Lock_Buffer(
+			static_cast<size_t>(batchStart) * vertexBuffer->FVF_Info().Get_FVF_Size(),
+			static_cast<size_t>(m_x) * m_y * vertexBuffer->FVF_Info().Get_FVF_Size(),
+			lockFlags, reinterpret_cast<void **>(&vb)))
 			return batchStart;
 	}
 	else
 	{	//ran out of room in last VB, request a substitute VB.
-		lockFlags = D3DLOCK_DISCARD;
+		lockFlags = NATIVE_BUFFER_LOCK_DISCARD;
 		bufferUpdateMode = rts::render::RENDER_BUFFER_UPDATE_DISCARD;
-		if(vertexBuffer->Get_DX8_Vertex_Buffer()->Lock(0,m_x*m_y*vertexBuffer->FVF_Info().Get_FVF_Size(),(unsigned char**)&vb,lockFlags) != D3D_OK)
+		if (!vertexBuffer->Lock_Buffer(0,
+			static_cast<size_t>(m_x) * m_y * vertexBuffer->FVF_Info().Get_FVF_Size(),
+			lockFlags, reinterpret_cast<void **>(&vb)))
 			return batchStart;
 		batchStart=0;	//reset start of page to first vertex
 	}
@@ -481,16 +506,17 @@ Int WaterTracksObj::render(DX8VertexBufferClass	*vertexBuffer, Int batchStart)
 	const size_t bufferUpdateBytes = static_cast<size_t>(m_x) * m_y *
 		vertexBuffer->FVF_Info().Get_FVF_Size();
 	vertexBuffer->Mark_Changed_Range(batchStart, m_x * m_y, lockFlags);
-	Publish_Render_Buffer_Change(
-		vertexBuffer->Get_DX8_Vertex_Buffer(),
+	rts::render::Publish_Render_Buffer_Change(
+		vertexBuffer,
 		rts::render::RENDER_BUFFER_VERTEX, lockedVertices, bufferUpdateBytes,
 		bufferUpdateOffset, bufferUpdateMode, vertexBuffer->Get_Generation());
-	vertexBuffer->Get_DX8_Vertex_Buffer()->Unlock();
+	if (!vertexBuffer->Unlock_Buffer())
+		return batchStart;
 
 	Int idxCount=(m_y-1)*(m_x*2+2) - 2;	//index count
 
-	DX8Wrapper::Set_Index_Buffer(TheWaterTracksRenderSystem->m_indexBuffer,batchStart);
-	DX8Wrapper::Draw_Strip(0,idxCount-2,0,m_x*m_y);	//there are always n-2 primitives for n index strip.
+	rts::render::SetGameIndexBuffer(TheWaterTracksRenderSystem->m_indexBuffer,batchStart);
+	rts::render::DrawGameStrip(0,idxCount-2,0,m_x*m_y);	//there are always n-2 primitives for n index strip.
 
 	return batchStart+m_x*m_y;	//return new offset into unused area of vertex buffer
 }
@@ -687,7 +713,7 @@ void WaterTracksRenderSystem::ReAcquireResources()
 		}
 	}
 
-	m_vertexBuffer=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZDUV1,m_stripSizeX*m_stripSizeY*WATER_VB_PAGES,DX8VertexBufferClass::USAGE_DYNAMIC));
+	m_vertexBuffer=NEW_REF(DX8VertexBufferClass,(GAME_VERTEX_XYZDUV1,m_stripSizeX*m_stripSizeY*WATER_VB_PAGES,DX8VertexBufferClass::USAGE_DYNAMIC));
 	m_batchStart=0;
 }
 
@@ -872,8 +898,8 @@ Try improving the fit to vertical surfaces like cliffs.
 	if (TheGlobalData->m_usingWaterTrackEditor)
 		TestWaterUpdate();
 
-	if (!DX8Wrapper::Is_D3D11_Backend_Active())
-		update();	//legacy D3D8 advances tracks when their render queue is flushed
+	if (!rts::render::IsNativeGameRendererActive())
+		update();	//The historical renderer advances tracks when its queue is flushed.
 
 	rinfo.Camera.Apply();
 
@@ -899,15 +925,15 @@ Try improving the fit to vertical surfaces like cliffs.
 	diffuseLight=REAL_TO_INT(shadeB) | (REAL_TO_INT(shadeG) << 8) | (REAL_TO_INT(shadeR) << 16);
 
 	Matrix3D tm(1);	///set to identity
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,tm);	//position the water surface
+	rts::render::SetGameTransform(GAME_TRANSFORM_WORLD,tm);	//position the water surface
 
-	DX8Wrapper::Set_Material(m_vertexMaterialClass);
-	DX8Wrapper::Set_Shader(m_shaderClass);
+	rts::render::SetGameMaterial(m_vertexMaterialClass);
+	rts::render::SetGameShader(m_shaderClass);
 
-	DX8Wrapper::Set_Vertex_Buffer(m_vertexBuffer);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZBIAS,8);
+	rts::render::SetGameVertexBuffer(m_vertexBuffer);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_Z_BIAS,8);
 	//Force apply of render states so we can override them.
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 	if (TheTerrainRenderObject->getShroud())
 	{
@@ -915,14 +941,14 @@ Try improving the fit to vertical surfaces like cliffs.
 		W3DShaderManager::setShader(W3DShaderManager::ST_SHROUD_TEXTURE, 1);
 
 		//modulate with shroud texture
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_TEXTURE );	//stage 1 texture
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_CURRENT );	//previous stage texture
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_MODULATE );
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );	//stage 1 texture
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );	//previous stage texture
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
 
 		//Shroud shader uses z-compare of EQUAL which wouldn't work on water because it doesn't
 		//write to the zbuffer.  Change to LESSEQUAL.
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC, D3DCMP_LESSEQUAL);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION, RENDER_COMPARE_LESS_EQUAL);
 	}
 
 	Int LastTextureType=-1;
@@ -932,7 +958,7 @@ Try improving the fit to vertical surfaces like cliffs.
 	while( mod )
 	{
 		if (LastTextureType != mod->m_type)
-			DX8Wrapper::Set_Texture(0,mod->m_stageZeroTexture);
+			rts::render::SetGameTexture(0,mod->m_stageZeroTexture);
 
 		Int vertsRendered=mod->render(m_vertexBuffer,m_batchStart);
 
@@ -941,11 +967,11 @@ Try improving the fit to vertical surfaces like cliffs.
 		mod = mod->m_nextSystem;
 	}
 
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZBIAS,0);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_Z_BIAS,0);
 
 	if (TheTerrainRenderObject->getShroud())
 	{	//we used the shroud shader, so reset it.
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC, D3DCMP_EQUAL);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION, RENDER_COMPARE_EQUAL);
 		W3DShaderManager::resetShader(W3DShaderManager::ST_SHROUD_TEXTURE);
 	}
 }
@@ -1309,7 +1335,7 @@ void TestWaterUpdate()
 				Real ydiff=terrainPointEnd.y - terrainPointStart.y;
 				if (sqrt (xdiff * xdiff + ydiff * ydiff) <= waveTypeInfo[currentWaveType].m_finalWidth)
 				{	TheDisplay->drawLine(mouseAnchor.x, mouseAnchor.y, screenPoint.x, screenPoint.y,1,0xffccccff);
-					DX8Wrapper::Invalidate_Cached_Render_States();
+					rts::render::InvalidateGameRenderStateCache();
 					ShaderClass::Invalidate();
 				}
 

@@ -4,6 +4,9 @@ add_executable(core_native_w3d2_tests
 
 target_link_libraries(core_native_w3d2_tests PRIVATE
     core_ww3d2_native
+    core_wwstub
+    core_wwlib
+    winmm
 )
 
 set_target_properties(core_native_w3d2_tests PROPERTIES

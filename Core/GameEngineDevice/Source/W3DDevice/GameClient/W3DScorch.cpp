@@ -18,13 +18,20 @@
 
 #include "W3DDevice/GameClient/W3DScorch.h"
 
+#include "WW3D2/dx8vertexbuffer.h"
+#include "WW3D2/dx8indexbuffer.h"
+#include "WW3D2/shader.h"
 #include "Common/GameMemory.h"
 #include "Common/GameType.h"
 #include "Common/GlobalData.h"
 #include "Common/MapObject.h"
 #include "W3DDevice/GameClient/TerrainTex.h"
 #include "W3DDevice/GameClient/WorldHeightMap.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
+
+// Keep the source-level contract explicit without importing the renderer namespace.
+using rts::render::GAME_VERTEX_XYZDUV1;
+
 
 W3DScorch::W3DScorch(bool deduplicateScorches)
   : m_vertexScorch(nullptr)
@@ -41,7 +48,7 @@ W3DScorch::~W3DScorch() { freeBuffers(); }
 void W3DScorch::allocateBuffers()
 {
 	freeBuffers();
-	m_vertexScorch = NEW_REF(DX8VertexBufferClass, (DX8_FVF_XYZDUV1, MAX_SCORCH_VERTEX, DX8VertexBufferClass::USAGE_DEFAULT));
+	m_vertexScorch = NEW_REF(DX8VertexBufferClass, (GAME_VERTEX_XYZDUV1, MAX_SCORCH_VERTEX, DX8VertexBufferClass::USAGE_DEFAULT));
 	m_indexScorch = NEW_REF(DX8IndexBufferClass, (MAX_SCORCH_INDEX));
 	m_scorchTexture = NEW ScorchTextureClass;
 	invalidateBuffers();
@@ -122,12 +129,12 @@ void W3DScorch::drawScorches(WorldHeightMap& map)
 	{
 		return;
 	}
-	DX8Wrapper::Set_Index_Buffer(m_indexScorch, 0);
-	DX8Wrapper::Set_Vertex_Buffer(m_vertexScorch);
-	DX8Wrapper::Set_Shader(ShaderClass::_PresetAlphaShader);
+	rts::render::SetGameIndexBuffer(m_indexScorch, 0);
+	rts::render::SetGameVertexBuffer(m_vertexScorch);
+	rts::render::SetGameShader(ShaderClass::_PresetAlphaShader);
 
-	DX8Wrapper::Set_Texture(0, m_scorchTexture);
-	DX8Wrapper::Draw_Triangles(0, m_curNumScorchIndices / 3, 0, m_curNumScorchVertices);
+	rts::render::SetGameTexture(0, m_scorchTexture);
+	rts::render::DrawGameTriangles(0, m_curNumScorchIndices / 3, 0, m_curNumScorchVertices);
 }
 
 static Real getMapHeight(WorldHeightMap& map, Int x, Int y)
@@ -157,7 +164,7 @@ void W3DScorch::updateScorches(WorldHeightMap& map)
 	Real shadeR = (TheGlobalData->m_terrainAmbient[0].red + TheGlobalData->m_terrainDiffuse[0].red) / 2.0f;
 	Real shadeG = (TheGlobalData->m_terrainAmbient[0].green + TheGlobalData->m_terrainDiffuse[0].green) / 2.0f;
 	Real shadeB = (TheGlobalData->m_terrainAmbient[0].blue + TheGlobalData->m_terrainDiffuse[0].blue) / 2.0f;
-	UnsignedInt diffuse = DX8Wrapper::Convert_Color_Clamp(Vector4(shadeR, shadeG, shadeB, 1.0f));
+	UnsignedInt diffuse = rts::render::ConvertGameColorClamp(Vector4(shadeR, shadeG, shadeB, 1.0f));
 
 	// TheSuperHackers @info Scorches are written in reverse order to ensure that the last added scorches fit in the buffers.
 	for (std::deque<TScorch>::reverse_iterator it = m_scorches.rbegin(); it != m_scorches.rend(); ++it)

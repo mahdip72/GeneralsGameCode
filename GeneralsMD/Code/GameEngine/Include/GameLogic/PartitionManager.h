@@ -92,6 +92,7 @@ class Team;
 class ThingTemplate;
 class GhostObject;
 class CommandButton;
+class ImmutableSpatialQueryRuntime;
 
 enum CommandSourceType CPP_11(: Int);
 
@@ -535,7 +536,8 @@ public:
 		is intersecting the ground, add it to the list as a possible
 		collide-with-ground.
 	*/
-	void addPossibleCollisions(PartitionContactList *ctList);
+	void addPossibleCollisions(PartitionContactList *ctList,
+		UnsignedInt ownerOrdinal);
 
 	Object *getObject() { return m_object; }				///< return the Object that owns this module
 	const Object *getObject() const { return m_object; }				///< return the Object that owns this module
@@ -1231,6 +1233,8 @@ protected:
 */
 class PartitionManager : public SubsystemInterface, public Snapshot
 {
+	friend class ImmutableSpatialQueryRuntime;
+	friend class PartitionData;
 
 private:
 
@@ -1250,6 +1254,11 @@ private:
 	PartitionCell*	m_cells;					///< array of cells
 	PartitionData*	m_dirtyModules;
 	Bool						m_updatedSinceLastReset;	///< Used to force a return of OBJECTSHROUD_INVALID before update has been called.
+#if defined(_WIN64)
+	UnsignedInt			m_immutableSpatialObjectCount;
+	UnsignedInt			m_immutableSpatialMemberCount;
+	UnsignedInt			*m_immutableSpatialCellMemberCounts;
+#endif
 
 	std::queue<SightingInfo *> m_pendingUndoShroudReveals;	///< Anything can queue up an Undo to happen later. This is a queue, because "later" is a constant
 

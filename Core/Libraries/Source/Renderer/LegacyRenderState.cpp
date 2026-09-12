@@ -2,6 +2,9 @@
 
 #include <math.h>
 
+class TextureBaseClass;
+class TextureClass;
+
 namespace rts
 {
 namespace render
@@ -11,6 +14,8 @@ namespace
 LegacyLogicalState g_trackedLogicalState;
 bool g_trackedPipelineStateValid = false;
 bool g_legacyStatePublicationFailed = false;
+TextureBaseClass *g_publishedRenderTextures[LEGACY_TEXTURE_STAGE_COUNT] = { 0 };
+unsigned int g_renderTextureUseCount = 0;
 }
 
 RenderFloat4::RenderFloat4() : x(0.0f), y(0.0f), z(0.0f), w(0.0f) {}
@@ -159,7 +164,7 @@ LegacyFixedFunctionConstants::LegacyFixedFunctionConstants() :
 	world(), view(), projection(), material(), fog(),
 	globalAmbient(0.0f, 0.0f, 0.0f, 1.0f)
 {
-	// Keep an uninitialized-but-enabled D3D8 clip plane on the accepted side
+	// Keep an uninitialized-but-enabled legacy clip plane on the accepted side
 	// of the plane. This prevents a neutral state from clipping the whole
 	// frame before the caller supplies its equation.
 	for (unsigned int index = 0; index < LEGACY_CLIP_PLANE_COUNT; ++index)
@@ -465,6 +470,11 @@ void ResetTrackedLegacyState()
 	g_trackedLogicalState = LegacyLogicalState();
 	g_trackedPipelineStateValid = false;
 	g_legacyStatePublicationFailed = false;
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		g_publishedRenderTextures[stage] = 0;
+	}
+	g_renderTextureUseCount = 0;
 }
 
 void SeedTrackedLegacyPipelineState()
@@ -497,7 +507,7 @@ void TrackLegacyShaderBits(unsigned int shaderBits)
 		return;
 	}
 
-	// ShaderClass owns only this subset of D3D8 state.  Decoding into a fresh
+	// ShaderClass owns only this subset of legacy state. Decoding into a fresh
 	// LegacyPipelineState and replacing the whole tracked pipeline erases live
 	// lighting, material sources, texture factor, clipping, stencil, fill and
 	// depth-bias state.  The retail Set_Shader path never resets those values.
@@ -690,6 +700,51 @@ bool GetTrackedLegacyTextureStage(unsigned int index,
 	return true;
 }
 
+void Publish_Render_Texture_Stage(unsigned int stage,
+	TextureBaseClass *texture)
+{
+	if (stage >= LEGACY_TEXTURE_STAGE_COUNT)
+	{
+		return;
+	}
+	g_publishedRenderTextures[stage] = texture;
+	TrackLegacyTexturePresence(stage, texture != 0);
+}
+
+TextureBaseClass *Get_Published_Render_Texture_Stage(unsigned int stage)
+{
+	return stage < LEGACY_TEXTURE_STAGE_COUNT ?
+		g_publishedRenderTextures[stage] : 0;
+}
+
+void Unpublish_Render_Texture(TextureBaseClass *texture)
+{
+	if (texture == 0)
+	{
+		return;
+	}
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		if (g_publishedRenderTextures[stage] == texture)
+		{
+			Publish_Render_Texture_Stage(stage, 0);
+		}
+	}
+}
+
+void Record_Render_Texture_Use(TextureClass *texture)
+{
+	if (texture != 0)
+	{
+		++g_renderTextureUseCount;
+	}
+}
+
+unsigned int Get_Render_Texture_Use_Count()
+{
+	return g_renderTextureUseCount;
+}
+
 bool TrackLegacyTexturePresence(unsigned int index, bool present)
 {
 	if (index >= LEGACY_TEXTURE_STAGE_COUNT)
@@ -727,7 +782,7 @@ bool TrackLegacyClipPlane(unsigned int index, const float *plane)
 	return true;
 }
 
-RenderFloat4 DecodeLegacyD3D8Ambient(unsigned int color)
+RenderFloat4 DecodeLegacyAmbientColor(unsigned int color)
 {
 	return RenderFloat4(
 		static_cast<float>((color >> 16) & 0xffU) / 255.0f,
@@ -763,7 +818,7 @@ bool IsLegacyProjectedTextureTransformValid(unsigned int count,
 	{
 		return false;
 	}
-	// D3D8 projection is defined for COUNT2/COUNT3/COUNT4.  COUNT1 has no
+	// Legacy projection is defined for COUNT2/COUNT3/COUNT4. COUNT1 has no
 	// homogeneous divisor and D3DTTFF_PROJECTED must not be accepted with it.
 	return !projected || count >= 2U;
 }

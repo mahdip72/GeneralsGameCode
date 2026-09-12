@@ -42,6 +42,10 @@
 #include "GameLogic/Module/HordeUpdate.h"
 #include "GameClient/Drawable.h"
 
+#if defined(_WIN64)
+#include <algorithm>
+#endif
+
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
@@ -242,6 +246,91 @@ void HordeUpdate::onDrawableBoundToObject()
 //-------------------------------------------------------------------------------------------------
 UpdateSleepTime HordeUpdate::update()
 {
+	return updateImpl(nullptr, 0, FALSE);
+}
+
+#if defined(_WIN64)
+//-------------------------------------------------------------------------------------------------
+Bool HordeUpdate::isObjectComputationScanDue(UnsignedInt frame) const
+{
+	const Object *obj = getObject();
+	const HordeUpdateModuleData *data = getHordeUpdateModuleData();
+	return obj != nullptr && (obj->isKindOf(KINDOF_INFANTRY) ||
+		frame > m_lastHordeRefreshFrame + data->m_updateRate);
+}
+
+//-------------------------------------------------------------------------------------------------
+UpdateSleepTime HordeUpdate::objectComputationSleepTime() const
+{
+	return getObject()->isKindOf(KINDOF_INFANTRY) ?
+		UPDATE_SLEEP(getHordeUpdateModuleData()->m_updateRate) :
+		UPDATE_SLEEP_NONE;
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool HordeUpdate::captureObjectComputationOwnerSnapshot(UnsignedInt frame,
+	UnsignedInt moduleOrdinal, ObjectComputationOwnerSnapshot &snapshot) const
+{
+	const Object *obj = getObject();
+	if (obj == nullptr || !isObjectComputationScanDue(frame)) return FALSE;
+	snapshot.frame = frame;
+	snapshot.wakePriority = friend_getPriority();
+	snapshot.motionGeneration = obj->getMotionGeneration();
+	snapshot.lastRefreshFrame = m_lastHordeRefreshFrame;
+	snapshot.moduleOrdinal = moduleOrdinal;
+	snapshot.inHorde = m_inHorde;
+	snapshot.trueHordeMember = m_trueHordeMember;
+	snapshot.moduleData = getHordeUpdateModuleData();
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool HordeUpdate::validateObjectComputationOwnerSnapshot(
+	const ObjectComputationOwnerSnapshot &snapshot) const
+{
+	const Object *obj = getObject();
+	return obj != nullptr && TheGameLogic->getFrame() == snapshot.frame &&
+		friend_getPriority() == snapshot.wakePriority &&
+		obj->getMotionGeneration() == snapshot.motionGeneration &&
+		m_lastHordeRefreshFrame == snapshot.lastRefreshFrame &&
+		m_inHorde == snapshot.inHorde &&
+		m_trueHordeMember == snapshot.trueHordeMember &&
+		getHordeUpdateModuleData() == snapshot.moduleData &&
+		isObjectComputationScanDue(snapshot.frame);
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool HordeUpdate::collectObjectComputationCandidateOracle(ObjectID *objectIDs,
+	UnsignedInt capacity, UnsignedInt *count) const
+{
+	if (objectIDs == nullptr || count == nullptr) return FALSE;
+	*count = 0;
+	PartitionFilter *filters[] = { nullptr };
+	SimpleObjectIterator *iter = ThePartitionManager->iterateObjectsInRange(
+		getObject(), getHordeUpdateModuleData()->m_minDist,
+		FROM_BOUNDINGSPHERE_3D, filters);
+	MemoryPoolObjectHolder hold(iter);
+	for (Object *candidate = iter->first(); candidate; candidate = iter->next())
+	{
+		if (*count == capacity) return FALSE;
+		objectIDs[(*count)++] = candidate->getID();
+	}
+	std::sort(objectIDs, objectIDs + *count);
+	return TRUE;
+}
+
+//-------------------------------------------------------------------------------------------------
+UpdateSleepTime HordeUpdate::updateFromObjectComputationCandidates(
+	Object *const *candidates, UnsignedInt candidateCount)
+{
+	return updateImpl(candidates, candidateCount, TRUE);
+}
+#endif
+
+//-------------------------------------------------------------------------------------------------
+UpdateSleepTime HordeUpdate::updateImpl(Object *const *preparedCandidates,
+	UnsignedInt preparedCandidateCount, Bool usePreparedCandidates)
+{
 
 
 	//This code handles decals and ONLY decals!
@@ -263,11 +352,43 @@ UpdateSleepTime HordeUpdate::update()
 		m_lastHordeRefreshFrame = TheGameLogic->getFrame();
 
 		PartitionFilterHordeMember hmFilter(getObject(), md);
-		PartitionFilter *filters[] = { &hmFilter, nullptr };
-		SimpleObjectIterator *iter = ThePartitionManager->iterateObjectsInRange(getObject(), md->m_minDist, FROM_BOUNDINGSPHERE_3D, filters);
-		MemoryPoolObjectHolder hold(iter);
+		Int eligibleCount = 0;
+		Bool rubOff = FALSE;
+		MemoryPoolObjectHolder hold;
+		if (usePreparedCandidates)
+		{
+			for (UnsignedInt candidateIndex = 0;
+				candidateIndex != preparedCandidateCount; ++candidateIndex)
+			{
+				Object *other = preparedCandidates[candidateIndex];
+				if (other != nullptr && hmFilter.allow(other)) ++eligibleCount;
+			}
+		}
+		else
+		{
+			PartitionFilter *filters[] = { &hmFilter, nullptr };
+			SimpleObjectIterator *iter = ThePartitionManager->iterateObjectsInRange(
+				getObject(), md->m_minDist, FROM_BOUNDINGSPHERE_3D, filters);
+			hold.hold(iter);
+			eligibleCount = iter->getCount();
+			if (eligibleCount < md->m_minCount - 1)
+			{
+				const Real rubOffRadiusSq = sqr(md->m_rubOffRadius);
+				for (Object *other = iter->first(); other; other = iter->next())
+				{
+					HordeUpdateInterface *hui = getHUI(other);
+					if (hui != nullptr && hui->isTrueHordeMember() &&
+						ThePartitionManager->getDistanceSquared(getObject(), other,
+							FROM_CENTER_2D) <= rubOffRadiusSq)
+					{
+						rubOff = TRUE;
+						break;
+					}
+				}
+			}
+		}
 
-		if ((iter->getCount() >= md->m_minCount - 1) )//we really are in the thick part of the horde
+		if ((eligibleCount >= md->m_minCount - 1) )//we really are in the thick part of the horde
 		{
 			m_inHorde = TRUE;
 			m_trueHordeMember = TRUE;
@@ -277,22 +398,25 @@ UpdateSleepTime HordeUpdate::update()
 			m_inHorde = FALSE;
 			m_trueHordeMember = FALSE;/// unless...
 
-			Real rubOffRadiusSq = sqr(md->m_rubOffRadius);
-			for (Object* other = iter->first(); other; other = iter->next())
+			if (usePreparedCandidates)
 			{
-				HordeUpdateInterface* hui = getHUI(other);
-				if ( hui != nullptr && hui->isTrueHordeMember() )
+				const Real rubOffRadiusSq = sqr(md->m_rubOffRadius);
+				for (UnsignedInt candidateIndex = 0;
+					candidateIndex != preparedCandidateCount; ++candidateIndex)
 				{
-					Real dist = ThePartitionManager->getDistanceSquared(getObject(), other, FROM_CENTER_2D);
-
-					if (dist <= rubOffRadiusSq )
+					Object *other = preparedCandidates[candidateIndex];
+					if (other == nullptr || !hmFilter.allow(other)) continue;
+					HordeUpdateInterface *hui = getHUI(other);
+					if (hui != nullptr && hui->isTrueHordeMember() &&
+						ThePartitionManager->getDistanceSquared(getObject(), other,
+							FROM_CENTER_2D) <= rubOffRadiusSq)
 					{
-						m_inHorde = TRUE;
+						rubOff = TRUE;
 						break;
 					}
-
 				}
 			}
+			m_inHorde = rubOff;
 		}
 
 		AIUpdateInterface *ai = getObject()->getAIUpdateInterface();

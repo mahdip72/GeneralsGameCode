@@ -18,7 +18,9 @@ enum SkirmishAIReplayEpochType
 {
 	SKIRMISH_AI_REPLAY_EPOCH_LEGACY = 0,
 	SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS = 1,
-	SKIRMISH_AI_REPLAY_EPOCH_CURRENT = 2
+	SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG = 2,
+	SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG = 3,
+	SKIRMISH_AI_REPLAY_EPOCH_CURRENT = SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG
 };
 
 inline const WideChar *GetSkirmishAILivenessReplayMarker()
@@ -26,9 +28,14 @@ inline const WideChar *GetSkirmishAILivenessReplayMarker()
 	return L" [SkirmishAILiveness=1]";
 }
 
-inline const WideChar *GetSkirmishAICurrentReplayMarker()
+inline const WideChar *GetSkirmishAIAdaptiveGlobalRngReplayMarker()
 {
 	return L" [SkirmishAIEpoch=2]";
+}
+
+inline const WideChar *GetSkirmishAICurrentReplayMarker()
+{
+	return L" [SkirmishAIEpoch=3]";
 }
 
 inline const WideChar *GetSkirmishAIReplayMarkerPrefix()
@@ -60,15 +67,50 @@ inline void MarkReplayVersionForSkirmishAICurrentEpoch(UnicodeString& versionTim
 		versionTimeString.concat(GetSkirmishAICurrentReplayMarker());
 }
 
+inline void MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(UnicodeString& versionTimeString)
+{
+	if (CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAIReplayMarkerPrefix()) == 0)
+		versionTimeString.concat(GetSkirmishAIAdaptiveGlobalRngReplayMarker());
+}
+
+inline void MarkReplayVersionForSkirmishAIRecordingCapability(
+	UnicodeString& versionTimeString, Bool supportsCounterRngPlanning)
+{
+	if (supportsCounterRngPlanning)
+		MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
+	else
+		MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(versionTimeString);
+}
+
+inline Bool BuildSupportsSkirmishAICounterRngPlanning()
+{
+#if defined(_WIN64)
+	return TRUE;
+#else
+	return FALSE;
+#endif
+}
+
+inline void MarkReplayVersionForSkirmishAIRecordingEpoch(UnicodeString& versionTimeString)
+{
+	MarkReplayVersionForSkirmishAIRecordingCapability(
+		versionTimeString, BuildSupportsSkirmishAICounterRngPlanning());
+}
+
 inline Int GetSkirmishAIReplayEpoch(const UnicodeString& versionTimeString)
 {
 	Int livenessMarkerCount = CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAILivenessReplayMarker());
+	Int adaptiveMarkerCount = CountSkirmishAIReplayMarkers(
+		versionTimeString, GetSkirmishAIAdaptiveGlobalRngReplayMarker());
 	Int currentMarkerCount = CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAICurrentReplayMarker());
 	Int markerLikeCount = CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAIReplayMarkerPrefix());
-	if (markerLikeCount != 1 || livenessMarkerCount + currentMarkerCount != 1)
+	if (markerLikeCount != 1 || livenessMarkerCount + adaptiveMarkerCount + currentMarkerCount != 1)
 		return SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
 	if (currentMarkerCount == 1 && versionTimeString.endsWith(GetSkirmishAICurrentReplayMarker()))
 		return SKIRMISH_AI_REPLAY_EPOCH_CURRENT;
+	if (adaptiveMarkerCount == 1 &&
+		versionTimeString.endsWith(GetSkirmishAIAdaptiveGlobalRngReplayMarker()))
+		return SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG;
 	if (livenessMarkerCount == 1 && versionTimeString.endsWith(GetSkirmishAILivenessReplayMarker()))
 		return SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS;
 	return SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
@@ -81,5 +123,12 @@ inline Bool ReplayVersionUsesSkirmishAILivenessRecovery(const UnicodeString& ver
 
 inline Bool ShouldUseSkirmishAICurrentBehavior(Bool isReplayGame, Int replayEpoch)
 {
-	return !isReplayGame || replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT;
+	return !isReplayGame ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
+}
+
+inline Bool ShouldUseSkirmishAICounterRng(Bool isReplayGame, Int replayEpoch)
+{
+	return !isReplayGame || replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }

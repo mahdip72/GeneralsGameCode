@@ -46,9 +46,10 @@
 //----------------------------------------------------------------------------
 
 #include "Common/GameMemory.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RendererDevice.h"
 #include "WW3D2/texture.h"
 #include "WW3D2/textureloader.h"
+#include "Renderer/RenderTexturePublication.h"
 #include "W3DDevice/GameClient/W3DVideoBuffer.h"
 
 //----------------------------------------------------------------------------
@@ -108,11 +109,28 @@ W3DVideoBuffer::W3DVideoBuffer( VideoBuffer::Type format )
 	m_surface(nullptr),
 	m_surfaceLocked(FALSE),
 	m_lockedMemory(nullptr),
-	m_framePublished(FALSE)
+	m_nativePublicationPath(FALSE),
+	m_nativePublicationPending(FALSE)
 {
 
 }
 
+//============================================================================
+// W3DVideoBuffer::UsesNativeD3D11PublicationPath
+//============================================================================
+
+Bool W3DVideoBuffer::UsesNativeD3D11PublicationPath()
+{
+#if defined(_WIN64)
+	const rts::render::RenderBackend backend =
+		rts::render::RequestedRenderBackend();
+	return backend == rts::render::RENDER_BACKEND_D3D11 &&
+		rts::render::IsRenderBackendSupported(backend) &&
+		rts::render::IsNativeD3D11PublicationActive() ? TRUE : FALSE;
+#else
+	return FALSE;
+#endif
+}
 
 //============================================================================
 // W3DVideoBuffer::SetBuffer
@@ -126,8 +144,17 @@ Bool W3DVideoBuffer::allocate( UnsignedInt width, UnsignedInt height )
 	m_height = height;
 	m_textureWidth = width;
 	m_textureHeight = height;
-	if (DX8Wrapper::Is_D3D11_Backend_Active())
+	m_nativePublicationPath = UsesNativeD3D11PublicationPath();
+	if (m_nativePublicationPath)
 	{
+		// The native lock surface exposes canonical BGRA8 bytes. Refuse legacy
+		// packed decoder layouts instead of allowing them to partially overwrite
+		// a four-byte native row; the video player can select its deterministic
+		// unsupported-format fallback.
+		if (m_format != TYPE_X8R8G8B8)
+		{
+			return FALSE;
+		}
 		// Preserve native 4K dimensions without accepting malformed movies that
 		// exceed the bridge's bounded full-level publication contract.
 		const UnsignedInt max_texture_dimension = 16384;
@@ -207,40 +234,28 @@ void*		W3DVideoBuffer::lock()
 		mem = m_surface->Lock( (Int*) &m_pitch );
 		m_surfaceLocked = mem != nullptr;
 		m_lockedMemory = mem;
-		m_framePublished = FALSE;
 		if (!m_surfaceLocked)
 		{
+			if (m_nativePublicationPath)
+			{
+				// A surface lock can fail while the device is lost even though
+				// Get_Surface_Level returned a wrapper. Keep the frame visibly
+				// invalid until a later lock/publication retry succeeds.
+				m_nativePublicationPending = TRUE;
+			}
 			m_surface->Release_Ref();
 			m_surface = nullptr;
 			m_lockedMemory = nullptr;
 		}
 	}
-
-	return mem;
-}
-
-//============================================================================
-// W3DVideoBuffer::publishLockedFrame
-//============================================================================
-
-Bool W3DVideoBuffer::publishLockedFrame()
-{
-	size_t slice_pitch = 0;
-	if (!m_surfaceLocked || m_lockedMemory == nullptr || m_texture == nullptr ||
-		m_format != TYPE_X8R8G8B8 || m_xPos != 0 || m_yPos != 0 ||
-		m_width != m_textureWidth || m_height != m_textureHeight ||
-		!ComputeDirectBGRA8SlicePitch(m_format, m_textureWidth,
-			m_textureHeight, m_pitch, &slice_pitch))
+	else if (m_nativePublicationPath)
 	{
-		return FALSE;
+		// A lost/invalid native surface must not be reported as a clean frame;
+		// the retained TextureClass CPU shadow will be retried on a later lock.
+		m_nativePublicationPending = TRUE;
 	}
 
-	const size_t row_pitch = static_cast<size_t>(m_pitch);
-
-	m_framePublished = Publish_Render_Texture_BGRA8_Change(
-		m_texture->Peek_D3D_Base_Texture(), m_lockedMemory, row_pitch,
-		slice_pitch) ? TRUE : FALSE;
-	return m_framePublished;
+	return mem;
 }
 
 //============================================================================
@@ -251,24 +266,35 @@ void		W3DVideoBuffer::unlock()
 {
 	if ( m_surface != nullptr )
 	{
-		const Bool frame_published = m_framePublished;
 		if (m_surfaceLocked)
 		{
-			m_surface->Unlock();
+			Bool publicationSucceeded = TRUE;
+#if defined(_WIN64)
+			if (m_nativePublicationPath)
+			{
+				publicationSucceeded = m_surface->Unlock_Native_Surface() ?
+					TRUE : FALSE;
+			}
+			else
+#endif
+			{
+				m_surface->Unlock();
+			}
+			if (m_nativePublicationPath)
+			{
+				m_nativePublicationPending = publicationSucceeded ? FALSE : TRUE;
+			}
 		}
 		m_surface->Release_Ref();
 		m_surface = nullptr;
 		m_surfaceLocked = FALSE;
 		m_lockedMemory = nullptr;
-		m_framePublished = FALSE;
-		// Decoded frames update the same managed legacy texture in place. Discard
-		// the D3D11 conversion unless the locked BGRA8 contents were published
-		// directly. Other formats, backends, and publication failures retain the
-		// conservative D3D8/Bink path.
-		if ( !frame_published && m_texture != nullptr )
+		// Native SurfaceClass::Unlock owns the one upload into the native texture.
+		// The legacy path still needs its dirty notification after Unlock; on x64,
+		// an inactive requested backend retains the previous defensive notification.
+		if (!m_nativePublicationPath && m_texture != nullptr)
 		{
-			Notify_Render_Texture_Changed(
-				m_texture->Peek_D3D_Base_Texture());
+			rts::render::NotifyTextureChanged(m_texture);
 		}
 	}
 }
@@ -279,7 +305,7 @@ void		W3DVideoBuffer::unlock()
 
 Bool		W3DVideoBuffer::valid()
 {
-	return m_texture != nullptr;
+	return m_texture != nullptr && !m_nativePublicationPending;
 }
 
 //============================================================================
@@ -297,6 +323,8 @@ void	W3DVideoBuffer::free()
 		m_texture = nullptr;
 	}
 	m_surface = nullptr;
+	m_nativePublicationPath = FALSE;
+	m_nativePublicationPending = FALSE;
 
 	VideoBuffer::free();
 }

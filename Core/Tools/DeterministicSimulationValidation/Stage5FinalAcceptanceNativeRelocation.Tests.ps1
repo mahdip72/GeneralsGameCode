@@ -1,0 +1,292 @@
+[CmdletBinding()]
+param(
+    [string]$ScratchRoot = '',
+    [string]$ModulePath = ''
+)
+
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+function Assert-RelocationTest {
+    param([bool]$Condition, [string]$Message)
+    if (-not $Condition) {
+        throw $Message
+    }
+}
+
+function Assert-RelocationThrows {
+    param(
+        [scriptblock]$Action,
+        [string]$Pattern,
+        [string]$Message
+    )
+    $caught = $null
+    try {
+        & $Action
+    }
+    catch {
+        $caught = $_.Exception
+    }
+    $errorText = if ($null -ne $caught) { $caught.Message } else { 'no exception' }
+    Assert-RelocationTest ($null -ne $caught -and $errorText -match $Pattern) "$Message (got '$errorText')"
+}
+
+function Write-RelocationText {
+    param([string]$Path, [string]$Text)
+    [IO.Directory]::CreateDirectory((Split-Path -Parent $Path)) | Out-Null
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Get-RelocationSha256 {
+    param([string]$Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        return (($sha.ComputeHash($bytes) | ForEach-Object {
+            $_.ToString('x2')
+        }) -join '').ToUpperInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Write-RelocationJson {
+    param([string]$Path, [object]$Value)
+    Write-RelocationText $Path ($Value | ConvertTo-Json -Depth 20)
+}
+
+function New-RelocationFixture {
+    param(
+        [ValidateSet('absolute', 'relative', 'ambiguous', 'no-match', 'alias')]
+        [string]$Mode,
+        [string]$Root
+    )
+
+    $nativeRoot = Join-Path $Root 'native'
+    $stagedRoot = Join-Path $Root 'staged'
+    [IO.Directory]::CreateDirectory($nativeRoot) | Out-Null
+    [IO.Directory]::CreateDirectory($stagedRoot) | Out-Null
+    $specs = @(
+        [pscustomobject]@{ sequence = 1; runNonce = '00000000-0000-4000-8000-000000000001'; sourceStem = 'runA'; candidateStem = 'runA' },
+        [pscustomobject]@{ sequence = 2; runNonce = '00000000-0000-4000-8000-000000000002'; sourceStem = 'case\logs'; candidateStem = 'Case\Logs' }
+    )
+    $cohortNonce = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    $children = New-Object 'Collections.Generic.List[object]'
+    foreach ($spec in $specs) {
+        $nativeRelative = 'native\{0:D4}.json' -f $spec.sequence
+        $nativePath = Join-Path $Root $nativeRelative
+        $rawDefinitions = New-Object 'Collections.Generic.List[object]'
+        foreach ($kind in @(
+            [pscustomobject]@{ name = 'raw-log'; leaf = 'raw.log'; text = 'raw' },
+            [pscustomobject]@{ name = 'timing'; leaf = 'timing.log'; text = 'timing' }
+        )) {
+            $sourceStem = $spec.sourceStem
+            $candidateStem = $spec.candidateStem
+            if ($Mode -ceq 'alias' -and $spec.sequence -eq 2 -and $kind.name -ceq 'raw-log') {
+                $sourceStem = 'runA'
+                $candidateStem = 'runA'
+            }
+            if ($Mode -ceq 'no-match' -and $spec.sequence -eq 1 -and $kind.name -ceq 'raw-log') {
+                $sourceStem = 'missing\never'
+            }
+            $candidateRelative = if ($Mode -ceq 'relative') {
+                'native\{0}\{1}' -f $candidateStem, $kind.leaf
+            }
+            else {
+                'staged\{0}\{1}' -f $candidateStem, $kind.leaf
+            }
+            $candidatePath = Join-Path $Root $candidateRelative
+            if (-not (Test-Path -LiteralPath $candidatePath -PathType Leaf)) {
+                Write-RelocationText $candidatePath "$($kind.text)-$($spec.sequence)"
+            }
+            $hash = Get-RelocationSha256 $candidatePath
+            $sourcePath = if ($Mode -ceq 'relative') {
+                '{0}\{1}' -f $candidateStem, $kind.leaf
+            }
+            else {
+                'H:\historical\{0}\{1}' -f $sourceStem, $kind.leaf
+            }
+            $rawDefinitions.Add([ordered]@{ name = $kind.name; path = $sourcePath; sha256 = $hash }) | Out-Null
+        }
+        $native = [ordered]@{
+            rawLogs = @($rawDefinitions.ToArray())
+            provenance = [ordered]@{ receiptPath = $nativeRelative }
+        }
+        Write-RelocationJson $nativePath $native
+        $nativeHash = Get-RelocationSha256 $nativePath
+        $children.Add([ordered]@{
+            sequence = $spec.sequence
+            runNonce = $spec.runNonce
+            nativeReceipt = [ordered]@{
+                path = $nativeRelative
+                sha256 = $nativeHash
+                producer = 'game-executable-stage5-performance-report-v5'
+                runNonce = $spec.runNonce
+                cohortNonce = $cohortNonce
+            }
+        }) | Out-Null
+    }
+    if ($Mode -ceq 'absolute' -or $Mode -ceq 'ambiguous' -or $Mode -ceq 'no-match' -or $Mode -ceq 'alias') {
+        foreach ($decoy in @('staged\logs\raw.log', 'staged\logs\timing.log', 'staged\other\raw.log', 'staged\other\timing.log')) {
+            $decoyPath = Join-Path $Root $decoy
+            if (-not (Test-Path -LiteralPath $decoyPath -PathType Leaf)) {
+                Write-RelocationText $decoyPath 'decoy'
+            }
+        }
+    }
+    if ($Mode -ceq 'ambiguous') {
+        Write-RelocationText (Join-Path $stagedRoot 'duplicate\runA\raw.log') 'ambiguous'
+    }
+    $hostReceiptPath = Join-Path $Root 'validation-results-receipt.json'
+    Write-RelocationJson $hostReceiptPath ([ordered]@{
+        trustDomain = 'host-runner'
+        provenance = [ordered]@{ children = @($children.ToArray()) }
+    })
+    return [pscustomobject]@{ root = $Root; receiptPath = $hostReceiptPath; nativeRoot = $nativeRoot }
+}
+
+function Invoke-RelocationBinding {
+    param([object]$Fixture)
+    return Get-Stage5FinalAcceptanceNativeRelocationBinding -Path $Fixture.receiptPath -EvidenceDirectory $Fixture.root
+}
+
+function Get-ChildBinding {
+    param([object]$Result, [int]$Sequence)
+    $matches = @($Result.children | Where-Object { [int]$_.sequence -eq $Sequence })
+    Assert-RelocationTest ($matches.Count -eq 1) "expected one relocation child for sequence $Sequence"
+    return $matches[0]
+}
+
+function Get-NamedRawBinding {
+    param([object]$Child, [string]$Name)
+    $matches = @($Child.nativeRawBindings | Where-Object { [string]$_.name -ceq $Name })
+    Assert-RelocationTest ($matches.Count -eq 1) "expected one '$Name' binding for sequence $($Child.sequence)"
+    return $matches[0]
+}
+
+function Enable-CandidateRelativeCounter {
+    param([object]$EvidenceModule, [Collections.IDictionary]$Counter)
+    $original = & $EvidenceModule { (Get-Command Get-Stage5FinalAcceptanceRelativePath -CommandType Function).ScriptBlock }
+    & $EvidenceModule {
+        param($originalFunction, $counter)
+        Set-Item Function:\script:Stage5OriginalRelativePath -Value $originalFunction
+        $script:Stage5CandidateRelativeCounter = $counter
+        $wrapper = {
+            param([string]$BaseDirectory, [string]$Path, [string]$Context)
+            if ($Context -match ' candidate$') {
+                $script:Stage5CandidateRelativeCounter['count'] = [int]$script:Stage5CandidateRelativeCounter['count'] + 1
+            }
+            & Stage5OriginalRelativePath $BaseDirectory $Path $Context
+        }
+        Set-Item Function:\script:Get-Stage5FinalAcceptanceRelativePath -Value $wrapper
+    } $original $Counter
+    return $original
+}
+
+function Disable-CandidateRelativeCounter {
+    param([object]$EvidenceModule, [object]$Original)
+    & $EvidenceModule {
+        param($originalFunction)
+        Set-Item Function:\script:Get-Stage5FinalAcceptanceRelativePath -Value $originalFunction
+        Remove-Item Function:\script:Stage5OriginalRelativePath -ErrorAction SilentlyContinue
+        Remove-Variable Stage5CandidateRelativeCounter -Scope Script -ErrorAction SilentlyContinue
+    } $Original
+}
+
+$configuredScratchRoot = if ([string]::IsNullOrWhiteSpace($ScratchRoot)) {
+    $env:RTS_STAGE5_VALIDATION_SCRATCH_ROOT
+}
+else {
+    $ScratchRoot
+}
+Assert-RelocationTest (-not [string]::IsNullOrWhiteSpace($configuredScratchRoot)) 'relocation tests require -ScratchRoot or RTS_STAGE5_VALIDATION_SCRATCH_ROOT'
+$resolvedScratchRoot = [IO.Path]::GetFullPath($configuredScratchRoot).TrimEnd('\')
+Assert-RelocationTest $resolvedScratchRoot.StartsWith('H:\', [StringComparison]::OrdinalIgnoreCase) 'relocation tests require an explicit H: scratch root'
+[IO.Directory]::CreateDirectory($resolvedScratchRoot) | Out-Null
+$runRoot = Join-Path $resolvedScratchRoot ('actual-binding-{0}-{1}' -f $PID, [Guid]::NewGuid().ToString('N'))
+[IO.Directory]::CreateDirectory($runRoot) | Out-Null
+$logPath = Join-Path $runRoot 'actual-binding-regression.log'
+$summaryPath = Join-Path $runRoot 'actual-binding-regression.json'
+$modulePath = if ([string]::IsNullOrWhiteSpace($ModulePath)) {
+    Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1'
+}
+else {
+    [IO.Path]::GetFullPath($ModulePath)
+}
+Assert-RelocationTest (Test-Path -LiteralPath $modulePath -PathType Leaf) "the source evidence module is missing: $modulePath"
+Import-Module $modulePath -Force
+$evidenceModule = Get-Module -Name 'DeterministicSimulationEvidence' | Where-Object { $_.Path -ceq ([IO.Path]::GetFullPath($modulePath)) } | Select-Object -First 1
+Assert-RelocationTest ($null -ne $evidenceModule) 'the source evidence module did not import'
+
+$summary = $null
+try {
+    $absoluteFixture = New-RelocationFixture -Mode absolute -Root (Join-Path $runRoot 'absolute')
+    $absoluteFileCount = @(Get-ChildItem -LiteralPath $absoluteFixture.root -Recurse -File -Force).Count
+    $counter = @{ count = 0 }
+    $originalRelative = Enable-CandidateRelativeCounter $evidenceModule $counter
+    try {
+        $absoluteResult = Invoke-RelocationBinding $absoluteFixture
+    }
+    finally {
+        Disable-CandidateRelativeCounter $evidenceModule $originalRelative
+    }
+    Assert-RelocationTest (@($absoluteResult.children).Count -eq 2) 'absolute binding did not return both native children'
+    $child1 = Get-ChildBinding $absoluteResult 1
+    $child2 = Get-ChildBinding $absoluteResult 2
+    $child1Raw = Get-NamedRawBinding $child1 'raw-log'
+    $child2Raw = Get-NamedRawBinding $child2 'raw-log'
+    Assert-RelocationTest ([string]$child1Raw.path -ceq 'staged\runA\raw.log') "unique absolute winner changed: '$($child1Raw.path)'"
+    Assert-RelocationTest ([string]$child2Raw.path -ceq 'staged\Case\Logs\raw.log') "case-insensitive absolute winner changed: '$($child2Raw.path)'"
+    Assert-RelocationTest ([int]$counter.count -eq $absoluteFileCount) "candidate relative path was evaluated $($counter.count) times; expected one per bounded file ($absoluteFileCount)"
+
+    $mutatedPath = Join-Path $absoluteFixture.root 'staged\runA\raw.log'
+    Write-RelocationText $mutatedPath 'changed-after-first-binding'
+    Assert-RelocationThrows { Invoke-RelocationBinding $absoluteFixture | Out-Null } 'SHA-256|sha256' 'a changed raw file must be re-read and fail its bound hash'
+
+    $relativeFixture = New-RelocationFixture -Mode relative -Root (Join-Path $runRoot 'relative')
+    $relativeResult = Invoke-RelocationBinding $relativeFixture
+    $relativeChild1 = Get-ChildBinding $relativeResult 1
+    $relativeRaw1 = Get-NamedRawBinding $relativeChild1 'raw-log'
+    Assert-RelocationTest ([string]$relativeRaw1.path -ceq 'native\runA\raw.log') "relative branch changed: '$($relativeRaw1.path)'"
+
+    $ambiguousFixture = New-RelocationFixture -Mode ambiguous -Root (Join-Path $runRoot 'ambiguous')
+    Assert-RelocationThrows { Invoke-RelocationBinding $ambiguousFixture | Out-Null } 'multiple staged candidates.*ambiguous' 'longest-suffix ties must remain ambiguous'
+
+    $noMatchFixture = New-RelocationFixture -Mode no-match -Root (Join-Path $runRoot 'no-match')
+    Assert-RelocationThrows { Invoke-RelocationBinding $noMatchFixture | Out-Null } 'no staged candidate matching' 'absolute paths without a qualifying suffix must be rejected'
+
+    $aliasFixture = New-RelocationFixture -Mode alias -Root (Join-Path $runRoot 'alias')
+    Assert-RelocationThrows { Invoke-RelocationBinding $aliasFixture | Out-Null } 'aliases another staged native raw log' 'two raw names resolving to one staged file must remain an alias error'
+
+    $summary = [ordered]@{
+        status = 'passed'
+        sourceModule = [IO.Path]::GetFullPath($modulePath)
+        runRoot = $runRoot
+        absoluteFileCount = $absoluteFileCount
+        candidateRelativeCallCount = [int]$counter.count
+        explicitWinners = [ordered]@{
+            unique = [string]$child1Raw.path
+            caseInsensitive = [string]$child2Raw.path
+        }
+        relativeWinner = [string]$relativeRaw1.path
+        checks = @(
+            'actual exported binding function invoked with real receipt/native/raw files',
+            'all selected raw hashes validated, then mutation was re-read and rejected',
+            'unique longest suffix winner',
+            'case-insensitive segment winner',
+            'relative branch',
+            'ambiguous tie rejection',
+            'no-match rejection',
+            'alias rejection'
+        )
+    }
+    Write-RelocationJson $summaryPath $summary
+    Write-RelocationText $logPath ($summary | ConvertTo-Json -Depth 12)
+    Write-Output ($summary | ConvertTo-Json -Depth 12)
+}
+catch {
+    $failure = [ordered]@{ status = 'failed'; runRoot = $runRoot; error = $_.Exception.Message }
+    Write-RelocationText $logPath ($failure | ConvertTo-Json -Depth 12)
+    throw
+}

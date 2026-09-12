@@ -53,6 +53,7 @@
 
 #if defined(_WIN64)
 #include "Lib/RuntimeEpochContract.h"
+#include "Lib/ReplayPathContract.h"
 #include "Lib/ReplayCommandContract.h"
 #include <array>
 #include <cstdint>
@@ -1203,7 +1204,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	// deterministic behavior without changing the retail replay header layout. Keep the existing
 	// SkirmishAI marker last because its parser intentionally requires a final suffix.
 	MarkReplayVersionForPathfindQueueCurrentEpoch(versionTimeString);
-	MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
+	MarkReplayVersionForSkirmishAIRecordingEpoch(versionTimeString);
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
 	#if defined(_WIN64)
 	nativeHeaderWriteOk = writeNativeReplayWideString(m_file, versionString.str()) && nativeHeaderWriteOk;
@@ -1260,7 +1261,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 			TheSkirmishGameInfo->setCRCInterval(REPLAY_CRC_INTERVAL);
       theSlotList = GameInfoToAsciiString(TheSkirmishGameInfo);
       DEBUG_LOG(("GameInfo String: %s",theSlotList.str()));
-			localIndex = 0;
+			localIndex = TheSkirmishGameInfo->getLocalSlotNum();
     }
     else
     {
@@ -1543,7 +1544,23 @@ void RecorderClass::writeArgument(GameMessageArgumentDataType type, const GameMe
 Bool RecorderClass::readReplayHeader(ReplayHeader& header)
 {
 	AsciiString filepath = getReplayDir();
-	filepath.concat(header.filename.str());
+#if defined(_WIN64)
+	if (header.forPlayback && TheGlobalData != 0 && TheGlobalData->m_headless)
+	{
+		char resolvedPath[MAX_PATH];
+		if (!rts::replay::ResolveReplayPlaybackPath(filepath.str(),
+			header.filename.str(), true, resolvedPath, sizeof(resolvedPath)))
+		{
+			DEBUG_LOG(("Invalid native headless replay path: %s", header.filename.str()));
+			return FALSE;
+		}
+		filepath = resolvedPath;
+	}
+	else
+#endif
+	{
+		filepath.concat(header.filename.str());
+	}
 
 	// TheSuperHackers @performance More buffered data reduces disk overhead and will improve fast forward playback
 	const UnsignedInt buffersize = header.forPlayback ? replayBufferBytes : File::BUFFERSIZE;
@@ -1882,8 +1899,13 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	UnicodeString pathLivenessMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLivenessMarkedVersionTimeString);
 	MarkReplayVersionForSkirmishAILivenessRecovery(pathLivenessMarkedVersionTimeString);
-	UnicodeString legacyCurrentMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
-	MarkReplayVersionForSkirmishAICurrentEpoch(legacyCurrentMarkedVersionTimeString);
+	UnicodeString adaptiveGlobalRngMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(adaptiveGlobalRngMarkedVersionTimeString);
+	UnicodeString pathAdaptiveGlobalRngMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForPathfindQueueCurrentEpoch(pathAdaptiveGlobalRngMarkedVersionTimeString);
+	MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(pathAdaptiveGlobalRngMarkedVersionTimeString);
+	UnicodeString counterRngMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAICurrentEpoch(counterRngMarkedVersionTimeString);
 	UnicodeString currentMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
 	MarkReplayVersionForPathfindQueueCurrentEpoch(currentMarkedVersionTimeString);
 	MarkReplayVersionForSkirmishAICurrentEpoch(currentMarkedVersionTimeString);
@@ -1891,7 +1913,9 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 		&& header.versionTimeString != pathMarkedVersionTimeString
 		&& header.versionTimeString != livenessMarkedVersionTimeString
 		&& header.versionTimeString != pathLivenessMarkedVersionTimeString
-		&& header.versionTimeString != legacyCurrentMarkedVersionTimeString
+		&& header.versionTimeString != adaptiveGlobalRngMarkedVersionTimeString
+		&& header.versionTimeString != pathAdaptiveGlobalRngMarkedVersionTimeString
+		&& header.versionTimeString != counterRngMarkedVersionTimeString
 		&& header.versionTimeString != currentMarkedVersionTimeString;
 	Bool versionNumberDiff = header.versionNumber != TheVersion->getVersionNumber();
 	Bool exeCRCDiff = header.exeCRC != TheGlobalData->m_exeCRC;

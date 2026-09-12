@@ -28,8 +28,9 @@ if(MINGW)
     target_link_options(projected_terrain_grid_tests PRIVATE -mconsole)
 endif()
 
-add_test(NAME projected_terrain_grid_tests COMMAND projected_terrain_grid_tests)
+add_test(NAME projected_terrain_grid_tests COMMAND projected_terrain_grid_tests
+    --local-capacity)
 set_tests_properties(projected_terrain_grid_tests PROPERTIES TIMEOUT 60)
 add_test(NAME projected_terrain_grid_serial_tests
-    COMMAND projected_terrain_grid_tests --serial)
+    COMMAND projected_terrain_grid_tests --local-capacity --serial)
 set_tests_properties(projected_terrain_grid_serial_tests PROPERTIES TIMEOUT 60)

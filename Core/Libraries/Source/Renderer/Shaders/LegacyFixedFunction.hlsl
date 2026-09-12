@@ -421,6 +421,16 @@ struct TexturedVertexInput
 	float3 normal : NORMAL;
 	float4 color : COLOR0;
 	float4 specular : COLOR1;
+	#if !defined(LEGACY_UNWEIGHTED_VERTEX_INPUT)
+	// Weighted legacy FVFs are decoded into explicit neutral semantics.  The
+	// current fixed-function path has no legacy bone-palette constant contract,
+	// so it preserves the serialized XYZ position while retaining these fields
+	// in the shader signature for exact D3D11 input-layout validation and for a
+	// future palette-backed skinning path.
+	float4 blendWeight0 : BLENDWEIGHT0;
+	float blendWeight1 : BLENDWEIGHT1;
+	uint4 blendIndices : BLENDINDICES0;
+	#endif
 	float4 textureCoordinate0 : TEXCOORD0;
 	float4 textureCoordinate1 : TEXCOORD1;
 	float4 textureCoordinate2 : TEXCOORD2;
@@ -430,6 +440,17 @@ struct TexturedVertexInput
 	float4 textureCoordinate6 : TEXCOORD6;
 	float4 textureCoordinate7 : TEXCOORD7;
 };
+
+bool HasLegacyBlendWeight(uint index)
+{
+	return index < 2U &&
+		(VertexLayoutParameters.w & (1U << (8U + index))) != 0U;
+}
+
+bool HasLegacyBlendIndices()
+{
+	return (VertexLayoutParameters.w & (1U << 10U)) != 0U;
+}
 
 struct TexturedVertexOutput
 {
@@ -494,6 +515,27 @@ TexturedVertexOutput VSTextured(TexturedVertexInput input)
 		return output;
 	}
 	const float4 objectPosition = float4(input.position.xyz, 1.0f);
+	#if !defined(LEGACY_UNWEIGHTED_VERTEX_INPUT)
+	// Keep weighted/LASTBETA data part of the validated vertex contract. The
+	// neutral renderer does not publish a bone palette, therefore the behavior
+	// for these streams remains the historical unskinned XYZ transform until a
+	// palette is supplied through an explicit renderer state extension.
+	const bool weightedStream = HasLegacyBlendWeight(0U) ||
+		HasLegacyBlendWeight(1U) || HasLegacyBlendIndices();
+	if (weightedStream)
+	{
+		// Referencing the fields keeps their input signature visible to the
+		// compiler without changing the unskinned result.
+		const float blendInputMagnitude =
+			dot(abs(input.blendWeight0), float4(1.0f, 1.0f, 1.0f, 1.0f)) +
+			abs(input.blendWeight1) +
+			(float)input.blendIndices.x * 0.0f;
+		if (blendInputMagnitude < -1.0f)
+		{
+			output.position = float4(0.0f, 0.0f, 0.0f, 1.0f);
+		}
+	}
+	#endif
 	output.position = TransformLegacyPosition(input.position);
 	const float4 diffuse = VertexLayoutParameters.y != 0 ?
 		input.color : float4(1.0f, 1.0f, 1.0f, 1.0f);

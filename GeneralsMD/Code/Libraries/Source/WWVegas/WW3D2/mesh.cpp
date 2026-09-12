@@ -106,19 +106,20 @@
 #include "meshgeometry.h"
 #include "ww3d.h"
 #include "camera.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "rinfo.h"
 #include "coltest.h"
 #include "inttest.h"
 #include "decalmsh.h"
 #include "decalsys.h"
-#include "dx8polygonrenderer.h"
-#include "dx8indexbuffer.h"
-#include "dx8renderer.h"
+#include "WW3D2/dx8polygonrenderer.h"
+#include "WW3D2/dx8indexbuffer.h"
+#include "WW3D2/dx8renderer.h"
 #include "visrasterizer.h"
 #include "WWDebug/wwmemlog.h"
-#include "dx8rendererdebugger.h"
+#include "WW3D2/dx8rendererdebugger.h"
 #include <WWDebug/wwprofile.h>
+#include "Renderer/RenderGameClient.h"
 
 static unsigned MeshDebugIdCount;
 
@@ -827,7 +828,7 @@ void MeshClass::Render_Material_Pass(MaterialPassClass * pass,IndexBufferClass *
 	Vector3 oldEmissive(-1,-1,-1);
 
 	if (LightEnvironment != nullptr) {
-		DX8Wrapper::Set_Light_Environment(LightEnvironment);
+		rts::render::SetGameLightEnvironment(LightEnvironment);
 	}
 
 	if (Model->Get_Flag(MeshModelClass::SKIN)) {
@@ -852,10 +853,11 @@ void MeshClass::Render_Material_Pass(MaterialPassClass * pass,IndexBufferClass *
 			}
 		}
 		pass->Install_Materials();
-		DX8Wrapper::Set_Index_Buffer(ib,0);
+		rts::render::SetGameIndexBuffer(ib,0);
 
 		SNAPSHOT_SAY(("Set_World_Identity"));
-		DX8Wrapper::Set_World_Identity();
+		rts::render::SetGameTransform(
+			rts::render::GAME_TRANSFORM_WORLD, Matrix3D(true));
 
 		DX8PolygonRendererListIterator it(&Model->PolygonRendererList);
 		while (!it.Is_Done()) {
@@ -945,10 +947,11 @@ void MeshClass::Render_Material_Pass(MaterialPassClass * pass,IndexBufferClass *
 			int vertex_offset = Model->PolygonRendererList.Peek_Head()->Get_Vertex_Offset();
 			pass->Install_Materials();
 
-			DX8Wrapper::Set_Transform(D3DTS_WORLD,Get_Transform());
-			DX8Wrapper::Set_Index_Buffer(dynamic_ib,vertex_offset);
+			rts::render::SetGameTransform(
+				rts::render::GAME_TRANSFORM_WORLD, Get_Transform());
+			rts::render::SetGameIndexBuffer(dynamic_ib,vertex_offset);
 
-			DX8Wrapper::Draw_Triangles(
+			rts::render::DrawGameTriangles(
 				0,
 				temp_apt.Count(),
 				min_v,
@@ -978,10 +981,11 @@ void MeshClass::Render_Material_Pass(MaterialPassClass * pass,IndexBufferClass *
 			}
 		}
 		pass->Install_Materials();
-		DX8Wrapper::Set_Index_Buffer(ib,0);
+		rts::render::SetGameIndexBuffer(ib,0);
 
 		SNAPSHOT_SAY(("Set_World_Transform"));
-		DX8Wrapper::Set_Transform(D3DTS_WORLD,Transform);
+		rts::render::SetGameTransform(
+			rts::render::GAME_TRANSFORM_WORLD, Transform);
 
 		DX8PolygonRendererListIterator it(&Model->PolygonRendererList);
 		while (!it.Is_Done()) {

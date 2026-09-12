@@ -102,7 +102,10 @@ enum Operation
 	OP_TEXTURE, OP_TOPOLOGY, OP_DRAW, OP_DRAW_INDEXED, OP_COPY_COLOR
 };
 enum Control { CONTROL_NONE, CONTROL_FENCE, CONTROL_CAPTURE,
-	CONTROL_RESIZE, CONTROL_RECOVER, CONTROL_DEBUG_COUNT, CONTROL_REPORT };
+	CONTROL_RESIZE, CONTROL_RECOVER, CONTROL_DEBUG_COUNT, CONTROL_REPORT,
+	CONTROL_ROLLBACK_RESOURCE, CONTROL_SET_SWAP_INTERVAL,
+	CONTROL_GET_SWAP_INTERVAL, CONTROL_SET_GAMMA, CONTROL_GET_GAMMA,
+	CONTROL_CONFIGURE_RESOURCE_FAULT, CONTROL_GET_RESOURCE_STATISTICS };
 
 struct Command
 {
@@ -123,15 +126,75 @@ struct Command
 struct TextureSpan { size_t offset, rowPitch, slicePitch; };
 struct LayoutState { LegacyLogicalState state; LegacyVertexLayout layout; };
 
+struct InitializedRange
+{
+	InitializedRange() : begin(0), end(0) {}
+	InitializedRange(size_t requestedBegin, size_t requestedEnd) :
+		begin(requestedBegin), end(requestedEnd) {}
+	size_t begin, end;
+};
+
+void RecordInitializedRange(std::vector<InitializedRange> &ranges,
+	size_t offset, size_t bytes, bool discard)
+{
+	if (discard) ranges.clear();
+	InitializedRange combined(offset, offset + bytes);
+	std::vector<InitializedRange> merged;
+	merged.reserve(ranges.size() + 1);
+	bool inserted = false;
+	for (size_t index = 0; index < ranges.size(); ++index)
+	{
+		const InitializedRange &existing = ranges[index];
+		if (existing.end < combined.begin) merged.push_back(existing);
+		else if (combined.end < existing.begin)
+		{
+			if (!inserted) { merged.push_back(combined); inserted = true; }
+			merged.push_back(existing);
+		}
+		else
+		{
+			combined.begin = (std::min)(combined.begin, existing.begin);
+			combined.end = (std::max)(combined.end, existing.end);
+		}
+	}
+	if (!inserted) merged.push_back(combined);
+	ranges.swap(merged);
+}
+
+bool IsInitializedRange(const std::vector<InitializedRange> &ranges,
+	size_t offset, size_t bytes)
+{
+	if (!bytes || offset > size_t(-1) - bytes) return false;
+	const size_t end = offset + bytes;
+	for (size_t index = 0; index < ranges.size(); ++index)
+	{
+		if (ranges[index].begin <= offset && ranges[index].end >= end)
+			return true;
+		if (ranges[index].begin > offset) break;
+	}
+	return false;
+}
+
 struct Reply
 {
 	Reply() : done(false), result(RENDER_RESULT_OK), format(RENDER_FORMAT_UNKNOWN),
-		rowPitch(0), count(0), width(0), height(0) {}
+		rowPitch(0), count(0), width(0), height(0), interval(0),
+		gamma(1.0f), brightness(0.0f), contrast(1.0f), calibrate(false),
+		useLimit(true), faultPoint(RENDER_RESOURCE_FAULT_NONE),
+		faultFailOnInvocation(0), faultResult(RENDER_RESULT_FAILED),
+		statistics(), handle() {}
 	bool done;
 	RenderResult result;
 	RenderFormat format;
 	size_t rowPitch;
-	unsigned int count, width, height;
+	unsigned int count, width, height, interval;
+	float gamma, brightness, contrast;
+	bool calibrate, useLimit;
+	RenderResourceFaultPoint faultPoint;
+	unsigned int faultFailOnInvocation;
+	RenderResult faultResult;
+	RenderResourceStatistics statistics;
+	GpuHandle handle;
 	std::vector<unsigned char> pixels;
 };
 
@@ -175,6 +238,7 @@ struct OwnerResource
 	bool gpuAuthoritative;
 	size_t byteCount;
 	uint64_t writtenSequence;
+	std::vector<InitializedRange> initializedBytes;
 };
 
 class ThreadedRenderDevice final : public IRenderDevice, public IRenderContext
@@ -195,7 +259,9 @@ public:
 		m_backend(0), m_context(0), m_ownerFrameOpen(false), m_ownerFrameActive(false), m_ownerDeviceRemoved(false),
 		m_ownerResourceFailure(false), m_outsideResourceFailure(false), m_ownerSequence(0),
 		m_ownerFrameResult(RENDER_RESULT_OK), m_outsideFailure(RENDER_RESULT_OK),
-		m_drainFailure(RENDER_RESULT_OK)
+		m_drainFailure(RENDER_RESULT_OK), m_ownerVertexBuffer(),
+		m_ownerIndexBuffer(), m_ownerVertexStride(0), m_ownerVertexOffset(0),
+		m_ownerIndexSize(0), m_ownerIndexOffset(0)
 	{
 		m_handles.reset(new GpuHandleAllocator(options.resourceCapacity));
 		if (m_handles->capacity() != options.resourceCapacity) throw std::bad_alloc();
@@ -223,6 +289,8 @@ public:
 	RenderResult createBuffer(const BufferDescriptor &, const void *, size_t, GpuHandle *) override;
 	RenderResult createTexture(const TextureDescriptor &, const TextureSubresourceData *,
 		unsigned int, GpuHandle *) override;
+	RenderResult updateBufferResource(GpuHandle, const void *, size_t, size_t,
+		RenderBufferUpdateMode) override;
 	RenderResult refreshTexture(GpuHandle, const TextureDescriptor &,
 		const TextureSubresourceData *, unsigned int) override;
 	RenderResult copyActiveColorTargetToTexture(GpuHandle) override;
@@ -230,6 +298,17 @@ public:
 	RenderResult recoverDevice() override { return lifecycle(CONTROL_RECOVER, 0, 0); }
 	RenderResult resize(unsigned int w, unsigned int h) override { return lifecycle(CONTROL_RESIZE, w, h); }
 	RenderResult present() override { return submitFrame(true); }
+	RenderResult setSwapInterval(unsigned int interval) override;
+	RenderResult getSwapInterval(unsigned int *interval) const override;
+	RenderResult setGamma(float gamma, float brightness, float contrast,
+		bool calibrate, bool useLimit = true) override;
+	RenderResult getGamma(float *gamma, float *brightness, float *contrast,
+		bool *calibrate, bool *useLimit) const override;
+	RenderResult configureResourceFaultInjection(
+		RenderResourceFaultPoint point, unsigned int failOnInvocation,
+		RenderResult result) override;
+	RenderResult getDebugResourceStatistics(
+		RenderResourceStatistics *statistics) const override;
 	RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const override
 	{
 		if (!info) return RENDER_RESULT_INVALID_ARGUMENT;
@@ -260,8 +339,13 @@ public:
 	RenderResult submitFrame(bool);
 	RenderResult cancelFrame(RenderResult);
 	RenderResult drain();
+	RenderResult rollbackResource(GpuHandle);
 	bool poll(ThreadedRenderFrameCompletion *);
 	uint64_t lastSequence() const { return producer() ? m_lastSequence : 0; }
+	uint64_t currentSequence() const
+	{
+		return producer() && m_recording ? m_sequence : 0;
+	}
 	bool metrics(ThreadedRenderMetrics *) const;
 
 private:
@@ -303,6 +387,8 @@ private:
 		bool requireFrame = true);
 	RenderResult textureCommand(Operation, GpuHandle, const TextureDescriptor &,
 		const TextureSubresourceData *, unsigned int);
+	RenderResult bufferUpdateCommand(GpuHandle, const void *, size_t, size_t,
+		RenderBufferUpdateMode, bool requireFrame);
 	RenderResult flush(Control, const std::shared_ptr<Reply> &, bool finalFrame, bool visible);
 	RenderResult sync(Control, const std::shared_ptr<Reply> &);
 	RenderResult lifecycle(Control, unsigned int, unsigned int);
@@ -356,6 +442,9 @@ private:
 	bool m_ownerResourceFailure, m_outsideResourceFailure;
 	uint64_t m_ownerSequence;
 	GpuHandle m_ownerColorTarget, m_ownerDepthTarget;
+	GpuHandle m_ownerVertexBuffer, m_ownerIndexBuffer;
+	unsigned int m_ownerVertexStride, m_ownerVertexOffset;
+	unsigned int m_ownerIndexSize, m_ownerIndexOffset;
 	RenderFrameOutcome m_ownerOutcome;
 	RenderResult m_ownerFrameResult, m_outsideFailure, m_drainFailure;
 };
@@ -556,6 +645,27 @@ RenderResult ThreadedRenderDevice::drain()
 	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY); }
 }
 
+RenderResult ThreadedRenderDevice::rollbackResource(GpuHandle handle)
+{
+	if (!usable() || !m_handles->isLive(handle))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		reply->handle = handle;
+		const RenderResult result = sync(CONTROL_ROLLBACK_RESOURCE, reply);
+		if (result != RENDER_RESULT_OK)
+			return result;
+		m_producerResources[handle.index()] = ProducerResource();
+		return m_handles->release(handle) ? RENDER_RESULT_OK :
+			RENDER_RESULT_FAILED;
+	}
+	catch (...)
+	{
+		return fail(RENDER_RESULT_OUT_OF_MEMORY);
+	}
+}
+
 RenderResult ThreadedRenderDevice::lifecycle(Control control, unsigned int width, unsigned int height)
 {
 	if (!usable() || m_recording) return RENDER_RESULT_INVALID_ARGUMENT;
@@ -566,6 +676,129 @@ RenderResult ThreadedRenderDevice::lifecycle(Control control, unsigned int width
 		return sync(control, reply);
 	}
 	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY); }
+}
+
+RenderResult ThreadedRenderDevice::setSwapInterval(unsigned int interval)
+{
+	if (!usable() || m_recording || interval > RENDER_SWAP_INTERVAL_MAX)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		reply->interval = interval;
+		return sync(CONTROL_SET_SWAP_INTERVAL, reply);
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::getSwapInterval(unsigned int *interval) const
+{
+	if (!interval || !usable() || m_recording)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		const RenderResult result = const_cast<ThreadedRenderDevice *>(this)->sync(
+			CONTROL_GET_SWAP_INTERVAL, reply);
+		if (result == RENDER_RESULT_OK)
+			*interval = reply->interval;
+		return result;
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::setGamma(float gamma, float brightness,
+	float contrast, bool calibrate, bool useLimit)
+{
+	if (!usable() || m_recording || gamma != gamma || brightness != brightness ||
+		contrast != contrast)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	// Preserve the legacy Set_Gamma contract at the producer boundary so both
+	// direct and threaded devices publish identical effective parameters.
+	gamma = gamma < 0.6f ? 0.6f : (gamma > 6.0f ? 6.0f : gamma);
+	brightness = brightness < -0.5f ? -0.5f :
+		(brightness > 0.5f ? 0.5f : brightness);
+	contrast = contrast < 0.5f ? 0.5f :
+		(contrast > 2.0f ? 2.0f : contrast);
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		reply->gamma = gamma;
+		reply->brightness = brightness;
+		reply->contrast = contrast;
+		reply->calibrate = calibrate;
+		reply->useLimit = useLimit;
+		return sync(CONTROL_SET_GAMMA, reply);
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::getGamma(float *gamma, float *brightness,
+	float *contrast, bool *calibrate, bool *useLimit) const
+{
+	if (!gamma || !brightness || !contrast || !calibrate || !useLimit ||
+		!usable() || m_recording)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		const RenderResult result =
+			const_cast<ThreadedRenderDevice *>(this)->sync(
+				CONTROL_GET_GAMMA, reply);
+		if (result == RENDER_RESULT_OK)
+		{
+			*gamma = reply->gamma;
+			*brightness = reply->brightness;
+			*contrast = reply->contrast;
+			*calibrate = reply->calibrate;
+			*useLimit = reply->useLimit;
+		}
+		return result;
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::configureResourceFaultInjection(
+	RenderResourceFaultPoint point, unsigned int failOnInvocation,
+	RenderResult result)
+{
+	if (!usable() || m_recording)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	if (point != RENDER_RESOURCE_FAULT_NONE &&
+		(point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
+		 point > RENDER_RESOURCE_FAULT_PRESENTATION_PASS ||
+		 failOnInvocation == 0 ||
+		 (result != RENDER_RESULT_OUT_OF_MEMORY &&
+		  result != RENDER_RESULT_DEVICE_REMOVED &&
+		  result != RENDER_RESULT_FAILED)))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		reply->faultPoint = point;
+		reply->faultFailOnInvocation = failOnInvocation;
+		reply->faultResult = result;
+		return sync(CONTROL_CONFIGURE_RESOURCE_FAULT, reply);
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
+}
+
+RenderResult ThreadedRenderDevice::getDebugResourceStatistics(
+	RenderResourceStatistics *statistics) const
+{
+	if (!statistics || !usable())
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		const RenderResult result =
+			const_cast<ThreadedRenderDevice *>(this)->sync(
+				CONTROL_GET_RESOURCE_STATISTICS, reply);
+		if (result == RENDER_RESULT_OK)
+			*statistics = reply->statistics;
+		return result;
+	}
+	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
 }
 
 void ThreadedRenderDevice::shutdown()
@@ -735,6 +968,20 @@ bool ThreadedRenderDevice::destroyResource(GpuHandle handle)
 RenderResult ThreadedRenderDevice::updateBuffer(GpuHandle handle, const void *data,
 	size_t bytes, size_t offset, RenderBufferUpdateMode mode)
 {
+	return bufferUpdateCommand(handle, data, bytes, offset, mode, true);
+}
+
+RenderResult ThreadedRenderDevice::updateBufferResource(GpuHandle handle,
+	const void *data, size_t bytes, size_t offset,
+	RenderBufferUpdateMode mode)
+{
+	return bufferUpdateCommand(handle, data, bytes, offset, mode, false);
+}
+
+RenderResult ThreadedRenderDevice::bufferUpdateCommand(GpuHandle handle,
+	const void *data, size_t bytes, size_t offset,
+	RenderBufferUpdateMode mode, bool requireFrame)
+{
 	if (!usable() || !valid(handle, false) || !data || !bytes ||
 		offset > m_producerResources[handle.index()].buffer.byteCount ||
 		bytes > m_producerResources[handle.index()].buffer.byteCount - offset)
@@ -748,7 +995,7 @@ RenderResult ThreadedRenderDevice::updateBuffer(GpuHandle handle, const void *da
 		(mode == RENDER_BUFFER_UPDATE_DISCARD && offset))) return fail(RENDER_RESULT_INVALID_ARGUMENT);
 	Command command(OP_UPDATE_BUFFER); command.handle = handle;
 	command.dataBytes = bytes; command.destinationOffset = offset; command.integers[0] = mode;
-	return append(command, data, bytes);
+	return append(command, data, bytes, requireFrame);
 }
 
 RenderResult ThreadedRenderDevice::copyActiveColorTargetToTexture(GpuHandle handle)
@@ -922,8 +1169,7 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 	if (command.handle.isValid() && !handle.isValid() &&
 		command.operation != OP_CREATE_BUFFER && command.operation != OP_CREATE_TEXTURE &&
 		command.operation != OP_DESTROY) return RENDER_RESULT_INVALID_ARGUMENT;
-	if (command.handle.isValid() && (command.operation == OP_TEXTURE ||
-		command.operation == OP_VERTEX_BUFFER || command.operation == OP_INDEX_BUFFER) &&
+	if (command.handle.isValid() && command.operation == OP_TEXTURE &&
 		!m_ownerResources[command.handle.index()].contentValid) return RENDER_RESULT_FAILED;
 	switch (command.operation)
 	{
@@ -937,6 +1183,9 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		m_ownerResourceFailure = m_outsideResourceFailure; m_outsideResourceFailure = false;
 		m_ownerSequence = packet.sequence;
 		m_ownerColorTarget = m_ownerDepthTarget = GpuHandle();
+		m_ownerVertexBuffer = m_ownerIndexBuffer = GpuHandle();
+		m_ownerVertexStride = m_ownerVertexOffset = 0;
+		m_ownerIndexSize = m_ownerIndexOffset = 0;
 		{
 			const RenderResult result = m_ownerDeviceRemoved ? RENDER_RESULT_DEVICE_REMOVED :
 				(m_context ? m_context->beginFrame() : RENDER_RESULT_FAILED);
@@ -950,14 +1199,25 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		slot.generation = command.handle.generation(); slot.backend = GpuHandle();
 		slot.texture = false; slot.contentValid = false;
 		slot.recoverySourceValid = false; slot.gpuAuthoritative = false; slot.writtenSequence = 0;
+		slot.initializedBytes.clear();
 		const BufferDescriptor descriptor = read<BufferDescriptor>(packet, command.payloadOffset);
 		slot.byteCount = descriptor.byteCount;
 		const RenderResult result = m_backend->createBuffer(descriptor,
 			command.dataBytes ? packet.bytes.data() + command.dataOffset : 0,
 			command.dataBytes, &slot.backend);
-		slot.contentValid = result == RENDER_RESULT_OK && slot.backend.isValid();
-		slot.recoverySourceValid = slot.contentValid;
-		return result == RENDER_RESULT_OK && !slot.contentValid ? RENDER_RESULT_FAILED : result;
+		if (result == RENDER_RESULT_OK && slot.backend.isValid() &&
+			command.dataBytes == descriptor.byteCount)
+		{
+			RecordInitializedRange(slot.initializedBytes, 0,
+				descriptor.byteCount, false);
+		}
+		slot.contentValid = result == RENDER_RESULT_OK && slot.backend.isValid() &&
+			IsInitializedRange(slot.initializedBytes, 0, slot.byteCount);
+		// Only immutable buffers have an explicit recreatable creation source.
+		// Mutable buffers retain no persistent byte shadow and must republish.
+		slot.recoverySourceValid = descriptor.usage == RENDER_USAGE_IMMUTABLE &&
+			slot.contentValid;
+		return result == RENDER_RESULT_OK && !slot.backend.isValid() ? RENDER_RESULT_FAILED : result;
 	}
 	case OP_CREATE_TEXTURE: case OP_REFRESH_TEXTURE:
 	{
@@ -972,6 +1232,7 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		}
 		const TextureDescriptor descriptor = read<TextureDescriptor>(packet, command.payloadOffset);
 		OwnerResource &slot = m_ownerResources[command.handle.index()];
+		slot.initializedBytes.clear();
 		if (command.operation == OP_REFRESH_TEXTURE)
 		{
 			slot.contentValid = false;
@@ -996,23 +1257,50 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 			m_ownerColorTarget = m_ownerDepthTarget = GpuHandle();
 		if (m_ownerResources[command.handle.index()].generation == command.handle.generation())
 		{
-			OwnerResource &slot = m_ownerResources[command.handle.index()];
-			slot.backend = GpuHandle(); slot.texture = false; slot.contentValid = false;
-			slot.recoverySourceValid = false; slot.writtenSequence = 0;
+			m_ownerResources[command.handle.index()] = OwnerResource();
+		}
+		if (command.handle == m_ownerVertexBuffer)
+		{
+			m_ownerVertexBuffer = GpuHandle();
+			m_ownerVertexStride = m_ownerVertexOffset = 0;
+		}
+		if (command.handle == m_ownerIndexBuffer)
+		{
+			m_ownerIndexBuffer = GpuHandle();
+			m_ownerIndexSize = m_ownerIndexOffset = 0;
 		}
 		return RENDER_RESULT_OK;
 	case OP_UPDATE_BUFFER:
 	{
 		OwnerResource &slot = m_ownerResources[command.handle.index()];
-		const bool previouslyValid = slot.contentValid;
-		slot.contentValid = false;
-		const RenderResult result = m_context->updateBuffer(handle, packet.bytes.data() + command.payloadOffset,
+		std::vector<InitializedRange> nextRanges;
+		try
+		{
+			nextRanges = slot.initializedBytes;
+			RecordInitializedRange(nextRanges, command.destinationOffset,
+				command.dataBytes,
+				static_cast<RenderBufferUpdateMode>(u[0]) == RENDER_BUFFER_UPDATE_DISCARD);
+		}
+		catch (...)
+		{
+			slot.initializedBytes.clear();
+			slot.contentValid = false;
+			return RENDER_RESULT_OUT_OF_MEMORY;
+		}
+		const RenderResult result = m_backend->updateBufferResource(handle,
+			packet.bytes.data() + command.payloadOffset,
 			command.dataBytes, command.destinationOffset, static_cast<RenderBufferUpdateMode>(u[0]));
 		if (result == RENDER_RESULT_OK)
 		{
-			slot.contentValid = previouslyValid || (!command.destinationOffset && command.dataBytes == slot.byteCount);
-			slot.recoverySourceValid = slot.recoverySourceValid
-				|| (!command.destinationOffset && command.dataBytes == slot.byteCount);
+			slot.initializedBytes.swap(nextRanges);
+			slot.contentValid = IsInitializedRange(slot.initializedBytes, 0,
+				slot.byteCount);
+			slot.writtenSequence = m_ownerFrameActive ? m_ownerSequence : 0;
+		}
+		else
+		{
+			slot.initializedBytes.clear();
+			slot.contentValid = false;
 		}
 		return result;
 	}
@@ -1060,14 +1348,82 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		const LayoutState state = read<LayoutState>(packet, command.payloadOffset);
 		return m_context->setLegacyStateForLayout(state.state, state.layout, u[0]);
 	}
-	case OP_VERTEX_BUFFER: return m_context->setVertexBuffer(handle, u[0], u[1]);
-	case OP_INDEX_BUFFER: return m_context->setIndexBuffer(handle, static_cast<RenderFormat>(u[0]), u[1]);
+	case OP_VERTEX_BUFFER:
+	{
+		if (command.handle.isValid() &&
+			m_ownerResources[command.handle.index()].initializedBytes.empty())
+			return RENDER_RESULT_FAILED;
+		const RenderResult result = m_context->setVertexBuffer(handle, u[0], u[1]);
+		if (result == RENDER_RESULT_OK)
+		{
+			m_ownerVertexBuffer = command.handle;
+			m_ownerVertexStride = u[0]; m_ownerVertexOffset = u[1];
+		}
+		return result;
+	}
+	case OP_INDEX_BUFFER:
+	{
+		const unsigned int indexSize = u[0] == RENDER_FORMAT_R16_UINT ? 2U :
+			(u[0] == RENDER_FORMAT_R32_UINT ? 4U : 0U);
+		if ((command.handle.isValid() &&
+			m_ownerResources[command.handle.index()].initializedBytes.empty()) ||
+			(command.handle.isValid() && indexSize == 0))
+			return RENDER_RESULT_FAILED;
+		const RenderResult result = m_context->setIndexBuffer(handle,
+			static_cast<RenderFormat>(u[0]), u[1]);
+		if (result == RENDER_RESULT_OK)
+		{
+			m_ownerIndexBuffer = command.handle;
+			m_ownerIndexSize = indexSize; m_ownerIndexOffset = u[1];
+		}
+		return result;
+	}
 	case OP_TEXTURE: return m_context->setTexture(u[0], handle);
 	case OP_TOPOLOGY: return m_context->setPrimitiveTopology(static_cast<RenderPrimitiveTopology>(u[0]));
-	case OP_DRAW: case OP_DRAW_INDEXED:
+	case OP_DRAW:
+	{
+		OwnerResource *vertex = ownerResource(m_ownerVertexBuffer);
+		const size_t first = u[1];
+		const size_t count = u[0];
+		if (m_ownerVertexBuffer.isValid() &&
+			(!vertex || !m_ownerVertexStride || !count ||
+			first > (size_t(-1) - m_ownerVertexOffset) / m_ownerVertexStride ||
+			count > size_t(-1) / m_ownerVertexStride ||
+			!IsInitializedRange(vertex->initializedBytes,
+				static_cast<size_t>(m_ownerVertexOffset) + first * m_ownerVertexStride,
+				count * m_ownerVertexStride)))
+		{
+			m_ownerResourceFailure = true;
+			return RENDER_RESULT_FAILED;
+		}
 		writeTarget(m_ownerColorTarget, false); writeTarget(m_ownerDepthTarget, false);
-		return command.operation == OP_DRAW ? m_context->draw(u[0], u[1]) :
-			m_context->drawIndexed(u[0], u[1], command.signedValue);
+		return m_context->draw(u[0], u[1]);
+	}
+	case OP_DRAW_INDEXED:
+	{
+		OwnerResource *indices = ownerResource(m_ownerIndexBuffer);
+		OwnerResource *vertices = ownerResource(m_ownerVertexBuffer);
+		const size_t first = u[1];
+		const size_t count = u[0];
+		if ((m_ownerVertexBuffer.isValid() &&
+			(!vertices || vertices->initializedBytes.empty())) ||
+			(m_ownerIndexBuffer.isValid() &&
+			(!indices || !m_ownerIndexSize || !count ||
+			first > (size_t(-1) - m_ownerIndexOffset) / m_ownerIndexSize ||
+			count > size_t(-1) / m_ownerIndexSize ||
+			!IsInitializedRange(indices->initializedBytes,
+				static_cast<size_t>(m_ownerIndexOffset) + first * m_ownerIndexSize,
+				count * m_ownerIndexSize))))
+		{
+			m_ownerResourceFailure = true;
+			return RENDER_RESULT_FAILED;
+		}
+		// Exact indexed vertex bytes are validated by NativeW3DResources before
+		// enqueue; the owner has no CPU index payload and therefore cannot derive
+		// min/max indices without duplicating a byte shadow.
+		writeTarget(m_ownerColorTarget, false); writeTarget(m_ownerDepthTarget, false);
+		return m_context->drawIndexed(u[0], u[1], command.signedValue);
+	}
 	case OP_COPY_COLOR:
 	{
 		OwnerResource &slot = m_ownerResources[command.handle.index()];
@@ -1188,15 +1544,91 @@ void ThreadedRenderDevice::execute(Packet &packet)
 				m_ownerDeviceRemoved = false;
 				for (OwnerResource &slot : m_ownerResources)
 				{
-					if (slot.gpuAuthoritative) slot.contentValid = false;
-					else if (!slot.texture && slot.recoverySourceValid) slot.contentValid = true;
+					if (!slot.texture)
+					{
+						slot.contentValid = slot.recoverySourceValid &&
+							IsInitializedRange(slot.initializedBytes, 0,
+								slot.byteCount);
+						if (!slot.contentValid)
+						{
+							slot.initializedBytes.clear();
+						}
+					}
+					else if (slot.gpuAuthoritative)
+					{
+						slot.contentValid = false;
+					}
 				}
 				m_drainFailure = m_outsideFailure = m_ownerFrameResult = RENDER_RESULT_OK;
+				m_outsideResourceFailure = false;
+				m_ownerResourceFailure = false;
 				frameResult = packetResult = RENDER_RESULT_OK;
 			}
 			break;
 		case CONTROL_DEBUG_COUNT: result = BackendCall([&] { return m_backend->getDebugValidationErrorCount(&packet.reply->count); }); break;
 		case CONTROL_REPORT: result = BackendCall([&] { return m_backend->reportDebugLiveObjects(); }); break;
+		case CONTROL_SET_SWAP_INTERVAL:
+			result = BackendCall([&] { return m_backend->setSwapInterval(packet.reply->interval); });
+			break;
+		case CONTROL_GET_SWAP_INTERVAL:
+			result = BackendCall([&] { return m_backend->getSwapInterval(&packet.reply->interval); });
+			break;
+		case CONTROL_SET_GAMMA:
+			result = BackendCall([&] { return m_backend->setGamma(
+				packet.reply->gamma, packet.reply->brightness,
+				packet.reply->contrast, packet.reply->calibrate,
+				packet.reply->useLimit); });
+			break;
+		case CONTROL_GET_GAMMA:
+			result = BackendCall([&] { return m_backend->getGamma(
+				&packet.reply->gamma, &packet.reply->brightness,
+				&packet.reply->contrast, &packet.reply->calibrate,
+				&packet.reply->useLimit); });
+			break;
+		case CONTROL_CONFIGURE_RESOURCE_FAULT:
+			result = BackendCall([&] { return m_backend->configureResourceFaultInjection(
+				packet.reply->faultPoint, packet.reply->faultFailOnInvocation,
+				packet.reply->faultResult); });
+			break;
+		case CONTROL_GET_RESOURCE_STATISTICS:
+			result = BackendCall([&] { return m_backend->getDebugResourceStatistics(
+				&packet.reply->statistics); });
+			break;
+		case CONTROL_ROLLBACK_RESOURCE:
+		{
+			const GpuHandle logical = packet.reply->handle;
+			if (!logical.isValid() || logical.index() >= m_ownerResources.size())
+			{
+				result = RENDER_RESULT_INVALID_ARGUMENT;
+				break;
+			}
+			OwnerResource &slot = m_ownerResources[logical.index()];
+			if (slot.generation != logical.generation())
+			{
+				result = RENDER_RESULT_INVALID_ARGUMENT;
+				break;
+			}
+			if (slot.backend.isValid() && !m_backend->destroyResource(slot.backend))
+			{
+				result = RENDER_RESULT_FAILED;
+				break;
+			}
+			slot = OwnerResource();
+			if (logical == m_ownerColorTarget || logical == m_ownerDepthTarget)
+				m_ownerColorTarget = m_ownerDepthTarget = GpuHandle();
+			if (logical == m_ownerVertexBuffer)
+			{
+				m_ownerVertexBuffer = GpuHandle();
+				m_ownerVertexStride = m_ownerVertexOffset = 0;
+			}
+			if (logical == m_ownerIndexBuffer)
+			{
+				m_ownerIndexBuffer = GpuHandle();
+				m_ownerIndexSize = m_ownerIndexOffset = 0;
+			}
+			result = RENDER_RESULT_OK;
+			break;
+		}
 		case CONTROL_FENCE:
 			// Resource-only packets have no frame-completion record. Keep their
 			// failure observable across fences until Begin inherits it or recovery
@@ -1226,11 +1658,15 @@ void ThreadedRenderDevice::execute(Packet &packet)
 		// Later CPU frames may already be queued with these handles. Invalidate
 		// the failed producer's GPU results before executing any dependent frame,
 		// independently of when the game owner polls completion/cache revisions.
+		// A successful CPU upload is already fenced owner state and survives an
+		// unrelated draw/end/present failure in the same frame.
 		for (OwnerResource &slot : m_ownerResources)
 		{
-			if (slot.writtenSequence == packet.sequence)
+			if (slot.gpuAuthoritative &&
+				slot.writtenSequence == packet.sequence)
 			{
 				slot.contentValid = false;
+				slot.initializedBytes.clear();
 				m_ownerResourceFailure = true;
 			}
 		}
@@ -1347,6 +1783,12 @@ uint64_t LastThreadedRenderFrameSequence(const IRenderDevice *device)
 	const ThreadedRenderDevice *threaded = dynamic_cast<const ThreadedRenderDevice *>(device);
 	return threaded ? threaded->lastSequence() : 0;
 }
+uint64_t CurrentThreadedRenderFrameSequence(const IRenderDevice *device)
+{
+	const ThreadedRenderDevice *threaded =
+		dynamic_cast<const ThreadedRenderDevice *>(device);
+	return threaded ? threaded->currentSequence() : 0;
+}
 bool PollThreadedRenderCompletion(IRenderDevice *device, ThreadedRenderFrameCompletion *completion)
 {
 	ThreadedRenderDevice *threaded = dynamic_cast<ThreadedRenderDevice *>(device);
@@ -1356,6 +1798,13 @@ RenderResult DrainThreadedRenderDevice(IRenderDevice *device)
 {
 	ThreadedRenderDevice *threaded = dynamic_cast<ThreadedRenderDevice *>(device);
 	return threaded ? threaded->drain() : RENDER_RESULT_UNSUPPORTED;
+}
+RenderResult RollbackThreadedRenderResource(IRenderDevice *device,
+	GpuHandle handle)
+{
+	ThreadedRenderDevice *threaded = dynamic_cast<ThreadedRenderDevice *>(device);
+	return threaded ? threaded->rollbackResource(handle) :
+		RENDER_RESULT_UNSUPPORTED;
 }
 bool GetThreadedRenderMetrics(const IRenderDevice *device, ThreadedRenderMetrics *metrics)
 {

@@ -1,9 +1,88 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$SourceRoot
+    [string]$SourceRoot,
+    [switch]$SelfTest
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Get-SurfaceUnlockBlock {
+    param([Parameter(Mandatory = $true)][string]$SurfaceText)
+
+    return [regex]::Match($SurfaceText,
+        '(?s)void SurfaceClass::Unlock\(\)\s*\{(?<body>.*?)\r?\n\}\r?\n\r?\nbool SurfaceClass::Unlock_Native_Surface').Groups['body'].Value
+}
+
+function Test-SurfaceUnlockPublicationContract {
+    param([Parameter(Mandatory = $true)][string]$SurfaceText)
+
+    $unlock = Get-SurfaceUnlockBlock $SurfaceText
+    if ([string]::IsNullOrWhiteSpace($unlock)) {
+        return $false
+    }
+    $guard = [regex]::Match($unlock,
+        '(?s)if\s*\(\s*NativeSurface\s*!=\s*nullptr\s*&&\s*NativeSurface->locked\s*\)\s*\{(?<body>.*?)\r?\n\s*\}')
+    if (-not $guard.Success) {
+        return $false
+    }
+    $guardBody = $guard.Groups['body'].Value
+    $publicationPattern = '\bPublish_Native_Surface\s*\(\s*NativeSurface\b'
+    $publication = [regex]::Matches($unlock, $publicationPattern)
+    $guardPublication = [regex]::Matches($guardBody, $publicationPattern)
+    $locked = $guardBody.IndexOf('NativeSurface->locked = false;',
+        [StringComparison]::Ordinal)
+    return $publication.Count -eq 1 -and $guardPublication.Count -eq 1 -and
+        $locked -ge 0 -and
+        $locked -lt $guardBody.IndexOf($guardPublication[0].Value,
+            [StringComparison]::Ordinal)
+}
+
+if ($SelfTest) {
+    $validSurface = @'
+void SurfaceClass::Unlock()
+{
+    if (NativeSurface != nullptr && NativeSurface->locked)
+    {
+        NativeSurface->locked = false;
+        (void)Publish_Native_Surface(NativeSurface);
+    }
+}
+
+bool SurfaceClass::Unlock_Native_Surface()
+{
+    return true;
+}
+'@
+    if (-not (Test-SurfaceUnlockPublicationContract $validSurface)) {
+        throw 'Valid neutral SurfaceClass unlock fixture rejected.'
+    }
+    $duplicatePublication = $validSurface.Replace(
+        '(void)Publish_Native_Surface(NativeSurface);',
+        "(void)Publish_Native_Surface(NativeSurface);`n        (void)Publish_Native_Surface(NativeSurface);")
+    $missingPublication = $validSurface.Replace(
+        '(void)Publish_Native_Surface(NativeSurface);', '')
+    $unguardedPublication = $validSurface.Replace(
+        'if (NativeSurface != nullptr && NativeSurface->locked)',
+        'if (NativeSurface != nullptr)')
+    $wrongPublicationTarget = $validSurface.Replace(
+        'Publish_Native_Surface(NativeSurface)',
+        'Publish_Native_Surface(OtherSurface)')
+    foreach ($mutation in @(
+        $duplicatePublication,
+        $missingPublication,
+        $unguardedPublication,
+        $wrongPublicationTarget)) {
+        if ($mutation -eq $validSurface -or
+            (Test-SurfaceUnlockPublicationContract $mutation)) {
+            throw 'Invalid neutral SurfaceClass unlock fixture accepted.'
+        }
+    }
+    Write-Output 'FFmpeg movie playback audit self-test passed.'
+    exit 0
+}
+
+if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
+    throw 'SourceRoot is required unless SelfTest is specified.'
+}
 
 $coreFiles = @(
     'Core/GameEngineDevice/Include/VideoDevice/FFmpeg/FFmpegMoviePlayback.h',
@@ -157,36 +236,48 @@ if ($playbackTest -notmatch '(?s)testResetPendingServiceReopensAdmission.*?servi
 
 $videoBufferPath = Join-Path $SourceRoot 'Core/GameEngineDevice/Source/W3DDevice/GameClient/W3DVideoBuffer.cpp'
 $videoBufferSource = Get-Content -LiteralPath $videoBufferPath -Raw
+$selectionBlock = [regex]::Match($videoBufferSource,
+    '(?s)Bool W3DVideoBuffer::UsesNativeD3D11PublicationPath\(\)\s*\{(.*?)\r?\n\}\r?\n\r?\n//={20,}\r?\n// W3DVideoBuffer::SetBuffer').Groups[1].Value
+if ([string]::IsNullOrWhiteSpace($selectionBlock) -or
+    $selectionBlock -notmatch '(?s)#if\s+defined\(_WIN64\).*?RequestedRenderBackend\(\).*?IsRenderBackendSupported\(backend\).*?IsNativeD3D11PublicationActive\(\).*?#else.*?return\s+FALSE;') {
+    throw 'W3D video native publication selection is not x64-only and active-owner bound.'
+}
 $allocateBlock = [regex]::Match($videoBufferSource,
     '(?s)Bool W3DVideoBuffer::allocate\(\s*UnsignedInt width, UnsignedInt height\s*\)\s*\{(.*?)\r?\n\}\r?\n\r?\n//={20,}\r?\n// W3DVideoBuffer::~W3DVideoBuffer').Groups[1].Value
 if ([string]::IsNullOrWhiteSpace($allocateBlock) -or
-    $allocateBlock -notmatch '(?s)if\s*\(\s*DX8Wrapper::Is_D3D11_Backend_Active\(\)\s*\).*?max_texture_dimension.*?max_texture_bytes.*?else\s*\{[^{}]*Validate_Texture_Size[^{}]*\}') {
-    throw 'D3D11 movie textures are still forced through legacy power-of-two allocation.'
+    $allocateBlock -notmatch '(?s)m_nativePublicationPath\s*=\s*UsesNativeD3D11PublicationPath\(\).*?if\s*\(\s*m_nativePublicationPath\s*\).*?max_texture_dimension.*?max_texture_bytes.*?else\s*\{.*?Validate_Texture_Size') {
+    throw 'D3D11 movie textures do not use the active native selection with a legacy fallback.'
 }
-$publishBlock = [regex]::Match($videoBufferSource,
-    '(?s)Bool W3DVideoBuffer::publishLockedFrame\(\)\s*\{(.*?)\r?\n\}\r?\n\r?\n//={20,}\r?\n// W3DVideoBuffer::unlock').Groups[1].Value
 $unlockBlock = [regex]::Match($videoBufferSource,
     '(?s)void\s+W3DVideoBuffer::unlock\(\)\s*\{(.*?)\r?\n\}\r?\n\r?\n//={20,}\r?\n// W3DVideoBuffer::valid').Groups[1].Value
-if ([string]::IsNullOrWhiteSpace($publishBlock) -or
-    $publishBlock -notmatch '(?s)m_surfaceLocked.*?TYPE_X8R8G8B8.*?Publish_Render_Texture_BGRA8_Change') {
-    throw 'The W3D video buffer does not publish a complete locked BGRA8 frame through the renderer bridge.'
+if ($videoBufferSource -match 'DX8Wrapper::Is_D3D11_Backend_Active|Publish_Render_Texture_BGRA8_Change|PublishTextureBGRA8Change|publishLockedFrame|m_framePublished|frame_published') {
+    throw 'The W3D video buffer still contains a retired direct or duplicate publication path.'
 }
 if ([string]::IsNullOrWhiteSpace($unlockBlock) -or
-    $unlockBlock -notmatch '(?s)frame_published.*?m_surface->Unlock\(\).*?if\s*\(\s*!frame_published.*?Notify_Render_Texture_Changed') {
-    throw 'The W3D video buffer no longer preserves dirty notification when direct publication is unavailable.'
+    $unlockBlock -notmatch '(?s)m_surface->Unlock\(\).*?m_nativePublicationPath.*?NotifyTextureChanged') {
+    throw 'The W3D video buffer no longer preserves the legacy fallback notification after unlock.'
+}
+
+$surfacePath = Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/surfaceclass.cpp'
+$surfaceSource = Get-Content -LiteralPath $surfacePath -Raw
+if (-not (Test-SurfaceUnlockPublicationContract $surfaceSource)) {
+    throw 'SurfaceClass::Unlock is not the sole native video publication boundary.'
 }
 
 $frameRenderBlock = [regex]::Match($streamSource,
     '(?s)void FFmpegVideoStream::frameRender\(\s*VideoBuffer \*buffer\s*\)\s*\{(.*?)\r?\n\}\r?\n\r?\n//={20,}\r?\n// FFmpegVideoStream::frameNext').Groups[1].Value
 if ([string]::IsNullOrWhiteSpace($frameRenderBlock) -or
-    $frameRenderBlock -notmatch '(?s)TYPE_X8R8G8B8.*?AV_PIX_FMT_BGRA.*?sws_scale.*?publishLockedFrame\(\).*?buffer->unlock\(\)') {
-    throw 'FFmpeg does not publish opaque BGRA8 pixels while the W3D video surface remains locked.'
+    $frameRenderBlock -notmatch '(?s)TYPE_X8R8G8B8.*?AV_PIX_FMT_BGRA.*?sws_scale.*?buffer->unlock\(\)') {
+    throw 'FFmpeg does not scale opaque BGRA8 pixels before the sole SurfaceClass unlock publication.'
+}
+if ($frameRenderBlock -match 'Publish_Render_Texture_BGRA8_Change|PublishTextureBGRA8Change') {
+    throw 'FFmpeg frame rendering reintroduced a second direct native texture upload.'
 }
 if ($frameRenderBlock -match 'AV_PIX_FMT_BGR0') {
-    throw 'The direct video publication path can expose a zero alpha channel to DRAW_IMAGE_ALPHA.'
+    throw 'The video conversion path can expose a zero alpha channel to DRAW_IMAGE_ALPHA.'
 }
 
-$bridgePath = Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/d3d11legacybridge.cpp'
+$bridgePath = Join-Path $SourceRoot 'Core/LegacyRenderer/WWVegas/WW3D2/d3d11legacybridge.cpp'
 $bridgeSource = Get-Content -LiteralPath $bridgePath -Raw
 $bridgePublishBlock = [regex]::Match($bridgeSource,
     '(?s)bool D3D11LegacyBridge::Publish_Texture_BGRA8_Change\(.*?\)\s*\{(.*?)\r?\n\}\r?\n\r?\nvoid D3D11LegacyBridge::Invalidate_Texture').Groups[1].Value
