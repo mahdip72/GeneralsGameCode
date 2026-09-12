@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -16,7 +17,23 @@ const wchar_t kWindowClassName[] =
 LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam,
 	LPARAM lparam)
 {
-	return DefWindowProcW(window, message, wparam, lparam);
+	const LRESULT result = DefWindowProcW(window, message, wparam, lparam);
+	const DWORD savedError = GetLastError();
+	const char *trace = std::getenv("GGC_STAGE5_WINDOW_TRACE");
+	if (message == WM_GETMINMAXINFO && lparam != 0 &&
+		trace != 0 && trace[0] == '1' && trace[1] == '\0')
+	{
+		const MINMAXINFO &info = *reinterpret_cast<const MINMAXINFO *>(lparam);
+		std::fprintf(stderr, "STAGE5_WINDOW_MINMAX_TRACE pid=%lu hwnd=%p "
+			"max_size=%ld,%ld max_position=%ld,%ld min_track=%ld,%ld max_track=%ld,%ld\n",
+			GetCurrentProcessId(), window, info.ptMaxSize.x, info.ptMaxSize.y,
+			info.ptMaxPosition.x, info.ptMaxPosition.y,
+			info.ptMinTrackSize.x, info.ptMinTrackSize.y,
+			info.ptMaxTrackSize.x, info.ptMaxTrackSize.y);
+		std::fflush(stderr);
+	}
+	SetLastError(savedError);
+	return result;
 }
 
 HWND CreateHiddenWindow()
@@ -387,19 +404,31 @@ int TestNativeLifecycle(HWND window)
 	const rts::render::RenderResult reentrantResize =
 		rts::render::SetGameRenderDeviceByIndex(0, 1024, 768, 16, 1, true,
 		true, true);
-	failures += !Check(reentrantResize == rts::render::RENDER_RESULT_OK &&
-		cleanupHook.releaseCalls == 1 && cleanupHook.reacquireCalls == 1 &&
-		cleanupHook.reentryCalls == 2 && cleanupHook.releaseDeviceCount == 0 &&
-		cleanupHook.releaseDeviceIndex == -1 &&
-		cleanupHook.reacquireDeviceCount == 0 &&
-		cleanupHook.releaseDeleteResult == rts::render::RENDER_RESULT_OK &&
-		cleanupHook.releaseCreateResult == rts::render::RENDER_RESULT_OK &&
-		cleanupHook.releaseCreatedDeleteResult ==
-			rts::render::RENDER_RESULT_OK &&
-		cleanupHook.reacquireCreateResult == rts::render::RENDER_RESULT_OK &&
-		cleanupHook.reacquireCreatedDeleteResult ==
-			rts::render::RENDER_RESULT_OK,
-		"resize cleanup callbacks can re-enter the native facade for shader rebuilds");
+	std::fprintf(stderr, "STAGE5_RESIZE_CALLBACK_TRACE result=%d release=%u reacquire=%u reentry=%u "
+		"release_devices=%d release_index=%d reacquire_devices=%d "
+		"release_delete=%d release_create=%d release_created_delete=%d "
+		"reacquire_create=%d reacquire_created_delete=%d\n",
+		static_cast<int>(reentrantResize), cleanupHook.releaseCalls, cleanupHook.reacquireCalls,
+		cleanupHook.reentryCalls, cleanupHook.releaseDeviceCount, cleanupHook.releaseDeviceIndex,
+		cleanupHook.reacquireDeviceCount, static_cast<int>(cleanupHook.releaseDeleteResult),
+		static_cast<int>(cleanupHook.releaseCreateResult), static_cast<int>(cleanupHook.releaseCreatedDeleteResult),
+		static_cast<int>(cleanupHook.reacquireCreateResult), static_cast<int>(cleanupHook.reacquireCreatedDeleteResult));
+	failures += !Check(reentrantResize == rts::render::RENDER_RESULT_OK, "callback resize succeeds");
+	failures += !Check(cleanupHook.releaseCalls == 1, "resize invokes release hook once");
+	failures += !Check(cleanupHook.reacquireCalls == 1, "resize invokes reacquire hook once");
+	failures += !Check(cleanupHook.reentryCalls == 2, "both resize hooks re-enter facade");
+	failures += !Check(cleanupHook.releaseDeviceCount == 0 && cleanupHook.releaseDeviceIndex == -1 &&
+		cleanupHook.reacquireDeviceCount == 0, "resize hooks observe closed device admission");
+	failures += !Check(cleanupHook.releaseDeleteResult == rts::render::RENDER_RESULT_OK,
+		"release hook deletes old shader");
+	failures += !Check(cleanupHook.releaseCreateResult == rts::render::RENDER_RESULT_OK,
+		"release hook creates shader");
+	failures += !Check(cleanupHook.releaseCreatedDeleteResult == rts::render::RENDER_RESULT_OK,
+		"release hook deletes recreated shader");
+	failures += !Check(cleanupHook.reacquireCreateResult == rts::render::RENDER_RESULT_OK,
+		"reacquire hook creates shader");
+	failures += !Check(cleanupHook.reacquireCreatedDeleteResult == rts::render::RENDER_RESULT_OK,
+		"reacquire hook deletes recreated shader");
 
 	rts::render::SetGameCleanupHook(0);
 	failures += !Check(rts::render::ShutdownGameRenderer() ==

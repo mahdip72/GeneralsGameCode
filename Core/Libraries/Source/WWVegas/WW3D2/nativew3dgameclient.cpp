@@ -31,6 +31,8 @@
 #include <new>
 #include <string.h>
 #include <atomic>
+#include <stdio.h>
+#include <stdlib.h>
 
 #if defined(_WIN64)
 
@@ -400,12 +402,85 @@ RenderResult ApplyPresentation(HWND window, bool windowed,
 		RENDER_RESULT_OK : RENDER_RESULT_FAILED;
 }
 
+// Temporary opt-in CI observation. Remove after the host sizing boundary is
+// diagnosed; this never changes window policy or sends window messages.
+struct WindowResizeTrace
+{
+	WindowResizeTrace(HWND hwnd, int w, int h) : window(hwnd), width(w), height(h),
+		enabled(false), initialClient{}, initialOuter{}, monitor{}, monitorValid(false),
+		outerWidth(0), outerHeight(0), left(0), top(0), setCalled(false),
+		setResult(FALSE), setError(0)
+	{
+		const DWORD savedError = GetLastError();
+		const char *flag = getenv("GGC_STAGE5_WINDOW_TRACE");
+		enabled = flag != 0 && strcmp(flag, "1") == 0;
+		SetLastError(savedError);
+	}
+	RenderResult Fail(const char *stage) const
+	{
+		if (!enabled) return RENDER_RESULT_FAILED;
+		const DWORD savedError = GetLastError();
+		RECT actualClient = {}, actualOuter = {};
+		const BOOL clientValid = GetClientRect(window, &actualClient);
+		const BOOL outerValid = GetWindowRect(window, &actualOuter);
+		typedef UINT (WINAPI *DpiProc)(HWND);
+		typedef HANDLE (WINAPI *WindowContextProc)(HWND);
+		typedef HANDLE (WINAPI *ThreadContextProc)();
+		typedef int (WINAPI *AwarenessProc)(HANDLE);
+		const HMODULE user32 = GetModuleHandleW(L"user32.dll");
+		const DpiProc dpiProc = reinterpret_cast<DpiProc>(GetProcAddress(user32, "GetDpiForWindow"));
+		const WindowContextProc windowContextProc = reinterpret_cast<WindowContextProc>(GetProcAddress(user32, "GetWindowDpiAwarenessContext"));
+		const ThreadContextProc threadContextProc = reinterpret_cast<ThreadContextProc>(GetProcAddress(user32, "GetThreadDpiAwarenessContext"));
+		const AwarenessProc awarenessProc = reinterpret_cast<AwarenessProc>(GetProcAddress(user32, "GetAwarenessFromDpiAwarenessContext"));
+		const HANDLE windowContext = windowContextProc ? windowContextProc(window) : 0;
+		const HANDLE threadContext = threadContextProc ? threadContextProc() : 0;
+		fprintf(stderr, "STAGE5_WINDOW_RESIZE_TRACE pid=%lu hwnd=%p stage=%s request=%dx%d "
+			"initial_client=%ld,%ld,%ld,%ld initial_outer=%ld,%ld,%ld,%ld "
+			"calculated_outer=%lldx%lld calculated_position=%lld,%lld\n",
+			GetCurrentProcessId(), window, stage, width, height,
+			initialClient.left, initialClient.top, initialClient.right, initialClient.bottom,
+			initialOuter.left, initialOuter.top, initialOuter.right, initialOuter.bottom,
+			outerWidth, outerHeight, left, top);
+		fprintf(stderr, "STAGE5_WINDOW_RESIZE_TRACE actual_client_valid=%d actual_client=%ld,%ld,%ld,%ld "
+			"actual_outer_valid=%d actual_outer=%ld,%ld,%ld,%ld monitor_valid=%d "
+			"monitor=%ld,%ld,%ld,%ld work=%ld,%ld,%ld,%ld\n",
+			clientValid, actualClient.left, actualClient.top, actualClient.right, actualClient.bottom,
+			outerValid, actualOuter.left, actualOuter.top, actualOuter.right, actualOuter.bottom,
+			monitorValid ? 1 : 0, monitor.rcMonitor.left, monitor.rcMonitor.top, monitor.rcMonitor.right, monitor.rcMonitor.bottom,
+			monitor.rcWork.left, monitor.rcWork.top, monitor.rcWork.right, monitor.rcWork.bottom);
+		fprintf(stderr, "STAGE5_WINDOW_RESIZE_TRACE style=%08lX ex_style=%08lX has_menu=%d dpi=%u "
+			"window_context=%p window_awareness=%d thread_context=%p thread_awareness=%d "
+			"set_called=%d set_result=%d set_immediate_error=%lu failure_error=%lu\n",
+			static_cast<DWORD>(GetWindowLongPtrW(window, GWL_STYLE)),
+			static_cast<DWORD>(GetWindowLongPtrW(window, GWL_EXSTYLE)), GetMenu(window) != 0 ? 1 : 0,
+			dpiProc ? dpiProc(window) : 0, windowContext, awarenessProc && windowContext ? awarenessProc(windowContext) : -1,
+			threadContext, awarenessProc && threadContext ? awarenessProc(threadContext) : -1,
+			setCalled ? 1 : 0, setResult, setError, savedError);
+		fflush(stderr);
+		SetLastError(savedError);
+		return RENDER_RESULT_FAILED;
+	}
+	HWND window;
+	int width, height;
+	bool enabled;
+	RECT initialClient, initialOuter;
+	MONITORINFO monitor;
+	bool monitorValid;
+	long long outerWidth, outerHeight, left, top;
+	bool setCalled;
+	BOOL setResult;
+	DWORD setError;
+};
+
 RenderResult ResizeWindowClient(HWND window, int width, int height)
 {
+	WindowResizeTrace trace(window, width, height);
 	RECT client = { 0 };
 	RECT outer = { 0 };
-	if (!GetClientRect(window, &client) || !GetWindowRect(window, &outer))
-		return RENDER_RESULT_FAILED;
+	if (!GetClientRect(window, &client)) return trace.Fail("initial-client-query");
+	trace.initialClient = client;
+	if (!GetWindowRect(window, &outer)) return trace.Fail("initial-outer-query");
+	trace.initialOuter = outer;
 	if (client.right - client.left == width &&
 		client.bottom - client.top == height)
 		return RENDER_RESULT_OK;
@@ -415,14 +490,18 @@ RenderResult ResizeWindowClient(HWND window, int width, int height)
 		(outer.right - outer.left) - (client.right - client.left);
 	const long long outerHeight = static_cast<long long>(height) +
 		(outer.bottom - outer.top) - (client.bottom - client.top);
+	trace.outerWidth = outerWidth;
+	trace.outerHeight = outerHeight;
 	if (outerWidth <= 0 || outerHeight <= 0 ||
 		outerWidth > INT_MAX || outerHeight > INT_MAX)
-		return RENDER_RESULT_FAILED;
+		return trace.Fail("outer-size-range");
 	MONITORINFO monitor = { sizeof(MONITORINFO) };
 	POINT clientOrigin = { client.left, client.top };
-	if (!GetMonitorInfo(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY), &monitor) ||
-		!ClientToScreen(window, &clientOrigin))
-		return RENDER_RESULT_FAILED;
+	if (!GetMonitorInfo(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY), &monitor))
+		return trace.Fail("monitor-query");
+	trace.monitor = monitor;
+	trace.monitorValid = true;
+	if (!ClientToScreen(window, &clientOrigin)) return trace.Fail("client-origin-query");
 	long long left = (static_cast<long long>(monitor.rcWork.left) +
 		monitor.rcWork.right - outerWidth) / 2;
 	long long top = (static_cast<long long>(monitor.rcWork.top) +
@@ -443,13 +522,19 @@ RenderResult ResizeWindowClient(HWND window, int width, int height)
 		dy = monitor.rcMonitor.top - clientTop;
 	left += dx;
 	top += dy;
-	if (left < INT_MIN || left > INT_MAX || top < INT_MIN || top > INT_MAX ||
-		!SetWindowPos(window, 0, static_cast<int>(left), static_cast<int>(top),
-			static_cast<int>(outerWidth), static_cast<int>(outerHeight),
-			SWP_NOZORDER | SWP_NOACTIVATE) ||
-		!GetClientRect(window, &client) ||
-		client.right - client.left != width || client.bottom - client.top != height)
-		return RENDER_RESULT_FAILED;
+	trace.left = left;
+	trace.top = top;
+	if (left < INT_MIN || left > INT_MAX || top < INT_MIN || top > INT_MAX)
+		return trace.Fail("position-range");
+	trace.setCalled = true;
+	const BOOL positioned = SetWindowPos(window, 0, static_cast<int>(left), static_cast<int>(top),
+		static_cast<int>(outerWidth), static_cast<int>(outerHeight), SWP_NOZORDER | SWP_NOACTIVATE);
+	trace.setError = GetLastError();
+	trace.setResult = positioned;
+	if (!positioned) return trace.Fail("set-window-pos");
+	if (!GetClientRect(window, &client)) return trace.Fail("final-client-query");
+	if (client.right - client.left != width || client.bottom - client.top != height)
+		return trace.Fail("client-size-mismatch");
 	return RENDER_RESULT_OK;
 }
 

@@ -18,7 +18,8 @@ function(add_native_title_camera_adapter_test target_name title_root title_prefi
     set_target_properties(${target_name} PROPERTIES
         CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
     add_test(NAME ${target_name} COMMAND ${target_name})
-    set_tests_properties(${target_name} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    set_tests_properties(${target_name} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        ENVIRONMENT "GGC_STAGE5_WINDOW_TRACE=1")
 endfunction()
 
 if(RTS_BUILD_GENERALS)

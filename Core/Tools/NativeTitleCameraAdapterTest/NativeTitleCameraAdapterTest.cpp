@@ -17,6 +17,7 @@
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <windows.h>
 
@@ -34,7 +35,23 @@ const wchar_t *kWindowClassName = L"GeneralsGameCodeNativeTitleCameraAdapterTest
 
 LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam)
 {
-	return DefWindowProcW(window, message, wparam, lparam);
+	const LRESULT result = DefWindowProcW(window, message, wparam, lparam);
+	const DWORD savedError = GetLastError();
+	const char *trace = std::getenv("GGC_STAGE5_WINDOW_TRACE");
+	if (message == WM_GETMINMAXINFO && lparam != 0 &&
+		trace != 0 && trace[0] == '1' && trace[1] == '\0')
+	{
+		const MINMAXINFO &info = *reinterpret_cast<const MINMAXINFO *>(lparam);
+		std::fprintf(stderr, "STAGE5_WINDOW_MINMAX_TRACE pid=%lu hwnd=%p "
+			"max_size=%ld,%ld max_position=%ld,%ld min_track=%ld,%ld max_track=%ld,%ld\n",
+			GetCurrentProcessId(), window, info.ptMaxSize.x, info.ptMaxSize.y,
+			info.ptMaxPosition.x, info.ptMaxPosition.y,
+			info.ptMinTrackSize.x, info.ptMinTrackSize.y,
+			info.ptMaxTrackSize.x, info.ptMaxTrackSize.y);
+		std::fflush(stderr);
+	}
+	SetLastError(savedError);
+	return result;
 }
 
 HWND CreateHiddenWindow()
@@ -1073,13 +1090,21 @@ int TestNativeOffscreenFacade(HWND window,
 	SetGameCleanupHook(hook);
 	const RenderResult recoveryResult = SetGameRendererResolution(101, 79, 32,
 		1, true);
+	std::fprintf(stderr, "STAGE5_CAMERA_RESIZE_CALLBACK_TRACE result=%d release=%u reacquire=%u "
+		"draw_gate_closed=%d created=%d factory_failed=%d color=%p depth=%p\n",
+		static_cast<int>(recoveryResult), hook->releaseCount, hook->reacquireCount,
+		hook->drawGateWasClosed ? 1 : 0, hook->createdDuringReacquire ? 1 : 0,
+		hook->factoryFailed ? 1 : 0, static_cast<void *>(hook->Color()), static_cast<void *>(hook->Depth()));
+	result |= Check(recoveryResult == RENDER_RESULT_OK, "camera resize succeeds");
+	result |= Check(hook->releaseCount == 1, "camera resize invokes release hook once");
+	result |= Check(hook->reacquireCount == 1, "camera resize invokes reacquire hook once");
+	result |= Check(hook->drawGateWasClosed, "camera resize hook observes closed draw gate");
+	result |= Check(hook->createdDuringReacquire, "camera resize reacquire creates targets");
+	result |= Check(hook->Color() != 0 && hook->Depth() != 0, "camera resize publishes target pair");
 	result |= Check(recoveryResult == RENDER_RESULT_OK &&
-		hook->releaseCount == 1 && hook->reacquireCount == 1 &&
-		hook->drawGateWasClosed && hook->createdDuringReacquire &&
-		hook->Color() != 0 && hook->Depth() != 0 &&
 		owner->IsOperational() &&
 		owner->ActiveRenderTargetKind() == GAME_RENDER_TARGET_BACK_BUFFER,
-		"resize recovery closes the draw gate while recreating a real target pair");
+		"camera resize reopens owner on back buffer");
 	NativeW3DTextureHandle staleHandle;
 	result |= Check(oldColor->Acquire_Native_Texture(&staleHandle) &&
 		shadow->Acquire_Native_Texture(&shadowHandle),
