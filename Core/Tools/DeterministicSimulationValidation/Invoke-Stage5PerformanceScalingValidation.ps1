@@ -6050,6 +6050,7 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
     $capturedOutput = $null
     $processStarted = $false
     $processIdentity = $null
+    $exitCode = $null
     $rawLogSnapshot = $null
     $lifecycle = [ordered]@{
         mutexAcquired = $false
@@ -6384,6 +6385,9 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
             $failure = New-Stage5NativeFixtureDiagnosticResult -Status failed -ErrorText $failureText `
                 -Lifecycle ([pscustomobject]$lifecycle) -ProcessIdentity $processIdentity `
                 -ExpectedInitialUnitCount $DiagnosticExpectedInitialUnits -CleanupErrors @($cleanupErrors.ToArray())
+            $failure.exitCode = if ($null -eq $exitCode) { $null } else { [int]$exitCode }
+            $failure.identityBoundExitProven = [bool]($null -ne $processIdentity -and
+                $processCleanup.exitProof -and -not $processCleanup.blocked)
             $failure.inputBinding = [ordered]@{ path = $retainedManifestPath; sha256 = $ReviewedManifestSha256 }
             $failure.prelaunchPlan = [ordered]@{ path = $planPath; sha256 = $planSnapshot.sha256 }
             $failure.capturedOutput = [ordered]@{
@@ -6413,6 +6417,9 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         $result = New-Stage5NativeFixtureDiagnosticResult -Status observed -Completion $completion `
             -Lifecycle ([pscustomobject]$lifecycle) -ProcessIdentity $processIdentity `
             -ExpectedInitialUnitCount $DiagnosticExpectedInitialUnits
+        $result.exitCode = if ($null -eq $exitCode) { $null } else { [int]$exitCode }
+        $result.identityBoundExitProven = [bool]($null -ne $processIdentity -and
+            $processCleanup.exitProof -and -not $processCleanup.blocked)
         $result.inputBinding = [ordered]@{ path = $retainedManifestPath; sha256 = $ReviewedManifestSha256 }
         $result.prelaunchPlan = [ordered]@{ path = $planPath; sha256 = $planSnapshot.sha256 }
         $result.rawLog = [ordered]@{ path = $rawLogPath; sha256 = $rawLogSnapshot.sha256 }

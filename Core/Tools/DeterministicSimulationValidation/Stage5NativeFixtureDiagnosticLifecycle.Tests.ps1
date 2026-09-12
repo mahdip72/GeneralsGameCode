@@ -98,12 +98,33 @@ foreach($script:case in @('success','exit-failure','capture-failure','foreign-ch
     Assert-True (-not $result.finalAcceptanceClaim -and -not $result.performanceScalingClaim -and -not $result.kernelQualificationClaim) 'Diagnostic made acceptance claims.'
     Assert-True (-not(Test-Path (Join-Path $out 'Stage5NativePerformanceFixture.json'))) 'Diagnostic published dense receipt.'
     Assert-True (Test-Path (Join-Path $out 'inputs/Stage5Dense.map')) 'Input map was lost.'
+    $hasObservedExitEvidence = $result.PSObject.Properties.Name -contains 'exitCode' -and
+        $result.PSObject.Properties.Name -contains 'identityBoundExitProven'
     if($script:case -eq 'success') {
-        Assert-True ($null -eq $caught -and $result.status -eq 'observed' -and $result.expectedPopulationObserved) "Successful diagnostic failed: $caught"
+        Assert-True ($null -eq $caught -and $result.status -eq 'observed' -and $result.expectedPopulationObserved -and
+            $hasObservedExitEvidence -and (Test-Stage5JsonInteger $result.exitCode) -and
+            $result.exitCode -eq 0 -and $result.identityBoundExitProven -and
+            $result.lifecycle.childExitProven) "Successful diagnostic failed: $caught"
         Assert-True (Test-Path (Join-Path $out 'replays/Stage5Performance.rep')) 'Replay was lost during cleanup.'
         Assert-True (-not(Test-Path (Join-Path $out 'TitleSession'))) 'Completed profile not cleaned.'
     }else{
         Assert-True ($null -ne $caught -and $result.status -eq 'failed' -and $null -eq $result.observation) "Failure became success: $script:case"
+        if($script:case -eq 'exit-failure') {
+            Assert-True ($hasObservedExitEvidence -and (Test-Stage5JsonInteger $result.exitCode) -and
+                $result.exitCode -eq 1 -and $result.identityBoundExitProven -and
+                -not $result.lifecycle.childExitProven) `
+                'Known nonzero child exit was not retained separately from clean-exit proof.'
+        }
+        elseif($script:case -eq 'capture-failure') {
+            Assert-True ($hasObservedExitEvidence -and $null -eq $result.exitCode -and
+                $result.identityBoundExitProven -and -not $result.lifecycle.childExitProven) `
+                'Capture failure must preserve an unknown exit code without inventing zero.'
+        }
+        elseif($script:case -eq 'foreign-child') {
+            Assert-True ($hasObservedExitEvidence -and $null -eq $result.exitCode -and
+                -not $result.identityBoundExitProven -and -not $result.lifecycle.childExitProven) `
+                'Foreign child identity must preserve unknown/unproven exit evidence.'
+        }
         if($script:case -eq 'foreign-child') {
             Assert-True ((Test-Path (Join-Path $out 'TitleSession')) -and (Test-Path (Join-Path $out 'Stage5FixtureRegistryRecovery.json'))) 'Unproven child lost profile/journal.'
         }else{
