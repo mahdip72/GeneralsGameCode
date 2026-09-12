@@ -163,6 +163,10 @@ int TestNativeLifecycle(HWND window)
 	// Mirror W3DDisplay startup: the saved policy is published before Init,
 	// then Set_Render_Device selects the final dimensions without recreating
 	// the already initialized native device.
+	MONITORINFO selectedMonitor = { sizeof(MONITORINFO) };
+	failures += !Check(GetMonitorInfo(MonitorFromWindow(window,
+		MONITOR_DEFAULTTOPRIMARY), &selectedMonitor) != FALSE,
+		"read the window's selected monitor before startup resizing");
 	const rts::render::RenderResult startupSelectionResult =
 		rts::render::SetGameRenderDeviceByIndex(0, 640, 480, 32, 1, true,
 		false, true);
@@ -171,6 +175,17 @@ int TestNativeLifecycle(HWND window)
 		rts::render::GetGameMSAAMode() ==
 		rts::render::GAME_RENDER_MULTISAMPLE_4X,
 		"product startup ordering preserves the effective 4x D3D11 scene target");
+	RECT clientRect = { 0 };
+	failures += !Check(GetClientRect(window, &clientRect) &&
+		clientRect.right == 640 && clientRect.bottom == 480,
+		"windowed startup sizes the physical client to the selected render resolution");
+	RECT positionedWindow = { 0 };
+	failures += !Check(GetWindowRect(window, &positionedWindow) &&
+		positionedWindow.left == (selectedMonitor.rcWork.left + selectedMonitor.rcWork.right -
+			(positionedWindow.right - positionedWindow.left)) / 2 &&
+		positionedWindow.top == (selectedMonitor.rcWork.top + selectedMonitor.rcWork.bottom -
+			(positionedWindow.bottom - positionedWindow.top)) / 2,
+		"resized window is centered in its selected monitor work area");
 
 	const long intervals[] = { 0, 1, 3 };
 	for (unsigned int i = 0; i != sizeof(intervals) / sizeof(intervals[0]); ++i)
@@ -286,6 +301,59 @@ int TestNativeLifecycle(HWND window)
 		&bitDepth, &windowed) == rts::render::RENDER_RESULT_OK &&
 		width == 800 && height == 600 && bitDepth == 32 && windowed,
 		"native selection reports effective 32-bit resized state");
+	failures += !Check(GetClientRect(window, &clientRect) &&
+		clientRect.right == 800 && clientRect.bottom == 600,
+		"same-mode windowed selection honors resizeWindow for the physical client");
+	rts::render::RenderBackBufferInfo backBuffer;
+	failures += !Check(rts::render::GetGameBackBufferInfo(&backBuffer) ==
+		rts::render::RENDER_RESULT_OK && backBuffer.width == 800 &&
+		backBuffer.height == 600,
+		"windowed client and actual backbuffer agree after resizing");
+	RECT originalWindowRect = { 0 };
+	GetWindowRect(window, &originalWindowRect);
+	const rts::render::GameRenderColor clearColor = { 0, 0, 0, 1 };
+	failures += !Check(rts::render::BeginGameRender(true, true, clearColor, 1.0f) ==
+		rts::render::RENDER_RESULT_OK, "open frame establishes a resize rejection boundary");
+	failures += !Check(rts::render::SetGameRendererResolution(960, 720, 32, 1, true) ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"resolution transaction rejects resizing an open render frame");
+	RECT rolledBackWindowRect = { 0 };
+	failures += !Check(GetWindowRect(window, &rolledBackWindowRect) &&
+		EqualRect(&originalWindowRect, &rolledBackWindowRect),
+		"failed render resize restores the complete prior window rectangle");
+	failures += !Check(rts::render::GetGameRendererResolution(&width, &height,
+		&bitDepth, &windowed) == rts::render::RENDER_RESULT_OK &&
+		width == 800 && height == 600 && windowed,
+		"failed resize does not publish new renderer dimensions");
+	failures += !Check(rts::render::GetGameBackBufferInfo(&backBuffer) ==
+		rts::render::RENDER_RESULT_OK && backBuffer.width == 800 &&
+		backBuffer.height == 600,
+		"rejected open-frame resize preserves actual backbuffer dimensions");
+	(void)rts::render::EndGameRender(false);
+	failures += !Check(rts::render::SetGameRendererResolution(640, 480, 32, 1, false) ==
+		rts::render::RENDER_RESULT_OK && GetClientRect(window, &clientRect) &&
+		clientRect.right == 800 && clientRect.bottom == 600 &&
+		rts::render::GetGameBackBufferInfo(&backBuffer) == rts::render::RENDER_RESULT_OK &&
+		backBuffer.width == 640 && backBuffer.height == 480,
+		"explicit nonresizing selection retains independent client and render sizes");
+	failures += !Check(rts::render::SetGameRendererResolution(800, 600, 32, 1, true) ==
+		rts::render::RENDER_RESULT_OK,
+		"resizing selection restores the matched client and renderer");
+	const int monitorWidth = selectedMonitor.rcMonitor.right - selectedMonitor.rcMonitor.left;
+	const int monitorHeight = selectedMonitor.rcMonitor.bottom - selectedMonitor.rcMonitor.top;
+	failures += !Check(rts::render::SetGameRendererResolution(monitorWidth,
+		monitorHeight, 32, 1, true) == rts::render::RENDER_RESULT_OK,
+		"windowed monitor-sized request preserves exact requested resolution");
+	POINT fittedClientOrigin = { 0, 0 };
+	failures += !Check(GetClientRect(window, &clientRect) &&
+		clientRect.right == monitorWidth && clientRect.bottom == monitorHeight &&
+		ClientToScreen(window, &fittedClientOrigin) &&
+		fittedClientOrigin.x == selectedMonitor.rcMonitor.left &&
+		fittedClientOrigin.y == selectedMonitor.rcMonitor.top,
+		"monitor-sized client fits monitor bounds without clipping from centered decorations");
+	failures += !Check(rts::render::SetGameRendererResolution(800, 600, 32, 1, true) ==
+		rts::render::RENDER_RESULT_OK,
+		"ordinary window resolution is restored after monitor-sized placement");
 	failures += !Check(rts::render::GetGameMSAAMode() ==
 		rts::render::GAME_RENDER_MULTISAMPLE_4X,
 		"native resize preserves the effective 4x D3D11 scene target");
@@ -344,6 +412,14 @@ int TestNativeLifecycle(HWND window)
 
 int main()
 {
+	// Match the native product's per-monitor awareness so client measurements
+	// exercise physical pixels on scaled desktops rather than DPI virtualization.
+	typedef HANDLE (WINAPI *SetThreadDpiAwarenessContextProc)(HANDLE);
+	const SetThreadDpiAwarenessContextProc setThreadDpiAwarenessContext =
+		reinterpret_cast<SetThreadDpiAwarenessContextProc>(GetProcAddress(
+			GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext"));
+	const HANDLE previousDpiContext = setThreadDpiAwarenessContext ?
+		setThreadDpiAwarenessContext(reinterpret_cast<HANDLE>(-4)) : 0;
 	int result = TestLogicalPolicies();
 	HWND window = CreateHiddenWindow();
 	if (window == 0)
@@ -358,5 +434,7 @@ int main()
 	else
 		result |= lifecycleResult;
 	DestroyWindow(window);
+	if (previousDpiContext)
+		setThreadDpiAwarenessContext(previousDpiContext);
 	return result;
 }

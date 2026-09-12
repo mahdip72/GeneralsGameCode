@@ -400,6 +400,59 @@ RenderResult ApplyPresentation(HWND window, bool windowed,
 		RENDER_RESULT_OK : RENDER_RESULT_FAILED;
 }
 
+RenderResult ResizeWindowClient(HWND window, int width, int height)
+{
+	RECT client = { 0 };
+	RECT outer = { 0 };
+	if (!GetClientRect(window, &client) || !GetWindowRect(window, &outer))
+		return RENDER_RESULT_FAILED;
+	if (client.right - client.left == width &&
+		client.bottom - client.top == height)
+		return RENDER_RESULT_OK;
+	// Use the window's actual non-client extents, which already include its
+	// current DPI, styles and menu.
+	const long long outerWidth = static_cast<long long>(width) +
+		(outer.right - outer.left) - (client.right - client.left);
+	const long long outerHeight = static_cast<long long>(height) +
+		(outer.bottom - outer.top) - (client.bottom - client.top);
+	if (outerWidth <= 0 || outerHeight <= 0 ||
+		outerWidth > INT_MAX || outerHeight > INT_MAX)
+		return RENDER_RESULT_FAILED;
+	MONITORINFO monitor = { sizeof(MONITORINFO) };
+	POINT clientOrigin = { client.left, client.top };
+	if (!GetMonitorInfo(MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY), &monitor) ||
+		!ClientToScreen(window, &clientOrigin))
+		return RENDER_RESULT_FAILED;
+	long long left = (static_cast<long long>(monitor.rcWork.left) +
+		monitor.rcWork.right - outerWidth) / 2;
+	long long top = (static_cast<long long>(monitor.rcWork.top) +
+		monitor.rcWork.bottom - outerHeight) / 2;
+	const long long clientLeft = left + clientOrigin.x - outer.left;
+	const long long clientTop = top + clientOrigin.y - outer.top;
+	// Preserve the legacy placement policy: center on the work area, then
+	// shift the client into the monitor without changing its requested size.
+	// An oversized client aligns to the monitor's left/top edges.
+	long long dx = 0, dy = 0;
+	if (clientLeft + width > monitor.rcMonitor.right)
+		dx = monitor.rcMonitor.right - (clientLeft + width);
+	if (clientLeft < monitor.rcMonitor.left)
+		dx = monitor.rcMonitor.left - clientLeft;
+	if (clientTop + height > monitor.rcMonitor.bottom)
+		dy = monitor.rcMonitor.bottom - (clientTop + height);
+	if (clientTop < monitor.rcMonitor.top)
+		dy = monitor.rcMonitor.top - clientTop;
+	left += dx;
+	top += dy;
+	if (left < INT_MIN || left > INT_MAX || top < INT_MIN || top > INT_MAX ||
+		!SetWindowPos(window, 0, static_cast<int>(left), static_cast<int>(top),
+			static_cast<int>(outerWidth), static_cast<int>(outerHeight),
+			SWP_NOZORDER | SWP_NOACTIVATE) ||
+		!GetClientRect(window, &client) ||
+		client.right - client.left != width || client.bottom - client.top != height)
+		return RENDER_RESULT_FAILED;
+	return RENDER_RESULT_OK;
+}
+
 } // anonymous namespace
 
 namespace rts
@@ -855,12 +908,19 @@ RenderResult SetGameRendererResolution(int width, int height, int bitDepth,
 	const HWND nativeWindow = static_cast<HWND>(previous.window);
 	WindowPresentationState nextPresentation = previous.presentation;
 	const bool transitionPresentation = previous.windowed != targetWindowed;
+	const bool resizeClient = targetWindowed && resizeWindow;
+	const bool changesWindow = transitionPresentation || resizeClient;
+	WindowPresentationState attemptSnapshot;
 	RenderResult result = RENDER_RESULT_OK;
-	if (transitionPresentation)
+	if (changesWindow && !attemptSnapshot.capture(nativeWindow))
+		result = RENDER_RESULT_FAILED;
+	if (result == RENDER_RESULT_OK && transitionPresentation)
 	{
 		result = ApplyPresentation(nativeWindow, targetWindowed,
 			&nextPresentation);
 	}
+	if (result == RENDER_RESULT_OK && resizeClient)
+		result = ResizeWindowClient(nativeWindow, width, height);
 	if (result == RENDER_RESULT_OK)
 	{
 		GameRenderCommand command;
@@ -881,19 +941,9 @@ RenderResult SetGameRendererResolution(int width, int height, int bitDepth,
 			result = Fail(owner, owner->ExecuteGameRenderCommand(command));
 	}
 
-	if (result != RENDER_RESULT_OK && transitionPresentation)
+	if (result != RENDER_RESULT_OK && attemptSnapshot.valid)
 	{
-		WindowPresentationState rollback = previous.presentation;
-		RenderResult rollbackResult;
-		if (previous.windowed)
-		{
-			rollbackResult = ApplyPresentation(nativeWindow, true, &rollback);
-		}
-		else
-		{
-			rollbackResult = ApplyPresentation(nativeWindow, false, &rollback);
-		}
-		if (rollbackResult != RENDER_RESULT_OK)
+		if (!RestoreWindowPresentationSnapshot(nativeWindow, &attemptSnapshot, true))
 			result = RENDER_RESULT_FAILED;
 	}
 
