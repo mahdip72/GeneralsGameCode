@@ -2,27 +2,33 @@
 param(
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [ValidateSet('Generals', 'ZeroHour')]
     [string]$Title,
 
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [string]$InstalledExecutablePath,
 
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [string]$ExpectedExecutableSha256,
 
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [string]$ExpectedSourceCommit,
 
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [string]$ExpectedArtifactSetSha256,
 
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [string]$ArtifactSetManifestPath,
 
     [string]$GeneralsInstallRoot = '',
@@ -31,6 +37,7 @@ param(
 
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [switch]$AllowHeadlessDirectExecution,
 
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
@@ -53,6 +60,7 @@ param(
 
     [Parameter(ParameterSetName = 'Run', Mandatory = $true)]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [string]$TaskRoot,
 
     [Parameter(ParameterSetName = 'Run')]
@@ -61,6 +69,7 @@ param(
 
     [Parameter(ParameterSetName = 'Run')]
     [Parameter(ParameterSetName = 'FixtureProduction')]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic')]
     [ValidateRange(1, 86400)]
     [int]$TimeoutSeconds = 7200,
 
@@ -93,10 +102,12 @@ param(
 
     [Parameter(ParameterSetName = 'Run')]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [string]$ExecutionCohortNonce,
 
     [Parameter(ParameterSetName = 'Run')]
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
     [string]$ExecutionCohortCreatedUtc,
 
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
@@ -107,6 +118,21 @@ param(
 
     [Parameter(ParameterSetName = 'FixtureProduction', Mandatory = $true)]
     [string]$ExpectedReviewedFixtureManifestSha256,
+
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
+    [switch]$RunNativeFixtureDiagnostic,
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
+    [string]$DiagnosticMapPath,
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
+    [string]$ExpectedDiagnosticMapSha256,
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
+    [string]$DiagnosticMapKey,
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic', Mandatory = $true)]
+    [ValidateRange(1, 1000000)][int]$DiagnosticExpectedInitialUnits,
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic')]
+    [ValidateRange(1, 2147483647)][int]$DiagnosticSeed = 1729,
+    [Parameter(ParameterSetName = 'NativeFixtureDiagnostic')]
+    [ValidateRange(1, 108000)][int]$DiagnosticFrameBudget = 108000,
 
     # This parameter set exists only for host-side contract tests. It consumes
     # already-created synthetic receipts and can never reach Process.Start().
@@ -5802,6 +5828,13 @@ function New-Stage5AuthoritativePerformanceEvidence {
     }
 }
 
+function New-Stage5NativeFixtureProcess {
+    param([Diagnostics.ProcessStartInfo]$StartInfo)
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $StartInfo
+    return $process
+}
+
 function Invoke-Stage5NativePerformanceFixtureProduction {
     param(
         [string]$FixtureTitle,
@@ -5816,17 +5849,17 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         [string]$CohortCreatedUtc,
         [string]$OutputRoot,
         [int]$Timeout,
-        [string]$GeneralsRuntimeRoot = ''
+        [string]$GeneralsRuntimeRoot = '',
+        [switch]$Diagnostic
     )
-    Assert-Stage5PerformanceCondition ([bool]$ProduceNativeFixture -and
+    Assert-Stage5PerformanceCondition (([bool]$ProduceNativeFixture -xor [bool]$Diagnostic) -and
         [bool]$AllowHeadlessDirectExecution) `
         'Native fixture production requires both explicit production and reviewed headless direct-execution consent.'
     Assert-Stage5PerformanceSourceCommit $SourceCommit 'ExpectedSourceCommit'
-    foreach ($binding in @(
-            @($ExecutableSha256, 'ExpectedExecutableSha256'),
-            @($ArtifactSetSha256, 'ExpectedArtifactSetSha256'),
-            @($ReviewedManifestSha256,
-                'ExpectedReviewedFixtureManifestSha256'))) {
+    $requiredHashes = @(@($ExecutableSha256, 'ExpectedExecutableSha256'),
+        @($ArtifactSetSha256, 'ExpectedArtifactSetSha256'))
+    if (-not $Diagnostic) { $requiredHashes += ,@($ReviewedManifestSha256, 'ExpectedReviewedFixtureManifestSha256') }
+    foreach ($binding in $requiredHashes) {
         Assert-Stage5PerformanceHash ([string]$binding[0]) ([string]$binding[1])
     }
     $executionCohort = Resolve-Stage5PerformanceExecutionCohort `
@@ -5858,7 +5891,14 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
     if ($null -ne $baseBinding) {
         $baseImmutablePaths = @($baseBinding.files | ForEach-Object { Join-Path $baseBinding.runtimeRoot $_.path })
     }
-    $reviewed = Read-Stage5ReviewedNativeKernelFixture `
+    if ($Diagnostic) {
+        $fixtureInput = Read-Stage5NativeFixtureDiagnosticInput -Path $DiagnosticMapPath `
+            -ExpectedSha256 $ExpectedDiagnosticMapSha256 -Title $FixtureTitle `
+            -ExecutableSha256 $ExecutableSha256 -MapKey $DiagnosticMapKey -Seed $DiagnosticSeed `
+            -FrameBudget $DiagnosticFrameBudget -ExpectedInitialUnitCount $DiagnosticExpectedInitialUnits
+    }
+    else {
+    $fixtureInput = Read-Stage5ReviewedNativeKernelFixture `
         -Path $ReviewedManifestPath `
         -ExpectedSha256 $ReviewedManifestSha256 `
         -ExpectedTitle $FixtureTitle `
@@ -5868,6 +5908,7 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         -ExpectedDependencyManifestSha256 `
             $artifact.runtimeClosure.dependencyManifestSha256 `
         -ExpectedRuntimeClosureSha256 $artifact.runtimeClosure.closureSha256
+    }
     $hostTopology = Get-Stage5HostTopology -MinimumPhysicalCores 4 `
         -MaximumPhysicalCores 6 -MaximumLogicalProcessors 12
 
@@ -5892,21 +5933,39 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         Assert-Stage5FinalAcceptanceNoReparsePath $taskFull $directory `
             'Native fixture output directory'
     }
-    $retainedManifestPath = Join-Path $inputRoot 'ReviewedFixture.json'
+    $bindingLeaf = if ($Diagnostic) { 'DiagnosticMapBinding.json' } else { 'ReviewedFixture.json' }
+    $retainedManifestPath = Join-Path $inputRoot $bindingLeaf
     $retainedMapPath = Join-Path $inputRoot `
-        ([IO.Path]::GetFileName([string]$reviewed.fixture.sourcePath))
+        ([IO.Path]::GetFileName([string]$fixtureInput.fixture.sourcePath))
+    if ($Diagnostic) {
+        $document = [ordered]@{
+            schemaVersion = 1; evidenceKind = 'stage5-native-fixture-diagnostic-input'
+            title = $FixtureTitle; sourceCommit = $SourceCommit; executableSha256 = $ExecutableSha256
+            artifactSetSha256 = $ArtifactSetSha256; runtimeClosure = $artifact.runtimeClosure
+            mapSource = [IO.Path]::GetFileName($retainedMapPath); mapKey = $fixtureInput.fixture.mapKey
+            mapSha256 = $fixtureInput.fixture.sha256; mapByteCount = $fixtureInput.fixture.byteCount
+            seed = $fixtureInput.fixture.seed; frameBudget = $fixtureInput.fixture.frameBudget
+            expectedInitialUnitCount = $DiagnosticExpectedInitialUnits
+            finalAcceptanceClaim = $false; performanceScalingClaim = $false; kernelQualificationClaim = $false
+        }
+        Write-Stage5JsonAtomically $retainedManifestPath $document -CreateNew
+        $ReviewedManifestSha256 = Get-Stage5PerformanceSha256 $retainedManifestPath
+        $fixtureInput | Add-Member -NotePropertyName path -NotePropertyValue $retainedManifestPath
+    }
+    else {
     Write-Stage5FinalAcceptanceFileAtomically -Path $retainedManifestPath `
-        -Bytes ([byte[]]$reviewed.snapshot.bytes) `
+        -Bytes ([byte[]]$fixtureInput.snapshot.bytes) `
         -Context 'Retained reviewed native fixture manifest' `
         -EvidenceKind JsonReceipt | Out-Null
+    }
     Write-Stage5FinalAcceptanceFileAtomically -Path $retainedMapPath `
-        -Bytes ([byte[]]$reviewed.fixture.sourceSnapshot.bytes) `
+        -Bytes ([byte[]]$fixtureInput.fixture.sourceSnapshot.bytes) `
         -Context 'Retained reviewed native map' -EvidenceKind RawLog | Out-Null
     Assert-Stage5PerformanceFileHash $retainedManifestPath `
         $ReviewedManifestSha256 'Retained reviewed fixture manifest SHA-256' |
         Out-Null
     Assert-Stage5PerformanceFileHash $retainedMapPath `
-        $reviewed.fixture.sha256 'Retained reviewed native map SHA-256' |
+        $fixtureInput.fixture.sha256 'Retained reviewed native map SHA-256' |
         Out-Null
 
     $titleSession = $null
@@ -5924,11 +5983,12 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
     $stdoutPath = Join-Path $logRoot 'stdout.log'
     $stderrPath = Join-Path $logRoot 'stderr.log'
     $retainedReplayPath = Join-Path $replayRoot 'Stage5Performance.rep'
-    $receiptPath = Join-Path $taskFull 'Stage5NativePerformanceFixture.json'
+    $receiptLeaf = if ($Diagnostic) { 'Stage5NativeFixtureDiagnostic.json' } else { 'Stage5NativePerformanceFixture.json' }
+    $receiptPath = Join-Path $taskFull $receiptLeaf
     $hostRunNonce = [Guid]::NewGuid().ToString('D')
     $argumentString = Get-Stage5NativePerformanceFixtureArgumentString `
-        -MapKey $reviewed.fixture.mapKey -Seed $reviewed.fixture.seed `
-        -FrameBudget $reviewed.fixture.frameBudget `
+        -MapKey $fixtureInput.fixture.mapKey -Seed $fixtureInput.fixture.seed `
+        -FrameBudget $fixtureInput.fixture.frameBudget `
         -ExecutableSha256 $ExecutableSha256
     $titleSessionRoot = Join-Path $taskFull 'TitleSession'
     $profileRelativeRoot = if ($FixtureTitle -ceq 'Generals') {
@@ -5936,7 +5996,7 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         } else { 'Documents\GGC-LockstepV2-ZeroHour' }
     $plannedProfileRoot = Join-Path $titleSessionRoot $profileRelativeRoot
     $plannedMapPath = Join-Path $plannedProfileRoot `
-        ([string]$reviewed.fixture.profileRelativePath)
+        ([string]$fixtureInput.fixture.profileRelativePath)
     $planPath = Join-Path $prelaunchRoot 'fixture-plan.json'
     $startPath = Join-Path $prelaunchRoot 'fixture-start.json'
     $plan = [pscustomobject][ordered]@{
@@ -5956,10 +6016,10 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         }
         executablePath = $executableFull
         executableSha256 = $ExecutableSha256
-        reviewedFixtureManifestPath = $reviewed.path
+        reviewedFixtureManifestPath = $fixtureInput.path
         reviewedFixtureManifestSha256 = $ReviewedManifestSha256
-        mapSourcePath = $reviewed.fixture.sourcePath
-        mapSha256 = $reviewed.fixture.sha256
+        mapSourcePath = $fixtureInput.fixture.sourcePath
+        mapSha256 = $fixtureInput.fixture.sha256
         mapDestinationPath = $plannedMapPath
         argumentString = $argumentString
         taskRoot = $taskFull
@@ -5967,6 +6027,14 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         workerCount = 4
         finalAcceptanceClaim = $false
         performanceScalingClaim = $false
+    }
+    if ($Diagnostic) {
+        $plan.event = 'native-fixture-diagnostic-plan'
+        $plan.PSObject.Properties.Remove('reviewedFixtureManifestPath')
+        $plan.PSObject.Properties.Remove('reviewedFixtureManifestSha256')
+        $plan | Add-Member -NotePropertyName diagnosticMapBindingPath -NotePropertyValue $retainedManifestPath
+        $plan | Add-Member -NotePropertyName diagnosticMapBindingSha256 -NotePropertyValue $ReviewedManifestSha256
+        $plan | Add-Member -NotePropertyName kernelQualificationClaim -NotePropertyValue $false
     }
     Write-Stage5JsonAtomically $planPath $plan -CreateNew
     if ($null -ne $baseBinding) {
@@ -5979,6 +6047,7 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
 
     $primaryError = $null
     $completion = $null
+    $capturedOutput = $null
     $processStarted = $false
     $processIdentity = $null
     $rawLogSnapshot = $null
@@ -6026,21 +6095,21 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         Assert-Stage5FinalAcceptanceNoReparsePath $titleSession.profileRoot `
             $mapDestinationDirectory 'Native fixture map directory'
         Write-Stage5FinalAcceptanceFileAtomically -Path $plannedMapPath `
-            -Bytes ([byte[]]$reviewed.fixture.sourceSnapshot.bytes) `
+            -Bytes ([byte[]]$fixtureInput.fixture.sourceSnapshot.bytes) `
             -Context 'Native fixture staged reviewed map' `
             -EvidenceKind RawLog | Out-Null
         Assert-Stage5PerformanceFileHash $plannedMapPath `
-            $reviewed.fixture.sha256 'Native fixture staged map SHA-256' |
+            $fixtureInput.fixture.sha256 'Native fixture staged map SHA-256' |
             Out-Null
         $readOnlyLocks = Open-Stage5PerformanceReadOnlyLocks $artifact `
             @([pscustomobject]@{
-                path = $reviewed.fixture.sourcePath
-                sha256 = $reviewed.fixture.sha256
-            }) $reviewed.path (@($planPath) + $baseImmutablePaths)
+                path = $fixtureInput.fixture.sourcePath
+                sha256 = $fixtureInput.fixture.sha256
+            }) $fixtureInput.path (@($planPath) + $baseImmutablePaths)
         if ($null -ne $baseBinding) { Assert-Stage5BaseGeneralsBindingCurrent $baseBinding }
         $start = [pscustomobject][ordered]@{
             schemaVersion = 1
-            event = 'native-fixture-production-start'
+            event = $(if ($Diagnostic) { 'native-fixture-diagnostic-start' } else { 'native-fixture-production-start' })
             recordedUtc = [DateTime]::UtcNow.ToString('o')
             plan = [pscustomobject]@{
                 path = $planPath; sha256 = $planSnapshot.sha256
@@ -6064,8 +6133,7 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
                 $info.EnvironmentVariables.Remove([string]$name)
             }
         }
-        $process = New-Object Diagnostics.Process
-        $process.StartInfo = $info
+        $process = New-Stage5NativeFixtureProcess $info
         $processStarted = $false
         $stdoutTask = $null
         $stderrTask = $null
@@ -6173,6 +6241,10 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
                     Out-Null
             }
         }
+        # Retain complete captures before reporting child/capture failures.
+        # Missing streams remain unavailable, never relabelled empty/complete.
+        $capturedOutput = Write-Stage5NativeFixtureCapturedOutput -TaskRoot $taskFull `
+            -StdoutBytes $stdoutBytes -StderrBytes $stderrBytes
         if ($null -ne $runError) { throw $runError }
         Assert-Stage5PerformanceCondition ($captureErrors.Count -eq 0) `
             "Native fixture output capture failed: $($captureErrors.ToArray() -join ' | ')"
@@ -6180,31 +6252,19 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
             $processCleanup.exitProof -and $exitCode -eq 0) `
             'Native fixture child did not exit cleanly with identity-bound proof.'
         $lifecycle.childExitProven = $true
-        Write-Stage5FinalAcceptanceFileAtomically -Path $stdoutPath `
-            -Bytes $stdoutBytes -Context 'Native fixture stdout retention' `
-            -EvidenceKind RawLog | Out-Null
-        Write-Stage5FinalAcceptanceFileAtomically -Path $stderrPath `
-            -Bytes $stderrBytes -Context 'Native fixture stderr retention' `
-            -EvidenceKind RawLog | Out-Null
-        $separator = [Text.Encoding]::UTF8.GetBytes("`n")
-        $rawBytes = New-Object byte[] (
-            $stdoutBytes.Length + $separator.Length + $stderrBytes.Length)
-        [Array]::Copy($stdoutBytes, 0, $rawBytes, 0, $stdoutBytes.Length)
-        [Array]::Copy($separator, 0, $rawBytes, $stdoutBytes.Length,
-            $separator.Length)
-        [Array]::Copy($stderrBytes, 0, $rawBytes,
-            $stdoutBytes.Length + $separator.Length, $stderrBytes.Length)
-        Write-Stage5FinalAcceptanceFileAtomically -Path $rawLogPath `
-            -Bytes $rawBytes -Context 'Native fixture combined raw log' `
-            -EvidenceKind RawLog | Out-Null
-        $rawLogSnapshot = Get-Stage5FinalAcceptanceFileSnapshot $rawLogPath `
-            'Native fixture combined raw log' -EvidenceKind RawLog
+        $rawLogSnapshot = $capturedOutput.rawLogSnapshot
         $diagnosticText = ConvertFrom-Stage5StrictUtf8OutputPair `
             $stdoutBytes $stderrBytes
-        $completion = ConvertFrom-Stage5NativePerformanceFixtureOutput `
-            -Text $diagnosticText -ReviewedFixture $reviewed `
-            -ExpectedProcessId $processIdentity.processId `
-            -ProfileRoot $titleSession.profileRoot
+        if ($Diagnostic) {
+            $completion = ConvertFrom-Stage5NativeFixtureObservation -Text $diagnosticText `
+                -MapBinding $fixtureInput -ExpectedProcessId $processIdentity.processId `
+                -ProfileRoot $titleSession.profileRoot
+        }
+        else {
+            $completion = ConvertFrom-Stage5NativePerformanceFixtureOutput `
+                -Text $diagnosticText -ReviewedFixture $fixtureInput `
+                -ExpectedProcessId $processIdentity.processId -ProfileRoot $titleSession.profileRoot
+        }
         Write-Stage5FinalAcceptanceFileAtomically -Path $retainedReplayPath `
             -Bytes ([byte[]]$completion.retainedReplaySnapshot.bytes) `
             -Context 'Native fixture replay retention' -EvidenceKind Replay |
@@ -6291,7 +6351,8 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
             }
         }
         if ($lifecycle.registryRestored) {
-            if ($lifecycle.registryRestored -and $null -ne $titleSession) {
+            if ($lifecycle.registryRestored -and $null -ne $titleSession -and
+                -not ($Diagnostic -and $null -ne $primaryError)) {
                 try {
                     Remove-Stage5TitleSessionDirectories $titleSession $taskFull
                     $lifecycle.profileRemoved = -not (Test-Path -LiteralPath `
@@ -6318,6 +6379,22 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
                     Out-Null
             }
         }
+        if ($Diagnostic -and ($null -ne $primaryError -or $cleanupErrors.Count -gt 0)) {
+            $failureText = if ($null -ne $primaryError) { $primaryError.Exception.Message } else { 'cleanup failure' }
+            $failure = New-Stage5NativeFixtureDiagnosticResult -Status failed -ErrorText $failureText `
+                -Lifecycle ([pscustomobject]$lifecycle) -ProcessIdentity $processIdentity `
+                -ExpectedInitialUnitCount $DiagnosticExpectedInitialUnits -CleanupErrors @($cleanupErrors.ToArray())
+            $failure.inputBinding = [ordered]@{ path = $retainedManifestPath; sha256 = $ReviewedManifestSha256 }
+            $failure.prelaunchPlan = [ordered]@{ path = $planPath; sha256 = $planSnapshot.sha256 }
+            $failure.capturedOutput = [ordered]@{
+                stdoutAvailable = ($null -ne $capturedOutput -and $capturedOutput.stdoutAvailable)
+                stderrAvailable = ($null -ne $capturedOutput -and $capturedOutput.stderrAvailable)
+                combinedLogAvailable = ($null -ne $capturedOutput -and $null -ne $capturedOutput.rawLogSnapshot)
+            }
+            $failure.retainedProfileRoot = if ($null -ne $titleSession -and
+                (Test-Path -LiteralPath $titleSession.sessionRoot)) { $titleSession.sessionRoot } else { $null }
+            Write-Stage5JsonAtomically $receiptPath $failure -CreateNew
+        }
         if ($null -ne $primaryError) {
             if ($cleanupErrors.Count -gt 0) {
                 throw "Native fixture production failed: $($primaryError.Exception.Message); cleanup also failed: $($cleanupErrors.ToArray() -join ' | ')"
@@ -6331,6 +6408,18 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
     foreach ($name in $lifecycle.Keys) {
         Assert-Stage5PerformanceCondition ([bool]$lifecycle[$name]) `
             "Native fixture final publication lacks lifecycle proof '$name'."
+    }
+    if ($Diagnostic) {
+        $result = New-Stage5NativeFixtureDiagnosticResult -Status observed -Completion $completion `
+            -Lifecycle ([pscustomobject]$lifecycle) -ProcessIdentity $processIdentity `
+            -ExpectedInitialUnitCount $DiagnosticExpectedInitialUnits
+        $result.inputBinding = [ordered]@{ path = $retainedManifestPath; sha256 = $ReviewedManifestSha256 }
+        $result.prelaunchPlan = [ordered]@{ path = $planPath; sha256 = $planSnapshot.sha256 }
+        $result.rawLog = [ordered]@{ path = $rawLogPath; sha256 = $rawLogSnapshot.sha256 }
+        $result.replay = [ordered]@{ path = $retainedReplayPath; sha256 = $completion.replaySha256 }
+        Write-Stage5JsonAtomically $receiptPath $result -CreateNew
+        Write-Output $receiptPath
+        return
     }
     $receipt = New-Stage5NativePerformanceFixtureProductionReceipt `
         -Title $FixtureTitle `
@@ -6376,6 +6465,17 @@ function Invoke-Stage5NativePerformanceFixtureProduction {
         $completion.replaySha256) `
         'Native fixture production failed its independent final receipt closure.'
     Write-Output $receiptPath
+}
+
+if ($PSCmdlet.ParameterSetName -ceq 'NativeFixtureDiagnostic') {
+    Assert-Stage5PerformanceCondition ([bool]$RunNativeFixtureDiagnostic) 'Native fixture diagnostic requires explicit opt-in.'
+    Invoke-Stage5NativePerformanceFixtureProduction -Diagnostic `
+        -FixtureTitle $Title -ExecutablePath $InstalledExecutablePath `
+        -ExecutableSha256 $ExpectedExecutableSha256 -GeneralsRuntimeRoot $GeneralsInstallRoot `
+        -SourceCommit $ExpectedSourceCommit -ArtifactSetSha256 $ExpectedArtifactSetSha256 `
+        -ArtifactManifestPath $ArtifactSetManifestPath -CohortNonce $ExecutionCohortNonce `
+        -CohortCreatedUtc $ExecutionCohortCreatedUtc -OutputRoot $TaskRoot -Timeout $TimeoutSeconds
+    return
 }
 
 if ($PSCmdlet.ParameterSetName -ceq 'FixtureProduction') {

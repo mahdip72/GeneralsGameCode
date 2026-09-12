@@ -496,11 +496,47 @@ function Get-Stage5NativeFixtureHexUInt32 {
     return $parsed
 }
 
-function ConvertFrom-Stage5NativePerformanceFixtureOutput {
+function Read-Stage5NativeFixtureDiagnosticInput {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)][ValidateSet('Generals', 'ZeroHour')][string]$Title,
+        [Parameter(Mandatory = $true)][string]$ExecutableSha256,
+        [Parameter(Mandatory = $true)][string]$MapKey,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 2147483647)][int]$Seed,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 108000)][int]$FrameBudget,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 1000000)][int]$ExpectedInitialUnitCount
+    )
+    Assert-Stage5NativeFixtureSha256 $ExpectedSha256 'Diagnostic map SHA256'
+    Assert-Stage5NativeFixtureSha256 $ExecutableSha256 'Diagnostic executable SHA256'
+    Assert-Stage5NativeFixtureCondition (Test-Stage5NativeFixtureSafeMapKey $MapKey) 'Diagnostic map path is unsafe.'
+    $full = [IO.Path]::GetFullPath($Path)
+    Assert-Stage5NativeFixtureCondition ([IO.Path]::GetExtension($full) -ceq '.map') 'Diagnostic input must be a map.'
+    Assert-Stage5FinalAcceptanceNoReparsePath ([IO.Path]::GetPathRoot($full)) $full 'Diagnostic map'
+    $snapshot = Get-Stage5FinalAcceptanceFileSnapshot $full 'Diagnostic map' -EvidenceKind RawLog
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $snapshot $ExpectedSha256 'Diagnostic map SHA256' | Out-Null
+    Assert-Stage5NativeFixtureCondition ($snapshot.length -ge 16384 -and $snapshot.length -le 67108864) 'Diagnostic map size is outside bounds.'
+    return [pscustomobject][ordered]@{
+        evidenceKind = 'stage5-native-fixture-diagnostic-input'
+        finalAcceptanceClaim = $false; performanceScalingClaim = $false; kernelQualificationClaim = $false
+        title = $Title; executableSha256 = $ExecutableSha256
+        fixture = [pscustomobject][ordered]@{
+            sourcePath = $full; sourceSnapshot = $snapshot
+            mapKey = $MapKey; profileRelativePath = $MapKey
+            sha256 = $ExpectedSha256; byteCount = [Int64]$snapshot.length
+            seed = $Seed; frameBudget = $FrameBudget; expectedInitialUnitCount = $ExpectedInitialUnitCount
+        }
+    }
+}
+
+# This parser verifies observations and natural recorder closure only. It does
+# not admit a map/replay to any reviewed density or kernel qualification gate.
+function ConvertFrom-Stage5NativeFixtureObservation {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Text,
-        [Parameter(Mandatory = $true)][object]$ReviewedFixture,
+        [Parameter(Mandatory = $true)][object]$MapBinding,
         [Parameter(Mandatory = $true)][ValidateRange(1, 4294967295)]
         [Int64]$ExpectedProcessId,
         [Parameter(Mandatory = $true)][string]$ProfileRoot,
@@ -564,10 +600,10 @@ function ConvertFrom-Stage5NativePerformanceFixtureOutput {
     }
     Assert-Stage5NativeFixtureCondition (
         $start.category -ceq 'native-performance-fixture' -and
-        $start.title -ceq $ReviewedFixture.title -and
-        $start.map -ceq $ReviewedFixture.fixture.mapKey -and
-        $start.map_sha256 -ceq $ReviewedFixture.fixture.sha256 -and
-        $start.executable_sha256 -ceq $ReviewedFixture.executableSha256 -and
+        $start.title -ceq $MapBinding.title -and
+        $start.map -ceq $MapBinding.fixture.mapKey -and
+        $start.map_sha256 -ceq $MapBinding.fixture.sha256 -and
+        $start.executable_sha256 -ceq $MapBinding.executableSha256 -and
         $start.run_nonce -cmatch '^[0-9A-F]{8}-[0-9A-F]{8}-[0-9A-F]{8}$') `
         'Native fixture start identity is detached from the reviewed candidate or native nonce format.'
     $seed = Get-Stage5NativeFixtureUInt32 $start.seed 'Native fixture seed'
@@ -578,9 +614,9 @@ function ConvertFrom-Stage5NativePerformanceFixtureOutput {
     $mapCrc = [string]$start.map_crc
     [void](Get-Stage5NativeFixtureHexUInt32 $mapCrc 'Native fixture map CRC')
     Assert-Stage5NativeFixtureCondition (
-        $seed -eq [UInt32]$ReviewedFixture.fixture.seed -and
-        $frameBudget -eq [UInt32]$ReviewedFixture.fixture.frameBudget -and
-        $mapByteCount -eq [UInt32]$ReviewedFixture.fixture.byteCount) `
+        $seed -eq [UInt32]$MapBinding.fixture.seed -and
+        $frameBudget -eq [UInt32]$MapBinding.fixture.frameBudget -and
+        $mapByteCount -eq [UInt32]$MapBinding.fixture.byteCount) `
         'Native fixture map/seed/frame identity differs from the reviewed manifest.'
 
     $nonceParts = @([string]$start.run_nonce -split '-')
@@ -644,9 +680,8 @@ function ConvertFrom-Stage5NativePerformanceFixtureOutput {
         'Native fixture initial unrostered unit count'
     Assert-Stage5NativeFixtureCondition ($firstFrame -ge 1 -and
         $players -eq 8 -and
-        $initialUnits -ge [UInt32]$ReviewedFixture.fixture.minimumInitialUnitCount -and
         $initialUnrostered -eq 0) `
-        'Native fixture first observation is not an exact dense eight-player workload.'
+        'Native fixture first observation is not an exact eight-player workload.'
 
     $playerUnits = New-Object 'Collections.Generic.List[object]'
     [UInt64]$initialSum = 0
@@ -702,16 +737,14 @@ function ConvertFrom-Stage5NativePerformanceFixtureOutput {
         'Native fixture replay epoch'
     $replayFrames = Get-Stage5NativeFixtureUInt32 $complete.replay_frame_count `
         'Native fixture replay frame count'
-    $expectedEpoch = if ($ReviewedFixture.title -ceq 'Generals') { 1 } else { 3 }
-    $expectedMarker = if ($ReviewedFixture.title -ceq 'Generals') {
+    $expectedEpoch = if ($MapBinding.title -ceq 'Generals') { 1 } else { 3 }
+    $expectedMarker = if ($MapBinding.title -ceq 'Generals') {
         ' [GeneralsAIPlanningEpoch=1]'
     } else { ' [SkirmishAIEpoch=3]' }
     Assert-Stage5NativeFixtureCondition (
         $actualPlayers -eq 8 -and $completedInitial -eq $initialUnits -and
         [UInt64]$completedInitial -eq $initialSum -and
         [UInt64]$peakUnits -eq $peakSum -and
-        $completedInitial -ge [UInt32]$ReviewedFixture.fixture.minimumInitialUnitCount -and
-        $peakUnits -ge [UInt32]$ReviewedFixture.fixture.minimumPeakUnitCount -and
         $completedInitialUnrostered -eq 0 -and $peakUnrostered -eq 0 -and
         $observedFirst -eq $firstFrame -and $observedLast -eq $endFrame -and
         $observedSamples -eq ([UInt64]$observedLast - [UInt64]$observedFirst + 1) -and
@@ -747,6 +780,7 @@ function ConvertFrom-Stage5NativePerformanceFixtureOutput {
         Out-Null
 
     return [pscustomobject][ordered]@{
+        diagnosticOnly = $true
         nativeRunNonce = [string]$start.run_nonce
         mapKey = [string]$start.map
         mapSha256 = [string]$start.map_sha256
@@ -771,6 +805,104 @@ function ConvertFrom-Stage5NativePerformanceFixtureOutput {
         nativeRetainedReplayPath = $replayFull
         retainedReplayPath = $replayFull
         retainedReplaySnapshot = $replaySnapshot
+    }
+}
+
+function ConvertFrom-Stage5NativePerformanceFixtureOutput {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Text,
+        [Parameter(Mandatory = $true)][object]$ReviewedFixture,
+        [Parameter(Mandatory = $true)][ValidateRange(1, 4294967295)][Int64]$ExpectedProcessId,
+        [Parameter(Mandatory = $true)][string]$ProfileRoot,
+        [object]$RetainedReplaySnapshot = $null
+    )
+    $completion = ConvertFrom-Stage5NativeFixtureObservation -Text $Text -MapBinding $ReviewedFixture `
+        -ExpectedProcessId $ExpectedProcessId -ProfileRoot $ProfileRoot -RetainedReplaySnapshot $RetainedReplaySnapshot
+    Assert-Stage5NativeFixtureCondition (
+        $completion.initialUnitCount -ge [Int64]$ReviewedFixture.fixture.minimumInitialUnitCount -and
+        $completion.peakUnitCount -ge [Int64]$ReviewedFixture.fixture.minimumPeakUnitCount) `
+        'Native fixture workload is below its reviewed dense minimum.'
+    $completion.diagnosticOnly = $false
+    return $completion
+}
+
+function Assert-Stage5NativeFixtureProductionCompletion {
+    param([Parameter(Mandatory = $true)][object]$Completion)
+    $isDictionary = $Completion -is [Collections.IDictionary]
+    $names = if ($isDictionary) { @($Completion.Keys) } else { @($Completion.PSObject.Properties.Name) }
+    $markers = @($names | Where-Object { $_ -is [string] -and $_ -ieq 'diagnosticOnly' })
+    # Historical production completions predate this marker. They still must
+    # pass the publisher's complete existing projection/receipt validation.
+    if ($markers.Count -eq 0) { return }
+    Assert-Stage5NativeFixtureCondition ($markers.Count -eq 1) 'Duplicate diagnostic marker is ambiguous.'
+    $value = if ($isDictionary) { $Completion[$markers[0]] } else { $Completion.PSObject.Properties[$markers[0]].Value }
+    Assert-Stage5NativeFixtureCondition ($value -is [bool]) 'Diagnostic marker must retain its boolean type.'
+    Assert-Stage5NativeFixtureCondition (-not $value) 'A diagnostic observation cannot publish a native production receipt.'
+}
+
+function Write-Stage5NativeFixtureCapturedOutput {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskRoot,
+        [AllowNull()][AllowEmptyCollection()][byte[]]$StdoutBytes,
+        [AllowNull()][AllowEmptyCollection()][byte[]]$StderrBytes
+    )
+    $root = [IO.Path]::GetFullPath($TaskRoot)
+    $logs = Join-Path $root 'logs'
+    Assert-Stage5NativeFixtureCondition ((Test-Path -LiteralPath $root -PathType Container) -and
+        (Test-Path -LiteralPath $logs -PathType Container)) 'Native fixture output sink must be an existing directory.'
+    Assert-Stage5FinalAcceptanceNoReparsePath ([IO.Path]::GetPathRoot($root)) $logs 'Native fixture log sink'
+    foreach ($entry in @(@('stdout.log', $StdoutBytes), @('stderr.log', $StderrBytes))) {
+        if ($null -ne $entry[1]) {
+            Assert-Stage5NativeFixtureCondition ($entry[1].Length -le 67108864) 'Native fixture captured output exceeds bound.'
+            Write-Stage5FinalAcceptanceFileAtomically -Path (Join-Path $logs $entry[0]) `
+                -Bytes ([byte[]]$entry[1]) -Context 'Native fixture captured output' -EvidenceKind RawLog | Out-Null
+        }
+    }
+    $raw = $null
+    if ($null -ne $StdoutBytes -and $null -ne $StderrBytes) {
+        $bytes = New-Object byte[] ($StdoutBytes.Length + 1 + $StderrBytes.Length)
+        [Array]::Copy($StdoutBytes, 0, $bytes, 0, $StdoutBytes.Length)
+        $bytes[$StdoutBytes.Length] = 10
+        [Array]::Copy($StderrBytes, 0, $bytes, $StdoutBytes.Length + 1, $StderrBytes.Length)
+        $path = Join-Path $logs 'fixture-output.log'
+        Write-Stage5FinalAcceptanceFileAtomically -Path $path -Bytes $bytes `
+            -Context 'Native fixture combined raw log' -EvidenceKind RawLog | Out-Null
+        $raw = Get-Stage5FinalAcceptanceFileSnapshot $path 'Native fixture combined raw log' -EvidenceKind RawLog
+    }
+    return [pscustomobject]@{ stdoutAvailable=($null -ne $StdoutBytes); stderrAvailable=($null -ne $StderrBytes); rawLogSnapshot=$raw }
+}
+
+function New-Stage5NativeFixtureDiagnosticResult {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('observed', 'failed')][string]$Status,
+        [object]$Completion = $null, [object]$ProcessIdentity = $null,
+        [Parameter(Mandatory = $true)][object]$Lifecycle,
+        [Parameter(Mandatory = $true)][int]$ExpectedInitialUnitCount,
+        [string]$ErrorText = '', [string[]]$CleanupErrors = @()
+    )
+    $observation = $null; $matches = $false
+    if ($Status -ceq 'observed') {
+        foreach ($name in @('mutexAcquired', 'noInstalledTitleProcessesAtPreflight', 'childExitProven',
+                'registryRestored', 'profileRemoved', 'recoveryJournalAbsent')) {
+            Assert-Stage5NativeFixtureCondition ($Lifecycle.PSObject.Properties.Name -ccontains $name -and
+                [bool]$Lifecycle.$name) "Diagnostic completion lacks lifecycle proof '$name'."
+        }
+        Assert-Stage5NativeFixtureCondition ($null -ne $ProcessIdentity -and
+            $ProcessIdentity.processId -gt 0 -and $null -ne $Completion -and $Completion.diagnosticOnly) `
+            'Diagnostic completion lacks identity-bound observation.'
+        $observation = Get-Stage5NativeFixtureCompletionProjection $Completion
+        $matches = $Completion.initialUnitCount -eq $ExpectedInitialUnitCount -and $Completion.peakUnitCount -eq $ExpectedInitialUnitCount
+    }
+    return [ordered]@{
+        schemaVersion=1; evidenceKind='stage5-native-fixture-diagnostic-observation'; status=$Status
+        recordedUtc=[DateTime]::UtcNow.ToString('o')
+        finalAcceptanceClaim=$false; performanceScalingClaim=$false; kernelQualificationClaim=$false
+        expectedInitialUnitCount=$ExpectedInitialUnitCount; expectedPopulationObserved=$matches
+        observation=$observation; processIdentity=$ProcessIdentity; lifecycle=$Lifecycle
+        error=$ErrorText; cleanupErrors=@($CleanupErrors)
     }
 }
 
@@ -826,6 +958,7 @@ function New-Stage5NativePerformanceFixtureProductionReceipt {
         [Parameter(Mandatory = $true)][string]$RetainedReplayPath,
         [Parameter(Mandatory = $true)][object]$Lifecycle
     )
+    Assert-Stage5NativeFixtureProductionCompletion $Completion
     $projected = Get-Stage5NativeFixtureCompletionProjection $Completion
     $receipt = [pscustomobject][ordered]@{
         schemaVersion = 1
@@ -1410,6 +1543,9 @@ function Read-Stage5NativePerformanceFixtureProductionReceipt {
 }
 
 Export-ModuleMember -Function Read-Stage5ReviewedNativeKernelFixture, `
+    Read-Stage5NativeFixtureDiagnosticInput, ConvertFrom-Stage5NativeFixtureObservation, `
+    Assert-Stage5NativeFixtureProductionCompletion, `
+    Write-Stage5NativeFixtureCapturedOutput, New-Stage5NativeFixtureDiagnosticResult, `
     Get-Stage5NativePerformanceFixtureArgumentString, `
     ConvertFrom-Stage5NativePerformanceFixtureOutput, `
     New-Stage5NativePerformanceFixtureProductionReceipt, `

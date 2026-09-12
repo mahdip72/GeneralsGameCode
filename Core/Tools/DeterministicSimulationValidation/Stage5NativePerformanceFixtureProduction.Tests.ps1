@@ -373,6 +373,10 @@ try {
     })
     $startSha256 = Get-TestSha256 $startPath
 
+    # Exercise historical marker-free production completion compatibility
+    # through the actual publisher and its complete receipt validation.
+    $legacyCompletion = $completion.PSObject.Copy()
+    $legacyCompletion.PSObject.Properties.Remove('diagnosticOnly')
     $receipt = New-Stage5NativePerformanceFixtureProductionReceipt `
         -Title $fixture.title -RecordedUtc '2026-09-04T11:30:00.0000000Z' `
         -CohortNonce '10000000-0000-4000-8000-000000000001' `
@@ -388,7 +392,7 @@ try {
         -CommandLine ('generalsv.exe ' + $argumentString) `
         -ArgumentString $argumentString -NativeProfileRoot $profileRoot `
         -TaskRoot $bundleRoot `
-        -Completion $completion `
+        -Completion $legacyCompletion `
         -RawLogPath 'logs/fixture-output.log' -RawLogSha256 $rawLogSha256 `
         -RetainedReplayPath 'replays/Stage5Performance.rep' `
         -PrelaunchPlanPath 'prelaunch/fixture-plan.json' `
