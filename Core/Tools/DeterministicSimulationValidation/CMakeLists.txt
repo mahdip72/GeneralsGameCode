@@ -217,6 +217,12 @@ if(WIN32)
             -ScratchRoot "${_stage5_validation_test_scratch_root}/native-fixture-diagnostic-lifecycle")
     set_tests_properties(core_stage5_native_fixture_diagnostic_lifecycle_tests
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 180)
+    add_test(NAME core_stage5_reviewed_ai_map_tests
+        COMMAND pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5ReviewedAiMap.Tests.ps1"
+            -ScratchRoot "${_stage5_validation_test_scratch_root}/reviewed-ai-map")
+    set_tests_properties(core_stage5_reviewed_ai_map_tests
+        PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 120)
     add_test(NAME core_stage5_qualification_provisioning_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5QualificationProvisioning.Tests.ps1")

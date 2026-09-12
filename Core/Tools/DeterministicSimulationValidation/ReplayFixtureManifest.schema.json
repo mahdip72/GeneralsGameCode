@@ -29,6 +29,17 @@
   ],
   "$defs": {
     "sha256": { "type": "string", "pattern": "^[0-9A-Fa-f]{64}$" },
+    "reviewedAiMap": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "mapKey", "sha256", "byteCount", "crc"],
+      "properties": {
+        "source": { "type": "string", "minLength": 1, "pattern": "^(?!.*[:\\u0000-\\u001f]).+\\.map$" },
+        "mapKey": { "type": "string", "pattern": "^Maps\\\\[A-Za-z0-9_-][A-Za-z0-9_. -]{0,63}\\\\[A-Za-z0-9_-][A-Za-z0-9_. -]{0,127}\\.map$" },
+        "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+        "byteCount": { "type": "integer", "minimum": 16384, "maximum": 67108864 },
+        "crc": { "type": "string", "pattern": "^[0-9A-F]{8}$" }
+      }
+    },
     "fixture": {
       "type": "object",
       "additionalProperties": false,
@@ -105,7 +116,8 @@
       "properties": {
         "seeds": { "$ref": "#/$defs/seeds" },
         "scenarios": { "$ref": "#/$defs/scenarios" },
-        "repeats": { "$ref": "#/$defs/repeats" }
+        "repeats": { "$ref": "#/$defs/repeats" },
+        "reviewedMap": { "$ref": "#/$defs/reviewedAiMap" }
       }
     },
     "aiV2": {
@@ -116,7 +128,8 @@
         "seeds": { "$ref": "#/$defs/seeds" },
         "scenarios": { "$ref": "#/$defs/scenarios" },
         "repeats": { "$ref": "#/$defs/repeats" },
-        "liveQualification": { "$ref": "#/$defs/liveQualification" }
+        "liveQualification": { "$ref": "#/$defs/liveQualification" },
+        "reviewedMap": { "$ref": "#/$defs/reviewedAiMap" }
       }
     }
   }

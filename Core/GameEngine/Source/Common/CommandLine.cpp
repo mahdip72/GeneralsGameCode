@@ -617,6 +617,9 @@ Int parseRunSkirmishAITest4v2(char *args[], int num)
 	return 2;
 }
 
+// Whole-command validation checks the four typed values in both passes.
+Int parseSkirmishAITestReviewedMap(char *[], int) { return 5; }
+
 Int parseReplay(char *args[], int num)
 {
 	if (num > 1)
@@ -1521,6 +1524,7 @@ static CommandLineParam paramsForStartup[] =
 	{ "-runStage5PerformanceFixture", parseRunStage5PerformanceFixtureForStartup },
 	// Explicit test-only 4v2 variant; the existing option remains 4v3.
 	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2ForStartup },
+	{ "-skirmishAITestReviewedMap", parseSkirmishAITestReviewedMap },
 	{ "-runSkirmishAITestPractical1v7",
 		parseRunSkirmishAITestPractical1v7ForStartup },
 #if defined(_WIN64)
@@ -1556,6 +1560,7 @@ static CommandLineParam paramsForEngineInit[] =
 {
 	{ "-runSkirmishAITest", parseRunSkirmishAITest },
 	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2 },
+	{ "-skirmishAITestReviewedMap", parseSkirmishAITestReviewedMap },
 	{ "-runSkirmishAITestPractical1v7",
 		parseRunSkirmishAITestPractical1v7 },
 #if defined(_WIN64)
@@ -1792,6 +1797,28 @@ static void parseCommandLine(const CommandLineParam* params, int numParams)
 		token = nextParam(nullptr, "\" ");
 	}
 	int argc = argv.size();
+	rts::ai_fixture::MapRequest reviewedMapRequest;
+	const char *reviewedMapError = 0;
+	bool reviewedMapSupported = false;
+#if defined(_WIN64)
+	reviewedMapSupported = true;
+#endif
+	if (!rts::ai_fixture::ParseMapRequest(argc, argv.empty() ? 0 : &argv[0],
+		reviewedMapSupported, &reviewedMapRequest, &reviewedMapError))
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=%s\n", reviewedMapError ? reviewedMapError : "invalid_reviewed_map");
+		fflush(stdout);
+		exit(2);
+	}
+#if defined(_WIN64)
+	if (params == paramsForStartup && reviewedMapRequest.requested &&
+		!ConfigureSkirmishAITestReviewedMap(reviewedMapRequest))
+	{
+		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_reviewed_map_configuration\n");
+		fflush(stdout);
+		exit(2);
+	}
+#endif
 	// Reject mixed modes before an installed-validation handler can execute or
 	// exit. This is intentionally independent of argument order and parser pass.
 	rts::fixture::Request fixtureRequest;

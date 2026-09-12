@@ -1,5 +1,6 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1')
 
 $script:Stage5ExporterMaximumReplayBytes = [Int64](256 * 1024 * 1024)
 $script:Stage5ExporterMaximumJsonBytes = [Int64](64 * 1024 * 1024)
@@ -1155,6 +1156,22 @@ function Copy-Stage5ReplayWithStableSource {
     }
 }
 
+function Export-Stage5ReviewedAiReplayMap {
+    param([object]$ReviewedMap,[string]$CorpusRoot)
+    $map=$ReviewedMap.binding
+    $destination=Join-Path $CorpusRoot $map.mapKey
+    if (-not(Test-Path -LiteralPath $destination)) {
+        Copy-Stage5ReviewedAiMapSnapshot -ReviewedMap $ReviewedMap -DestinationRoot $CorpusRoot | Out-Null
+    }
+    # Reopen retained bytes independently; never reopen the mutable source map.
+    Read-Stage5ReviewedAiMap -ManifestDirectory $CorpusRoot -Map ([ordered]@{
+        source=$map.mapKey;mapKey=$map.mapKey;sha256=$map.sha256;byteCount=$map.byteCount;crc=$map.crc
+    }) | Out-Null
+    return [pscustomobject][ordered]@{
+        source=$map.mapKey;profileRelativePath=$map.mapKey;sha256=$map.sha256;byteCount=$map.byteCount;crc=$map.crc
+    }
+}
+
 function Export-Stage5FreshReplayArtifact {
     [CmdletBinding()]
     param(
@@ -1164,7 +1181,8 @@ function Export-Stage5FreshReplayArtifact {
         [Parameter(Mandatory = $true)][string]$TaskRunRoot,
         [Parameter(Mandatory = $true)][string]$ProfileRoot,
         [Parameter(Mandatory = $true)][string]$CorpusExportRoot,
-        [Parameter(Mandatory = $true)][Collections.IDictionary]$Metadata
+        [Parameter(Mandatory = $true)][Collections.IDictionary]$Metadata,
+        [object]$ReviewedMap = $null
     )
     Assert-Stage5ExporterMetadata $Metadata
     $title = Get-Stage5ExporterMetadataValue $Metadata 'title'
@@ -1192,6 +1210,12 @@ function Export-Stage5FreshReplayArtifact {
         [StringComparison]::OrdinalIgnoreCase)) `
         'CorpusExportRoot must be below TaskRoot.'
     Ensure-Stage5ExporterDirectory $corpusRootFull 'CorpusExportRoot' | Out-Null
+    $exportedMap = $null
+    if ($null -ne $ReviewedMap) {
+        Assert-Stage5ExporterCondition ((Get-Stage5ExporterMetadataValue $Metadata 'scenario') -ceq '4v2') `
+            'Reviewed AI replay map binding is restricted to4v2.'
+        $exportedMap = Export-Stage5ReviewedAiReplayMap $ReviewedMap $corpusRootFull
+    }
     $titleComponent = ConvertTo-Stage5ExporterPathComponent `
         (Get-Stage5ExporterMetadataValue $Metadata 'title')
     $categoryComponent = Get-Stage5ExporterMetadataValue $Metadata 'category'
@@ -1306,6 +1330,7 @@ function Export-Stage5FreshReplayArtifact {
             replayQualification = $destinationHeader.replayQualification
             exportedUtc = ([DateTime]::UtcNow).ToString('o')
         }
+        if ($null -ne $exportedMap) { $result | Add-Member -NotePropertyName maps -NotePropertyValue @($exportedMap) }
         $commitAccepted = $true
         return $result
     }
@@ -1404,6 +1429,15 @@ function Assert-Stage5ExporterRecord {
         'Corpus manifest record references a reparse-point artifact.'
     $recordLength = Get-Stage5ExporterRecordInteger $Record 'length' 46 `
         $script:Stage5ExporterMaximumReplayBytes
+    if ($null -ne $Record.PSObject.Properties['maps']) {
+        Assert-Stage5ExporterCondition ($Record.maps -is [Array] -and $Record.maps.Count -le 1 -and
+            ($Record.maps.Count -eq 0 -or [string]$Record.scenario -ceq '4v2')) 'Reviewed replay maps must retain one4v2 map binding or the legacy empty list.'
+        foreach ($map in $Record.maps) {
+            Read-Stage5ReviewedAiMap -ManifestDirectory $corpusRootFull -Map ([ordered]@{
+                source=$map.source;mapKey=$map.profileRelativePath;sha256=$map.sha256;byteCount=$map.byteCount;crc=$map.crc
+            }) | Out-Null
+        }
+    }
     $destinationSnapshot = Get-Stage5ExporterReplaySnapshot $destinationFull `
         $Title 'Corpus record destination'
     Assert-Stage5ExporterCondition ($recordLength -eq $destinationSnapshot.length) `
@@ -1735,6 +1769,26 @@ function Assert-Stage5ExporterValidationResults {
                 [IO.Path]::GetFullPath([string]$record.sourcePath),
                 [StringComparison]::OrdinalIgnoreCase)) `
             "Corpus record sequence $sequence lacks matching live-AI and replay-hash provenance."
+        $hasMapEvidence = if ($fields -is [Collections.IDictionary]) {
+            @($fields.Keys | Where-Object { [string]$_ -ceq 'map_sha256' }).Count -gt 0
+        } else { $fields.PSObject.Properties.Name -ccontains 'map_sha256' }
+        $hasRetainedMap = $null -ne $record.PSObject.Properties['maps'] -and $record.maps.Count -gt 0
+        Assert-Stage5ExporterCondition ($hasMapEvidence -eq $hasRetainedMap) `
+            'Reviewed completion map identity and retained map dependency must both be present.'
+        if ($hasRetainedMap) {
+            $map = $record.maps[0]
+            $mapFields = @{}
+            foreach ($name in @('map','map_sha256','map_crc','map_size')) {
+                $field = Get-Stage5ExporterJsonProperty $fields $name 'Reviewed replay map completion'
+                Assert-Stage5ExporterCondition ($field -is [string]) 'Reviewed replay map completion fields must retain native string types.'
+                $mapFields[$name] = $field
+            }
+            Assert-Stage5ReviewedAiMapCompletion -Fields $mapFields -Entry ([pscustomobject]@{
+                scenario='4v2';reviewedMap=[pscustomobject]@{
+                    source=$map.source;mapKey=$map.profileRelativePath;sha256=$map.sha256;byteCount=$map.byteCount;crc=$map.crc
+                }
+            })
+        }
     }
 }
 
@@ -2364,12 +2418,18 @@ function Convert-Stage5FreshReplayCorpusManifestToFixtures {
         else {
             'native-{0:D2}' -f $normalIndex++
         }
+        $fixtureMaps = @()
+        if ($null -ne $record.PSObject.Properties['maps']) {
+            $fixtureMaps = @($record.maps | ForEach-Object {
+                [ordered]@{source=$_.source;profileRelativePath=$_.profileRelativePath;sha256=$_.sha256}
+            })
+        }
         $fixtureEntries.Add([ordered]@{
             id = $id
             source = $relative
             sha256 = ([string]$record.destinationSha256).ToUpperInvariant()
             stress = [bool]$selectedRecord.stress
-            maps = @()
+            maps = $fixtureMaps
         }) | Out-Null
         $rich = [ordered]@{
             id = $id

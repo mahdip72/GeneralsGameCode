@@ -7,6 +7,7 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'Stage5ReplayCorpusExporter.psm1') -Force
+Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') -Force
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -431,7 +432,7 @@ function Write-TestValidationResults {
     )
     Complete-TestCorpusRecords $Records
     $results = @($Records | ForEach-Object {
-        [ordered]@{
+        $result = [ordered]@{
             sequence = $_.sequence
             title = $_.title
             kind = 'ai'
@@ -452,6 +453,13 @@ function Write-TestValidationResults {
                 }
             }
         }
+        if ($null -ne $_.PSObject.Properties['maps'] -and $_.maps.Count -gt 0) {
+            $result.aiEvidence.fields.map = $_.maps[0].profileRelativePath
+            $result.aiEvidence.fields.map_sha256 = $_.maps[0].sha256
+            $result.aiEvidence.fields.map_crc = $_.maps[0].crc
+            $result.aiEvidence.fields.map_size = [string]$_.maps[0].byteCount
+        }
+        $result
     })
     [IO.File]::WriteAllText($Path, ($results | ConvertTo-Json -Depth 12))
 }
@@ -628,6 +636,30 @@ try {
     Assert-True ($record.sourceSha256 -ceq $record.destinationSha256 -and
         $record.sourceSha256 -ceq $sourceSha256) `
         'source and destination hashes do not match.'
+    $mapPath = Join-Path $taskRoot 'reviewed.map'
+    [IO.File]::WriteAllBytes($mapPath, (New-Object byte[] 16384))
+    $mapHash = (Get-FileHash $mapPath -Algorithm SHA256).Hash
+    $reviewedMap = Read-Stage5ReviewedAiMap -ManifestDirectory $taskRoot -Map ([ordered]@{
+        source='reviewed.map';mapKey='Maps\AiProof\AiProof.map';sha256=$mapHash;byteCount=16384;crc='00000000'
+    })
+    [IO.File]::WriteAllText($mapPath, 'changed after immutable map snapshot')
+    $mappedRecord = Export-Stage5FreshReplayArtifact -SourcePath $retention.replayRetained `
+        -ExpectedSha256 $retention.replaySha256 -TaskRoot $taskRoot -TaskRunRoot $taskRunRoot `
+        -ProfileRoot $profileRoot -CorpusExportRoot $corpusRoot -ReviewedMap $reviewedMap `
+        -Metadata (New-TestMetadata '00AB-000006-00000001' $retention.scenario $retention.seed 'local-capacity-ai')
+    Assert-True ($mappedRecord.maps.Count -eq 1 -and
+        $mappedRecord.maps[0].profileRelativePath -ceq 'Maps\AiProof\AiProof.map' -and
+        (Get-FileHash (Join-Path $corpusRoot $mappedRecord.maps[0].source) -Algorithm SHA256).Hash -ceq $mapHash) `
+        'Exported replay lost its immutable reviewed map bytes or portable key.'
+    $mapResultsPath = Join-Path $taskRoot 'map-results.json'
+    Write-TestValidationResults $mapResultsPath @($mappedRecord)
+    $mapResults = Get-Content -LiteralPath $mapResultsPath -Raw | ConvertFrom-Json
+    $missingMapRecord = Copy-TestRecord $mappedRecord
+    $missingMapRecord.PSObject.Properties.Remove('maps')
+    Assert-Throws {
+        & $exporterModule { param($record,$results) Assert-Stage5ExporterValidationResults @($record) $results } `
+            $missingMapRecord $mapResults
+    } 'map' 'Stripping a reviewed map dependency must invalidate corpus provenance'
     Assert-True ($record.containerMagic -ceq 'RPL3' -and
         $record.containerSchemaVersion -eq 2 -and
         $record.containerEngineEpoch -eq 1 -and
@@ -1083,6 +1115,10 @@ try {
             -Metadata (New-TestMetadata $nonce $scenario $seed 'local-capacity-ai'))) | Out-Null
     }
     Complete-TestCorpusRecords $conversionRecords.ToArray()
+    $conversionMap = & $exporterModule { param($map,$root) Export-Stage5ReviewedAiReplayMap $map $root } $reviewedMap $conversionCorpusRoot
+    foreach ($record in @($conversionRecords.ToArray() | Where-Object scenario -CEQ '4v2')) {
+        $record | Add-Member -NotePropertyName maps -NotePropertyValue @($conversionMap)
+    }
     foreach ($record in $conversionRecords.ToArray()) {
         $record.configuration = 'serial-1'
     }
@@ -1106,6 +1142,14 @@ try {
         'completion parsing must preserve the true hard-ai-2v6 scenario and retained source binding'
     $conversionResults = Join-Path $conversionTaskRoot 'validation-results.json'
     Write-TestValidationResults $conversionResults $conversionRecords.ToArray()
+    $wrongMapResults = Get-Content -LiteralPath $conversionResults -Raw | ConvertFrom-Json
+    foreach ($result in @($wrongMapResults | Where-Object scenario -CEQ '4v2')) {
+        $result.aiEvidence.fields.map_sha256 = 'F' * 64
+    }
+    Assert-Throws {
+        & $exporterModule { param($records,$results) Assert-Stage5ExporterValidationResults $records $results } `
+            $conversionRecords.ToArray() $wrongMapResults
+    } 'map' 'Replay map must match its actual completion provenance'
     $artifactIndex = Write-Stage5FreshReplayArtifactIndex `
         -TaskRoot $conversionTaskRoot -CorpusExportRoot $conversionCorpusRoot `
         -Title 'ZeroHour' -ExecutableSha256 ('A' * 64) `
@@ -1166,6 +1210,10 @@ try {
     $stressFixtures = @($fixtureDocument.fixtures | Where-Object { $_.stress })
     $selectedShas = @($fixtureDocument.fixtures | ForEach-Object { $_.sha256 })
     $richRecords = @($provenanceDocument.fixtures)
+    $mappedFixtures = @($fixtureDocument.fixtures | Where-Object { $_.maps.Count -gt 0 })
+    Assert-True ($mappedFixtures.Count -gt 0 -and
+        @($mappedFixtures | Where-Object { $_.maps[0].sha256 -cne $mapHash -or $_.maps[0].profileRelativePath -cne 'Maps\AiProof\AiProof.map' }).Count -eq 0) `
+        'Replay fixture conversion lost the exact portable map closure.'
     Assert-True ($conversion.fixtureCount -eq 10 -and
         $fixtureDocument.fixtures.Count -eq 10 -and
         $fixtureDocument.ai.seeds.Count -eq 5 -and

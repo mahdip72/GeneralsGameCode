@@ -24,6 +24,7 @@ struct PhysicsIntegrationRuntimeMetrics;
 
 #include "GameNetwork/GameInfo.h"
 #include "Common/SkirmishAITestReceipt.h"
+#include "Common/SkirmishAITestMapBinding.h"
 
 enum
 {
@@ -88,6 +89,9 @@ struct SkirmishAITestLoadedState
 };
 
 Bool TryParseSkirmishAITestSeed(const char *text, Int *seed);
+#if defined(_WIN64)
+Bool ConfigureSkirmishAITestReviewedMap(const rts::ai_fixture::MapRequest &request);
+#endif
 Bool ShouldBypassFramePacingForSkirmishAITest(Bool runnerArmed);
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan);
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestScenario scenario,

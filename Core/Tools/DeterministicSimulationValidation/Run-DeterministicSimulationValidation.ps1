@@ -168,6 +168,7 @@ function Resolve-Stage5FrozenLivePlanEntry {
     $frozenEntry = @($frozenPlan.entries | Where-Object {
         $_.kind -ceq 'ai' -and $_.entryId -ceq $requirements.entryId
     })[0]
+    Assert-Stage5ReviewedAiMapEntryIdentity -Entry $Entry -FrozenEntry $frozenEntry
     Assert-Condition ([String]::Equals([IO.Path]::GetFullPath($Executable),
         [IO.Path]::GetFullPath($frozenPlan.executable), [StringComparison]::OrdinalIgnoreCase) -and
         [String]::Equals([IO.Path]::GetFullPath($WorkingDirectory),
@@ -1279,7 +1280,7 @@ function Get-ManifestData {
     $aiObject = Get-RequiredProperty $manifest 'ai' 'Fixture manifest'
     $aiFields = @('seeds', 'scenarios', 'repeats')
     if ($schemaVersion -eq 2) { $aiFields += 'liveQualification' }
-    Assert-JsonObjectShape $aiObject $aiFields $aiFields 'AI manifest'
+    Assert-JsonObjectShape $aiObject $aiFields @($aiFields + 'reviewedMap') 'AI manifest'
     $liveQualification = $null
     if ($schemaVersion -eq 2) {
         $liveQualification = Get-RequiredProperty $aiObject 'liveQualification' 'AI manifest'
@@ -1337,6 +1338,12 @@ function Get-ManifestData {
             'The deterministic-runtime gate requires at least three distinct live-AI seeds.'
     }
     $ai = [pscustomobject]@{ seeds = $seeds; scenarios = $scenarios; repeats = [int]$aiRepeats }
+    if (@($aiObject.Keys | Where-Object { [string]$_ -ceq 'reviewedMap' }).Count -eq 1) {
+        Assert-Condition ($scenarios -ccontains '4v2') 'Reviewed AI map requires the4v2 scenario.'
+        $reviewedMap = Read-Stage5ReviewedAiMap -Map $aiObject['reviewedMap'] -ManifestDirectory $manifestDirectory
+        Assert-Stage5ReviewedAiMapNoCollisions -ReviewedMap $reviewedMap -ReplayFixtures $fixtures.ToArray()
+        $ai | Add-Member -NotePropertyName reviewedMap -NotePropertyValue $reviewedMap
+    }
     if ($schemaVersion -eq 2) {
         $ai | Add-Member -NotePropertyName liveQualification -NotePropertyValue $liveQualification
     }
@@ -1486,6 +1493,16 @@ function New-ValidationPlan {
         Add-PlanEntry $plan 'ai' "4v2-shadow-seed-$shadowSeed" $shadowConfiguration 1 `
             $AiTimeout $shadowArguments $Executable $OutputDirectory "4v2-seed-$shadowSeed" `
             '' '' $true 0 $shadowSeed '4v2'
+    }
+    if ($Data.ai.PSObject.Properties.Name -ccontains 'reviewedMap') {
+        $mapBinding = $Data.ai.reviewedMap.binding
+        foreach ($entry in @($plan | Where-Object { $_.kind -ceq 'ai' -and $_.scenario -ceq '4v2' })) {
+            $entry.arguments = @($entry.arguments) + @('-skirmishAITestReviewedMap',
+                [string]$mapBinding.mapKey, [string]$mapBinding.sha256,
+                [string]$mapBinding.byteCount, [string]$mapBinding.crc)
+            $entry.command = ConvertTo-DisplayCommand $Executable $entry.arguments
+            $entry | Add-Member -NotePropertyName reviewedMap -NotePropertyValue $mapBinding
+        }
     }
     if ($Data.schemaVersion -eq 2) {
         $aiEntries = @($plan | Where-Object { $_.kind -ceq 'ai' })
@@ -3155,7 +3172,8 @@ function Export-LocalCapacityAiCorpus {
         [Parameter(Mandatory = $true)][object[]]$Results,
         [Parameter(Mandatory = $true)][string]$ValidationResultsPath,
         [ValidateSet('local-capacity-ai', 'serial-baseline-ai')]
-        [string]$CaptureMode = 'local-capacity-ai'
+        [string]$CaptureMode = 'local-capacity-ai',
+        [object]$ReviewedMap = $null
     )
     $CaptureMode = $CaptureMode.ToLowerInvariant()
     Assert-Condition (-not [string]::IsNullOrWhiteSpace($TaskRoot) -and
@@ -3222,11 +3240,19 @@ function Export-LocalCapacityAiCorpus {
             -Output ([string]$run.stdout) -ExpectedSeed $entrySeed `
             -ExpectedScenario ([string]$entry.scenario) -ExpectedTitle $Title `
             -Context "LocalCapacity AI sequence $($entry.sequence) completion"
+        $entryReviewedMap = $null
+        if ($entry.PSObject.Properties.Name -ccontains 'reviewedMap') {
+            Assert-Condition ($null -ne $ReviewedMap) 'Reviewed AI export is missing its original map snapshot.'
+            Assert-Stage5ReviewedAiMapEntryIdentity -Entry $entry -FrozenEntry ([pscustomobject]@{
+                scenario='4v2';reviewedMap=$ReviewedMap.binding
+            })
+            $entryReviewedMap = $ReviewedMap
+        }
         $artifact = Export-Stage5FreshReplayArtifact `
             -SourcePath $completion.replayRetained `
             -ExpectedSha256 $completion.replaySha256 `
             -TaskRoot $TaskRoot -TaskRunRoot $TaskRunRoot `
-            -ProfileRoot $ProfileRoot -CorpusExportRoot $CorpusExportRoot `
+            -ProfileRoot $ProfileRoot -CorpusExportRoot $CorpusExportRoot -ReviewedMap $entryReviewedMap `
             -Metadata ([ordered]@{
                 title = $Title
                 category = 'local-capacity-ai'
@@ -3238,7 +3264,7 @@ function Export-LocalCapacityAiCorpus {
                 executableSha256 = $ExecutableSha256
                 origin = 'native-fresh-runtime'
             })
-        $records.Add([pscustomobject]@{
+        $record = [pscustomobject]@{
             sequence = $entrySequence
             configuration = [string]$entry.configuration
             repeat = $entryRepeat
@@ -3268,7 +3294,11 @@ function Export-LocalCapacityAiCorpus {
             replayQualificationVersion = $artifact.replayQualificationVersion
             replayQualification = $artifact.replayQualification
             exportedUtc = $artifact.exportedUtc
-        }) | Out-Null
+        }
+        if ($artifact.PSObject.Properties.Name -ccontains 'maps') {
+            $record | Add-Member -NotePropertyName maps -NotePropertyValue @($artifact.maps)
+        }
+        $records.Add($record) | Out-Null
     }
     Assert-Condition ($records.Count -gt 0) `
         'LocalCapacity corpus export produced no replay records.'
@@ -3450,6 +3480,10 @@ $runtimeFull = [IO.Path]::GetFullPath($RuntimeRoot)
 $manifestData = Get-ManifestData $FixtureManifestPath $ValidationSet `
     ([bool]$AllowNonStandardCorpus) $ExpectedExecutableSha256 $Title `
     ($localCapacityRequested -and $ValidationSet -ceq 'AI')
+$reviewedAiMap = $null
+if ($ValidationSet -cne 'Replay' -and $manifestData.ai.PSObject.Properties.Name -ccontains 'reviewedMap') {
+    $reviewedAiMap = $manifestData.ai.reviewedMap
+}
 if ($serialBaselineCorpusCaptureRequested) {
     Assert-SerialBaselineCorpusCaptureManifest $manifestData
 } elseif ($corpusExportRequested) {
@@ -3480,7 +3514,7 @@ $logicalProcessorCount = 0
 $localCapacityTopology = $null
 $stage3PerformanceBaseline = $null
 $stage3PerformanceBaselineEvidencePath = $null
-if ($RequireX64 -or $EnforcePerformance) {
+if ($RequireX64 -or $EnforcePerformance -or $null -ne $reviewedAiMap) {
     Assert-X64PeExecutable $executableFull
 }
 if ($EnforcePerformance) {
@@ -3867,6 +3901,8 @@ $corpusExport = $null
 $localCapacityReceipt = $null
 $resultsPath = Join-Path $outputFull 'validation-results.json'
 $qualificationRuntimeGuard = $null
+$reviewedAiMapLock = $null
+$stagedReviewedAiMapPath = $null
 $baseGeneralsRuntimeGuard = $null
 $baseGeneralsBinding = $null
 $fatalPattern = '(?i)(CRC Mismatch|game thread ownership violation|assertion failed|fatal error|missing map|replay read error|SKIRMISH_AI_TEST_FAIL|SIMULATION_JOB_SYSTEM_FALLBACK|SIMULATION_SHADOW_(?:MISMATCH|FAIL)|SIMULATION_COLLISION_MISMATCH)'
@@ -3910,6 +3946,18 @@ try {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
 
+if ($null -ne $reviewedAiMap) {
+    $stagedReviewedAiMapPath = Copy-Stage5ReviewedAiMapSnapshot -ReviewedMap $reviewedAiMap -DestinationRoot $profileFull
+    $retainedMapRoot = Join-Path $outputFull 'ReviewedAiMap'
+    Assert-ContainedPathNoReparse $outputFull $retainedMapRoot 'Retained reviewed AI map sink' | Out-Null
+    [IO.Directory]::CreateDirectory($retainedMapRoot) | Out-Null
+    $retainedAiMapPath = Copy-Stage5ReviewedAiMapSnapshot -ReviewedMap $reviewedAiMap -DestinationRoot $retainedMapRoot
+    $reviewedAiMapLock = [IO.File]::Open($stagedReviewedAiMapPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    Assert-FileHash $stagedReviewedAiMapPath $reviewedAiMap.binding.sha256 'Locked reviewed AI map before execution' | Out-Null
+    $planDocument | Add-Member -NotePropertyName reviewedAiMap -NotePropertyValue ([ordered]@{
+        binding=$reviewedAiMap.binding; retainedSource=('ReviewedAiMap\' + $reviewedAiMap.binding.mapKey)
+    })
+}
 foreach ($fixture in $manifestData.fixtures) {
     $replayDestination = Join-Path $profileFull "Replays\$($fixture.replayArgument)"
     Copy-Item -LiteralPath $fixture.source -Destination $replayDestination
@@ -4139,6 +4187,9 @@ $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot).TrimEnd('\',
     } else { $null }
     foreach ($entry in $plan) {
         Assert-FreeSpace $outputFull $MinimumFreeBytes 'Validation evidence volume'
+        if ($null -ne $reviewedAiMap) {
+            Assert-FileHash $stagedReviewedAiMapPath $reviewedAiMap.binding.sha256 'Reviewed AI map before matrix entry' | Out-Null
+        }
         Assert-FileHash $executableFull $manifestData.executableSha256 'Installed runtime executable before run' | Out-Null
         if ($acceptanceBindingsRequested) {
             Assert-Stage5SimulationQualificationRuntimeMembership `
@@ -4338,7 +4389,7 @@ $generalsInstallFull = [IO.Path]::GetFullPath($GeneralsInstallRoot).TrimEnd('\',
             -ProfileRoot $profileFull -CorpusExportRoot $corpusExportRootFull `
             -Title $manifestData.title -ExecutableSha256 $manifestData.executableSha256 `
             -ChildRuns $childRuns.ToArray() -Results $results.ToArray() `
-            -ValidationResultsPath $resultsPath `
+            -ValidationResultsPath $resultsPath -ReviewedMap $reviewedAiMap `
             -CaptureMode $(if ($serialBaselineCorpusCaptureRequested) {
                 'serial-baseline-ai'
             } else { 'local-capacity-ai' })
@@ -4484,6 +4535,7 @@ catch {
     $primaryError = $_
 }
 finally {
+    if ($null -ne $reviewedAiMapLock) { $reviewedAiMapLock.Dispose(); $reviewedAiMapLock = $null }
     $cleanupErrors = New-Object 'Collections.Generic.List[string]'
     if ($null -ne $baseGeneralsRuntimeGuard) {
         try {

@@ -75,3 +75,12 @@ set_target_properties(core_skirmish_phase_snapshot_tests PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 add_test(NAME core_skirmish_phase_snapshot_tests COMMAND core_skirmish_phase_snapshot_tests)
 set_tests_properties(core_skirmish_phase_snapshot_tests PROPERTIES TIMEOUT 30)
+
+# Typed reviewed4v2 map command-line binding; independent of game startup.
+add_executable(core_reviewed_ai_map_contract_tests ReviewedAiMapContractTest.cpp)
+target_include_directories(core_reviewed_ai_map_contract_tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include")
+set_target_properties(core_reviewed_ai_map_contract_tests PROPERTIES
+    CXX_STANDARD 98 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+add_test(NAME core_reviewed_ai_map_contract_tests COMMAND core_reviewed_ai_map_contract_tests)
+set_tests_properties(core_reviewed_ai_map_contract_tests PROPERTIES TIMEOUT 30)

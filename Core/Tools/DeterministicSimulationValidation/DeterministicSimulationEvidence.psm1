@@ -727,6 +727,9 @@ function New-Stage5LiveValidationRequirementsMap {
                 else { $candidate[$field] }
             $recordMutable.Add($field, $value)
         }
+        if ($candidate.Contains('reviewedMap')) {
+            $recordMutable.Add('reviewedMapIdentity', (Get-Stage5ReviewedAiMapEntryIdentity $candidate))
+        }
         $record = [Collections.ObjectModel.ReadOnlyDictionary[string,object]]::new(
             $recordMutable)
         $requirementsMutable.Add([string]$candidate.entryId, $record)
@@ -748,6 +751,9 @@ function Get-Stage5LiveValidationRequirementsFromMap {
     $candidate = $RequirementsMap[$requested.entryId]
     Assert-Stage5Condition ($null -ne $candidate) `
         "$context requested entry is not a member of the planned matrix."
+    $expectedMapIdentity = if ($candidate.ContainsKey('reviewedMapIdentity')) { $candidate['reviewedMapIdentity'] } else { '' }
+    Assert-Stage5Condition ((Get-Stage5ReviewedAiMapEntryIdentity $requested) -ceq $expectedMapIdentity) `
+        "$context reviewed map binding differs from the original plan."
     $identityFields = @('entryId', 'kind', 'sequence', 'scenario', 'seed',
         'configuration', 'repeat', 'simulationMode', 'requestedWorkers',
         'workerPolicy', 'stress', 'validationRole', 'proofProfileId')
@@ -1028,6 +1034,130 @@ function ConvertFrom-Stage5ImmutableSpatialFields {
     }
 }
 
+function Assert-Stage5ReviewedAiMapKey {
+    param([object]$MapKey)
+    Assert-Stage5Condition ($MapKey -is [string] -and
+        $MapKey -cmatch '^Maps\\[A-Za-z0-9_-][A-Za-z0-9_. -]{0,63}\\[A-Za-z0-9_-][A-Za-z0-9_. -]{0,127}\.map$') `
+        'Reviewed AI map key must be a safe profile-relative map path.'
+    foreach ($segment in ($MapKey -split '\\')) {
+        Assert-Stage5Condition ($segment -notmatch '[. ]$' -and $segment -notmatch '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') `
+            'Reviewed AI map path has an ambiguous Windows segment.'
+    }
+    $parts = $MapKey -split '\\'
+    Assert-Stage5Condition ([string]::Equals($parts[1], [IO.Path]::GetFileNameWithoutExtension($parts[2]),
+        [StringComparison]::OrdinalIgnoreCase)) 'Reviewed AI map must retain the replay-portable directory/leaf identity.'
+    Assert-Stage5Condition (-not [string]::Equals($MapKey, 'Maps\Twilight Flame\Twilight Flame.map',
+        [StringComparison]::OrdinalIgnoreCase)) 'Reviewed AI map cannot shadow the default map.'
+}
+
+function Read-Stage5ReviewedAiMap {
+    param([Parameter(Mandatory=$true)][object]$Map, [Parameter(Mandatory=$true)][string]$ManifestDirectory)
+    $context = 'Reviewed AI map'
+    $value = ConvertTo-Stage5LiveDictionary $Map $context
+    $names = @('source','mapKey','sha256','byteCount','crc')
+    Assert-Stage5Condition ($value.Count -eq $names.Count) "$context has unexpected properties."
+    foreach ($name in $names) { Get-Stage5JsonValue $value $name $context | Out-Null }
+    Assert-Stage5ReviewedAiMapKey $value['mapKey']
+    $source = $value['source']
+    Assert-Stage5Condition ($source -is [string] -and $source.Length -gt 0 -and
+        -not [IO.Path]::IsPathRooted($source) -and $source -notmatch '[:\x00-\x1f]' -and
+        [IO.Path]::GetExtension($source) -ceq '.map') "$context source path must be manifest-relative."
+    foreach ($segment in ($source -split '[\\/]')) {
+        Assert-Stage5Condition ($segment.Length -gt 0 -and $segment -ne '.' -and $segment -ne '..' -and
+            $segment -notmatch '[. ]$' -and $segment -notmatch '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') "$context source path has an unsafe segment."
+    }
+    Assert-Stage5Condition ($value['sha256'] -is [string] -and $value['sha256'] -cmatch '^[0-9A-F]{64}$' -and
+        $value['crc'] -is [string] -and $value['crc'] -cmatch '^[0-9A-F]{8}$') "$context hash/CRC type or format is invalid."
+    Assert-Stage5Condition ((Test-Stage5JsonInteger $value['byteCount']) -and
+        $value['byteCount'] -ge 16384 -and $value['byteCount'] -le 67108864) "$context byteCount must be a bounded JSON integer."
+    $root = [IO.Path]::GetFullPath($ManifestDirectory).TrimEnd('\','/')
+    $full = [IO.Path]::GetFullPath((Join-Path $root $source))
+    Assert-Stage5Condition ($full.StartsWith($root + [IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)) "$context source path escapes its manifest directory."
+    Assert-Stage5FinalAcceptanceNoReparsePath ([IO.Path]::GetPathRoot($full)) $full "$context source"
+    # One immutable read supplies SHA, CRC and the exact bytes later staged.
+    $snapshot = Get-Stage5FinalAcceptanceFileSnapshot $full $context -EvidenceKind RawLog
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $snapshot $value['sha256'] "$context SHA256" | Out-Null
+    Assert-Stage5Condition ($snapshot.length -eq $value['byteCount']) "$context size differs from the snapshot."
+    [UInt64]$crc = 0
+    foreach ($byte in $snapshot.bytes) { $crc = (($crc -shl 1) + $byte + ($crc -shr 31)) -band [UInt64]4294967295 }
+    Assert-Stage5Condition (('{0:X8}' -f $crc) -ceq $value['crc']) "$context engine CRC differs from the snapshot."
+    return [pscustomobject]@{
+        sourcePath=$full; snapshot=$snapshot
+        binding=[pscustomobject][ordered]@{source=$source;mapKey=$value['mapKey'];sha256=$value['sha256'];byteCount=[Int64]$value['byteCount'];crc=$value['crc']}
+    }
+}
+
+function Assert-Stage5ReviewedAiMapNoCollisions {
+    param([Parameter(Mandatory=$true)][object]$ReviewedMap,[object[]]$ReplayFixtures=@())
+    foreach ($fixture in $ReplayFixtures) {
+        foreach ($map in $fixture.maps) {
+            $key = ([string]$map.relative).Replace('/','\')
+            Assert-Stage5Condition (-not [string]::Equals($key,$ReviewedMap.binding.mapKey,[StringComparison]::OrdinalIgnoreCase) -and
+                -not [string]::Equals($key,'Maps\Twilight Flame\Twilight Flame.map',[StringComparison]::OrdinalIgnoreCase)) `
+                'Replay map collision would shadow the reviewed AI map or default Twilight Flame.'
+        }
+    }
+}
+
+function Copy-Stage5ReviewedAiMapSnapshot {
+    param([Parameter(Mandatory=$true)][object]$ReviewedMap,[Parameter(Mandatory=$true)][string]$DestinationRoot)
+    Assert-Stage5ReviewedAiMapKey $ReviewedMap.binding.mapKey
+    $root=[IO.Path]::GetFullPath($DestinationRoot).TrimEnd('\','/')
+    Assert-Stage5Condition ($root.Substring([IO.Path]::GetPathRoot($root).Length) -notmatch ':') 'Reviewed AI map output sink contains ADS syntax.'
+    Assert-Stage5FinalAcceptanceNoReparsePath ([IO.Path]::GetPathRoot($root)) $root 'Reviewed AI map output sink'
+    Assert-Stage5Condition (Test-Path -LiteralPath $root -PathType Container) 'Reviewed AI map output sink must be an existing directory.'
+    $path=Join-Path $root $ReviewedMap.binding.mapKey
+    Assert-Stage5Condition (-not(Test-Path -LiteralPath $path)) 'Reviewed AI map sink already exists; overwrite is forbidden.'
+    $directory=Split-Path -Parent $path
+    $current=$root
+    foreach ($segment in @('Maps',($ReviewedMap.binding.mapKey -split '\\')[1])) {
+        $current=Join-Path $current $segment
+        if (-not(Test-Path -LiteralPath $current)) { [IO.Directory]::CreateDirectory($current)|Out-Null }
+        Assert-Stage5FinalAcceptanceNoReparsePath $root $current 'Reviewed AI map output directory'
+    }
+    Assert-Stage5FinalAcceptanceSnapshotSha256 $ReviewedMap.snapshot $ReviewedMap.binding.sha256 'Reviewed AI map original snapshot'|Out-Null
+    Write-Stage5FinalAcceptanceFileAtomically -Path $path -Bytes ([byte[]]$ReviewedMap.snapshot.bytes) `
+        -Context 'Reviewed AI map staged snapshot' -EvidenceKind RawLog|Out-Null
+    return $path
+}
+
+function Get-Stage5ReviewedAiMapEntryIdentity {
+    param([object]$Entry)
+    $entryValue=ConvertTo-Stage5LiveDictionary $Entry 'Reviewed map entry'
+    if (-not $entryValue.Contains('reviewedMap')) { return '' }
+    Assert-Stage5Condition ($entryValue['scenario'] -ceq '4v2') 'Reviewed map entry must retain4v2 authority.'
+    $map=ConvertTo-Stage5LiveDictionary $entryValue['reviewedMap'] 'Reviewed map binding'
+    Assert-Stage5ReviewedAiMapKey $map['mapKey']
+    Assert-Stage5Condition ($map.Count -eq 5 -and $map['source'] -is [string] -and
+        $map['sha256'] -is [string] -and $map['sha256'] -cmatch '^[0-9A-F]{64}$' -and
+        $map['crc'] -is [string] -and $map['crc'] -cmatch '^[0-9A-F]{8}$' -and
+        (Test-Stage5JsonInteger $map['byteCount']) -and $map['byteCount'] -ge 16384 -and $map['byteCount'] -le 67108864) `
+        'Reviewed map binding has invalid scalar identity.'
+    return ([ordered]@{source=$map['source'];mapKey=$map['mapKey'];sha256=$map['sha256'];byteCount=[Int64]$map['byteCount'];crc=$map['crc']} | ConvertTo-Json -Compress)
+}
+
+function Assert-Stage5ReviewedAiMapEntryIdentity {
+    param([object]$Entry,[object]$FrozenEntry)
+    Assert-Stage5Condition ((Get-Stage5ReviewedAiMapEntryIdentity $Entry) -ceq (Get-Stage5ReviewedAiMapEntryIdentity $FrozenEntry)) `
+        'Reviewed map binding differs from the frozen plan.'
+}
+
+function Assert-Stage5ReviewedAiMapCompletion {
+    param([hashtable]$Fields,[object]$Entry)
+    $entryValue=ConvertTo-Stage5LiveDictionary $Entry 'Reviewed map completion entry'
+    if (-not $entryValue.Contains('reviewedMap')) {
+        Assert-Stage5Condition (-not $Fields.ContainsKey('map_sha256')) 'Unplanned reviewed map identity appeared in completion.'
+        return
+    }
+    Get-Stage5ReviewedAiMapEntryIdentity $Entry | Out-Null
+    $map=ConvertTo-Stage5LiveDictionary $entryValue['reviewedMap'] 'Reviewed map completion binding'
+    Assert-Stage5Condition ((Get-Stage5RequiredField $Fields 'map' 'Reviewed map') -ceq $map['mapKey'] -and
+        (Get-Stage5RequiredField $Fields 'map_sha256' 'Reviewed map') -ceq $map['sha256'] -and
+        (Get-Stage5RequiredField $Fields 'map_crc' 'Reviewed map') -ceq $map['crc'] -and
+        (Get-Stage5UInt64Field $Fields 'map_size' 'Reviewed map') -eq [UInt64]$map['byteCount']) `
+        'Reviewed map completion identity does not match the planned snapshot.'
+}
+
 function ConvertFrom-Stage5AiCompletionCore {
     param([string]$Output, [object]$Entry, [string]$ExecutableHash,
         [bool]$RequireAuthoritativeWorkEvidence = $true, [object]$ValidationPlan = $null,
@@ -1051,6 +1181,7 @@ function ConvertFrom-Stage5AiCompletionCore {
         $liveRequirements.validationRole -ceq 'live-shadow-stress'
     $line = Get-Stage5SingleLine $Output 'SKIRMISH_AI_TEST_COMPLETE' $context
     $fields = ConvertFrom-Stage5MetricLine $line 'SKIRMISH_AI_TEST_COMPLETE' "$context completion manifest"
+    Assert-Stage5ReviewedAiMapCompletion -Fields $fields -Entry $Entry
     foreach ($required in @('seed', 'loaded_seed', 'scenario', 'actual_ai', 'actual_teams', 'winner_team', 'end_frame', 'executable_sha256',
         'simulation_mode', 'requested_pipeline', 'effective_pipeline', 'requested_simulation',
         'effective_simulation', 'requested_workers', 'effective_workers', 'worker_policy',
@@ -15806,6 +15937,8 @@ function Invoke-Stage5FinalAcceptanceAggregation {
 # .psm1 file into a caller scope, where Export-ModuleMember is invalid and the
 # private commands are unavailable.
 Export-ModuleMember -Function ConvertFrom-Stage5JsonDictionary, Get-Stage5JsonValue, `
+    Read-Stage5ReviewedAiMap, Assert-Stage5ReviewedAiMapNoCollisions, Copy-Stage5ReviewedAiMapSnapshot, `
+    Assert-Stage5ReviewedAiMapCompletion, Assert-Stage5ReviewedAiMapEntryIdentity, `
     Assert-Stage5NativePerformanceReceiptProvenance, `
     Assert-Stage5PhaseAccountingContract, `
     Assert-Stage5JsonShape, Test-Stage5JsonInteger, Test-Stage5JsonNumber, `

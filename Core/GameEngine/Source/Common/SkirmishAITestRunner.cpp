@@ -30,6 +30,7 @@
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 #if defined(_WIN64)
 #include "Common/FileSystem.h"
+#include "Common/Stage5MapResolution.h"
 #include "Common/PerformanceReceiptRuntime.h"
 #include "Common/crc.h"
 #include "Lib/CollisionCandidateKernel.h"
@@ -53,6 +54,11 @@
 
 namespace
 {
+#if defined(_WIN64)
+rts::ai_fixture::MapRequest s_reviewedMapRequest;
+rts::fixture::ResolvedMapIdentity s_reviewedMapIdentity;
+char s_reviewedMapSha256[65] = {};
+#endif
 struct SkirmishAITestRunnerState
 {
 	Bool armed;
@@ -778,6 +784,38 @@ struct ClosePerformanceMapFile
 	void operator()(File *file) const { if (file != 0) file->close(); }
 };
 
+Bool VerifyReviewedSkirmishMapBytes()
+{
+	if (!s_reviewedMapRequest.requested || !TheFileSystem) return FALSE;
+	std::unique_ptr<File, ClosePerformanceMapFile> file(TheFileSystem->openFile(
+		s_reviewedMapIdentity.runtimePath, File::READ | File::BINARY | File::STREAMING));
+	const Int length = file ? file->size() : 0;
+	if (length <= 0 || static_cast<unsigned>(length) != s_reviewedMapRequest.byteCount ||
+		length > 64 * 1024 * 1024) return FALSE;
+	try
+	{
+		std::vector<unsigned char> bytes(static_cast<size_t>(length));
+		Int offset = 0;
+		while (offset < length)
+		{
+			const Int count = file->read(&bytes[static_cast<size_t>(offset)], length - offset);
+			if (count <= 0 || count > length - offset) return FALSE;
+			offset += count;
+		}
+		unsigned char extra = 0;
+		if (file->read(&extra, 1) != 0) return FALSE;
+		CRC crc;
+		crc.computeCRC(&bytes[0], length);
+		char sha256[65];
+		if (crc.get() != s_reviewedMapRequest.crc ||
+			!HashSkirmishAITestBytes(&bytes[0], bytes.size(), sha256) ||
+			strcmp(sha256, s_reviewedMapRequest.sha256) != 0) return FALSE;
+		memcpy(s_reviewedMapSha256, sha256, sizeof(s_reviewedMapSha256));
+		return TRUE;
+	}
+	catch (const std::bad_alloc &) { return FALSE; }
+}
+
 void BindSkirmishAITestPerformanceMap()
 {
 	if (!s_performanceReceipt || !s_performanceReceipt->active()) return;
@@ -820,7 +858,8 @@ void BindSkirmishAITestPerformanceMap()
 			s_performanceReceipt->invalidate("loaded map content disagrees with the live map");
 			return;
 		}
-		s_performanceReceipt->bindFixture("fresh-ai-map", s_runner.loadedMapName,
+		s_performanceReceipt->bindFixture("fresh-ai-map", s_reviewedMapRequest.requested ?
+			s_reviewedMapIdentity.logicalKey : s_runner.loadedMapName,
 			sha256, static_cast<unsigned>(s_runner.loadedSeed));
 	}
 	catch (const std::bad_alloc &)
@@ -2276,6 +2315,15 @@ Bool IsSkirmishAITestRunnerArmed()
 	return s_runner.armed;
 }
 
+#if defined(_WIN64)
+Bool ConfigureSkirmishAITestReviewedMap(const rts::ai_fixture::MapRequest &request)
+{
+	if (!request.requested || s_reviewedMapRequest.requested) return FALSE;
+	s_reviewedMapRequest = request;
+	return TRUE;
+}
+#endif
+
 Bool StartSkirmishAITestRunner()
 {
 	if (!s_runner.armed)
@@ -2309,6 +2357,21 @@ Bool StartSkirmishAITestRunner()
 
 	SkirmishAITestPlan plan;
 	BuildSkirmishAITestPlan(s_runner.seed, s_runner.scenario, &plan);
+#if defined(_WIN64)
+	if (s_reviewedMapRequest.requested)
+	{
+		if (!IsSkirmishAITest4v2(s_runner.scenario) ||
+			!ResolveStage5MapIdentity(s_reviewedMapRequest.mapKey, &s_reviewedMapIdentity) ||
+			!s_reviewedMapIdentity.profileMap ||
+			strlen(s_reviewedMapIdentity.runtimePath) >= sizeof(s_runner.loadedMapName) ||
+			!VerifyReviewedSkirmishMapBytes())
+		{
+			FailSkirmishAITest("reviewed_map_binding_failed");
+			return FALSE;
+		}
+		plan.mapName = s_reviewedMapIdentity.runtimePath;
+	}
+#endif
 	const MapMetaData *map = TheMapCache->findMap(plan.mapName);
 	const Int expectedMapPlayers = ExpectedSkirmishAITestAiCount(s_runner.scenario) +
 		(IsSkirmishAITestHardAI2v6(s_runner.scenario) ? 0 : 1);
@@ -2321,6 +2384,14 @@ Bool StartSkirmishAITestRunner()
 	DEBUG_LOG(("SkirmishAITestRunner::start phase=map_ready"));
 	s_runner.expectedMapCRC = map->m_CRC;
 	s_runner.expectedMapSize = map->m_filesize;
+#if defined(_WIN64)
+	if (s_reviewedMapRequest.requested && (map->m_CRC != s_reviewedMapRequest.crc ||
+		map->m_filesize != s_reviewedMapRequest.byteCount))
+	{
+		FailSkirmishAITest("reviewed_map_cache_identity_mismatch");
+		return FALSE;
+	}
+#endif
 
 	delete TheSkirmishGameInfo;
 	TheSkirmishGameInfo = NEW SkirmishGameInfo;
@@ -2404,25 +2475,29 @@ Bool StartSkirmishAITestRunner()
 	message->appendIntegerArgument(0);
 
 	s_runner.started = TRUE;
+	const char *reportedMapName = plan.mapName;
+#if defined(_WIN64)
+	if (s_reviewedMapRequest.requested) reportedMapName = s_reviewedMapIdentity.logicalKey;
+#endif
 	if (IsSkirmishAITest4v2(s_runner.scenario))
 	{
 		printf("SKIRMISH_AI_TEST_START seed=%d scenario=%s map=\"%s\" expected_ai=6 expected_teams=4v2\n",
-			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), plan.mapName);
+			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), reportedMapName);
 	}
 	else if (IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
 	{
 		printf("SKIRMISH_AI_TEST_START seed=%d scenario=%s map=\"%s\" expected_ai=7 expected_teams=1-controller+3v4-ai\n",
-			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), plan.mapName);
+			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), reportedMapName);
 	}
 	else if (IsSkirmishAITestHardAI2v6(s_runner.scenario))
 	{
 		printf("SKIRMISH_AI_TEST_START seed=%d scenario=%s map=\"%s\" expected_ai=8 expected_teams=2v6\n",
-			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), plan.mapName);
+			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), reportedMapName);
 	}
 	else
 	{
 		printf("SKIRMISH_AI_TEST_START seed=%d scenario=%s map=\"%s\" expected_ai=7 expected_teams=4v3\n",
-			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), plan.mapName);
+			plan.seed, SkirmishAITestScenarioName(s_runner.scenario), reportedMapName);
 	}
 	fflush(stdout);
 	return TRUE;
@@ -2491,6 +2566,9 @@ void UpdateSkirmishAITestRunner()
 
 	SkirmishAITestPlan expectedPlan;
 	BuildSkirmishAITestPlan(s_runner.seed, s_runner.scenario, &expectedPlan);
+#if defined(_WIN64)
+	if (s_reviewedMapRequest.requested) expectedPlan.mapName = s_reviewedMapIdentity.runtimePath;
+#endif
 	const AsciiString gameInfoMap = TheGameInfo->getMap();
 	const AsciiString globalMap = TheGlobalData->m_mapName;
 	const AsciiString terrainMap = TheTerrainLogic
@@ -2509,6 +2587,14 @@ void UpdateSkirmishAITestRunner()
 	}
 	if (!s_runner.loadedStateValidated)
 	{
+#if defined(_WIN64)
+		if (s_reviewedMapRequest.requested && !VerifyReviewedSkirmishMapBytes())
+		{
+			FailSkirmishAITest("reviewed_loaded_map_identity_mismatch");
+			RequestSkirmishAITestStop();
+			return;
+		}
+#endif
 		s_runner.loadedStateValidated = TRUE;
 		strlcpy(s_runner.loadedMapName, loadedState.gameInfoMapName, ARRAY_SIZE(s_runner.loadedMapName));
 		s_runner.loadedMapCRC = loadedState.mapCRC;
@@ -2894,7 +2980,11 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 	{
 		printf("SKIRMISH_AI_TEST_COMPLETE seed=%d scenario=%s map=\"%s\" map_crc=%08X map_size=%u loaded_seed=%d "
 			"actual_ai=%d actual_teams=%dv%d winner_team=%d end_frame=%u replay=%s",
-			s_runner.seed, SkirmishAITestScenarioName(s_runner.scenario), s_runner.loadedMapName,
+			s_runner.seed, SkirmishAITestScenarioName(s_runner.scenario),
+#if defined(_WIN64)
+			s_reviewedMapRequest.requested ? s_reviewedMapIdentity.logicalKey :
+#endif
+			s_runner.loadedMapName,
 			s_runner.loadedMapCRC, s_runner.loadedMapSize, s_runner.loadedSeed,
 			s_runner.actualAiCount, s_runner.actualTeamCounts[0], s_runner.actualTeamCounts[1],
 			s_runner.winnerTeam, s_runner.endFrame, replayPath.str());
@@ -2908,6 +2998,9 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 			s_runner.actualAiCount, s_runner.actualTeamCounts[0], s_runner.actualTeamCounts[1],
 			s_runner.winnerTeam, s_runner.endFrame, replayPath.str());
 	}
+#if defined(_WIN64)
+	if (s_reviewedMapRequest.requested) printf(" map_sha256=%s", s_reviewedMapSha256);
+#endif
 	PrintSkirmishAITestManifest();
 	fflush(stdout);
 	return 0;
