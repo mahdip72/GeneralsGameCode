@@ -163,8 +163,19 @@ $script:exe=Join-Path $runtime 'generalszh.exe'
 $script:fixture.executableSha256=Get-TestSha256 $script:exe
 $DiagnosticMapPath=$script:fixture.mapPath;$ExpectedDiagnosticMapSha256=$script:fixture.mapSha256
 $DiagnosticMapKey='Maps\Stage5Dense\Stage5Dense.map'
-$sourceCommit = (& git -C $PSScriptRoot rev-parse HEAD).Trim()
-foreach($script:case in @('success','exit-failure','capture-failure','foreign-child','tamper-before-lock')) {
+$testRepositoryRoot = (& git -C $PSScriptRoot rev-parse --show-toplevel 2>$null |
+    Select-Object -First 1)
+if ([string]::IsNullOrWhiteSpace([string]$testRepositoryRoot)) {
+    throw 'The native-fixture lifecycle harness must run from a Git checkout.'
+}
+# The lifecycle harness imports runner functions from their AST.  Those
+# dynamically defined functions do not retain the runner's $PSScriptRoot, so
+# make their Git provenance lookup deterministic without weakening the
+# production source-commit check.
+Push-Location ([string]$testRepositoryRoot).Trim()
+try {
+    $sourceCommit = (& git -C $PSScriptRoot rev-parse HEAD).Trim()
+    foreach($script:case in @('success','exit-failure','capture-failure','foreign-child','tamper-before-lock')) {
     $out=Join-Path $ScratchRoot $script:case
     $script:lockObservedStagedMap=$false;$script:stagedMapPath=$null
     $script:observedLockFixtureManifestPath=$null;$script:observedLockAdditionalPaths=@()
@@ -231,5 +242,9 @@ foreach($script:case in @('success','exit-failure','capture-failure','foreign-ch
                 ($result.capturedOutput.stderrAvailable -eq ($script:case -ne 'capture-failure'))) 'Capture availability was not recorded accurately.'
         }
     }
+    }
+    Write-Output 'PASS: real native-fixture host lifecycle with bounded fake child/registry adapters'
 }
-Write-Output 'PASS: real native-fixture host lifecycle with bounded fake child/registry adapters'
+finally {
+    Pop-Location
+}
