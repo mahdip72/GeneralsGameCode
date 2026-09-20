@@ -11,13 +11,22 @@
 #include "PreRTS.h"
 
 #include "Common/GameEngine.h"
+#include "Common/BuildAssistant.h"
 #include "Common/GameState.h"
 #include "Common/GlobalData.h"
 #include "Common/Money.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/PlayerTemplate.h"
+#include "Common/ScoreKeeper.h"
 #include "Common/SkirmishAILegacySaveTest.h"
+#include "Common/ThingFactory.h"
+#include "Common/ThingTemplate.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/Object.h"
+#include "GameLogic/SidesList.h"
+#include "GameLogic/Module/AIUpdate.h"
+#include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameNetwork/GameInfo.h"
 
 #include <limits.h>
@@ -29,8 +38,10 @@ namespace
 enum
 {
 	LEGACY_SAVE_NAME_CAPACITY = 64,
-	LEGACY_SAVE_SIMULATION_FRAMES = 120,
-	LEGACY_SAVE_MAX_UPDATE_CALLS = 480
+	LEGACY_SAVE_SETTLE_FRAMES = 120,
+	LEGACY_SAVE_RECOVERY_TIMEOUT_FRAMES = 18000,
+	LEGACY_SAVE_MAX_UPDATE_CALLS = 24000,
+	LEGACY_SAVE_MAX_CONSTRUCTION_SCAFFOLDS = 24
 };
 
 enum LegacySaveTestState
@@ -59,6 +70,110 @@ Int s_loadedAIPlayers = 0;
 Int s_admissionPlayerIndex = -1;
 Bool s_identityEstablished = FALSE;
 Bool s_identitySettleReported = FALSE;
+Bool s_recoveryFaultApplied = FALSE;
+Bool s_sawConstructionProgress = FALSE;
+Bool s_sawOrdinaryBuilderProvenance = FALSE;
+Int s_recoveryPlayerIndex = -1;
+ObjectID s_destroyedCenterID = INVALID_ID;
+ObjectID s_recoveryConstructionID = INVALID_ID;
+UnsignedInt s_recoveryFaultFrame = 0;
+Int s_recoveryCenterCost = 0;
+Int s_recoveryBaselineMoneySpent = 0;
+Int s_recoveryConstructionScaffolds = 0;
+Real s_recoveryConstructionPercent = 0.0f;
+const ThingTemplate *s_recoveryCenterTemplate = nullptr;
+
+Bool isLiveObject(const Object *object)
+{
+	return object != nullptr && !object->isDestroyed() &&
+		!object->isEffectivelyDead();
+}
+
+BuildListInfo *findBuildInfo(
+	Player *player, const ThingTemplate *thing, ObjectID objectID)
+{
+	if (!player || !thing || !TheThingFactory)
+		return nullptr;
+	for (BuildListInfo *info = player->getBuildList(); info; info = info->getNext())
+	{
+		const ThingTemplate *plan = TheThingFactory->findTemplate(info->getTemplateName());
+		if (plan && plan->isEquivalentTo(thing) &&
+			info->getObjectID() == objectID)
+			return info;
+	}
+	return nullptr;
+}
+
+Int countMatchingCommandCenters(
+	Player *player, const ThingTemplate *thing, Object **first,
+	Bool *underConstruction)
+{
+	if (first)
+		*first = nullptr;
+	if (underConstruction)
+		*underConstruction = FALSE;
+	if (!player || !thing || !TheGameLogic)
+		return 0;
+
+	Int count = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject())
+	{
+		if (!isLiveObject(object) || object->getControllingPlayer() != player ||
+			!object->isKindOf(KINDOF_COMMANDCENTER) ||
+			object->testStatus(OBJECT_STATUS_SOLD) || !object->getTemplate() ||
+			!object->getTemplate()->isEquivalentTo(thing))
+			continue;
+		++count;
+		if (underConstruction &&
+			object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION))
+			*underConstruction = TRUE;
+		if (first && (*first == nullptr || object->getID() < (*first)->getID()))
+			*first = object;
+	}
+	return count;
+}
+
+Int countCompatibleBuilders(
+	Player *player, const ThingTemplate *primaryTemplate)
+{
+	if (!player || !primaryTemplate || !TheGameLogic || !TheBuildAssistant)
+		return 0;
+	Int count = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject())
+	{
+		if (!IsSkirmishAILegacySaveBuilderLive(
+				object != nullptr, object->isDestroyed(),
+				object->isEffectivelyDead(),
+				object->testStatus(OBJECT_STATUS_SOLD)) ||
+			object->isContained() ||
+			object->getControllingPlayer() != player ||
+			!object->isKindOf(KINDOF_DOZER) || !object->getAIUpdateInterface() ||
+			!object->getAIUpdateInterface()->getDozerAIInterface() ||
+			object->isDisabledByType(DISABLED_UNMANNED))
+			continue;
+		if (!TheBuildAssistant->isPossibleToMakeUnit(object, primaryTemplate))
+			continue;
+		++count;
+	}
+	return count;
+}
+
+Bool hasOtherStructure(Player *player, Object *excluded)
+{
+	if (!player || !TheGameLogic)
+		return FALSE;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject())
+	{
+		if (object != excluded && isLiveObject(object) && object->isStructure() &&
+			object->getControllingPlayer() == player &&
+			!object->testStatus(OBJECT_STATUS_SOLD))
+			return TRUE;
+	}
+	return FALSE;
+}
 
 Bool isSafeSaveBasename(const char *basename)
 {
@@ -113,6 +228,230 @@ void finishFailure(const char *reason)
 	s_state = LEGACY_SAVE_TEST_FINISHED;
 	requestQuit();
 }
+
+Bool startRecoveryProbeFor(
+	Player *player, Object *center, BuildListInfo *info,
+	Int builderCount, UnsignedInt frame)
+{
+	if (!player || !center || !info || !center->getTemplate() ||
+		!player->getScoreKeeper() || builderCount <= 0 ||
+		s_admissionPlayerIndex != player->getPlayerIndex())
+		return FALSE;
+
+	s_recoveryPlayerIndex = s_admissionPlayerIndex;
+	s_destroyedCenterID = center->getID();
+	s_recoveryCenterTemplate = center->getTemplate();
+	s_recoveryCenterCost = s_recoveryCenterTemplate->calcCostToBuild(player);
+	s_recoveryBaselineMoneySpent = player->getScoreKeeper()->getTotalMoneySpent();
+	s_recoveryFaultFrame = frame;
+	info->setNumRebuilds(0);
+	TheGameLogic->destroyObject(center);
+	s_recoveryFaultApplied = TRUE;
+	printf("LEGACY_SAVE_TEST_RECOVERY_FAULT frame=%u player=%d center=%u "
+		"template=%s center_cost=%d cash=%u rebuilds=%d "
+		"expected=recovery route=surviving_builder builders=%d\n",
+		frame, s_recoveryPlayerIndex, s_destroyedCenterID,
+		s_recoveryCenterTemplate->getName().str(), s_recoveryCenterCost,
+		player->getMoney()->countMoney(), info->getNumRebuilds(), builderCount);
+	fflush(stdout);
+	return TRUE;
+}
+
+struct LegacySaveRecoveryCandidate
+{
+	LegacySaveRecoveryCandidate() :
+		player(nullptr),
+		center(nullptr),
+		info(nullptr),
+		builderCount(0),
+		cash(0)
+	{
+	}
+
+	Player *player;
+	Object *center;
+	BuildListInfo *info;
+	Int builderCount;
+	UnsignedInt cash;
+};
+
+Bool findRecoveryProbeCandidate(LegacySaveRecoveryCandidate *selected)
+{
+	if (!selected)
+		return FALSE;
+
+	Bool hasSelection = FALSE;
+	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i)
+	{
+		Player *player = ThePlayerList->getNthPlayer(i);
+		if (!player)
+			continue;
+
+		SkirmishAILegacySaveCandidateInput input;
+		input.isComputer = player->getPlayerType() == PLAYER_COMPUTER;
+		input.isSkirmishAI = player->isSkirmishAIPlayer();
+		input.hasPlayerTemplate = player->getPlayerTemplate() != nullptr;
+		if (!input.isComputer || !input.isSkirmishAI ||
+			!input.hasPlayerTemplate)
+			continue;
+
+		const AsciiString startingBuilding =
+			player->getPlayerTemplate()->getStartingBuilding();
+		const ThingTemplate *primaryTemplate = startingBuilding.isNotEmpty()
+			? TheThingFactory->findTemplate(startingBuilding) : nullptr;
+		if (!primaryTemplate || !primaryTemplate->isKindOf(KINDOF_COMMANDCENTER))
+			continue;
+		Object *center = nullptr;
+		Bool underConstruction = FALSE;
+		input.hasCompletedPrimaryCenter = countMatchingCommandCenters(
+			player, primaryTemplate, &center, &underConstruction) == 1 &&
+			center && !underConstruction;
+		input.hasOtherStructure = input.hasCompletedPrimaryCenter &&
+			hasOtherStructure(player, center);
+		BuildListInfo *info = input.hasCompletedPrimaryCenter
+			? findBuildInfo(player, primaryTemplate, center->getID()) : nullptr;
+		input.hasBuildInfo = info != nullptr;
+		input.hasScoreKeeper = player->getScoreKeeper() != nullptr;
+		input.compatibleBuilderCount = countCompatibleBuilders(
+			player, primaryTemplate);
+		input.centerCost = primaryTemplate->calcCostToBuild(player);
+		input.cash = player->getMoney() ? player->getMoney()->countMoney() : 0;
+		input.reserveAdmitted = player->getMoney() &&
+			input.cash <= static_cast<UnsignedInt>(INT_MAX) &&
+			player->canSpendForSkirmishAIRecovery(
+				static_cast<Int>(input.cash), nullptr, FALSE);
+		const Int selectedPlayerIndex = selected->player
+			? selected->player->getPlayerIndex() : -1;
+		if (!ShouldSelectSkirmishAILegacySaveCandidate(
+				hasSelection, selectedPlayerIndex,
+				player->getPlayerIndex(), input))
+			continue;
+
+		selected->player = player;
+		selected->center = center;
+		selected->info = info;
+		selected->builderCount = input.compatibleBuilderCount;
+		selected->cash = input.cash;
+		hasSelection = TRUE;
+	}
+	return hasSelection;
+}
+
+Bool tryStartRecoveryProbe(UnsignedInt frame)
+{
+	LegacySaveRecoveryCandidate candidate;
+	if (!findRecoveryProbeCandidate(&candidate))
+		return FALSE;
+
+	s_admissionPlayerIndex = candidate.player->getPlayerIndex();
+	printf("LEGACY_SAVE_TEST_ADMISSION_OK player=%d cash=%u\n",
+		s_admissionPlayerIndex, candidate.cash);
+	fflush(stdout);
+	return startRecoveryProbeFor(candidate.player, candidate.center,
+		candidate.info, candidate.builderCount, frame);
+}
+
+void finishSuccess(UnsignedInt endFrame, const char *outcome)
+{
+	printf("LEGACY_SAVE_TEST_SIMULATION_OK start_frame=%u end_frame=%u frames=%u "
+		"updates=%u max_delta=%u recovery=%s duplicate_cc=0 "
+		"construction_scaffolds=%d\n",
+		s_startFrame, endFrame, s_framesAdvanced, s_updateCalls,
+		s_maxFrameDelta, outcome, s_recoveryConstructionScaffolds);
+	fflush(stdout);
+	s_result = 0;
+	s_state = LEGACY_SAVE_TEST_FINISHED;
+	emit("PASS");
+	requestQuit();
+}
+
+void observeRecoveryProbe(Player *player, UnsignedInt frame)
+{
+	const Int currentMoneySpent = player->getScoreKeeper()->getTotalMoneySpent();
+	Object *commandCenter = nullptr;
+	Bool underConstruction = FALSE;
+	const Int commandCenterCount = countMatchingCommandCenters(
+		player, s_recoveryCenterTemplate, &commandCenter, &underConstruction);
+	if (commandCenterCount > 1)
+	{
+		finishFailure("recovery_duplicate_command_center");
+		return;
+	}
+
+	if (commandCenter && commandCenter->getID() == s_destroyedCenterID)
+	{
+		finishFailure("destroyed_center_remained_live");
+		return;
+	}
+	if (commandCenter && underConstruction)
+	{
+		if (commandCenter->getID() != s_recoveryConstructionID)
+		{
+			s_recoveryConstructionID = commandCenter->getID();
+			++s_recoveryConstructionScaffolds;
+			s_sawConstructionProgress = FALSE;
+			s_sawOrdinaryBuilderProvenance = FALSE;
+			s_recoveryConstructionPercent = commandCenter->getConstructionPercent();
+			if (s_recoveryConstructionScaffolds >
+				LEGACY_SAVE_MAX_CONSTRUCTION_SCAFFOLDS)
+			{
+				finishFailure("recovery_scaffold_bound");
+				return;
+			}
+			const ObjectID builderID = commandCenter->getBuilderID();
+			Object *builder = TheGameLogic->findObjectByID(builderID);
+			if (commandCenter->getProducerID() != builderID ||
+				commandCenter->testStatus(OBJECT_STATUS_RECONSTRUCTING) ||
+				!isLiveObject(builder) || builder->isContained() ||
+				builder->getControllingPlayer() != player ||
+				!builder->isKindOf(KINDOF_DOZER) ||
+				!builder->getAIUpdateInterface() ||
+				!builder->getAIUpdateInterface()->getDozerAIInterface() ||
+				!TheBuildAssistant->isPossibleToMakeUnit(
+					builder, s_recoveryCenterTemplate))
+			{
+				finishFailure("recovery_scaffold_provenance_invalid");
+				return;
+			}
+			s_sawOrdinaryBuilderProvenance = TRUE;
+			printf("LEGACY_SAVE_TEST_RECOVERY_CONSTRUCTION frame=%u player=%d "
+				"construction=%u builder=%u producer=%u reconstructing=0 "
+				"route=ordinary_builder scaffold=%d\n",
+				frame, s_recoveryPlayerIndex, s_recoveryConstructionID,
+				builderID, commandCenter->getProducerID(),
+				s_recoveryConstructionScaffolds);
+			fflush(stdout);
+		}
+		else if (commandCenter->getConstructionPercent() >
+			s_recoveryConstructionPercent)
+			s_sawConstructionProgress = TRUE;
+		s_recoveryConstructionPercent = commandCenter->getConstructionPercent();
+		return;
+	}
+	if (commandCenter && !underConstruction)
+	{
+		const Int aggregateSpend =
+			currentMoneySpent - s_recoveryBaselineMoneySpent;
+		if (s_recoveryConstructionID == INVALID_ID ||
+			commandCenter->getID() != s_recoveryConstructionID ||
+			!s_sawConstructionProgress ||
+			!s_sawOrdinaryBuilderProvenance ||
+			aggregateSpend < s_recoveryCenterCost)
+		{
+			finishFailure("recovery_completion_unattributed");
+			return;
+		}
+		printf("LEGACY_SAVE_TEST_RECOVERY_OK frame=%u player=%d center=%u "
+			"destroyed_center=%u route=ordinary_builder provenance=verified "
+			"aggregate_spend_delta=%d spend_floor=%d progress=verified "
+			"duplicate_cc=0\n",
+			frame, s_recoveryPlayerIndex, commandCenter->getID(),
+			s_destroyedCenterID, aggregateSpend, s_recoveryCenterCost);
+		fflush(stdout);
+		finishSuccess(frame, "completed");
+		return;
+	}
+}
 }
 
 void RequestSkirmishAILegacySaveTest(const char *basename)
@@ -122,6 +461,19 @@ void RequestSkirmishAILegacySaveTest(const char *basename)
 	s_state = LEGACY_SAVE_TEST_NOT_STARTED;
 	s_result = 1;
 	s_loadUpdateCalls = 0;
+	s_admissionPlayerIndex = -1;
+	s_recoveryFaultApplied = FALSE;
+	s_sawConstructionProgress = FALSE;
+	s_sawOrdinaryBuilderProvenance = FALSE;
+	s_recoveryPlayerIndex = -1;
+	s_destroyedCenterID = INVALID_ID;
+	s_recoveryConstructionID = INVALID_ID;
+	s_recoveryFaultFrame = 0;
+	s_recoveryCenterCost = 0;
+	s_recoveryBaselineMoneySpent = 0;
+	s_recoveryConstructionScaffolds = 0;
+	s_recoveryConstructionPercent = 0.0f;
+	s_recoveryCenterTemplate = nullptr;
 	if (!isSafeSaveBasename(basename))
 	{
 		emitFailure("unsafe_save_basename");
@@ -236,7 +588,6 @@ void UpdateSkirmishAILegacySaveTest()
 		}
 		emit("LOAD_OK");
 
-		Player *cashPlayer = nullptr;
 		Int skirmishAIPlayers = 0;
 		for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i)
 		{
@@ -246,8 +597,6 @@ void UpdateSkirmishAILegacySaveTest()
 			if (!player->isSkirmishAIPlayer())
 				continue;
 			++skirmishAIPlayers;
-			if (!cashPlayer && player->getMoney()->countMoney() > 0)
-				cashPlayer = player;
 		}
 		if (skirmishAIPlayers == 0)
 		{
@@ -255,23 +604,6 @@ void UpdateSkirmishAILegacySaveTest()
 			return;
 		}
 		printf("LEGACY_SAVE_TEST_AI_OK players=%d\n", skirmishAIPlayers);
-		fflush(stdout);
-		if (cashPlayer == nullptr)
-		{
-			finishFailure("no_positive_cash_ai");
-			return;
-		}
-
-		const UnsignedInt cash = cashPlayer->getMoney()->countMoney();
-		if (cash > static_cast<UnsignedInt>(INT_MAX) ||
-			!cashPlayer->canSpendForSkirmishAIRecovery(
-				static_cast<Int>(cash), nullptr, FALSE))
-		{
-			finishFailure("recovery_reserve_admission_failed");
-			return;
-		}
-		printf("LEGACY_SAVE_TEST_ADMISSION_OK player=%d cash=%u\n",
-			cashPlayer->getPlayerIndex(), cash);
 		fflush(stdout);
 
 		s_startFrame = TheGameLogic->getFrame();
@@ -284,7 +616,6 @@ void UpdateSkirmishAILegacySaveTest()
 		s_loadedPristineMapName = TheGameState->getPristineMapName();
 		s_loadedPlayerCount = ThePlayerList->getPlayerCount();
 		s_loadedAIPlayers = skirmishAIPlayers;
-		s_admissionPlayerIndex = cashPlayer->getPlayerIndex();
 		s_identityEstablished = FALSE;
 		s_identitySettleReported = FALSE;
 		s_state = LEGACY_SAVE_TEST_SIMULATING;
@@ -312,11 +643,13 @@ void UpdateSkirmishAILegacySaveTest()
 			++currentAIPlayers;
 		}
 	}
-	Player *admissionPlayer = ThePlayerList->getNthPlayer(s_admissionPlayerIndex);
+	Player *admissionPlayer = s_admissionPlayerIndex >= 0
+		? ThePlayerList->getNthPlayer(s_admissionPlayerIndex) : nullptr;
 	if (ThePlayerList->getPlayerCount() != s_loadedPlayerCount ||
-		currentAIPlayers != s_loadedAIPlayers || admissionPlayer == nullptr ||
-		admissionPlayer->getPlayerType() != PLAYER_COMPUTER ||
-		!admissionPlayer->isSkirmishAIPlayer())
+		currentAIPlayers != s_loadedAIPlayers ||
+		(s_admissionPlayerIndex >= 0 &&
+			(!admissionPlayer || admissionPlayer->getPlayerType() != PLAYER_COMPUTER ||
+				!admissionPlayer->isSkirmishAIPlayer())))
 	{
 		printf("LEGACY_SAVE_TEST_IDENTITY_REJECT reason=players frame=%u updates=%u players=%d ai_players=%d\n",
 			endFrame, s_updateCalls, ThePlayerList->getPlayerCount(),
@@ -373,17 +706,35 @@ void UpdateSkirmishAILegacySaveTest()
 		if (frameDelta > s_maxFrameDelta)
 			s_maxFrameDelta = frameDelta;
 	}
-	if (s_framesAdvanced >= LEGACY_SAVE_SIMULATION_FRAMES)
+	if (!s_recoveryFaultApplied &&
+		s_framesAdvanced >= LEGACY_SAVE_SETTLE_FRAMES)
 	{
-		printf("LEGACY_SAVE_TEST_SIMULATION_OK start_frame=%u end_frame=%u frames=%u updates=%u max_delta=%u\n",
-			s_startFrame, endFrame, s_framesAdvanced, s_updateCalls,
-			s_maxFrameDelta);
-		fflush(stdout);
-		s_result = 0;
-		s_state = LEGACY_SAVE_TEST_FINISHED;
-		emit("PASS");
-		requestQuit();
-		return;
+		if (!tryStartRecoveryProbe(endFrame) &&
+			s_framesAdvanced >= LEGACY_SAVE_RECOVERY_TIMEOUT_FRAMES)
+		{
+			finishFailure("recovery_subject_unavailable");
+			return;
+		}
+	}
+	if (s_recoveryFaultApplied)
+	{
+		Player *recoveryPlayer =
+			ThePlayerList->getNthPlayer(s_recoveryPlayerIndex);
+		if (!recoveryPlayer || recoveryPlayer->getPlayerType() != PLAYER_COMPUTER ||
+			!recoveryPlayer->isSkirmishAIPlayer())
+		{
+			finishFailure("recovery_player_lost");
+			return;
+		}
+		observeRecoveryProbe(recoveryPlayer, endFrame);
+		if (s_state == LEGACY_SAVE_TEST_FINISHED)
+			return;
+		if (endFrame - s_recoveryFaultFrame >
+			LEGACY_SAVE_RECOVERY_TIMEOUT_FRAMES)
+		{
+			finishFailure("recovery_timeout");
+			return;
+		}
 	}
 	if (TheGameEngine->getQuitting())
 	{

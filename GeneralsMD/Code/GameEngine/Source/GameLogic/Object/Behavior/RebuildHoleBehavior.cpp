@@ -30,6 +30,8 @@
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 #include "Common/GameState.h"
+#include "Common/Recorder.h"
+#include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
 #include "Common/Xfer.h"
@@ -389,6 +391,13 @@ void RebuildHoleBehavior::crc( Xfer *xfer )
 
 	// extend base class
 	UpdateModule::crc( xfer );
+
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int replayEpoch = TheRecorder
+		? TheRecorder->getSkirmishAIReplayEpoch()
+		: SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	if (ShouldIncludeSkirmishAIRecoveryCRCFields(replay, replayEpoch))
+		xfer->xferObjectID(&m_workerID);
 
 }
 

@@ -98,6 +98,8 @@ enum
 	SKIRMISH_AI_RECOVERY_NO_PATH_BASELINE_TIMEOUT_FRAMES =
 		SKIRMISH_AI_RECOVERY_PHASE_TIMEOUT_FRAMES,
 	SKIRMISH_AI_RECOVERY_LOW_CASH_WAIT_FRAMES = 120,
+	SKIRMISH_AI_RECOVERY_DISABLED_FACTORY_VERIFY_FRAMES =
+		5 * LOGICFRAMES_PER_SECOND,
 	SKIRMISH_AI_RECOVERY_NO_PATH_VERIFY_FRAMES = 600,
 	SKIRMISH_AI_RECOVERY_REPEAT_SETTLE_FRAMES = 30,
 	SKIRMISH_AI_RECOVERY_MAX_CONSTRUCTION_ATTEMPTS = 24,
@@ -135,10 +137,17 @@ struct SkirmishAIRecoveryFixtureState
 	Bool secondBuilderReplacementObserved;
 	Bool secondBuilderRoutePaid;
 	Bool holeObserved;
+	Bool holeLineageObserved;
 	Bool saveLoadIssued;
 	Bool saveLoadRebound;
 	Bool saveLoadProgressPreserved;
 	Bool saveLoadSawProgress;
+	Bool factoryDisabled;
+	Bool factoryBlockVerified;
+	Bool factoryRestored;
+	Bool factoryWorkerObserved;
+	Bool factoryReserveHeldObserved;
+	Bool factoryReserveReleasedObserved;
 	Bool sawNoDuplicateCommandCenter;
 	Bool lastStandBaselinePrepared;
 	Bool obstructionOriginalLocationBlocked;
@@ -151,12 +160,14 @@ struct SkirmishAIRecoveryFixtureState
 	ObjectID obstructionID;
 	ObjectID lastStandBaselineEvidenceUnitID;
 	ObjectID holeID;
+	ObjectID holeReconstructionID;
 	ObjectID saveLoadConstructionID;
 	ObjectID spawnedBuilderID;
 	ObjectID secondBuilderLossID;
 	ObjectID secondBuilderLossConstructionID;
 	ObjectID secondBuilderReplacementID;
 	ObjectID secondBuilderRouteFactoryID;
+	ObjectID disabledFactoryBuilderID;
 	ProductionID recoveryBuilderProductionID;
 	ProductionID secondBuilderRouteProductionID;
 	Int initialBuilderCount;
@@ -182,6 +193,7 @@ struct SkirmishAIRecoveryFixtureState
 	// Counts visible under-construction center scaffolds; failed pre-scaffold
 	// placement calls are intentionally outside this fixture's observation API.
 	Int constructionScaffoldCount;
+	Int disabledFactoryBuilderCount;
 	UnsignedInt lastConstructionAttemptFrame;
 	Bool hasConstructionAttempt;
 	Bool lastStandBaselineObjectiveObserved;
@@ -196,6 +208,9 @@ struct SkirmishAIRecoveryFixtureState
 	UnsignedInt cashAfterConstruction;
 	UnsignedInt secondBuilderRouteCashBefore;
 	UnsignedInt secondBuilderRouteCashAfter;
+	UnsignedInt disabledFactoryBlockUntilFrame;
+	UnsignedInt disabledFactoryCash;
+	Real disabledFactoryProductionPercent;
 	Real saveLoadConstructionPercent;
 	AsciiString saveLoadFilename;
 	const ThingTemplate *primaryTemplate;
@@ -239,10 +254,17 @@ struct SkirmishAIRecoveryFixtureState
 		secondBuilderReplacementObserved = FALSE;
 		secondBuilderRoutePaid = FALSE;
 		holeObserved = FALSE;
+		holeLineageObserved = FALSE;
 		saveLoadIssued = FALSE;
 		saveLoadRebound = FALSE;
 		saveLoadProgressPreserved = FALSE;
 		saveLoadSawProgress = FALSE;
+		factoryDisabled = FALSE;
+		factoryBlockVerified = FALSE;
+		factoryRestored = FALSE;
+		factoryWorkerObserved = FALSE;
+		factoryReserveHeldObserved = FALSE;
+		factoryReserveReleasedObserved = FALSE;
 		sawNoDuplicateCommandCenter = TRUE;
 		lastStandBaselinePrepared = FALSE;
 		obstructionOriginalLocationBlocked = FALSE;
@@ -257,12 +279,14 @@ struct SkirmishAIRecoveryFixtureState
 		obstructionID = INVALID_ID;
 		lastStandBaselineEvidenceUnitID = INVALID_ID;
 		holeID = INVALID_ID;
+		holeReconstructionID = INVALID_ID;
 		saveLoadConstructionID = INVALID_ID;
 		spawnedBuilderID = INVALID_ID;
 		secondBuilderLossID = INVALID_ID;
 		secondBuilderLossConstructionID = INVALID_ID;
 		secondBuilderReplacementID = INVALID_ID;
 		secondBuilderRouteFactoryID = INVALID_ID;
+		disabledFactoryBuilderID = INVALID_ID;
 		recoveryBuilderProductionID = PRODUCTIONID_INVALID;
 		secondBuilderRouteProductionID = PRODUCTIONID_INVALID;
 		initialBuilderCount = 0;
@@ -289,6 +313,7 @@ struct SkirmishAIRecoveryFixtureState
 		destructionCount = 0;
 		recoveryCompletionCount = 0;
 		constructionScaffoldCount = 0;
+		disabledFactoryBuilderCount = 0;
 		lastConstructionAttemptFrame = 0;
 		hasConstructionAttempt = FALSE;
 		lastConstructionPercent = 0.0f;
@@ -301,6 +326,9 @@ struct SkirmishAIRecoveryFixtureState
 		cashAfterConstruction = 0;
 		secondBuilderRouteCashBefore = 0;
 		secondBuilderRouteCashAfter = 0;
+		disabledFactoryBlockUntilFrame = 0;
+		disabledFactoryCash = 0;
+		disabledFactoryProductionPercent = 0.0f;
 		saveLoadConstructionPercent = 0.0f;
 		saveLoadFilename.clear();
 		primaryTemplate = nullptr;
@@ -322,7 +350,8 @@ static const char *const g_skirmishAIRecoveryFixtureCaseNames[] =
 	"obstructed",
 	"low_cash",
 	"gla_hole",
-	"save_load"
+	"save_load",
+	"disabled_factory"
 };
 
 static const char *const g_skirmishAIRecoveryFactionNames[] =
@@ -390,6 +419,12 @@ Int ExpectedSkirmishAITestAiCount(SkirmishAITestScenario scenario)
 const char *SkirmishAITestScenarioName(SkirmishAITestScenario scenario)
 {
 	return IsSkirmishAITest4v2(scenario) ? "4v2" : "4v3";
+}
+
+Bool IsSkirmishAIRecoveryFactoryFixture()
+{
+	return s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY ||
+		s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_DISABLED_FACTORY;
 }
 
 Bool IsLiveSkirmishAIRecoveryObject(const Object *object)
@@ -773,6 +808,33 @@ ProductionID FindSkirmishAIRecoveryBuilderQueueIDOnFactory(
 			return entry->getProductionID();
 	}
 	return PRODUCTIONID_INVALID;
+}
+
+const ProductionEntry *FindSkirmishAIRecoveryProductionEntryOnFactory(
+	Player *player, const ThingTemplate *builderTemplate, ObjectID factoryID,
+	ProductionID productionID)
+{
+	if (!player || !builderTemplate || factoryID == INVALID_ID ||
+		productionID == PRODUCTIONID_INVALID || !TheGameLogic)
+		return nullptr;
+
+	Object *factory = TheGameLogic->findObjectByID(factoryID);
+	if (!IsLiveSkirmishAIRecoveryObject(factory) ||
+		factory->getControllingPlayer() != player ||
+		!factory->getProductionUpdateInterface())
+		return nullptr;
+
+	ProductionUpdateInterface *production = factory->getProductionUpdateInterface();
+	for (const ProductionEntry *entry = production->firstProduction(); entry;
+		entry = production->nextProduction(entry))
+	{
+		if (entry->getProductionID() == productionID &&
+			entry->getProductionType() == PRODUCTION_UNIT &&
+			entry->getProductionObject() &&
+			entry->getProductionObject()->isEquivalentTo(builderTemplate))
+			return entry;
+	}
+	return nullptr;
 }
 
 Int CountSkirmishAIRecoveryBuilderQueueEntriesOnFactoryExcept(
@@ -1246,7 +1308,7 @@ void PrintSkirmishAIRecoveryScaffoldDiagnostics(
 
 void MaybePrintSkirmishAIRecoveryFactoryDiagnostics(Player *player)
 {
-	if (!player || s_recovery.fixtureCase != SKIRMISH_AI_RECOVERY_FACTORY_ONLY)
+	if (!player || !IsSkirmishAIRecoveryFactoryFixture())
 		return;
 	const Int workerCount = CountSkirmishAIRecoveryBuilders(player, nullptr);
 	const Int queueCount = CountSkirmishAIRecoveryBuilderQueueEntriesOnFactory(
@@ -1348,6 +1410,48 @@ Object *FindSkirmishAIRecoveryHole(
 			firstHole = object;
 	}
 	return firstHole;
+}
+
+Bool ObserveSkirmishAIRecoveryHoleLineage(Object *commandCenter)
+{
+	if (s_recovery.fixtureCase != SKIRMISH_AI_RECOVERY_GLA_HOLE ||
+		!commandCenter || commandCenter->getID() == s_recovery.initialCenterID)
+		return TRUE;
+	if (!s_recovery.holeObserved || s_recovery.holeID == INVALID_ID)
+	{
+		FailSkirmishAITest("fixture_gla_hole_lineage_mismatch");
+		return FALSE;
+	}
+	if (s_recovery.holeLineageObserved)
+	{
+		if (commandCenter->getID() != s_recovery.holeReconstructionID)
+		{
+			FailSkirmishAITest("fixture_gla_hole_reconstruction_replaced");
+			return FALSE;
+		}
+		return TRUE;
+	}
+	Object *hole = TheGameLogic->findObjectByID(s_recovery.holeID);
+	RebuildHoleBehaviorInterface *holeBehavior =
+		IsLiveSkirmishAIRecoveryObject(hole)
+			? RebuildHoleBehavior::getRebuildHoleBehaviorInterfaceFromObject(hole)
+			: nullptr;
+	if (!holeBehavior || hole->getControllingPlayer() !=
+			commandCenter->getControllingPlayer() ||
+		holeBehavior->getSpawnerID() != s_recovery.initialCenterID ||
+		holeBehavior->getReconstructedBuildingID() != commandCenter->getID() ||
+		!holeBehavior->getRebuildTemplate() || !s_recovery.primaryTemplate ||
+		!holeBehavior->getRebuildTemplate()->isEquivalentTo(s_recovery.primaryTemplate))
+		return TRUE;
+
+	s_recovery.holeLineageObserved = TRUE;
+	s_recovery.holeReconstructionID = commandCenter->getID();
+	printf("SKIRMISH_AI_RECOVERY_HOLE_PHASE phase=hole_lineage_verified frame=%u "
+		"spawner=%u hole=%u reconstruction=%u producer=%u\n",
+		TheGameLogic->getFrame(), s_recovery.initialCenterID, s_recovery.holeID,
+		s_recovery.holeReconstructionID, commandCenter->getProducerID());
+	fflush(stdout);
+	return TRUE;
 }
 
 Object *FindSkirmishAIRecoveryObstruction(Player *player, Object *center)
@@ -1563,6 +1667,7 @@ Bool IsSupportedSkirmishAIRecoveryFixtureCombination(Int fixtureCase, Int factio
 	// Stock USA/China do not expose an alternate dozer-producing factory. The
 	// factory-only and die-module hole fixtures therefore require a GLA side.
 	if ((fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY ||
+			fixtureCase == SKIRMISH_AI_RECOVERY_DISABLED_FACTORY ||
 			fixtureCase == SKIRMISH_AI_RECOVERY_GLA_HOLE) &&
 		faction < SKIRMISH_AI_RECOVERY_FACTION_GLA)
 		return FALSE;
@@ -2224,6 +2329,8 @@ Bool ObserveSkirmishAIRecoveryFixture(Player *player)
 		FailSkirmishAITest("fixture_duplicate_command_center");
 		return FALSE;
 	}
+	if (!ObserveSkirmishAIRecoveryHoleLineage(commandCenter))
+		return FALSE;
 	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_REPEATED_COMMAND_CENTER &&
 		s_recovery.secondBuilderLossIssued && commandCenter &&
 		commandCenter->getID() != s_recovery.secondBuilderLossConstructionID)
@@ -2241,13 +2348,13 @@ Bool ObserveSkirmishAIRecoveryFixture(Player *player)
 		return FALSE;
 	}
 	if (s_recovery.baselineCaptured &&
-		s_recovery.fixtureCase != SKIRMISH_AI_RECOVERY_FACTORY_ONLY &&
+		!IsSkirmishAIRecoveryFactoryFixture() &&
 		builderCount > s_recovery.initialBuilderCount + 2)
 	{
 		FailSkirmishAITest("fixture_duplicate_builder");
 		return FALSE;
 	}
-	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY &&
+	if (IsSkirmishAIRecoveryFactoryFixture() &&
 		!s_recovery.sawConstruction &&
 		CountSkirmishAIRecoveryBuildersProducedByFactory(
 			player, s_recovery.builderTemplate, s_recovery.builderFactoryID) >
@@ -2258,8 +2365,7 @@ Bool ObserveSkirmishAIRecoveryFixture(Player *player)
 		return FALSE;
 	}
 
-	const Int recoveryQueueCount = s_recovery.fixtureCase ==
-		SKIRMISH_AI_RECOVERY_FACTORY_ONLY
+	const Int recoveryQueueCount = IsSkirmishAIRecoveryFactoryFixture()
 		? CountSkirmishAIRecoveryBuilderQueueEntriesOnFactory(
 			player, s_recovery.builderTemplate, s_recovery.builderFactoryID) : 0;
 	const ProductionID firstQueueID = recoveryQueueCount > 0
@@ -2379,11 +2485,44 @@ Bool ObserveSkirmishAIRecoveryFixture(Player *player)
 						? "baseline" : "factory");
 				fflush(stdout);
 			}
-			if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY &&
+			if (IsSkirmishAIRecoveryFactoryFixture() &&
 				(builder->getProducerID() != s_recovery.builderFactoryID ||
 				 s_recovery.builderFactoryID == INVALID_ID))
 			{
 				FailSkirmishAITest("fixture_recovery_builder_wrong_factory");
+				return FALSE;
+			}
+			if (s_recovery.fixtureCase ==
+					SKIRMISH_AI_RECOVERY_DISABLED_FACTORY &&
+				!s_recovery.factoryWorkerObserved)
+			{
+				// Observation runs before the disabled-factory phase updater. When
+				// production and construction begin in the same frame, validate and
+				// record the exact resumed worker here. The original paid entry must
+				// be consumed, while a later ordinary resource-worker ID remains a
+				// valid post-ownership economy order.
+				if (FindSkirmishAIRecoveryProductionEntryOnFactory(
+						player, s_recovery.builderTemplate,
+						s_recovery.builderFactoryID,
+						s_recovery.recoveryBuilderProductionID))
+				{
+					FailSkirmishAITest("fixture_disabled_factory_queue_not_consumed");
+					return FALSE;
+				}
+				s_recovery.disabledFactoryBuilderID = builder->getID();
+				s_recovery.factoryWorkerObserved = TRUE;
+				printf("SKIRMISH_AI_RECOVERY_PHASE phase=builder_production_resumed "
+					"frame=%u factory=%u production_id=%d builder=%u\n",
+					TheGameLogic->getFrame(), s_recovery.builderFactoryID,
+					static_cast<Int>(s_recovery.recoveryBuilderProductionID),
+					builder->getID());
+				fflush(stdout);
+			}
+			if (s_recovery.fixtureCase ==
+					SKIRMISH_AI_RECOVERY_DISABLED_FACTORY &&
+				builder->getID() != s_recovery.disabledFactoryBuilderID)
+			{
+				FailSkirmishAITest("fixture_disabled_factory_builder_not_reused");
 				return FALSE;
 			}
 			if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_SURVIVING_BUILDER &&
@@ -2497,13 +2636,215 @@ Bool ObserveSkirmishAIRecoveryFixture(Player *player)
 	return TRUE;
 }
 
+Bool UpdateSkirmishAIRecoveryDisabledFactoryFixture(Player *player)
+{
+	if (!player || s_recovery.fixtureCase !=
+		SKIRMISH_AI_RECOVERY_DISABLED_FACTORY || !TheGameLogic)
+		return TRUE;
+
+	Object *factory = s_recovery.builderFactoryID != INVALID_ID
+		? TheGameLogic->findObjectByID(s_recovery.builderFactoryID) : nullptr;
+	if (!IsLiveSkirmishAIRecoveryObject(factory) ||
+		factory->getControllingPlayer() != player ||
+		!factory->getProductionUpdateInterface())
+	{
+		FailSkirmishAITest("fixture_disabled_factory_lost");
+		return FALSE;
+	}
+
+	const UnsignedInt frame = TheGameLogic->getFrame();
+	if (!s_recovery.factoryDisabled)
+	{
+		if (!s_recovery.sawBuilderQueuePayment)
+			return TRUE;
+		const ProductionEntry *entry =
+			FindSkirmishAIRecoveryProductionEntryOnFactory(
+				player, s_recovery.builderTemplate,
+				s_recovery.builderFactoryID,
+				s_recovery.recoveryBuilderProductionID);
+		if (!entry || CountSkirmishAIRecoveryBuilderQueueEntries(
+				player, s_recovery.builderTemplate, nullptr) != 1)
+		{
+			FailSkirmishAITest("fixture_disabled_factory_paid_queue_missing");
+			return FALSE;
+		}
+		s_recovery.disabledFactoryProductionPercent =
+			entry->getPercentComplete();
+		s_recovery.disabledFactoryCash = player->getMoney()->countMoney();
+		s_recovery.disabledFactoryBuilderCount =
+			CountSkirmishAIRecoveryBuildersProducedByFactory(
+				player, s_recovery.builderTemplate,
+				s_recovery.builderFactoryID);
+		s_recovery.disabledFactoryBlockUntilFrame = frame +
+			SKIRMISH_AI_RECOVERY_DISABLED_FACTORY_VERIFY_FRAMES;
+		factory->setScriptStatus(OBJECT_STATUS_SCRIPT_DISABLED, TRUE);
+		if (!factory->testScriptStatusBit(OBJECT_STATUS_SCRIPT_DISABLED) ||
+			!factory->isDisabled())
+		{
+			FailSkirmishAITest("fixture_disabled_factory_status_not_applied");
+			return FALSE;
+		}
+		s_recovery.factoryDisabled = TRUE;
+		printf("SKIRMISH_AI_RECOVERY_PHASE phase=factory_disabled frame=%u "
+			"factory=%u production_id=%d percent=%g cash=%u verify_until=%u\n",
+			frame, s_recovery.builderFactoryID,
+			static_cast<Int>(s_recovery.recoveryBuilderProductionID),
+			s_recovery.disabledFactoryProductionPercent,
+			s_recovery.disabledFactoryCash,
+			s_recovery.disabledFactoryBlockUntilFrame);
+		fflush(stdout);
+		return TRUE;
+	}
+
+	if (!s_recovery.factoryBlockVerified)
+	{
+		const ProductionEntry *entry =
+			FindSkirmishAIRecoveryProductionEntryOnFactory(
+				player, s_recovery.builderTemplate,
+				s_recovery.builderFactoryID,
+				s_recovery.recoveryBuilderProductionID);
+		const Int factoryQueueCount =
+			CountSkirmishAIRecoveryBuilderQueueEntriesOnFactory(
+				player, s_recovery.builderTemplate,
+				s_recovery.builderFactoryID);
+		const Int globalQueueCount =
+			CountSkirmishAIRecoveryBuilderQueueEntries(
+				player, s_recovery.builderTemplate, nullptr);
+		const Int producedBuilderCount =
+			CountSkirmishAIRecoveryBuildersProducedByFactory(
+				player, s_recovery.builderTemplate,
+				s_recovery.builderFactoryID);
+		Int commandCenterCount = 0;
+		Bool commandCenterUnderConstruction = FALSE;
+		FindSkirmishAIRecoveryCommandCenter(
+			player, s_recovery.primaryTemplate, &commandCenterCount,
+			&commandCenterUnderConstruction);
+		const UnsignedInt cash = player->getMoney()->countMoney();
+		if (!factory->testScriptStatusBit(OBJECT_STATUS_SCRIPT_DISABLED) ||
+			!factory->isDisabled() || !entry || factoryQueueCount != 1 ||
+			globalQueueCount != 1 ||
+			entry->getPercentComplete() !=
+				s_recovery.disabledFactoryProductionPercent ||
+			producedBuilderCount != s_recovery.disabledFactoryBuilderCount ||
+			CountSkirmishAIRecoveryBuilders(player, nullptr) != 0 ||
+			commandCenterCount != 0 || commandCenterUnderConstruction ||
+			s_recovery.constructionScaffoldCount != 0 ||
+			cash < s_recovery.disabledFactoryCash)
+		{
+			PrintSkirmishAIRecoveryFactoryDiagnostics(
+				player, "disabled_factory_block_changed");
+			FailSkirmishAITest("fixture_disabled_factory_block_changed");
+			return FALSE;
+		}
+
+		// Neutralize deterministic resource income after proving no debit. This
+		// keeps the restored producer at the exact command-center reserve.
+		if (cash != s_recovery.disabledFactoryCash)
+			SetSkirmishAIRecoveryCash(
+				player, s_recovery.disabledFactoryCash);
+		const UnsignedInt recoverySpendProbeCash =
+			player->getMoney()->countMoney();
+		if (recoverySpendProbeCash > static_cast<UnsignedInt>(INT_MAX))
+		{
+			FailSkirmishAITest("fixture_disabled_factory_cash_out_of_probe_range");
+			return FALSE;
+		}
+		const Int recoverySpendProbeCost =
+			static_cast<Int>(recoverySpendProbeCash);
+#if RTS_ZEROHOUR
+		const Bool recoverySpendAllowed =
+			player->canSpendForSkirmishAIRecovery(
+				recoverySpendProbeCost, nullptr, FALSE);
+#else
+		// The disabled-factory fixture exercises Zero Hour-only recovery state.
+		// Keep the shared runner buildable for Generals without inventing a
+		// product-side reserve policy for that title.
+		const Bool recoverySpendAllowed = FALSE;
+#endif
+		if (!recoverySpendAllowed)
+			s_recovery.factoryReserveHeldObserved = TRUE;
+		if (frame < s_recovery.disabledFactoryBlockUntilFrame)
+			return TRUE;
+		if (!s_recovery.factoryReserveHeldObserved || !recoverySpendAllowed)
+		{
+			PrintSkirmishAIRecoveryFactoryDiagnostics(
+				player, "disabled_factory_reserve_not_released");
+			FailSkirmishAITest("fixture_disabled_factory_reserve_not_released");
+			return FALSE;
+		}
+		s_recovery.factoryReserveReleasedObserved = TRUE;
+		printf("SKIRMISH_AI_RECOVERY_PHASE "
+			"phase=post_grace_reserve_released frame=%u factory=%u "
+			"production_id=%d reserve_held=1 spend_probe_cost=%d "
+			"spend_probe_allowed=1 queue=1 percent=%g scaffolds=0\n",
+			frame, s_recovery.builderFactoryID,
+			static_cast<Int>(s_recovery.recoveryBuilderProductionID),
+			recoverySpendProbeCost,
+			s_recovery.disabledFactoryProductionPercent);
+
+		s_recovery.factoryBlockVerified = TRUE;
+		printf("SKIRMISH_AI_RECOVERY_PHASE phase=factory_block_verified "
+			"frame=%u factory=%u production_id=%d percent=%g queue=1 "
+			"workers=%d scaffolds=0 additional_payment=0 blocked_frames=%u "
+			"post_grace_reserve_release=verified\n",
+			frame, s_recovery.builderFactoryID,
+			static_cast<Int>(s_recovery.recoveryBuilderProductionID),
+			s_recovery.disabledFactoryProductionPercent,
+			s_recovery.disabledFactoryBuilderCount,
+			SKIRMISH_AI_RECOVERY_DISABLED_FACTORY_VERIFY_FRAMES);
+		factory->clearScriptStatus(OBJECT_STATUS_SCRIPT_DISABLED);
+		if (factory->testScriptStatusBit(OBJECT_STATUS_SCRIPT_DISABLED) ||
+			factory->isDisabledByType(DISABLED_SCRIPT_DISABLED))
+		{
+			FailSkirmishAITest("fixture_disabled_factory_status_not_cleared");
+			return FALSE;
+		}
+		s_recovery.factoryRestored = TRUE;
+		printf("SKIRMISH_AI_RECOVERY_PHASE phase=factory_restored frame=%u "
+			"factory=%u production_id=%d cash=%u\n", frame,
+			s_recovery.builderFactoryID,
+			static_cast<Int>(s_recovery.recoveryBuilderProductionID),
+			player->getMoney()->countMoney());
+		fflush(stdout);
+		return TRUE;
+	}
+
+	if (!s_recovery.factoryWorkerObserved)
+	{
+		const ObjectID builderID = FindSkirmishAIRecoveryBuilderProducedByFactory(
+			player, s_recovery.builderTemplate, s_recovery.builderFactoryID);
+		if (builderID == INVALID_ID)
+			return TRUE;
+		if (FindSkirmishAIRecoveryProductionEntryOnFactory(
+				player, s_recovery.builderTemplate,
+				s_recovery.builderFactoryID,
+				s_recovery.recoveryBuilderProductionID))
+		{
+			FailSkirmishAITest("fixture_disabled_factory_queue_not_consumed");
+			return FALSE;
+		}
+		s_recovery.disabledFactoryBuilderID = builderID;
+		s_recovery.factoryWorkerObserved = TRUE;
+		printf("SKIRMISH_AI_RECOVERY_PHASE phase=builder_production_resumed "
+			"frame=%u factory=%u production_id=%d builder=%u\n", frame,
+			s_recovery.builderFactoryID,
+			static_cast<Int>(s_recovery.recoveryBuilderProductionID), builderID);
+		fflush(stdout);
+	}
+	return TRUE;
+}
+
 Bool FinishSkirmishAIRecoveryFixture();
 
 Bool FinishSkirmishAIRecoveryHoleFixture()
 {
-	if (!s_recovery.holeObserved)
+	if (!s_recovery.holeObserved || !s_recovery.holeLineageObserved ||
+		s_recovery.holeReconstructionID == INVALID_ID ||
+		s_recovery.lastCompletedCenterID != s_recovery.holeReconstructionID)
 	{
-		FailSkirmishAITest("fixture_gla_hole_not_observed");
+		FailSkirmishAITest(s_recovery.holeObserved
+			? "fixture_gla_hole_lineage_not_observed"
+			: "fixture_gla_hole_not_observed");
 		return FALSE;
 	}
 
@@ -2762,10 +3103,22 @@ Bool FinishSkirmishAIRecoveryFixture()
 		FailSkirmishAITest("fixture_incomplete_construction_observation");
 		return FALSE;
 	}
-	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY &&
+	if (IsSkirmishAIRecoveryFactoryFixture() &&
 		!s_recovery.sawBuilderQueuePayment)
 	{
 		FailSkirmishAITest("fixture_builder_queue_not_observed");
+		return FALSE;
+	}
+	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_DISABLED_FACTORY &&
+		(!s_recovery.factoryDisabled || !s_recovery.factoryBlockVerified ||
+		 !s_recovery.factoryRestored || !s_recovery.factoryWorkerObserved ||
+		 !s_recovery.factoryReserveHeldObserved ||
+		 !s_recovery.factoryReserveReleasedObserved ||
+		 s_recovery.disabledFactoryBuilderID == INVALID_ID ||
+		 s_recovery.lastConstructionBuilderID !=
+			s_recovery.disabledFactoryBuilderID))
+	{
+		FailSkirmishAITest("fixture_disabled_factory_incomplete");
 		return FALSE;
 	}
 	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_OBSTRUCTED &&
@@ -2848,7 +3201,7 @@ void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 			return;
 		}
 
-		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY)
+		if (IsSkirmishAIRecoveryFactoryFixture())
 		{
 			Object *factory = nullptr;
 			if (CountSkirmishAIRecoveryBuilderFactories(
@@ -3006,12 +3359,12 @@ void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 			static_cast<Int>(blockedCode), static_cast<Int>(controlCode));
 		fflush(stdout);
 	}
-	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY ||
+	if (IsSkirmishAIRecoveryFactoryFixture() ||
 		s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_NO_PATH_LASTSTAND)
 		DestroySkirmishAIRecoveryBuilders(player);
 	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_NO_PATH_LASTSTAND)
 		DestroySkirmishAIRecoveryBuilderFactories(player, s_recovery.builderTemplate);
-	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY)
+	if (IsSkirmishAIRecoveryFactoryFixture())
 	{
 		// Give the legitimate factory exactly one paid builder plus the
 		// subsequent paid command-center construction. The protected reserve
@@ -3127,7 +3480,7 @@ void UpdateSkirmishAIRecoveryFixture()
 		if (builderCount <= 0 || !builderTemplate ||
 			!HasSkirmishAIRecoveryBuilderTemplate(player, builderTemplate))
 			return;
-		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY &&
+		if (IsSkirmishAIRecoveryFactoryFixture() &&
 			(builderFactoryCount == 0 || !builderFactory))
 			return;
 	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_OBSTRUCTED &&
@@ -3183,7 +3536,7 @@ void UpdateSkirmishAIRecoveryFixture()
 			return;
 		}
 
-		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY)
+		if (IsSkirmishAIRecoveryFactoryFixture())
 		{
 			s_recovery.builderFactoryID = builderFactory->getID();
 			s_recovery.preFaultFactoryBuilderQueueCount =
@@ -3298,7 +3651,7 @@ void UpdateSkirmishAIRecoveryFixture()
 			s_recovery.initialCombatCount, s_recovery.initialFactoryCount,
 			s_recovery.initialCash, s_recovery.ccCost, s_recovery.builderCost);
 		fflush(stdout);
-		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_FACTORY_ONLY ||
+		if (IsSkirmishAIRecoveryFactoryFixture() ||
 			s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_NO_PATH_LASTSTAND)
 			ApplySkirmishAIRecoveryFixtureFault(player);
 		return;
@@ -3317,6 +3670,11 @@ void UpdateSkirmishAIRecoveryFixture()
 	}
 
 	if (!ObserveSkirmishAIRecoveryFixture(player))
+	{
+		RequestSkirmishAITestStop();
+		return;
+	}
+	if (!UpdateSkirmishAIRecoveryDisabledFactoryFixture(player))
 	{
 		RequestSkirmishAITestStop();
 		return;
@@ -3644,11 +4002,24 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 			s_recovery.fixtureCase != SKIRMISH_AI_RECOVERY_REPEATED_COMMAND_CENTER
 				? "not_run"
 				: (s_recovery.secondBuilderLossIssued ? "verified" : "skipped");
+		const char *factoryBlockResult =
+			s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_DISABLED_FACTORY &&
+			s_recovery.factoryBlockVerified ? "verified" : "not_run";
+		const char *factoryBuilderReuseResult =
+			s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_DISABLED_FACTORY &&
+			s_recovery.factoryWorkerObserved &&
+			s_recovery.lastConstructionBuilderID ==
+				s_recovery.disabledFactoryBuilderID ? "verified" : "not_run";
+		const char *postGraceReserveReleaseResult =
+			s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_DISABLED_FACTORY &&
+			s_recovery.factoryReserveHeldObserved &&
+			s_recovery.factoryReserveReleasedObserved ? "verified" : "not_run";
 		printf("%s seed=%d case=%s faction=%s "
 			"template=%s map=\"%s\" map_crc=%08X map_size=%u loaded_seed=%d "
 			"destructions=%d recoveries=%d construction_scaffolds=%d duplicate_cc=0 "
 			"campaign_isolation=skirmish_only save_load=%s builder_loss=%s "
-			"old_save_defaults=not_run\n",
+			"factory_block=%s post_grace_reserve_release=%s "
+			"factory_builder_reuse=%s old_save_defaults=not_run\n",
 			fixtureResult,
 			s_runner.seed, GetSkirmishAIRecoveryFixtureCaseName(s_recovery.fixtureCase),
 			GetSkirmishAIRecoveryFactionName(s_recovery.faction),
@@ -3657,7 +4028,8 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 			s_runner.loadedSeed, s_recovery.destructionCount,
 			s_recovery.recoveryCompletionCount, s_recovery.constructionScaffoldCount,
 			s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_SAVE_LOAD ? "run" : "not_run",
-			builderLossResult);
+			builderLossResult, factoryBlockResult,
+			postGraceReserveReleaseResult, factoryBuilderReuseResult);
 		fflush(stdout);
 		return 0;
 	}

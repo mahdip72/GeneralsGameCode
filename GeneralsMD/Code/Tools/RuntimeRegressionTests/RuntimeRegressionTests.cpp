@@ -18,6 +18,7 @@
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "Common/SkirmishAILegacySaveTest.h"
 #include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/PathfindQueueReplayEpoch.h"
 #include "GameLogic/SkirmishAIDecision.h"
@@ -1028,19 +1029,204 @@ static void TestSkirmishAIRecoveryPolicies()
 	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1600);
 	CHECK(IsSkirmishAIRecoveryBuilderPathUnavailable(
 		false, false, false, false));
+	CHECK(!IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+		true, false, false, false));
+	CHECK(IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+		true, false, false, true));
+	CHECK(IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+		false, true, false, true));
+	CHECK(IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+		false, false, true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+		false, true, false, false));
+	CHECK(!IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+		false, false, true, false));
+	CHECK(IsSkirmishAIRecoveryFactorySchedulingBounded(
+		true, false, false, false));
+	CHECK(IsSkirmishAIRecoveryFactorySchedulingBounded(
+		false, true, false, false));
+	CHECK(IsSkirmishAIRecoveryFactorySchedulingBounded(
+		false, false, true, false));
+	CHECK(!IsSkirmishAIRecoveryFactorySchedulingBounded(
+		true, false, false, true));
+	// A scheduler-blocked lower-ID CANMAKE_OK factory cannot outrank a healthy
+	// higher-ID candidate merely because deterministic selection sees it first.
+	CHECK(!IsSkirmishAIRecoveryFactoryBestCandidate(true, false));
+	CHECK(IsSkirmishAIRecoveryFactoryBestCandidate(true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryBestCandidate(false, true));
+	CHECK(IsSkirmishAIRecoveryBuilderAdmissionActionable(true, true));
+	CHECK(!IsSkirmishAIRecoveryBuilderAdmissionActionable(true, false));
+	CHECK(!IsSkirmishAIRecoveryBuilderAdmissionActionable(false, true));
+	CHECK(IsSkirmishAIRecoveryBuilderUpdateBounded(true, false));
+	CHECK(!IsSkirmishAIRecoveryBuilderUpdateBounded(true, true));
+	CHECK(!IsSkirmishAIRecoveryBuilderUpdateBounded(false, false));
+	CHECK(IsSkirmishAIRecoveryAdmissionBounded(
+		true, false, false, false));
+	CHECK(IsSkirmishAIRecoveryAdmissionBounded(
+		false, true, false, false));
+	CHECK(IsSkirmishAIRecoveryAdmissionBounded(
+		false, false, true, false));
+	CHECK(IsSkirmishAIRecoveryAdmissionBounded(
+		false, false, false, true));
+	CHECK(!IsSkirmishAIRecoveryAdmissionBounded(
+		false, false, false, false));
+	CHECK(IsSkirmishAIRecoveryFactoryPotentialDuringGrace(
+		true, false, false));
+	CHECK(IsSkirmishAIRecoveryFactoryPotentialDuringGrace(
+		true, true, false));
+	CHECK(IsSkirmishAIRecoveryFactoryPotentialDuringGrace(
+		false, true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryPotentialDuringGrace(
+		false, true, false));
+	CHECK(!IsSkirmishAIRecoveryFactoryPotentialDuringGrace(
+		false, false, true));
+	CHECK(!ShouldLatchSkirmishAIRecoveryLastStand(true));
+	CHECK(ShouldLatchSkirmishAIRecoveryLastStand(false));
+	CHECK(ShouldPreserveSkirmishAIRecoveryTrackedObject(
+		false, true, true, false));
+	CHECK(ShouldPreserveSkirmishAIRecoveryTrackedObject(
+		false, true, false, true));
+	CHECK(!ShouldPreserveSkirmishAIRecoveryTrackedObject(
+		true, true, true, false));
+	CHECK(!ShouldPreserveSkirmishAIRecoveryTrackedObject(
+		false, false, true, false));
+	CHECK(!ShouldPreserveSkirmishAIRecoveryTrackedObject(
+		false, true, false, false));
+	CHECK(!IsSkirmishAIRecoveryPaidQueueBounded(
+		false, true, false));
+	CHECK(!IsSkirmishAIRecoveryPaidQueueBounded(
+		true, true, true));
+	CHECK(IsSkirmishAIRecoveryPaidQueueBounded(
+		true, false, true));
+	CHECK(IsSkirmishAIRecoveryPaidQueueBounded(
+		true, true, false));
+	CHECK(ShouldFailoverSkirmishAIRecoveryPaidQueue(
+		true, false, false, true, false));
+	CHECK(!ShouldFailoverSkirmishAIRecoveryPaidQueue(
+		true, true, false, true, false));
+	CHECK(!ShouldFailoverSkirmishAIRecoveryPaidQueue(
+		true, false, true, true, false));
+	CHECK(!ShouldFailoverSkirmishAIRecoveryPaidQueue(
+		true, false, false, false, false));
+	CHECK(!ShouldFailoverSkirmishAIRecoveryPaidQueue(
+		true, false, false, true, true));
+	CHECK(!ShouldFailoverSkirmishAIRecoveryPaidQueue(
+		false, false, false, true, false));
+	CHECK(ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
+		true, false, false));
+	CHECK(!ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
+		true, true, false));
+	CHECK(!ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
+		true, false, true));
+	CHECK(IsSkirmishAIRecoveryFailoverAdmissionEligible(
+		true, false, false, false, false, false, false));
+	CHECK(IsSkirmishAIRecoveryFailoverAdmissionEligible(
+		false, true, false, true, false, false, false));
+	CHECK(!IsSkirmishAIRecoveryFailoverAdmissionEligible(
+		false, true, false, false, false, false, false));
+	CHECK(IsSkirmishAIRecoveryFailoverAdmissionEligible(
+		false, false, true, true, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryFailoverAdmissionEligible(
+		false, false, true, true, false, true, true));
+	CHECK(!IsSkirmishAIRecoveryFailoverAdmissionEligible(
+		false, false, true, true, true, false, true));
+	CHECK(!IsSkirmishAIRecoveryFailoverAdmissionEligible(
+		false, false, true, true, true, true, false));
+	CHECK(!IsSkirmishAIRecoveryFailoverAdmissionEligible(
+		false, false, true, false, true, true, true));
+	CHECK(GetSkirmishAIRecoveryFailoverAdmissionRank(
+		true, false, false) == 0);
+	CHECK(GetSkirmishAIRecoveryFailoverAdmissionRank(
+		false, true, false) == 1);
+	CHECK(GetSkirmishAIRecoveryFailoverAdmissionRank(
+		false, false, true) == 2);
+	CHECK(ShouldClearSkirmishAIRecoveryFailoverBinding(
+		true, true, true));
+	CHECK(!ShouldClearSkirmishAIRecoveryFailoverBinding(
+		false, true, true));
+	CHECK(!ShouldClearSkirmishAIRecoveryFailoverBinding(
+		true, false, true));
+	CHECK(!ShouldClearSkirmishAIRecoveryFailoverBinding(
+		true, true, false));
+	CHECK(WouldSkirmishAIRecoveryCancellationFreeMax(1, 0));
+	CHECK(!WouldSkirmishAIRecoveryCancellationFreeMax(1, 1));
+	CHECK(!WouldSkirmishAIRecoveryCancellationFreeMax(2, 2));
+	CHECK(WouldSkirmishAIRecoveryCancellationFreeMax(2, 1));
+	CHECK(!WouldSkirmishAIRecoveryCancellationFreeMax(0, 0));
+	CHECK(ShouldSelectSkirmishAIRecoveryPaidQueueProducer(
+		false, false, false));
+	CHECK(ShouldSelectSkirmishAIRecoveryPaidQueueProducer(
+		true, false, true));
+	CHECK(!ShouldSelectSkirmishAIRecoveryPaidQueueProducer(
+		true, true, false));
+	CHECK(!ShouldSelectSkirmishAIRecoveryPaidQueueProducer(
+		true, false, false));
+	CHECK(!ShouldSelectSkirmishAIRecoveryPaidQueueProducer(
+		true, true, true));
+	// A progressing ordinary compatible queue on B outranks bounded tracked A,
+	// so recovery waits for B and cannot enter failover or pay an alternate.
+	CHECK(ShouldSelectSkirmishAIRecoveryPaidQueueProducer(
+		true, false, true));
+	CHECK(!ShouldPreferTrackedSkirmishAIRecoveryPaidQueue(true, true));
+	const bool progressingOrdinaryQueueBounded =
+		IsSkirmishAIRecoveryPaidQueueBounded(true, true, true);
+	CHECK(!progressingOrdinaryQueueBounded);
+	CHECK(!ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
+		progressingOrdinaryQueueBounded, false, false));
+	// When every compatible queue is bounded, exact tracked A wins over the
+	// deterministic ordinary B fallback. Refunding A before paying C preserves
+	// both cash and the number of paid compatible entries.
+	CHECK(ShouldPreferTrackedSkirmishAIRecoveryPaidQueue(true, false));
+	CHECK(!ShouldPreferTrackedSkirmishAIRecoveryPaidQueue(false, false));
+	const int boundedPaidEntriesBeforeFailover = 2;
+	const int trackedBuilderCost = 200;
+	const int boundedCashBeforeFailover = 1000;
+	const int boundedCashAfterRefund = AddSkirmishAIRecoveryCost(
+		boundedCashBeforeFailover, trackedBuilderCost);
+	const int boundedCashAfterAlternate =
+		boundedCashAfterRefund - trackedBuilderCost;
+	const int boundedPaidEntriesAfterFailover =
+		boundedPaidEntriesBeforeFailover - 1 + 1;
+	CHECK(boundedCashAfterAlternate == boundedCashBeforeFailover);
+	CHECK(boundedPaidEntriesAfterFailover ==
+		boundedPaidEntriesBeforeFailover);
+	CHECK(ShouldClearSkirmishAIRecoveryExactFailoverBinding(
+		true, true, true, true));
+	CHECK(!ShouldClearSkirmishAIRecoveryExactFailoverBinding(
+		false, true, true, true));
+	// A completed equivalent center is authoritative over an older scaffold.
+	// Within the same construction state, keep the lowest ObjectID so iteration
+	// order cannot affect simulation state.
+	CHECK(ShouldSelectSkirmishAIPrimaryCommandCenter(
+		true, false, 3, true, 6));
+	CHECK(!ShouldSelectSkirmishAIPrimaryCommandCenter(
+		true, true, 6, false, 3));
+	CHECK(ShouldSelectSkirmishAIPrimaryCommandCenter(
+		true, true, 6, true, 3));
+	CHECK(!ShouldSelectSkirmishAIPrimaryCommandCenter(
+		true, false, 3, false, 6));
+	CHECK(!ShouldSelectSkirmishAIPrimaryCommandCenter(
+		true, true, 3, true, 3));
+	const bool validContainedBuilderRoute =
+		IsSkirmishAIRecoveryContainedBuilderRoute(
+			true, true, true, true, true, true);
+	CHECK(validContainedBuilderRoute);
+	CHECK(!IsSkirmishAIRecoveryContainedBuilderRoute(
+		true, false, true, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryContainedBuilderRoute(
+		true, true, false, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryContainedBuilderRoute(
+		true, true, true, false, true, true));
+	CHECK(!IsSkirmishAIRecoveryContainedBuilderRoute(
+		true, true, true, true, false, true));
+	CHECK(!IsSkirmishAIRecoveryContainedBuilderRoute(
+		true, true, true, true, true, false));
 	CHECK(ShouldOrderSkirmishAIRecoveryBuilderExit(
-		true, true, true,
-		IsSkirmishAIRecoveryProductionActive(0), false));
+		validContainedBuilderRoute, false));
+	// Production state is deliberately absent from the exit policy. A tunnel
+	// upgrade therefore cannot suppress recovery evacuation.
 	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
-		true, true, true,
-		IsSkirmishAIRecoveryProductionActive(1), false));
-	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
-		true, false, true, false, false));
-	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
-		true, true, false, false, false));
-	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
-		true, true, true, false, true));
-	CHECK(IsSkirmishAIRecoveryProductionActive(2));
+		validContainedBuilderRoute, true));
 	CHECK(IsSkirmishAIRecoveryInsuranceBuilderCandidate(
 		false, true, false));
 	CHECK(!IsSkirmishAIRecoveryInsuranceBuilderCandidate(
@@ -1049,6 +1235,229 @@ static void TestSkirmishAIRecoveryPolicies()
 		false, false, false));
 	CHECK(!IsSkirmishAIRecoveryInsuranceBuilderCandidate(
 		false, true, true));
+	// A paid recovery worker is authoritative while the center is missing, so a
+	// resource WorkOrder cannot pay a duplicate when its producer resumes. An
+	// unpaid resource order remains an income route and the completed center
+	// restores normal admission. Non-resource builders retain reserve gating.
+	CHECK(ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false, false, 200, true));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false, false, 200, false));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false, true, 200, true));
+	const bool underConstructionCenterIsCompleted = false;
+	CHECK(ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false,
+		underConstructionCenterIsCompleted, 200, true));
+	const bool completedPrimaryCenter = true;
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false,
+		completedPrimaryCenter, 200, true));
+	CHECK(ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		false, true, true, true, false, false, 200, false));
+	CHECK(ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		false, true, true, true, false, false, 0, true));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, false, true, true, false, false, 200, true));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, false, true, false, false, 200, true));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, false, false, false, 200, true));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, true, false, 200, true));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		false, true, true, true, false, false, 0, false));
+	// Recovery may reuse only default-team, non-reinforcement requests. A
+	// resource request deterministically outranks an earlier eligible dozer
+	// request, while candidates at the same rank retain queue order.
+	CHECK(!IsSkirmishAIRecoveryReusableWorkOrder(
+		true, true, true, false, false));
+	CHECK(!IsSkirmishAIRecoveryReusableWorkOrder(
+		true, true, true, true, true));
+	CHECK(IsSkirmishAIRecoveryReusableWorkOrder(
+		true, true, true, true, false));
+	bool hasReusableOrder = false;
+	bool selectedReusableOrderIsResource = false;
+	const bool customTeamCandidate = IsSkirmishAIRecoveryReusableWorkOrder(
+		true, true, true, false, false);
+	if (ShouldSelectSkirmishAIRecoveryReusableWorkOrder(
+			hasReusableOrder, selectedReusableOrderIsResource,
+			customTeamCandidate, false)) {
+		hasReusableOrder = true;
+		selectedReusableOrderIsResource = false;
+	}
+	const bool reinforcementCandidate = IsSkirmishAIRecoveryReusableWorkOrder(
+		true, true, true, true, true);
+	if (ShouldSelectSkirmishAIRecoveryReusableWorkOrder(
+			hasReusableOrder, selectedReusableOrderIsResource,
+			reinforcementCandidate, true)) {
+		hasReusableOrder = true;
+		selectedReusableOrderIsResource = true;
+	}
+	CHECK(!hasReusableOrder); // The live path queues directly without an order.
+	const bool defaultDozerCandidate = IsSkirmishAIRecoveryReusableWorkOrder(
+		true, true, true, true, false);
+	CHECK(ShouldSelectSkirmishAIRecoveryReusableWorkOrder(
+		hasReusableOrder, selectedReusableOrderIsResource,
+		defaultDozerCandidate, false));
+	hasReusableOrder = true;
+	selectedReusableOrderIsResource = false;
+	const bool defaultResourceCandidate = IsSkirmishAIRecoveryReusableWorkOrder(
+		true, true, true, true, false);
+	CHECK(ShouldSelectSkirmishAIRecoveryReusableWorkOrder(
+		hasReusableOrder, selectedReusableOrderIsResource,
+		defaultResourceCandidate, true));
+	selectedReusableOrderIsResource = true;
+	CHECK(!ShouldSelectSkirmishAIRecoveryReusableWorkOrder(
+		hasReusableOrder, selectedReusableOrderIsResource,
+		defaultResourceCandidate, true));
+	// Direct recovery production stores exact provenance without manufacturing
+	// an orphanable WorkOrder. A reused order binds only after queue success;
+	// all failed queues leave the existing order untouched.
+	SkirmishAIRecoveryQueueCommit queueCommit =
+		GetSkirmishAIRecoveryQueueCommit(false, true);
+	CHECK(!queueCommit.bindReusableWorkOrder);
+	CHECK(queueCommit.storeProductionIdentity);
+	queueCommit = GetSkirmishAIRecoveryQueueCommit(false, false);
+	CHECK(!queueCommit.bindReusableWorkOrder);
+	CHECK(!queueCommit.storeProductionIdentity);
+	queueCommit = GetSkirmishAIRecoveryQueueCommit(true, true);
+	CHECK(queueCommit.bindReusableWorkOrder);
+	CHECK(queueCommit.storeProductionIdentity);
+	queueCommit = GetSkirmishAIRecoveryQueueCommit(true, false);
+	CHECK(!queueCommit.bindReusableWorkOrder);
+	CHECK(!queueCommit.storeProductionIdentity);
+	CHECK(IsSkirmishAIRecoveryFactoryFinisherUsable(
+		false, false, true, true, true, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryFinisherUsable(
+		true, false, true, true, true, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryFinisherUsable(
+		false, true, true, true, true, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryFinisherUsable(
+		false, false, false, true, true, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryFinisherUsable(
+		false, false, true, false, true, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryFinisherUsable(
+		false, false, true, true, false, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryFinisherUsable(
+		false, false, true, true, true, false, true, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryFinisherUsable(
+		false, false, true, true, true, true, false, true));
+	CHECK(!IsSkirmishAIRecoveryFactoryFinisherUsable(
+		false, false, true, true, true, true, true, false));
+	CHECK(IsSkirmishAIRecoveryHoleConstructionMatch(
+		true, true, true, 41, 41));
+	CHECK(!IsSkirmishAIRecoveryHoleConstructionMatch(
+		false, true, true, 41, 41));
+	CHECK(!IsSkirmishAIRecoveryHoleConstructionMatch(
+		true, false, true, 41, 41));
+	CHECK(!IsSkirmishAIRecoveryHoleConstructionMatch(
+		true, true, false, 41, 41));
+	CHECK(!IsSkirmishAIRecoveryHoleConstructionMatch(
+		true, true, true, 40, 41));
+	CHECK(ShouldRestoreSkirmishAIRecoveryScaffoldBuilder(true, false));
+	CHECK(!ShouldRestoreSkirmishAIRecoveryScaffoldBuilder(false, false));
+	CHECK(!ShouldRestoreSkirmishAIRecoveryScaffoldBuilder(true, true));
+	const int placementOffsetCount = 37;
+	CHECK(!HasSkirmishAIRecoveryScaffoldReplacementAttempt(
+		0, placementOffsetCount));
+	CHECK(!HasSkirmishAIRecoveryScaffoldReplacementAttempt(
+		placementOffsetCount - 1, placementOffsetCount));
+	CHECK(HasSkirmishAIRecoveryScaffoldReplacementAttempt(
+		placementOffsetCount, placementOffsetCount));
+	CHECK(MarkSkirmishAIRecoveryScaffoldReplacementAttempt(
+		0, placementOffsetCount) == placementOffsetCount);
+	CHECK(MarkSkirmishAIRecoveryScaffoldReplacementAttempt(
+		8, placementOffsetCount) == placementOffsetCount + 8);
+	CHECK(MarkSkirmishAIRecoveryScaffoldReplacementAttempt(
+		8, placementOffsetCount) % placementOffsetCount == 8);
+	CHECK(MarkSkirmishAIRecoveryScaffoldReplacementAttempt(
+		placementOffsetCount + 8, placementOffsetCount) ==
+		placementOffsetCount + 8);
+	CHECK(MarkSkirmishAIRecoveryScaffoldReplacementAttempt(
+		-1, placementOffsetCount) == placementOffsetCount);
+	CHECK(!HasSkirmishAIRecoveryObservedReplacement(
+		placementOffsetCount + 8, placementOffsetCount));
+	CHECK(HasSkirmishAIRecoveryObservedReplacement(
+		2 * placementOffsetCount, placementOffsetCount));
+	CHECK(MarkSkirmishAIRecoveryObservedReplacement(
+		placementOffsetCount + 8, placementOffsetCount) ==
+		2 * placementOffsetCount + 8);
+	// A vanished paid queue reopens the replacement route until a compatible
+	// builder has actually emerged.  An observed replacement keeps the marker.
+	CHECK(ReconcileSkirmishAIRecoveryReplacementAttempt(
+		placementOffsetCount + 8, placementOffsetCount,
+		true) == placementOffsetCount + 8);
+	CHECK(ReconcileSkirmishAIRecoveryReplacementAttempt(
+		placementOffsetCount + 8, placementOffsetCount,
+		false) == 8);
+	CHECK(ReconcileSkirmishAIRecoveryReplacementAttempt(
+		2 * placementOffsetCount + 8, placementOffsetCount,
+		false) == 2 * placementOffsetCount + 8);
+	// A pre-existing compatible builder is not attributable production and is
+	// deliberately absent from reconciliation.  Once the paid queue vanishes,
+	// the unconfirmed marker clears and a healthy alternate factory is usable.
+	const int vanishedQueueWithPreexistingBuilder =
+		ReconcileSkirmishAIRecoveryReplacementAttempt(
+			placementOffsetCount + 8, placementOffsetCount, false);
+	CHECK(!HasSkirmishAIRecoveryScaffoldReplacementAttempt(
+		vanishedQueueWithPreexistingBuilder, placementOffsetCount));
+	const bool healthyAlternateFactoryPotential =
+		!HasSkirmishAIRecoveryScaffoldReplacementAttempt(
+			vanishedQueueWithPreexistingBuilder, placementOffsetCount) &&
+		IsSkirmishAIRecoveryFactoryPotentialDuringGrace(true, false, false);
+	CHECK(healthyAlternateFactoryPotential);
+	CHECK(!IsSkirmishAIRecoveryBuilderPathUnavailable(
+		false, false, false, healthyAlternateFactoryPotential));
+	CHECK(AdvanceSkirmishAIRecoveryPlacementAttempt(
+		0, placementOffsetCount) == 1);
+	CHECK(AdvanceSkirmishAIRecoveryPlacementAttempt(
+		placementOffsetCount - 1, placementOffsetCount) == 0);
+	CHECK(AdvanceSkirmishAIRecoveryPlacementAttempt(
+		placementOffsetCount, placementOffsetCount) ==
+		placementOffsetCount + 1);
+	CHECK(AdvanceSkirmishAIRecoveryPlacementAttempt(
+		2 * placementOffsetCount - 1, placementOffsetCount) ==
+		placementOffsetCount);
+	CHECK(AdvanceSkirmishAIRecoveryPlacementAttempt(
+		3 * placementOffsetCount - 1, placementOffsetCount) ==
+		2 * placementOffsetCount);
+	CHECK(AdvanceSkirmishAIRecoveryPlacementAttempt(
+		-1, placementOffsetCount) == 1);
+	CHECK(!ShouldSellSkirmishAIRecoveryScaffold(
+		true, true, false, true, true));
+	CHECK(ShouldSellSkirmishAIRecoveryScaffold(
+		false, false, false, true, false));
+	CHECK(!ShouldSellSkirmishAIRecoveryScaffold(
+		true, false, true, true, true));
+	// A possible factory remains retryable while cash or admission is
+	// temporarily unavailable, until a paid replacement is actually attempted.
+	CHECK(!ShouldSellSkirmishAIRecoveryScaffold(
+		true, false, false, false, true));
+	CHECK(ShouldSellSkirmishAIRecoveryScaffold(
+		true, false, false, true, true));
+	CHECK(ShouldSellSkirmishAIRecoveryScaffold(
+		true, false, false, false, false));
+	const bool stalledScaffoldWouldSell =
+		ShouldSellSkirmishAIRecoveryScaffold(
+			true, false, false, false, false);
+	const unsigned int nativeRetryFrames = 2U * 30U;
+	const unsigned int nativeWorkerRespawnFrames = 10U * 30U;
+	CHECK(nativeRetryFrames < nativeWorkerRespawnFrames);
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		false, true, true) == SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP);
+	// The first evaluation recycles the exact live hole worker.  On the next
+	// earlier AI retry that worker is absent while the native respawn timer is
+	// pending, so KEEP proves recovery will not restart the longer countdown.
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		stalledScaffoldWouldSell, true, true) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER);
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		stalledScaffoldWouldSell, true, false) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP);
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		stalledScaffoldWouldSell, false, false) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_SELL);
 	UnsignedInt evacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
 		100, 0, true, 60);
 	CHECK(evacuationDeadline == 160);
@@ -1067,8 +1476,87 @@ static void TestSkirmishAIRecoveryPolicies()
 	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, TRUE, FALSE, 0);
 	CHECK(GetSkirmishAIRecoveryEvacuationDeadline(
 		120, evacuationDeadline, false, 60) == 0);
+	// Expiring a transient external or unreachable route releases its reserve
+	// without latching recovery off.  A later internally progressing admission
+	// becomes potential again on the next scan.
+	UnsignedInt transientRouteDeadline =
+		GetSkirmishAIRecoveryEvacuationDeadline(200, 0, true, 60);
+	CHECK(IsSkirmishAIRecoveryFactoryPotentialDuringGrace(
+		false, true, IsSkirmishAIRecoveryEvacuationGraceActive(
+			259, transientRouteDeadline, true)));
+	CHECK(!IsSkirmishAIRecoveryFactoryPotentialDuringGrace(
+		false, true, IsSkirmishAIRecoveryEvacuationGraceActive(
+			260, transientRouteDeadline, true)));
+	CHECK(!ShouldLatchSkirmishAIRecoveryLastStand(true));
+	CHECK(IsSkirmishAIRecoveryFactoryPotentialDuringGrace(
+		true, false, false));
 	CHECK(GetSkirmishAIRecoveryEvacuationDeadlineForVersion(3, 999) == 0);
 	CHECK(GetSkirmishAIRecoveryEvacuationDeadlineForVersion(4, 999) == 999);
+	SkirmishAIRecoveryProductionIdentity oldIdentity =
+		GetSkirmishAIRecoveryProductionIdentityForVersion(
+			4, 17, 23, 0, 0);
+	CHECK(oldIdentity.factoryID == 0);
+	CHECK(oldIdentity.productionID == 0);
+	SkirmishAIRecoveryProductionIdentity savedIdentity =
+		GetSkirmishAIRecoveryProductionIdentityForVersion(
+			5, 17, 23, 0, 0);
+	CHECK(savedIdentity.factoryID == 17);
+	CHECK(savedIdentity.productionID == 23);
+	CHECK(IsSkirmishAIRecoveryProductionIdentityTracked(17, 23, 0, 0));
+	CHECK(!IsSkirmishAIRecoveryProductionIdentityTracked(0, 23, 0, 0));
+	CHECK(!IsSkirmishAIRecoveryProductionIdentityTracked(17, 0, 0, 0));
+	CHECK(IsSkirmishAIRecoveryProductionIdentityMatch(
+		17, 23, 17, 23, 0, 0));
+	CHECK(!IsSkirmishAIRecoveryProductionIdentityMatch(
+		17, 23, 18, 23, 0, 0));
+	CHECK(!IsSkirmishAIRecoveryProductionIdentityMatch(
+		17, 23, 17, 24, 0, 0));
+	// A queued recovery identity shields earlier ordinary compatible output.
+	CHECK(!ShouldAdoptSkirmishAIRecoveryProduction(true, true, true));
+	CHECK(ShouldAdoptSkirmishAIRecoveryProduction(false, true, true));
+	CHECK(!ShouldAdoptSkirmishAIRecoveryProduction(false, false, true));
+	CHECK(!ShouldAdoptSkirmishAIRecoveryProduction(false, true, false));
+	// A v4 load has no saved identity.  Load post-processing binds the
+	// authoritative paid entry before the first production callback while the
+	// replacement remains active and unobserved.
+	CHECK(ShouldBindSkirmishAIRecoveryProductionIdentity(
+		true, false, true, false,
+		IsSkirmishAIRecoveryProductionIdentityTracked(
+			oldIdentity.factoryID, oldIdentity.productionID, 0, 0),
+		true, true, true));
+	CHECK(!ShouldBindSkirmishAIRecoveryProductionIdentity(
+		true, false, true, true, false, true, true, true));
+	CHECK(!ShouldBindSkirmishAIRecoveryProductionIdentity(
+		true, false, true, false, true, true, true, true));
+	CHECK(!ShouldBindSkirmishAIRecoveryProductionIdentity(
+		true, false, true, false, false, true, true, false));
+	CHECK(!ShouldBindSkirmishAIRecoveryProductionIdentity(
+		true, false, false, false, false, true, true, true));
+	CHECK(!ShouldBindSkirmishAIRecoveryProductionIdentity(
+		false, false, true, false, false, true, true, true));
+	CHECK(!ShouldBindSkirmishAIRecoveryProductionIdentity(
+		true, true, true, false, false, true, true, true));
+	CHECK(!ShouldClearSkirmishAIRecoveryProductionIdentity(true, true));
+	CHECK(ShouldClearSkirmishAIRecoveryProductionIdentity(false, true));
+	CHECK(ShouldClearSkirmishAIRecoveryProductionIdentity(true, false));
+	// With two simultaneous native rebuild holes, each free worker remains
+	// reserved for the hole that spawned it. A different worker ID and a dead
+	// or foreign hole do not reserve the candidate.
+	CHECK(IsSkirmishAIRecoveryReservedNativeWorker(true, 41, 41, 0));
+	CHECK(!IsSkirmishAIRecoveryReservedNativeWorker(true, 41, 42, 0));
+	CHECK(!IsSkirmishAIRecoveryReservedNativeWorker(false, 41, 41, 0));
+	CHECK(!IsSkirmishAIRecoveryReservedNativeWorker(true, 0, 0, 0));
+	// A native respawn cancels only a still-existing exact paid recovery entry.
+	CHECK(ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
+		true, false, true, true));
+	CHECK(!ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
+		true, true, true, true));
+	CHECK(!ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
+		true, false, false, true));
+	CHECK(!ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
+		true, false, true, false));
+	CHECK(!ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
+		false, false, true, true));
 	evacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
 		0xFFFFFFFEU, 0, true, 3);
 	CHECK(evacuationDeadline == 1U);
@@ -1163,11 +1651,33 @@ static void TestSkirmishAIRecoveryPolicies()
 	CHECK(!IsSkirmishAIRecoveryRetryDue(99U, 100U));
 	CHECK(IsSkirmishAIRecoveryRetryDue(100U, 100U));
 	CHECK(IsSkirmishAIRecoveryRetryDue(101U, 100U));
+	CHECK(!IsSkirmishAIRecoveryBoundedGraceExpired(100U, 0U));
+	CHECK(!IsSkirmishAIRecoveryBoundedGraceExpired(99U, 100U));
+	CHECK(IsSkirmishAIRecoveryBoundedGraceExpired(100U, 100U));
+	CHECK(ShouldReleaseSkirmishAIRecoveryReserveForExpiredGrace(
+		true, true));
+	CHECK(!ShouldReleaseSkirmishAIRecoveryReserveForExpiredGrace(
+		true, false));
+	CHECK(!ShouldReleaseSkirmishAIRecoveryReserveForExpiredGrace(
+		false, true));
+	CHECK(ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
+		true, false));
+	CHECK(ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
+		false, true));
+	CHECK(!ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
+		false, false));
+	CHECK(ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
+		false, IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+			false, true, false, true)));
+	CHECK(!ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
+		false, IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+			false, true, false, false)));
 	CHECK(GetSkirmishAIRecoveryRetryFrame(100U, 5U) == 105U);
 	CHECK(!IsSkirmishAIRecoveryRetryDue(0xFFFFFFFEU, 1U));
 	CHECK(!IsSkirmishAIRecoveryRetryDue(0xFFFFFFFFU, 1U));
 	CHECK(!IsSkirmishAIRecoveryRetryDue(0U, 1U));
 	CHECK(IsSkirmishAIRecoveryRetryDue(1U, 1U));
+	CHECK(IsSkirmishAIRecoveryBoundedGraceExpired(1U, 0xFFFFFFFEU));
 	CHECK(GetSkirmishAIRecoveryRetryFrame(0xFFFFFFFEU, 3U) == 1U);
 	CHECK(GetSkirmishAIRecoveryRetryFrame(0xFFFFFFFFU, 1U) == 1U);
 }
@@ -1180,17 +1690,27 @@ static void TestSkirmishAIReplayEpoch()
 
 	// Live games always use the current and recovery paths. Replays retain the
 	// behavior selected by their recording epoch; an unknown epoch is legacy.
-	const Int replayEpochs[] = { 0, 1, 2, 3, 4 };
-	const Bool expectedReplayCurrentBehavior[] = { FALSE, FALSE, TRUE, TRUE, FALSE };
-	const Bool expectedReplayRecoveryBehavior[] = { FALSE, FALSE, FALSE, TRUE, FALSE };
-	for (Int i = 0; i < 5; ++i)
+	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5 };
+	const Bool expectedReplayCurrentBehavior[] =
+		{ FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
+	const Bool expectedReplayRecoveryBehavior[] =
+		{ FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+	const Bool expectedRecoveryCRCFields[] =
+		{ FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
+	for (Int i = 0; i < 6; ++i)
 	{
 		CHECK(ShouldUseSkirmishAICurrentBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAIRecoveryNativeHoleOwnership(FALSE, replayEpochs[i]));
+		CHECK(ShouldIncludeSkirmishAIRecoveryCRCFields(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, replayEpochs[i])
 			== expectedReplayCurrentBehavior[i]);
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, replayEpochs[i])
 			== expectedReplayRecoveryBehavior[i]);
+		CHECK(ShouldUseSkirmishAIRecoveryNativeHoleOwnership(TRUE, replayEpochs[i])
+			== expectedRecoveryCRCFields[i]);
+		CHECK(ShouldIncludeSkirmishAIRecoveryCRCFields(TRUE, replayEpochs[i])
+			== expectedRecoveryCRCFields[i]);
 	}
 
 	UnicodeString livenessOnly = unmarked;
@@ -1220,31 +1740,49 @@ static void TestSkirmishAIReplayEpoch()
 	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityEpoch2);
 	CHECK(compatibilityEpoch2.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
 
-	// The existing recorder call now writes epoch 3. Parsing that literal must
-	// round-trip to recovery behavior, and both writer entry points are idempotent.
-	UnicodeString recoveryEpoch = unmarked;
-	MarkReplayVersionForSkirmishAICurrentEpoch(recoveryEpoch);
-	CHECK(recoveryEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
-	CHECK(GetSkirmishAIReplayEpoch(recoveryEpoch) == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY);
-	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(recoveryEpoch));
+	// Epoch 3 retains the recovery behavior and CRC layout used by existing
+	// recordings. The explicit compatibility writer remains idempotent.
+	UnicodeString recoveryEpoch3 = unmarked;
+	MarkReplayVersionForSkirmishAIRecoveryEpoch(recoveryEpoch3);
+	CHECK(recoveryEpoch3.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(recoveryEpoch3) == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY);
+	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(recoveryEpoch3));
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY));
 	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY));
-	MarkReplayVersionForSkirmishAICurrentEpoch(recoveryEpoch);
-	CHECK(recoveryEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
-	MarkReplayVersionForSkirmishAIRecoveryEpoch(recoveryEpoch);
-	CHECK(recoveryEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
-	UnicodeString compatibilityEpoch3 = recoveryEpoch;
+	CHECK(!ShouldIncludeSkirmishAIRecoveryCRCFields(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY));
+	CHECK(!ShouldUseSkirmishAIRecoveryNativeHoleOwnership(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY));
+	MarkReplayVersionForSkirmishAIRecoveryEpoch(recoveryEpoch3);
+	CHECK(recoveryEpoch3.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
+	UnicodeString compatibilityEpoch3 = recoveryEpoch3;
 	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityEpoch3);
 	CHECK(compatibilityEpoch3.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
 
-	UnicodeString directRecoveryEpoch = unmarked;
-	MarkReplayVersionForSkirmishAIRecoveryEpoch(directRecoveryEpoch);
-	CHECK(directRecoveryEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
+	// New recordings use epoch 4. It keeps recovery decisions enabled and opts
+	// playback into the expanded recovery CRC fields.
+	UnicodeString recoveryCRCEpoch = unmarked;
+	MarkReplayVersionForSkirmishAICurrentEpoch(recoveryCRCEpoch);
+	CHECK(recoveryCRCEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(recoveryCRCEpoch) ==
+		SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC);
+	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(recoveryCRCEpoch));
+	CHECK(ShouldUseSkirmishAICurrentBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC));
+	CHECK(ShouldUseSkirmishAIRecoveryBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC));
+	CHECK(ShouldIncludeSkirmishAIRecoveryCRCFields(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC));
+	CHECK(ShouldUseSkirmishAIRecoveryNativeHoleOwnership(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC));
+	MarkReplayVersionForSkirmishAICurrentEpoch(recoveryCRCEpoch);
+	MarkReplayVersionForSkirmishAIRecoveryCRCEpoch(recoveryCRCEpoch);
+	CHECK(recoveryCRCEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4]") == 0);
 
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4]";
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=5]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -1257,6 +1795,9 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString mixedEpoch2And3 =
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2] [SkirmishAIEpoch=3]";
 	CHECK(GetSkirmishAIReplayEpoch(mixedEpoch2And3) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString mixedEpoch3And4 =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] [SkirmishAIEpoch=4]";
+	CHECK(GetSkirmishAIReplayEpoch(mixedEpoch3And4) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedRecoveryEpoch =
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=03]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedRecoveryEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -1273,7 +1814,7 @@ static void TestSkirmishAIReplayEpoch()
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] [SkirmishAIEpoch=3]";
 	CHECK(GetSkirmishAIReplayEpoch(duplicateMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString unknownThenCurrent =
-		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4] [SkirmishAIEpoch=2]";
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=5] [SkirmishAIEpoch=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unknownThenCurrent) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedThenLiveness =
 		L"Aug 14 2026 21:00:00 [SkirmishAILiveness=x] [SkirmishAILiveness=1]";
@@ -1293,8 +1834,10 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString compatibilityUnknown = futureEpoch;
 	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityUnknown);
 	CHECK(compatibilityUnknown == futureEpoch);
-	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, 4));
-	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, 4));
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, 5));
+	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, 5));
+	CHECK(!ShouldIncludeSkirmishAIRecoveryCRCFields(TRUE, 5));
+	CHECK(!ShouldUseSkirmishAIRecoveryNativeHoleOwnership(TRUE, 5));
 }
 
 static void TestPathfindQueueReplayEpoch()
@@ -1339,13 +1882,13 @@ static void TestPathfindQueueReplayEpoch()
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=3]") == 0);
-	CHECK(GetSkirmishAIReplayEpoch(combined) == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=4]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(combined) == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC);
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=3]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=4]") == 0);
 
 	UnicodeString pathLiveness = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);
@@ -1728,6 +2271,52 @@ static void TestSkirmishAIFeedbackPolicies()
 	CHECK(newState.hasPathFailureFrame);
 }
 
+static void TestSkirmishAILegacySaveCandidateSelection()
+{
+	CHECK(IsSkirmishAILegacySaveBuilderLive(TRUE, FALSE, FALSE, FALSE));
+	CHECK(!IsSkirmishAILegacySaveBuilderLive(TRUE, FALSE, FALSE, TRUE));
+	CHECK(!IsSkirmishAILegacySaveBuilderLive(TRUE, TRUE, FALSE, FALSE));
+	CHECK(!IsSkirmishAILegacySaveBuilderLive(TRUE, FALSE, TRUE, FALSE));
+	CHECK(!IsSkirmishAILegacySaveBuilderLive(FALSE, FALSE, FALSE, FALSE));
+
+	SkirmishAILegacySaveCandidateInput candidate;
+	candidate.isComputer = TRUE;
+	candidate.isSkirmishAI = TRUE;
+	candidate.hasPlayerTemplate = TRUE;
+	candidate.hasCompletedPrimaryCenter = TRUE;
+	candidate.hasOtherStructure = TRUE;
+	candidate.hasBuildInfo = TRUE;
+	candidate.hasScoreKeeper = TRUE;
+	candidate.compatibleBuilderCount = 1;
+	candidate.centerCost = 2000;
+	candidate.cash = 5000;
+	candidate.reserveAdmitted = TRUE;
+	Int selectedPlayerIndex = -1;
+	Bool hasSelection = FALSE;
+	SkirmishAILegacySaveCandidateInput ineligible = candidate;
+	ineligible.hasOtherStructure = FALSE;
+	CHECK(!ShouldSelectSkirmishAILegacySaveCandidate(
+		hasSelection, selectedPlayerIndex, 1, ineligible));
+	CHECK(ShouldSelectSkirmishAILegacySaveCandidate(
+		hasSelection, selectedPlayerIndex, 7, candidate));
+	selectedPlayerIndex = 7;
+	hasSelection = TRUE;
+	CHECK(ShouldSelectSkirmishAILegacySaveCandidate(
+		hasSelection, selectedPlayerIndex, 3, candidate));
+	selectedPlayerIndex = 3;
+	CHECK(!ShouldSelectSkirmishAILegacySaveCandidate(
+		hasSelection, selectedPlayerIndex, 5, candidate));
+	ineligible = candidate;
+	ineligible.reserveAdmitted = FALSE;
+	CHECK(!ShouldSelectSkirmishAILegacySaveCandidate(
+		hasSelection, selectedPlayerIndex, 2, ineligible));
+	ineligible = candidate;
+	ineligible.cash = 1999;
+	CHECK(!ShouldSelectSkirmishAILegacySaveCandidate(
+		hasSelection, selectedPlayerIndex, 1, ineligible));
+	CHECK(selectedPlayerIndex == 3);
+}
+
 static void TestSkirmishAITestRunnerContract()
 {
 	Int i;
@@ -1739,7 +2328,8 @@ static void TestSkirmishAITestRunnerContract()
 		"obstructed",
 		"low_cash",
 		"gla_hole",
-		"save_load"
+		"save_load",
+		"disabled_factory"
 	};
 	const Int expectedRecoveryCases[] = {
 		SKIRMISH_AI_RECOVERY_SURVIVING_BUILDER,
@@ -1749,9 +2339,10 @@ static void TestSkirmishAITestRunnerContract()
 		SKIRMISH_AI_RECOVERY_OBSTRUCTED,
 		SKIRMISH_AI_RECOVERY_LOW_CASH,
 		SKIRMISH_AI_RECOVERY_GLA_HOLE,
-		SKIRMISH_AI_RECOVERY_SAVE_LOAD
+		SKIRMISH_AI_RECOVERY_SAVE_LOAD,
+		SKIRMISH_AI_RECOVERY_DISABLED_FACTORY
 	};
-	for (i = 0; i < 8; ++i)
+	for (i = 0; i < 9; ++i)
 	{
 		Int fixtureCase = -1;
 		CHECK(TryParseSkirmishAIRecoveryFixtureCase(recoveryCaseNames[i], &fixtureCase));
@@ -1837,6 +2428,10 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
 		SKIRMISH_AI_RECOVERY_FACTORY_ONLY, SKIRMISH_AI_RECOVERY_FACTION_GLA));
 	CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
+		SKIRMISH_AI_RECOVERY_DISABLED_FACTORY, SKIRMISH_AI_RECOVERY_FACTION_GLA));
+	CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+		SKIRMISH_AI_RECOVERY_DISABLED_FACTORY, SKIRMISH_AI_RECOVERY_FACTION_CHINA));
+	CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
 		SKIRMISH_AI_RECOVERY_SAVE_LOAD, SKIRMISH_AI_RECOVERY_FACTION_AMERICA));
 	CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
 		-1, SKIRMISH_AI_RECOVERY_FACTION_AMERICA));
@@ -1852,6 +2447,8 @@ static void TestSkirmishAITestRunnerContract()
 		CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
 			SKIRMISH_AI_RECOVERY_FACTORY_ONLY, i));
 		CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+			SKIRMISH_AI_RECOVERY_DISABLED_FACTORY, i));
+		CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
 			SKIRMISH_AI_RECOVERY_GLA_HOLE, i));
 	}
 	for (i = SKIRMISH_AI_RECOVERY_FACTION_GLA;
@@ -1859,6 +2456,8 @@ static void TestSkirmishAITestRunnerContract()
 	{
 		CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
 			SKIRMISH_AI_RECOVERY_FACTORY_ONLY, i));
+		CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
+			SKIRMISH_AI_RECOVERY_DISABLED_FACTORY, i));
 		CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
 			SKIRMISH_AI_RECOVERY_GLA_HOLE, i));
 	}
@@ -2073,6 +2672,19 @@ int main(int argc, char **argv)
 		shutdownMemoryManager();
 		return 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-legacy-save-selection") == 0)
+	{
+		TestSkirmishAILegacySaveCandidateSelection();
+		if (s_failures != 0)
+		{
+			printf("%d skirmish AI legacy-save selection test(s) failed.\n", s_failures);
+			shutdownMemoryManager();
+			return 1;
+		}
+		printf("All skirmish AI legacy-save selection tests passed.\n");
+		shutdownMemoryManager();
+		return 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-replay-epoch") == 0)
 	{
 		TestSkirmishAILivenessPolicies();
@@ -2120,6 +2732,7 @@ int main(int argc, char **argv)
 	TestSkirmishAIProductionPolicies();
 	TestSkirmishAITargetingPolicies();
 	TestSkirmishAIFeedbackPolicies();
+	TestSkirmishAILegacySaveCandidateSelection();
 	TestSkirmishAITestRunnerContract();
 	TestFrameRateLimitCpuUsage();
 

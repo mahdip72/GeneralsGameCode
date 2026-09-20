@@ -64,6 +64,7 @@ public:
 	virtual ObjectID getSpawnerID() = 0;
 	virtual ObjectID getReconstructedBuildingID() = 0;
 	virtual const ThingTemplate* getRebuildTemplate() const = 0;
+	virtual ObjectID getWorkerID() = 0;
 
 };
 
@@ -100,6 +101,7 @@ public:
 	virtual ObjectID getSpawnerID() override { return m_spawnerObjectID; }
 	virtual ObjectID getReconstructedBuildingID() override { return m_reconstructingID; }
 	virtual const ThingTemplate* getRebuildTemplate() const override { return m_rebuildTemplate; }
+	virtual ObjectID getWorkerID() override { return m_workerID; }
 	void transferBombs( Object *reconstruction );
 
 	// interface acquisition

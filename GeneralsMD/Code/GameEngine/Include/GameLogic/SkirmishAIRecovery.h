@@ -60,26 +60,370 @@ inline bool IsSkirmishAIRecoveryBuilderPathUnavailable(
 		!builderQueuePaid && !hasPotentialFactory;
 }
 
-inline bool ShouldOrderSkirmishAIRecoveryBuilderExit(
-	bool hasCompatibleContainedBuilder, bool hasLiveOwnedContainer,
-	bool hasContainInterface, bool containerHasActiveProduction,
-	bool builderAlreadyExiting)
+inline bool IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+	bool canMake, bool queueFull, bool parkingPlacesFull,
+	bool productionCanAdvance)
 {
-	return hasCompatibleContainedBuilder && hasLiveOwnedContainer &&
-		hasContainInterface && !containerHasActiveProduction &&
-		!builderAlreadyExiting;
+	return productionCanAdvance &&
+		(canMake || queueFull || parkingPlacesFull);
 }
 
-inline bool IsSkirmishAIRecoveryProductionActive(
-	unsigned int productionCount)
+inline bool IsSkirmishAIRecoveryFactorySchedulingBounded(
+	bool canMake, bool queueFull, bool parkingPlacesFull,
+	bool productionCanAdvance)
 {
-	return productionCount > 0;
+	return (canMake || queueFull || parkingPlacesFull) &&
+		!productionCanAdvance;
+}
+
+inline bool IsSkirmishAIRecoveryFactoryBestCandidate(
+	bool canMake, bool productionCanAdvance)
+{
+	return canMake && productionCanAdvance;
+}
+
+inline bool IsSkirmishAIRecoveryBuilderAdmissionActionable(
+	bool canMake, bool aiUpdateCanAdvance)
+{
+	return canMake && aiUpdateCanAdvance;
+}
+
+inline bool IsSkirmishAIRecoveryBuilderUpdateBounded(
+	bool hasPhysicalRoute, bool aiUpdateCanAdvance)
+{
+	return hasPhysicalRoute && !aiUpdateCanAdvance;
+}
+
+inline bool IsSkirmishAIRecoveryAdmissionBounded(
+	bool noMoney, bool factoryDisabled,
+	bool noPrerequisite, bool maxedOutForPlayer)
+{
+	return noMoney || factoryDisabled || noPrerequisite || maxedOutForPlayer;
+}
+
+inline bool IsSkirmishAIRecoveryFactoryPotentialDuringGrace(
+	bool internallyProgressing, bool boundedOnly, bool graceActive)
+{
+	return internallyProgressing || (boundedOnly && graceActive);
+}
+
+inline bool ShouldLatchSkirmishAIRecoveryLastStand(
+	bool hasPhysicalRetryRoute)
+{
+	return !hasPhysicalRetryRoute;
+}
+
+inline bool ShouldPreserveSkirmishAIRecoveryTrackedObject(
+	bool permanent, bool liveOwnedObject,
+	bool underConstructionCommandCenter, bool validPrimaryRebuildHole)
+{
+	return !permanent && liveOwnedObject &&
+		(underConstructionCommandCenter || validPrimaryRebuildHole);
+}
+
+inline bool IsSkirmishAIRecoveryPaidQueueBounded(
+	bool paid, bool liveOwnedProducer,
+	bool productionCanAdvance)
+{
+	return paid && (!liveOwnedProducer || !productionCanAdvance);
+}
+
+inline bool ShouldFailoverSkirmishAIRecoveryPaidQueue(
+	bool paidQueueBounded, bool graceActive, bool replacementObserved,
+	bool hasAdvancingAlternate, bool sameProducer)
+{
+	return paidQueueBounded && !graceActive && !replacementObserved &&
+		hasAdvancingAlternate && !sameProducer;
+}
+
+inline bool ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
+	bool paidQueueBounded, bool graceActive, bool replacementObserved)
+{
+	return paidQueueBounded && !graceActive && !replacementObserved;
+}
+
+inline bool IsSkirmishAIRecoveryFailoverAdmissionEligible(
+	bool canMake, bool noMoney, bool maxed, bool refundAffordable,
+	bool cancellationFreesMax, bool nonMaxBuildable, bool queueReady)
+{
+	return canMake ||
+		(noMoney && refundAffordable) ||
+		(maxed && refundAffordable && cancellationFreesMax &&
+		 nonMaxBuildable && queueReady);
+}
+
+inline int GetSkirmishAIRecoveryFailoverAdmissionRank(
+	bool canMake, bool noMoney, bool maxed)
+{
+	if (canMake)
+		return 0;
+	if (noMoney)
+		return 1;
+	if (maxed)
+		return 2;
+	return 3;
+}
+
+inline bool ShouldClearSkirmishAIRecoveryFailoverBinding(
+	bool sameFactory, bool equivalentTemplate, bool incomplete)
+{
+	return sameFactory && equivalentTemplate && incomplete;
+}
+
+inline bool WouldSkirmishAIRecoveryCancellationFreeMax(
+	unsigned int maxCount, unsigned int predictedCountAfterCancellation)
+{
+	return maxCount != 0 && predictedCountAfterCancellation < maxCount;
+}
+
+inline bool ShouldSelectSkirmishAIRecoveryPaidQueueProducer(
+	bool hasSelection, bool selectedCanAdvance, bool candidateCanAdvance)
+{
+	return !hasSelection || (!selectedCanAdvance && candidateCanAdvance);
+}
+
+inline bool ShouldPreferTrackedSkirmishAIRecoveryPaidQueue(
+	bool trackedEntryExists, bool selectedCanAdvance)
+{
+	// A progressing compatible queue is already the fastest recovery route.
+	// Exact provenance breaks ties only when every compatible queue is bounded.
+	return trackedEntryExists && !selectedCanAdvance;
+}
+
+inline bool ShouldClearSkirmishAIRecoveryExactFailoverBinding(
+	bool selectedIsFirstCompatible, bool sameFactory,
+	bool equivalentTemplate, bool incomplete)
+{
+	return selectedIsFirstCompatible &&
+		ShouldClearSkirmishAIRecoveryFailoverBinding(
+			sameFactory, equivalentTemplate, incomplete);
+}
+
+inline bool IsSkirmishAIRecoveryReservedNativeWorker(
+	bool liveOwnedHole, int holeWorkerID, int candidateWorkerID,
+	int invalidObjectID)
+{
+	return liveOwnedHole && holeWorkerID != invalidObjectID &&
+		holeWorkerID == candidateWorkerID;
+}
+
+inline bool ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
+	bool hasNativeHole, bool assignedWorkerLive,
+	bool exactIdentityTracked, bool exactEntryExists)
+{
+	return hasNativeHole && !assignedWorkerLive &&
+		exactIdentityTracked && exactEntryExists;
+}
+
+inline bool ShouldSelectSkirmishAIPrimaryCommandCenter(
+	bool hasSelection, bool selectedCompleted, int selectedObjectID,
+	bool candidateCompleted, int candidateObjectID)
+{
+	return !hasSelection ||
+		(candidateCompleted && !selectedCompleted) ||
+		(candidateCompleted == selectedCompleted &&
+		 candidateObjectID < selectedObjectID);
+}
+
+inline bool IsSkirmishAIRecoveryContainedBuilderRoute(
+	bool hasCompatibleBuilder, bool isContained,
+	bool hasLiveContainer, bool hasOwnedContainer,
+	bool hasContainInterface, bool containReportsBuilder)
+{
+	return hasCompatibleBuilder && isContained && hasLiveContainer &&
+		hasOwnedContainer && hasContainInterface && containReportsBuilder;
+}
+
+inline bool ShouldOrderSkirmishAIRecoveryBuilderExit(
+	bool hasValidContainedBuilderRoute, bool builderAlreadyExiting)
+{
+	return hasValidContainedBuilderRoute && !builderAlreadyExiting;
 }
 
 inline bool IsSkirmishAIRecoveryInsuranceBuilderCandidate(
 	bool isContained, bool isDozer, bool isUnmanned)
 {
 	return !isContained && isDozer && !isUnmanned;
+}
+
+inline bool ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+	bool isResourceGatherer, bool isCompatibleBuilder,
+	bool recoveryEnabled, bool recoveryEverCompleted,
+	bool recoveryImpossible, bool hasCompletedPrimaryCommandCenter,
+	int reserveCost, bool hasPaidCompatibleBuilderQueue)
+{
+	if (!isCompatibleBuilder || !recoveryEnabled ||
+		!recoveryEverCompleted || recoveryImpossible ||
+		hasCompletedPrimaryCommandCenter)
+		return false;
+	// Once recovery has paid for an equivalent builder, suppress every ordinary
+	// WorkOrder so a resumed producer cannot pay a duplicate. Without a paid
+	// entry, a resource worker remains an income route while other builders keep
+	// the reserve gate.
+	if (hasPaidCompatibleBuilderQueue)
+		return true;
+	if (isResourceGatherer)
+		return false;
+	return reserveCost > 0;
+}
+
+inline bool IsSkirmishAIRecoveryReusableWorkOrder(
+	bool unbound, bool equivalentTemplate, bool incomplete,
+	bool belongsToDefaultTeam, bool reinforcement)
+{
+	return unbound && equivalentTemplate && incomplete &&
+		belongsToDefaultTeam && !reinforcement;
+}
+
+inline bool ShouldSelectSkirmishAIRecoveryReusableWorkOrder(
+	bool hasSelection, bool selectedIsResourceGatherer,
+	bool candidateEligible, bool candidateIsResourceGatherer)
+{
+	return candidateEligible &&
+		(!hasSelection ||
+			 (!selectedIsResourceGatherer && candidateIsResourceGatherer));
+}
+
+struct SkirmishAIRecoveryQueueCommit
+{
+	bool bindReusableWorkOrder;
+	bool storeProductionIdentity;
+};
+
+inline SkirmishAIRecoveryQueueCommit GetSkirmishAIRecoveryQueueCommit(
+	bool hasReusableWorkOrder, bool queueSucceeded)
+{
+	SkirmishAIRecoveryQueueCommit result;
+	result.bindReusableWorkOrder = hasReusableWorkOrder && queueSucceeded;
+	result.storeProductionIdentity = queueSucceeded;
+	return result;
+}
+
+inline bool IsSkirmishAIRecoveryFactoryFinisherUsable(
+	bool isContained, bool isUnmanned, bool hasDozerAI,
+	bool hasBuildTask, bool targetsFactory, bool hasBuildDock,
+	bool hasPathToBuildDock, bool aiUpdateCanAdvance)
+{
+	return !isContained && !isUnmanned && hasDozerAI &&
+		hasBuildTask && targetsFactory && hasBuildDock &&
+		hasPathToBuildDock && aiUpdateCanAdvance;
+}
+
+inline bool IsSkirmishAIRecoveryHoleConstructionMatch(
+	bool isLiveOwnedHole, bool hasRebuildTemplate,
+	bool rebuildTemplateEquivalent, unsigned int reconstructedBuildingID,
+	unsigned int constructionID)
+{
+	return isLiveOwnedHole && hasRebuildTemplate &&
+		rebuildTemplateEquivalent &&
+		reconstructedBuildingID == constructionID;
+}
+
+inline bool ShouldRestoreSkirmishAIRecoveryScaffoldBuilder(
+	bool priorBuilderStillLive, bool replacementTaskEstablished)
+{
+	return priorBuilderStillLive && !replacementTaskEstablished;
+}
+
+inline bool HasSkirmishAIRecoveryScaffoldReplacementAttempt(
+	int placementAttempt, int placementOffsetCount)
+{
+	// Placement uses this value modulo the offset count.  The next band is a
+	// persisted one-bit marker, avoiding a snapshot layout change.
+	return placementOffsetCount > 0 &&
+		placementAttempt >= placementOffsetCount;
+}
+
+inline int MarkSkirmishAIRecoveryScaffoldReplacementAttempt(
+	int placementAttempt, int placementOffsetCount)
+{
+	if (placementOffsetCount <= 0)
+		return placementAttempt;
+	if (placementAttempt < 0)
+		placementAttempt = 0;
+	return HasSkirmishAIRecoveryScaffoldReplacementAttempt(
+		placementAttempt, placementOffsetCount)
+		? placementAttempt : placementAttempt + placementOffsetCount;
+}
+
+inline bool HasSkirmishAIRecoveryObservedReplacement(
+	int placementAttempt, int placementOffsetCount)
+{
+	return placementOffsetCount > 0 &&
+		placementAttempt >= 2 * placementOffsetCount;
+}
+
+inline int MarkSkirmishAIRecoveryObservedReplacement(
+	int placementAttempt, int placementOffsetCount)
+{
+	if (placementOffsetCount <= 0)
+		return placementAttempt;
+	if (placementAttempt < 0)
+		placementAttempt = 0;
+	return 2 * placementOffsetCount +
+		placementAttempt % placementOffsetCount;
+}
+
+inline int ReconcileSkirmishAIRecoveryReplacementAttempt(
+	int placementAttempt, int placementOffsetCount,
+	bool paidQueueExists)
+{
+	if (!HasSkirmishAIRecoveryScaffoldReplacementAttempt(
+			placementAttempt, placementOffsetCount) || paidQueueExists)
+		return placementAttempt;
+	if (!HasSkirmishAIRecoveryObservedReplacement(
+			placementAttempt, placementOffsetCount))
+		return placementAttempt % placementOffsetCount;
+	return placementAttempt;
+}
+
+inline int AdvanceSkirmishAIRecoveryPlacementAttempt(
+	int placementAttempt, int placementOffsetCount)
+{
+	if (placementOffsetCount <= 0)
+		return placementAttempt;
+	if (placementAttempt < 0)
+		placementAttempt = 0;
+	const int replacementBand =
+		HasSkirmishAIRecoveryObservedReplacement(
+			placementAttempt, placementOffsetCount)
+		? 2 * placementOffsetCount :
+		(HasSkirmishAIRecoveryScaffoldReplacementAttempt(
+			placementAttempt, placementOffsetCount)
+			? placementOffsetCount : 0);
+	return replacementBand +
+		((placementAttempt % placementOffsetCount) + 1) % placementOffsetCount;
+}
+
+inline bool ShouldSellSkirmishAIRecoveryScaffold(
+	bool hasCompatibleBuilder, bool resumeGraceActive,
+	bool replacementQueuePaid, bool replacementAttempted,
+	bool hasPotentialFactory)
+{
+	return !resumeGraceActive && !replacementQueuePaid &&
+		(replacementAttempted ||
+			(hasCompatibleBuilder && !hasPotentialFactory));
+}
+
+enum SkirmishAIRecoveryStalledScaffoldAction
+{
+	SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP,
+	SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER,
+	SKIRMISH_AI_RECOVERY_SCAFFOLD_SELL
+};
+
+inline SkirmishAIRecoveryStalledScaffoldAction
+GetSkirmishAIRecoveryStalledScaffoldAction(
+	bool shouldSell, bool hasNativeRebuildHole,
+	bool hasLiveAssociatedNativeWorker)
+{
+	if (!shouldSell)
+		return SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP;
+	if (!hasNativeRebuildHole)
+		return SKIRMISH_AI_RECOVERY_SCAFFOLD_SELL;
+	return hasLiveAssociatedNativeWorker
+		? SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER
+		: SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP;
 }
 
 inline int GetSkirmishAIRecoveryReserveCost(
@@ -161,6 +505,25 @@ inline bool IsSkirmishAIRecoveryRetryDue(
 		(int)(currentFrame - retryFrame) >= 0;
 }
 
+inline bool IsSkirmishAIRecoveryBoundedGraceExpired(
+	unsigned int currentFrame, unsigned int deadline)
+{
+	return deadline != 0 &&
+		IsSkirmishAIRecoveryRetryDue(currentFrame, deadline);
+}
+
+inline bool ShouldReleaseSkirmishAIRecoveryReserveForExpiredGrace(
+	bool boundedGraceExpired, bool deadlineIsPendingWakeup)
+{
+	return boundedGraceExpired && deadlineIsPendingWakeup;
+}
+
+inline bool ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
+	bool paidQueueProgressing, bool factoryPotential)
+{
+	return paidQueueProgressing || factoryPotential;
+}
+
 // Never produce zero for a scheduled deadline: zero is reserved for the
 // unset/due sentinel.  Unsigned subtraction in the due check keeps ordinary
 // short delays correct across the 32-bit frame wrap.
@@ -195,4 +558,64 @@ inline unsigned int GetSkirmishAIRecoveryEvacuationDeadlineForVersion(
 	int version, unsigned int storedDeadline)
 {
 	return version >= 4 ? storedDeadline : 0;
+}
+
+struct SkirmishAIRecoveryProductionIdentity
+{
+	int factoryID;
+	int productionID;
+};
+
+inline SkirmishAIRecoveryProductionIdentity
+GetSkirmishAIRecoveryProductionIdentityForVersion(
+	int version, int storedFactoryID, int storedProductionID,
+	int invalidFactoryID, int invalidProductionID)
+{
+	SkirmishAIRecoveryProductionIdentity identity;
+	identity.factoryID = version >= 5 ? storedFactoryID : invalidFactoryID;
+	identity.productionID = version >= 5 ? storedProductionID : invalidProductionID;
+	return identity;
+}
+
+inline bool IsSkirmishAIRecoveryProductionIdentityTracked(
+	int factoryID, int productionID,
+	int invalidFactoryID, int invalidProductionID)
+{
+	return factoryID != invalidFactoryID && productionID != invalidProductionID;
+}
+
+inline bool IsSkirmishAIRecoveryProductionIdentityMatch(
+	int trackedFactoryID, int trackedProductionID,
+	int currentFactoryID, int currentProductionID,
+	int invalidFactoryID, int invalidProductionID)
+{
+	return IsSkirmishAIRecoveryProductionIdentityTracked(
+		trackedFactoryID, trackedProductionID,
+		invalidFactoryID, invalidProductionID) &&
+		trackedFactoryID == currentFactoryID &&
+		trackedProductionID == currentProductionID;
+}
+
+inline bool ShouldAdoptSkirmishAIRecoveryProduction(
+	bool identityTracked, bool newlyObserved, bool currentEntryCompatible)
+{
+	return !identityTracked && newlyObserved && currentEntryCompatible;
+}
+
+inline bool ShouldBindSkirmishAIRecoveryProductionIdentity(
+	bool recoveryActive, bool hasCompletedPrimaryCenter,
+	bool replacementAttempted, bool replacementObserved,
+	bool identityTracked, bool paidQueueExists,
+	bool hasFactoryID, bool hasProductionID)
+{
+	return recoveryActive && !hasCompletedPrimaryCenter &&
+		replacementAttempted && !replacementObserved &&
+		!identityTracked && paidQueueExists &&
+		hasFactoryID && hasProductionID;
+}
+
+inline bool ShouldClearSkirmishAIRecoveryProductionIdentity(
+	bool hasLiveProducer, bool hasExactEntry)
+{
+	return !hasLiveProducer || !hasExactEntry;
 }

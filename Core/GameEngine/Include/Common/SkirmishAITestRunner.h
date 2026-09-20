@@ -32,7 +32,8 @@ enum SkirmishAITestScenario
 // separate from the normal replay scenarios: they stop on fixture assertions
 // and never report a fixture result as a gameplay/replay gate.
 // Cases: surviving_builder, factory_only, no_path_laststand, repeated_cc,
-// obstructed, low_cash, gla_hole, save_load. Factions are the 12 playable Zero Hour Faction*
+// obstructed, low_cash, gla_hole, save_load, disabled_factory. Factions are the
+// 12 playable Zero Hour Faction*
 // templates returned by GetSkirmishAIRecoveryFactionTemplateName().
 enum SkirmishAIRecoveryFixtureCase
 {
@@ -44,6 +45,7 @@ enum SkirmishAIRecoveryFixtureCase
 	SKIRMISH_AI_RECOVERY_LOW_CASH,
 	SKIRMISH_AI_RECOVERY_GLA_HOLE,
 	SKIRMISH_AI_RECOVERY_SAVE_LOAD,
+	SKIRMISH_AI_RECOVERY_DISABLED_FACTORY,
 	SKIRMISH_AI_RECOVERY_FIXTURE_CASE_COUNT
 };
 

@@ -35,6 +35,7 @@
 class BuildListInfo;
 class SpecialPowerTemplate;
 class ThingTemplate;
+enum ProductionID CPP_11(: Int);
 
 
 /**
@@ -118,17 +119,31 @@ protected:
 	BuildListInfo *findPrimaryCommandCenterBuildInfo( const ThingTemplate *primaryTemplate ) const;
 	Bool findRecoveryBuilderTemplateAndFactory(
 		const ThingTemplate *primaryTemplate,
-		const ThingTemplate **builderTemplate, Object **factory, Bool *hasPotentialFactory);
+		const ThingTemplate **builderTemplate, Object **factory,
+		Bool *hasPotentialFactory, Bool *hasBoundedFactory);
 	void normalizeRecoveryWorkOrders(const ThingTemplate *primaryTemplate);
 	Bool hasRecoveryBuilderQueued(
-		const ThingTemplate *primaryTemplate, Bool *paid, ObjectID *factoryID );
+		const ThingTemplate *primaryTemplate, Bool *paid, ObjectID *factoryID,
+		ProductionID *productionID );
 	Bool queueRecoveryBuilder( const ThingTemplate *builderTemplate, Object *factory );
+	void clearRecoveryBuilderProduction();
+	void validateRecoveryBuilderProduction();
+	void bindRecoveryBuilderProductionIfNeeded(
+		Bool hasCompletedPrimaryCenter, Bool paidQueueExists,
+		ObjectID factoryID, ProductionID productionID );
+	Bool failoverRecoveryBuilderQueue(
+		const ThingTemplate *primaryTemplate, Object *boundedFactory,
+		ProductionID boundedProductionID );
+	Bool cancelRecoveryBuilderQueueForNativeRespawn(
+		const ThingTemplate *primaryTemplate );
 	Object *findRecoveryBuilder(
 		const Coord3D *position, const ThingTemplate *primaryTemplate) const;
+	Bool hasCriticalRecoveryPlacementRoute(
+		const ThingTemplate *primaryTemplate, Object *builder) const;
 	Bool prepareCriticalRecoveryBuilder(Object *builder);
 	Bool tryCriticalCommandCenterConstruction(
 		const ThingTemplate *primaryTemplate, BuildListInfo *info, Object *builder);
-	void enterRecoveryLastStand();
+	void enterRecoveryLastStand(Bool permanent);
 	Bool estimateTeamProduction( TeamPrototype *proto, Bool planned,
 		Int *productionCost, Int *completionFrames );
 	void getVisibleEnemyComposition( Int *aircraftValue, Int *vehicleValue, Int *infantryValue,
@@ -163,12 +178,16 @@ protected:
 	Bool m_recoveryEverCompleted;
 	Bool m_recoveryImpossible;
 	ObjectID m_recoveryConstructionID;
+	// Modulo the placement offset count is the next site; the next integer band
+	// records that this scaffold already received one paid replacement attempt.
 	Int m_recoveryPlacementAttempt;
 	UnsignedInt m_recoveryNextAttemptFrame;
 	UnsignedInt m_recoveryEvacuationDeadline;
 	Coord3D m_recoveryLocation;
 	Real m_recoveryAngle;
 	Int m_recoveryReserveCost;
+	ObjectID m_recoveryBuilderFactoryID;
+	ProductionID m_recoveryBuilderProductionID;
 	const ThingTemplate *m_recoveryAuthorizedThing;
 
 };
