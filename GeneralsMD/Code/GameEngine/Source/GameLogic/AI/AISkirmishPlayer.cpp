@@ -32,6 +32,7 @@
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
 #include "Common/Player.h"
+#include "Common/PlayerTemplate.h"
 #include "Common/PlayerList.h"
 #include "Common/Recorder.h"
 #include "Common/Team.h"
@@ -52,13 +53,16 @@
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
+#include "GameLogic/Module/SupplyTruckAIUpdate.h"
 #include "GameLogic/Module/UpdateModule.h"
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/ScriptEngine.h"
 #include "GameLogic/SkirmishAIDecision.h"
+#include "GameLogic/SkirmishAIRecovery.h"
 #include "GameLogic/Weapon.h"
 #include "GameLogic/WeaponSet.h"
 #include "GameLogic/Module/ProductionUpdate.h"
+#include "GameClient/ControlBar.h"
 #include "GameClient/TerrainVisual.h"
 #include "GameNetwork/GameInfo.h"
 
@@ -70,6 +74,260 @@ static Bool ShouldUseCurrentSkirmishAIBehavior()
 	return ShouldUseSkirmishAICurrentBehavior(
 		TheGameLogic->isInReplayGame(),
 		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+static Bool IsCriticalRecoveryModeEnabled(Player *player)
+{
+	if (!player || player->getPlayerType() != PLAYER_COMPUTER || !TheGameLogic)
+		return false;
+
+	const Bool replay = TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: TheGameLogic->getGameMode();
+	if (!IsSkirmishAIRecoveryGameMode(gameMode))
+		return false;
+
+	return ShouldUseSkirmishAIRecoveryBehavior(
+		replay,
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+struct SkirmishAIRecoveryOffset
+{
+	Int x;
+	Int y;
+};
+
+// Keep placement deterministic and bounded.  The final position is tested by
+// BuildAssistant and by the builder's pathfinder before any object is created.
+static const SkirmishAIRecoveryOffset g_skirmishAIRecoveryOffsets[] =
+{
+	{ 0, 0 },
+	{ 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 },
+	{ 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 },
+	{ 2, 0 }, { -2, 0 }, { 0, 2 }, { 0, -2 },
+	{ 2, 1 }, { -2, 1 }, { 2, -1 }, { -2, -1 },
+	{ 1, 2 }, { -1, 2 }, { 1, -2 }, { -1, -2 },
+	{ 3, 0 }, { -3, 0 }, { 0, 3 }, { 0, -3 },
+	{ 3, 1 }, { -3, 1 }, { 3, -1 }, { -3, -1 },
+	{ 1, 3 }, { -1, 3 }, { 1, -3 }, { -1, -3 },
+	{ 4, 0 }, { -4, 0 }, { 0, 4 }, { 0, -4 }
+};
+
+static const Int g_skirmishAIRecoveryOffsetCount =
+	sizeof(g_skirmishAIRecoveryOffsets) / sizeof(g_skirmishAIRecoveryOffsets[0]);
+
+static Bool HasSkirmishAICommandSetForTemplate(
+	const AsciiString &commandSetName, const ThingTemplate *product)
+{
+	if (!product || !TheControlBar)
+		return false;
+	const CommandSet *commandSet = TheControlBar->findCommandSet(commandSetName);
+	if (!commandSet)
+		return false;
+	for (Int command = 0; command < MAX_COMMANDS_PER_SET; ++command) {
+		const CommandButton *button = commandSet->getCommandButton(command);
+		if (button &&
+			(button->getCommandType() == GUI_COMMAND_UNIT_BUILD ||
+			 button->getCommandType() == GUI_COMMAND_DOZER_CONSTRUCT) &&
+			button->getThingTemplate() &&
+			button->getThingTemplate()->isEquivalentTo(product))
+			return true;
+	}
+	return false;
+}
+
+static Bool HasSkirmishAICommandForTemplate(
+	const Object *producer, const ThingTemplate *product)
+{
+	if (!producer || !product)
+		return false;
+	return HasSkirmishAICommandSetForTemplate(
+		producer->getCommandSetString(), product);
+}
+
+static Bool IsLiveSkirmishAIRecoveryObject(
+	const Object *object, const Player *owner)
+{
+	return object && !object->isDestroyed() && !object->isEffectivelyDead() &&
+		!object->testStatus(OBJECT_STATUS_SOLD) &&
+		(!owner || object->getControllingPlayer() == owner);
+}
+
+static Bool HasSkirmishAIRecoveryProduction(
+	Object *factory, const ThingTemplate *product)
+{
+	if (!factory || !product || !IsLiveSkirmishAIRecoveryObject(
+		factory, factory->getControllingPlayer()))
+		return false;
+	ProductionUpdateInterface *production =
+		factory->getProductionUpdateInterface();
+	if (!production)
+		return false;
+	for (const ProductionEntry *entry = production->firstProduction(); entry;
+		entry = production->nextProduction(entry)) {
+		if (entry->getProductionType() == PRODUCTION_UNIT &&
+			entry->getProductionObject() &&
+			entry->getProductionObject()->isEquivalentTo(product) &&
+			entry->getProductionQuantityRemaining() > 0)
+			return true;
+	}
+	return false;
+}
+
+static Bool HasSkirmishAIRecoveryFactoryFinisher(
+	Object *factory, const Player *owner)
+{
+	if (!factory || !factory->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION))
+		return true;
+	if (!TheGameLogic)
+		return false;
+	Object *builder = TheGameLogic->findObjectByID(factory->getBuilderID());
+	if (IsLiveSkirmishAIRecoveryObject(builder, owner) &&
+		!builder->isDisabledByType(DISABLED_UNMANNED) &&
+		builder->getAIUpdateInterface() &&
+		builder->getAIUpdateInterface()->getDozerAIInterface())
+		return true;
+
+	// A GLA rebuild scaffold may temporarily have no worker while its hole's
+	// respawn timer is active.  Preserve that self-rebuild route, but only when
+	// the live hole owns this exact reconstruction template.
+	Object *hole = TheGameLogic->findObjectByID(factory->getProducerID());
+	RebuildHoleBehaviorInterface *holeAI = hole
+		? RebuildHoleBehavior::getRebuildHoleBehaviorInterfaceFromObject(hole)
+		: nullptr;
+	return IsLiveSkirmishAIRecoveryObject(hole, owner) && holeAI &&
+		factory->getTemplate() && holeAI->getRebuildTemplate() &&
+		holeAI->getRebuildTemplate()->isEquivalentTo(factory->getTemplate());
+}
+
+static Bool IsSkirmishAIRecoveryPrimaryHole(
+	Object *hole, const Player *owner, const ThingTemplate *primaryTemplate,
+	const BuildListInfo *info, ObjectID trackedID)
+{
+	if (!IsLiveSkirmishAIRecoveryObject(hole, owner) ||
+		!hole->isKindOf(KINDOF_REBUILD_HOLE) || !primaryTemplate)
+		return false;
+	RebuildHoleBehaviorInterface *holeAI =
+		RebuildHoleBehavior::getRebuildHoleBehaviorInterfaceFromObject(hole);
+	if (!holeAI || !holeAI->getRebuildTemplate() ||
+		!holeAI->getRebuildTemplate()->isEquivalentTo(primaryTemplate))
+		return false;
+	return trackedID == hole->getID() ||
+		(info && info->getObjectID() == hole->getID()) ||
+		(trackedID != INVALID_ID &&
+		 (holeAI->getSpawnerID() == trackedID ||
+		  holeAI->getReconstructedBuildingID() == trackedID));
+}
+
+static Bool IsSkirmishAIRecoveryLocationSafe(
+	Player *player, const Coord3D *position, const ThingTemplate *thing)
+{
+	if (!player || !position || !thing || !TheAI || !ThePartitionManager)
+		return false;
+	Real radius = TheAI->getAiData()->m_supplyCenterSafeRadius +
+		thing->getTemplateGeometryInfo().getBoundingCircleRadius();
+
+	PartitionFilterPlayerAffiliation filterTeam(
+		player, (ALLOW_ALLIES | ALLOW_NEUTRAL), false);
+	PartitionFilterAlive filterAlive;
+	PartitionFilterInsignificantBuildings filterInsignificant(true, false);
+	PartitionFilterRejectByKindOf filterHarvesters(
+		MAKE_KINDOF_MASK(KINDOF_HARVESTER), KINDOFMASK_NONE);
+	PartitionFilterRejectByKindOf filterDozer(
+		MAKE_KINDOF_MASK(KINDOF_DOZER), KINDOFMASK_NONE);
+	PartitionFilter *filters[] = {
+		&filterTeam, &filterAlive, &filterInsignificant,
+		&filterHarvesters, &filterDozer, nullptr
+	};
+	ObjectIterator *iter = ThePartitionManager->iterateObjectsInRange(
+		position, radius, FROM_BOUNDINGSPHERE_2D, filters);
+	MemoryPoolObjectHolder hold(iter);
+	for (Object *object = iter->first(); object; object = iter->next()) {
+		ObjectShroudStatus shroud =
+			object->getShroudedStatus(player->getPlayerIndex());
+		Bool visible = shroud == OBJECTSHROUD_CLEAR ||
+			shroud == OBJECTSHROUD_PARTIAL_CLEAR;
+		Bool fogged = shroud == OBJECTSHROUD_FOGGED;
+		if (IsSkirmishAIIntelEligible(
+			object->isKindOf(KINDOF_STRUCTURE), visible, fogged,
+			object->testStatus(OBJECT_STATUS_STEALTHED),
+			object->testStatus(OBJECT_STATUS_DETECTED),
+			object->testStatus(OBJECT_STATUS_MASKED)))
+			return false;
+	}
+	return true;
+}
+
+struct SkirmishAIRecoveryBuilderCandidate
+{
+	Object *object;
+	Bool idle;
+	Real distance;
+};
+
+static Bool IsSkirmishAIRecoveryBuilderCandidateBetter(
+	const SkirmishAIRecoveryBuilderCandidate &candidate,
+	const SkirmishAIRecoveryBuilderCandidate &current)
+{
+	return (candidate.idle && !current.idle) ||
+		(candidate.idle == current.idle &&
+		 (candidate.distance < current.distance ||
+		  (candidate.distance == current.distance &&
+		   candidate.object->getID() < current.object->getID())));
+}
+
+static void CollectSkirmishAIRecoveryBuilders(
+	Player *player, const Coord3D *position,
+	const ThingTemplate *primaryTemplate, std::vector<Object *> *builders)
+{
+	if (!builders)
+		return;
+	builders->clear();
+	if (!player || !TheGameLogic || !primaryTemplate)
+		return;
+
+	std::vector<SkirmishAIRecoveryBuilderCandidate> candidates;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (!IsLiveSkirmishAIRecoveryObject(object, player) ||
+			!object->isKindOf(KINDOF_DOZER) ||
+			object->isDisabledByType(DISABLED_UNMANNED) ||
+			!object->getAIUpdateInterface() ||
+			!HasSkirmishAICommandForTemplate(object, primaryTemplate))
+			continue;
+		DozerAIInterface *dozerAI =
+			object->getAIUpdateInterface()->getDozerAIInterface();
+		if (!dozerAI)
+			continue;
+
+		SkirmishAIRecoveryBuilderCandidate candidate;
+		candidate.object = object;
+		candidate.idle = !dozerAI->isAnyTaskPending();
+		candidate.distance = 0.0f;
+		if (position) {
+			Real dx = object->getPosition()->x - position->x;
+			Real dy = object->getPosition()->y - position->y;
+			candidate.distance = dx * dx + dy * dy;
+		}
+		candidates.push_back(candidate);
+	}
+
+	for (UnsignedInt i = 0; i < candidates.size(); ++i) {
+		UnsignedInt best = i;
+		for (UnsignedInt j = i + 1; j < candidates.size(); ++j) {
+			if (IsSkirmishAIRecoveryBuilderCandidateBetter(
+				candidates[j], candidates[best]))
+				best = j;
+		}
+		if (best != i) {
+			SkirmishAIRecoveryBuilderCandidate temp = candidates[i];
+			candidates[i] = candidates[best];
+			candidates[best] = temp;
+		}
+		builders->push_back(candidates[i].object);
+	}
 }
 
 struct SkirmishProductionCandidate
@@ -107,7 +365,15 @@ static Int getSkirmishProductionEntryFrames(
 	if (!entry)
 		return 0;
 	Int buildFrames = 0;
-	if (entry->getProductionObject())
+	// ProductionEntry is a tagged union. Preserve the historical timing path
+	// for old recordings, but never treat an upgrade as a unit in new games.
+	if (IsCriticalRecoveryModeEnabled(player)) {
+		if (entry->getProductionType() == PRODUCTION_UNIT && entry->getProductionObject())
+			buildFrames = entry->getProductionObject()->calcTimeToBuild(player);
+		else if (entry->getProductionType() == PRODUCTION_UPGRADE && entry->getProductionUpgrade())
+			buildFrames = entry->getProductionUpgrade()->calcTimeToBuild(player);
+	}
+	else if (entry->getProductionObject())
 		buildFrames = entry->getProductionObject()->calcTimeToBuild(player);
 	else if (entry->getProductionUpgrade())
 		buildFrames = entry->getProductionUpgrade()->calcTimeToBuild(player);
@@ -178,12 +444,21 @@ m_curLeftFlankLeftDefenseAngle(0),
 m_curLeftFlankRightDefenseAngle(0),
 m_curRightFlankLeftDefenseAngle(0),
 m_curRightFlankRightDefenseAngle(0),
-m_frameToCheckEnemy(0),
-m_currentEnemy(nullptr),
-m_currentEnemyPlayerIndex(-1)
+	m_frameToCheckEnemy(0),
+	m_currentEnemy(nullptr),
+	m_currentEnemyPlayerIndex(-1),
+	m_recoveryEverCompleted(false),
+	m_recoveryImpossible(false),
+	m_recoveryConstructionID(INVALID_ID),
+	m_recoveryPlacementAttempt(0),
+	m_recoveryNextAttemptFrame(0),
+	m_recoveryReserveCost(0),
+	m_recoveryAuthorizedThing(nullptr)
 
 {
 	m_frameLastBuildingBuilt = TheGameLogic->getFrame();
+	m_recoveryLocation.zero();
+	m_recoveryAngle = 0.0f;
 	p->setCanBuildUnits(true); // turn on ai production by default.
 }
 
@@ -192,12 +467,962 @@ AISkirmishPlayer::~AISkirmishPlayer()
 	clearTeamsInQueue();
 }
 
+Bool AISkirmishPlayer::usesCriticalRecoveryBehavior() const
+{
+	return IsCriticalRecoveryModeEnabled(m_player);
+}
+
+Bool AISkirmishPlayer::canSpendForCriticalRecovery(
+	Int cost, const ThingTemplate *thing, Bool isUpgrade) const
+{
+	if (cost <= 0 || !usesCriticalRecoveryBehavior())
+		return true;
+	if (!m_player || !m_player->getMoney())
+		return false;
+	const Int money = m_player->getMoney()->countMoney();
+	if (cost > money)
+		return false;
+	if (m_recoveryAuthorizedThing && !isUpgrade && thing &&
+		thing->isEquivalentTo(m_recoveryAuthorizedThing))
+		return true;
+	if (m_recoveryEverCompleted && m_recoveryConstructionID != INVALID_ID &&
+		TheGameLogic) {
+		Object *tracked = TheGameLogic->findObjectByID(m_recoveryConstructionID);
+		if (!IsLiveSkirmishAIRecoveryObject(tracked, m_player))
+			return false;
+	}
+	if (m_recoveryImpossible || m_recoveryReserveCost <= 0)
+		return true;
+	return cost <= money - m_recoveryReserveCost;
+}
+
+Bool AISkirmishPlayer::findPrimaryCommandCenter(
+	const ThingTemplate *primaryTemplate, Object **center) const
+{
+	if (center)
+		*center = nullptr;
+	if (!primaryTemplate || !TheGameLogic || !m_player)
+		return false;
+
+	Object *best = nullptr;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (!IsLiveSkirmishAIRecoveryObject(object, m_player) ||
+			!object->isKindOf(KINDOF_COMMANDCENTER) || !object->getTemplate() ||
+			!object->getTemplate()->isEquivalentTo(primaryTemplate))
+			continue;
+		if (!best || object->getID() < best->getID())
+			best = object;
+	}
+	if (center)
+		*center = best;
+	return best != nullptr;
+}
+
+BuildListInfo *AISkirmishPlayer::findPrimaryCommandCenterBuildInfo(
+	const ThingTemplate *primaryTemplate) const
+{
+	if (!primaryTemplate || !m_player)
+		return nullptr;
+	for (BuildListInfo *info = m_player->getBuildList(); info; info = info->getNext()) {
+		const ThingTemplate *plan = TheThingFactory->findTemplate(info->getTemplateName());
+		if (plan && plan->isEquivalentTo(primaryTemplate))
+			return info;
+	}
+	return nullptr;
+}
+
+Bool AISkirmishPlayer::findRecoveryBuilderTemplateAndFactory(
+	const ThingTemplate *primaryTemplate,
+	const ThingTemplate **builderTemplate, Object **factory, Bool *hasPotentialFactory)
+{
+	if (builderTemplate)
+		*builderTemplate = nullptr;
+	if (factory)
+		*factory = nullptr;
+	if (hasPotentialFactory)
+		*hasPotentialFactory = false;
+	if (!primaryTemplate || !m_player || !TheGameLogic || !TheThingFactory)
+		return false;
+
+	// Inspect each owned factory's command set once.  This deliberately does
+	// not call isPossibleToMakeUnit(): temporary prerequisites, max-count,
+	// disabled, and cash failures remain retryable recovery states.
+	Object *bestFactory = nullptr;
+	const ThingTemplate *bestTemplate = nullptr;
+	Int bestCommand = 0;
+	Object *fallbackFactory = nullptr;
+	const ThingTemplate *fallbackTemplate = nullptr;
+	Int fallbackCommand = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (!IsLiveSkirmishAIRecoveryObject(object, m_player) ||
+			!object->getProductionUpdateInterface())
+			continue;
+		const CommandSet *commandSet = TheControlBar
+			? TheControlBar->findCommandSet(object->getCommandSetString()) : nullptr;
+		if (!commandSet)
+			continue;
+		for (Int command = 0; command < MAX_COMMANDS_PER_SET; ++command) {
+			const CommandButton *button = commandSet->getCommandButton(command);
+			const ThingTemplate *product = button ? button->getThingTemplate() : nullptr;
+			if (!button ||
+				(button->getCommandType() != GUI_COMMAND_UNIT_BUILD &&
+				 button->getCommandType() != GUI_COMMAND_DOZER_CONSTRUCT) ||
+				!product || !product->isKindOf(KINDOF_DOZER) ||
+				!HasSkirmishAICommandSetForTemplate(
+					product->friend_getCommandSetString(), primaryTemplate))
+				continue;
+			if (object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION)) {
+				// A factory scaffold with no assigned live finisher is an
+				// abandoned object, not a future recovery route.  Completed
+				// factories remain potential routes even when temporarily
+				// disabled or blocked by prerequisites/capacity.
+				if (!HasSkirmishAIRecoveryFactoryFinisher(object, m_player))
+					continue;
+				if (hasPotentialFactory)
+					*hasPotentialFactory = true;
+				if (!fallbackFactory || object->getID() < fallbackFactory->getID() ||
+					(object->getID() == fallbackFactory->getID() &&
+						command < fallbackCommand)) {
+					fallbackFactory = object;
+					fallbackTemplate = product;
+					fallbackCommand = command;
+				}
+				continue;
+			}
+			if (hasPotentialFactory)
+				*hasPotentialFactory = true;
+			if (!fallbackFactory || object->getID() < fallbackFactory->getID() ||
+				(object->getID() == fallbackFactory->getID() &&
+					command < fallbackCommand)) {
+				fallbackFactory = object;
+				fallbackTemplate = product;
+				fallbackCommand = command;
+			}
+			if (TheBuildAssistant->canMakeUnit(object, product) != CANMAKE_OK)
+				continue;
+			if (!bestFactory || object->getID() < bestFactory->getID() ||
+				(object->getID() == bestFactory->getID() && command < bestCommand)) {
+				bestFactory = object;
+				bestTemplate = product;
+				bestCommand = command;
+			}
+		}
+	}
+	if (!bestFactory) {
+		bestFactory = fallbackFactory;
+		bestTemplate = fallbackTemplate;
+		bestCommand = fallbackCommand;
+	}
+	if (bestFactory && bestTemplate) {
+		if (builderTemplate)
+			*builderTemplate = bestTemplate;
+		if (factory)
+			*factory = bestFactory;
+		return true;
+	}
+
+	return false;
+}
+
+void AISkirmishPlayer::normalizeRecoveryWorkOrders(
+	const ThingTemplate *primaryTemplate)
+{
+	if (!primaryTemplate || !m_player || !TheGameLogic)
+		return;
+
+	// Production death/capture refunds the entry but does not own the AI
+	// WorkOrder.  Clear only compatible stale bindings here, before recovery
+	// decides whether to allocate or reuse an order.  A valid binding must
+	// still point at an owned live producer with the matching real queue entry.
+	for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue();
+		!iter.done(); iter.advance()) {
+		TeamInQueue *team = iter.cur();
+		if (!team)
+			continue;
+		for (WorkOrder *order = team->m_workOrders; order;
+			order = order->m_next) {
+			if (order->m_factoryID == INVALID_ID || !order->m_thing ||
+				!order->m_thing->isKindOf(KINDOF_DOZER) ||
+				!HasSkirmishAICommandSetForTemplate(
+					order->m_thing->friend_getCommandSetString(), primaryTemplate) ||
+				order->m_numCompleted >= order->m_numRequired)
+				continue;
+
+			Object *factory = TheGameLogic->findObjectByID(order->m_factoryID);
+			if (!IsLiveSkirmishAIRecoveryObject(factory, m_player) ||
+				!HasSkirmishAIRecoveryProduction(factory, order->m_thing))
+				order->m_factoryID = INVALID_ID;
+		}
+	}
+}
+
+Bool AISkirmishPlayer::hasRecoveryBuilderQueued(
+	const ThingTemplate *primaryTemplate, Bool *paid, ObjectID *factoryID)
+{
+	if (paid)
+		*paid = false;
+	if (factoryID)
+		*factoryID = INVALID_ID;
+	// Production queues are authoritative for paid work.  This also sees
+	// script-issued dozers and GLA worker/supply-worker entries that do not
+	// necessarily have a matching TeamInQueue order.
+	if (m_player && TheGameLogic) {
+		for (Object *factory = TheGameLogic->getFirstObject(); factory;
+			factory = factory->getNextObject()) {
+			if (!IsLiveSkirmishAIRecoveryObject(factory, m_player))
+				continue;
+			ProductionUpdateInterface *production = factory->getProductionUpdateInterface();
+			if (!production)
+				continue;
+			for (const ProductionEntry *entry = production->firstProduction(); entry;
+				entry = production->nextProduction(entry)) {
+				if (entry->getProductionType() != PRODUCTION_UNIT)
+					continue;
+				const ThingTemplate *product = entry->getProductionObject();
+				if (product && product->isKindOf(KINDOF_DOZER) &&
+					HasSkirmishAICommandSetForTemplate(
+						product->friend_getCommandSetString(), primaryTemplate) &&
+					entry->getProductionQuantityRemaining() > 0) {
+					if (paid)
+						*paid = true;
+					if (factoryID)
+						*factoryID = factory->getID();
+					return true;
+				}
+			}
+		}
+	}
+
+	// A WorkOrder without a real production entry is an unpaid waiting
+	// request.  Count all dozer templates here; resource-gatherer workers are
+	// also recoverable builders and must not trigger another paid queue.
+	for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue();
+		!iter.done(); iter.advance()) {
+		TeamInQueue *team = iter.cur();
+		if (!team)
+			continue;
+		for (WorkOrder *order = team->m_workOrders; order; order = order->m_next) {
+			if (!order->m_thing || !order->m_thing->isKindOf(KINDOF_DOZER) ||
+				!HasSkirmishAICommandSetForTemplate(
+					order->m_thing->friend_getCommandSetString(), primaryTemplate) ||
+				order->m_numCompleted >= order->m_numRequired ||
+				order->m_factoryID != INVALID_ID)
+				continue;
+			if (factoryID)
+				*factoryID = order->m_factoryID;
+			return true;
+		}
+	}
+	return false;
+}
+
+Bool AISkirmishPlayer::queueRecoveryBuilder(
+	const ThingTemplate *builderTemplate, Object *factory)
+{
+	if (!builderTemplate || !factory || !m_player ||
+		!IsLiveSkirmishAIRecoveryObject(factory, m_player) ||
+		factory->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+		factory->isDestroyed())
+		return false;
+	ProductionUpdateInterface *production = factory->getProductionUpdateInterface();
+	if (!production || TheBuildAssistant->canMakeUnit(factory, builderTemplate) != CANMAKE_OK)
+		return false;
+
+	WorkOrder *order = nullptr;
+	for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue();
+		!iter.done() && !order; iter.advance()) {
+		for (WorkOrder *waiting = iter.cur()->m_workOrders; waiting;
+			waiting = waiting->m_next) {
+			if (waiting->m_factoryID == INVALID_ID && waiting->m_thing &&
+				waiting->m_thing->isEquivalentTo(builderTemplate) &&
+				waiting->m_numCompleted < waiting->m_numRequired) {
+				order = waiting;
+				break;
+			}
+		}
+	}
+	TeamInQueue *newTeam = nullptr;
+	if (!order) {
+		order = newInstance(WorkOrder);
+		order->m_thing = builderTemplate;
+		order->m_numRequired = 1;
+		order->m_required = true;
+		order->m_isResourceGatherer = false;
+		newTeam = newInstance(TeamInQueue);
+		newTeam->m_priorityBuild = true;
+		newTeam->m_workOrders = order;
+		newTeam->m_frameStarted = TheGameLogic->getFrame();
+		newTeam->m_team = m_player->getDefaultTeam();
+		prependTo_TeamBuildQueue(newTeam);
+	}
+
+	Bool queued = false;
+	const ThingTemplate *previousAuthorization = m_recoveryAuthorizedThing;
+	m_recoveryAuthorizedThing = builderTemplate;
+	queued = production->queueCreateUnit(builderTemplate, production->requestUniqueUnitID());
+	m_recoveryAuthorizedThing = previousAuthorization;
+	if (!queued) {
+		if (newTeam) {
+			removeFrom_TeamBuildQueue(newTeam);
+			deleteInstance(newTeam);
+		}
+		return false;
+	}
+
+	order->m_factoryID = factory->getID();
+	m_teamDelay = 0;
+	if (TheGlobalData->m_debugAI) {
+		AsciiString message = "Critical recovery queued builder from ";
+		message.concat(factory->getTemplate()->getName());
+		TheScriptEngine->AppendDebugMessage(message, false);
+	}
+	return true;
+}
+
+Object *AISkirmishPlayer::findRecoveryBuilder(
+	const Coord3D *position, const ThingTemplate *primaryTemplate) const
+{
+	std::vector<Object *> builders;
+	CollectSkirmishAIRecoveryBuilders(
+		m_player, position, primaryTemplate, &builders);
+	return builders.empty() ? nullptr : builders[0];
+}
+
+Bool AISkirmishPlayer::prepareCriticalRecoveryBuilder(Object *builder)
+{
+	if (!builder || !m_player || !TheGameLogic ||
+		!IsLiveSkirmishAIRecoveryObject(builder, m_player) ||
+		!builder->isKindOf(KINDOF_DOZER) ||
+		builder->isDisabledByType(DISABLED_UNMANNED))
+		return false;
+
+	AIUpdateInterface *ai = builder->getAIUpdateInterface();
+	DozerAIInterface *dozerAI = ai ? ai->getDozerAIInterface() : nullptr;
+	if (!ai || !dozerAI)
+		return false;
+	// A recovery-funded GLA worker may still carry the resource order's forced
+	// supply transition.  Clear it before that transition resets the build task.
+	SupplyTruckAIInterface *supplyAI = ai->getSupplyTruckAIInterface();
+	if (supplyAI)
+		supplyAI->setForceWantingState(false);
+
+	// Keep an already active recovery scaffold untouched.  This helper is
+	// called only while the primary center is missing, but the guard also
+	// protects a same-frame callback from cancelling a critical build task.
+	const ObjectID criticalID = m_recoveryConstructionID;
+	for (Int task = DOZER_TASK_FIRST; task < DOZER_NUM_TASKS; ++task) {
+		const DozerTask dozerTask = static_cast<DozerTask>(task);
+		if (!dozerAI->isTaskPending(dozerTask))
+			continue;
+		const ObjectID targetID = dozerAI->getTaskTarget(dozerTask);
+		Object *target = targetID != INVALID_ID
+			? TheGameLogic->findObjectByID(targetID) : nullptr;
+		if (criticalID != INVALID_ID && targetID == criticalID &&
+			dozerAI->getCurrentTask() == dozerTask &&
+			IsLiveSkirmishAIRecoveryObject(target, m_player) &&
+			target->getBuilderID() == builder->getID() &&
+			target->isKindOf(KINDOF_COMMANDCENTER) &&
+			target->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION))
+			return false;
+		dozerAI->cancelTask(dozerTask);
+	}
+
+	// A current task is not necessarily still present in the pending-task
+	// array.  Cancel it as well when it is ordinary work, then force the same
+	// idle transition used by the normal build command path.
+	const DozerTask currentTask = dozerAI->getCurrentTask();
+	if (currentTask >= DOZER_TASK_FIRST && currentTask < DOZER_NUM_TASKS) {
+		const ObjectID targetID = dozerAI->getTaskTarget(currentTask);
+		if (criticalID == INVALID_ID || targetID != criticalID)
+			dozerAI->cancelTask(currentTask);
+	}
+	ai->aiIdle(CMD_FROM_AI);
+	return !dozerAI->isAnyTaskPending();
+}
+
+Bool AISkirmishPlayer::tryCriticalCommandCenterConstruction(
+	const ThingTemplate *primaryTemplate, BuildListInfo *info, Object *builder)
+{
+	if (!primaryTemplate || !builder || !m_player || !TheGameLogic || !info ||
+		!IsLiveSkirmishAIRecoveryObject(builder, m_player) ||
+		builder->isDisabledByType(DISABLED_UNMANNED))
+		return false;
+	AIUpdateInterface *ai = builder->getAIUpdateInterface();
+	DozerAIInterface *dozerAI = ai ? ai->getDozerAIInterface() : nullptr;
+	if (!ai || !dozerAI ||
+		TheBuildAssistant->canMakeUnit(builder, primaryTemplate) != CANMAKE_OK)
+		return false;
+
+	const Int cost = primaryTemplate->calcCostToBuild(m_player);
+	if (cost < 0 || m_player->getMoney()->countMoney() < cost)
+		return false;
+
+	Coord3D origin = m_recoveryLocation;
+	if (origin.x == 0.0f && origin.y == 0.0f && origin.z == 0.0f && info)
+		origin = *info->getLocation();
+	const Int start = m_recoveryPlacementAttempt >= 0
+		? m_recoveryPlacementAttempt % g_skirmishAIRecoveryOffsetCount : 0;
+	const Real angle = m_recoveryAngle;
+	// A few path cells still overlap an obstructed command-center footprint.
+	// Space the alternatives by the building's diameter so a neighboring site
+	// can be legal even when another structure occupies the original center.
+	const Real placementStep = max(PATHFIND_CELL_SIZE_F,
+		2.0f * primaryTemplate->getTemplateGeometryInfo().getBoundingCircleRadius() +
+		PATHFIND_CELL_SIZE_F);
+	for (Int attempt = 0; attempt < g_skirmishAIRecoveryOffsetCount; ++attempt) {
+		const SkirmishAIRecoveryOffset &offset =
+			g_skirmishAIRecoveryOffsets[(start + attempt) % g_skirmishAIRecoveryOffsetCount];
+		Coord3D position = origin;
+		position.x += offset.x * placementStep;
+		position.y += offset.y * placementStep;
+		position.z = TheTerrainLogic->getGroundHeight(position.x, position.y);
+
+		if (!IsSkirmishAIRecoveryLocationSafe(
+				m_player, &position, primaryTemplate) ||
+			TheBuildAssistant->isLocationLegalToBuild(
+				&position,
+				primaryTemplate,
+				angle,
+				BuildAssistant::CLEAR_PATH |
+				BuildAssistant::TERRAIN_RESTRICTIONS |
+				BuildAssistant::NO_OBJECT_OVERLAP,
+				builder,
+				m_player) != LBC_OK ||
+			!ai->isPathAvailable(&position)) {
+			TheTerrainVisual->removeAllBibs();
+			continue;
+		}
+		TheTerrainVisual->removeAllBibs();
+
+		// Defer optional-task preemption until the candidate has passed all
+		// affordability, placement, and path checks.  This preserves useful
+		// work when recovery is temporarily cash-starved or obstructed.
+		if (!prepareCriticalRecoveryBuilder(builder)) {
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
+			return false;
+		}
+		ai = builder->getAIUpdateInterface();
+		dozerAI = ai ? ai->getDozerAIInterface() : nullptr;
+		if (!ai || !dozerAI || dozerAI->isAnyTaskPending() ||
+			TheBuildAssistant->canMakeUnit(builder, primaryTemplate) != CANMAKE_OK) {
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
+			return false;
+		}
+
+		// Match the normal BuildAssistant command transition, including workers
+		// that need to leave their supply-truck state before beginning a build.
+		ai->aiIdle(CMD_FROM_AI);
+		const ThingTemplate *previousAuthorization = m_recoveryAuthorizedThing;
+		m_recoveryAuthorizedThing = primaryTemplate;
+		Object *construction = ai->construct(
+			primaryTemplate, &position, angle, m_player, FALSE);
+		m_recoveryAuthorizedThing = previousAuthorization;
+		if (!construction)
+			continue;
+
+		m_recoveryConstructionID = construction->getID();
+		m_recoveryLocation = position;
+		m_recoveryPlacementAttempt = 0;
+		m_recoveryNextAttemptFrame = 0;
+		m_recoveryReserveCost = 0;
+		info->setObjectID(construction->getID());
+		info->setObjectTimestamp(TheGameLogic->getFrame() + 1);
+		info->setUnderConstruction(true);
+		m_buildDelay = 0;
+		m_readyToBuildStructure = false;
+		return true;
+	}
+
+	m_recoveryPlacementAttempt = (start + 1) % g_skirmishAIRecoveryOffsetCount;
+	m_recoveryNextAttemptFrame =
+		GetSkirmishAIRecoveryRetryFrame(
+			TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
+	return false;
+}
+
+void AISkirmishPlayer::enterRecoveryLastStand()
+{
+	const Bool maintenance = m_recoveryImpossible;
+	// Hunt deliberately searches enemies without line-of-sight checks. Use a
+	// known objective and ordinary attack-move acquisition for the last stand.
+	Coord3D target;
+	if (!getKnownEnemyPosition(getAiEnemy(), &target)) {
+		// Objective discovery can lag the recovery decision on a fogged map.
+		// Keep this state retryable instead of permanently abandoning the
+		// surviving forces without issuing any command.
+		m_recoveryConstructionID = INVALID_ID;
+		m_recoveryReserveCost = 0;
+		m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+			TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
+		return;
+	}
+	m_recoveryImpossible = true;
+	m_recoveryConstructionID = INVALID_ID;
+	m_recoveryReserveCost = 0;
+	m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+		TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (!IsLiveSkirmishAIRecoveryObject(object, m_player) ||
+			object->isKindOf(KINDOF_IMMOBILE) || !object->isAbleToAttack())
+			continue;
+		AIUpdateInterface *ai = object->getAIUpdateInterface();
+		if (ai) {
+			if (maintenance && (ai->isAttacking() || ai->isAttackPath()))
+				continue;
+			// Sleep rejects ordinary AI commands before the attack-action mood
+			// policy is consulted.  Normalize either blocker, then use the legal
+			// wake command before issuing the fair known-position attack move.
+			const UnsignedInt mood = ai->getMoodMatrixValue();
+			if ((mood & MM_Controller_AI) &&
+				((mood & MM_Mood_Sleep) ||
+				 (ai->getMoodMatrixActionAdjustment(MM_Action_Attack) &
+				  MAA_Action_Ok) == 0))
+				ai->setAttitude(ATTITUDE_NORMAL);
+			ai->aiMoveToPositionEvenIfSleeping(
+				object->getPosition(), CMD_FROM_AI);
+			ai->aiAttackMoveToPosition(&target, NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+		}
+	}
+	if (TheGlobalData->m_debugAI)
+		TheScriptEngine->AppendDebugMessage(
+			"Critical recovery impossible; surviving forces attack a known objective.", false);
+}
+
+void AISkirmishPlayer::updateCriticalRecovery()
+{
+	if (!usesCriticalRecoveryBehavior()) {
+		m_recoveryReserveCost = 0;
+		return;
+	}
+	const UnsignedInt frame = TheGameLogic->getFrame();
+	if (m_recoveryImpossible) {
+		m_recoveryReserveCost = 0;
+		if (IsSkirmishAIRecoveryRetryDue(frame, m_recoveryNextAttemptFrame)) {
+			enterRecoveryLastStand();
+		}
+		return;
+	}
+	const ObjectID priorConstructionID = m_recoveryConstructionID;
+	if (IsSkirmishAIRecoveryRetryDue(frame, m_recoveryNextAttemptFrame))
+		m_recoveryNextAttemptFrame = 0;
+	if (!IsSkirmishAIRecoveryRetryDue(frame, m_recoveryNextAttemptFrame)) {
+		// A tracked center lets us cheaply notice destruction/capture while the
+		// periodic recovery evaluation is asleep.  Missing targets retain their
+		// bounded retry deadline without rescanning every frame.
+		if (m_recoveryConstructionID != INVALID_ID) {
+			Object *tracked = TheGameLogic->findObjectByID(m_recoveryConstructionID);
+			if (IsLiveSkirmishAIRecoveryObject(tracked, m_player))
+				return;
+			m_recoveryConstructionID = INVALID_ID;
+		}
+		else
+			return;
+	}
+
+	const PlayerTemplate *playerTemplate = m_player ? m_player->getPlayerTemplate() : nullptr;
+	AsciiString startingBuilding = playerTemplate
+		? playerTemplate->getStartingBuilding() : AsciiString::TheEmptyString;
+	const ThingTemplate *primaryTemplate = startingBuilding.isEmpty()
+		? nullptr : TheThingFactory->findTemplate(startingBuilding);
+	if (!primaryTemplate || !primaryTemplate->isKindOf(KINDOF_COMMANDCENTER)) {
+		m_recoveryReserveCost = 0;
+		m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+			frame, 5 * LOGICFRAMES_PER_SECOND);
+		return;
+	}
+
+	BuildListInfo *info = findPrimaryCommandCenterBuildInfo(primaryTemplate);
+	Object *center = nullptr;
+	const Bool hasCenter = findPrimaryCommandCenter(primaryTemplate, &center);
+	normalizeRecoveryWorkOrders(primaryTemplate);
+	Bool hasConstruction = false;
+	if (hasCenter && center->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION)) {
+		hasConstruction = true;
+		// A captured incomplete center must not become a completed recovery
+		// history entry.  Only our own recovery construction receives an ID.
+		if (m_recoveryEverCompleted)
+			m_recoveryConstructionID = center->getID();
+	} else if (hasCenter) {
+		m_recoveryEverCompleted = true;
+		m_recoveryImpossible = false;
+		m_recoveryConstructionID = center->getID();
+		m_recoveryLocation = *center->getPosition();
+		m_recoveryAngle = center->getOrientation();
+	}
+
+	// A recovery scaffold remains a live critical objective even after its
+	// original builder disappears.  Rebind it through the normal resume command
+	// before allowing the ordinary base-building path to observe the scaffold.
+	if (hasCenter && hasConstruction && m_recoveryEverCompleted) {
+		Object *nativeHole = TheGameLogic->findObjectByID(
+			center->getProducerID());
+		if (IsSkirmishAIRecoveryPrimaryHole(
+			nativeHole, m_player, primaryTemplate, info, center->getID())) {
+			// The hole owns the free worker and native isRebuild construction;
+			// leave that lifecycle untouched and do not queue a paid duplicate.
+			m_recoveryConstructionID = center->getID();
+			m_recoveryReserveCost = 0;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+		m_recoveryConstructionID = center->getID();
+		Object *assignedBuilder = TheGameLogic->findObjectByID(
+			center->getBuilderID());
+		Bool assignedUsable = IsLiveSkirmishAIRecoveryObject(
+			assignedBuilder, m_player) &&
+			!assignedBuilder->isDisabledByType(DISABLED_UNMANNED) &&
+			assignedBuilder->getAIUpdateInterface() &&
+			assignedBuilder->getAIUpdateInterface()->getDozerAIInterface();
+		if (assignedUsable) {
+			AIUpdateInterface *assignedAI =
+				assignedBuilder->getAIUpdateInterface();
+			DozerAIInterface *assignedDozer =
+				assignedAI->getDozerAIInterface();
+			Coord3D assignedActionPosition;
+			Object *assignedResumeTarget =
+				DozerAIUpdate::findGoodBuildOrRepairPositionAndTarget(
+					assignedBuilder, center, assignedActionPosition);
+			const Bool assignedPathable = assignedResumeTarget == center &&
+				assignedAI->isPathAvailable(&assignedActionPosition);
+			if (assignedPathable &&
+				(assignedDozer->getCurrentTask() != DOZER_TASK_BUILD ||
+				 assignedDozer->getTaskTarget(DOZER_TASK_BUILD) != center->getID()) &&
+				prepareCriticalRecoveryBuilder(assignedBuilder))
+				assignedAI->aiResumeConstruction(center, CMD_FROM_AI);
+			if (assignedPathable &&
+				assignedDozer->isTaskPending(DOZER_TASK_BUILD) &&
+				assignedDozer->getTaskTarget(DOZER_TASK_BUILD) == center->getID()) {
+				m_recoveryReserveCost = 0;
+				m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+					frame, 2 * LOGICFRAMES_PER_SECOND);
+				return;
+			}
+			// A live assigned builder or pending task does not prove that this
+			// scaffold is reachable.  Let the bounded replacement pass consider
+			// every compatible builder before retrying the assigned one later.
+		}
+
+		// The old builder is no longer a valid owner of the scaffold.  Clear
+		// the binding before asking a different compatible builder to resume it.
+		center->setBuilder(nullptr);
+		std::vector<Object *> replacementBuilders;
+		CollectSkirmishAIRecoveryBuilders(
+			m_player, center->getPosition(), primaryTemplate,
+			&replacementBuilders);
+		for (std::vector<Object *>::iterator replacement =
+			replacementBuilders.begin(); replacement != replacementBuilders.end();
+			++replacement) {
+			Object *replacementBuilder = *replacement;
+			AIUpdateInterface *replacementAI =
+				replacementBuilder->getAIUpdateInterface();
+			Coord3D actionPosition;
+			Object *resumeTarget =
+				DozerAIUpdate::findGoodBuildOrRepairPositionAndTarget(
+					replacementBuilder, center, actionPosition);
+			if (!replacementAI || resumeTarget != center ||
+				!replacementAI->isPathAvailable(&actionPosition))
+				continue;
+			if (prepareCriticalRecoveryBuilder(replacementBuilder)) {
+				replacementAI->aiResumeConstruction(center, CMD_FROM_AI);
+				DozerAIInterface *replacementDozer = replacementAI
+					? replacementAI->getDozerAIInterface() : nullptr;
+				if (replacementDozer && replacementDozer->isTaskPending(DOZER_TASK_BUILD) &&
+					replacementDozer->getTaskTarget(DOZER_TASK_BUILD) == center->getID()) {
+					m_recoveryReserveCost = 0;
+					m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+						frame, 2 * LOGICFRAMES_PER_SECOND);
+					return;
+				}
+			}
+		}
+		if (!replacementBuilders.empty()) {
+			// Live compatible replacements remain retryable even when every
+			// cancellation/resume transition is temporarily blocked.
+			m_recoveryReserveCost = 0;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+
+		Bool builderQueuedPaid = false;
+		ObjectID queuedFactoryID = INVALID_ID;
+		const Bool builderQueued = hasRecoveryBuilderQueued(
+			primaryTemplate, &builderQueuedPaid, &queuedFactoryID);
+		const ThingTemplate *replacementTemplate = nullptr;
+		Object *replacementFactory = nullptr;
+		Bool hasPotentialFactory = false;
+		findRecoveryBuilderTemplateAndFactory(
+			primaryTemplate, &replacementTemplate, &replacementFactory,
+			&hasPotentialFactory);
+		const Int replacementCost = replacementTemplate
+			? replacementTemplate->calcCostToBuild(m_player) : 0;
+		if ((!builderQueued || !builderQueuedPaid) && replacementFactory &&
+			replacementTemplate && replacementCost >= 0 &&
+			m_player->getMoney()->countMoney() >= replacementCost &&
+			TheBuildAssistant->canMakeUnit(
+				replacementFactory, replacementTemplate) == CANMAKE_OK &&
+			queueRecoveryBuilder(replacementTemplate, replacementFactory)) {
+			m_recoveryReserveCost = replacementCost;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+		if (builderQueuedPaid || hasPotentialFactory) {
+			m_recoveryReserveCost = replacementCost > 0 ? replacementCost : 0;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+		enterRecoveryLastStand();
+		return;
+	}
+
+	if (m_recoveryConstructionID != INVALID_ID && !hasCenter) {
+		Object *tracked = TheGameLogic->findObjectByID(m_recoveryConstructionID);
+		if (IsSkirmishAIRecoveryPrimaryHole(
+			tracked, m_player, primaryTemplate, info, m_recoveryConstructionID)) {
+			m_recoveryReserveCost = 0;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+		if (!IsLiveSkirmishAIRecoveryObject(tracked, m_player) ||
+			!tracked->isKindOf(KINDOF_COMMANDCENTER) || !tracked->getTemplate() ||
+			!tracked->getTemplate()->isEquivalentTo(primaryTemplate) ||
+			!tracked->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION))
+			m_recoveryConstructionID = INVALID_ID;
+		else
+			hasConstruction = true;
+	}
+
+	const Int protectedReserve = max(0, TheAI->getAiData()->m_resourcesPoor);
+	m_recoveryReserveCost = 0;
+
+	// GLA's rebuild-hole behavior owns its own free worker and construction
+	// object.  Scan the holes directly because the build-list object ID still
+	// names the destroyed center during the first frame of the transition.
+	// Treat only a hole for this player's original center as pending so a
+	// captured enemy hole cannot freeze paid recovery.
+	if (!hasCenter) {
+		for (Object *hole = TheGameLogic->getFirstObject(); hole;
+			hole = hole->getNextObject()) {
+			if (!IsLiveSkirmishAIRecoveryObject(hole, m_player) ||
+				!hole->isKindOf(KINDOF_REBUILD_HOLE))
+				continue;
+			RebuildHoleBehaviorInterface *holeAI =
+				RebuildHoleBehavior::getRebuildHoleBehaviorInterfaceFromObject(hole);
+			if (!holeAI || !holeAI->getRebuildTemplate() ||
+				!holeAI->getRebuildTemplate()->isEquivalentTo(primaryTemplate))
+				continue;
+			const Bool trackedByBuildList = info && info->getObjectID() == hole->getID();
+			const Bool trackedByRecoveryHole =
+				m_recoveryConstructionID == hole->getID();
+			const Bool trackedBySpawner = priorConstructionID != INVALID_ID &&
+				holeAI->getSpawnerID() == priorConstructionID;
+			const Bool trackedByReconstruction = priorConstructionID != INVALID_ID &&
+				holeAI->getReconstructedBuildingID() == priorConstructionID;
+			if (!trackedByBuildList && !trackedByRecoveryHole &&
+				!trackedBySpawner && !trackedByReconstruction)
+				continue;
+			if (info && !trackedByBuildList)
+			info->setObjectID(hole->getID());
+			ObjectID reconstructionID = holeAI->getReconstructedBuildingID();
+			m_recoveryConstructionID = reconstructionID != INVALID_ID
+				? reconstructionID : hole->getID();
+			m_recoveryReserveCost = 0;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+	}
+
+	if (hasCenter) {
+		if (!m_recoveryEverCompleted || m_recoveryImpossible || hasConstruction)
+		{
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+
+		Int builderCount = 0;
+		for (Object *object = TheGameLogic->getFirstObject(); object;
+			object = object->getNextObject()) {
+			if (IsLiveSkirmishAIRecoveryObject(object, m_player) &&
+				object->isKindOf(KINDOF_DOZER) &&
+				!object->isDisabledByType(DISABLED_UNMANNED) &&
+				object->getAIUpdateInterface() &&
+				object->getAIUpdateInterface()->getDozerAIInterface() &&
+				HasSkirmishAICommandForTemplate(object, primaryTemplate))
+				++builderCount;
+		}
+
+		Bool builderQueuedPaid = false;
+		ObjectID queuedFactoryID = INVALID_ID;
+		const Bool builderQueued = hasRecoveryBuilderQueued(
+			primaryTemplate, &builderQueuedPaid, &queuedFactoryID);
+		const Int desiredBuilders =
+			(!hasConstruction && m_player->getMoney()->countMoney() >=
+				TheAI->getAiData()->m_resourcesWealthy) ? 2 : 1;
+		if (builderCount < desiredBuilders && !builderQueued) {
+			const ThingTemplate *builderTemplate = nullptr;
+			Object *factory = nullptr;
+			Bool hasPotentialFactory = false;
+			if (findRecoveryBuilderTemplateAndFactory(
+				primaryTemplate,
+				&builderTemplate, &factory, &hasPotentialFactory) && factory && builderTemplate) {
+				const Int builderCost = builderTemplate->calcCostToBuild(m_player);
+				if (builderCost >= 0 &&
+					m_player->getMoney()->countMoney() >=
+						AddSkirmishAIRecoveryCost(builderCost, protectedReserve) &&
+					TheBuildAssistant->canMakeUnit(factory, builderTemplate) == CANMAKE_OK)
+					queueRecoveryBuilder(builderTemplate, factory);
+			}
+		}
+		m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+			frame, 5 * LOGICFRAMES_PER_SECOND);
+		return;
+	}
+
+	// Old snapshots intentionally default to no recovery history.  A live
+	// center establishes that history above; without one, do not infer that a
+	// captured/incomplete center was ever completed.
+	if (!m_recoveryEverCompleted || m_recoveryImpossible) {
+		m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+			frame, 5 * LOGICFRAMES_PER_SECOND);
+		return;
+	}
+	if (!info) {
+		enterRecoveryLastStand();
+		return;
+	}
+	if (m_recoveryLocation.x == 0.0f && m_recoveryLocation.y == 0.0f &&
+		m_recoveryLocation.z == 0.0f)
+		m_recoveryLocation = *info->getLocation();
+	if (m_recoveryAngle == 0.0f)
+		m_recoveryAngle = info->getAngle();
+
+	Bool builderQueuedPaid = false;
+	ObjectID queuedFactoryID = INVALID_ID;
+	const Bool builderQueued = hasRecoveryBuilderQueued(
+		primaryTemplate, &builderQueuedPaid, &queuedFactoryID);
+	const ThingTemplate *builderTemplate = nullptr;
+	Object *builderFactory = nullptr;
+	Bool hasPotentialFactory = false;
+	findRecoveryBuilderTemplateAndFactory(
+		primaryTemplate,
+		&builderTemplate, &builderFactory, &hasPotentialFactory);
+	Object *builder = findRecoveryBuilder(&m_recoveryLocation, primaryTemplate);
+	const Bool hasBuilder = builder != nullptr;
+	const Bool retryDue = IsSkirmishAIRecoveryRetryDue(
+		TheGameLogic->getFrame(), m_recoveryNextAttemptFrame);
+	const Int commandCenterCost = primaryTemplate->calcCostToBuild(m_player);
+	const Int builderCost = builderTemplate
+		? builderTemplate->calcCostToBuild(m_player) : 0;
+	const Int money = m_player->getMoney()->countMoney();
+
+	SkirmishAIRecoveryPolicyInput input;
+	input.enabled = true;
+	input.everCompleted = m_recoveryEverCompleted;
+	input.hasPrimaryCommandCenter = false;
+	input.hasConstruction = hasConstruction;
+	input.hasBuilder = hasBuilder;
+	input.builderQueued = builderQueued;
+	input.builderQueuePaid = builderQueuedPaid;
+	input.hasBuilderFactory = builderFactory != nullptr;
+	input.noBuilderPath = !hasBuilder && !builderQueuedPaid && !hasPotentialFactory;
+	input.builderAffordable = builderFactory && builderTemplate && retryDue &&
+		TheBuildAssistant->canMakeUnit(builderFactory, builderTemplate) == CANMAKE_OK &&
+		money >= builderCost;
+	input.commandCenterAffordable = commandCenterCost >= 0 &&
+		money >= commandCenterCost;
+	input.placementReady = builder && retryDue;
+	input.commandCenterCost = commandCenterCost;
+	input.builderCost = builderCost;
+	input.protectedReserve = protectedReserve;
+	SkirmishAIRecoveryPolicyResult decision = DecideSkirmishAIRecovery(input);
+	m_recoveryReserveCost = decision.reserveCost;
+
+	if (decision.recoveryImpossible) {
+		enterRecoveryLastStand();
+		return;
+	}
+	if (decision.shouldQueueBuilder) {
+		if (queueRecoveryBuilder(builderTemplate, builderFactory)) {
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
+			Bool paid = false;
+			ObjectID factoryID = INVALID_ID;
+			if (hasRecoveryBuilderQueued(primaryTemplate, &paid, &factoryID))
+				m_recoveryReserveCost = paid
+					? max(protectedReserve, commandCenterCost)
+					: max(protectedReserve,
+						AddSkirmishAIRecoveryCost(commandCenterCost, builderCost));
+		}
+		else if (m_recoveryNextAttemptFrame == 0) {
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
+		}
+		return;
+	}
+	if (decision.shouldConstructCommandCenter) {
+		std::vector<Object *> constructionBuilders;
+		CollectSkirmishAIRecoveryBuilders(
+			m_player, &m_recoveryLocation, primaryTemplate,
+			&constructionBuilders);
+		for (std::vector<Object *>::iterator candidate =
+			constructionBuilders.begin(); candidate != constructionBuilders.end();
+			++candidate) {
+			if (tryCriticalCommandCenterConstruction(
+				primaryTemplate, info, *candidate))
+				return;
+		}
+		if (m_recoveryNextAttemptFrame == 0)
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
+	}
+	if (decision.shouldRetry && m_recoveryNextAttemptFrame == 0)
+		m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+			TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
+}
+
 
 /**
  * Build our base.
  */
 void AISkirmishPlayer::processBaseBuilding()
 {
+	if (usesCriticalRecoveryBehavior() && m_recoveryEverCompleted &&
+		!m_recoveryImpossible && m_recoveryConstructionID != INVALID_ID &&
+		TheGameLogic) {
+		Object *construction = TheGameLogic->findObjectByID(
+			m_recoveryConstructionID);
+		if (IsLiveSkirmishAIRecoveryObject(construction, m_player) &&
+			construction->isKindOf(KINDOF_COMMANDCENTER) &&
+			construction->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION))
+			return;
+		const PlayerTemplate *playerTemplate = m_player->getPlayerTemplate();
+		const ThingTemplate *primaryTemplate = playerTemplate
+			? TheThingFactory->findTemplate(playerTemplate->getStartingBuilding())
+			: nullptr;
+		if (IsSkirmishAIRecoveryPrimaryHole(
+			construction, m_player, primaryTemplate,
+			primaryTemplate ? findPrimaryCommandCenterBuildInfo(primaryTemplate) : nullptr,
+			m_recoveryConstructionID))
+			return;
+	}
+	// While a completed primary center is missing, recovery owns all builder
+	// and structure spending.  Leave the ordinary build-list path untouched
+	// once a center/scaffold exists or recovery has entered last stand.
+	if (usesCriticalRecoveryBehavior() && m_recoveryEverCompleted &&
+		!m_recoveryImpossible && m_recoveryConstructionID == INVALID_ID &&
+		m_recoveryReserveCost > 0)
+		return;
 	//
 	// Refresh base buildings. Scan through list, if a building is missing,
 	// rebuild it, unless it's rebuild count is zero.
@@ -425,6 +1650,33 @@ void AISkirmishPlayer::processBaseBuilding()
 void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 {
 	AIPlayer::onUnitProduced(factory, unit);
+	if (usesCriticalRecoveryBehavior() && unit && unit->isKindOf(KINDOF_DOZER))
+		m_recoveryNextAttemptFrame = 0;
+}
+
+void AISkirmishPlayer::onStructureProduced(Object *factory, Object *structure)
+{
+	AIPlayer::onStructureProduced(factory, structure);
+	if (!usesCriticalRecoveryBehavior() || !structure ||
+		structure->getControllingPlayer() != m_player || !m_player->getPlayerTemplate())
+		return;
+	const ThingTemplate *primaryTemplate = TheThingFactory->findTemplate(
+		m_player->getPlayerTemplate()->getStartingBuilding());
+	if (!primaryTemplate || !structure->isKindOf(KINDOF_COMMANDCENTER) ||
+		!structure->getTemplate() ||
+		!structure->getTemplate()->isEquivalentTo(primaryTemplate))
+		return;
+	// A captured incomplete center does not establish history while it is
+	// incomplete.  Once this completion callback fires, however, the owned
+	// primary center is a real completed recovery landmark.
+	m_recoveryEverCompleted = true;
+	m_recoveryImpossible = false;
+	m_recoveryConstructionID = structure->getID();
+	m_recoveryLocation = *structure->getPosition();
+	m_recoveryAngle = structure->getOrientation();
+	m_recoveryPlacementAttempt = 0;
+	m_recoveryNextAttemptFrame = 0;
+	m_recoveryReserveCost = 0;
 }
 
 /**
@@ -435,6 +1687,21 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
  */
 Bool AISkirmishPlayer::startTraining( WorkOrder *order, Bool busyOK, AsciiString teamName)
 {
+	// While recovery holds a positive reserve for a missing or interrupted
+	// primary-center path, it owns compatible builder admission.  Suppress a
+	// second ordinary builder order, but preserve explicit GLA resource-worker
+	// orders; healthy recovery scaffolds clear this reserve.
+	if (order && !order->m_isResourceGatherer &&
+		order->m_thing && order->m_thing->isKindOf(KINDOF_DOZER) &&
+		usesCriticalRecoveryBehavior() && m_recoveryEverCompleted &&
+		!m_recoveryImpossible &&
+		m_recoveryReserveCost > 0 && m_player->getPlayerTemplate()) {
+		const ThingTemplate *primaryTemplate = TheThingFactory->findTemplate(
+			m_player->getPlayerTemplate()->getStartingBuilding());
+		if (primaryTemplate && HasSkirmishAICommandSetForTemplate(
+			order->m_thing->friend_getCommandSetString(), primaryTemplate))
+			return false;
+	}
 	Object *factory = findFactory(order->m_thing, busyOK);
 	if( factory )
 	{
@@ -580,6 +1847,12 @@ Int AISkirmishPlayer::getCriticalRebuildReserve(Bool *canStartNow)
 		if (cost > 0 && (cheapestCost == 0 || cost < cheapestCost))
 			cheapestCost = cost;
 		if (canStartNow && !*canStartNow && canStartCriticalRebuildNow(info, plan))
+			*canStartNow = true;
+	}
+	if (usesCriticalRecoveryBehavior() && m_recoveryEverCompleted &&
+		!m_recoveryImpossible && m_recoveryReserveCost > cheapestCost) {
+		cheapestCost = m_recoveryReserveCost;
+		if (canStartNow)
 			*canStartNow = true;
 	}
 	return cheapestCost;
@@ -1352,6 +2625,7 @@ void AISkirmishPlayer::acquireEnemy()
 			TheScriptEngine->AppendDebugMessage(msg, false);
 		}
 	}
+
 }
 
 
@@ -1693,6 +2967,14 @@ void AISkirmishPlayer::processTeamBuilding()
  */
 void AISkirmishPlayer::doBaseBuilding()
 {
+	if (usesCriticalRecoveryBehavior())
+		updateCriticalRecovery();
+	// The recovery controller owns all base-spend decisions until the missing
+	// completed center has a real construction object or enters last stand.
+	if (usesCriticalRecoveryBehavior() && m_recoveryEverCompleted &&
+		!m_recoveryImpossible && m_recoveryConstructionID == INVALID_ID &&
+		m_recoveryReserveCost > 0)
+		return;
 	if (m_player->getCanBuildBase()) {
 		// See if we are ready to start trying a structure.
 		if (!m_readyToBuildStructure) {
@@ -1932,6 +3214,24 @@ void AISkirmishPlayer::newMap()
 			info->incrementNumRebuilds(); // the initial build in the normal build list consumes a rebuild, so add one.
 		}
 	}
+
+	// Initial construction remains the existing instant-build path.  Record
+	// only the completed primary center so recovery cannot mistake an
+	// incomplete captured center for prior ownership.
+	if (usesCriticalRecoveryBehavior() && m_player->getPlayerTemplate()) {
+		const ThingTemplate *primaryTemplate = TheThingFactory->findTemplate(
+			m_player->getPlayerTemplate()->getStartingBuilding());
+		Object *center = nullptr;
+		if (primaryTemplate && findPrimaryCommandCenter(primaryTemplate, &center) &&
+			center && !center->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION)) {
+			m_recoveryEverCompleted = true;
+			m_recoveryImpossible = false;
+			m_recoveryConstructionID = center->getID();
+			m_recoveryLocation = *center->getPosition();
+			m_recoveryAngle = center->getOrientation();
+			m_recoveryReserveCost = 0;
+		}
+	}
 }
 
 //----------------------------------------------------------------------------------------------------------
@@ -2008,20 +3308,30 @@ Bool AISkirmishPlayer::computeSuperweaponTarget(const SpecialPowerTemplate *powe
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::crc( Xfer *xfer )
 {
-
+	if (!usesCriticalRecoveryBehavior())
+		return;
+	xfer->xferBool(&m_recoveryEverCompleted);
+	xfer->xferBool(&m_recoveryImpossible);
+	xfer->xferObjectID(&m_recoveryConstructionID);
+	xfer->xferInt(&m_recoveryPlacementAttempt);
+	xfer->xferUnsignedInt(&m_recoveryNextAttemptFrame);
+	xfer->xferCoord3D(&m_recoveryLocation);
+	xfer->xferReal(&m_recoveryAngle);
+	xfer->xferInt(&m_recoveryReserveCost);
 }
 
 // ------------------------------------------------------------------------------------------------
 /** Xfer method
 	* Version Info;
 	* 1: Initial version
-	* 2: Current enemy and next enemy evaluation frame */
+	* 2: Current enemy and next enemy evaluation frame
+	* 3: Critical command-center recovery state */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 2;
+	XferVersion currentVersion = 3;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -2066,6 +3376,26 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 		m_currentEnemyPlayerIndex = state.enemyPlayerIndex;
 		m_frameToCheckEnemy = state.nextEvaluationFrame;
 	}
+	if (version >= 3) {
+		xfer->xferBool(&m_recoveryEverCompleted);
+		xfer->xferBool(&m_recoveryImpossible);
+		xfer->xferObjectID(&m_recoveryConstructionID);
+		xfer->xferInt(&m_recoveryPlacementAttempt);
+		xfer->xferUnsignedInt(&m_recoveryNextAttemptFrame);
+		xfer->xferCoord3D(&m_recoveryLocation);
+		xfer->xferReal(&m_recoveryAngle);
+		xfer->xferInt(&m_recoveryReserveCost);
+	} else if (xfer->getXferMode() == XFER_LOAD) {
+		m_recoveryEverCompleted = false;
+		m_recoveryImpossible = false;
+		m_recoveryConstructionID = INVALID_ID;
+		m_recoveryPlacementAttempt = 0;
+		m_recoveryNextAttemptFrame = 0;
+		m_recoveryLocation.zero();
+		m_recoveryAngle = 0.0f;
+		m_recoveryReserveCost = 0;
+	}
+	m_recoveryAuthorizedThing = nullptr;
 
 }
 
@@ -2084,5 +3414,10 @@ void AISkirmishPlayer::loadPostProcess()
 	}
 	if (!m_currentEnemy)
 		m_currentEnemyPlayerIndex = -1;
+	m_recoveryAuthorizedThing = nullptr;
+	if (m_recoveryPlacementAttempt < 0)
+		m_recoveryPlacementAttempt = 0;
+	if (m_recoveryReserveCost < 0)
+		m_recoveryReserveCost = 0;
 }
 

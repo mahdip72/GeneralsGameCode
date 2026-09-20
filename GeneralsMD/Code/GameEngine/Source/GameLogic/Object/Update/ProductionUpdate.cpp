@@ -56,6 +56,7 @@
 #include "GameLogic/ScriptEngine.h"
 
 
+
 // PUBLIC /////////////////////////////////////////////////////////////////////////////////////////
 
 static const ModelConditionFlagType theOpeningFlags[DOOR_COUNT_MAX] =
@@ -263,6 +264,9 @@ Bool ProductionUpdate::queueUpgrade( const UpgradeTemplate *upgrade )
 
 	// get the player
 	Player *player = getObject()->getControllingPlayer();
+	if (!player->canSpendForSkirmishAIRecovery(
+		upgrade->calcCostToBuild(player), nullptr, TRUE))
+		return FALSE;
 
 	// sanity check to make sure we can build this upgrade
 	if( upgrade->getUpgradeType() == UPGRADE_TYPE_PLAYER &&
@@ -380,6 +384,11 @@ void ProductionUpdate::cancelUpgrade( const UpgradeTemplate *upgrade )
 //-------------------------------------------------------------------------------------------------
 Bool ProductionUpdate::queueCreateUnit( const ThingTemplate *unitType, ProductionID productionID )
 {
+	Player *player = getObject()->getControllingPlayer();
+	if (player && !player->canSpendForSkirmishAIRecovery(
+		unitType ? unitType->calcCostToBuild(player) : 0, unitType, FALSE))
+		return FALSE;
+
 	// if we can't create the unit do nothing
 	if( TheBuildAssistant->canMakeUnit( getObject(), unitType ) != CANMAKE_OK )
 		return FALSE;
@@ -417,7 +426,6 @@ Bool ProductionUpdate::queueCreateUnit( const ThingTemplate *unitType, Productio
 	}
 
 	// take the cost for the build away from the player
-	Player *player = getObject()->getControllingPlayer();
 	Money *money = player->getMoney();
 	money->withdraw( unitType->calcCostToBuild( player ) );
 

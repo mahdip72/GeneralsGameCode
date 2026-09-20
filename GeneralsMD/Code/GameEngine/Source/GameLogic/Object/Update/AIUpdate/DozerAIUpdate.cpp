@@ -1652,6 +1652,13 @@ Object *DozerAIUpdate::construct( const ThingTemplate *what,
 	// !!! NOTE: If you modify this you must modify the worker too !!!
 	// !!! Graham: Please please please have inspiration for how to *not* duplicate this code
 
+	// Reject optional purchases before altering construction state or creating
+	// a scaffold. Existing rebuild-hole reconstruction is already paid for.
+	if (!isRebuild && what && owningPlayer &&
+		!owningPlayer->canSpendForSkirmishAIRecovery(
+			what->calcCostToBuild(owningPlayer), what, FALSE))
+		return nullptr;
+
 	// create our machines if they don't yet exist
 	///@todo make 'construct' a real AI command and you won't need a special case
 	m_isRebuild = isRebuild;

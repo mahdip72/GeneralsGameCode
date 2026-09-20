@@ -1153,6 +1153,15 @@ Bool Player::isSkirmishAIPlayer()
 	return m_ai ? m_ai->isSkirmishAI() : false;
 }
 
+Bool Player::canSpendForSkirmishAIRecovery(
+	Int cost, const ThingTemplate *thing, Bool isUpgrade) const
+{
+	if (!m_ai || !m_ai->isSkirmishAI())
+		return true;
+	return static_cast<AISkirmishPlayer *>(m_ai)->canSpendForCriticalRecovery(
+		cost, thing, isUpgrade);
+}
+
 
 //----------------------------------------------------------------------------------------------------------
 /**
@@ -4035,6 +4044,12 @@ void Player::crc( Xfer *xfer )
 
 	xfer->xferInt( &m_skillPoints );
 	xfer->xferInt( &m_sciencePurchasePoints );
+
+	// Recovery decisions affect subsequent simulation. Older replay epochs keep
+	// their original player CRC layout, as do humans and scripted campaign AI.
+	if (m_ai && m_ai->isSkirmishAI() &&
+		static_cast<AISkirmishPlayer *>(m_ai)->usesCriticalRecoveryBehavior())
+		xfer->xferSnapshot(m_ai);
 
 }
 

@@ -21,9 +21,12 @@
 #include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/PathfindQueueReplayEpoch.h"
 #include "GameLogic/SkirmishAIDecision.h"
+#include "GameLogic/SkirmishAIRecovery.h"
 #include "GameLogic/SkirmishAILiveness.h"
+#include "GameLogic/GameLogic.h"
 #include "WW3D2/textureloader.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
@@ -930,49 +933,303 @@ static void TestSkirmishAILivenessPolicies()
 	CHECK(!IsUsableSupplyCenter(true, true));
 }
 
+static SkirmishAIRecoveryPolicyInput MakeSkirmishAIRecoveryPolicyInput()
+{
+	SkirmishAIRecoveryPolicyInput input;
+	input.enabled = true;
+	input.everCompleted = true;
+	input.hasPrimaryCommandCenter = false;
+	input.hasConstruction = false;
+	input.hasBuilder = false;
+	input.builderQueued = false;
+	input.builderQueuePaid = false;
+	input.hasBuilderFactory = true;
+	input.noBuilderPath = false;
+	input.builderAffordable = true;
+	input.commandCenterAffordable = true;
+	input.placementReady = true;
+	input.commandCenterCost = 1200;
+	input.builderCost = 400;
+	input.protectedReserve = 300;
+	return input;
+}
+
+static void CheckSkirmishAIRecoveryDecision(
+	const SkirmishAIRecoveryPolicyInput &input,
+	Bool expectedQueueBuilder, Bool expectedConstructCommandCenter,
+	Bool expectedRecoveryImpossible, Bool expectedRetry, Int expectedReserveCost)
+{
+	const SkirmishAIRecoveryPolicyResult result = DecideSkirmishAIRecovery(input);
+	CHECK(result.shouldQueueBuilder == expectedQueueBuilder);
+	CHECK(result.shouldConstructCommandCenter == expectedConstructCommandCenter);
+	CHECK(result.recoveryImpossible == expectedRecoveryImpossible);
+	CHECK(result.shouldRetry == expectedRetry);
+	CHECK(result.reserveCost == expectedReserveCost);
+}
+
+static void TestSkirmishAIRecoveryPolicies()
+{
+	SkirmishAIRecoveryPolicyInput input = MakeSkirmishAIRecoveryPolicyInput();
+
+	// Disabled recovery, an AI that never completed a command center, an
+	// existing command center, and a command center scaffold must not impose
+	// a recovery reserve on ordinary construction or production.
+	input.enabled = false;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, FALSE, 0);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.everCompleted = false;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, FALSE, 0);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.hasPrimaryCommandCenter = true;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, FALSE, 0);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.hasConstruction = true;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, FALSE, 0);
+
+	// A completed command center that is now missing still needs recovery. If
+	// a builder survives, the next legal action is the command center build.
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.hasBuilder = true;
+	input.protectedReserve = 300;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, TRUE, FALSE, FALSE, 1200);
+
+	// Builder-first recovery is allowed when only the builder is affordable;
+	// the reserve still accounts for the later command center and builder cost.
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.commandCenterAffordable = false;
+	input.protectedReserve = 0;
+	CHECK(GetSkirmishAIRecoveryReserveCost(input) == 1600);
+	CheckSkirmishAIRecoveryDecision(input, TRUE, FALSE, FALSE, FALSE, 1600);
+	input.hasBuilder = true;
+	CHECK(GetSkirmishAIRecoveryReserveCost(input) == 1200);
+
+	// Lack of cash and a temporarily unavailable builder factory are retryable
+	// states, not permanent recovery failure.
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.builderAffordable = false;
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1600);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.hasBuilderFactory = false;
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1600);
+
+	// With no builder route left, the completed-but-missing AI has reached a
+	// genuine last stand. Retaining a construction reserve cannot help.
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.noBuilderPath = true;
+	input.protectedReserve = 750;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, TRUE, FALSE, 0);
+
+	// Fund an existing unpaid builder request rather than letting the reserve
+	// block its only recovery path. The runtime reuses that work order.
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.builderQueued = true;
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(input, TRUE, FALSE, FALSE, FALSE, 1600);
+	// A pending unpaid request that cannot be funded yet remains retryable; it
+	// must not be reported as a successful duplicate queue operation.
+	input.builderAffordable = false;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1600);
+	// An unpaid request alone is not a surviving physical recovery route.
+	input.hasBuilderFactory = false;
+	input.noBuilderPath = true;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, TRUE, FALSE, 0);
+	// A paid queue must not reserve or charge the builder a second time.
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.builderQueuePaid = true;
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1200);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.builderQueued = true;
+	input.builderQueuePaid = true;
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1200);
+
+	// A builder with insufficient funds or an obstructed placement keeps the
+	// command center recovery pending for the bounded retry timer.
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.hasBuilder = true;
+	input.commandCenterAffordable = false;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1200);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.hasBuilder = true;
+	input.placementReady = false;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1200);
+
+	// Recovery cost arithmetic clamps invalid negative inputs and saturates
+	// rather than wrapping when both required purchases exceed Int::max.
+	CHECK(AddSkirmishAIRecoveryCost(-100, -200) == 0);
+	CHECK(AddSkirmishAIRecoveryCost(-100, 5) == 5);
+	CHECK(AddSkirmishAIRecoveryCost(INT_MAX, 1) == INT_MAX);
+	CHECK(AddSkirmishAIRecoveryCost(INT_MAX, -1) == INT_MAX);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.commandCenterCost = INT_MAX;
+	input.builderCost = 100;
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(input, TRUE, FALSE, FALSE, FALSE, INT_MAX);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.commandCenterCost = -10;
+	input.builderCost = -20;
+	input.protectedReserve = -30;
+	CheckSkirmishAIRecoveryDecision(input, TRUE, FALSE, FALSE, FALSE, 0);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.protectedReserve = 2000;
+	CheckSkirmishAIRecoveryDecision(input, TRUE, FALSE, FALSE, FALSE, 2000);
+
+	// The recovery mode policy must follow the real engine enum values. This
+	// catches drift from hard-coded mode integers while keeping unsupported
+	// shell, replay, single-player, and none modes isolated.
+	CHECK(!IsSkirmishAIRecoveryGameMode(GAME_SINGLE_PLAYER));
+	CHECK(IsSkirmishAIRecoveryGameMode(GAME_LAN));
+	CHECK(IsSkirmishAIRecoveryGameMode(GAME_SKIRMISH));
+	CHECK(!IsSkirmishAIRecoveryGameMode(GAME_REPLAY));
+	CHECK(!IsSkirmishAIRecoveryGameMode(GAME_SHELL));
+	CHECK(IsSkirmishAIRecoveryGameMode(GAME_INTERNET));
+	CHECK(!IsSkirmishAIRecoveryGameMode(GAME_NONE));
+	CHECK(!IsSkirmishAIRecoveryGameMode(99));
+
+	// Retry frame zero is the unset sentinel, even when the current frame is
+	// large. Scheduled deadlines use unsigned wrap-safe comparisons and never
+	// publish zero, including an exact wrap from UINT_MAX + 1.
+	CHECK(IsSkirmishAIRecoveryRetryDue(0xF0000000U, 0U));
+	CHECK(GetSkirmishAIRecoveryRetryFrame(0xF0000000U, 0U) == 0xF0000000U);
+	CHECK(GetSkirmishAIRecoveryRetryFrame(0U, 0U) == 1U);
+	CHECK(!IsSkirmishAIRecoveryRetryDue(99U, 100U));
+	CHECK(IsSkirmishAIRecoveryRetryDue(100U, 100U));
+	CHECK(IsSkirmishAIRecoveryRetryDue(101U, 100U));
+	CHECK(GetSkirmishAIRecoveryRetryFrame(100U, 5U) == 105U);
+	CHECK(!IsSkirmishAIRecoveryRetryDue(0xFFFFFFFEU, 1U));
+	CHECK(!IsSkirmishAIRecoveryRetryDue(0xFFFFFFFFU, 1U));
+	CHECK(!IsSkirmishAIRecoveryRetryDue(0U, 1U));
+	CHECK(IsSkirmishAIRecoveryRetryDue(1U, 1U));
+	CHECK(GetSkirmishAIRecoveryRetryFrame(0xFFFFFFFEU, 3U) == 1U);
+	CHECK(GetSkirmishAIRecoveryRetryFrame(0xFFFFFFFFU, 1U) == 1U);
+}
+
 static void TestSkirmishAIReplayEpoch()
 {
 	UnicodeString unmarked = L"Aug 14 2026 21:00:00";
 	CHECK(GetSkirmishAIReplayEpoch(unmarked) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unmarked));
-	CHECK(ShouldUseSkirmishAICurrentBehavior(false, SKIRMISH_AI_REPLAY_EPOCH_LEGACY));
-	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_LEGACY));
+
+	// Live games always use the current and recovery paths. Replays retain the
+	// behavior selected by their recording epoch; an unknown epoch is legacy.
+	const Int replayEpochs[] = { 0, 1, 2, 3, 4 };
+	const Bool expectedReplayCurrentBehavior[] = { FALSE, FALSE, TRUE, TRUE, FALSE };
+	const Bool expectedReplayRecoveryBehavior[] = { FALSE, FALSE, FALSE, TRUE, FALSE };
+	for (Int i = 0; i < 5; ++i)
+	{
+		CHECK(ShouldUseSkirmishAICurrentBehavior(FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAIRecoveryBehavior(FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, replayEpochs[i])
+			== expectedReplayCurrentBehavior[i]);
+		CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, replayEpochs[i])
+			== expectedReplayRecoveryBehavior[i]);
+	}
 
 	UnicodeString livenessOnly = unmarked;
 	MarkReplayVersionForSkirmishAILivenessRecovery(livenessOnly);
 	CHECK(livenessOnly.compare(L"Aug 14 2026 21:00:00 [SkirmishAILiveness=1]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(livenessOnly) == SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS);
 	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(livenessOnly));
-	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS));
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS));
+	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS));
 
-	UnicodeString currentEpoch = unmarked;
-	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
-	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
-	CHECK(GetSkirmishAIReplayEpoch(currentEpoch) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
-	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(currentEpoch));
-	CHECK(ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
-	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
-	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
+	// Epoch 2 is already shipped behavior and must continue to select current
+	// behavior without opting into the newer recovery behavior.
+	UnicodeString preservedEpoch2 =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]";
+	CHECK(GetSkirmishAIReplayEpoch(preservedEpoch2) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(preservedEpoch2));
+	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+	MarkReplayVersionForSkirmishAICurrentEpoch(preservedEpoch2);
+	CHECK(preservedEpoch2.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
+	UnicodeString compatibilityEpoch2 = unmarked;
+	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityEpoch2);
+	CHECK(compatibilityEpoch2.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(compatibilityEpoch2) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_CURRENT));
+	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityEpoch2);
+	CHECK(compatibilityEpoch2.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2]") == 0);
+
+	// The existing recorder call now writes epoch 3. Parsing that literal must
+	// round-trip to recovery behavior, and both writer entry points are idempotent.
+	UnicodeString recoveryEpoch = unmarked;
+	MarkReplayVersionForSkirmishAICurrentEpoch(recoveryEpoch);
+	CHECK(recoveryEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(recoveryEpoch) == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY);
+	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(recoveryEpoch));
+	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY));
+	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY));
+	MarkReplayVersionForSkirmishAICurrentEpoch(recoveryEpoch);
+	CHECK(recoveryEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
+	MarkReplayVersionForSkirmishAIRecoveryEpoch(recoveryEpoch);
+	CHECK(recoveryEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
+	UnicodeString compatibilityEpoch3 = recoveryEpoch;
+	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityEpoch3);
+	CHECK(compatibilityEpoch3.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
+
+	UnicodeString directRecoveryEpoch = unmarked;
+	MarkReplayVersionForSkirmishAIRecoveryEpoch(directRecoveryEpoch);
+	CHECK(directRecoveryEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
 
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]";
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
-	UnicodeString mixedMarkers = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=1] [SkirmishAIEpoch=2]";
+	UnicodeString mixedMarkers =
+		L"Aug 14 2026 21:00:00 [SkirmishAILiveness=1] [SkirmishAIEpoch=3]";
 	CHECK(GetSkirmishAIReplayEpoch(mixedMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
-	UnicodeString duplicateMarkers = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2] [SkirmishAIEpoch=2]";
+	UnicodeString mixedEpoch2Markers =
+		L"Aug 14 2026 21:00:00 [SkirmishAILiveness=1] [SkirmishAIEpoch=2]";
+	CHECK(GetSkirmishAIReplayEpoch(mixedEpoch2Markers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString mixedEpoch2And3 =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2] [SkirmishAIEpoch=3]";
+	CHECK(GetSkirmishAIReplayEpoch(mixedEpoch2And3) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString malformedRecoveryEpoch =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=03]";
+	CHECK(GetSkirmishAIReplayEpoch(malformedRecoveryEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString unterminatedRecoveryEpoch =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3";
+	CHECK(GetSkirmishAIReplayEpoch(unterminatedRecoveryEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString trailingRecoveryGarbage =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] trailing";
+	CHECK(GetSkirmishAIReplayEpoch(trailingRecoveryGarbage) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString duplicateEpoch2Markers =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=2] [SkirmishAIEpoch=2]";
+	CHECK(GetSkirmishAIReplayEpoch(duplicateEpoch2Markers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString duplicateMarkers =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] [SkirmishAIEpoch=3]";
 	CHECK(GetSkirmishAIReplayEpoch(duplicateMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
-	UnicodeString unknownThenCurrent = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] [SkirmishAIEpoch=2]";
+	UnicodeString unknownThenCurrent =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4] [SkirmishAIEpoch=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unknownThenCurrent) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
-	UnicodeString malformedThenLiveness = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=x] [SkirmishAILiveness=1]";
+	UnicodeString malformedThenLiveness =
+		L"Aug 14 2026 21:00:00 [SkirmishAILiveness=x] [SkirmishAILiveness=1]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedThenLiveness) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString unknownWriterInput = futureEpoch;
 	MarkReplayVersionForSkirmishAICurrentEpoch(unknownWriterInput);
 	CHECK(unknownWriterInput.compare(futureEpoch) == 0);
-	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, 3));
+	UnicodeString compatibilityMalformed = malformedRecoveryEpoch;
+	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityMalformed);
+	CHECK(compatibilityMalformed == malformedRecoveryEpoch);
+	UnicodeString compatibilityDuplicate = duplicateEpoch2Markers;
+	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityDuplicate);
+	CHECK(compatibilityDuplicate == duplicateEpoch2Markers);
+	UnicodeString compatibilityMixed = mixedEpoch2And3;
+	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityMixed);
+	CHECK(compatibilityMixed == mixedEpoch2And3);
+	UnicodeString compatibilityUnknown = futureEpoch;
+	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityUnknown);
+	CHECK(compatibilityUnknown == futureEpoch);
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, 4));
+	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, 4));
 }
 
 static void TestPathfindQueueReplayEpoch()
@@ -994,11 +1251,36 @@ static void TestPathfindQueueReplayEpoch()
 	CHECK(GetPathfindCellInfoCapacityForPolicy(true, true, true) == PATHFIND_CELL_INFO_CURRENT_CAPACITY);
 	CHECK(GetPathfindCellInfoCapacityForPolicy(true, false, false) == PATHFIND_CELL_INFO_CURRENT_CAPACITY);
 
+	UnicodeString pathCompatibility = unmarked;
+	MarkReplayVersionForPathfindQueueCurrentEpoch(pathCompatibility);
+	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(pathCompatibility);
+	CHECK(pathCompatibility.compare(
+		L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=2]") == 0);
+	CHECK(GetPathfindQueueReplayEpoch(pathCompatibility) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
+	CHECK(GetSkirmishAIReplayEpoch(pathCompatibility) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+	MarkReplayVersionForPathfindQueueCurrentEpoch(pathCompatibility);
+	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(pathCompatibility);
+	CHECK(pathCompatibility.compare(
+		L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=2]") == 0);
+
+	UnicodeString pathEpoch2 =
+		L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=2]";
+	CHECK(GetPathfindQueueReplayEpoch(pathEpoch2) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
+	CHECK(GetSkirmishAIReplayEpoch(pathEpoch2) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(pathEpoch2)));
+	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(pathEpoch2)));
+
 	UnicodeString combined = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
-	CHECK(GetSkirmishAIReplayEpoch(combined) == SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=3]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(combined) == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY);
+	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
+	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
+	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
+	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=3]") == 0);
 
 	UnicodeString pathLiveness = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);
@@ -1083,6 +1365,11 @@ static void TestSkirmishAIProductionPolicies()
 
 	CHECK(GetSkirmishAIProductionEntryWaitFrames(900, 25.0f, true, 4) == 675);
 	CHECK(GetSkirmishAIProductionEntryWaitFrames(900, 25.0f, false, 4) == 900);
+	CHECK(GetSkirmishAIProductionEntryWaitFrames(0, 25.0f, true, 4) == 0);
+	CHECK(GetSkirmishAIProductionEntryWaitFrames(-1, 25.0f, true, 4) == 0);
+	CHECK(GetSkirmishAIProductionEntryWaitFrames(900, -25.0f, true, 4) == 900);
+	CHECK(GetSkirmishAIProductionEntryWaitFrames(900, 125.0f, true, 4) == 0);
+	CHECK(GetSkirmishAIProductionEntryWaitFrames(900, 25.0f, false, 0) == 900);
 	CHECK(GetSkirmishAIUnitsRemainingAfterProductionEntry(0, 4) == 0);
 	CHECK(GetSkirmishAIUnitsRemainingAfterProductionEntry(4, 4) == 0);
 	CHECK(GetSkirmishAIUnitsRemainingAfterProductionEntry(5, 4) == 1);
@@ -1378,6 +1665,139 @@ static void TestSkirmishAIFeedbackPolicies()
 
 static void TestSkirmishAITestRunnerContract()
 {
+	Int i;
+	const char *recoveryCaseNames[] = {
+		"surviving_builder",
+		"factory_only",
+		"no_path_laststand",
+		"repeated_cc",
+		"obstructed",
+		"low_cash",
+		"gla_hole",
+		"save_load"
+	};
+	const Int expectedRecoveryCases[] = {
+		SKIRMISH_AI_RECOVERY_SURVIVING_BUILDER,
+		SKIRMISH_AI_RECOVERY_FACTORY_ONLY,
+		SKIRMISH_AI_RECOVERY_NO_PATH_LASTSTAND,
+		SKIRMISH_AI_RECOVERY_REPEATED_COMMAND_CENTER,
+		SKIRMISH_AI_RECOVERY_OBSTRUCTED,
+		SKIRMISH_AI_RECOVERY_LOW_CASH,
+		SKIRMISH_AI_RECOVERY_GLA_HOLE,
+		SKIRMISH_AI_RECOVERY_SAVE_LOAD
+	};
+	for (i = 0; i < 8; ++i)
+	{
+		Int fixtureCase = -1;
+		CHECK(TryParseSkirmishAIRecoveryFixtureCase(recoveryCaseNames[i], &fixtureCase));
+		CHECK(fixtureCase == expectedRecoveryCases[i]);
+		CHECK(strcmp(GetSkirmishAIRecoveryFixtureCaseName(fixtureCase), recoveryCaseNames[i]) == 0);
+	}
+	CHECK(strcmp(GetSkirmishAIRecoveryFixtureCaseName(-1), "invalid") == 0);
+	CHECK(strcmp(GetSkirmishAIRecoveryFixtureCaseName(SKIRMISH_AI_RECOVERY_FIXTURE_CASE_COUNT), "invalid") == 0);
+
+	const char *recoveryFactionNames[] = {
+		"FactionAmerica",
+		"FactionAmericaSuperWeaponGeneral",
+		"FactionAmericaLaserGeneral",
+		"FactionAmericaAirForceGeneral",
+		"FactionChina",
+		"FactionChinaTankGeneral",
+		"FactionChinaInfantryGeneral",
+		"FactionChinaNukeGeneral",
+		"FactionGLA",
+		"FactionGLAToxinGeneral",
+		"FactionGLADemolitionGeneral",
+		"FactionGLAStealthGeneral"
+	};
+	const Int expectedRecoveryFactions[] = {
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+	};
+	for (i = 0; i < 12; ++i)
+	{
+		Int faction = -1;
+		CHECK(TryParseSkirmishAIRecoveryFaction(recoveryFactionNames[i], &faction));
+		CHECK(faction == expectedRecoveryFactions[i]);
+		CHECK(strcmp(GetSkirmishAIRecoveryFactionName(faction), recoveryFactionNames[i]) == 0);
+		CHECK(strcmp(GetSkirmishAIRecoveryFactionTemplateName(faction), recoveryFactionNames[i]) == 0);
+	}
+	CHECK(strcmp(GetSkirmishAIRecoveryFactionName(-1), "invalid") == 0);
+	CHECK(strcmp(GetSkirmishAIRecoveryFactionName(SKIRMISH_AI_RECOVERY_FACTION_COUNT), "invalid") == 0);
+	CHECK(strcmp(GetSkirmishAIRecoveryFactionTemplateName(SKIRMISH_AI_RECOVERY_FACTION_COUNT), "invalid") == 0);
+
+	const char *invalidRecoveryCases[] = {
+		nullptr,
+		"",
+		"unknown_case",
+		"surviving_builder ",
+		" surviving_builder",
+		"surviving_builderx"
+	};
+	for (i = 0; i < 6; ++i)
+	{
+		Int fixtureCase = 1731;
+		CHECK(!TryParseSkirmishAIRecoveryFixtureCase(invalidRecoveryCases[i], &fixtureCase));
+		CHECK(fixtureCase == 1731);
+	}
+	CHECK(!TryParseSkirmishAIRecoveryFixtureCase("surviving_builder", nullptr));
+
+	const char *invalidRecoveryFactions[] = {
+		nullptr,
+		"",
+		"FactionUnknown",
+		"FactionAmerica ",
+		" FactionAmerica",
+		"FactionAmericaX",
+		"FactionAmericaTankCommand",
+		"FactionAmericaSpecialForces",
+		"FactionAmericaAirForce",
+		"FactionChinaRedArmy",
+		"FactionChinaSpecialWeapons",
+		"FactionChinaSecretPolice",
+		"FactionGLATerrorCell",
+		"FactionGLABiowarCommand",
+		"FactionGLAWarlordCommand"
+	};
+	for (i = 0; i < (Int)(sizeof(invalidRecoveryFactions) / sizeof(invalidRecoveryFactions[0])); ++i)
+	{
+		Int faction = 1732;
+		CHECK(!TryParseSkirmishAIRecoveryFaction(invalidRecoveryFactions[i], &faction));
+		CHECK(faction == 1732);
+	}
+	CHECK(!TryParseSkirmishAIRecoveryFaction("FactionAmerica", nullptr));
+	CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+		SKIRMISH_AI_RECOVERY_FACTORY_ONLY, SKIRMISH_AI_RECOVERY_FACTION_AMERICA));
+	CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+		SKIRMISH_AI_RECOVERY_GLA_HOLE, SKIRMISH_AI_RECOVERY_FACTION_CHINA));
+	CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
+		SKIRMISH_AI_RECOVERY_FACTORY_ONLY, SKIRMISH_AI_RECOVERY_FACTION_GLA));
+	CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
+		SKIRMISH_AI_RECOVERY_SAVE_LOAD, SKIRMISH_AI_RECOVERY_FACTION_AMERICA));
+	CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+		-1, SKIRMISH_AI_RECOVERY_FACTION_AMERICA));
+	CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+		SKIRMISH_AI_RECOVERY_FIXTURE_CASE_COUNT, SKIRMISH_AI_RECOVERY_FACTION_AMERICA));
+	CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+		SKIRMISH_AI_RECOVERY_FACTORY_ONLY, -1));
+	CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+		SKIRMISH_AI_RECOVERY_FACTORY_ONLY, SKIRMISH_AI_RECOVERY_FACTION_COUNT));
+	for (i = SKIRMISH_AI_RECOVERY_FACTION_AMERICA;
+		i < SKIRMISH_AI_RECOVERY_FACTION_GLA; ++i)
+	{
+		CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+			SKIRMISH_AI_RECOVERY_FACTORY_ONLY, i));
+		CHECK(!IsSupportedSkirmishAIRecoveryFixtureCombination(
+			SKIRMISH_AI_RECOVERY_GLA_HOLE, i));
+	}
+	for (i = SKIRMISH_AI_RECOVERY_FACTION_GLA;
+		i < SKIRMISH_AI_RECOVERY_FACTION_COUNT; ++i)
+	{
+		CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
+			SKIRMISH_AI_RECOVERY_FACTORY_ONLY, i));
+		CHECK(IsSupportedSkirmishAIRecoveryFixtureCombination(
+			SKIRMISH_AI_RECOVERY_GLA_HOLE, i));
+	}
+
 	CommandLineData commandLineData;
 	CHECK(!commandLineData.hasSkirmishAITestRequest());
 	CHECK(commandLineData.getSkirmishAITestSeed() == 0);
@@ -1388,6 +1808,7 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(commandLineData.getSkirmishAITestSeed() == 1729);
 	CHECK(!commandLineData.requestSkirmishAITest(1730));
 	CHECK(!commandLineData.requestSkirmishAITest4v2(1730));
+	CHECK(!commandLineData.requestSkirmishAIRecoveryTest(1730, 0, 0));
 
 	CommandLineData commandLineData4v2;
 	CHECK(commandLineData4v2.requestSkirmishAITest4v2(1730));
@@ -1395,6 +1816,33 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(commandLineData4v2.getSkirmishAITest4v2Seed() == 1730);
 	CHECK(!commandLineData4v2.requestSkirmishAITest4v2(1731));
 	CHECK(!commandLineData4v2.requestSkirmishAITest(1731));
+	CHECK(!commandLineData4v2.requestSkirmishAIRecoveryTest(1731, 0, 0));
+
+	CommandLineData commandLineDataRecovery;
+	CHECK(!commandLineDataRecovery.hasSkirmishAIRecoveryTestRequest());
+	CHECK(commandLineDataRecovery.getSkirmishAIRecoveryTestSeed() == 0);
+	CHECK(commandLineDataRecovery.getSkirmishAIRecoveryFixtureCase() == 0);
+	CHECK(commandLineDataRecovery.getSkirmishAIRecoveryFaction() == 0);
+	CHECK(commandLineDataRecovery.requestSkirmishAIRecoveryTest(
+		1733, SKIRMISH_AI_RECOVERY_REPEATED_COMMAND_CENTER,
+		SKIRMISH_AI_RECOVERY_FACTION_GLA));
+	CHECK(commandLineDataRecovery.hasSkirmishAIRecoveryTestRequest());
+	CHECK(commandLineDataRecovery.getSkirmishAIRecoveryTestSeed() == 1733);
+	CHECK(commandLineDataRecovery.getSkirmishAIRecoveryFixtureCase() ==
+		SKIRMISH_AI_RECOVERY_REPEATED_COMMAND_CENTER);
+	CHECK(commandLineDataRecovery.getSkirmishAIRecoveryFaction() ==
+		SKIRMISH_AI_RECOVERY_FACTION_GLA);
+	CHECK(!commandLineDataRecovery.hasSkirmishAITestRequest());
+	CHECK(!commandLineDataRecovery.hasSkirmishAITest4v2Request());
+	CHECK(!commandLineDataRecovery.requestSkirmishAIRecoveryTest(
+		1734, SKIRMISH_AI_RECOVERY_LOW_CASH, SKIRMISH_AI_RECOVERY_FACTION_AMERICA));
+	CHECK(!commandLineDataRecovery.requestSkirmishAITest(1734));
+	CHECK(!commandLineDataRecovery.requestSkirmishAITest4v2(1734));
+	CHECK(commandLineDataRecovery.getSkirmishAIRecoveryTestSeed() == 1733);
+	CHECK(commandLineDataRecovery.getSkirmishAIRecoveryFixtureCase() ==
+		SKIRMISH_AI_RECOVERY_REPEATED_COMMAND_CENTER);
+	CHECK(commandLineDataRecovery.getSkirmishAIRecoveryFaction() ==
+		SKIRMISH_AI_RECOVERY_FACTION_GLA);
 
 	CHECK(!IsSkirmishAITestRunnerArmed());
 	CHECK(!ShouldBypassFramePacingForSkirmishAITest(FALSE));
@@ -1421,7 +1869,7 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(plan.slots[0].startPosition == -1);
 	CHECK(plan.slots[0].teamNumber == -1);
 
-	for (Int i = 1; i < SKIRMISH_AI_TEST_SLOT_COUNT; ++i)
+	for (i = 1; i < SKIRMISH_AI_TEST_SLOT_COUNT; ++i)
 	{
 		CHECK(plan.slots[i].state == SLOT_BRUTAL_AI);
 		CHECK(plan.slots[i].playerTemplate == PLAYERTEMPLATE_RANDOM);
@@ -1575,6 +2023,19 @@ int main(int argc, char **argv)
 		shutdownMemoryManager();
 		return 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-recovery") == 0)
+	{
+		TestSkirmishAIRecoveryPolicies();
+		if (s_failures != 0)
+		{
+			printf("%d skirmish AI recovery policy test(s) failed.\n", s_failures);
+			shutdownMemoryManager();
+			return 1;
+		}
+		printf("All skirmish AI recovery policy tests passed.\n");
+		shutdownMemoryManager();
+		return 0;
+	}
 
 	TestNetworkValidation();
 	TestPacketRouterFallbackSelection();
@@ -1587,6 +2048,9 @@ int main(int argc, char **argv)
 	TestStringConversionAndZeroLengthReads();
 	TestFrameRateLimitWaitCalculation();
 	TestSkirmishAILivenessPolicies();
+	TestSkirmishAIRecoveryPolicies();
+	TestSkirmishAIReplayEpoch();
+	TestPathfindQueueReplayEpoch();
 	TestSkirmishAICorrectnessPolicies();
 	TestSkirmishAIProductionPolicies();
 	TestSkirmishAITargetingPolicies();

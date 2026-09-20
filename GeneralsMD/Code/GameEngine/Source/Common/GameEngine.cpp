@@ -66,6 +66,7 @@
 #include "Common/DamageFX.h"
 #include "Common/MultiplayerSettings.h"
 #include "Common/Recorder.h"
+#include "Common/SkirmishAILegacySaveTest.h"
 #include "Common/SkirmishAITestRunner.h"
 #include "Common/SpecialPower.h"
 #include "Common/TerrainTypes.h"
@@ -962,6 +963,7 @@ void GameEngine::update()
 				PROFILER_SECTION_NAME("Engine.Update.Client");
 				rts::frame_timing::Scope frameTiming(rts::frame_timing::Client);
 				TheGameClient->UPDATE();
+				UpdateSkirmishAILegacySaveTest();
 			}
 			{
 				PROFILER_SECTION_NAME("Engine.Update.MessageStream");

@@ -34,6 +34,7 @@
 
 class BuildListInfo;
 class SpecialPowerTemplate;
+class ThingTemplate;
 
 
 /**
@@ -57,6 +58,9 @@ public:	// AIPlayer interface methods.
 	/// Invoked when a unit I am training comes into existence
 	virtual void onUnitProduced( Object *factory, Object *unit ) override;
 
+	/// Invoked when a structure I am building becomes complete.
+	virtual void onStructureProduced( Object *factory, Object *structure ) override;
+
 	virtual void buildSpecificAITeam(TeamPrototype *teamProto, Bool priorityBuild) override; ///< Builds this team immediately.
 
 	virtual void buildSpecificAIBuilding(const AsciiString &thingName) override; ///< Builds this building as soon as possible.
@@ -68,6 +72,8 @@ public:	// AIPlayer interface methods.
 	virtual void recruitSpecificAITeam(TeamPrototype *teamProto, Real recruitRadius) override; ///< Builds this team immediately.
 
 	virtual Bool isSkirmishAI() override {return true;}
+	Bool usesCriticalRecoveryBehavior() const;
+	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing, Bool isUpgrade) const;
 
 	virtual Bool checkBridges(Object *unit, Waypoint *way) override;
 
@@ -107,6 +113,22 @@ protected:
 		Int *factoryWaitFrames );
 	Int getCriticalRebuildReserve( Bool *canStartNow );
 	Bool canStartCriticalRebuildNow( BuildListInfo *info, const ThingTemplate *plan );
+	void updateCriticalRecovery();
+	Bool findPrimaryCommandCenter( const ThingTemplate *primaryTemplate, Object **center ) const;
+	BuildListInfo *findPrimaryCommandCenterBuildInfo( const ThingTemplate *primaryTemplate ) const;
+	Bool findRecoveryBuilderTemplateAndFactory(
+		const ThingTemplate *primaryTemplate,
+		const ThingTemplate **builderTemplate, Object **factory, Bool *hasPotentialFactory);
+	void normalizeRecoveryWorkOrders(const ThingTemplate *primaryTemplate);
+	Bool hasRecoveryBuilderQueued(
+		const ThingTemplate *primaryTemplate, Bool *paid, ObjectID *factoryID );
+	Bool queueRecoveryBuilder( const ThingTemplate *builderTemplate, Object *factory );
+	Object *findRecoveryBuilder(
+		const Coord3D *position, const ThingTemplate *primaryTemplate) const;
+	Bool prepareCriticalRecoveryBuilder(Object *builder);
+	Bool tryCriticalCommandCenterConstruction(
+		const ThingTemplate *primaryTemplate, BuildListInfo *info, Object *builder);
+	void enterRecoveryLastStand();
 	Bool estimateTeamProduction( TeamPrototype *proto, Bool planned,
 		Int *productionCost, Int *completionFrames );
 	void getVisibleEnemyComposition( Int *aircraftValue, Int *vehicleValue, Int *infantryValue,
@@ -135,5 +157,17 @@ protected:
 	UnsignedInt m_frameToCheckEnemy;
 	Player			*m_currentEnemy;
 	Int m_currentEnemyPlayerIndex;
+
+	// Critical command-center recovery state. The reserve is serialized because
+	// it gates same-frame production before the next AI refresh.
+	Bool m_recoveryEverCompleted;
+	Bool m_recoveryImpossible;
+	ObjectID m_recoveryConstructionID;
+	Int m_recoveryPlacementAttempt;
+	UnsignedInt m_recoveryNextAttemptFrame;
+	Coord3D m_recoveryLocation;
+	Real m_recoveryAngle;
+	Int m_recoveryReserveCost;
+	const ThingTemplate *m_recoveryAuthorizedThing;
 
 };

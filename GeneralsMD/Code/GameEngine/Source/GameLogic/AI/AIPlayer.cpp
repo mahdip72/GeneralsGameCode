@@ -70,6 +70,7 @@
 
 #define USE_DOZER 1
 
+
 // ------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------
 AIPlayer::AIPlayer( Player *p ) :
@@ -520,6 +521,10 @@ Object *AIPlayer::buildStructureNow(const ThingTemplate *bldgPlan, BuildListInfo
 // ------------------------------------------------------------------------------------------------
 Object *AIPlayer::buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildListInfo *info)
 {
+	if (!m_player->canSpendForSkirmishAIRecovery(
+		bldgPlan->calcCostToBuild(m_player), bldgPlan, FALSE))
+		return nullptr;
+
 	// Find a dozer.
 	Object *dozer = findDozer(info->getLocation());
 	if (dozer==nullptr) {
