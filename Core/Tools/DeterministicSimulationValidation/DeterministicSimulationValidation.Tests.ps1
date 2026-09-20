@@ -713,6 +713,22 @@ function Assert-Throws {
     }
 }
 
+function Reset-Stage5TestFinalAcceptanceValidatedClosure {
+    $modulePath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot `
+        'DeterministicSimulationEvidence.psm1'))
+    $module = Get-Module | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_.Path) -and
+        [IO.Path]::GetFullPath([string]$_.Path) -ceq $modulePath
+    } | Select-Object -First 1
+    if ($null -eq $module) {
+        throw 'The Stage 5 evidence module is unavailable for test closure isolation.'
+    }
+    & $module {
+        Remove-Variable -Name Stage5FinalAcceptanceValidatedClosure `
+            -Scope Script -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-Stage5LivePlanEntryIdentityFocusedCase {
     # This focused contract reaches the same result projection and live-plan
     # resolver used by the 253-entry execution path without creating its corpus
@@ -9852,7 +9868,13 @@ try {
     $acceptanceRequest = Join-Path $acceptanceRoot 'final-acceptance.json'
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
+            -DevelopmentReadiness | Out-Null
+    } 'Installed-kernel execution may be skipped only when the caller explicitly authorizes' `
+        'a skipped installed-kernel qualification fails closed without an explicit exemption'
+    Assert-Throws {
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
+            -ExternalQualificationExempt | Out-Null
     } 'diagnostic NET3 v1|lockstep-v2' `
         'a fully valid diagnostic NET3 v1 envelope cannot satisfy final acceptance'
 
@@ -9860,7 +9882,8 @@ try {
     Write-AcceptanceRequest $outOfBandAcceptanceRequest `
         @($acceptanceKinds + 'manual-acceptance')
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $outOfBandAcceptanceRequest | Out-Null
+        Invoke-Stage5FinalAcceptanceAggregation $outOfBandAcceptanceRequest `
+            -ExternalQualificationExempt | Out-Null
     } 'not part of the local pre-manual contract|out-of-band' `
         'a local request cannot promote manual approval evidence into acceptance authority'
 
@@ -10252,8 +10275,8 @@ try {
         'mixed-worker-multiplayer.json'
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     try {
-    $adapterAcceptance = Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-        -DevelopmentReadiness
+        $adapterAcceptance = Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
+            -DevelopmentReadiness -ExternalQualificationExempt
         Assert-True ($adapterAcceptance.status -ceq 'ready-for-manual-approval' -and
             $adapterAcceptance.gateName -ceq 'stage5-development-readiness' -and
             -not [bool]$adapterAcceptance.finalAcceptanceClaim -and
@@ -10264,6 +10287,9 @@ try {
                 $_.freshness -cne 'current-cohort'
             }).Count -eq 0) `
             'the installed lockstep-v2 child passes through the pre-manual readiness adapter'
+        $adapterValidatedClosure = @(Get-Stage5FinalAcceptanceValidatedClosure)
+        Assert-True ($adapterValidatedClosure.Count -gt 0) `
+            'a successful development-readiness aggregation publishes its validated closure'
     }
     catch {
         Assert-True $false "the installed lockstep-v2 adapter should satisfy final acceptance: $($_.Exception.Message)"
@@ -10283,7 +10309,7 @@ try {
         Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
         Assert-Throws {
             Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-                -DevelopmentReadiness | Out-Null
+                -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
         } 'repeats or does not authorize attachment' `
             'replay acceptance rejects a duplicate composite role/title attachment key'
 
@@ -10302,7 +10328,7 @@ try {
         Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
         Assert-Throws {
             Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-                -DevelopmentReadiness | Out-Null
+                -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
         } 'title scope|expected.*Generals|expected.*ZeroHour' `
             'replay acceptance rejects reviewed receipts swapped across title bindings'
     }
@@ -10316,7 +10342,7 @@ try {
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {
         Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -DevelopmentReadiness | Out-Null
+            -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
     } "exact title scope 'ZeroHour'" `
         'final acceptance rejects a deterministic-runtime envelope relabeled as Generals'
     $runtimeTitleDocument.title = 'ZeroHour'
@@ -10328,7 +10354,7 @@ try {
     Write-JsonDocument $acceptanceRequest $futureCohortRequest
     Assert-Throws {
         Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -DevelopmentReadiness | Out-Null
+            -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
     } 'canonical current UTC timestamp' `
         'final acceptance rejects a fully self-consistent manifest cohort rebased into the future'
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
@@ -10351,7 +10377,7 @@ try {
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {
         Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -DevelopmentReadiness | Out-Null
+            -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
     } 'canonical artifact-set files|canonical executable' `
         'the lockstep adapter rejects a copied executable with staged sidecars'
     $evidencePaths['mixed-worker-multiplayer'] = $lockstepAdapterEvidencePath
@@ -10362,7 +10388,8 @@ try {
     Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
+            -ExternalQualificationExempt | Out-Null
     } 'wrong trust domain' `
         'the lockstep-v2 adapter rejects a multiplayer child outside the host-runner trust domain'
     $lockstepAdapterDocument.attachments[0].trustDomain = $adapterTrustDomain
@@ -10370,12 +10397,17 @@ try {
     Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
+            -ExternalQualificationExempt | Out-Null
     } 'SHA-256 mismatch' `
         'the lockstep-v2 adapter rejects a substituted native-child hash'
     $lockstepAdapterDocument.attachments[0].sha256 = $lockstepAdapterHash
     Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
+    # Failed aggregations intentionally fail closed after collecting a partial
+    # closure. Standalone immutable-reader mutation tests below are independent
+    # invocations, so they must not inherit that abandoned collector.
+    Reset-Stage5TestFinalAcceptanceValidatedClosure
 
     $receiptBytesCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-receipt-bytes'
     $receiptBytesPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $receiptBytesCaseRoot
@@ -10954,7 +10986,7 @@ try {
     $acceptanceOutput = Join-Path $acceptanceRoot 'final-acceptance-report.json'
     & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
         -AcceptanceManifestPath $acceptanceRequest -OutputPath $acceptanceOutput `
-        -DevelopmentReadiness | Out-Null
+        -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
     $acceptanceReport = Get-Content -LiteralPath $acceptanceOutput -Raw | ConvertFrom-Json
     Assert-True ($acceptanceReport.status -ceq 'ready-for-manual-approval' -and
         $acceptanceReport.gateName -ceq 'stage5-development-readiness' -and
@@ -10967,7 +10999,8 @@ try {
     Write-AcceptanceRequest $missingManualRequest @($acceptanceKinds | Where-Object {
         $_ -cne 'manual-acceptance'
     })
-    $missingManualReport = Invoke-Stage5FinalAcceptanceAggregation $missingManualRequest
+    $missingManualReport = Invoke-Stage5FinalAcceptanceAggregation $missingManualRequest `
+        -ExternalQualificationExempt
     Assert-True ($missingManualReport.status -ceq 'ready-for-manual-approval' -and
         -not [bool]$missingManualReport.finalAcceptanceClaim -and
         [bool]$missingManualReport.manualApprovalRequired) `
@@ -10978,7 +11011,8 @@ try {
     Write-JsonDocument $evidencePaths['combined-stage4-stage5-installed-runtime'] $combinedDocument
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
+            -ExternalQualificationExempt | Out-Null
     } 'requires pipelineMode=parallel' `
         'final acceptance rejects a serial Stage 4 pipeline masquerading as the combined policy lane'
     $combinedDocument.details.pipelineMode = 'parallel'
@@ -10989,11 +11023,15 @@ try {
     Write-JsonDocument $evidencePaths['deterministic-runtime'] $staleArtifactDocument
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
+            -ExternalQualificationExempt | Out-Null
     } 'does not identify the same passed x64 commit and artifact set' `
         'final acceptance rejects evidence from a different artifact set'
     $staleArtifactDocument.artifactSetSha256 = $artifactSetHash
     Write-JsonDocument $evidencePaths['deterministic-runtime'] $staleArtifactDocument
+    # The failed stale-artifact aggregation above owns a partial collector;
+    # the NET3 and scaling reader tests below are separate mutation suites.
+    Reset-Stage5TestFinalAcceptanceValidatedClosure
 
     $net3Manifest = Join-Path $attachmentRoot 'mixed-worker-multiplayer-multiplayer-results.json'
     $net3Proof = Read-Stage5Net3LoopbackEvidence $net3Manifest $sourceCommit $artifactSetHash `
@@ -11448,7 +11486,8 @@ try {
     [IO.File]::AppendAllText($hostAttachment, 'tampered')
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest | Out-Null
+        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
+            -ExternalQualificationExempt | Out-Null
     } 'attachment.*SHA-256 mismatch' `
         'final acceptance independently rehashes and rejects a tampered attachment'
     }

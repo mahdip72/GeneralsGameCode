@@ -5,6 +5,49 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $sourcePath = Join-Path $PSScriptRoot 'DeterministicSimulationValidation.Tests.ps1'
 $sourceText = [IO.File]::ReadAllText($sourcePath)
+$tokens = $null
+$parseErrors = $null
+$sourceAst = [Management.Automation.Language.Parser]::ParseInput(
+    $sourceText, [ref]$tokens, [ref]$parseErrors)
+if (@($parseErrors).Count -ne 0) {
+    throw "The validation entrypoint does not parse: $($parseErrors[0].Message)"
+}
+
+# The synthetic final-acceptance fixture deliberately records installed-kernel
+# execution as externally exempt. Every positive or downstream-negative use of
+# that fixture must therefore opt in, while one explicit omission remains to
+# prove the production guard fails closed.
+$aggregationCommands = @($sourceAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -ceq 'Invoke-Stage5FinalAcceptanceAggregation'
+}, $true))
+$unexemptedAggregationCommands = @($aggregationCommands | Where-Object {
+    @($_.CommandElements | Where-Object {
+        $_ -is [Management.Automation.Language.CommandParameterAst] -and
+            $_.ParameterName -ceq 'ExternalQualificationExempt'
+    }).Count -eq 0
+})
+if ($unexemptedAggregationCommands.Count -ne 1 -or
+    $unexemptedAggregationCommands[0].Extent.Text -cnotmatch '-DevelopmentReadiness') {
+    throw 'The skipped installed-kernel fixture must have exactly one explicit fail-closed omission case.'
+}
+if ($sourceText -cnotmatch
+    'a skipped installed-kernel qualification fails closed without an explicit exemption') {
+    throw 'The explicit installed-kernel exemption omission is missing its guard assertion.'
+}
+$closureResetCommands = @($sourceAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -ceq 'Reset-Stage5TestFinalAcceptanceValidatedClosure'
+}, $true))
+if ($closureResetCommands.Count -ne 2) {
+    throw 'Independent immutable-reader mutation suites must reset abandoned aggregation collectors.'
+}
+if ($sourceText -cnotmatch
+    '(?s)Invoke-Stage5FinalAcceptance\.ps1.{0,300}-ExternalQualificationExempt') {
+    throw 'The final-acceptance script test must authorize its synthetic installed-kernel exemption.'
+}
 # Execute the actual test entrypoint's early routing preflight, not a copied
 # selector implementation. It returns before module imports or fixture I/O.
 $entrypoint = [scriptblock]::Create($sourceText)
