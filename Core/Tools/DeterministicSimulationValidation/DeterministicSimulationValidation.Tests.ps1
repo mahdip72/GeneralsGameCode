@@ -9625,8 +9625,17 @@ try {
         'combined host producer rejects reused source run nonces'
 
     function Set-CombinedNativeRawPathFixture {
-        param([string]$CaseRoot, [ValidateSet('absolute', 'upload-rebase', 'traversal', 'ads', 'drive-relative')][string]$Mode)
-        foreach ($title in @('Generals', 'ZeroHour')) {
+        param(
+            [string]$CaseRoot,
+            [ValidateSet('absolute', 'upload-rebase', 'traversal', 'ads', 'drive-relative')]
+            [string]$Mode,
+            [ValidateSet('Generals', 'ZeroHour', 'Both')][string]$Title = 'Both'
+        )
+        $titles = if ($Title -ceq 'Both') {
+            @('Generals', 'ZeroHour')
+        }
+        else { @($Title) }
+        foreach ($title in $titles) {
             $receiptDirectory = Join-Path $CaseRoot "combined-source-receipts\$title"
             $sourcePath = Join-Path $receiptDirectory 'validation-results-receipt.json'
             $receiptDocuments = [ordered]@{}
@@ -9717,46 +9726,44 @@ try {
         }
     }
 
-    $combinedAbsoluteRoot = New-CombinedHostProducerTestCase 'native-absolute-paths'
-    Set-CombinedNativeRawPathFixture $combinedAbsoluteRoot 'absolute'
+    # One complete two-title corpus exercises both accepted native path modes.
+    # Repeating the 253-child producer once per mode duplicates the expensive
+    # immutable-read and staging matrix without covering a distinct code path;
+    # the focused relocation suite retains exhaustive per-mode negatives.
+    $combinedPathModesRoot = New-CombinedHostProducerTestCase 'native-path-modes'
+    Set-CombinedNativeRawPathFixture $combinedPathModesRoot 'absolute' 'Generals'
+    Set-CombinedNativeRawPathFixture $combinedPathModesRoot 'upload-rebase' 'ZeroHour'
     try {
-        Invoke-CombinedHostProducerTestCase $combinedAbsoluteRoot
-        $combinedAbsoluteDocument = Get-Content -LiteralPath (Join-Path $combinedAbsoluteRoot 'combined-results.json') -Raw |
+        Invoke-CombinedHostProducerTestCase $combinedPathModesRoot
+        $combinedPathModesDocument = Get-Content -LiteralPath `
+            (Join-Path $combinedPathModesRoot 'combined-results.json') -Raw |
             ConvertFrom-Json
-        $combinedAbsoluteChildren = @($combinedAbsoluteDocument.provenance.children)
-        Assert-True ($combinedAbsoluteChildren.Count -eq 2 -and
-            @($combinedAbsoluteChildren | Where-Object {
+        $combinedPathModeChildren = @($combinedPathModesDocument.provenance.children)
+        Assert-True ($combinedPathModeChildren.Count -eq 2 -and
+            @($combinedPathModeChildren | Where-Object {
+                [string]$_.title -ceq 'Generals' -and
                 @($_.nativeRawBindings).Count -eq 2 -and
                 @($_.nativeRawBindings | Where-Object {
                     [string]$_.sourcePath -match '^[A-Za-z]:[\\/]' -and
+                    [string]$_.sourcePath -notmatch '^H:\\uploaded-stage5\\' -and
                     [string]$_.path -notmatch '^[A-Za-z]:|^[\\/]' -and
                     [string]$_.path -notmatch '(^|[\\/])\.\.([\\/]|$)'
                 }).Count -eq 2 -and
                 [string]$_.nativeReceiptSourcePath -match '^[A-Za-z]:[\\/]'
-            }).Count -eq 2) `
-            'combined host producer stages native absolute raw-log paths through explicit relative bindings without rewriting the hash-bound receipt'
+            }).Count -eq 1 -and
+            @($combinedPathModeChildren | Where-Object {
+                [string]$_.title -ceq 'ZeroHour' -and
+                [string]$_.nativeReceiptSourcePath -match '^H:\\uploaded-stage5\\' -and
+                @($_.nativeRawBindings | Where-Object {
+                    [string]$_.sourcePath -match '^H:\\uploaded-stage5\\' -and
+                    [string]$_.path -notmatch '^[A-Za-z]:|^[\\/]' -and
+                    [string]$_.path -notmatch '(^|[\\/])\.\.([\\/]|$)'
+                }).Count -eq 2
+            }).Count -eq 1) `
+            'combined producer stages absolute and uploaded native provenance in one complete title-scoped corpus'
     }
     catch {
-        Assert-True $false "combined host producer accepts native absolute raw-log paths: $($_.Exception.Message)"
-    }
-    $combinedRebasedRoot = New-CombinedHostProducerTestCase 'native-upload-rebase'
-    Set-CombinedNativeRawPathFixture $combinedRebasedRoot 'upload-rebase'
-    try {
-        Invoke-CombinedHostProducerTestCase $combinedRebasedRoot
-        $rebasedDocument = Get-Content -LiteralPath `
-            (Join-Path $combinedRebasedRoot 'combined-results.json') -Raw |
-            ConvertFrom-Json
-        Assert-True (@($rebasedDocument.provenance.children | Where-Object {
-            [string]$_.nativeReceiptSourcePath -match '^H:\\uploaded-stage5\\' -and
-            @($_.nativeRawBindings | Where-Object {
-                [string]$_.sourcePath -match '^H:\\uploaded-stage5\\' -and
-                [string]$_.path -notmatch '^[A-Za-z]:'
-            }).Count -eq 2
-        }).Count -eq 2) `
-            'combined producer preserves original uploaded native provenance while validating downloaded immutable copies'
-    }
-    catch {
-        Assert-True $false "combined host producer accepts an uploaded/rebased native receipt: $($_.Exception.Message)"
+        Assert-True $false "combined host producer accepts mixed absolute and uploaded native paths: $($_.Exception.Message)"
     }
     foreach ($pathMode in @(
         @{ mode = 'traversal'; pattern = 'parent traversal' },
