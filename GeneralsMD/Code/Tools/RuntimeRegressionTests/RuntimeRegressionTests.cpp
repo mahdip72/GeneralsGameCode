@@ -1014,6 +1014,53 @@ static void TestSkirmishAIRecoveryPolicies()
 	input.protectedReserve = 0;
 	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1600);
 
+	// A contained builder is not usable, but it prevents the runtime from
+	// declaring permanent last stand. A factory may queue a usable replacement;
+	// without a factory, recovery keeps retrying for the contained unit to exit.
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.noBuilderPath = IsSkirmishAIRecoveryBuilderPathUnavailable(
+		false, true, false, true);
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(input, TRUE, FALSE, FALSE, FALSE, 1600);
+	input.hasBuilderFactory = false;
+	input.noBuilderPath = IsSkirmishAIRecoveryBuilderPathUnavailable(
+		false, true, false, false);
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1600);
+	CHECK(IsSkirmishAIRecoveryBuilderPathUnavailable(
+		false, false, false, false));
+	CHECK(ShouldOrderSkirmishAIRecoveryBuilderExit(
+		true, true, true, false, false));
+	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
+		true, true, true, true, false));
+	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
+		true, false, true, false, false));
+	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
+		true, true, false, false, false));
+	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
+		true, true, true, false, true));
+	UnsignedInt evacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
+		100, 0, true, 60);
+	CHECK(evacuationDeadline == 160);
+	CHECK(GetSkirmishAIRecoveryEvacuationDeadline(
+		120, evacuationDeadline, true, 60) == evacuationDeadline);
+	CHECK(IsSkirmishAIRecoveryEvacuationGraceActive(
+		159, evacuationDeadline, true));
+	CHECK(!IsSkirmishAIRecoveryEvacuationGraceActive(
+		160, evacuationDeadline, true));
+	CHECK(GetSkirmishAIRecoveryEvacuationDeadline(
+		120, evacuationDeadline, false, 60) == 0);
+	CHECK(GetSkirmishAIRecoveryEvacuationDeadlineForVersion(3, 999) == 0);
+	CHECK(GetSkirmishAIRecoveryEvacuationDeadlineForVersion(4, 999) == 999);
+	evacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
+		0xFFFFFFFEU, 0, true, 3);
+	CHECK(evacuationDeadline == 1U);
+	CHECK(IsSkirmishAIRecoveryEvacuationGraceActive(
+		0xFFFFFFFFU, evacuationDeadline, true));
+	CHECK(IsSkirmishAIRecoveryEvacuationGraceActive(
+		0U, evacuationDeadline, true));
+	CHECK(!IsSkirmishAIRecoveryEvacuationGraceActive(
+		1U, evacuationDeadline, true));
+
 	// With no builder route left, the completed-but-missing AI has reached a
 	// genuine last stand. Retaining a construction reserve cannot help.
 	input = MakeSkirmishAIRecoveryPolicyInput();

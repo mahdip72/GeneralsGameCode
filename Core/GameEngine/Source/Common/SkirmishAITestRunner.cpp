@@ -506,6 +506,7 @@ Int CountSkirmishAIRecoveryBuilders(Player *player, const ThingTemplate **builde
 		object = object->getNextObject())
 	{
 		if (!IsLiveSkirmishAIRecoveryObject(object) ||
+			object->isContained() ||
 			object->getControllingPlayer() != player ||
 			!object->isKindOf(KINDOF_DOZER) || !object->getAIUpdateInterface() ||
 			!object->getAIUpdateInterface()->getDozerAIInterface())
@@ -529,6 +530,7 @@ Int CountSkirmishAIRecoveryBuildersForTemplate(
 		object = object->getNextObject())
 	{
 		if (!IsLiveSkirmishAIRecoveryObject(object) ||
+			object->isContained() ||
 			object->getControllingPlayer() != player ||
 			!object->isKindOf(KINDOF_DOZER) || !object->getAIUpdateInterface() ||
 			!object->getAIUpdateInterface()->getDozerAIInterface() ||
@@ -548,6 +550,7 @@ Bool HasSkirmishAIRecoveryBuilderTemplate(Player *player, const ThingTemplate *b
 		object = object->getNextObject())
 	{
 		if (!IsLiveSkirmishAIRecoveryObject(object) ||
+			object->isContained() ||
 			object->getControllingPlayer() != player ||
 			!object->isKindOf(KINDOF_DOZER) || !object->getAIUpdateInterface() ||
 			!object->getAIUpdateInterface()->getDozerAIInterface() ||
@@ -567,6 +570,7 @@ Bool HasSkirmishAIRecoveryPendingBuilderWork(Player *player)
 		object = object->getNextObject())
 	{
 		if (!IsLiveSkirmishAIRecoveryObject(object) ||
+			object->isContained() ||
 			object->getControllingPlayer() != player ||
 			!object->isKindOf(KINDOF_DOZER) || !object->getAIUpdateInterface())
 			continue;
@@ -601,6 +605,7 @@ const ThingTemplate *ResolveSkirmishAIRecoveryBuilderTemplate(
 					object = object->getNextObject())
 				{
 					if (!IsLiveSkirmishAIRecoveryObject(object) ||
+						object->isContained() ||
 						object->getControllingPlayer() != player ||
 						!object->isKindOf(KINDOF_DOZER) ||
 						!object->getAIUpdateInterface() ||
@@ -621,6 +626,7 @@ const ThingTemplate *ResolveSkirmishAIRecoveryBuilderTemplate(
 		object = object->getNextObject())
 	{
 		if (!IsLiveSkirmishAIRecoveryObject(object) ||
+			object->isContained() ||
 			object->getControllingPlayer() != player ||
 			!object->isKindOf(KINDOF_DOZER) || !object->getAIUpdateInterface() ||
 			!object->getAIUpdateInterface()->getDozerAIInterface())
@@ -843,6 +849,7 @@ Int CountSkirmishAIRecoveryBuildersProducedByFactory(
 		object = object->getNextObject())
 	{
 		if (IsLiveSkirmishAIRecoveryObject(object) &&
+			!object->isContained() &&
 			object->getControllingPlayer() == player &&
 			object->isKindOf(KINDOF_DOZER) &&
 			object->getTemplate()->isEquivalentTo(builderTemplate) &&
@@ -863,6 +870,7 @@ ObjectID FindSkirmishAIRecoveryBuilderProducedByFactory(
 		object = object->getNextObject())
 	{
 		if (IsLiveSkirmishAIRecoveryObject(object) &&
+			!object->isContained() &&
 			object->getControllingPlayer() == player &&
 			object->isKindOf(KINDOF_DOZER) &&
 			object->getTemplate()->isEquivalentTo(builderTemplate) &&
@@ -907,8 +915,10 @@ Object *FindSkirmishAIRecoveryBaselineBuilder(Player *player)
 	{
 		Object *object = TheGameLogic->findObjectByID(s_recovery.baselineBuilderIDs[i]);
 		if (IsLiveSkirmishAIRecoveryObject(object) &&
+			!object->isContained() &&
 			object->getControllingPlayer() == player &&
-			object->isKindOf(KINDOF_DOZER) && object->getAIUpdateInterface())
+			object->isKindOf(KINDOF_DOZER) && object->getAIUpdateInterface() &&
+			object->getAIUpdateInterface()->getDozerAIInterface())
 			return object;
 	}
 	return nullptr;
@@ -923,6 +933,7 @@ Bool HasUnexpectedSkirmishAIRecoveryBuilder(Player *player)
 		object = object->getNextObject())
 	{
 		if (IsLiveSkirmishAIRecoveryObject(object) &&
+			!object->isContained() &&
 			object->getControllingPlayer() == player &&
 			object->isKindOf(KINDOF_DOZER) &&
 			object->getTemplate()->isEquivalentTo(s_recovery.builderTemplate) &&
@@ -942,6 +953,7 @@ Object *FindSkirmishAIRecoverySpareBaselineBuilder(
 	{
 		Object *object = TheGameLogic->findObjectByID(s_recovery.baselineBuilderIDs[i]);
 		if (!IsLiveSkirmishAIRecoveryObject(object) ||
+			object->isContained() ||
 			object->getID() == excludedBuilderID ||
 			object->getControllingPlayer() != player ||
 			!object->isKindOf(KINDOF_DOZER) ||
@@ -1086,8 +1098,11 @@ void CaptureSkirmishAIRecoveryBaselineIDs(
 		if (s_recovery.baselineBuilderIDCount >= SKIRMISH_AI_RECOVERY_DIAGNOSTIC_MAX_IDS)
 			break;
 		if (IsLiveSkirmishAIRecoveryObject(object) &&
+			!object->isContained() &&
 			object->getControllingPlayer() == player &&
 			object->isKindOf(KINDOF_DOZER) &&
+			object->getAIUpdateInterface() &&
+			object->getAIUpdateInterface()->getDozerAIInterface() &&
 			object->getTemplate()->isEquivalentTo(builderTemplate))
 			s_recovery.baselineBuilderIDs[s_recovery.baselineBuilderIDCount++] = object->getID();
 	}
@@ -1164,6 +1179,7 @@ void PrintSkirmishAIRecoveryFactoryDiagnostics(Player *player, const char *reaso
 		object = object->getNextObject())
 	{
 		if (!IsLiveSkirmishAIRecoveryObject(object) ||
+			object->isContained() ||
 			object->getControllingPlayer() != player ||
 			!object->isKindOf(KINDOF_DOZER) ||
 			!s_recovery.builderTemplate ||
@@ -1192,7 +1208,8 @@ void PrintSkirmishAIRecoveryScaffoldDiagnostics(
 		? commandCenter->getBuilderID() : s_recovery.lastConstructionBuilderID;
 	Object *builder = builderID != INVALID_ID && TheGameLogic
 		? TheGameLogic->findObjectByID(builderID) : nullptr;
-	const Bool builderLive = IsLiveSkirmishAIRecoveryObject(builder);
+	const Bool builderLive = IsLiveSkirmishAIRecoveryObject(builder) &&
+		!builder->isContained();
 	const Bool builderOwner = builderLive && player &&
 		builder->getControllingPlayer() == player;
 	AIUpdateInterface *ai = builderLive ? builder->getAIUpdateInterface() : nullptr;
@@ -2334,6 +2351,7 @@ Bool ObserveSkirmishAIRecoveryFixture(Player *player)
 
 		Object *builder = TheGameLogic->findObjectByID(commandCenter->getBuilderID());
 		if (builder && IsLiveSkirmishAIRecoveryObject(builder) &&
+			!builder->isContained() &&
 			builder->getControllingPlayer() == player)
 		{
 			s_recovery.sawConstructionOwnership = TRUE;
@@ -2601,6 +2619,7 @@ Bool TryInjectSkirmishAIRecoverySecondBuilderLoss(
 
 	Object *builder = TheGameLogic->findObjectByID(commandCenter->getBuilderID());
 	if (!builder || !IsLiveSkirmishAIRecoveryObject(builder) ||
+		builder->isContained() ||
 		builder->getControllingPlayer() != player)
 	{
 		FailSkirmishAITest("fixture_second_builder_loss_target_missing");
@@ -2857,6 +2876,32 @@ void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 			}
 			s_recovery.obstructionID = obstruction->getID();
 			s_recovery.obstructionOriginalPosition = *obstruction->getPosition();
+		}
+		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_SURVIVING_BUILDER)
+		{
+			// Isolate surviving_builder's baseline-builder reuse assertion without
+			// adding a free faction building that changes power, production, or
+			// placement. The low_cash fixture separately covers recovery under the
+			// stock victory rule with a real non-command-center victory structure.
+			const Int priorVictoryConditions =
+				TheVictoryConditions->getVictoryConditions();
+			if (priorVictoryConditions != VICTORY_NOBUILDINGS)
+			{
+				printf("SKIRMISH_AI_RECOVERY_DIAGNOSTIC "
+					"reason=unexpected_victory_conditions frame=%u conditions=%d\n",
+					frame, priorVictoryConditions);
+				fflush(stdout);
+				FailSkirmishAITest("fixture_unexpected_victory_conditions");
+				RequestSkirmishAITestStop();
+				return;
+			}
+			const Int fixtureVictoryConditions =
+				VICTORY_NOBUILDINGS | VICTORY_NOUNITS;
+			TheVictoryConditions->setVictoryConditions(fixtureVictoryConditions);
+			printf("SKIRMISH_AI_RECOVERY_PHASE phase=victory_conditions_overridden "
+				"frame=%u prior_conditions=%d conditions=%d\n", frame,
+				priorVictoryConditions, fixtureVictoryConditions);
+			fflush(stdout);
 		}
 
 #if RTS_ZEROHOUR
@@ -3160,6 +3205,10 @@ void UpdateSkirmishAIRecoveryFixture()
 		s_recovery.builderTemplate = builderTemplate;
 		CaptureSkirmishAIRecoveryBaselineIDs(
 			player, s_recovery.builderTemplate, s_recovery.builderFactoryID);
+		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_SURVIVING_BUILDER &&
+			(s_recovery.baselineBuilderIDCount <= 0 ||
+				!FindSkirmishAIRecoveryBaselineBuilder(player)))
+			return;
 		s_recovery.initialCenterID = commandCenter->getID();
 		s_recovery.lastCompletedCenterID = commandCenter->getID();
 		s_recovery.originalCenterPosition = *commandCenter->getPosition();

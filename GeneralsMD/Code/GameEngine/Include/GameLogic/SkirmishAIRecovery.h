@@ -52,6 +52,24 @@ inline int AddSkirmishAIRecoveryCost(int first, int second)
 	return first + second;
 }
 
+inline bool IsSkirmishAIRecoveryBuilderPathUnavailable(
+	bool hasBuilder, bool hasContainedBuilder,
+	bool builderQueuePaid, bool hasPotentialFactory)
+{
+	return !hasBuilder && !hasContainedBuilder &&
+		!builderQueuePaid && !hasPotentialFactory;
+}
+
+inline bool ShouldOrderSkirmishAIRecoveryBuilderExit(
+	bool hasCompatibleContainedBuilder, bool hasLiveOwnedContainer,
+	bool hasContainInterface, bool containerHasProduction,
+	bool builderAlreadyExiting)
+{
+	return hasCompatibleContainedBuilder && hasLiveOwnedContainer &&
+		hasContainInterface && !containerHasProduction &&
+		!builderAlreadyExiting;
+}
+
 inline int GetSkirmishAIRecoveryReserveCost(
 	const SkirmishAIRecoveryPolicyInput &input)
 {
@@ -141,4 +159,28 @@ inline unsigned int GetSkirmishAIRecoveryRetryFrame(
 	if (retryFrame == 0)
 		retryFrame = 1;
 	return retryFrame;
+}
+
+inline unsigned int GetSkirmishAIRecoveryEvacuationDeadline(
+	unsigned int currentFrame, unsigned int existingDeadline,
+	bool hasContainedBuilder, unsigned int graceFrames)
+{
+	if (!hasContainedBuilder)
+		return 0;
+	return existingDeadline != 0 ? existingDeadline :
+		GetSkirmishAIRecoveryRetryFrame(currentFrame, graceFrames);
+}
+
+inline bool IsSkirmishAIRecoveryEvacuationGraceActive(
+	unsigned int currentFrame, unsigned int deadline,
+	bool hasContainedBuilder)
+{
+	return hasContainedBuilder && deadline != 0 &&
+		!IsSkirmishAIRecoveryRetryDue(currentFrame, deadline);
+}
+
+inline unsigned int GetSkirmishAIRecoveryEvacuationDeadlineForVersion(
+	int version, unsigned int storedDeadline)
+{
+	return version >= 4 ? storedDeadline : 0;
 }

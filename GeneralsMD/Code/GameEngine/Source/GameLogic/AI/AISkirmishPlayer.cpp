@@ -278,6 +278,41 @@ static Bool IsSkirmishAIRecoveryBuilderCandidateBetter(
 		   candidate.object->getID() < current.object->getID())));
 }
 
+static Bool RecoverSkirmishAIContainedBuilders(
+	Player *player, const ThingTemplate *primaryTemplate)
+{
+	if (!player || !TheGameLogic || !primaryTemplate)
+		return false;
+	Bool hasContainedBuilder = false;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (!IsLiveSkirmishAIRecoveryObject(object, player) ||
+			!object->isContained() ||
+			!object->isKindOf(KINDOF_DOZER) ||
+			object->isDisabledByType(DISABLED_UNMANNED) ||
+			!object->getAIUpdateInterface() ||
+			!object->getAIUpdateInterface()->getDozerAIInterface() ||
+			!HasSkirmishAICommandForTemplate(object, primaryTemplate))
+			continue;
+		hasContainedBuilder = true;
+
+		Object *container = object->getContainedBy();
+		AIUpdateInterface *builderAI = object->getAIUpdateInterface();
+		const StateID builderState = builderAI->getCurrentStateID();
+		const Bool builderAlreadyExiting = builderState == AI_EXIT ||
+			builderState == AI_EXIT_INSTANTLY ||
+			builderState == AI_FOLLOW_EXITPRODUCTION_PATH;
+		if (!ShouldOrderSkirmishAIRecoveryBuilderExit(
+			true, IsLiveSkirmishAIRecoveryObject(container, player),
+			container && container->getContain(),
+			container && container->getProductionUpdateInterface(),
+			builderAlreadyExiting))
+			continue;
+		builderAI->aiExit(container, CMD_FROM_AI);
+	}
+	return hasContainedBuilder;
+}
+
 static void CollectSkirmishAIRecoveryBuilders(
 	Player *player, const Coord3D *position,
 	const ThingTemplate *primaryTemplate, std::vector<Object *> *builders)
@@ -292,6 +327,7 @@ static void CollectSkirmishAIRecoveryBuilders(
 	for (Object *object = TheGameLogic->getFirstObject(); object;
 		object = object->getNextObject()) {
 		if (!IsLiveSkirmishAIRecoveryObject(object, player) ||
+			object->isContained() ||
 			!object->isKindOf(KINDOF_DOZER) ||
 			object->isDisabledByType(DISABLED_UNMANNED) ||
 			!object->getAIUpdateInterface() ||
@@ -452,6 +488,7 @@ m_curRightFlankRightDefenseAngle(0),
 	m_recoveryConstructionID(INVALID_ID),
 	m_recoveryPlacementAttempt(0),
 	m_recoveryNextAttemptFrame(0),
+	m_recoveryEvacuationDeadline(0),
 	m_recoveryReserveCost(0),
 	m_recoveryAuthorizedThing(nullptr)
 
@@ -925,6 +962,7 @@ Bool AISkirmishPlayer::tryCriticalCommandCenterConstruction(
 			continue;
 
 		m_recoveryConstructionID = construction->getID();
+		m_recoveryEvacuationDeadline = 0;
 		m_recoveryLocation = position;
 		m_recoveryPlacementAttempt = 0;
 		m_recoveryNextAttemptFrame = 0;
@@ -947,6 +985,7 @@ Bool AISkirmishPlayer::tryCriticalCommandCenterConstruction(
 void AISkirmishPlayer::enterRecoveryLastStand()
 {
 	const Bool maintenance = m_recoveryImpossible;
+	m_recoveryEvacuationDeadline = 0;
 	// Hunt deliberately searches enemies without line-of-sight checks. Use a
 	// known objective and ordinary attack-move acquisition for the last stand.
 	Coord3D target;
@@ -997,11 +1036,13 @@ void AISkirmishPlayer::updateCriticalRecovery()
 {
 	if (!usesCriticalRecoveryBehavior()) {
 		m_recoveryReserveCost = 0;
+		m_recoveryEvacuationDeadline = 0;
 		return;
 	}
 	const UnsignedInt frame = TheGameLogic->getFrame();
 	if (m_recoveryImpossible) {
 		m_recoveryReserveCost = 0;
+		m_recoveryEvacuationDeadline = 0;
 		if (IsSkirmishAIRecoveryRetryDue(frame, m_recoveryNextAttemptFrame)) {
 			enterRecoveryLastStand();
 		}
@@ -1050,6 +1091,7 @@ void AISkirmishPlayer::updateCriticalRecovery()
 	} else if (hasCenter) {
 		m_recoveryEverCompleted = true;
 		m_recoveryImpossible = false;
+		m_recoveryEvacuationDeadline = 0;
 		m_recoveryConstructionID = center->getID();
 		m_recoveryLocation = *center->getPosition();
 		m_recoveryAngle = center->getOrientation();
@@ -1066,6 +1108,7 @@ void AISkirmishPlayer::updateCriticalRecovery()
 			// The hole owns the free worker and native isRebuild construction;
 			// leave that lifecycle untouched and do not queue a paid duplicate.
 			m_recoveryConstructionID = center->getID();
+			m_recoveryEvacuationDeadline = 0;
 			m_recoveryReserveCost = 0;
 			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
 				frame, 2 * LOGICFRAMES_PER_SECOND);
@@ -1076,6 +1119,7 @@ void AISkirmishPlayer::updateCriticalRecovery()
 			center->getBuilderID());
 		Bool assignedUsable = IsLiveSkirmishAIRecoveryObject(
 			assignedBuilder, m_player) &&
+			!assignedBuilder->isContained() &&
 			!assignedBuilder->isDisabledByType(DISABLED_UNMANNED) &&
 			assignedBuilder->getAIUpdateInterface() &&
 			assignedBuilder->getAIUpdateInterface()->getDozerAIInterface();
@@ -1098,6 +1142,7 @@ void AISkirmishPlayer::updateCriticalRecovery()
 			if (assignedPathable &&
 				assignedDozer->isTaskPending(DOZER_TASK_BUILD) &&
 				assignedDozer->getTaskTarget(DOZER_TASK_BUILD) == center->getID()) {
+				m_recoveryEvacuationDeadline = 0;
 				m_recoveryReserveCost = 0;
 				m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
 					frame, 2 * LOGICFRAMES_PER_SECOND);
@@ -1107,6 +1152,11 @@ void AISkirmishPlayer::updateCriticalRecovery()
 			// scaffold is reachable.  Let the bounded replacement pass consider
 			// every compatible builder before retrying the assigned one later.
 		}
+		const Bool hasContainedBuilder =
+			RecoverSkirmishAIContainedBuilders(m_player, primaryTemplate);
+		m_recoveryEvacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
+			frame, m_recoveryEvacuationDeadline, hasContainedBuilder,
+			2 * LOGICFRAMES_PER_SECOND);
 
 		// The old builder is no longer a valid owner of the scaffold.  Clear
 		// the binding before asking a different compatible builder to resume it.
@@ -1134,6 +1184,7 @@ void AISkirmishPlayer::updateCriticalRecovery()
 					? replacementAI->getDozerAIInterface() : nullptr;
 				if (replacementDozer && replacementDozer->isTaskPending(DOZER_TASK_BUILD) &&
 					replacementDozer->getTaskTarget(DOZER_TASK_BUILD) == center->getID()) {
+					m_recoveryEvacuationDeadline = 0;
 					m_recoveryReserveCost = 0;
 					m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
 						frame, 2 * LOGICFRAMES_PER_SECOND);
@@ -1149,7 +1200,6 @@ void AISkirmishPlayer::updateCriticalRecovery()
 				frame, 2 * LOGICFRAMES_PER_SECOND);
 			return;
 		}
-
 		Bool builderQueuedPaid = false;
 		ObjectID queuedFactoryID = INVALID_ID;
 		const Bool builderQueued = hasRecoveryBuilderQueued(
@@ -1162,6 +1212,12 @@ void AISkirmishPlayer::updateCriticalRecovery()
 			&hasPotentialFactory);
 		const Int replacementCost = replacementTemplate
 			? replacementTemplate->calcCostToBuild(m_player) : 0;
+		if (IsSkirmishAIRecoveryEvacuationGraceActive(
+			frame, m_recoveryEvacuationDeadline, hasContainedBuilder)) {
+			m_recoveryReserveCost = replacementCost > 0 ? replacementCost : 0;
+			m_recoveryNextAttemptFrame = m_recoveryEvacuationDeadline;
+			return;
+		}
 		if ((!builderQueued || !builderQueuedPaid) && replacementFactory &&
 			replacementTemplate && replacementCost >= 0 &&
 			m_player->getMoney()->countMoney() >= replacementCost &&
@@ -1175,6 +1231,12 @@ void AISkirmishPlayer::updateCriticalRecovery()
 		}
 		if (builderQueuedPaid || hasPotentialFactory) {
 			m_recoveryReserveCost = replacementCost > 0 ? replacementCost : 0;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+		if (hasContainedBuilder) {
+			m_recoveryReserveCost = 0;
 			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
 				frame, 2 * LOGICFRAMES_PER_SECOND);
 			return;
@@ -1319,12 +1381,26 @@ void AISkirmishPlayer::updateCriticalRecovery()
 		&builderTemplate, &builderFactory, &hasPotentialFactory);
 	Object *builder = findRecoveryBuilder(&m_recoveryLocation, primaryTemplate);
 	const Bool hasBuilder = builder != nullptr;
+	const Bool hasContainedBuilder =
+		RecoverSkirmishAIContainedBuilders(m_player, primaryTemplate);
+	m_recoveryEvacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
+		frame, m_recoveryEvacuationDeadline, hasContainedBuilder,
+		2 * LOGICFRAMES_PER_SECOND);
 	const Bool retryDue = IsSkirmishAIRecoveryRetryDue(
 		TheGameLogic->getFrame(), m_recoveryNextAttemptFrame);
 	const Int commandCenterCost = primaryTemplate->calcCostToBuild(m_player);
 	const Int builderCost = builderTemplate
 		? builderTemplate->calcCostToBuild(m_player) : 0;
 	const Int money = m_player->getMoney()->countMoney();
+	if (!hasBuilder && IsSkirmishAIRecoveryEvacuationGraceActive(
+		frame, m_recoveryEvacuationDeadline, hasContainedBuilder)) {
+		const Int recoveryCost = builderQueuedPaid
+			? commandCenterCost
+			: AddSkirmishAIRecoveryCost(commandCenterCost, builderCost);
+		m_recoveryReserveCost = max(protectedReserve, recoveryCost);
+		m_recoveryNextAttemptFrame = m_recoveryEvacuationDeadline;
+		return;
+	}
 
 	SkirmishAIRecoveryPolicyInput input;
 	input.enabled = true;
@@ -1335,7 +1411,9 @@ void AISkirmishPlayer::updateCriticalRecovery()
 	input.builderQueued = builderQueued;
 	input.builderQueuePaid = builderQueuedPaid;
 	input.hasBuilderFactory = builderFactory != nullptr;
-	input.noBuilderPath = !hasBuilder && !builderQueuedPaid && !hasPotentialFactory;
+	input.noBuilderPath = IsSkirmishAIRecoveryBuilderPathUnavailable(
+		hasBuilder, hasContainedBuilder, builderQueuedPaid,
+		hasPotentialFactory);
 	input.builderAffordable = builderFactory && builderTemplate && retryDue &&
 		TheBuildAssistant->canMakeUnit(builderFactory, builderTemplate) == CANMAKE_OK &&
 		money >= builderCost;
@@ -1672,6 +1750,7 @@ void AISkirmishPlayer::onStructureProduced(Object *factory, Object *structure)
 	m_recoveryEverCompleted = true;
 	m_recoveryImpossible = false;
 	m_recoveryConstructionID = structure->getID();
+	m_recoveryEvacuationDeadline = 0;
 	m_recoveryLocation = *structure->getPosition();
 	m_recoveryAngle = structure->getOrientation();
 	m_recoveryPlacementAttempt = 0;
@@ -3227,6 +3306,7 @@ void AISkirmishPlayer::newMap()
 			m_recoveryEverCompleted = true;
 			m_recoveryImpossible = false;
 			m_recoveryConstructionID = center->getID();
+			m_recoveryEvacuationDeadline = 0;
 			m_recoveryLocation = *center->getPosition();
 			m_recoveryAngle = center->getOrientation();
 			m_recoveryReserveCost = 0;
@@ -3315,6 +3395,8 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	xfer->xferObjectID(&m_recoveryConstructionID);
 	xfer->xferInt(&m_recoveryPlacementAttempt);
 	xfer->xferUnsignedInt(&m_recoveryNextAttemptFrame);
+	// Active evacuation grace is already mirrored by the retry frame.  Keep the
+	// v4 save field out of CRC so epoch-3 recordings retain their CRC layout.
 	xfer->xferCoord3D(&m_recoveryLocation);
 	xfer->xferReal(&m_recoveryAngle);
 	xfer->xferInt(&m_recoveryReserveCost);
@@ -3325,13 +3407,14 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	* Version Info;
 	* 1: Initial version
 	* 2: Current enemy and next enemy evaluation frame
-	* 3: Critical command-center recovery state */
+	* 3: Critical command-center recovery state
+	* 4: Contained-builder evacuation grace deadline */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 3;
+	XferVersion currentVersion = 4;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -3395,6 +3478,11 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 		m_recoveryAngle = 0.0f;
 		m_recoveryReserveCost = 0;
 	}
+	if (version >= 4)
+		xfer->xferUnsignedInt(&m_recoveryEvacuationDeadline);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		m_recoveryEvacuationDeadline =
+			GetSkirmishAIRecoveryEvacuationDeadlineForVersion(version, 0);
 	m_recoveryAuthorizedThing = nullptr;
 
 }

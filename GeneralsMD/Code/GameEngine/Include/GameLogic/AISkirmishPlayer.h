@@ -165,6 +165,7 @@ protected:
 	ObjectID m_recoveryConstructionID;
 	Int m_recoveryPlacementAttempt;
 	UnsignedInt m_recoveryNextAttemptFrame;
+	UnsignedInt m_recoveryEvacuationDeadline;
 	Coord3D m_recoveryLocation;
 	Real m_recoveryAngle;
 	Int m_recoveryReserveCost;
