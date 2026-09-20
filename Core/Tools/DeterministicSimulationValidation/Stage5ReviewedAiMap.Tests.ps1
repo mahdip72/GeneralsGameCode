@@ -1,6 +1,29 @@
 param([Parameter(Mandatory=$true)][string]$ScratchRoot)
 $ErrorActionPreference='Stop';Set-StrictMode -Version 2.0
-[IO.Directory]::CreateDirectory($ScratchRoot)|Out-Null
+
+# CTest supplies a shared H: validation scratch parent. Keep every fixture
+# below a fresh invocation root so a retained junction or snapshot from an
+# earlier run can never collide with this run. The parent itself remains an
+# ordinary, explicitly H:-contained directory; do not follow or remove a
+# reparse point while establishing the child root.
+$scratchParent = [IO.Path]::GetFullPath($ScratchRoot).TrimEnd('\')
+if (-not $scratchParent.StartsWith('H:\',
+        [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Stage 5 reviewed AI map test scratch must remain on H:.'
+}
+[IO.Directory]::CreateDirectory($scratchParent) | Out-Null
+$scratchParentItem = Get-Item -LiteralPath $scratchParent -Force
+if (($scratchParentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Stage 5 reviewed AI map test scratch parent is a reparse point: $scratchParent"
+}
+$runRoot = Join-Path $scratchParent ('reviewed-ai-map-{0}-{1}' -f
+    $PID, [Guid]::NewGuid().ToString('N'))
+[IO.Directory]::CreateDirectory($runRoot) | Out-Null
+$runRootItem = Get-Item -LiteralPath $runRoot -Force
+if (($runRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Stage 5 reviewed AI map test run root is a reparse point: $runRoot"
+}
+$ScratchRoot = $runRoot
 $env:TEMP=Join-Path $ScratchRoot 'Temp';$env:TMP=$env:TEMP
 [IO.Directory]::CreateDirectory($env:TEMP)|Out-Null
 Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') -Force
