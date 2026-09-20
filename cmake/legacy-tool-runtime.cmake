@@ -8,6 +8,15 @@ if(RTS_BUILD_PRODUCT OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
 endif()
 
 add_library(rts_legacy_tool_runtime INTERFACE)
+
+# The FFmpeg graph audit intentionally excludes the historical Miles/Bink
+# SDK targets.  Preserve the architecture-selected interface target so the
+# non-product x86 runtime selector remains valid, but keep the audit graph
+# free of dangling plain library names.
+if(RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+    return()
+endif()
+
 target_link_libraries(rts_legacy_tool_runtime INTERFACE milesstub)
 
 if(NOT RTS_BUILD_OPTION_FFMPEG)

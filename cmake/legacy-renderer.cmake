@@ -169,8 +169,10 @@ endfunction()
 # Attach the title-specific x86 renderer ABI and its historical PCH at the
 # target boundary.  The product CMake files call this neutral helper so no
 # backend source, include root, or compatibility link can enter the x64 graph.
+# The FFmpeg graph audit intentionally follows the neutral PCH branch below;
+# it has no D3D8 SDK target to satisfy the historical compatibility surface.
 function(rts_configure_title_ww3d2 target title)
-    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
         set(_legacy_root "${CMAKE_SOURCE_DIR}/Core/LegacyRenderer")
         set(_legacy_ww3d2 "${_legacy_root}/WWVegas/WW3D2")
         set(_legacy_gameengine_device "${_legacy_root}/GameEngineDevice")
@@ -231,7 +233,9 @@ function(rts_attach_title_legacy_renderer target title)
             "${_legacy_root}/WWVegas"
             "${_legacy_ww3d2}"
             "${_legacy_root}/GameEngineDevice/Include")
-        target_link_libraries(${target} PRIVATE ${_legacy_target})
+        if(NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+            target_link_libraries(${target} PRIVATE ${_legacy_target})
+        endif()
     endif()
 endfunction()
 
@@ -251,6 +255,8 @@ function(rts_attach_title_game_engine_device target title)
         else()
             message(FATAL_ERROR "Unknown title renderer ABI: ${title}")
         endif()
-        target_link_libraries(${target} PUBLIC ${_legacy_target})
+        if(NOT RTS_VIDEO_BACKEND_GRAPH_AUDIT)
+            target_link_libraries(${target} PUBLIC ${_legacy_target})
+        endif()
     endif()
 endfunction()

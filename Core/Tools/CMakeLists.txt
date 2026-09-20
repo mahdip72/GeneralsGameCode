@@ -1,5 +1,33 @@
 # Build tools
 
+# The FFmpeg backend graph audit uses interface-only FFmpeg package fixtures,
+# so it cannot compile the SDK implementation itself.  This tiny executable
+# still exercises the generated linker closure for the selected backend and
+# the architecture-selected runtime boundary.  Keep it diagnostic-only; it
+# must never enter a product or ordinary authoring graph.
+if(RTS_VIDEO_BACKEND_GRAPH_AUDIT AND TARGET rts_product_runtime)
+    find_package(FFMPEG REQUIRED)
+    add_executable(core_ffmpeg_graph_link_probe
+        VideoBackendSelectionAudit/FFmpegGraphLinkProbe.cpp
+    )
+    target_link_libraries(core_ffmpeg_graph_link_probe PRIVATE
+        rts_product_runtime
+        FFMPEG::avcodec
+        FFMPEG::avformat
+        FFMPEG::avutil
+        FFMPEG::swresample
+        FFMPEG::swscale
+    )
+    target_compile_definitions(core_ffmpeg_graph_link_probe PRIVATE
+        RTS_VIDEO_BACKEND_GRAPH_AUDIT=1
+    )
+    set_target_properties(core_ffmpeg_graph_link_probe PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED YES
+        CXX_EXTENSIONS NO
+    )
+endif()
+
 # Build useful tool binaries.
 if(RTS_BUILD_CORE_TOOLS)
     add_subdirectory(DebugWindow)
@@ -536,7 +564,7 @@ if(WIN32)
                 -FFmpegConfigDir "${CMAKE_CURRENT_SOURCE_DIR}/VideoBackendSelectionAudit/FFmpegConfig"
                 -CMakeCommand "${CMAKE_COMMAND}"
         )
-        set_tests_properties(core_video_backend_ffmpeg_graph_audit PROPERTIES TIMEOUT 300)
+        set_tests_properties(core_video_backend_ffmpeg_graph_audit PROPERTIES TIMEOUT 1200)
     endif()
 endif()
 
