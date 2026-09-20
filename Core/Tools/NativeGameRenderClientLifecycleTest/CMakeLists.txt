@@ -31,7 +31,6 @@ function(add_native_game_render_client_lifecycle_test target_name title_ww3d2)
         COMMAND ${target_name})
     set_tests_properties(${target_name} PROPERTIES
         TIMEOUT 30
-        ENVIRONMENT "GGC_STAGE5_WINDOW_TRACE=1"
         SKIP_RETURN_CODE 77)
 endfunction()
 
