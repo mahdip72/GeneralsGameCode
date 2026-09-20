@@ -188,6 +188,7 @@ protected:
 	Int m_recoveryReserveCost;
 	ObjectID m_recoveryBuilderFactoryID;
 	ProductionID m_recoveryBuilderProductionID;
+	Bool m_recoveryBuilderCancellationOwned;
 	const ThingTemplate *m_recoveryAuthorizedThing;
 
 };

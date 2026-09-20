@@ -278,10 +278,19 @@ inline bool ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
 }
 
 inline bool ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
-	bool nativeLifecycleOwned, bool exactIdentityTracked,
+	bool nativeLifecycleOwned, bool cancellationOwned,
+	bool exactIdentityTracked,
 	bool exactEntryExists)
 {
-	return nativeLifecycleOwned && exactIdentityTracked && exactEntryExists;
+	return nativeLifecycleOwned && cancellationOwned &&
+		exactIdentityTracked && exactEntryExists;
+}
+
+inline bool ShouldCancelSkirmishAIRecoveryExactPaidQueueForFailover(
+	bool cancellationOwned, bool exactIdentityMatches,
+	bool exactEntryExists)
+{
+	return cancellationOwned && exactIdentityMatches && exactEntryExists;
 }
 
 inline bool ShouldSelectSkirmishAIPrimaryCommandCenter(
@@ -726,13 +735,15 @@ inline bool ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
 
 inline bool ShouldDeferSkirmishAIRecoveryStalledDisposition(
 	bool paidQueueProgressing, bool factoryPotential,
+	bool replacementAttempted,
 	bool hasPresentUnusableNativeWorker)
 {
-	// Progressing paid production always defers. Factory potential also remains
-	// retryable for every state except a present unusable exact native worker,
-	// whose free canonical reset is the stronger bounded route.
+	// Progressing paid production always defers. Bare factory potential is a
+	// retryable route only while the one paid replacement budget remains. A
+	// present unusable exact native worker still takes its stronger bounded reset.
 	return paidQueueProgressing ||
-		(factoryPotential && !hasPresentUnusableNativeWorker);
+		(factoryPotential && !replacementAttempted &&
+		 !hasPresentUnusableNativeWorker);
 }
 
 // Never produce zero for a scheduled deadline: zero is reserved for the
@@ -786,6 +797,12 @@ GetSkirmishAIRecoveryProductionIdentityForVersion(
 	identity.factoryID = version >= 5 ? storedFactoryID : invalidFactoryID;
 	identity.productionID = version >= 5 ? storedProductionID : invalidProductionID;
 	return identity;
+}
+
+inline bool GetSkirmishAIRecoveryProductionCancellationOwnershipForVersion(
+	int version, bool storedOwnership)
+{
+	return version >= 6 ? storedOwnership : false;
 }
 
 inline bool IsSkirmishAIRecoveryProductionIdentityTracked(

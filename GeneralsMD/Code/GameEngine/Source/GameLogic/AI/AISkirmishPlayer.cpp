@@ -84,6 +84,14 @@ static Bool ShouldUseCurrentSkirmishAIRecoveryNativeHoleOwnership()
 		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 }
 
+static Bool ShouldUseCurrentSkirmishAIRecoveryCancellationOwnership()
+{
+	return ShouldUseSkirmishAIRecoveryCancellationOwnership(
+		TheGameLogic && TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
 static Bool IsCriticalRecoveryModeEnabled(Player *player)
 {
 	if (!player || player->getPlayerType() != PLAYER_COMPUTER || !TheGameLogic)
@@ -606,6 +614,7 @@ m_curRightFlankRightDefenseAngle(0),
 	m_recoveryReserveCost(0),
 	m_recoveryBuilderFactoryID(INVALID_ID),
 	m_recoveryBuilderProductionID(PRODUCTIONID_INVALID),
+	m_recoveryBuilderCancellationOwned(false),
 	m_recoveryAuthorizedThing(nullptr)
 
 {
@@ -1097,6 +1106,7 @@ Bool AISkirmishPlayer::queueRecoveryBuilder(
 		order->m_factoryID = factory->getID();
 	m_recoveryBuilderFactoryID = factory->getID();
 	m_recoveryBuilderProductionID = productionID;
+	m_recoveryBuilderCancellationOwned = true;
 	m_teamDelay = 0;
 	if (TheGlobalData->m_debugAI) {
 		AsciiString message = "Critical recovery queued builder from ";
@@ -1110,6 +1120,7 @@ void AISkirmishPlayer::clearRecoveryBuilderProduction()
 {
 	m_recoveryBuilderFactoryID = INVALID_ID;
 	m_recoveryBuilderProductionID = PRODUCTIONID_INVALID;
+	m_recoveryBuilderCancellationOwned = false;
 }
 
 void AISkirmishPlayer::validateRecoveryBuilderProduction()
@@ -1159,6 +1170,7 @@ void AISkirmishPlayer::bindRecoveryBuilderProductionIfNeeded(
 			productionID != PRODUCTIONID_INVALID)) {
 		m_recoveryBuilderFactoryID = factoryID;
 		m_recoveryBuilderProductionID = productionID;
+		m_recoveryBuilderCancellationOwned = false;
 	}
 }
 
@@ -1199,6 +1211,17 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 		}
 	}
 	if (!boundedEntry)
+		return false;
+	const Bool exactIdentityMatches =
+		IsSkirmishAIRecoveryProductionIdentityMatch(
+			m_recoveryBuilderFactoryID, m_recoveryBuilderProductionID,
+			boundedFactory->getID(), static_cast<Int>(boundedProductionID),
+			INVALID_ID, PRODUCTIONID_INVALID);
+	if (!ShouldCancelSkirmishAIRecoveryExactPaidQueueForFailover(
+			!ShouldUseCurrentSkirmishAIRecoveryCancellationOwnership() ||
+				m_recoveryBuilderCancellationOwned,
+			exactIdentityMatches,
+			boundedEntry != nullptr))
 		return false;
 
 	const ThingTemplate *boundedTemplate = boundedEntry->getProductionObject();
@@ -1269,11 +1292,7 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 	if (!alternateFactory || !alternateTemplate)
 		return false;
 
-	if (IsSkirmishAIRecoveryProductionIdentityMatch(
-			m_recoveryBuilderFactoryID, m_recoveryBuilderProductionID,
-			boundedFactory->getID(), static_cast<Int>(boundedProductionID),
-			INVALID_ID, PRODUCTIONID_INVALID))
-		clearRecoveryBuilderProduction();
+	clearRecoveryBuilderProduction();
 	boundedProduction->cancelUnitCreate(boundedProductionID);
 	Bool bindingCleared = false;
 	const Bool selectedIsFirstCompatible =
@@ -1319,6 +1338,8 @@ Bool AISkirmishPlayer::cancelRecoveryBuilderQueueForNativeRespawn(
 {
 	if (!ShouldUseCurrentSkirmishAIRecoveryNativeHoleOwnership() ||
 		!primaryTemplate || !m_player || !TheGameLogic ||
+		(ShouldUseCurrentSkirmishAIRecoveryCancellationOwnership() &&
+		 !m_recoveryBuilderCancellationOwned) ||
 		!IsSkirmishAIRecoveryProductionIdentityTracked(
 			m_recoveryBuilderFactoryID, m_recoveryBuilderProductionID,
 			INVALID_ID, PRODUCTIONID_INVALID))
@@ -1353,7 +1374,10 @@ Bool AISkirmishPlayer::cancelRecoveryBuilderQueueForNativeRespawn(
 		}
 	}
 	if (!ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
-			true, true, exactEntry != nullptr))
+			true,
+			!ShouldUseCurrentSkirmishAIRecoveryCancellationOwnership() ||
+				m_recoveryBuilderCancellationOwned,
+			true, exactEntry != nullptr))
 		return false;
 
 	const ThingTemplate *cancelledTemplate = exactEntry->getProductionObject();
@@ -2166,6 +2190,8 @@ void AISkirmishPlayer::updateCriticalRecovery()
 		// actions already returned above.
 		if (ShouldDeferSkirmishAIRecoveryStalledDisposition(
 				paidQueueProgressing, factoryPotential,
+				ShouldUseCurrentSkirmishAIRecoveryCancellationOwnership() &&
+					replacementAttempted,
 				hasPresentUnusableNativeWorker)) {
 			m_recoveryEvacuationDeadline = 0;
 			m_recoveryReserveCost = replacementCost > 0 ? replacementCost : 0;
@@ -4723,9 +4749,9 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	xfer->xferObjectID(&m_recoveryConstructionID);
 	xfer->xferInt(&m_recoveryPlacementAttempt);
 	xfer->xferUnsignedInt(&m_recoveryNextAttemptFrame);
-	// Epoch 3 retains its recorded CRC layout. Live games and epoch-4 replays
-	// cover the full decision state: an expired deadline prevents a fresh grace
-	// period, and exact paid-production provenance controls failover/refunds.
+	// Epoch 3 retains its recorded CRC layout. Epoch 4 adds the deadline and
+	// exact production identity. Live games and epoch 5 also cover cancellation
+	// ownership, which changes failover/refund decisions.
 	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
 	const Int replayEpoch = TheRecorder
 		? TheRecorder->getSkirmishAIReplayEpoch()
@@ -4735,6 +4761,10 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 		xfer->xferObjectID(&m_recoveryBuilderFactoryID);
 		xfer->xferUser(
 			&m_recoveryBuilderProductionID, sizeof(ProductionID));
+	}
+	if (ShouldIncludeSkirmishAIRecoveryCancellationOwnershipCRCField(
+			replay, replayEpoch)) {
+		xfer->xferBool(&m_recoveryBuilderCancellationOwned);
 	}
 	xfer->xferCoord3D(&m_recoveryLocation);
 	xfer->xferReal(&m_recoveryAngle);
@@ -4748,13 +4778,14 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	* 2: Current enemy and next enemy evaluation frame
 	* 3: Critical command-center recovery state
 	* 4: Contained-builder evacuation grace deadline
-	* 5: Recovery builder production identity */
+	* 5: Recovery builder production identity
+	* 6: Recovery builder cancellation ownership */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 5;
+	XferVersion currentVersion = 6;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -4835,6 +4866,12 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 		m_recoveryBuilderProductionID =
 			static_cast<ProductionID>(identity.productionID);
 	}
+	if (version >= 6)
+		xfer->xferBool(&m_recoveryBuilderCancellationOwned);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		m_recoveryBuilderCancellationOwned =
+			GetSkirmishAIRecoveryProductionCancellationOwnershipForVersion(
+				version, false);
 	m_recoveryAuthorizedThing = nullptr;
 
 }

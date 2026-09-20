@@ -154,7 +154,8 @@ public:
 	Bool replayUsesSkirmishAICurrentBehavior() const { return
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY ||
-		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC; }
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP; }
 	Int getPathfindQueueReplayEpoch() const { return m_pathfindQueueReplayEpoch; }
 	Bool replayUsesPathfindQueueCapacity() const { return m_pathfindQueueReplayEpoch == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT; }
 	void initControls();															///< Show or Hide the Replay controls
@@ -181,7 +182,7 @@ protected:
 	// Recorder.cpp keeps one unqualified stamping call for both recording and
 	// DEBUG_CRASHING compatibility checks. Playback can shadow that call here so
 	// an epoch-2 replay gets an exact epoch-2 allow-list candidate while the
-	// global helper continues to stamp new recordings with epoch 3.
+	// global helper continues to stamp new recordings with the latest epoch.
 	void MarkReplayVersionForSkirmishAICurrentEpoch(UnicodeString& versionTimeString);
 
 	void startRecording(GameDifficulty diff, Int originalGameMode, Int rankPoints, Int maxFPS);					///< Start recording to m_file.
@@ -255,11 +256,13 @@ inline void RecorderClass::MarkReplayVersionForSkirmishAICurrentEpoch(
 	UnicodeString& versionTimeString)
 {
 	// startRecording() resets this field before writing a new header. Loaded
-	// epoch-2 and epoch-3 headers retain their original compatibility stamps.
+	// Earlier known headers retain their original compatibility stamps.
 	if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT)
 		MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(versionTimeString);
 	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY)
 		MarkReplayVersionForSkirmishAIRecoveryEpoch(versionTimeString);
+	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC)
+		MarkReplayVersionForSkirmishAIRecoveryCRCEpoch(versionTimeString);
 	else
 		::MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
 }
