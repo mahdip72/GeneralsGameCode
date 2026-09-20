@@ -139,9 +139,11 @@ inline bool ShouldFailoverSkirmishAIRecoveryPaidQueue(
 }
 
 inline bool ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
-	bool paidQueueBounded, bool graceActive, bool replacementObserved)
+	bool paidQueueBounded, bool graceActive, bool replacementObserved,
+	bool boundFailover, bool failoverConsumed)
 {
-	return paidQueueBounded && !graceActive && !replacementObserved;
+	return paidQueueBounded && !graceActive && !replacementObserved &&
+		(!boundFailover || !failoverConsumed);
 }
 
 inline bool ShouldReturnFromSkirmishAIRecoveryBoundedQueueFailure(
@@ -816,6 +818,25 @@ inline bool GetSkirmishAIRecoveryProductionCancellationOwnershipForVersion(
 	int version, bool storedOwnership)
 {
 	return version >= 6 ? storedOwnership : false;
+}
+
+inline bool GetSkirmishAIRecoveryBuilderFailoverConsumedForVersion(
+	int version, bool storedConsumed)
+{
+	return version >= 7 ? storedConsumed : false;
+}
+
+inline bool GetSkirmishAIRecoveryBuilderFailoverConsumedAfterQueueAttempt(
+	bool alreadyConsumed, bool alternateQueued)
+{
+	return alreadyConsumed || alternateQueued;
+}
+
+inline bool ReconcileSkirmishAIRecoveryBuilderFailoverConsumed(
+	bool alreadyConsumed, bool recoveryActive, bool hasCompletedPrimaryCenter)
+{
+	return recoveryActive && !hasCompletedPrimaryCenter
+		? alreadyConsumed : false;
 }
 
 inline bool IsSkirmishAIRecoveryProductionIdentityTracked(

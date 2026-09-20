@@ -100,6 +100,14 @@ static Bool ShouldUseCurrentSkirmishAIRecoveryUnownedQueueFailover()
 			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 }
 
+static Bool ShouldUseCurrentSkirmishAIRecoveryBoundedFailover()
+{
+	return ShouldUseSkirmishAIRecoveryBoundedFailover(
+		TheGameLogic && TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
 static Bool IsCriticalRecoveryModeEnabled(Player *player)
 {
 	if (!player || player->getPlayerType() != PLAYER_COMPUTER || !TheGameLogic)
@@ -623,6 +631,7 @@ m_curRightFlankRightDefenseAngle(0),
 	m_recoveryBuilderFactoryID(INVALID_ID),
 	m_recoveryBuilderProductionID(PRODUCTIONID_INVALID),
 	m_recoveryBuilderCancellationOwned(false),
+	m_recoveryBuilderFailoverConsumed(false),
 	m_recoveryAuthorizedThing(nullptr)
 
 {
@@ -1190,6 +1199,9 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 		!IsLiveSkirmishAIRecoveryObject(boundedFactory, m_player) ||
 		boundedProductionID == PRODUCTIONID_INVALID)
 		return false;
+	if (ShouldUseCurrentSkirmishAIRecoveryBoundedFailover() &&
+		m_recoveryBuilderFailoverConsumed)
+		return false;
 	if (HasSkirmishAIRecoveryObservedReplacement(
 			m_recoveryPlacementAttempt, g_skirmishAIRecoveryOffsetCount))
 		return false;
@@ -1319,6 +1331,10 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 				alternateFactory, alternateTemplate) != CANMAKE_OK ||
 			!queueRecoveryBuilder(alternateTemplate, alternateFactory))
 			return false;
+		if (ShouldUseCurrentSkirmishAIRecoveryBoundedFailover())
+			m_recoveryBuilderFailoverConsumed =
+				GetSkirmishAIRecoveryBuilderFailoverConsumedAfterQueueAttempt(
+					m_recoveryBuilderFailoverConsumed, true);
 		m_recoveryPlacementAttempt = MarkSkirmishAIRecoveryScaffoldReplacementAttempt(
 			m_recoveryPlacementAttempt, g_skirmishAIRecoveryOffsetCount);
 		return true;
@@ -1360,6 +1376,10 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 		return false;
 	if (!queueRecoveryBuilder(alternateTemplate, alternateFactory))
 		return false;
+	if (ShouldUseCurrentSkirmishAIRecoveryBoundedFailover())
+		m_recoveryBuilderFailoverConsumed =
+			GetSkirmishAIRecoveryBuilderFailoverConsumedAfterQueueAttempt(
+				m_recoveryBuilderFailoverConsumed, true);
 	m_recoveryPlacementAttempt = MarkSkirmishAIRecoveryScaffoldReplacementAttempt(
 		m_recoveryPlacementAttempt, g_skirmishAIRecoveryOffsetCount);
 	return true;
@@ -1738,6 +1758,9 @@ void AISkirmishPlayer::updateCriticalRecovery()
 	if (!usesCriticalRecoveryBehavior()) {
 		m_recoveryReserveCost = 0;
 		m_recoveryEvacuationDeadline = 0;
+		m_recoveryBuilderFailoverConsumed =
+			ReconcileSkirmishAIRecoveryBuilderFailoverConsumed(
+				m_recoveryBuilderFailoverConsumed, false, false);
 		clearRecoveryBuilderProduction();
 		return;
 	}
@@ -1800,6 +1823,9 @@ void AISkirmishPlayer::updateCriticalRecovery()
 		m_recoveryEverCompleted = true;
 		m_recoveryImpossible = false;
 		m_recoveryEvacuationDeadline = 0;
+		m_recoveryBuilderFailoverConsumed =
+			ReconcileSkirmishAIRecoveryBuilderFailoverConsumed(
+				m_recoveryBuilderFailoverConsumed, true, true);
 		m_recoveryConstructionID = center->getID();
 		m_recoveryLocation = *center->getPosition();
 		m_recoveryAngle = center->getOrientation();
@@ -2174,7 +2200,9 @@ void AISkirmishPlayer::updateCriticalRecovery()
 					g_skirmishAIRecoveryOffsetCount);
 			const Bool failoverSucceeded =
 				ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
-					paidQueueBounded, resumeGraceActive, replacementObserved) &&
+					paidQueueBounded, resumeGraceActive, replacementObserved,
+					ShouldUseCurrentSkirmishAIRecoveryBoundedFailover(),
+					m_recoveryBuilderFailoverConsumed) &&
 				failoverRecoveryBuilderQueue(
 					primaryTemplate, queuedFactory, queuedProductionID);
 			if (failoverSucceeded) {
@@ -2601,7 +2629,9 @@ void AISkirmishPlayer::updateCriticalRecovery()
 			HasSkirmishAIRecoveryObservedReplacement(
 				m_recoveryPlacementAttempt, g_skirmishAIRecoveryOffsetCount);
 		if (ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
-				paidQueueBounded, evacuationGraceActive, replacementObserved) &&
+				paidQueueBounded, evacuationGraceActive, replacementObserved,
+				ShouldUseCurrentSkirmishAIRecoveryBoundedFailover(),
+				m_recoveryBuilderFailoverConsumed) &&
 			failoverRecoveryBuilderQueue(
 				primaryTemplate, queuedFactory, queuedProductionID)) {
 			m_recoveryEvacuationDeadline = 0;
@@ -3064,6 +3094,9 @@ void AISkirmishPlayer::onStructureProduced(Object *factory, Object *structure)
 	m_recoveryLocation = *structure->getPosition();
 	m_recoveryAngle = structure->getOrientation();
 	m_recoveryPlacementAttempt = 0;
+	m_recoveryBuilderFailoverConsumed =
+		ReconcileSkirmishAIRecoveryBuilderFailoverConsumed(
+			m_recoveryBuilderFailoverConsumed, true, true);
 	m_recoveryNextAttemptFrame = 0;
 	m_recoveryReserveCost = 0;
 }
@@ -4693,6 +4726,9 @@ void AISkirmishPlayer::newMap()
 			m_recoveryImpossible = false;
 			m_recoveryConstructionID = center->getID();
 			m_recoveryEvacuationDeadline = 0;
+			m_recoveryBuilderFailoverConsumed =
+				ReconcileSkirmishAIRecoveryBuilderFailoverConsumed(
+					m_recoveryBuilderFailoverConsumed, true, true);
 			m_recoveryLocation = *center->getPosition();
 			m_recoveryAngle = center->getOrientation();
 			m_recoveryReserveCost = 0;
@@ -4782,8 +4818,8 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	xfer->xferInt(&m_recoveryPlacementAttempt);
 	xfer->xferUnsignedInt(&m_recoveryNextAttemptFrame);
 	// Epoch 3 retains its recorded CRC layout. Epoch 4 adds the deadline and
-	// exact production identity. Live games and epoch 5 also cover cancellation
-	// ownership, which changes failover/refund decisions.
+	// exact production identity. Epochs 5 and 6 add cancellation ownership.
+	// Live games and epoch 7 also cover one-shot paid-queue failover state.
 	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
 	const Int replayEpoch = TheRecorder
 		? TheRecorder->getSkirmishAIReplayEpoch()
@@ -4798,6 +4834,10 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 			replay, replayEpoch)) {
 		xfer->xferBool(&m_recoveryBuilderCancellationOwned);
 	}
+	if (ShouldIncludeSkirmishAIRecoveryFailoverConsumedCRCField(
+			replay, replayEpoch)) {
+		xfer->xferBool(&m_recoveryBuilderFailoverConsumed);
+	}
 	xfer->xferCoord3D(&m_recoveryLocation);
 	xfer->xferReal(&m_recoveryAngle);
 	xfer->xferInt(&m_recoveryReserveCost);
@@ -4811,13 +4851,14 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	* 3: Critical command-center recovery state
 	* 4: Contained-builder evacuation grace deadline
 	* 5: Recovery builder production identity
-	* 6: Recovery builder cancellation ownership */
+	* 6: Recovery builder cancellation ownership
+	* 7: Recovery builder bounded-failover consumption */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 6;
+	XferVersion currentVersion = 7;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -4904,6 +4945,12 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 		m_recoveryBuilderCancellationOwned =
 			GetSkirmishAIRecoveryProductionCancellationOwnershipForVersion(
 				version, false);
+	if (version >= 7)
+		xfer->xferBool(&m_recoveryBuilderFailoverConsumed);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		m_recoveryBuilderFailoverConsumed =
+			GetSkirmishAIRecoveryBuilderFailoverConsumedForVersion(
+				version, false);
 	m_recoveryAuthorizedThing = nullptr;
 
 }
@@ -4944,6 +4991,10 @@ void AISkirmishPlayer::loadPostProcess()
 		findPrimaryCommandCenter(primaryTemplate, &primaryCenter) &&
 		primaryCenter &&
 		!primaryCenter->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION);
+	m_recoveryBuilderFailoverConsumed =
+		ReconcileSkirmishAIRecoveryBuilderFailoverConsumed(
+			m_recoveryBuilderFailoverConsumed, true,
+			hasCompletedPrimaryCenter);
 	Bool paidQueueExists = false;
 	ObjectID factoryID = INVALID_ID;
 	ProductionID productionID = PRODUCTIONID_INVALID;

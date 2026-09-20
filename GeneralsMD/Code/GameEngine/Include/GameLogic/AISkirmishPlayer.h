@@ -189,6 +189,7 @@ protected:
 	ObjectID m_recoveryBuilderFactoryID;
 	ProductionID m_recoveryBuilderProductionID;
 	Bool m_recoveryBuilderCancellationOwned;
+	Bool m_recoveryBuilderFailoverConsumed;
 	const ThingTemplate *m_recoveryAuthorizedThing;
 
 };

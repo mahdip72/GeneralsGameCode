@@ -31,7 +31,10 @@ enum SkirmishAIReplayEpochType
 	SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP = 5,
 	// Epoch 6 lets an independently affordable owned replacement bypass a
 	// bounded adopted queue without cancelling or refunding that ordinary work.
-	SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER = 6
+	SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER = 6,
+	// Epoch 7 permits at most one paid-queue failover during a command-center
+	// recovery episode, preventing repeated cancel/refund/requeue churn.
+	SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER = 7
 };
 
 inline const WideChar *GetSkirmishAILivenessReplayMarker()
@@ -62,6 +65,11 @@ inline const WideChar *GetSkirmishAIRecoveryOwnershipReplayMarker()
 inline const WideChar *GetSkirmishAINonCancellingFailoverReplayMarker()
 {
 	return L" [SkirmishAIEpoch=6]";
+}
+
+inline const WideChar *GetSkirmishAIBoundedFailoverReplayMarker()
+{
+	return L" [SkirmishAIEpoch=7]";
 }
 
 inline const WideChar *GetSkirmishAIReplayMarkerPrefix()
@@ -115,12 +123,20 @@ inline void MarkReplayVersionForSkirmishAINonCancellingFailoverEpoch(
 		versionTimeString.concat(GetSkirmishAINonCancellingFailoverReplayMarker());
 }
 
+inline void MarkReplayVersionForSkirmishAIBoundedFailoverEpoch(
+	UnicodeString& versionTimeString)
+{
+	if (CountSkirmishAIReplayMarkers(
+			versionTimeString, GetSkirmishAIReplayMarkerPrefix()) == 0)
+		versionTimeString.concat(GetSkirmishAIBoundedFailoverReplayMarker());
+}
+
 // Global writer helper. RecorderClass shadows its unchanged member call only
 // for playback compatibility checks; this helper keeps new recordings at the
 // latest AI behavior and CRC epoch.
 inline void MarkReplayVersionForSkirmishAICurrentEpoch(UnicodeString& versionTimeString)
 {
-	MarkReplayVersionForSkirmishAINonCancellingFailoverEpoch(versionTimeString);
+	MarkReplayVersionForSkirmishAIBoundedFailoverEpoch(versionTimeString);
 }
 
 // Compatibility-only stamp for the already-shipped epoch-2 behavior. The
@@ -143,12 +159,17 @@ inline Int GetSkirmishAIReplayEpoch(const UnicodeString& versionTimeString)
 		versionTimeString, GetSkirmishAIRecoveryOwnershipReplayMarker());
 	Int nonCancellingFailoverMarkerCount = CountSkirmishAIReplayMarkers(
 		versionTimeString, GetSkirmishAINonCancellingFailoverReplayMarker());
+	Int boundedFailoverMarkerCount = CountSkirmishAIReplayMarkers(
+		versionTimeString, GetSkirmishAIBoundedFailoverReplayMarker());
 	Int markerLikeCount = CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAIReplayMarkerPrefix());
 	if (markerLikeCount != 1 ||
 		livenessMarkerCount + currentMarkerCount + recoveryMarkerCount +
 			recoveryCRCMarkerCount + recoveryOwnershipMarkerCount +
-			nonCancellingFailoverMarkerCount != 1)
+			nonCancellingFailoverMarkerCount + boundedFailoverMarkerCount != 1)
 		return SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	if (boundedFailoverMarkerCount == 1 &&
+		versionTimeString.endsWith(GetSkirmishAIBoundedFailoverReplayMarker()))
+		return SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER;
 	if (nonCancellingFailoverMarkerCount == 1 &&
 		versionTimeString.endsWith(GetSkirmishAINonCancellingFailoverReplayMarker()))
 		return SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
@@ -178,7 +199,8 @@ inline Bool ShouldUseSkirmishAICurrentBehavior(Bool isReplayGame, Int replayEpoc
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryBehavior(Bool isReplayGame, Int replayEpoch)
@@ -187,7 +209,8 @@ inline Bool ShouldUseSkirmishAIRecoveryBehavior(Bool isReplayGame, Int replayEpo
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryNativeHoleOwnership(Bool isReplayGame, Int replayEpoch)
@@ -195,7 +218,8 @@ inline Bool ShouldUseSkirmishAIRecoveryNativeHoleOwnership(Bool isReplayGame, In
 	return !isReplayGame ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER;
 }
 
 inline Bool ShouldIncludeSkirmishAIRecoveryCRCFields(Bool isReplayGame, Int replayEpoch)
@@ -208,19 +232,35 @@ inline Bool ShouldUseSkirmishAIRecoveryCancellationOwnership(
 {
 	return !isReplayGame ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
 	Bool isReplayGame, Int replayEpoch)
 {
 	return !isReplayGame ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER;
+}
+
+inline Bool ShouldUseSkirmishAIRecoveryBoundedFailover(
+	Bool isReplayGame, Int replayEpoch)
+{
+	return !isReplayGame ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER;
 }
 
 inline Bool ShouldIncludeSkirmishAIRecoveryCancellationOwnershipCRCField(
 	Bool isReplayGame, Int replayEpoch)
 {
 	return ShouldUseSkirmishAIRecoveryCancellationOwnership(
+		isReplayGame, replayEpoch);
+}
+
+inline Bool ShouldIncludeSkirmishAIRecoveryFailoverConsumedCRCField(
+	Bool isReplayGame, Int replayEpoch)
+{
+	return ShouldUseSkirmishAIRecoveryBoundedFailover(
 		isReplayGame, replayEpoch);
 }
