@@ -182,6 +182,27 @@ private:
 #include "FreshProducerRunnerState.inc"
 #include "FreshProducerCaptureState.inc"
 
+// The extracted runner start/finalizer bodies retain the production reviewed
+// map branch.  This lifetime fixture never arms a reviewed-map request, so
+// keep its anonymous-namespace state and content gate local and fail closed if
+// that unsupported shape is accidentally exercised.
+#if defined(_WIN64)
+rts::ai_fixture::MapRequest s_reviewedMapRequest;
+rts::fixture::ResolvedMapIdentity s_reviewedMapIdentity;
+char s_reviewedMapSha256[65] = {};
+
+bool ResolveStage5MapIdentity(const char *, rts::fixture::ResolvedMapIdentity *out)
+{
+	if (out != 0) *out = rts::fixture::ResolvedMapIdentity();
+	return false;
+}
+
+static Bool VerifyReviewedSkirmishMapBytes()
+{
+	return FALSE;
+}
+#endif
+
 struct MapMetaData
 {
 	MapMetaData() : m_doesExist(TRUE), m_isMultiplayer(TRUE), m_numPlayers(8),
