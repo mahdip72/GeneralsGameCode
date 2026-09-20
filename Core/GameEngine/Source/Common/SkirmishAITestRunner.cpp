@@ -2859,9 +2859,11 @@ void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 			s_recovery.obstructionOriginalPosition = *obstruction->getPosition();
 		}
 
+#if RTS_ZEROHOUR
 		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_GLA_HOLE)
 			commandCenter->kill(DAMAGE_UNRESISTABLE, DEATH_NORMAL);
 		else
+#endif
 			DestroySkirmishAIRecoveryObject(commandCenter);
 		++s_recovery.destructionCount;
 		s_recovery.faultApplied = TRUE;
