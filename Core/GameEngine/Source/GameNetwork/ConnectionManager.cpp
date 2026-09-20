@@ -1164,12 +1164,17 @@ Bool ConnectionManager::resolveNetworkSimulationPolicy()
 
 	if (remotePeerCount == 0U)
 		return FALSE;
-	// A rejected negotiation is still a resolved, persisted serial policy.
-	// Unsupported or unproven contracts must not turn a compatible NET3
-	// transport exchange into implicit worker permission.
-	rts::ResolveMultiplayerSimulationSessionPolicy(localPeer, remotePeers,
+	// A policy rejection is an incompatible NET3 session identity, not a
+	// serial scheduling choice. Keep the Hello gate closed so serviceNetworkHello
+	// takes the terminal rejection path instead of draining gameplay commands.
+	// A READY policy with no common proven kernels still returns true here and
+	// remains the valid serial fallback.
+	if (!rts::ResolveMultiplayerSimulationSessionPolicy(localPeer, remotePeers,
 		remotePeerCount, rts::MULTIPLAYER_SIMULATION_KERNEL_KNOWN_MASK,
-		m_networkSimulationSessionPolicy);
+		m_networkSimulationSessionPolicy))
+	{
+		return FALSE;
+	}
 	m_networkSimulationPolicyResolved = TRUE;
 	return TRUE;
 }

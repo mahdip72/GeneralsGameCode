@@ -63,6 +63,33 @@ function Get-TokenViolations {
         }
     }
 
+    $policyStart = $Source.IndexOf(
+        'Bool ConnectionManager::resolveNetworkSimulationPolicy()',
+        [StringComparison]::Ordinal)
+    $policyEnd = if ($policyStart -ge 0) {
+        $Source.IndexOf('void ConnectionManager::beginNetworkHello()', $policyStart,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($policyStart -lt 0 -or $policyEnd -lt 0) {
+        $violations.Add('network simulation-policy resolution path is missing')
+    } else {
+        $policy = $Source.Substring($policyStart, $policyEnd - $policyStart)
+        $resolveIndex = $policy.IndexOf(
+            'if (!rts::ResolveMultiplayerSimulationSessionPolicy(',
+            [StringComparison]::Ordinal)
+        $rejectionIndex = if ($resolveIndex -ge 0) {
+            $policy.IndexOf('return FALSE;', $resolveIndex,
+                [StringComparison]::Ordinal)
+        } else { -1 }
+        $publishIndex = $policy.IndexOf(
+            'm_networkSimulationPolicyResolved = TRUE;',
+            [StringComparison]::Ordinal)
+        if ($resolveIndex -lt 0 -or $rejectionIndex -lt $resolveIndex -or
+            $publishIndex -lt $rejectionIndex) {
+            $violations.Add('NET3 policy rejection must fail closed before resolved-policy publication')
+        }
+    }
+
     $ackStart = $Source.IndexOf('Bool ConnectionManager::sendNetworkHelloAck(',
         [StringComparison]::Ordinal)
     $ackEnd = if ($ackStart -ge 0) {
@@ -580,6 +607,23 @@ function Get-TokenViolations {
                 $violations.Add("NET3 handshake must retain its bounded retry/timeout failure gate '$required'")
             }
         }
+        $completeIndex = $service.IndexOf('IsNetworkHelloComplete(',
+            [StringComparison]::Ordinal)
+        $resolveIndex = $service.IndexOf('if (!resolveNetworkSimulationPolicy())',
+            [StringComparison]::Ordinal)
+        $rejectIndex = if ($resolveIndex -ge 0) {
+            $service.IndexOf('rejectNetworkHello(-1,', $resolveIndex,
+                [StringComparison]::Ordinal)
+        } else { -1 }
+        $openIndex = $service.IndexOf('m_networkHelloRequired = FALSE;',
+            [StringComparison]::Ordinal)
+        $drainIndex = $service.IndexOf('drainNetworkHelloPendingCommands();',
+            [StringComparison]::Ordinal)
+        if ($completeIndex -lt 0 -or $resolveIndex -lt $completeIndex -or
+            $rejectIndex -lt $resolveIndex -or $openIndex -lt $rejectIndex -or
+            $drainIndex -lt $openIndex) {
+            $violations.Add('NET3 policy rejection must close the Hello gate before command drain')
+        }
     }
 
     $deferStart = $Source.IndexOf('void ConnectionManager::deferNetworkMessage(',
@@ -987,11 +1031,31 @@ inline bool IsNetworkFrameResendResponseAuthorized(
         (expectedOriginMask & (1U << claimedSlot)) != 0U;
 }
 inline bool IsNetworkFrameResendResponseComplete(...) { return true; }
+Bool ConnectionManager::resolveNetworkSimulationPolicy() {
+    if (!rts::ResolveMultiplayerSimulationSessionPolicy(
+            localPeer, remotePeers, remotePeerCount, requestedKernelMask,
+            m_networkSimulationSessionPolicy)) {
+        return FALSE;
+    }
+    m_networkSimulationPolicyResolved = TRUE;
+    return TRUE;
+}
 void ConnectionManager::beginNetworkHello() {
     generateNetworkHelloToken(&m_networkHelloLocalToken);
     sendNetworkHello(i);
 }
 void ConnectionManager::serviceNetworkHello() {
+    if (IsNetworkHelloComplete(m_networkHelloExpectedSlots,
+            validatedSlots, acknowledgedSlots)) {
+        if (!resolveNetworkSimulationPolicy()) {
+            rejectNetworkHello(-1,
+                "NET3 simulation policy roster could not be resolved");
+            return;
+        }
+        m_networkHelloRequired = FALSE;
+        drainNetworkHelloPendingCommands();
+        return;
+    }
     if ((m_networkHelloExpectedSlots & (1U << i)) != 0U) {
         if (!m_networkHelloValidated[i] || !m_networkHelloAckReceived[i]) {
             sendNetworkHello(i);
@@ -1491,6 +1555,22 @@ void NAT::connectionUpdate() {
     $failOpen = $goodSource.Replace('if (m_networkHelloFailed)', 'if (false)')
     if (-not ((Get-TokenViolations $failOpen $goodCMake $goodNAT) -match 'fail closed')) {
         throw 'fail-open relay fixture was not rejected'
+    }
+    $ignoredPolicyResult = $goodSource.Replace(
+        'if (!rts::ResolveMultiplayerSimulationSessionPolicy(',
+        'if (false && !rts::ResolveMultiplayerSimulationSessionPolicy(')
+    if ($ignoredPolicyResult -ceq $goodSource -or
+        -not ((Get-TokenViolations $ignoredPolicyResult $goodCMake $goodNAT) -match
+            'policy rejection must fail closed')) {
+        throw 'ignored simulation-policy rejection fixture was not rejected'
+    }
+    $openedRejectedPolicy = $goodSource.Replace(
+        'if (!resolveNetworkSimulationPolicy()) {',
+        'if (false) {')
+    if ($openedRejectedPolicy -ceq $goodSource -or
+        -not ((Get-TokenViolations $openedRejectedPolicy $goodCMake $goodNAT) -match
+            'policy rejection must close')) {
+        throw 'policy-rejection Hello-gate bypass fixture was not rejected'
     }
     $slotBeforeIntegrity = $goodSource.Replace(
         "    DecodeAndValidateNetworkHelloRecord(message);`n    findNetworkHelloSlot(identity);",

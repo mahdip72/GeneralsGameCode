@@ -216,9 +216,11 @@ struct MultiplayerSimulationPeerPolicy
 	unsigned provenKernelMask;
 };
 
-// A rejected policy is a fully initialized serial policy. When the local peer
-// contract itself is valid, its identity remains available for owner-side
-// diagnostics/publication even if a remote peer rejects worker execution.
+// A rejected policy is fully initialized and query-safe, but its false resolver
+// result identifies an incompatible session and must not open a transport gate.
+// A true READY result with enabledKernelMask == 0 is the playable serial
+// fallback. When the local peer contract itself is valid, its identity remains
+// available for owner-side diagnostics even if a remote contract is rejected.
 // Missing proof for a known kernel removes only that kernel from the enabled
 // intersection; an unknown proof bit rejects the complete policy as an
 // incompatible contract.

@@ -444,6 +444,51 @@ int TestNetworkHelloContract()
 		ordinarySessionPolicy.enabledKernelMask == liveIntegratedMask,
 		"matching ordinary promoted peers resolve all six worker kernels");
 
+	const auto rejectsSessionPolicy = [&](const rts::MultiplayerSimulationPeerPolicy &remote,
+		rts::MultiplayerSimulationPolicyStatus expectedStatus) {
+		rts::MultiplayerSimulationSessionPolicy rejectedPolicy;
+		return !rts::ResolveMultiplayerSimulationSessionPolicy(
+			localProductPeer, &remote, 1U, liveIntegratedMask,
+			rejectedPolicy) && rejectedPolicy.status == expectedStatus &&
+			rejectedPolicy.enabledKernelMask == 0;
+	};
+
+	remoteProductPeer = localProductPeer;
+	remoteProductPeer.buildCompatibilityCrc ^= 1U;
+	result |= Check(rejectsSessionPolicy(remoteProductPeer,
+		rts::MULTIPLAYER_SIMULATION_POLICY_SERIAL_BUILD_MISMATCH),
+		"NET3 session policy rejects a build-identity mismatch");
+	remoteProductPeer = localProductPeer;
+	remoteProductPeer.contentCrc ^= 1U;
+	result |= Check(rejectsSessionPolicy(remoteProductPeer,
+		rts::MULTIPLAYER_SIMULATION_POLICY_SERIAL_CONTENT_MISMATCH),
+		"NET3 session policy rejects a content-identity mismatch");
+	remoteProductPeer = localProductPeer;
+	remoteProductPeer.mapCrc ^= 1U;
+	result |= Check(rejectsSessionPolicy(remoteProductPeer,
+		rts::MULTIPLAYER_SIMULATION_POLICY_SERIAL_CONTENT_MISMATCH),
+		"NET3 session policy rejects a map-identity mismatch");
+	remoteProductPeer = localProductPeer;
+	remoteProductPeer.determinismEpoch ^= 1U;
+	result |= Check(rejectsSessionPolicy(remoteProductPeer,
+		rts::MULTIPLAYER_SIMULATION_POLICY_SERIAL_UNSUPPORTED_EPOCH),
+		"NET3 session policy rejects a determinism-epoch mismatch");
+	remoteProductPeer = localProductPeer;
+	remoteProductPeer.provenKernelMask |= 1U << 31;
+	result |= Check(rejectsSessionPolicy(remoteProductPeer,
+		rts::MULTIPLAYER_SIMULATION_POLICY_SERIAL_INVALID_KERNEL_PROOF),
+		"NET3 session policy rejects an unknown proof-bit mismatch");
+
+	remoteProductPeer = localProductPeer;
+	remoteProductPeer.provenKernelMask = 0U;
+	rts::MultiplayerSimulationSessionPolicy serialSessionPolicy;
+	result |= Check(rts::ResolveMultiplayerSimulationSessionPolicy(
+		localProductPeer, &remoteProductPeer, 1U, liveIntegratedMask,
+		serialSessionPolicy) && serialSessionPolicy.status ==
+			rts::MULTIPLAYER_SIMULATION_POLICY_READY &&
+		serialSessionPolicy.enabledKernelMask == 0,
+		"NET3 READY zero-mask policy remains a valid serial session");
+
 	rts::network_epoch::NetworkHelloIdentity identity;
 	result |= Check(DecodeAndValidateNetworkHello(encoded.data(), encoded.size(),
 		executableCrc, iniCrc, 2U, 5U, sessionToken, &decoded, &identity).ok(),
