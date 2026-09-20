@@ -272,7 +272,11 @@ while varying only Stage 5 simulation workers. Structured job metrics and the
 authoritative `SIMULATION_REPLAY_RESULT` final frame/CRC must agree across all
 repeats and worker configurations; timing maximum frame must also match the
 structured result. A forced one-worker simulation may report its expected
-serial kernel fallback; fallback in another parallel configuration fails.
+scoped serial kernel fallback. In a multiworker configuration, the aggregate
+JobSystem fallback count is admission telemetry; scheduler liveness instead
+requires a started scheduler, parallel effective mode, balanced executed jobs,
+and zero failed or cancelled jobs. Each kernel's scoped qualification remains
+fail-closed on its own fallback and authority evidence.
 
 The final optimized VC6 differential oracle was captured before cutover. It is
 not a continuing product or CI lane. Replay qualification now runs only against

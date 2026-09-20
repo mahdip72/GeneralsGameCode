@@ -2239,6 +2239,10 @@ function ConvertFrom-Stage5ReplayMetrics {
         "$context reports failed jobs."
     Assert-Stage5Condition ((Get-Stage5UInt64Field $fields 'cancelled' $context) -eq 0) `
         "$context reports cancelled jobs."
+	$submitted = Get-Stage5UInt64Field $fields 'submitted' $context
+	$executed = Get-Stage5UInt64Field $fields 'executed' $context
+	Assert-Stage5Condition ($executed -eq $submitted) `
+		"$context submitted/executed job counts do not match."
 
     $collisionLine = Get-Stage5SingleLine $Output 'COLLISION_CANDIDATE_MANIFEST' $context
     $collisionFields = ConvertFrom-Stage5MetricLine $collisionLine `
@@ -2630,8 +2634,6 @@ function ConvertFrom-Stage5ReplayMetrics {
         "$context effective_mode is not a supported serial/parallel value."
     $schedulerStarted = Get-Stage5UInt64Field $fields 'scheduler_started' $context
     $workers = Get-Stage5UInt64Field $fields 'workers' $context
-    $submitted = Get-Stage5UInt64Field $fields 'submitted' $context
-    $executed = Get-Stage5UInt64Field $fields 'executed' $context
     $fallback = Get-Stage5UInt64Field $fields 'fallback' $context
     $isExpectedOneWorkerFallback = $Entry.configuration -ceq 'parallel-1' -and
         ($fallback -gt 0 -or $submitted -eq 0)
@@ -2648,15 +2650,15 @@ function ConvertFrom-Stage5ReplayMetrics {
         Assert-Stage5Condition ($schedulerStarted -eq 1 -and $workers -eq $expectedWorkers) `
             "$context scheduler/worker count does not match explicit configuration '$($Entry.configuration)'."
         if (-not $isExpectedOneWorkerFallback) {
-            Assert-Stage5Condition ($submitted -gt 0 -and $executed -gt 0 -and $fallback -eq 0) `
-                "$context did not execute parallel jobs without fallback."
+            Assert-Stage5Condition ($submitted -gt 0) `
+                "$context did not execute parallel jobs."
         }
     }
     elseif ($Entry.configuration -ceq 'parallel-auto') {
         Assert-Stage5Condition ($effectiveMode -ceq 'parallel' -and $schedulerStarted -eq 1 -and
             $workers -gt 0) "$context automatic configuration did not start workers."
-        Assert-Stage5Condition ($submitted -gt 0 -and $executed -gt 0 -and $fallback -eq 0) `
-            "$context automatic configuration did not execute parallel jobs without fallback."
+        Assert-Stage5Condition ($submitted -gt 0) `
+            "$context automatic configuration did not execute parallel jobs."
     }
     else {
         throw "$context has unsupported worker configuration '$($Entry.configuration)'."

@@ -5965,6 +5965,7 @@ function New-AiResult {
 function New-ReplayMetricOutput {
     param([string]$Mode = 'parallel', [string]$EffectiveMode = 'parallel', [int]$Scheduler = 1,
         [int]$Workers = 2, [int]$Submitted = 20, [int]$Executed = 20, [int]$Fallback = 0,
+		[int]$Failures = 0, [int]$Cancelled = 0,
 		[string]$ReplayArgument = 'Stage5Validation\reference.rep',
 		[int]$CollisionShadowMismatches = 0, [int]$CollisionUnexpectedFallbacks = 0,
 		[int]$CollisionShadowExecutions = 0,
@@ -6133,7 +6134,7 @@ function New-ReplayMetricOutput {
     return ('SIMULATION_JOB_METRICS replay="' + $ReplayArgument + '" ' +
         "requested_mode=$Mode effective_mode=$EffectiveMode requested_pipeline=serial effective_pipeline=serial " +
         "scheduler_started=$Scheduler workers=$Workers submitted=$Submitted executed=$Executed steals=0 owner_help=0 " +
-        "waits=0 worker_wait_rejections=0 failures=0 cancelled=0 fallback=$Fallback queue_latency_ns=1 " +
+        "waits=0 worker_wait_rejections=0 failures=$Failures cancelled=$Cancelled fallback=$Fallback queue_latency_ns=1 " +
         "max_queue_latency_ns=1 sleeps=0 wakes=0 affinity_failures=0 queue_high_water=1 peak_active_workers=$Workers " +
         "available_cpus=16 reserved_owner_cpus=1 selected_worker_cpus=$Workers") + "`n" +
         ("COLLISION_CANDIDATE_MANIFEST authoritative_commits=$CollisionAuthoritativeCommits shadow_executions=$CollisionShadowExecutions " +
@@ -8000,6 +8001,48 @@ try {
         replayArgument = 'Stage5Validation\reference.rep'; stress = $true
     }
     $replayMetrics = ConvertFrom-Stage5ReplayMetrics (New-ReplayMetricOutput) $replayEntry
+	$historicalParallelTwoMetrics = ConvertFrom-Stage5ReplayMetrics `
+		(New-ReplayMetricOutput -Submitted 311636 -Executed 311636 -Fallback 3133) `
+		$replayEntry
+	Assert-True ($historicalParallelTwoMetrics.workers -eq 2) `
+		'aggregate kernel-admission fallback does not masquerade as scheduler startup failure'
+	Assert-Throws {
+		ConvertFrom-Stage5ReplayMetrics `
+			(New-ReplayMetricOutput -Submitted 311636 -Executed 311635 `
+				-Fallback 3133) $replayEntry | Out-Null
+	} 'submitted/executed job counts do not match' `
+		'replay scheduler liveness rejects incomplete aggregate execution'
+	Assert-Throws {
+		ConvertFrom-Stage5ReplayMetrics `
+			(New-ReplayMetricOutput -Failures 1) $replayEntry | Out-Null
+	} 'reports failed jobs' 'replay scheduler liveness rejects failed jobs'
+	Assert-Throws {
+		ConvertFrom-Stage5ReplayMetrics `
+			(New-ReplayMetricOutput -Cancelled 1) $replayEntry | Out-Null
+	} 'reports cancelled jobs' 'replay scheduler liveness rejects cancelled jobs'
+	Assert-Throws {
+		ConvertFrom-Stage5ReplayMetrics `
+			(New-ReplayMetricOutput -Scheduler 0) $replayEntry | Out-Null
+	} 'scheduler/worker count does not match' `
+		'replay scheduler liveness rejects a scheduler that did not start'
+	Assert-Throws {
+		ConvertFrom-Stage5ReplayMetrics `
+			("SIMULATION_JOB_SYSTEM_FALLBACK requested_mode=parallel reason=start_failed`n" +
+				(New-ReplayMetricOutput -EffectiveMode serial -Scheduler 0 `
+					-Workers 0 -Submitted 0 -Executed 0)) `
+			([pscustomobject]@{
+				sequence = 303; configuration = 'parallel-2'; simulationMode = 'parallel'
+				replayArgument = 'Stage5Validation\reference.rep'; stress = $false
+			}) | Out-Null
+	} 'unexpectedly fell back to serial' `
+		'replay scheduler liveness rejects an explicit startup failure and effective serial fallback'
+	Assert-Throws {
+		ConvertFrom-Stage5ReplayMetrics `
+			(New-ReplayMetricOutput -Submitted 311636 -Executed 311636 `
+				-Fallback 3133 -CollisionUnexpectedFallbacks 1) `
+			$replayEntry | Out-Null
+	} 'unexpected collision owner fallbacks' `
+		'aggregate fallback evidence cannot weaken scoped kernel qualification'
     Assert-Throws {
         ConvertFrom-Stage5ReplayMetrics `
             (New-ReplayMetricOutput -SpatialCapturedArenas 0) $replayEntry | Out-Null
