@@ -298,6 +298,11 @@ static Bool RecoverSkirmishAIContainedBuilders(
 
 		Object *container = object->getContainedBy();
 		AIUpdateInterface *builderAI = object->getAIUpdateInterface();
+		ProductionUpdateInterface *production = container
+			? container->getProductionUpdateInterface() : nullptr;
+		const Bool containerHasActiveProduction = production &&
+			IsSkirmishAIRecoveryProductionActive(
+				production->getProductionCount());
 		const StateID builderState = builderAI->getCurrentStateID();
 		const Bool builderAlreadyExiting = builderState == AI_EXIT ||
 			builderState == AI_EXIT_INSTANTLY ||
@@ -305,7 +310,7 @@ static Bool RecoverSkirmishAIContainedBuilders(
 		if (!ShouldOrderSkirmishAIRecoveryBuilderExit(
 			true, IsLiveSkirmishAIRecoveryObject(container, player),
 			container && container->getContain(),
-			container && container->getProductionUpdateInterface(),
+			containerHasActiveProduction,
 			builderAlreadyExiting))
 			continue;
 		builderAI->aiExit(container, CMD_FROM_AI);

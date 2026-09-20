@@ -62,12 +62,18 @@ inline bool IsSkirmishAIRecoveryBuilderPathUnavailable(
 
 inline bool ShouldOrderSkirmishAIRecoveryBuilderExit(
 	bool hasCompatibleContainedBuilder, bool hasLiveOwnedContainer,
-	bool hasContainInterface, bool containerHasProduction,
+	bool hasContainInterface, bool containerHasActiveProduction,
 	bool builderAlreadyExiting)
 {
 	return hasCompatibleContainedBuilder && hasLiveOwnedContainer &&
-		hasContainInterface && !containerHasProduction &&
+		hasContainInterface && !containerHasActiveProduction &&
 		!builderAlreadyExiting;
+}
+
+inline bool IsSkirmishAIRecoveryProductionActive(
+	unsigned int productionCount)
+{
+	return productionCount > 0;
 }
 
 inline int GetSkirmishAIRecoveryReserveCost(

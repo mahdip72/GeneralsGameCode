@@ -1029,15 +1029,18 @@ static void TestSkirmishAIRecoveryPolicies()
 	CHECK(IsSkirmishAIRecoveryBuilderPathUnavailable(
 		false, false, false, false));
 	CHECK(ShouldOrderSkirmishAIRecoveryBuilderExit(
-		true, true, true, false, false));
+		true, true, true,
+		IsSkirmishAIRecoveryProductionActive(0), false));
 	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
-		true, true, true, true, false));
+		true, true, true,
+		IsSkirmishAIRecoveryProductionActive(1), false));
 	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
 		true, false, true, false, false));
 	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
 		true, true, false, false, false));
 	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
 		true, true, true, false, true));
+	CHECK(IsSkirmishAIRecoveryProductionActive(2));
 	UnsignedInt evacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
 		100, 0, true, 60);
 	CHECK(evacuationDeadline == 160);
