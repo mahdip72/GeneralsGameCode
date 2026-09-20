@@ -1,7 +1,28 @@
 param([Parameter(Mandatory = $true)][string]$ScratchRoot)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2.0
-[IO.Directory]::CreateDirectory($ScratchRoot)|Out-Null
+# CTest supplies a shared H: validation scratch parent. Keep every lifecycle
+# case below a fresh invocation root so retained case output from an earlier
+# run cannot collide with this run. Production still rejects an existing
+# output sink; this test-only child is unique and never removes old evidence.
+$scratchParent = [IO.Path]::GetFullPath($ScratchRoot).TrimEnd('\')
+if (-not $scratchParent.StartsWith('H:\',
+        [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Stage 5 native fixture lifecycle scratch must remain on H:.'
+}
+[IO.Directory]::CreateDirectory($scratchParent)|Out-Null
+$scratchParentItem = Get-Item -LiteralPath $scratchParent -Force
+if (($scratchParentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Stage 5 native fixture lifecycle scratch parent is a reparse point: $scratchParent"
+}
+$runRoot = Join-Path $scratchParent ('native-fixture-diagnostic-lifecycle-{0}-{1}' -f
+    $PID, [Guid]::NewGuid().ToString('N'))
+[IO.Directory]::CreateDirectory($runRoot)|Out-Null
+$runRootItem = Get-Item -LiteralPath $runRoot -Force
+if (($runRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "Stage 5 native fixture lifecycle run root is a reparse point: $runRoot"
+}
+$ScratchRoot = $runRoot
 $env:TEMP=Join-Path $ScratchRoot 'Temp';$env:TMP=$env:TEMP
 [IO.Directory]::CreateDirectory($env:TEMP)|Out-Null
 Import-Module (Join-Path $PSScriptRoot 'Stage5NativePerformanceFixtureProduction.psm1') -Force
