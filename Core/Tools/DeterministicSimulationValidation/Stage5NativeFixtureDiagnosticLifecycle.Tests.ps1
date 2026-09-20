@@ -15,8 +15,21 @@ $scratchParentItem = Get-Item -LiteralPath $scratchParent -Force
 if (($scratchParentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
     throw "Stage 5 native fixture lifecycle scratch parent is a reparse point: $scratchParent"
 }
-$runRoot = Join-Path $scratchParent ('native-fixture-diagnostic-lifecycle-{0}-{1}' -f
-    $PID, [Guid]::NewGuid().ToString('N'))
+# The host lifecycle creates this deepest title-session path below each case.
+# Check the worst-case full-GUID leaf before creating it so the canonical
+# CTest parent remains below the bounded Windows path budget.
+$deepestRelativePath = 'success\TitleSession\Documents\GGC-LockstepV2-ZeroHour'
+$maximumUniqueRunRoot = Join-Path $scratchParent ('nf-l-{0}' -f ('0' * 32))
+$deepestGeneratedPath = Join-Path $maximumUniqueRunRoot $deepestRelativePath
+if ($deepestGeneratedPath.Length -ge 248) {
+    throw ('Stage 5 native fixture lifecycle path budget exceeded: deepest ' +
+        "generated path length $($deepestGeneratedPath.Length) under $scratchParent")
+}
+$runRoot = Join-Path $scratchParent ('nf-l-{0}' -f
+    [Guid]::NewGuid().ToString('N'))
+if (Test-Path -LiteralPath $runRoot) {
+    throw "Stage 5 native fixture lifecycle run root unexpectedly exists: $runRoot"
+}
 [IO.Directory]::CreateDirectory($runRoot)|Out-Null
 $runRootItem = Get-Item -LiteralPath $runRoot -Force
 if (($runRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
