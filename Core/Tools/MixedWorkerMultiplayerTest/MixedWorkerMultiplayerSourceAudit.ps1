@@ -30,6 +30,80 @@ function Require-Count(
     }
 }
 
+function Get-FunctionSlice(
+    [string]$source,
+    [string]$beginMarker,
+    [string]$endMarker,
+    [string]$description
+) {
+    $begin = $source.IndexOf($beginMarker, [StringComparison]::Ordinal)
+    $end = $source.IndexOf($endMarker, $begin + $beginMarker.Length,
+        [StringComparison]::Ordinal)
+    if ($begin -lt 0 -or $end -lt 0) {
+        $failures.Add("$description is missing its planning function boundary")
+        return ''
+    }
+    return $source.Substring($begin, $end - $begin)
+}
+
+function Assert-OrderedMarker(
+    [string]$source,
+    [string]$earlier,
+    [string]$later,
+    [string]$description
+) {
+    $earlierIndex = $source.IndexOf($earlier, [StringComparison]::Ordinal)
+    $laterIndex = $source.IndexOf($later, [StringComparison]::Ordinal)
+    if ($earlierIndex -lt 0 -or $laterIndex -lt 0 -or
+        $earlierIndex -ge $laterIndex) {
+        $failures.Add("$description must order '$earlier' before '$later'")
+    }
+}
+
+function Assert-EnemyPlanningReceiptContract(
+    [string]$source,
+    [string]$description,
+    [string]$publicationMarker
+) {
+    $enemy = Get-FunctionSlice $source `
+        'Bool RunSkirmishEnemyPlanningBatch()' `
+        'Bool RunSkirmishProductionPlanningBatch()' `
+        "$description enemy planning"
+    if ([string]::IsNullOrEmpty($enemy)) {
+        return
+    }
+
+    $receiptClose =
+        'const Bool referenceClosed = FinishLiveAIPlanningReferenceAttempt('
+    $receiptFailure = 'if (!referenceClosed)'
+    Require-Count $enemy $receiptClose 1 `
+        "$description enemy planning closes exactly one live receipt"
+    Require-Count $enemy $receiptFailure 1 `
+        "$description enemy planning has one fail-closed receipt guard"
+    Require-Count $enemy 'resolveEnemyPlanningCommit(' 1 `
+        "$description enemy planning validates the complete live membership set"
+    Require-Count $enemy $publicationMarker 1 `
+        "$description enemy planning publishes one resolved owner target"
+    Assert-OrderedMarker $enemy $receiptClose $receiptFailure `
+        "$description enemy planning receipt closure"
+    Assert-OrderedMarker $enemy $receiptFailure $publicationMarker `
+        "$description enemy planning fail-closed publication"
+
+    $failureStart = $enemy.IndexOf($receiptFailure,
+        [StringComparison]::Ordinal)
+    $publication = $enemy.IndexOf($publicationMarker,
+        [StringComparison]::Ordinal)
+    if ($failureStart -ge 0 -and $publication -gt $failureStart) {
+        $failureBlock = $enemy.Substring($failureStart,
+            $publication - $failureStart)
+        if (-not $failureBlock.Contains('RecordAIPlanningOwnerCommit(false)') -or
+            -not $failureBlock.Contains('return false;')) {
+            $failures.Add(
+                "$description enemy receipt failure can publish a partial target")
+        }
+    }
+}
+
 function Assert-SelfTestAcceptsCount(
     [string]$source,
     [string]$token,
@@ -233,6 +307,39 @@ policy.multiplayerPolicyEnabled = policy.networkGame &&
         'policy.multiplayerPolicyEnabled = policy.networkGame &&' 1 `
         'path fixture missing the non-network fallback'
 
+    $validAIPlanning = @'
+Bool RunSkirmishEnemyPlanningBatch()
+resolveEnemyPlanningCommit(
+const Bool referenceClosed = FinishLiveAIPlanningReferenceAttempt(
+if (!referenceClosed)
+{
+    rts::RecordAIPlanningOwnerCommit(false);
+    return false;
+}
+owners[i]->applyEnemyPlanningCommit(resolved[i]);
+Bool RunSkirmishProductionPlanningBatch()
+'@
+    $failures.Clear()
+    Assert-EnemyPlanningReceiptContract $validAIPlanning `
+        'AI planning receipt fixture' `
+        'owners[i]->applyEnemyPlanningCommit(resolved[i]);'
+    if ($failures.Count -ne 0) {
+        $messages = $failures -join '; '
+        $failures.Clear()
+        throw "Self-test rejected a valid AI planning receipt fixture: $messages"
+    }
+    $failures.Clear()
+    $malformedAIPlanning = $validAIPlanning.Replace(
+        'const Bool referenceClosed = FinishLiveAIPlanningReferenceAttempt(',
+        'removed_reference_close(')
+    Assert-EnemyPlanningReceiptContract $malformedAIPlanning `
+        'AI planning receipt mutation fixture' `
+        'owners[i]->applyEnemyPlanningCommit(resolved[i]);'
+    if ($failures.Count -eq 0) {
+        throw 'Self-test accepted an AI planning fixture without receipt closure.'
+    }
+    $failures.Clear()
+
     Write-Output 'Mixed-worker multiplayer source audit self-test passed.'
 }
 
@@ -293,8 +400,8 @@ Require-Count $generalsAI 'MULTIPLAYER_SIMULATION_KERNEL_AI_PLANNING' 1 `
     "$generalsAIPath has one AI planning policy route"
 Require-Count $generalsAI 'IsEnemyPlanningMultiplayerPolicyBlocked()' 4 `
     "$generalsAIPath applies one policy decision to admission, execution, and epoch gates"
-Require-Count $generalsAI 'owners[i]->applyEnemyPlanningCommit(resolved[i]);' 1 `
-    "$generalsAIPath preserves the canonical owner commit"
+Assert-EnemyPlanningReceiptContract $generalsAI $generalsAIPath `
+    'owners[ownerIndex]->applyEnemyPlanningCommit(resolved[ownerIndex]);'
 
 $zeroHourAIPath = 'GeneralsMD/Code/GameEngine/Source/GameLogic/AI/AI.cpp'
 $zeroHourAI = Read-Source $zeroHourAIPath
@@ -302,9 +409,8 @@ Require-Count $zeroHourAI 'GameNetwork/MultiplayerSimulationRuntimePolicy.h' 1 `
     "$zeroHourAIPath includes the centralized runtime policy adapter exactly once"
 Require-Count $zeroHourAI 'MULTIPLAYER_SIMULATION_KERNEL_AI_PLANNING' 1 `
     "$zeroHourAIPath has one centralized AI planning policy route"
-Require-Count $zeroHourAI `
-    'owners[i]->commitEnemyPlanningResult(' 1 `
-    'Zero Hour enemy planning preserves its owner commit loop'
+Assert-EnemyPlanningReceiptContract $zeroHourAI $zeroHourAIPath `
+    'owners[i]->applyEnemyPlanningCommit(resolved[i]);'
 $zeroHourProductionPath = 'GeneralsMD/Code/GameEngine/Source/GameLogic/AI/AISkirmishPlayer.cpp'
 Require-Count (Read-Source $zeroHourProductionPath) `
     'commitProductionPlanningResult(' 2 `
