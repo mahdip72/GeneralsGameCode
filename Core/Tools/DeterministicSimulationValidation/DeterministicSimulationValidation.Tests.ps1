@@ -17,19 +17,23 @@ $focusedLivePlanEntryIdentity =
     $FocusedAcceptanceCase -ceq 'LivePlanEntryIdentity'
 $focusedResultTreeDictionary =
     $FocusedAcceptanceCase -ceq 'ResultTreeDictionary'
+$focusedPerformanceScalingExport =
+    $FocusedAcceptanceCase -ceq 'PerformanceScalingExport'
 if (-not [string]::IsNullOrWhiteSpace($FocusedAcceptanceCase) -and
     -not ($focusedQualificationData -or
         $focusedDevelopmentReadinessExecutionEvidence -or
         $focusedAiDeterminismGrouping -or
         $focusedLivePlanEntryIdentity -or
-        $focusedResultTreeDictionary)) {
+        $focusedResultTreeDictionary -or
+        $focusedPerformanceScalingExport)) {
     throw "Unknown focused acceptance case '$FocusedAcceptanceCase'."
 }
 if (($focusedQualificationData -or
     $focusedDevelopmentReadinessExecutionEvidence -or
         $focusedAiDeterminismGrouping -or
         $focusedLivePlanEntryIdentity -or
-        $focusedResultTreeDictionary) -and
+        $focusedResultTreeDictionary -or
+        $focusedPerformanceScalingExport) -and
     $ValidationPartition -notin @('All', 'Acceptance')) {
     throw 'Focused acceptance cases require ValidationPartition Acceptance or All.'
 }
@@ -37,7 +41,8 @@ $hasFocusedAcceptanceCase = $focusedQualificationData -or
     $focusedDevelopmentReadinessExecutionEvidence -or
     $focusedAiDeterminismGrouping -or
     $focusedLivePlanEntryIdentity -or
-    $focusedResultTreeDictionary
+    $focusedResultTreeDictionary -or
+    $focusedPerformanceScalingExport
 $runPlan = -not $hasFocusedAcceptanceCase -and
     ($ValidationPartition -eq 'All' -or $ValidationPartition -eq 'Plan')
 $runRuntime = -not $hasFocusedAcceptanceCase -and
@@ -50,7 +55,8 @@ $runAcceptance = $hasFocusedAcceptanceCase -or
 # invariants run in every partition and catch accidental routing regressions.
 $expectedFocusedSelection = $focusedQualificationData -or
     $focusedDevelopmentReadinessExecutionEvidence -or $focusedAiDeterminismGrouping -or
-    $focusedLivePlanEntryIdentity -or $focusedResultTreeDictionary
+    $focusedLivePlanEntryIdentity -or $focusedResultTreeDictionary -or
+    $focusedPerformanceScalingExport
 if ($runPlan -ne (($ValidationPartition -in @('All', 'Plan')) -and
         -not $expectedFocusedSelection) -or
     $runRuntime -ne (($ValidationPartition -in @('All', 'Runtime')) -and
@@ -3623,7 +3629,6 @@ function Write-PerformanceScalingTestManifest {
         [string]$PhaseBaselineProfileOutputPath,
         [ValidateSet('ZeroHour')][string]$Title = 'ZeroHour')
     $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
-    $stem = [IO.Path]::GetFileNameWithoutExtension($Path)
     Assert-True ((Test-Path -LiteralPath $ArtifactSetManifestPath -PathType Leaf) -and
         (Get-Sha256 $ArtifactSetManifestPath) -ceq $ArtifactSetSha256) `
         'authoritative scaling fixture requires the exact reviewed artifact-set manifest'
@@ -3635,8 +3640,20 @@ function Write-PerformanceScalingTestManifest {
     Assert-True ($zeroHourExecutable.Count -eq 1 -and
         $zeroHourExecutable[0].sha256 -ceq $ExecutableSha256) `
         'authoritative scaling fixture requires the reviewed Zero Hour executable'
-    $closureLeaf = "$stem.authoritative"
+    # This fixture runs below an already unique acceptance root. Keep its
+    # internal leaf compact so the copied installed-runtime relative path and
+    # TitleSession remain below the production 248-character safety boundary.
+    $closureLeaf = 's5perf.authoritative'
     $closureRoot = Join-Path $directory $closureLeaf
+    $sessionRoot = Join-Path $closureRoot 'TitleSession'
+    $runtimeExecutablePath = Join-Path $closureRoot `
+        ([string]$zeroHourExecutable[0].path)
+    $runtimeRoot = Split-Path -Parent `
+        ([IO.Path]::GetFullPath($runtimeExecutablePath))
+    Assert-True ($sessionRoot.Length -lt 248 -and $runtimeRoot.Length -lt 248) `
+        ("authoritative scaling fixture exceeds the production title-path budget: " +
+            "session='$sessionRoot' ($($sessionRoot.Length)); " +
+            "runtime='$runtimeRoot' ($($runtimeRoot.Length))")
     Assert-True (-not (Test-Path -LiteralPath $closureRoot)) `
         'authoritative scaling fixture closure root must be fresh'
     $exportOutput = @(& (Join-Path $PSScriptRoot `
@@ -9051,6 +9068,31 @@ try {
         'Runtime role semantic positive'
     Assert-True ($runtimeRoleBinding.fileCount -eq 10) `
         'runtime closure binds all six core artifact roles to the complete installed closure'
+
+    if ($focusedPerformanceScalingExport) {
+        $focusedPerformancePath = Join-Path $attachmentRoot `
+            'performance-scaling-performance-report.json'
+        $focusedPerformanceBinding = Write-PerformanceScalingTestManifest `
+            -Path $focusedPerformancePath `
+            -SourceCommit $sourceCommit `
+            -ArtifactSetSha256 $artifactSetHash `
+            -ExecutableSha256 $artifactTestHashes['zerohour-executable'] `
+            -ArtifactSetManifestPath $artifactSetPath `
+            -Stage3BaselineOutputPath (Join-Path $attachmentRoot `
+                'performance-scaling-stage3-baseline.json') `
+            -PhaseBaselineProfileOutputPath (Join-Path $attachmentRoot `
+                'performance-scaling-phase-baseline-profile.json')
+        Assert-True ((Test-Path -LiteralPath $focusedPerformancePath `
+                    -PathType Leaf) -and
+            [IO.Path]::GetFileName([string]$focusedPerformanceBinding.closureRoot) `
+                -ceq 's5perf.authoritative') `
+            'focused performance-scaling export did not use its bounded authoritative closure'
+        if ($script:Failures -ne 0) {
+            throw "$script:Failures focused performance-scaling export test(s) failed."
+        }
+        Write-Output 'Stage 5 focused performance-scaling export passed.'
+        return
+    }
 
     $runtimeClosureOriginalBytes = [IO.File]::ReadAllBytes($runtimeClosureManifestPath)
     try {
