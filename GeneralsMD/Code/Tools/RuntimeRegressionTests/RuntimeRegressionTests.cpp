@@ -25,6 +25,7 @@
 #include "GameLogic/SkirmishAIRecovery.h"
 #include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/Module/RailedTransportDockUpdate.h"
 #include "WW3D2/textureloader.h"
 
 #include <limits.h>
@@ -1118,6 +1119,17 @@ static void TestSkirmishAIRecoveryPolicies()
 		true, true, false));
 	CHECK(!ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
 		true, false, true));
+	// A bounded paid entry that failed failover is not progress. If an exact
+	// unusable native worker is blocking respawn, disposition must reach RESET;
+	// other native states retain the existing retryable bounded-queue behavior.
+	CHECK(!ShouldReturnFromSkirmishAIRecoveryBoundedQueueFailure(
+		true, false, true));
+	CHECK(ShouldReturnFromSkirmishAIRecoveryBoundedQueueFailure(
+		true, false, false));
+	CHECK(ShouldReturnFromSkirmishAIRecoveryBoundedQueueFailure(
+		true, true, true));
+	CHECK(!ShouldReturnFromSkirmishAIRecoveryBoundedQueueFailure(
+		false, false, false));
 	CHECK(IsSkirmishAIRecoveryFailoverAdmissionEligible(
 		true, false, false, false, false, false, false));
 	CHECK(IsSkirmishAIRecoveryFailoverAdmissionEligible(
@@ -1267,6 +1279,21 @@ static void TestSkirmishAIRecoveryPolicies()
 		true, true, true, true, true, false, 200, true));
 	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
 		false, true, true, true, false, false, 0, false));
+	// A primary native reconstruction owns its free-worker lifecycle. This
+	// overrides both the resource-order exception and a cleared reserve after
+	// exact paid-queue cancellation, while unrelated units remain unaffected.
+	CHECK(ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false, false, 0, false, true));
+	// The same still-owned native lifecycle must continue suppressing this
+	// resource WorkOrder on later queue updates, after the cancellation frame.
+	CHECK(ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false, false, 0, false, true));
+	CHECK(ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		false, true, true, true, false, false, 0, false, true));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, false, true, true, false, false, 0, false, true));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false, true, 0, false, true));
 	// Recovery may reuse only default-team, non-reinforcement requests. A
 	// resource request deterministically outranks an earlier eligible dozer
 	// request, while candidates at the same rank retain queue order.
@@ -1445,18 +1472,141 @@ static void TestSkirmishAIRecoveryPolicies()
 	const unsigned int nativeWorkerRespawnFrames = 10U * 30U;
 	CHECK(nativeRetryFrames < nativeWorkerRespawnFrames);
 	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
-		false, true, true) == SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP);
+		false, true, true, true) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER);
+	// Once advancing routes have returned, a present unusable exact worker must
+	// reset even when the independent scaffold-relocation predicate says KEEP.
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		false, true, true, false) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER);
+	const bool boundedFailoverFailureReturns =
+		ShouldReturnFromSkirmishAIRecoveryBoundedQueueFailure(
+			true, false, true);
+	CHECK(!boundedFailoverFailureReturns &&
+		GetSkirmishAIRecoveryStalledScaffoldAction(
+			false, true, true, false) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER);
+	const bool bareFactoryDefersDisposition =
+		ShouldDeferSkirmishAIRecoveryStalledDisposition(
+			false, true, true);
+	const bool replacementAttemptedWouldSell =
+		ShouldSellSkirmishAIRecoveryScaffold(
+			true, false, false, true, true);
+	CHECK(!bareFactoryDefersDisposition && replacementAttemptedWouldSell &&
+		GetSkirmishAIRecoveryStalledScaffoldAction(
+			replacementAttemptedWouldSell, true, true, false) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER);
+	const SkirmishAIRecoveryStalledScaffoldAction unusableResetAction =
+		GetSkirmishAIRecoveryStalledScaffoldAction(
+			false, true, true, false);
+	const bool liveForeignAssignedBuilder = true;
+	// Exact cancellation is part of RESET itself, independent of the scaffold's
+	// live foreign builder, so production cannot resume during the retry window.
+	CHECK(liveForeignAssignedBuilder &&
+		ShouldCancelSkirmishAIRecoveryPaidQueueForNativeWorkerReset(
+			unusableResetAction, true, true));
+	CHECK(!ShouldCancelSkirmishAIRecoveryPaidQueueForNativeWorkerReset(
+		unusableResetAction, true, false)); // exact entry already vanished
+	CHECK(!ShouldCancelSkirmishAIRecoveryPaidQueueForNativeWorkerReset(
+		unusableResetAction, false, true)); // unrelated entry is never exact
+	CHECK(!ShouldCancelSkirmishAIRecoveryPaidQueueForNativeWorkerReset(
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP, true, true));
+	CHECK(ShouldDetachSkirmishAIRecoveryNativeWorkerWithoutDestroying(
+		true, false)); // captured worker survives while the hole detaches
+	CHECK(!ShouldDetachSkirmishAIRecoveryNativeWorkerWithoutDestroying(
+		true, true));
+	CHECK(!ShouldDetachSkirmishAIRecoveryNativeWorkerWithoutDestroying(
+		false, false));
+	const ThingTemplate *exactNativeVariant =
+		reinterpret_cast<const ThingTemplate *>(1);
+	const ThingTemplate *equivalentPrimaryVariant =
+		reinterpret_cast<const ThingTemplate *>(2);
+	CHECK(GetSkirmishAIRecoveryExactNativeRebuildTemplate(
+		exactNativeVariant, equivalentPrimaryVariant) == exactNativeVariant);
+	CHECK(ShouldClearSkirmishAIRecoveryHoleImposedUnselectable(
+		true, true, false, false, false, false));
+	CHECK(!ShouldClearSkirmishAIRecoveryHoleImposedUnselectable(
+		false, true, false, false, false, false));
+	CHECK(!ShouldClearSkirmishAIRecoveryHoleImposedUnselectable(
+		true, false, false, false, false, false));
+	CHECK(!ShouldClearSkirmishAIRecoveryHoleImposedUnselectable(
+		true, true, true, false, false, false)); // container owns selection state
+	CHECK(!ShouldClearSkirmishAIRecoveryHoleImposedUnselectable(
+		true, true, false, true, false, false)); // masking owns selection state
+	CHECK(!ShouldClearSkirmishAIRecoveryHoleImposedUnselectable(
+		true, true, false, false, false, true)); // slaver/sold/scuttle owner
+	CHECK(ShouldClearSkirmishAIRecoveryHoleImposedUnselectable(
+		true, true, false, false, true, false)); // script-held alone owns no bit
+	const ObjectID dockedWorkerID = static_cast<ObjectID>(91);
+	const ObjectID unloadingWorkerID = static_cast<ObjectID>(93);
+	const ObjectID unrelatedWorkerID = static_cast<ObjectID>(92);
+	CHECK(IsExactRailedTransportDockOwnedObject(
+		dockedWorkerID, INVALID_ID, dockedWorkerID));
+	CHECK(IsExactRailedTransportDockOwnedObject(
+		INVALID_ID, unloadingWorkerID, unloadingWorkerID));
+	CHECK(!IsExactRailedTransportDockOwnedObject(
+		dockedWorkerID, unloadingWorkerID,
+		unrelatedWorkerID)); // unrelated ferry
+	CHECK(!IsExactRailedTransportDockOwnedObject(
+		INVALID_ID, INVALID_ID, dockedWorkerID));
+	const int capturedNativeWorkerID = 73;
+	const int invalidNativeWorkerID = -1;
+	const bool capturedNativeWorkerDetached =
+		ShouldDetachSkirmishAIRecoveryNativeWorkerWithoutDestroying(true, false);
+	CHECK(GetSkirmishAIRecoveryNativeWorkerIDAfterOwnershipDetach(
+		capturedNativeWorkerDetached, capturedNativeWorkerID,
+		invalidNativeWorkerID) == invalidNativeWorkerID);
+	const bool resumeGraceWouldOtherwiseReturn = true;
+	CHECK(resumeGraceWouldOtherwiseReturn &&
+		ShouldImmediatelyAbandonSkirmishAINativeLineageAfterCapture(
+			capturedNativeWorkerDetached, true));
+	const SkirmishAINativeCapturedWorkerTerminalTransition
+		secondCapturedWorkerTransition =
+			GetSkirmishAINativeCapturedWorkerTerminalTransition(
+				capturedNativeWorkerDetached, true);
+	CHECK(secondCapturedWorkerTransition.abandonImmediately);
+	CHECK(secondCapturedWorkerTransition.preserveDetachedWorker);
+	CHECK(secondCapturedWorkerTransition.removeHole);
+	CHECK(secondCapturedWorkerTransition.removeScaffold);
+	CHECK(secondCapturedWorkerTransition.clearRecycleMarker);
+	CHECK(!secondCapturedWorkerTransition.spawnReplacementWorker);
+	CHECK(!ShouldImmediatelyAbandonSkirmishAINativeLineageAfterCapture(
+		capturedNativeWorkerDetached, false));
+	CHECK(ClearSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+		3 * 9 + 2, 9) == 2);
+	// The captured unit remains independently live while the hole observes an
+	// invalid worker ID before either the assigned replacement or paid queue can
+	// return progress. Both paths therefore preserve native respawn ownership and
+	// cancel only the exact tracked paid duplicate.
+	const bool capturedUnitSurvivesDetach = true;
+	const bool assignedReplacementCanResume = true;
+	const bool paidReplacementWasProgressing = true;
+	CHECK(capturedUnitSurvivesDetach && assignedReplacementCanResume &&
+		ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+			true, false, false, false, false, false));
+	CHECK(capturedUnitSurvivesDetach && paidReplacementWasProgressing &&
+		ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
+			true, true, true));
+	CHECK(GetSkirmishAIRecoveryNativeWorkerIDAfterOwnershipDetach(
+		capturedNativeWorkerDetached, capturedNativeWorkerID,
+		invalidNativeWorkerID) == invalidNativeWorkerID);
 	// The first evaluation recycles the exact live hole worker.  On the next
 	// earlier AI retry that worker is absent while the native respawn timer is
 	// pending, so KEEP proves recovery will not restart the longer countdown.
 	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
-		stalledScaffoldWouldSell, true, true) ==
+		stalledScaffoldWouldSell, true, true, true) ==
 		SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER);
 	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
-		stalledScaffoldWouldSell, true, false) ==
+		stalledScaffoldWouldSell, true, false, false) ==
 		SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP);
+	// A captured, dead-present, non-dozer, or incompatible exact object cannot
+	// start native respawn while its ID still resolves. Reset that exact object
+	// once instead of masking the bounded disposition with KEEP forever.
 	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
-		stalledScaffoldWouldSell, false, false) ==
+		stalledScaffoldWouldSell, true, true, false) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER);
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		stalledScaffoldWouldSell, false, false, false) ==
 		SKIRMISH_AI_RECOVERY_SCAFFOLD_SELL);
 	UnsignedInt evacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
 		100, 0, true, 60);
@@ -1546,6 +1696,190 @@ static void TestSkirmishAIRecoveryPolicies()
 	CHECK(!IsSkirmishAIRecoveryReservedNativeWorker(true, 41, 42, 0));
 	CHECK(!IsSkirmishAIRecoveryReservedNativeWorker(false, 41, 41, 0));
 	CHECK(!IsSkirmishAIRecoveryReservedNativeWorker(true, 0, 0, 0));
+	// Worker A belongs to the primary hole. Replacement B may temporarily own
+	// the scaffold; once B dies, the still-live compatible A must re-enter the
+	// dedicated assigned-builder path rather than being treated as a respawn gap.
+	CHECK(!ShouldUseSkirmishAIRecoveryNativeWorkerAsAssigned(
+		true, true, true, true));
+	CHECK(ShouldUseSkirmishAIRecoveryNativeWorkerAsAssigned(
+		false, true, true, true));
+	CHECK(!ShouldUseSkirmishAIRecoveryNativeWorkerAsAssigned(
+		false, true, false, true));
+	CHECK(!ShouldUseSkirmishAIRecoveryNativeWorkerAsAssigned(
+		false, true, true, false));
+	CHECK(!ShouldUseSkirmishAIRecoveryNativeWorkerAsAssigned(
+		false, false, true, true));
+	// A merely live assigned worker cannot mask the exact native worker. Each
+	// operational and path condition must hold before the center binding wins.
+	CHECK(IsSkirmishAIRecoveryAssignedBuilderOperational(
+		true, false, false, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryAssignedBuilderOperational(
+		true, true, false, true, true, true)); // contained
+	CHECK(!IsSkirmishAIRecoveryAssignedBuilderOperational(
+		true, false, true, true, true, true)); // unmanned
+	CHECK(!IsSkirmishAIRecoveryAssignedBuilderOperational(
+		true, false, false, false, false, true)); // no AI/DozerAI
+	CHECK(!IsSkirmishAIRecoveryAssignedBuilderOperational(
+		true, false, false, true, true, false)); // update cannot advance
+	CHECK(!IsSkirmishAIRecoveryAssignedBuilderUsable(
+		true, true, false)); // path blocked
+	CHECK(!IsSkirmishAIRecoveryAssignedBuilderUsable(
+		true, false, true)); // no valid build dock despite a pathable fallback
+	// The legacy target-returning wrapper discards a failed dock search and can
+	// leave its fallback working position path-reachable. Recovery uses the Bool
+	// search result directly, so that fallback cannot claim native progress,
+	// cancel an exact paid route, or suppress an ordinary compatible WorkOrder.
+	const bool buildDockSearchSucceeded = false;
+	const bool fallbackWorkingPositionPathReachable = true;
+	const bool falsePositiveDockRoute =
+		IsSkirmishAIRecoveryAssignedBuilderUsable(
+			true, buildDockSearchSucceeded,
+			fallbackWorkingPositionPathReachable);
+	CHECK(!falsePositiveDockRoute);
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, true, true, true, falsePositiveDockRoute));
+	CHECK(!ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
+		falsePositiveDockRoute, true, true));
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false, false, 0, false,
+		falsePositiveDockRoute));
+	CHECK(IsSkirmishAIRecoveryNativeWorkerActivelyBuilding(
+		true, true, true, true, true));
+	CHECK(!IsSkirmishAIRecoveryNativeWorkerActivelyBuilding(
+		true, true, true, false, true)); // pending/moving, not building at dock
+	CHECK(!IsSkirmishAIRecoveryNativeWorkerActivelyBuilding(
+		true, true, true, true, false)); // wrong scaffold
+	const bool liveUnusableAssigned =
+		!IsSkirmishAIRecoveryAssignedBuilderUsable(true, true, false);
+	CHECK(liveUnusableAssigned &&
+		ShouldUseSkirmishAIRecoveryNativeWorkerAsAssigned(
+			false, true, true, true)); // present native replaces it
+	CHECK(liveUnusableAssigned &&
+		ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+			true, false, false, false, false, false)); // absent native retries
+	const bool nativeWrongResumeTarget =
+		!IsSkirmishAIRecoveryAssignedBuilderUsable(true, false, true);
+	const bool nativePathBlocked =
+		!IsSkirmishAIRecoveryAssignedBuilderUsable(true, true, false);
+	CHECK(nativeWrongResumeTarget &&
+		!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+			true, true, true, true, true, false));
+	CHECK(nativePathBlocked &&
+		!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+			true, true, true, true, true, false));
+	CHECK(liveUnusableAssigned && nativePathBlocked &&
+		!ShouldUseSkirmishAIRecoveryNativeWorkerAsAssigned(
+			false, true, true, false));
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		false, true, true, false) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER);
+	const int nativeRecycleMarker =
+		MarkSkirmishAIRecoveryNativeWorkerRecycleAttempt(2, placementOffsetCount);
+	CHECK(HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+		nativeRecycleMarker, placementOffsetCount));
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		false, true, true, false, false) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER);
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		false, true, true, false, true) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_ABANDON_NATIVE_LINEAGE);
+	// The persisted recycle band survives placement advancement and replacement
+	// observation, proving a respawned path-blocked worker cannot reset forever.
+	CHECK(HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+		AdvanceSkirmishAIRecoveryPlacementAttempt(
+			nativeRecycleMarker, placementOffsetCount), placementOffsetCount));
+	CHECK(HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+		MarkSkirmishAIRecoveryObservedReplacement(
+			nativeRecycleMarker, placementOffsetCount), placementOffsetCount));
+	CHECK(ClearSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+		nativeRecycleMarker, placementOffsetCount) == 2);
+	// External scaffold sale/capture or destruction can remove both members of
+	// the native lineage without visiting its terminal teardown. The next
+	// no-center scan clears only band 3, retaining the lower placement value so a
+	// viable factory remains an ordinary recovery route instead of inheriting a
+	// stale one-recycle terminal state.
+	const int afterExternalNativeLineageLoss =
+		ReconcileSkirmishAIRecoveryNativeWorkerRecycleAfterLineageScan(
+			nativeRecycleMarker, placementOffsetCount, false, false);
+	CHECK(afterExternalNativeLineageLoss == 2);
+	CHECK(!HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+		afterExternalNativeLineageLoss, placementOffsetCount));
+	// Bands 1 and 2 are existing placement/replacement observations, including
+	// epoch-3-compatible snapshot state. A lineage scan must not modulo those
+	// values merely because the current-epoch native scaffold is absent.
+	CHECK(ReconcileSkirmishAIRecoveryNativeWorkerRecycleAfterLineageScan(
+		placementOffsetCount + 2, placementOffsetCount, false, false) ==
+		placementOffsetCount + 2);
+	CHECK(ReconcileSkirmishAIRecoveryNativeWorkerRecycleAfterLineageScan(
+		2 * placementOffsetCount + 2, placementOffsetCount, false, false) ==
+		2 * placementOffsetCount + 2);
+	CHECK(ReconcileSkirmishAIRecoveryNativeWorkerRecycleAfterLineageScan(
+		3 * placementOffsetCount + 2, placementOffsetCount, false, false) == 2);
+	// A live scaffold without a matching hole owns no recycle band. Clearing it
+	// allows one paid factory replacement instead of indefinite native deferral.
+	const int afterLiveScaffoldLosesNativeHole =
+		ReconcileSkirmishAIRecoveryNativeWorkerRecycleAfterLineageScan(
+			nativeRecycleMarker, placementOffsetCount, true, false);
+	CHECK(afterLiveScaffoldLosesNativeHole == 2);
+	CHECK(!HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+		afterLiveScaffoldLosesNativeHole, placementOffsetCount));
+	CHECK(ReconcileSkirmishAIRecoveryNativeWorkerRecycleAfterLineageScan(
+		nativeRecycleMarker, placementOffsetCount, false, true) ==
+		nativeRecycleMarker);
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(
+		input, TRUE, FALSE, FALSE, FALSE, 1600);
+	// Exact multi-cycle policy: transient grace, one persisted canonical recycle,
+	// an absent-worker respawn gap, then deterministic lineage abandonment if the
+	// respawned worker is still unusable. Clearing the band enables relocation.
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		false, true, true, false,
+		HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+			2, placementOffsetCount)) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER);
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		false, true, false, false, true) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP);
+	CHECK(GetSkirmishAIRecoveryStalledScaffoldAction(
+		false, true, true, false,
+		HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+			nativeRecycleMarker, placementOffsetCount)) ==
+		SKIRMISH_AI_RECOVERY_SCAFFOLD_ABANDON_NATIVE_LINEAGE);
+	// Only a missing exact worker or an existing usable owned compatible dozer
+	// preserves current-epoch native ownership. An exact object that still
+	// resolves cannot enter the hole's respawn process, so unusable variants
+	// must fall through to generic recovery.
+	CHECK(ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, false, false, false, false, false)); // absent: respawn gap
+	CHECK(ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, true, true, true, true)); // usable exact native worker
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, false, true, true, true)); // captured or otherwise unowned
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, true, true, false, true)); // incompatible command set
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, true, false, true, true)); // non-dozer exact object
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, false, true, true, false)); // effectively dead but still present
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		false, false, false, false, false, false)); // unrelated/no native hole
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, true, true, true, false)); // contained
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, true, true, true, false)); // disabled/unmanned
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, true, true, true, false)); // missing DozerAI
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+		true, true, true, true, true, false)); // update cannot advance
+	// Epoch 3 preserves the original unconditional producer-linked native-hole
+	// return. Live games and epoch 4 inspect the assigned/native worker instead.
+	CHECK(ShouldPreserveSkirmishAIRecoveryNativeHoleLifecycle(
+		false, true));
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeHoleLifecycle(
+		true, true));
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeHoleLifecycle(
+		false, false));
 	// A native respawn cancels only a still-existing exact paid recovery entry.
 	CHECK(ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
 		true, false, true, true));
@@ -1557,6 +1891,18 @@ static void TestSkirmishAIRecoveryPolicies()
 		true, false, true, false));
 	CHECK(!ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
 		false, false, true, true));
+	// Current native ownership cancels its exact paid duplicate before any live
+	// foreign assigned builder can return successfully from scaffold resume.
+	const bool foreignAssignedBuilderLive = true;
+	CHECK(foreignAssignedBuilderLive &&
+		ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
+			true, true, true));
+	CHECK(!ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
+		true, true, false));
+	CHECK(!ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
+		true, false, true));
+	CHECK(!ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
+		false, true, true));
 	evacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
 		0xFFFFFFFEU, 0, true, 3);
 	CHECK(evacuationDeadline == 1U);
@@ -1666,6 +2012,21 @@ static void TestSkirmishAIRecoveryPolicies()
 		false, true));
 	CHECK(!ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
 		false, false));
+	CHECK(ShouldDeferSkirmishAIRecoveryStalledDisposition(
+		true, false, true)); // progressing paid queue always defers disposition
+	CHECK(!ShouldDeferSkirmishAIRecoveryStalledDisposition(
+		false, true, true)); // factory capability cannot mask native RESET
+	CHECK(!ShouldDeferSkirmishAIRecoveryStalledDisposition(
+		false, false, true));
+	const bool queueFullAdvancingFactory =
+		IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
+			false, true, false, true);
+	CHECK(ShouldDeferSkirmishAIRecoveryStalledDisposition(
+		false, queueFullAdvancingFactory, false));
+	const bool unfinishedFactoryWithFinisher =
+		IsSkirmishAIRecoveryFactoryPotentialDuringGrace(true, true, false);
+	CHECK(ShouldDeferSkirmishAIRecoveryStalledDisposition(
+		false, unfinishedFactoryWithFinisher, false));
 	CHECK(ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
 		false, IsSkirmishAIRecoveryFactoryAdmissionInternallyProgressing(
 			false, true, false, true)));
@@ -1753,6 +2114,9 @@ static void TestSkirmishAIReplayEpoch()
 		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY));
 	CHECK(!ShouldUseSkirmishAIRecoveryNativeHoleOwnership(
 		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY));
+	CHECK(ShouldPreserveSkirmishAIRecoveryNativeHoleLifecycle(
+		ShouldUseSkirmishAIRecoveryNativeHoleOwnership(
+			TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY), true));
 	MarkReplayVersionForSkirmishAIRecoveryEpoch(recoveryEpoch3);
 	CHECK(recoveryEpoch3.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3]") == 0);
 	UnicodeString compatibilityEpoch3 = recoveryEpoch3;
@@ -1775,6 +2139,9 @@ static void TestSkirmishAIReplayEpoch()
 		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC));
 	CHECK(ShouldUseSkirmishAIRecoveryNativeHoleOwnership(
 		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC));
+	CHECK(!ShouldPreserveSkirmishAIRecoveryNativeHoleLifecycle(
+		ShouldUseSkirmishAIRecoveryNativeHoleOwnership(
+			TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC), true));
 	MarkReplayVersionForSkirmishAICurrentEpoch(recoveryCRCEpoch);
 	MarkReplayVersionForSkirmishAIRecoveryCRCEpoch(recoveryCRCEpoch);
 	CHECK(recoveryCRCEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4]") == 0);

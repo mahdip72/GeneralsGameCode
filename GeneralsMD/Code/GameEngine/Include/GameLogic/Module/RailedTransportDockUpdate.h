@@ -32,6 +32,16 @@
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "GameLogic/Module/DockUpdate.h"
 
+inline Bool IsExactRailedTransportDockOwnedObject(
+	ObjectID dockingObjectID, ObjectID unloadingObjectID,
+	ObjectID candidateObjectID)
+{
+	return (dockingObjectID != INVALID_ID &&
+			dockingObjectID == candidateObjectID) ||
+		(unloadingObjectID != INVALID_ID &&
+			unloadingObjectID == candidateObjectID);
+}
+
 // ------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------
 class RailedTransportDockUpdateModuleData : public DockUpdateModuleData
@@ -61,6 +71,8 @@ public:
 	virtual Bool isLoadingOrUnloading() = 0;
 	virtual void unloadAll() = 0;
 	virtual void unloadSingleObject( Object *obj ) = 0;
+	// Appended to preserve the legacy interface's existing virtual slots.
+	virtual Bool ownsDockingObject(ObjectID objectID) const = 0;
 
 };
 
@@ -93,6 +105,11 @@ public:
 	virtual Bool isLoadingOrUnloading() override;
 	virtual void unloadAll() override;
 	virtual void unloadSingleObject( Object *obj ) override;
+	virtual Bool ownsDockingObject(ObjectID objectID) const override
+	{
+		return IsExactRailedTransportDockOwnedObject(
+			m_dockingObjectID, m_unloadingObjectID, objectID);
+	}
 
 protected:
 

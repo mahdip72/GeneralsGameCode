@@ -13,6 +13,8 @@
 // This header deliberately contains only POD data and pure policy helpers.
 // Keep it usable by VC6/C++98 regression tests and by the live AI code.
 
+class ThingTemplate;
+
 struct SkirmishAIRecoveryPolicyInput
 {
 	bool enabled;
@@ -142,6 +144,14 @@ inline bool ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
 	return paidQueueBounded && !graceActive && !replacementObserved;
 }
 
+inline bool ShouldReturnFromSkirmishAIRecoveryBoundedQueueFailure(
+	bool paidQueueBounded, bool failoverSucceeded,
+	bool hasPresentUnusableNativeWorker)
+{
+	return paidQueueBounded &&
+		(failoverSucceeded || !hasPresentUnusableNativeWorker);
+}
+
 inline bool IsSkirmishAIRecoveryFailoverAdmissionEligible(
 	bool canMake, bool noMoney, bool maxed, bool refundAffordable,
 	bool cancellationFreesMax, bool nonMaxBuildable, bool queueReady)
@@ -207,12 +217,71 @@ inline bool IsSkirmishAIRecoveryReservedNativeWorker(
 		holeWorkerID == candidateWorkerID;
 }
 
+inline bool ShouldUseSkirmishAIRecoveryNativeWorkerAsAssigned(
+	bool centerAssignedWorkerUsable, bool currentNativeHole,
+	bool nativeWorkerLive, bool nativeWorkerCompatible)
+{
+	return !centerAssignedWorkerUsable && currentNativeHole &&
+		nativeWorkerLive && nativeWorkerCompatible;
+}
+
+inline bool IsSkirmishAIRecoveryAssignedBuilderOperational(
+	bool liveOwned, bool contained, bool unmanned, bool hasAIUpdate,
+	bool hasDozerAI, bool updateCanAdvance)
+{
+	return liveOwned && !contained && !unmanned && hasAIUpdate && hasDozerAI &&
+		updateCanAdvance;
+}
+
+inline bool IsSkirmishAIRecoveryAssignedBuilderUsable(
+	bool operational, bool buildDockFound, bool pathAvailable)
+{
+	return operational && buildDockFound && pathAvailable;
+}
+
+inline bool IsSkirmishAIRecoveryNativeWorkerActivelyBuilding(
+	bool liveOwned, bool updateCanAdvance, bool currentTaskIsBuild,
+	bool buildSubTaskIsAtDock, bool targetsExactScaffold)
+{
+	return liveOwned && updateCanAdvance && currentTaskIsBuild &&
+		buildSubTaskIsAtDock && targetsExactScaffold;
+}
+
+inline bool ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+	bool currentNativeHole, bool nativeWorkerExists,
+	bool nativeWorkerLiveOwned, bool nativeWorkerIsDozer,
+	bool nativeWorkerCompatible, bool nativeWorkerResumeUsable)
+{
+	if (!currentNativeHole)
+		return false;
+	// A missing exact worker is the native respawn gap. If the exact ObjectID
+	// still resolves, the hole will not start its respawn timer, so preserve the
+	// native lifecycle only while that object is an owned compatible dozer that
+	// can actually reach and resume this exact scaffold.
+	return !nativeWorkerExists ||
+		(nativeWorkerLiveOwned && nativeWorkerIsDozer && nativeWorkerCompatible &&
+		 nativeWorkerResumeUsable);
+}
+
+inline bool ShouldPreserveSkirmishAIRecoveryNativeHoleLifecycle(
+	bool useCurrentNativeHoleOwnership, bool hasPrimaryNativeHole)
+{
+	return !useCurrentNativeHoleOwnership && hasPrimaryNativeHole;
+}
+
 inline bool ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
 	bool hasNativeHole, bool assignedWorkerLive,
 	bool exactIdentityTracked, bool exactEntryExists)
 {
 	return hasNativeHole && !assignedWorkerLive &&
 		exactIdentityTracked && exactEntryExists;
+}
+
+inline bool ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
+	bool nativeLifecycleOwned, bool exactIdentityTracked,
+	bool exactEntryExists)
+{
+	return nativeLifecycleOwned && exactIdentityTracked && exactEntryExists;
 }
 
 inline bool ShouldSelectSkirmishAIPrimaryCommandCenter(
@@ -250,12 +319,18 @@ inline bool ShouldSuppressSkirmishAIRecoveryBuilderOrder(
 	bool isResourceGatherer, bool isCompatibleBuilder,
 	bool recoveryEnabled, bool recoveryEverCompleted,
 	bool recoveryImpossible, bool hasCompletedPrimaryCommandCenter,
-	int reserveCost, bool hasPaidCompatibleBuilderQueue)
+	int reserveCost, bool hasPaidCompatibleBuilderQueue,
+	bool nativePrimaryRebuildPending = false)
 {
 	if (!isCompatibleBuilder || !recoveryEnabled ||
 		!recoveryEverCompleted || recoveryImpossible ||
 		hasCompletedPrimaryCommandCenter)
 		return false;
+	// The native hole owns a free worker lifecycle for this exact primary
+	// reconstruction. Ordinary WorkOrders must not replace an exact recovery
+	// cancellation while that worker is live or awaiting respawn.
+	if (nativePrimaryRebuildPending)
+		return true;
 	// Once recovery has paid for an equivalent builder, suppress every ordinary
 	// WorkOrder so a resumed producer cannot pay a duplicate. Without a paid
 	// entry, a resource worker remains an income route while other builders keep
@@ -353,6 +428,45 @@ inline bool HasSkirmishAIRecoveryObservedReplacement(
 		placementAttempt >= 2 * placementOffsetCount;
 }
 
+inline bool HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+	int placementAttempt, int placementOffsetCount)
+{
+	return placementOffsetCount > 0 &&
+		placementAttempt >= 3 * placementOffsetCount;
+}
+
+inline int MarkSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+	int placementAttempt, int placementOffsetCount)
+{
+	if (placementOffsetCount <= 0)
+		return placementAttempt;
+	if (placementAttempt < 0)
+		placementAttempt = 0;
+	return 3 * placementOffsetCount +
+		placementAttempt % placementOffsetCount;
+}
+
+inline int ClearSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+	int placementAttempt, int placementOffsetCount)
+{
+	if (placementOffsetCount <= 0 || placementAttempt < 0)
+		return placementAttempt;
+	return placementAttempt % placementOffsetCount;
+}
+
+inline int ReconcileSkirmishAIRecoveryNativeWorkerRecycleAfterLineageScan(
+	int placementAttempt, int placementOffsetCount,
+	bool hasLivePrimaryScaffold, bool hasMatchingNativeHole)
+{
+	(void)hasLivePrimaryScaffold;
+	if (hasMatchingNativeHole ||
+		!HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+			placementAttempt, placementOffsetCount))
+		return placementAttempt;
+	return ClearSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+		placementAttempt, placementOffsetCount);
+}
+
 inline int MarkSkirmishAIRecoveryObservedReplacement(
 	int placementAttempt, int placementOffsetCount)
 {
@@ -360,6 +474,9 @@ inline int MarkSkirmishAIRecoveryObservedReplacement(
 		return placementAttempt;
 	if (placementAttempt < 0)
 		placementAttempt = 0;
+	if (HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+			placementAttempt, placementOffsetCount))
+		return placementAttempt;
 	return 2 * placementOffsetCount +
 		placementAttempt % placementOffsetCount;
 }
@@ -385,12 +502,15 @@ inline int AdvanceSkirmishAIRecoveryPlacementAttempt(
 	if (placementAttempt < 0)
 		placementAttempt = 0;
 	const int replacementBand =
-		HasSkirmishAIRecoveryObservedReplacement(
+		HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+			placementAttempt, placementOffsetCount)
+		? 3 * placementOffsetCount :
+		(HasSkirmishAIRecoveryObservedReplacement(
 			placementAttempt, placementOffsetCount)
 		? 2 * placementOffsetCount :
 		(HasSkirmishAIRecoveryScaffoldReplacementAttempt(
 			placementAttempt, placementOffsetCount)
-			? placementOffsetCount : 0);
+			? placementOffsetCount : 0));
 	return replacementBand +
 		((placementAttempt % placementOffsetCount) + 1) % placementOffsetCount;
 }
@@ -409,21 +529,101 @@ enum SkirmishAIRecoveryStalledScaffoldAction
 {
 	SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP,
 	SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER,
+	SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER,
+	SKIRMISH_AI_RECOVERY_SCAFFOLD_ABANDON_NATIVE_LINEAGE,
 	SKIRMISH_AI_RECOVERY_SCAFFOLD_SELL
 };
 
 inline SkirmishAIRecoveryStalledScaffoldAction
 GetSkirmishAIRecoveryStalledScaffoldAction(
 	bool shouldSell, bool hasNativeRebuildHole,
-	bool hasLiveAssociatedNativeWorker)
+	bool nativeWorkerExists, bool nativeWorkerUsable,
+	bool nativeWorkerRecycleAttempted = false)
 {
-	if (!shouldSell)
-		return SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP;
 	if (!hasNativeRebuildHole)
-		return SKIRMISH_AI_RECOVERY_SCAFFOLD_SELL;
-	return hasLiveAssociatedNativeWorker
+		return shouldSell ? SKIRMISH_AI_RECOVERY_SCAFFOLD_SELL :
+			SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP;
+	if (!nativeWorkerExists)
+		return SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP;
+	if (nativeWorkerRecycleAttempted)
+		return SKIRMISH_AI_RECOVERY_SCAFFOLD_ABANDON_NATIVE_LINEAGE;
+	return nativeWorkerUsable
 		? SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER
-		: SKIRMISH_AI_RECOVERY_SCAFFOLD_KEEP;
+		: SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER;
+}
+
+inline bool ShouldCancelSkirmishAIRecoveryPaidQueueForNativeWorkerReset(
+	SkirmishAIRecoveryStalledScaffoldAction action,
+	bool exactIdentityTracked, bool exactEntryExists)
+{
+	return action ==
+			SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER &&
+		exactIdentityTracked && exactEntryExists;
+}
+
+inline bool ShouldDetachSkirmishAIRecoveryNativeWorkerWithoutDestroying(
+	bool nativeWorkerExists, bool nativeWorkerOwned)
+{
+	return nativeWorkerExists && !nativeWorkerOwned;
+}
+
+inline bool ShouldImmediatelyAbandonSkirmishAINativeLineageAfterCapture(
+	bool capturedWorkerDetached, bool recycleAttemptedBeforeDetach)
+{
+	return capturedWorkerDetached && recycleAttemptedBeforeDetach;
+}
+
+struct SkirmishAINativeCapturedWorkerTerminalTransition
+{
+	bool abandonImmediately;
+	bool preserveDetachedWorker;
+	bool removeHole;
+	bool removeScaffold;
+	bool clearRecycleMarker;
+	bool spawnReplacementWorker;
+};
+
+inline SkirmishAINativeCapturedWorkerTerminalTransition
+GetSkirmishAINativeCapturedWorkerTerminalTransition(
+	bool capturedWorkerDetached, bool recycleAttemptedBeforeDetach)
+{
+	SkirmishAINativeCapturedWorkerTerminalTransition result;
+	result.abandonImmediately =
+		ShouldImmediatelyAbandonSkirmishAINativeLineageAfterCapture(
+			capturedWorkerDetached, recycleAttemptedBeforeDetach);
+	result.preserveDetachedWorker = result.abandonImmediately;
+	result.removeHole = result.abandonImmediately;
+	result.removeScaffold = result.abandonImmediately;
+	result.clearRecycleMarker = result.abandonImmediately;
+	result.spawnReplacementWorker = false;
+	return result;
+}
+
+inline const ThingTemplate *GetSkirmishAIRecoveryExactNativeRebuildTemplate(
+	const ThingTemplate *nativeRebuildTemplate,
+	const ThingTemplate *equivalentPrimaryTemplate)
+{
+	(void)equivalentPrimaryTemplate;
+	return nativeRebuildTemplate;
+}
+
+inline bool ShouldClearSkirmishAIRecoveryHoleImposedUnselectable(
+	bool detachedWorkerExists, bool workerIsUnselectable,
+	bool workerIsContained, bool workerIsMasked,
+	bool workerIsGenericallyHeld,
+	bool hasIndependentUnselectableOwner)
+{
+	// DISABLED_HELD is also used by scripts that do not own selection state.
+	// Only a concrete containment/masking/module owner may retain this shared bit.
+	(void)workerIsGenericallyHeld;
+	return detachedWorkerExists && workerIsUnselectable && !workerIsContained &&
+		!workerIsMasked && !hasIndependentUnselectableOwner;
+}
+
+inline int GetSkirmishAIRecoveryNativeWorkerIDAfterOwnershipDetach(
+	bool detachedWithoutDestroying, int nativeWorkerID, int invalidObjectID)
+{
+	return detachedWithoutDestroying ? invalidObjectID : nativeWorkerID;
 }
 
 inline int GetSkirmishAIRecoveryReserveCost(
@@ -522,6 +722,17 @@ inline bool ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
 	bool paidQueueProgressing, bool factoryPotential)
 {
 	return paidQueueProgressing || factoryPotential;
+}
+
+inline bool ShouldDeferSkirmishAIRecoveryStalledDisposition(
+	bool paidQueueProgressing, bool factoryPotential,
+	bool hasPresentUnusableNativeWorker)
+{
+	// Progressing paid production always defers. Factory potential also remains
+	// retryable for every state except a present unusable exact native worker,
+	// whose free canonical reset is the stronger bounded route.
+	return paidQueueProgressing ||
+		(factoryPotential && !hasPresentUnusableNativeWorker);
 }
 
 // Never produce zero for a scheduled deadline: zero is reserved for the

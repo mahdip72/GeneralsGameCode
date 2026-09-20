@@ -1352,8 +1352,8 @@ Bool AISkirmishPlayer::cancelRecoveryBuilderQueueForNativeRespawn(
 			break;
 		}
 	}
-	if (!ShouldCancelSkirmishAIRecoveryPaidQueueForNativeRespawn(
-			true, false, true, exactEntry != nullptr))
+	if (!ShouldCancelSkirmishAIRecoveryExactPaidQueueForNativeLifecycle(
+			true, true, exactEntry != nullptr))
 		return false;
 
 	const ThingTemplate *cancelledTemplate = exactEntry->getProductionObject();
@@ -1753,21 +1753,215 @@ void AISkirmishPlayer::updateCriticalRecovery()
 	// original builder disappears.  Rebind it through the normal resume command
 	// before allowing the ordinary base-building path to observe the scaffold.
 	if (hasCenter && hasConstruction && m_recoveryEverCompleted) {
+		const Bool useCurrentNativeHoleOwnership =
+			ShouldUseCurrentSkirmishAIRecoveryNativeHoleOwnership();
 		Object *nativeHole = TheGameLogic->findObjectByID(
 			center->getProducerID());
 		if (!IsSkirmishAIRecoveryPrimaryHole(
-				nativeHole, m_player, primaryTemplate, info, center->getID()))
-			nativeHole = FindSkirmishAIRecoveryHoleForConstruction(
-				m_player, primaryTemplate, center->getID());
+				nativeHole, m_player, primaryTemplate, info, center->getID())) {
+			nativeHole = useCurrentNativeHoleOwnership
+				? FindSkirmishAIRecoveryHoleForConstruction(
+					m_player, primaryTemplate, center->getID())
+				: nullptr;
+		}
+		if (ShouldPreserveSkirmishAIRecoveryNativeHoleLifecycle(
+				useCurrentNativeHoleOwnership, nativeHole != nullptr)) {
+			// Epoch 3 returned for every producer-linked primary hole before
+			// inspecting its assigned worker. Preserve those recorded decisions.
+			m_recoveryConstructionID = center->getID();
+			m_recoveryEvacuationDeadline = 0;
+			m_recoveryReserveCost = 0;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+		if (useCurrentNativeHoleOwnership) {
+			// Band 3 belongs to a matching native hole, not to the scaffold by
+			// itself. If external state removed the hole, release that exhausted
+			// lineage before replacement admission and factory policy run.
+			m_recoveryPlacementAttempt =
+				ReconcileSkirmishAIRecoveryNativeWorkerRecycleAfterLineageScan(
+					m_recoveryPlacementAttempt,
+					g_skirmishAIRecoveryOffsetCount, true,
+					nativeHole != nullptr);
+		}
 		Object *assignedBuilder = TheGameLogic->findObjectByID(
 			center->getBuilderID());
-		const Bool assignedLive = IsLiveSkirmishAIRecoveryObject(
+		Bool assignedLive = IsLiveSkirmishAIRecoveryObject(
 			assignedBuilder, m_player);
-		if (nativeHole && !assignedLive) {
+		AIUpdateInterface *assignedAI = assignedLive
+			? assignedBuilder->getAIUpdateInterface() : nullptr;
+		DozerAIInterface *assignedDozer = assignedAI
+			? assignedAI->getDozerAIInterface() : nullptr;
+		Bool assignedOperational =
+			IsSkirmishAIRecoveryAssignedBuilderOperational(
+				assignedLive, assignedLive && assignedBuilder->isContained(),
+				assignedLive && assignedBuilder->isDisabledByType(DISABLED_UNMANNED),
+				assignedAI != nullptr, assignedDozer != nullptr,
+				assignedLive && assignedAI &&
+					CanSkirmishAIRecoveryUpdateAdvance(assignedBuilder, assignedAI));
+		Coord3D assignedActionPosition;
+		Bool assignedBuildDockFound = assignedOperational &&
+			DozerAIUpdate::findGoodBuildOrRepairPosition(
+				assignedBuilder, center, assignedActionPosition);
+		Bool assignedPathable = assignedBuildDockFound &&
+			assignedAI->isPathAvailable(&assignedActionPosition);
+		Bool assignedUsable = IsSkirmishAIRecoveryAssignedBuilderUsable(
+			assignedOperational, assignedBuildDockFound,
+			assignedPathable);
+		RebuildHoleBehaviorInterface *primaryNativeHoleAI = nativeHole
+			? RebuildHoleBehavior::getRebuildHoleBehaviorInterfaceFromObject(
+				nativeHole) : nullptr;
+		Object *primaryNativeWorker = primaryNativeHoleAI
+			? TheGameLogic->findObjectByID(primaryNativeHoleAI->getWorkerID())
+			: nullptr;
+		Bool nativeWorkerExists = primaryNativeWorker != nullptr;
+		Bool nativeWorkerOwned = nativeWorkerExists &&
+			primaryNativeWorker->getControllingPlayer() == m_player;
+		Bool nativeWorkerRecycleAttempted =
+			HasSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+				m_recoveryPlacementAttempt, g_skirmishAIRecoveryOffsetCount);
+		// A captured exact worker must be detached before any assigned-builder,
+		// grace, or production-progress path can return. Otherwise the hole keeps
+		// the foreign ObjectID and can destroy that unit when reconstruction
+		// completes or the hole is destroyed.
+		if (primaryNativeHoleAI &&
+			ShouldDetachSkirmishAIRecoveryNativeWorkerWithoutDestroying(
+				nativeWorkerExists, nativeWorkerOwned)) {
+			const Bool recycleAttemptedBeforeDetach =
+				nativeWorkerRecycleAttempted;
+			if (!nativeWorkerRecycleAttempted) {
+				m_recoveryPlacementAttempt =
+					MarkSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+						m_recoveryPlacementAttempt,
+						g_skirmishAIRecoveryOffsetCount);
+				nativeWorkerRecycleAttempted = true;
+			}
+			primaryNativeHoleAI->restartRebuildProcessWithoutDestroyingWorker(
+				GetSkirmishAIRecoveryExactNativeRebuildTemplate(
+					primaryNativeHoleAI->getRebuildTemplate(), primaryTemplate),
+				primaryNativeHoleAI->getSpawnerID());
+			primaryNativeWorker = nullptr;
+			nativeWorkerExists = false;
+			nativeWorkerOwned = false;
+			const SkirmishAINativeCapturedWorkerTerminalTransition
+				capturedTransition =
+					GetSkirmishAINativeCapturedWorkerTerminalTransition(
+						true, recycleAttemptedBeforeDetach);
+			if (capturedTransition.abandonImmediately) {
+				// A second captured native worker proves this lineage cannot supply a
+				// stable owned finisher. Teardown is immediate so assigned, grace, and
+				// production routes cannot preserve another capture/respawn cycle.
+				cancelRecoveryBuilderQueueForNativeRespawn(primaryTemplate);
+				center->setProducer(nullptr);
+				center->clearStatus(
+					MAKE_OBJECT_STATUS_MASK(OBJECT_STATUS_RECONSTRUCTING));
+				TheGameLogic->destroyObject(nativeHole);
+				TheGameLogic->destroyObject(center);
+				if (info) {
+					info->setObjectID(INVALID_ID);
+					info->setObjectTimestamp(frame + 1);
+					info->setUnderConstruction(false);
+				}
+				m_recoveryConstructionID = INVALID_ID;
+				m_recoveryEvacuationDeadline = 0;
+				m_recoveryPlacementAttempt =
+					ClearSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+						m_recoveryPlacementAttempt,
+						g_skirmishAIRecoveryOffsetCount);
+				m_recoveryReserveCost = max(1,
+					primaryTemplate->calcCostToBuild(m_player));
+				m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+					frame, 2 * LOGICFRAMES_PER_SECOND);
+				return;
+			}
+		}
+		const Bool nativeWorkerLive = IsLiveSkirmishAIRecoveryObject(
+			primaryNativeWorker, m_player);
+		const Bool nativeWorkerIsDozer = nativeWorkerExists &&
+			primaryNativeWorker->isKindOf(KINDOF_DOZER);
+		const Bool nativeWorkerCompatible = nativeWorkerExists &&
+			HasSkirmishAICommandForTemplate(primaryNativeWorker, primaryTemplate);
+		AIUpdateInterface *nativeWorkerAI = nativeWorkerLive
+			? primaryNativeWorker->getAIUpdateInterface() : nullptr;
+		DozerAIInterface *nativeWorkerDozer = nativeWorkerAI
+			? nativeWorkerAI->getDozerAIInterface() : nullptr;
+		const Bool nativeWorkerOperational = nativeWorkerLive &&
+			!primaryNativeWorker->isContained() &&
+			!primaryNativeWorker->isDisabledByType(DISABLED_UNMANNED) &&
+			nativeWorkerAI && nativeWorkerDozer &&
+			CanSkirmishAIRecoveryUpdateAdvance(
+				primaryNativeWorker, nativeWorkerAI);
+		const Bool nativeWorkerActivelyBuilding =
+			IsSkirmishAIRecoveryNativeWorkerActivelyBuilding(
+				nativeWorkerLive, nativeWorkerOperational,
+				nativeWorkerDozer &&
+					nativeWorkerDozer->getCurrentTask() == DOZER_TASK_BUILD,
+				nativeWorkerDozer &&
+					nativeWorkerDozer->getBuildSubTask() == DOZER_DO_BUILD_AT_DOCK,
+				nativeWorkerDozer &&
+					nativeWorkerDozer->getTaskTarget(DOZER_TASK_BUILD) == center->getID());
+		Coord3D nativeWorkerActionPosition;
+		const Bool nativeWorkerBuildDockFound = nativeWorkerOperational &&
+			DozerAIUpdate::findGoodBuildOrRepairPosition(
+				primaryNativeWorker, center, nativeWorkerActionPosition);
+		const Bool nativeWorkerPathUsable = nativeWorkerBuildDockFound &&
+			nativeWorkerAI->isPathAvailable(&nativeWorkerActionPosition);
+		const Bool nativeWorkerResumeUsable = nativeWorkerActivelyBuilding ||
+			nativeWorkerPathUsable;
+		const Bool preserveNativeWorkerLifecycle =
+			ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+				nativeHole != nullptr, nativeWorkerExists, nativeWorkerLive,
+				nativeWorkerIsDozer, nativeWorkerCompatible,
+				nativeWorkerResumeUsable);
+		const Bool hasPresentUnusableNativeWorker = nativeHole != nullptr &&
+			nativeWorkerExists && !preserveNativeWorkerLifecycle;
+		const Bool nativeWorkerFailureNeedsGrace =
+			hasPresentUnusableNativeWorker && !nativeWorkerRecycleAttempted;
+		if (preserveNativeWorkerLifecycle)
+			cancelRecoveryBuilderQueueForNativeRespawn(primaryTemplate);
+		if (nativeWorkerActivelyBuilding) {
+			m_recoveryConstructionID = center->getID();
+			m_recoveryEvacuationDeadline = 0;
+			m_recoveryReserveCost = 0;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+		if (ShouldUseSkirmishAIRecoveryNativeWorkerAsAssigned(
+				assignedUsable, nativeHole != nullptr,
+				nativeWorkerLive,
+				nativeWorkerIsDozer && nativeWorkerCompatible &&
+					nativeWorkerResumeUsable)) {
+			// A replacement can take the construction binding and cause the hole's
+			// exact worker to finish its old task while remaining alive. If that
+			// replacement later dies, resume through the dedicated assigned path.
+			assignedBuilder = primaryNativeWorker;
+			assignedLive = true;
+			assignedAI = nativeWorkerAI;
+			assignedDozer = assignedAI
+				? assignedAI->getDozerAIInterface() : nullptr;
+			assignedOperational =
+				IsSkirmishAIRecoveryAssignedBuilderOperational(
+					assignedLive, assignedLive && assignedBuilder->isContained(),
+					assignedLive && assignedBuilder->isDisabledByType(DISABLED_UNMANNED),
+					assignedAI != nullptr, assignedDozer != nullptr,
+					assignedLive && assignedAI &&
+						CanSkirmishAIRecoveryUpdateAdvance(assignedBuilder, assignedAI));
+			assignedBuildDockFound = assignedOperational &&
+				DozerAIUpdate::findGoodBuildOrRepairPosition(
+					assignedBuilder, center, assignedActionPosition);
+			assignedPathable = assignedBuildDockFound &&
+				assignedAI->isPathAvailable(&assignedActionPosition);
+			assignedUsable = IsSkirmishAIRecoveryAssignedBuilderUsable(
+				assignedOperational, assignedBuildDockFound,
+				assignedPathable);
+		}
+		if (preserveNativeWorkerLifecycle && !nativeWorkerExists &&
+			!assignedUsable) {
 			// The hole owns the free worker and native isRebuild construction;
 			// preserve its respawn gap and do not retain a paid duplicate. Exact
 			// production provenance ensures unrelated compatible queues survive.
-			cancelRecoveryBuilderQueueForNativeRespawn(primaryTemplate);
 			m_recoveryConstructionID = center->getID();
 			m_recoveryEvacuationDeadline = 0;
 			m_recoveryReserveCost = 0;
@@ -1781,25 +1975,7 @@ void AISkirmishPlayer::updateCriticalRecovery()
 		// check, so the native-hole retry remains aware of its blocked worker.
 		if (!assignedLive)
 			center->setBuilder(nullptr);
-		Bool assignedUsable = IsLiveSkirmishAIRecoveryObject(
-			assignedBuilder, m_player) &&
-			!assignedBuilder->isContained() &&
-			!assignedBuilder->isDisabledByType(DISABLED_UNMANNED) &&
-			assignedBuilder->getAIUpdateInterface() &&
-			assignedBuilder->getAIUpdateInterface()->getDozerAIInterface() &&
-			CanSkirmishAIRecoveryUpdateAdvance(
-				assignedBuilder, assignedBuilder->getAIUpdateInterface());
 		if (assignedUsable) {
-			AIUpdateInterface *assignedAI =
-				assignedBuilder->getAIUpdateInterface();
-			DozerAIInterface *assignedDozer =
-				assignedAI->getDozerAIInterface();
-			Coord3D assignedActionPosition;
-			Object *assignedResumeTarget =
-				DozerAIUpdate::findGoodBuildOrRepairPositionAndTarget(
-					assignedBuilder, center, assignedActionPosition);
-			const Bool assignedPathable = assignedResumeTarget == center &&
-				assignedAI->isPathAvailable(&assignedActionPosition);
 			if (assignedPathable &&
 				(assignedDozer->getCurrentTask() != DOZER_TASK_BUILD ||
 				 assignedDozer->getTaskTarget(DOZER_TASK_BUILD) != center->getID()) &&
@@ -1837,10 +2013,10 @@ void AISkirmishPlayer::updateCriticalRecovery()
 					replacementBuilder, replacementAI))
 				continue;
 			Coord3D actionPosition;
-			Object *resumeTarget =
-				DozerAIUpdate::findGoodBuildOrRepairPositionAndTarget(
+			const Bool buildDockFound =
+				DozerAIUpdate::findGoodBuildOrRepairPosition(
 					replacementBuilder, center, actionPosition);
-			if (!replacementAI || resumeTarget != center ||
+			if (!replacementAI || !buildDockFound ||
 				!replacementAI->isPathAvailable(&actionPosition))
 				continue;
 			if (prepareCriticalRecoveryBuilder(replacementBuilder)) {
@@ -1896,7 +2072,8 @@ void AISkirmishPlayer::updateCriticalRecovery()
 			m_recoveryEvacuationDeadline = 0;
 		const Bool hasFailedResumeRoute = hasContainedBuilder ||
 			!replacementBuilders.empty();
-		const Bool hasBoundedResumeRoute = paidQueueBounded ||
+		const Bool hasBoundedResumeRoute = nativeWorkerFailureNeedsGrace ||
+			paidQueueBounded ||
 			(!builderQueuedPaid &&
 			 (hasFailedResumeRoute ||
 			  (hasBoundedFactory && !hasPotentialFactory)));
@@ -1939,22 +2116,32 @@ void AISkirmishPlayer::updateCriticalRecovery()
 				HasSkirmishAIRecoveryObservedReplacement(
 					m_recoveryPlacementAttempt,
 					g_skirmishAIRecoveryOffsetCount);
-			if (ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
+			const Bool failoverSucceeded =
+				ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
 					paidQueueBounded, resumeGraceActive, replacementObserved) &&
 				failoverRecoveryBuilderQueue(
-					primaryTemplate, queuedFactory, queuedProductionID)) {
+					primaryTemplate, queuedFactory, queuedProductionID);
+			if (failoverSucceeded) {
 				m_recoveryEvacuationDeadline = 0;
 				m_recoveryReserveCost = replacementCost > 0 ? replacementCost : 0;
 				m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
 					frame, 2 * LOGICFRAMES_PER_SECOND);
 				return;
 			}
-			// The paid entry remains authoritative, but a producer whose
-			// ProductionUpdate cannot run cannot hold the recovery reserve forever.
-			// Keep both the entry and scaffold, release the reserve through the
-			// retryable last stand, and rescan the same producer later.
-			enterRecoveryLastStand(false);
-			return;
+			if (ShouldReturnFromSkirmishAIRecoveryBoundedQueueFailure(
+					paidQueueBounded, failoverSucceeded,
+					hasPresentUnusableNativeWorker)) {
+				// The paid entry remains authoritative, but a producer whose
+				// ProductionUpdate cannot run cannot hold the recovery reserve forever.
+				// Keep both the entry and scaffold, release the reserve through the
+				// retryable last stand, and rescan the same producer later.
+				enterRecoveryLastStand(false);
+				return;
+			}
+			// The bounded queue did not advance or fail over, and the exact native
+			// worker cannot enter respawn while it still resolves. Preserve the paid
+			// entry and continue to the one-shot native-worker reset below; the next
+			// absent-worker pass cancels and refunds that exact tracked production.
 		}
 		if (!replacementAttempted &&
 			(!builderQueued || !builderQueuedPaid) && replacementFactory &&
@@ -1973,34 +2160,97 @@ void AISkirmishPlayer::updateCriticalRecovery()
 				frame, 2 * LOGICFRAMES_PER_SECOND);
 			return;
 		}
+		// Do not dispose while paid production advances. Factory potential remains
+		// retryable for other states, but cannot mask the free bounded reset of a
+		// present unusable exact native worker. Grace and successful queue/failover
+		// actions already returned above.
+		if (ShouldDeferSkirmishAIRecoveryStalledDisposition(
+				paidQueueProgressing, factoryPotential,
+				hasPresentUnusableNativeWorker)) {
+			m_recoveryEvacuationDeadline = 0;
+			m_recoveryReserveCost = replacementCost > 0 ? replacementCost : 0;
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
 		const Bool shouldSellScaffold = ShouldSellSkirmishAIRecoveryScaffold(
 			!replacementBuilders.empty(), resumeGraceActive,
 			paidQueueProgressing, replacementAttempted,
 			factoryPotential);
-		RebuildHoleBehaviorInterface *nativeHoleAI = nativeHole
-			? RebuildHoleBehavior::getRebuildHoleBehaviorInterfaceFromObject(
-				nativeHole)
-			: nullptr;
-		Object *nativeWorker = nativeHoleAI && TheGameLogic
-			? TheGameLogic->findObjectByID(nativeHoleAI->getWorkerID())
-			: nullptr;
-		const Bool hasLiveAssociatedNativeWorker =
-			IsLiveSkirmishAIRecoveryObject(nativeWorker, m_player) &&
-			nativeWorker->isKindOf(KINDOF_DOZER);
+		RebuildHoleBehaviorInterface *nativeHoleAI = primaryNativeHoleAI;
+		const Bool stalledNativeWorkerExists = nativeWorkerExists;
+		const Bool stalledNativeWorkerUsable = nativeWorkerExists &&
+			preserveNativeWorkerLifecycle;
 		const SkirmishAIRecoveryStalledScaffoldAction scaffoldAction =
 			GetSkirmishAIRecoveryStalledScaffoldAction(
 				shouldSellScaffold, nativeHole != nullptr,
-				hasLiveAssociatedNativeWorker);
+				stalledNativeWorkerExists, stalledNativeWorkerUsable,
+				nativeWorkerRecycleAttempted);
 		if (scaffoldAction ==
-			SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER) {
-			// A native rebuild hole owns both this site and its free worker.  Selling
-			// the scaffold would sever the reconstruction ID before the hole can
-			// observe the loss, allowing paid recovery to build a second center.
-			// Restart the hole's canonical worker cycle and retain all lineage.
+				SKIRMISH_AI_RECOVERY_SCAFFOLD_ABANDON_NATIVE_LINEAGE) {
+			// The one persisted canonical recycle still produced a worker that cannot
+			// resume this site. Remove both native owners before ordinary recovery
+			// relocates, so no hole can later create a duplicate center.
+			cancelRecoveryBuilderQueueForNativeRespawn(primaryTemplate);
 			if (nativeHoleAI && nativeHoleAI->getRebuildTemplate())
-				nativeHoleAI->startRebuildProcess(
+				nativeHoleAI->restartRebuildProcessWithoutDestroyingWorker(
 					nativeHoleAI->getRebuildTemplate(),
 					nativeHoleAI->getSpawnerID());
+			center->setProducer(nullptr);
+			center->clearStatus(
+				MAKE_OBJECT_STATUS_MASK(OBJECT_STATUS_RECONSTRUCTING));
+			if (nativeHole)
+				TheGameLogic->destroyObject(nativeHole);
+			TheGameLogic->destroyObject(center);
+			if (info) {
+				info->setObjectID(INVALID_ID);
+				info->setObjectTimestamp(frame + 1);
+				info->setUnderConstruction(false);
+			}
+			m_recoveryConstructionID = INVALID_ID;
+			m_recoveryEvacuationDeadline = 0;
+			m_recoveryPlacementAttempt =
+				ClearSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+					m_recoveryPlacementAttempt,
+					g_skirmishAIRecoveryOffsetCount);
+			m_recoveryReserveCost = max(1,
+				primaryTemplate->calcCostToBuild(m_player));
+			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
+				frame, 2 * LOGICFRAMES_PER_SECOND);
+			return;
+		}
+		if (scaffoldAction ==
+				SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER ||
+			scaffoldAction ==
+				SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER) {
+			// A native rebuild hole owns both this site and its free worker.  Selling
+			// the scaffold would sever the reconstruction ID before the hole can
+			// observe the loss, allowing paid recovery to build a second center. An
+			// exact worker that still exists but is unusable cannot trigger the hole's
+			// null-ID respawn path, so reset it once through the canonical cycle too.
+			if (scaffoldAction ==
+					SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER ||
+				scaffoldAction ==
+					SKIRMISH_AI_RECOVERY_SCAFFOLD_RECYCLE_NATIVE_WORKER) {
+				cancelRecoveryBuilderQueueForNativeRespawn(primaryTemplate);
+				m_recoveryPlacementAttempt =
+					MarkSkirmishAIRecoveryNativeWorkerRecycleAttempt(
+						m_recoveryPlacementAttempt,
+						g_skirmishAIRecoveryOffsetCount);
+			}
+			if (nativeHoleAI && nativeHoleAI->getRebuildTemplate()) {
+				if (scaffoldAction ==
+						SKIRMISH_AI_RECOVERY_SCAFFOLD_RESET_UNUSABLE_NATIVE_WORKER &&
+					ShouldDetachSkirmishAIRecoveryNativeWorkerWithoutDestroying(
+						nativeWorkerExists, nativeWorkerOwned))
+					nativeHoleAI->restartRebuildProcessWithoutDestroyingWorker(
+						nativeHoleAI->getRebuildTemplate(),
+						nativeHoleAI->getSpawnerID());
+				else
+					nativeHoleAI->startRebuildProcess(
+						nativeHoleAI->getRebuildTemplate(),
+						nativeHoleAI->getSpawnerID());
+			}
 			m_recoveryEvacuationDeadline = 0;
 			m_recoveryReserveCost = 0;
 			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
@@ -2033,15 +2283,6 @@ void AISkirmishPlayer::updateCriticalRecovery()
 			const Int commandCenterCost =
 				primaryTemplate->calcCostToBuild(m_player);
 			m_recoveryReserveCost = max(1, commandCenterCost);
-			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
-				frame, 2 * LOGICFRAMES_PER_SECOND);
-			return;
-		}
-		if (paidQueueProgressing || factoryPotential) {
-			if (ShouldClearSkirmishAIRecoveryDeadlineForProgressingRoute(
-					paidQueueProgressing, factoryPotential))
-				m_recoveryEvacuationDeadline = 0;
-			m_recoveryReserveCost = replacementCost > 0 ? replacementCost : 0;
 			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
 				frame, 2 * LOGICFRAMES_PER_SECOND);
 			return;
@@ -2108,6 +2349,16 @@ void AISkirmishPlayer::updateCriticalRecovery()
 				frame, 2 * LOGICFRAMES_PER_SECOND);
 			return;
 		}
+	}
+	if (!hasCenter && !hasConstruction) {
+		// Once both the primary scaffold and its matching native hole are gone,
+		// the persisted one-recycle budget belongs to a dead lineage. Retain the
+		// lower placement/replacement state while allowing ordinary factory
+		// recovery to proceed.
+		m_recoveryPlacementAttempt =
+			ReconcileSkirmishAIRecoveryNativeWorkerRecycleAfterLineageScan(
+				m_recoveryPlacementAttempt,
+				g_skirmishAIRecoveryOffsetCount, false, false);
 	}
 
 	if (hasCenter) {
@@ -2785,6 +3036,65 @@ Bool AISkirmishPlayer::startTraining( WorkOrder *order, Bool busyOK, AsciiString
 		const Bool hasCompletedPrimaryCenter = hasPrimaryCenter &&
 			primaryCenter &&
 			!primaryCenter->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION);
+		Bool nativePrimaryRebuildPending = false;
+		if (compatibleBuilder &&
+			ShouldUseCurrentSkirmishAIRecoveryNativeHoleOwnership() &&
+			hasPrimaryCenter && primaryCenter &&
+			primaryCenter->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION)) {
+			BuildListInfo *primaryInfo =
+				findPrimaryCommandCenterBuildInfo(primaryTemplate);
+			Object *primaryHole = TheGameLogic->findObjectByID(
+				primaryCenter->getProducerID());
+			if (!IsSkirmishAIRecoveryPrimaryHole(
+					primaryHole, m_player, primaryTemplate, primaryInfo,
+					primaryCenter->getID()))
+				primaryHole = FindSkirmishAIRecoveryHoleForConstruction(
+					m_player, primaryTemplate, primaryCenter->getID());
+			RebuildHoleBehaviorInterface *primaryHoleAI = primaryHole
+				? RebuildHoleBehavior::getRebuildHoleBehaviorInterfaceFromObject(
+					primaryHole) : nullptr;
+			Object *nativeWorker = primaryHoleAI
+				? TheGameLogic->findObjectByID(primaryHoleAI->getWorkerID())
+				: nullptr;
+			const Bool nativeWorkerExists = nativeWorker != nullptr;
+			const Bool nativeWorkerLive = IsLiveSkirmishAIRecoveryObject(
+				nativeWorker, m_player);
+			const Bool nativeWorkerIsDozer = nativeWorkerExists &&
+				nativeWorker->isKindOf(KINDOF_DOZER);
+			const Bool nativeWorkerCompatible = nativeWorkerExists &&
+				HasSkirmishAICommandForTemplate(nativeWorker, primaryTemplate);
+			AIUpdateInterface *nativeWorkerAI = nativeWorkerLive
+				? nativeWorker->getAIUpdateInterface() : nullptr;
+			DozerAIInterface *nativeWorkerDozer = nativeWorkerAI
+				? nativeWorkerAI->getDozerAIInterface() : nullptr;
+			const Bool nativeWorkerOperational = nativeWorkerLive &&
+				!nativeWorker->isContained() &&
+				!nativeWorker->isDisabledByType(DISABLED_UNMANNED) &&
+				nativeWorkerAI && nativeWorkerDozer &&
+				CanSkirmishAIRecoveryUpdateAdvance(nativeWorker, nativeWorkerAI);
+			const Bool nativeWorkerActivelyBuilding =
+				IsSkirmishAIRecoveryNativeWorkerActivelyBuilding(
+					nativeWorkerLive, nativeWorkerOperational,
+					nativeWorkerDozer &&
+						nativeWorkerDozer->getCurrentTask() == DOZER_TASK_BUILD,
+					nativeWorkerDozer &&
+						nativeWorkerDozer->getBuildSubTask() == DOZER_DO_BUILD_AT_DOCK,
+					nativeWorkerDozer &&
+						nativeWorkerDozer->getTaskTarget(DOZER_TASK_BUILD) ==
+							primaryCenter->getID());
+			Coord3D nativeWorkerActionPosition;
+			const Bool nativeWorkerBuildDockFound = nativeWorkerOperational &&
+				DozerAIUpdate::findGoodBuildOrRepairPosition(
+					nativeWorker, primaryCenter, nativeWorkerActionPosition);
+			const Bool nativeWorkerResumeUsable = nativeWorkerActivelyBuilding ||
+				(nativeWorkerBuildDockFound &&
+				 nativeWorkerAI->isPathAvailable(&nativeWorkerActionPosition));
+			nativePrimaryRebuildPending =
+				ShouldPreserveSkirmishAIRecoveryNativeWorkerLifecycle(
+					primaryHole != nullptr, nativeWorkerExists,
+					nativeWorkerLive, nativeWorkerIsDozer,
+					nativeWorkerCompatible, nativeWorkerResumeUsable);
+		}
 		Bool paidCompatibleBuilderQueue = false;
 		if (compatibleBuilder &&
 			usesCriticalRecoveryBehavior() && m_recoveryEverCompleted &&
@@ -2795,7 +3105,8 @@ Bool AISkirmishPlayer::startTraining( WorkOrder *order, Bool busyOK, AsciiString
 			order->m_isResourceGatherer, compatibleBuilder,
 			usesCriticalRecoveryBehavior(), m_recoveryEverCompleted,
 			m_recoveryImpossible, hasCompletedPrimaryCenter,
-			m_recoveryReserveCost, paidCompatibleBuilderQueue))
+			m_recoveryReserveCost, paidCompatibleBuilderQueue,
+			nativePrimaryRebuildPending))
 			return false;
 	}
 	Object *factory = findFactory(order->m_thing, busyOK);

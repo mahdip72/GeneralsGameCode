@@ -42,7 +42,9 @@
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
+#include "GameLogic/Module/RailedTransportDockUpdate.h"
 #include "GameLogic/Module/StickyBombUpdate.h"
+#include "GameLogic/SkirmishAIRecovery.h"
 
 
 //-------------------------------------------------------------------------------------------------
@@ -155,6 +157,62 @@ void RebuildHoleBehavior::startRebuildProcess( const ThingTemplate *rebuild, Obj
 	Object *worker = TheGameLogic->findObjectByID(m_workerID);
 	newWorkerRespawnProcess( worker ); //Kill the worker if we have one.
 
+}
+
+// ------------------------------------------------------------------------------------------------
+/** Restart native reconstruction after the exact worker changed ownership.
+ *  The hole must detach that ObjectID without destroying the other player's unit. */
+// ------------------------------------------------------------------------------------------------
+void RebuildHoleBehavior::restartRebuildProcessWithoutDestroyingWorker(
+	const ThingTemplate *rebuild, ObjectID spawnerID )
+{
+	m_rebuildTemplate = rebuild;
+	m_spawnerObjectID = spawnerID;
+	Object *detachedWorker = TheGameLogic->findObjectByID(m_workerID);
+	Bool hasIndependentUnselectableOwner = detachedWorker &&
+		(detachedWorker->testStatus(OBJECT_STATUS_SOLD) ||
+		 detachedWorker->testStatus(OBJECT_STATUS_IMMOBILE));
+	if (detachedWorker && !hasIndependentUnselectableOwner) {
+		for (BehaviorModule **module = detachedWorker->getBehaviorModules();
+			*module; ++module) {
+			SlavedUpdateInterface *slaved = (*module)->getSlavedUpdateInterface();
+			if (slaved && slaved->getSlaverID() != INVALID_ID) {
+				hasIndependentUnselectableOwner = true;
+				break;
+			}
+		}
+	}
+	if (detachedWorker && !hasIndependentUnselectableOwner) {
+		for (Object *dockOwner = TheGameLogic->getFirstObject(); dockOwner;
+			dockOwner = dockOwner->getNextObject()) {
+			if (dockOwner->isDestroyed() || dockOwner->isEffectivelyDead() ||
+				dockOwner->testStatus(OBJECT_STATUS_SOLD))
+				continue;
+			for (BehaviorModule **module = dockOwner->getBehaviorModules();
+				*module; ++module) {
+				RailedTransportDockUpdateInterface *railDock =
+					(*module)->getRailedTransportDockUpdateInterface();
+				if (railDock && railDock->ownsDockingObject(
+						detachedWorker->getID())) {
+					hasIndependentUnselectableOwner = true;
+					break;
+				}
+			}
+			if (hasIndependentUnselectableOwner)
+				break;
+		}
+	}
+	if (ShouldClearSkirmishAIRecoveryHoleImposedUnselectable(
+			detachedWorker != nullptr,
+			detachedWorker && detachedWorker->testStatus(
+				OBJECT_STATUS_UNSELECTABLE),
+			detachedWorker && detachedWorker->isContained(),
+			detachedWorker && detachedWorker->testStatus(OBJECT_STATUS_MASKED),
+			detachedWorker && detachedWorker->isDisabledByType(DISABLED_HELD),
+			hasIndependentUnselectableOwner))
+		detachedWorker->clearStatus(
+			MAKE_OBJECT_STATUS_MASK(OBJECT_STATUS_UNSELECTABLE));
+	newWorkerRespawnProcess( nullptr );
 }
 
 
