@@ -53,10 +53,10 @@ inline int AddSkirmishAIRecoveryCost(int first, int second)
 }
 
 inline bool IsSkirmishAIRecoveryBuilderPathUnavailable(
-	bool hasBuilder, bool hasContainedBuilder,
+	bool hasBuilder, bool hasContainedBuilderRoute,
 	bool builderQueuePaid, bool hasPotentialFactory)
 {
-	return !hasBuilder && !hasContainedBuilder &&
+	return !hasBuilder && !hasContainedBuilderRoute &&
 		!builderQueuePaid && !hasPotentialFactory;
 }
 

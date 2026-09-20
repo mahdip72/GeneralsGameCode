@@ -1014,9 +1014,9 @@ static void TestSkirmishAIRecoveryPolicies()
 	input.protectedReserve = 0;
 	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, FALSE, TRUE, 1600);
 
-	// A contained builder is not usable, but it prevents the runtime from
-	// declaring permanent last stand. A factory may queue a usable replacement;
-	// without a factory, recovery keeps retrying for the contained unit to exit.
+	// A contained builder is not usable. During its bounded evacuation grace it
+	// remains a recovery route; afterward a factory may queue a replacement, or
+	// recovery becomes impossible when no other physical route survives.
 	input = MakeSkirmishAIRecoveryPolicyInput();
 	input.noBuilderPath = IsSkirmishAIRecoveryBuilderPathUnavailable(
 		false, true, false, true);
@@ -1047,6 +1047,13 @@ static void TestSkirmishAIRecoveryPolicies()
 		159, evacuationDeadline, true));
 	CHECK(!IsSkirmishAIRecoveryEvacuationGraceActive(
 		160, evacuationDeadline, true));
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.hasBuilderFactory = false;
+	input.noBuilderPath = IsSkirmishAIRecoveryBuilderPathUnavailable(
+		false, IsSkirmishAIRecoveryEvacuationGraceActive(
+			160, evacuationDeadline, true), false, false);
+	input.protectedReserve = 750;
+	CheckSkirmishAIRecoveryDecision(input, FALSE, FALSE, TRUE, FALSE, 0);
 	CHECK(GetSkirmishAIRecoveryEvacuationDeadline(
 		120, evacuationDeadline, false, 60) == 0);
 	CHECK(GetSkirmishAIRecoveryEvacuationDeadlineForVersion(3, 999) == 0);

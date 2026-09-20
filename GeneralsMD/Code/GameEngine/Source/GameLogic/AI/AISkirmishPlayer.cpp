@@ -1157,6 +1157,9 @@ void AISkirmishPlayer::updateCriticalRecovery()
 		m_recoveryEvacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
 			frame, m_recoveryEvacuationDeadline, hasContainedBuilder,
 			2 * LOGICFRAMES_PER_SECOND);
+		const Bool evacuationGraceActive =
+			IsSkirmishAIRecoveryEvacuationGraceActive(
+				frame, m_recoveryEvacuationDeadline, hasContainedBuilder);
 
 		// The old builder is no longer a valid owner of the scaffold.  Clear
 		// the binding before asking a different compatible builder to resume it.
@@ -1212,8 +1215,7 @@ void AISkirmishPlayer::updateCriticalRecovery()
 			&hasPotentialFactory);
 		const Int replacementCost = replacementTemplate
 			? replacementTemplate->calcCostToBuild(m_player) : 0;
-		if (IsSkirmishAIRecoveryEvacuationGraceActive(
-			frame, m_recoveryEvacuationDeadline, hasContainedBuilder)) {
+		if (evacuationGraceActive) {
 			m_recoveryReserveCost = replacementCost > 0 ? replacementCost : 0;
 			m_recoveryNextAttemptFrame = m_recoveryEvacuationDeadline;
 			return;
@@ -1231,12 +1233,6 @@ void AISkirmishPlayer::updateCriticalRecovery()
 		}
 		if (builderQueuedPaid || hasPotentialFactory) {
 			m_recoveryReserveCost = replacementCost > 0 ? replacementCost : 0;
-			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
-				frame, 2 * LOGICFRAMES_PER_SECOND);
-			return;
-		}
-		if (hasContainedBuilder) {
-			m_recoveryReserveCost = 0;
 			m_recoveryNextAttemptFrame = GetSkirmishAIRecoveryRetryFrame(
 				frame, 2 * LOGICFRAMES_PER_SECOND);
 			return;
@@ -1386,14 +1382,15 @@ void AISkirmishPlayer::updateCriticalRecovery()
 	m_recoveryEvacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
 		frame, m_recoveryEvacuationDeadline, hasContainedBuilder,
 		2 * LOGICFRAMES_PER_SECOND);
+	const Bool evacuationGraceActive = IsSkirmishAIRecoveryEvacuationGraceActive(
+		frame, m_recoveryEvacuationDeadline, hasContainedBuilder);
 	const Bool retryDue = IsSkirmishAIRecoveryRetryDue(
 		TheGameLogic->getFrame(), m_recoveryNextAttemptFrame);
 	const Int commandCenterCost = primaryTemplate->calcCostToBuild(m_player);
 	const Int builderCost = builderTemplate
 		? builderTemplate->calcCostToBuild(m_player) : 0;
 	const Int money = m_player->getMoney()->countMoney();
-	if (!hasBuilder && IsSkirmishAIRecoveryEvacuationGraceActive(
-		frame, m_recoveryEvacuationDeadline, hasContainedBuilder)) {
+	if (!hasBuilder && evacuationGraceActive) {
 		const Int recoveryCost = builderQueuedPaid
 			? commandCenterCost
 			: AddSkirmishAIRecoveryCost(commandCenterCost, builderCost);
@@ -1412,7 +1409,7 @@ void AISkirmishPlayer::updateCriticalRecovery()
 	input.builderQueuePaid = builderQueuedPaid;
 	input.hasBuilderFactory = builderFactory != nullptr;
 	input.noBuilderPath = IsSkirmishAIRecoveryBuilderPathUnavailable(
-		hasBuilder, hasContainedBuilder, builderQueuedPaid,
+		hasBuilder, evacuationGraceActive, builderQueuedPaid,
 		hasPotentialFactory);
 	input.builderAffordable = builderFactory && builderTemplate && retryDue &&
 		TheBuildAssistant->canMakeUnit(builderFactory, builderTemplate) == CANMAKE_OK &&
