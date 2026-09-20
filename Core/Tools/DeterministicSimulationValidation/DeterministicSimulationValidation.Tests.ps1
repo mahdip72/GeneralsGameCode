@@ -729,6 +729,34 @@ function Reset-Stage5TestFinalAcceptanceValidatedClosure {
     }
 }
 
+function Assert-Stage5FinalAcceptanceLockstepWiring {
+    $modulePath = Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1'
+    $tokens = $null
+    $parseErrors = $null
+    $tree = [Management.Automation.Language.Parser]::ParseFile(
+        $modulePath, [ref]$tokens, [ref]$parseErrors)
+    Assert-True (@($parseErrors).Count -eq 0) `
+        'final acceptance lockstep wiring requires a parseable evidence module'
+    $definition = $tree.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Invoke-Stage5FinalAcceptanceAggregation'
+    }, $true)
+    $source = if ($null -ne $definition) { $definition.Extent.Text } else { '' }
+    $strictReaderIndex = $source.IndexOf('Read-Stage5LockstepV2Evidence',
+        [StringComparison]::Ordinal)
+    $deferredFailureIndex = $source.IndexOf("throw `$lockstepV2Failure",
+        [StringComparison]::Ordinal)
+    $readinessIndex = $source.IndexOf(
+        'Assert-Stage5DevelopmentReadinessExecutionEvidence',
+        [StringComparison]::Ordinal)
+    Assert-True ($strictReaderIndex -ge 0 -and
+        $source -match "(?s)kind -ceq 'mixed-worker-multiplayer'.*?role -ceq 'multiplayer-results'.*?Read-Stage5LockstepV2Evidence" -and
+        $deferredFailureIndex -gt $strictReaderIndex -and
+        $readinessIndex -gt $deferredFailureIndex) `
+        'final acceptance consumes strict lockstep-v2 rejection before readiness projection'
+}
+
 function Invoke-Stage5LivePlanEntryIdentityFocusedCase {
     # This focused contract reaches the same result projection and live-plan
     # resolver used by the 253-entry execution path without creating its corpus
@@ -9236,6 +9264,12 @@ try {
         (Join-Path $syntheticCorpusRoot 'ZeroHour') 'ZeroHour' $sourceCommit `
         $artifactSetHash $artifactTestHashes `
         $artifactTestPaths['zerohour-executable']
+    $syntheticZeroHourReceipts = [ordered]@{
+        'validation-plan' = [string]$syntheticZeroHour.receiptPlans[0].path
+        'validation-results' = [string]$syntheticZeroHour.validationReceiptPath
+        'replay-results' = [string]$syntheticZeroHour.replayReceiptPath
+        'ai-results' = [string]$syntheticZeroHour.aiReceiptPath
+    }
     $requiredAttachmentRoles = [ordered]@{
         # Attachment identity is the composite role/title key.  Replay
         # qualification has one reviewed fixture receipt per title; retaining
@@ -9374,6 +9408,14 @@ try {
                 # test evidence, never a production authority.
                 $attachmentPath = [string]$reviewed.receiptPath
             }
+            elseif (($kind -ceq 'replay-determinism' -and
+                    $role -ceq 'replay-results') -or
+                ($kind -ceq 'fresh-ai' -and $role -ceq 'ai-results')) {
+                # These are the independent ZeroHour authorities consumed by
+                # the combined receipt. Bind the same immutable source bytes
+                # instead of manufacturing detached one-child lookalikes.
+                $attachmentPath = [string]$syntheticZeroHourReceipts[$role]
+            }
             elseif ($role -eq 'premium-review-results') {
                 Write-Stage5ExternalReceiptTestDocument $attachmentPath 'premium-review' `
                     $role 'premium-review' $sourceCommit $artifactSetHash
@@ -9431,7 +9473,11 @@ try {
             else {
                 [IO.File]::WriteAllText($attachmentPath, "{`"evidence`":`"$kind/$role`"}")
             }
-            $attachmentRelativePath = if ($role -ceq 'replay-fixture-manifest') {
+            $defaultAttachmentPath = Join-Path $attachmentRoot $leaf
+            $attachmentRelativePath = if (-not [String]::Equals(
+                    [IO.Path]::GetFullPath($attachmentPath),
+                    [IO.Path]::GetFullPath($defaultAttachmentPath),
+                    [StringComparison]::OrdinalIgnoreCase)) {
                 ConvertTo-OutputRelativePath $attachmentPath $acceptanceRoot `
                     'Synthetic acceptance attachment'
             }
@@ -9810,14 +9856,43 @@ try {
     $deterministicAttachments = @()
     foreach ($role in $requiredAttachmentRoles[$deterministicKind]) {
         $leaf = "$deterministicKind-$role.json"
-        $attachmentPath = Join-Path $attachmentRoot $leaf
-        Write-Stage5HostReceiptTestDocument $attachmentPath $role 'ZeroHour' `
-            $sourceCommit $artifactSetHash $artifactTestHashes
+        if ($syntheticZeroHourReceipts.Contains($role)) {
+            $attachmentPath = [string]$syntheticZeroHourReceipts[$role]
+        }
+        else {
+            $attachmentPath = Join-Path $attachmentRoot $leaf
+            Write-Stage5HostReceiptTestDocument $attachmentPath $role 'ZeroHour' `
+                $sourceCommit $artifactSetHash $artifactTestHashes
+        }
         $deterministicAttachments += [ordered]@{
-            role = $role; title = 'ZeroHour'; path = "attachments\$leaf"
+            role = $role; title = 'ZeroHour'
+            path = ConvertTo-OutputRelativePath $attachmentPath $acceptanceRoot `
+                'Deterministic-runtime acceptance attachment'
             sha256 = Get-Sha256 $attachmentPath
             trustDomain = 'host-runner'
         }
+    }
+    $reusedValidationAttachment = @($deterministicAttachments | Where-Object {
+        [string]$_.role -ceq 'validation-results'
+    })[0]
+    $reusedValidationDocument = Read-TestJson `
+        ([string]$syntheticZeroHourReceipts['validation-results'])
+    Assert-True ($deterministicAttachments.Count -eq 3 -and
+        [string]$reusedValidationAttachment.sha256 -ceq
+            [string]$syntheticZeroHour.validationReceiptSha256 -and
+        @($reusedValidationDocument.provenance.children).Count -eq 253 -and
+        @($reusedValidationDocument.rawLogs).Count -eq 507 -and
+        [int]$reusedValidationDocument.details.resultCount -eq 253) `
+        'deterministic-runtime reuses the complete byte-identical ZeroHour validation authority'
+    foreach ($binding in @(
+        [pscustomobject]@{ kind='replay-determinism'; role='replay-results' },
+        [pscustomobject]@{ kind='fresh-ai'; role='ai-results' }
+    )) {
+        $authority = @($evidenceDocuments[$binding.kind].attachments |
+            Where-Object { [string]$_.role -ceq [string]$binding.role })[0]
+        Assert-True ([string]$authority.sha256 -ceq
+            (Get-Sha256 ([string]$syntheticZeroHourReceipts[$binding.role]))) `
+            "$($binding.kind) reuses its exact combined ZeroHour authority"
     }
     $deterministicDocument = [ordered]@{
         schemaVersion = 1; evidenceKind = $deterministicKind; status = 'passed'
@@ -9884,11 +9959,23 @@ try {
             -DevelopmentReadiness | Out-Null
     } 'Installed-kernel execution may be skipped only when the caller explicitly authorizes' `
         'a skipped installed-kernel qualification fails closed without an explicit exemption'
+    $diagnosticNet3Path = Join-Path $attachmentRoot `
+        'mixed-worker-multiplayer-multiplayer-results.json'
+    Assert-Stage5FinalAcceptanceLockstepWiring
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -ExternalQualificationExempt | Out-Null
+        Read-Stage5LockstepV2Evidence `
+            -Path $diagnosticNet3Path `
+            -ExpectedSourceCommit $sourceCommit `
+            -ExpectedArtifactSetSha256 $artifactSetHash `
+            -ArtifactHashes $artifactTestHashes `
+            -ArtifactPaths $artifactTestPaths `
+            -ArtifactRootDirectory $acceptanceRoot `
+            -ExpectedEvidenceSha256 (Get-Sha256 $diagnosticNet3Path) `
+            -ExpectedCohortNonce $script:TestCohortNonce `
+            -ExpectedCohortCreatedUtc $script:TestCohortCreatedUtc `
+            -ExpectedRuntimeClosure $script:TestRuntimeClosure | Out-Null
     } 'diagnostic NET3 v1|lockstep-v2' `
-        'a fully valid diagnostic NET3 v1 envelope cannot satisfy final acceptance'
+        'the canonical diagnostic NET3 v1 fixture cannot satisfy strict final-acceptance lockstep-v2 authority'
 
     $outOfBandAcceptanceRequest = Join-Path $acceptanceRoot 'out-of-band-local-request.json'
     Write-AcceptanceRequest $outOfBandAcceptanceRequest `
@@ -11494,7 +11581,10 @@ try {
         }
     }
 
-    $hostAttachment = Join-Path $attachmentRoot 'deterministic-runtime-validation-plan.json'
+    $hostPlanBinding = @($deterministicDocument.attachments | Where-Object {
+        [string]$_.role -ceq 'validation-plan'
+    })[0]
+    $hostAttachment = Join-Path $acceptanceRoot ([string]$hostPlanBinding.path)
     [IO.File]::AppendAllText($hostAttachment, 'tampered')
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {

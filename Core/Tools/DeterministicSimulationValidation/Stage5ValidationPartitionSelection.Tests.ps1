@@ -72,6 +72,34 @@ foreach ($binding in @('ExpectedArguments', 'ExpectedCohortCreatedUtc')) {
         throw "The native receipt parser test omits $binding."
     }
 }
+foreach ($pattern in @(
+    '\$syntheticZeroHourReceipts\s*=\s*\[ordered\]@\{',
+    '\$syntheticZeroHourReceipts\.Contains\(\$role\)',
+    'reusedValidationDocument\.provenance\.children\)\.Count\s*-eq\s*253',
+    'reusedValidationDocument\.rawLogs\)\.Count\s*-eq\s*507',
+    'reusedValidationDocument\.details\.resultCount\s*-eq\s*253'
+)) {
+    if ($sourceText -cnotmatch $pattern) {
+        throw 'The complete synthetic ZeroHour authority reuse contract is missing.'
+    }
+}
+$installedKernelGuardBoundary = $sourceText.IndexOf(
+    'a skipped installed-kernel qualification fails closed without an explicit exemption',
+    [StringComparison]::Ordinal)
+$outOfBandBoundary = $sourceText.IndexOf('$outOfBandAcceptanceRequest =',
+    [StringComparison]::Ordinal)
+$redundantDiagnosticAggregations = @($aggregationCommands | Where-Object {
+    $_.Extent.StartOffset -gt $installedKernelGuardBoundary -and
+        $_.Extent.StartOffset -lt $outOfBandBoundary
+})
+if ($installedKernelGuardBoundary -lt 0 -or $outOfBandBoundary -lt 0 -or
+    $redundantDiagnosticAggregations.Count -ne 0) {
+    throw 'The diagnostic NET3 regression must not invoke redundant full final aggregation.'
+}
+if ($sourceText -cnotmatch
+    '(?s)Read-Stage5LockstepV2Evidence.{0,1000}canonical diagnostic NET3 v1 fixture') {
+    throw 'The diagnostic NET3 regression must exercise the strict lockstep-v2 reader directly.'
+}
 # Execute the actual test entrypoint's early routing preflight, not a copied
 # selector implementation. It returns before module imports or fixture I/O.
 $entrypoint = [scriptblock]::Create($sourceText)
