@@ -1079,16 +1079,17 @@ Bool AISkirmishPlayer::captureEnemyPlanningSnapshot(
 }
 
 //-------------------------------------------------------------------------------------------------
-/** Publish a target ID after all player results have been sorted by their order keys. */
+/** Resolve a target ID without publishing it. */
 //-------------------------------------------------------------------------------------------------
-Bool AISkirmishPlayer::commitEnemyPlanningResult(
+Bool AISkirmishPlayer::resolveEnemyPlanningCommit(
 	const rts::AIEnemyPlanningSnapshot &snapshot,
-	const rts::AIEnemyPlanningResult &result )
+	const rts::AIEnemyPlanningResult &result,
+	Player **resolvedEnemy ) const
 {
-	if (!validateEnemyPlanningCommit(snapshot, result))
+	if (!resolvedEnemy || !validateEnemyPlanningCommit(snapshot, result))
 		return false;
 
-	Player *newEnemy = nullptr;
+	*resolvedEnemy = nullptr;
 	if (result.selectedPlayerIndex >= 0)
 	{
 		for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i)
@@ -1096,16 +1097,21 @@ Bool AISkirmishPlayer::commitEnemyPlanningResult(
 			Player *candidate = ThePlayerList->getNthPlayer(i);
 			if (candidate && candidate->getPlayerIndex() == result.selectedPlayerIndex)
 			{
-				newEnemy = candidate;
+				*resolvedEnemy = candidate;
 				break;
 			}
 		}
 	}
+	return result.selectedPlayerIndex < 0 || *resolvedEnemy != nullptr;
+}
+
+void AISkirmishPlayer::applyEnemyPlanningCommit(Player *resolvedEnemy)
+{
 	m_frameToCheckEnemy = TheGameLogic->getFrame() + 5*LOGICFRAMES_PER_SECOND;
 
-	if (newEnemy != m_currentEnemy)
+	if (resolvedEnemy != m_currentEnemy)
 	{
-		m_currentEnemy = newEnemy;
+		m_currentEnemy = resolvedEnemy;
 		m_currentEnemyPlayerIndex = m_currentEnemy ? m_currentEnemy->getPlayerIndex() : -1;
 		if (m_currentEnemy)
 		{
@@ -1115,7 +1121,6 @@ Bool AISkirmishPlayer::commitEnemyPlanningResult(
 			TheScriptEngine->AppendDebugMessage(message, false);
 		}
 	}
-	return true;
 }
 
 Bool AISkirmishPlayer::validateEnemyPlanningCommit(

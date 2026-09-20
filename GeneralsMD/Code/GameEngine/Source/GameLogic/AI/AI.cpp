@@ -490,25 +490,26 @@ struct DeferredAIPlanningReferenceFinish
 
 DeferredAIPlanningReferenceFinish s_deferredAIPlanningReferenceFinish;
 
-void CompleteDeferredAIPlanningReferenceFinish()
+Bool CompleteDeferredAIPlanningReferenceFinish()
 {
 	if (!s_deferredAIPlanningReferenceFinish.active)
-		return;
-	if (TheGameLogic)
+		return true;
+	const Bool closed = TheGameLogic != 0 &&
 		TheGameLogic->finishPerformanceReceiptAttempt(
 			s_deferredAIPlanningReferenceFinish.attempt,
 			s_deferredAIPlanningReferenceFinish.batch,
 			s_deferredAIPlanningReferenceFinish.disposition, true, true);
 	s_deferredAIPlanningReferenceFinish = DeferredAIPlanningReferenceFinish();
+	return closed;
 }
 
-void FinishLiveAIPlanningReferenceAttempt(
+Bool FinishLiveAIPlanningReferenceAttempt(
 	rts::AIPlanningReferenceBatchTransport *transport,
 	const rts::AIPlanningBatchStatus *status, Bool ownerCommitted)
 {
 	if (!transport || !transport->referenceLedger ||
 		!transport->referenceBatch)
-		return;
+		return false;
 	const rts::performance::KernelPerformanceReferenceBatch linked =
 		*transport->referenceBatch;
 	const Bool fallbackCompleted = ownerCommitted && status &&
@@ -520,8 +521,10 @@ void FinishLiveAIPlanningReferenceAttempt(
 		(status && status->nativeAdmissionAccepted != 0U ?
 			rts::performance::KERNEL_PERFORMANCE_ABORTED_AFTER_ADMISSION :
 			rts::performance::KERNEL_PERFORMANCE_NOT_ADMITTED);
-	if (transport->referenceAttempt.valid() && TheGameLogic)
+	if (transport->referenceAttempt.valid())
 	{
+		if (!TheGameLogic)
+			return false;
 		if (!ownerCommitted)
 		{
 			s_deferredAIPlanningReferenceFinish.attempt =
@@ -533,21 +536,21 @@ void FinishLiveAIPlanningReferenceAttempt(
 				rts::performance::KernelPerformanceReferenceBatch();
 			transport->referenceAttempt =
 				rts::performance::KernelPerformanceAttempt();
-			return;
+			return true;
 		}
-		TheGameLogic->finishPerformanceReceiptAttempt(
+		const Bool closed = TheGameLogic->finishPerformanceReceiptAttempt(
 			transport->referenceAttempt, linked, disposition,
 			fallbackCompleted != FALSE, fallbackCompleted != FALSE);
 		*transport->referenceBatch =
 			rts::performance::KernelPerformanceReferenceBatch();
 		transport->referenceAttempt =
 			rts::performance::KernelPerformanceAttempt();
+		return closed;
 	}
-	else
-	{
-		rts::FinishAIPlanningReferenceBatch(transport,
+	if (linked.valid())
+		return rts::FinishAIPlanningReferenceBatch(transport,
 			attemptCommitted != FALSE);
-	}
+	return true;
 }
 
 Bool RunSkirmishEnemyPlanningBatch()
@@ -631,14 +634,14 @@ Bool RunSkirmishEnemyPlanningBatch()
 		return false;
 	}
 
-	// commitEnemyPlanningResult performs the sole canonical/live membership
-	// validation immediately before each ordered owner mutation. Do not run the
-	// same enemy oracle once during precommit and again during commit.
+	Player *resolved[rts::AI_PLANNING_MAX_PLAYERS] = { nullptr };
+	// Resolve the complete live membership set before closing the receipt. No
+	// target becomes visible unless both validation and checked closure succeed.
 	performanceBatch.begin(rts::performance::KERNEL_PERFORMANCE_COMMIT);
 	for (UnsignedInt i = 0; i < snapshots.size(); ++i)
 	{
-		if (!owners[i]->commitEnemyPlanningResult(
-			snapshots[i].enemyTarget, committed[i].enemyTarget))
+		if (!owners[i]->resolveEnemyPlanningCommit(
+			snapshots[i].enemyTarget, committed[i].enemyTarget, &resolved[i]))
 		{
 			performanceBatch.abort();
 			FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, false);
@@ -646,14 +649,23 @@ Bool RunSkirmishEnemyPlanningBatch()
 			return false;
 		}
 	}
-	rts::RecordAIPlanningOwnerCommit(true, &status);
-	performanceBatch.end();
 	const Bool referenceCommitted =
 		executionMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.parallelSucceeded != 0U &&
 		status.committedMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.usedSerialFallback == 0U;
-	FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, true);
+	const Bool referenceClosed = FinishLiveAIPlanningReferenceAttempt(
+		&referenceTransport, &status, true);
+	if (!referenceClosed)
+	{
+		performanceBatch.abort();
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+	for (UnsignedInt i = 0; i < snapshots.size(); ++i)
+		owners[i]->applyEnemyPlanningCommit(resolved[i]);
+	performanceBatch.end();
+	rts::RecordAIPlanningOwnerCommit(true, &status);
 	if (referenceCommitted)
 		performanceBatch.commit();
 	else
@@ -797,14 +809,23 @@ Bool RunSkirmishProductionPlanningBatch()
 			return false;
 		}
 	}
-	rts::RecordAIPlanningOwnerCommit(true, &status);
 	performanceBatch.end();
 	const Bool referenceCommitted =
 		executionMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.parallelSucceeded != 0U &&
 		status.committedMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.usedSerialFallback == 0U;
-	FinishLiveAIPlanningReferenceAttempt(&referenceTransport, &status, true);
+	const Bool referenceClosed = FinishLiveAIPlanningReferenceAttempt(
+		&referenceTransport, &status, true);
+	if (!referenceClosed)
+	{
+		for (UnsignedInt i = 0; i < owners.size(); ++i)
+			owners[i]->discardStagedProductionPlanningResult();
+		performanceBatch.abort();
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
+	}
+	rts::RecordAIPlanningOwnerCommit(true, &status);
 	if (referenceCommitted)
 		performanceBatch.commit();
 	else
@@ -841,7 +862,8 @@ void AI::update()
 		ThePlayerList->UPDATE();
 	}
 #if defined(_WIN64)
-	CompleteDeferredAIPlanningReferenceFinish();
+	if (!CompleteDeferredAIPlanningReferenceFinish())
+		rts::RecordAIPlanningOwnerCommit(false);
 #endif
 
 }

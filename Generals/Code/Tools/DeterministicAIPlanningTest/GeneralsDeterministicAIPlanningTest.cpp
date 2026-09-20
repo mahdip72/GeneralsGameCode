@@ -319,6 +319,77 @@ void AssertEqualBatch(const GeneralsAIEnemyPlanningResult *expected,
 		assert(EqualGeneralsAIEnemyPlanningResult(expected[i], actual[i]));
 }
 
+void TestRetailOrderedInitialEnemyProjection()
+{
+	GeneralsAIEnemyPlanningSnapshot captured[2];
+	ClearGeneralsAIEnemyPlanningSnapshot(&captured[0]);
+	captured[0].frame = 1U;
+	captured[0].ownerPlayerIndex = 0U;
+	captured[0].initialBestDistanceSquared = kRetailEnemyThreshold;
+	captured[0].candidateCount = 2U;
+	captured[0].candidates[0].sourceOrdinal = 2U;
+	captured[0].candidates[0].playerIndex = 2;
+	captured[0].candidates[0].baseDistanceSquared = 1000.0f;
+	captured[0].candidates[1].sourceOrdinal = 3U;
+	captured[0].candidates[1].playerIndex = 3;
+	captured[0].candidates[1].baseDistanceSquared = 2000.0f;
+	MakeEnemySnapshot(&captured[1], 1U, 2U, 2);
+	captured[1].frame = 1U;
+
+	GeneralsAIEnemyPlanningResult simultaneous[2];
+	assert(PlanGeneralsAIEnemyPlanningBatchSerial(captured, 2U, simultaneous));
+	assert(simultaneous[0].selectedPlayerIndex == 2);
+	assert(simultaneous[1].selectedPlayerIndex == 2);
+
+	const UnsignedInt ownerSources[2] = { 0U, 1U };
+	const Bool skirmishBySource[4] = { true, true, false, false };
+	const Int initialTargets[4] = { -1, -1, -1, -1 };
+	GeneralsAIEnemyPlanningSnapshot projected[2];
+	GeneralsAIEnemyPlanningResult projectedResults[2];
+	UnsignedInt publicationOrder[2];
+	assert(ProjectGeneralsAIEnemyPlanningOrder(captured, ownerSources, 2U,
+		skirmishBySource, initialTargets, 4U, projected, projectedResults,
+		publicationOrder));
+	// Owner zero recursively observes owner one acquire source two before its
+	// own first score, exactly matching the retail getCurrentEnemy recursion.
+	assert(projected[0].candidates[0].targetingCandidateMask == (1U << 1U));
+	assert(projectedResults[1].selectedPlayerIndex == 2);
+	assert(projectedResults[0].selectedPlayerIndex == 3);
+	assert(publicationOrder[0] == 1U);
+	assert(publicationOrder[1] == 0U);
+
+	GeneralsAIEnemyPlanningResult parallelInputs[2];
+	assert(PlanGeneralsAIEnemyPlanningBatchSerial(
+		projected, 2U, parallelInputs));
+	AssertEqualBatch(projectedResults, parallelInputs, 2U);
+	rts::JobSystem &jobs = rts::JobSystem::instance();
+	rts::JobSystemConfig config;
+	config.workerCount = 2U;
+	config.queueCapacity = 64U;
+	config.scratchBytesPerWorker = 64U * 1024U;
+	config.pinWorkers = false;
+	assert(jobs.start(config));
+	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
+	rts::AIPlanningBatchStatus status;
+	assert(ExecuteGeneralsAIEnemyPlanningBatch(
+		rts::AI_PLANNING_EXECUTION_PARALLEL, false, projected, 2U,
+		parallelInputs, rts::AI_PLANNING_INVALID_ORDINAL, &status));
+	AssertEqualBatch(projectedResults, parallelInputs, 2U);
+	assert(status.parallelSucceeded == 1U);
+	jobs.shutdown();
+	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
+
+	// A retained non-due target participates in the same observation table and
+	// must not be mistaken for an all-null first-tick view.
+	const Bool oneDueSkirmish[4] = { true, true, false, false };
+	const Int retainedTargets[4] = { -1, 2, -1, -1 };
+	assert(ProjectGeneralsAIEnemyPlanningOrder(captured, ownerSources, 1U,
+		oneDueSkirmish, retainedTargets, 4U, projected, projectedResults,
+		publicationOrder));
+	assert(projected[0].candidates[0].targetingCandidateMask == (1U << 1U));
+	assert(projectedResults[0].selectedPlayerIndex == 3);
+}
+
 void TestCanonicalBatchAcrossTopologiesAndFailure()
 {
 	rts::JobSystem &jobs = rts::JobSystem::instance();
@@ -732,6 +803,7 @@ int main()
 	TestGeneralsPathfindingReplayEpochContract();
 	TestTopologyAndReplayGates();
 	TestGeneralsScoringAndUntrustedResults();
+	TestRetailOrderedInitialEnemyProjection();
 	TestCanonicalBatchAcrossTopologiesAndFailure();
 #if defined(_WIN64)
 	TestGeneralsActualNativeSourceConsumer();

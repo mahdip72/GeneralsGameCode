@@ -65,3 +65,12 @@ endif()
 add_test(NAME core_deterministic_ai_planning_tests
     COMMAND core_deterministic_ai_planning_tests --local-capacity)
 set_tests_properties(core_deterministic_ai_planning_tests PROPERTIES TIMEOUT 30)
+
+if(WIN32)
+    add_test(NAME core_ai_planning_publication_transaction_tests
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/AIPlanningPublicationTransaction.Tests.ps1"
+            -SourceRoot "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(core_ai_planning_publication_transaction_tests
+        PROPERTIES TIMEOUT 30)
+endif()

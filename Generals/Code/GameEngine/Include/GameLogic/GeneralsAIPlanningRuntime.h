@@ -436,6 +436,157 @@ inline Bool PlanGeneralsAIEnemyPlanningBatchSerial(
 	return true;
 }
 
+// Retail Generals evaluates due skirmish owners recursively while scoring the
+// first owner in PlayerList order.  The live batch cannot publish those nested
+// targets during capture, so project the same recursion into immutable masks.
+// The resulting snapshots remain independent and can still be planned by the
+// worker batch; only the owner-observation order is serialized here.
+class GeneralsAIEnemyPlanningOrderProjector
+{
+public:
+	GeneralsAIEnemyPlanningOrderProjector(
+		const GeneralsAIEnemyPlanningSnapshot *captured,
+		const UnsignedInt *ownerSourceOrdinals, UnsignedInt ownerCount,
+		const Bool *skirmishBySource, const Int *initialEnemySourceOrdinals,
+		UnsignedInt playerCount, GeneralsAIEnemyPlanningSnapshot *projected,
+		GeneralsAIEnemyPlanningResult *results,
+		UnsignedInt *publicationOrder) :
+		m_captured(captured), m_ownerSourceOrdinals(ownerSourceOrdinals),
+		m_ownerCount(ownerCount), m_skirmishBySource(skirmishBySource),
+		m_playerCount(playerCount), m_projected(projected), m_results(results),
+		m_publicationOrder(publicationOrder), m_publicationCount(0U)
+	{
+		for (UnsignedInt i = 0U; i < GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS; ++i)
+		{
+			m_dueOwnerBySource[i] = -1;
+			m_projectedEnemyBySource[i] = -1;
+			m_state[i] = 0U;
+		}
+		for (UnsignedInt i = 0U; i < playerCount; ++i)
+			m_projectedEnemyBySource[i] = initialEnemySourceOrdinals[i];
+		for (UnsignedInt i = 0U; i < ownerCount; ++i)
+			m_dueOwnerBySource[ownerSourceOrdinals[i]] = (Int)i;
+	}
+
+	Bool run()
+	{
+		for (UnsignedInt i = 0U; i < m_ownerCount; ++i)
+		{
+			if (!project(i))
+				return false;
+		}
+		return true;
+	}
+
+private:
+	Bool project(UnsignedInt ownerIndex)
+	{
+		if (m_state[ownerIndex] == 2U)
+			return true;
+		// getAiEnemy advances the due frame before entering acquireEnemy, so a
+		// recursive query of the same owner observes its pre-existing target.
+		if (m_state[ownerIndex] == 1U)
+			return true;
+		m_state[ownerIndex] = 1U;
+		m_projected[ownerIndex] = m_captured[ownerIndex];
+		GeneralsAIEnemyPlanningSnapshot &snapshot = m_projected[ownerIndex];
+		const UnsignedInt ownerSource = m_ownerSourceOrdinals[ownerIndex];
+		for (UnsignedInt candidateIndex = 0U;
+			candidateIndex < snapshot.candidateCount; ++candidateIndex)
+		{
+			GeneralsAIEnemyCandidateFact &candidate =
+				snapshot.candidates[candidateIndex];
+			candidate.targetingCandidateMask = 0U;
+			candidate.targetingOwnerMask = 0U;
+			for (UnsignedInt source = 0U; source < m_playerCount; ++source)
+			{
+				if (source == candidate.sourceOrdinal || !m_skirmishBySource[source])
+					continue;
+				const Int dueOwner = m_dueOwnerBySource[source];
+				if (dueOwner >= 0 && m_state[(UnsignedInt)dueOwner] == 0U &&
+					!project((UnsignedInt)dueOwner))
+				{
+					return false;
+				}
+				const Int target = m_projectedEnemyBySource[source];
+				const UnsignedInt sourceBit = 1U << source;
+				if (target == (Int)candidate.sourceOrdinal)
+					candidate.targetingCandidateMask |= sourceBit;
+				if (target == (Int)ownerSource)
+					candidate.targetingOwnerMask |= sourceBit;
+			}
+		}
+		if (!PlanGeneralsAIEnemyTarget(snapshot, &m_results[ownerIndex]) ||
+			!ValidateGeneralsAIEnemyPlanningResult(
+				snapshot, m_results[ownerIndex]))
+		{
+			return false;
+		}
+		if (m_results[ownerIndex].selectedPlayerIndex >= 0)
+		{
+			m_projectedEnemyBySource[ownerSource] =
+				(Int)m_results[ownerIndex].orderKey.sourceOrdinal;
+		}
+		m_state[ownerIndex] = 2U;
+		m_publicationOrder[m_publicationCount++] = ownerIndex;
+		return true;
+	}
+
+	const GeneralsAIEnemyPlanningSnapshot *m_captured;
+	const UnsignedInt *m_ownerSourceOrdinals;
+	UnsignedInt m_ownerCount;
+	const Bool *m_skirmishBySource;
+	UnsignedInt m_playerCount;
+	GeneralsAIEnemyPlanningSnapshot *m_projected;
+	GeneralsAIEnemyPlanningResult *m_results;
+	UnsignedInt *m_publicationOrder;
+	UnsignedInt m_publicationCount;
+	Int m_dueOwnerBySource[GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
+	Int m_projectedEnemyBySource[GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
+	UnsignedInt m_state[GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
+};
+
+inline Bool ProjectGeneralsAIEnemyPlanningOrder(
+	const GeneralsAIEnemyPlanningSnapshot *captured,
+	const UnsignedInt *ownerSourceOrdinals, UnsignedInt ownerCount,
+	const Bool *skirmishBySource, const Int *initialEnemySourceOrdinals,
+	UnsignedInt playerCount, GeneralsAIEnemyPlanningSnapshot *projected,
+	GeneralsAIEnemyPlanningResult *results, UnsignedInt *publicationOrder)
+{
+	if (!captured || !ownerSourceOrdinals || !skirmishBySource ||
+		!initialEnemySourceOrdinals || !projected || !results || !publicationOrder ||
+		ownerCount == 0U ||
+		ownerCount > GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS || playerCount == 0U ||
+		playerCount > GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS)
+	{
+		return false;
+	}
+	Bool seen[GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS] = { false };
+	for (UnsignedInt source = 0U; source < playerCount; ++source)
+	{
+		if (initialEnemySourceOrdinals[source] < -1 ||
+			initialEnemySourceOrdinals[source] >= (Int)playerCount)
+		{
+			return false;
+		}
+	}
+	for (UnsignedInt i = 0U; i < ownerCount; ++i)
+	{
+		const UnsignedInt source = ownerSourceOrdinals[i];
+		if (source >= playerCount || seen[source] || !skirmishBySource[source] ||
+			!ValidateGeneralsAIEnemyPlanningSnapshot(captured[i]))
+		{
+			return false;
+		}
+		seen[source] = true;
+	}
+	GeneralsAIEnemyPlanningOrderProjector projector(captured,
+		ownerSourceOrdinals, ownerCount, skirmishBySource,
+		initialEnemySourceOrdinals, playerCount, projected, results,
+		publicationOrder);
+	return projector.run();
+}
+
 // Production executor shared by the game and focused test. Once the current
 // planning epoch has captured snapshots, every unavailable or failed parallel
 // path recomputes that same complete batch serially. It never switches epochs.

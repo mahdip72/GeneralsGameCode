@@ -86,9 +86,11 @@ public:	// AIPlayer interface methods.
 	Bool validateEnemyPlanningCommit(
 		const rts::AIEnemyPlanningSnapshot &snapshot,
 		const rts::AIEnemyPlanningResult &result ) const;
-	Bool commitEnemyPlanningResult(
+	Bool resolveEnemyPlanningCommit(
 		const rts::AIEnemyPlanningSnapshot &snapshot,
-		const rts::AIEnemyPlanningResult &result );
+		const rts::AIEnemyPlanningResult &result,
+		Player **resolvedEnemy ) const;
+	void applyEnemyPlanningCommit(Player *resolvedEnemy);
 	Bool prepareAdaptiveProductionPlanningSnapshot(
 		rts::AIProductionPlanningSnapshot *snapshot,
 		const rts::AICounterRngKey &baseRandomKey,

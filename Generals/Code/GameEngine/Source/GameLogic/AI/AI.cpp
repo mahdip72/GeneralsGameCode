@@ -584,8 +584,40 @@ Bool RunSkirmishEnemyPlanningBatch()
 	}
 
 	AISkirmishPlayer *owners[GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS] = { nullptr };
+	GeneralsAIEnemyPlanningSnapshot capturedSnapshots[
+		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
 	GeneralsAIEnemyPlanningSnapshot snapshots[
 		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
+	GeneralsAIEnemyPlanningResult projectedResults[
+		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
+	UnsignedInt ownerSourceOrdinals[
+		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS] = { 0U };
+	UnsignedInt publicationOrder[
+		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS] = { 0U };
+	Bool skirmishBySource[
+		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS] = { false };
+	Int initialEnemySourceOrdinals[
+		GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS];
+	const UnsignedInt playerCount =
+		(UnsignedInt)ThePlayerList->getPlayerCount();
+	for (UnsignedInt source = 0U; source < playerCount; ++source)
+	{
+		initialEnemySourceOrdinals[source] = -1;
+		Player *player = ThePlayerList->getNthPlayer((Int)source);
+		if (!player || !player->isSkirmishAIPlayer())
+			continue;
+		skirmishBySource[source] = true;
+		Player *enemy = player->getCachedCurrentEnemy();
+		for (UnsignedInt enemySource = 0U;
+			enemy && enemySource < playerCount; ++enemySource)
+		{
+			if (ThePlayerList->getNthPlayer((Int)enemySource) == enemy)
+			{
+				initialEnemySourceOrdinals[source] = (Int)enemySource;
+				break;
+			}
+		}
+	}
 	UnsignedInt ownerCount = 0U;
 	for (Int sourceOrdinal = 0;
 		sourceOrdinal < ThePlayerList->getPlayerCount(); ++sourceOrdinal)
@@ -604,14 +636,25 @@ Bool RunSkirmishEnemyPlanningBatch()
 			return false;
 		}
 
-		if (!owner->captureEnemyPlanningSnapshot(&snapshots[ownerCount]))
+		if (!owner->captureEnemyPlanningSnapshot(&capturedSnapshots[ownerCount]))
 		{
 			performanceBatch.abort();
 			rts::RecordAIPlanningOwnerCommit(false);
 			return false;
 		}
-		rts::RecordAIPlanningOwnerCapture(snapshots[ownerCount].candidateCount);
+		rts::RecordAIPlanningOwnerCapture(
+			capturedSnapshots[ownerCount].candidateCount);
+		ownerSourceOrdinals[ownerCount] = (UnsignedInt)sourceOrdinal;
 		owners[ownerCount++] = owner;
+	}
+	if (ownerCount != 0U && !ProjectGeneralsAIEnemyPlanningOrder(
+		capturedSnapshots, ownerSourceOrdinals, ownerCount, skirmishBySource,
+		initialEnemySourceOrdinals, playerCount, snapshots, projectedResults,
+		publicationOrder))
+	{
+		performanceBatch.abort();
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
 	}
 	performanceBatch.end();
 	if (ownerCount == 0U)
@@ -677,11 +720,6 @@ Bool RunSkirmishEnemyPlanningBatch()
 			return false;
 		}
 	}
-	for (UnsignedInt i = 0U; i < ownerCount; ++i)
-	{
-		owners[i]->applyEnemyPlanningCommit(resolved[i]);
-	}
-	performanceBatch.end();
 	const Bool referenceCommitted =
 		executionMode == rts::AI_PLANNING_EXECUTION_PARALLEL &&
 		status.parallelSucceeded != 0U &&
@@ -695,6 +733,12 @@ Bool RunSkirmishEnemyPlanningBatch()
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
 	}
+	for (UnsignedInt i = 0U; i < ownerCount; ++i)
+	{
+		const UnsignedInt ownerIndex = publicationOrder[i];
+		owners[ownerIndex]->applyEnemyPlanningCommit(resolved[ownerIndex]);
+	}
+	performanceBatch.end();
 	rts::RecordAIPlanningOwnerCommit(true, &status);
 	if (referenceCommitted)
 		performanceBatch.commit();
@@ -832,6 +876,8 @@ Bool RunSkirmishProductionPlanningBatch()
 		&referenceTransport, &status, true);
 	if (!referenceClosed)
 	{
+		for (UnsignedInt i = 0; i < owners.size(); ++i)
+			owners[i]->discardStagedProductionPlanningResult();
 		performanceBatch.abort();
 		rts::RecordAIPlanningOwnerCommit(false);
 		return false;
