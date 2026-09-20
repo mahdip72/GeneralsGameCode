@@ -2471,16 +2471,28 @@ function Assert-CurrentNativeReceiptCatalog {
         & $publish
         $readArguments = @{Path=$path;Kind='deterministic-runtime';Role='validation-results'
             EvidenceTitle='ZeroHour';ExpectedSourceCommit=$SourceCommit
-            ExpectedArtifactSetSha256=$ArtifactSetSha256;ArtifactHashes=$ArtifactHashes}
+            ExpectedArtifactSetSha256=$ArtifactSetSha256;ArtifactHashes=$ArtifactHashes
+            ExpectedCohortNonce=$script:TestCohortNonce
+            ExpectedCohortCreatedUtc=$script:TestCohortCreatedUtc
+            ExpectedRuntimeClosure=$script:TestRuntimeClosure}
         Assert-Throws { Read-Stage5FinalAcceptanceImmutableReceipt @readArguments } 'producer|version|V5|obsolete' `
             "$domain cannot promote an obsolete hash-bound native receipt"
+        [string[]]$expectedArguments = if ($domain -ceq 'host-runner') {
+            @('-headless', '-noFPSLimit', '-pipelineMode', 'serial',
+                '-simulationMode', 'serial', '-workerPolicy', 'auto',
+                '-workerCount', '1', '-validationExecutableSha256',
+                [string]$ArtifactHashes['zerohour-executable'])
+        }
+        else { @('-headless', '-stage5-validation') }
         $parserArguments = @{OutputText="SIMULATION_PERFORMANCE_RECEIPT status=written path=$nativePath"
             OutputRoot=$Directory;WorkingDirectory=$Directory;Role='validation-results'
             SourceCommit=$SourceCommit;ArtifactSetSha256=$ArtifactSetSha256
             ExecutableSha256=$ArtifactHashes['zerohour-executable'];RunNonce=$native.runNonce
             CohortNonce=$native.cohortNonce;RuntimeClosure=$script:TestRuntimeClosure;ExpectedTitle='ZeroHour'
             ProcessId=$native.provenance.processId;ProcessCreationUtc=$native.provenance.processCreationUtc
-            ExpectedExecutablePath=$native.provenance.executablePath}
+            ExpectedExecutablePath=$native.provenance.executablePath
+            ExpectedArguments=$expectedArguments
+            ExpectedCohortCreatedUtc=$script:TestCohortCreatedUtc}
         Assert-True ($null -eq (& $parserCommand @parserArguments)) `
             'runner child reader rejects obsolete native protocol despite correct raw hashes'
         Add-Stage5NativeReceiptTestObservations $native

@@ -48,6 +48,30 @@ if ($sourceText -cnotmatch
     '(?s)Invoke-Stage5FinalAcceptance\.ps1.{0,300}-ExternalQualificationExempt') {
     throw 'The final-acceptance script test must authorize its synthetic installed-kernel exemption.'
 }
+$catalogFunction = $sourceAst.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ceq 'Assert-CurrentNativeReceiptCatalog'
+}, $true)
+if ($null -eq $catalogFunction) {
+    throw 'The current native receipt catalog regression helper is missing.'
+}
+$catalogSource = $catalogFunction.Extent.Text
+foreach ($binding in @('ExpectedCohortNonce', 'ExpectedCohortCreatedUtc',
+        'ExpectedRuntimeClosure')) {
+    $pattern = '(?s)\$readArguments\s*=\s*@\{.*?' +
+        [regex]::Escape($binding) + '\s*='
+    if ($catalogSource -cnotmatch $pattern) {
+        throw "The current native receipt reader test omits $binding."
+    }
+}
+foreach ($binding in @('ExpectedArguments', 'ExpectedCohortCreatedUtc')) {
+    $pattern = '(?s)\$parserArguments\s*=\s*@\{.*?' +
+        [regex]::Escape($binding) + '\s*='
+    if ($catalogSource -cnotmatch $pattern) {
+        throw "The native receipt parser test omits $binding."
+    }
+}
 # Execute the actual test entrypoint's early routing preflight, not a copied
 # selector implementation. It returns before module imports or fixture I/O.
 $entrypoint = [scriptblock]::Create($sourceText)
