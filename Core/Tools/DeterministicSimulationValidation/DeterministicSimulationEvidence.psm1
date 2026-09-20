@@ -4812,6 +4812,61 @@ function Get-Stage5FinalAcceptancePathSegments {
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
 
+function Get-Stage5FinalAcceptanceCandidateSuffixKey {
+    param([string[]]$Segments, [int]$Length)
+    $start = $Segments.Count - $Length
+    return (($Segments[$start..($Segments.Count - 1)]) -join '\')
+}
+
+function New-Stage5FinalAcceptanceCandidateSuffixIndex {
+    param([object[]]$CandidatePathRecords)
+    $buckets = New-Object 'Collections.Generic.Dictionary[string,object]' `
+        ([StringComparer]::OrdinalIgnoreCase)
+    [int]$maximumLength = 0
+    foreach ($candidate in $CandidatePathRecords) {
+        $segments = @($candidate.segments)
+        for ($length = 2; $length -le $segments.Count; ++$length) {
+            $key = Get-Stage5FinalAcceptanceCandidateSuffixKey `
+                ([string[]]$segments) $length
+            if (-not $buckets.ContainsKey($key)) {
+                $buckets[$key] = New-Object 'Collections.Generic.List[object]'
+            }
+            ([Collections.Generic.List[object]]$buckets[$key]).Add($candidate) |
+                Out-Null
+            if ($length -gt $maximumLength) { $maximumLength = $length }
+        }
+    }
+    return [pscustomobject]@{
+        buckets = $buckets
+        maximumLength = $maximumLength
+    }
+}
+
+function Find-Stage5FinalAcceptanceCandidateMatches {
+    param(
+        [object]$CandidateSuffixIndex,
+        [string[]]$SourceSegments
+    )
+    $segments = @($SourceSegments)
+    $buckets = $CandidateSuffixIndex.buckets
+    $maximumLength = [Math]::Min($segments.Count,
+        [int]$CandidateSuffixIndex.maximumLength)
+    for ($length = $maximumLength; $length -ge 2; --$length) {
+        $key = Get-Stage5FinalAcceptanceCandidateSuffixKey `
+            ([string[]]$segments) $length
+        if (-not $buckets.ContainsKey($key)) { continue }
+        $matches = New-Object 'Collections.Generic.List[object]'
+        foreach ($candidate in ([Collections.Generic.List[object]]$buckets[$key]).ToArray()) {
+            $matches.Add([pscustomobject]@{
+                path = [string]$candidate.path
+                suffixLength = $length
+            }) | Out-Null
+        }
+        if ($matches.Count -gt 0) { return $matches.ToArray() }
+    }
+    return @()
+}
+
 function Get-Stage5FinalAcceptanceNativePathKey {
     param(
         [string]$Path,
@@ -4935,6 +4990,7 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
     # Candidate normalization depends only on this invocation's root and file
     # list; defer it until the first absolute source path.
     $candidatePathRecords = $null
+    $candidateSuffixIndex = $null
     $childBindings = New-Object 'Collections.Generic.List[object]'
     foreach ($child in $children) {
         $childNonce = [string](Get-Stage5JsonValue $child 'runNonce' `
@@ -5035,25 +5091,14 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
                             segments = @(Get-Stage5FinalAcceptancePathSegments $relative)
                         }) | Out-Null
                     }
+                    $candidateSuffixIndex =
+                        New-Stage5FinalAcceptanceCandidateSuffixIndex `
+                            $candidatePathRecords.ToArray()
                 }
                 $matches = New-Object 'Collections.Generic.List[object]'
-                foreach ($candidate in $candidatePathRecords) {
-                    $maximum = [Math]::Min($sourceSegments.Count,
-                        $candidate.segments.Count)
-                    $suffixLength = 0
-                    for ($count = 1; $count -le $maximum; ++$count) {
-                        if ($sourceSegments[$sourceSegments.Count - $count].Equals(
-                                $candidate.segments[$candidate.segments.Count - $count],
-                                [StringComparison]::OrdinalIgnoreCase)) {
-                            $suffixLength = $count
-                        }
-                        else { break }
-                    }
-                    if ($suffixLength -ge 2) {
-                        $matches.Add([pscustomobject]@{
-                            path = $candidate.path; suffixLength = $suffixLength
-                        }) | Out-Null
-                    }
+                foreach ($match in @(Find-Stage5FinalAcceptanceCandidateMatches `
+                            $candidateSuffixIndex $sourceSegments)) {
+                    $matches.Add($match) | Out-Null
                 }
                 Assert-Stage5Condition ($matches.Count -gt 0) `
                     "$childContext native raw log '$name' has no staged candidate matching its source path."

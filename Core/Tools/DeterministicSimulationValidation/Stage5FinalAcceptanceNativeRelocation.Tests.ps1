@@ -219,6 +219,69 @@ Import-Module $modulePath -Force
 $evidenceModule = Get-Module -Name 'DeterministicSimulationEvidence' | Where-Object { $_.Path -ceq ([IO.Path]::GetFullPath($modulePath)) } | Select-Object -First 1
 Assert-RelocationTest ($null -ne $evidenceModule) 'the source evidence module did not import'
 
+function Invoke-CandidateIndexLookup {
+    param(
+        [object]$Module,
+        [object[]]$Records,
+        [string[]]$SourceSegments
+    )
+    return & $Module {
+        param($candidateRecords, $sourcePathSegments)
+        $index = New-Stage5FinalAcceptanceCandidateSuffixIndex $candidateRecords
+        @(Find-Stage5FinalAcceptanceCandidateMatches `
+            $index $sourcePathSegments)
+    } $Records $SourceSegments
+}
+
+$candidateRecords = @(
+    [pscustomobject]@{
+        path = 'staged\short\runA\raw.log'
+        segments = @('staged', 'short', 'runA', 'raw.log')
+    },
+    [pscustomobject]@{
+        path = 'staged\runA\raw.log'
+        segments = @('staged', 'runA', 'raw.log')
+    },
+    [pscustomobject]@{
+        path = 'staged\Case\Logs\raw.log'
+        segments = @('staged', 'Case', 'Logs', 'raw.log')
+    },
+    [pscustomobject]@{
+        path = 'staged\decoy\raw.log'
+        segments = @('staged', 'decoy', 'raw.log')
+    }
+)
+$longestMatches = @(Invoke-CandidateIndexLookup $evidenceModule `
+    $candidateRecords @('historical', 'short', 'runA', 'raw.log'))
+Assert-RelocationTest ($longestMatches.Count -eq 1 -and
+    [int]$longestMatches[0].suffixLength -eq 3 -and
+    [string]$longestMatches[0].path -ceq 'staged\short\runA\raw.log') `
+    'candidate suffix index did not preserve the longest unique suffix winner'
+$caseMatches = @(Invoke-CandidateIndexLookup $evidenceModule `
+    $candidateRecords @('historical', 'case', 'logs', 'raw.log'))
+Assert-RelocationTest ($caseMatches.Count -eq 1 -and
+    [string]$caseMatches[0].path -ceq 'staged\Case\Logs\raw.log') `
+    'candidate suffix index did not preserve case-insensitive matching'
+$ambiguousRecords = @(
+    [pscustomobject]@{
+        path = 'staged\one\shared\raw.log'
+        segments = @('staged', 'one', 'shared', 'raw.log')
+    },
+    [pscustomobject]@{
+        path = 'staged\two\shared\raw.log'
+        segments = @('staged', 'two', 'shared', 'raw.log')
+    }
+)
+$ambiguousMatches = @(Invoke-CandidateIndexLookup $evidenceModule `
+    $ambiguousRecords @('historical', 'shared', 'raw.log'))
+Assert-RelocationTest ($ambiguousMatches.Count -eq 2 -and
+    @($ambiguousMatches | Where-Object { $_.suffixLength -eq 2 }).Count -eq 2) `
+    'candidate suffix index did not preserve a longest-suffix ambiguity'
+$noMatch = @(Invoke-CandidateIndexLookup $evidenceModule `
+    $candidateRecords @('historical', 'missing', 'raw.log'))
+Assert-RelocationTest ($noMatch.Count -eq 0) `
+    'candidate suffix index returned a candidate for an unmatched suffix'
+
 $summary = $null
 try {
     $absoluteFixture = New-RelocationFixture -Mode absolute -Root (Join-Path $runRoot 'absolute')
