@@ -7126,6 +7126,22 @@ try {
         sequence = 2; configuration = 'parallel-2'; simulationMode = 'parallel'
         requestedWorkers = '2'; seed = 1729; scenario = '4v3'
     }
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion `
+            (New-AiCompletionOutput -Submitted 20 -Executed 19) `
+            $twoWorkerEntry ('A' * 64) | Out-Null
+    } 'submitted/executed job counts do not match' `
+        'parallel AI evidence rejects incomplete aggregate execution'
+    $automaticWorkerEntry = [pscustomobject]@{
+        sequence = 64; configuration = 'parallel-auto'; simulationMode = 'parallel'
+        requestedWorkers = 'auto'; seed = 1729; scenario = '4v3'
+    }
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion `
+            (New-AiCompletionOutput -RequestedWorkers 'auto' -Submitted 20 -Executed 19) `
+            $automaticWorkerEntry ('A' * 64) | Out-Null
+    } 'submitted/executed job counts do not match' `
+        'automatic parallel AI evidence rejects incomplete aggregate execution'
     try {
         $fallbackEvidence = ConvertFrom-Stage5AiCompletion `
             (New-AiCompletionOutput -Fallback 4 -OwnerFallbacks 4) `
@@ -7375,6 +7391,15 @@ try {
     }
     $shadowCompletion = ConvertFrom-Stage5AiCompletion `
         (New-AiCompletionOutput @shadowCompletionArguments) $shadowEntry ('A' * 64)
+    $shadowMismatchArguments = @{} + $shadowCompletionArguments
+    $shadowMismatchArguments.Submitted = 20
+    $shadowMismatchArguments.Executed = 19
+    Assert-Throws {
+        ConvertFrom-Stage5AiCompletion `
+            (New-AiCompletionOutput @shadowMismatchArguments) `
+            $shadowEntry ('A' * 64) | Out-Null
+    } 'submitted/executed job counts do not match' `
+        'shadow AI evidence rejects incomplete aggregate execution'
     Assert-True ($shadowCompletion.collisionShadowExecutions -eq 3 -and
         $shadowCompletion.collisionSubmittedJobs -eq 4 -and
         $shadowCompletion.aiCommittedBatches -eq 5 -and

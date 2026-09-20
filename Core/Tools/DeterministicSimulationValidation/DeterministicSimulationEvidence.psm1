@@ -2103,6 +2103,8 @@ function ConvertFrom-Stage5AiCompletionCore {
         $expectedWorkers = [UInt64]$Matches[1]
         Assert-Stage5Condition ($effectiveWorkers -eq $expectedWorkers) `
             "$context effective worker count does not match explicit configuration '$($Entry.configuration)'."
+        Assert-Stage5Condition ($submittedJobs -eq $executedJobs) `
+            "$context submitted/executed job counts do not match."
         if (-not $isExpectedOneWorkerFallback) {
             Assert-Stage5Condition ($submittedJobs -gt 0 -and $executedJobs -gt 0) `
                 "$context did not submit and execute jobs."
@@ -2112,6 +2114,8 @@ function ConvertFrom-Stage5AiCompletionCore {
     elseif ($Entry.configuration -ceq 'parallel-auto') {
         Assert-Stage5Condition ($effectiveWorkers -gt 0) `
             "$context automatic configuration did not report an effective worker."
+        Assert-Stage5Condition ($submittedJobs -eq $executedJobs) `
+            "$context submitted/executed job counts do not match."
         Assert-Stage5Condition ($submittedJobs -gt 0 -and
             $executedJobs -gt 0 -and $peakWorkers -gt 0) `
             "$context automatic configuration did not execute parallel jobs."
@@ -2121,6 +2125,8 @@ function ConvertFrom-Stage5AiCompletionCore {
         $expectedShadowWorkers = if ($Entry.configuration -ceq 'shadow-8') { 8 } else { 16 }
         Assert-Stage5Condition ($effectiveWorkers -eq $expectedShadowWorkers) `
             "$context shadow stress did not run with $expectedShadowWorkers effective workers."
+        Assert-Stage5Condition ($submittedJobs -eq $executedJobs) `
+            "$context submitted/executed job counts do not match."
         Assert-Stage5Condition ($submittedJobs -gt 0 -and
             $executedJobs -gt 0 -and $peakWorkers -gt 0) `
             "$context shadow stress did not execute worker jobs."
