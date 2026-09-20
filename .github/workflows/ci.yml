@@ -31,16 +31,6 @@ on:
         required: false
         type: string
         default: ""
-      stage5_generals_performance_baseline:
-        description: "Generals-only repository-relative Stage 3 performance baseline JSON"
-        required: false
-        type: string
-        default: ""
-      stage5_generals_expected_stage3_executable_sha256:
-        description: "Independently recorded Stage 3 x64 Generals executable SHA-256"
-        required: false
-        type: string
-        default: ""
       stage5_acceptance_manifest:
         description: "Repository-relative reviewed final Stage 5 acceptance manifest"
         required: false
@@ -1158,8 +1148,6 @@ jobs:
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&
           inputs.stage5_fixture_manifest != '' &&
-          inputs.stage5_performance_baseline != '' &&
-          inputs.stage5_expected_stage3_executable_sha256 != '' &&
           inputs.stage5_acceptance_manifest != '' }}
     uses: ./.github/workflows/check-replays.yml
     with:
@@ -1168,8 +1156,6 @@ jobs:
       stage5: true
       stage5_require_x64: true
       stage5_fixture_manifest: ${{ inputs.stage5_fixture_manifest }}
-      stage5_performance_baseline: ${{ inputs.stage5_performance_baseline }}
-      stage5_expected_stage3_executable_sha256: ${{ inputs.stage5_expected_stage3_executable_sha256 }}
       stage5_acceptance_manifest: ${{ inputs.stage5_acceptance_manifest }}
       stage5_execution_cohort_nonce: ${{ needs['stage5-execution-cohort'].outputs.nonce }}
       stage5_execution_cohort_created_utc: ${{ needs['stage5-execution-cohort'].outputs.created_utc }}
@@ -1183,8 +1169,6 @@ jobs:
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&
           inputs.stage5_generals_fixture_manifest != '' &&
-          inputs.stage5_generals_performance_baseline != '' &&
-          inputs.stage5_generals_expected_stage3_executable_sha256 != '' &&
           inputs.stage5_acceptance_manifest != '' }}
     uses: ./.github/workflows/check-replays.yml
     with:
@@ -1193,8 +1177,6 @@ jobs:
       stage5: true
       stage5_require_x64: true
       stage5_fixture_manifest: ${{ inputs.stage5_generals_fixture_manifest }}
-      stage5_performance_baseline: ${{ inputs.stage5_generals_performance_baseline }}
-      stage5_expected_stage3_executable_sha256: ${{ inputs.stage5_generals_expected_stage3_executable_sha256 }}
       stage5_acceptance_manifest: ${{ inputs.stage5_acceptance_manifest }}
       stage5_execution_cohort_nonce: ${{ needs['stage5-execution-cohort'].outputs.nonce }}
       stage5_execution_cohort_created_utc: ${{ needs['stage5-execution-cohort'].outputs.created_utc }}

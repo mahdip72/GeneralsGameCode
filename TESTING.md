@@ -74,6 +74,14 @@ The resulting installed-kernel disposition must remain `status=skipped` and
 `finalAcceptanceClaim=false`. This is an explicit exemption, not a
 qualification pass or release authority.
 
+The reusable hosted replay workflow runs the full functional replay/AI matrix
+and native correctness checks on `windows-2022` without
+`-EnforcePerformance`. It cannot satisfy or report the physical-core
+performance gate. That authority belongs only to the explicitly dispatched
+`Stage 5 External 16-Core Performance Qualification` job on the dedicated
+`stage5-16-physical-core` self-hosted runner; an unrun external lane remains
+deferred.
+
 The multiplayer attachment is not a free-form soak summary. It must match
 `Net3LoopbackEvidence.schema.json`: exactly 16 canonically ordered installed
 NET3 matches (both titles, four supported topologies, seeds 23063 and 49374)

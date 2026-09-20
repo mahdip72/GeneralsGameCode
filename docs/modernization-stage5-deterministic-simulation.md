@@ -622,11 +622,17 @@ the candidate result; do not tune them after observing the matrix.
 ## CI and final candidate
 
 Ordinary pull requests build only the native x64 products plus explicitly
-non-product Win32 authoring tools. A manual `GenCI` dispatch may provide the Zero Hour-specific `stage5_fixture_manifest`,
-`stage5_performance_baseline`, and executable hash, or the corresponding
-`stage5_generals_*` inputs for Generals. Each opt-in job downloads its
-title-specific native x64 installed artifact and runs the full replay matrix;
-title-specific evidence is uploaded even when the matrix fails.
+non-product Win32 authoring tools. A manual `GenCI` dispatch may provide the
+title-specific replay fixture manifest and reviewed acceptance manifest. Each
+opt-in hosted job downloads its title-specific native x64 installed artifact
+and runs the full functional replay/AI matrix with native correctness checks;
+title-specific evidence is uploaded even when the matrix fails. Hosted
+`windows-2022` jobs never pass `-EnforcePerformance` and cannot claim the
+physical-core performance gate or final deterministic-runtime acceptance.
+Only the separately opted-in `Stage 5 External 16-Core Performance
+Qualification` job on the dedicated `stage5-16-physical-core` self-hosted
+runner is authoritative for physical performance. When that lane is not run,
+external qualification remains deferred rather than passed.
 
 Extras-enabled CI installs the title contract executables beneath
 `Validation/Generals` or `Validation/ZeroHour` and runs them with the matching

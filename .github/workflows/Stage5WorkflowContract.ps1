@@ -1352,8 +1352,6 @@ function Assert-Stage5CheckReplaysContract {
             STAGE5_REPLAY_MATRIX_REPEATS = '${{ inputs.stage5_replay_matrix_repeats }}'
             STAGE5_STRESS_REPEATS = '${{ inputs.stage5_stress_repeats }}'
             STAGE5_FIXTURE_MANIFEST = '${{ inputs.stage5_fixture_manifest }}'
-            STAGE5_PERFORMANCE_BASELINE = '${{ inputs.stage5_performance_baseline }}'
-            STAGE5_EXPECTED_STAGE3_EXECUTABLE_SHA256 = '${{ inputs.stage5_expected_stage3_executable_sha256 }}'
             STAGE5_ACCEPTANCE_MANIFEST = '${{ inputs.stage5_acceptance_manifest }}'
             STAGE5_EXECUTION_COHORT_NONCE = '${{ inputs.stage5_execution_cohort_nonce }}'
             STAGE5_EXECUTION_COHORT_CREATED_UTC = '${{ inputs.stage5_execution_cohort_created_utc }}'
@@ -1362,8 +1360,6 @@ function Assert-Stage5CheckReplaysContract {
         "$Context exact repository input resolver" ([ordered]@{
             '$requestedManifestPath' = @('$workspace',
                 '$env:STAGE5_FIXTURE_MANIFEST', "'Stage 5 fixture manifest'")
-            '$baselinePath' = @('$workspace',
-                '$env:STAGE5_PERFORMANCE_BASELINE', "'Stage 5 performance baseline'")
             '$acceptancePath' = @('$workspace',
                 '$env:STAGE5_ACCEPTANCE_MANIFEST', "'Stage 5 final acceptance manifest'")
             '$artifactSetPath' = @('$workspace', '$artifactSetRelative',
@@ -1393,9 +1389,6 @@ function Assert-Stage5CheckReplaysContract {
             GeneralsQualificationDataManifestPath = '$env:STAGE5_GENERALS_QUALIFICATION_DATA_MANIFEST_PATH'
             GeneralsQualificationDataManifestSha256 = '$env:STAGE5_GENERALS_QUALIFICATION_DATA_MANIFEST_SHA256'
             MinimumFreeBytes = '2147483648'
-            EnforcePerformance = $null
-            Stage3PerformanceBaselinePath = '$baselinePath'
-            ExpectedStage3ExecutableSha256 = '$expectedStage3Hash'
             AcceptanceSourceCommit = '$acceptanceSourceCommit'
             AcceptanceArtifactSetSha256 = '$artifactSetHash'
             ExecutionCohortNonce = '$executionCohortNonce'
@@ -1412,7 +1405,7 @@ function Assert-Stage5CheckReplaysContract {
     Assert-Stage5CheckReplaysCardinalityAndArrayContracts $matrixStep `
         "$Context replay-matrix JSON array cardinality"
     Assert-Stage5ClosedPowerShellRunBlock $matrixStep `
-        '682211EE77ACC6497072FBA9EF067446A1F13591A61356F0FA3F2A9AC816D4FD' 107 `
+        '10269C9A341446AA72E843E7AE8F2CE4E661E0AC33433DFB023C83415651D5EF' 104 `
         "$Context sealed installed-runtime validation program"
 
     $normalizerStep = Get-Stage5IndentedBlock $job `
@@ -1495,6 +1488,10 @@ function Invoke-Stage5CheckReplaysContractSelfTest {
             '-Token "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.game }}-${{ inputs.preset }}"',
             '-Token "${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.game }}"')
         args = $fixture.Replace("-ValidationSet 'All'", "-ValidationSet 'Replay'")
+        'hosted-performance-enforcement' = $fixture.Replace(
+            '            -MinimumFreeBytes 2147483648 `',
+            ('            -MinimumFreeBytes 2147483648 `' + "`n" +
+                '            -EnforcePerformance `'))
         swap = $swap
         duplicate = $fixture.Replace(
             '    timeout-minutes: 240',
@@ -4075,8 +4072,6 @@ $zeroHourCondition = Get-Stage5IndentedBlock $zeroHourStage5Job 'if: >-' 4
 Assert-Stage5ExactFoldedJobCondition $zeroHourCondition `
     ("github.event_name == 'workflow_dispatch' && " +
         "inputs.stage5_fixture_manifest != '' && " +
-        "inputs.stage5_performance_baseline != '' && " +
-        "inputs.stage5_expected_stage3_executable_sha256 != '' && " +
         "inputs.stage5_acceptance_manifest != ''") `
     'Zero Hour Stage 5 exact evidence-input gate'
 Assert-Stage5WorkflowLiteral $zeroHourStage5Job `
@@ -4097,8 +4092,6 @@ $generalsCondition = Get-Stage5IndentedBlock $generalsStage5Job 'if: >-' 4
 Assert-Stage5ExactFoldedJobCondition $generalsCondition `
     ("github.event_name == 'workflow_dispatch' && " +
         "inputs.stage5_generals_fixture_manifest != '' && " +
-        "inputs.stage5_generals_performance_baseline != '' && " +
-        "inputs.stage5_generals_expected_stage3_executable_sha256 != '' && " +
         "inputs.stage5_acceptance_manifest != ''") `
     'Generals Stage 5 exact evidence-input gate'
 Assert-Stage5WorkflowLiteral $generalsStage5Job `
@@ -4183,9 +4176,6 @@ Assert-Stage5WorkflowContains $check `
     "(?m)^\s*-ValidationSet\s+'All'" `
     'full qualification ValidationSet'
 Assert-Stage5WorkflowContains $check `
-    'STAGE5_PERFORMANCE_BASELINE' `
-    'full qualification performance inputs'
-Assert-Stage5WorkflowContains $check `
     'Normalize-Stage5EvidenceForUpload\.ps1' `
     'evidence upload normalizer invocation'
 Assert-Stage5WorkflowContains $check 'ExecutionCohortNonce' `
@@ -4213,6 +4203,8 @@ Assert-Stage5WorkflowNotContains $stage5Block '-AllowNonStandardCorpus' `
     'Stage 5 full qualification runner'
 Assert-Stage5WorkflowNotContains $stage5Block '-DiagnosticNonAcceptance' `
     'Stage 5 full qualification runner'
+Assert-Stage5WorkflowNotContains $stage5Block '-EnforcePerformance' `
+    'hosted functional matrix must not claim physical performance authority'
 Assert-Stage5WorkflowLiteral $stage5Block "`$taskRoot = 'H:\Stage5SimulationValidationTask'" `
     'Stage 5 H-resident task root'
 Assert-Stage5WorkflowLiteral $stage5Block '-TaskRoot $taskRoot' `
