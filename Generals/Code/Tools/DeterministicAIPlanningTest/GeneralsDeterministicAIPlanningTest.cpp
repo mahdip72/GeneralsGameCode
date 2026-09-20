@@ -371,10 +371,15 @@ void TestRetailOrderedInitialEnemyProjection()
 	assert(jobs.start(config));
 	assert(jobs.registerCurrentThread(rts::JOB_OWNER_GAME));
 	rts::AIPlanningBatchStatus status;
+	std::atomic<UnsignedInt> physicalRendezvous(0U);
 	assert(ExecuteGeneralsAIEnemyPlanningBatch(
 		rts::AI_PLANNING_EXECUTION_PARALLEL, false, projected, 2U,
-		parallelInputs, rts::AI_PLANNING_INVALID_ORDINAL, &status));
+		parallelInputs, rts::AI_PLANNING_INVALID_ORDINAL, &status,
+		&physicalRendezvous));
 	AssertEqualBatch(projectedResults, parallelInputs, 2U);
+	assert(physicalRendezvous.load(std::memory_order_acquire) == 2U);
+	assert(status.distinctPhysicalWorkers == 2U);
+	assert(status.peakConcurrentPhysicalWorkers == 2U);
 	assert(status.parallelSucceeded == 1U);
 	jobs.shutdown();
 	assert(jobs.unregisterCurrentThread(rts::JOB_OWNER_GAME));
