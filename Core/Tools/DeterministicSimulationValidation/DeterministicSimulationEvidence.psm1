@@ -727,7 +727,7 @@ function New-Stage5LiveValidationRequirementsMap {
                 else { $candidate[$field] }
             $recordMutable.Add($field, $value)
         }
-        if ($candidate.Contains('reviewedMap')) {
+        if ($candidate.ContainsKey('reviewedMap')) {
             $recordMutable.Add('reviewedMapIdentity', (Get-Stage5ReviewedAiMapEntryIdentity $candidate))
         }
         $record = [Collections.ObjectModel.ReadOnlyDictionary[string,object]]::new(
@@ -1124,7 +1124,7 @@ function Copy-Stage5ReviewedAiMapSnapshot {
 function Get-Stage5ReviewedAiMapEntryIdentity {
     param([object]$Entry)
     $entryValue=ConvertTo-Stage5LiveDictionary $Entry 'Reviewed map entry'
-    if (-not $entryValue.Contains('reviewedMap')) { return '' }
+    if (-not $entryValue.ContainsKey('reviewedMap')) { return '' }
     Assert-Stage5Condition ($entryValue['scenario'] -ceq '4v2') 'Reviewed map entry must retain4v2 authority.'
     $map=ConvertTo-Stage5LiveDictionary $entryValue['reviewedMap'] 'Reviewed map binding'
     Assert-Stage5ReviewedAiMapKey $map['mapKey']
@@ -1145,7 +1145,7 @@ function Assert-Stage5ReviewedAiMapEntryIdentity {
 function Assert-Stage5ReviewedAiMapCompletion {
     param([hashtable]$Fields,[object]$Entry)
     $entryValue=ConvertTo-Stage5LiveDictionary $Entry 'Reviewed map completion entry'
-    if (-not $entryValue.Contains('reviewedMap')) {
+    if (-not $entryValue.ContainsKey('reviewedMap')) {
         Assert-Stage5Condition (-not $Fields.ContainsKey('map_sha256')) 'Unplanned reviewed map identity appeared in completion.'
         return
     }
