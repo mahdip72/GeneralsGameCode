@@ -1317,8 +1317,9 @@ void AISkirmishPlayer::updateCriticalRecovery()
 		for (Object *object = TheGameLogic->getFirstObject(); object;
 			object = object->getNextObject()) {
 			if (IsLiveSkirmishAIRecoveryObject(object, m_player) &&
-				object->isKindOf(KINDOF_DOZER) &&
-				!object->isDisabledByType(DISABLED_UNMANNED) &&
+				IsSkirmishAIRecoveryInsuranceBuilderCandidate(
+					object->isContained(), object->isKindOf(KINDOF_DOZER),
+					object->isDisabledByType(DISABLED_UNMANNED)) &&
 				object->getAIUpdateInterface() &&
 				object->getAIUpdateInterface()->getDozerAIInterface() &&
 				HasSkirmishAICommandForTemplate(object, primaryTemplate))

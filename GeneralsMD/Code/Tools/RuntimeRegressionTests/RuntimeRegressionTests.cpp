@@ -1041,6 +1041,14 @@ static void TestSkirmishAIRecoveryPolicies()
 	CHECK(!ShouldOrderSkirmishAIRecoveryBuilderExit(
 		true, true, true, false, true));
 	CHECK(IsSkirmishAIRecoveryProductionActive(2));
+	CHECK(IsSkirmishAIRecoveryInsuranceBuilderCandidate(
+		false, true, false));
+	CHECK(!IsSkirmishAIRecoveryInsuranceBuilderCandidate(
+		true, true, false));
+	CHECK(!IsSkirmishAIRecoveryInsuranceBuilderCandidate(
+		false, false, false));
+	CHECK(!IsSkirmishAIRecoveryInsuranceBuilderCandidate(
+		false, true, true));
 	UnsignedInt evacuationDeadline = GetSkirmishAIRecoveryEvacuationDeadline(
 		100, 0, true, 60);
 	CHECK(evacuationDeadline == 160);

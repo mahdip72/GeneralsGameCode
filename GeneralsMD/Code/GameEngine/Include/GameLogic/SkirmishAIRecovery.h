@@ -76,6 +76,12 @@ inline bool IsSkirmishAIRecoveryProductionActive(
 	return productionCount > 0;
 }
 
+inline bool IsSkirmishAIRecoveryInsuranceBuilderCandidate(
+	bool isContained, bool isDozer, bool isUnmanned)
+{
+	return !isContained && isDozer && !isUnmanned;
+}
+
 inline int GetSkirmishAIRecoveryReserveCost(
 	const SkirmishAIRecoveryPolicyInput &input)
 {
