@@ -18,6 +18,8 @@
 #error This source-connected test must preserve native Release parser/table guards.
 #endif
 
+#include "Common/SkirmishAITestMapBinding.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -155,6 +157,8 @@ static Bool ParseCommandLine(Int, const char *const *, Bool, Request *request,
 }
 }
 
+namespace ai_fixture = ::rts::ai_fixture;
+
 class JobSystem
 {
 public:
@@ -168,6 +172,12 @@ public:
 	static void setMultiInstance(Bool) { ++s_scenario.multiInstanceCalls; }
 	static void skipPrimaryInstance() { ++s_scenario.skipPrimaryCalls; }
 };
+}
+
+static Bool ConfigureSkirmishAITestReviewedMap(
+	const rts::ai_fixture::MapRequest &)
+{
+	return TRUE;
 }
 
 static Bool ConfigureStage5PerformanceFixture(const rts::fixture::Request &)

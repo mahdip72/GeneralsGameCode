@@ -259,7 +259,9 @@ function(_hard_ai_2v6_add_title_test target title test_name)
 
 	target_sources(${target} PRIVATE
 		"${_HARD_AI_2V6_TEST_DEFINITION_DIR}/HardAI2v6CommandLineRecorderTest.cpp")
-	target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+	target_include_directories(${target} PRIVATE
+		"${CMAKE_CURRENT_BINARY_DIR}"
+		"${CMAKE_SOURCE_DIR}/Core/GameEngine/Include")
 	if(title STREQUAL "Generals")
 		target_compile_definitions(${target} PRIVATE HARD_AI2V6_GENERALS)
 	else()
