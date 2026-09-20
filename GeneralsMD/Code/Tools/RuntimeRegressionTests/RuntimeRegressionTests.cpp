@@ -1146,6 +1146,16 @@ static void TestSkirmishAIRecoveryPolicies()
 		false, false, true, true, true, true, false));
 	CHECK(!IsSkirmishAIRecoveryFailoverAdmissionEligible(
 		false, false, true, false, true, true, true));
+	// An unowned bounded queue cannot contribute a refund or free a max slot.
+	// Its alternate must be independently affordable and immediately admissible.
+	CHECK(IsSkirmishAIRecoveryNonCancellingFailoverAdmissionEligible(
+		true, true, true));
+	CHECK(!IsSkirmishAIRecoveryNonCancellingFailoverAdmissionEligible(
+		false, true, true));
+	CHECK(!IsSkirmishAIRecoveryNonCancellingFailoverAdmissionEligible(
+		true, false, true));
+	CHECK(!IsSkirmishAIRecoveryNonCancellingFailoverAdmissionEligible(
+		true, true, false));
 	CHECK(GetSkirmishAIRecoveryFailoverAdmissionRank(
 		true, false, false) == 0);
 	CHECK(GetSkirmishAIRecoveryFailoverAdmissionRank(
@@ -1653,6 +1663,8 @@ static void TestSkirmishAIRecoveryPolicies()
 	CHECK(savedIdentity.factoryID == 17);
 	CHECK(savedIdentity.productionID == 23);
 	CHECK(!GetSkirmishAIRecoveryProductionCancellationOwnershipForVersion(
+		4, true));
+	CHECK(!GetSkirmishAIRecoveryProductionCancellationOwnershipForVersion(
 		5, true));
 	CHECK(GetSkirmishAIRecoveryProductionCancellationOwnershipForVersion(
 		6, true));
@@ -1695,6 +1707,14 @@ static void TestSkirmishAIRecoveryPolicies()
 	CHECK(!ShouldClearSkirmishAIRecoveryProductionIdentity(true, true));
 	CHECK(ShouldClearSkirmishAIRecoveryProductionIdentity(false, true));
 	CHECK(ShouldClearSkirmishAIRecoveryProductionIdentity(true, false));
+	// loadPostProcess validates the migrated v5 identity against the loaded
+	// production queue. A missing exact entry clears both identity and ownership.
+	bool migratedV5Ownership =
+		GetSkirmishAIRecoveryProductionCancellationOwnershipForVersion(
+			5, false);
+	if (ShouldClearSkirmishAIRecoveryProductionIdentity(true, false))
+		migratedV5Ownership = false;
+	CHECK(!migratedV5Ownership);
 	// An ordinary compatible queue remains an authoritative paid route, but its
 	// adopted identity never grants cancellation or refund authority.
 	int ordinaryQueueEntries = 1;
@@ -1711,6 +1731,72 @@ static void TestSkirmishAIRecoveryPolicies()
 	}
 	CHECK(ordinaryQueueEntries == 1);
 	CHECK(ordinaryCash == 700);
+	CHECK(ShouldUseSkirmishAIRecoveryNonCancellingFailover(
+		false, true, true));
+	CHECK(ShouldUseSkirmishAIRecoveryUnownedQueueFailover(FALSE, 0));
+	CHECK(!ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP));
+	CHECK(ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER));
+	CHECK(!ShouldUseSkirmishAIRecoveryNonCancellingFailover(
+		true, true, true));
+	CHECK(!ShouldUseSkirmishAIRecoveryNonCancellingFailover(
+		false, false, true));
+	CHECK(!ShouldUseSkirmishAIRecoveryNonCancellingFailover(
+		false, true, false));
+	// Disabled unowned A remains paid and bound. An independently affordable
+	// healthy B adds one owned route without refunding A; tracking changes only
+	// after B succeeds.
+	int unownedAEntries = 1;
+	int ownedBEntries = 0;
+	int nonCancellingCash = 700;
+	int trackedFactory = 17;
+	bool trackedOwned =
+		GetSkirmishAIRecoveryProductionCancellationOwnershipForVersion(5, true);
+	CHECK(!trackedOwned);
+	if (ShouldUseSkirmishAIRecoveryUnownedQueueFailover(FALSE, 0) &&
+		ShouldUseSkirmishAIRecoveryNonCancellingFailover(
+			trackedOwned, true, unownedAEntries == 1) &&
+		IsSkirmishAIRecoveryNonCancellingFailoverAdmissionEligible(
+			true, nonCancellingCash >= 200, true)) {
+		++ownedBEntries;
+		nonCancellingCash -= 200;
+		trackedFactory = 18;
+		trackedOwned = true;
+	}
+	CHECK(unownedAEntries == 1);
+	CHECK(ownedBEntries == 1);
+	CHECK(nonCancellingCash == 500);
+	CHECK(trackedFactory == 18);
+	CHECK(trackedOwned);
+	// Neither an unaffordable alternate nor a max-blocked alternate may debit,
+	// cancel A, or switch identity.
+	int blockedAEntries = 1;
+	int blockedBEntries = 0;
+	int blockedCash = 100;
+	int blockedTrackedFactory = 17;
+	if (IsSkirmishAIRecoveryNonCancellingFailoverAdmissionEligible(
+			true, false, true) ||
+		IsSkirmishAIRecoveryNonCancellingFailoverAdmissionEligible(
+			false, true, true)) {
+		--blockedAEntries;
+		++blockedBEntries;
+		blockedCash -= 200;
+		blockedTrackedFactory = 18;
+	}
+	CHECK(blockedAEntries == 1);
+	CHECK(blockedBEntries == 0);
+	CHECK(blockedCash == 100);
+	CHECK(blockedTrackedFactory == 17);
+	// A temporarily disabled A that is progressing again never enters failover,
+	// so recovery does not buy B as a duplicate.
+	int temporaryAEntries = 1;
+	int temporaryBEntries = 0;
+	if (ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
+			false, false, false))
+		++temporaryBEntries;
+	CHECK(temporaryAEntries == 1);
+	CHECK(temporaryBEntries == 0);
 	// A queue created by this recovery instance retains exact cancellation and
 	// refund authority; a same-cost failover leaves one paid route and net cash.
 	int ownedQueueEntries = 1;
@@ -2117,16 +2203,18 @@ static void TestSkirmishAIReplayEpoch()
 
 	// Live games always use the current and recovery paths. Replays retain the
 	// behavior selected by their recording epoch; an unknown epoch is legacy.
-	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6 };
+	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7 };
 	const Bool expectedReplayCurrentBehavior[] =
-		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedReplayRecoveryBehavior[] =
-		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedRecoveryCRCFields[] =
-		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedCancellationOwnership[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
-	for (Int i = 0; i < 7; ++i)
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+	const Bool expectedUnownedQueueFailover[] =
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
+	for (Int i = 0; i < 8; ++i)
 	{
 		CHECK(ShouldUseSkirmishAICurrentBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(FALSE, replayEpochs[i]));
@@ -2135,6 +2223,8 @@ static void TestSkirmishAIReplayEpoch()
 		CHECK(ShouldUseSkirmishAIRecoveryCancellationOwnership(
 			FALSE, replayEpochs[i]));
 		CHECK(ShouldIncludeSkirmishAIRecoveryCancellationOwnershipCRCField(
+			FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
 			FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, replayEpochs[i])
 			== expectedReplayCurrentBehavior[i]);
@@ -2148,6 +2238,8 @@ static void TestSkirmishAIReplayEpoch()
 			TRUE, replayEpochs[i]) == expectedCancellationOwnership[i]);
 		CHECK(ShouldIncludeSkirmishAIRecoveryCancellationOwnershipCRCField(
 			TRUE, replayEpochs[i]) == expectedCancellationOwnership[i]);
+		CHECK(ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
+			TRUE, replayEpochs[i]) == expectedUnownedQueueFailover[i]);
 	}
 
 	UnicodeString livenessOnly = unmarked;
@@ -2237,10 +2329,10 @@ static void TestSkirmishAIReplayEpoch()
 	MarkReplayVersionForSkirmishAIRecoveryCRCEpoch(recoveryCRCEpoch);
 	CHECK(recoveryCRCEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=4]") == 0);
 
-	// New recordings use epoch 5 and opt into cancellation ownership in both
-	// decisions and CRC state.
+	// Epoch 5 opts into cancellation ownership in both decisions and CRC state,
+	// but retains the original refusal to replace an unowned bounded queue.
 	UnicodeString recoveryOwnershipEpoch = unmarked;
-	MarkReplayVersionForSkirmishAICurrentEpoch(recoveryOwnershipEpoch);
+	MarkReplayVersionForSkirmishAIRecoveryOwnershipEpoch(recoveryOwnershipEpoch);
 	CHECK(recoveryOwnershipEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=5]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(recoveryOwnershipEpoch) ==
@@ -2251,6 +2343,8 @@ static void TestSkirmishAIReplayEpoch()
 		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP));
 	CHECK(!ShouldCancelSkirmishAIRecoveryExactPaidQueueForFailover(
 		false, true, true));
+	CHECK(!ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP));
 	CHECK(!ShouldDeferSkirmishAIRecoveryStalledDisposition(
 		false, true, true, false));
 	MarkReplayVersionForSkirmishAIRecoveryOwnershipEpoch(
@@ -2258,10 +2352,29 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(recoveryOwnershipEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=5]") == 0);
 
+	// New recordings use epoch 6. It keeps the epoch-5 CRC layout and enables
+	// only the independently funded, non-cancelling unowned-queue failover.
+	UnicodeString nonCancellingFailoverEpoch = unmarked;
+	MarkReplayVersionForSkirmishAICurrentEpoch(nonCancellingFailoverEpoch);
+	CHECK(nonCancellingFailoverEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=6]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(nonCancellingFailoverEpoch) ==
+		SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER);
+	CHECK(ShouldUseSkirmishAIRecoveryCancellationOwnership(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER));
+	CHECK(ShouldIncludeSkirmishAIRecoveryCancellationOwnershipCRCField(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER));
+	CHECK(ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER));
+	MarkReplayVersionForSkirmishAINonCancellingFailoverEpoch(
+		nonCancellingFailoverEpoch);
+	CHECK(nonCancellingFailoverEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=6]") == 0);
+
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=6]";
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=7]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -2293,7 +2406,7 @@ static void TestSkirmishAIReplayEpoch()
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] [SkirmishAIEpoch=3]";
 	CHECK(GetSkirmishAIReplayEpoch(duplicateMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString unknownThenCurrent =
-		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=6] [SkirmishAIEpoch=2]";
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=7] [SkirmishAIEpoch=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unknownThenCurrent) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedThenLiveness =
 		L"Aug 14 2026 21:00:00 [SkirmishAILiveness=x] [SkirmishAILiveness=1]";
@@ -2313,10 +2426,10 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString compatibilityUnknown = futureEpoch;
 	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityUnknown);
 	CHECK(compatibilityUnknown == futureEpoch);
-	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, 6));
-	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, 6));
-	CHECK(!ShouldIncludeSkirmishAIRecoveryCRCFields(TRUE, 6));
-	CHECK(!ShouldUseSkirmishAIRecoveryNativeHoleOwnership(TRUE, 6));
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, 7));
+	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, 7));
+	CHECK(!ShouldIncludeSkirmishAIRecoveryCRCFields(TRUE, 7));
+	CHECK(!ShouldUseSkirmishAIRecoveryNativeHoleOwnership(TRUE, 7));
 }
 
 static void TestPathfindQueueReplayEpoch()
@@ -2361,14 +2474,14 @@ static void TestPathfindQueueReplayEpoch()
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=5]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=6]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(combined) ==
-		SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP);
+		SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER);
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=5]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=6]") == 0);
 
 	UnicodeString pathLiveness = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);

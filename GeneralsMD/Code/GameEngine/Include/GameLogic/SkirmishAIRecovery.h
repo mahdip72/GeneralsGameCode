@@ -293,6 +293,19 @@ inline bool ShouldCancelSkirmishAIRecoveryExactPaidQueueForFailover(
 	return cancellationOwned && exactIdentityMatches && exactEntryExists;
 }
 
+inline bool ShouldUseSkirmishAIRecoveryNonCancellingFailover(
+	bool cancellationOwned, bool exactIdentityMatches,
+	bool exactEntryExists)
+{
+	return !cancellationOwned && exactIdentityMatches && exactEntryExists;
+}
+
+inline bool IsSkirmishAIRecoveryNonCancellingFailoverAdmissionEligible(
+	bool canMake, bool independentlyAffordable, bool queueReady)
+{
+	return canMake && independentlyAffordable && queueReady;
+}
+
 inline bool ShouldSelectSkirmishAIPrimaryCommandCenter(
 	bool hasSelection, bool selectedCompleted, int selectedObjectID,
 	bool candidateCompleted, int candidateObjectID)

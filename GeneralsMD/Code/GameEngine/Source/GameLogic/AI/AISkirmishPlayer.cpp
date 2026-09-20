@@ -92,6 +92,14 @@ static Bool ShouldUseCurrentSkirmishAIRecoveryCancellationOwnership()
 			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 }
 
+static Bool ShouldUseCurrentSkirmishAIRecoveryUnownedQueueFailover()
+{
+	return ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
+		TheGameLogic && TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
 static Bool IsCriticalRecoveryModeEnabled(Player *player)
 {
 	if (!player || player->getPlayerType() != PLAYER_COMPUTER || !TheGameLogic)
@@ -1217,17 +1225,23 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 			m_recoveryBuilderFactoryID, m_recoveryBuilderProductionID,
 			boundedFactory->getID(), static_cast<Int>(boundedProductionID),
 			INVALID_ID, PRODUCTIONID_INVALID);
-	if (!ShouldCancelSkirmishAIRecoveryExactPaidQueueForFailover(
-			!ShouldUseCurrentSkirmishAIRecoveryCancellationOwnership() ||
-				m_recoveryBuilderCancellationOwned,
-			exactIdentityMatches,
-			boundedEntry != nullptr))
+	const Bool cancellationOwned =
+		!ShouldUseCurrentSkirmishAIRecoveryCancellationOwnership() ||
+		m_recoveryBuilderCancellationOwned;
+	const Bool cancelBoundedEntry =
+		ShouldCancelSkirmishAIRecoveryExactPaidQueueForFailover(
+			cancellationOwned, exactIdentityMatches, boundedEntry != nullptr);
+	const Bool retainBoundedEntry =
+		ShouldUseCurrentSkirmishAIRecoveryUnownedQueueFailover() &&
+		ShouldUseSkirmishAIRecoveryNonCancellingFailover(
+			cancellationOwned, exactIdentityMatches, boundedEntry != nullptr);
+	if (!cancelBoundedEntry && !retainBoundedEntry)
 		return false;
 
 	const ThingTemplate *boundedTemplate = boundedEntry->getProductionObject();
 	const Int refund = boundedTemplate->calcCostToBuild(m_player);
-	const Int availableAfterRefund = AddSkirmishAIRecoveryCost(
-		m_player->getMoney()->countMoney(), refund);
+	const Int currentMoney = m_player->getMoney()->countMoney();
+	const Int availableAfterRefund = AddSkirmishAIRecoveryCost(currentMoney, refund);
 	Object *alternateFactory = nullptr;
 	const ThingTemplate *alternateTemplate = nullptr;
 	Int alternateCommand = 0;
@@ -1261,6 +1275,7 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 				TheBuildAssistant->canMakeUnit(object, product);
 			const Int cost = product->calcCostToBuild(m_player);
 			const Bool refundAffordable = cost >= 0 && availableAfterRefund >= cost;
+			const Bool independentlyAffordable = cost >= 0 && currentMoney >= cost;
 			const Bool cancellationFreesMax =
 				WouldSkirmishAIRecoveryQueueCancellationFreeMax(
 					m_player, product, boundedFactory, boundedProductionID);
@@ -1268,12 +1283,16 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 				CanSkirmishAIRecoveryBuildIgnoringMax(m_player, product);
 			const Bool queueReady =
 				production->canQueueCreateUnit(product) == CANMAKE_OK;
-			if (!IsSkirmishAIRecoveryFailoverAdmissionEligible(
+			const Bool eligible = retainBoundedEntry
+				? IsSkirmishAIRecoveryNonCancellingFailoverAdmissionEligible(
+					admission == CANMAKE_OK, independentlyAffordable, queueReady)
+				: IsSkirmishAIRecoveryFailoverAdmissionEligible(
 					admission == CANMAKE_OK,
 					admission == CANMAKE_NO_MONEY,
 					admission == CANMAKE_MAXED_OUT_FOR_PLAYER,
 					refundAffordable, cancellationFreesMax,
-					nonMaxBuildable, queueReady))
+					nonMaxBuildable, queueReady);
+			if (!eligible)
 				continue;
 			const Int rank = GetSkirmishAIRecoveryFailoverAdmissionRank(
 				admission == CANMAKE_OK, admission == CANMAKE_NO_MONEY,
@@ -1291,6 +1310,19 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 	}
 	if (!alternateFactory || !alternateTemplate)
 		return false;
+	if (retainBoundedEntry) {
+		// An adopted ordinary queue is authoritative but is not ours to cancel.
+		// Pay an independently admissible alternate without touching that entry,
+		// its WorkOrder, or its original debit. queueRecoveryBuilder changes the
+		// tracked identity only after the new queue succeeds.
+		if (TheBuildAssistant->canMakeUnit(
+				alternateFactory, alternateTemplate) != CANMAKE_OK ||
+			!queueRecoveryBuilder(alternateTemplate, alternateFactory))
+			return false;
+		m_recoveryPlacementAttempt = MarkSkirmishAIRecoveryScaffoldReplacementAttempt(
+			m_recoveryPlacementAttempt, g_skirmishAIRecoveryOffsetCount);
+		return true;
+	}
 
 	clearRecoveryBuilderProduction();
 	boundedProduction->cancelUnitCreate(boundedProductionID);

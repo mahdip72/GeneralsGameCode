@@ -28,7 +28,10 @@ enum SkirmishAIReplayEpochType
 	SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC = 4,
 	// Epoch 5 adds explicit cancellation ownership and consumes replacement
 	// budget when deciding whether bare factory potential can defer disposition.
-	SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP = 5
+	SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP = 5,
+	// Epoch 6 lets an independently affordable owned replacement bypass a
+	// bounded adopted queue without cancelling or refunding that ordinary work.
+	SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER = 6
 };
 
 inline const WideChar *GetSkirmishAILivenessReplayMarker()
@@ -54,6 +57,11 @@ inline const WideChar *GetSkirmishAIRecoveryCRCReplayMarker()
 inline const WideChar *GetSkirmishAIRecoveryOwnershipReplayMarker()
 {
 	return L" [SkirmishAIEpoch=5]";
+}
+
+inline const WideChar *GetSkirmishAINonCancellingFailoverReplayMarker()
+{
+	return L" [SkirmishAIEpoch=6]";
 }
 
 inline const WideChar *GetSkirmishAIReplayMarkerPrefix()
@@ -99,18 +107,26 @@ inline void MarkReplayVersionForSkirmishAIRecoveryOwnershipEpoch(
 		versionTimeString.concat(GetSkirmishAIRecoveryOwnershipReplayMarker());
 }
 
+inline void MarkReplayVersionForSkirmishAINonCancellingFailoverEpoch(
+	UnicodeString& versionTimeString)
+{
+	if (CountSkirmishAIReplayMarkers(
+			versionTimeString, GetSkirmishAIReplayMarkerPrefix()) == 0)
+		versionTimeString.concat(GetSkirmishAINonCancellingFailoverReplayMarker());
+}
+
 // Global writer helper. RecorderClass shadows its unchanged member call only
 // for playback compatibility checks; this helper keeps new recordings at the
 // latest AI behavior and CRC epoch.
 inline void MarkReplayVersionForSkirmishAICurrentEpoch(UnicodeString& versionTimeString)
 {
-	MarkReplayVersionForSkirmishAIRecoveryOwnershipEpoch(versionTimeString);
+	MarkReplayVersionForSkirmishAINonCancellingFailoverEpoch(versionTimeString);
 }
 
 // Compatibility-only stamp for the already-shipped epoch-2 behavior. The
 // RecorderClass playback allow-list uses this on a freshly constructed build
 // time string; the global current-epoch writer above intentionally remains the
-	// epoch-5 stamp for newly recorded replays.
+	// epoch-6 stamp for newly recorded replays.
 inline void MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(UnicodeString& versionTimeString)
 {
 	if (CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAIReplayMarkerPrefix()) == 0)
@@ -125,11 +141,17 @@ inline Int GetSkirmishAIReplayEpoch(const UnicodeString& versionTimeString)
 	Int recoveryCRCMarkerCount = CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAIRecoveryCRCReplayMarker());
 	Int recoveryOwnershipMarkerCount = CountSkirmishAIReplayMarkers(
 		versionTimeString, GetSkirmishAIRecoveryOwnershipReplayMarker());
+	Int nonCancellingFailoverMarkerCount = CountSkirmishAIReplayMarkers(
+		versionTimeString, GetSkirmishAINonCancellingFailoverReplayMarker());
 	Int markerLikeCount = CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAIReplayMarkerPrefix());
 	if (markerLikeCount != 1 ||
 		livenessMarkerCount + currentMarkerCount + recoveryMarkerCount +
-			recoveryCRCMarkerCount + recoveryOwnershipMarkerCount != 1)
+			recoveryCRCMarkerCount + recoveryOwnershipMarkerCount +
+			nonCancellingFailoverMarkerCount != 1)
 		return SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	if (nonCancellingFailoverMarkerCount == 1 &&
+		versionTimeString.endsWith(GetSkirmishAINonCancellingFailoverReplayMarker()))
+		return SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
 	if (recoveryOwnershipMarkerCount == 1 &&
 		versionTimeString.endsWith(GetSkirmishAIRecoveryOwnershipReplayMarker()))
 		return SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP;
@@ -155,7 +177,8 @@ inline Bool ShouldUseSkirmishAICurrentBehavior(Bool isReplayGame, Int replayEpoc
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryBehavior(Bool isReplayGame, Int replayEpoch)
@@ -163,14 +186,16 @@ inline Bool ShouldUseSkirmishAIRecoveryBehavior(Bool isReplayGame, Int replayEpo
 	return !isReplayGame ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryNativeHoleOwnership(Bool isReplayGame, Int replayEpoch)
 {
 	return !isReplayGame ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
 }
 
 inline Bool ShouldIncludeSkirmishAIRecoveryCRCFields(Bool isReplayGame, Int replayEpoch)
@@ -182,7 +207,15 @@ inline Bool ShouldUseSkirmishAIRecoveryCancellationOwnership(
 	Bool isReplayGame, Int replayEpoch)
 {
 	return !isReplayGame ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
+}
+
+inline Bool ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
+	Bool isReplayGame, Int replayEpoch)
+{
+	return !isReplayGame ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER;
 }
 
 inline Bool ShouldIncludeSkirmishAIRecoveryCancellationOwnershipCRCField(
