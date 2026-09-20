@@ -53,6 +53,11 @@ if(WIN32)
             -ScratchRoot "${_stage5_validation_test_scratch_root}/profile-contract")
     set_tests_properties(core_stage5_validation_profile_root_contract_tests
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 120)
+    add_test(NAME core_stage5_powershell_module_host_tests
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5PowerShellModuleHost.Tests.ps1")
+    set_tests_properties(core_stage5_powershell_module_host_tests
+        PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
     add_test(NAME core_stage5_validation_partition_selection_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5ValidationPartitionSelection.Tests.ps1")
@@ -311,4 +316,48 @@ if(WIN32)
         PROPERTIES TIMEOUT 60
             ENVIRONMENT
                 "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=${_stage5_validation_test_scratch_root}")
+
+    # CTest launches Windows PowerShell directly rather than through a
+    # PowerShell host.  When the parent process carries a mixed PS7/PS5
+    # PSModulePath, Windows PowerShell 5.1 can import the PS7
+    # Microsoft.PowerShell.Utility module first.  That module loads but does
+    # not export the Windows PowerShell Get-FileHash command, causing these
+    # tests to fail before their source-connected assertions run.  Clear the
+    # inherited value for only the Windows PowerShell tests; powershell.exe
+    # repopulates its supported PS5 module roots, while pwsh tests retain
+    # their normal PS7 module path and schema-validation behavior.
+    set_property(TEST
+        core_stage5_validation_profile_root_contract_tests
+        core_stage5_powershell_module_host_tests
+        core_stage5_validation_partition_selection_tests
+        core_deterministic_simulation_validation_plan_tests
+        core_deterministic_simulation_validation_runtime_tests
+        core_deterministic_simulation_validation_acceptance_tests
+        core_stage5_replay_corpus_exporter_tests
+        core_stage5_validation_runner_safety_tests
+        core_stage5_validation_results_provenance_tests
+        core_stage5_final_acceptance_native_relocation_tests
+        core_stage5_development_readiness_raw_index_tests
+        core_stage5_schema_version_type_contract_tests
+        core_stage5_schema_version_scalar_guard_tests
+        core_stage5_schema_version_schema_contract_tests
+        core_stage5_json_array_cardinality_tests
+        core_stage5_lockstep_numeric_type_tests
+        core_stage5_performance_qualification_data_tests
+        core_stage5_combined_host_runner_receipt_tests
+        core_stage5_development_readiness_bundle_tests
+        core_stage5_installed_lockstep_v2_session_tests
+        core_stage5_suspended_process_powershell_tests
+        core_stage5_local_lockstep_diagnostic_tests
+        core_stage5_lockstep_qualification_binding_tests
+        core_stage5_qualification_provisioning_tests
+        core_stage5_simulation_qualification_data_tests
+        core_stage5_registry_recovery_tests
+        core_stage5_BaseGeneralsBinding_tests
+        core_stage5_PairedPerformanceBinding_tests
+        core_stage5_SimulationProvisioningRoles_tests
+        core_stage5_performance_scaling_host_validation_tests
+        core_replay_mode_propagation_audit_self_test
+        core_replay_mode_propagation_audit
+        APPEND PROPERTY ENVIRONMENT "PSModulePath=")
 endif()
