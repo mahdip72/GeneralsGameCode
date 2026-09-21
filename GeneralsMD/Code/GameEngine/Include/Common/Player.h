@@ -450,6 +450,8 @@ public:
 
 	/// Is this player a skirmish ai player?
 	Bool isSkirmishAIPlayer();
+	/// Preserve critical reconstruction money at the actual purchase boundary.
+	Bool canSpendForSkirmishAIRecovery(Int cost, const ThingTemplate *thing, Bool isUpgrade) const;
 
 	/// Have the ai check for bridges.
 	virtual Bool checkBridges(Object *unit, Waypoint *way);

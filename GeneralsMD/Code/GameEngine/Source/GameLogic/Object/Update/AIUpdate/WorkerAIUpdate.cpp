@@ -324,6 +324,13 @@ Object *WorkerAIUpdate::construct( const ThingTemplate *what,
 
 	// !!! NOTE: If you modify this you must modify the dozer too !!!
 	// !!! Graham: Please please please have inspiration for how to *not* duplicate this code
+
+	// Match DozerAIUpdate: reject a paid purchase before any construction state
+	// changes, while preserving the existing rebuild-hole path.
+	if (!isRebuild && what && owningPlayer &&
+		!owningPlayer->canSpendForSkirmishAIRecovery(
+			what->calcCostToBuild(owningPlayer), what, FALSE))
+		return nullptr;
 	// GS - Construct needs to be an AI primitive.  Inheriting off of AIUpdate means you are writing a
 	// master brain that will call AI primitives on the object, not something that does stuff itself.
   // SupplyTruckAI decides who to call AIDock on.  Worker should decide to AIDock or AIConstruct

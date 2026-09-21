@@ -31,6 +31,9 @@
 #include "Common/LocalFileSystem.h"
 #include "Common/Recorder.h"
 #include "Common/SkirmishAITestRunner.h"
+#if RTS_ZEROHOUR
+#include "Common/SkirmishAILegacySaveTest.h"
+#endif
 #include "Common/version.h"
 #include "GameClient/ClientInstance.h"
 #include "GameClient/TerrainVisual.h" // for TERRAIN_LOD_MIN definition
@@ -469,6 +472,53 @@ Bool parseSkirmishAITestSeedArgument(char *args[], int num, Int *seed)
 	return TRUE;
 }
 
+#if RTS_ZEROHOUR
+// Startup parsing runs before the engine-init pass that records the ordinary
+// skirmish requests. Keep only this narrow marker so replay conflicts are
+// rejected regardless of argument order; the request itself is made during
+// engine init after all normal request state is available.
+static Bool s_skirmishAILegacySaveTestSeenAtStartup = FALSE;
+
+static Bool isGenericSkirmishAILegacySaveBasename(const char *basename)
+{
+	if (basename == nullptr || basename[0] == '\0')
+		return FALSE;
+
+	for (const char *cursor = basename; *cursor != '\0'; ++cursor)
+	{
+		if (*cursor == '\\' || *cursor == '/' || *cursor == ':')
+			return FALSE;
+	}
+	return TRUE;
+}
+
+static void rejectSkirmishAILegacySaveTest(const char *reason)
+{
+	printf("LEGACY_SAVE_TEST_FAIL reason=%s\n", reason);
+	fflush(stdout);
+	exit(2);
+}
+
+Int parseRunSkirmishAILegacySaveTestForStartup(char *args[], int num)
+{
+	if (s_skirmishAILegacySaveTestSeenAtStartup ||
+		!TheGlobalData->m_simulateReplays.empty())
+	{
+		rejectSkirmishAILegacySaveTest("duplicate_or_replay_option");
+	}
+	if (num < 2 || !isGenericSkirmishAILegacySaveBasename(args[1]))
+		rejectSkirmishAILegacySaveTest("invalid_basename");
+
+	s_skirmishAILegacySaveTestSeenAtStartup = TRUE;
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 2;
+}
+#endif
+
 Int parseRunSkirmishAITestForStartup(char *args[], int num)
 {
 	Int seed = 0;
@@ -481,6 +531,43 @@ Int parseRunSkirmishAITestForStartup(char *args[], int num)
 	rts::ClientInstance::skipPrimaryInstance();
 	return 2;
 }
+
+#if RTS_ZEROHOUR
+static void parseSkirmishAIRecoveryFixtureArguments(
+	char *args[], int num, Int *seed, Int *fixtureCase, Int *faction)
+{
+	if (num < 4 || !TryParseSkirmishAITestSeed(args[1], seed) ||
+		!TryParseSkirmishAIRecoveryFixtureCase(args[2], fixtureCase) ||
+		!TryParseSkirmishAIRecoveryFaction(args[3], faction))
+	{
+		printf("SKIRMISH_AI_RECOVERY_FIXTURE_FAIL seed=0 reason=invalid_arguments\n");
+		fflush(stdout);
+		exit(2);
+	}
+	if (!IsSupportedSkirmishAIRecoveryFixtureCombination(*fixtureCase, *faction))
+	{
+		printf("SKIRMISH_AI_RECOVERY_FIXTURE_FAIL seed=%d reason=unsupported_case_faction\n",
+			*seed);
+		fflush(stdout);
+		exit(2);
+	}
+}
+
+Int parseRunSkirmishAIRecoveryTestForStartup(char *args[], int num)
+{
+	Int seed = 0;
+	Int fixtureCase = 0;
+	Int faction = 0;
+	parseSkirmishAIRecoveryFixtureArguments(args, num, &seed, &fixtureCase, &faction);
+
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 4;
+}
+#endif
 
 Int parseRunSkirmishAITest4v2ForStartup(char *args[], int num)
 {
@@ -497,8 +584,14 @@ Int parseRunSkirmishAITest4v2ForStartup(char *args[], int num)
 
 Int parseRunSkirmishAITest(char *args[], int num)
 {
-	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
-		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
+	Bool hasRequest = TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request();
+#if RTS_ZEROHOUR
+	hasRequest = hasRequest ||
+		TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest() ||
+		IsSkirmishAILegacySaveTestRequested();
+#endif
+	if (hasRequest)
 	{
 		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
 		fflush(stdout);
@@ -518,8 +611,14 @@ Int parseRunSkirmishAITest(char *args[], int num)
 
 Int parseRunSkirmishAITest4v2(char *args[], int num)
 {
-	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
-		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
+	Bool hasRequest = TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request();
+#if RTS_ZEROHOUR
+	hasRequest = hasRequest ||
+		TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest() ||
+		IsSkirmishAILegacySaveTestRequested();
+#endif
+	if (hasRequest)
 	{
 		printf("SKIRMISH_AI_TEST_FAIL seed=0 reason=duplicate_option\n");
 		fflush(stdout);
@@ -537,10 +636,60 @@ Int parseRunSkirmishAITest4v2(char *args[], int num)
 	return 2;
 }
 
+#if RTS_ZEROHOUR
+Int parseRunSkirmishAIRecoveryTest(char *args[], int num)
+{
+	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest() ||
+		IsSkirmishAILegacySaveTestRequested())
+	{
+		printf("SKIRMISH_AI_RECOVERY_FIXTURE_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+
+	Int seed = 0;
+	Int fixtureCase = 0;
+	Int faction = 0;
+	parseSkirmishAIRecoveryFixtureArguments(args, num, &seed, &fixtureCase, &faction);
+	if (!TheWritableGlobalData->m_commandLineData.requestSkirmishAIRecoveryTest(
+		seed, fixtureCase, faction))
+	{
+		printf("SKIRMISH_AI_RECOVERY_FIXTURE_FAIL seed=0 reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+	return 4;
+}
+
+Int parseRunSkirmishAILegacySaveTest(char *args[], int num)
+{
+	if (IsSkirmishAILegacySaveTestRequested() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest() ||
+		!TheGlobalData->m_simulateReplays.empty())
+	{
+		rejectSkirmishAILegacySaveTest("duplicate_or_conflicting_option");
+	}
+	if (num < 2 || !isGenericSkirmishAILegacySaveBasename(args[1]))
+		rejectSkirmishAILegacySaveTest("invalid_basename");
+
+	RequestSkirmishAILegacySaveTest(args[1]);
+	return 2;
+}
+#endif
+
 Int parseReplay(char *args[], int num)
 {
 	if (num > 1)
 	{
+#if RTS_ZEROHOUR
+		if (s_skirmishAILegacySaveTestSeenAtStartup ||
+			IsSkirmishAILegacySaveTestRequested())
+			rejectSkirmishAILegacySaveTest("conflicting_replay_option");
+#endif
 		AsciiString filename = args[1];
 		if (!filename.endsWithNoCase(RecorderClass::getReplayExtention()))
 		{
@@ -1309,6 +1458,12 @@ static CommandLineParam paramsForStartup[] =
 	{ "-runSkirmishAITest", parseRunSkirmishAITestForStartup },
 	// Explicit test-only 4v2 variant; the existing option remains 4v3.
 	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2ForStartup },
+	// Explicit full-engine Stage 1 recovery fixture; one case/faction per process.
+#if RTS_ZEROHOUR
+	{ "-runSkirmishAIRecoveryTest", parseRunSkirmishAIRecoveryTestForStartup },
+	// Explicit snapshot-only legacy-save probe; the argument is a leaf .sav name.
+	{ "-runSkirmishAILegacySaveTest", parseRunSkirmishAILegacySaveTestForStartup },
+#endif
 
 	// TheSuperHackers @feature helmutbuhler 13/04/2025
 	// Play back a replay. Pass the filename including .rep afterwards.
@@ -1334,6 +1489,10 @@ static CommandLineParam paramsForEngineInit[] =
 {
 	{ "-runSkirmishAITest", parseRunSkirmishAITest },
 	{ "-runSkirmishAITest4v2", parseRunSkirmishAITest4v2 },
+#if RTS_ZEROHOUR
+	{ "-runSkirmishAIRecoveryTest", parseRunSkirmishAIRecoveryTest },
+	{ "-runSkirmishAILegacySaveTest", parseRunSkirmishAILegacySaveTest },
+#endif
 	{ "-nologo", parseNoLogo }, // TheSuperHackers @tweak Is now available in Release builds.
 	{ "-noshellmap", parseNoShellMap },
 	{ "-noShellAnim", parseNoWindowAnimation }, // TheSuperHackers @tweak Is now available in Release builds.

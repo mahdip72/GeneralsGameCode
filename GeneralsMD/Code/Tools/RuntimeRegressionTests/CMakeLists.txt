@@ -51,8 +51,14 @@ endif()
 add_test(NAME z_skirmish_ai_replay_epoch_tests COMMAND z_runtime_regression_tests --skirmish-ai-replay-epoch)
 set_tests_properties(z_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)
 
+add_test(NAME z_skirmish_ai_recovery_tests COMMAND z_runtime_regression_tests --skirmish-ai-recovery)
+set_tests_properties(z_skirmish_ai_recovery_tests PROPERTIES TIMEOUT 30)
+
 add_test(NAME z_skirmish_ai_runner_contract_tests COMMAND z_runtime_regression_tests --skirmish-ai-runner-contract)
 set_tests_properties(z_skirmish_ai_runner_contract_tests PROPERTIES TIMEOUT 30)
+
+add_test(NAME z_skirmish_ai_legacy_save_selection_tests COMMAND z_runtime_regression_tests --skirmish-ai-legacy-save-selection)
+set_tests_properties(z_skirmish_ai_legacy_save_selection_tests PROPERTIES TIMEOUT 30)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
 	# Exercise the real product AudioEventRTS/GameAudio implementations, not the
@@ -163,11 +169,13 @@ set_tests_properties(z_texture_load_queue_contract_tests PROPERTIES TIMEOUT 30)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD
 		AND RTS_BUILD_OPTION_FFMPEG AND FFMPEG_RUNTIME_DIR)
-	# All four tests share the same loader dependency set, not just the audio
+	# All six tests share the same loader dependency set, not just the audio
 	# mode. Keep the SDK lookup local to these test processes.
 	set_tests_properties(
 		z_skirmish_ai_replay_epoch_tests
+		z_skirmish_ai_recovery_tests
 		z_skirmish_ai_runner_contract_tests
+		z_skirmish_ai_legacy_save_selection_tests
 		z_native_logical_audio_tests
 		z_texture_load_queue_contract_tests
 		PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:${FFMPEG_RUNTIME_DIR}"

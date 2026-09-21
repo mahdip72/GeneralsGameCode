@@ -34,6 +34,9 @@
 #include "Common/GlobalData.h"
 #include "Common/ReplaySimulation.h"
 #include "Common/SkirmishAITestRunner.h"
+#if RTS_ZEROHOUR
+#include "Common/SkirmishAILegacySaveTest.h"
+#endif
 
 
 /**
@@ -48,7 +51,27 @@ Int GameMain()
 	TheFramePacer->enableFramesPerSecondLimit(TRUE);
 	TheGameEngine = CreateGameEngine();
 	TheGameEngine->init();
-	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
+
+#if RTS_ZEROHOUR
+	if (IsSkirmishAILegacySaveTestRequested())
+	{
+		// The utility uses the ordinary queued startup-load lifecycle and observes
+		// it from the engine update. Do not arm the skirmish runner around it.
+		if (!StartSkirmishAILegacySaveTest())
+			TheGameEngine->setQuitting(TRUE);
+		else
+			TheGameEngine->execute();
+		exitcode = FinalizeSkirmishAILegacySaveTest(exitcode);
+	}
+	else
+#endif
+	{
+	if (TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest())
+		ArmSkirmishAIRecoveryFixtureRunner(
+			TheGlobalData->m_commandLineData.getSkirmishAIRecoveryTestSeed(),
+			TheGlobalData->m_commandLineData.getSkirmishAIRecoveryFixtureCase(),
+			TheGlobalData->m_commandLineData.getSkirmishAIRecoveryFaction());
+	else if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
 		ArmSkirmishAITestRunner(TheGlobalData->m_commandLineData.getSkirmishAITestSeed(),
 			SKIRMISH_AI_TEST_SCENARIO_4V3);
 	else if (TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request())
@@ -71,6 +94,7 @@ Int GameMain()
 	}
 	if (IsSkirmishAITestRunnerArmed())
 		exitcode = FinalizeSkirmishAITestRunner(exitcode);
+	}
 
 	// since execute() returned, we are exiting the game
 	delete TheFramePacer;

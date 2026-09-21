@@ -27,6 +27,45 @@ enum SkirmishAITestScenario
 	SKIRMISH_AI_TEST_SCENARIO_4V2
 };
 
+// CLI: -runSkirmishAIRecoveryTest <positive-seed> <case> <FactionTemplate>.
+// Opt-in, full-engine Stage 1 recovery fixtures.  These are deliberately
+// separate from the normal replay scenarios: they stop on fixture assertions
+// and never report a fixture result as a gameplay/replay gate.
+// Cases: surviving_builder, factory_only, no_path_laststand, repeated_cc,
+// obstructed, low_cash, gla_hole, save_load, disabled_factory. Factions are the
+// 12 playable Zero Hour Faction*
+// templates returned by GetSkirmishAIRecoveryFactionTemplateName().
+enum SkirmishAIRecoveryFixtureCase
+{
+	SKIRMISH_AI_RECOVERY_SURVIVING_BUILDER,
+	SKIRMISH_AI_RECOVERY_FACTORY_ONLY,
+	SKIRMISH_AI_RECOVERY_NO_PATH_LASTSTAND,
+	SKIRMISH_AI_RECOVERY_REPEATED_COMMAND_CENTER,
+	SKIRMISH_AI_RECOVERY_OBSTRUCTED,
+	SKIRMISH_AI_RECOVERY_LOW_CASH,
+	SKIRMISH_AI_RECOVERY_GLA_HOLE,
+	SKIRMISH_AI_RECOVERY_SAVE_LOAD,
+	SKIRMISH_AI_RECOVERY_DISABLED_FACTORY,
+	SKIRMISH_AI_RECOVERY_FIXTURE_CASE_COUNT
+};
+
+enum SkirmishAIRecoveryFaction
+{
+	SKIRMISH_AI_RECOVERY_FACTION_AMERICA,
+	SKIRMISH_AI_RECOVERY_FACTION_AMERICA_SUPER_WEAPON_GENERAL,
+	SKIRMISH_AI_RECOVERY_FACTION_AMERICA_LASER_GENERAL,
+	SKIRMISH_AI_RECOVERY_FACTION_AMERICA_AIR_FORCE_GENERAL,
+	SKIRMISH_AI_RECOVERY_FACTION_CHINA,
+	SKIRMISH_AI_RECOVERY_FACTION_CHINA_TANK_GENERAL,
+	SKIRMISH_AI_RECOVERY_FACTION_CHINA_INFANTRY_GENERAL,
+	SKIRMISH_AI_RECOVERY_FACTION_CHINA_NUKE_GENERAL,
+	SKIRMISH_AI_RECOVERY_FACTION_GLA,
+	SKIRMISH_AI_RECOVERY_FACTION_GLA_TOXIN_GENERAL,
+	SKIRMISH_AI_RECOVERY_FACTION_GLA_DEMOLITION_GENERAL,
+	SKIRMISH_AI_RECOVERY_FACTION_GLA_STEALTH_GENERAL,
+	SKIRMISH_AI_RECOVERY_FACTION_COUNT
+};
+
 enum SkirmishAITestProgress
 {
 	SKIRMISH_AI_TEST_RUNNING,
@@ -61,6 +100,12 @@ struct SkirmishAITestLoadedState
 };
 
 Bool TryParseSkirmishAITestSeed(const char *text, Int *seed);
+Bool TryParseSkirmishAIRecoveryFixtureCase(const char *text, Int *fixtureCase);
+Bool TryParseSkirmishAIRecoveryFaction(const char *text, Int *faction);
+Bool IsSupportedSkirmishAIRecoveryFixtureCombination(Int fixtureCase, Int faction);
+const char *GetSkirmishAIRecoveryFixtureCaseName(Int fixtureCase);
+const char *GetSkirmishAIRecoveryFactionName(Int faction);
+const char *GetSkirmishAIRecoveryFactionTemplateName(Int faction);
 Bool ShouldBypassFramePacingForSkirmishAITest(Bool runnerArmed);
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan);
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestScenario scenario,
@@ -78,6 +123,7 @@ Bool IsSkirmishAITestShutdownTimedOut(UnsignedInt elapsedMilliseconds);
 
 void ArmSkirmishAITestRunner(Int seed,
 	SkirmishAITestScenario scenario = SKIRMISH_AI_TEST_SCENARIO_4V3);
+void ArmSkirmishAIRecoveryFixtureRunner(Int seed, Int fixtureCase, Int faction);
 Bool IsSkirmishAITestRunnerArmed();
 Bool StartSkirmishAITestRunner();
 void UpdateSkirmishAITestRunner();
