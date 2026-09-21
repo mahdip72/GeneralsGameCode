@@ -108,6 +108,14 @@ static Bool ShouldUseCurrentSkirmishAIRecoveryBoundedFailover()
 			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 }
 
+static Bool ShouldUseCurrentSkirmishAIRecoveryResourceWorkerPreservation()
+{
+	return ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
+		TheGameLogic && TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
 static Bool IsCriticalRecoveryModeEnabled(Player *player)
 {
 	if (!player || player->getPlayerType() != PLAYER_COMPUTER || !TheGameLogic)
@@ -2974,6 +2982,7 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 	Bool newlyObservedRecoveryReplacement = false;
 	Bool producedRecoveryReplacement = false;
 	Bool trackedRecoveryReplacement = false;
+	Int recoveryCommandCenterCost = -1;
 	ProductionUpdateInterface *production = factory
 		? factory->getProductionUpdateInterface() : nullptr;
 	const ProductionEntry *currentEntry = production
@@ -2994,6 +3003,8 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 		unit->isKindOf(KINDOF_DOZER) && m_player->getPlayerTemplate()) {
 		const ThingTemplate *primaryTemplate = TheThingFactory->findTemplate(
 			m_player->getPlayerTemplate()->getStartingBuilding());
+		if (primaryTemplate)
+			recoveryCommandCenterCost = primaryTemplate->calcCostToBuild(m_player);
 		Object *primaryCenter = nullptr;
 		const Bool hasCompletedPrimaryCenter = primaryTemplate &&
 			findPrimaryCommandCenter(primaryTemplate, &primaryCenter) &&
@@ -3029,10 +3040,16 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 
 	WorkOrder *recoveryOrder = nullptr;
 	Bool recoveryOrderWasResourceGatherer = false;
+	Bool startDirectRecoveryResourceGathering = false;
+	SupplyTruckAIInterface *directRecoverySupplyAI = nullptr;
 	if (producedRecoveryReplacement) {
-		// Match the order the base callback will consume, but suppress its supply
-		// routing only for this produced recovery builder.  Keep the stored role
-		// intact for cancellation, producer loss, and later economy scheduling.
+		// Match the order the base callback will consume.  Keep a resource worker
+		// gathering when its post-debit cash cannot yet fund the command center;
+		// recovery will preempt it after affordability and placement checks pass.
+		// Otherwise suppress supply routing only for this produced recovery builder.
+		// Keep the stored role intact for cancellation and later economy scheduling.
+		// A direct recovery queue has no order for the base callback to route, so
+		// start only an actual harvester with a supply interface after that callback.
 		for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue();
 			!iter.done() && !recoveryOrder; iter.advance()) {
 			TeamInQueue *team = iter.cur();
@@ -3042,15 +3059,35 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 					unit->getTemplate()->isEquivalentTo(order->m_thing)) {
 					recoveryOrder = order;
 					recoveryOrderWasResourceGatherer = order->m_isResourceGatherer;
-					order->m_isResourceGatherer = false;
 					break;
 				}
 			}
 		}
+		const Bool preservationBehavior =
+			ShouldUseCurrentSkirmishAIRecoveryResourceWorkerPreservation();
+		if (preservationBehavior && !recoveryOrder &&
+			unit->isKindOf(KINDOF_HARVESTER)) {
+			AIUpdateInterface *recoveryAI = unit->getAIUpdateInterface();
+			if (recoveryAI)
+				directRecoverySupplyAI = recoveryAI->getSupplyTruckAIInterface();
+		}
+		const SkirmishAIRecoveryResourceRoutingDecision routing =
+			GetSkirmishAIRecoveryResourceRoutingDecision(
+				preservationBehavior,
+				recoveryOrder != nullptr, recoveryOrderWasResourceGatherer,
+				directRecoverySupplyAI != nullptr,
+				m_player->getMoney()->countMoney(), recoveryCommandCenterCost);
+		if (recoveryOrder)
+			recoveryOrder->m_isResourceGatherer =
+				routing.resourceGathererDuringCallback;
+		startDirectRecoveryResourceGathering =
+			routing.startDirectResourceGatheringAfterCallback;
 	}
 	AIPlayer::onUnitProduced(factory, unit);
 	if (recoveryOrder)
 		recoveryOrder->m_isResourceGatherer = recoveryOrderWasResourceGatherer;
+	else if (startDirectRecoveryResourceGathering && directRecoverySupplyAI)
+		directRecoverySupplyAI->setForceWantingState(true);
 #if defined(_MSC_VER) && _MSC_VER < 1300
 	// The retail-compatible base callback initializes its local supply flag true.
 	// A direct recovery queue has no WorkOrder to clear that flag, so preserve

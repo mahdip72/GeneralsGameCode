@@ -1311,6 +1311,106 @@ static void TestSkirmishAIRecoveryPolicies()
 		true, true, true, true, true, false, 200, true));
 	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
 		false, true, true, true, false, false, 0, false));
+	// Compose the low-cash GLA resource-worker route across ordinary admission,
+	// recovery payment, completion routing, and later command-center admission.
+	// The ordinary resource order remains visible, but the reserve rejects its
+	// unowned purchase; recovery then pays exactly one worker and reuses it.
+	const Int resourceWorkerCost = 400;
+	const Int resourceCommandCenterCost = 1200;
+	Int resourceRecoveryCash = resourceWorkerCost;
+	CHECK(!ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false, false,
+		resourceWorkerCost + resourceCommandCenterCost, false));
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.commandCenterAffordable = false;
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(
+		input, TRUE, FALSE, FALSE, FALSE,
+		resourceWorkerCost + resourceCommandCenterCost);
+	const SkirmishAIRecoveryQueueCommit resourceQueueCommit =
+		GetSkirmishAIRecoveryQueueCommit(true, true);
+	CHECK(resourceQueueCommit.bindReusableWorkOrder);
+	CHECK(resourceQueueCommit.storeProductionIdentity);
+	resourceRecoveryCash -= resourceWorkerCost;
+	const SkirmishAIRecoveryResourceRoutingDecision liveResourceRouting =
+		GetSkirmishAIRecoveryResourceRoutingDecision(
+			ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
+				FALSE, SKIRMISH_AI_REPLAY_EPOCH_LEGACY),
+			true, true, true, resourceRecoveryCash, resourceCommandCenterCost);
+	CHECK(liveResourceRouting.resourceGathererDuringCallback);
+	CHECK(liveResourceRouting.resourceGathererAfterCallback);
+	CHECK(!liveResourceRouting.startDirectResourceGatheringAfterCallback);
+	const SkirmishAIRecoveryResourceRoutingDecision epoch8ResourceRouting =
+		GetSkirmishAIRecoveryResourceRoutingDecision(
+			ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
+				TRUE, SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION),
+			true, true, true, resourceRecoveryCash, resourceCommandCenterCost);
+	CHECK(epoch8ResourceRouting.resourceGathererDuringCallback);
+	CHECK(epoch8ResourceRouting.resourceGathererAfterCallback);
+	CHECK(!epoch8ResourceRouting.startDirectResourceGatheringAfterCallback);
+	const SkirmishAIRecoveryResourceRoutingDecision epoch7ResourceRouting =
+		GetSkirmishAIRecoveryResourceRoutingDecision(
+			ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
+				TRUE, SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER),
+			true, true, true, resourceRecoveryCash, resourceCommandCenterCost);
+	CHECK(!epoch7ResourceRouting.resourceGathererDuringCallback);
+	CHECK(epoch7ResourceRouting.resourceGathererAfterCallback);
+	CHECK(!epoch7ResourceRouting.startDirectResourceGatheringAfterCallback);
+	const SkirmishAIRecoveryResourceRoutingDecision nonResourceRouting =
+		GetSkirmishAIRecoveryResourceRoutingDecision(
+			true, true, false, false,
+			resourceRecoveryCash, resourceCommandCenterCost);
+	CHECK(!nonResourceRouting.resourceGathererDuringCallback);
+	CHECK(!nonResourceRouting.resourceGathererAfterCallback);
+	CHECK(!nonResourceRouting.startDirectResourceGatheringAfterCallback);
+	const SkirmishAIRecoveryQueueCommit directResourceQueueCommit =
+		GetSkirmishAIRecoveryQueueCommit(false, true);
+	CHECK(!directResourceQueueCommit.bindReusableWorkOrder);
+	CHECK(directResourceQueueCommit.storeProductionIdentity);
+	const SkirmishAIRecoveryResourceRoutingDecision directResourceRouting =
+		GetSkirmishAIRecoveryResourceRoutingDecision(
+			ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
+				TRUE, SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION),
+			false, false, true, resourceRecoveryCash, resourceCommandCenterCost);
+	CHECK(!directResourceRouting.resourceGathererDuringCallback);
+	CHECK(!directResourceRouting.resourceGathererAfterCallback);
+	CHECK(directResourceRouting.startDirectResourceGatheringAfterCallback);
+	const SkirmishAIRecoveryResourceRoutingDecision directNonResourceRouting =
+		GetSkirmishAIRecoveryResourceRoutingDecision(
+			true, false, false, false,
+			resourceRecoveryCash, resourceCommandCenterCost);
+	CHECK(!directNonResourceRouting.startDirectResourceGatheringAfterCallback);
+	const SkirmishAIRecoveryResourceRoutingDecision epoch7DirectResourceRouting =
+		GetSkirmishAIRecoveryResourceRoutingDecision(
+			ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
+				TRUE, SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER),
+			false, false, true, resourceRecoveryCash, resourceCommandCenterCost);
+	CHECK(!epoch7DirectResourceRouting.startDirectResourceGatheringAfterCallback);
+	CHECK(ShouldSuppressSkirmishAIRecoveryBuilderOrder(
+		true, true, true, true, false, false,
+		resourceCommandCenterCost, true));
+	input = MakeSkirmishAIRecoveryPolicyInput();
+	input.hasBuilder = true;
+	input.commandCenterAffordable = false;
+	input.protectedReserve = 0;
+	CheckSkirmishAIRecoveryDecision(
+		input, FALSE, FALSE, FALSE, TRUE, resourceCommandCenterCost);
+	resourceRecoveryCash = resourceCommandCenterCost;
+	const SkirmishAIRecoveryResourceRoutingDecision affordableResourceRouting =
+		GetSkirmishAIRecoveryResourceRoutingDecision(
+			true, true, true, true,
+			resourceRecoveryCash, resourceCommandCenterCost);
+	CHECK(!affordableResourceRouting.resourceGathererDuringCallback);
+	CHECK(affordableResourceRouting.resourceGathererAfterCallback);
+	CHECK(!affordableResourceRouting.startDirectResourceGatheringAfterCallback);
+	const SkirmishAIRecoveryResourceRoutingDecision affordableDirectRouting =
+		GetSkirmishAIRecoveryResourceRoutingDecision(
+			true, false, false, true,
+			resourceRecoveryCash, resourceCommandCenterCost);
+	CHECK(!affordableDirectRouting.startDirectResourceGatheringAfterCallback);
+	input.commandCenterAffordable = true;
+	CheckSkirmishAIRecoveryDecision(
+		input, FALSE, TRUE, FALSE, FALSE, resourceCommandCenterCost);
 	// A primary native reconstruction owns its free-worker lifecycle. This
 	// overrides both the resource-order exception and a cleared reserve after
 	// exact paid-queue cancellation, while unrelated units remain unaffected.
@@ -2238,20 +2338,22 @@ static void TestSkirmishAIReplayEpoch()
 
 	// Live games always use the current and recovery paths. Replays retain the
 	// behavior selected by their recording epoch; an unknown epoch is legacy.
-	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8 };
+	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
 	const Bool expectedReplayCurrentBehavior[] =
-		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedReplayRecoveryBehavior[] =
-		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedRecoveryCRCFields[] =
-		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedCancellationOwnership[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedUnownedQueueFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedBoundedFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
-	for (Int i = 0; i < 9; ++i)
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+	const Bool expectedResourceWorkerPreservation[] =
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
+	for (Int i = 0; i < 10; ++i)
 	{
 		CHECK(ShouldUseSkirmishAICurrentBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(FALSE, replayEpochs[i]));
@@ -2266,6 +2368,8 @@ static void TestSkirmishAIReplayEpoch()
 		CHECK(ShouldUseSkirmishAIRecoveryBoundedFailover(
 			FALSE, replayEpochs[i]));
 		CHECK(ShouldIncludeSkirmishAIRecoveryFailoverConsumedCRCField(
+			FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
 			FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, replayEpochs[i])
 			== expectedReplayCurrentBehavior[i]);
@@ -2285,6 +2389,8 @@ static void TestSkirmishAIReplayEpoch()
 			TRUE, replayEpochs[i]) == expectedBoundedFailover[i]);
 		CHECK(ShouldIncludeSkirmishAIRecoveryFailoverConsumedCRCField(
 			TRUE, replayEpochs[i]) == expectedBoundedFailover[i]);
+		CHECK(ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
+			TRUE, replayEpochs[i]) == expectedResourceWorkerPreservation[i]);
 	}
 
 	UnicodeString livenessOnly = unmarked;
@@ -2425,10 +2531,11 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(nonCancellingFailoverEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=6]") == 0);
 
-	// New recordings use epoch 7. Its additional CRC field and decision gate
-	// consume one successful paid-queue failover per recovery episode.
+	// Epoch 7 keeps its additional CRC field and decision gate, consuming one
+	// successful paid-queue failover per recovery episode without opting into
+	// resource-worker preservation.
 	UnicodeString boundedFailoverEpoch = unmarked;
-	MarkReplayVersionForSkirmishAICurrentEpoch(boundedFailoverEpoch);
+	MarkReplayVersionForSkirmishAIBoundedFailoverEpoch(boundedFailoverEpoch);
 	CHECK(boundedFailoverEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=7]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(boundedFailoverEpoch) ==
@@ -2436,6 +2543,8 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(ShouldUseSkirmishAIRecoveryBoundedFailover(
 		TRUE, SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER));
 	CHECK(ShouldIncludeSkirmishAIRecoveryFailoverConsumedCRCField(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER));
+	CHECK(!ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
 		TRUE, SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER));
 	CHECK(!ShouldSearchSkirmishAIRecoveryPaidQueueFailover(
 		true, false, false,
@@ -2445,10 +2554,29 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(boundedFailoverEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=7]") == 0);
 
+	// New recordings use epoch 8. They retain the complete epoch-7 CRC layout
+	// and enable only the low-cash recovery resource-worker routing change.
+	UnicodeString resourceWorkerPreservationEpoch = unmarked;
+	MarkReplayVersionForSkirmishAICurrentEpoch(resourceWorkerPreservationEpoch);
+	CHECK(resourceWorkerPreservationEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=8]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(resourceWorkerPreservationEpoch) ==
+		SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION);
+	CHECK(ShouldUseSkirmishAIRecoveryBoundedFailover(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION));
+	CHECK(ShouldIncludeSkirmishAIRecoveryFailoverConsumedCRCField(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION));
+	CHECK(ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION));
+	MarkReplayVersionForSkirmishAIResourceWorkerPreservationEpoch(
+		resourceWorkerPreservationEpoch);
+	CHECK(resourceWorkerPreservationEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=8]") == 0);
+
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=8]";
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=9]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -2480,7 +2608,7 @@ static void TestSkirmishAIReplayEpoch()
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] [SkirmishAIEpoch=3]";
 	CHECK(GetSkirmishAIReplayEpoch(duplicateMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString unknownThenCurrent =
-		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=8] [SkirmishAIEpoch=2]";
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=9] [SkirmishAIEpoch=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unknownThenCurrent) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedThenLiveness =
 		L"Aug 14 2026 21:00:00 [SkirmishAILiveness=x] [SkirmishAILiveness=1]";
@@ -2500,10 +2628,11 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString compatibilityUnknown = futureEpoch;
 	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityUnknown);
 	CHECK(compatibilityUnknown == futureEpoch);
-	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, 8));
-	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, 8));
-	CHECK(!ShouldIncludeSkirmishAIRecoveryCRCFields(TRUE, 8));
-	CHECK(!ShouldUseSkirmishAIRecoveryNativeHoleOwnership(TRUE, 8));
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, 9));
+	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, 9));
+	CHECK(!ShouldIncludeSkirmishAIRecoveryCRCFields(TRUE, 9));
+	CHECK(!ShouldUseSkirmishAIRecoveryNativeHoleOwnership(TRUE, 9));
+	CHECK(!ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(TRUE, 9));
 }
 
 static void TestPathfindQueueReplayEpoch()
@@ -2548,14 +2677,14 @@ static void TestPathfindQueueReplayEpoch()
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=7]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=8]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(combined) ==
-		SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER);
+		SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION);
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=7]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=8]") == 0);
 
 	UnicodeString pathLiveness = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);

@@ -366,6 +366,32 @@ inline bool ShouldSuppressSkirmishAIRecoveryBuilderOrder(
 	return reserveCost > 0;
 }
 
+struct SkirmishAIRecoveryResourceRoutingDecision
+{
+	bool resourceGathererDuringCallback;
+	bool resourceGathererAfterCallback;
+	bool startDirectResourceGatheringAfterCallback;
+};
+
+inline SkirmishAIRecoveryResourceRoutingDecision
+GetSkirmishAIRecoveryResourceRoutingDecision(
+	bool preservationBehavior, bool hasMatchingWorkOrder,
+	bool storedResourceGatherer, bool hasResourceSupplyCapability,
+	int moneyAfterBuilderDebit, int commandCenterCost)
+{
+	SkirmishAIRecoveryResourceRoutingDecision decision;
+	decision.resourceGathererDuringCallback = hasMatchingWorkOrder &&
+		preservationBehavior &&
+		storedResourceGatherer && commandCenterCost >= 0 &&
+		moneyAfterBuilderDebit < commandCenterCost;
+	decision.resourceGathererAfterCallback = storedResourceGatherer;
+	decision.startDirectResourceGatheringAfterCallback =
+		!hasMatchingWorkOrder && preservationBehavior &&
+		hasResourceSupplyCapability && commandCenterCost >= 0 &&
+		moneyAfterBuilderDebit < commandCenterCost;
+	return decision;
+}
+
 inline bool IsSkirmishAIRecoveryReusableWorkOrder(
 	bool unbound, bool equivalentTemplate, bool incomplete,
 	bool belongsToDefaultTeam, bool reinforcement)
