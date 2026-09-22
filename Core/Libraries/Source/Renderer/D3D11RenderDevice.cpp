@@ -5,6 +5,7 @@
 #include <d3d11sdklayers.h>
 #include <dxgi1_2.h>
 
+#include "D3D11ResultTranslation.h"
 #include "LegacyFixedFunctionPS.h"
 #include "LegacyFixedFunctionVS.h"
 #include "LegacyWaterFlatPS.h"
@@ -73,29 +74,7 @@ enum ResourceKind
 
 RenderResult TranslateResult(HRESULT result)
 {
-	if (SUCCEEDED(result))
-	{
-		return RENDER_RESULT_OK;
-	}
-	if (result == E_INVALIDARG)
-	{
-		return RENDER_RESULT_INVALID_ARGUMENT;
-	}
-	if (result == E_OUTOFMEMORY)
-	{
-		return RENDER_RESULT_OUT_OF_MEMORY;
-	}
-	if (result == DXGI_ERROR_UNSUPPORTED)
-	{
-		return RENDER_RESULT_UNSUPPORTED;
-	}
-	if (result == DXGI_ERROR_DEVICE_HUNG ||
-		result == DXGI_ERROR_DEVICE_REMOVED ||
-		result == DXGI_ERROR_DEVICE_RESET)
-	{
-		return RENDER_RESULT_DEVICE_REMOVED;
-	}
-	return RENDER_RESULT_FAILED;
+	return detail::TranslateD3D11Result(result);
 }
 
 HRESULT TranslateInjectedFault(RenderResult result)
@@ -1322,7 +1301,8 @@ public:
 		}
 		else if (slot.kind == RESOURCE_BUFFER)
 		{
-			if ((slot.binding & RENDER_BUFFER_VERTEX) != 0)
+			if ((slot.binding & RENDER_BUFFER_VERTEX) != 0 &&
+				m_boundVertexBuffer == resource)
 			{
 				ID3D11Buffer *emptyBuffer = 0;
 				const UINT zero = 0;
@@ -1330,7 +1310,8 @@ public:
 				m_vertexBufferBound = false;
 				m_boundVertexBuffer = GpuHandle();
 			}
-			if ((slot.binding & RENDER_BUFFER_INDEX) != 0)
+			if ((slot.binding & RENDER_BUFFER_INDEX) != 0 &&
+				m_boundIndexBuffer == resource)
 			{
 				m_context->IASetIndexBuffer(0, DXGI_FORMAT_UNKNOWN, 0);
 				m_indexBufferBound = false;
@@ -1665,6 +1646,7 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		bindDefaultRenderTargets();
+		bindDefaultViewport(m_width, m_height);
 		bool needsTextureReset = !m_textureBindingsValid;
 		for (unsigned int stage = 0; !needsTextureReset &&
 			stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
@@ -3129,6 +3111,31 @@ private:
 		m_renderTargetsBound = colorView != 0;
 	}
 
+	void bindDefaultViewport(unsigned int width, unsigned int height)
+	{
+		if (defaultRenderTarget() == 0 || width == 0 || height == 0)
+		{
+			m_viewportBound = false;
+			return;
+		}
+		D3D11_VIEWPORT viewport;
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = static_cast<float>(width);
+		viewport.Height = static_cast<float>(height);
+		viewport.MinDepth = 0.0f;
+		viewport.MaxDepth = 1.0f;
+		m_context->RSSetViewports(1, &viewport);
+		m_viewportX = viewport.TopLeftX;
+		m_viewportY = viewport.TopLeftY;
+		m_viewportWidth = viewport.Width;
+		m_viewportHeight = viewport.Height;
+		m_viewportMinimumDepth = viewport.MinDepth;
+		m_viewportMaximumDepth = viewport.MaxDepth;
+		m_viewportBound = true;
+		m_transformConstantsChanged = true;
+	}
+
 	RenderResult resolveBackBuffer()
 	{
 		if (m_multisampleCount == 1)
@@ -4532,21 +4539,7 @@ private:
 			// The legacy API publishes a full-back-buffer viewport when a device or reset
 			// completes. Mirror that default here because the legacy state cache
 			// may suppress its first SetViewport call after this backend starts.
-			D3D11_VIEWPORT viewport;
-			viewport.TopLeftX = 0.0f;
-			viewport.TopLeftY = 0.0f;
-			viewport.Width = static_cast<float>(width);
-			viewport.Height = static_cast<float>(height);
-			viewport.MinDepth = 0.0f;
-			viewport.MaxDepth = 1.0f;
-			m_context->RSSetViewports(1, &viewport);
-			m_viewportX = 0.0f;
-			m_viewportY = 0.0f;
-			m_viewportWidth = static_cast<float>(width);
-			m_viewportHeight = static_cast<float>(height);
-			m_viewportMinimumDepth = 0.0f;
-			m_viewportMaximumDepth = 1.0f;
-			m_viewportBound = true;
+			bindDefaultViewport(width, height);
 		}
 		return result;
 	}

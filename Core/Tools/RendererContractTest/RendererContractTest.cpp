@@ -2,6 +2,9 @@
 #include "Renderer/RendererDevice.h"
 #include "Renderer/RenderTexturePublication.h"
 #include "W3DDevice/GameClient/W3DVideoBuffer.h"
+#if defined(RTS_RENDERER_HAS_D3D11)
+#include "../../Libraries/Source/Renderer/D3D11ResultTranslation.h"
+#endif
 #if defined(RTS_RENDERER_HAS_D3D11) && !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 #include "d3d11legacybridge.h"
 #endif
@@ -2736,6 +2739,69 @@ int testD3D11HiddenSwapChain()
 			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
 				&captureFormat) == rts::render::RENDER_RESULT_OK,
 			"D3D11 parity pipeline binds and draws indexed geometry");
+		rts::render::GpuHandle unrelatedVertexBuffer;
+		rts::render::GpuHandle unrelatedIndexBuffer;
+		const bool unrelatedVertexCreated = device->createBuffer(vertexDescriptor,
+			vertices, sizeof(vertices), &unrelatedVertexBuffer) ==
+			rts::render::RENDER_RESULT_OK;
+		const bool unrelatedIndexCreated = device->createBuffer(indexDescriptor,
+			indices, sizeof(indices), &unrelatedIndexBuffer) ==
+			rts::render::RENDER_RESULT_OK;
+		const bool bufferDestroyFrameStarted = unrelatedVertexCreated &&
+			unrelatedIndexCreated && context->beginFrame() ==
+			rts::render::RENDER_RESULT_OK;
+		bool bufferDestroyFrameSucceeded = false;
+		bool unrelatedVertexDestroyed = false;
+		bool unrelatedIndexDestroyed = false;
+		if (bufferDestroyFrameStarted)
+		{
+			bool drawStateReady =
+				context->clear(rts::render::RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f),
+					1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+				context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setLegacyState(logicalState,
+					rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setVertexBuffer(vertexBuffer, sizeof(TestVertex), 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setIndexBuffer(indexBuffer,
+					rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setPrimitiveTopology(
+					rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+					rts::render::RENDER_RESULT_OK;
+			unrelatedVertexDestroyed = device->destroyResource(
+				unrelatedVertexBuffer);
+			if (unrelatedVertexDestroyed)
+				unrelatedVertexBuffer = rts::render::GpuHandle();
+			const rts::render::RenderResult afterVertexDestroy = drawStateReady ?
+				context->drawIndexed(3, 0, 0) :
+				rts::render::RENDER_RESULT_FAILED;
+			drawStateReady = context->setVertexBuffer(vertexBuffer,
+				sizeof(TestVertex), 0) == rts::render::RENDER_RESULT_OK &&
+				drawStateReady;
+			unrelatedIndexDestroyed = device->destroyResource(unrelatedIndexBuffer);
+			if (unrelatedIndexDestroyed)
+				unrelatedIndexBuffer = rts::render::GpuHandle();
+			const rts::render::RenderResult afterIndexDestroy = drawStateReady ?
+				context->drawIndexed(3, 0, 0) :
+				rts::render::RENDER_RESULT_FAILED;
+			const rts::render::RenderResult bufferDestroyEndResult =
+				context->endFrame();
+			bufferDestroyFrameSucceeded = drawStateReady &&
+				afterVertexDestroy == rts::render::RENDER_RESULT_OK &&
+				afterIndexDestroy == rts::render::RENDER_RESULT_OK &&
+				bufferDestroyEndResult == rts::render::RENDER_RESULT_OK;
+		}
+		result |= check(bufferDestroyFrameSucceeded && unrelatedVertexDestroyed &&
+			unrelatedIndexDestroyed,
+			"D3D11 preserves active IA buffers when unrelated buffers are destroyed");
+		result |= check((!unrelatedVertexBuffer.isValid() ||
+			device->destroyResource(unrelatedVertexBuffer)) &&
+			(!unrelatedIndexBuffer.isValid() ||
+			device->destroyResource(unrelatedIndexBuffer)),
+			"D3D11 releases any buffer-destruction regression leftovers");
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(center[0] > 240 && center[2] < 16,
 			"captured indexed triangle preserves the indexed draw result");
@@ -5698,12 +5764,56 @@ int testD3D11HiddenSwapChain()
 			context->endFrame() == rts::render::RENDER_RESULT_OK &&
 			device->destroyResource(resizeRecoveryBuffer),
 			"D3D11 recovery preserves logical handles before applying a requested resize");
-		result |= check(device->setGamma(2.0f, 0.1f, 1.25f, true, true) ==
-			rts::render::RENDER_RESULT_OK &&
-			device->present() == rts::render::RENDER_RESULT_OK &&
-			device->setGamma(1.0f, 0.0f, 1.0f, false, true) ==
-				rts::render::RENDER_RESULT_OK,
+		const bool gammaConfigured = device->setGamma(2.0f, 0.1f, 1.25f,
+			true, true) == rts::render::RENDER_RESULT_OK;
+		const bool gammaPresented = gammaConfigured &&
+			device->present() == rts::render::RENDER_RESULT_OK;
+		const bool gammaViewportFrameStarted = gammaPresented &&
+			context->beginFrame() == rts::render::RENDER_RESULT_OK;
+		bool gammaViewportFrameEnded = false;
+		if (gammaViewportFrameStarted)
+		{
+			bool gammaViewportDrawSucceeded =
+				context->clear(rts::render::RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f),
+					1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyState(logicalState,
+					rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setVertexBuffer(greenVertexBuffer, sizeof(TestVertex), 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setPrimitiveTopology(
+					rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+			gammaViewportFrameEnded = context->endFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			gammaViewportDrawSucceeded = gammaViewportDrawSucceeded &&
+				gammaViewportFrameEnded;
+			std::vector<unsigned char> gammaViewportPixels(
+				resizeRecoveryInfo.width * resizeRecoveryInfo.height * 4);
+			rts::render::RenderFormat gammaViewportFormat =
+				rts::render::RENDER_FORMAT_UNKNOWN;
+			const bool gammaViewportCaptured = gammaViewportDrawSucceeded &&
+				device->captureBackBuffer(&gammaViewportPixels[0],
+					gammaViewportPixels.size(), resizeRecoveryInfo.width * 4,
+					&gammaViewportFormat) == rts::render::RENDER_RESULT_OK;
+			const unsigned int centerOffset = 4 *
+				((resizeRecoveryInfo.height / 2) * resizeRecoveryInfo.width +
+				 resizeRecoveryInfo.width / 2);
+			const bool gammaViewportPixelRendered = gammaViewportCaptured &&
+				gammaViewportFormat == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM &&
+				gammaViewportPixels[centerOffset + 1] > 240 &&
+				gammaViewportPixels[centerOffset] < 16 &&
+				gammaViewportPixels[centerOffset + 2] < 16;
+			result |= check(gammaViewportPixelRendered,
+				"D3D11 gamma presentation restores the default viewport for the next frame");
+		}
+		result |= check(gammaConfigured && gammaPresented &&
+			gammaViewportFrameStarted && gammaViewportFrameEnded,
 			"D3D11 resolves the multisampled scene through gamma presentation");
+		result |= check(device->setGamma(1.0f, 0.0f, 1.0f, false, true) ==
+			rts::render::RENDER_RESULT_OK,
+			"D3D11 restores identity gamma after the presentation test");
 		unsigned int debugErrorCount = 0xffffffffU;
 		const rts::render::RenderResult debugValidationResult =
 			device->getDebugValidationErrorCount(&debugErrorCount);
@@ -6760,6 +6870,14 @@ int main()
 	result |= testRenderCaptureQueue();
 	result |= testW3DVideoBufferDirectPublicationLayout();
 #if defined(RTS_RENDERER_HAS_D3D11)
+	result |= check(rts::render::detail::TranslateD3D11Result(
+		DXGI_ERROR_DRIVER_INTERNAL_ERROR) ==
+		rts::render::RENDER_RESULT_DEVICE_REMOVED &&
+		rts::render::detail::TranslateD3D11Result(DXGI_ERROR_DEVICE_RESET) ==
+		rts::render::RENDER_RESULT_DEVICE_REMOVED &&
+		rts::render::detail::TranslateD3D11Result(E_FAIL) ==
+		rts::render::RENDER_RESULT_FAILED,
+		"D3D11 maps internal driver errors to device-removed results");
 #if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	result |= testD3D11PrimitiveTopologyTranslation();
 #endif
