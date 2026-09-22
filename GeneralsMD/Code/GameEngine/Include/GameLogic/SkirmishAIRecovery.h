@@ -392,6 +392,12 @@ GetSkirmishAIRecoveryResourceRoutingDecision(
 	return decision;
 }
 
+inline bool IsSkirmishAIRecoveryLastStandCombatCandidate(
+	bool live, bool immobile, bool dozer, bool harvester, bool ableToAttack)
+{
+	return live && !immobile && !dozer && !harvester && ableToAttack;
+}
+
 inline bool IsSkirmishAIRecoveryReusableWorkOrder(
 	bool unbound, bool equivalentTemplate, bool incomplete,
 	bool belongsToDefaultTeam, bool reinforcement)

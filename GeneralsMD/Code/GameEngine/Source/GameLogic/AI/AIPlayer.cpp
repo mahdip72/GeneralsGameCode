@@ -2785,6 +2785,15 @@ void AIPlayer::doBaseBuilding()
 
 //----------------------------------------------------------------------------------------------------------
 /**
+ * Return true when a completed team may leave the ready queue and become active.
+ */
+Bool AIPlayer::canActivateReadyTeam( const TeamInQueue * ) const
+{
+	return true;
+}
+
+//----------------------------------------------------------------------------------------------------------
+/**
  * See if any ready teams have finished moving to the rally point.
  */
 void AIPlayer::checkReadyTeams()
@@ -2838,6 +2847,8 @@ void AIPlayer::checkReadyTeams()
 					}
 					*/
 				}
+				if (!canActivateReadyTeam(team))
+					continue;
 				// Start the team up.
 				removeFrom_TeamReadyQueue(team);
 				if (team->m_reinforcement) {

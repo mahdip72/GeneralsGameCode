@@ -31,6 +31,7 @@
 #include "Common/GameMemory.h"
 #include "GameLogic/AIPlayer.h"
 #include "GameLogic/SkirmishAIDecision.h"
+#include "GameLogic/SkirmishAIStrategy.h"
 
 class BuildListInfo;
 class SpecialPowerTemplate;
@@ -90,6 +91,7 @@ protected:
 
 	virtual void doBaseBuilding() override;
 	virtual void checkReadyTeams() override;
+	virtual Bool canActivateReadyTeam( const TeamInQueue *team ) const override;
 	virtual void checkQueuedTeams() override;
 	virtual void doTeamBuilding() override;
 	virtual Object *findDozer(const Coord3D *pos) override;
@@ -158,6 +160,13 @@ protected:
 		Object *representative, const Coord3D *enemyPosition, Bool hasEnemyPosition ) const;
 	Int countAlliedSkirmishAIsTargeting( Player *enemy ) const;
 	SkirmishAIDecisionDifficulty getDecisionDifficulty() const;
+	Bool usesStrategyBehavior() const;
+	Bool updateStrategy();
+	void collectStrategyMetrics( SkirmishStrategyMetrics *metrics,
+		ObjectID *strategicTargetID );
+	void applyStrategyMode( SkirmishStrategyMode previousMode,
+		SkirmishStrategyMode currentMode, ObjectID previousTargetID );
+	void commandOffensiveTeams( SkirmishStrategyMode mode, Object *target );
 
 protected:
 	Int m_curFrontBaseDefense; // First is 0.
@@ -172,6 +181,7 @@ protected:
 	UnsignedInt m_frameToCheckEnemy;
 	Player			*m_currentEnemy;
 	Int m_currentEnemyPlayerIndex;
+	SkirmishStrategyState m_strategyState;
 
 	// Critical command-center recovery state. The reserve is serialized because
 	// it gates same-frame production before the next AI refresh.
