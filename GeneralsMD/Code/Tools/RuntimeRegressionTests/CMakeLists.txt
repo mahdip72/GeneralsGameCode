@@ -54,6 +54,9 @@ set_tests_properties(z_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)
 add_test(NAME z_skirmish_ai_recovery_tests COMMAND z_runtime_regression_tests --skirmish-ai-recovery)
 set_tests_properties(z_skirmish_ai_recovery_tests PROPERTIES TIMEOUT 30)
 
+add_test(NAME z_skirmish_ai_strategy_tests COMMAND z_runtime_regression_tests --skirmish-ai-strategy)
+set_tests_properties(z_skirmish_ai_strategy_tests PROPERTIES TIMEOUT 30)
+
 add_test(NAME z_skirmish_ai_runner_contract_tests COMMAND z_runtime_regression_tests --skirmish-ai-runner-contract)
 set_tests_properties(z_skirmish_ai_runner_contract_tests PROPERTIES TIMEOUT 30)
 
@@ -174,6 +177,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD
 	set_tests_properties(
 		z_skirmish_ai_replay_epoch_tests
 		z_skirmish_ai_recovery_tests
+		z_skirmish_ai_strategy_tests
 		z_skirmish_ai_runner_contract_tests
 		z_skirmish_ai_legacy_save_selection_tests
 		z_native_logical_audio_tests

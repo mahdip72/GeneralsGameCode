@@ -28,6 +28,7 @@
 
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
+#include <algorithm>
 
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
@@ -51,6 +52,7 @@
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/TerrainLogic.h"
 #include "GameLogic/Module/AIUpdate.h"
+#include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/Module/ContainModule.h"
 #include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
@@ -75,6 +77,324 @@ static Bool ShouldUseCurrentSkirmishAIBehavior()
 	return ShouldUseSkirmishAICurrentBehavior(
 		TheGameLogic->isInReplayGame(),
 		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+static Bool ShouldUseCurrentSkirmishAIStrategyControllerBehavior()
+{
+	return TheGameLogic && ShouldUseSkirmishAIStrategyBehavior(
+		TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+static Int ClampSkirmishStrategyPercent(Int value)
+{
+	if (value < 0)
+		return 0;
+	if (value > 100)
+		return 100;
+	return value;
+}
+
+static Int GetSkirmishStrategyHealthPercent(const Object *object)
+{
+	if (!object || !object->getBodyModule())
+		return 100;
+	const Real maximum = object->getBodyModule()->getMaxHealth();
+	if (maximum <= 0.0f)
+		return 100;
+	return ClampSkirmishStrategyPercent(
+		(Int)(object->getBodyModule()->getHealth() * 100.0f / maximum + 0.5f));
+}
+
+static Int AddSkirmishStrategyValue(Int total, Int value)
+{
+	if (value <= 0)
+		return total;
+	if (total > 2147483647 - value)
+		return 2147483647;
+	return total + value;
+}
+
+static Int GetSkirmishStrategyValuePercent(Int value, Int scale)
+{
+	if (value <= 0)
+		return 0;
+	if (scale <= 0 || value >= scale)
+		return 100;
+	return ClampSkirmishStrategyPercent(
+		(Int)((__int64)value * 100 / scale));
+}
+
+static Int GetSkirmishStrategyCategoryPercent(
+	Int healthTotal, Int expectedCount)
+{
+	if (expectedCount <= 0)
+		return 100;
+	return ClampSkirmishStrategyPercent(
+		(Int)((__int64)healthTotal / expectedCount));
+}
+
+static Bool IsSkirmishStrategyCombatObject(const Object *object)
+{
+	return object && !object->isKindOf(KINDOF_STRUCTURE) &&
+		!object->isKindOf(KINDOF_DOZER) &&
+		!object->isKindOf(KINDOF_HARVESTER) &&
+		!object->isKindOf(KINDOF_PROJECTILE) &&
+		!object->isKindOf(KINDOF_MINE) &&
+		!object->isKindOf(KINDOF_INERT) && object->isAbleToAttack();
+}
+
+static Bool IsSkirmishStrategyStaticTarget(const Object *object)
+{
+	return object && object->isKindOf(KINDOF_STRUCTURE) &&
+		object->isKindOf(KINDOF_IMMOBILE) && !object->isContained();
+}
+
+enum {
+	MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES = 4,
+	MAX_SKIRMISH_STRATEGY_GROUND_PROBES_PER_TARGET = 4,
+	MAX_SKIRMISH_STRATEGY_QUICK_PATH_QUERIES = 16
+};
+
+struct SkirmishStrategyCapabilityCandidate
+{
+	Object *object;
+	Int value;
+};
+
+static Bool IsSkirmishStrategyOffensiveTeamType(
+	Team *team, Player *player)
+{
+	if (!team || !player || team == player->getDefaultTeam())
+		return false;
+	const TeamPrototype *prototype = team->getPrototype();
+	const TeamTemplateInfo *info = prototype ?
+		prototype->getTemplateInfo() : 0;
+	return info && !info->m_isBaseDefense && !info->m_isPerimeterDefense;
+}
+
+static Bool IsSkirmishStrategyOffensiveTeam(Team *team, Player *player)
+{
+	return IsSkirmishStrategyOffensiveTeamType(team, player) &&
+		team->isActive();
+}
+
+static Bool IsSkirmishStrategyPotentialOffensiveRecipient(
+	Object *object, Player *player, Team *team)
+{
+	return object && player && object->getControllingPlayer() == player &&
+		object->getTeam() == team &&
+		!object->isEffectivelyDead() && !object->isDestroyed() &&
+		!object->testStatus(OBJECT_STATUS_SOLD) &&
+		!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+		!object->isContained() &&
+		IsSkirmishStrategyCombatObject(object) && object->getAIUpdateInterface();
+}
+
+static Bool IsSkirmishStrategyOffensiveRecipient(
+	Object *object, Player *player)
+{
+	Team *team = object ? object->getTeam() : 0;
+	return IsSkirmishStrategyPotentialOffensiveRecipient(
+		object, player, team) && IsSkirmishStrategyOffensiveTeam(team, player);
+}
+
+static void InsertSkirmishStrategyTargetCandidate(
+	SkirmishStrategyCapabilityCandidate *candidates, Int *candidateCount,
+	Object *object, Int value)
+{
+	Int insertAt = *candidateCount;
+	Int index;
+	for (index = 0; index < *candidateCount; ++index) {
+		if (value > candidates[index].value ||
+			(value == candidates[index].value &&
+			 object->getID() < candidates[index].object->getID())) {
+			insertAt = index;
+			break;
+		}
+	}
+	if (insertAt >= MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES)
+		return;
+	Int last = *candidateCount < MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES ?
+		*candidateCount : MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES - 1;
+	for (index = last; index > insertAt; --index)
+		candidates[index] = candidates[index - 1];
+	candidates[insertAt].object = object;
+	candidates[insertAt].value = value;
+	if (*candidateCount < MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES)
+		++(*candidateCount);
+}
+
+static Bool IsSkirmishStrategyCapabilityCandidateBefore(
+	const SkirmishStrategyCapabilityCandidate &left,
+	const SkirmishStrategyCapabilityCandidate &right)
+{
+	return left.value > right.value ||
+		(left.value == right.value && left.object->getID() < right.object->getID());
+}
+
+static void SortSkirmishStrategyCapabilityCandidates(
+	std::vector<SkirmishStrategyCapabilityCandidate> *candidates)
+{
+	std::sort(candidates->begin(), candidates->end(),
+		IsSkirmishStrategyCapabilityCandidateBefore);
+}
+
+static void AppendSkirmishStrategyCapabilityCandidate(
+	std::vector<SkirmishStrategyCapabilityCandidate> *candidates,
+	Object *object, Int value)
+{
+	size_t index;
+	for (index = 0; index < candidates->size(); ++index) {
+		if ((*candidates)[index].object->getID() == object->getID())
+			return;
+	}
+	SkirmishStrategyCapabilityCandidate candidate;
+	candidate.object = object;
+	candidate.value = value;
+	candidates->push_back(candidate);
+}
+
+static Bool IsSkirmishStrategyReadyTeamActivationDue(
+	const TeamInQueue *readyTeam)
+{
+	if (!readyTeam || readyTeam->m_reinforcement || !readyTeam->m_team ||
+		!readyTeam->m_team->getPrototype())
+		return false;
+	Bool allIdle = readyTeam->m_team->isIdle();
+	Bool anyIdle = false;
+	{
+		for (DLINK_ITERATOR<Object> member =
+				readyTeam->m_team->iterate_TeamMemberList();
+			!member.done(); member.advance()) {
+			Object *object = member.cur();
+			if (object && object->getAI() && object->getAI()->isIdle())
+				anyIdle = true;
+		}
+	}
+	const TeamTemplateInfo *info =
+		readyTeam->m_team->getPrototype()->getTemplateInfo();
+	if (anyIdle && info && info->m_executeActions) {
+		const Script *script = TheScriptEngine->findScriptByName(
+			info->m_productionCondition);
+		if (script && script->getAction())
+			allIdle = true;
+	}
+	if (readyTeam->m_frameStarted + 60 * LOGICFRAMES_PER_SECOND <
+		TheGameLogic->getFrame())
+		allIdle = true;
+	return allIdle;
+}
+
+static Bool HasSkirmishStrategyTargetCapability(
+	Object *target,
+	const std::vector<SkirmishStrategyCapabilityCandidate> &airAttackers,
+	const std::vector<SkirmishStrategyCapabilityCandidate> &groundAttackers,
+	Int *quickPathQueryCount)
+{
+	size_t index;
+	for (index = 0; index < airAttackers.size(); ++index) {
+		if (airAttackers[index].object->getAbleToAttackSpecificObject(
+				ATTACK_NEW_TARGET, target, CMD_FROM_AI) != ATTACKRESULT_NOT_POSSIBLE)
+			return true;
+	}
+	if (!TheAI || !TheAI->pathfinder())
+		return false;
+	Int capableGroundProbeCount = 0;
+	for (index = 0; index < groundAttackers.size(); ++index) {
+		Object *attacker = groundAttackers[index].object;
+		if (attacker->getAbleToAttackSpecificObject(
+				ATTACK_NEW_TARGET, target, CMD_FROM_AI) == ATTACKRESULT_NOT_POSSIBLE)
+			continue;
+		if (capableGroundProbeCount >= MAX_SKIRMISH_STRATEGY_GROUND_PROBES_PER_TARGET)
+			break;
+		if (*quickPathQueryCount >= MAX_SKIRMISH_STRATEGY_QUICK_PATH_QUERIES)
+			return false;
+		++capableGroundProbeCount;
+		++(*quickPathQueryCount);
+		AIUpdateInterface *ai = attacker->getAIUpdateInterface();
+		if (ai && TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+				ai->getLocomotorSet(), attacker->getPosition(), target->getPosition()))
+			return true;
+	}
+	return false;
+}
+
+struct SkirmishStrategyGroupRecipientContext
+{
+	Player *player;
+	AIGroup *group;
+	Bool found;
+};
+
+static void CollectSkirmishStrategyGroupRecipient(Object *object, void *userData)
+{
+	SkirmishStrategyGroupRecipientContext *context =
+		(SkirmishStrategyGroupRecipientContext *)userData;
+	if (!context || !IsSkirmishStrategyOffensiveRecipient(object, context->player))
+		return;
+	context->found = true;
+	if (context->group)
+		context->group->add(object);
+}
+
+static Bool IsSkirmishStrategyIntelEligible(
+	const Object *object, const Player *observer)
+{
+	if (!object || !observer)
+		return false;
+	const ObjectShroudStatus shroud =
+		object->getShroudedStatus(observer->getPlayerIndex());
+	const Bool visible = shroud == OBJECTSHROUD_CLEAR ||
+		shroud == OBJECTSHROUD_PARTIAL_CLEAR;
+	if (!visible)
+		return false;
+	return IsSkirmishAIIntelEligible(
+		object->isKindOf(KINDOF_STRUCTURE), visible, false,
+		object->testStatus(OBJECT_STATUS_STEALTHED),
+		object->testStatus(OBJECT_STATUS_DETECTED),
+		object->testStatus(OBJECT_STATUS_MASKED));
+}
+
+struct SkirmishStrategyExpectedAssets
+{
+	Int commandCenters;
+	Int economyStructures;
+	Int powerStructures;
+	Int productionStructures;
+};
+
+static SkirmishStrategyExpectedAssets GetSkirmishStrategyExpectedAssets(
+	Player *player)
+{
+	SkirmishStrategyExpectedAssets result;
+	result.commandCenters = 0;
+	result.economyStructures = 0;
+	result.powerStructures = 0;
+	result.productionStructures = 0;
+	for (BuildListInfo *info = player ? player->getBuildList() : nullptr;
+		info; info = info->getNext()) {
+		const ThingTemplate *plan =
+			TheThingFactory->findTemplate(info->getTemplateName());
+		if (!plan)
+			continue;
+		if (plan->isKindOf(KINDOF_COMMANDCENTER))
+			++result.commandCenters;
+		else if (plan->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+			plan->isKindOf(KINDOF_CASH_GENERATOR))
+			++result.economyStructures;
+		else if (plan->isKindOf(KINDOF_FS_POWER) &&
+			!plan->isKindOf(KINDOF_CASH_GENERATOR))
+			++result.powerStructures;
+		else if (plan->isKindOf(KINDOF_FS_BARRACKS) ||
+			plan->isKindOf(KINDOF_FS_WARFACTORY) ||
+			plan->isKindOf(KINDOF_FS_AIRFIELD))
+			++result.productionStructures;
+	}
+	if (result.commandCenters < 1)
+		result.commandCenters = 1;
+	return result;
 }
 
 static Bool ShouldUseCurrentSkirmishAIRecoveryNativeHoleOwnership()
@@ -646,6 +966,8 @@ m_curRightFlankRightDefenseAngle(0),
 	m_frameLastBuildingBuilt = TheGameLogic->getFrame();
 	m_recoveryLocation.zero();
 	m_recoveryAngle = 0.0f;
+	InitializeSkirmishStrategyState(
+		&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
 	p->setCanBuildUnits(true); // turn on ai production by default.
 }
 
@@ -1064,11 +1386,20 @@ Bool AISkirmishPlayer::hasRecoveryBuilderQueued(
 		if (!team)
 			continue;
 		for (WorkOrder *order = team->m_workOrders; order; order = order->m_next) {
-			if (!order->m_thing || !order->m_thing->isKindOf(KINDOF_DOZER) ||
-				!HasSkirmishAICommandSetForTemplate(
-					order->m_thing->friend_getCommandSetString(), primaryTemplate) ||
-				order->m_numCompleted >= order->m_numRequired ||
-				order->m_factoryID != INVALID_ID)
+			const Bool compatibleOrder = order->m_thing &&
+				order->m_thing->isKindOf(KINDOF_DOZER) &&
+				HasSkirmishAICommandSetForTemplate(
+					order->m_thing->friend_getCommandSetString(), primaryTemplate);
+			const Bool reusable = ShouldUseCurrentSkirmishAIStrategyControllerBehavior()
+				? IsSkirmishAIRecoveryReusableWorkOrder(
+					order->m_factoryID == INVALID_ID,
+					compatibleOrder,
+					order->m_numCompleted < order->m_numRequired,
+					team->m_team == m_player->getDefaultTeam(),
+					team->m_reinforcement)
+				: order->m_factoryID == INVALID_ID && compatibleOrder &&
+					order->m_numCompleted < order->m_numRequired;
+			if (!reusable)
 				continue;
 			if (factoryID)
 				*factoryID = order->m_factoryID;
@@ -1538,6 +1869,11 @@ Bool AISkirmishPlayer::prepareCriticalRecoveryBuilder(Object *builder)
 	if (!ai || !dozerAI ||
 		!CanSkirmishAIRecoveryUpdateAdvance(builder, ai))
 		return false;
+	if (ShouldUseCurrentSkirmishAIStrategyControllerBehavior()) {
+		Team *defaultTeam = m_player->getDefaultTeam();
+		if (defaultTeam && builder->getTeam() != defaultTeam)
+			builder->setTeam(defaultTeam);
+	}
 	// A recovery-funded GLA worker may still carry the resource order's forced
 	// supply transition.  Clear it before that transition resets the build task.
 	SupplyTruckAIInterface *supplyAI = ai->getSupplyTruckAIInterface();
@@ -1732,8 +2068,15 @@ void AISkirmishPlayer::enterRecoveryLastStand(Bool permanent)
 		TheGameLogic->getFrame(), 2 * LOGICFRAMES_PER_SECOND);
 	for (Object *object = TheGameLogic->getFirstObject(); object;
 		object = object->getNextObject()) {
-		if (!IsLiveSkirmishAIRecoveryObject(object, m_player) ||
-			object->isKindOf(KINDOF_IMMOBILE) || !object->isAbleToAttack())
+		const Bool currentCandidate = IsSkirmishAIRecoveryLastStandCombatCandidate(
+			IsLiveSkirmishAIRecoveryObject(object, m_player),
+			object->isKindOf(KINDOF_IMMOBILE),
+			object->isKindOf(KINDOF_DOZER),
+			object->isKindOf(KINDOF_HARVESTER), object->isAbleToAttack());
+		const Bool legacyCandidate = IsLiveSkirmishAIRecoveryObject(object, m_player) &&
+			!object->isKindOf(KINDOF_IMMOBILE) && object->isAbleToAttack();
+		if (ShouldUseCurrentSkirmishAIStrategyControllerBehavior()
+				? !currentCandidate : !legacyCandidate)
 			continue;
 		AIUpdateInterface *ai = object->getAIUpdateInterface();
 		if (ai) {
@@ -3040,6 +3383,7 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 
 	WorkOrder *recoveryOrder = nullptr;
 	Bool recoveryOrderWasResourceGatherer = false;
+	Bool recoveryOrderWasForeignTeam = false;
 	Bool startDirectRecoveryResourceGathering = false;
 	SupplyTruckAIInterface *directRecoverySupplyAI = nullptr;
 	if (producedRecoveryReplacement) {
@@ -3059,6 +3403,8 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 					unit->getTemplate()->isEquivalentTo(order->m_thing)) {
 					recoveryOrder = order;
 					recoveryOrderWasResourceGatherer = order->m_isResourceGatherer;
+					recoveryOrderWasForeignTeam =
+						team->m_team != m_player->getDefaultTeam();
 					break;
 				}
 			}
@@ -3088,6 +3434,14 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 		recoveryOrder->m_isResourceGatherer = recoveryOrderWasResourceGatherer;
 	else if (startDirectRecoveryResourceGathering && directRecoverySupplyAI)
 		directRecoverySupplyAI->setForceWantingState(true);
+	if (ShouldUseCurrentSkirmishAIStrategyControllerBehavior() &&
+		producedRecoveryReplacement && recoveryOrderWasForeignTeam && unit &&
+		m_player && m_player->getDefaultTeam()) {
+		unit->setTeam(m_player->getDefaultTeam());
+		AIUpdateInterface *recoveryAI = unit->getAIUpdateInterface();
+		if (recoveryAI)
+			recoveryAI->aiIdle(CMD_FROM_AI);
+	}
 #if defined(_MSC_VER) && _MSC_VER < 1300
 	// The retail-compatible base callback initializes its local supply flag true.
 	// A direct recovery queue has no WorkOrder to clear that flag, so preserve
@@ -3795,6 +4149,442 @@ SkirmishAIDecisionDifficulty AISkirmishPlayer::getDecisionDifficulty() const
 	if (m_difficulty == DIFFICULTY_NORMAL)
 		return SKIRMISH_AI_DIFFICULTY_NORMAL;
 	return SKIRMISH_AI_DIFFICULTY_HARD;
+}
+
+Bool AISkirmishPlayer::usesStrategyBehavior() const
+{
+	if (!m_player || m_player->getPlayerType() != PLAYER_COMPUTER ||
+		!TheGameLogic)
+		return false;
+	const Bool replay = TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: TheGameLogic->getGameMode();
+	if (!IsSkirmishAIRecoveryGameMode(gameMode))
+		return false;
+	return ShouldUseSkirmishAIStrategyBehavior(
+		replay, TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+void AISkirmishPlayer::collectStrategyMetrics(
+	SkirmishStrategyMetrics *metrics, ObjectID *strategicTargetID)
+{
+	metrics->economyHealth = 0;
+	metrics->baseIntegrity = 0;
+	metrics->armyReadiness = 0;
+	metrics->immediateThreat = 0;
+	metrics->attackConfidence = 0;
+	metrics->enemyOpportunity = 0;
+	metrics->alliedDistress = 0;
+	metrics->availableCombatValue = 0;
+	metrics->hasStrategicTarget = false;
+	metrics->assaultLostHalfForce = false;
+	metrics->assaultObjectiveComplete = false;
+	metrics->viableAssaultForceAssembled = false;
+	*strategicTargetID = INVALID_ID;
+
+	const SkirmishStrategyExpectedAssets expected =
+		GetSkirmishStrategyExpectedAssets(m_player);
+	Int commandHealth = 0;
+	Int economyHealth = 0;
+	Int powerHealth = 0;
+	Int productionHealth = 0;
+	Int ownCombatValue = 0;
+	Int ownLocalCombatValue = 0;
+	Int enemyCombatValue = 0;
+	Int enemyLocalCombatValue = 0;
+	Int knownOpportunityValue = 0;
+	std::vector<SkirmishStrategyCapabilityCandidate> groundAttackers;
+	std::vector<SkirmishStrategyCapabilityCandidate> airAttackers;
+	SkirmishStrategyCapabilityCandidate
+		targetCandidates[MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES];
+	Int targetCandidateCount = 0;
+	Object *persistedTarget = nullptr;
+	Player *enemy = m_currentEnemy;
+	const Bool retainObservedTarget =
+		m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+		m_strategyState.strategicTargetID != INVALID_ID &&
+		IsSkirmishStrategyTargetObservationAvailable(
+			m_strategyState.strategicTargetObserved, TheGameLogic->getFrame(),
+			m_strategyState.strategicTargetLastSeenFrame);
+	Bool persistedTargetVisible = false;
+	const Real threatRadius = (m_baseRadius > 0.0f ? m_baseRadius : 0.0f) + 500.0f;
+	const Real threatRadiusSquared = threatRadius * threatRadius;
+
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		const Bool isPersistedAssaultTarget =
+			(m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT ||
+			 m_strategyState.pendingMode == SKIRMISH_STRATEGY_ASSAULT) &&
+			m_strategyState.strategicTargetID != INVALID_ID &&
+			object->getID() == m_strategyState.strategicTargetID;
+		if (isPersistedAssaultTarget &&
+			!IsSkirmishStrategyIntelEligible(object, m_player))
+			continue;
+		if (isPersistedAssaultTarget) {
+			persistedTargetVisible = true;
+			metrics->assaultObjectiveComplete = object->isEffectivelyDead() ||
+				object->isDestroyed() || object->testStatus(OBJECT_STATUS_SOLD) ||
+				!enemy || object->getControllingPlayer() != enemy;
+			if (!metrics->assaultObjectiveComplete &&
+				IsSkirmishStrategyStaticTarget(object))
+				persistedTarget = object;
+		}
+		if (!object || object->isEffectivelyDead() || object->isDestroyed() ||
+			object->testStatus(OBJECT_STATUS_SOLD))
+			continue;
+		Player *owner = object->getControllingPlayer();
+		if (owner == m_player) {
+			const Int health = GetSkirmishStrategyHealthPercent(object);
+			if (object->isKindOf(KINDOF_COMMANDCENTER))
+				commandHealth = AddSkirmishStrategyValue(commandHealth, health);
+			else if (object->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+				object->isKindOf(KINDOF_CASH_GENERATOR))
+				economyHealth = AddSkirmishStrategyValue(economyHealth, health);
+			else if (object->isKindOf(KINDOF_FS_POWER) &&
+				!object->isKindOf(KINDOF_CASH_GENERATOR))
+				powerHealth = AddSkirmishStrategyValue(powerHealth, health);
+			else if (object->isKindOf(KINDOF_FS_BARRACKS) ||
+				object->isKindOf(KINDOF_FS_WARFACTORY) ||
+				object->isKindOf(KINDOF_FS_AIRFIELD))
+				productionHealth = AddSkirmishStrategyValue(productionHealth, health);
+
+			if (IsSkirmishStrategyCombatObject(object) && !object->isContained()) {
+				const Int cost = object->getTemplate()->calcCostToBuild(m_player);
+				const Int value = cost > 0 ?
+					(Int)((__int64)cost * health / 100) : 0;
+				ownCombatValue = AddSkirmishStrategyValue(ownCombatValue, value);
+				if (m_baseCenterSet) {
+					const Real dx = object->getPosition()->x - m_baseCenter.x;
+					const Real dy = object->getPosition()->y - m_baseCenter.y;
+					if (dx * dx + dy * dy <= threatRadiusSquared)
+						ownLocalCombatValue = AddSkirmishStrategyValue(
+							ownLocalCombatValue, value);
+				}
+				if (IsSkirmishStrategyOffensiveRecipient(object, m_player)) {
+					if (object->isKindOf(KINDOF_AIRCRAFT))
+						AppendSkirmishStrategyCapabilityCandidate(
+							&airAttackers, object, value);
+					else
+						AppendSkirmishStrategyCapabilityCandidate(
+							&groundAttackers, object, value);
+				}
+			}
+			continue;
+		}
+
+		if (!owner || !IsSkirmishStrategyIntelEligible(object, m_player))
+			continue;
+		const Int health = GetSkirmishStrategyHealthPercent(object);
+		const Int cost = object->getTemplate()->calcCostToBuild(owner);
+		const Int value = cost > 0 ?
+			(Int)((__int64)cost * health / 100) : 0;
+		Team *ownerDefaultTeam = owner->getDefaultTeam();
+		if (ownerDefaultTeam &&
+			m_player->getRelationship(ownerDefaultTeam) == ENEMIES &&
+			IsSkirmishStrategyCombatObject(object) && m_baseCenterSet) {
+			const Real dx = object->getPosition()->x - m_baseCenter.x;
+			const Real dy = object->getPosition()->y - m_baseCenter.y;
+			if (dx * dx + dy * dy <= threatRadiusSquared)
+				enemyLocalCombatValue = AddSkirmishStrategyValue(
+					enemyLocalCombatValue, value);
+		}
+		if (!enemy || owner != enemy)
+			continue;
+		if (IsSkirmishStrategyCombatObject(object))
+			enemyCombatValue = AddSkirmishStrategyValue(enemyCombatValue, value);
+		if (object->isKindOf(KINDOF_STRUCTURE) ||
+			object->isKindOf(KINDOF_HARVESTER))
+			knownOpportunityValue = AddSkirmishStrategyValue(
+				knownOpportunityValue, value);
+		if (IsSkirmishStrategyStaticTarget(object)) {
+			InsertSkirmishStrategyTargetCandidate(
+				targetCandidates, &targetCandidateCount, object, value);
+		}
+	}
+	if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY) {
+		for (DLINK_ITERATOR<TeamInQueue> ready = iterate_TeamReadyQueue();
+			!ready.done(); ready.advance()) {
+			TeamInQueue *readyTeam = ready.cur();
+			Team *team = readyTeam ? readyTeam->m_team : 0;
+			if (!IsSkirmishStrategyOffensiveTeamType(team, m_player) ||
+				!IsSkirmishStrategyReadyTeamActivationDue(readyTeam))
+				continue;
+			for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+				!member.done(); member.advance()) {
+				Object *readyObject = member.cur();
+				if (!IsSkirmishStrategyPotentialOffensiveRecipient(
+						readyObject, m_player, team))
+					continue;
+				const Int health = GetSkirmishStrategyHealthPercent(readyObject);
+				const Int cost = readyObject->getTemplate()->calcCostToBuild(m_player);
+				const Int value = cost > 0 ?
+					(Int)((__int64)cost * health / 100) : 0;
+				if (readyObject->isKindOf(KINDOF_AIRCRAFT))
+					AppendSkirmishStrategyCapabilityCandidate(
+						&airAttackers, readyObject, value);
+				else
+					AppendSkirmishStrategyCapabilityCandidate(
+						&groundAttackers, readyObject, value);
+			}
+		}
+	}
+	SortSkirmishStrategyCapabilityCandidates(&airAttackers);
+	SortSkirmishStrategyCapabilityCandidates(&groundAttackers);
+
+	const Int poor = TheAI->getAiData()->m_resourcesPoor > 0 ?
+		TheAI->getAiData()->m_resourcesPoor : 2500;
+	const __int64 fallbackWealthy = (__int64)poor * 4;
+	const Int wealthy = TheAI->getAiData()->m_resourcesWealthy > poor ?
+		TheAI->getAiData()->m_resourcesWealthy :
+		(Int)(fallbackWealthy > 2147483647 ? 2147483647 : fallbackWealthy);
+	const Int money = m_player->getMoney()->countMoney();
+	Int cashScore = 0;
+	if (money <= poor)
+		cashScore = ClampSkirmishStrategyPercent(
+			(Int)((__int64)(money > 0 ? money : 0) * 50 / poor));
+	else if (money >= wealthy)
+		cashScore = 100;
+	else
+		cashScore = 50 +
+			(Int)((__int64)(money - poor) * 50 / (wealthy - poor));
+	const Int economyStructureScore = GetSkirmishStrategyCategoryPercent(
+		economyHealth, expected.economyStructures);
+	metrics->economyHealth = ClampSkirmishStrategyPercent(
+		(60 * cashScore + 40 * economyStructureScore) / 100);
+
+	Int baseWeighted = 35 * GetSkirmishStrategyCategoryPercent(
+		commandHealth, expected.commandCenters);
+	Int baseWeight = 35;
+	if (expected.economyStructures > 0) {
+		baseWeighted += 20 * economyStructureScore;
+		baseWeight += 20;
+	}
+	if (expected.powerStructures > 0) {
+		baseWeighted += 15 * GetSkirmishStrategyCategoryPercent(
+			powerHealth, expected.powerStructures);
+		baseWeight += 15;
+	}
+	if (expected.productionStructures > 0) {
+		baseWeighted += 30 * GetSkirmishStrategyCategoryPercent(
+			productionHealth, expected.productionStructures);
+		baseWeight += 30;
+	}
+	metrics->baseIntegrity = ClampSkirmishStrategyPercent(
+		baseWeight > 0 ? baseWeighted / baseWeight : 0);
+	metrics->armyReadiness = GetSkirmishStrategyValuePercent(
+		ownCombatValue, wealthy);
+	metrics->availableCombatValue = ownCombatValue;
+	metrics->assaultLostHalfForce =
+		m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+		m_strategyState.assaultEntryCombatValue > 0 &&
+		(__int64)ownCombatValue * 2 <= m_strategyState.assaultEntryCombatValue;
+
+	const Int absoluteThreat = GetSkirmishStrategyValuePercent(
+		enemyLocalCombatValue, poor);
+	Int relativeThreat = 0;
+	if (enemyLocalCombatValue > 0)
+		relativeThreat = ClampSkirmishStrategyPercent(
+			(Int)((__int64)enemyLocalCombatValue * 100 /
+				((__int64)enemyLocalCombatValue + ownLocalCombatValue)));
+	metrics->immediateThreat = absoluteThreat > relativeThreat ?
+		absoluteThreat : relativeThreat;
+	const UnsignedInt attackedFrame = m_player->getAttackedFrame();
+	if (attackedFrame != 0 &&
+		TheGameLogic->getFrame() - attackedFrame <= 10 * LOGICFRAMES_PER_SECOND &&
+		metrics->immediateThreat < 60)
+		metrics->immediateThreat = 60;
+
+	Int forceConfidence = 75;
+	if (enemyCombatValue > 0)
+		forceConfidence = ClampSkirmishStrategyPercent(
+			(Int)((__int64)ownCombatValue * 100 /
+				((__int64)ownCombatValue + enemyCombatValue)));
+	const Bool preserveHiddenTarget = retainObservedTarget &&
+		!persistedTargetVisible;
+	Object *selectedTarget = nullptr;
+	Int quickPathQueryCount = 0;
+	Int targetAttemptCount = 0;
+	if (!preserveHiddenTarget && persistedTarget) {
+		++targetAttemptCount;
+		if (HasSkirmishStrategyTargetCapability(
+				persistedTarget, airAttackers, groundAttackers,
+				&quickPathQueryCount))
+			selectedTarget = persistedTarget;
+	}
+	if (!preserveHiddenTarget && !selectedTarget) {
+		Int candidateIndex;
+		for (candidateIndex = 0;
+			candidateIndex < targetCandidateCount &&
+				targetAttemptCount < MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES;
+			++candidateIndex) {
+			Object *candidate = targetCandidates[candidateIndex].object;
+			if (candidate == persistedTarget)
+				continue;
+			++targetAttemptCount;
+			if (HasSkirmishStrategyTargetCapability(
+					candidate, airAttackers, groundAttackers,
+					&quickPathQueryCount)) {
+				selectedTarget = candidate;
+				break;
+			}
+		}
+	}
+	const Bool routeAvailable = selectedTarget != nullptr;
+	const Bool hasVisibleTargetCandidate =
+		persistedTarget != nullptr || targetCandidateCount > 0;
+	const Int routeConfidence = preserveHiddenTarget ? 50 :
+		(hasVisibleTargetCandidate ? (routeAvailable ? 100 : 20) : 50);
+	metrics->attackConfidence = ClampSkirmishStrategyPercent(
+		(70 * forceConfidence + 30 * routeConfidence) / 100);
+	metrics->enemyOpportunity = GetSkirmishStrategyValuePercent(
+		knownOpportunityValue, wealthy);
+	metrics->viableAssaultForceAssembled = metrics->armyReadiness >= 70;
+	metrics->hasStrategicTarget = preserveHiddenTarget || routeAvailable;
+	if (routeAvailable)
+		*strategicTargetID = selectedTarget->getID();
+}
+
+void AISkirmishPlayer::commandOffensiveTeams(
+	SkirmishStrategyMode mode, Object *target)
+{
+	if (!TheAI || !m_player)
+		return;
+	std::vector<Team *> teams;
+	Player::PlayerTeamList::const_iterator prototype;
+	for (prototype = m_player->getPlayerTeams()->begin();
+		prototype != m_player->getPlayerTeams()->end(); ++prototype) {
+		for (DLINK_ITERATOR<Team> teamInstance =
+				(*prototype)->iterate_TeamInstanceList();
+			!teamInstance.done(); teamInstance.advance()) {
+			Team *candidate = teamInstance.cur();
+			if (IsSkirmishStrategyOffensiveTeam(candidate, m_player) &&
+				candidate->hasAnyObjects()) {
+				SkirmishStrategyGroupRecipientContext context;
+				context.player = m_player;
+				context.group = 0;
+				context.found = false;
+				candidate->iterateObjects(
+					CollectSkirmishStrategyGroupRecipient, &context);
+				if (context.found)
+					teams.push_back(candidate);
+			}
+		}
+	}
+	size_t i;
+	for (i = 1; i < teams.size(); ++i) {
+		Team *candidate = teams[i];
+		size_t position = i;
+		while (position > 0 && candidate->getID() < teams[position - 1]->getID()) {
+			teams[position] = teams[position - 1];
+			--position;
+		}
+		teams[position] = candidate;
+	}
+	std::vector<Team *>::iterator teamIterator;
+	for (teamIterator = teams.begin();
+		teamIterator != teams.end(); ++teamIterator) {
+		AIGroupPtr group = TheAI->createGroup();
+		if (!group)
+			continue;
+#if RETAIL_COMPATIBLE_AIGROUP
+		AIGroup *groupObject = group;
+#else
+		AIGroup *groupObject = group.Peek();
+#endif
+		SkirmishStrategyGroupRecipientContext context;
+		context.player = m_player;
+		context.group = groupObject;
+		context.found = false;
+		(*teamIterator)->iterateObjects(
+			CollectSkirmishStrategyGroupRecipient, &context);
+		if (!context.found)
+			continue;
+		if (mode == SKIRMISH_STRATEGY_BALANCED) {
+			group->groupIdle(CMD_FROM_AI);
+		} else if (mode == SKIRMISH_STRATEGY_FORTIFY) {
+			if (m_baseCenterSet)
+				group->groupGuardPosition(
+					&m_baseCenter, GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+			else
+				group->groupIdle(CMD_FROM_AI);
+		} else if (mode == SKIRMISH_STRATEGY_ASSAULT) {
+			if (target)
+				group->groupAttackMoveToPosition(
+					target->getPosition(), NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+			else
+				group->groupIdle(CMD_FROM_AI);
+		}
+	}
+}
+
+void AISkirmishPlayer::applyStrategyMode(
+	SkirmishStrategyMode previousMode, SkirmishStrategyMode currentMode,
+	ObjectID previousTargetID)
+{
+	// Strategy commands are transition impulses.  Native team scripts retain
+	// ownership on later frames; stable modes must not keep overwriting them.
+	if (previousMode == currentMode &&
+		(currentMode != SKIRMISH_STRATEGY_ASSAULT ||
+		 previousTargetID == m_strategyState.strategicTargetID))
+		return;
+	Object *target = currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+		m_strategyState.strategicTargetID != INVALID_ID
+		? TheGameLogic->findObjectByID(m_strategyState.strategicTargetID) : nullptr;
+	if (target && !IsSkirmishStrategyIntelEligible(target, m_player))
+		target = nullptr;
+	if (target && (!IsSkirmishStrategyStaticTarget(target) ||
+		 target->isEffectivelyDead() || target->isDestroyed() ||
+		 target->testStatus(OBJECT_STATUS_SOLD) || !m_currentEnemy ||
+		 target->getControllingPlayer() != m_currentEnemy))
+		target = nullptr;
+	if (currentMode == SKIRMISH_STRATEGY_ASSAULT && !target)
+		ClearSkirmishStrategyTargetObservation(&m_strategyState);
+	commandOffensiveTeams(currentMode, target);
+}
+
+Bool AISkirmishPlayer::updateStrategy()
+{
+	const UnsignedInt currentFrame = TheGameLogic->getFrame();
+	if (!usesStrategyBehavior() || !IsSkirmishStrategyFrameReached(
+			currentFrame, m_strategyState.nextEvaluationFrame))
+		return false;
+	SkirmishStrategyMetrics metrics;
+	ObjectID targetID = INVALID_ID;
+	collectStrategyMetrics(&metrics, &targetID);
+	const SkirmishStrategyMode previousMode = m_strategyState.currentMode;
+	SkirmishStrategyDecision decision = EvaluateSkirmishStrategy(
+		m_strategyState, metrics, m_difficulty, currentFrame);
+	const Bool leftAssault = previousMode == SKIRMISH_STRATEGY_ASSAULT &&
+		decision.nextState.currentMode != SKIRMISH_STRATEGY_ASSAULT;
+	if (leftAssault) {
+		ClearSkirmishStrategyTargetObservation(&decision.nextState);
+	} else if (targetID != INVALID_ID &&
+		(decision.nextState.currentMode == SKIRMISH_STRATEGY_ASSAULT ||
+		 decision.nextState.pendingMode == SKIRMISH_STRATEGY_ASSAULT)) {
+		decision.nextState.strategicTargetID = targetID;
+		decision.nextState.strategicTargetObserved = true;
+		decision.nextState.strategicTargetLastSeenFrame = currentFrame;
+	} else if (decision.nextState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+		!metrics.hasStrategicTarget) {
+		ClearSkirmishStrategyTargetObservation(&decision.nextState);
+	} else if (decision.nextState.currentMode != SKIRMISH_STRATEGY_ASSAULT) {
+		ClearSkirmishStrategyTargetObservation(&decision.nextState);
+	}
+	m_strategyState = decision.nextState;
+	if (TheGlobalData->m_debugAI && TheScriptEngine && decision.evaluated) {
+		AsciiString message;
+		message.format("AI strategy mode=%d reason=%d E=%d B=%d A=%d T=%d C=%d O=%d L=%d fortify=%u assault=%u",
+			(Int)m_strategyState.currentMode, (Int)decision.reason,
+			metrics.economyHealth, metrics.baseIntegrity, metrics.armyReadiness,
+			metrics.immediateThreat, metrics.attackConfidence,
+			metrics.enemyOpportunity, metrics.alliedDistress,
+			decision.fortifyPressureHundredths,
+			decision.assaultReadinessHundredths);
+		TheScriptEngine->AppendDebugMessage(message, false);
+	}
+	return decision.evaluated;
 }
 
 /**
@@ -4548,6 +5338,26 @@ void AISkirmishPlayer::checkReadyTeams()
 
 //----------------------------------------------------------------------------------------------------------
 /**
+ * Hold completed offensive teams while Fortify is active. Reinforcements and
+ * defensive teams remain available, and permanent recovery last stand releases
+ * every ready team.
+ */
+Bool AISkirmishPlayer::canActivateReadyTeam( const TeamInQueue *team ) const
+{
+	if (!team || !usesStrategyBehavior() ||
+		m_strategyState.currentMode != SKIRMISH_STRATEGY_FORTIFY)
+		return true;
+	if (team->m_reinforcement || m_recoveryImpossible)
+		return true;
+	if (!team->m_team || team->m_team == m_player->getDefaultTeam() ||
+		!team->m_team->getPrototype())
+		return true;
+	const TeamTemplateInfo *info = team->m_team->getPrototype()->getTemplateInfo();
+	return !info || info->m_isBaseDefense || info->m_isPerimeterDefense;
+}
+
+//----------------------------------------------------------------------------------------------------------
+/**
  * See if any queued teams have finished building, or have run out of time.
  */
 void AISkirmishPlayer::checkQueuedTeams()
@@ -4595,9 +5405,31 @@ void AISkirmishPlayer::doTeamBuilding()
  */
 void AISkirmishPlayer::update()
 {
-	if (ShouldUseCurrentSkirmishAIBehavior())
+	const SkirmishStrategyMode previousMode = m_strategyState.currentMode;
+	const ObjectID previousTargetID = m_strategyState.strategicTargetID;
+	Bool strategyEvaluated = false;
+	Bool strategyTargetExpired = false;
+	if (!m_recoveryImpossible && usesStrategyBehavior() &&
+		m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+		m_strategyState.strategicTargetID != INVALID_ID &&
+		m_strategyState.strategicTargetObserved &&
+		!IsSkirmishStrategyTargetObservationAvailable(
+			m_strategyState.strategicTargetObserved, TheGameLogic->getFrame(),
+			m_strategyState.strategicTargetLastSeenFrame)) {
+		// This scalar check runs every frame so the fair target grace is an exact
+		// bound.  Clearing the ID makes command dispatch idle assault groups once.
+		ClearSkirmishStrategyTargetObservation(&m_strategyState);
+		strategyTargetExpired = true;
+	}
+	if (ShouldUseCurrentSkirmishAIBehavior()) {
 		getAiEnemy();
+		if (!m_recoveryImpossible)
+			strategyEvaluated = updateStrategy();
+	}
 	AIPlayer::update();
+	if ((strategyEvaluated || strategyTargetExpired) && !m_recoveryImpossible)
+		applyStrategyMode(
+			previousMode, m_strategyState.currentMode, previousTargetID);
 }
 
 //----------------------------------------------------------------------------------------------------------
@@ -4716,6 +5548,8 @@ void AISkirmishPlayer::adjustBuildList(BuildListInfo *list)
  */
 void AISkirmishPlayer::newMap()
 {
+	InitializeSkirmishStrategyState(
+		&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
 
 	/* Get our proper build list. */
 	AsciiString mySide = m_player->getSide();
@@ -4842,6 +5676,40 @@ Bool AISkirmishPlayer::computeSuperweaponTarget(const SpecialPowerTemplate *powe
 
 }
 
+static void XferSkirmishStrategyState(
+	Xfer *xfer, SkirmishStrategyState *state)
+{
+	Int currentMode = (Int)state->currentMode;
+	Int pendingMode = (Int)state->pendingMode;
+	Int fortifyAttemptStatus = (Int)state->fortifyAttemptStatus;
+	Int superweaponAttemptStatus = (Int)state->superweaponAttemptStatus;
+	xfer->xferInt(&currentMode);
+	xfer->xferInt(&pendingMode);
+	xfer->xferUnsignedInt(&state->modeEntryFrame);
+	xfer->xferUnsignedInt(&state->pendingSinceFrame);
+	xfer->xferUnsignedInt(&state->nextEvaluationFrame);
+	xfer->xferObjectID(&state->strategicTargetID);
+	xfer->xferBool(&state->strategicTargetObserved);
+	xfer->xferUnsignedInt(&state->strategicTargetLastSeenFrame);
+	xfer->xferInt(&fortifyAttemptStatus);
+	xfer->xferInt(&superweaponAttemptStatus);
+	xfer->xferBool(&state->assaultAssemblyDeadlineActive);
+	xfer->xferUnsignedInt(&state->assaultAssemblyDeadlineFrame);
+	xfer->xferBool(&state->alliedCoordinationCooldownActive);
+	xfer->xferUnsignedInt(&state->nextAlliedCoordinationFrame);
+	xfer->xferBool(&state->donationCooldownActive);
+	xfer->xferUnsignedInt(&state->nextDonationFrame);
+	xfer->xferInt(&state->assaultEntryCombatValue);
+	if (xfer->getXferMode() == XFER_LOAD) {
+		state->currentMode = (SkirmishStrategyMode)currentMode;
+		state->pendingMode = (SkirmishStrategyMode)pendingMode;
+		state->fortifyAttemptStatus =
+			(SkirmishStrategyAttemptStatus)fortifyAttemptStatus;
+		state->superweaponAttemptStatus =
+			(SkirmishStrategyAttemptStatus)superweaponAttemptStatus;
+	}
+}
+
 // ------------------------------------------------------------------------------------------------
 /** CRC */
 // ------------------------------------------------------------------------------------------------
@@ -4878,6 +5746,8 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	xfer->xferCoord3D(&m_recoveryLocation);
 	xfer->xferReal(&m_recoveryAngle);
 	xfer->xferInt(&m_recoveryReserveCost);
+	if (ShouldIncludeSkirmishAIStrategyCRCFields(replay, replayEpoch))
+		XferSkirmishStrategyState(xfer, &m_strategyState);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4889,13 +5759,14 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	* 4: Contained-builder evacuation grace deadline
 	* 5: Recovery builder production identity
 	* 6: Recovery builder cancellation ownership
-	* 7: Recovery builder bounded-failover consumption */
+	* 7: Recovery builder bounded-failover consumption
+	* 8: Deterministic skirmish strategy controller state */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 7;
+	XferVersion currentVersion = 8;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -4988,6 +5859,11 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 		m_recoveryBuilderFailoverConsumed =
 			GetSkirmishAIRecoveryBuilderFailoverConsumedForVersion(
 				version, false);
+	if (version >= 8)
+		XferSkirmishStrategyState(xfer, &m_strategyState);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		InitializeOldSaveSkirmishStrategyState(
+			&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
 	m_recoveryAuthorizedThing = nullptr;
 
 }
@@ -5007,6 +5883,37 @@ void AISkirmishPlayer::loadPostProcess()
 	}
 	if (!m_currentEnemy)
 		m_currentEnemyPlayerIndex = -1;
+	if (m_strategyState.currentMode < SKIRMISH_STRATEGY_BALANCED ||
+		m_strategyState.currentMode > SKIRMISH_STRATEGY_ASSAULT ||
+		m_strategyState.pendingMode < SKIRMISH_STRATEGY_NONE ||
+		m_strategyState.pendingMode > SKIRMISH_STRATEGY_ASSAULT) {
+		InitializeOldSaveSkirmishStrategyState(
+			&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
+	}
+	const UnsignedInt currentFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+	if (m_strategyState.strategicTargetID == INVALID_ID ||
+		!m_strategyState.strategicTargetObserved ||
+		(m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT &&
+		 m_strategyState.pendingMode != SKIRMISH_STRATEGY_ASSAULT) ||
+		!IsSkirmishStrategyFrameReached(
+			currentFrame, m_strategyState.strategicTargetLastSeenFrame))
+		ClearSkirmishStrategyTargetObservation(&m_strategyState);
+	if (!TheGameLogic) {
+		ClearSkirmishStrategyTargetObservation(&m_strategyState);
+	} else if (m_strategyState.strategicTargetID != INVALID_ID) {
+		Object *strategyTarget =
+			TheGameLogic->findObjectByID(m_strategyState.strategicTargetID);
+		if (strategyTarget &&
+			IsSkirmishStrategyIntelEligible(strategyTarget, m_player) &&
+			(!IsSkirmishStrategyStaticTarget(strategyTarget) ||
+			 strategyTarget->isEffectivelyDead() || strategyTarget->isDestroyed() ||
+			 strategyTarget->testStatus(OBJECT_STATUS_SOLD) || !m_currentEnemy ||
+			 strategyTarget->getControllingPlayer() != m_currentEnemy))
+			ClearSkirmishStrategyTargetObservation(&m_strategyState);
+	}
+	if (m_strategyState.assaultEntryCombatValue < 0 ||
+		m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT)
+		m_strategyState.assaultEntryCombatValue = 0;
 	m_recoveryAuthorizedThing = nullptr;
 	if (m_recoveryPlacementAttempt < 0)
 		m_recoveryPlacementAttempt = 0;

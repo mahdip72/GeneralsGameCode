@@ -220,6 +220,7 @@ protected:
 
 	virtual void doBaseBuilding();
 	virtual void checkReadyTeams();
+	virtual Bool canActivateReadyTeam( const TeamInQueue *team ) const;
 	virtual void checkQueuedTeams();
 	virtual void doTeamBuilding();
 	virtual void doUpgradesAndSkills();

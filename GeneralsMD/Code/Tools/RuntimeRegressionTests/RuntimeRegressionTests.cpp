@@ -23,6 +23,7 @@
 #include "Common/PathfindQueueReplayEpoch.h"
 #include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/SkirmishAIRecovery.h"
+#include "GameLogic/SkirmishAIStrategy.h"
 #include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Module/RailedTransportDockUpdate.h"
@@ -956,6 +957,234 @@ static SkirmishAIRecoveryPolicyInput MakeSkirmishAIRecoveryPolicyInput()
 	return input;
 }
 
+static SkirmishStrategyMetrics MakeSkirmishStrategyMetrics()
+{
+	SkirmishStrategyMetrics metrics;
+	metrics.economyHealth = 100;
+	metrics.baseIntegrity = 100;
+	metrics.armyReadiness = 100;
+	metrics.immediateThreat = 0;
+	metrics.attackConfidence = 100;
+	metrics.enemyOpportunity = 100;
+	metrics.alliedDistress = 0;
+	metrics.availableCombatValue = 10000;
+	metrics.hasStrategicTarget = true;
+	metrics.assaultLostHalfForce = false;
+	metrics.assaultObjectiveComplete = false;
+	metrics.viableAssaultForceAssembled = false;
+	return metrics;
+}
+
+static void TestSkirmishAIStrategyPolicies()
+{
+	SkirmishStrategyMetrics metrics = MakeSkirmishStrategyMetrics();
+	CHECK(CalculateSkirmishFortifyPressure(metrics) == 0);
+	CHECK(CalculateSkirmishAssaultReadiness(metrics) == 10000);
+
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.baseIntegrity = 0;
+	CHECK(CalculateSkirmishFortifyPressure(metrics) == 3000);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.economyHealth = 0;
+	CHECK(CalculateSkirmishFortifyPressure(metrics) == 2500);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.immediateThreat = 100;
+	CHECK(CalculateSkirmishFortifyPressure(metrics) == 2000);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.armyReadiness = 0;
+	CHECK(CalculateSkirmishFortifyPressure(metrics) == 1500);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.attackConfidence = 0;
+	CHECK(CalculateSkirmishFortifyPressure(metrics) == 1000);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.economyHealth = 200;
+	metrics.baseIntegrity = -20;
+	CHECK(CalculateSkirmishFortifyPressure(metrics) == 3000);
+
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.economyHealth = 0;
+	CHECK(CalculateSkirmishAssaultReadiness(metrics) == 7500);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.baseIntegrity = 0;
+	CHECK(CalculateSkirmishAssaultReadiness(metrics) == 8000);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.armyReadiness = 0;
+	CHECK(CalculateSkirmishAssaultReadiness(metrics) == 7500);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.attackConfidence = 0;
+	CHECK(CalculateSkirmishAssaultReadiness(metrics) == 8500);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.enemyOpportunity = 0;
+	CHECK(CalculateSkirmishAssaultReadiness(metrics) == 8500);
+
+	SkirmishStrategyState state;
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	CHECK(state.currentMode == SKIRMISH_STRATEGY_BALANCED);
+	CHECK(state.pendingMode == SKIRMISH_STRATEGY_NONE);
+	CHECK(state.nextEvaluationFrame == 0);
+	CHECK(state.strategicTargetID == INVALID_ID);
+	CHECK(!state.strategicTargetObserved);
+	CHECK(state.strategicTargetLastSeenFrame == 0);
+	CHECK(HasSkirmishStrategyDurationElapsed(
+		0, state.modeEntryFrame, 90 * LOGICFRAMES_PER_SECOND));
+	InitializeSkirmishStrategyState(&state, 0);
+	CHECK(!HasSkirmishStrategyDurationElapsed(
+		0, state.modeEntryFrame, 90 * LOGICFRAMES_PER_SECOND));
+	CHECK(IsSkirmishStrategyTargetObservationAvailable(
+		true, 29 * LOGICFRAMES_PER_SECOND, 0));
+	CHECK(!IsSkirmishStrategyTargetObservationAvailable(
+		true, 30 * LOGICFRAMES_PER_SECOND, 0));
+	CHECK(!IsSkirmishStrategyTargetObservationAvailable(false, 0, 0));
+	CHECK(IsSkirmishStrategyTargetObservationAvailable(
+		true, 5, UINT_MAX - 5));
+
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.baseIntegrity = 34;
+	SkirmishStrategyDecision decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.modeChanged);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_FORTIFY);
+	CHECK(decision.reason == SKIRMISH_STRATEGY_REASON_FORTIFY_CRITICAL_BASE);
+	metrics.baseIntegrity = 35;
+	metrics.immediateThreat = 85;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.modeChanged);
+	CHECK(decision.reason == SKIRMISH_STRATEGY_REASON_FORTIFY_SEVERE_THREAT);
+
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.baseIntegrity = 35;
+	metrics.economyHealth = 0;
+	metrics.armyReadiness = 0;
+	metrics.attackConfidence = 0;
+	CHECK(CalculateSkirmishFortifyPressure(metrics) == 6950);
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.nextState.pendingMode == SKIRMISH_STRATEGY_FORTIFY);
+	CHECK(!decision.modeChanged);
+	state = decision.nextState;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.immediateThreat = 60;
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 5 * LOGICFRAMES_PER_SECOND);
+	CHECK(decision.nextState.pendingMode == SKIRMISH_STRATEGY_NONE);
+	CHECK(decision.reason == SKIRMISH_STRATEGY_REASON_PENDING_CLEARED);
+
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.economyHealth = 50;
+	metrics.baseIntegrity = 65;
+	metrics.armyReadiness = 60;
+	metrics.attackConfidence = 100;
+	metrics.enemyOpportunity = 100;
+	metrics.immediateThreat = 59;
+	CHECK(CalculateSkirmishAssaultReadiness(metrics) == 7050);
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.nextState.pendingMode == SKIRMISH_STRATEGY_ASSAULT);
+	state = decision.nextState;
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 10 * LOGICFRAMES_PER_SECOND - 1);
+	CHECK(!decision.modeChanged);
+	state.nextEvaluationFrame = 10 * LOGICFRAMES_PER_SECOND;
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 10 * LOGICFRAMES_PER_SECOND);
+	CHECK(decision.modeChanged);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_ASSAULT);
+	metrics.immediateThreat = 60;
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.nextState.pendingMode != SKIRMISH_STRATEGY_ASSAULT);
+	metrics.immediateThreat = 59;
+	metrics.hasStrategicTarget = false;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.nextState.pendingMode != SKIRMISH_STRATEGY_ASSAULT);
+
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	state.currentMode = SKIRMISH_STRATEGY_FORTIFY;
+	state.modeEntryFrame = 0 - 120 * LOGICFRAMES_PER_SECOND;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.enemyOpportunity = 0;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.nextState.pendingMode == SKIRMISH_STRATEGY_BALANCED);
+	state = decision.nextState;
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 10 * LOGICFRAMES_PER_SECOND);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_BALANCED);
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	state.currentMode = SKIRMISH_STRATEGY_ASSAULT;
+	state.strategicTargetID = (ObjectID)123;
+	state.strategicTargetObserved = true;
+	state.strategicTargetLastSeenFrame = 0;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.assaultObjectiveComplete = true;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.modeChanged);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_BALANCED);
+	CHECK(decision.nextState.strategicTargetID == INVALID_ID);
+	CHECK(!decision.nextState.strategicTargetObserved);
+	CHECK(decision.nextState.strategicTargetLastSeenFrame == 0);
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	state.currentMode = SKIRMISH_STRATEGY_ASSAULT;
+	state.modeEntryFrame = 0 - 90 * LOGICFRAMES_PER_SECOND;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.assaultLostHalfForce = true;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.nextState.pendingMode == SKIRMISH_STRATEGY_BALANCED);
+
+	InitializeSkirmishStrategyState(&state, 0);
+	state.currentMode = SKIRMISH_STRATEGY_ASSAULT;
+	state.strategicTargetID = (ObjectID)123;
+	state.strategicTargetObserved = true;
+	state.strategicTargetLastSeenFrame = 0;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.hasStrategicTarget = false;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(!decision.modeChanged);
+	CHECK(decision.nextState.pendingMode == SKIRMISH_STRATEGY_BALANCED);
+	CHECK(decision.reason == SKIRMISH_STRATEGY_REASON_PENDING_STARTED);
+	state = decision.nextState;
+	state.nextEvaluationFrame = 10 * LOGICFRAMES_PER_SECOND;
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 10 * LOGICFRAMES_PER_SECOND);
+	CHECK(!decision.modeChanged);
+	CHECK(decision.reason == SKIRMISH_STRATEGY_REASON_MINIMUM_DURATION);
+	state = decision.nextState;
+	state.nextEvaluationFrame = 90 * LOGICFRAMES_PER_SECOND;
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 90 * LOGICFRAMES_PER_SECOND);
+	CHECK(decision.modeChanged);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_BALANCED);
+	CHECK(decision.reason ==
+		SKIRMISH_STRATEGY_REASON_BALANCED_ASSAULT_TARGET_UNAVAILABLE);
+	CHECK(decision.nextState.strategicTargetID == INVALID_ID);
+	CHECK(!decision.nextState.strategicTargetObserved);
+	CHECK(decision.nextState.strategicTargetLastSeenFrame == 0);
+
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	state.currentMode = SKIRMISH_STRATEGY_ASSAULT;
+	state.strategicTargetID = (ObjectID)123;
+	state.strategicTargetObserved = true;
+	state.strategicTargetLastSeenFrame = 0;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.hasStrategicTarget = false;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0);
+	CHECK(decision.nextState.pendingMode == SKIRMISH_STRATEGY_BALANCED);
+	state = decision.nextState;
+	metrics.hasStrategicTarget = true;
+	state.nextEvaluationFrame = 5 * LOGICFRAMES_PER_SECOND;
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 5 * LOGICFRAMES_PER_SECOND);
+	CHECK(!decision.modeChanged);
+	CHECK(decision.nextState.pendingMode == SKIRMISH_STRATEGY_NONE);
+	CHECK(decision.reason == SKIRMISH_STRATEGY_REASON_PENDING_CLEARED);
+	CHECK(decision.nextState.strategicTargetID == (ObjectID)123);
+	CHECK(decision.nextState.strategicTargetObserved);
+	CHECK(decision.nextState.strategicTargetLastSeenFrame == 0);
+
+	CHECK(!IsSkirmishStrategyFrameReached(UINT_MAX - 3, 5));
+	CHECK(IsSkirmishStrategyFrameReached(5, 5));
+	CHECK(HasSkirmishStrategyDurationElapsed(5, UINT_MAX - 5, 11));
+}
+
 static void CheckSkirmishAIRecoveryDecision(
 	const SkirmishAIRecoveryPolicyInput &input,
 	Bool expectedQueueBuilder, Bool expectedConstructCommandCenter,
@@ -972,6 +1201,14 @@ static void CheckSkirmishAIRecoveryDecision(
 static void TestSkirmishAIRecoveryPolicies()
 {
 	SkirmishAIRecoveryPolicyInput input = MakeSkirmishAIRecoveryPolicyInput();
+	CHECK(IsSkirmishAIRecoveryLastStandCombatCandidate(
+		true, false, false, false, true));
+	CHECK(!IsSkirmishAIRecoveryLastStandCombatCandidate(
+		true, false, true, false, true));
+	CHECK(!IsSkirmishAIRecoveryLastStandCombatCandidate(
+		true, false, false, true, true));
+	CHECK(!IsSkirmishAIRecoveryLastStandCombatCandidate(
+		true, true, false, false, true));
 
 	// Disabled recovery, an AI that never completed a command center, an
 	// existing command center, and a command center scaffold must not impose
@@ -2338,22 +2575,24 @@ static void TestSkirmishAIReplayEpoch()
 
 	// Live games always use the current and recovery paths. Replays retain the
 	// behavior selected by their recording epoch; an unknown epoch is legacy.
-	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
 	const Bool expectedReplayCurrentBehavior[] =
-		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedReplayRecoveryBehavior[] =
-		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedRecoveryCRCFields[] =
-		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedCancellationOwnership[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedUnownedQueueFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedBoundedFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedResourceWorkerPreservation[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
-	for (Int i = 0; i < 10; ++i)
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+	const Bool expectedStrategyBehavior[] =
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
+	for (Int i = 0; i < 11; ++i)
 	{
 		CHECK(ShouldUseSkirmishAICurrentBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(FALSE, replayEpochs[i]));
@@ -2371,6 +2610,8 @@ static void TestSkirmishAIReplayEpoch()
 			FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
 			FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAIStrategyBehavior(FALSE, replayEpochs[i]));
+		CHECK(ShouldIncludeSkirmishAIStrategyCRCFields(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, replayEpochs[i])
 			== expectedReplayCurrentBehavior[i]);
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, replayEpochs[i])
@@ -2391,6 +2632,10 @@ static void TestSkirmishAIReplayEpoch()
 			TRUE, replayEpochs[i]) == expectedBoundedFailover[i]);
 		CHECK(ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
 			TRUE, replayEpochs[i]) == expectedResourceWorkerPreservation[i]);
+		CHECK(ShouldUseSkirmishAIStrategyBehavior(TRUE, replayEpochs[i])
+			== expectedStrategyBehavior[i]);
+		CHECK(ShouldIncludeSkirmishAIStrategyCRCFields(TRUE, replayEpochs[i])
+			== expectedStrategyBehavior[i]);
 	}
 
 	UnicodeString livenessOnly = unmarked;
@@ -2554,12 +2799,34 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(boundedFailoverEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=7]") == 0);
 
-	// New recordings use epoch 8. They retain the complete epoch-7 CRC layout
-	// and enable only the low-cash recovery resource-worker routing change.
+	// Epoch 8 retains the complete epoch-7 CRC layout and enables only the
+	// low-cash recovery resource-worker routing change.
 	UnicodeString resourceWorkerPreservationEpoch = unmarked;
-	MarkReplayVersionForSkirmishAICurrentEpoch(resourceWorkerPreservationEpoch);
+	MarkReplayVersionForSkirmishAIResourceWorkerPreservationEpoch(
+		resourceWorkerPreservationEpoch);
 	CHECK(resourceWorkerPreservationEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=8]") == 0);
+
+	// New recordings use epoch 9 and opt into the persisted strategy controller
+	// while retaining every Stage 1 recovery behavior and CRC field.
+	UnicodeString strategyControllerEpoch = unmarked;
+	MarkReplayVersionForSkirmishAICurrentEpoch(strategyControllerEpoch);
+	CHECK(strategyControllerEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=9]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(strategyControllerEpoch) ==
+		SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER);
+	CHECK(ShouldUseSkirmishAICurrentBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER));
+	CHECK(ShouldUseSkirmishAIRecoveryBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER));
+	CHECK(ShouldUseSkirmishAIStrategyBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER));
+	CHECK(ShouldIncludeSkirmishAIStrategyCRCFields(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER));
+	MarkReplayVersionForSkirmishAIStrategyControllerEpoch(
+		strategyControllerEpoch);
+	CHECK(strategyControllerEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=9]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(resourceWorkerPreservationEpoch) ==
 		SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION);
 	CHECK(ShouldUseSkirmishAIRecoveryBoundedFailover(
@@ -2576,7 +2843,7 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=9]";
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=10]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -2628,11 +2895,15 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString compatibilityUnknown = futureEpoch;
 	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityUnknown);
 	CHECK(compatibilityUnknown == futureEpoch);
-	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, 9));
-	CHECK(!ShouldUseSkirmishAIRecoveryBehavior(TRUE, 9));
-	CHECK(!ShouldIncludeSkirmishAIRecoveryCRCFields(TRUE, 9));
-	CHECK(!ShouldUseSkirmishAIRecoveryNativeHoleOwnership(TRUE, 9));
-	CHECK(!ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(TRUE, 9));
+	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, 9));
+	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, 9));
+	CHECK(ShouldIncludeSkirmishAIRecoveryCRCFields(TRUE, 9));
+	CHECK(ShouldUseSkirmishAIRecoveryNativeHoleOwnership(TRUE, 9));
+	CHECK(ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(TRUE, 9));
+	CHECK(ShouldUseSkirmishAIStrategyBehavior(TRUE, 9));
+	CHECK(ShouldIncludeSkirmishAIStrategyCRCFields(TRUE, 9));
+	CHECK(!ShouldUseSkirmishAIStrategyBehavior(TRUE, 8));
+	CHECK(!ShouldIncludeSkirmishAIStrategyCRCFields(TRUE, 8));
 }
 
 static void TestPathfindQueueReplayEpoch()
@@ -2677,14 +2948,14 @@ static void TestPathfindQueueReplayEpoch()
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=8]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=9]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(combined) ==
-		SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION);
+		SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER);
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=8]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=9]") == 0);
 
 	UnicodeString pathLiveness = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);
@@ -3509,6 +3780,19 @@ int main(int argc, char **argv)
 		shutdownMemoryManager();
 		return 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-strategy") == 0)
+	{
+		TestSkirmishAIStrategyPolicies();
+		if (s_failures != 0)
+		{
+			printf("%d skirmish AI strategy policy test(s) failed.\n", s_failures);
+			shutdownMemoryManager();
+			return 1;
+		}
+		printf("All skirmish AI strategy policy tests passed.\n");
+		shutdownMemoryManager();
+		return 0;
+	}
 
 	TestNetworkValidation();
 	TestPacketRouterFallbackSelection();
@@ -3522,6 +3806,7 @@ int main(int argc, char **argv)
 	TestFrameRateLimitWaitCalculation();
 	TestSkirmishAILivenessPolicies();
 	TestSkirmishAIRecoveryPolicies();
+	TestSkirmishAIStrategyPolicies();
 	TestSkirmishAIReplayEpoch();
 	TestPathfindQueueReplayEpoch();
 	TestSkirmishAICorrectnessPolicies();
