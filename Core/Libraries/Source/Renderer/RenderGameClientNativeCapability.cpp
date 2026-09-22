@@ -341,16 +341,28 @@ void ReleaseGameSnowVertexBuffer(void *opaque)
 	(void)opaque;
 }
 
+#if defined(RTS_RENDERER_HAS_D3D11)
+RenderResult BeginGameDisplayIteration()
+#else
 void BeginGameDisplayIteration()
+#endif
 {
 	NativeGameRenderOwnerScope scope;
 	IGameRenderClientNativeOwner *owner = scope.Get();
-	if (owner != 0)
+	if (owner == 0)
 	{
-		const RenderResult result = owner->BeginGameDisplayIteration();
-		if (result != RENDER_RESULT_OK)
-			owner->RecordGameFailure(result);
+#if defined(RTS_RENDERER_HAS_D3D11)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+#else
+		return;
+#endif
 	}
+	const RenderResult result = owner->BeginGameDisplayIteration();
+	if (result != RENDER_RESULT_OK)
+		owner->RecordGameFailure(result);
+#if defined(RTS_RENDERER_HAS_D3D11)
+	return result;
+#endif
 }
 
 RenderResult ResetGameRenderFrameResources(bool frameChanged)

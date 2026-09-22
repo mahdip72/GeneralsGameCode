@@ -1429,7 +1429,17 @@ WW3DErrorType WW3D::Begin_Render(bool clear,bool clearz,const Vector3 & color, f
 	WWASSERT(!IsRendering);
 	IsRendering = true;
 
+	#if defined(RTS_RENDERER_HAS_D3D11)
+	const rts::render::RenderResult iterationResult =
+		rts::render::BeginGameDisplayIteration();
+	if (iterationResult != rts::render::RENDER_RESULT_OK)
+	{
+		IsRendering = false;
+		return ToWW3DError(iterationResult);
+	}
+	#else
 	rts::render::BeginGameDisplayIteration();
+	#endif
 	const rts::render::GameRenderColor gameColor =
 		ToGameRenderColor(color, dest_alpha);
 	const rts::render::RenderResult beginResult =

@@ -340,7 +340,14 @@ const GameDebugRenderStats &GetGameDebugRenderStats();
 GameDebugRenderStats &GetMutableGameDebugRenderStats();
 void SetGameDebugRenderStats(const GameDebugRenderStats &stats);
 RenderResult ResetGameRenderFrameResources(bool frameChanged);
+#if defined(RTS_RENDERER_HAS_D3D11)
+// The native renderer may discover a worker-thread failure only when the
+// owner-thread display boundary services its completed frame.  Preserve that
+// result so WW3D can reject the new frame instead of submitting another one.
+RenderResult BeginGameDisplayIteration();
+#else
 void BeginGameDisplayIteration();
+#endif
 RenderResult GetGameTextureFilterCapabilities(
 	GameTextureFilterCapabilities *capabilities);
 unsigned int GetGameMaxTexturesPerPass();

@@ -874,7 +874,8 @@ int TestPublicFrameResetRecoversRemovedDevice(HWND window)
 		&owner.Renderer(), RENDER_RESOURCE_FAULT_PRESENTATION_PASS, 1,
 		RENDER_RESULT_DEVICE_REMOVED) == RENDER_RESULT_OK,
 		"public frame recovery arms device removal during presentation");
-	BeginGameDisplayIteration();
+	result |= Check(BeginGameDisplayIteration() == RENDER_RESULT_OK,
+		"public frame recovery enters the first display boundary");
 	GameRenderCommand begin = {};
 	begin.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
 	begin.value0 = RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH;
@@ -896,11 +897,21 @@ int TestPublicFrameResetRecoversRemovedDevice(HWND window)
 		"public frame resource reset reaches recovery while the device is removed");
 	if (reset == RENDER_RESULT_OK)
 	{
-		BeginGameDisplayIteration();
-		// Consume the failed prior frame at its display boundary, then prove a
-		// subsequent normal public frame can draw and present after recovery.
-		BeginGameDisplayIteration();
-		result |= Check(owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
+		// Completion is deferred until the public display boundary.  The caller
+		// must not issue BEGIN_RENDER after that error; a later healthy boundary
+		// is allowed to start the recovered frame.
+		const RenderResult failedBoundary = BeginGameDisplayIteration();
+		const RenderResult rejectedBegin = failedBoundary == RENDER_RESULT_OK ?
+			owner.ExecuteGameRenderCommand(begin) : failedBoundary;
+		result |= Check(failedBoundary == RENDER_RESULT_DEVICE_REMOVED &&
+			rejectedBegin == RENDER_RESULT_DEVICE_REMOVED &&
+			!owner.Renderer().IsFrameOpen(),
+			"public boundary propagates deferred worker failure without opening another frame");
+		const RenderResult healthyBoundary = BeginGameDisplayIteration();
+		result |= Check(healthyBoundary == RENDER_RESULT_OK,
+			"public display boundary clears the deferred failure for the following frame");
+		result |= Check(healthyBoundary == RENDER_RESULT_OK &&
+			owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
 			owner.ExecuteGameRenderCommand(end) == RENDER_RESULT_OK &&
 			owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
 			"public frame rendering resumes after device recovery");
