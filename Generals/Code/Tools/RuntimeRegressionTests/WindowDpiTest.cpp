@@ -57,6 +57,55 @@ namespace
 		return true;
 	}
 
+	bool VerifyPm1LinearSuggestionFallback(HWND window, UINT currentDpi)
+	{
+		const LONG clientWidth = 800;
+		const LONG clientHeight = 600;
+		SIZE currentDpiSize;
+		if (!WindowDpi::GetWindowSizeForClientAtDpi(
+			window, clientWidth, clientHeight, currentDpi, &currentDpiSize))
+			return Fail("could not prepare the PMv1 800x600 client window");
+
+		RECT before;
+		if (!GetWindowRect(window, &before) ||
+			!SetWindowPos(window, NULL, before.left, before.top,
+				currentDpiSize.cx, currentDpiSize.cy,
+				SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE))
+			return Fail("could not prepare the PMv1 800x600 client window");
+
+		RECT actualClient;
+		RECT currentWindow;
+		if (!GetClientRect(window, &actualClient) || !GetWindowRect(window, &currentWindow) ||
+			actualClient.right - actualClient.left != clientWidth ||
+			actualClient.bottom - actualClient.top != clientHeight)
+			return Fail("PMv1 test window did not reach the exact 800x600 client size");
+
+		const UINT targetDpi = currentDpi + currentDpi / 2;
+		RECT suggested;
+		suggested.left = currentWindow.left + 29;
+		suggested.top = currentWindow.top + 37;
+		suggested.right = suggested.left + (currentWindow.right - currentWindow.left) * 3 / 2;
+		suggested.bottom = suggested.top + (currentWindow.bottom - currentWindow.top) * 3 / 2;
+		const LONG suggestedLeft = suggested.left;
+		const LONG suggestedTop = suggested.top;
+		if (!WindowDpi::AdjustDpiChangedRectForClientSize(window, &suggested, targetDpi))
+			return Fail("PMv1 fallback rejected a valid linearly scaled DPI suggestion");
+
+		SIZE expectedTargetSize;
+		if (!ExpectWindowSizeForClientAtDpi(window, clientWidth, clientHeight, targetDpi) ||
+			!WindowDpi::GetWindowSizeForClientAtDpi(
+				window, clientWidth, clientHeight, targetDpi, &expectedTargetSize))
+			return false;
+
+		if (suggested.left != suggestedLeft || suggested.top != suggestedTop)
+			return Fail("PMv1 fallback changed the suggested cursor-relative position");
+		if (suggested.right - suggested.left != expectedTargetSize.cx ||
+			suggested.bottom - suggested.top != expectedTargetSize.cy)
+			return Fail("1.5x WM_DPICHANGED suggestion did not retain the 800x600 client at target DPI");
+
+		return true;
+	}
+
 	bool RunWindowDpiContractTest()
 	{
 		SIZE fullscreenSize = { 1920, 1080 };
@@ -167,11 +216,22 @@ namespace
 			(finalClient.bottom - finalClient.top) == initialClientHeight;
 		const bool honoredSuggestedPosition =
 			finalWindow.left == suggested.left && finalWindow.top == suggested.top;
-		DestroyWindow(window);
 		if (!preservedClientSize)
+		{
+			DestroyWindow(window);
 			return Fail("WM_DPICHANGED altered the client/render dimensions");
+		}
 		if (!honoredSuggestedPosition)
+		{
+			DestroyWindow(window);
 			return Fail("WM_DPICHANGED did not honor the suggested position");
+		}
+		if (!VerifyPm1LinearSuggestionFallback(window, currentDpi))
+		{
+			DestroyWindow(window);
+			return false;
+		}
+		DestroyWindow(window);
 
 		return true;
 	}

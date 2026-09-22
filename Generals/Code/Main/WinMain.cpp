@@ -85,6 +85,7 @@ const char *gAppPrefix = ""; /// So WB can have a different debug log file name.
 static Bool gInitializing = false;
 static Bool gDoPaint = true;
 static Bool isWinMainActive = false;
+static UINT gDpiPrechangeSizeTarget = 0;
 
 static HBITMAP gLoadScreenBitmap = nullptr;
 
@@ -414,23 +415,46 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 
 			case WM_GETDPISCALEDSIZE:
 			{
+				gDpiPrechangeSizeTarget = 0;
 				// Fullscreen sizing belongs to the display-mode owner; don't let
 				// Windows linearly scale its pending size during a monitor move.
 				if (!TheGlobalData || !TheGlobalData->m_windowed)
 					return WindowDpi::PreservePendingWindowSize(
 						reinterpret_cast<SIZE *>(lParam));
 
-				return WindowDpi::AdjustPendingWindowSizeForDpi(
+				const BOOL sizeAdjusted = WindowDpi::AdjustPendingWindowSizeForDpi(
 					hWnd, (UINT)wParam, reinterpret_cast<SIZE *>(lParam));
+				if (sizeAdjusted)
+					gDpiPrechangeSizeTarget = (UINT)wParam;
+				return sizeAdjusted;
 			}
 
 			case WM_DPICHANGED:
 			{
+				const UINT dpi = LOWORD(wParam);
+				const BOOL hasPmV2PrechangeSize =
+					gDpiPrechangeSizeTarget != 0 && gDpiPrechangeSizeTarget == dpi;
+				gDpiPrechangeSizeTarget = 0;
+
 				// The renderer owns fullscreen mode transitions. For windowed mode,
-				// update position/frame only and keep the exact client render size.
+				// retain the client render size and Windows' suggested position.
 				if (TheGlobalData && TheGlobalData->m_windowed)
-					WindowDpi::ApplyDpiChangedRect(
-						hWnd, reinterpret_cast<const RECT *>(lParam));
+				{
+					const RECT *suggestedRect = reinterpret_cast<const RECT *>(lParam);
+					if (suggestedRect)
+					{
+						if (hasPmV2PrechangeSize)
+							WindowDpi::ApplyDpiChangedRect(hWnd, suggestedRect);
+						else
+						{
+							RECT adjustedRect = *suggestedRect;
+							if (!WindowDpi::AdjustDpiChangedRectForClientSize(
+								hWnd, &adjustedRect, dpi))
+								adjustedRect = *suggestedRect;
+							WindowDpi::ApplyDpiChangedRect(hWnd, &adjustedRect);
+						}
+					}
+				}
 
 				return 0;
 			}

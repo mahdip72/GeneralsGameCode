@@ -134,6 +134,33 @@ namespace WindowDpi
 			height,
 			SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
 	}
+
+	// Per-monitor-v1 windows do not receive WM_GETDPISCALEDSIZE. Their
+	// WM_DPICHANGED suggestion is linearly scaled, so preserve the current client
+	// dimensions and use the suggestion only for cursor-relative positioning.
+	static inline BOOL AdjustDpiChangedRectForClientSize(
+		HWND window, RECT *suggestedRect, UINT dpi)
+	{
+		if (!window || !suggestedRect)
+			return FALSE;
+
+		RECT clientRect;
+		if (!::GetClientRect(window, &clientRect))
+			return FALSE;
+
+		const LONG clientWidth = clientRect.right - clientRect.left;
+		const LONG clientHeight = clientRect.bottom - clientRect.top;
+		SIZE windowSize;
+		if (!GetWindowSizeForClientAtDpi(
+			window, clientWidth, clientHeight, dpi, &windowSize))
+			return FALSE;
+
+		const LONG left = suggestedRect->left;
+		const LONG top = suggestedRect->top;
+		suggestedRect->right = left + windowSize.cx;
+		suggestedRect->bottom = top + windowSize.cy;
+		return TRUE;
+	}
 }
 
 #endif // WINDOW_DPI_H
