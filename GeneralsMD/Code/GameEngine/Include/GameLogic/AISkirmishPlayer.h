@@ -28,6 +28,8 @@
 
 #pragma once
 
+#include <map>
+
 #include "Common/GameMemory.h"
 #include "GameLogic/AIPlayer.h"
 #include "GameLogic/SkirmishAIDecision.h"
@@ -50,6 +52,10 @@ public:	 // AISkirmish specific methods.
 
 	AISkirmishPlayer( Player *p );							///< constructor
 	virtual Bool computeSuperweaponTarget(const SpecialPowerTemplate *power, Coord3D *pos, Int playerNdx, Real weaponRadius) override; ///< Calculates best pos for weapon given radius.
+	virtual Bool shouldUseSkirmishSpecialPowerSource(Object *source, const SpecialPowerTemplate *power) override;
+	virtual void resolveSpecialPowerDispatchAttempt(Object *source,
+		const SpecialPowerTemplate *power, Bool accepted) override;
+	virtual void notifySpecialPowerFired(Object *source, const SpecialPowerTemplate *power) override;
 
 public:	// AIPlayer interface methods.
 
@@ -58,7 +64,7 @@ public:	// AIPlayer interface methods.
 	virtual void newMap() override;											///< New map loaded call.
 
 	/// Invoked when a unit I am training comes into existence
-	virtual void onUnitProduced( Object *factory, Object *unit ) override;
+	virtual void onUnitProduced( Object *factory, Object *unit, Int productionID ) override;
 
 	/// Invoked when a structure I am building becomes complete.
 	virtual void onStructureProduced( Object *factory, Object *structure ) override;
@@ -75,7 +81,8 @@ public:	// AIPlayer interface methods.
 
 	virtual Bool isSkirmishAI() override {return true;}
 	Bool usesCriticalRecoveryBehavior() const;
-	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing, Bool isUpgrade) const;
+	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing,
+		Bool isUpgrade, Bool refreshProductionReserve);
 
 	virtual Bool checkBridges(Object *unit, Waypoint *way) override;
 
@@ -114,6 +121,7 @@ protected:
 	void acquireEnemyLegacy();
 	Bool isAdaptiveProductionCandidate( TeamPrototype *proto, SkirmishAICostRange *costRange,
 		Int *factoryWaitFrames );
+	Int getActiveRecoveryReserveCost() const;
 	Int getCriticalRebuildReserve( Bool *canStartNow );
 	Bool canStartCriticalRebuildNow( BuildListInfo *info, const ThingTemplate *plan );
 	void updateCriticalRecovery();
@@ -161,6 +169,18 @@ protected:
 	Int countAlliedSkirmishAIsTargeting( Player *enemy ) const;
 	SkirmishAIDecisionDifficulty getDecisionDifficulty() const;
 	Bool usesStrategyBehavior() const;
+	Bool usesProductionBehavior() const;
+	void clearStrategySourceCommandLock();
+	Bool isStrategySourceCommandLockValid() const;
+	Bool hasUsableSupplySource(const Coord3D *position, Real centerRadius) const;
+	Bool hasOwnedSupplyCenter(const ThingTemplate *supplyPlan) const;
+	Bool hasQueuedSupplyCenter(const ThingTemplate *supplyPlan) const;
+	Bool hasUsableSupplyCenterForCollectors() const;
+	void cancelDepletedCollectorProduction();
+	Bool isSupplyCenterPrerequisiteNeeded(const ThingTemplate *supplyPlan) const;
+	void refreshStrategyProductionReserve();
+	Bool queueAuthorizedStrategyBuilder(const ThingTemplate *structure);
+	void refreshStrategyProductionState();
 	Bool updateStrategy();
 	void collectStrategyMetrics( SkirmishStrategyMetrics *metrics,
 		ObjectID *strategicTargetID );
@@ -182,6 +202,17 @@ protected:
 	Player			*m_currentEnemy;
 	Int m_currentEnemyPlayerIndex;
 	SkirmishStrategyState m_strategyState;
+	Int m_strategyProductionReserveCost;
+	ObjectID m_strategySuperweaponID;
+	const ThingTemplate *m_strategyAuthorizedThing;
+	SkirmishAISpendAuthorization m_strategySpendAuthorization;
+	Bool m_strategyProductionReserveRefreshing;
+	Bool m_strategyProductionReserveLoaded;
+	Bool m_strategySourceCommandLocked;
+	ObjectID m_strategyLockedSourceID;
+	UnsignedInt m_strategyLockedPowerID;
+	UnsignedInt m_reinforcementRoundRobinCursor;
+	std::map<ObjectID, Bool> m_stage3CollectorRolesToRestore;
 
 	// Critical command-center recovery state. The reserve is serialized because
 	// it gates same-frame production before the next AI refresh.

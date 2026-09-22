@@ -34,6 +34,7 @@
 enum { INVALID_SKILLSET_SELECTION = -1 };
 
 class BuildListInfo;
+class ProductionEntry;
 
 /**
  * When a team is selected for training, a list of these
@@ -50,7 +51,7 @@ class WorkOrder : public MemoryPoolObject,
 
 public:
 
-	WorkOrder():m_thing(nullptr), m_factoryID(INVALID_ID), m_isResourceGatherer(false), m_numCompleted(0), m_numRequired(1), m_next(nullptr) {};
+	WorkOrder():m_thing(nullptr), m_factoryID(INVALID_ID), m_productionID(0), m_isResourceGatherer(false), m_numCompleted(0), m_numRequired(1), m_next(nullptr) {};
 
 	Bool isWaitingToBuild();		///< return true if nothing is yet building this unit
 	void validateFactory( Player *thisPlayer );			///< verify factoryID still refers to an active object
@@ -59,6 +60,7 @@ public:
 
 	const ThingTemplate *m_thing;			///< thing to build
 	ObjectID m_factoryID;							///< ID of object that is building this, or zero if no-one is
+	Int m_productionID;							///< exact queue entry, or zero for legacy/unbound orders
 	WorkOrder *m_next;
 	Int			m_numCompleted;					  ///< Number built.
 	Int			m_numRequired;					  ///< Number needed.
@@ -154,6 +156,10 @@ public:
 	AIPlayer( Player *p );							///< constructor
 
 	virtual Bool computeSuperweaponTarget(const SpecialPowerTemplate *power, Coord3D *pos, Int playerNdx, Real weaponRadius); ///< Calculates best pos for weapon given radius.
+	virtual Bool shouldUseSkirmishSpecialPowerSource(Object *source, const SpecialPowerTemplate *power) { return true; }
+	virtual void resolveSpecialPowerDispatchAttempt(Object *source,
+		const SpecialPowerTemplate *power, Bool accepted) {}
+	virtual void notifySpecialPowerFired(Object *source, const SpecialPowerTemplate *power) {}
 
 public: // AIPlayer interface, may be overridden by AISkirmishPlayer.  jba.
 
@@ -162,7 +168,7 @@ public: // AIPlayer interface, may be overridden by AISkirmishPlayer.  jba.
 	virtual void newMap();											///< New map loaded call.
 
 	/// Invoked when a unit I am training comes into existence
-	virtual void onUnitProduced( Object *factory, Object *unit );
+	virtual void onUnitProduced( Object *factory, Object *unit, Int productionID );
 
 	/// Invoked when a structure I am building comes into existence
 	virtual void onStructureProduced( Object *factory, Object *structure );
@@ -250,7 +256,11 @@ protected:
 	Object *findFactory(const ThingTemplate *thing, Bool busyOK); ///< Find a factory to build a unit.  If force is true, may return a busy factory.
 	void queueUnits();						///< Check the team build list, & queue up units at any idle factories.
 	void checkForSupplyCenter( BuildListInfo *info, Object *bldg);
- 	void queueSupplyTruck();
+	void queueSupplyTruck();
+	Int getStage3SupplyCollectorDemand() const;
+	Int countSkirmishAIPendingCollectors();
+	Bool isSkirmishAIPendingCollectorEntry(
+		Object *factory, const ProductionEntry *entry);
 	void updateBridgeRepair();
 	Bool dozerInQueue();
 	Object *findSupplyCenter(Int minSupplies);

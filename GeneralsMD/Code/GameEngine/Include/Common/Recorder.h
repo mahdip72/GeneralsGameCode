@@ -159,7 +159,8 @@ public:
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
-		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER; }
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION; }
 	Int getPathfindQueueReplayEpoch() const { return m_pathfindQueueReplayEpoch; }
 	Bool replayUsesPathfindQueueCapacity() const { return m_pathfindQueueReplayEpoch == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT; }
 	void initControls();															///< Show or Hide the Replay controls
@@ -275,6 +276,10 @@ inline void RecorderClass::MarkReplayVersionForSkirmishAICurrentEpoch(
 		MarkReplayVersionForSkirmishAIBoundedFailoverEpoch(versionTimeString);
 	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION)
 		MarkReplayVersionForSkirmishAIResourceWorkerPreservationEpoch(versionTimeString);
+	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER)
+		MarkReplayVersionForSkirmishAIStrategyControllerEpoch(versionTimeString);
+	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION)
+		MarkReplayVersionForSkirmishAIProductionEpoch(versionTimeString);
 	else
 		::MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
 }

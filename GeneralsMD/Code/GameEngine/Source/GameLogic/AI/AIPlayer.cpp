@@ -29,6 +29,7 @@
 
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
+
 #include "Common/GameMemory.h"
 #include "Common/GameState.h"
 #include "Common/GlobalData.h"
@@ -58,10 +59,12 @@
 #include "GameLogic/Module/UpdateModule.h"
 #include "GameLogic/ScriptEngine.h"
 #include "GameLogic/SkirmishAIDecision.h"
+#include "GameLogic/SkirmishAIRecovery.h"
 #include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
 #include "GameLogic/Module/SupplyTruckAIUpdate.h"
+#include "GameLogic/Module/WorkerAIUpdate.h"
 #include "GameLogic/Module/SupplyWarehouseDockUpdate.h"
 #include "GameLogic/PartitionManager.h"
 
@@ -69,6 +72,487 @@
 #define SUPPLY_CENTER_CLOSE_DIST (20*PATHFIND_CELL_SIZE_F)
 
 #define USE_DOZER 1
+
+// Stage 3 must not keep a collector queue alive for a supply center whose
+// nearby source is empty. Keep these checks local to collector queueing and
+// routing so legacy production paths retain their behavior outside the
+// Stage 3 production epoch.
+static Object *FindSkirmishAIUsableSupplySource(Player *player, Object *supplyCenter)
+{
+	if (!player || !supplyCenter || supplyCenter->isEffectivelyDead() ||
+		supplyCenter->isDestroyed() ||
+		supplyCenter->isKindOf(KINDOF_REBUILD_HOLE) ||
+		supplyCenter->testStatus(OBJECT_STATUS_SOLD) ||
+		supplyCenter->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+		supplyCenter->testStatus(OBJECT_STATUS_RECONSTRUCTING) ||
+		supplyCenter->getControllingPlayer() != player) {
+		return nullptr;
+	}
+
+	Coord3D center = *supplyCenter->getPosition();
+	Real radius = SUPPLY_CENTER_CLOSE_DIST +
+		supplyCenter->getGeometryInfo().getBoundingCircleRadius();
+
+	PartitionFilterAcceptByKindOf filterSupplySource(
+		MAKE_KINDOF_MASK(KINDOF_SUPPLY_SOURCE), KINDOFMASK_NONE);
+	PartitionFilterPlayerAffiliation filterAffiliation(
+		player, ALLOW_ALLIES | ALLOW_NEUTRAL, true);
+	PartitionFilterAlive filterAlive;
+	PartitionFilterOnMap filterMapStatus;
+	PartitionFilter *filters[] = {
+		&filterSupplySource, &filterAffiliation, &filterAlive,
+		&filterMapStatus, nullptr
+	};
+
+	SimpleObjectIterator *iter = ThePartitionManager->iterateObjectsInRange(
+		&center, radius, FROM_BOUNDINGSPHERE_2D, filters,
+		ITER_SORTED_NEAR_TO_FAR);
+	MemoryPoolObjectHolder hold(iter);
+	for (Object *supplySource = iter->first(); supplySource;
+		supplySource = iter->next()) {
+		static const NameKeyType key_warehouseUpdate =
+			NAMEKEY("SupplyWarehouseDockUpdate");
+		SupplyWarehouseDockUpdate *warehouseModule =
+			(SupplyWarehouseDockUpdate *)supplySource->findUpdateModule(
+				key_warehouseUpdate);
+		if (warehouseModule && warehouseModule->getBoxesStored() > 0) {
+			return supplySource;
+		}
+	}
+
+	return nullptr;
+}
+
+struct SkirmishAISupplyCenterState
+{
+	Object *m_center;
+	Int m_gatherers;
+	Int m_desiredGatherers;
+	Bool m_listed;
+};
+
+typedef std::vector<SkirmishAISupplyCenterState> SkirmishAISupplyCenterStateList;
+
+static void FindSkirmishAIUsableSupplyCenters(
+	Player *player, SkirmishAISupplyCenterStateList *centers)
+{
+	if (!player || !TheGameLogic || !centers) {
+		return;
+	}
+
+	for (Object *center = TheGameLogic->getFirstObject(); center;
+		center = center->getNextObject()) {
+		if (!center->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+			!FindSkirmishAIUsableSupplySource(player, center)) {
+			continue;
+		}
+		SkirmishAISupplyCenterState state;
+		state.m_center = center;
+		state.m_gatherers = 0;
+		state.m_desiredGatherers = 0;
+		state.m_listed = false;
+		centers->push_back(state);
+	}
+}
+
+static SkirmishAISupplyCenterState *FindSkirmishAISupplyCenterState(
+	SkirmishAISupplyCenterStateList *centers, ObjectID centerID)
+{
+	if (!centers)
+		return nullptr;
+
+	for (SkirmishAISupplyCenterStateList::iterator center = centers->begin();
+		center != centers->end(); ++center) {
+		if (center->m_center->getID() == centerID)
+			return &(*center);
+	}
+	return nullptr;
+}
+
+static Bool IsEligibleSkirmishAICollector(
+	Object *object, Player *player, SupplyTruckAIInterface **supplyTruckAI)
+{
+	if (supplyTruckAI)
+		*supplyTruckAI = nullptr;
+	AIUpdateInterface *ai = object ? object->getAI() : nullptr;
+	DozerAIInterface *dozerAI = ai ? ai->getDozerAIInterface() : nullptr;
+	SupplyTruckAIInterface *truckAI = ai
+		? ai->getSupplyTruckAIInterface() : nullptr;
+	WorkerAIInterface *workerAI = ai ? ai->getWorkerAIInterface() : nullptr;
+	const Bool eligible = IsSkirmishAIEligibleCollector(
+		object != nullptr, object && object->getControllingPlayer() == player,
+		object && object->isKindOf(KINDOF_HARVESTER), ai != nullptr,
+		object && object->isEffectivelyDead(), object && object->isDestroyed(),
+		object && object->testStatus(OBJECT_STATUS_SOLD),
+		object && object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+		object && object->testStatus(OBJECT_STATUS_RECONSTRUCTING),
+		object && object->isContained(),
+		object && object->isDisabledByType(DISABLED_UNMANNED),
+		dozerAI && (dozerAI->getCurrentTask() != DOZER_TASK_INVALID ||
+			dozerAI->isTaskPending(DOZER_TASK_BUILD)),
+		truckAI != nullptr);
+	// Worker role survives order completion and save/load, including when a
+	// collector has not reached its first dock yet.
+	if (eligible && workerAI && !workerAI->isStage3CollectorRole())
+		return false;
+	if (eligible && supplyTruckAI)
+		*supplyTruckAI = truckAI;
+	return eligible;
+}
+
+static void CountSkirmishAISupplyCenterGatherers(Player *player,
+	SkirmishAISupplyCenterStateList *centers, Int *totalGatherers,
+	Object **looseGatherer)
+{
+	if (!player || !centers)
+		return;
+
+	Player::PlayerTeamList::const_iterator playerTeam;
+	for (playerTeam = player->getPlayerTeams()->begin();
+		playerTeam != player->getPlayerTeams()->end(); ++playerTeam) {
+		for (DLINK_ITERATOR<Team> teamIter =
+			(*playerTeam)->iterate_TeamInstanceList();
+			!teamIter.done(); teamIter.advance()) {
+			Team *team = teamIter.cur();
+			if (!team)
+				continue;
+			for (DLINK_ITERATOR<Object> objectIter =
+				team->iterate_TeamMemberList();
+				!objectIter.done(); objectIter.advance()) {
+				Object *object = objectIter.cur();
+				SupplyTruckAIInterface *supplyTruckAI = nullptr;
+				if (!IsEligibleSkirmishAICollector(
+						object, player, &supplyTruckAI))
+					continue;
+				if (totalGatherers)
+					(*totalGatherers)++;
+
+				SkirmishAISupplyCenterState *centerState =
+					FindSkirmishAISupplyCenterState(
+						centers, supplyTruckAI->getPreferredDockID());
+				if (centerState) {
+					centerState->m_gatherers++;
+				} else if (looseGatherer &&
+					(!*looseGatherer ||
+					 object->getID() < (*looseGatherer)->getID())) {
+					*looseGatherer = object;
+				}
+			}
+		}
+	}
+
+	// A collector assigned beyond one center's demand can satisfy another
+	// center's deficit.  Choose the lowest ObjectID so reassignment is stable.
+	if (looseGatherer && !*looseGatherer) {
+		for (playerTeam = player->getPlayerTeams()->begin();
+			playerTeam != player->getPlayerTeams()->end(); ++playerTeam) {
+			for (DLINK_ITERATOR<Team> teamIter =
+				(*playerTeam)->iterate_TeamInstanceList();
+				!teamIter.done(); teamIter.advance()) {
+				Team *team = teamIter.cur();
+				if (!team)
+					continue;
+				for (DLINK_ITERATOR<Object> objectIter =
+					team->iterate_TeamMemberList();
+					!objectIter.done(); objectIter.advance()) {
+					Object *object = objectIter.cur();
+					SupplyTruckAIInterface *supplyTruckAI = nullptr;
+					if (!IsEligibleSkirmishAICollector(
+							object, player, &supplyTruckAI))
+						continue;
+					SkirmishAISupplyCenterState *centerState = supplyTruckAI
+						? FindSkirmishAISupplyCenterState(
+							centers, supplyTruckAI->getPreferredDockID()) : nullptr;
+					if (!centerState ||
+						centerState->m_gatherers <= centerState->m_desiredGatherers)
+						continue;
+					if (!*looseGatherer || object->getID() < (*looseGatherer)->getID())
+						*looseGatherer = object;
+				}
+			}
+		}
+	}
+}
+
+static Object *FindSkirmishAIUnderfilledUnlistedSupplyCenter(
+	SkirmishAISupplyCenterStateList *centers)
+{
+	Object *bestCenter = nullptr;
+	if (!centers)
+		return nullptr;
+
+	for (SkirmishAISupplyCenterStateList::iterator center = centers->begin();
+		center != centers->end(); ++center) {
+		if (center->m_listed ||
+			center->m_gatherers >= center->m_desiredGatherers)
+			continue;
+		if (!bestCenter || center->m_center->getID() < bestCenter->getID())
+			bestCenter = center->m_center;
+	}
+	return bestCenter;
+}
+
+static Object *FindSkirmishAIUnderfilledSupplyCenter(
+	SkirmishAISupplyCenterStateList *centers)
+{
+	Object *bestCenter = nullptr;
+	if (!centers)
+		return nullptr;
+	for (SkirmishAISupplyCenterStateList::iterator center = centers->begin();
+		center != centers->end(); ++center) {
+		if (center->m_gatherers >= center->m_desiredGatherers)
+			continue;
+		if (!bestCenter || center->m_center->getID() < bestCenter->getID())
+			bestCenter = center->m_center;
+	}
+	return bestCenter;
+}
+
+static Int GetSupplyCenterDesiredGatherers(
+	Player *player, GameDifficulty difficulty)
+{
+	Int desiredGatherers = 0;
+	const AISideInfo *resInfo = TheAI->getAiData()->m_sideInfo;
+	while (resInfo) {
+		if (player && resInfo->m_side == player->getSide()) {
+			if (difficulty == DIFFICULTY_EASY)
+				desiredGatherers = resInfo->m_easy;
+			if (difficulty == DIFFICULTY_NORMAL)
+				desiredGatherers = resInfo->m_normal;
+			if (difficulty == DIFFICULTY_HARD)
+				desiredGatherers = resInfo->m_hard;
+		}
+		resInfo = resInfo->m_next;
+	}
+
+	// Supply centers normally create one collector for free.  Keep that total
+	// target for captured/scripted centers even though their fallback must pay
+	// to train every missing collector.
+	return desiredGatherers + 1;
+}
+
+static Int GetSkirmishAIAggregateSupplyCollectorDemand(
+	const SkirmishAISupplyCenterStateList &centers, Int totalGatherers)
+{
+	Int desired = 0;
+	for (SkirmishAISupplyCenterStateList::const_iterator center = centers.begin();
+		center != centers.end(); ++center)
+		desired = AddSkirmishAISupplyCollectorDeficit(
+			desired, center->m_desiredGatherers, 0);
+	return GetSkirmishAISupplyCollectorDemand(
+		desired, totalGatherers, false);
+}
+
+static const ThingTemplate *FindSkirmishAIAutomaticCollectorTemplate(
+	Object *supplyCenter);
+
+Bool AIPlayer::isSkirmishAIPendingCollectorEntry(
+	Object *factory, const ProductionEntry *entry)
+{
+	if (!factory || !entry || !m_player ||
+		entry->getProductionType() != PRODUCTION_UNIT ||
+		!entry->getProductionObject() ||
+		!entry->getProductionObject()->isKindOf(KINDOF_HARVESTER) ||
+		entry->getProductionQuantityRemaining() <= 0)
+		return false;
+
+	const ThingTemplate *product = entry->getProductionObject();
+	Bool hasExactOrder = false;
+	Bool exactCollectorOrder = false;
+	Bool exactNonCollectorOrder = false;
+	Bool hasCollectorOrder = false;
+	Bool hasNonCollectorOrder = false;
+	Int outstandingOrderQuantity = 0;
+	for (DLINK_ITERATOR<TeamInQueue> teamIt = iterate_TeamBuildQueue();
+		!teamIt.done(); teamIt.advance()) {
+		TeamInQueue *team = teamIt.cur();
+		for (WorkOrder *order = team && !team->m_reinforcement
+				? team->m_workOrders : nullptr;
+			order; order = order->m_next) {
+			if (!order->m_thing || order->m_factoryID != factory->getID() ||
+				!order->m_thing->isEquivalentTo(product) ||
+				order->m_numCompleted >= order->m_numRequired)
+				continue;
+			if (order->m_productionID != 0) {
+				if (order->m_productionID !=
+						static_cast<Int>(entry->getProductionID()))
+					continue;
+				hasExactOrder = true;
+				if (order->m_isResourceGatherer)
+					exactCollectorOrder = true;
+				else
+					exactNonCollectorOrder = true;
+				continue;
+			}
+			if (order->m_isResourceGatherer)
+				hasCollectorOrder = true;
+			else
+				hasNonCollectorOrder = true;
+			outstandingOrderQuantity = AddSkirmishAISupplyCollectorDeficit(
+				outstandingOrderQuantity,
+				order->m_numRequired - order->m_numCompleted, 0);
+		}
+	}
+	if (hasExactOrder)
+		return exactCollectorOrder && !exactNonCollectorOrder;
+
+	ProductionUpdateInterface *production =
+		factory->getProductionUpdateInterface();
+	Int matchingEntryCount = 0;
+	Int matchingEntryQuantity = 0;
+	for (const ProductionEntry *queued = production
+			? production->firstProduction() : nullptr;
+		 queued; queued = production->nextProduction(queued)) {
+		if (queued->getProductionType() != PRODUCTION_UNIT ||
+			!queued->getProductionObject() ||
+			!queued->getProductionObject()->isEquivalentTo(product) ||
+			queued->getProductionQuantityRemaining() <= 0)
+			continue;
+		++matchingEntryCount;
+		matchingEntryQuantity = AddSkirmishAISupplyCollectorDeficit(
+			matchingEntryQuantity,
+			queued->getProductionQuantityRemaining(), 0);
+	}
+
+	Bool automaticCollectorProof = false;
+	if (!hasCollectorOrder && !hasNonCollectorOrder &&
+		factory->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+		matchingEntryCount == 1 && matchingEntryQuantity == 1 &&
+		entry->getProductionQuantity() == 1) {
+		const ThingTemplate *automaticCollector =
+			FindSkirmishAIAutomaticCollectorTemplate(factory);
+		for (BuildListInfo *info = m_player->getBuildList(); info;
+			info = info->getNext()) {
+			if (info->isSupplyBuilding() &&
+				info->getObjectID() == factory->getID() &&
+				info->getCurrentGatherers() == -1 && automaticCollector &&
+				automaticCollector->isEquivalentTo(product)) {
+				automaticCollectorProof = true;
+				break;
+			}
+		}
+	}
+
+	// Version-1 WorkOrders have no ProductionID. Keep their conservative
+	// aggregate proof until those outstanding legacy orders complete.
+	return IsSkirmishAIPendingCollectorEntry(
+		hasCollectorOrder, hasNonCollectorOrder,
+		outstandingOrderQuantity, matchingEntryQuantity,
+		automaticCollectorProof);
+}
+
+Int AIPlayer::countSkirmishAIPendingCollectors()
+{
+	Int pending = 0;
+	if (!m_player || !TheGameLogic)
+		return pending;
+	for (Object *factory = TheGameLogic->getFirstObject(); factory;
+		factory = factory->getNextObject()) {
+		if (factory->getControllingPlayer() != m_player ||
+			factory->isEffectivelyDead() || factory->isDestroyed() ||
+			factory->testStatus(OBJECT_STATUS_SOLD))
+			continue;
+		ProductionUpdateInterface *production =
+			factory->getProductionUpdateInterface();
+		for (const ProductionEntry *entry = production
+				? production->firstProduction() : nullptr;
+			 entry; entry = production->nextProduction(entry)) {
+			if (!isSkirmishAIPendingCollectorEntry(factory, entry))
+				continue;
+			pending = AddSkirmishAISupplyCollectorDeficit(
+				pending, entry->getProductionQuantityRemaining(), 0);
+		}
+	}
+	return pending;
+}
+
+static const ThingTemplate *FindSkirmishAICollectorTemplate(
+	Player *player, Object **selectedProducer)
+{
+	if (selectedProducer)
+		*selectedProducer = nullptr;
+	if (!player || !TheGameLogic || !TheThingFactory)
+		return nullptr;
+	Object *bestProducer = nullptr;
+	const ThingTemplate *bestTemplate = nullptr;
+	for (Object *producer = TheGameLogic->getFirstObject(); producer;
+		producer = producer->getNextObject()) {
+		ProductionUpdateInterface *production =
+			producer->getProductionUpdateInterface();
+		if (!IsSkirmishAIOperationalProducer(
+				producer->getControllingPlayer() == player,
+				producer->isEffectivelyDead(), producer->isDestroyed(),
+				producer->isKindOf(KINDOF_REBUILD_HOLE),
+				producer->testStatus(OBJECT_STATUS_SOLD),
+				producer->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+				producer->testStatus(OBJECT_STATUS_RECONSTRUCTING),
+				producer->isDisabled(),
+				producer->isDisabledByType(DISABLED_UNMANNED),
+				production != nullptr))
+			continue;
+		if (!production || production->getProductionCount() > 0)
+			continue;
+		if (producer->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+			!FindSkirmishAIUsableSupplySource(player, producer))
+			continue;
+		const ThingTemplate *candidate = TheThingFactory->firstTemplate();
+		while (candidate) {
+			if (candidate->isKindOf(KINDOF_HARVESTER) &&
+				TheBuildAssistant->isPossibleToMakeUnit(producer, candidate) &&
+				TheBuildAssistant->canMakeUnit(producer, candidate) == CANMAKE_OK)
+				break;
+			candidate = candidate->friend_getNextTemplate();
+		}
+		if (!candidate)
+			continue;
+		if (!bestProducer || producer->getID() < bestProducer->getID()) {
+			bestProducer = producer;
+			bestTemplate = candidate;
+		}
+	}
+	if (selectedProducer)
+		*selectedProducer = bestProducer;
+	return bestTemplate;
+}
+
+static const ThingTemplate *FindSkirmishAIAutomaticCollectorTemplate(
+	Object *supplyCenter)
+{
+	if (!supplyCenter || !TheThingFactory)
+		return nullptr;
+	for (const ThingTemplate *candidate = TheThingFactory->firstTemplate(); candidate;
+		candidate = candidate->friend_getNextTemplate()) {
+		if (candidate->isKindOf(KINDOF_HARVESTER) &&
+			TheBuildAssistant->isPossibleToMakeUnit(supplyCenter, candidate))
+			return candidate;
+	}
+	return nullptr;
+}
+
+Int AIPlayer::getStage3SupplyCollectorDemand() const
+{
+	SkirmishAISupplyCenterStateList centers;
+	FindSkirmishAIUsableSupplyCenters(m_player, &centers);
+	const Int defaultDesiredGatherers =
+		GetSupplyCenterDesiredGatherers(m_player, m_difficulty);
+	for (SkirmishAISupplyCenterStateList::iterator center = centers.begin();
+		center != centers.end(); ++center)
+		center->m_desiredGatherers = defaultDesiredGatherers;
+	for (BuildListInfo *info = m_player ? m_player->getBuildList() : nullptr;
+		info; info = info->getNext()) {
+		if (!info->isSupplyBuilding())
+			continue;
+		SkirmishAISupplyCenterState *center =
+			FindSkirmishAISupplyCenterState(&centers, info->getObjectID());
+		if (center && info->getDesiredGatherers() > 0)
+			center->m_desiredGatherers = info->getDesiredGatherers();
+	}
+	Int totalGatherers = 0;
+	CountSkirmishAISupplyCenterGatherers(
+		m_player, &centers, &totalGatherers, nullptr);
+	return GetSkirmishAIAggregateSupplyCollectorDemand(
+		centers, totalGatherers);
+}
 
 
 // ------------------------------------------------------------------------------------------------
@@ -198,26 +682,10 @@ void AIPlayer::checkForSupplyCenter( BuildListInfo *info, Object *bldg )
 	if( centerModule  )
 	{
 		info->setSupplyBuilding(true);
-		Int desiredGatherers = 0;
-		const AISideInfo *resInfo = TheAI->getAiData()->m_sideInfo;
-		while (resInfo) {
-			if (resInfo->m_side == m_player->getSide()) {
-				GameDifficulty difficulty = m_difficulty;
-				if (difficulty == DIFFICULTY_EASY) {
-					desiredGatherers = resInfo->m_easy;
-				}
-				if (difficulty == DIFFICULTY_NORMAL) {
-					desiredGatherers = resInfo->m_normal;
-				}
-				if (difficulty == DIFFICULTY_HARD) {
-					desiredGatherers = resInfo->m_hard;
-				}
-			}
-			resInfo = resInfo->m_next;
-		}
 		info->setSupplyBuilding(true);
 		info->setCurrentGatherers(-1);
-		info->setDesiredGatherers(desiredGatherers+1); // get a freebie with the supply depots.
+		info->setDesiredGatherers(
+			GetSupplyCenterDesiredGatherers(m_player, m_difficulty));
 	}
 }
 
@@ -226,6 +694,95 @@ void AIPlayer::checkForSupplyCenter( BuildListInfo *info, Object *bldg )
 // ------------------------------------------------------------------------------------------------
 void AIPlayer::queueSupplyTruck()
 {
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: (TheGameLogic ? TheGameLogic->getGameMode() : GAME_NONE);
+	const Bool useStage3SupplyProduction =
+		isSkirmishAI() && IsSkirmishAIRecoveryGameMode(gameMode) &&
+		ShouldUseSkirmishAIProductionBehavior(
+			replay,
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	SkirmishAISupplyCenterStateList stage3SupplyCenters;
+	if (useStage3SupplyProduction)
+		FindSkirmishAIUsableSupplyCenters(m_player, &stage3SupplyCenters);
+	if (useStage3SupplyProduction) {
+		for (BuildListInfo *info = m_player->getBuildList(); info;
+			info = info->getNext()) {
+			if (!info->isSupplyBuilding() || info->getCurrentGatherers() != -1)
+				continue;
+			Object *center = TheGameLogic->findObjectByID(info->getObjectID());
+			if (!center || center->getControllingPlayer() != m_player ||
+				!center->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+				center->isKindOf(KINDOF_REBUILD_HOLE) ||
+				center->isEffectivelyDead() || center->isDestroyed() ||
+				center->testStatus(OBJECT_STATUS_SOLD)) {
+				info->setCurrentGatherers(0);
+				continue;
+			}
+			const ThingTemplate *collector =
+				FindSkirmishAIAutomaticCollectorTemplate(center);
+			ProductionUpdateInterface *production =
+				center->getProductionUpdateInterface();
+			const ProductionEntry *automaticEntry = nullptr;
+			Int matchingEntryCount = 0;
+			for (const ProductionEntry *entry = production
+					? production->firstProduction() : nullptr;
+				 entry; entry = production->nextProduction(entry)) {
+				if (!collector || entry->getProductionType() != PRODUCTION_UNIT ||
+					!entry->getProductionObject() ||
+					!entry->getProductionObject()->isEquivalentTo(collector) ||
+					entry->getProductionQuantityRemaining() <= 0)
+					continue;
+				++matchingEntryCount;
+				if (entry->getProductionQuantityRemaining() == 1)
+					automaticEntry = entry;
+			}
+			Bool boundOrderExists = false;
+			for (DLINK_ITERATOR<TeamInQueue> orderTeam = iterate_TeamBuildQueue();
+				!orderTeam.done() && !boundOrderExists; orderTeam.advance()) {
+				TeamInQueue *queuedTeam = orderTeam.cur();
+				for (WorkOrder *queued = queuedTeam
+						? queuedTeam->m_workOrders : nullptr;
+					 queued; queued = queued->m_next) {
+					if (queued->m_factoryID == center->getID() && queued->m_thing &&
+						collector && queued->m_thing->isEquivalentTo(collector) &&
+						queued->m_numCompleted < queued->m_numRequired) {
+						boundOrderExists = true;
+						break;
+					}
+				}
+			}
+			// The -1 sentinel is only evidence that this listed center expects its
+			// automatic free collector. Bind it only to the sole exact one-unit
+			// collector entry when no paid/scripted order already owns
+			// that factory/template. Otherwise normalize the sentinel and reconcile
+			// later from the actual produced/assigned collector.
+			if (!automaticEntry || matchingEntryCount != 1 || boundOrderExists) {
+				info->setCurrentGatherers(0);
+				continue;
+			}
+			WorkOrder *order = newInstance(WorkOrder);
+			order->m_thing = collector;
+			order->m_factoryID = center->getID();
+			order->m_productionID =
+				static_cast<Int>(automaticEntry->getProductionID());
+			order->m_numRequired = 1;
+			order->m_required = true;
+			order->m_isResourceGatherer = true;
+			order->m_next = nullptr;
+			TeamInQueue *team = newInstance(TeamInQueue);
+			prependTo_TeamBuildQueue(team);
+			team->m_priorityBuild = true;
+			team->m_workOrders = order;
+			team->m_frameStarted = TheGameLogic->getFrame();
+			team->m_team = m_player->getDefaultTeam();
+			info->setCurrentGatherers(0);
+			m_teamDelay = 0;
+			return;
+		}
+	}
 	Bool truckInQueue = false;
 	for ( DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue(); !iter.done(); iter.advance())
 	{
@@ -233,22 +790,51 @@ void AIPlayer::queueSupplyTruck()
 		WorkOrder *order;
 		for( order = team->m_workOrders; order; order = order->m_next )
 		{
-			// GLA dozers (workers) are also resource gatherers, so make sure it isn't a worker. jba.
-			if (order->m_isResourceGatherer) {
+			// The work-order role is authoritative: a GLA worker queued here as a
+			// gatherer is a collector, while builder orders leave this flag clear.
+			if (order->m_isResourceGatherer &&
+				(!useStage3SupplyProduction ||
+				 order->m_numCompleted < order->m_numRequired))
 				truckInQueue = true;
-			}
 		}
 	}
-
-	if (truckInQueue) {
+	if (truckInQueue && !useStage3SupplyProduction) {
 		return; // already building a supply truck.
 	}
 	Int totalHarvesters = 0;
+	Object *stage3LooseHarvester = nullptr;
+	Int aggregateCollectorDeficit = 0;
 
 	// See how many harvesters we have servicing this supply src.
 	// Scan my units.
+	if (useStage3SupplyProduction) {
+		const Int defaultDesiredGatherers =
+			GetSupplyCenterDesiredGatherers(m_player, m_difficulty);
+		for (SkirmishAISupplyCenterStateList::iterator center =
+			stage3SupplyCenters.begin(); center != stage3SupplyCenters.end();
+			++center)
+			center->m_desiredGatherers = defaultDesiredGatherers;
+		for (BuildListInfo *info = m_player->getBuildList(); info;
+			info = info->getNext()) {
+			if (!info->isSupplyBuilding())
+				continue;
+			SkirmishAISupplyCenterState *center =
+				FindSkirmishAISupplyCenterState(
+					&stage3SupplyCenters, info->getObjectID());
+			if (center) {
+				center->m_listed = true;
+				if (info->getDesiredGatherers() > 0)
+					center->m_desiredGatherers = info->getDesiredGatherers();
+			}
+		}
+		CountSkirmishAISupplyCenterGatherers(m_player, &stage3SupplyCenters,
+			&totalHarvesters, &stage3LooseHarvester);
+		aggregateCollectorDeficit = GetSkirmishAIAggregateSupplyCollectorDemand(
+			stage3SupplyCenters, totalHarvesters);
+	}
 	Player::PlayerTeamList::const_iterator it;
-	for (it = m_player->getPlayerTeams()->begin(); it != m_player->getPlayerTeams()->end(); ++it) {
+	for (it = m_player->getPlayerTeams()->begin();
+		!useStage3SupplyProduction && it != m_player->getPlayerTeams()->end(); ++it) {
 		for (DLINK_ITERATOR<Team> iter = (*it)->iterate_TeamInstanceList(); !iter.done(); iter.advance()) {
 			Team *team = iter.cur();
 			if (!team) {
@@ -274,46 +860,81 @@ void AIPlayer::queueSupplyTruck()
 		if (info->isSupplyBuilding() == false) continue;
 		Int desiredGatherers = info->getDesiredGatherers();
 		Int curGatherers = info->getCurrentGatherers();
+		Object *stage3ListedCenter = nullptr;
+		SkirmishAISupplyCenterState *stage3ListedCenterState = nullptr;
+		if (useStage3SupplyProduction) {
+			stage3ListedCenter =
+				TheGameLogic->findObjectByID(info->getObjectID());
+			if (!FindSkirmishAIUsableSupplySource(
+					m_player, stage3ListedCenter)) {
+				stage3ListedCenter = nullptr;
+			} else {
+				stage3ListedCenterState = FindSkirmishAISupplyCenterState(
+					&stage3SupplyCenters, stage3ListedCenter->getID());
+				if (stage3ListedCenterState) {
+					stage3ListedCenterState->m_listed = true;
+					if (curGatherers != -1) {
+						curGatherers = stage3ListedCenterState->m_gatherers;
+						info->setCurrentGatherers(curGatherers);
+					}
+				}
+			}
+		}
 
 		if (curGatherers>=desiredGatherers) {
 			// Check & see if any have died.
 			Object *supplyCenter = TheGameLogic->findObjectByID(info->getObjectID());
+			Object *stage3SupplySource = nullptr;
+			if (useStage3SupplyProduction) {
+				stage3SupplySource =
+					FindSkirmishAIUsableSupplySource(m_player, supplyCenter);
+			}
+			if (useStage3SupplyProduction && !stage3SupplySource) {
+				continue;
+			}
 			// Check for supplies.
 			if (supplyCenter) {
 				if (supplyCenter->isKindOf(KINDOF_REBUILD_HOLE)) {
 					continue; // don't consider rebuild holes.
 				}
 				// Make sure we have a supplies near it.
-				Coord3D center = *supplyCenter->getPosition();
-				Real radius = SUPPLY_CENTER_CLOSE_DIST + supplyCenter->getGeometryInfo().getBoundingCircleRadius();
+				if (!useStage3SupplyProduction) {
+					Coord3D center = *supplyCenter->getPosition();
+					Real radius = SUPPLY_CENTER_CLOSE_DIST + supplyCenter->getGeometryInfo().getBoundingCircleRadius();
 
-				PartitionFilterAcceptByKindOf f1(MAKE_KINDOF_MASK(KINDOF_SUPPLY_SOURCE), KINDOFMASK_NONE);
-				PartitionFilterPlayer f2(m_player, false);	// Only find other.
-				PartitionFilterOnMap filterMapStatus;
+					PartitionFilterAcceptByKindOf f1(MAKE_KINDOF_MASK(KINDOF_SUPPLY_SOURCE), KINDOFMASK_NONE);
+					PartitionFilterPlayer f2(m_player, false);	// Only find other.
+					PartitionFilterOnMap filterMapStatus;
 
-				PartitionFilter *filters[] = { &f1, &f2, &filterMapStatus, nullptr };
+					PartitionFilter *filters[] = { &f1, &f2, &filterMapStatus, nullptr };
 
-				Object *supplySource = ThePartitionManager->getClosestObject(&center, radius, FROM_BOUNDINGSPHERE_2D, filters);
-				if (!supplySource) {
-					// No supplies.
-					continue;
-				}
-				static const NameKeyType key_warehouseUpdate = NAMEKEY("SupplyWarehouseDockUpdate");
-				SupplyWarehouseDockUpdate *warehouseModule = (SupplyWarehouseDockUpdate*)supplySource->findUpdateModule( key_warehouseUpdate );
-				if( warehouseModule )	{
-					Int availableCash = warehouseModule->getBoxesStored()*TheGlobalData->m_baseValuePerSupplyBox;
-					if (availableCash<=0) continue;
-					if( m_player->getRelationship(supplySource->getTeam()) == ENEMIES ) {
+					Object *supplySource = ThePartitionManager->getClosestObject(&center, radius, FROM_BOUNDINGSPHERE_2D, filters);
+					if (!supplySource) {
+						// No supplies.
 						continue;
+					}
+					static const NameKeyType key_warehouseUpdate = NAMEKEY("SupplyWarehouseDockUpdate");
+					SupplyWarehouseDockUpdate *warehouseModule = (SupplyWarehouseDockUpdate*)supplySource->findUpdateModule( key_warehouseUpdate );
+					if( warehouseModule )	{
+						Int availableCash = warehouseModule->getBoxesStored()*TheGlobalData->m_baseValuePerSupplyBox;
+						if (availableCash<=0) continue;
+						if( m_player->getRelationship(supplySource->getTeam()) == ENEMIES ) {
+							continue;
+						}
 					}
 				}
 				// Ok, it has supplies available near it.
-				checkForSupplyCenter(info, supplyCenter);
-				Int curGatherers = 0;
+				if (!useStage3SupplyProduction)
+					checkForSupplyCenter(info, supplyCenter);
+				Int curGatherers = useStage3SupplyProduction &&
+					stage3ListedCenterState ?
+					stage3ListedCenterState->m_gatherers : 0;
 				// See how many harvesters we have servicing this supply src.
 				// Scan my units.
 				Player::PlayerTeamList::const_iterator it;
-				for (it = m_player->getPlayerTeams()->begin(); it != m_player->getPlayerTeams()->end(); ++it) {
+				for (it = m_player->getPlayerTeams()->begin();
+					!useStage3SupplyProduction &&
+					it != m_player->getPlayerTeams()->end(); ++it) {
 					for (DLINK_ITERATOR<Team> iter = (*it)->iterate_TeamInstanceList(); !iter.done(); iter.advance()) {
 						Team *team = iter.cur();
 						if (!team) {
@@ -345,12 +966,31 @@ void AIPlayer::queueSupplyTruck()
 				//DEBUG_LOG(("Expected %d harvesters, found %d, need %d", info->getDesiredGatherers(),
 				//	curGatherers, info->getDesiredGatherers()-curGatherers) );
 				info->setCurrentGatherers(curGatherers);
+				if (useStage3SupplyProduction &&
+					curGatherers < info->getDesiredGatherers()) {
+				}
 			}
 		} else {
+			if (useStage3SupplyProduction) {
+				Object *supplyCenter =
+					TheGameLogic->findObjectByID(info->getObjectID());
+				if (!FindSkirmishAIUsableSupplySource(m_player, supplyCenter)) {
+					continue;
+				}
+				if (stage3LooseHarvester) {
+					info->setCurrentGatherers(info->getCurrentGatherers() + 1);
+					stage3LooseHarvester->getAI()->aiDock(
+						supplyCenter, CMD_FROM_PLAYER);
+					DEBUG_LOG(("Re-attaching supply truck to supply center."));
+					return;
+				}
+			}
 			/* See if we have any "loose" harvesters (cause my supply center got nuked.) */
-			Player::PlayerTeamList::const_iterator it;
-			for (it = m_player->getPlayerTeams()->begin(); it != m_player->getPlayerTeams()->end(); ++it) {
-				for (DLINK_ITERATOR<Team> iter = (*it)->iterate_TeamInstanceList(); !iter.done(); iter.advance()) {
+			Player::PlayerTeamList::const_iterator looseIt;
+			for (looseIt = m_player->getPlayerTeams()->begin();
+				!useStage3SupplyProduction && looseIt != m_player->getPlayerTeams()->end();
+				++looseIt) {
+				for (DLINK_ITERATOR<Team> iter = (*looseIt)->iterate_TeamInstanceList(); !iter.done(); iter.advance()) {
 					Team *team = iter.cur();
 					if (!team) continue;
 					for (DLINK_ITERATOR<Object> objIter = team->iterate_TeamMemberList(); !objIter.done(); objIter.advance()) {
@@ -387,7 +1027,15 @@ void AIPlayer::queueSupplyTruck()
 					}
 				}
 			}
-			if (totalHarvesters >= desiredGatherers*3) {
+			if (useStage3SupplyProduction &&
+				GetSkirmishAISupplyCollectorDemand(
+					aggregateCollectorDeficit, 0, false) == 0) {
+				continue;
+			}
+			if (useStage3SupplyProduction)
+				continue;
+			if (!useStage3SupplyProduction &&
+				totalHarvesters >= desiredGatherers*3) {
 				continue; // we got lotsa gatherers.
 			}
 			Bool canBuildUnits = m_player->getCanBuildUnits();
@@ -435,6 +1083,56 @@ void AIPlayer::queueSupplyTruck()
 			m_player->setCanBuildUnits(canBuildUnits);
 		}
 	}
+
+	if (!useStage3SupplyProduction) {
+		return;
+	}
+
+	Object *stage3SupplyCenter = FindSkirmishAIUnderfilledSupplyCenter(
+		&stage3SupplyCenters);
+	if (!stage3SupplyCenter)
+		return;
+
+	if (stage3LooseHarvester) {
+		stage3LooseHarvester->getAI()->aiDock(
+			stage3SupplyCenter, CMD_FROM_PLAYER);
+		DEBUG_LOG(("Re-attaching supply truck to unlisted supply center."));
+		return;
+	}
+
+	const Int pendingCollectorQuantity =
+		countSkirmishAIPendingCollectors();
+	if (GetSkirmishAISupplyCollectorDemand(
+		aggregateCollectorDeficit, pendingCollectorQuantity, false) == 0)
+		return;
+
+	Bool canBuildUnits = m_player->getCanBuildUnits();
+	m_player->setCanBuildUnits(true);
+	Object *collectorProducer = nullptr;
+	const ThingTemplate *tTemplate = FindSkirmishAICollectorTemplate(
+		m_player, &collectorProducer);
+	if (tTemplate) {
+		WorkOrder *order = newInstance(WorkOrder);
+		order->m_thing = tTemplate;
+		order->m_factoryID = collectorProducer->getID();
+		order->m_numRequired = 1;
+		order->m_required = true;
+		order->m_isResourceGatherer = true;
+		order->m_next = nullptr;
+		TeamInQueue *team = newInstance(TeamInQueue);
+		prependTo_TeamBuildQueue(team);
+		team->m_priorityBuild = true;
+		team->m_workOrders = order;
+		team->m_frameStarted = TheGameLogic->getFrame();
+		team->m_team = m_player->getDefaultTeam();
+		if (startTraining(order, team->m_priorityBuild, team->m_team->getName())) {
+			m_teamDelay = 0;
+		} else {
+			removeFrom_TeamBuildQueue(team);
+			deleteInstance(team);
+		}
+	}
+	m_player->setCanBuildUnits(canBuildUnits);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1058,9 +1756,31 @@ Bool AIPlayer::isLocationSafe(const Coord3D *pos, const ThingTemplate *tthing )
 // ------------------------------------------------------------------------------------------------
 /** Invoked when a unit I am training comes into existence */
 // ------------------------------------------------------------------------------------------------
-void AIPlayer::onUnitProduced( Object *factory, Object *unit )
+void AIPlayer::onUnitProduced( Object *factory, Object *unit, Int productionID )
 {
 	Bool found = false;
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: (TheGameLogic ? TheGameLogic->getGameMode() : GAME_NONE);
+	const Bool useStage3SupplyProduction =
+		isSkirmishAI() && IsSkirmishAIRecoveryGameMode(gameMode) &&
+		ShouldUseSkirmishAIProductionBehavior(
+			replay,
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	SkirmishAISupplyCenterStateList stage3SupplyCenters;
+	if (useStage3SupplyProduction) {
+		FindSkirmishAIUsableSupplyCenters(m_player, &stage3SupplyCenters);
+		const Int defaultDesiredGatherers =
+			GetSupplyCenterDesiredGatherers(m_player, m_difficulty);
+		for (SkirmishAISupplyCenterStateList::iterator center =
+			stage3SupplyCenters.begin(); center != stage3SupplyCenters.end();
+			++center)
+			center->m_desiredGatherers = defaultDesiredGatherers;
+		CountSkirmishAISupplyCenterGatherers(
+			m_player, &stage3SupplyCenters, nullptr, nullptr);
+	}
 	// TheSuperHackers @fix Mauller 26/04/2025 Fixes uninitialized variable.
 	// To keep retail compatibility it needs to be set true in VS6 builds.
 #if defined(_MSC_VER) && _MSC_VER < 1300
@@ -1082,7 +1802,11 @@ void AIPlayer::onUnitProduced( Object *factory, Object *unit )
 		if (found) break;
 		for( order = team->m_workOrders; order; order = order->m_next )
 		{
-			if (order->m_factoryID == factory->getID() && order->m_numCompleted < order->m_numRequired && unit->getTemplate()->isEquivalentTo(order->m_thing))
+			if (order->m_factoryID == factory->getID() &&
+				(!useStage3SupplyProduction || order->m_productionID == 0 ||
+				 (productionID != 0 && order->m_productionID == productionID)) &&
+				order->m_numCompleted < order->m_numRequired &&
+				unit->getTemplate()->isEquivalentTo(order->m_thing))
 			{
 				// found associated order, mark it complete.
 				order->m_numCompleted++;
@@ -1093,6 +1817,11 @@ void AIPlayer::onUnitProduced( Object *factory, Object *unit )
 					team->m_reinforcementID = unit->getID();
 				}
 				AIUpdateInterface *ai = unit->getAIUpdateInterface();
+				WorkerAIInterface *workerAI =
+					useStage3SupplyProduction && ai
+						? ai->getWorkerAIInterface() : nullptr;
+				if (workerAI)
+					workerAI->setStage3CollectorRole(order->m_isResourceGatherer);
 				if (team->m_team->getPrototype()->getTemplateInfo()->m_hasHomeLocation) {
 					if (ai) {
 						std::vector<Coord3D> path;
@@ -1103,6 +1832,7 @@ void AIPlayer::onUnitProduced( Object *factory, Object *unit )
 				}
 
 				order->m_factoryID = INVALID_ID; // no longer using this factory.
+				order->m_productionID = 0;
 				if (ai) {
 					// tell it to start gathering resources.
 					// Here is the special bit for this exit style, force wanting on SupplyTruck types
@@ -1116,20 +1846,59 @@ void AIPlayer::onUnitProduced( Object *factory, Object *unit )
 						supplyTruckAI->setForceWantingState(supplyTruck);
 						if (supplyTruck) {
 							// assign to a supply depot.
+							Bool routedToSupplyCenter = false;
 							for( BuildListInfo *info = m_player->getBuildList(); info; info = info->getNext() )
 							{
-								if (info->isSupplyBuilding() && info->getDesiredGatherers()>0 &&
-									info->getDesiredGatherers()>info->getCurrentGatherers()) {
+								SkirmishAISupplyCenterState *centerState =
+									useStage3SupplyProduction && info->isSupplyBuilding()
+										? FindSkirmishAISupplyCenterState(
+											&stage3SupplyCenters, info->getObjectID()) : nullptr;
+								if (centerState) {
+									centerState->m_listed = true;
+									if (info->getDesiredGatherers() > 0)
+										centerState->m_desiredGatherers =
+											info->getDesiredGatherers();
+								}
+								const Bool routeToListedCenter = useStage3SupplyProduction
+									? ShouldRouteSkirmishAICollectorToCenter(
+										centerState != nullptr,
+										centerState ? centerState->m_desiredGatherers : 0,
+										centerState ? centerState->m_gatherers : 0)
+									: info->isSupplyBuilding() && info->getDesiredGatherers()>0 &&
+										info->getDesiredGatherers()>info->getCurrentGatherers();
+								if (routeToListedCenter) {
 										Object *obj = TheGameLogic->findObjectByID(info->getObjectID());
-										if (obj) {
-											info->setCurrentGatherers(info->getCurrentGatherers()+1);
+										if (obj && (!useStage3SupplyProduction ||
+											FindSkirmishAIUsableSupplySource(m_player, obj))) {
+											if (centerState) {
+												centerState->m_gatherers++;
+												info->setCurrentGatherers(centerState->m_gatherers);
+											} else {
+												info->setCurrentGatherers(info->getCurrentGatherers()+1);
+											}
 											// Note - although this is the ai, we are sending in CMD_FROM_PLAYER.
 											// This causes the dock object to stick in the docking interface.
 											// The supply truck ai issues dock commands, and they become confused.
 											// Thus, player.  jba.  ;(
 											ai->aiDock(obj, CMD_FROM_PLAYER);
+											routedToSupplyCenter = true;
+											if (useStage3SupplyProduction)
+												break;
 										}
 									}
+							}
+							if (useStage3SupplyProduction && !routedToSupplyCenter) {
+								Object *stage3SupplyCenter =
+									FindSkirmishAIUnderfilledUnlistedSupplyCenter(
+										&stage3SupplyCenters);
+								if (stage3SupplyCenter) {
+									ai->aiDock(stage3SupplyCenter, CMD_FROM_PLAYER);
+									SkirmishAISupplyCenterState *centerState =
+										FindSkirmishAISupplyCenterState(
+											&stage3SupplyCenters, stage3SupplyCenter->getID());
+									if (centerState)
+										centerState->m_gatherers++;
+								}
 							}
 
 						}
@@ -1406,12 +2175,36 @@ Int AIPlayer::getPlayerSuperweaponValue(Coord3D *center, Int playerNdx, Real rad
 // ------------------------------------------------------------------------------------------------
 Bool AIPlayer::startTraining( WorkOrder *order, Bool busyOK, AsciiString teamName)
 {
-	Object *factory = findFactory(order->m_thing, busyOK);
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: (TheGameLogic ? TheGameLogic->getGameMode() : GAME_NONE);
+	const Bool useStage3Production = isSkirmishAI() &&
+		IsSkirmishAIRecoveryGameMode(gameMode) &&
+		ShouldUseSkirmishAIProductionBehavior(replay,
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	Object *factory = nullptr;
+	if (useStage3Production && order->m_isResourceGatherer &&
+		order->m_factoryID != INVALID_ID) {
+		factory = TheGameLogic->findObjectByID(order->m_factoryID);
+		if (!factory || factory->getControllingPlayer() != m_player ||
+			(factory->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+			 !FindSkirmishAIUsableSupplySource(m_player, factory)) ||
+			!TheBuildAssistant->isPossibleToMakeUnit(factory, order->m_thing))
+			return false;
+	} else {
+		factory = findFactory(order->m_thing, busyOK);
+	}
 	if( factory )
 	{
 		ProductionUpdateInterface *pu = factory->getProductionUpdateInterface();
-		if (pu && pu->queueCreateUnit( order->m_thing, pu->requestUniqueUnitID() )) {
+		const ProductionID productionID = pu
+			? pu->requestUniqueUnitID() : PRODUCTIONID_INVALID;
+		if (pu && pu->queueCreateUnit( order->m_thing, productionID )) {
 			order->m_factoryID = factory->getID();
+			order->m_productionID = useStage3Production
+				? static_cast<Int>(productionID) : 0;
 			if (TheGlobalData->m_debugAI) {
 				AsciiString teamStr = "Queuing ";
 				teamStr.concat(order->m_thing->getName());
@@ -1434,6 +2227,38 @@ Bool AIPlayer::startTraining( WorkOrder *order, Bool busyOK, AsciiString teamNam
 // ------------------------------------------------------------------------------------------------
 Object *AIPlayer::findFactory(const ThingTemplate *thing, Bool busyOK)
 {
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: (TheGameLogic ? TheGameLogic->getGameMode() : GAME_NONE);
+	if (isSkirmishAI() && IsSkirmishAIRecoveryGameMode(gameMode) &&
+		ShouldUseSkirmishAIProductionBehavior(replay,
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY)) {
+		Object *idleFactory = nullptr;
+		Object *busyFactory = nullptr;
+		for (Object *factory = TheGameLogic->getFirstObject(); factory;
+			factory = factory->getNextObject()) {
+			ProductionUpdateInterface *production = factory->getProductionUpdateInterface();
+			if (!IsSkirmishAIOperationalProducer(
+					factory->getControllingPlayer() == m_player,
+					factory->isEffectivelyDead(), factory->isDestroyed(),
+					factory->isKindOf(KINDOF_REBUILD_HOLE),
+					factory->testStatus(OBJECT_STATUS_SOLD),
+					factory->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+					factory->testStatus(OBJECT_STATUS_RECONSTRUCTING),
+					factory->isDisabled(),
+					factory->isDisabledByType(DISABLED_UNMANNED),
+					production != nullptr) ||
+				!TheBuildAssistant->isPossibleToMakeUnit(factory, thing))
+				continue;
+			Object **best = production->getProductionCount() == 0
+				? &idleFactory : &busyFactory;
+			if (!*best || factory->getID() < (*best)->getID())
+				*best = factory;
+		}
+		return idleFactory ? idleFactory : (busyOK ? busyFactory : nullptr);
+	}
 	Object *busyFactory = nullptr; // We prefer a factory that isn't busy.
 	for( BuildListInfo *info = m_player->getBuildList(); info; info = info->getNext() )
 	{
@@ -1754,7 +2579,29 @@ Bool AIPlayer::queueSelectedTeam( TeamPrototype *teamProto )
 		TheScriptEngine->AppendDebugMessage(teamStr, false);
 	}
 	// Build it at low priority, as we have selected it automagically.
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: (TheGameLogic ? TheGameLogic->getGameMode() : GAME_NONE);
+	const Bool stage3Production = isSkirmishAI() &&
+		IsSkirmishAIRecoveryGameMode(gameMode) &&
+		ShouldUseSkirmishAIProductionBehavior(replay,
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	TeamInQueue *previousLast = nullptr;
+	if (stage3Production)
+		for (DLINK_ITERATOR<TeamInQueue> team = iterate_TeamBuildQueue();
+			!team.done(); team.advance())
+			previousLast = team.cur();
 	buildSpecificAITeam(teamProto, false);
+	if (stage3Production) {
+		TeamInQueue *currentLast = nullptr;
+		for (DLINK_ITERATOR<TeamInQueue> team = iterate_TeamBuildQueue();
+			!team.done(); team.advance())
+			currentLast = team.cur();
+		if (currentLast == previousLast)
+			return false;
+	}
 	m_readyToBuildTeam = false;
 	m_teamTimer = m_teamSeconds*LOGICFRAMES_PER_SECOND;
 	if (m_player->getMoney()->countMoney() < TheAI->getAiData()->m_resourcesPoor) {
@@ -3335,7 +4182,23 @@ Object * AIPlayer::findDozer( const Coord3D *pos )
 // ------------------------------------------------------------------------------------------------
 void AIPlayer::crc( Xfer *xfer )
 {
-
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: (TheGameLogic ? TheGameLogic->getGameMode() : GAME_NONE);
+	if (!isSkirmishAI() || !IsSkirmishAIRecoveryGameMode(gameMode) ||
+		!ShouldIncludeSkirmishAIProductionCRCFields(replay,
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY))
+		return;
+	UnsignedShort teamCount = 0;
+	for (DLINK_ITERATOR<TeamInQueue> team = iterate_TeamBuildQueue();
+		!team.done(); team.advance())
+		++teamCount;
+	xfer->xferUnsignedShort(&teamCount);
+	for (DLINK_ITERATOR<TeamInQueue> team = iterate_TeamBuildQueue();
+		!team.done(); team.advance())
+		xfer->xferSnapshot(team.cur());
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -3643,7 +4506,14 @@ void TeamInQueue::disband()
 // ------------------------------------------------------------------------------------------------
 void TeamInQueue::crc( Xfer *xfer )
 {
-
+	TeamID teamID = m_team ? m_team->getID() : TEAM_ID_INVALID;
+	xfer->xferUser(&teamID, sizeof(TeamID));
+	UnsignedShort orderCount = 0;
+	for (WorkOrder *order = m_workOrders; order; order = order->m_next)
+		++orderCount;
+	xfer->xferUnsignedShort(&orderCount);
+	for (WorkOrder *order = m_workOrders; order; order = order->m_next)
+		xfer->xferSnapshot(order);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -3767,17 +4637,42 @@ void WorkOrder::validateFactory( Player *thisPlayer )
 	Object *factory = TheGameLogic->findObjectByID( m_factoryID );
 	if ( factory == nullptr) {
 		m_factoryID = INVALID_ID;
+		m_productionID = 0;
 		return;
 	}
 	if (factory->getControllingPlayer() != thisPlayer) {
 		m_factoryID = INVALID_ID;
+		m_productionID = 0;
 		return;
 	}
 	if (ShouldUseSkirmishAILivenessRecovery(TheGameLogic->isInReplayGame(), TheRecorder && TheRecorder->replayUsesSkirmishAILivenessRecovery())) {
 		ProductionUpdateInterface *production = factory->getProductionUpdateInterface();
 		UnsignedInt queuedUnitCount = production ? production->countUnitTypeInQueue(m_thing) : 0;
+		const Bool replay = TheGameLogic->isInReplayGame();
+		const Int gameMode = replay
+			? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+			: TheGameLogic->getGameMode();
+		if (production && m_productionID != 0 &&
+			IsSkirmishAIRecoveryGameMode(gameMode) &&
+			ShouldUseSkirmishAIProductionBehavior(replay,
+				TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+				SKIRMISH_AI_REPLAY_EPOCH_LEGACY)) {
+			queuedUnitCount = 0;
+			for (const ProductionEntry *entry = production->firstProduction(); entry;
+				entry = production->nextProduction(entry)) {
+				if (static_cast<Int>(entry->getProductionID()) == m_productionID &&
+					entry->getProductionType() == PRODUCTION_UNIT &&
+					entry->getProductionObject() && m_thing &&
+					entry->getProductionObject()->isEquivalentTo(m_thing) &&
+					entry->getProductionQuantityRemaining() > 0) {
+					queuedUnitCount = 1;
+					break;
+				}
+			}
+		}
 		if (!IsWorkOrderFactoryQueueValid(true, production != nullptr, queuedUnitCount)) {
 			m_factoryID = INVALID_ID;
+			m_productionID = 0;
 		}
 	}
 
@@ -3788,19 +4683,37 @@ void WorkOrder::validateFactory( Player *thisPlayer )
 // ------------------------------------------------------------------------------------------------
 void WorkOrder::crc( Xfer *xfer )
 {
-
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: (TheGameLogic ? TheGameLogic->getGameMode() : GAME_NONE);
+	if (IsSkirmishAIRecoveryGameMode(gameMode) &&
+		ShouldIncludeSkirmishAIProductionCRCFields(replay,
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY)) {
+		AsciiString thingName = m_thing
+			? m_thing->getName() : AsciiString::TheEmptyString;
+		xfer->xferAsciiString(&thingName);
+		xfer->xferObjectID(&m_factoryID);
+		xfer->xferInt(&m_productionID);
+		xfer->xferInt(&m_numCompleted);
+		xfer->xferInt(&m_numRequired);
+		xfer->xferBool(&m_required);
+		xfer->xferBool(&m_isResourceGatherer);
+	}
 }
 
 // ------------------------------------------------------------------------------------------------
 /** Xfer method
 	* Version Info:
-	* 1: Initial version */
+	* 1: Initial version
+	* 2: Added exact production queue identity. */
 // ------------------------------------------------------------------------------------------------
 void WorkOrder::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 1;
+	XferVersion currentVersion = 2;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -3812,6 +4725,13 @@ void WorkOrder::xfer( Xfer *xfer )
 
 	// factory id
 	xfer->xferObjectID( &m_factoryID );
+
+	// Exact queue identity. Legacy saves retain zero and use callback-order
+	// matching until their outstanding orders complete.
+	if (version >= 2)
+		xfer->xferInt( &m_productionID );
+	else if (xfer->getXferMode() == XFER_LOAD)
+		m_productionID = 0;
 
 	// num completed
 	xfer->xferInt( &m_numCompleted );
