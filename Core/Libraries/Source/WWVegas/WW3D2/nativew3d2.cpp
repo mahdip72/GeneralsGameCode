@@ -15,9 +15,64 @@
 #include <new>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 namespace
 {
+
+thread_local const rts::render::GameRenderCommand *g_failureCommand = 0;
+thread_local bool g_gameFailureStreakObserved = false;
+
+class GameRenderCommandFailureScope
+{
+public:
+	explicit GameRenderCommandFailureScope(
+		const rts::render::GameRenderCommand *command) :
+		m_previous(g_failureCommand)
+	{
+		g_failureCommand = command;
+	}
+	~GameRenderCommandFailureScope()
+	{
+		g_failureCommand = m_previous;
+	}
+private:
+	const rts::render::GameRenderCommand *m_previous;
+};
+
+uint64_t PackTraceHandle(const rts::render::GameRenderHandle &handle)
+{
+	return (static_cast<uint64_t>(handle.index) << 32) | handle.generation;
+}
+
+void TraceGameFailure(rts::render::RenderResult result,
+	unsigned int displayIteration, uint64_t lastSubmittedSequence,
+	const rts::render::GameRenderCommand *command)
+{
+	const char *path = getenv("RTS_RENDER_FAILURE_TRACE");
+	if (path == 0 || path[0] == '\0') return;
+	FILE *trace = fopen(path, "ab");
+	if (trace != 0)
+	{
+		fprintf(trace,
+			"renderer_failure source=game display_iteration=%u last_submitted=%llu result=%d operation=game-command command=%u value0=%u value1=%u value2=%u value3=%u value4=%u value5=%u resource0=%llu resource1=%llu\r\n",
+			displayIteration,
+			static_cast<unsigned long long>(lastSubmittedSequence),
+			static_cast<int>(result),
+			command == 0 ? 0U : static_cast<unsigned int>(command->type),
+			command == 0 ? 0U : command->value0,
+			command == 0 ? 0U : command->value1,
+			command == 0 ? 0U : command->value2,
+			command == 0 ? 0U : command->value3,
+			command == 0 ? 0U : command->value4,
+			command == 0 ? 0U : command->value5,
+			static_cast<unsigned long long>(command == 0 ? 0U :
+				PackTraceHandle(command->resource0)),
+			static_cast<unsigned long long>(command == 0 ? 0U :
+				PackTraceHandle(command->resource1)));
+		fclose(trace);
+	}
+}
 
 rts::render::RenderResult BindNativeResourceOwners(
 	rts::render::NativeW3DResources *resources)
@@ -1179,6 +1234,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	const rts::render::GameRenderCommand &command)
 {
 	using namespace rts::render;
+	GameRenderCommandFailureScope failureCommandScope(&command);
 	// Completion publication is an owner-boundary operation. Service before the
 	// operational gate so an async removal can recover the owned device instead
 	// of being hidden by IsInitialized()/IsOperational() returning false.
@@ -3159,6 +3215,7 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 
 rts::render::RenderResult NativeW3D2::BeginGameDisplayIteration()
 {
+	const bool previousIterationSucceeded = !m_gameFailure.hasFailure();
 	const rts::render::RenderResult serviceResult =
 		ServiceThreadedCompletions();
 	if (serviceResult != rts::render::RENDER_RESULT_OK &&
@@ -3169,6 +3226,9 @@ rts::render::RenderResult NativeW3D2::BeginGameDisplayIteration()
 	m_displayIterationEpoch = rts::render::Advance_D3D11_Display_Epoch(
 		m_displayIterationEpoch);
 	m_gameFailure.reset();
+	if (serviceResult == rts::render::RENDER_RESULT_OK &&
+		previousIterationSucceeded)
+		g_gameFailureStreakObserved = false;
 	if (m_deferredFailureSequence != 0)
 	{
 		const rts::render::RenderResult deferredResult =
@@ -3760,6 +3820,12 @@ void NativeW3D2::RecordGameFailure(rts::render::RenderResult result)
 {
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
+		if (!m_gameFailure.hasFailure() && !g_gameFailureStreakObserved)
+		{
+			g_gameFailureStreakObserved = true;
+			TraceGameFailure(result, m_displayIterationEpoch,
+				m_renderer.LastThreadedSubmissionSequence(), g_failureCommand);
+		}
 		if (m_reacquiringResources)
 			m_reacquireFailure.record(result);
 		m_gameFailure.record(result);

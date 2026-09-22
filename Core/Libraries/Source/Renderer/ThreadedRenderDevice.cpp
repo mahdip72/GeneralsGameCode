@@ -12,6 +12,8 @@
 #include <climits>
 #include <condition_variable>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -60,6 +62,45 @@ RenderResult FirstFailure(RenderResult first, RenderResult next)
 {
 	if (next == RENDER_RESULT_DEVICE_REMOVED) return next;
 	return first == RENDER_RESULT_OK ? next : first;
+}
+
+uint64_t PackHandle(GpuHandle handle)
+{
+	return (static_cast<uint64_t>(handle.index()) << 32) | handle.generation();
+}
+
+const char *ShortOperationName(const char *function)
+{
+	if (function == 0) return "unknown";
+	const char *name = function;
+	for (const char *cursor = function; *cursor != '\0'; ++cursor)
+		if (cursor[0] == ':' && cursor[1] == ':') name = cursor + 2;
+	return name;
+}
+
+void TraceProducerFailure(uint64_t sequence, RenderResult result,
+	const char *operation, unsigned int sourceLine, bool recording, bool ended,
+	uint64_t argument0, uint64_t argument1, uint64_t argument2,
+	uint64_t argument3)
+{
+	// This runs only after a producer-side failure.  The normal Release path
+	// performs no environment lookup, formatting, file open, or allocation.
+	const char *path = std::getenv("RTS_RENDER_FAILURE_TRACE");
+	if (path == 0 || path[0] == '\0') return;
+	std::FILE *trace = std::fopen(path, "ab");
+	if (trace != 0)
+	{
+		std::fprintf(trace,
+			"renderer_failure source=producer frame=%llu op=%s line=%u result=%d recording=%u ended=%u arg0=%llu arg1=%llu arg2=%llu arg3=%llu\r\n",
+			static_cast<unsigned long long>(sequence),
+			ShortOperationName(operation), sourceLine,
+			static_cast<int>(result), recording ? 1U : 0U, ended ? 1U : 0U,
+			static_cast<unsigned long long>(argument0),
+			static_cast<unsigned long long>(argument1),
+			static_cast<unsigned long long>(argument2),
+			static_cast<unsigned long long>(argument3));
+		std::fclose(trace);
+	}
 }
 
 template <typename Call> RenderResult BackendCall(Call call)
@@ -256,6 +297,7 @@ public:
 		m_completedSequence(0), m_completedResult(RENDER_RESULT_OK),
 		m_recording(false), m_ended(false), m_nextSequence(1), m_sequence(0),
 		m_lastSequence(0), m_producerFailure(RENDER_RESULT_OK),
+		m_failureStreakObserved(false),
 		m_backend(0), m_context(0), m_ownerFrameOpen(false), m_ownerFrameActive(false), m_ownerDeviceRemoved(false),
 		m_ownerResourceFailure(false), m_outsideResourceFailure(false), m_ownerSequence(0),
 		m_ownerFrameResult(RENDER_RESULT_OK), m_outsideFailure(RENDER_RESULT_OK),
@@ -351,14 +393,27 @@ public:
 private:
 	bool producer() const { return std::this_thread::get_id() == m_producer && !m_waiting; }
 	bool usable() const { return producer() && m_initialized; }
-	RenderResult fail(RenderResult result)
+	RenderResult fail(RenderResult result, const char *operation,
+		unsigned int sourceLine, uint64_t argument0 = 0,
+		uint64_t argument1 = 0, uint64_t argument2 = 0,
+		uint64_t argument3 = 0)
 	{
 		// Synchronous producer validation/capacity failures outside a frame are
 		// returned to the caller directly.  Only failures while a frame is being
 		// recorded belong in that frame's packet; accepted asynchronous resource
 		// commands still report owner-side failures from execute().
 		if (producer() && m_recording)
+		{
+			const bool firstFailure = m_producerFailure == RENDER_RESULT_OK;
 			m_producerFailure = FirstFailure(m_producerFailure, result);
+			if (firstFailure && !m_failureStreakObserved)
+			{
+				m_failureStreakObserved = true;
+				TraceProducerFailure(m_sequence, result, operation, sourceLine,
+					m_recording, m_ended, argument0, argument1, argument2,
+					argument3);
+			}
+		}
 		return result;
 	}
 	bool valid(GpuHandle h, bool texture, bool nullable = false) const
@@ -435,6 +490,7 @@ private:
 	bool m_recording, m_ended;
 	uint64_t m_nextSequence, m_sequence, m_lastSequence;
 	RenderResult m_producerFailure;
+	bool m_failureStreakObserved;
 	// Everything below this line belongs exclusively to the render owner.
 	IRenderDevice *m_backend;
 	IRenderContext *m_context;
@@ -524,8 +580,12 @@ RenderResult ThreadedRenderDevice::append(Command command, const void *payload,
 	size_t bytes, bool requireFrame)
 {
 	if (!usable() || (requireFrame && (!m_recording || m_ended)))
-		return fail(RENDER_RESULT_INVALID_ARGUMENT);
-	if (!reservePayload(bytes)) return fail(RENDER_RESULT_OUT_OF_MEMORY);
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			static_cast<uint64_t>(command.operation), bytes,
+			requireFrame ? 1U : 0U, m_sequence);
+	if (!reservePayload(bytes)) return fail(RENDER_RESULT_OUT_OF_MEMORY,
+		__FUNCTION__, __LINE__, static_cast<uint64_t>(command.operation), bytes,
+		m_options.maxPacketBytes, m_current == 0 ? 0U : m_current->bytes.size());
 	command.payloadOffset = copyPayload(payload, bytes);
 	m_current->commands.push_back(command);
 	return RENDER_RESULT_OK;
@@ -533,7 +593,9 @@ RenderResult ThreadedRenderDevice::append(Command command, const void *payload,
 
 RenderResult ThreadedRenderDevice::beginFrame()
 {
-	if (!usable() || m_recording) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+	if (!usable() || m_recording) return fail(RENDER_RESULT_INVALID_ARGUMENT,
+		__FUNCTION__, __LINE__, usable() ? 1U : 0U, m_recording ? 1U : 0U,
+		m_sequence, m_lastSequence);
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (m_completionCount + m_reservedCompletions == COMPLETION_CAPACITY)
@@ -566,10 +628,15 @@ RenderResult ThreadedRenderDevice::beginFrame()
 
 RenderResult ThreadedRenderDevice::endFrame()
 {
-	if (!usable() || !m_recording || m_ended) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+	if (!usable() || !m_recording || m_ended)
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			usable() ? 1U : 0U, m_recording ? 1U : 0U, m_ended ? 1U : 0U,
+			m_sequence);
 	m_ended = true;
 	acquire();
 	m_current->closeFrame = true;
+	if (m_producerFailure == RENDER_RESULT_OK)
+		m_failureStreakObserved = false;
 	return m_producerFailure;
 }
 
@@ -627,7 +694,8 @@ RenderResult ThreadedRenderDevice::cancelFrame(RenderResult reason)
 {
 	if (!usable() || !m_recording || reason == RENDER_RESULT_OK)
 		return RENDER_RESULT_INVALID_ARGUMENT;
-	fail(reason);
+	fail(reason, __FUNCTION__, __LINE__, static_cast<uint64_t>(reason),
+		m_sequence, m_ended ? 1U : 0U);
 	if (!m_ended) endFrame();
 	return submitFrame(false);
 }
@@ -642,7 +710,8 @@ RenderResult ThreadedRenderDevice::drain()
 {
 	if (!usable()) return RENDER_RESULT_INVALID_ARGUMENT;
 	try { return sync(CONTROL_FENCE, std::make_shared<Reply>()); }
-	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY); }
+	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__,
+		__LINE__, m_sequence); }
 }
 
 RenderResult ThreadedRenderDevice::rollbackResource(GpuHandle handle)
@@ -662,7 +731,8 @@ RenderResult ThreadedRenderDevice::rollbackResource(GpuHandle handle)
 	}
 	catch (...)
 	{
-		return fail(RENDER_RESULT_OUT_OF_MEMORY);
+		return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__,
+			PackHandle(handle));
 	}
 }
 
@@ -675,7 +745,8 @@ RenderResult ThreadedRenderDevice::lifecycle(Control control, unsigned int width
 		reply->width = width; reply->height = height;
 		return sync(control, reply);
 	}
-	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY); }
+	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__,
+		__LINE__, static_cast<uint64_t>(control), width, height); }
 }
 
 RenderResult ThreadedRenderDevice::setSwapInterval(unsigned int interval)
@@ -845,17 +916,26 @@ bool ThreadedRenderDevice::metrics(ThreadedRenderMetrics *metrics) const
 RenderResult ThreadedRenderDevice::createBuffer(const BufferDescriptor &descriptor,
 	const void *data, size_t bytes, GpuHandle *handle)
 {
-	if (!usable() || !handle) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+	if (!usable() || !handle) return fail(RENDER_RESULT_INVALID_ARGUMENT,
+		__FUNCTION__, __LINE__, usable() ? 1U : 0U, handle ? 1U : 0U,
+		descriptor.byteCount, static_cast<uint64_t>(descriptor.binding));
 	*handle = GpuHandle();
 	if (!descriptor.byteCount || descriptor.byteCount > UINT_MAX || !descriptor.binding ||
 		(!data && bytes) || (data && bytes != descriptor.byteCount) ||
 		(!data && descriptor.usage == RENDER_USAGE_IMMUTABLE) ||
 		((descriptor.binding & RENDER_BUFFER_CONSTANT) && descriptor.byteCount % 16))
-		return fail(RENDER_RESULT_INVALID_ARGUMENT);
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			descriptor.byteCount, static_cast<uint64_t>(descriptor.binding),
+			bytes, static_cast<uint64_t>(descriptor.usage));
 	if (bytes > m_options.maxPacketBytes || sizeof(descriptor) > m_options.maxPacketBytes - bytes ||
-		!reservePayload(sizeof(descriptor) + bytes)) return fail(RENDER_RESULT_OUT_OF_MEMORY);
+		!reservePayload(sizeof(descriptor) + bytes))
+		return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__,
+			descriptor.byteCount, bytes, m_options.maxPacketBytes,
+			static_cast<uint64_t>(descriptor.binding));
 	GpuHandle logical = m_handles->allocate();
-	if (!logical.isValid()) return fail(RENDER_RESULT_OUT_OF_MEMORY);
+	if (!logical.isValid()) return fail(RENDER_RESULT_OUT_OF_MEMORY,
+		__FUNCTION__, __LINE__, m_handles->capacity(),
+		static_cast<uint64_t>(descriptor.binding));
 	Command command(OP_CREATE_BUFFER);
 	command.handle = logical;
 	command.payloadOffset = copyPayload(&descriptor, sizeof(descriptor));
@@ -882,11 +962,16 @@ RenderResult ThreadedRenderDevice::textureCommand(Operation operation, GpuHandle
 			descriptor.arrayCount != 6 || (descriptor.binding & (RENDER_TEXTURE_RENDER_TARGET | RENDER_TEXTURE_DEPTH_STENCIL)))) ||
 		(!data && count) || (data && count != descriptor.mipCount * descriptor.arrayCount) ||
 		(!data && (descriptor.usage == RENDER_USAGE_IMMUTABLE || operation == OP_REFRESH_TEXTURE)))
-		return fail(RENDER_RESULT_INVALID_ARGUMENT);
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			static_cast<uint64_t>(operation), count,
+			(static_cast<uint64_t>(descriptor.width) << 32) | descriptor.height,
+			static_cast<uint64_t>(descriptor.format));
 	size_t spanBytes = 0;
 	if (!Multiply(count, sizeof(TextureSpan), &spanBytes) ||
 		spanBytes > m_options.maxPacketBytes - (std::min)(sizeof(descriptor), m_options.maxPacketBytes))
-		return fail(RENDER_RESULT_OUT_OF_MEMORY);
+		return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__,
+			static_cast<uint64_t>(operation), count, spanBytes,
+			m_options.maxPacketBytes);
 	size_t total = sizeof(descriptor) + spanBytes;
 	for (unsigned int i = 0; i < count; ++i)
 	{
@@ -898,13 +983,18 @@ RenderResult ThreadedRenderDevice::textureCommand(Operation operation, GpuHandle
 			data[i].slicePitch > UINT_MAX || !Multiply(width, bpp, &rowBytes) ||
 			data[i].rowPitch < rowBytes || !Multiply(height, data[i].rowPitch, &minimum) ||
 			(data[i].slicePitch && data[i].slicePitch < minimum))
-			return fail(RENDER_RESULT_INVALID_ARGUMENT);
+			return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+				i, data[i].rowPitch, data[i].slicePitch,
+				(static_cast<uint64_t>(width) << 32) | height);
 		const size_t bytes = (std::max)(minimum, data[i].slicePitch);
 		if (total > m_options.maxPacketBytes || bytes > m_options.maxPacketBytes - total)
-			return fail(RENDER_RESULT_OUT_OF_MEMORY);
+			return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__,
+				i, bytes, total, m_options.maxPacketBytes);
 		total += bytes;
 	}
-	if (!reservePayload(total)) return fail(RENDER_RESULT_OUT_OF_MEMORY);
+	if (!reservePayload(total)) return fail(RENDER_RESULT_OUT_OF_MEMORY,
+		__FUNCTION__, __LINE__, static_cast<uint64_t>(operation), total,
+		m_options.maxPacketBytes, count);
 	Command command(operation);
 	command.handle = handle;
 	command.payloadOffset = copyPayload(&descriptor, sizeof(descriptor));
@@ -928,10 +1018,15 @@ RenderResult ThreadedRenderDevice::textureCommand(Operation operation, GpuHandle
 RenderResult ThreadedRenderDevice::createTexture(const TextureDescriptor &descriptor,
 	const TextureSubresourceData *data, unsigned int count, GpuHandle *handle)
 {
-	if (!usable() || !handle) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+	if (!usable() || !handle) return fail(RENDER_RESULT_INVALID_ARGUMENT,
+		__FUNCTION__, __LINE__, usable() ? 1U : 0U, handle ? 1U : 0U,
+		count, (static_cast<uint64_t>(descriptor.width) << 32) | descriptor.height);
 	*handle = GpuHandle();
 	GpuHandle logical = m_handles->allocate();
-	if (!logical.isValid()) return fail(RENDER_RESULT_OUT_OF_MEMORY);
+	if (!logical.isValid()) return fail(RENDER_RESULT_OUT_OF_MEMORY,
+		__FUNCTION__, __LINE__, m_handles->capacity(), count,
+		(static_cast<uint64_t>(descriptor.width) << 32) | descriptor.height,
+		static_cast<uint64_t>(descriptor.format));
 	const RenderResult result = textureCommand(OP_CREATE_TEXTURE, logical, descriptor, data, count);
 	if (result != RENDER_RESULT_OK) { m_handles->release(logical); return result; }
 	m_producerResources[logical.index()].texture = true;
@@ -943,7 +1038,10 @@ RenderResult ThreadedRenderDevice::createTexture(const TextureDescriptor &descri
 RenderResult ThreadedRenderDevice::refreshTexture(GpuHandle handle, const TextureDescriptor &descriptor,
 	const TextureSubresourceData *data, unsigned int count)
 {
-	if (!usable() || !valid(handle, true)) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+	if (!usable() || !valid(handle, true)) return fail(RENDER_RESULT_INVALID_ARGUMENT,
+		__FUNCTION__, __LINE__, PackHandle(handle), usable() ? 1U : 0U,
+		m_targets.hasColor ? PackHandle(m_targets.color.resource) : 0U,
+		m_targets.hasDepth ? PackHandle(m_targets.depth.resource) : 0U);
 	const TextureDescriptor &existing = m_producerResources[handle.index()].descriptor;
 	// This capability result must be synchronous: the bridge uses it to choose
 	// recreation. It is not a failed frame, unlike a failed accepted upload.
@@ -951,7 +1049,10 @@ RenderResult ThreadedRenderDevice::refreshTexture(GpuHandle handle, const Textur
 		return RENDER_RESULT_UNSUPPORTED;
 	if ((m_targets.hasColor && !m_targets.useBackBufferColor && m_targets.color.resource == handle) ||
 		(m_targets.hasDepth && !m_targets.useBackBufferDepth && m_targets.depth.resource == handle))
-		return fail(RENDER_RESULT_INVALID_ARGUMENT);
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			PackHandle(handle), m_targets.hasColor ? PackHandle(m_targets.color.resource) : 0U,
+			m_targets.hasDepth ? PackHandle(m_targets.depth.resource) : 0U,
+			m_sequence);
 	return textureCommand(OP_REFRESH_TEXTURE, handle, descriptor, data, count);
 }
 
@@ -985,14 +1086,20 @@ RenderResult ThreadedRenderDevice::bufferUpdateCommand(GpuHandle handle,
 	if (!usable() || !valid(handle, false) || !data || !bytes ||
 		offset > m_producerResources[handle.index()].buffer.byteCount ||
 		bytes > m_producerResources[handle.index()].buffer.byteCount - offset)
-		return fail(RENDER_RESULT_INVALID_ARGUMENT);
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			PackHandle(handle), bytes, offset, static_cast<uint64_t>(mode));
 	const BufferDescriptor &descriptor = m_producerResources[handle.index()].buffer;
 	if (descriptor.usage == RENDER_USAGE_IMMUTABLE) return RENDER_RESULT_UNSUPPORTED;
 	if (mode != RENDER_BUFFER_UPDATE_PRESERVE && mode != RENDER_BUFFER_UPDATE_DISCARD &&
-		mode != RENDER_BUFFER_UPDATE_NO_OVERWRITE) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+		mode != RENDER_BUFFER_UPDATE_NO_OVERWRITE)
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			static_cast<uint64_t>(mode), PackHandle(handle), bytes, offset);
 	if (mode != RENDER_BUFFER_UPDATE_PRESERVE && (descriptor.usage != RENDER_USAGE_DYNAMIC ||
 		(descriptor.binding != RENDER_BUFFER_VERTEX && descriptor.binding != RENDER_BUFFER_INDEX) ||
-		(mode == RENDER_BUFFER_UPDATE_DISCARD && offset))) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+		(mode == RENDER_BUFFER_UPDATE_DISCARD && offset)))
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			PackHandle(handle), static_cast<uint64_t>(mode), offset,
+			static_cast<uint64_t>(descriptor.binding));
 	Command command(OP_UPDATE_BUFFER); command.handle = handle;
 	command.dataBytes = bytes; command.destinationOffset = offset; command.integers[0] = mode;
 	return append(command, data, bytes, requireFrame);
@@ -1000,7 +1107,9 @@ RenderResult ThreadedRenderDevice::bufferUpdateCommand(GpuHandle handle,
 
 RenderResult ThreadedRenderDevice::copyActiveColorTargetToTexture(GpuHandle handle)
 {
-	if (!usable() || !valid(handle, true)) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+	if (!usable() || !valid(handle, true)) return fail(RENDER_RESULT_INVALID_ARGUMENT,
+		__FUNCTION__, __LINE__, PackHandle(handle), usable() ? 1U : 0U,
+		m_sequence);
 	Command command(OP_COPY_COLOR); command.handle = handle;
 	return append(command);
 }
@@ -1019,7 +1128,13 @@ RenderResult ThreadedRenderDevice::setRenderTargets(const RenderTargetBinding &b
 	if (!usable() || (binding.hasColor && !binding.useBackBufferColor && !valid(binding.color.resource, true)) ||
 		(binding.hasDepth && !binding.useBackBufferDepth && !valid(binding.depth.resource, true)) ||
 		(binding.hasColor && binding.useBackBufferColor) || (binding.hasDepth && binding.useBackBufferDepth))
-		return fail(RENDER_RESULT_INVALID_ARGUMENT);
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			binding.hasColor ? PackHandle(binding.color.resource) : 0U,
+			binding.hasDepth ? PackHandle(binding.depth.resource) : 0U,
+			(static_cast<uint64_t>(binding.hasColor) << 3) |
+			(static_cast<uint64_t>(binding.hasDepth) << 2) |
+			(static_cast<uint64_t>(binding.useBackBufferColor) << 1) |
+			static_cast<uint64_t>(binding.useBackBufferDepth), m_sequence);
 	if ((binding.hasColor && (binding.color.mip || binding.color.arraySlice)) ||
 		(binding.hasDepth && (binding.depth.mip || binding.depth.arraySlice))) return RENDER_RESULT_UNSUPPORTED;
 	const RenderResult result = append(Command(OP_TARGETS), &binding, sizeof(binding));
@@ -1056,7 +1171,9 @@ RenderResult ThreadedRenderDevice::setLegacyStateForLayout(const LegacyLogicalSt
 	const LegacyVertexLayout &layout, unsigned int mask)
 {
 	if (layout.elementCount > LegacyVertexLayout::MAX_ELEMENT_COUNT)
-		return fail(RENDER_RESULT_INVALID_ARGUMENT);
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			layout.elementCount, LegacyVertexLayout::MAX_ELEMENT_COUNT, mask,
+			m_sequence);
 	LayoutState payload; payload.state = state; payload.layout = layout;
 	Command command(OP_LEGACY_LAYOUT); command.integers[0] = mask;
 	return append(command, &payload, sizeof(payload));
@@ -1064,20 +1181,26 @@ RenderResult ThreadedRenderDevice::setLegacyStateForLayout(const LegacyLogicalSt
 
 RenderResult ThreadedRenderDevice::setVertexBuffer(GpuHandle handle, unsigned int stride, unsigned int offset)
 {
-	if (!usable() || !valid(handle, false, true)) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+	if (!usable() || !valid(handle, false, true)) return fail(RENDER_RESULT_INVALID_ARGUMENT,
+		__FUNCTION__, __LINE__, PackHandle(handle), stride, offset,
+		usable() ? 1U : 0U);
 	Command command(OP_VERTEX_BUFFER); command.handle = handle;
 	command.integers[0] = stride; command.integers[1] = offset; return append(command);
 }
 RenderResult ThreadedRenderDevice::setIndexBuffer(GpuHandle handle, RenderFormat format, unsigned int offset)
 {
-	if (!usable() || !valid(handle, false, true)) return fail(RENDER_RESULT_INVALID_ARGUMENT);
+	if (!usable() || !valid(handle, false, true)) return fail(RENDER_RESULT_INVALID_ARGUMENT,
+		__FUNCTION__, __LINE__, PackHandle(handle), static_cast<uint64_t>(format),
+		offset, usable() ? 1U : 0U);
 	Command command(OP_INDEX_BUFFER); command.handle = handle;
 	command.integers[0] = format; command.integers[1] = offset; return append(command);
 }
 RenderResult ThreadedRenderDevice::setTexture(unsigned int stage, GpuHandle handle)
 {
 	if (!usable() || !valid(handle, true, true) || stage >= LEGACY_TEXTURE_STAGE_COUNT)
-		return fail(RENDER_RESULT_INVALID_ARGUMENT);
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			stage, PackHandle(handle), LEGACY_TEXTURE_STAGE_COUNT,
+			usable() ? 1U : 0U);
 	Command command(OP_TEXTURE); command.handle = handle; command.integers[0] = stage; return append(command);
 }
 RenderResult ThreadedRenderDevice::setPrimitiveTopology(RenderPrimitiveTopology topology)

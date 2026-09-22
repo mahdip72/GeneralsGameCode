@@ -10,10 +10,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -639,6 +643,91 @@ void GenerationsAndResourceFailure()
 	CHECK(f.presents == 0);
 }
 
+void ProducerFailureTraceIsOptInAndRateLimited()
+{
+#ifdef _WIN32
+	struct TraceEnvironment
+	{
+		TraceEnvironment() : hadPrevious(std::getenv("RTS_RENDER_FAILURE_TRACE") != 0),
+			enabled(false)
+		{
+			path[0] = '\0';
+			const char *previous = std::getenv("RTS_RENDER_FAILURE_TRACE");
+			if (previous != 0) previousPath = previous;
+		}
+		~TraceEnvironment()
+		{
+			if (enabled)
+				_putenv_s("RTS_RENDER_FAILURE_TRACE",
+					hadPrevious ? previousPath.c_str() : "");
+			if (path[0] != '\0') DeleteFileA(path);
+		}
+		bool configure()
+		{
+			char directory[MAX_PATH];
+			const DWORD length = GetCurrentDirectoryA(MAX_PATH, directory);
+			if (length == 0 || length >= MAX_PATH ||
+				GetTempFileNameA(directory, "rft", 0, path) == 0)
+				return false;
+			enabled = _putenv_s("RTS_RENDER_FAILURE_TRACE", path) == 0;
+			return enabled;
+		}
+		bool hadPrevious;
+		bool enabled;
+		char path[MAX_PATH];
+		std::string previousPath;
+	} trace;
+	CHECK(trace.configure());
+
+	Fixture f;
+	auto device = Device(f);
+	IRenderContext *context = device->immediateContext();
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->setTexture(LEGACY_TEXTURE_STAGE_COUNT, GpuHandle()) ==
+		RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(context->setTexture(LEGACY_TEXTURE_STAGE_COUNT + 1, GpuHandle()) ==
+		RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(context->endFrame() == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(!Complete(device.get(), RENDER_RESULT_INVALID_ARGUMENT).presented);
+
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->setTexture(LEGACY_TEXTURE_STAGE_COUNT, GpuHandle()) ==
+		RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(context->endFrame() == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(!Complete(device.get(), RENDER_RESULT_INVALID_ARGUMENT).presented);
+
+	EmptyFrame(device.get());
+	CHECK(Complete(device.get()).presented);
+
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->setTexture(LEGACY_TEXTURE_STAGE_COUNT, GpuHandle()) ==
+		RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(context->endFrame() == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(!Complete(device.get(), RENDER_RESULT_INVALID_ARGUMENT).presented);
+
+	std::ifstream traceFile(trace.path, std::ios::binary);
+	const std::string contents((std::istreambuf_iterator<char>(traceFile)),
+		std::istreambuf_iterator<char>());
+	const std::string marker("renderer_failure source=producer");
+	std::size_t markerCount = 0, offset = 0;
+	while ((offset = contents.find(marker, offset)) != std::string::npos)
+	{
+		++markerCount;
+		offset += marker.size();
+	}
+	CHECK(markerCount == 2);
+	CHECK(contents.find("op=setTexture") != std::string::npos);
+	CHECK(contents.find("arg0=8") != std::string::npos);
+	CHECK(contents.find("arg2=8") != std::string::npos);
+	CHECK(contents.find("arg3=1") != std::string::npos);
+	CHECK(contents.find("frame=1") != std::string::npos);
+	CHECK(contents.find("frame=4") != std::string::npos);
+#endif
+}
+
 void FailurePublicationAndRecovery()
 {
 	Fixture f;
@@ -1138,6 +1227,7 @@ int main()
 		OwnershipAndDeepCopy();
 		SynchronousProducerRejectionsDoNotPoisonNextFrame();
 		GenerationsAndResourceFailure();
+		ProducerFailureTraceIsOptInAndRateLimited();
 		FailurePublicationAndRecovery();
 		BufferUpdateFailureRecoveryRestoresBinding();
 		BufferMutationFailureIsIsolated();
