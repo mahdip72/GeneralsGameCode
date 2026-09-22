@@ -157,6 +157,134 @@ std::vector<Pixels> run(bool threaded, bool serial, unsigned frameSlots)
 	return captures;
 }
 
+Pixels runBufferPreserveRegression(bool threaded, bool serial,
+	unsigned frameSlots)
+{
+	HiddenWindow window;
+	NativeFactoryState factory;
+	ThreadedRenderOptions options;
+	options.serial = serial;
+	options.maxFramesInFlight = frameSlots;
+	std::unique_ptr<IRenderDevice> device(threaded ?
+		CreateThreadedRenderDevice(nativeFactory, &factory, options) :
+		CreateD3D11RenderDevice());
+	require(device.get() != 0, "create buffer-preserve native device");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = window.value;
+	parameters.width = parameters.height = 64;
+	parameters.enableDebugLayer = true;
+	parameters.enableVsync = false;
+	require(device->initialize(parameters) == RENDER_RESULT_OK,
+		"initialize buffer-preserve native swap chain");
+	if (threaded)
+	{
+		require(factory.owner.load(),
+			"buffer-preserve backend factory executes on render owner");
+	}
+	IRenderContext *context = device->immediateContext();
+	require(context != 0, "buffer-preserve native context exists");
+	struct Vertex { float x, y, z; unsigned int color; };
+	Vertex vertices[6] = {
+		{ -0.95f, -0.75f, 0.0f, 0xffff0000U },
+		{ -0.30f, -0.75f, 0.0f, 0xffff0000U },
+		{ -0.625f, 0.75f, 0.0f, 0xffff0000U },
+		{ 0.30f, -0.75f, 0.0f, 0xff00ff00U },
+		{ 0.95f, -0.75f, 0.0f, 0xff00ff00U },
+		{ 0.625f, 0.75f, 0.0f, 0xff00ff00U }
+	};
+	const unsigned short indices[6] = { 0, 1, 2, 0, 1, 2 };
+	BufferDescriptor vertexDescriptor;
+	vertexDescriptor.byteCount = sizeof(vertices);
+	vertexDescriptor.stride = sizeof(Vertex);
+	vertexDescriptor.binding = RENDER_BUFFER_VERTEX;
+	vertexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle vertexBuffer;
+	require(device->createBuffer(vertexDescriptor, vertices, sizeof(vertices),
+		&vertexBuffer) == RENDER_RESULT_OK,
+		"create mutable buffer-preserve vertex stream");
+	BufferDescriptor indexDescriptor;
+	indexDescriptor.byteCount = sizeof(indices);
+	indexDescriptor.stride = sizeof(unsigned short);
+	indexDescriptor.binding = RENDER_BUFFER_INDEX;
+	indexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle indexBuffer;
+	require(device->createBuffer(indexDescriptor, indices, sizeof(indices),
+		&indexBuffer) == RENDER_RESULT_OK,
+		"create mutable buffer-preserve index stream");
+	LegacyLogicalState logical;
+	logical.pipeline.rasterizer.cullMode = RENDER_CULL_NONE;
+	require(context->beginFrame() == RENDER_RESULT_OK &&
+		context->clear(RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f), 1.0f, 0) ==
+			RENDER_RESULT_OK &&
+		context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+			RENDER_RESULT_OK &&
+		context->setLegacyState(logical, RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			RENDER_RESULT_OK &&
+		context->setVertexBuffer(vertexBuffer, sizeof(Vertex), 0) ==
+			RENDER_RESULT_OK &&
+		context->setIndexBuffer(indexBuffer, RENDER_FORMAT_R16_UINT, 0) ==
+			RENDER_RESULT_OK &&
+		context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK && context->drawIndexed(3, 0, 0) ==
+			RENDER_RESULT_OK,
+		"queue original left triangle before overlapping buffer updates");
+	const Vertex replacementVertices[3] = {
+		{ -0.30f, -0.50f, 0.0f, 0xff0000ffU },
+		{ 0.30f, -0.50f, 0.0f, 0xff0000ffU },
+		{ 0.0f, 0.50f, 0.0f, 0xff0000ffU }
+	};
+	const unsigned short replacementIndices[3] = { 3, 4, 5 };
+	require(context->updateBuffer(vertexBuffer, replacementVertices,
+		sizeof(replacementVertices), 0, RENDER_BUFFER_UPDATE_PRESERVE) ==
+			RENDER_RESULT_OK &&
+		context->updateBuffer(indexBuffer, replacementIndices,
+			sizeof(replacementIndices), 0, RENDER_BUFFER_UPDATE_PRESERVE) ==
+			RENDER_RESULT_OK,
+		"partially preserve overlapping vertex and index prefixes");
+	require(context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK &&
+		context->drawIndexed(3, 3, 0) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK,
+		"queue updated and unchanged-tail indexed draws after preserve");
+	Pixels pixels(64 * 64 * 4);
+	RenderFormat format = RENDER_FORMAT_UNKNOWN;
+	require(device->captureBackBuffer(pixels.data(), pixels.size(), 64 * 4,
+		&format) == RENDER_RESULT_OK && format == RENDER_FORMAT_B8G8R8A8_UNORM,
+		"capture D3D11 queued preserve regression before flip");
+	const unsigned char *left = &pixels[(32 * 64 + 12) * 4];
+	const unsigned char *center = &pixels[(32 * 64 + 32) * 4];
+	const unsigned char *right = &pixels[(32 * 64 + 52) * 4];
+	require(left[0] < 16 && left[1] < 16 && left[2] > 240,
+		"overlapping preserve leaves the earlier queued red draw intact");
+	require(center[0] > 240 && center[1] < 16 && center[2] < 16,
+		"unchanged index tail still selects the newly published blue vertices");
+	require(right[0] < 16 && right[1] > 240 && right[2] < 16,
+		"unchanged vertex tail survives the partial vertex preserve");
+	require(device->present() == RENDER_RESULT_OK,
+		"present buffer-preserve regression frame");
+	if (threaded)
+	{
+		require(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK,
+			"drain queued buffer-preserve commands");
+		ThreadedRenderFrameCompletion completion;
+		unsigned int completions = 0;
+		while (PollThreadedRenderCompletion(device.get(), &completion))
+		{
+			require(completion.result == RENDER_RESULT_OK && completion.presented &&
+				completion.operational && !completion.resourceFailure,
+				"buffer-preserve frame completed without deferred native failure");
+			++completions;
+		}
+		require(completions == 1,
+			"buffer-preserve regression produced one queued frame completion");
+	}
+	require(device->destroyResource(indexBuffer) &&
+		device->destroyResource(vertexBuffer),
+		"destroy buffer-preserve regression resources");
+	device->shutdown();
+	return pixels;
+}
+
 std::vector<Pixels> runTexturePipeline(bool threaded, bool serial,
 	unsigned frameSlots)
 {
@@ -558,6 +686,11 @@ int main()
 		require(run(true, true, 2) == reference, "serial native owner pixels equal direct D3D11 reference");
 		require(run(true, false, 2) == reference, "two-slot native owner pixels equal direct D3D11 reference");
 		require(run(true, false, 3) == reference, "three-slot native owner pixels equal direct D3D11 reference");
+		const Pixels preserveReference = runBufferPreserveRegression(false,
+			false, 2);
+		require(runBufferPreserveRegression(true, false, 2) ==
+			preserveReference,
+			"queued direct and threaded overlapping-preserve pixels match");
 		const std::vector<Pixels> textureReference = runTexturePipeline(false, false, 2);
 		require(runTexturePipeline(true, true, 2) == textureReference,
 			"serial native texture/copy pixels equal direct D3D11 reference");

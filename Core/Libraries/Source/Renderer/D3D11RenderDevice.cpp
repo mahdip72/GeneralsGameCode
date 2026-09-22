@@ -28,6 +28,7 @@
 #include "PresentationColorTransformPS.h"
 #include "PresentationColorTransformVS.h"
 
+#include <algorithm>
 #include <float.h>
 #include <limits.h>
 #include <new>
@@ -71,6 +72,124 @@ enum ResourceKind
 	RESOURCE_BUFFER,
 	RESOURCE_TEXTURE
 };
+
+struct BufferByteRange
+{
+	size_t begin;
+	size_t end;
+};
+
+bool IsBufferRangeInitialized(const std::vector<BufferByteRange> &ranges,
+	size_t begin, size_t end)
+{
+	for (size_t index = 0; index < ranges.size(); ++index)
+	{
+		if (ranges[index].begin <= begin && ranges[index].end >= end)
+		{
+			return true;
+		}
+		if (ranges[index].begin > begin)
+		{
+			return false;
+		}
+	}
+	return false;
+}
+
+bool PrepareBufferRangeUpdate(std::vector<BufferByteRange> *ranges,
+	size_t begin, size_t end, bool discard)
+{
+	if (ranges == 0 || begin >= end)
+	{
+		return false;
+	}
+	size_t requiredCapacity = discard ? 1 : ranges->size();
+	bool mergesExisting = false;
+	if (!discard && !ranges->empty())
+	{
+		const BufferByteRange &last = ranges->back();
+		if (begin >= last.begin && begin <= last.end)
+		{
+			mergesExisting = true;
+		}
+		else
+		{
+			for (size_t index = 0; index < ranges->size(); ++index)
+			{
+				if ((*ranges)[index].end >= begin &&
+					(*ranges)[index].begin <= end)
+				{
+					mergesExisting = true;
+					break;
+				}
+			}
+		}
+	}
+	if (!discard && !mergesExisting)
+	{
+		++requiredCapacity;
+	}
+	try
+	{
+		if (ranges->capacity() < requiredCapacity)
+		{
+			ranges->reserve(requiredCapacity);
+		}
+	}
+	catch (...)
+	{
+		return false;
+	}
+	return true;
+}
+
+void ApplyBufferRangeUpdate(std::vector<BufferByteRange> *ranges,
+	size_t begin, size_t end, bool discard)
+{
+	if (discard)
+	{
+		ranges->clear();
+		ranges->push_back(BufferByteRange{ begin, end });
+		return;
+	}
+	if (!ranges->empty())
+	{
+		BufferByteRange &last = ranges->back();
+		if (begin >= last.begin && begin <= last.end)
+		{
+			if (end > last.end) last.end = end;
+			return;
+		}
+	}
+	size_t first = 0;
+	while (first < ranges->size() && (*ranges)[first].end < begin)
+	{
+		++first;
+	}
+	size_t mergedBegin = begin;
+	size_t mergedEnd = end;
+	size_t last = first;
+	while (last < ranges->size() && (*ranges)[last].begin <= mergedEnd)
+	{
+		if ((*ranges)[last].begin < mergedBegin)
+		{
+			mergedBegin = (*ranges)[last].begin;
+		}
+		if ((*ranges)[last].end > mergedEnd)
+		{
+			mergedEnd = (*ranges)[last].end;
+		}
+		++last;
+	}
+	if (first == last)
+	{
+		ranges->insert(ranges->begin() + first,
+			BufferByteRange{ begin, end });
+		return;
+	}
+	(*ranges)[first] = BufferByteRange{ mergedBegin, mergedEnd };
+	ranges->erase(ranges->begin() + first + 1, ranges->begin() + last);
+}
 
 RenderResult TranslateResult(HRESULT result)
 {
@@ -380,6 +499,10 @@ struct ResourceSlot
 	// Immutable buffers cannot be republished through updateBufferResource.
 	// Retain their explicit creation source only; mutable buffers retain none.
 	std::vector<unsigned char> immutableBufferRecoverySource;
+	// Mutable image supports safe dynamic PRESERVE uploads and exact draw-range
+	// validation. It is discarded on recovery and is not a recovery source.
+	std::vector<unsigned char> bufferImage;
+	std::vector<BufferByteRange> initializedBufferRanges;
 	std::vector<unsigned char> shadow;
 	std::vector<size_t> subresourceOffsets;
 	std::vector<size_t> subresourceRowPitches;
@@ -746,14 +869,27 @@ public:
 		slot.bufferDescriptor = descriptor;
 		slot.bufferContentValid = initialData != 0 &&
 			initialDataBytes == descriptor.byteCount;
-		if (descriptor.usage == RENDER_USAGE_IMMUTABLE)
+		if (slot.bufferContentValid)
 		{
 			try
 			{
-				slot.immutableBufferRecoverySource.assign(
-					static_cast<const unsigned char *>(initialData),
-					static_cast<const unsigned char *>(initialData) +
-						descriptor.byteCount);
+				slot.initializedBufferRanges.push_back(
+					BufferByteRange{ 0, descriptor.byteCount });
+				if (descriptor.usage == RENDER_USAGE_IMMUTABLE)
+				{
+					slot.immutableBufferRecoverySource.assign(
+						static_cast<const unsigned char *>(initialData),
+						static_cast<const unsigned char *>(initialData) +
+							descriptor.byteCount);
+				}
+				else if (descriptor.usage == RENDER_USAGE_DYNAMIC ||
+					(descriptor.binding & RENDER_BUFFER_INDEX) != 0)
+				{
+					slot.bufferImage.assign(
+						static_cast<const unsigned char *>(initialData),
+						static_cast<const unsigned char *>(initialData) +
+							descriptor.byteCount);
+				}
 			}
 			catch (...)
 			{
@@ -1368,6 +1504,13 @@ public:
 			ResourceSlot &slot = m_resources[i];
 			if (slot.kind == RESOURCE_BUFFER)
 			{
+				if (slot.bufferDescriptor.usage != RENDER_USAGE_IMMUTABLE)
+				{
+					std::vector<unsigned char>().swap(slot.bufferImage);
+					std::vector<BufferByteRange>().swap(
+						slot.initializedBufferRanges);
+					slot.bufferContentValid = false;
+				}
 				result = recreateBuffer(slot);
 				if (SUCCEEDED(result))
 				{
@@ -1712,6 +1855,28 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		const size_t destinationEnd = destinationOffset + byteCount;
+		if (!PrepareBufferRangeUpdate(&slot.initializedBufferRanges,
+			destinationOffset, destinationEnd,
+			mode == RENDER_BUFFER_UPDATE_DISCARD))
+		{
+			return RENDER_RESULT_OUT_OF_MEMORY;
+		}
+		const bool maintainImage =
+			(slot.binding & RENDER_BUFFER_INDEX) != 0 ||
+			(slot.usage == RENDER_USAGE_DYNAMIC &&
+			 (slot.binding & (RENDER_BUFFER_VERTEX | RENDER_BUFFER_INDEX)) != 0);
+		if (maintainImage && slot.bufferImage.size() != slot.byteCount)
+		{
+			try
+			{
+				slot.bufferImage.assign(slot.byteCount, 0);
+			}
+			catch (...)
+			{
+				return RENDER_RESULT_OUT_OF_MEMORY;
+			}
+		}
 		if (slot.usage == RENDER_USAGE_DYNAMIC)
 		{
 			D3D11_MAPPED_SUBRESOURCE mapped;
@@ -1722,9 +1887,10 @@ public:
 			{
 				return RENDER_RESULT_UNSUPPORTED;
 			}
-			const D3D11_MAP mapMode =
-				mode == RENDER_BUFFER_UPDATE_NO_OVERWRITE ||
-				(mode == RENDER_BUFFER_UPDATE_PRESERVE && !fullWrite) ?
+			// NO_OVERWRITE is the only operation that promises the written range
+			// does not overlap queued GPU reads. PRESERVE must use a fresh backing
+			// allocation and republish the CPU image; it cannot assume a fence.
+			const D3D11_MAP mapMode = mode == RENDER_BUFFER_UPDATE_NO_OVERWRITE ?
 				D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD;
 			const HRESULT result = m_context->Map(slot.resource, 0,
 				mapMode, 0, &mapped);
@@ -1737,10 +1903,30 @@ public:
 				m_context->Unmap(slot.resource, 0);
 				return RENDER_RESULT_FAILED;
 			}
-			memcpy(static_cast<unsigned char *>(mapped.pData) +
-				destinationOffset, data, byteCount);
+			if (mode == RENDER_BUFFER_UPDATE_PRESERVE && !fullWrite)
+			{
+				memcpy(mapped.pData, &slot.bufferImage[0], slot.byteCount);
+				memcpy(static_cast<unsigned char *>(mapped.pData) +
+					destinationOffset, data, byteCount);
+			}
+			else
+			{
+				memcpy(static_cast<unsigned char *>(mapped.pData) +
+					destinationOffset, data, byteCount);
+			}
 			m_context->Unmap(slot.resource, 0);
-			slot.bufferContentValid = true;
+			if (maintainImage)
+			{
+				if (mode == RENDER_BUFFER_UPDATE_DISCARD)
+				{
+					std::fill(slot.bufferImage.begin(), slot.bufferImage.end(), 0);
+				}
+				memcpy(&slot.bufferImage[destinationOffset], data, byteCount);
+			}
+			ApplyBufferRangeUpdate(&slot.initializedBufferRanges,
+				destinationOffset, destinationEnd,
+				mode == RENDER_BUFFER_UPDATE_DISCARD);
+			slot.bufferContentValid = !slot.initializedBufferRanges.empty();
 			return RENDER_RESULT_OK;
 		}
 
@@ -1752,7 +1938,14 @@ public:
 		destination.front = 0;
 		destination.back = 1;
 		m_context->UpdateSubresource(slot.resource, 0, &destination, data, 0, 0);
-		slot.bufferContentValid = true;
+		if (maintainImage)
+		{
+			memcpy(&slot.bufferImage[destinationOffset], data, byteCount);
+		}
+		ApplyBufferRangeUpdate(&slot.initializedBufferRanges,
+			destinationOffset, destinationEnd,
+			mode == RENDER_BUFFER_UPDATE_DISCARD);
+		slot.bufferContentValid = !slot.initializedBufferRanges.empty();
 		return RENDER_RESULT_OK;
 	}
 
@@ -2767,6 +2960,15 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		const size_t firstVertexByte = m_boundVertexOffset +
+			static_cast<size_t>(startVertex) * m_boundVertexStride;
+		const size_t vertexByteEnd = firstVertexByte +
+			static_cast<size_t>(vertexCount) * m_boundVertexStride;
+		if (!IsBufferRangeInitialized(vertexSlot.initializedBufferRanges,
+			firstVertexByte, vertexByteEnd))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
 		const RenderResult transformResult = refreshTransformConstantsForDraw();
 		if (transformResult != RENDER_RESULT_OK)
 		{
@@ -2793,6 +2995,61 @@ public:
 			m_boundIndexOffset, indexSize, startIndex, indexCount))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const size_t firstIndexByte = m_boundIndexOffset +
+			static_cast<size_t>(startIndex) * indexSize;
+		const size_t indexByteEnd = firstIndexByte +
+			static_cast<size_t>(indexCount) * indexSize;
+		if (!IsBufferRangeInitialized(indexSlot.initializedBufferRanges,
+			firstIndexByte, indexByteEnd))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const ResourceSlot &vertexSlot =
+			m_resources[m_boundVertexBuffer.index()];
+		if (!IsBufferRangeInitialized(vertexSlot.initializedBufferRanges,
+			m_boundVertexOffset, vertexSlot.byteCount))
+		{
+			const std::vector<unsigned char> *indexBytes =
+				indexSlot.usage == RENDER_USAGE_IMMUTABLE ?
+				&indexSlot.immutableBufferRecoverySource : &indexSlot.bufferImage;
+			if (indexBytes->size() != indexSlot.byteCount)
+			{
+				return RENDER_RESULT_INVALID_ARGUMENT;
+			}
+			for (unsigned int index = 0; index < indexCount; ++index)
+			{
+				const size_t sourceOffset = firstIndexByte +
+					static_cast<size_t>(index) * indexSize;
+				unsigned int vertexIndex = 0;
+				if (indexSize == 2)
+				{
+					unsigned short value = 0;
+					memcpy(&value, &(*indexBytes)[sourceOffset], sizeof(value));
+					vertexIndex = value;
+				}
+				else
+				{
+					memcpy(&vertexIndex, &(*indexBytes)[sourceOffset],
+						sizeof(vertexIndex));
+				}
+				const long long addressedVertex =
+					static_cast<long long>(vertexIndex) + baseVertex;
+				if (addressedVertex < 0 || addressedVertex > UINT_MAX ||
+					!isElementRangeWithinBuffer(vertexSlot.byteCount,
+						m_boundVertexOffset, m_boundVertexStride,
+						static_cast<unsigned int>(addressedVertex), 1))
+				{
+					return RENDER_RESULT_INVALID_ARGUMENT;
+				}
+				const size_t vertexByteBegin = m_boundVertexOffset +
+					static_cast<size_t>(addressedVertex) * m_boundVertexStride;
+				if (!IsBufferRangeInitialized(vertexSlot.initializedBufferRanges,
+					vertexByteBegin, vertexByteBegin + m_boundVertexStride))
+				{
+					return RENDER_RESULT_INVALID_ARGUMENT;
+				}
+			}
 		}
 		const RenderResult transformResult = refreshTransformConstantsForDraw();
 		if (transformResult != RENDER_RESULT_OK)
@@ -5410,6 +5667,8 @@ private:
 		// This logical resource is gone, unlike an in-place refresh or device
 		// recovery. Do not retain its largest CPU shadow in the reusable slot.
 		std::vector<unsigned char>().swap(slot.immutableBufferRecoverySource);
+		std::vector<unsigned char>().swap(slot.bufferImage);
+		std::vector<BufferByteRange>().swap(slot.initializedBufferRanges);
 		std::vector<unsigned char>().swap(slot.shadow);
 		std::vector<size_t>().swap(slot.subresourceOffsets);
 		std::vector<size_t>().swap(slot.subresourceRowPitches);

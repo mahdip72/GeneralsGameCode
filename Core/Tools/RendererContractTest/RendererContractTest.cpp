@@ -6049,6 +6049,31 @@ int testD3D11HeadlessDevice()
 		device->immediateContext()->endFrame() ==
 			rts::render::RENDER_RESULT_OK,
 		"reused mutable buffer recovers only its descriptor shell");
+	unsigned int recoveredPrefix[4] = { 0, 0, 0, 0 };
+	rts::render::LegacyLogicalState recoveredLogical;
+	recoveredLogical.pipeline.rasterizer.cullMode =
+		rts::render::RENDER_CULL_NONE;
+	rts::render::IRenderContext *recoveredContext = device->immediateContext();
+	result |= check(recoveredContext->beginFrame() ==
+		rts::render::RENDER_RESULT_OK &&
+		recoveredContext->updateBuffer(largerMutableBuffer, recoveredPrefix,
+			sizeof(recoveredPrefix), 0,
+			rts::render::RENDER_BUFFER_UPDATE_PRESERVE) ==
+			rts::render::RENDER_RESULT_OK &&
+		recoveredContext->setLegacyState(recoveredLogical,
+			rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		recoveredContext->setVertexBuffer(largerMutableBuffer,
+			largerMutableDescriptor.stride, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		recoveredContext->setPrimitiveTopology(
+			rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			rts::render::RENDER_RESULT_OK &&
+		recoveredContext->draw(1, 0) == rts::render::RENDER_RESULT_OK &&
+		recoveredContext->draw(1, 1) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		recoveredContext->endFrame() == rts::render::RENDER_RESULT_OK,
+		"post-recovery partial preserve publishes only its initialized draw range");
 	unsigned int largerMutableBytes[16] = { 0 };
 	result |= check(device->updateBufferResource(largerMutableBuffer,
 		largerMutableBytes, sizeof(largerMutableBytes), 0,
@@ -6154,6 +6179,37 @@ int testD3D11HeadlessDevice()
 		device->recoverDevice() == rts::render::RENDER_RESULT_OK &&
 		device->isOperational(),
 		"dynamic index ranges recover while constant ranges fail closed");
+	unsigned short recoveredIndexPrefix[2] = { 0, 1 };
+	rts::render::LegacyLogicalState recoveredIndexLogical;
+	recoveredIndexLogical.pipeline.rasterizer.cullMode =
+		rts::render::RENDER_CULL_NONE;
+	result |= check(rangeContext->beginFrame() ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(buffer, rangeValues, sizeof(rangeValues), 0,
+			rts::render::RENDER_BUFFER_UPDATE_PRESERVE) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->updateBuffer(indexBuffer, recoveredIndexPrefix,
+			sizeof(recoveredIndexPrefix), 0,
+			rts::render::RENDER_BUFFER_UPDATE_PRESERVE) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setLegacyState(recoveredIndexLogical,
+			rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setVertexBuffer(buffer, descriptor.stride, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setIndexBuffer(indexBuffer,
+			rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setPrimitiveTopology(
+			rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->drawIndexed(1, 0, 0) == rts::render::RENDER_RESULT_OK &&
+		rangeContext->drawIndexed(1, 1, 0) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->drawIndexed(1, 2, 0) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK,
+		"post-recovery partial vertex/index preserves validate exact draw ranges");
 	result |= check(device->destroyResource(indexBuffer) &&
 		device->destroyResource(constantBuffer),
 		"dynamic range contract resources release cleanly");
