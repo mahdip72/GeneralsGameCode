@@ -4192,13 +4192,13 @@ void AIPlayer::crc( Xfer *xfer )
 			SKIRMISH_AI_REPLAY_EPOCH_LEGACY))
 		return;
 	UnsignedShort teamCount = 0;
-	for (DLINK_ITERATOR<TeamInQueue> team = iterate_TeamBuildQueue();
-		!team.done(); team.advance())
+	for (DLINK_ITERATOR<TeamInQueue> teamToCount = iterate_TeamBuildQueue();
+		!teamToCount.done(); teamToCount.advance())
 		++teamCount;
 	xfer->xferUnsignedShort(&teamCount);
-	for (DLINK_ITERATOR<TeamInQueue> team = iterate_TeamBuildQueue();
-		!team.done(); team.advance())
-		xfer->xferSnapshot(team.cur());
+	for (DLINK_ITERATOR<TeamInQueue> teamToXfer = iterate_TeamBuildQueue();
+		!teamToXfer.done(); teamToXfer.advance())
+		xfer->xferSnapshot(teamToXfer.cur());
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -4509,11 +4509,11 @@ void TeamInQueue::crc( Xfer *xfer )
 	TeamID teamID = m_team ? m_team->getID() : TEAM_ID_INVALID;
 	xfer->xferUser(&teamID, sizeof(TeamID));
 	UnsignedShort orderCount = 0;
-	for (WorkOrder *order = m_workOrders; order; order = order->m_next)
+	for (WorkOrder *orderToCount = m_workOrders; orderToCount; orderToCount = orderToCount->m_next)
 		++orderCount;
 	xfer->xferUnsignedShort(&orderCount);
-	for (WorkOrder *order = m_workOrders; order; order = order->m_next)
-		xfer->xferSnapshot(order);
+	for (WorkOrder *orderToXfer = m_workOrders; orderToXfer; orderToXfer = orderToXfer->m_next)
+		xfer->xferSnapshot(orderToXfer);
 }
 
 // ------------------------------------------------------------------------------------------------
