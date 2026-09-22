@@ -50,6 +50,14 @@ add_test(NAME g_generals_pathfinding_replay_epoch_tests
     COMMAND g_skirmish_ai_runner_contract_tests --generals-pathfinding-replay-epoch)
 set_tests_properties(g_generals_pathfinding_replay_epoch_tests PROPERTIES TIMEOUT 30)
 
+add_executable(g_window_dpi_contract_tests WindowDpiTest.cpp)
+target_include_directories(g_window_dpi_contract_tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/Generals/Code/Main"
+)
+target_link_libraries(g_window_dpi_contract_tests PRIVATE user32)
+add_test(NAME g_window_dpi_contract_tests COMMAND g_window_dpi_contract_tests)
+set_tests_properties(g_window_dpi_contract_tests PROPERTIES TIMEOUT 30)
+
 add_test(NAME g_texture_load_queue_contract_tests
     COMMAND g_skirmish_ai_runner_contract_tests --texture-load-queue-contract)
 set_tests_properties(g_texture_load_queue_contract_tests PROPERTIES TIMEOUT 30)

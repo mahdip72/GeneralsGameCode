@@ -41,6 +41,7 @@
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "WinMain.h"
+#include "../../../Generals/Code/Main/WindowDpi.h"
 #include "Lib/BaseType.h"
 #include "Common/CommandLine.h"
 #include "Common/CriticalSection.h"
@@ -103,6 +104,8 @@ static const char *messageToString(unsigned int message)
 	case WM_DESTROY: return  "WM_DESTROY";
 	case WM_MOVE: return  "WM_MOVE";
 	case WM_SIZE: return  "WM_SIZE";
+	case WM_DPICHANGED: return "WM_DPICHANGED";
+	case WM_GETDPISCALEDSIZE: return "WM_GETDPISCALEDSIZE";
 	case WM_ACTIVATE: return  "WM_ACTIVATE";
 	case WM_SETFOCUS: return  "WM_SETFOCUS";
 	case WM_KILLFOCUS: return  "WM_KILLFOCUS";
@@ -409,6 +412,29 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 					TheMouse->refreshCursorCapture();
 
 				break;
+			}
+
+			case WM_GETDPISCALEDSIZE:
+			{
+				// Fullscreen sizing belongs to the display-mode owner; don't let
+				// Windows linearly scale its pending size during a monitor move.
+				if (!TheGlobalData || !TheGlobalData->m_windowed)
+					return WindowDpi::PreservePendingWindowSize(
+						reinterpret_cast<SIZE *>(lParam));
+
+				return WindowDpi::AdjustPendingWindowSizeForDpi(
+					hWnd, (UINT)wParam, reinterpret_cast<SIZE *>(lParam));
+			}
+
+			case WM_DPICHANGED:
+			{
+				// The renderer owns fullscreen mode transitions. For windowed mode,
+				// update position/frame only and keep the exact client render size.
+				if (TheGlobalData && TheGlobalData->m_windowed)
+					WindowDpi::ApplyDpiChangedRect(
+						hWnd, reinterpret_cast<const RECT *>(lParam));
+
+				return 0;
 			}
 
 			//-------------------------------------------------------------------------
