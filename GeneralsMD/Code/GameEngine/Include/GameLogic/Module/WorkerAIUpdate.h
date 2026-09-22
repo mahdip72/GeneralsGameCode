@@ -113,6 +113,8 @@ class WorkerAIInterface
 {
 	public:
 		virtual void exitingSupplyTruckState() = 0; ///< This worker is leaving a supply truck task and should go back to Dozer mode.
+		virtual void setStage3CollectorRole(Bool collector) = 0;
+		virtual Bool isStage3CollectorRole() const = 0;
 };
 
 class WorkerAIUpdate : public AIUpdateInterface, public DozerAIInterface, public SupplyTruckAIInterface, public WorkerAIInterface
@@ -202,6 +204,8 @@ public:
 	void resetDozerBrain();
 
 	virtual void exitingSupplyTruckState() override; ///< This worker is leaving a supply truck task and should go back to Dozer mode.
+	virtual void setStage3CollectorRole(Bool collector) override { m_stage3CollectorRole = collector; }
+	virtual Bool isStage3CollectorRole() const override { return m_stage3CollectorRole; }
 
 	virtual UpdateSleepTime update() override;				///< the update entry point
 
@@ -251,6 +255,7 @@ protected:
 	Int m_numberBoxes;
 	ObjectID									m_preferredDock;			///< Instead of searching, try this one first
 	Bool m_forcePending; // To prevent a function from doing a setState, forceWanting will latch into here until serviced.
+	Bool m_stage3CollectorRole;
 	Bool m_isRebuild;	// is our current construction task a rebuild?
 	Bool m_forcedBusyPending;	// A supply truck can't tell the difference between Idle since
 														// I'm between docking states, or a Stop command without help.

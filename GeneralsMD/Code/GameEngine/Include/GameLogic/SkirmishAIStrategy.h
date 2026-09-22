@@ -51,7 +51,10 @@ enum SkirmishStrategyReason
 	SKIRMISH_STRATEGY_REASON_BALANCED_ASSAULT_LOW_READINESS,
 	SKIRMISH_STRATEGY_REASON_BALANCED_ASSAULT_FORCE_LOSS,
 	SKIRMISH_STRATEGY_REASON_BALANCED_ASSAULT_OBJECTIVE_COMPLETE,
-	SKIRMISH_STRATEGY_REASON_BALANCED_ASSAULT_TARGET_UNAVAILABLE
+	SKIRMISH_STRATEGY_REASON_BALANCED_ASSAULT_TARGET_UNAVAILABLE,
+
+	SKIRMISH_STRATEGY_REASON_ASSAULT_FORTIFY_DEADLINE,
+	SKIRMISH_STRATEGY_REASON_BALANCED_FORTIFY_DEADLINE
 };
 
 struct SkirmishStrategyMetrics
@@ -119,6 +122,9 @@ void ClearSkirmishStrategyTargetObservation( SkirmishStrategyState *state );
 
 void InitializeSkirmishStrategyState( SkirmishStrategyState *state, UnsignedInt currentFrame );
 void InitializeOldSaveSkirmishStrategyState( SkirmishStrategyState *state, UnsignedInt currentFrame );
+void ArmOldSaveSkirmishFortifyDeadline( SkirmishStrategyState *state,
+	GameDifficulty difficulty, UnsignedInt currentFrame );
 
 SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &state,
-	const SkirmishStrategyMetrics &metrics, GameDifficulty difficulty, UnsignedInt currentFrame );
+	const SkirmishStrategyMetrics &metrics, GameDifficulty difficulty, UnsignedInt currentFrame,
+	Bool useProductionBehavior = false );

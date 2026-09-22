@@ -21,6 +21,11 @@ namespace
 	const UnsignedInt SKIRMISH_TARGET_LAST_SEEN_GRACE_FRAMES =
 		30 * LOGICFRAMES_PER_SECOND;
 	const UnsignedInt SKIRMISH_FRAME_HALF_RANGE = 0x80000000U;
+	// A Fortify episode has a deterministic assembly budget.  Easier AIs get
+	// more time because they evaluate and produce less often.
+	const UnsignedInt SKIRMISH_EASY_FORTIFY_ASSEMBLY_SECONDS = 240;
+	const UnsignedInt SKIRMISH_NORMAL_FORTIFY_ASSEMBLY_SECONDS = 180;
+	const UnsignedInt SKIRMISH_HARD_FORTIFY_ASSEMBLY_SECONDS = 120;
 
 	Int ClampStrategyMetric( Int value )
 	{
@@ -56,6 +61,23 @@ namespace
 		return 90 * LOGICFRAMES_PER_SECOND;
 	}
 
+	UnsignedInt GetFortifyAssemblyDeadlineFrames( GameDifficulty difficulty )
+	{
+		if( difficulty == DIFFICULTY_EASY )
+			return SKIRMISH_EASY_FORTIFY_ASSEMBLY_SECONDS * LOGICFRAMES_PER_SECOND;
+		if( difficulty == DIFFICULTY_HARD )
+			return SKIRMISH_HARD_FORTIFY_ASSEMBLY_SECONDS * LOGICFRAMES_PER_SECOND;
+		return SKIRMISH_NORMAL_FORTIFY_ASSEMBLY_SECONDS * LOGICFRAMES_PER_SECOND;
+	}
+
+	void ArmFortifyAssemblyDeadline( SkirmishStrategyState *state,
+		GameDifficulty difficulty, UnsignedInt currentFrame )
+	{
+		state->assaultAssemblyDeadlineActive = true;
+		state->assaultAssemblyDeadlineFrame = currentFrame +
+			GetFortifyAssemblyDeadlineFrames( difficulty );
+	}
+
 	Bool MeetsNormalAssaultRequirements( const SkirmishStrategyMetrics &metrics,
 		UnsignedInt readiness )
 	{
@@ -83,11 +105,51 @@ namespace
 		state->pendingSinceFrame = 0;
 	}
 
-	void CommitMode( SkirmishStrategyDecision *decision, SkirmishStrategyMode mode,
-		SkirmishStrategyReason reason, UnsignedInt currentFrame )
+	void BeginFortifyEpisode( SkirmishStrategyState *state, GameDifficulty difficulty,
+		UnsignedInt currentFrame )
 	{
+		state->fortifyAttemptStatus = SKIRMISH_STRATEGY_ATTEMPT_PENDING;
+		state->superweaponAttemptStatus = SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED;
+		ArmFortifyAssemblyDeadline( state, difficulty, currentFrame );
+	}
+
+	void EndFortifyEpisode( SkirmishStrategyState *state, Bool forceAssemblySucceeded )
+	{
+		if( forceAssemblySucceeded &&
+			state->fortifyAttemptStatus != SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED &&
+			state->fortifyAttemptStatus != SKIRMISH_STRATEGY_ATTEMPT_FAILED )
+		{
+			state->fortifyAttemptStatus = SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED;
+		}
+		else if( state->fortifyAttemptStatus != SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED &&
+			state->fortifyAttemptStatus != SKIRMISH_STRATEGY_ATTEMPT_FAILED )
+		{
+			state->fortifyAttemptStatus = SKIRMISH_STRATEGY_ATTEMPT_FAILED;
+		}
+		if( state->superweaponAttemptStatus != SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED &&
+			state->superweaponAttemptStatus != SKIRMISH_STRATEGY_ATTEMPT_FAILED )
+			state->superweaponAttemptStatus = SKIRMISH_STRATEGY_ATTEMPT_FAILED;
+		state->assaultAssemblyDeadlineActive = false;
+		state->assaultAssemblyDeadlineFrame = 0;
+	}
+
+	void CommitMode( SkirmishStrategyDecision *decision, SkirmishStrategyMode mode,
+		SkirmishStrategyReason reason, GameDifficulty difficulty, UnsignedInt currentFrame,
+		Bool fortifyForceAssemblySucceeded, Bool useProductionBehavior )
+	{
+		const SkirmishStrategyMode previousMode = decision->nextState.currentMode;
 		decision->modeChanged = decision->nextState.currentMode != mode;
+		if( useProductionBehavior && previousMode == SKIRMISH_STRATEGY_FORTIFY &&
+			mode != SKIRMISH_STRATEGY_FORTIFY )
+		{
+			EndFortifyEpisode( &decision->nextState, fortifyForceAssemblySucceeded );
+		}
 		decision->nextState.currentMode = mode;
+		if( useProductionBehavior && previousMode != SKIRMISH_STRATEGY_FORTIFY &&
+			mode == SKIRMISH_STRATEGY_FORTIFY )
+		{
+			BeginFortifyEpisode( &decision->nextState, difficulty, currentFrame );
+		}
 		if( mode != SKIRMISH_STRATEGY_ASSAULT )
 		{
 			decision->nextState.assaultEntryCombatValue = 0;
@@ -172,8 +234,19 @@ void InitializeOldSaveSkirmishStrategyState( SkirmishStrategyState *state, Unsig
 	state->modeEntryFrame = currentFrame - 90 * LOGICFRAMES_PER_SECOND;
 }
 
+void ArmOldSaveSkirmishFortifyDeadline( SkirmishStrategyState *state,
+	GameDifficulty difficulty, UnsignedInt currentFrame )
+{
+	if( state && state->currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+		!state->assaultAssemblyDeadlineActive )
+	{
+		ArmFortifyAssemblyDeadline( state, difficulty, currentFrame );
+	}
+}
+
 SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &state,
-	const SkirmishStrategyMetrics &metrics, GameDifficulty difficulty, UnsignedInt currentFrame )
+	const SkirmishStrategyMetrics &metrics, GameDifficulty difficulty, UnsignedInt currentFrame,
+	Bool useProductionBehavior )
 {
 	SkirmishStrategyDecision decision;
 	SkirmishStrategyMode candidateMode = SKIRMISH_STRATEGY_NONE;
@@ -195,13 +268,46 @@ SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &
 	decision.nextState.nextEvaluationFrame = currentFrame + GetEvaluationIntervalFrames( difficulty );
 	if( state.currentMode != SKIRMISH_STRATEGY_ASSAULT )
 		decision.nextState.assaultEntryCombatValue = 0;
+	if( useProductionBehavior && state.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+		!decision.nextState.assaultAssemblyDeadlineActive )
+	{
+		ArmFortifyAssemblyDeadline( &decision.nextState, difficulty, currentFrame );
+	}
+
+	// A Fortify episode is a hard bound. Emergency pressure may keep the AI in
+	// Fortify before this frame, but it cannot consume the deadline and leave an
+	// inactive, permanent Fortify state.
+	if( useProductionBehavior && state.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+		decision.nextState.assaultAssemblyDeadlineActive &&
+		IsSkirmishStrategyFrameReached( currentFrame,
+			decision.nextState.assaultAssemblyDeadlineFrame ) )
+	{
+		if( metrics.hasStrategicTarget &&
+			(metrics.viableAssaultForceAssembled ||
+			 ClampStrategyMetric( metrics.armyReadiness ) >= 35) )
+		{
+			CommitMode( &decision, SKIRMISH_STRATEGY_ASSAULT,
+				SKIRMISH_STRATEGY_REASON_ASSAULT_FORTIFY_DEADLINE, difficulty,
+				currentFrame, false, useProductionBehavior );
+			decision.nextState.assaultEntryCombatValue = metrics.availableCombatValue > 0 ?
+				metrics.availableCombatValue : 0;
+		}
+		else
+		{
+			CommitMode( &decision, SKIRMISH_STRATEGY_BALANCED,
+				SKIRMISH_STRATEGY_REASON_BALANCED_FORTIFY_DEADLINE, difficulty,
+				currentFrame, false, useProductionBehavior );
+		}
+		return decision;
+	}
 
 	if( base < 35 )
 	{
 		ClearPendingMode( &decision.nextState );
 		if( state.currentMode != SKIRMISH_STRATEGY_FORTIFY )
 			CommitMode( &decision, SKIRMISH_STRATEGY_FORTIFY,
-				SKIRMISH_STRATEGY_REASON_FORTIFY_CRITICAL_BASE, currentFrame );
+				SKIRMISH_STRATEGY_REASON_FORTIFY_CRITICAL_BASE, difficulty,
+				currentFrame, false, useProductionBehavior );
 		else
 			decision.reason = SKIRMISH_STRATEGY_REASON_FORTIFY_CRITICAL_BASE;
 		return decision;
@@ -212,7 +318,8 @@ SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &
 		ClearPendingMode( &decision.nextState );
 		if( state.currentMode != SKIRMISH_STRATEGY_FORTIFY )
 			CommitMode( &decision, SKIRMISH_STRATEGY_FORTIFY,
-				SKIRMISH_STRATEGY_REASON_FORTIFY_SEVERE_THREAT, currentFrame );
+				SKIRMISH_STRATEGY_REASON_FORTIFY_SEVERE_THREAT, difficulty,
+				currentFrame, false, useProductionBehavior );
 		else
 			decision.reason = SKIRMISH_STRATEGY_REASON_FORTIFY_SEVERE_THREAT;
 		return decision;
@@ -221,7 +328,8 @@ SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &
 	if( state.currentMode == SKIRMISH_STRATEGY_ASSAULT && metrics.assaultObjectiveComplete )
 	{
 		CommitMode( &decision, SKIRMISH_STRATEGY_BALANCED,
-			SKIRMISH_STRATEGY_REASON_BALANCED_ASSAULT_OBJECTIVE_COMPLETE, currentFrame );
+			SKIRMISH_STRATEGY_REASON_BALANCED_ASSAULT_OBJECTIVE_COMPLETE, difficulty,
+			currentFrame, false, useProductionBehavior );
 		return decision;
 	}
 
@@ -324,7 +432,9 @@ SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &
 		return decision;
 	}
 
-	CommitMode( &decision, candidateMode, candidateReason, currentFrame );
+	CommitMode( &decision, candidateMode, candidateReason, difficulty, currentFrame,
+		candidateReason == SKIRMISH_STRATEGY_REASON_ASSAULT_FORCE_ASSEMBLED,
+		useProductionBehavior );
 	if( candidateMode == SKIRMISH_STRATEGY_ASSAULT )
 		decision.nextState.assaultEntryCombatValue =
 			metrics.availableCombatValue > 0 ? metrics.availableCombatValue : 0;

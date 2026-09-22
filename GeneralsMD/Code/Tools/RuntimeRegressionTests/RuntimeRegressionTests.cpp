@@ -2575,24 +2575,26 @@ static void TestSkirmishAIReplayEpoch()
 
 	// Live games always use the current and recovery paths. Replays retain the
 	// behavior selected by their recording epoch; an unknown epoch is legacy.
-	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
 	const Bool expectedReplayCurrentBehavior[] =
-		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedReplayRecoveryBehavior[] =
-		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedRecoveryCRCFields[] =
-		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedCancellationOwnership[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedUnownedQueueFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedBoundedFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedResourceWorkerPreservation[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedStrategyBehavior[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
-	for (Int i = 0; i < 11; ++i)
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+	const Bool expectedProductionBehavior[] =
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
+	for (Int i = 0; i < 12; ++i)
 	{
 		CHECK(ShouldUseSkirmishAICurrentBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(FALSE, replayEpochs[i]));
@@ -2636,6 +2638,10 @@ static void TestSkirmishAIReplayEpoch()
 			== expectedStrategyBehavior[i]);
 		CHECK(ShouldIncludeSkirmishAIStrategyCRCFields(TRUE, replayEpochs[i])
 			== expectedStrategyBehavior[i]);
+		CHECK(ShouldUseSkirmishAIProductionBehavior(TRUE, replayEpochs[i])
+			== expectedProductionBehavior[i]);
+		CHECK(ShouldIncludeSkirmishAIProductionCRCFields(TRUE, replayEpochs[i])
+			== expectedProductionBehavior[i]);
 	}
 
 	UnicodeString livenessOnly = unmarked;
@@ -2807,10 +2813,11 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(resourceWorkerPreservationEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=8]") == 0);
 
-	// New recordings use epoch 9 and opt into the persisted strategy controller
-	// while retaining every Stage 1 recovery behavior and CRC field.
+	// Epoch 9 remains the strategy-controller compatibility epoch. New
+	// recordings use epoch 10 and add the Stage 3 production policy while
+	// retaining every earlier behavior and CRC field.
 	UnicodeString strategyControllerEpoch = unmarked;
-	MarkReplayVersionForSkirmishAICurrentEpoch(strategyControllerEpoch);
+	MarkReplayVersionForSkirmishAIStrategyControllerEpoch(strategyControllerEpoch);
 	CHECK(strategyControllerEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=9]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(strategyControllerEpoch) ==
@@ -2827,6 +2834,27 @@ static void TestSkirmishAIReplayEpoch()
 		strategyControllerEpoch);
 	CHECK(strategyControllerEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=9]") == 0);
+	UnicodeString productionEpoch = unmarked;
+	MarkReplayVersionForSkirmishAICurrentEpoch(productionEpoch);
+	CHECK(productionEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=10]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(productionEpoch) ==
+		SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION);
+	CHECK(ShouldUseSkirmishAICurrentBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
+	CHECK(ShouldUseSkirmishAIRecoveryBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
+	CHECK(ShouldUseSkirmishAIStrategyBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
+	CHECK(ShouldIncludeSkirmishAIStrategyCRCFields(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
+	CHECK(ShouldUseSkirmishAIProductionBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
+	CHECK(ShouldIncludeSkirmishAIProductionCRCFields(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
+	MarkReplayVersionForSkirmishAIProductionEpoch(productionEpoch);
+	CHECK(productionEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=10]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(resourceWorkerPreservationEpoch) ==
 		SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION);
 	CHECK(ShouldUseSkirmishAIRecoveryBoundedFailover(
@@ -2843,7 +2871,7 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=10]";
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=11]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -2948,14 +2976,14 @@ static void TestPathfindQueueReplayEpoch()
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=9]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=10]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(combined) ==
-		SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER);
+		SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION);
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=9]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=10]") == 0);
 
 	UnicodeString pathLiveness = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);
@@ -3122,10 +3150,12 @@ static void TestSkirmishAIProductionPolicies()
 	input.routeClass = SKIRMISH_AI_ROUTE_GROUND_UNREACHABLE;
 	input.difficulty = SKIRMISH_AI_DIFFICULTY_HARD;
 	CHECK(ScoreSkirmishAITeam(input).counterFitScore == 300);
+	CHECK(ScoreSkirmishAITeam(input, true).counterFitScore == 500);
 	CHECK(ScoreSkirmishAITeam(input).factoryWaitScore == -250);
 	CHECK(ScoreSkirmishAITeam(input).lossScore == -225);
 	CHECK(ScoreSkirmishAITeam(input).pathFailureScore == -300);
 	CHECK(ScoreSkirmishAITeam(input).rawContextScore == -1000);
+	CHECK(ScoreSkirmishAITeam(input, true).rawContextScore == -875);
 
 	CHECK(GetSkirmishAIRouteScore(SKIRMISH_AI_ROUTE_GROUND_REACHABLE) == 50);
 	CHECK(GetSkirmishAIRouteScore(SKIRMISH_AI_ROUTE_UNKNOWN) == 0);
@@ -3139,6 +3169,477 @@ static void TestSkirmishAIProductionPolicies()
 		(__int64)2147483647 * 1000, (__int64)2147483646 * 1000));
 	CHECK(GetSkirmishAITieSelectionIndex(1, 99) == 0);
 	CHECK(GetSkirmishAITieSelectionIndex(3, 2) == 2);
+}
+
+static void TestSkirmishAIStage3Policies()
+{
+	// Stage 3 keeps a single aggregate reserve boundary for ordinary
+	// production.  The max operation and the affordability check must remain
+	// well-defined at the signed 32-bit limit.
+	const Int maximumInt = 2147483647;
+	CHECK(GetSkirmishAIAggregateReserve(1200, 900, 1000) == 1200);
+	CHECK(GetSkirmishAIAggregateReserve(1200, 1800, 1000) == 1800);
+	CHECK(GetSkirmishAIAggregateReserve(1200, 900, 2400) == 2400);
+	CHECK(GetSkirmishAIAggregateReserve(-1, -2, -3) == 0);
+	CHECK(GetSkirmishAIAggregateReserve(
+		maximumInt, maximumInt, maximumInt) == maximumInt);
+	CHECK(IsSkirmishAIAffordable(maximumInt, maximumInt, 0));
+	CHECK(!IsSkirmishAIAffordable(maximumInt, maximumInt, 1));
+	CHECK(!IsSkirmishAIAffordable(maximumInt, maximumInt, maximumInt));
+	CHECK(IsSkirmishAIAffordable(0, -1, -1));
+	CHECK(!IsSkirmishAIAffordable(-1, 0, 0));
+
+	// Fortify and Assault deliberately amplify the same deterministic counter
+	// fit signal; Balanced retains the unweighted score.
+	CHECK(GetSkirmishAIProductionCounterFitScore(
+		300, SKIRMISH_AI_PRODUCTION_BALANCED) == 300);
+	CHECK(GetSkirmishAIProductionCounterFitScore(
+		300, SKIRMISH_AI_PRODUCTION_FORTIFY) == 400);
+	CHECK(GetSkirmishAIProductionCounterFitScore(
+		300, SKIRMISH_AI_PRODUCTION_ASSAULT) == 500);
+	CHECK(GetSkirmishAIProductionCounterFitScore(
+		-20, SKIRMISH_AI_PRODUCTION_ASSAULT) == 0);
+	CHECK(GetSkirmishAIProductionCounterFitScore(
+		1000, SKIRMISH_AI_PRODUCTION_FORTIFY) == 400);
+	SkirmishAITeamScoreInput weightedScoreInput;
+	weightedScoreInput.configuredPriority = 1;
+	weightedScoreInput.counterFitScore = 500;
+	weightedScoreInput.resources = 0;
+	weightedScoreInput.minimumCost = 0;
+	weightedScoreInput.plannedCost = 0;
+	weightedScoreInput.reserve = 0;
+	weightedScoreInput.factoryWaitFrames = 0;
+	weightedScoreInput.logicFramesPerSecond = LOGICFRAMES_PER_SECOND;
+	weightedScoreInput.routeClass = SKIRMISH_AI_ROUTE_UNKNOWN;
+	weightedScoreInput.recentLossCount = 0;
+	weightedScoreInput.recentPathFailureCount = 0;
+	weightedScoreInput.difficulty = SKIRMISH_AI_DIFFICULTY_HARD;
+	CHECK(ScoreSkirmishAITeam(weightedScoreInput).counterFitScore == 300);
+	CHECK(ScoreSkirmishAITeam(weightedScoreInput, true).counterFitScore == 500);
+
+	// Offensive powers require a live hostile slot with at least one object.
+	// This prevents the historical end-of-game fallback to a human ally.
+	CHECK(IsSkirmishAIOffensiveTargetEligible(true, true, true));
+	CHECK(!IsSkirmishAIOffensiveTargetEligible(false, true, true));
+	CHECK(!IsSkirmishAIOffensiveTargetEligible(true, false, true));
+	CHECK(!IsSkirmishAIOffensiveTargetEligible(true, true, false));
+	CHECK(HasSkirmishAIOffensiveTargetObjects(false, true, false));
+	CHECK(!HasSkirmishAIOffensiveTargetObjects(false, false, true));
+	CHECK(HasSkirmishAIOffensiveTargetObjects(true, false, true));
+	CHECK(!HasSkirmishAIOffensiveTargetObjects(true, true, false));
+	CHECK(IsSkirmishAIOffensiveTargetObjectEligible(
+		true, true, false, false, false, false, false, false,
+		false, false, false, false, 1));
+	CHECK(!IsSkirmishAIOffensiveTargetObjectEligible(
+		true, true, true, false, false, false, false, false,
+		false, false, false, false, 1000));
+	CHECK(IsSkirmishAIOffensiveTargetObjectEligible(
+		true, true, false, false, false, false, true, false,
+		false, false, false, false, 1000));
+	CHECK(IsSkirmishAIOffensiveTargetObjectEligible(
+		true, true, false, false, false, false, false, true,
+		false, false, false, false, 1000));
+	CHECK(!IsSkirmishAIOffensiveTargetObjectEligible(
+		true, true, false, false, false, false, false, false,
+		true, false, false, false, 1000));
+	CHECK(IsSkirmishAIOffensiveTargetObjectEligible(
+		true, true, false, false, false, false, false, false,
+		false, false, false, false, 0));
+
+	// Aggregate demand scales with every usable center and counts only assigned,
+	// available collectors. One pending collector suppresses duplicate work.
+	CHECK(GetSkirmishAISupplyCollectorDemand(8, 3, false) == 5);
+	CHECK(GetSkirmishAISupplyCollectorDemand(8, 8, false) == 0);
+	CHECK(GetSkirmishAISupplyCollectorDemand(8, 3, true) == 0);
+	CHECK(GetSkirmishAISupplyCollectorDemand(-1, -1, false) == 0);
+	Int aggregateDeficit = AddSkirmishAISupplyCollectorDeficit(0, 4, 6);
+	aggregateDeficit = AddSkirmishAISupplyCollectorDeficit(
+		aggregateDeficit, 4, 0);
+	CHECK(aggregateDeficit == 4);
+	CHECK(IsSkirmishAIPendingCollectorEntry(true, false, 1, 1, false));
+	CHECK(!IsSkirmishAIPendingCollectorEntry(false, true, 1, 1, false));
+	CHECK(!IsSkirmishAIPendingCollectorEntry(true, true, 2, 2, false));
+	CHECK(!IsSkirmishAIPendingCollectorEntry(true, false, 1, 2, false));
+	CHECK(IsSkirmishAIPendingCollectorEntry(false, false, 0, 1, true));
+	CHECK(!IsSkirmishAIPendingCollectorEntry(false, false, 0, 1, false));
+	CHECK(IsSkirmishAIEligibleCollector(
+		true, true, true, true, false, false, false, false, false,
+		false, false, false, true));
+	CHECK(!IsSkirmishAIEligibleCollector(
+		true, true, true, true, false, false, false, false, false,
+		false, false, true, true));
+	CHECK(!IsSkirmishAIEligibleCollector(
+		true, true, true, true, false, false, false, false, false,
+		true, false, false, true));
+	CHECK(ShouldRouteSkirmishAICollectorToCenter(true, 4, 3));
+	CHECK(!ShouldRouteSkirmishAICollectorToCenter(true, 4, 4));
+	CHECK(!ShouldRouteSkirmishAICollectorToCenter(false, 4, 0));
+
+	// A satisfied OR block cannot create demand for one of its alternatives.
+	CHECK(ShouldInspectSkirmishAIPrerequisiteAlternative(true, false));
+	CHECK(!ShouldInspectSkirmishAIPrerequisiteAlternative(true, true));
+	CHECK(!ShouldInspectSkirmishAIPrerequisiteAlternative(false, false));
+
+	// Spending uses the current aggregate, and free recruitment is considered
+	// from an otherwise valid candidate before paid affordability is relevant.
+	CHECK(GetFreshSkirmishAIProductionReserve(1200, 1800, 1000) == 1800);
+	CHECK(GetFreshSkirmishAIProductionReserve(1200, 900, 2400) == 2400);
+	CHECK(!CanSkirmishAISpendWithAuthorization(2500, 1000, 2000, 800,
+		SKIRMISH_AI_SPEND_AUTHORIZATION_NONE));
+	CHECK(CanSkirmishAISpendWithAuthorization(2500, 1000, 2000, 800,
+		SKIRMISH_AI_SPEND_AUTHORIZATION_BUILDER));
+	CHECK(CanSkirmishAISpendWithAuthorization(2500, 1000, 2000, 800,
+		SKIRMISH_AI_SPEND_AUTHORIZATION_COLLECTOR));
+	CHECK(CanSkirmishAISpendWithAuthorization(2500, 1000, 2000, 800,
+		SKIRMISH_AI_SPEND_AUTHORIZATION_PRIORITY_STRUCTURE));
+	CHECK(!CanSkirmishAISpendWithAuthorization(1799, 1000, 2000, 800,
+		SKIRMISH_AI_SPEND_AUTHORIZATION_COLLECTOR));
+	CHECK(ShouldTrySkirmishAIRecruitBeforePaidTraining(0, 1, true, false));
+	CHECK(ShouldTrySkirmishAIRecruitBeforePaidTraining(0, 1, true, true));
+	CHECK(!ShouldTrySkirmishAIRecruitBeforePaidTraining(1, 1, true, false));
+	CHECK(ShouldTrySkirmishAIRecruitBeforePaidTraining(0, 1, false, false));
+	CHECK(ShouldSelectSkirmishAIReinforcementCandidate(true, false, false));
+	CHECK(ShouldSelectSkirmishAIReinforcementCandidate(false, true, true));
+	CHECK(!ShouldSelectSkirmishAIReinforcementCandidate(false, false, true));
+	CHECK(!ShouldSelectSkirmishAIReinforcementCandidate(false, true, false));
+	CHECK(IsSkirmishAIOperationalProducer(
+		true, false, false, false, false, false, false, false, false, true));
+	CHECK(!IsSkirmishAIOperationalProducer(
+		true, false, false, false, false, false, false, true, false, true));
+	CHECK(!IsSkirmishAIOperationalProducer(
+		true, false, false, false, false, false, false, false, true, true));
+	CHECK(IsSkirmishAICollectorProducerEligible(false, false));
+	CHECK(IsSkirmishAICollectorProducerEligible(true, true));
+	CHECK(!IsSkirmishAICollectorProducerEligible(true, false));
+	CHECK(ShouldRetainSkirmishAIDepletedCollectorProduction(
+		true, true, 0.25f));
+	CHECK(!ShouldRetainSkirmishAIDepletedCollectorProduction(
+		true, true, 0.0f));
+	CHECK(!ShouldRetainSkirmishAIDepletedCollectorProduction(
+		true, false, 0.75f));
+	CHECK(IsSkirmishAIDepletedCollectorQueueMappingUnambiguous(3, 3, false));
+	CHECK(!IsSkirmishAIDepletedCollectorQueueMappingUnambiguous(2, 3, false));
+	CHECK(!IsSkirmishAIDepletedCollectorQueueMappingUnambiguous(3, 3, true));
+	CHECK(GetSkirmishAIDepletedCollectorRetainedOrderQuantity(4, 3) == 3);
+	CHECK(GetSkirmishAIDepletedCollectorRetainedOrderQuantity(2, 3) == 2);
+	CHECK(GetSkirmishAIDepletedCollectorRetainedOrderQuantity(2, 0) == 0);
+
+	// Structure admission preserves explicit script priority, then repairs
+	// critical infrastructure and revenue before ordinary production and
+	// fortification. A depleted supply point is therefore not a revenue
+	// priority, while a prerequisite-only depot remains admissible separately.
+	CHECK(GetSkirmishAIStructurePriority(
+		true, false, false, false, false, false, false, false, false) == 1000);
+	CHECK(GetSkirmishAIStructurePriority(
+		false, true, false, false, false, false, false, false, false) == 900);
+	CHECK(GetSkirmishAIStructurePriority(
+		false, false, true, false, false, false, false, false, false) == 850);
+	CHECK(GetSkirmishAIStructurePriority(
+		false, false, false, true, false, false, false, false, false) == 800);
+	CHECK(GetSkirmishAIStructurePriority(
+		false, false, false, false, true, false, false, false, false) == 775);
+	CHECK(GetSkirmishAIStructurePriority(
+		false, false, false, false, false, true, false, false, false) == 700);
+	CHECK(GetSkirmishAIStructurePriority(
+		false, false, false, false, false, false, true, true, false) == 675);
+	CHECK(GetSkirmishAIStructurePriority(
+		false, false, false, false, false, false, true, false, false) == 550);
+	CHECK(GetSkirmishAIStructurePriority(
+		false, false, false, false, false, false, false, false, true) == 625);
+	CHECK(IsSkirmishAIAlternateIncomeStructure(true, false, false, false));
+	CHECK(IsSkirmishAIAlternateIncomeStructure(false, true, false, false));
+	CHECK(IsSkirmishAIAlternateIncomeStructure(false, false, true, false));
+	CHECK(IsSkirmishAIAlternateIncomeStructure(false, false, false, true));
+	CHECK(!IsSkirmishAIAlternateIncomeStructure(false, false, false, false));
+	CHECK(IsSkirmishAISupplyRevenueAvailable(
+		true, true, false, true, false, 1));
+	CHECK(!IsSkirmishAISupplyRevenueAvailable(
+		false, true, false, true, false, 1));
+	CHECK(!IsSkirmishAISupplyRevenueAvailable(
+		true, false, false, true, false, 1));
+	CHECK(!IsSkirmishAISupplyRevenueAvailable(
+		true, true, true, true, false, 1));
+	CHECK(!IsSkirmishAISupplyRevenueAvailable(
+		true, true, false, false, false, 1));
+	CHECK(!IsSkirmishAISupplyRevenueAvailable(
+		true, true, false, true, true, 1));
+	CHECK(!IsSkirmishAISupplyRevenueAvailable(
+		true, true, false, true, false, 0));
+	CHECK(!ShouldBuildSkirmishAIPrerequisiteSupplyCenter(true, false, false));
+	CHECK(ShouldBuildSkirmishAIPrerequisiteSupplyCenter(false, false, false));
+	CHECK(!ShouldBuildSkirmishAIPrerequisiteSupplyCenter(false, true, false));
+	CHECK(!ShouldBuildSkirmishAIPrerequisiteSupplyCenter(false, false, true));
+	CHECK(ShouldKeepSkirmishAISuperweaponConstructionPending(
+		true, true, true, false, false, false, false, true, false));
+	CHECK(ShouldKeepSkirmishAISuperweaponConstructionPending(
+		true, true, true, false, false, false, false, false, true));
+	CHECK(!ShouldKeepSkirmishAISuperweaponConstructionPending(
+		true, true, true, false, false, false, true, true, false));
+	CHECK(!ShouldKeepSkirmishAISuperweaponConstructionPending(
+		true, false, true, false, false, false, false, true, false));
+	CHECK(ShouldContinueSkirmishAIStrategyAfterRecovery(false, false));
+	CHECK(ShouldContinueSkirmishAIStrategyAfterRecovery(false, true));
+	CHECK(!ShouldContinueSkirmishAIStrategyAfterRecovery(true, false));
+	CHECK(ShouldContinueSkirmishAIStrategyAfterRecovery(true, true));
+	CHECK(DoesSkirmishAIDependentStructureSatisfyPrerequisiteDemand(
+		true, true, false, false, false, false, false, false));
+	CHECK(!DoesSkirmishAIDependentStructureSatisfyPrerequisiteDemand(
+		true, true, true, false, false, false, false, false));
+	CHECK(!DoesSkirmishAIDependentStructureSatisfyPrerequisiteDemand(
+		true, true, false, true, false, false, false, false));
+	CHECK(!DoesSkirmishAIDependentStructureSatisfyPrerequisiteDemand(
+		true, true, false, false, true, false, false, false));
+	CHECK(!DoesSkirmishAIDependentStructureSatisfyPrerequisiteDemand(
+		true, true, false, false, false, true, false, false));
+	CHECK(!DoesSkirmishAIDependentStructureSatisfyPrerequisiteDemand(
+		true, true, false, false, false, false, true, false));
+	CHECK(!DoesSkirmishAIDependentStructureSatisfyPrerequisiteDemand(
+		true, true, false, false, false, false, false, true));
+
+	// Outside current Stage 3 Fortify behavior, native script selection remains
+	// unchanged. Inside it, strategic powers require a pending attempt and the
+	// exact source chosen for that compatible power.
+	CHECK(ShouldUseSkirmishAIStrategicPowerSource(
+		false, true, true, false, false));
+	CHECK(ShouldUseSkirmishAIStrategicPowerSource(
+		true, false, true, false, false));
+	CHECK(ShouldUseSkirmishAIStrategicPowerSource(
+		true, true, false, false, false));
+	CHECK(ShouldUseSkirmishAIStrategicPowerSource(
+		true, true, true, true, true));
+	CHECK(!ShouldUseSkirmishAIStrategicPowerSource(
+		true, true, true, true, false));
+	CHECK(!ShouldUseSkirmishAIStrategicPowerSource(
+		true, true, true, false, true));
+	CHECK(ShouldLockSkirmishAIStrategicPowerSource(true, false, true));
+	CHECK(!ShouldLockSkirmishAIStrategicPowerSource(true, true, true));
+	CHECK(!ShouldLockSkirmishAIStrategicPowerSource(false, false, true));
+	CHECK(!ShouldLockSkirmishAIStrategicPowerSource(true, false, false));
+	CHECK(!ShouldFailSkirmishAIStrategicPowerSourceLock(true, true, true));
+	CHECK(ShouldFailSkirmishAIStrategicPowerSourceLock(true, true, false));
+	CHECK(!ShouldFailSkirmishAIStrategicPowerSourceLock(true, false, false));
+	CHECK(!ShouldFailSkirmishAIStrategicPowerSourceLock(false, true, false));
+	// Version 10 lacks the exact power/source identity and therefore restores
+	// unlocked. A valid lock rejects every later request independent of the
+	// newly requested power. A paused, disabled, destroyed, or module-less
+	// accepted source consumes the attempt as failed before the lock is cleared.
+	CHECK(!GetSkirmishAIStrategicPowerSourceLockForVersion(10, true));
+	CHECK(GetSkirmishAIStrategicPowerSourceLockForVersion(11, true));
+	CHECK(!GetSkirmishAIStrategicPowerSourceLockForVersion(11, false));
+	CHECK(ShouldRejectSkirmishAIStrategicPowerRequest(true, true));
+	CHECK(!ShouldRejectSkirmishAIStrategicPowerRequest(true, false));
+	CHECK(IsSkirmishAIStrategicPowerDispatchable(false, false));
+	CHECK(!IsSkirmishAIStrategicPowerDispatchable(true, false));
+	CHECK(!IsSkirmishAIStrategicPowerDispatchable(false, true));
+	// The persisted TeamID cursor partitions equal-priority candidates into the
+	// after-cursor pass and a wrapped pass, and advances only on success.
+	CHECK(GetSkirmishAIReinforcementCursorForVersion(10, 17) == 0);
+	CHECK(GetSkirmishAIReinforcementCursorForVersion(11, 17) == 17);
+	CHECK(GetSkirmishAIReinforcementRoundRobinPass(18, 17) == 0);
+	CHECK(GetSkirmishAIReinforcementRoundRobinPass(16, 17) == 1);
+	CHECK(GetSkirmishAIReinforcementRoundRobinPass(17, 17) == 2);
+	CHECK(AdvanceSkirmishAIRoundRobinCursor(17, 18, false) == 17);
+	CHECK(AdvanceSkirmishAIRoundRobinCursor(17, 18, true) == 18);
+	// An accepted delayed command retains its still-present lock. A synchronous
+	// trigger has already cleared the lock, while a rejected call has no
+	// acceptance acknowledgement and is cleared by the caller-side resolver.
+	CHECK(ShouldRetainSkirmishAIStrategicPowerDispatchLock(true, true));
+	CHECK(!ShouldRetainSkirmishAIStrategicPowerDispatchLock(true, false));
+	CHECK(!ShouldRetainSkirmishAIStrategicPowerDispatchLock(false, true));
+
+	// Entering Fortify opens one episode and one bounded assembly deadline.
+	// The deadline is intentionally difficulty-specific.
+	const GameDifficulty difficulties[] = {
+		DIFFICULTY_EASY, DIFFICULTY_NORMAL, DIFFICULTY_HARD };
+	const UnsignedInt deadlineSeconds[] = { 240, 180, 120 };
+	Int difficultyIndex;
+	for (difficultyIndex = 0; difficultyIndex < 3; ++difficultyIndex)
+	{
+		SkirmishStrategyState state;
+		InitializeSkirmishStrategyState(&state, 0);
+		SkirmishStrategyMetrics metrics = MakeSkirmishStrategyMetrics();
+		metrics.baseIntegrity = 34;
+		SkirmishStrategyDecision decision = EvaluateSkirmishStrategy(
+			state, metrics, difficulties[difficultyIndex], 0, true);
+		CHECK(decision.modeChanged);
+		CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_FORTIFY);
+		CHECK(decision.nextState.fortifyAttemptStatus ==
+			SKIRMISH_STRATEGY_ATTEMPT_PENDING);
+		CHECK(decision.nextState.superweaponAttemptStatus ==
+			SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED);
+		CHECK(decision.nextState.assaultAssemblyDeadlineActive);
+		CHECK(decision.nextState.assaultAssemblyDeadlineFrame ==
+			deadlineSeconds[difficultyIndex] * LOGICFRAMES_PER_SECOND);
+	}
+
+	SkirmishStrategyState entryState;
+	InitializeSkirmishStrategyState(&entryState, 0);
+	SkirmishStrategyMetrics metrics = MakeSkirmishStrategyMetrics();
+	metrics.baseIntegrity = 34;
+	SkirmishStrategyDecision entry = EvaluateSkirmishStrategy(
+		entryState, metrics, DIFFICULTY_HARD, 0, true);
+
+	// At the hard deadline, a target and an assembled force immediately escape
+	// Fortify into Assault. Both unresolved attempts become terminal for the
+	// episode, and the deadline is cleared.
+	SkirmishStrategyState deadlineState = entry.nextState;
+	deadlineState.nextEvaluationFrame = 120 * LOGICFRAMES_PER_SECOND;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.viableAssaultForceAssembled = true;
+	SkirmishStrategyDecision deadlineAssault = EvaluateSkirmishStrategy(
+		deadlineState, metrics, DIFFICULTY_HARD,
+		120 * LOGICFRAMES_PER_SECOND, true);
+	CHECK(deadlineAssault.modeChanged);
+	CHECK(deadlineAssault.nextState.currentMode == SKIRMISH_STRATEGY_ASSAULT);
+	CHECK(deadlineAssault.reason == SKIRMISH_STRATEGY_REASON_ASSAULT_FORTIFY_DEADLINE);
+	CHECK(deadlineAssault.nextState.fortifyAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_FAILED);
+	CHECK(deadlineAssault.nextState.superweaponAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_FAILED);
+	CHECK(!deadlineAssault.nextState.assaultAssemblyDeadlineActive);
+	CHECK(deadlineAssault.nextState.assaultAssemblyDeadlineFrame == 0);
+
+	// With neither a viable force nor a target, the same deadline exits to
+	// Balanced and still closes the pending attempts.
+	SkirmishStrategyState balancedDeadlineState = entry.nextState;
+	balancedDeadlineState.nextEvaluationFrame = 120 * LOGICFRAMES_PER_SECOND;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.hasStrategicTarget = false;
+	metrics.viableAssaultForceAssembled = false;
+	SkirmishStrategyDecision deadlineBalanced = EvaluateSkirmishStrategy(
+		balancedDeadlineState, metrics, DIFFICULTY_HARD,
+		120 * LOGICFRAMES_PER_SECOND, true);
+	CHECK(deadlineBalanced.modeChanged);
+	CHECK(deadlineBalanced.nextState.currentMode == SKIRMISH_STRATEGY_BALANCED);
+	CHECK(deadlineBalanced.reason == SKIRMISH_STRATEGY_REASON_BALANCED_FORTIFY_DEADLINE);
+	CHECK(deadlineBalanced.nextState.fortifyAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_FAILED);
+	CHECK(deadlineBalanced.nextState.superweaponAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_FAILED);
+	CHECK(!deadlineBalanced.nextState.assaultAssemblyDeadlineActive);
+
+	// Emergency Fortify triggers retain precedence only before the hard bound.
+	// At the deadline a critical base still exits to Assault when a target and
+	// usable force exist; severe threat without them exits to Balanced.
+	SkirmishStrategyState criticalDeadlineState = entry.nextState;
+	criticalDeadlineState.nextEvaluationFrame =
+		120 * LOGICFRAMES_PER_SECOND;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.baseIntegrity = 34;
+	metrics.hasStrategicTarget = true;
+	metrics.viableAssaultForceAssembled = true;
+	SkirmishStrategyDecision criticalDeadline = EvaluateSkirmishStrategy(
+		criticalDeadlineState, metrics, DIFFICULTY_HARD,
+		120 * LOGICFRAMES_PER_SECOND, true);
+	CHECK(criticalDeadline.modeChanged);
+	CHECK(criticalDeadline.nextState.currentMode ==
+		SKIRMISH_STRATEGY_ASSAULT);
+	CHECK(criticalDeadline.reason ==
+		SKIRMISH_STRATEGY_REASON_ASSAULT_FORTIFY_DEADLINE);
+
+	SkirmishStrategyState threatDeadlineState = entry.nextState;
+	threatDeadlineState.nextEvaluationFrame =
+		120 * LOGICFRAMES_PER_SECOND;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.immediateThreat = 85;
+	metrics.hasStrategicTarget = false;
+	metrics.viableAssaultForceAssembled = false;
+	SkirmishStrategyDecision threatDeadline = EvaluateSkirmishStrategy(
+		threatDeadlineState, metrics, DIFFICULTY_HARD,
+		120 * LOGICFRAMES_PER_SECOND, true);
+	CHECK(threatDeadline.modeChanged);
+	CHECK(threatDeadline.nextState.currentMode ==
+		SKIRMISH_STRATEGY_BALANCED);
+	CHECK(threatDeadline.reason ==
+		SKIRMISH_STRATEGY_REASON_BALANCED_FORTIFY_DEADLINE);
+
+	// Re-entering a later Fortify episode resets the terminal attempt state and
+	// receives a new bounded deadline; a previous failure cannot authorize a
+	// second attempt inside the same episode.
+	SkirmishStrategyState resetState = deadlineBalanced.nextState;
+	resetState.currentMode = SKIRMISH_STRATEGY_BALANCED;
+	resetState.modeEntryFrame = 0;
+	resetState.nextEvaluationFrame = 0;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.baseIntegrity = 34;
+	SkirmishStrategyDecision reset = EvaluateSkirmishStrategy(
+		resetState, metrics, DIFFICULTY_HARD, 0, true);
+	CHECK(reset.nextState.currentMode == SKIRMISH_STRATEGY_FORTIFY);
+	CHECK(reset.nextState.fortifyAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_PENDING);
+	CHECK(reset.nextState.superweaponAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED);
+	CHECK(reset.nextState.assaultAssemblyDeadlineActive);
+
+	// A conventional force that assembles before the deadline succeeds in the
+	// Fortify episode. The not-started superweapon attempt becomes terminal
+	// without being retried after the mode change.
+	SkirmishStrategyState successState;
+	InitializeSkirmishStrategyState(&successState, 0);
+	successState.currentMode = SKIRMISH_STRATEGY_FORTIFY;
+	successState.modeEntryFrame = 0;
+	successState.nextEvaluationFrame = 0;
+	successState.fortifyAttemptStatus = SKIRMISH_STRATEGY_ATTEMPT_PENDING;
+	successState.superweaponAttemptStatus = SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED;
+	successState.assaultAssemblyDeadlineActive = true;
+	successState.assaultAssemblyDeadlineFrame = 1000000;
+	metrics = MakeSkirmishStrategyMetrics();
+	metrics.viableAssaultForceAssembled = true;
+	SkirmishStrategyDecision pendingAssault = EvaluateSkirmishStrategy(
+		successState, metrics, DIFFICULTY_HARD, 0, true);
+	CHECK(!pendingAssault.modeChanged);
+	CHECK(pendingAssault.nextState.pendingMode == SKIRMISH_STRATEGY_ASSAULT);
+	successState = pendingAssault.nextState;
+	successState.nextEvaluationFrame = 120 * LOGICFRAMES_PER_SECOND;
+	SkirmishStrategyDecision assembledAssault = EvaluateSkirmishStrategy(
+		successState, metrics, DIFFICULTY_HARD,
+		120 * LOGICFRAMES_PER_SECOND, true);
+	CHECK(assembledAssault.modeChanged);
+	CHECK(assembledAssault.nextState.currentMode == SKIRMISH_STRATEGY_ASSAULT);
+	CHECK(assembledAssault.reason == SKIRMISH_STRATEGY_REASON_ASSAULT_FORCE_ASSEMBLED);
+	CHECK(assembledAssault.nextState.fortifyAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED);
+	CHECK(assembledAssault.nextState.superweaponAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_FAILED);
+	CHECK(!assembledAssault.nextState.assaultAssemblyDeadlineActive);
+
+	// A Fortify attempt that already expired stays failed even if the force
+	// assembles while an Assault transition is still pending.
+	SkirmishStrategyState failedAssemblyState = successState;
+	failedAssemblyState.fortifyAttemptStatus =
+		SKIRMISH_STRATEGY_ATTEMPT_FAILED;
+	SkirmishStrategyDecision failedAssemblyAssault = EvaluateSkirmishStrategy(
+		failedAssemblyState, metrics, DIFFICULTY_HARD,
+		120 * LOGICFRAMES_PER_SECOND, true);
+	CHECK(failedAssemblyAssault.modeChanged);
+	CHECK(failedAssemblyAssault.nextState.currentMode ==
+		SKIRMISH_STRATEGY_ASSAULT);
+	CHECK(failedAssemblyAssault.nextState.fortifyAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_FAILED);
+
+	// A successful superweapon attempt is already terminal: it selects Assault
+	// but must survive the episode transition without being rewritten as a
+	// second attempt.
+	SkirmishStrategyState firedState = successState;
+	firedState.pendingMode = SKIRMISH_STRATEGY_NONE;
+	firedState.pendingSinceFrame = 0;
+	firedState.superweaponAttemptStatus = SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED;
+	firedState.nextEvaluationFrame = 0;
+	SkirmishStrategyDecision pendingFired = EvaluateSkirmishStrategy(
+		firedState, metrics, DIFFICULTY_HARD, 0, true);
+	CHECK(!pendingFired.modeChanged);
+	CHECK(pendingFired.reason == SKIRMISH_STRATEGY_REASON_PENDING_STARTED);
+	firedState = pendingFired.nextState;
+	firedState.nextEvaluationFrame = 120 * LOGICFRAMES_PER_SECOND;
+	SkirmishStrategyDecision firedAssault = EvaluateSkirmishStrategy(
+		firedState, metrics, DIFFICULTY_HARD,
+		120 * LOGICFRAMES_PER_SECOND, true);
+	CHECK(firedAssault.modeChanged);
+	CHECK(firedAssault.reason == SKIRMISH_STRATEGY_REASON_ASSAULT_SUPERWEAPON_FIRED);
+	CHECK(firedAssault.nextState.fortifyAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_FAILED);
+	CHECK(firedAssault.nextState.superweaponAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED);
 }
 
 static void TestSkirmishAITargetingPolicies()
@@ -3793,6 +4294,21 @@ int main(int argc, char **argv)
 		shutdownMemoryManager();
 		return 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-stage3") == 0)
+	{
+		TestSkirmishAIReplayEpoch();
+		TestSkirmishAIProductionPolicies();
+		TestSkirmishAIStage3Policies();
+		if (s_failures != 0)
+		{
+			printf("%d skirmish AI Stage 3 test(s) failed.\n", s_failures);
+			shutdownMemoryManager();
+			return 1;
+		}
+		printf("All skirmish AI Stage 3 tests passed.\n");
+		shutdownMemoryManager();
+		return 0;
+	}
 
 	TestNetworkValidation();
 	TestPacketRouterFallbackSelection();
@@ -3811,6 +4327,7 @@ int main(int argc, char **argv)
 	TestPathfindQueueReplayEpoch();
 	TestSkirmishAICorrectnessPolicies();
 	TestSkirmishAIProductionPolicies();
+	TestSkirmishAIStage3Policies();
 	TestSkirmishAITargetingPolicies();
 	TestSkirmishAIFeedbackPolicies();
 	TestSkirmishAILegacySaveCandidateSelection();

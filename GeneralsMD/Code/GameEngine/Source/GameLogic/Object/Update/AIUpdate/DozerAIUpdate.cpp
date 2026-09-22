@@ -1656,7 +1656,7 @@ Object *DozerAIUpdate::construct( const ThingTemplate *what,
 	// a scaffold. Existing rebuild-hole reconstruction is already paid for.
 	if (!isRebuild && what && owningPlayer &&
 		!owningPlayer->canSpendForSkirmishAIRecovery(
-			what->calcCostToBuild(owningPlayer), what, FALSE))
+			what->calcCostToBuild(owningPlayer), what, FALSE, TRUE))
 		return nullptr;
 
 	// create our machines if they don't yet exist

@@ -56,7 +56,10 @@
 #include "GameLogic/Module/ContainModule.h"
 #include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
+#include "GameLogic/Module/SpecialPowerModule.h"
 #include "GameLogic/Module/SupplyTruckAIUpdate.h"
+#include "GameLogic/Module/WorkerAIUpdate.h"
+#include "GameLogic/Module/SupplyWarehouseDockUpdate.h"
 #include "GameLogic/Module/UpdateModule.h"
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/ScriptEngine.h"
@@ -85,6 +88,268 @@ static Bool ShouldUseCurrentSkirmishAIStrategyControllerBehavior()
 		TheGameLogic->isInReplayGame(),
 		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
 			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+static Bool ShouldUseCurrentSkirmishAIProductionBehavior()
+{
+	return TheGameLogic && ShouldUseSkirmishAIProductionBehavior(
+		TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+static void GatherSkirmishAICollectorRoles(
+	Player *owner, std::map<ObjectID, Bool> *roles)
+{
+	roles->clear();
+	if (!owner || !TheGameLogic)
+		return;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (object->getControllingPlayer() != owner)
+			continue;
+		AIUpdateInterface *ai = object->getAIUpdateInterface();
+		WorkerAIInterface *worker = ai ? ai->getWorkerAIInterface() : nullptr;
+		if (worker)
+			(*roles)[object->getID()] = worker->isStage3CollectorRole();
+	}
+}
+
+static Bool IsSkirmishAIStrategicLaunchPower(SpecialPowerType type)
+{
+	switch (type) {
+		case SPECIAL_NEUTRON_MISSILE:
+		case NUKE_SPECIAL_NEUTRON_MISSILE:
+		case SUPW_SPECIAL_NEUTRON_MISSILE:
+		case SPECIAL_SCUD_STORM:
+		case SPECIAL_PARTICLE_UPLINK_CANNON:
+		case SUPW_SPECIAL_PARTICLE_UPLINK_CANNON:
+		case LAZR_SPECIAL_PARTICLE_UPLINK_CANNON:
+		case SUPR_SPECIAL_CRUISE_MISSILE:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static Bool IsUsableSkirmishAIStrategicSource(
+	Object *object, const Player *owner)
+{
+	return object && owner && object->getControllingPlayer() == owner &&
+		object->isKindOf(KINDOF_FS_SUPERWEAPON) &&
+		!object->isKindOf(KINDOF_REBUILD_HOLE) &&
+		!object->isEffectivelyDead() && !object->isDestroyed() &&
+		!object->testStatus(OBJECT_STATUS_SOLD) &&
+		!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+		!object->testStatus(OBJECT_STATUS_RECONSTRUCTING);
+}
+
+static Bool HasSkirmishAIStrategicPowerModule(
+	Object *source, const SpecialPowerTemplate *requestedPower)
+{
+	if (!source)
+		return false;
+	if (requestedPower)
+		return IsSkirmishAIStrategicLaunchPower(
+			requestedPower->getSpecialPowerType()) &&
+			source->getSpecialPowerModule(requestedPower) != nullptr;
+	if (!TheSpecialPowerStore)
+		return false;
+	const Int powerCount = TheSpecialPowerStore->getNumSpecialPowers();
+	for (Int powerIndex = 0; powerIndex < powerCount; ++powerIndex) {
+		const SpecialPowerTemplate *power =
+			TheSpecialPowerStore->getSpecialPowerTemplateByIndex(
+				(UnsignedInt)powerIndex);
+		if (power && IsSkirmishAIStrategicLaunchPower(
+				power->getSpecialPowerType()) &&
+			source->getSpecialPowerModule(power))
+			return true;
+	}
+	return false;
+}
+
+static Bool IsSkirmishAIPlannedSuperweaponObject(
+	Player *owner, const Object *object)
+{
+	if (!owner || !object || !object->getTemplate() || !TheThingFactory)
+		return false;
+	for (BuildListInfo *build = owner->getBuildList(); build;
+		build = build->getNext()) {
+		const ThingTemplate *plan =
+			TheThingFactory->findTemplate(build->getTemplateName());
+		if (plan && plan->isKindOf(KINDOF_FS_SUPERWEAPON) &&
+			object->getTemplate()->isEquivalentTo(plan))
+			return true;
+	}
+	return false;
+}
+
+static Object *FindSkirmishAISuperweaponConstruction(Player *owner)
+{
+	if (!owner || !TheGameLogic)
+		return nullptr;
+	Object *selected = nullptr;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (!ShouldKeepSkirmishAISuperweaponConstructionPending(
+				object != nullptr,
+				object->getControllingPlayer() == owner,
+				object->isKindOf(KINDOF_FS_SUPERWEAPON),
+				object->isKindOf(KINDOF_REBUILD_HOLE),
+				object->isEffectivelyDead(), object->isDestroyed(),
+				object->testStatus(OBJECT_STATUS_SOLD),
+				object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+				object->testStatus(OBJECT_STATUS_RECONSTRUCTING)))
+			continue;
+		if (!IsSkirmishAIPlannedSuperweaponObject(owner, object))
+			continue;
+		if (!selected || object->getID() < selected->getID())
+			selected = object;
+	}
+	return selected;
+}
+
+static Object *FindSkirmishAIStrategicSource(
+	Player *owner, const SpecialPowerTemplate *requestedPower)
+{
+	if (!owner || !TheGameLogic)
+		return nullptr;
+	Object *selected = nullptr;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (!IsUsableSkirmishAIStrategicSource(object, owner) ||
+			!HasSkirmishAIStrategicPowerModule(object, requestedPower))
+			continue;
+		if (requestedPower) {
+			SpecialPowerModuleInterface *module =
+				object->getSpecialPowerModule(requestedPower);
+			if (!module || !module->isReady() || !module->isDispatchable())
+				continue;
+		}
+		if (!selected || object->getID() < selected->getID())
+			selected = object;
+	}
+	return selected;
+}
+
+static Bool IsSkirmishAIProducerIDBefore(Object *left, Object *right)
+{
+	return left->getID() < right->getID();
+}
+
+static Bool IsSkirmishAIReinforcementTeamIDBefore(Team *left, Team *right)
+{
+	return left->getID() < right->getID();
+}
+
+static Bool HasSkirmishAIReinforcementDeficit(Team *team)
+{
+	const TeamPrototype *prototype = team ? team->getPrototype() : nullptr;
+	const TeamTemplateInfo *teamInfo = prototype
+		? prototype->getTemplateInfo() : nullptr;
+	if (!teamInfo || !TheThingFactory)
+		return false;
+	for (Int unitIndex = 0; unitIndex < teamInfo->m_numUnitsInfo;
+		++unitIndex) {
+		const TCreateUnitsInfo *unitInfo = &teamInfo->m_unitsInfo[unitIndex];
+		if (unitInfo->maxUnits < 1)
+			continue;
+		const ThingTemplate *thing =
+			TheThingFactory->findTemplate(unitInfo->unitThingName);
+		if (!thing)
+			continue;
+		Int count = 0;
+		team->countObjectsByThingTemplate(1, &thing, false, &count);
+		if (count < unitInfo->maxUnits)
+			return true;
+	}
+	return false;
+}
+
+static void FindSkirmishAIProductionProducers(
+	Player *owner, std::vector<Object *> *factories)
+{
+	if (!owner || !factories || !TheGameLogic)
+		return;
+	for (Object *factory = TheGameLogic->getFirstObject(); factory;
+		factory = factory->getNextObject()) {
+		if (!IsSkirmishAIOperationalProducer(
+				factory->getControllingPlayer() == owner,
+				factory->isEffectivelyDead(), factory->isDestroyed(),
+				factory->isKindOf(KINDOF_REBUILD_HOLE),
+				factory->testStatus(OBJECT_STATUS_SOLD),
+				factory->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+				factory->testStatus(OBJECT_STATUS_RECONSTRUCTING),
+				factory->isDisabled(),
+				factory->isDisabledByType(DISABLED_UNMANNED),
+				factory->getProductionUpdateInterface() != nullptr))
+			continue;
+		factories->push_back(factory);
+	}
+	std::sort(factories->begin(), factories->end(),
+		IsSkirmishAIProducerIDBefore);
+}
+
+static void FindSkirmishAICompatibleProducers(
+	Player *owner, const ThingTemplate *thing,
+	std::vector<Object *> *factories)
+{
+	if (!owner || !thing || !factories || !TheGameLogic)
+		return;
+	FindSkirmishAIProductionProducers(owner, factories);
+	for (std::vector<Object *>::iterator factory = factories->begin();
+		factory != factories->end();) {
+		if (!TheBuildAssistant->isPossibleToMakeUnit(*factory, thing)) {
+			factory = factories->erase(factory);
+			continue;
+		}
+		++factory;
+	}
+}
+
+static Object *QueueSkirmishAIUnitAtCompatibleProducer(
+	const std::vector<Object *> &factories, const ThingTemplate *thing,
+	Bool busyOK, ProductionID *queuedProductionID)
+{
+	if (queuedProductionID)
+		*queuedProductionID = PRODUCTIONID_INVALID;
+	if (!thing)
+		return nullptr;
+	for (Int pass = 0; pass < (busyOK ? 2 : 1); ++pass) {
+		for (std::vector<Object *>::const_iterator factory = factories.begin();
+			factory != factories.end(); ++factory) {
+			ProductionUpdateInterface *production =
+				(*factory)->getProductionUpdateInterface();
+			const Bool busy = production->getProductionCount() > 0;
+			if ((pass == 0 && busy) || (pass == 1 && !busy))
+				continue;
+			const ProductionID productionID = production->requestUniqueUnitID();
+			if (production->queueCreateUnit(thing, productionID)) {
+				if (queuedProductionID)
+					*queuedProductionID = productionID;
+				return *factory;
+			}
+		}
+	}
+	return nullptr;
+}
+
+static Bool IsSkirmishAIStrategyAuthorizedStructure(
+	const ThingTemplate *thing)
+{
+	return thing &&
+		(thing->isKindOf(KINDOF_COMMANDCENTER) ||
+		 thing->isKindOf(KINDOF_FS_POWER) ||
+		 IsSkirmishAIAlternateIncomeStructure(
+			 thing->isKindOf(KINDOF_CASH_GENERATOR),
+			 thing->isKindOf(KINDOF_FS_SUPPLY_DROPZONE),
+			 thing->isKindOf(KINDOF_FS_BLACK_MARKET),
+			 thing->isKindOf(KINDOF_FS_INTERNET_CENTER)) ||
+		 thing->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+		 thing->isKindOf(KINDOF_FS_FACTORY) ||
+		 thing->isKindOf(KINDOF_FS_BARRACKS) ||
+		 thing->isKindOf(KINDOF_FS_WARFACTORY) ||
+		 thing->isKindOf(KINDOF_FS_AIRFIELD));
 }
 
 static Int ClampSkirmishStrategyPercent(Int value)
@@ -949,6 +1214,16 @@ m_curRightFlankRightDefenseAngle(0),
 	m_frameToCheckEnemy(0),
 	m_currentEnemy(nullptr),
 	m_currentEnemyPlayerIndex(-1),
+	m_strategyProductionReserveCost(0),
+	m_strategySuperweaponID(INVALID_ID),
+	m_strategyAuthorizedThing(nullptr),
+	m_strategySpendAuthorization(SKIRMISH_AI_SPEND_AUTHORIZATION_NONE),
+	m_strategyProductionReserveRefreshing(false),
+	m_strategyProductionReserveLoaded(false),
+	m_strategySourceCommandLocked(false),
+	m_strategyLockedSourceID(INVALID_ID),
+	m_strategyLockedPowerID(0),
+	m_reinforcementRoundRobinCursor(0),
 	m_recoveryEverCompleted(false),
 	m_recoveryImpossible(false),
 	m_recoveryConstructionID(INVALID_ID),
@@ -981,26 +1256,682 @@ Bool AISkirmishPlayer::usesCriticalRecoveryBehavior() const
 	return IsCriticalRecoveryModeEnabled(m_player);
 }
 
-Bool AISkirmishPlayer::canSpendForCriticalRecovery(
-	Int cost, const ThingTemplate *thing, Bool isUpgrade) const
+Bool AISkirmishPlayer::usesProductionBehavior() const
 {
-	if (cost <= 0 || !usesCriticalRecoveryBehavior())
+	if (!m_player || m_player->getPlayerType() != PLAYER_COMPUTER ||
+		!TheGameLogic)
+		return false;
+	const Bool replay = TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: TheGameLogic->getGameMode();
+	if (!IsSkirmishAIRecoveryGameMode(gameMode))
+		return false;
+	return ShouldUseCurrentSkirmishAIProductionBehavior();
+}
+
+void AISkirmishPlayer::clearStrategySourceCommandLock()
+{
+	m_strategySourceCommandLocked = false;
+	m_strategyLockedSourceID = INVALID_ID;
+	m_strategyLockedPowerID = 0;
+}
+
+Bool AISkirmishPlayer::isStrategySourceCommandLockValid() const
+{
+	if (!m_strategySourceCommandLocked || !TheGameLogic ||
+		m_strategyState.currentMode != SKIRMISH_STRATEGY_FORTIFY ||
+		m_strategyLockedSourceID == INVALID_ID ||
+		m_strategyLockedPowerID == 0 || !TheSpecialPowerStore)
+		return false;
+	Object *source = TheGameLogic->findObjectByID(m_strategyLockedSourceID);
+	const SpecialPowerTemplate *power =
+		TheSpecialPowerStore->findSpecialPowerTemplateByID(
+			m_strategyLockedPowerID);
+	SpecialPowerModuleInterface *module = source && power
+		? source->getSpecialPowerModule(power)
+		: nullptr;
+	return power && IsSkirmishAIStrategicLaunchPower(
+		power->getSpecialPowerType()) &&
+		m_strategySuperweaponID == m_strategyLockedSourceID &&
+		source && source->getControllingPlayer() == m_player &&
+		source->isKindOf(KINDOF_FS_SUPERWEAPON) &&
+		!source->isKindOf(KINDOF_REBUILD_HOLE) &&
+		!source->isEffectivelyDead() && !source->isDestroyed() &&
+		!source->testStatus(OBJECT_STATUS_SOLD) &&
+		!source->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+		!source->testStatus(OBJECT_STATUS_RECONSTRUCTING) && module &&
+		module->isDispatchable();
+}
+
+Bool AISkirmishPlayer::hasUsableSupplySource(
+	const Coord3D *position, Real centerRadius) const
+{
+	if (!position || !m_player || !ThePartitionManager)
+		return false;
+	static const NameKeyType keyWarehouseUpdate =
+		NAMEKEY("SupplyWarehouseDockUpdate");
+	const Real supplyCenterCloseDistance = 20 * PATHFIND_CELL_SIZE_F;
+	const Real baseRadius = supplyCenterCloseDistance + centerRadius;
+	PartitionFilterAcceptByKindOf filterSupplySource(
+		MAKE_KINDOF_MASK(KINDOF_SUPPLY_SOURCE), KINDOFMASK_NONE);
+	PartitionFilterPlayerAffiliation filterAffiliation(
+		m_player, ALLOW_ALLIES | ALLOW_NEUTRAL, true);
+	PartitionFilterAlive filterAlive;
+	PartitionFilterOnMap filterMapStatus;
+	PartitionFilter *filters[] = {
+		&filterSupplySource, &filterAffiliation, &filterAlive,
+		&filterMapStatus, nullptr
+	};
+	ObjectIterator *iter = ThePartitionManager->iterateObjectsInRange(
+		position, baseRadius, FROM_BOUNDINGSPHERE_2D, filters);
+	MemoryPoolObjectHolder hold(iter);
+	for (Object *source = iter->first(); source; source = iter->next()) {
+		SupplyWarehouseDockUpdate *warehouse =
+			(SupplyWarehouseDockUpdate *)source->findUpdateModule(
+				keyWarehouseUpdate);
+		if (warehouse && warehouse->getBoxesStored() > 0)
+			return true;
+	}
+	return false;
+}
+
+Bool AISkirmishPlayer::hasOwnedSupplyCenter(
+	const ThingTemplate *supplyPlan) const
+{
+	if (!supplyPlan || !m_player || !TheGameLogic)
+		return false;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (object->getControllingPlayer() == m_player &&
+			object->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+			object->getTemplate() &&
+			object->getTemplate()->isEquivalentTo(supplyPlan) &&
+			!object->isKindOf(KINDOF_REBUILD_HOLE) &&
+			!object->isEffectivelyDead() && !object->isDestroyed() &&
+			!object->testStatus(OBJECT_STATUS_SOLD) &&
+			!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+			!object->testStatus(OBJECT_STATUS_RECONSTRUCTING))
+			return true;
+	}
+	return false;
+}
+
+Bool AISkirmishPlayer::hasQueuedSupplyCenter(
+	const ThingTemplate *supplyPlan) const
+{
+	if (!supplyPlan || !m_player || !TheGameLogic)
+		return false;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (object->getControllingPlayer() == m_player &&
+			object->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+			object->getTemplate() &&
+			object->getTemplate()->isEquivalentTo(supplyPlan) &&
+			!object->isKindOf(KINDOF_REBUILD_HOLE) &&
+			!object->isEffectivelyDead() && !object->isDestroyed() &&
+			!object->testStatus(OBJECT_STATUS_SOLD) &&
+			(object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+			 object->testStatus(OBJECT_STATUS_RECONSTRUCTING)))
+			return true;
+	}
+	return false;
+}
+
+Bool AISkirmishPlayer::hasUsableSupplyCenterForCollectors() const
+{
+	if (!m_player || !TheGameLogic)
+		return false;
+	for (Object *center = TheGameLogic->getFirstObject(); center;
+		center = center->getNextObject()) {
+		if (center->getControllingPlayer() != m_player ||
+			!center->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+			center->isKindOf(KINDOF_REBUILD_HOLE) ||
+			center->isEffectivelyDead() || center->isDestroyed() ||
+			center->testStatus(OBJECT_STATUS_SOLD) ||
+			center->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+			center->testStatus(OBJECT_STATUS_RECONSTRUCTING))
+			continue;
+		if (hasUsableSupplySource(
+				center->getPosition(),
+				center->getGeometryInfo().getBoundingCircleRadius()))
+			return true;
+	}
+	return false;
+}
+
+void AISkirmishPlayer::cancelDepletedCollectorProduction()
+{
+	if (!usesProductionBehavior() || !TheGameLogic)
+		return;
+	const Int collectorDemand = getStage3SupplyCollectorDemand();
+	const Bool hasUsableCollectorEconomy =
+		hasUsableSupplyCenterForCollectors();
+	Int queuedCollectorQuantity = 0;
+	for (Object *queuedFactory = TheGameLogic->getFirstObject(); queuedFactory;
+		queuedFactory = queuedFactory->getNextObject()) {
+		if (queuedFactory->getControllingPlayer() != m_player ||
+			queuedFactory->isEffectivelyDead() || queuedFactory->isDestroyed() ||
+			queuedFactory->testStatus(OBJECT_STATUS_SOLD))
+			continue;
+		ProductionUpdateInterface *queuedProduction =
+			queuedFactory->getProductionUpdateInterface();
+		for (const ProductionEntry *queuedEntry = queuedProduction
+				? queuedProduction->firstProduction() : nullptr;
+			 queuedEntry;
+			 queuedEntry = queuedProduction->nextProduction(queuedEntry)) {
+			if (!isSkirmishAIPendingCollectorEntry(
+					queuedFactory, queuedEntry))
+				continue;
+			const Int queuedRemaining =
+				queuedEntry->getProductionQuantityRemaining();
+			if (queuedRemaining > 0) {
+				queuedCollectorQuantity = AddSkirmishAISupplyCollectorDeficit(
+					queuedCollectorQuantity, queuedRemaining, 0);
+			}
+		}
+	}
+	std::vector<WorkOrder *> processed;
+	for (DLINK_ITERATOR<TeamInQueue> teamIt = iterate_TeamBuildQueue();
+		!teamIt.done(); teamIt.advance()) {
+		TeamInQueue *team = teamIt.cur();
+		// Reinforcement orders belong to a team's deficit, not economy staffing.
+		for (WorkOrder *leader = team && !team->m_reinforcement
+				? team->m_workOrders : nullptr;
+			leader; leader = leader->m_next) {
+			if (!hasUsableCollectorEconomy && team->m_priorityBuild &&
+				team->m_team == m_player->getDefaultTeam() &&
+				leader->m_isResourceGatherer && leader->m_thing &&
+				leader->m_thing->isKindOf(KINDOF_HARVESTER) &&
+				leader->m_factoryID == INVALID_ID &&
+				leader->m_productionID == 0 &&
+				leader->m_numCompleted == 0 &&
+				leader->m_numRequired > 0) {
+				leader->m_numRequired = 0;
+				leader->m_required = false;
+				continue;
+			}
+			if (!leader->m_isResourceGatherer || !leader->m_thing ||
+				leader->m_factoryID == INVALID_ID ||
+				leader->m_numCompleted >= leader->m_numRequired)
+				continue;
+			Bool alreadyProcessed = false;
+			for (std::vector<WorkOrder *>::const_iterator seen = processed.begin();
+				seen != processed.end(); ++seen) {
+				if (*seen == leader) {
+					alreadyProcessed = true;
+					break;
+				}
+			}
+			if (alreadyProcessed)
+				continue;
+
+			Object *factory = TheGameLogic->findObjectByID(leader->m_factoryID);
+			ProductionUpdateInterface *production = factory &&
+				factory->getControllingPlayer() == m_player
+					? factory->getProductionUpdateInterface() : nullptr;
+			if (!production)
+				continue;
+
+			if (leader->m_productionID != 0) {
+				const ProductionEntry *exactEntry = nullptr;
+				for (const ProductionEntry *entry = production->firstProduction(); entry;
+					entry = production->nextProduction(entry)) {
+					if (static_cast<Int>(entry->getProductionID()) ==
+							leader->m_productionID) {
+						exactEntry = entry;
+						break;
+					}
+				}
+				if (!exactEntry || exactEntry->getProductionType() != PRODUCTION_UNIT ||
+					!exactEntry->getProductionObject() ||
+					!exactEntry->getProductionObject()->isEquivalentTo(leader->m_thing) ||
+					exactEntry->getProductionQuantityRemaining() <= 0)
+					continue;
+				const Int matchingEntryQuantity =
+					exactEntry->getProductionQuantityRemaining();
+				const Bool depletedSupplyCenter =
+					factory->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+					!hasUsableSupplySource(factory->getPosition(),
+						factory->getGeometryInfo().getBoundingCircleRadius());
+				const Bool retainEntry = exactEntry->getPercentComplete() > 0.0f ||
+					(!depletedSupplyCenter &&
+					 queuedCollectorQuantity - matchingEntryQuantity < collectorDemand);
+				processed.push_back(leader);
+				if (retainEntry)
+					continue;
+				production->cancelUnitCreate(exactEntry->getProductionID());
+				queuedCollectorQuantity =
+					matchingEntryQuantity >= queuedCollectorQuantity
+						? 0 : queuedCollectorQuantity - matchingEntryQuantity;
+				leader->m_numRequired = leader->m_numCompleted;
+				leader->m_factoryID = INVALID_ID;
+				leader->m_productionID = 0;
+				leader->m_required = false;
+				continue;
+			}
+
+			std::vector<WorkOrder *> matchingOrders;
+			Bool hasNonCollectorOrder = false;
+			for (DLINK_ITERATOR<TeamInQueue> matchTeamIt = iterate_TeamBuildQueue();
+				!matchTeamIt.done(); matchTeamIt.advance()) {
+				TeamInQueue *matchTeam = matchTeamIt.cur();
+				for (WorkOrder *order = matchTeam && !matchTeam->m_reinforcement
+						? matchTeam->m_workOrders : nullptr;
+					order; order = order->m_next) {
+					if (!order->m_thing || order->m_factoryID != leader->m_factoryID ||
+						!order->m_thing->isEquivalentTo(leader->m_thing) ||
+						order->m_numCompleted >= order->m_numRequired)
+						continue;
+					if (order->m_isResourceGatherer) {
+						matchingOrders.push_back(order);
+						processed.push_back(order);
+					} else {
+						hasNonCollectorOrder = true;
+					}
+				}
+			}
+			const ProductionEntry *matchingEntry = nullptr;
+			Int matchingEntryCount = 0;
+			Int matchingEntryQuantity = 0;
+			Int outstandingOrderQuantity = 0;
+			for (UnsignedInt orderIndex = 0;
+				orderIndex < matchingOrders.size(); ++orderIndex) {
+				outstandingOrderQuantity +=
+					matchingOrders[orderIndex]->m_numRequired -
+					matchingOrders[orderIndex]->m_numCompleted;
+			}
+			const Bool depletedSupplyCenter =
+				factory->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+				!hasUsableSupplySource(factory->getPosition(),
+					factory->getGeometryInfo().getBoundingCircleRadius());
+			for (const ProductionEntry *entry = production->firstProduction(); entry;
+				entry = production->nextProduction(entry)) {
+				const Bool isMatchingEntry = entry->getProductionType() == PRODUCTION_UNIT &&
+					entry->getProductionObject() &&
+					entry->getProductionObject()->isEquivalentTo(leader->m_thing);
+				if (!isMatchingEntry)
+					continue;
+				const Int remaining = entry->getProductionQuantityRemaining();
+				if (remaining <= 0)
+					continue;
+				matchingEntry = entry;
+				++matchingEntryCount;
+				matchingEntryQuantity += remaining;
+			}
+			const Bool ambiguousMapping = hasNonCollectorOrder ||
+				matchingOrders.size() != 1 || matchingEntryCount != 1 ||
+				outstandingOrderQuantity != 1 || matchingEntryQuantity != 1;
+			if (!IsSkirmishAIDepletedCollectorQueueMappingUnambiguous(
+					outstandingOrderQuantity, matchingEntryQuantity,
+					ambiguousMapping))
+				continue;
+
+			// WorkOrder has no ProductionID. Only a one-unit, single-order/single-entry
+			// case proves ownership strongly enough to mutate. Multi-unit batches and
+			// indistinguishable entries retain their existing callback bindings.
+			const Bool inProgress = matchingEntry->getPercentComplete() > 0.0f;
+			const Bool retainEntry = inProgress ||
+				(!depletedSupplyCenter &&
+				 queuedCollectorQuantity - matchingEntryQuantity < collectorDemand);
+			if (retainEntry)
+				continue;
+
+			production->cancelUnitCreate(matchingEntry->getProductionID());
+			queuedCollectorQuantity =
+				matchingEntryQuantity >= queuedCollectorQuantity
+					? 0 : queuedCollectorQuantity - matchingEntryQuantity;
+			WorkOrder *order = matchingOrders[0];
+			order->m_numRequired = order->m_numCompleted;
+			order->m_factoryID = INVALID_ID;
+			order->m_productionID = 0;
+			order->m_required = false;
+		}
+	}
+}
+
+Bool AISkirmishPlayer::isSupplyCenterPrerequisiteNeeded(
+	const ThingTemplate *supplyPlan) const
+{
+	if (!supplyPlan || !m_player)
+		return false;
+	for (BuildListInfo *build = m_player->getBuildList(); build;
+		build = build->getNext()) {
+		const ThingTemplate *candidate =
+			TheThingFactory->findTemplate(build->getTemplateName());
+		if (!candidate || candidate->isEquivalentTo(supplyPlan) ||
+			!build->isBuildable())
+			continue;
+		Object *existing = TheGameLogic
+			? TheGameLogic->findObjectByID(build->getObjectID()) : nullptr;
+		if (DoesSkirmishAIDependentStructureSatisfyPrerequisiteDemand(
+			existing != nullptr,
+			existing && existing->getControllingPlayer() == m_player,
+			existing && existing->isKindOf(KINDOF_REBUILD_HOLE),
+			existing && existing->isEffectivelyDead(),
+			existing && existing->isDestroyed(),
+			existing && existing->testStatus(OBJECT_STATUS_SOLD),
+			existing && existing->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+			existing && existing->testStatus(OBJECT_STATUS_RECONSTRUCTING)))
+			continue;
+		for (Int prereqIndex = 0;
+			prereqIndex < candidate->getPrereqCount(); ++prereqIndex) {
+			const ProductionPrerequisite *prereq =
+				candidate->getNthPrereq(prereqIndex);
+			if (!ShouldInspectSkirmishAIPrerequisiteAlternative(
+					prereq != nullptr,
+					prereq && prereq->isSatisfied(m_player)))
+				continue;
+			const ThingTemplate *facilities[32];
+			const Int facilityCount = prereq
+				? prereq->getAllPossibleBuildFacilityTemplates(facilities, 32) : 0;
+			for (Int facilityIndex = 0; facilityIndex < facilityCount;
+				++facilityIndex) {
+				if (facilities[facilityIndex] &&
+					facilities[facilityIndex]->isEquivalentTo(supplyPlan))
+					return true;
+			}
+		}
+	}
+	return false;
+}
+
+void AISkirmishPlayer::refreshStrategyProductionState()
+{
+	if (!usesProductionBehavior()) {
+		m_strategyProductionReserveCost = 0;
+		m_strategySuperweaponID = INVALID_ID;
+		m_strategyAuthorizedThing = nullptr;
+		m_strategySpendAuthorization = SKIRMISH_AI_SPEND_AUTHORIZATION_NONE;
+		clearStrategySourceCommandLock();
+		m_reinforcementRoundRobinCursor = 0;
+		return;
+	}
+	cancelDepletedCollectorProduction();
+
+	if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY) {
+		if (m_strategyState.superweaponAttemptStatus ==
+			SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED) {
+			Object *selected = FindSkirmishAIStrategicSource(m_player, nullptr);
+			if (!selected)
+				selected = FindSkirmishAISuperweaponConstruction(m_player);
+			if (selected) {
+				m_strategySuperweaponID = selected->getID();
+				m_strategyState.superweaponAttemptStatus =
+					SKIRMISH_STRATEGY_ATTEMPT_PENDING;
+			}
+		}
+		if (m_strategyState.superweaponAttemptStatus ==
+			SKIRMISH_STRATEGY_ATTEMPT_PENDING) {
+			if (ShouldFailSkirmishAIStrategicPowerSourceLock(
+					m_strategySourceCommandLocked, true,
+					isStrategySourceCommandLockValid())) {
+				m_strategyState.superweaponAttemptStatus =
+					SKIRMISH_STRATEGY_ATTEMPT_FAILED;
+				m_strategySuperweaponID = INVALID_ID;
+				clearStrategySourceCommandLock();
+			}
+		}
+		if (m_strategyState.superweaponAttemptStatus ==
+			SKIRMISH_STRATEGY_ATTEMPT_PENDING) {
+			Object *tracked = m_strategySuperweaponID != INVALID_ID
+				? TheGameLogic->findObjectByID(m_strategySuperweaponID) : nullptr;
+			const Bool trackedConstructionPending =
+				ShouldKeepSkirmishAISuperweaponConstructionPending(
+					tracked != nullptr,
+					tracked && tracked->getControllingPlayer() == m_player,
+					tracked && tracked->isKindOf(KINDOF_FS_SUPERWEAPON),
+					tracked && tracked->isKindOf(KINDOF_REBUILD_HOLE),
+					tracked && tracked->isEffectivelyDead(),
+					tracked && tracked->isDestroyed(),
+					tracked && tracked->testStatus(OBJECT_STATUS_SOLD),
+					tracked && tracked->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+					tracked && tracked->testStatus(OBJECT_STATUS_RECONSTRUCTING));
+			if (!trackedConstructionPending &&
+				(!IsUsableSkirmishAIStrategicSource(tracked, m_player) ||
+				!HasSkirmishAIStrategicPowerModule(tracked, nullptr))) {
+				Object *replacement =
+					FindSkirmishAIStrategicSource(m_player, nullptr);
+				if (!replacement)
+					replacement = FindSkirmishAISuperweaponConstruction(m_player);
+				if (replacement) {
+					m_strategySuperweaponID = replacement->getID();
+				} else {
+					m_strategyState.superweaponAttemptStatus =
+						SKIRMISH_STRATEGY_ATTEMPT_FAILED;
+					m_strategySuperweaponID = INVALID_ID;
+				}
+			}
+		}
+		if (m_strategyState.superweaponAttemptStatus !=
+			SKIRMISH_STRATEGY_ATTEMPT_PENDING)
+			clearStrategySourceCommandLock();
+	} else {
+		m_strategySuperweaponID = INVALID_ID;
+		clearStrategySourceCommandLock();
+	}
+
+	refreshStrategyProductionReserve();
+}
+
+void AISkirmishPlayer::refreshStrategyProductionReserve()
+{
+	if (!usesProductionBehavior() || m_strategyProductionReserveRefreshing) {
+		if (!usesProductionBehavior())
+			m_strategyProductionReserveCost = 0;
+		return;
+	}
+	m_strategyProductionReserveRefreshing = true;
+	if (!TheAI || !TheAI->getAiData()) {
+		m_strategyProductionReserveCost = 0;
+		m_strategyProductionReserveRefreshing = false;
+		return;
+	}
+	const Int rebuildReserve = getCriticalRebuildReserve(nullptr);
+	m_strategyProductionReserveCost = GetFreshSkirmishAIProductionReserve(
+		TheAI->getAiData()->m_resourcesPoor, rebuildReserve,
+		getActiveRecoveryReserveCost());
+	m_strategyProductionReserveRefreshing = false;
+}
+
+Bool AISkirmishPlayer::queueAuthorizedStrategyBuilder(
+	const ThingTemplate *structure)
+{
+	if (!usesProductionBehavior() || !structure || !m_player || !TheThingFactory)
+		return false;
+	for (DLINK_ITERATOR<TeamInQueue> queue = iterate_TeamBuildQueue();
+		!queue.done(); queue.advance()) {
+		TeamInQueue *team = queue.cur();
+		for (WorkOrder *order = team ? team->m_workOrders : nullptr;
+			order; order = order->m_next) {
+			if (order->m_thing && !order->m_isResourceGatherer &&
+				order->m_thing->isKindOf(KINDOF_DOZER) &&
+				order->m_numCompleted < order->m_numRequired &&
+				HasSkirmishAICommandSetForTemplate(
+					order->m_thing->friend_getCommandSetString(), structure)) {
+				if (order->m_factoryID != INVALID_ID)
+					return true;
+				const Bool canBuildUnits = m_player->getCanBuildUnits();
+				m_player->setCanBuildUnits(true);
+				const ThingTemplate *previousThing = m_strategyAuthorizedThing;
+				const SkirmishAISpendAuthorization previousClass =
+					m_strategySpendAuthorization;
+				m_strategyAuthorizedThing = order->m_thing;
+				m_strategySpendAuthorization =
+					SKIRMISH_AI_SPEND_AUTHORIZATION_BUILDER;
+				const Bool queued = startTraining(
+					order, true, team->m_team->getName());
+				m_strategyAuthorizedThing = previousThing;
+				m_strategySpendAuthorization = previousClass;
+				m_player->setCanBuildUnits(canBuildUnits);
+				if (queued)
+					m_teamDelay = 0;
+				return queued;
+			}
+		}
+	}
+
+	Bool canBuildUnits = m_player->getCanBuildUnits();
+	m_player->setCanBuildUnits(true);
+	Bool queued = false;
+	for (const ThingTemplate *builder = TheThingFactory->firstTemplate(); builder;
+		builder = builder->friend_getNextTemplate()) {
+		if (!builder->isKindOf(KINDOF_DOZER) ||
+			!HasSkirmishAICommandSetForTemplate(
+				builder->friend_getCommandSetString(), structure))
+			continue;
+		std::vector<Object *> producers;
+		FindSkirmishAICompatibleProducers(m_player, builder, &producers);
+		if (producers.empty())
+			continue;
+		TeamInQueue *team = newInstance(TeamInQueue);
+		WorkOrder *order = newInstance(WorkOrder);
+		order->m_thing = builder;
+		order->m_factoryID = INVALID_ID;
+		order->m_numRequired = 1;
+		order->m_required = true;
+		order->m_isResourceGatherer = false;
+		order->m_next = nullptr;
+		team->m_priorityBuild = true;
+		team->m_workOrders = order;
+		team->m_frameStarted = TheGameLogic->getFrame();
+		team->m_team = m_player->getDefaultTeam();
+		prependTo_TeamBuildQueue(team);
+		const ThingTemplate *previousThing = m_strategyAuthorizedThing;
+		const SkirmishAISpendAuthorization previousClass =
+			m_strategySpendAuthorization;
+		m_strategyAuthorizedThing = builder;
+		m_strategySpendAuthorization = SKIRMISH_AI_SPEND_AUTHORIZATION_BUILDER;
+		queued = startTraining(order, true, team->m_team->getName());
+		m_strategyAuthorizedThing = previousThing;
+		m_strategySpendAuthorization = previousClass;
+		if (!queued) {
+			removeFrom_TeamBuildQueue(team);
+			deleteInstance(team);
+			continue;
+		}
+		m_teamDelay = 0;
+		break;
+	}
+	m_player->setCanBuildUnits(canBuildUnits);
+	return queued;
+}
+
+void AISkirmishPlayer::notifySpecialPowerFired(
+	Object *source, const SpecialPowerTemplate *power)
+{
+	if (!usesProductionBehavior() || !source || !power ||
+		m_strategyState.currentMode != SKIRMISH_STRATEGY_FORTIFY ||
+		m_strategyState.superweaponAttemptStatus !=
+			SKIRMISH_STRATEGY_ATTEMPT_PENDING ||
+		source->getControllingPlayer() != m_player ||
+		!source->isKindOf(KINDOF_FS_SUPERWEAPON) ||
+		source->getID() != m_strategyLockedSourceID ||
+		power->getID() != m_strategyLockedPowerID ||
+		!IsSkirmishAIStrategicLaunchPower(power->getSpecialPowerType()))
+		return;
+	m_strategyState.superweaponAttemptStatus =
+		SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED;
+	clearStrategySourceCommandLock();
+}
+
+Bool AISkirmishPlayer::shouldUseSkirmishSpecialPowerSource(
+	Object *source, const SpecialPowerTemplate *power)
+{
+	if (!usesProductionBehavior() || !source || !power ||
+		m_strategyState.currentMode != SKIRMISH_STRATEGY_FORTIFY ||
+		!IsSkirmishAIStrategicLaunchPower(power->getSpecialPowerType()))
+		return true;
+	if (m_strategyState.superweaponAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED) {
+		Object *attemptSource = FindSkirmishAIStrategicSource(m_player, nullptr);
+		if (!attemptSource)
+			return false;
+		m_strategyState.superweaponAttemptStatus =
+			SKIRMISH_STRATEGY_ATTEMPT_PENDING;
+		m_strategySuperweaponID = attemptSource->getID();
+	}
+	if (m_strategyState.superweaponAttemptStatus !=
+		SKIRMISH_STRATEGY_ATTEMPT_PENDING)
+		return false;
+	const Bool lockedCommandValid = isStrategySourceCommandLockValid();
+	if (ShouldRejectSkirmishAIStrategicPowerRequest(
+			m_strategySourceCommandLocked, lockedCommandValid))
+		return false;
+	if (ShouldFailSkirmishAIStrategicPowerSourceLock(
+			m_strategySourceCommandLocked, true, lockedCommandValid)) {
+		m_strategyState.superweaponAttemptStatus =
+			SKIRMISH_STRATEGY_ATTEMPT_FAILED;
+		m_strategySuperweaponID = INVALID_ID;
+		clearStrategySourceCommandLock();
+		return false;
+	}
+	Object *selected = IsUsableSkirmishAIStrategicSource(source, m_player) &&
+		HasSkirmishAIStrategicPowerModule(source, power)
+		? source : nullptr;
+	SpecialPowerModuleInterface *selectedModule = selected
+		? selected->getSpecialPowerModule(power) : nullptr;
+	const Bool exactSource = selectedModule && selectedModule->isReady() &&
+		selectedModule->isDispatchable();
+	if (!ShouldLockSkirmishAIStrategicPowerSource(true,
+			m_strategySourceCommandLocked, exactSource))
+		return false;
+	m_strategySuperweaponID = selected->getID();
+	m_strategySourceCommandLocked = true;
+	m_strategyLockedSourceID = selected->getID();
+	m_strategyLockedPowerID = power->getID();
+	return true;
+}
+
+void AISkirmishPlayer::resolveSpecialPowerDispatchAttempt(
+	Object *source, const SpecialPowerTemplate *power, Bool accepted)
+{
+	const Bool exactAttempt = source && power &&
+		source->getID() == m_strategyLockedSourceID &&
+		power->getID() == m_strategyLockedPowerID;
+	if (m_strategySourceCommandLocked && exactAttempt &&
+		!ShouldRetainSkirmishAIStrategicPowerDispatchLock(
+			m_strategySourceCommandLocked, accepted))
+		clearStrategySourceCommandLock();
+}
+
+Bool AISkirmishPlayer::canSpendForCriticalRecovery(
+	Int cost, const ThingTemplate *thing, Bool isUpgrade,
+	Bool refreshProductionReserve)
+{
+	if (cost <= 0)
+		return true;
+	const Bool recoveryBehavior = usesCriticalRecoveryBehavior();
+	const Bool productionBehavior = usesProductionBehavior();
+	if (!recoveryBehavior && !productionBehavior)
 		return true;
 	if (!m_player || !m_player->getMoney())
 		return false;
 	const Int money = m_player->getMoney()->countMoney();
 	if (cost > money)
 		return false;
-	if (m_recoveryAuthorizedThing && !isUpgrade && thing &&
-		thing->isEquivalentTo(m_recoveryAuthorizedThing))
+	const Bool recoveryAuthorized = !isUpgrade && thing &&
+		m_recoveryAuthorizedThing &&
+		thing->isEquivalentTo(m_recoveryAuthorizedThing);
+	if (recoveryAuthorized)
 		return true;
+	const Bool strategyAuthorized = !isUpgrade && thing &&
+		m_strategyAuthorizedThing &&
+		thing->isEquivalentTo(m_strategyAuthorizedThing);
+	if (productionBehavior && refreshProductionReserve)
+		refreshStrategyProductionReserve();
+	Int reserve = productionBehavior ? m_strategyProductionReserveCost : 0;
+	const Int activeRecoveryReserve = getActiveRecoveryReserveCost();
+	if (strategyAuthorized)
+		return CanSkirmishAISpendWithAuthorization(
+			money, cost, reserve, activeRecoveryReserve,
+			m_strategySpendAuthorization);
+	if (!recoveryBehavior) {
+		return cost <= money - reserve;
+	}
 	const Bool boundedGraceExpired = TheGameLogic &&
 		IsSkirmishAIRecoveryBoundedGraceExpired(
 			TheGameLogic->getFrame(), m_recoveryEvacuationDeadline);
-	const Bool releaseExpiredGraceReserve =
-		ShouldReleaseSkirmishAIRecoveryReserveForExpiredGrace(
-			boundedGraceExpired,
-			m_recoveryNextAttemptFrame == m_recoveryEvacuationDeadline);
 	if (m_recoveryEverCompleted && m_recoveryConstructionID != INVALID_ID &&
 		TheGameLogic) {
 		Object *tracked = TheGameLogic->findObjectByID(m_recoveryConstructionID);
@@ -1008,10 +1939,11 @@ Bool AISkirmishPlayer::canSpendForCriticalRecovery(
 			!boundedGraceExpired)
 			return false;
 	}
-	if (m_recoveryImpossible || m_recoveryReserveCost <= 0 ||
-		releaseExpiredGraceReserve)
-		return true;
-	return cost <= money - m_recoveryReserveCost;
+	if (activeRecoveryReserve <= 0)
+		return cost <= money - reserve;
+	if (activeRecoveryReserve > reserve)
+		reserve = activeRecoveryReserve;
+	return cost <= money - reserve;
 }
 
 Bool AISkirmishPlayer::findPrimaryCommandCenter(
@@ -1458,8 +2390,11 @@ Bool AISkirmishPlayer::queueRecoveryBuilder(
 	if (!commit.storeProductionIdentity)
 		return false;
 
-	if (commit.bindReusableWorkOrder)
+	if (commit.bindReusableWorkOrder) {
 		order->m_factoryID = factory->getID();
+		if (usesProductionBehavior())
+			order->m_productionID = static_cast<Int>(productionID);
+	}
 	m_recoveryBuilderFactoryID = factory->getID();
 	m_recoveryBuilderProductionID = productionID;
 	m_recoveryBuilderCancellationOwned = true;
@@ -1684,24 +2619,28 @@ Bool AISkirmishPlayer::failoverRecoveryBuilderQueue(
 	Bool bindingCleared = false;
 	const Bool selectedIsFirstCompatible =
 		firstCompatibleProductionID == boundedProductionID;
-	if (selectedIsFirstCompatible) {
-		for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue();
-			!iter.done() && !bindingCleared; iter.advance()) {
-			TeamInQueue *team = iter.cur();
-			if (!team)
-				continue;
-			for (WorkOrder *order = team->m_workOrders; order;
-				order = order->m_next) {
-				if (order->m_thing &&
-					ShouldClearSkirmishAIRecoveryExactFailoverBinding(
-						selectedIsFirstCompatible,
-						order->m_factoryID == boundedFactory->getID(),
-						order->m_thing->isEquivalentTo(boundedTemplate),
-						order->m_numCompleted < order->m_numRequired)) {
-					order->m_factoryID = INVALID_ID;
-					bindingCleared = true;
-					break;
-				}
+	const Bool productionBehavior = usesProductionBehavior();
+	for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue();
+		!iter.done() && !bindingCleared; iter.advance()) {
+		TeamInQueue *team = iter.cur();
+		if (!team)
+			continue;
+		for (WorkOrder *order = team->m_workOrders; order;
+			order = order->m_next) {
+			const Bool ownsCancelledEntry = productionBehavior
+				? (order->m_productionID == static_cast<Int>(boundedProductionID) ||
+				   (order->m_productionID == 0 && selectedIsFirstCompatible))
+				: selectedIsFirstCompatible;
+			if (order->m_thing && ownsCancelledEntry &&
+				ShouldClearSkirmishAIRecoveryExactFailoverBinding(
+					true, order->m_factoryID == boundedFactory->getID(),
+					order->m_thing->isEquivalentTo(boundedTemplate),
+					order->m_numCompleted < order->m_numRequired)) {
+				order->m_factoryID = INVALID_ID;
+				if (productionBehavior)
+					order->m_productionID = 0;
+				bindingCleared = true;
+				break;
 			}
 		}
 	}
@@ -1776,26 +2715,31 @@ Bool AISkirmishPlayer::cancelRecoveryBuilderQueueForNativeRespawn(
 	production->cancelUnitCreate(cancelledProductionID);
 	clearRecoveryBuilderProduction();
 
-	// WorkOrders do not store ProductionID. The base callback binds the first
-	// compatible entry to the order, so clear only that unambiguous binding.
-	if (firstCompatibleProductionID == cancelledProductionID) {
-		Bool bindingCleared = false;
-		for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue();
-			!iter.done() && !bindingCleared; iter.advance()) {
-			TeamInQueue *team = iter.cur();
-			if (!team)
-				continue;
-			for (WorkOrder *order = team->m_workOrders; order;
-				order = order->m_next) {
-				if (order->m_thing &&
-					ShouldClearSkirmishAIRecoveryExactFailoverBinding(
-						true, order->m_factoryID == factory->getID(),
-						order->m_thing->isEquivalentTo(cancelledTemplate),
-						order->m_numCompleted < order->m_numRequired)) {
-					order->m_factoryID = INVALID_ID;
-					bindingCleared = true;
-					break;
-				}
+	Bool bindingCleared = false;
+	const Bool selectedIsFirstCompatible =
+		firstCompatibleProductionID == cancelledProductionID;
+	const Bool productionBehavior = usesProductionBehavior();
+	for (DLINK_ITERATOR<TeamInQueue> iter = iterate_TeamBuildQueue();
+		!iter.done() && !bindingCleared; iter.advance()) {
+		TeamInQueue *team = iter.cur();
+		if (!team)
+			continue;
+		for (WorkOrder *order = team->m_workOrders; order;
+			order = order->m_next) {
+			const Bool ownsCancelledEntry = productionBehavior
+				? (order->m_productionID == static_cast<Int>(cancelledProductionID) ||
+				   (order->m_productionID == 0 && selectedIsFirstCompatible))
+				: selectedIsFirstCompatible;
+			if (order->m_thing && ownsCancelledEntry &&
+				ShouldClearSkirmishAIRecoveryExactFailoverBinding(
+					true, order->m_factoryID == factory->getID(),
+					order->m_thing->isEquivalentTo(cancelledTemplate),
+					order->m_numCompleted < order->m_numRequired)) {
+				order->m_factoryID = INVALID_ID;
+				if (productionBehavior)
+					order->m_productionID = 0;
+				bindingCleared = true;
+				break;
 			}
 		}
 	}
@@ -3070,6 +4014,8 @@ void AISkirmishPlayer::updateCriticalRecovery()
  */
 void AISkirmishPlayer::processBaseBuilding()
 {
+	if (usesProductionBehavior())
+		refreshStrategyProductionState();
 	if (usesCriticalRecoveryBehavior() && m_recoveryEverCompleted &&
 		!m_recoveryImpossible && m_recoveryConstructionID != INVALID_ID &&
 		TheGameLogic) {
@@ -3105,6 +4051,7 @@ void AISkirmishPlayer::processBaseBuilding()
 		const ThingTemplate *bldgPlan=nullptr;
 		BuildListInfo	*bldgInfo = nullptr;
 		Bool isPriority = false;
+		Int selectedStructurePriority = (-2147483647 - 1);
 		Object *bldg = nullptr;
 		const ThingTemplate *powerPlan=nullptr;
 		BuildListInfo	*powerInfo = nullptr;
@@ -3164,7 +4111,11 @@ void AISkirmishPlayer::processBaseBuilding()
 
 							if (myDozer==nullptr) {
 								DEBUG_LOG(("AI's Dozer got killed (or captured).  Find another dozer."));
-								queueDozer();
+								if (usesProductionBehavior() &&
+									IsSkirmishAIStrategyAuthorizedStructure(curPlan))
+									queueAuthorizedStrategyBuilder(curPlan);
+								else
+									queueDozer();
  								myDozer = findDozer(bldg->getPosition());
 								if (myDozer==nullptr || myDozer->getAI()==nullptr) {
 									continue;
@@ -3195,6 +4146,41 @@ void AISkirmishPlayer::processBaseBuilding()
 			if (bldg) {
 				continue; // already built.
 			}
+			Bool usableSupplyCenter = false;
+			Bool prerequisiteSupplyCenter = false;
+			const Bool productionBehavior = usesProductionBehavior();
+			const Bool isSupplyCenter =
+				curPlan->isKindOf(KINDOF_FS_SUPPLY_CENTER);
+			if (productionBehavior && isSupplyCenter &&
+				!info->isPriorityBuild()) {
+				usableSupplyCenter = hasUsableSupplySource(
+					info->getLocation(),
+					curPlan->getTemplateGeometryInfo().getBoundingCircleRadius());
+				if (!usableSupplyCenter) {
+					prerequisiteSupplyCenter =
+						ShouldBuildSkirmishAIPrerequisiteSupplyCenter(
+							false, hasOwnedSupplyCenter(curPlan),
+							hasQueuedSupplyCenter(curPlan)) &&
+						isSupplyCenterPrerequisiteNeeded(curPlan);
+					if (!prerequisiteSupplyCenter || !m_baseCenterSet)
+						continue;
+					Coord3D prerequisiteLocation = m_baseCenter;
+					if (!calcClosestConstructionZoneLocation(
+							curPlan, &prerequisiteLocation))
+						continue;
+					info->setLocation(prerequisiteLocation);
+				}
+			}
+			const Bool isAutomaticSuperweapon = productionBehavior &&
+				curPlan->isKindOf(KINDOF_FS_SUPERWEAPON) &&
+				!info->isPriorityBuild();
+			const Bool admittedSuperweapon = isAutomaticSuperweapon &&
+				m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+				m_strategyState.superweaponAttemptStatus ==
+					SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED;
+			if (isAutomaticSuperweapon && !admittedSuperweapon)
+				continue;
+
 			// Make sure it is safe to build here.
 			if (!isLocationSafe(info->getLocation(), curPlan)) {
 				continue;
@@ -3206,7 +4192,7 @@ void AISkirmishPlayer::processBaseBuilding()
 				isUnderPowered)) {
 				continue;
 			}
-			if (info->isPriorityBuild()) {
+			if (!productionBehavior && info->isPriorityBuild()) {
 				// Always take priority build, unless we already have priority build.
 				if (!isPriority) {
 					bldgPlan = curPlan;
@@ -3222,17 +4208,25 @@ void AISkirmishPlayer::processBaseBuilding()
 					}
 				}
 			}
-			if (!info->isAutomaticBuild()) {
+			if (!info->isAutomaticBuild() &&
+				(!productionBehavior || !info->isPriorityBuild())) {
 				continue; // marked to not build automatically.
 			}
 			Object *dozer = findDozer(info->getLocation());
+			const Bool authorizedWithoutBuilder = productionBehavior &&
+				info->isBuildable() &&
+				(info->isPriorityBuild() ||
+				 IsSkirmishAIStrategyAuthorizedStructure(curPlan));
 			if (dozer==nullptr) {
-				if (isUnderPowered) {
+				if (!authorizedWithoutBuilder && (isUnderPowered ||
+					(productionBehavior && info->isBuildable()))) {
 					queueDozer();
 				}
-				continue;
+				if (!authorizedWithoutBuilder)
+					continue;
 			}
-			if (TheBuildAssistant->canMakeUnit(dozer, GetSkirmishAutomaticConstructionPlan(curPlan, bldgPlan))!=CANMAKE_OK) {
+			if (dozer && TheBuildAssistant->canMakeUnit(dozer,
+					GetSkirmishAutomaticConstructionPlan(curPlan, bldgPlan))!=CANMAKE_OK) {
 				if (info->isBuildable()) {
 					AsciiString bldgName = info->getTemplateName();
 					bldgName.concat(" - Dozer unable to build - money or technology missing.");
@@ -3240,16 +4234,69 @@ void AISkirmishPlayer::processBaseBuilding()
 				}
 				continue;
 			}
+			if (productionBehavior && info->isBuildable()) {
+				const ThingTemplate *previousAuthorization =
+					m_strategyAuthorizedThing;
+				const SkirmishAISpendAuthorization previousAuthorizationClass =
+					m_strategySpendAuthorization;
+				const Bool authorizeCriticalCandidate =
+					info->isPriorityBuild() ||
+					(IsSkirmishAIStrategyAuthorizedStructure(curPlan) &&
+					 (!dozer || canStartCriticalRebuildNow(info, curPlan)));
+				m_strategyAuthorizedThing = authorizeCriticalCandidate
+					? curPlan : nullptr;
+				m_strategySpendAuthorization = authorizeCriticalCandidate
+					? SKIRMISH_AI_SPEND_AUTHORIZATION_PRIORITY_STRUCTURE
+					: SKIRMISH_AI_SPEND_AUTHORIZATION_NONE;
+				const Bool candidateCanSpend = canSpendForCriticalRecovery(
+					curPlan->calcCostToBuild(m_player), curPlan, false, false);
+				m_strategyAuthorizedThing = previousAuthorization;
+				m_strategySpendAuthorization = previousAuthorizationClass;
+				if (!candidateCanSpend)
+					continue;
+			}
 			// check if this building has any "rebuilds" left
 			if (info->isBuildable())
 			{
-				if (bldgPlan == nullptr) {
+				if (productionBehavior) {
+					const Bool cashGenerator =
+						IsSkirmishAIAlternateIncomeStructure(
+							curPlan->isKindOf(KINDOF_CASH_GENERATOR),
+							curPlan->isKindOf(KINDOF_FS_SUPPLY_DROPZONE),
+							curPlan->isKindOf(KINDOF_FS_BLACK_MARKET),
+							curPlan->isKindOf(KINDOF_FS_INTERNET_CENTER));
+					const Bool productionFacility =
+						!curPlan->isKindOf(KINDOF_COMMANDCENTER) &&
+						(curPlan->isKindOf(KINDOF_FS_FACTORY) ||
+						 curPlan->isKindOf(KINDOF_FS_BARRACKS) ||
+						 curPlan->isKindOf(KINDOF_FS_WARFACTORY) ||
+						 curPlan->isKindOf(KINDOF_FS_AIRFIELD));
+					const Int priority = GetSkirmishAIStructurePriority(
+						info->isPriorityBuild(),
+						curPlan->isKindOf(KINDOF_COMMANDCENTER),
+						curPlan->isKindOf(KINDOF_FS_POWER) &&
+							!curPlan->isKindOf(KINDOF_CASH_GENERATOR) &&
+							isUnderPowered,
+						cashGenerator,
+						isSupplyCenter &&
+							(usableSupplyCenter || prerequisiteSupplyCenter),
+						productionFacility,
+						curPlan->isKindOf(KINDOF_FS_BASE_DEFENSE),
+						m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY,
+						admittedSuperweapon);
+					if (!bldgPlan || priority > selectedStructurePriority) {
+						bldgPlan = curPlan;
+						bldgInfo = info;
+						selectedStructurePriority = priority;
+					}
+				} else if (bldgPlan == nullptr) {
 					bldgPlan = curPlan;
 					bldgInfo = info;
 				}
 			}
 		}
-		if (powerInfo && powerPlan && !powerPlan->isEquivalentTo(bldgPlan)) {
+		if (!usesProductionBehavior() && powerInfo && powerPlan &&
+			!powerPlan->isEquivalentTo(bldgPlan)) {
 			if (!powerUnderConstruction) {
 				bldgPlan = powerPlan;
 				bldgInfo = powerInfo;
@@ -3258,13 +4305,43 @@ void AISkirmishPlayer::processBaseBuilding()
 		}
 		if (bldgPlan && bldgInfo) {
 #ifdef USE_DOZER
+			if (!findDozer(bldgInfo->getLocation())) {
+				queueAuthorizedStrategyBuilder(bldgPlan);
+				return;
+			}
 			// dozer-construct the building
+			const Bool authorizeCriticalBuild = usesProductionBehavior() &&
+				(bldgInfo->isPriorityBuild() ||
+				 (IsSkirmishAIStrategyAuthorizedStructure(bldgPlan) &&
+				  canStartCriticalRebuildNow(bldgInfo, bldgPlan)));
+			const ThingTemplate *previousAuthorization =
+				m_strategyAuthorizedThing;
+			const SkirmishAISpendAuthorization previousAuthorizationClass =
+				m_strategySpendAuthorization;
+			m_strategyAuthorizedThing = authorizeCriticalBuild
+				? bldgPlan : nullptr;
+			m_strategySpendAuthorization = authorizeCriticalBuild
+				? SKIRMISH_AI_SPEND_AUTHORIZATION_PRIORITY_STRUCTURE
+				: SKIRMISH_AI_SPEND_AUTHORIZATION_NONE;
 			bldg = buildStructureWithDozer(bldgPlan, bldgInfo);
+			m_strategyAuthorizedThing = previousAuthorization;
+			m_strategySpendAuthorization = previousAuthorizationClass;
 			// store the object with the build order
 			if (bldg)
 			{
 				bldgInfo->setObjectID( bldg->getID() );
 				bldgInfo->decrementNumRebuilds();
+				if (usesProductionBehavior() &&
+					bldgPlan->isKindOf(KINDOF_FS_SUPERWEAPON) &&
+					m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+					m_strategyState.superweaponAttemptStatus ==
+						SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED) {
+					m_strategySuperweaponID = bldg->getID();
+					m_strategyState.superweaponAttemptStatus =
+						SKIRMISH_STRATEGY_ATTEMPT_PENDING;
+				}
+				if (usesProductionBehavior())
+					refreshStrategyProductionReserve();
 
 				m_readyToBuildStructure = false;
 				m_structureTimer = TheAI->getAiData()->m_structureSeconds*LOGICFRAMES_PER_SECOND;
@@ -3288,7 +4365,8 @@ void AISkirmishPlayer::processBaseBuilding()
 				// building is missing, (re)build it
 				// deduct money to build, if we have it
 				Int cost = bldgPlan->calcCostToBuild( m_player );
-				if (m_player->getMoney()->countMoney() >= cost)
+				if (m_player->getMoney()->countMoney() >= cost &&
+					canSpendForCriticalRecovery(cost, bldgPlan, false, false))
 				{
 					// we have the money, deduct it
 					m_player->getMoney()->withdraw( cost );
@@ -3309,6 +4387,8 @@ void AISkirmishPlayer::processBaseBuilding()
 							m_structureTimer = m_structureTimer/TheAI->getAiData()->m_structuresWealthyMod;
 						}
 						m_frameLastBuildingBuilt = TheGameLogic->getFrame();
+						if (usesProductionBehavior())
+							refreshStrategyProductionReserve();
 					}
 				}
 			}
@@ -3320,7 +4400,8 @@ void AISkirmishPlayer::processBaseBuilding()
 /**
  * Invoked when a unit I am training comes into existence
  */
-void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
+void AISkirmishPlayer::onUnitProduced(
+	Object *factory, Object *unit, Int productionID)
 {
 	Bool newlyObservedRecoveryReplacement = false;
 	Bool producedRecoveryReplacement = false;
@@ -3330,6 +4411,16 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 		? factory->getProductionUpdateInterface() : nullptr;
 	const ProductionEntry *currentEntry = production
 		? production->firstProduction() : nullptr;
+	if (production && productionID != 0) {
+		currentEntry = nullptr;
+		for (const ProductionEntry *entry = production->firstProduction(); entry;
+			entry = production->nextProduction(entry)) {
+			if (static_cast<Int>(entry->getProductionID()) == productionID) {
+				currentEntry = entry;
+				break;
+			}
+		}
+	}
 	const ThingTemplate *currentProduct = currentEntry &&
 		currentEntry->getProductionType() == PRODUCTION_UNIT
 			? currentEntry->getProductionObject() : nullptr;
@@ -3399,6 +4490,9 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 			TeamInQueue *team = iter.cur();
 			for (WorkOrder *order = team->m_workOrders; order; order = order->m_next) {
 				if (order->m_factoryID == factory->getID() &&
+					(!usesProductionBehavior() || order->m_productionID == 0 ||
+					 (productionID != 0 &&
+					  order->m_productionID == productionID)) &&
 					order->m_numCompleted < order->m_numRequired &&
 					unit->getTemplate()->isEquivalentTo(order->m_thing)) {
 					recoveryOrder = order;
@@ -3429,7 +4523,7 @@ void AISkirmishPlayer::onUnitProduced( Object *factory, Object *unit )
 		startDirectRecoveryResourceGathering =
 			routing.startDirectResourceGatheringAfterCallback;
 	}
-	AIPlayer::onUnitProduced(factory, unit);
+	AIPlayer::onUnitProduced(factory, unit, productionID);
 	if (recoveryOrder)
 		recoveryOrder->m_isResourceGatherer = recoveryOrderWasResourceGatherer;
 	else if (startDirectRecoveryResourceGathering && directRecoverySupplyAI)
@@ -3591,11 +4685,64 @@ Bool AISkirmishPlayer::startTraining( WorkOrder *order, Bool busyOK, AsciiString
 			nativePrimaryRebuildPending))
 			return false;
 	}
-	Object *factory = findFactory(order->m_thing, busyOK);
+	Object *factory = nullptr;
+	if (usesProductionBehavior()) {
+		std::vector<Object *> compatibleProducers;
+		FindSkirmishAICompatibleProducers(
+			m_player, order->m_thing, &compatibleProducers);
+		const Bool economyRecoveryCollector =
+			order->m_isResourceGatherer &&
+			order->m_thing->isKindOf(KINDOF_HARVESTER);
+		if (economyRecoveryCollector &&
+			!hasUsableSupplyCenterForCollectors())
+			return false;
+		if (economyRecoveryCollector) {
+			for (std::vector<Object *>::iterator producer =
+				compatibleProducers.begin(); producer != compatibleProducers.end();) {
+				const Bool supplyCenter =
+					(*producer)->isKindOf(KINDOF_FS_SUPPLY_CENTER);
+				const Bool usableLocalSource = !supplyCenter ||
+					hasUsableSupplySource(
+						(*producer)->getPosition(),
+						(*producer)->getGeometryInfo().getBoundingCircleRadius());
+				if (!IsSkirmishAICollectorProducerEligible(
+						supplyCenter, usableLocalSource)) {
+					producer = compatibleProducers.erase(producer);
+					continue;
+				}
+				++producer;
+			}
+		}
+		if (compatibleProducers.empty())
+			return false;
+		// Candidate selection reuses the current snapshot. queueCreateUnit performs
+		// the single fresh reserve check at the authoritative debit boundary.
+		const ThingTemplate *previousAuthorization = m_strategyAuthorizedThing;
+		const SkirmishAISpendAuthorization previousAuthorizationClass =
+			m_strategySpendAuthorization;
+		if (economyRecoveryCollector) {
+			m_strategyAuthorizedThing = order->m_thing;
+			m_strategySpendAuthorization =
+				SKIRMISH_AI_SPEND_AUTHORIZATION_COLLECTOR;
+		}
+		ProductionID queuedProductionID = PRODUCTIONID_INVALID;
+		factory = QueueSkirmishAIUnitAtCompatibleProducer(
+			compatibleProducers, order->m_thing, busyOK,
+			&queuedProductionID);
+		if (factory)
+			order->m_productionID = static_cast<Int>(queuedProductionID);
+		m_strategyAuthorizedThing = previousAuthorization;
+		m_strategySpendAuthorization = previousAuthorizationClass;
+	} else {
+		factory = findFactory(order->m_thing, busyOK);
+	}
 	if( factory )
 	{
 		ProductionUpdateInterface *pu = factory->getProductionUpdateInterface();
-		if (pu && pu->queueCreateUnit( order->m_thing, pu->requestUniqueUnitID() )) {
+		const Bool queued = usesProductionBehavior() ||
+			(pu && pu->queueCreateUnit(
+				order->m_thing, pu->requestUniqueUnitID()));
+		if (queued) {
 			order->m_factoryID = factory->getID();
 			if (TheGlobalData->m_debugAI) {
 				AsciiString teamStr = "Queuing ";
@@ -3660,7 +4807,157 @@ Bool AISkirmishPlayer::isAGoodIdeaToBuildTeam( TeamPrototype *proto )
  */
 Bool AISkirmishPlayer::selectTeamToReinforce( Int minPriority )
 {
-	return AIPlayer::selectTeamToReinforce(minPriority);
+	if (!usesProductionBehavior())
+		return AIPlayer::selectTeamToReinforce(minPriority);
+	refreshStrategyProductionState();
+	refreshStrategyProductionReserve();
+	const Int resources = m_player->getMoney()->countMoney();
+	const Int reserve = m_strategyProductionReserveCost;
+	const Int recoveryReserve = getActiveRecoveryReserveCost();
+	const Bool hasUsableCollectorEconomy =
+		hasUsableSupplyCenterForCollectors();
+	Int priorityCeiling = 2147483647;
+	while (true) {
+		Int selectedPriority = minPriority;
+		Player::PlayerTeamList::const_iterator priorityIt;
+		for (priorityIt = m_player->getPlayerTeams()->begin();
+			priorityIt != m_player->getPlayerTeams()->end(); ++priorityIt) {
+			TeamPrototype *prototype = *priorityIt;
+			const Int priority = prototype->getTemplateInfo()->m_productionPriority;
+			if (prototype->getTemplateInfo()->m_automaticallyReinforce &&
+				priority > selectedPriority && priority < priorityCeiling)
+				selectedPriority = priority;
+		}
+		if (selectedPriority <= minPriority)
+			return false;
+
+		std::vector<Team *> candidates;
+		Player::PlayerTeamList::const_iterator prototypeIt;
+		for (prototypeIt = m_player->getPlayerTeams()->begin();
+			prototypeIt != m_player->getPlayerTeams()->end(); ++prototypeIt) {
+			TeamPrototype *prototype = *prototypeIt;
+			if (!prototype->getTemplateInfo()->m_automaticallyReinforce ||
+				prototype->getTemplateInfo()->m_productionPriority != selectedPriority)
+				continue;
+			Bool busy = false;
+			for (DLINK_ITERATOR<TeamInQueue> queueIt = iterate_TeamBuildQueue();
+				!queueIt.done(); queueIt.advance()) {
+				TeamInQueue *queued = queueIt.cur();
+				if (queued && queued->m_team &&
+					queued->m_team->getPrototype() == prototype) {
+					busy = true;
+					break;
+				}
+			}
+			if (busy)
+				continue;
+			for (DLINK_ITERATOR<Team> teamIt = prototype->iterate_TeamInstanceList();
+				!teamIt.done(); teamIt.advance()) {
+				Team *team = teamIt.cur();
+				if (team && team->hasAnyUnits() &&
+					HasSkirmishAIReinforcementDeficit(team))
+					candidates.push_back(team);
+			}
+		}
+		std::sort(candidates.begin(), candidates.end(),
+			IsSkirmishAIReinforcementTeamIDBefore);
+		for (Int roundRobinPass = 0; roundRobinPass < 3; ++roundRobinPass) {
+			for (std::vector<Team *>::const_iterator teamIt = candidates.begin();
+				teamIt != candidates.end(); ++teamIt) {
+			Team *team = *teamIt;
+			if (GetSkirmishAIReinforcementRoundRobinPass(
+					team->getID(), m_reinforcementRoundRobinCursor) !=
+					roundRobinPass)
+				continue;
+			const TeamPrototype *prototype = team->getPrototype();
+			if (!prototype)
+				continue;
+			const TeamTemplateInfo *teamInfo = prototype->getTemplateInfo();
+			for (Int unitIndex = 0; unitIndex < teamInfo->m_numUnitsInfo;
+				++unitIndex) {
+				const TCreateUnitsInfo *unitInfo = &teamInfo->m_unitsInfo[unitIndex];
+				if (unitInfo->maxUnits < 1)
+					continue;
+				const ThingTemplate *thing =
+					TheThingFactory->findTemplate(unitInfo->unitThingName);
+				if (!thing)
+					continue;
+				Int count = 0;
+				team->countObjectsByThingTemplate(1, &thing, false, &count);
+				if (!ShouldTrySkirmishAIRecruitBeforePaidTraining(
+						count, unitInfo->maxUnits, false, false))
+					continue;
+				const Bool collector = thing->isKindOf(KINDOF_HARVESTER) &&
+					!thing->isKindOf(KINDOF_DOZER);
+				if (collector && !hasUsableCollectorEconomy)
+					continue;
+
+				Coord3D origin = prototype->getTemplateInfo()->m_homeLocation;
+				if (team->getFirstItemIn_TeamMemberList())
+					origin = *team->getFirstItemIn_TeamMemberList()->getPosition();
+				Object *recruit = team->tryToRecruit(
+					thing, &origin, TheAI->getAiData()->m_maxRecruitDistance);
+				std::vector<Object *> producers;
+				if (!recruit) {
+					FindSkirmishAICompatibleProducers(m_player, thing, &producers);
+					Bool idleProducer = false;
+					for (std::vector<Object *>::const_iterator producer = producers.begin();
+						producer != producers.end(); ++producer) {
+						ProductionUpdateInterface *production =
+							(*producer)->getProductionUpdateInterface();
+						if (production && production->getProductionCount() == 0) {
+							idleProducer = true;
+							break;
+						}
+					}
+					const SkirmishAISpendAuthorization authorization = collector
+						? SKIRMISH_AI_SPEND_AUTHORIZATION_COLLECTOR
+						: SKIRMISH_AI_SPEND_AUTHORIZATION_NONE;
+					const Bool reserveAdmitted = CanSkirmishAISpendWithAuthorization(
+							resources, thing->calcCostToBuild(m_player), reserve,
+							recoveryReserve, authorization);
+					if (!ShouldSelectSkirmishAIReinforcementCandidate(
+							false, idleProducer, reserveAdmitted))
+						continue;
+				}
+
+				TeamInQueue *teamQueue = newInstance(TeamInQueue);
+				WorkOrder *order = newInstance(WorkOrder);
+				order->m_thing = thing;
+				order->m_factoryID = INVALID_ID;
+				order->m_numRequired = 1;
+				order->m_required = true;
+				order->m_isResourceGatherer = collector;
+				order->m_next = nullptr;
+				teamQueue->m_priorityBuild = false;
+				teamQueue->m_reinforcement = true;
+				teamQueue->m_workOrders = order;
+				teamQueue->m_frameStarted = TheGameLogic->getFrame();
+				teamQueue->m_team = team;
+				prependTo_TeamBuildQueue(teamQueue);
+				if (recruit) {
+					order->m_numCompleted = 1;
+					recruit->setTeam(team);
+					teamQueue->m_reinforcementID = recruit->getID();
+					AIUpdateInterface *ai = recruit->getAIUpdateInterface();
+					if (ai)
+						ai->aiIdle(CMD_FROM_AI);
+				} else if (!startTraining(
+						order, false, team->getName())) {
+					removeFrom_TeamBuildQueue(teamQueue);
+					deleteInstance(teamQueue);
+					continue;
+				}
+				m_teamDelay = 0;
+				m_reinforcementRoundRobinCursor =
+					AdvanceSkirmishAIRoundRobinCursor(
+						m_reinforcementRoundRobinCursor, team->getID(), true);
+				return true;
+			}
+		}
+		}
+		priorityCeiling = selectedPriority;
+	}
 }
 
 Bool AISkirmishPlayer::isAdaptiveProductionCandidate(
@@ -3677,18 +4974,46 @@ Bool AISkirmishPlayer::isAdaptiveProductionCandidate(
 	}
 
 	Bool anyIdleFactory = false;
+	Bool containsCollector = false;
 	const TeamTemplateInfo *info = proto->getTemplateInfo();
 	for (Int i = 0; i < info->m_numUnitsInfo; ++i) {
 		const TCreateUnitsInfo *unitInfo = &info->m_unitsInfo[i];
 		const ThingTemplate *thing = TheThingFactory->findTemplate(unitInfo->unitThingName);
 		if (!thing)
 			continue;
-		if (!findFactory(thing, true))
-			return false;
-		if (findFactory(thing, false))
-			anyIdleFactory = true;
+		if (thing->isKindOf(KINDOF_HARVESTER) &&
+			!thing->isKindOf(KINDOF_DOZER))
+			containsCollector = true;
+		if (usesProductionBehavior()) {
+			std::vector<Object *> compatibleProducers;
+			FindSkirmishAICompatibleProducers(
+				m_player, thing, &compatibleProducers);
+			if (compatibleProducers.empty())
+				return false;
+			for (std::vector<Object *>::const_iterator producer =
+					compatibleProducers.begin();
+				producer != compatibleProducers.end(); ++producer) {
+				ProductionUpdateInterface *production =
+					(*producer)->getProductionUpdateInterface();
+				if (production && production->getProductionCount() == 0) {
+					anyIdleFactory = true;
+					break;
+				}
+			}
+		} else {
+			if (!findFactory(thing, true))
+				return false;
+			if (findFactory(thing, false))
+				anyIdleFactory = true;
+		}
 	}
 	if (!anyIdleFactory)
+		return false;
+	// Initial team creation is atomic, so a team containing any collector must
+	// wait for a live supply economy. Reinforcement queues only one order and
+	// can skip an individual collector instead.
+	if (usesProductionBehavior() && containsCollector &&
+		!hasUsableSupplyCenterForCollectors())
 		return false;
 
 	*costRange = MakeSkirmishAICostRange();
@@ -3703,23 +5028,55 @@ Bool AISkirmishPlayer::isAdaptiveProductionCandidate(
 	return true;
 }
 
+Int AISkirmishPlayer::getActiveRecoveryReserveCost() const
+{
+	if (m_recoveryImpossible || m_recoveryReserveCost <= 0)
+		return 0;
+	const Bool boundedGraceExpired = TheGameLogic &&
+		IsSkirmishAIRecoveryBoundedGraceExpired(
+			TheGameLogic->getFrame(), m_recoveryEvacuationDeadline);
+	if (ShouldReleaseSkirmishAIRecoveryReserveForExpiredGrace(
+			boundedGraceExpired,
+			m_recoveryNextAttemptFrame == m_recoveryEvacuationDeadline))
+		return 0;
+	return m_recoveryReserveCost;
+}
+
 Int AISkirmishPlayer::getCriticalRebuildReserve(Bool *canStartNow)
 {
 	if (canStartNow)
 		*canStartNow = false;
 	Int cheapestCost = 0;
 	Bool isUnderPowered = !m_player->getEnergy()->hasSufficientPower();
+	const Bool productionBehavior = usesProductionBehavior();
 	for (BuildListInfo *info = m_player->getBuildList(); info; info = info->getNext()) {
 		const ThingTemplate *plan = TheThingFactory->findTemplate(info->getTemplateName());
 		if (!plan)
 			continue;
-		Bool critical = plan->isKindOf(KINDOF_COMMANDCENTER) ||
+		const Bool isSupplyCenter =
+			plan->isKindOf(KINDOF_FS_SUPPLY_CENTER);
+		const Bool alternateIncome = productionBehavior &&
+			IsSkirmishAIAlternateIncomeStructure(
+				plan->isKindOf(KINDOF_CASH_GENERATOR),
+				plan->isKindOf(KINDOF_FS_SUPPLY_DROPZONE),
+				plan->isKindOf(KINDOF_FS_BLACK_MARKET),
+				plan->isKindOf(KINDOF_FS_INTERNET_CENTER));
+		const Bool critical = plan->isKindOf(KINDOF_COMMANDCENTER) ||
 			plan->isKindOf(KINDOF_FS_POWER) ||
-			plan->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+			alternateIncome ||
+			isSupplyCenter ||
 			plan->isKindOf(KINDOF_FS_FACTORY) ||
 			plan->isKindOf(KINDOF_FS_BARRACKS) ||
 			plan->isKindOf(KINDOF_FS_WARFACTORY) ||
 			plan->isKindOf(KINDOF_FS_AIRFIELD);
+		if (productionBehavior && isSupplyCenter &&
+			!hasUsableSupplySource(
+				info->getLocation(),
+				plan->getTemplateGeometryInfo().getBoundingCircleRadius())) {
+			if (hasOwnedSupplyCenter(plan) || hasQueuedSupplyCenter(plan) ||
+				!isSupplyCenterPrerequisiteNeeded(plan))
+				continue;
+		}
 		if (!critical || !info->isBuildable() ||
 			!ShouldSkirmishAIConsiderRebuild(
 				info->isAutomaticBuild(),
@@ -3738,9 +5095,14 @@ Int AISkirmishPlayer::getCriticalRebuildReserve(Bool *canStartNow)
 		if (canStartNow && !*canStartNow && canStartCriticalRebuildNow(info, plan))
 			*canStartNow = true;
 	}
+	const Int activeRecoveryReserve = productionBehavior
+		? getActiveRecoveryReserveCost() : m_recoveryReserveCost;
+	const Bool recoveryReserveAvailable = productionBehavior
+		? activeRecoveryReserve > 0 :
+			!m_recoveryImpossible && m_recoveryReserveCost > 0;
 	if (usesCriticalRecoveryBehavior() && m_recoveryEverCompleted &&
-		!m_recoveryImpossible && m_recoveryReserveCost > cheapestCost) {
-		cheapestCost = m_recoveryReserveCost;
+		recoveryReserveAvailable && activeRecoveryReserve > cheapestCost) {
+		cheapestCost = activeRecoveryReserve;
 		if (canStartNow)
 			*canStartNow = true;
 	}
@@ -3784,7 +5146,12 @@ Bool AISkirmishPlayer::estimateTeamProduction(
 	*productionCost = 0;
 	*completionFrames = 0;
 	std::vector<SkirmishFactoryProjection> factories;
-	for (BuildListInfo *build = m_player->getBuildList(); build; build = build->getNext()) {
+	std::vector<Object *> ownedFactories;
+	if (usesProductionBehavior())
+		FindSkirmishAIProductionProducers(m_player, &ownedFactories);
+	for (BuildListInfo *build = usesProductionBehavior()
+			? nullptr : m_player->getBuildList();
+		build; build = build->getNext()) {
 		Object *factory = TheGameLogic->findObjectByID(build->getObjectID());
 		if (!factory || factory->getControllingPlayer() != m_player ||
 			factory->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
@@ -3805,6 +5172,25 @@ Bool AISkirmishPlayer::estimateTeamProduction(
 		if (duplicate)
 			continue;
 
+		SkirmishFactoryProjection projection;
+		projection.factory = factory;
+		projection.projectedFrames = 0;
+		projection.usedByCandidate = false;
+		Bool firstEntry = true;
+		for (const ProductionEntry *entry = production->firstProduction(); entry;
+			entry = production->nextProduction(entry)) {
+			projection.projectedFrames = AddSkirmishAIFrameValue(
+				projection.projectedFrames,
+				getSkirmishProductionEntryFrames(entry, m_player, firstEntry));
+			firstEntry = false;
+		}
+		factories.push_back(projection);
+	}
+	for (std::vector<Object *>::const_iterator owned = ownedFactories.begin();
+		owned != ownedFactories.end(); ++owned) {
+		Object *factory = *owned;
+		ProductionUpdateInterface *production =
+			factory->getProductionUpdateInterface();
 		SkirmishFactoryProjection projection;
 		projection.factory = factory;
 		projection.projectedFrames = 0;
@@ -4555,7 +5941,8 @@ Bool AISkirmishPlayer::updateStrategy()
 	collectStrategyMetrics(&metrics, &targetID);
 	const SkirmishStrategyMode previousMode = m_strategyState.currentMode;
 	SkirmishStrategyDecision decision = EvaluateSkirmishStrategy(
-		m_strategyState, metrics, m_difficulty, currentFrame);
+		m_strategyState, metrics, m_difficulty, currentFrame,
+		usesProductionBehavior());
 	const Bool leftAssault = previousMode == SKIRMISH_STRATEGY_ASSAULT &&
 		decision.nextState.currentMode != SKIRMISH_STRATEGY_ASSAULT;
 	if (leftAssault) {
@@ -4573,6 +5960,12 @@ Bool AISkirmishPlayer::updateStrategy()
 		ClearSkirmishStrategyTargetObservation(&decision.nextState);
 	}
 	m_strategyState = decision.nextState;
+	if (previousMode != SKIRMISH_STRATEGY_FORTIFY &&
+		m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY)
+		clearStrategySourceCommandLock();
+	else if (m_strategyState.superweaponAttemptStatus !=
+		SKIRMISH_STRATEGY_ATTEMPT_PENDING)
+		clearStrategySourceCommandLock();
 	if (TheGlobalData->m_debugAI && TheScriptEngine && decision.evaluated) {
 		AsciiString message;
 		message.format("AI strategy mode=%d reason=%d E=%d B=%d A=%d T=%d C=%d O=%d L=%d fortify=%u assault=%u",
@@ -4621,10 +6014,20 @@ Bool AISkirmishPlayer::selectTeamToBuild()
 	Bool criticalRebuildCanStart = false;
 	Int rebuildReserve = getCriticalRebuildReserve(&criticalRebuildCanStart);
 	Int poorReserve = TheAI->getAiData()->m_resourcesPoor;
-	Int reserve = GetSkirmishAIReserve(poorReserve, rebuildReserve);
+	Int reserve = usesProductionBehavior()
+		? GetSkirmishAIAggregateReserve(poorReserve, rebuildReserve,
+			getActiveRecoveryReserveCost())
+		: GetSkirmishAIReserve(poorReserve, rebuildReserve);
+	if (usesProductionBehavior())
+		m_strategyProductionReserveCost = reserve;
 	Bool rebuildReserveApplied = reserve > GetSkirmishAIReserve(poorReserve, 0);
 	Int resources = m_player->getMoney()->countMoney();
 	SkirmishAIDecisionDifficulty difficulty = getDecisionDifficulty();
+	SkirmishAIProductionMode productionMode = SKIRMISH_AI_PRODUCTION_BALANCED;
+	if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY)
+		productionMode = SKIRMISH_AI_PRODUCTION_FORTIFY;
+	else if (m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT)
+		productionMode = SKIRMISH_AI_PRODUCTION_ASSAULT;
 
 	Int enemyAircraftValue;
 	Int enemyVehicleValue;
@@ -4645,13 +6048,19 @@ Bool AISkirmishPlayer::selectTeamToBuild()
 			TeamPrototype *prototype = candidateIt->prototype;
 			Int priority = prototype->getTemplateInfo()->m_productionPriority;
 			if (!IsSkirmishAIPriorityAdmitted(priority, highestPriority, difficulty) ||
-				!IsSkirmishAIAffordable(resources, candidateIt->costRange.minimumCost, reserve))
+				!IsSkirmishAIAffordable(resources,
+					usesProductionBehavior() ? candidateIt->costRange.plannedCost :
+						candidateIt->costRange.minimumCost,
+					reserve))
 				continue;
 
 			SkirmishAITeamScoreInput input;
 			input.configuredPriority = priority;
 			input.counterFitScore = getCandidateCounterFit(
 				prototype, enemyAircraftValue, enemyVehicleValue, enemyInfantryValue);
+			if (usesProductionBehavior())
+				input.counterFitScore = GetSkirmishAIProductionCounterFitScore(
+					input.counterFitScore, productionMode);
 			input.resources = resources;
 			input.minimumCost = candidateIt->costRange.minimumCost;
 			input.plannedCost = candidateIt->costRange.plannedCost;
@@ -4662,7 +6071,8 @@ Bool AISkirmishPlayer::selectTeamToBuild()
 			input.recentLossCount = prototype->getRecentSkirmishAILossCount();
 			input.recentPathFailureCount = prototype->getRecentSkirmishAIPathFailureCount();
 			input.difficulty = difficulty;
-			SkirmishAITeamScoreResult score = ScoreSkirmishAITeam(input);
+			SkirmishAITeamScoreResult score = ScoreSkirmishAITeam(
+				input, usesProductionBehavior());
 
 			if (TheGlobalData->m_debugAI) {
 				AsciiString message;
@@ -4685,6 +6095,8 @@ Bool AISkirmishPlayer::selectTeamToBuild()
 		}
 
 		if (!bestTeams.empty())
+			break;
+		if (usesProductionBehavior())
 			break;
 		if (!ShouldRetrySkirmishAIReserve(
 			criticalRebuildCanStart, rebuildReserveApplied, false))
@@ -4760,9 +6172,15 @@ void AISkirmishPlayer::buildSpecificAIBuilding(const AsciiString &thingName)
 	*/
 Int AISkirmishPlayer::getMyEnemyPlayerIndex() {
 	Int playerNdx;
+	const Bool productionBehavior = usesProductionBehavior();
 	if (m_currentEnemy) {
-		return m_currentEnemy->getPlayerIndex();
+		if (!productionBehavior ||
+			(m_currentEnemy->getDefaultTeam() &&
+			 m_player->getRelationship(m_currentEnemy->getDefaultTeam()) == ENEMIES))
+			return m_currentEnemy->getPlayerIndex();
 	}
+	if (productionBehavior)
+		return -1;
 	// For now, return first human player, as there should only be one. jba
 	for (playerNdx=0; playerNdx<ThePlayerList->getPlayerCount(); playerNdx++) {
 		if (ThePlayerList->getNthPlayer(playerNdx)->getPlayerType() == PLAYER_HUMAN) {
@@ -4848,6 +6266,7 @@ void AISkirmishPlayer::acquireEnemyLegacy()
 */
 void AISkirmishPlayer::acquireEnemy()
 {
+	const Bool productionBehavior = usesProductionBehavior();
 	std::vector<SkirmishEnemyCandidate> candidates;
 	Int maximumKnownAssetValue = 0;
 	Int minimumDistance = 2147483647;
@@ -4856,9 +6275,13 @@ void AISkirmishPlayer::acquireEnemy()
 	Object *representative = findEnemyRouteRepresentative();
 	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
 		Player *candidatePlayer = ThePlayerList->getNthPlayer(i);
+		const Bool hasTargetObjects = candidatePlayer &&
+			(productionBehavior
+				? candidatePlayer->hasOffensiveTargetableObjects()
+				: candidatePlayer->hasAnyObjects());
 		if (!candidatePlayer ||
 			m_player->getRelationship(candidatePlayer->getDefaultTeam()) != ENEMIES ||
-			!candidatePlayer->hasAnyObjects())
+			!hasTargetObjects)
 			continue;
 
 		SkirmishEnemyCandidate candidate;
@@ -4968,11 +6391,22 @@ Player *AISkirmishPlayer::getAiEnemy()
 		return m_currentEnemy;
 	}
 
-	Bool currentEnemyInvalid = m_currentEnemy &&
-		(m_player->getRelationship(m_currentEnemy->getDefaultTeam()) != ENEMIES ||
-		 !m_currentEnemy->hasAnyObjects());
+	const Bool productionBehavior = usesProductionBehavior();
+	const Bool currentEnemyInvalid = m_currentEnemy &&
+		(!m_currentEnemy->getDefaultTeam() ||
+		 m_player->getRelationship(m_currentEnemy->getDefaultTeam()) != ENEMIES ||
+		 (productionBehavior ? !m_currentEnemy->hasOffensiveTargetableObjects() :
+			!m_currentEnemy->hasAnyObjects()));
+	if (productionBehavior && currentEnemyInvalid) {
+		m_currentEnemy = nullptr;
+		m_currentEnemyPlayerIndex = -1;
+		m_frameToCheckEnemy = TheGameLogic->getFrame() +
+			5 * LOGICFRAMES_PER_SECOND;
+		acquireEnemy();
+	}
 	if (ShouldEvaluateSkirmishAITarget(
-		currentEnemyInvalid, TheGameLogic->getFrame(), m_frameToCheckEnemy, true)) {
+		productionBehavior ? false : currentEnemyInvalid,
+		TheGameLogic->getFrame(), m_frameToCheckEnemy, true)) {
 		m_frameToCheckEnemy = TheGameLogic->getFrame() + 5*LOGICFRAMES_PER_SECOND;
 		acquireEnemy();
 	}
@@ -5046,7 +6480,10 @@ void AISkirmishPlayer::buildAIBaseDefenseStructure(const AsciiString &thingName,
 		} else {
 			if (flank) return;
 			Region2D bounds;
-			getPlayerStructureBounds(&bounds, getMyEnemyPlayerIndex());
+			const Int enemyIndex = getMyEnemyPlayerIndex();
+			if (enemyIndex < 0)
+				return;
+			getPlayerStructureBounds(&bounds, enemyIndex);
 			goalPos.x = bounds.lo.x + bounds.width()/2;
 			goalPos.y = bounds.lo.y + bounds.height()/2;
 		}
@@ -5407,9 +6844,12 @@ void AISkirmishPlayer::update()
 {
 	const SkirmishStrategyMode previousMode = m_strategyState.currentMode;
 	const ObjectID previousTargetID = m_strategyState.strategicTargetID;
+	const Bool strategyAllowedAfterRecovery =
+		ShouldContinueSkirmishAIStrategyAfterRecovery(
+			m_recoveryImpossible, usesProductionBehavior());
 	Bool strategyEvaluated = false;
 	Bool strategyTargetExpired = false;
-	if (!m_recoveryImpossible && usesStrategyBehavior() &&
+	if (strategyAllowedAfterRecovery && usesStrategyBehavior() &&
 		m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
 		m_strategyState.strategicTargetID != INVALID_ID &&
 		m_strategyState.strategicTargetObserved &&
@@ -5423,11 +6863,12 @@ void AISkirmishPlayer::update()
 	}
 	if (ShouldUseCurrentSkirmishAIBehavior()) {
 		getAiEnemy();
-		if (!m_recoveryImpossible)
+		if (strategyAllowedAfterRecovery)
 			strategyEvaluated = updateStrategy();
 	}
 	AIPlayer::update();
-	if ((strategyEvaluated || strategyTargetExpired) && !m_recoveryImpossible)
+	if ((strategyEvaluated || strategyTargetExpired) &&
+		strategyAllowedAfterRecovery)
 		applyStrategyMode(
 			previousMode, m_strategyState.currentMode, previousTargetID);
 }
@@ -5550,6 +6991,13 @@ void AISkirmishPlayer::newMap()
 {
 	InitializeSkirmishStrategyState(
 		&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
+	m_strategyProductionReserveCost = 0;
+	m_strategySuperweaponID = INVALID_ID;
+	m_strategyAuthorizedThing = nullptr;
+	m_strategySpendAuthorization = SKIRMISH_AI_SPEND_AUTHORIZATION_NONE;
+	m_strategyProductionReserveRefreshing = false;
+	clearStrategySourceCommandLock();
+	m_reinforcementRoundRobinCursor = 0;
 
 	/* Get our proper build list. */
 	AsciiString mySide = m_player->getSide();
@@ -5632,9 +7080,21 @@ Object * AISkirmishPlayer::findDozer( const Coord3D *pos )
  */
 Bool AISkirmishPlayer::computeSuperweaponTarget(const SpecialPowerTemplate *power, Coord3D *retPos, Int playerNdx, Real weaponRadius)
 {
-
-	Region2D bounds;
-	getPlayerStructureBounds(&bounds, playerNdx);
+	const Bool defensiveMines = power &&
+		(power->getSpecialPowerType() == SPECIAL_CLUSTER_MINES ||
+		 power->getSpecialPowerType() == NUKE_SPECIAL_CLUSTER_MINES);
+	if (usesProductionBehavior() && !defensiveMines) {
+		if (!power || !retPos || !ThePlayerList || playerNdx < 0 ||
+			playerNdx >= ThePlayerList->getPlayerCount())
+			return false;
+		Player *target = ThePlayerList->getNthPlayer(playerNdx);
+		if (!IsSkirmishAIOffensiveTargetEligible(
+			target != nullptr,
+			target && target->getDefaultTeam() &&
+				m_player->getRelationship(target->getDefaultTeam()) == ENEMIES,
+			target && target->hasOffensiveTargetableObjects()))
+			return false;
+	}
 
 	if( power->getSpecialPowerType() == SPECIAL_CLUSTER_MINES || power->getSpecialPowerType() == NUKE_SPECIAL_CLUSTER_MINES )
 	{
@@ -5655,7 +7115,11 @@ Bool AISkirmishPlayer::computeSuperweaponTarget(const SpecialPowerTemplate *powe
 			goalPos = *way->getLocation();
 		} else {
 			Region2D bounds;
-			getPlayerStructureBounds(&bounds, getMyEnemyPlayerIndex());
+			const Int referenceIndex = usesProductionBehavior() ?
+				m_player->getPlayerIndex() : getMyEnemyPlayerIndex();
+			if (referenceIndex < 0)
+				return FALSE;
+			getPlayerStructureBounds(&bounds, referenceIndex);
 			goalPos.x = bounds.lo.x + bounds.width()/2;
 			goalPos.y = bounds.lo.y + bounds.height()/2;
 		}
@@ -5715,7 +7179,7 @@ static void XferSkirmishStrategyState(
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::crc( Xfer *xfer )
 {
-	if (!usesCriticalRecoveryBehavior())
+	if (!usesCriticalRecoveryBehavior() && !usesProductionBehavior())
 		return;
 	xfer->xferBool(&m_recoveryEverCompleted);
 	xfer->xferBool(&m_recoveryImpossible);
@@ -5748,6 +7212,26 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	xfer->xferInt(&m_recoveryReserveCost);
 	if (ShouldIncludeSkirmishAIStrategyCRCFields(replay, replayEpoch))
 		XferSkirmishStrategyState(xfer, &m_strategyState);
+	if (ShouldIncludeSkirmishAIProductionCRCFields(replay, replayEpoch)) {
+		xfer->xferInt(&m_strategyProductionReserveCost);
+		xfer->xferObjectID(&m_strategySuperweaponID);
+		xfer->xferBool(&m_strategySourceCommandLocked);
+		xfer->xferObjectID(&m_strategyLockedSourceID);
+		xfer->xferUnsignedInt(&m_strategyLockedPowerID);
+		xfer->xferUnsignedInt(&m_reinforcementRoundRobinCursor);
+		AIPlayer::crc(xfer);
+		std::map<ObjectID, Bool> collectorRoles;
+		GatherSkirmishAICollectorRoles(m_player, &collectorRoles);
+		UnsignedInt roleCount = static_cast<UnsignedInt>(collectorRoles.size());
+		xfer->xferUnsignedInt(&roleCount);
+		for (std::map<ObjectID, Bool>::iterator role = collectorRoles.begin();
+			role != collectorRoles.end(); ++role) {
+			ObjectID objectID = role->first;
+			Bool collector = role->second;
+			xfer->xferObjectID(&objectID);
+			xfer->xferBool(&collector);
+		}
+	}
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -5760,13 +7244,17 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	* 5: Recovery builder production identity
 	* 6: Recovery builder cancellation ownership
 	* 7: Recovery builder bounded-failover consumption
-	* 8: Deterministic skirmish strategy controller state */
+	* 8: Deterministic skirmish strategy controller state
+	 * 9: Stage 3 production reserve and Fortify superweapon identity
+	 * 10: One-shot Fortify strategic-source command lock
+	 * 11: Exact strategic command identity and reinforcement fairness cursor
+	 * 12: Stage 3 worker collector roles, keyed by ObjectID */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 8;
+	XferVersion currentVersion = 12;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -5864,7 +7352,66 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 	else if (xfer->getXferMode() == XFER_LOAD)
 		InitializeOldSaveSkirmishStrategyState(
 			&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
+	if (xfer->getXferMode() == XFER_LOAD && version == 8 &&
+		usesProductionBehavior())
+		ArmOldSaveSkirmishFortifyDeadline(
+			&m_strategyState, m_difficulty,
+			TheGameLogic ? TheGameLogic->getFrame() : 0);
+	if (version >= 9) {
+		xfer->xferInt(&m_strategyProductionReserveCost);
+		xfer->xferObjectID(&m_strategySuperweaponID);
+	} else if (xfer->getXferMode() == XFER_LOAD) {
+		m_strategyProductionReserveCost = 0;
+		m_strategySuperweaponID = INVALID_ID;
+	}
+	if (version >= 10)
+		xfer->xferBool(&m_strategySourceCommandLocked);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		m_strategySourceCommandLocked =
+			GetSkirmishAIStrategicPowerSourceLockForVersion(version, false);
+	if (version >= 11) {
+		xfer->xferObjectID(&m_strategyLockedSourceID);
+		xfer->xferUnsignedInt(&m_strategyLockedPowerID);
+		xfer->xferUnsignedInt(&m_reinforcementRoundRobinCursor);
+	} else if (xfer->getXferMode() == XFER_LOAD) {
+		clearStrategySourceCommandLock();
+		m_reinforcementRoundRobinCursor =
+			GetSkirmishAIReinforcementCursorForVersion(version, 0);
+	}
+	// WorkerAIUpdate remains v1 in retail-compatible saves. Keep the Stage 3
+	// role here so an idle worker can resume as a collector after loading.
+	m_stage3CollectorRolesToRestore.clear();
+	if (version >= 12) {
+		std::map<ObjectID, Bool> collectorRoles;
+		if (xfer->getXferMode() == XFER_SAVE)
+			GatherSkirmishAICollectorRoles(m_player, &collectorRoles);
+		UnsignedInt roleCount = static_cast<UnsignedInt>(collectorRoles.size());
+		xfer->xferUnsignedInt(&roleCount);
+		if (xfer->getXferMode() == XFER_SAVE) {
+			for (std::map<ObjectID, Bool>::iterator role = collectorRoles.begin();
+				role != collectorRoles.end(); ++role) {
+				ObjectID objectID = role->first;
+				Bool collector = role->second;
+				xfer->xferObjectID(&objectID);
+				xfer->xferBool(&collector);
+			}
+		} else {
+			for (UnsignedInt i = 0; i < roleCount; ++i) {
+				ObjectID objectID = INVALID_ID;
+				Bool collector = false;
+				xfer->xferObjectID(&objectID);
+				xfer->xferBool(&collector);
+				m_stage3CollectorRolesToRestore[objectID] = collector;
+			}
+		}
+	}
+	if (xfer->getXferMode() == XFER_LOAD) {
+		m_strategyProductionReserveLoaded = version >= 9;
+	}
 	m_recoveryAuthorizedThing = nullptr;
+	m_strategyAuthorizedThing = nullptr;
+	m_strategySpendAuthorization = SKIRMISH_AI_SPEND_AUTHORIZATION_NONE;
+	m_strategyProductionReserveRefreshing = false;
 
 }
 
@@ -5873,6 +7420,20 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::loadPostProcess()
 {
+	if (TheGameLogic) {
+		for (std::map<ObjectID, Bool>::const_iterator role =
+			m_stage3CollectorRolesToRestore.begin();
+			role != m_stage3CollectorRolesToRestore.end(); ++role) {
+			Object *object = TheGameLogic->findObjectByID(role->first);
+			if (!object || object->getControllingPlayer() != m_player)
+				continue;
+			AIUpdateInterface *ai = object->getAIUpdateInterface();
+			WorkerAIInterface *worker = ai ? ai->getWorkerAIInterface() : nullptr;
+			if (worker)
+				worker->setStage3CollectorRole(role->second);
+		}
+	}
+	m_stage3CollectorRolesToRestore.clear();
 	m_currentEnemy = nullptr;
 	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
 		Player *player = ThePlayerList->getNthPlayer(i);
@@ -5881,8 +7442,13 @@ void AISkirmishPlayer::loadPostProcess()
 			break;
 		}
 	}
-	if (!m_currentEnemy)
+	if (!m_currentEnemy || (usesProductionBehavior() &&
+		(!m_currentEnemy->getDefaultTeam() ||
+		 m_player->getRelationship(m_currentEnemy->getDefaultTeam()) != ENEMIES ||
+		 !m_currentEnemy->hasOffensiveTargetableObjects()))) {
+		m_currentEnemy = nullptr;
 		m_currentEnemyPlayerIndex = -1;
+	}
 	if (m_strategyState.currentMode < SKIRMISH_STRATEGY_BALANCED ||
 		m_strategyState.currentMode > SKIRMISH_STRATEGY_ASSAULT ||
 		m_strategyState.pendingMode < SKIRMISH_STRATEGY_NONE ||
@@ -5915,6 +7481,84 @@ void AISkirmishPlayer::loadPostProcess()
 		m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT)
 		m_strategyState.assaultEntryCombatValue = 0;
 	m_recoveryAuthorizedThing = nullptr;
+	m_strategyAuthorizedThing = nullptr;
+	m_strategySpendAuthorization = SKIRMISH_AI_SPEND_AUTHORIZATION_NONE;
+	m_strategyProductionReserveRefreshing = false;
+	if (!usesProductionBehavior()) {
+		clearStrategySourceCommandLock();
+		m_reinforcementRoundRobinCursor = 0;
+	} else if (!m_strategySourceCommandLocked) {
+		clearStrategySourceCommandLock();
+	}
+	if (m_strategyProductionReserveCost < 0)
+		m_strategyProductionReserveCost = 0;
+	if (usesProductionBehavior() && !m_strategyProductionReserveLoaded)
+		refreshStrategyProductionReserve();
+	if (usesProductionBehavior() &&
+		m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+		m_strategyState.superweaponAttemptStatus ==
+			SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED) {
+		Object *construction = FindSkirmishAIStrategicSource(m_player, nullptr);
+		if (!construction)
+			construction = FindSkirmishAISuperweaponConstruction(m_player);
+		if (construction) {
+			m_strategySuperweaponID = construction->getID();
+			m_strategyState.superweaponAttemptStatus =
+				SKIRMISH_STRATEGY_ATTEMPT_PENDING;
+		}
+	}
+	if (ShouldFailSkirmishAIStrategicPowerSourceLock(
+			m_strategySourceCommandLocked,
+			m_strategyState.superweaponAttemptStatus ==
+				SKIRMISH_STRATEGY_ATTEMPT_PENDING,
+			isStrategySourceCommandLockValid())) {
+		m_strategyState.superweaponAttemptStatus =
+			SKIRMISH_STRATEGY_ATTEMPT_FAILED;
+		m_strategySuperweaponID = INVALID_ID;
+		clearStrategySourceCommandLock();
+	}
+	if (m_strategySuperweaponID != INVALID_ID && TheGameLogic) {
+		Object *superweapon = TheGameLogic->findObjectByID(
+			m_strategySuperweaponID);
+		const Bool recognizedLiveSource =
+			IsUsableSkirmishAIStrategicSource(superweapon, m_player) &&
+			HasSkirmishAIStrategicPowerModule(superweapon, nullptr);
+		const Bool pendingConstruction =
+			ShouldKeepSkirmishAISuperweaponConstructionPending(
+				superweapon != nullptr,
+				superweapon && superweapon->getControllingPlayer() == m_player,
+				superweapon && superweapon->isKindOf(KINDOF_FS_SUPERWEAPON),
+				superweapon && superweapon->isKindOf(KINDOF_REBUILD_HOLE),
+				superweapon && superweapon->isEffectivelyDead(),
+				superweapon && superweapon->isDestroyed(),
+				superweapon && superweapon->testStatus(OBJECT_STATUS_SOLD),
+				superweapon && superweapon->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+				superweapon && superweapon->testStatus(OBJECT_STATUS_RECONSTRUCTING)) &&
+			IsSkirmishAIPlannedSuperweaponObject(m_player, superweapon);
+		if (!superweapon || superweapon->getControllingPlayer() != m_player ||
+			!superweapon->isKindOf(KINDOF_FS_SUPERWEAPON) ||
+			superweapon->isEffectivelyDead() || superweapon->isDestroyed() ||
+			superweapon->testStatus(OBJECT_STATUS_SOLD) ||
+			(!recognizedLiveSource && !pendingConstruction)) {
+			Object *replacement = FindSkirmishAIStrategicSource(m_player, nullptr);
+			if (!replacement)
+				replacement = FindSkirmishAISuperweaponConstruction(m_player);
+			if (replacement) {
+				m_strategySuperweaponID = replacement->getID();
+			} else {
+				m_strategySuperweaponID = INVALID_ID;
+				if (m_strategyState.superweaponAttemptStatus ==
+					SKIRMISH_STRATEGY_ATTEMPT_PENDING) {
+					m_strategyState.superweaponAttemptStatus =
+						SKIRMISH_STRATEGY_ATTEMPT_FAILED;
+				}
+			}
+		}
+	}
+	if (m_strategyState.superweaponAttemptStatus !=
+		SKIRMISH_STRATEGY_ATTEMPT_PENDING)
+		clearStrategySourceCommandLock();
+	m_strategyProductionReserveLoaded = false;
 	if (m_recoveryPlacementAttempt < 0)
 		m_recoveryPlacementAttempt = 0;
 	if (m_recoveryReserveCost < 0)

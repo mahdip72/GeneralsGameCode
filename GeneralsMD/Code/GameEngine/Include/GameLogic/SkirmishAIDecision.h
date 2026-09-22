@@ -32,6 +32,13 @@ enum SkirmishAITargetRouteClass
 	SKIRMISH_AI_TARGET_ROUTE_UNREACHABLE
 };
 
+enum SkirmishAIProductionMode
+{
+	SKIRMISH_AI_PRODUCTION_BALANCED = 0,
+	SKIRMISH_AI_PRODUCTION_FORTIFY,
+	SKIRMISH_AI_PRODUCTION_ASSAULT
+};
+
 struct SkirmishAICostRange
 {
 	int minimumCost;
@@ -459,6 +466,314 @@ inline int GetSkirmishAIReserve(int resourcesPoor, int rebuildCost)
 	return resourcesPoor > rebuildCost ? resourcesPoor : rebuildCost;
 }
 
+inline bool IsSkirmishAIOffensiveTargetEligible(
+	bool targetExists, bool isEnemy, bool hasObjects)
+{
+	return targetExists && isEnemy && hasObjects;
+}
+
+inline bool HasSkirmishAIOffensiveTargetObjects(
+	bool productionBehavior, bool hasAnyObjects,
+	bool hasOffensiveTargetableObjects)
+{
+	return productionBehavior ? hasOffensiveTargetableObjects : hasAnyObjects;
+}
+
+inline bool IsSkirmishAIOffensiveTargetObjectEligible(
+	bool exists, bool owned, bool rebuildHole, bool effectivelyDead,
+	bool destroyed, bool sold, bool underConstruction, bool reconstructing,
+	bool unattackable, bool inert, bool projectile, bool mine, int scoreValue)
+{
+	(void)underConstruction;
+	(void)reconstructing;
+	(void)scoreValue;
+	return exists && owned && !rebuildHole && !effectivelyDead && !destroyed &&
+		!sold && !unattackable && !inert && !projectile && !mine;
+}
+
+inline int GetSkirmishAISupplyCollectorDemand(
+	int aggregateDesired, int usableAssigned, bool collectorQueued)
+{
+	if (aggregateDesired < 0)
+		aggregateDesired = 0;
+	if (usableAssigned < 0)
+		usableAssigned = 0;
+	if (collectorQueued || usableAssigned >= aggregateDesired)
+		return 0;
+	return aggregateDesired - usableAssigned;
+}
+
+inline int AddSkirmishAISupplyCollectorDeficit(
+	int aggregateDeficit, int desired, int assigned)
+{
+	int deficit = GetSkirmishAISupplyCollectorDemand(desired, assigned, false);
+	if (aggregateDeficit < 0)
+		aggregateDeficit = 0;
+	if (deficit > 2147483647 - aggregateDeficit)
+		return 2147483647;
+	return aggregateDeficit + deficit;
+}
+
+inline bool IsSkirmishAIPendingCollectorEntry(
+	bool hasCollectorOrder, bool hasNonCollectorOrder,
+	int outstandingOrderQuantity, int matchingEntryQuantity,
+	bool strictAutomaticCollectorProof)
+{
+	if (hasCollectorOrder || hasNonCollectorOrder)
+		return hasCollectorOrder && !hasNonCollectorOrder &&
+			outstandingOrderQuantity > 0 &&
+			outstandingOrderQuantity == matchingEntryQuantity;
+	return strictAutomaticCollectorProof;
+}
+
+inline bool IsSkirmishAIEligibleCollector(
+	bool exists, bool owned, bool harvester, bool hasAI,
+	bool effectivelyDead, bool destroyed, bool sold,
+	bool underConstruction, bool reconstructing, bool contained,
+	bool unmanned, bool activeDozerTask, bool hasSupplyTruckAI)
+{
+	return exists && owned && harvester && hasAI && !effectivelyDead &&
+		!destroyed && !sold && !underConstruction && !reconstructing &&
+		!contained && !unmanned && !activeDozerTask && hasSupplyTruckAI;
+}
+
+inline bool ShouldRouteSkirmishAICollectorToCenter(
+	bool usableCenter, int desiredGatherers, int currentGatherers)
+{
+	return usableCenter && desiredGatherers > 0 &&
+		currentGatherers < desiredGatherers;
+}
+
+inline bool ShouldTrySkirmishAIRecruitBeforePaidTraining(
+	int currentCount, int maximumCount, bool factoryExists,
+	bool paidTrainingAffordable)
+{
+	(void)factoryExists;
+	(void)paidTrainingAffordable;
+	return currentCount < maximumCount;
+}
+
+inline bool ShouldSelectSkirmishAIReinforcementCandidate(
+	bool recruitedForFree, bool compatibleIdleProducer, bool reserveAdmitted)
+{
+	return recruitedForFree || (compatibleIdleProducer && reserveAdmitted);
+}
+
+inline bool IsSkirmishAIOperationalProducer(
+	bool owned, bool effectivelyDead, bool destroyed, bool rebuildHole,
+	bool sold, bool underConstruction, bool reconstructing,
+	bool disabled, bool unmanned, bool hasProduction)
+{
+	return owned && !effectivelyDead && !destroyed && !rebuildHole &&
+		!sold && !underConstruction && !reconstructing && !disabled &&
+		!unmanned && hasProduction;
+}
+
+inline bool IsSkirmishAICollectorProducerEligible(
+	bool supplyCenter, bool hasUsableLocalSource)
+{
+	return !supplyCenter || hasUsableLocalSource;
+}
+
+inline bool ShouldRetainSkirmishAIDepletedCollectorProduction(
+	bool matchingEntry, bool queueHead, float percentComplete)
+{
+	return matchingEntry && queueHead && percentComplete > 0.0f;
+}
+
+inline bool IsSkirmishAIDepletedCollectorQueueMappingUnambiguous(
+	int outstandingOrderQuantity, int matchingEntryQuantity,
+	bool ambiguousTail)
+{
+	return outstandingOrderQuantity > 0 && !ambiguousTail &&
+		outstandingOrderQuantity == matchingEntryQuantity;
+}
+
+inline int GetSkirmishAIDepletedCollectorRetainedOrderQuantity(
+	int outstandingOrderQuantity, int retainedHeadQuantity)
+{
+	if (outstandingOrderQuantity <= 0 || retainedHeadQuantity <= 0)
+		return 0;
+	return retainedHeadQuantity < outstandingOrderQuantity
+		? retainedHeadQuantity : outstandingOrderQuantity;
+}
+
+inline bool ShouldRetainSkirmishAIStrategicPowerDispatchLock(
+	bool lockStillPresent, bool acceptanceObserved)
+{
+	return lockStillPresent && acceptanceObserved;
+}
+
+inline int GetSkirmishAIAggregateReserve(
+	int resourcesPoor, int rebuildCost, int recoveryCost)
+{
+	int reserve = GetSkirmishAIReserve(resourcesPoor, rebuildCost);
+	if (recoveryCost < 0)
+		recoveryCost = 0;
+	return recoveryCost > reserve ? recoveryCost : reserve;
+}
+
+inline int GetFreshSkirmishAIProductionReserve(
+	int resourcesPoor, int rebuildCost, int recoveryCost)
+{
+	return GetSkirmishAIAggregateReserve(
+		resourcesPoor, rebuildCost, recoveryCost);
+}
+
+enum SkirmishAISpendAuthorization
+{
+	SKIRMISH_AI_SPEND_AUTHORIZATION_NONE = 0,
+	SKIRMISH_AI_SPEND_AUTHORIZATION_BUILDER,
+	SKIRMISH_AI_SPEND_AUTHORIZATION_COLLECTOR,
+	SKIRMISH_AI_SPEND_AUTHORIZATION_PRIORITY_STRUCTURE
+};
+
+inline bool CanSkirmishAISpendWithAuthorization(
+	int resources, int cost, int productionReserve, int recoveryReserve,
+	SkirmishAISpendAuthorization authorization)
+{
+	if (cost < 0)
+		cost = 0;
+	if (productionReserve < 0)
+		productionReserve = 0;
+	if (recoveryReserve < 0)
+		recoveryReserve = 0;
+	const int reserve = authorization == SKIRMISH_AI_SPEND_AUTHORIZATION_NONE
+		? productionReserve : recoveryReserve;
+	return (double)resources >= (double)cost + (double)reserve;
+}
+
+inline bool ShouldLockSkirmishAIStrategicPowerSource(
+	bool attemptPending, bool sourceCommandLocked, bool exactReadyCompatibleSource)
+{
+	return attemptPending && !sourceCommandLocked && exactReadyCompatibleSource;
+}
+
+inline bool ShouldFailSkirmishAIStrategicPowerSourceLock(
+	bool sourceCommandLocked, bool attemptPending, bool trackedSourceValid)
+{
+	return sourceCommandLocked && attemptPending && !trackedSourceValid;
+}
+
+inline bool IsSkirmishAIStrategicPowerDispatchable(
+	bool countdownPaused, bool sourceDisabled)
+{
+	return !countdownPaused && !sourceDisabled;
+}
+
+inline bool ShouldRejectSkirmishAIStrategicPowerRequest(
+	bool sourceCommandLocked, bool lockedCommandValid)
+{
+	return sourceCommandLocked && lockedCommandValid;
+}
+
+inline bool GetSkirmishAIStrategicPowerSourceLockForVersion(
+	int version, bool savedLock)
+{
+	return version >= 11 ? savedLock : false;
+}
+
+inline unsigned int GetSkirmishAIReinforcementCursorForVersion(
+	int version, unsigned int savedCursor)
+{
+	return version >= 11 ? savedCursor : 0;
+}
+
+inline int GetSkirmishAIProductionCounterFitScore(
+	int counterFitScore, SkirmishAIProductionMode mode)
+{
+	counterFitScore = ClampSkirmishAIDecisionValue(counterFitScore, 0, 300);
+	if (mode == SKIRMISH_AI_PRODUCTION_ASSAULT)
+		return ClampSkirmishAIDecisionValue(counterFitScore * 2, 0, 500);
+	if (mode == SKIRMISH_AI_PRODUCTION_FORTIFY)
+		return ClampSkirmishAIDecisionValue(counterFitScore * 3 / 2, 0, 400);
+	return counterFitScore;
+}
+
+inline bool IsSkirmishAISupplyRevenueAvailable(
+	bool centerExists, bool centerOwned, bool isRebuildHole,
+	bool sourceExists, bool sourceIsEnemy, int boxesStored)
+{
+	return centerExists && centerOwned && !isRebuildHole && sourceExists &&
+		!sourceIsEnemy && boxesStored > 0;
+}
+
+inline bool IsSkirmishAIAlternateIncomeStructure(
+	bool cashGenerator, bool supplyDropzone,
+	bool blackMarket, bool internetCenter)
+{
+	return cashGenerator || supplyDropzone || blackMarket || internetCenter;
+}
+
+inline bool ShouldBuildSkirmishAIPrerequisiteSupplyCenter(
+	bool hasUsableSupply, bool hasOwnedSupplyCenter, bool hasQueuedSupplyCenter)
+{
+	return !hasUsableSupply && !hasOwnedSupplyCenter && !hasQueuedSupplyCenter;
+}
+
+inline bool ShouldKeepSkirmishAISuperweaponConstructionPending(
+	bool exists, bool owned, bool superweapon, bool isRebuildHole,
+	bool effectivelyDead, bool destroyed, bool sold,
+	bool underConstruction, bool reconstructing)
+{
+	return exists && owned && superweapon && !isRebuildHole &&
+		!effectivelyDead && !destroyed && !sold &&
+		(underConstruction || reconstructing);
+}
+
+inline bool ShouldContinueSkirmishAIStrategyAfterRecovery(
+	bool recoveryImpossible, bool productionBehavior)
+{
+	return !recoveryImpossible || productionBehavior;
+}
+
+inline bool DoesSkirmishAIDependentStructureSatisfyPrerequisiteDemand(
+	bool exists, bool owned, bool isRebuildHole, bool effectivelyDead,
+	bool destroyed, bool sold, bool underConstruction, bool reconstructing)
+{
+	return exists && owned && !isRebuildHole && !effectivelyDead &&
+		!destroyed && !sold && !underConstruction && !reconstructing;
+}
+
+inline bool ShouldInspectSkirmishAIPrerequisiteAlternative(
+	bool prerequisiteExists, bool prerequisiteSatisfied)
+{
+	return prerequisiteExists && !prerequisiteSatisfied;
+}
+
+inline bool ShouldUseSkirmishAIStrategicPowerSource(
+	bool productionBehavior, bool fortifyMode, bool strategicPower,
+	bool attemptPending, bool exactReadyCompatibleSource)
+{
+	if (!productionBehavior || !fortifyMode || !strategicPower)
+		return true;
+	return attemptPending && exactReadyCompatibleSource;
+}
+
+inline int GetSkirmishAIStructurePriority(
+	bool scriptedPriority, bool commandCenter, bool requiredPower,
+	bool cashGenerator, bool usableSupplyCenter, bool productionFacility,
+	bool baseDefense, bool fortifyMode, bool admittedSuperweapon)
+{
+	if (scriptedPriority)
+		return 1000;
+	if (commandCenter)
+		return 900;
+	if (requiredPower)
+		return 850;
+	if (cashGenerator)
+		return 800;
+	if (usableSupplyCenter)
+		return 775;
+	if (productionFacility)
+		return 700;
+	if (baseDefense)
+		return fortifyMode ? 675 : 550;
+	if (admittedSuperweapon)
+		return 625;
+	return 100;
+}
+
 inline bool IsSkirmishAIAffordable(int resources, int minimumCost, int reserve)
 {
 	if (minimumCost < 0)
@@ -632,10 +947,12 @@ inline __int64 GetSkirmishAIFinalScore(int configuredPriority, int contextScore,
 		(__int64)contextScore * contextPercent / 100;
 }
 
-inline SkirmishAITeamScoreResult ScoreSkirmishAITeam(const SkirmishAITeamScoreInput &input)
+inline SkirmishAITeamScoreResult ScoreSkirmishAITeam(
+	const SkirmishAITeamScoreInput &input, bool allowExpandedCounterFit)
 {
 	SkirmishAITeamScoreResult result;
-	result.counterFitScore = ClampSkirmishAIDecisionValue(input.counterFitScore, 0, 300);
+	result.counterFitScore = ClampSkirmishAIDecisionValue(
+		input.counterFitScore, 0, allowExpandedCounterFit ? 500 : 300);
 	result.economyScore = GetSkirmishAIEconomyScore(
 		input.resources, input.minimumCost, input.plannedCost, input.reserve);
 	result.factoryWaitScore = GetSkirmishAIFactoryWaitScore(
@@ -653,6 +970,28 @@ inline SkirmishAITeamScoreResult ScoreSkirmishAITeam(const SkirmishAITeamScoreIn
 		result.rawContextScore,
 		GetSkirmishAIContextInfluencePercent(input.difficulty));
 	return result;
+}
+
+inline SkirmishAITeamScoreResult ScoreSkirmishAITeam(
+	const SkirmishAITeamScoreInput &input)
+{
+	return ScoreSkirmishAITeam(input, false);
+}
+
+inline int GetSkirmishAIReinforcementRoundRobinPass(
+	unsigned int candidateID, unsigned int cursorID)
+{
+	if (candidateID > cursorID)
+		return 0;
+	if (candidateID < cursorID)
+		return 1;
+	return 2;
+}
+
+inline unsigned int AdvanceSkirmishAIRoundRobinCursor(
+	unsigned int cursorID, unsigned int selectedID, bool selectionSucceeded)
+{
+	return selectionSucceeded ? selectedID : cursorID;
 }
 
 inline bool IsSkirmishAITeamScoreTie(__int64 firstScore, __int64 secondScore)

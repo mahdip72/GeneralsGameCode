@@ -38,6 +38,8 @@
 #include "Common/ThingTemplate.h"
 #include "Common/ThingFactory.h"
 #include "Common/Player.h"
+#include "Common/Recorder.h"
+#include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/Money.h"
 #include "Common/Radar.h"
 #include "Common/RandomValue.h"
@@ -50,8 +52,10 @@
 #include "GameClient/InGameUI.h"
 
 #include "GameLogic/AIPathfind.h"
+#include "GameLogic/GameLogic.h"
 #include "GameLogic/Locomotor.h"
 #include "GameLogic/PartitionManager.h"
+#include "GameLogic/SkirmishAIRecovery.h"
 #include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/Module/BridgeBehavior.h"
 #include "GameLogic/Module/BridgeTowerBehavior.h"
@@ -106,6 +110,7 @@ WorkerAIUpdate::WorkerAIUpdate( Thing *thing, const ModuleData* moduleData ) :
 	m_supplyTruckStateMachine = nullptr;
 	m_numberBoxes = 0;
 	m_forcePending = FALSE;
+	m_stage3CollectorRole = FALSE;
 	m_forcedBusyPending = FALSE;
 
 	m_workerMachine = nullptr;
@@ -329,7 +334,7 @@ Object *WorkerAIUpdate::construct( const ThingTemplate *what,
 	// changes, while preserving the existing rebuild-hole path.
 	if (!isRebuild && what && owningPlayer &&
 		!owningPlayer->canSpendForSkirmishAIRecovery(
-			what->calcCostToBuild(owningPlayer), what, FALSE))
+			what->calcCostToBuild(owningPlayer), what, FALSE, TRUE))
 		return nullptr;
 	// GS - Construct needs to be an AI primitive.  Inheriting off of AIUpdate means you are writing a
 	// master brain that will call AI primitives on the object, not something that does stuff itself.
@@ -551,6 +556,9 @@ void WorkerAIUpdate::privateIdle(CommandSourceType cmdSource)
 void WorkerAIUpdate::privateDock( Object *dock, CommandSourceType cmdSource )
 {
 	AIUpdateInterface::privateDock( dock, cmdSource );
+	if (dock && (dock->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+		dock->isKindOf(KINDOF_SUPPLY_SOURCE)))
+		m_stage3CollectorRole = TRUE;
 
 	// If this is a command from a player, I will remember this as my favorite dock to override
 	// ResourceManager searches.
@@ -622,6 +630,7 @@ void WorkerAIUpdate::newTask( DozerTask task, Object* target )
 		return;
 
 	m_preferredDock = INVALID_ID; // If we are dozing, we don't want any supply truck stuff going on. jba.
+	m_stage3CollectorRole = FALSE;
 
 	//
 	// special check for the build task, we should never be given more than one of them ...
@@ -1441,6 +1450,15 @@ void WorkerAIUpdate::crc( Xfer *xfer )
 {
 	// extend base class
 	AIUpdateInterface::crc(xfer);
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: (TheGameLogic ? TheGameLogic->getGameMode() : GAME_NONE);
+	if (IsSkirmishAIRecoveryGameMode(gameMode) &&
+		ShouldIncludeSkirmishAIProductionCRCFields(replay,
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY))
+		xfer->xferBool(&m_stage3CollectorRole);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -1448,6 +1466,7 @@ void WorkerAIUpdate::crc( Xfer *xfer )
 	* Version Info:
 	* 1: Initial version
 	* 2: TheSuperHackers @tweak Stubbjax 17/11/2025 Save the worker's previous task
+	* 3: Stage 3 collector versus builder role
 	*/
 // ------------------------------------------------------------------------------------------------
 void WorkerAIUpdate::xfer( Xfer *xfer )
@@ -1455,7 +1474,7 @@ void WorkerAIUpdate::xfer( Xfer *xfer )
 #if RETAIL_COMPATIBLE_XFER_SAVE
 	XferVersion currentVersion = 1;
 #else
-	XferVersion currentVersion = 2;
+	XferVersion currentVersion = 3;
 #endif
   XferVersion version = currentVersion;
   xfer->xferVersion( &version, currentVersion );
@@ -1480,7 +1499,7 @@ void WorkerAIUpdate::xfer( Xfer *xfer )
 	xfer->xferSnapshot(m_dozerMachine);
 	xfer->xferUser(&m_currentTask, sizeof(m_currentTask));
 
-	if (currentVersion >= 2)
+	if (version >= 2)
 	{
 		xfer->xferUser(&m_previousTask, sizeof(m_previousTask));
 		xfer->xferUser(&m_previousTaskInfo, sizeof(m_previousTaskInfo));
@@ -1509,6 +1528,11 @@ void WorkerAIUpdate::xfer( Xfer *xfer )
 
 	//-------------------------- xfer Worker info
 	xfer->xferSnapshot(m_workerMachine);
+	if (version >= 3)
+		xfer->xferBool(&m_stage3CollectorRole);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		m_stage3CollectorRole = m_preferredDock != INVALID_ID ||
+			m_forcePending || isCurrentlyFerryingSupplies();
 
 }
 
