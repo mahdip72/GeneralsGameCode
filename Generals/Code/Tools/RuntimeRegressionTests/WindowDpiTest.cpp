@@ -4,6 +4,10 @@
 
 #include "WindowDpi.h"
 
+#ifndef DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE
+#define DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE ((HANDLE)-3)
+#endif
+
 namespace
 {
 	const char *kWindowClassName = "RTS_WindowDpiContractTest";
@@ -57,53 +61,133 @@ namespace
 		return true;
 	}
 
-	bool VerifyPm1LinearSuggestionFallback(HWND window, UINT currentDpi)
+	class ScopedPerMonitorV1ThreadContext
 	{
-		const LONG clientWidth = 800;
-		const LONG clientHeight = 600;
-		SIZE currentDpiSize;
-		if (!WindowDpi::GetWindowSizeForClientAtDpi(
-			window, clientWidth, clientHeight, currentDpi, &currentDpiSize))
-			return Fail("could not prepare the PMv1 800x600 client window");
+		typedef HANDLE (WINAPI *SetThreadDpiAwarenessContextProc)(HANDLE);
 
-		RECT before;
-		if (!GetWindowRect(window, &before) ||
-			!SetWindowPos(window, NULL, before.left, before.top,
-				currentDpiSize.cx, currentDpiSize.cy,
-				SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE))
-			return Fail("could not prepare the PMv1 800x600 client window");
+	public:
+		ScopedPerMonitorV1ThreadContext() :
+			m_setContext(NULL),
+			m_previousContext(NULL)
+		{
+			HMODULE user32 = GetModuleHandleA("user32.dll");
+			FARPROC proc = user32 ? GetProcAddress(user32, "SetThreadDpiAwarenessContext") : NULL;
+			if (proc)
+			{
+				m_setContext = reinterpret_cast<SetThreadDpiAwarenessContextProc>(proc);
+				m_previousContext = m_setContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+			}
+		}
 
-		RECT actualClient;
-		RECT currentWindow;
-		if (!GetClientRect(window, &actualClient) || !GetWindowRect(window, &currentWindow) ||
-			actualClient.right - actualClient.left != clientWidth ||
-			actualClient.bottom - actualClient.top != clientHeight)
-			return Fail("PMv1 test window did not reach the exact 800x600 client size");
+		~ScopedPerMonitorV1ThreadContext()
+		{
+			if (m_setContext && m_previousContext)
+				m_setContext(m_previousContext);
+		}
 
-		const UINT targetDpi = currentDpi + currentDpi / 2;
-		RECT suggested;
-		suggested.left = currentWindow.left + 29;
-		suggested.top = currentWindow.top + 37;
-		suggested.right = suggested.left + (currentWindow.right - currentWindow.left) * 3 / 2;
-		suggested.bottom = suggested.top + (currentWindow.bottom - currentWindow.top) * 3 / 2;
-		const LONG suggestedLeft = suggested.left;
-		const LONG suggestedTop = suggested.top;
-		if (!WindowDpi::AdjustDpiChangedRectForClientSize(window, &suggested, targetDpi))
-			return Fail("PMv1 fallback rejected a valid linearly scaled DPI suggestion");
+		bool IsActive() const
+		{
+			return m_setContext != NULL && m_previousContext != NULL;
+		}
 
-		SIZE expectedTargetSize;
-		if (!ExpectWindowSizeForClientAtDpi(window, clientWidth, clientHeight, targetDpi) ||
-			!WindowDpi::GetWindowSizeForClientAtDpi(
-				window, clientWidth, clientHeight, targetDpi, &expectedTargetSize))
-			return false;
+	private:
+		SetThreadDpiAwarenessContextProc m_setContext;
+		HANDLE m_previousContext;
+	};
 
-		if (suggested.left != suggestedLeft || suggested.top != suggestedTop)
-			return Fail("PMv1 fallback changed the suggested cursor-relative position");
-		if (suggested.right - suggested.left != expectedTargetSize.cx ||
-			suggested.bottom - suggested.top != expectedTargetSize.cy)
-			return Fail("1.5x WM_DPICHANGED suggestion did not retain the 800x600 client at target DPI");
+	bool VerifyPm1AppliedLinearSuggestionFallback()
+	{
+		ScopedPerMonitorV1ThreadContext dpiContext;
+		if (!dpiContext.IsActive())
+		{
+			puts("PMv1 applied-window DPI check skipped: SetThreadDpiAwarenessContext is unavailable");
+			return true;
+		}
 
-		return true;
+		// Create the host window as PMv1 without enabling non-client DPI scaling,
+		// matching the game window's legacy-awareness fallback.
+		HWND window = CreateWindowExA(0, kWindowClassName, "", kWindowStyle,
+			20, 20, 640, 480, NULL, NULL, GetModuleHandleA(NULL), NULL);
+		if (!window)
+			return Fail("could not create a PMv1-aware fallback test window");
+
+		bool success = false;
+		do
+		{
+			const LONG clientWidth = 800;
+			const LONG clientHeight = 600;
+			RECT initialClient;
+			RECT initialWindow;
+			if (!GetClientRect(window, &initialClient) || !GetWindowRect(window, &initialWindow))
+			{
+				Fail("could not inspect the PMv1 fallback test window");
+				break;
+			}
+
+			const LONG frameWidth = (initialWindow.right - initialWindow.left) -
+				(initialClient.right - initialClient.left);
+			const LONG frameHeight = (initialWindow.bottom - initialWindow.top) -
+				(initialClient.bottom - initialClient.top);
+			if (frameWidth < 0 || frameHeight < 0 ||
+				!SetWindowPos(window, NULL, initialWindow.left, initialWindow.top,
+					clientWidth + frameWidth, clientHeight + frameHeight,
+					SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE))
+			{
+				Fail("could not prepare the PMv1 800x600 client window");
+				break;
+			}
+
+			RECT actualClient;
+			RECT currentWindow;
+			if (!GetClientRect(window, &actualClient) || !GetWindowRect(window, &currentWindow) ||
+				actualClient.right - actualClient.left != clientWidth ||
+				actualClient.bottom - actualClient.top != clientHeight)
+			{
+				Fail("PMv1 test window did not reach the exact 800x600 client size");
+				break;
+			}
+
+			RECT suggested;
+			suggested.left = currentWindow.left + 29;
+			suggested.top = currentWindow.top + 37;
+			suggested.right = suggested.left + (currentWindow.right - currentWindow.left) * 3 / 2;
+			suggested.bottom = suggested.top + (currentWindow.bottom - currentWindow.top) * 3 / 2;
+			const LONG suggestedLeft = suggested.left;
+			const LONG suggestedTop = suggested.top;
+			if (!WindowDpi::AdjustDpiChangedRectForClientSize(window, &suggested) ||
+				!WindowDpi::ApplyDpiChangedRect(window, &suggested))
+			{
+				Fail("PMv1 fallback could not apply the corrected DPI suggestion");
+				break;
+			}
+
+			RECT finalClient;
+			RECT finalWindow;
+			if (!GetClientRect(window, &finalClient) || !GetWindowRect(window, &finalWindow))
+			{
+				Fail("could not inspect the applied PMv1 fallback window");
+				break;
+			}
+
+			if (finalClient.right - finalClient.left != clientWidth ||
+				finalClient.bottom - finalClient.top != clientHeight)
+			{
+				Fail("applied 1.5x PMv1 DPI suggestion changed the 800x600 client size");
+				break;
+			}
+			if (finalWindow.left != suggestedLeft || finalWindow.top != suggestedTop)
+			{
+				Fail("PMv1 fallback did not retain the suggested cursor-relative position");
+				break;
+			}
+
+			success = true;
+		} while (false);
+
+		DestroyWindow(window);
+		if (success)
+			puts("PMv1 applied-window DPI fallback passed");
+		return success;
 	}
 
 	bool RunWindowDpiContractTest()
@@ -226,7 +310,7 @@ namespace
 			DestroyWindow(window);
 			return Fail("WM_DPICHANGED did not honor the suggested position");
 		}
-		if (!VerifyPm1LinearSuggestionFallback(window, currentDpi))
+		if (!VerifyPm1AppliedLinearSuggestionFallback())
 		{
 			DestroyWindow(window);
 			return false;

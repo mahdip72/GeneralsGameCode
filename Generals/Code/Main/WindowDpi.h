@@ -135,30 +135,32 @@ namespace WindowDpi
 			SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
 	}
 
-	// Per-monitor-v1 windows do not receive WM_GETDPISCALEDSIZE. Their
-	// WM_DPICHANGED suggestion is linearly scaled, so preserve the current client
-	// dimensions and use the suggestion only for cursor-relative positioning.
+	// Per-monitor-v1 windows do not receive WM_GETDPISCALEDSIZE and their
+	// non-client frame is not automatically rescaled. Preserve the current client
+	// dimensions using the measured frame, and use the suggestion only for its
+	// cursor-relative position.
 	static inline BOOL AdjustDpiChangedRectForClientSize(
-		HWND window, RECT *suggestedRect, UINT dpi)
+		HWND window, RECT *suggestedRect)
 	{
 		if (!window || !suggestedRect)
 			return FALSE;
 
+		RECT windowRect;
 		RECT clientRect;
-		if (!::GetClientRect(window, &clientRect))
+		if (!::GetWindowRect(window, &windowRect) || !::GetClientRect(window, &clientRect))
 			return FALSE;
 
 		const LONG clientWidth = clientRect.right - clientRect.left;
 		const LONG clientHeight = clientRect.bottom - clientRect.top;
-		SIZE windowSize;
-		if (!GetWindowSizeForClientAtDpi(
-			window, clientWidth, clientHeight, dpi, &windowSize))
+		const LONG frameWidth = (windowRect.right - windowRect.left) - clientWidth;
+		const LONG frameHeight = (windowRect.bottom - windowRect.top) - clientHeight;
+		if (clientWidth <= 0 || clientHeight <= 0 || frameWidth < 0 || frameHeight < 0)
 			return FALSE;
 
 		const LONG left = suggestedRect->left;
 		const LONG top = suggestedRect->top;
-		suggestedRect->right = left + windowSize.cx;
-		suggestedRect->bottom = top + windowSize.cy;
+		suggestedRect->right = left + clientWidth + frameWidth;
+		suggestedRect->bottom = top + clientHeight + frameHeight;
 		return TRUE;
 	}
 }

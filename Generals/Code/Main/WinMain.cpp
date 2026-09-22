@@ -448,8 +448,7 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 						else
 						{
 							RECT adjustedRect = *suggestedRect;
-							if (!WindowDpi::AdjustDpiChangedRectForClientSize(
-								hWnd, &adjustedRect, dpi))
+							if (!WindowDpi::AdjustDpiChangedRectForClientSize(hWnd, &adjustedRect))
 								adjustedRect = *suggestedRect;
 							WindowDpi::ApplyDpiChangedRect(hWnd, &adjustedRect);
 						}
