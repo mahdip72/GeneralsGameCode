@@ -135,6 +135,36 @@ function Assert-RendererCaptureContract {
         "W3DDisplay for $TitleRoot must evaluate native capture completion after End_Render"
 }
 
+function Assert-EndRenderFailureReportingContract {
+    param(
+        [string] $TitleRoot
+    )
+
+    $displayPath = Join-Path $SourceRoot "$TitleRoot/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp"
+    $displaySource = Get-Content -LiteralPath $displayPath -Raw
+    $helperStart = $displaySource.IndexOf('static void reportEndRenderFailure(WW3DErrorType result)')
+    $helperEnd = $displaySource.IndexOf('#ifdef SAMPLE_DYNAMIC_LIGHT', $helperStart)
+    Assert-SourceContract ($helperStart -ge 0 -and $helperEnd -gt $helperStart) `
+        "could not isolate End_Render failure reporting for $TitleRoot"
+
+    $helper = $displaySource.Substring($helperStart, $helperEnd - $helperStart)
+    Assert-SourceContract ($helper.Contains('static bool failureAlreadyReported = false;') -and
+        $helper.Contains('if (result == WW3D_ERROR_OK)') -and
+        $helper.Contains('failureAlreadyReported = false;')) `
+        "End_Render failure reporting for $TitleRoot must reset its once-per-streak latch after a successful frame"
+    Assert-SourceContract ($helper.Contains('if (failureAlreadyReported)') -and
+        $helper.Contains('::OutputDebugString(message);')) `
+        "End_Render failure reporting for $TitleRoot must suppress repeated errors and emit through the Release-safe debugger channel"
+
+    $endRenderCount = [regex]::Matches($displaySource, 'WW3D::End_Render\(\)').Count
+    $reportedResultCount = [regex]::Matches(
+        $displaySource,
+        'const WW3DErrorType endRenderResult = WW3D::End_Render\(\);\s*reportEndRenderFailure\(endRenderResult\);'
+    ).Count
+    Assert-SourceContract ($endRenderCount -eq 3 -and $reportedResultCount -eq $endRenderCount) `
+        "every End_Render path for $TitleRoot must report its result"
+}
+
 function Assert-NativeCaptureAndTeardownContract {
     $nativePath = Join-Path $SourceRoot 'Core/Libraries/Source/WWVegas/WW3D2/nativew3d2.cpp'
     $rendererPath = Join-Path $SourceRoot 'Core/Libraries/Source/Renderer/NativeW3DRenderer.cpp'
@@ -172,8 +202,9 @@ foreach ($titleRoot in @('Generals', 'GeneralsMD')) {
     Assert-InitialRender2DResolutionContract $titleRoot
     Assert-InitialMSAAContract $titleRoot
     Assert-RendererCaptureContract $titleRoot
+    Assert-EndRenderFailureReportingContract $titleRoot
 }
 
 Assert-NativeCaptureAndTeardownContract
 
-Write-Output 'Native GameRenderClient lifecycle, capture acknowledgement, teardown, startup MSAA, and 2D viewport source audit passed.'
+Write-Output 'Native GameRenderClient lifecycle, capture acknowledgement, End_Render failure reporting, teardown, startup MSAA, and 2D viewport source audit passed.'

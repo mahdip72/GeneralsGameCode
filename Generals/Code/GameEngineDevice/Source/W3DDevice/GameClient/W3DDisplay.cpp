@@ -39,6 +39,7 @@ static void drawFramerateBar();
 #include <windows.h>
 #include <mmsystem.h>
 #include <io.h>
+#include <stdio.h>
 #include <time.h>
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
@@ -151,6 +152,27 @@ private:
 // DEFINE AND ENUMS ///////////////////////////////////////////////////////////
 
 #define no_SAMPLE_DYNAMIC_LIGHT	1
+
+// End_Render failures can suppress native presentation.  Report the first
+// failure in a continuous run without adding per-frame diagnostic traffic.
+static void reportEndRenderFailure(WW3DErrorType result)
+{
+	static bool failureAlreadyReported = false;
+
+	if (result == WW3D_ERROR_OK)
+	{
+		failureAlreadyReported = false;
+		return;
+	}
+	if (failureAlreadyReported)
+		return;
+
+	char message[96];
+	sprintf(message, "W3DDisplay: WW3D::End_Render failed (%d).\n", static_cast<int>(result));
+	::OutputDebugString(message);
+	failureAlreadyReported = true;
+}
+
 #ifdef SAMPLE_DYNAMIC_LIGHT
 static W3DDynamicLight * theDynamicLight = nullptr;
 static Real theLightXOffset = 0.1f;
@@ -1797,7 +1819,8 @@ void W3DDisplay::calculateTerrainLOD()
 			{	// draw all views of the world
 				drawViews();
 				// render is all done!
-				WW3D::End_Render();
+				const WW3DErrorType endRenderResult = WW3D::End_Render();
+				reportEndRenderFailure(endRenderResult);
 			}
 			Int64 time64 = getPerformanceCounter();
 			timeForFrame = (float)((double)(time64-startTime64) / (double)(freq64));
@@ -2054,6 +2077,7 @@ AGAIN:
 					if (captureArmed)
 						rts::render::RequestGameBackBufferCapture();
 					const WW3DErrorType endRenderResult = WW3D::End_Render();
+					reportEndRenderFailure(endRenderResult);
 					const bool captureCompleted = captureArmed &&
 						rts::render::ConsumeGameBackBufferCaptureSuccess();
 					if (captureArmed && rendererCaptureFrameGate.complete(
@@ -2156,6 +2180,7 @@ AGAIN:
 				if (captureArmed)
 					rts::render::RequestGameBackBufferCapture();
 				const WW3DErrorType endRenderResult = WW3D::End_Render();
+				reportEndRenderFailure(endRenderResult);
 				const bool captureCompleted = captureArmed &&
 					rts::render::ConsumeGameBackBufferCaptureSuccess();
 				if (captureArmed && rendererCaptureFrameGate.complete(
