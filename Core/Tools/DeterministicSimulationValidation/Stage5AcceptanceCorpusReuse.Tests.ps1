@@ -9,6 +9,21 @@ function Assert-CorpusReuseTest {
     if (-not $Condition) { throw $Message }
 }
 
+function Get-Sha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try {
+            return (($sha.ComputeHash($stream) | ForEach-Object {
+                $_.ToString('X2')
+            }) -join '')
+        }
+        finally { $sha.Dispose() }
+    }
+    finally { $stream.Dispose() }
+}
+
 $scratchFull = [IO.Path]::GetFullPath($ScratchRoot)
 if (-not [String]::Equals([IO.Path]::GetPathRoot($scratchFull), 'H:\',
         [StringComparison]::OrdinalIgnoreCase)) {
@@ -62,6 +77,74 @@ try {
     }
     catch {
         throw "The installed-runtime Acceptance fixture violates the production details contract: $($_.Exception.Message)"
+    }
+
+    $replayBindingDefinitions = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Set-Stage5ReplayEvidenceHashBinding'
+    }, $true))
+    Assert-CorpusReuseTest ($replayBindingDefinitions.Count -eq 1) `
+        'The Acceptance entrypoint must define one replay-evidence hash rebinding helper.'
+    Invoke-Expression $replayBindingDefinitions[0].Extent.Text
+    $replayBindingCalls = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'Set-Stage5ReplayEvidenceHashBinding'
+    }, $true))
+    Assert-CorpusReuseTest ($replayBindingCalls.Count -eq 3) `
+        'Duplicate-title, restored-source, and swapped-title acceptance probes must each refresh the cross-evidence hash.'
+
+    $replayBindingProbePath = Join-Path $runRoot 'replay-binding-probe.json'
+    [IO.File]::WriteAllText($replayBindingProbePath, '{"marker":"mutated replay"}')
+    $actualReplayHash = Get-Sha256 $replayBindingProbePath
+    $runtimeDetailsProbe = [ordered]@{
+        gateName = 'deterministic-runtime'; isolatedPipelineMode = 'serial'
+        simulationModes = @('serial', 'parallel', 'shadow')
+        workerConfigurations = @('serial-1', 'parallel-1', 'parallel-2',
+            'parallel-4', 'parallel-8', 'parallel-16', 'parallel-auto')
+        isolatedMatrixPassed = $true; finalAcceptanceClaim = $false
+        replayEvidenceSha256 = 'A' * 64
+        freshAiEvidenceSha256 = 'B' * 64
+        performanceEvidenceSha256 = 'C' * 64
+        installedKernelExecution = [ordered]@{
+            status = 'skipped'; claim = $false
+            reason = 'external-qualification-exempt-and-reviewed-native-fixture-unavailable'
+            sha256 = $null
+        }
+    }
+    $runtimeHashesProbe = @{
+        'replay-determinism' = $actualReplayHash
+        'fresh-ai' = 'B' * 64
+        'performance-scaling' = 'C' * 64
+    }
+    $staleReplayBindingError = ''
+    try {
+        & $evidenceModule {
+            param($Details, $EvidenceHashes)
+            Assert-Stage5FinalAcceptanceDetails 'deterministic-runtime' `
+                $Details ('a' * 40) $EvidenceHashes
+        } $runtimeDetailsProbe $runtimeHashesProbe
+    }
+    catch { $staleReplayBindingError = $_.Exception.Message }
+    Assert-CorpusReuseTest ($staleReplayBindingError -match
+        'replayEvidenceSha256 does not bind the independently hashed replay-determinism evidence') `
+        'The focused replay mutation probe must expose the stale cross-evidence binding before title-specific validation.'
+
+    $runtimeEvidenceProbe = [ordered]@{ details = $runtimeDetailsProbe }
+    Set-Stage5ReplayEvidenceHashBinding $replayBindingProbePath $runtimeEvidenceProbe
+    Assert-CorpusReuseTest ($runtimeEvidenceProbe.details.replayEvidenceSha256 -ceq
+        $actualReplayHash) `
+        'Refreshing the deterministic-runtime binding must hash the current replay evidence bytes.'
+    try {
+        & $evidenceModule {
+            param($Details, $EvidenceHashes)
+            Assert-Stage5FinalAcceptanceDetails 'deterministic-runtime' `
+                $Details ('a' * 40) $EvidenceHashes
+        } $runtimeEvidenceProbe.details $runtimeHashesProbe
+    }
+    catch {
+        throw "The rebound runtime evidence does not satisfy its production contract: $($_.Exception.Message)"
     }
 
     $helperNames = @(
@@ -235,7 +318,7 @@ try {
     Assert-CorpusReuseTest ([Convert]::ToBase64String([IO.File]::ReadAllBytes($firstPath)) -ceq
         $firstOriginal) 'A successful case must also restore its source document byte-for-byte.'
 
-    Write-Output 'Stage 5 Acceptance corpus reuse self-test passed: one full corpus, nine producer cases, and byte-identical mutation restores.'
+    Write-Output 'Stage 5 Acceptance preflight self-test passed: installed-runtime/replay bindings, one full corpus, nine producer cases, and byte-identical mutation restores.'
 }
 finally {
     $runItem = Get-Item -LiteralPath $runRoot -Force

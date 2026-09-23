@@ -10477,17 +10477,33 @@ try {
         Assert-True $false "the installed lockstep-v2 adapter should satisfy final acceptance: $($_.Exception.Message)"
     }
 
-    # Replay qualification is title-scoped.  Exercise the composite
+    function Set-Stage5ReplayEvidenceHashBinding {
+        param([Parameter(Mandatory = $true)][string]$ReplayEvidencePath,
+            [Parameter(Mandatory = $true)][object]$RuntimeEvidenceDocument)
+        $RuntimeEvidenceDocument.details.replayEvidenceSha256 =
+            Get-Sha256 $ReplayEvidencePath
+    }
+
+    # Replay qualification is title-scoped. Exercise the composite
     # role/title attachment key explicitly: collapsing the two reviewed
     # manifests to one key, or swapping a title onto the other receipt, must
-    # fail closed even when every referenced file remains byte-valid.
+    # fail closed even when every referenced file remains byte-valid. Rebind
+    # the deterministic-runtime receipt after each mutation so the aggregator
+    # reaches the title-binding guard instead of correctly rejecting a stale
+    # cross-evidence hash first.
     $replayEvidencePath = $evidencePaths['replay-determinism']
     $replayEvidenceOriginalText = [IO.File]::ReadAllText($replayEvidencePath)
+    $runtimeEvidencePath = $evidencePaths['deterministic-runtime']
+    $runtimeEvidenceOriginalText = [IO.File]::ReadAllText($runtimeEvidencePath)
+    $runtimeEvidenceDocument = $evidenceDocuments['deterministic-runtime']
     try {
         $duplicateReplayDocument = ConvertFrom-Stage5TestJsonDictionary `
             $replayEvidencePath
         $duplicateReplayDocument['attachments'][2]['title'] = 'Generals'
         Write-JsonDocument $replayEvidencePath $duplicateReplayDocument
+        Set-Stage5ReplayEvidenceHashBinding $replayEvidencePath `
+            $runtimeEvidenceDocument
+        Write-JsonDocument $runtimeEvidencePath $runtimeEvidenceDocument
         Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
         Assert-Throws {
             Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
@@ -10496,6 +10512,9 @@ try {
             'replay acceptance rejects a duplicate composite role/title attachment key'
 
         [IO.File]::WriteAllText($replayEvidencePath, $replayEvidenceOriginalText)
+        Set-Stage5ReplayEvidenceHashBinding $replayEvidencePath `
+            $runtimeEvidenceDocument
+        Write-JsonDocument $runtimeEvidencePath $runtimeEvidenceDocument
         $swappedReplayDocument = ConvertFrom-Stage5TestJsonDictionary `
             $replayEvidencePath
         $generalsManifestPath = $swappedReplayDocument['attachments'][1]['path']
@@ -10507,6 +10526,9 @@ try {
         $swappedReplayDocument['attachments'][2]['path'] = $generalsManifestPath
         $swappedReplayDocument['attachments'][2]['sha256'] = $generalsManifestHash
         Write-JsonDocument $replayEvidencePath $swappedReplayDocument
+        Set-Stage5ReplayEvidenceHashBinding $replayEvidencePath `
+            $runtimeEvidenceDocument
+        Write-JsonDocument $runtimeEvidencePath $runtimeEvidenceDocument
         Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
         Assert-Throws {
             Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
@@ -10516,6 +10538,9 @@ try {
     }
     finally {
         [IO.File]::WriteAllText($replayEvidencePath, $replayEvidenceOriginalText)
+        [IO.File]::WriteAllText($runtimeEvidencePath, $runtimeEvidenceOriginalText)
+        $runtimeEvidenceDocument.details.replayEvidenceSha256 =
+            $evidenceHashes['replay-determinism']
         Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     }
     $runtimeTitleDocument = $evidenceDocuments['deterministic-runtime']
