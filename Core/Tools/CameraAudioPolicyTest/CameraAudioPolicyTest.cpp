@@ -22,6 +22,7 @@ static rts::TerrainDrawSizingInput MakeTerrainInput()
 {
 	rts::TerrainDrawSizingInput input;
 	input.cameraHeight = 200.0f;
+	input.cameraHeightAboveMax = 200.0f;
 	input.cameraToPivotDistance = 260.645f;
 	input.pitchRadians = 0.65449846f;
 	input.horizontalFovRadians = 0.87266463f;
@@ -71,6 +72,7 @@ static void TestTerrainDrawSizing()
 	// window at 4:3, while a narrower vertical FOV needs less terrain at 16:9.
 	input = MakeTerrainInput();
 	input.cameraHeight = 618.125f;
+	input.cameraHeightAboveMax = 518.125f;
 	input.cameraToPivotDistance = 782.0f;
 	input.mapWidth = 315;
 	input.mapHeight = 315;
@@ -110,6 +112,7 @@ static void TestShellTerrainDrawSizing()
 {
 	rts::TerrainDrawSizingInput input = MakeTerrainInput();
 	input.cameraHeight = 618.125f;
+	input.cameraHeightAboveMax = 518.125f;
 	input.cameraToPivotDistance = 782.0f;
 	input.mapWidth = 315;
 	input.mapHeight = 315;
@@ -118,10 +121,10 @@ static void TestShellTerrainDrawSizing()
 	rts::TerrainCameraBasis basis = MakeTerrainBasis(0.053675f, 0.791536f,
 		input.pitchRadians);
 
-	// Two recorded shell camera headings at 4:3 and the first at 16:9.
+	// The first 4:3 pose projects both extrema of a 100-unit terrain range.
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
 		basis, width, height));
-	CHECK(width == 225 && height == 193);
+	CHECK(width == 225 && height == 225);
 	// Roll rotates the screen edges even when forward remains unchanged.
 	const float roll = 0.087266f;
 	const float rollCos = (float)cos(roll), rollSin = (float)sin(roll);
@@ -137,21 +140,27 @@ static void TestShellTerrainDrawSizing()
 	CHECK(width == 225 && height == 225);
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
 		basis, width, height));
-	rts::StabilizeTerrainDrawSizeForMap(129, 129, 315, 315, width, height);
+	rts::StabilizeTerrainDrawSizeForMap(129, 129, 315, 315, false, width, height);
 	CHECK(width == 225 && height == 225);
-	rts::StabilizeTerrainDrawSizeForMap(315, 315, 315, 315, width, height);
+	rts::StabilizeTerrainDrawSizeForMap(315, 315, 315, 315, false, width, height);
+	CHECK(width == 225 && height == 225);
+	rts::StabilizeTerrainDrawSizeForMap(315, 315, 315, 315, true, width, height);
+	CHECK(width == 315 && height == 315);
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		basis, width, height));
+	rts::StabilizeTerrainDrawSizeForMap(315, 315, 315, 315, false, width, height);
 	CHECK(width == 225 && height == 225);
 	width = 315; height = 315;
-	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, width, height);
+	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, false, width, height);
 	CHECK(width == 315 && height == 315);
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
 		MakeTerrainBasis(0.611570f, 0.505363f, input.pitchRadians), width, height));
 	CHECK(width == 225 && height == 225);
-	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, width, height);
+	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, false, width, height);
 	CHECK(width == 225 && height == 225);
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
 		basis, width, height));
-	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, width, height);
+	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, false, width, height);
 	CHECK(width == 225 && height == 225);
 
 	// A newly constructed map starts with a new 129-cell draw area, not the
@@ -160,8 +169,21 @@ static void TestShellTerrainDrawSizing()
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
 		basis, width, height));
 	CHECK(width == 193 && height == 161);
-	rts::StabilizeTerrainDrawSizeForMap(129, 129, 315, 315, width, height);
+	rts::StabilizeTerrainDrawSizeForMap(129, 129, 315, 315, false, width, height);
 	CHECK(width == 193 && height == 193);
+
+	// A high ridge still intersects every corner ray before its min-height
+	// endpoint; a camera at or under the maximum terrain is conservatively full.
+	input.verticalFovRadians = 0.672870f;
+	input.cameraHeightAboveMax = 1.0f;
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		MakeTerrainBasis(0.611570f, 0.505363f, input.pitchRadians), width, height));
+	CHECK(width == 257 && height == 225);
+	input.cameraHeightAboveMax = 0.0f;
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		basis, width, height));
+	CHECK(width == 315 && height == 315);
+	input.cameraHeightAboveMax = 518.125f;
 
 	// A smaller map and an extreme finite view clamp before float-to-int.
 	input.mapWidth = 160;

@@ -98,6 +98,14 @@ namespace rts
 		// Retain the conservative result for invalid inputs.
 		if (!CalculateTerrainDrawSize(input, width, height))
 			return false;
+		if (!(input.cameraHeightAboveMax > 0.0f &&
+			input.cameraHeightAboveMax <= input.cameraHeight &&
+			input.cameraHeightAboveMax < FLT_MAX))
+		{
+			width = input.mapWidth;
+			height = input.mapHeight;
+			return true;
+		}
 		const float vectors[9] = {
 			basis.forwardX, basis.forwardY, basis.forwardZ,
 			basis.rightX, basis.rightY, basis.rightZ,
@@ -139,19 +147,32 @@ namespace rts
 					height = input.mapHeight;
 					return true;
 				}
-				const float groundX = input.cameraHeight * x / -z;
-				const float groundY = input.cameraHeight * y / -z;
-				if (vertical == -1 && horizontal == -1)
+				// Every height between the terrain extrema intersects this ray
+				// between these two endpoints.
+				const float heights[2] = {input.cameraHeight, input.cameraHeightAboveMax};
+				for (int plane = 0; plane < 2; ++plane)
 				{
-					minX = maxX = groundX;
-					minY = maxY = groundY;
-				}
-				else
-				{
-					if (groundX < minX) minX = groundX;
-					if (groundX > maxX) maxX = groundX;
-					if (groundY < minY) minY = groundY;
-					if (groundY > maxY) maxY = groundY;
+					const float groundX = heights[plane] * x / -z;
+					const float groundY = heights[plane] * y / -z;
+					if (!(groundX > -FLT_MAX && groundX < FLT_MAX &&
+						groundY > -FLT_MAX && groundY < FLT_MAX))
+					{
+						width = input.mapWidth;
+						height = input.mapHeight;
+						return true;
+					}
+					if (vertical == -1 && horizontal == -1 && plane == 0)
+					{
+						minX = maxX = groundX;
+						minY = maxY = groundY;
+					}
+					else
+					{
+						if (groundX < minX) minX = groundX;
+						if (groundX > maxX) maxX = groundX;
+						if (groundY < minY) minY = groundY;
+						if (groundY > maxY) maxY = groundY;
+					}
 				}
 			}
 		}
@@ -166,13 +187,13 @@ namespace rts
 	}
 
 	void StabilizeTerrainDrawSizeForMap(int currentWidth, int currentHeight,
-		int mapWidth, int mapHeight, int &width, int &height)
+		int mapWidth, int mapHeight, bool deferFullShrink, int &width, int &height)
 	{
 		const int square = width > height ? width : height;
 		// Full-map draws can precede shell sizing, or be temporary for a low
-		// camera pitch. Do not permanently retain either as the shell floor.
-		width = currentWidth < mapWidth && currentWidth > square ? currentWidth : square;
-		height = currentHeight < mapHeight && currentHeight > square ? currentHeight : square;
+		// camera pitch. Retain them only until an active shake ends.
+		width = (deferFullShrink || currentWidth < mapWidth) && currentWidth > square ? currentWidth : square;
+		height = (deferFullShrink || currentHeight < mapHeight) && currentHeight > square ? currentHeight : square;
 		if (width > mapWidth) width = mapWidth;
 		if (height > mapHeight) height = mapHeight;
 	}

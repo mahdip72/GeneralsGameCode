@@ -3751,6 +3751,7 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 			const Real cameraToPivotY = cameraPosition.Y - m_pos.y;
 			rts::TerrainDrawSizingInput input;
 			input.cameraHeight = cameraPosition.Z - TheTerrainRenderObject->getMinHeight();
+			input.cameraHeightAboveMax = cameraPosition.Z - TheTerrainRenderObject->getMaxHeight();
 			input.cameraToPivotDistance = sqrt(
 				cameraToPivotX * cameraToPivotX + cameraToPivotY * cameraToPivotY);
 			input.pitchRadians = cameraPitch;
@@ -3788,11 +3789,13 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 				if (isShellCamera)
 				{
 					// A square avoids width/height swaps as the shell camera turns.
-					// This map's current draw area is a floor until the next map loads;
-					// shrinking it would rebuild terrain and shroud each time.
+					// Keep the current draw area through a camera shake, then allow
+					// contraction from a transient full-map draw when it ends.
+					const bool deferFullShrink = CameraShakerSystem.IsCameraShaking() ||
+						m_shakeIntensity > 0.01f;
 					rts::StabilizeTerrainDrawSizeForMap(heightMap->getDrawWidth(),
 						heightMap->getDrawHeight(), heightMap->getXExtent(),
-						heightMap->getYExtent(), dimensions.x, dimensions.y);
+						heightMap->getYExtent(), deferFullShrink, dimensions.x, dimensions.y);
 				}
 				return true;
 			}
