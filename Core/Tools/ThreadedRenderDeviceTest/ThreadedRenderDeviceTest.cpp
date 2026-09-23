@@ -33,7 +33,7 @@ enum Event
 	CREATED, INITIALIZED, CONTEXT, BEGIN, BUFFER, TEXTURE, REFRESH, COPY,
 	DESTROY_RESOURCE, UPDATE, CLEAR, TARGETS, VIEWPORT, STATE, LAYOUT,
 	VERTEX, INDEX, BIND_TEXTURE, TOPOLOGY, DRAW, DRAW_INDEXED, END, PRESENT,
-	CAPTURE, INFO, RESIZE, RECOVER, DEBUG_COUNT, REPORT, SWAP_SET, SWAP_GET,
+	CAPTURE, INFO, FILTER_CAPS, RESIZE, RECOVER, DEBUG_COUNT, REPORT, SWAP_SET, SWAP_GET,
 	GAMMA_SET, GAMMA_GET, FAULT_CONFIG, RESOURCE_STATS, SHUTDOWN, DELETED
 };
 
@@ -43,7 +43,9 @@ struct Fixture
 		wrongThread(false), failCreate(false), failDraw(false), failEnd(false),
 		failPresent(false), failCapture(false), failInitialize(false), failUpdate(false),
 		createFailureResult(RENDER_RESULT_OUT_OF_MEMORY), updateFailureResult(RENDER_RESULT_DEVICE_REMOVED),
-		factoryCalls(0), draws(0), presents(0), infos(0), destroys(0), failEndFrames(0),
+		factoryCalls(0), draws(0), presents(0), infos(0),
+		textureFilterCapabilityCalls(0), reportedMaxAnisotropy(16),
+		destroys(0), failEndFrames(0),
 		stateValue(0), layoutStride(0), layoutOffset(0), window(0), proxy(0),
 		swapIntervalSetCalls(0), swapIntervalGetCalls(0),
 		gammaSetCalls(0), gammaGetCalls(0), faultConfigCalls(0),
@@ -57,7 +59,8 @@ struct Fixture
 	bool gateEntered, gateReleased, wrongThread;
 	bool failCreate, failDraw, failEnd, failPresent, failCapture, failInitialize, failUpdate;
 	RenderResult createFailureResult, updateFailureResult;
-	unsigned int factoryCalls, draws, presents, infos, destroys;
+	unsigned int factoryCalls, draws, presents, infos, textureFilterCapabilityCalls;
+	unsigned int reportedMaxAnisotropy, destroys;
 	unsigned int failEndFrames;
 	float stateValue;
 	unsigned int layoutStride, layoutOffset;
@@ -190,6 +193,18 @@ public:
 	}
 	RenderResult getBackBufferInfo(RenderBackBufferInfo *output) const override
 	{ f.event(INFO); ++f.infos; *output = info; return RENDER_RESULT_OK; }
+	RenderResult getTextureFilterCapabilities(
+		RenderTextureFilterCapabilities *output) const override
+	{
+		f.event(FILTER_CAPS);
+		CHECK(!open && output != 0);
+		++f.textureFilterCapabilityCalls;
+		output->supportsPoint = true;
+		output->supportsLinear = true;
+		output->supportsAnisotropic = true;
+		output->maxAnisotropy = f.reportedMaxAnisotropy;
+		return RENDER_RESULT_OK;
+	}
 	RenderResult setSwapInterval(unsigned int interval) override
 	{
 		f.event(SWAP_SET);
@@ -425,6 +440,32 @@ void GammaOwnerTransport()
 	CHECK(offOwnerSet == RENDER_RESULT_INVALID_ARGUMENT &&
 		offOwnerGet == RENDER_RESULT_INVALID_ARGUMENT &&
 		f.gammaSetCalls == 2 && f.gammaGetCalls == 2);
+}
+
+void TextureFilterCapabilitiesArePublishedFromOwner()
+{
+	Fixture f;
+	std::unique_ptr<IRenderDevice> device = Device(f);
+	CHECK(f.textureFilterCapabilityCalls == 1);
+
+	RenderTextureFilterCapabilities capabilities;
+	CHECK(device->getTextureFilterCapabilities(&capabilities) == RENDER_RESULT_OK);
+	CHECK(capabilities.supportsPoint && capabilities.supportsLinear &&
+		capabilities.supportsAnisotropic && capabilities.maxAnisotropy == 16);
+	CHECK(device->getTextureFilterCapabilities(0) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(f.textureFilterCapabilityCalls == 1);
+
+	CHECK(device->resize(8, 6) == RENDER_RESULT_OK);
+	CHECK(f.textureFilterCapabilityCalls == 2);
+	CHECK(device->getTextureFilterCapabilities(&capabilities) == RENDER_RESULT_OK &&
+		capabilities.maxAnisotropy == 16);
+
+	f.reportedMaxAnisotropy = 8;
+	CHECK(device->recoverDevice() == RENDER_RESULT_OK);
+	CHECK(f.textureFilterCapabilityCalls == 3);
+	CHECK(device->getTextureFilterCapabilities(&capabilities) == RENDER_RESULT_OK &&
+		capabilities.maxAnisotropy == 8);
+	CHECK(f.textureFilterCapabilityCalls == 3 && !f.wrongThread);
 }
 
 void DebugResourceOwnerTransport()
@@ -1223,6 +1264,7 @@ int main()
 		CHECK(rts::JobSystem::instance().registerCurrentThread(rts::JOB_OWNER_GAME));
 		SwapIntervalOwnerTransport();
 		GammaOwnerTransport();
+		TextureFilterCapabilitiesArePublishedFromOwner();
 		DebugResourceOwnerTransport();
 		OwnershipAndDeepCopy();
 		SynchronousProducerRejectionsDoNotPoisonNextFrame();

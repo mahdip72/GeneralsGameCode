@@ -292,6 +292,7 @@ public:
 		m_started(false), m_stopping(false), m_operational(false),
 		m_ownerExecuting(false),
 		m_initialResult(RENDER_RESULT_FAILED), m_infoResult(RENDER_RESULT_FAILED),
+		m_textureFilterCapabilitiesResult(RENDER_RESULT_FAILED),
 		m_current(0), m_queueRead(0), m_queueCount(0), m_pending(0),
 		m_completionRead(0), m_completionCount(0), m_reservedCompletions(0),
 		m_completedSequence(0), m_completedResult(RENDER_RESULT_OK),
@@ -357,6 +358,16 @@ public:
 		std::lock_guard<std::mutex> lock(m_mutex);
 		if (m_infoResult == RENDER_RESULT_OK) *info = m_info;
 		return m_infoResult;
+	}
+	RenderResult getTextureFilterCapabilities(
+		RenderTextureFilterCapabilities *capabilities) const override
+	{
+		if (!capabilities) return RENDER_RESULT_INVALID_ARGUMENT;
+		*capabilities = RenderTextureFilterCapabilities();
+		std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_textureFilterCapabilitiesResult == RENDER_RESULT_OK)
+			*capabilities = m_textureFilterCapabilities;
+		return m_textureFilterCapabilitiesResult;
 	}
 	RenderResult captureBackBuffer(void *, size_t, size_t, RenderFormat *) override;
 	RenderResult getDebugValidationErrorCount(unsigned int *) const override;
@@ -468,8 +479,10 @@ private:
 	std::thread::id m_producer;
 	bool m_waiting, m_initialized, m_started, m_stopping, m_operational;
 	bool m_ownerExecuting;
-	RenderResult m_initialResult, m_infoResult;
+	RenderResult m_initialResult, m_infoResult,
+		m_textureFilterCapabilitiesResult;
 	RenderBackBufferInfo m_info;
+	RenderTextureFilterCapabilities m_textureFilterCapabilities;
 	mutable std::mutex m_mutex;
 	std::condition_variable m_changed;
 	std::thread m_thread;
@@ -1565,6 +1578,7 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 void ThreadedRenderDevice::publishMetadata(RenderResult result, bool refreshInfo)
 {
 	RenderBackBufferInfo info;
+	RenderTextureFilterCapabilities textureFilterCapabilities;
 	bool operational = false;
 	if (result == RENDER_RESULT_DEVICE_REMOVED) m_ownerDeviceRemoved = true;
 	try { operational = m_backend && m_backend->isOperational() && !m_ownerDeviceRemoved; }
@@ -1572,12 +1586,23 @@ void ThreadedRenderDevice::publishMetadata(RenderResult result, bool refreshInfo
 	const RenderResult infoResult = operational && refreshInfo ?
 		BackendCall([&] { return m_backend->getBackBufferInfo(&info); }) : RENDER_RESULT_FAILED;
 	if (infoResult == RENDER_RESULT_DEVICE_REMOVED) { m_ownerDeviceRemoved = true; operational = false; }
+	const RenderResult textureFilterCapabilitiesResult = operational && refreshInfo ?
+		BackendCall([&] { return m_backend->getTextureFilterCapabilities(
+			&textureFilterCapabilities); }) : RENDER_RESULT_FAILED;
+	if (textureFilterCapabilitiesResult == RENDER_RESULT_DEVICE_REMOVED)
+	{
+		m_ownerDeviceRemoved = true;
+		operational = false;
+	}
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_operational = operational;
 	if (refreshInfo || !operational)
 	{
 		m_infoResult = infoResult;
 		if (infoResult == RENDER_RESULT_OK) m_info = info;
+		m_textureFilterCapabilitiesResult = textureFilterCapabilitiesResult;
+		if (textureFilterCapabilitiesResult == RENDER_RESULT_OK)
+			m_textureFilterCapabilities = textureFilterCapabilities;
 	}
 }
 
