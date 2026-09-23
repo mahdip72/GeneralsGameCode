@@ -73,11 +73,37 @@ try {
         'Acceptance must create one relocated corpus for all combined producer cases.'
     Assert-CorpusReuseTest ($copyFunctions.Count -eq 1) `
         'The corpus creation helper must be uniquely identifiable for scoped assertions.'
-    $copyFunctionText = $copyFunctions[0].Extent.Text
-    Assert-CorpusReuseTest ($copyFunctionText -match
-        '(?s)@\(\$template\.corpus\.children\)\.Count\s*-ne\s*253' -and
-        $copyFunctionText -match '\[int\]\$template\.corpus\.rawLogCount\s*-ne\s*507') `
-        'The corpus creation helper must retain its 253-child / 507-raw-log assertions.'
+    $corpusCardinalityGuards = @($copyFunctions[0].FindAll({
+        param($node)
+        if ($node -isnot [Management.Automation.Language.IfStatementAst]) {
+            return $false
+        }
+        $cardinalityClauses = @($node.Clauses | Where-Object {
+            $clause = $_
+            $inequalityChecks = @($clause.Item1.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.BinaryExpressionAst] -and
+                    $candidate.Operator -eq [Management.Automation.Language.TokenKind]::Ine
+            }, $true))
+            $childCountCheck = @($inequalityChecks | Where-Object {
+                $_.Left.Extent.Text -match '^\s*@\(\$template\.corpus\.children\)\.Count\s*$' -and
+                    $_.Right.Extent.Text.Trim() -ceq '253'
+            }).Count -eq 1
+            $rawLogCountCheck = @($inequalityChecks | Where-Object {
+                $_.Left.Extent.Text -match '^\s*\[int\]\$template\.corpus\.rawLogCount\s*$' -and
+                    $_.Right.Extent.Text.Trim() -ceq '507'
+            }).Count -eq 1
+            $cardinalityFailure = @($clause.Item2.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.ThrowStatementAst] -and
+                    $candidate.Extent.Text -match 'cardinality changed before copying'
+            }, $true)).Count -eq 1
+            $childCountCheck -and $rawLogCountCheck -and $cardinalityFailure
+        })
+        return ($cardinalityClauses.Count -eq 1)
+    }, $true))
+    Assert-CorpusReuseTest ($corpusCardinalityGuards.Count -eq 1) `
+        'The corpus creation helper must actively guard the 253-child / 507-raw-log cardinality in an if condition.'
 
     $pathModeLoops = @($sourceAst.FindAll({
         param($node)
