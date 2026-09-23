@@ -609,6 +609,10 @@ public:
 	virtual RenderResult initialize(const RenderDeviceParameters &parameters) = 0;
 	virtual void shutdown() = 0;
 	virtual IRenderContext *immediateContext() = 0;
+	// Raw handles may outlive a device and be passed to a rebound resource host.
+	// Implementations must never reissue an (index, generation) pair in this
+	// process, including after slot reuse or across device instances. Use
+	// GpuHandleAllocator to obtain this identity and fail closed on exhaustion.
 	virtual RenderResult createBuffer(const BufferDescriptor &descriptor,
 		const void *initialData, size_t initialDataBytes, GpuHandle *buffer) = 0;
 	virtual RenderResult createTexture(const TextureDescriptor &descriptor,
