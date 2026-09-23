@@ -1,9 +1,14 @@
 #include "pointgr.h"
 #include "nativew3dbufferowner.h"
+#include "Renderer/RenderGameClient.h"
+#include "Renderer/LegacyColorPacking.h"
 
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+unsigned int PackPointGroupVertexColor(const Vector4 *colors, int vertex,
+	bool quads, unsigned int &packed);
 
 namespace
 {
@@ -17,6 +22,43 @@ int Check(bool condition, const char *message)
 	}
 	std::fprintf(stderr, "FAILED: %s\n", message);
 	return 1;
+}
+
+int CheckPackedQuadColors()
+{
+	const int verticesPerChunk = 2048;
+	std::vector<Vector4> colors(verticesPerChunk + 8);
+	for (int i = 0; i < static_cast<int>(colors.size()); ++i)
+	{
+		const int particle = i / 4;
+		colors[i] = Vector4((particle % 7) / 6.0f,
+			(particle % 11) / 10.0f, (particle % 13) / 12.0f,
+			(particle % 17) / 16.0f);
+	}
+	for (int mode = 0; mode != 2; ++mode)
+	{
+		if (mode != 0)
+		{
+			for (int i = 0; i < static_cast<int>(colors.size()); ++i)
+				colors[i] = Vector4((i % 7) / 6.0f, (i % 11) / 10.0f,
+					(i % 13) / 12.0f, (i % 17) / 16.0f);
+		}
+		unsigned int packed = 0;
+		for (int i = 0; i < static_cast<int>(colors.size()); ++i)
+		{
+			if (i == verticesPerChunk) packed = 0;
+			const Vector4 &color = colors[i];
+			const unsigned int expected = PackLegacyARGB(color.X, color.Y,
+				color.Z, color.W);
+			const unsigned int actual = PackPointGroupVertexColor(
+				&colors[0], i, mode == 0, packed);
+			if (actual != expected)
+				return Check(false, mode == 0 ?
+					"quad RGBA packing preserves colors across vertex chunks" :
+					"non-quad RGBA packing preserves each vertex color");
+		}
+	}
+	return 0;
 }
 
 class PointGroupDevice;
@@ -218,6 +260,7 @@ int RunFailureCase(unsigned int failCreateOn, unsigned int failUpdateOn,
 int main()
 {
 	int result = 0;
+	result |= CheckPackedQuadColors();
 	result |= RunFailureCase(2, 0, 2, 1,
 		"actual PointGroup second allocation failure rolls back its first buffer");
 	result |= RunFailureCase(0, 2, 2, 2,
