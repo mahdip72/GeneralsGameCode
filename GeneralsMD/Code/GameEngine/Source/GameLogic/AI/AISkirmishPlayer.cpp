@@ -8891,6 +8891,11 @@ void AISkirmishPlayer::updateTunnelTransit(
 				members.push_back(object);
 			continue;
 		}
+		// A selected member entering another container has left the planned
+		// tunnel route, even though it still belongs to this team.
+		if (tracker && object->isContained() &&
+			!tracker->isInContainer(object))
+			memberSetStable = false;
 		members.push_back(object);
 	}
 	Int currentTeamMembers = 0;
@@ -8901,9 +8906,13 @@ void AISkirmishPlayer::updateTunnelTransit(
 				object, m_player, team, true) ||
 			object->isKindOf(KINDOF_AIRCRAFT))
 			continue;
-		++currentTeamMembers;
 		const Bool contained = tracker ? tracker->isInContainer(object) :
 			object->isContained();
+		// Cargo inside a selected transport shares its team, but was never
+		// selected to enter the tunnel as a separate member.
+		if (object->isContained() && !contained)
+			continue;
+		++currentTeamMembers;
 		if (!contained)
 			continue;
 		Bool alreadyTracked = FALSE;
