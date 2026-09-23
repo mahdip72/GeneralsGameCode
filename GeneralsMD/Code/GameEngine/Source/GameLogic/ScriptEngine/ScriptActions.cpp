@@ -29,6 +29,8 @@
 
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
+#include <algorithm>
+
 #include "Common/AudioAffect.h"
 #include "Common/AudioHandleSpecialValues.h"
 #include "Common/FramePacer.h"
@@ -83,6 +85,7 @@
 #include "GameLogic/PolygonTrigger.h"
 #include "GameLogic/ScriptActions.h"
 #include "GameLogic/ScriptEngine.h"
+#include "GameLogic/SkirmishAIRecovery.h"
 #include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/Weapon.h"
 #include "GameLogic/VictoryConditions.h"
@@ -97,6 +100,11 @@ static Bool isWaypointOnPath(const Waypoint *way, const AsciiString& pathLabel)
 	return pathLabel.compareNoCase(way->getPathLabel1()) == 0 ||
 		pathLabel.compareNoCase(way->getPathLabel2()) == 0 ||
 		pathLabel.compareNoCase(way->getPathLabel3()) == 0;
+}
+
+static Bool IsSkirmishSpecialPowerSourceIDBefore(Object *left, Object *right)
+{
+	return left->getID() < right->getID();
 }
 
 static Bool waypointHasIncomingPathLink(const Waypoint *candidate, const AsciiString& pathLabel)
@@ -4329,25 +4337,110 @@ void ScriptActions::doNamedFireSpecialPowerAtWaypoint( const AsciiString& unit, 
 //-------------------------------------------------------------------------------------------------
 void ScriptActions::doSkirmishFireSpecialPowerAtMostCost( const AsciiString &player, const AsciiString& specialPower )
 {
-	Int enemyNdx;
-	Player *enemyPlayer = TheScriptEngine->getSkirmishEnemyPlayer();
-	if (enemyPlayer == nullptr) return;
-	enemyNdx = enemyPlayer->getPlayerIndex();
-
 	const SpecialPowerTemplate *power = TheSpecialPowerStore->findSpecialPowerTemplate(specialPower);
 	if (power==nullptr)
 		return;
+	Player *pPlayer = TheScriptEngine->getPlayerFromAsciiString(player);
+	if (pPlayer==nullptr)
+		return;
+	const Bool replay = TheGameLogic && TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: (TheGameLogic ? TheGameLogic->getGameMode() : GAME_NONE);
+	const Bool productionBehavior = pPlayer->isSkirmishAIPlayer() &&
+		IsSkirmishAIRecoveryGameMode(gameMode) &&
+		ShouldUseSkirmishAIProductionBehavior(
+			replay,
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+				SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	const Bool defensiveMines =
+		power->getSpecialPowerType() == SPECIAL_CLUSTER_MINES ||
+		power->getSpecialPowerType() == NUKE_SPECIAL_CLUSTER_MINES;
+	Player *enemyPlayer = TheScriptEngine->getSkirmishEnemyPlayer();
+	Int enemyNdx = -1;
+	if (productionBehavior && defensiveMines) {
+		enemyNdx = pPlayer->getPlayerIndex();
+	} else {
+		if (productionBehavior &&
+			(!enemyPlayer || !enemyPlayer->getDefaultTeam() ||
+			 pPlayer->getRelationship(enemyPlayer->getDefaultTeam()) != ENEMIES ||
+				 !enemyPlayer->hasOffensiveTargetableObjects())) {
+			enemyPlayer = nullptr;
+			for (Int playerIndex = 0;
+				playerIndex < ThePlayerList->getPlayerCount(); ++playerIndex) {
+				Player *candidate = ThePlayerList->getNthPlayer(playerIndex);
+				if (candidate && candidate->getDefaultTeam() &&
+					pPlayer->getRelationship(candidate->getDefaultTeam()) == ENEMIES &&
+					candidate->hasOffensiveTargetableObjects()) {
+					enemyPlayer = candidate;
+					break;
+				}
+			}
+		}
+		if (enemyPlayer == nullptr)
+			return;
+		enemyNdx = enemyPlayer->getPlayerIndex();
+	}
 	Real radius = 50.0f;
 	if (power->getRadiusCursorRadius()>radius) {
 		radius = power->getRadiusCursorRadius();
 	}
+	if (productionBehavior) {
+		std::vector<Object *> sources;
+		Player::PlayerTeamList::const_iterator sourceTeam;
+		for (sourceTeam = pPlayer->getPlayerTeams()->begin();
+			sourceTeam != pPlayer->getPlayerTeams()->end(); ++sourceTeam) {
+			for (DLINK_ITERATOR<Team> team =
+				(*sourceTeam)->iterate_TeamInstanceList();
+				!team.done(); team.advance()) {
+				Team *sourceTeamInstance = team.cur();
+				if (!sourceTeamInstance)
+					continue;
+				for (DLINK_ITERATOR<Object> object =
+					sourceTeamInstance->iterate_TeamMemberList();
+					!object.done(); object.advance()) {
+					Object *source = object.cur();
+					SpecialPowerModuleInterface *module = source
+						? source->getSpecialPowerModule(power) : nullptr;
+					if (module && module->isReady() && module->isDispatchable())
+						sources.push_back(source);
+				}
+			}
+		}
+		std::sort(sources.begin(), sources.end(),
+			IsSkirmishSpecialPowerSourceIDBefore);
+		for (std::vector<Object *>::const_iterator source = sources.begin();
+			source != sources.end(); ++source) {
+			SpecialPowerModuleInterface *module =
+				(*source)->getSpecialPowerModule(power);
+			Coord3D location;
+			Bool locationFound = pPlayer->computeSuperweaponTarget(
+				power, &location, enemyNdx, radius);
+			if (locationFound &&
+				power->getSpecialPowerType() == SPECIAL_SNEAK_ATTACK) {
+				const ThingTemplate *sneakAttackTemplate =
+					module->getReferenceThingTemplate();
+				if (sneakAttackTemplate)
+					locationFound = pPlayer->calcClosestConstructionZoneLocation(
+						sneakAttackTemplate, &location);
+			}
+			DEBUG_ASSERTCRASH(locationFound,
+				("ScriptActions::doSkirmishFireSpecialPowerAtMostCost() could not find a valid (costly) location."));
+			if (!locationFound || location.lengthSqr() <= 0.0f)
+				continue;
+			if (!pPlayer->shouldUseSkirmishSpecialPowerSource(*source, power))
+				continue;
+			const Bool accepted = module->doSpecialPowerAtLocation(
+				&location, INVALID_ANGLE, COMMAND_FIRED_BY_SCRIPT);
+			pPlayer->resolveSkirmishSpecialPowerDispatchAttempt(
+				*source, power, accepted);
+			if (accepted)
+				break;
+		}
+		return;
+	}
 
 	Player::PlayerTeamList::const_iterator it;
-
-	Player *pPlayer = TheScriptEngine->getPlayerFromAsciiString(player);
-	if (pPlayer==nullptr)
-		return;
-
 
 	for (it = pPlayer->getPlayerTeams()->begin(); it != pPlayer->getPlayerTeams()->end(); ++it)
 	{
@@ -4362,7 +4455,6 @@ void ScriptActions::doSkirmishFireSpecialPowerAtMostCost( const AsciiString &pla
 				Object *pObj = iter.cur();
 				if (!pObj)
 					continue;
-
 				SpecialPowerModuleInterface *mod = pObj->getSpecialPowerModule(power);
 				if (mod)
 				{
@@ -4390,7 +4482,12 @@ void ScriptActions::doSkirmishFireSpecialPowerAtMostCost( const AsciiString &pla
 
 					if( locationFound && location.lengthSqr() > 0.0f )
 					{
-						mod->doSpecialPowerAtLocation( &location, INVALID_ANGLE, COMMAND_FIRED_BY_SCRIPT );
+						if (!pPlayer->shouldUseSkirmishSpecialPowerSource(pObj, power))
+							continue;
+						const Bool accepted = mod->doSpecialPowerAtLocation(
+							&location, INVALID_ANGLE, COMMAND_FIRED_BY_SCRIPT );
+						pPlayer->resolveSkirmishSpecialPowerDispatchAttempt(
+							pObj, power, accepted);
 					}
 					break;
 				}

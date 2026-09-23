@@ -84,10 +84,12 @@ CleanupAreaPower::~CleanupAreaPower()
 }
 
 //-------------------------------------------------------------------------------------------------
-void CleanupAreaPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
+Bool CleanupAreaPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
 {
 	if (getObject()->isDisabled())
-		return;
+		return false;
+	if (!loc)
+		return false;
 
 	Object *obj = getObject();
 	const CleanupAreaPowerModuleData *data = getCleanupAreaPowerModuleData();
@@ -97,12 +99,14 @@ void CleanupAreaPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle,
 	if( update )
 	{
 		update->setCleanupAreaParameters( loc, data->m_cleanupMoveRange );
+		return true;
 	}
 	else
 	{
 		//This case will only happen should the ambulance not have a cleanuphazard update module.
 		DEBUG_CRASH( ("%s is attempting to use CleanupAreaPower, but requires a CleanupHazardUpdate module to work!", obj->getTemplate()->getName().str() ) );
 	}
+	return false;
 }
 
 

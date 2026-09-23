@@ -28,15 +28,20 @@
 
 #pragma once
 
+#include <map>
+
 #include "Common/GameMemory.h"
 #include "GameLogic/AIPlayer.h"
 #include "GameLogic/SkirmishAIDecision.h"
 #if defined(_WIN64)
 #include "Lib/DeterministicAIPlanning.h"
 #endif
+#include "GameLogic/SkirmishAIStrategy.h"
 
 class BuildListInfo;
 class SpecialPowerTemplate;
+class ThingTemplate;
+enum ProductionID CPP_11(: Int);
 
 
 /**
@@ -50,6 +55,10 @@ public:	 // AISkirmish specific methods.
 
 	AISkirmishPlayer( Player *p );							///< constructor
 	virtual Bool computeSuperweaponTarget(const SpecialPowerTemplate *power, Coord3D *pos, Int playerNdx, Real weaponRadius) override; ///< Calculates best pos for weapon given radius.
+	virtual Bool shouldUseSkirmishSpecialPowerSource(Object *source, const SpecialPowerTemplate *power) override;
+	virtual void resolveSpecialPowerDispatchAttempt(Object *source,
+		const SpecialPowerTemplate *power, Bool accepted) override;
+	virtual void notifySpecialPowerFired(Object *source, const SpecialPowerTemplate *power) override;
 
 public:	// AIPlayer interface methods.
 
@@ -58,7 +67,10 @@ public:	// AIPlayer interface methods.
 	virtual void newMap() override;											///< New map loaded call.
 
 	/// Invoked when a unit I am training comes into existence
-	virtual void onUnitProduced( Object *factory, Object *unit ) override;
+	virtual void onUnitProduced( Object *factory, Object *unit, Int productionID ) override;
+
+	/// Invoked when a structure I am building becomes complete.
+	virtual void onStructureProduced( Object *factory, Object *structure ) override;
 
 	virtual void buildSpecificAITeam(TeamPrototype *teamProto, Bool priorityBuild) override; ///< Builds this team immediately.
 
@@ -71,6 +83,9 @@ public:	// AIPlayer interface methods.
 	virtual void recruitSpecificAITeam(TeamPrototype *teamProto, Real recruitRadius) override; ///< Builds this team immediately.
 
 	virtual Bool isSkirmishAI() override {return true;}
+	Bool usesCriticalRecoveryBehavior() const;
+	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing,
+		Bool isUpgrade, Bool refreshProductionReserve);
 
 	virtual Bool checkBridges(Object *unit, Waypoint *way) override;
 
@@ -110,6 +125,7 @@ protected:
 
 	virtual void doBaseBuilding() override;
 	virtual void checkReadyTeams() override;
+	virtual Bool canActivateReadyTeam( const TeamInQueue *team ) const override;
 	virtual void checkQueuedTeams() override;
 	virtual void doTeamBuilding() override;
 	virtual Object *findDozer(const Coord3D *pos) override;
@@ -132,8 +148,39 @@ protected:
 	void acquireEnemyLegacy();
 	Bool isAdaptiveProductionCandidate( TeamPrototype *proto, SkirmishAICostRange *costRange,
 		Int *factoryWaitFrames );
+	Int getActiveRecoveryReserveCost() const;
 	Int getCriticalRebuildReserve( Bool *canStartNow );
 	Bool canStartCriticalRebuildNow( BuildListInfo *info, const ThingTemplate *plan );
+	void updateCriticalRecovery();
+	Bool findPrimaryCommandCenter( const ThingTemplate *primaryTemplate, Object **center ) const;
+	BuildListInfo *findPrimaryCommandCenterBuildInfo( const ThingTemplate *primaryTemplate ) const;
+	Bool findRecoveryBuilderTemplateAndFactory(
+		const ThingTemplate *primaryTemplate,
+		const ThingTemplate **builderTemplate, Object **factory,
+		Bool *hasPotentialFactory, Bool *hasBoundedFactory);
+	void normalizeRecoveryWorkOrders(const ThingTemplate *primaryTemplate);
+	Bool hasRecoveryBuilderQueued(
+		const ThingTemplate *primaryTemplate, Bool *paid, ObjectID *factoryID,
+		ProductionID *productionID );
+	Bool queueRecoveryBuilder( const ThingTemplate *builderTemplate, Object *factory );
+	void clearRecoveryBuilderProduction();
+	void validateRecoveryBuilderProduction();
+	void bindRecoveryBuilderProductionIfNeeded(
+		Bool hasCompletedPrimaryCenter, Bool paidQueueExists,
+		ObjectID factoryID, ProductionID productionID );
+	Bool failoverRecoveryBuilderQueue(
+		const ThingTemplate *primaryTemplate, Object *boundedFactory,
+		ProductionID boundedProductionID );
+	Bool cancelRecoveryBuilderQueueForNativeRespawn(
+		const ThingTemplate *primaryTemplate );
+	Object *findRecoveryBuilder(
+		const Coord3D *position, const ThingTemplate *primaryTemplate) const;
+	Bool hasCriticalRecoveryPlacementRoute(
+		const ThingTemplate *primaryTemplate, Object *builder) const;
+	Bool prepareCriticalRecoveryBuilder(Object *builder);
+	Bool tryCriticalCommandCenterConstruction(
+		const ThingTemplate *primaryTemplate, BuildListInfo *info, Object *builder);
+	void enterRecoveryLastStand(Bool permanent);
 	Bool estimateTeamProduction( TeamPrototype *proto, Bool planned,
 		Int *productionCost, Int *completionFrames );
 	void getVisibleEnemyComposition( Int *aircraftValue, Int *vehicleValue, Int *infantryValue,
@@ -171,6 +218,25 @@ protected:
 		const rts::AIProductionPlanningResult &result );
 	Bool selectTeamToBuildWithPlanning();
 #endif
+	Bool usesStrategyBehavior() const;
+	Bool usesProductionBehavior() const;
+	void clearStrategySourceCommandLock();
+	Bool isStrategySourceCommandLockValid() const;
+	Bool hasUsableSupplySource(const Coord3D *position, Real centerRadius) const;
+	Bool hasOwnedSupplyCenter(const ThingTemplate *supplyPlan) const;
+	Bool hasQueuedSupplyCenter(const ThingTemplate *supplyPlan) const;
+	Bool hasUsableSupplyCenterForCollectors() const;
+	void cancelDepletedCollectorProduction();
+	Bool isSupplyCenterPrerequisiteNeeded(const ThingTemplate *supplyPlan) const;
+	void refreshStrategyProductionReserve();
+	Bool queueAuthorizedStrategyBuilder(const ThingTemplate *structure);
+	void refreshStrategyProductionState();
+	Bool updateStrategy();
+	void collectStrategyMetrics( SkirmishStrategyMetrics *metrics,
+		ObjectID *strategicTargetID );
+	void applyStrategyMode( SkirmishStrategyMode previousMode,
+		SkirmishStrategyMode currentMode, ObjectID previousTargetID );
+	void commandOffensiveTeams( SkirmishStrategyMode mode, Object *target );
 
 protected:
 	Int m_curFrontBaseDefense; // First is 0.
@@ -185,5 +251,36 @@ protected:
 	UnsignedInt m_frameToCheckEnemy;
 	Player			*m_currentEnemy;
 	Int m_currentEnemyPlayerIndex;
+	SkirmishStrategyState m_strategyState;
+	Int m_strategyProductionReserveCost;
+	ObjectID m_strategySuperweaponID;
+	const ThingTemplate *m_strategyAuthorizedThing;
+	SkirmishAISpendAuthorization m_strategySpendAuthorization;
+	Bool m_strategyProductionReserveRefreshing;
+	Bool m_strategyProductionReserveLoaded;
+	Bool m_strategySourceCommandLocked;
+	ObjectID m_strategyLockedSourceID;
+	UnsignedInt m_strategyLockedPowerID;
+	UnsignedInt m_reinforcementRoundRobinCursor;
+	std::map<ObjectID, Bool> m_stage3CollectorRolesToRestore;
+
+	// Critical command-center recovery state. The reserve is serialized because
+	// it gates same-frame production before the next AI refresh.
+	Bool m_recoveryEverCompleted;
+	Bool m_recoveryImpossible;
+	ObjectID m_recoveryConstructionID;
+	// Modulo the placement offset count is the next site; the next integer band
+	// records that this scaffold already received one paid replacement attempt.
+	Int m_recoveryPlacementAttempt;
+	UnsignedInt m_recoveryNextAttemptFrame;
+	UnsignedInt m_recoveryEvacuationDeadline;
+	Coord3D m_recoveryLocation;
+	Real m_recoveryAngle;
+	Int m_recoveryReserveCost;
+	ObjectID m_recoveryBuilderFactoryID;
+	ProductionID m_recoveryBuilderProductionID;
+	Bool m_recoveryBuilderCancellationOwned;
+	Bool m_recoveryBuilderFailoverConsumed;
+	const ThingTemplate *m_recoveryAuthorizedThing;
 
 };

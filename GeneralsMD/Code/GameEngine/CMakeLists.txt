@@ -569,6 +569,7 @@ set(GAMEENGINE_SRC
     Source/Common/GameEngine.cpp
     Source/Common/GameLOD.cpp
     Source/Common/GameMain.cpp
+    Source/Common/SkirmishAILegacySaveTest.cpp
     Source/Common/GlobalData.cpp
 #    Source/Common/INI/INI.cpp
 #    Source/Common/INI/INIAiData.cpp
@@ -831,6 +832,7 @@ set(GAMEENGINE_SRC
 #    Source/GameLogic/AI/AIPathfind.cpp
     Source/GameLogic/AI/AIPlayer.cpp
     Source/GameLogic/AI/AISkirmishPlayer.cpp
+    Source/GameLogic/AI/SkirmishAIStrategy.cpp
     Source/GameLogic/AI/AIStates.cpp
     Source/GameLogic/AI/AITNGuard.cpp
     Source/GameLogic/AI/Squad.cpp

@@ -64,6 +64,10 @@ public:
 	virtual ObjectID getSpawnerID() = 0;
 	virtual ObjectID getReconstructedBuildingID() = 0;
 	virtual const ThingTemplate* getRebuildTemplate() const = 0;
+	virtual ObjectID getWorkerID() = 0;
+	// Appended to preserve the legacy interface's existing virtual slots.
+	virtual void restartRebuildProcessWithoutDestroyingWorker(
+		const ThingTemplate *rebuild, ObjectID spawnerID ) = 0;
 
 };
 
@@ -100,6 +104,9 @@ public:
 	virtual ObjectID getSpawnerID() override { return m_spawnerObjectID; }
 	virtual ObjectID getReconstructedBuildingID() override { return m_reconstructingID; }
 	virtual const ThingTemplate* getRebuildTemplate() const override { return m_rebuildTemplate; }
+	virtual ObjectID getWorkerID() override { return m_workerID; }
+	virtual void restartRebuildProcessWithoutDestroyingWorker(
+		const ThingTemplate *rebuild, ObjectID spawnerID ) override;
 	void transferBombs( Object *reconstruction );
 
 	// interface acquisition

@@ -55,6 +55,7 @@
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/ParkingPlaceBehavior.h"
 
+
 // PUBLIC DATA ////////////////////////////////////////////////////////////////////////////////////
 BuildAssistant *TheBuildAssistant = nullptr;
 
@@ -334,6 +335,9 @@ Object *BuildAssistant::buildObjectNow( Object *constructorObject, const ThingTe
 	{
 		DEBUG_ASSERTCRASH( constructorObject->getControllingPlayer() == owningPlayer,
 											 ("buildObjectNow: Constructor object player is not the same as the controlling player passed in\n") );
+		if (!owningPlayer->canSpendForSkirmishAIRecovery(
+			what->calcCostToBuild(owningPlayer), what, FALSE))
+			return nullptr;
 
 	}
 

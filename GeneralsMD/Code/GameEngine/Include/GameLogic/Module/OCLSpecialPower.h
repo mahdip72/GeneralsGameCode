@@ -94,7 +94,7 @@ public:
 
 	virtual void doSpecialPower( UnsignedInt commandOptions ) override;
 	virtual void doSpecialPowerAtObject( Object *obj, UnsignedInt commandOptions ) override;
-	virtual void doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions ) override;
+	virtual Bool doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions ) override;
 
 	//If the special power launches a construction site, we need to know the final product for placement purposes.
 	virtual const ThingTemplate* getReferenceThingTemplate() const override;

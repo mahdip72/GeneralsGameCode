@@ -425,7 +425,7 @@ public:
 	Bool getListInScoreScreen();
 
 	/// A unit was just created and is ready to control
-	void onUnitCreated( Object *factory, Object *unit );
+	void onUnitCreated( Object *factory, Object *unit, Int productionID = 0 );
 
 	/// A team is about to be destroyed.
 	void preTeamDestroy( const Team *team );
@@ -443,6 +443,10 @@ public:
 	void guardSupplyCenter( Team *team, Int minSupplies );
 
 	virtual Bool computeSuperweaponTarget(const SpecialPowerTemplate *power, Coord3D *pos, Int playerNdx, Real weaponRadius); ///< Calculates best pos for weapon given radius.
+	Bool shouldUseSkirmishSpecialPowerSource(Object *source, const SpecialPowerTemplate *power) const;
+	void resolveSkirmishSpecialPowerDispatchAttempt(Object *source,
+		const SpecialPowerTemplate *power, Bool accepted);
+	void notifySkirmishSpecialPowerFired(Object *source, const SpecialPowerTemplate *power);
 
 	/// Get the enemy an ai player is currently focused on.  NOTE - Can be nullptr.
 	Player  *getCurrentEnemy();
@@ -454,6 +458,9 @@ public:
 	/// Stage 5 owner-side orchestration only; workers never receive this pointer.
 	AIPlayer *getAIPlayerForPlanning() const { return m_ai; }
 #endif
+	/// Preserve critical reconstruction money at the actual purchase boundary.
+	Bool canSpendForSkirmishAIRecovery(Int cost, const ThingTemplate *thing,
+		Bool isUpgrade, Bool refreshProductionReserve = FALSE) const;
 
 	/// Have the ai check for bridges.
 	virtual Bool checkBridges(Object *unit, Waypoint *way);
@@ -513,6 +520,7 @@ public:
 		a convenience routine to quickly check if any objects are owned.
 	*/
 	Bool hasAnyObjects() const;
+	Bool hasOffensiveTargetableObjects() const;
 
 	/**
 		a convenience routine to quickly check if any buildfacilities are owned.

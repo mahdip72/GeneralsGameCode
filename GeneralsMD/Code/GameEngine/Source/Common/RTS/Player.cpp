@@ -78,6 +78,7 @@
 #include "GameClient/GameText.h"
 
 #include "GameLogic/AI.h"
+#include "GameLogic/SkirmishAIDecision.h"
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/AISkirmishPlayer.h"
 #include "GameLogic/ExperienceTracker.h"
@@ -1153,6 +1154,16 @@ Bool Player::isSkirmishAIPlayer()
 	return m_ai ? m_ai->isSkirmishAI() : false;
 }
 
+Bool Player::canSpendForSkirmishAIRecovery(
+	Int cost, const ThingTemplate *thing, Bool isUpgrade,
+	Bool refreshProductionReserve) const
+{
+	if (!m_ai || !m_ai->isSkirmishAI())
+		return true;
+	return static_cast<AISkirmishPlayer *>(m_ai)->canSpendForCriticalRecovery(
+		cost, thing, isUpgrade, refreshProductionReserve);
+}
+
 
 //----------------------------------------------------------------------------------------------------------
 /**
@@ -1165,6 +1176,26 @@ Bool Player::computeSuperweaponTarget(const SpecialPowerTemplate *power, Coord3D
 	}
 
   return FALSE;
+}
+
+Bool Player::shouldUseSkirmishSpecialPowerSource(
+	Object *source, const SpecialPowerTemplate *power) const
+{
+	return !m_ai || m_ai->shouldUseSkirmishSpecialPowerSource(source, power);
+}
+
+void Player::resolveSkirmishSpecialPowerDispatchAttempt(
+	Object *source, const SpecialPowerTemplate *power, Bool accepted)
+{
+	if (m_ai)
+		m_ai->resolveSpecialPowerDispatchAttempt(source, power, accepted);
+}
+
+void Player::notifySkirmishSpecialPowerFired(
+	Object *source, const SpecialPowerTemplate *power)
+{
+	if (m_ai)
+		m_ai->notifySpecialPowerFired(source, power);
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1555,7 +1586,7 @@ void Player::repairStructure(ObjectID structureID)
 //-------------------------------------------------------------------------------------------------
 /** A unit was just created and is ready to control */
 //-------------------------------------------------------------------------------------------------
-void Player::onUnitCreated( Object *factory, Object *unit )
+void Player::onUnitCreated( Object *factory, Object *unit, Int productionID )
 {
 	// When a a unit is completed, it becomes "real" as far as scripting is
 	// concerned. jba.
@@ -1566,7 +1597,7 @@ void Player::onUnitCreated( Object *factory, Object *unit )
 
 	// ai notification callback
 	if( m_ai )
-		m_ai->onUnitProduced( factory, unit );
+		m_ai->onUnitProduced( factory, unit, productionID );
 }
 
 
@@ -1883,6 +1914,28 @@ Bool Player::hasAnyObjects() const
 		if ((*it)->hasAnyObjects()) {
 			return true;
 		}
+	}
+	return false;
+}
+
+//=============================================================================
+Bool Player::hasOffensiveTargetableObjects() const
+{
+	if (!TheGameLogic)
+		return false;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (IsSkirmishAIOffensiveTargetObjectEligible(
+			object != nullptr, object->getControllingPlayer() == this,
+			object->isKindOf(KINDOF_REBUILD_HOLE), object->isEffectivelyDead(),
+			object->isDestroyed(), object->testStatus(OBJECT_STATUS_SOLD),
+			object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+			object->testStatus(OBJECT_STATUS_RECONSTRUCTING),
+			object->isKindOf(KINDOF_UNATTACKABLE),
+			object->isKindOf(KINDOF_INERT),
+			object->isKindOf(KINDOF_PROJECTILE),
+			object->isKindOf(KINDOF_MINE), 0))
+			return true;
 	}
 	return false;
 }
@@ -4035,6 +4088,12 @@ void Player::crc( Xfer *xfer )
 
 	xfer->xferInt( &m_skillPoints );
 	xfer->xferInt( &m_sciencePurchasePoints );
+
+	// Recovery decisions affect subsequent simulation. Older replay epochs keep
+	// their original player CRC layout, as do humans and scripted campaign AI.
+	if (m_ai && m_ai->isSkirmishAI() &&
+		static_cast<AISkirmishPlayer *>(m_ai)->usesCriticalRecoveryBehavior())
+		xfer->xferSnapshot(m_ai);
 
 }
 

@@ -1204,7 +1204,7 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	// deterministic behavior without changing the retail replay header layout. Keep the existing
 	// SkirmishAI marker last because its parser intentionally requires a final suffix.
 	MarkReplayVersionForPathfindQueueCurrentEpoch(versionTimeString);
-	MarkReplayVersionForSkirmishAIRecordingEpoch(versionTimeString);
+	::MarkReplayVersionForSkirmishAIRecordingEpoch(versionTimeString);
 	UnsignedInt versionNumber = TheVersion->getVersionNumber();
 	#if defined(_WIN64)
 	nativeHeaderWriteOk = writeNativeReplayWideString(m_file, versionString.str()) && nativeHeaderWriteOk;
@@ -1899,24 +1899,20 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	UnicodeString pathLivenessMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLivenessMarkedVersionTimeString);
 	MarkReplayVersionForSkirmishAILivenessRecovery(pathLivenessMarkedVersionTimeString);
-	UnicodeString adaptiveGlobalRngMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
-	MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(adaptiveGlobalRngMarkedVersionTimeString);
-	UnicodeString pathAdaptiveGlobalRngMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
-	MarkReplayVersionForPathfindQueueCurrentEpoch(pathAdaptiveGlobalRngMarkedVersionTimeString);
-	MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(pathAdaptiveGlobalRngMarkedVersionTimeString);
-	UnicodeString counterRngMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
-	MarkReplayVersionForSkirmishAICurrentEpoch(counterRngMarkedVersionTimeString);
-	UnicodeString currentMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
-	MarkReplayVersionForPathfindQueueCurrentEpoch(currentMarkedVersionTimeString);
-	MarkReplayVersionForSkirmishAICurrentEpoch(currentMarkedVersionTimeString);
+	// The member helper restamps the exact parsed epoch, including released
+	// epochs 2-10 and the Stage 5 epochs 11-12. This avoids reinterpreting an
+	// older replay as the latest AI contract during the compatibility check.
+	UnicodeString compatibilityMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForSkirmishAICurrentEpoch(compatibilityMarkedVersionTimeString);
+	UnicodeString pathCompatibilityMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
+	MarkReplayVersionForPathfindQueueCurrentEpoch(pathCompatibilityMarkedVersionTimeString);
+	MarkReplayVersionForSkirmishAICurrentEpoch(pathCompatibilityMarkedVersionTimeString);
 	Bool versionTimeStringDiff = header.versionTimeString != TheVersion->getUnicodeBuildTime()
 		&& header.versionTimeString != pathMarkedVersionTimeString
 		&& header.versionTimeString != livenessMarkedVersionTimeString
 		&& header.versionTimeString != pathLivenessMarkedVersionTimeString
-		&& header.versionTimeString != adaptiveGlobalRngMarkedVersionTimeString
-		&& header.versionTimeString != pathAdaptiveGlobalRngMarkedVersionTimeString
-		&& header.versionTimeString != counterRngMarkedVersionTimeString
-		&& header.versionTimeString != currentMarkedVersionTimeString;
+		&& header.versionTimeString != compatibilityMarkedVersionTimeString
+		&& header.versionTimeString != pathCompatibilityMarkedVersionTimeString;
 	Bool versionNumberDiff = header.versionNumber != TheVersion->getVersionNumber();
 	Bool exeCRCDiff = header.exeCRC != TheGlobalData->m_exeCRC;
 	Bool exeDifferent = versionStringDiff || versionTimeStringDiff || versionNumberDiff || exeCRCDiff;

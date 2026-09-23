@@ -41,6 +41,9 @@
 #include "Common/PerfTimer.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#if RTS_ZEROHOUR
+#include "Common/SkirmishAILegacySaveTest.h"
+#endif
 #include "Common/SkirmishAITestRunner.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
@@ -539,7 +542,11 @@ void GameClient::update()
 			delete m_intro;
 			m_intro = nullptr;
 
-			if (!IsSkirmishAITestRunnerArmed())
+			if (!IsSkirmishAITestRunnerArmed()
+#if RTS_ZEROHOUR
+				&& !IsSkirmishAILegacySaveTestActive()
+#endif
+				)
 			{
 				TheShell->showShellMap(TRUE);
 				TheShell->showShell();

@@ -56,6 +56,7 @@
 #include "GameLogic/ScriptEngine.h"
 
 
+
 // PUBLIC /////////////////////////////////////////////////////////////////////////////////////////
 
 static const ModelConditionFlagType theOpeningFlags[DOOR_COUNT_MAX] =
@@ -263,7 +264,6 @@ Bool ProductionUpdate::queueUpgrade( const UpgradeTemplate *upgrade )
 
 	// get the player
 	Player *player = getObject()->getControllingPlayer();
-
 	// sanity check to make sure we can build this upgrade
 	if( upgrade->getUpgradeType() == UPGRADE_TYPE_PLAYER &&
 			TheUpgradeCenter->canAffordUpgrade( player, upgrade ) == FALSE )
@@ -294,6 +294,9 @@ Bool ProductionUpdate::queueUpgrade( const UpgradeTemplate *upgrade )
 		DEBUG_CRASH(("Production Queue is full... how did we get here?"));
 		return FALSE;
 	}
+	if (!player->canSpendForSkirmishAIRecovery(
+		upgrade->calcCostToBuild(player), nullptr, TRUE, TRUE))
+		return FALSE;
 
 	// take the cost for the build away from the player
 	Money *money = player->getMoney();
@@ -380,8 +383,12 @@ void ProductionUpdate::cancelUpgrade( const UpgradeTemplate *upgrade )
 //-------------------------------------------------------------------------------------------------
 Bool ProductionUpdate::queueCreateUnit( const ThingTemplate *unitType, ProductionID productionID )
 {
+	Player *player = getObject()->getControllingPlayer();
 	// if we can't create the unit do nothing
 	if( TheBuildAssistant->canMakeUnit( getObject(), unitType ) != CANMAKE_OK )
+		return FALSE;
+	if (player && !player->canSpendForSkirmishAIRecovery(
+		unitType ? unitType->calcCostToBuild(player) : 0, unitType, FALSE, TRUE))
 		return FALSE;
 
 	ExitDoorType exitDoor = DOOR_NONE_AVAILABLE;
@@ -417,7 +424,6 @@ Bool ProductionUpdate::queueCreateUnit( const ThingTemplate *unitType, Productio
 	}
 
 	// take the cost for the build away from the player
-	Player *player = getObject()->getControllingPlayer();
 	Money *money = player->getMoney();
 	money->withdraw( unitType->calcCostToBuild( player ) );
 
@@ -847,7 +853,9 @@ UpdateSleepTime ProductionUpdate::update()
 							TheAudio->addAudioEvent(&voiceCreate);
 
 							// call the onUnitCreated for the player
-							creationBuilding->getControllingPlayer()->onUnitCreated( creationBuilding, newObj );
+							creationBuilding->getControllingPlayer()->onUnitCreated(
+								creationBuilding, newObj,
+								static_cast<Int>(production->getProductionID()) );
 
 							// onCreates have been called on newObj, and after that the owner was set,
 							// so now is the time to call the game side of CreateModules
