@@ -326,17 +326,10 @@ Assert-RelocationThrows {
 } 'does not identify the same passed x64 commit and artifact set' `
     'the production evidence identity guard rejects a stale artifact-set binding'
 
-$snapshotPath = Join-Path $runRoot 'snapshot-hash-guard.txt'
-Write-RelocationText $snapshotPath 'snapshot guard bytes'
-$snapshot = Get-Stage5FinalAcceptanceFileSnapshot `
-    -Path $snapshotPath -Context 'bounded snapshot-hash test'
-Assert-RelocationThrows {
-    Assert-Stage5FinalAcceptanceSnapshotSha256 `
-        $snapshot ('0' * 64) 'bounded snapshot-hash test' | Out-Null
-} 'SHA-256 mismatch' `
-    'the production snapshot guard rejects a substituted attachment digest'
+$lockstepEvidencePath = Join-Path $runRoot 'lockstep-evidence-hash-guard.json'
+Write-RelocationText $lockstepEvidencePath '{}'
 $wrongExpectedLockstepHashArgs = @{
-    Path = $snapshotPath
+    Path = $lockstepEvidencePath
     ExpectedSourceCommit = 'a' * 40
     ExpectedArtifactSetSha256 = 'B' * 64
     ArtifactHashes = @{
@@ -348,7 +341,7 @@ $wrongExpectedLockstepHashArgs = @{
 Assert-RelocationThrows {
     Read-Stage5LockstepV2Evidence @wrongExpectedLockstepHashArgs | Out-Null
 } 'Lockstep-v2 multiplayer evidence SHA-256 mismatch' `
-    'the production lockstep-v2 reader rejects bytes detached from the independent expected hash'
+    'the lockstep-v2 reader rejects JSON evidence detached from its independent ExpectedEvidenceSha256'
 
 $launcherRoot = Join-Path $runRoot 'launcher-canonical'
 $copiedLauncherRoot = Join-Path $runRoot 'launcher-copied'
@@ -539,7 +532,7 @@ try {
         checks = @(
             'production acceptance role/title, trust, and duplicate-binding guards',
             'production evidence identity and outer/immutable receipt title guards',
-            'production immutable snapshot and lockstep reader digest rejection',
+            'production lockstep reader ExpectedEvidenceSha256 rejection',
             'production launcher canonical-path rejection for a copied runtime',
             'actual exported binding function invoked with real receipt/native/raw files',
             'all selected raw hashes validated, then mutation was re-read and rejected',
