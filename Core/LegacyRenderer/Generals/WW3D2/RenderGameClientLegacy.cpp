@@ -1027,11 +1027,18 @@ void SetGameDebugRenderStats(const GameDebugRenderStats &stats)
 	GetMutableGameDebugRenderStats() = stats;
 }
 
+#if defined(RTS_RENDERER_HAS_D3D11)
+RenderResult BeginGameDisplayIteration()
+#else
 void BeginGameDisplayIteration()
+#endif
 {
 	// The Win32 compatibility lane keeps GPU-copy lease ownership in the DX8
 	// wrapper/bridge.  Its display iteration hook remains the authoritative
 	// epoch boundary; the neutral call is intentionally a no-op here.
+#if defined(RTS_RENDERER_HAS_D3D11)
+	return RENDER_RESULT_OK;
+#endif
 }
 
 RenderResult ResetGameRenderFrameResources(bool frameChanged)
