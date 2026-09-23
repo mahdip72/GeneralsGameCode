@@ -579,6 +579,7 @@ ConnectionManager::~ConnectionManager()
 	deleteInstance(m_networkHelloPendingCommands);
 	m_networkHelloPendingCommands = nullptr;
 	clearNetworkFrameRecovery();
+	m_pendingMapPackage.clear();
 #endif
 
 	s_fileCommandMap.clear();
@@ -651,6 +652,7 @@ void ConnectionManager::init()
 
 #if defined(_WIN64)
 	m_networkHelloStarted = FALSE;
+	m_pendingMapPackage.clear();
 	m_networkHelloRequired = FALSE;
 	m_networkHelloFailed = FALSE;
 	m_networkHelloStartTime = 0U;
@@ -790,6 +792,7 @@ void ConnectionManager::reset()
 
 #if defined(_WIN64)
 	m_networkHelloStarted = FALSE;
+	m_pendingMapPackage.clear();
 	m_networkHelloRequired = FALSE;
 	m_networkHelloFailed = FALSE;
 	m_networkHelloStartTime = 0U;
@@ -2518,61 +2521,64 @@ void ConnectionManager::processChat(NetChatCommandMsg *msg)
 }
 
 #if defined(_WIN64)
-static Bool writeTransferredFileAtomically(const AsciiString &path,
-	const UnsignedByte *bytes, Int length)
+static Int selectedMapPackageFileIndex(const AsciiString &path,
+	const AsciiString &map, AsciiString *destination)
 {
-	const char *separator = strrchr(path.str(), '\\');
-	if (separator == nullptr || length < 0)
-		return FALSE;
-	const size_t directoryLength = separator - path.str() + 1;
-	if (directoryLength >= MAX_PATH)
-		return FALSE;
-	char directory[MAX_PATH];
-	memcpy(directory, path.str(), directoryLength);
-	directory[directoryLength] = 0;
-	// A downloaded custom map may not have a destination directory yet.
-	// Create each component without opening or truncating any existing file.
-	size_t firstComponent = directory[1] == ':' ? 3U : 0U;
-	if (directory[0] == '\\' && directory[1] == '\\')
+	if (destination == nullptr)
+		return -1;
+	const AsciiString files[] = {
+		map, GetPreviewFromMap(map), GetINIFromMap(map),
+		GetStrFileFromMap(map), GetSoloINIFromMap(map),
+		GetAssetUsageFromMap(map), GetReadmeFromMap(map)
+	};
+	for (Int i = 0; i < ARRAY_SIZE(files); ++i)
 	{
-		const char *serverEnd = strchr(directory + 2, '\\');
-		const char *shareEnd = serverEnd ? strchr(serverEnd + 1, '\\') : nullptr;
-		if (shareEnd == nullptr)
-			return FALSE;
-		firstComponent = static_cast<size_t>(shareEnd - directory + 1);
+		if (rts::network_epoch::IsSameCanonicalNetworkMapPath(
+			TheGameState->realMapPathToPortableMapPath(path).str(),
+			TheGameState->realMapPathToPortableMapPath(files[i]).str()))
+		{
+			*destination = files[i];
+			return i;
+		}
 	}
-	for (size_t i = firstComponent; i < directoryLength; ++i)
-	{
-		if (directory[i] != '\\' || i == 0)
-			continue;
-		const char separator = directory[i];
-		directory[i] = 0;
-		if (!CreateDirectoryA(directory, nullptr) &&
-			GetLastError() != ERROR_ALREADY_EXISTS)
-			return FALSE;
-		directory[i] = separator;
-	}
-	char temporary[MAX_PATH];
-	if (GetTempFileNameA(directory, "ggc", 0, temporary) == 0)
+	return -1;
+}
+
+static Bool projectedNetworkMapSidecar(const AsciiString &path,
+	const UnsignedByte **bytes, UnsignedInt *length, void *context)
+{
+	rts::network_epoch::NetworkMapPackageTransaction *package =
+		static_cast<rts::network_epoch::NetworkMapPackageTransaction *>(context);
+	size_t stagedLength = 0;
+	if (!package->staged(path.str(), bytes, &stagedLength))
 		return FALSE;
-	HANDLE file = CreateFileA(temporary, GENERIC_WRITE, 0, nullptr,
-		TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
-		nullptr);
-	DWORD written = 0;
-	const Bool complete = file != INVALID_HANDLE_VALUE &&
-		(length == 0 || WriteFile(file, bytes, static_cast<DWORD>(length), &written, nullptr)) &&
-		written == static_cast<DWORD>(length) &&
-		FlushFileBuffers(file);
-	if (file != INVALID_HANDLE_VALUE)
-		CloseHandle(file);
-	if (!complete || !MoveFileExA(temporary, path.str(),
-		MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-	{
-		DeleteFileA(temporary);
-		return FALSE;
-	}
-	TheFileSystem->noteExternalFileReplacement(path.str());
+	*length = static_cast<UnsignedInt>(stagedLength);
 	return TRUE;
+}
+
+struct NetworkMapCommitContext
+{
+	AsciiString map;
+	UnsignedInt mapCrc;
+	UnsignedInt hostMask;
+	UnsignedInt hostSidecarCrc;
+};
+
+static bool validateCommittedNetworkMap(void *context)
+{
+	NetworkMapCommitContext *identity =
+		static_cast<NetworkMapCommitContext *>(context);
+	UnsignedInt localSidecarCrc = 0U;
+	return GetMapSimulationSidecarCRC(identity->map, &localSidecarCrc) &&
+		rts::network_epoch::IsNetworkMapPackageReady(true,
+			identity->mapCrc, GetMapFileCRC(identity->map),
+			identity->hostMask, identity->hostSidecarCrc,
+			GetMapSimulationSidecarMask(identity->map), localSidecarCrc);
+}
+
+static void noteCommittedNetworkMapFile(const char *path, void *)
+{
+	TheFileSystem->noteExternalFileReplacement(path);
 }
 #endif
 
@@ -2655,10 +2661,34 @@ void ConnectionManager::processFile(NetFileCommandMsg *msg)
 	}
 
 #if defined(_WIN64)
-	const Bool selectedMap = TheGameInfo != nullptr &&
-		rts::network_epoch::IsSameCanonicalNetworkMapPath(
-			TheGameState->realMapPathToPortableMapPath(realFileName).str(),
-			TheGameState->realMapPathToPortableMapPath(TheGameInfo->getMap()).str());
+	// Native transfers are restricted to the selected host map and its six
+	// known companions. A progress ACK must correspond to a host announcement.
+	AsciiString packageDestination;
+	const Int packageIndex = TheGameInfo != nullptr ?
+		selectedMapPackageFileIndex(realFileName, TheGameInfo->getMap(),
+			&packageDestination) : -1;
+	const FileCommandMap::const_iterator announcement = s_fileCommandMap.find(msg->getID());
+	const FileMaskMap::const_iterator recipients = s_fileRecipientMaskMap.find(msg->getID());
+	if (packageIndex < 0 || msg->getPlayerID() != 0 ||
+		m_localSlot >= MAX_SLOTS ||
+		TheGameInfo->amIHost() || announcement == s_fileCommandMap.end() ||
+		recipients == s_fileRecipientMaskMap.end() ||
+		!rts::network_epoch::IsSameCanonicalNetworkMapPath(
+			TheGameState->realMapPathToPortableMapPath(announcement->second).str(),
+			TheGameState->realMapPathToPortableMapPath(realFileName).str()) ||
+		(recipients->second & (1 << m_localSlot)) == 0)
+	{
+		DEBUG_LOG(("Rejecting unannounced or unrelated NET3 map file '%s'",
+			realFileName.str()));
+		return;
+	}
+	const Bool selectedMap = packageIndex == 0;
+	if (!m_pendingMapPackage.stage(packageDestination.str(), buf,
+		static_cast<size_t>(len)))
+	{
+		DEBUG_LOG(("Cannot stage NET3 map package file '%s'", realFileName.str()));
+		return;
+	}
 	if (selectedMap)
 	{
 		CRC transferredMapCrc;
@@ -2666,17 +2696,20 @@ void ConnectionManager::processFile(NetFileCommandMsg *msg)
 		transferredMapCrc.computeCRC(buf, len);
 		UnsignedInt hostContentsMask = 0U;
 		UnsignedInt hostSidecarCrc = 0U;
-		UnsignedInt localSidecarCrc = 0U;
+		UnsignedInt projectedSidecarMask = 0U;
+		UnsignedInt projectedSidecarCrc = 0U;
 		if (!getNetworkMapSidecarIdentity(0, &hostContentsMask,
 			&hostSidecarCrc) ||
-			!GetMapSimulationSidecarCRC(TheGameInfo->getMap(), &localSidecarCrc) ||
+			!GetProjectedMapSimulationSidecarCRC(TheGameInfo->getMap(),
+				projectedNetworkMapSidecar, &m_pendingMapPackage,
+				&projectedSidecarMask, &projectedSidecarCrc) ||
 			!rts::network_epoch::IsNetworkMapPackageReady(TRUE,
 				TheGameInfo->getMapCRC(), transferredMapCrc.get(),
 				hostContentsMask, hostSidecarCrc,
-				GetMapSimulationSidecarMask(TheGameInfo->getMap()),
-				localSidecarCrc))
+				projectedSidecarMask, projectedSidecarCrc))
 		{
-			DEBUG_LOG(("Transferred map bytes or sidecars fail NET3 host identity"));
+			m_pendingMapPackage.clear();
+			DEBUG_LOG(("Staged map bytes or sidecars fail NET3 host identity"));
 			return;
 		}
 	}
@@ -2684,7 +2717,20 @@ void ConnectionManager::processFile(NetFileCommandMsg *msg)
 
 	Bool wroteFile = FALSE;
 #if defined(_WIN64)
-	wroteFile = writeTransferredFileAtomically(realFileName, buf, len);
+	if (selectedMap)
+	{
+		NetworkMapCommitContext identity;
+		identity.map = TheGameInfo->getMap();
+		identity.mapCrc = TheGameInfo->getMapCRC();
+		wroteFile = getNetworkMapSidecarIdentity(0, &identity.hostMask,
+			&identity.hostSidecarCrc) &&
+			m_pendingMapPackage.commit(validateCommittedNetworkMap, &identity,
+				noteCommittedNetworkMapFile);
+		if (!wroteFile && !m_pendingMapPackage.rollbackComplete())
+			DEBUG_LOG(("NET3 map package rollback incomplete; backups retained"));
+	}
+	else
+		wroteFile = TRUE; // Accepted in memory; the final map ACK commits the package.
 #else
 	File *fp = TheFileSystem->openFile(realFileName.str(), File::CREATE | File::BINARY | File::WRITE);
 	if (fp)
@@ -2710,30 +2756,6 @@ void ConnectionManager::processFile(NetFileCommandMsg *msg)
 #endif
 		return;
 	}
-
-#if defined(_WIN64)
-	// The selected .map is always transferred last. Its progress ACK is the
-	// host's proof that this recipient committed the complete simulation map
-	// package, including every advertised sidecar.
-	if (selectedMap)
-	{
-		UnsignedInt hostContentsMask = 0U;
-		UnsignedInt hostSidecarCrc = 0U;
-		UnsignedInt localSidecarCrc = 0U;
-		if (!getNetworkMapSidecarIdentity(0, &hostContentsMask,
-			&hostSidecarCrc) ||
-			!GetMapSimulationSidecarCRC(TheGameInfo->getMap(), &localSidecarCrc) ||
-			!rts::network_epoch::IsNetworkMapPackageReady(wroteFile,
-				TheGameInfo->getMapCRC(), GetMapFileCRC(TheGameInfo->getMap()),
-				hostContentsMask, hostSidecarCrc,
-				GetMapSimulationSidecarMask(TheGameInfo->getMap()),
-				localSidecarCrc))
-		{
-			DEBUG_LOG(("Transferred map package does not match NET3 host identity"));
-			return;
-		}
-	}
-#endif
 
 	DEBUG_LOG(("ConnectionManager::processFile() - sending a NetFileProgressCommandMsg"));
 

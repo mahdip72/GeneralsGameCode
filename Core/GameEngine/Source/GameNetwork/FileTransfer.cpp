@@ -295,6 +295,10 @@ AsciiString GetReadmeFromMap( AsciiString path )
 Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 {
 	TheGameInfo = game;
+#if defined(_WIN64)
+	if (game == nullptr || !RecoverInterruptedNetworkMapPackage(game->getMap()))
+		return FALSE;
+#endif
 	Int mask = 0;
 	Int i=0;
 #if defined(_WIN64)

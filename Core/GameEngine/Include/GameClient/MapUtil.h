@@ -139,7 +139,15 @@ UnsignedInt GetMapFileCRC(const AsciiString &mapName);
 Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc);
 Int GetMapSimulationSidecarMask(const AsciiString &mapName);
 #if defined(_WIN64)
+Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName);
 Bool GetMapSimulationSidecarCRC(const AsciiString &mapName, UnsignedInt *crcOut);
+// An override supplies received, validated bytes before a NET3 package is
+// installed. Returning FALSE reads the existing file instead.
+typedef Bool (*MapSimulationSidecarOverride)(const AsciiString &path,
+	const UnsignedByte **bytes, UnsignedInt *length, void *context);
+Bool GetProjectedMapSimulationSidecarCRC(const AsciiString &mapName,
+	MapSimulationSidecarOverride overrideFile, void *context,
+	UnsignedInt *maskOut, UnsignedInt *crcOut);
 #endif
 
 // TheSuperHackers @refactor xezon 28/11/2025 Refactors the map list population implementation

@@ -35,6 +35,7 @@
 #include <cstdint>
 #include "Lib/LockstepV2Contract.h"
 #include "Lib/NetworkEpochHandshake.h"
+#include "Lib/NetworkMapPackageTransaction.h"
 #endif
 
 #include "GameNetwork/Connection.h"
@@ -291,6 +292,7 @@ private:
 
 #if defined(_WIN64)
 	Bool m_networkHelloStarted;
+	rts::network_epoch::NetworkMapPackageTransaction m_pendingMapPackage;
 	Bool m_networkHelloRequired;
 	Bool m_networkHelloFailed;
 	Bool m_networkHelloValidated[MAX_SLOTS];

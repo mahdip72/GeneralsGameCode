@@ -63,6 +63,7 @@
 #include "GameNetwork/NetworkDefs.h"
 #if defined(_WIN64)
 #include "Lib/NetworkEpochHandshake.h"
+#include "Lib/NetworkMapPackageTransaction.h"
 #endif
 
 
@@ -110,8 +111,27 @@ static UnsignedInt calcCRC( AsciiString fname )
 	return theCRC.get();
 }
 
+#if defined(_WIN64)
+static void noteRecoveredMapFile(const char *path, void *)
+{
+	if (TheFileSystem != nullptr)
+		TheFileSystem->noteExternalFileReplacement(path);
+}
+
+Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName)
+{
+	return rts::network_epoch::NetworkMapPackageTransaction::isCommitting() ||
+		rts::network_epoch::NetworkMapPackageTransaction::recover(
+			mapName.str(), noteRecoveredMapFile);
+}
+#endif
+
 UnsignedInt GetMapFileCRC(const AsciiString &mapName)
 {
+#if defined(_WIN64)
+	if (!RecoverInterruptedNetworkMapPackage(mapName))
+		return 0U;
+#endif
 	File *file = TheFileSystem->openFile(mapName.str(), File::READ);
 	if (!file)
 		return 0;
@@ -130,6 +150,10 @@ Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc)
 
 Int GetMapSimulationSidecarMask(const AsciiString &mapName)
 {
+#if defined(_WIN64)
+	if (!RecoverInterruptedNetworkMapPackage(mapName))
+		return 0;
+#endif
 	const AsciiString paths[] = {
 		GetINIFromMap(mapName), GetSoloINIFromMap(mapName),
 		GetAssetUsageFromMap(mapName)
@@ -151,13 +175,24 @@ Int GetMapSimulationSidecarMask(const AsciiString &mapName)
 #if defined(_WIN64)
 Bool GetMapSimulationSidecarCRC(const AsciiString &mapName, UnsignedInt *crcOut)
 {
-	if (crcOut == nullptr)
+	return GetProjectedMapSimulationSidecarCRC(mapName, nullptr, nullptr,
+		nullptr, crcOut);
+}
+
+Bool GetProjectedMapSimulationSidecarCRC(const AsciiString &mapName,
+	MapSimulationSidecarOverride overrideFile, void *context,
+	UnsignedInt *maskOut, UnsignedInt *crcOut)
+{
+	if (crcOut == nullptr || !RecoverInterruptedNetworkMapPackage(mapName))
 		return FALSE;
 	*crcOut = 0U;
+	if (maskOut != nullptr)
+		*maskOut = 0U;
 	const AsciiString paths[] = {
 		GetINIFromMap(mapName), GetSoloINIFromMap(mapName),
 		GetAssetUsageFromMap(mapName)
 	};
+	const UnsignedInt maskBits[] = { 4U, 16U, 32U };
 	CRC crc;
 	crc.clear();
 	const UnsignedByte domain[] = { 'M', 'A', 'P', 'S', 'I', 'M', 1 };
@@ -166,17 +201,26 @@ Bool GetMapSimulationSidecarCRC(const AsciiString &mapName, UnsignedInt *crcOut)
 	{
 		const UnsignedByte kind = static_cast<UnsignedByte>(i + 1);
 		crc.computeCRC(&kind, 1);
-		File *file = TheFileSystem->openFile(paths[i].str(), File::READ);
-		const UnsignedByte present = file ? 1 : 0;
+		const UnsignedByte *stagedBytes = nullptr;
+		UnsignedInt stagedLength = 0U;
+		const Bool staged = overrideFile != nullptr &&
+			overrideFile(paths[i], &stagedBytes, &stagedLength, context);
+		File *file = staged ? nullptr :
+			TheFileSystem->openFile(paths[i].str(), File::READ);
+		const UnsignedByte present = staged || file ? 1 : 0;
 		crc.computeCRC(&present, 1);
-		if (file)
+		if (present)
 		{
-			const Int fileLength = file->size();
-			if (fileLength < 0)
+			const Int fileLength = staged ? static_cast<Int>(stagedLength) : file->size();
+			if (fileLength < 0 ||
+				(staged && stagedLength != 0U && stagedBytes == nullptr))
 			{
-				file->close();
+				if (file)
+					file->close();
 				return FALSE;
 			}
+			if (maskOut != nullptr)
+				*maskOut |= maskBits[i];
 			const UnsignedInt length = static_cast<UnsignedInt>(fileLength);
 			const UnsignedByte lengthBytes[] = {
 				static_cast<UnsignedByte>(length),
@@ -185,22 +229,30 @@ Bool GetMapSimulationSidecarCRC(const AsciiString &mapName, UnsignedInt *crcOut)
 				static_cast<UnsignedByte>(length >> 24)
 			};
 			crc.computeCRC(lengthBytes, sizeof(lengthBytes));
-			UnsignedByte buffer[4096];
-			UnsignedInt remaining = length;
-			while (remaining > 0)
+			if (staged)
 			{
-				const Int wanted = remaining < sizeof(buffer) ?
-					static_cast<Int>(remaining) : static_cast<Int>(sizeof(buffer));
-				const Int count = file->read(buffer, wanted);
-				if (count <= 0 || count > wanted)
-				{
-					file->close();
-					return FALSE; // Incomplete content must never become a valid identity.
-				}
-				crc.computeCRC(buffer, count);
-				remaining -= static_cast<UnsignedInt>(count);
+				if (length != 0U)
+					crc.computeCRC(stagedBytes, length);
 			}
-			file->close();
+			else
+			{
+				UnsignedByte buffer[4096];
+				UnsignedInt remaining = length;
+				while (remaining > 0)
+				{
+					const Int wanted = remaining < sizeof(buffer) ?
+						static_cast<Int>(remaining) : static_cast<Int>(sizeof(buffer));
+					const Int count = file->read(buffer, wanted);
+					if (count <= 0 || count > wanted)
+					{
+						file->close();
+						return FALSE; // Incomplete content must never become a valid identity.
+					}
+					crc.computeCRC(buffer, count);
+					remaining -= static_cast<UnsignedInt>(count);
+				}
+				file->close();
+			}
 		}
 	}
 	*crcOut = crc.get();
@@ -319,6 +371,10 @@ static Bool ParseSizeOnlyInChunk(DataChunkInput &file, DataChunkInfo *info, void
 
 static Bool loadMap( AsciiString filename )
 {
+#if defined(_WIN64)
+	if (!RecoverInterruptedNetworkMapPackage(filename))
+		return FALSE;
+#endif
 	CachedFileInputStream fileStrm;
 
 	if( !fileStrm.open(filename) )

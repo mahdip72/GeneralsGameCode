@@ -71,6 +71,10 @@ GameStateMap::~GameStateMap()
 // ------------------------------------------------------------------------------------------------
 static void embedPristineMap( AsciiString map, Xfer *xfer )
 {
+#if defined(_WIN64)
+	if (!RecoverInterruptedNetworkMapPackage(map))
+		throw SC_INVALID_DATA;
+#endif
 
 	// open the map file
 	File *file = TheFileSystem->openFile( map.str(), File::READ | File::BINARY );
