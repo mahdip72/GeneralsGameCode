@@ -18,6 +18,7 @@
 #include <math.h>
 #include <new>
 #include <string.h>
+#include <utility>
 #include <vector>
 
 namespace
@@ -554,7 +555,7 @@ RenderResult NativeSortingRenderer::Queue(const LegacyLogicalState &state,
 		submission.insertionOrder = m_impl->nextInsertionOrder++;
 		if (m_impl->nextInsertionOrder == 0)
 			m_impl->nextInsertionOrder = 1;
-		m_impl->submissions.push_back(submission);
+		m_impl->submissions.push_back(std::move(submission));
 	}
 	catch (const std::bad_alloc &)
 	{
