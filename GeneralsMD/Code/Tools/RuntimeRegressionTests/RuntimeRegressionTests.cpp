@@ -3827,9 +3827,9 @@ static void TestSkirmishAIStage4DefensePolicies()
 		SKIRMISH_AI_DEFENSE_CENTER, 0, 2, 3));
 	// A single low-value contact does not unlock a second site. Penetration or
 	// a second contact raises the score to 200 and does.
-	for (int route = 0; route < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++route) {
-		counts.owned[route] = 0;
-		counts.queued[route] = 0;
+	for (int resetRoute = 0; resetRoute < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++resetRoute) {
+		counts.owned[resetRoute] = 0;
+		counts.queued[resetRoute] = 0;
 	}
 	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_CENTER,
 		true, true, false, 100);
@@ -3885,7 +3885,7 @@ static void TestSkirmishAIStage4DefensePolicies()
 	// Model the first two teams exhausting a shared path-query budget. Every
 	// team must still lead a scan within a bounded number of 2-second ticks.
 	for (unsigned int teamCount = 1; teamCount <= 512; ++teamCount) {
-		bool visited[512] = {};
+		bool visited[512] = { false };
 		const unsigned int windowsPerSweep = (teamCount - 1) / 64 + 1;
 		const unsigned int sweeps = teamCount < 64 ? teamCount : 64;
 		for (unsigned int tick = 0; tick < windowsPerSweep * sweeps; ++tick) {
@@ -4021,9 +4021,9 @@ static void TestSkirmishAITunnelRoutePolicies()
 			CHECK(!largeSweepSeen[first][second]);
 			largeSweepSeen[first][second] = TRUE;
 		}
-	for (Int first = 0; first < 31; ++first)
-		for (Int second = first + 1; second < 32; ++second)
-			CHECK(largeSweepSeen[first][second]);
+	for (Int largeFirst = 0; largeFirst < 31; ++largeFirst)
+		for (Int largeSecond = largeFirst + 1; largeSecond < 32; ++largeSecond)
+			CHECK(largeSweepSeen[largeFirst][largeSecond]);
 	CHECK(SelectSiteIndex(0, 0) == -1);
 	Bool visitedSites[5] = { FALSE, FALSE, FALSE, FALSE, FALSE };
 	for (UnsignedInt siteCursor = 2; siteCursor < 7; ++siteCursor) {
@@ -4037,7 +4037,7 @@ static void TestSkirmishAITunnelRoutePolicies()
 	UnsignedInt endpointRemaining = 32;
 	Bool endpointSeen[32] = { FALSE };
 	for (Int scan = 0; scan < 16; ++scan)
-		for (Int probe = 0; probe < 2; ++probe) {
+		for (Int endpointProbe = 0; endpointProbe < 2; ++endpointProbe) {
 			const UnsignedInt index = endpointCursor % 32;
 			CHECK(!endpointSeen[index]);
 			endpointSeen[index] = TRUE;
@@ -4160,8 +4160,8 @@ static void TestSkirmishAITunnelRoutePolicies()
 		targetB, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
 	CHECK(!CanAttemptForwardEndpoint(TRUE, targetB, INVALID_ID, FALSE,
 		targetA, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
-	for (Int i = 2; i < MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
-		RememberExhaustedForwardTarget(static_cast<ObjectID>(710 + i),
+	for (Int exhaustedIndex = 2; exhaustedIndex < MAX_EXHAUSTED_FORWARD_TARGETS; ++exhaustedIndex)
+		RememberExhaustedForwardTarget(static_cast<ObjectID>(710 + exhaustedIndex),
 			exhaustedTargets);
 	CHECK(!CanAttemptForwardEndpoint(TRUE, targetB, INVALID_ID, FALSE,
 		static_cast<ObjectID>(900), generatedIDs, generatedTargets,
