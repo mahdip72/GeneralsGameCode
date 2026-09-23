@@ -531,6 +531,97 @@ DWORD WINAPI UpdateFromWrongOwner(void *parameter)
 	return 0;
 }
 
+int TestResourceLookupHints()
+{
+	int result = 0;
+	FakeRenderDevice device;
+	NativeW3DResourceHost host(8);
+	NativeW3DResources resources(8);
+	if (host.Attach(&device, device.immediateContext()) != RENDER_RESULT_OK ||
+		resources.BindHost(&host) != RENDER_RESULT_OK)
+	{
+		return Check(false, "lookup fixture attaches a resource table");
+	}
+
+	const unsigned int value = 7;
+	BufferDescriptor descriptor;
+	descriptor.byteCount = sizeof(value);
+	descriptor.stride = sizeof(value);
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	descriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle aligned;
+	const bool alignedCreated = resources.CreateBuffer(descriptor, &value,
+		sizeof(value), &aligned) == RENDER_RESULT_OK;
+	result |= Check(alignedCreated && aligned.index() == 0,
+		"resource and backend first-free indices align initially");
+	if (alignedCreated)
+	{
+		const NativeW3DResources &readOnly = resources;
+		for (unsigned int repeat = 0; repeat < 8; ++repeat)
+			result |= Check(readOnly.IsVertexRangeValidForSubmission(aligned,
+				sizeof(value), 0, 0, 1),
+				"aligned lookup preserves initialized range proof");
+		const GpuHandle stale(aligned.index(), aligned.generation() + 1);
+		result |= Check(!readOnly.IsVertexRangeValidForSubmission(stale,
+			sizeof(value), 0, 0, 1),
+			"lookup hint rejects a different handle generation");
+		result |= Check(resources.Destroy(aligned),
+			"aligned lookup still destroys the exact resource");
+	}
+
+	GpuHandle external;
+	const bool externalCreated = device.createBuffer(descriptor, &value,
+		sizeof(value), &external) == RENDER_RESULT_OK;
+	GpuHandle misaligned;
+	const bool misalignedCreated = externalCreated &&
+		resources.CreateBuffer(descriptor, &value, sizeof(value),
+			&misaligned) == RENDER_RESULT_OK;
+	result |= Check(misalignedCreated && external.index() == 0 &&
+		misaligned.index() == 1,
+		"out-of-band allocation makes handle index differ from table slot");
+	if (misalignedCreated)
+	{
+		const NativeW3DResources &readOnly = resources;
+		for (unsigned int repeat = 0; repeat < 8; ++repeat)
+			result |= Check(readOnly.IsVertexRangeValidForSubmission(misaligned,
+				sizeof(value), 0, 0, 1),
+				"fallback and repeated cache hits retain range proof");
+		result |= Check(!readOnly.IsVertexRangeValidForSubmission(external,
+			sizeof(value), 0, 0, 1),
+			"out-of-band backend handle is not a table resource");
+		result |= Check(resources.Destroy(misaligned),
+			"cached fallback lookup destroys the exact resource");
+	}
+	if (externalCreated)
+		result |= Check(device.destroyResource(external),
+			"fixture removes only its out-of-band backend allocation");
+	GpuHandle externalReuse;
+	const bool externalRecreated = device.createBuffer(descriptor, &value,
+		sizeof(value), &externalReuse) == RENDER_RESULT_OK;
+	GpuHandle reused;
+	const bool reusedCreated = externalRecreated &&
+		resources.CreateBuffer(descriptor, &value, sizeof(value),
+			&reused) == RENDER_RESULT_OK;
+	result |= Check(reusedCreated && reused.index() == misaligned.index() &&
+		reused.generation() != misaligned.generation(),
+		"backend slot reuse advances the generation without moving table slot");
+	if (reusedCreated)
+	{
+		result |= Check(resources.IsVertexRangeValidForSubmission(reused,
+			sizeof(value), 0, 0, 1),
+			"stale cached generation falls back to the newly published resource");
+		result |= Check(resources.Destroy(reused),
+			"reused generation remains destructible");
+	}
+	if (externalRecreated)
+		result |= Check(device.destroyResource(externalReuse),
+			"fixture removes the reused out-of-band allocation");
+	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+		host.Detach() == RENDER_RESULT_OK && device.LiveCount() == 0,
+		"lookup fixture closes without retained resources");
+	return result;
+}
+
 struct WorkerDestroy
 {
 	NativeW3DResources *resources;
@@ -2162,6 +2253,7 @@ int main()
 		device.LiveCount() == 0 && device.isOperational(),
 		"public borrowed shutdown succeeds after EndFrame and product cleanup preserves backend ownership");
 	result |= TestThreadedResourceCompletion();
+	result |= TestResourceLookupHints();
 	result |= TestThreadedNativeBufferOwnerFailureRecovery();
 	result |= TestThreadedBetweenFrameBufferUpdates();
 	result |= TestUnrelatedFrameFailureDoesNotInvalidateResourceMutation();

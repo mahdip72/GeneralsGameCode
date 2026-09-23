@@ -2593,18 +2593,8 @@ bool NativeW3DResources::IsValid(NativeW3DSurfaceHandle handle) const
 
 NativeW3DResources::Slot *NativeW3DResources::Find(GpuHandle handle)
 {
-	if (m_impl == 0 || !handle.isValid())
-	{
-		return 0;
-	}
-	for (size_t index = 0; index < m_impl->slots.size(); ++index)
-	{
-		if (m_impl->slots[index].handle == handle)
-		{
-			return &m_impl->slots[index];
-		}
-	}
-	return 0;
+	return const_cast<Slot *>(
+		static_cast<const NativeW3DResources *>(this)->Find(handle));
 }
 
 const NativeW3DResources::Slot *NativeW3DResources::Find(
@@ -2614,10 +2604,43 @@ const NativeW3DResources::Slot *NativeW3DResources::Find(
 	{
 		return 0;
 	}
+	const size_t hintedIndex = handle.index();
+	if (hintedIndex < m_impl->slots.size() &&
+		m_impl->slots[hintedIndex].handle == handle)
+	{
+		return &m_impl->slots[hintedIndex];
+	}
+#if defined(_WIN64)
+	// Sorted draws repeatedly validate the same scratch buffers and textures.
+	// A thread-local hint avoids a table scan when backend handle indices do not
+	// match resource-table slots. Always verify the full generation-bearing
+	// handle against the current slot before using the hint.
+	struct LookupHint
+	{
+		LookupHint() : owner(0), handle(), slot(0) {}
+		const Impl *owner;
+		GpuHandle handle;
+		size_t slot;
+	};
+	enum { HintCount = 32 };
+	static thread_local LookupHint hints[HintCount];
+	LookupHint &hint = hints[handle.index() % HintCount];
+	if (hint.owner == m_impl && hint.handle == handle &&
+		hint.slot < m_impl->slots.size() &&
+		m_impl->slots[hint.slot].handle == handle)
+	{
+		return &m_impl->slots[hint.slot];
+	}
+#endif
 	for (size_t index = 0; index < m_impl->slots.size(); ++index)
 	{
 		if (m_impl->slots[index].handle == handle)
 		{
+#if defined(_WIN64)
+			hint.owner = m_impl;
+			hint.handle = handle;
+			hint.slot = index;
+#endif
 			return &m_impl->slots[index];
 		}
 	}
