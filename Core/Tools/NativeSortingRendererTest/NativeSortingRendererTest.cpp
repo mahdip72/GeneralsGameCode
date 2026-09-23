@@ -414,6 +414,93 @@ void TestMixedGeometryPreservesSortedOrder()
 	CHECK(renderer.Empty());
 }
 
+void TestSameSubmissionTrianglesBeforeIncompatibleSubmission()
+{
+	NativeSortingRenderer renderer;
+	RecordingSink sink;
+	sink.requireHomogeneous = true;
+	std::vector<TestVertex> narrow;
+	MakeVertices(narrow, std::vector<float>{1.0f, 1.0f, 1.0f,
+		2.0f, 2.0f, 2.0f, 3.0f, 3.0f, 3.0f});
+	TestVertexWide wide[3] = {};
+	for (unsigned int index = 0; index < 3; ++index)
+		wide[index].z = 4.0f;
+
+	unsigned short narrowIndices[9];
+	for (unsigned short index = 0; index < 9; ++index)
+		narrowIndices[index] = index;
+	const unsigned short wideIndices[] = {0, 1, 2};
+	LegacyLogicalState state;
+	state.pipeline.shaderBits = 101;
+	NativeDrawPacket narrowPacket = MakePacket(9, 9);
+	CHECK(renderer.Queue(state, narrowPacket, narrow.data(),
+		narrow.size() * sizeof(TestVertex), narrowIndices,
+		sizeof(narrowIndices), 0) == RENDER_RESULT_OK);
+
+	state.pipeline.shaderBits = 202;
+	NativeDrawPacket widePacket = MakePacket(3, 3);
+	widePacket.vertexStride = sizeof(TestVertexWide);
+	widePacket.vertexLayout.stride = sizeof(TestVertexWide);
+	widePacket.vertexLayout.elementCount = 3;
+	widePacket.vertexLayout.elements[2].semantic =
+		RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE;
+	widePacket.vertexLayout.elements[2].semanticIndex = 0;
+	widePacket.vertexLayout.elements[2].format = RENDER_VERTEX_DATA_FLOAT2;
+	widePacket.vertexLayout.elements[2].byteOffset = sizeof(TestVertex);
+	CHECK(renderer.Queue(state, widePacket, wide,
+		sizeof(wide), wideIndices,
+		sizeof(wideIndices), 0) == RENDER_RESULT_OK);
+
+	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
+	CHECK(sink.calls == 2);
+	CHECK(sink.batches.size() == 2);
+	if (sink.batches.size() == 2)
+	{
+		CHECK(sink.batches[0].states.size() == 1);
+		CHECK(sink.batches[0].states[0] == 101);
+		CHECK(sink.batches[0].indexCounts.size() == 1);
+		CHECK(sink.batches[0].indexCounts[0] == 9);
+		CHECK(sink.batches[1].states.size() == 1);
+		CHECK(sink.batches[1].states[0] == 202);
+		CHECK(sink.batches[1].indexCounts.size() == 1);
+		CHECK(sink.batches[1].indexCounts[0] == 3);
+	}
+
+	std::vector<CapturedDraw> captured;
+	CHECK(CaptureAcceptedDrawStream(sink, captured));
+	CHECK(captured.size() == 2);
+	if (captured.size() == 2)
+	{
+		const unsigned short expectedNarrowIndices[] =
+			{0, 1, 2, 3, 4, 5, 6, 7, 8};
+		const unsigned short expectedWideIndices[] = {0, 1, 2};
+		CHECK(captured[0].state == 101);
+		CHECK(captured[0].indices.size() == 9);
+		if (captured[0].indices.size() == 9)
+			CHECK(memcmp(captured[0].indices.data(), expectedNarrowIndices,
+				sizeof(expectedNarrowIndices)) == 0);
+		CHECK(captured[0].referencedVertices.size() ==
+			narrow.size() * sizeof(TestVertex));
+		if (captured[0].referencedVertices.size() ==
+			narrow.size() * sizeof(TestVertex))
+			CHECK(memcmp(captured[0].referencedVertices.data(), narrow.data(),
+				narrow.size() * sizeof(TestVertex)) == 0);
+
+		CHECK(captured[1].state == 202);
+		CHECK(captured[1].indices.size() == 3);
+		if (captured[1].indices.size() == 3)
+			CHECK(memcmp(captured[1].indices.data(), expectedWideIndices,
+				sizeof(expectedWideIndices)) == 0);
+		CHECK(captured[1].referencedVertices.size() ==
+			3 * sizeof(TestVertexWide));
+		if (captured[1].referencedVertices.size() ==
+			3 * sizeof(TestVertexWide))
+			CHECK(memcmp(captured[1].referencedVertices.data(), wide,
+				3 * sizeof(TestVertexWide)) == 0);
+	}
+	CHECK(renderer.Empty());
+}
+
 void TestFailureAfterFirstChunkRetainsOnlyPendingGeometry()
 {
 	NativeSortingRenderer renderer;
@@ -526,6 +613,7 @@ int main()
 	TestNodeOrderingAndFlushBoundary();
 	TestPerTriangleDepthOrder();
 	TestMixedGeometryPreservesSortedOrder();
+	TestSameSubmissionTrianglesBeforeIncompatibleSubmission();
 	TestFailureAfterFirstChunkRetainsOnlyPendingGeometry();
 	TestPartialDrawFailureRetryMatchesOneShotOutput();
 	CHECK(NativeSortingRendererTestRetireAllComplete());

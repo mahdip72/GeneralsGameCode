@@ -674,15 +674,15 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 					submissionIndex];
 				if (submissionIndex >= vertexOffsets.size())
 					return RENDER_RESULT_INVALID_ARGUMENT;
-				if (chunkPacket != 0 &&
-					!SameChunkGeometry(*chunkPacket, submission.packet))
-					break;
-				if (chunkPacket == 0)
-					chunkPacket = &submission.packet;
-
 				if (vertexOffsets[submissionIndex] ==
 					std::numeric_limits<size_t>::max())
 				{
+					if (chunkPacket != 0 &&
+						!SameChunkGeometry(*chunkPacket, submission.packet))
+						break;
+					if (chunkPacket == 0)
+						chunkPacket = &submission.packet;
+
 					const size_t stride = submission.packet.vertexStride;
 					if (stride == 0 || chunkVertices.size() % stride != 0)
 						return RENDER_RESULT_INVALID_ARGUMENT;
