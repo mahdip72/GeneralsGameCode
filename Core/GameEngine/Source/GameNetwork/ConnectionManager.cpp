@@ -4072,15 +4072,20 @@ void ConnectionManager::parseUserList(const GameInfo *game)
 #if defined(_WIN64)
 	clearNetworkSimulationPolicy();
 	m_networkSimulationMapCrc = game->getMapCRC();
-	m_networkSimulationMapContentsMask = game->getMapContentsMask();
-	m_networkSimulationSidecarMask =
-		(game->getMapContentsMask() & ~(4 | 16 | 32)) |
-		GetMapSimulationSidecarMask(game->getMap());
+	UnsignedInt currentContentsMask = 0U;
+	const Bool contentsReadable =
+		GetCurrentMapTransferContentsMask(game->getMap(), &currentContentsMask);
+	// The lobby's map mask remains the shared simulation-policy input, but
+	// current local simulation sidecars must never gain parallel authority.
+	m_networkSimulationMapContentsMask = game->getMapContentsMask() |
+		static_cast<Int>(currentContentsMask &
+			rts::network_epoch::kNetworkSimulationSidecarMask);
+	m_networkSimulationSidecarMask = currentContentsMask;
 	const Bool sidecarIdentityReadable =
 		GetMapSimulationSidecarCRC(game->getMap(), &m_networkSimulationSidecarCrc);
 	beginNetworkHello();
-	if (!sidecarIdentityReadable)
-		rejectNetworkHello(-1, "NET3 map sidecar read failed");
+	if (!contentsReadable || !sidecarIdentityReadable)
+		rejectNetworkHello(-1, "NET3 map package read failed");
 #endif
 #ifdef MEMORYPOOL_DEBUG
 	TheMemoryPoolFactory->debugSetInitFillerIndex(m_localSlot);

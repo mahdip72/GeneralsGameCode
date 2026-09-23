@@ -26,9 +26,10 @@ public:
 	{
 		if (!safePath(path) || (length != 0 && bytes == nullptr))
 			return false;
+		const std::string normalized = normalizePath(path);
 		for (std::size_t i = 0; i < m_files.size(); ++i)
 		{
-			if (_stricmp(m_files[i].path.c_str(), path) == 0)
+			if (_stricmp(m_files[i].path.c_str(), normalized.c_str()) == 0)
 			{
 				m_files[i].bytes.clear();
 				if (length != 0)
@@ -39,7 +40,7 @@ public:
 		if (m_files.size() >= 7)
 			return false;
 		File file;
-		file.path = path;
+		file.path = normalized;
 		if (length != 0)
 			file.bytes.assign(bytes, bytes + length);
 		m_files.push_back(file);
@@ -51,9 +52,10 @@ public:
 	{
 		if (path == nullptr || bytes == nullptr || length == nullptr)
 			return false;
+		const std::string normalized = normalizePath(path);
 		for (std::size_t i = 0; i < m_files.size(); ++i)
 		{
-			if (_stricmp(m_files[i].path.c_str(), path) == 0)
+			if (_stricmp(m_files[i].path.c_str(), normalized.c_str()) == 0)
 			{
 				*bytes = m_files[i].bytes.empty() ? nullptr : m_files[i].bytes.data();
 				*length = m_files[i].bytes.size();
@@ -71,6 +73,10 @@ public:
 	static bool recover(const char *map, NotifyReplacement notify = nullptr,
 		void *context = nullptr)
 	{
+		if (!safePath(map))
+			return false;
+		const std::string normalizedMap = normalizePath(map);
+		map = normalizedMap.c_str();
 		const std::string journal = journalPath(map);
 		if (journal.empty())
 			return false;
@@ -214,6 +220,17 @@ public:
 	static bool isCommitting() { return commitDepth() != 0; }
 
 private:
+	static std::string normalizePath(const char *path)
+	{
+		std::string normalized(path);
+		for (std::size_t i = 0; i < normalized.size(); ++i)
+		{
+			if (normalized[i] == '/')
+				normalized[i] = '\\';
+		}
+		return normalized;
+	}
+
 	struct File
 	{
 		std::string path;

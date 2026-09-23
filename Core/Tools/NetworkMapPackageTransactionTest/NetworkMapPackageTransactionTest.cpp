@@ -41,6 +41,12 @@ static bool CrashAfterFirst(std::size_t committed, void *)
 		ExitProcess(88);
 	return true;
 }
+static bool CrashAfterThird(std::size_t committed, void *)
+{
+	if (committed == 3)
+		ExitProcess(89);
+	return true;
+}
 
 int main(int argc, char **argv)
 {
@@ -58,6 +64,27 @@ int main(int argc, char **argv)
 				reinterpret_cast<const unsigned char *>(newMap.data()), newMap.size()))
 			return 2;
 		child.commit(Valid, nullptr, nullptr, CrashAfterFirst);
+		return 3;
+	}
+	if (argc == 3 && std::string(argv[1]) == "--crash-new")
+	{
+		const std::string folder = argv[2];
+		const std::string preview = folder + "\\fresh.tga";
+		const std::string str = folder + "\\map.str";
+		const std::string readme = folder + "\\readme.txt";
+		const std::string map = folder + "\\fresh.map";
+		const std::string bytes = "received";
+		NetworkMapPackageTransaction child;
+		if (!child.stage(preview.c_str(),
+			reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size()) ||
+			!child.stage(str.c_str(),
+				reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size()) ||
+			!child.stage(readme.c_str(),
+				reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size()) ||
+			!child.stage(map.c_str(),
+				reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size()))
+			return 2;
+		child.commit(Valid, nullptr, nullptr, CrashAfterThird);
 		return 3;
 	}
 	char current[MAX_PATH];
@@ -125,7 +152,7 @@ int main(int argc, char **argv)
 	DWORD crashCode = 0;
 	if (launched)
 	{
-		WaitForSingleObject(process.hProcess, 10000);
+		WaitForSingleObject(process.hProcess, 30000);
 		GetExitCodeProcess(process.hProcess, &crashCode);
 		CloseHandle(process.hThread);
 		CloseHandle(process.hProcess);
@@ -137,6 +164,45 @@ int main(int argc, char **argv)
 		Read(ini) == oldIni && Read(map) == oldMap &&
 		Read(preview) == oldPreview,
 		"restart recovery restores the original package byte-for-byte") && ok;
+	const std::string freshMap = folder + "\\fresh.map";
+	std::string freshMapForward = freshMap;
+	for (std::size_t i = 0; i < freshMapForward.size(); ++i)
+	{
+		if (freshMapForward[i] == '\\')
+			freshMapForward[i] = '/';
+	}
+	const std::string freshPreview = folder + "\\fresh.tga";
+	const std::string freshStr = folder + "\\map.str";
+	const std::string freshReadme = folder + "\\readme.txt";
+	std::string newCommand = "\"" + std::string(executable) +
+		"\" --crash-new \"" + folder + "\"";
+	std::vector<char> newCommandLine(newCommand.begin(), newCommand.end());
+	newCommandLine.push_back(0);
+	PROCESS_INFORMATION newProcess = {};
+	const bool newLaunched = CreateProcessA(nullptr, newCommandLine.data(),
+		nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+		&startup, &newProcess) != 0;
+	DWORD newCrashCode = 0;
+	if (newLaunched)
+	{
+		WaitForSingleObject(newProcess.hProcess, 30000);
+		GetExitCodeProcess(newProcess.hProcess, &newCrashCode);
+		CloseHandle(newProcess.hThread);
+		CloseHandle(newProcess.hProcess);
+	}
+	ok = Check(newLaunched && newCrashCode == 89 &&
+		GetFileAttributesA(freshPreview.c_str()) != INVALID_FILE_ATTRIBUTES &&
+		GetFileAttributesA(freshStr.c_str()) != INVALID_FILE_ATTRIBUTES &&
+		GetFileAttributesA(freshReadme.c_str()) != INVALID_FILE_ATTRIBUTES &&
+		GetFileAttributesA(freshMap.c_str()) == INVALID_FILE_ATTRIBUTES,
+		"hard exit after new companions leaves a recoverable journal") && ok;
+	ok = Check(NetworkMapPackageTransaction::recover(freshMapForward.c_str()) &&
+		GetFileAttributesA(freshPreview.c_str()) == INVALID_FILE_ATTRIBUTES &&
+		GetFileAttributesA(freshStr.c_str()) == INVALID_FILE_ATTRIBUTES &&
+		GetFileAttributesA(freshReadme.c_str()) == INVALID_FILE_ATTRIBUTES &&
+		GetFileAttributesA(freshMap.c_str()) == INVALID_FILE_ATTRIBUTES &&
+		Read(ini) == oldIni && Read(map) == oldMap,
+		"restart recovery with forward-slash map removes absent companions") && ok;
 	ok = Check(stage() && transaction.commit(Valid, nullptr) &&
 		Read(ini) == newIni && Read(map) == newMap &&
 		Read(preview) == oldPreview,

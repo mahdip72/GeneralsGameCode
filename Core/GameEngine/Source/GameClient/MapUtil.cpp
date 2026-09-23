@@ -124,6 +124,29 @@ Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName)
 		rts::network_epoch::NetworkMapPackageTransaction::recover(
 			mapName.str(), noteRecoveredMapFile);
 }
+
+Bool GetCurrentMapTransferContentsMask(const AsciiString &mapName,
+	UnsignedInt *maskOut)
+{
+	if (maskOut == nullptr || !RecoverInterruptedNetworkMapPackage(mapName))
+		return FALSE;
+	*maskOut = 0U;
+	const AsciiString paths[] = {
+		mapName, GetPreviewFromMap(mapName), GetINIFromMap(mapName),
+		GetStrFileFromMap(mapName), GetSoloINIFromMap(mapName),
+		GetAssetUsageFromMap(mapName), GetReadmeFromMap(mapName)
+	};
+	for (Int i = 0; i < ARRAY_SIZE(paths); ++i)
+	{
+		File *file = TheFileSystem->openFile(paths[i].str(), File::READ);
+		if (file != nullptr)
+		{
+			*maskOut |= 1U << i;
+			file->close();
+		}
+	}
+	return TRUE;
+}
 #endif
 
 UnsignedInt GetMapFileCRC(const AsciiString &mapName)
@@ -713,6 +736,12 @@ Bool MapCache::loadMapsFromDisk( const AsciiString &mapDir, Bool isOfficial, Boo
 			continue;
 		}
 
+#if defined(_WIN64)
+		// A crash may have replaced the .map itself before the journal was
+		// removed. Restore it before the cache records size or timestamp.
+		if (!RecoverInterruptedNetworkMapPackage(*filepathIt))
+			continue;
+#endif
 		if (!TheFileSystem->getFileInfo(*filepathIt, &fileInfo))
 		{
 			DEBUG_CRASH(("Could not get file info for map %s", filepathIt->str()));
@@ -1301,6 +1330,10 @@ Image *getMapPreviewImage( AsciiString mapName )
 {
 	if(!TheGlobalData)
 		return nullptr;
+#if defined(_WIN64)
+	if (!RecoverInterruptedNetworkMapPackage(mapName))
+		return nullptr;
+#endif
 	DEBUG_LOG(("%s Map Name", mapName.str()));
 	AsciiString tgaName = mapName;
 	AsciiString name;

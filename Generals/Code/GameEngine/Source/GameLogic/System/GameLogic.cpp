@@ -3061,6 +3061,12 @@ void GameLogic::loadMapINI( AsciiString mapName )
 	if (length < 4) {
 		return;
 	}
+#if defined(_WIN64)
+	// Map INI, strings, and asset-use data are read before TerrainLogic loads
+	// the .map. Recover an interrupted NET3 package before any companion read.
+	if (!RecoverInterruptedNetworkMapPackage(AsciiString(pristineMapName)))
+		throw SC_INVALID_DATA;
+#endif
 
 	// back up over the ".map" extension and to the first directory separator
 	char *extension = filename + length - 4;

@@ -140,6 +140,8 @@ Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc);
 Int GetMapSimulationSidecarMask(const AsciiString &mapName);
 #if defined(_WIN64)
 Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName);
+Bool GetCurrentMapTransferContentsMask(const AsciiString &mapName,
+	UnsignedInt *maskOut);
 Bool GetMapSimulationSidecarCRC(const AsciiString &mapName, UnsignedInt *crcOut);
 // An override supplies received, validated bytes before a NET3 package is
 // installed. Returning FALSE reads the existing file instead.

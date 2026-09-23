@@ -509,6 +509,13 @@ Bool GameInfo::amIHost() const
 void GameInfo::setMap( AsciiString mapName )
 {
 	m_mapName = mapName;
+#if defined(_WIN64)
+	if (!RecoverInterruptedNetworkMapPackage(m_mapName))
+	{
+		m_mapMask = 0;
+		return;
+	}
+#endif
 	if (m_inGame && amIHost())
 	{
 		const MapMetaData *mapData = TheMapCache->findMap( mapName );
