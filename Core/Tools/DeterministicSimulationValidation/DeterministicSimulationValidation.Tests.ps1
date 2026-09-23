@@ -1249,6 +1249,12 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
     New-Item -ItemType Directory -Path $reparseManifest, $reparseTarget, `
         $publicationSwapTarget, $publicationSwapParent `
         -Force | Out-Null
+    $publicationSwapState = @{
+        hookRan = $false
+        moved = $false
+        moveError = 0
+        junctionCreated = $false
+    }
     try {
         $scriptPath = Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1'
         $scriptSource = Get-Content -LiteralPath $scriptPath -Raw
@@ -1286,12 +1292,6 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
             'create-only publication rejects a destination created after its precheck and preserves the concurrent bytes'
 
         $publicationSwapPath = Join-Path $publicationSwapParent 'report.json'
-        $publicationSwapState = @{
-            hookRan = $false
-            moved = $false
-            moveError = 0
-            junctionCreated = $false
-        }
         $publicationSwapFailure = $null
         $publicationSwapPublished = $false
         try {
@@ -1421,7 +1421,8 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
         }
     }
     finally {
-        if ($publicationSwapState.junctionCreated) {
+        if ($null -ne $publicationSwapState -and
+            $publicationSwapState.junctionCreated) {
             Remove-Stage5AcceptanceReparseFixtureLink -FixtureRoot $reparseRoot `
                 -LinkPath $publicationSwapParent
         }

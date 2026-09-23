@@ -65,10 +65,61 @@ try {
         'Acceptance scratch cleanup must define one fail-closed reparse preflight.'
     Invoke-Expression $scratchTreeGuardDefinitions[0].Extent.Text
 
-    $reparseRootAssignments = @($sourceAst.FindAll({
+    $focusedOutputFixtureDefinitions = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase'
+    }, $true))
+    Assert-CorpusReuseTest ($focusedOutputFixtureDefinitions.Count -eq 1) `
+        'Acceptance must define one focused output-publication regression fixture.'
+    $focusedOutputFixture = $focusedOutputFixtureDefinitions[0]
+    $focusedOutputStartOffset = $focusedOutputFixture.Extent.StartOffset
+    $focusedOutputEndOffset = $focusedOutputFixture.Extent.EndOffset
+    $focusedReparseRootAssignments = @($focusedOutputFixture.Body.FindAll({
         param($node)
         $node -is [Management.Automation.Language.AssignmentStatementAst] -and
             $node.Left.Extent.Text -ceq '$reparseRoot'
+    }, $true))
+    $focusedJunctionCreates = @($focusedOutputFixture.Body.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'New-Item' -and
+            $node.Extent.Text -match '-ItemType\s+Junction'
+    }, $true))
+    Assert-CorpusReuseTest ($focusedReparseRootAssignments.Count -eq 1 -and
+        $focusedJunctionCreates.Count -eq 2) `
+        'The focused output fixture must retain its own reparse root and exactly two junction probes.'
+    $focusedSwapStateInitializers = @($focusedOutputFixture.Body.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -ceq '$publicationSwapState'
+    }, $true))
+    $focusedFinallyTries = @($focusedOutputFixture.Body.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.TryStatementAst] -and
+            $null -ne $node.Finally
+    }, $true))
+    Assert-CorpusReuseTest ($focusedSwapStateInitializers.Count -eq 1 -and
+        $focusedFinallyTries.Count -eq 1) `
+        'The focused output fixture must initialize swap state before its single cleanup try.'
+    $focusedFinallyStateGuards = @($focusedFinallyTries[0].Finally.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.IfStatementAst] -and
+            $node.Clauses[0].Item1.Extent.Text -match '\$null\s+-ne\s+\$publicationSwapState'
+    }, $true))
+    Assert-CorpusReuseTest ($focusedSwapStateInitializers[0].Extent.StartOffset -lt
+            $focusedFinallyTries[0].Extent.StartOffset -and
+        $focusedFinallyStateGuards.Count -eq 1) `
+        'Early failure must leave the focused output cleanup state initialized and guarded.'
+
+    # Keep the main-corpus cardinality checks scoped to the top-level Acceptance
+    # body; independently assert the focused fixture's expected structure above.
+    $reparseRootAssignments = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -ceq '$reparseRoot' -and
+            ($node.Extent.StartOffset -lt $focusedOutputStartOffset -or
+                $node.Extent.StartOffset -ge $focusedOutputEndOffset)
     }, $true))
     $acceptanceSchemaCalls = @($sourceAst.FindAll({
         param($node)
@@ -79,7 +130,9 @@ try {
         param($node)
         $node -is [Management.Automation.Language.CommandAst] -and
             $node.GetCommandName() -ceq 'New-Item' -and
-            $node.Extent.Text -match '-ItemType\s+Junction'
+            $node.Extent.Text -match '-ItemType\s+Junction' -and
+            ($node.Extent.StartOffset -lt $focusedOutputStartOffset -or
+                $node.Extent.StartOffset -ge $focusedOutputEndOffset)
     }, $true))
     $sharedProducerCalls = @($sourceAst.FindAll({
         param($node)
@@ -102,6 +155,8 @@ try {
         $node -is [Management.Automation.Language.TryStatementAst] -and
             $null -ne $node.Finally -and
             $node.Body.Extent.Text -match '-ItemType\s+Junction' -and
+            ($node.Extent.StartOffset -lt $focusedOutputStartOffset -or
+                $node.Extent.StartOffset -ge $focusedOutputEndOffset) -and
             @($node.Finally.FindAll({
                 param($candidate)
                 $candidate -is [Management.Automation.Language.CommandAst] -and
