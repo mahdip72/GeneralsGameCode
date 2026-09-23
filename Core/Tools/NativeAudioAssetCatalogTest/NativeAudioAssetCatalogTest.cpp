@@ -53,6 +53,27 @@ private:
 	mutable UnsignedInt m_readCalls = 0;
 };
 
+class BudgetVirtualAudioSource final : public AudioVirtualFileSource
+{
+public:
+	explicit BudgetVirtualAudioSource(std::vector<std::uint8_t> bytes) : m_bytes(std::move(bytes)) {}
+	Bool readFile(const AsciiString &fileName, std::vector<std::uint8_t> &bytes,
+		std::string &identity) const override
+	{
+		const std::string name = fileName.str() == nullptr ? "" : fileName.str();
+		if (name.rfind("archive\\budget-", 0) != 0) return FALSE;
+		++m_readCalls;
+		bytes = m_bytes;
+		identity = name;
+		return TRUE;
+	}
+	UnsignedInt getReadCalls() const { return m_readCalls; }
+
+private:
+	std::vector<std::uint8_t> m_bytes;
+	mutable UnsignedInt m_readCalls = 0;
+};
+
 void writeWaveFrames(const std::filesystem::path &path, UnsignedInt frames,
 	UnsignedInt sampleRate = 48000, UnsignedShort channels = 2)
 {
@@ -612,6 +633,52 @@ int runCatalogTest(int argc, char *argv[])
 		"a failed cache fill does not poison subsequent complete sample reuse");
 	cachedFirst.reset();
 	cachedSecond.reset();
+#endif
+
+#if defined(_WIN64)
+	BudgetVirtualAudioSource nativeBudgetArchive(readBinaryFile(twoSecondPath));
+	FileAudioAssetSource nativeBudgetSource(AsciiString(root.string().c_str()), &nativeBudgetArchive);
+	nativeBudgetSource.setSamplePcmCacheBudget(4U * 1024U * 1024U);
+	for (UnsignedInt index = 0; index < 11U; ++index) {
+		const std::string name = "archive\\budget-" + std::to_string(index) + ".wav";
+		check(nativeBudgetSource.openPcmSampleStream(AsciiString(name.c_str()), cachedFirst),
+			"native default budget opens each two-second sample");
+		cachedFirst.reset();
+	}
+	check(nativeBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst)
+		&& nativeBudgetArchive.getReadCalls() == 11U,
+		"native 8 MiB default retains eleven two-second samples beyond the shipped 4 MiB budget");
+	cachedFirst.reset();
+	for (UnsignedInt index = 11U; index < 22U; ++index) {
+		const std::string name = "archive\\budget-" + std::to_string(index) + ".wav";
+		check(nativeBudgetSource.openPcmSampleStream(AsciiString(name.c_str()), cachedFirst),
+			"native cache admits later samples within its bounded LRU");
+		cachedFirst.reset();
+	}
+	check(nativeBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-1.wav"), cachedFirst)
+		&& nativeBudgetArchive.getReadCalls() == 23U,
+		"native 8 MiB cache evicts its oldest unpinned sample at the byte bound");
+	cachedFirst.reset();
+	BudgetVirtualAudioSource customBudgetArchive(readBinaryFile(twoSecondPath));
+	FileAudioAssetSource customBudgetSource(AsciiString(root.string().c_str()), &customBudgetArchive);
+	customBudgetSource.setSamplePcmCacheBudget(0);
+	check(customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst)
+		&& customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedSecond)
+		&& customBudgetArchive.getReadCalls() == 2U,
+		"zero budget still disables native sample caching");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	customBudgetSource.setSamplePcmCacheBudget(twoSecondPcmBytes);
+	check(customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst),
+		"custom one-entry budget admits its first sample");
+	cachedFirst.reset();
+	check(customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-1.wav"), cachedFirst),
+		"custom one-entry budget evicts for its second sample");
+	cachedFirst.reset();
+	check(customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst)
+		&& customBudgetArchive.getReadCalls() == 5U,
+		"native default promotion does not override smaller custom byte budgets");
+	cachedFirst.reset();
 #endif
 
 	const std::filesystem::path genericPath = root / "main.aiff";
