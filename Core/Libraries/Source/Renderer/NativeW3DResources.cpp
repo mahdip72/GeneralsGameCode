@@ -289,11 +289,13 @@ struct InitializedByteRange
 struct PendingBufferPublication
 {
 	PendingBufferPublication() : sequence(0),
-		authority(NATIVE_W3D_CONTENT_INVALID), backendEpoch(0) {}
+		authority(NATIVE_W3D_CONTENT_INVALID), backendEpoch(0),
+		restoresAfterFailure(false) {}
 	NativeW3DSubmissionSequence sequence;
 	std::vector<InitializedByteRange> initializedBytes;
 	NativeW3DContentAuthority authority;
 	unsigned int backendEpoch;
+	bool restoresAfterFailure;
 };
 
 struct PendingTexturePublication
@@ -860,16 +862,39 @@ RenderResult NativeW3DResources::PublishThreadedCompletion(
 		{
 			// Completion does not expose a per-command failure handle. Invalidate
 			// only slots that had accepted writes in the failed sequence window;
-			// unrelated buffer authority and DEFAULT recovery sources survive.
+			// unrelated buffer authority and DEFAULT recovery sources survive. A
+			// later full upload independently restores the owner resource, so keep
+			// that publication and every snapshot ordered after it.
+			size_t recoveryIndex = completedCount;
+			while (recoveryIndex < slot.pendingBufferPublications.size() &&
+				!slot.pendingBufferPublications[recoveryIndex].restoresAfterFailure)
+			{
+				++recoveryIndex;
+			}
+			std::vector<PendingBufferPublication> remainingPublications;
+			try
+			{
+				remainingPublications.assign(
+					slot.pendingBufferPublications.begin() + recoveryIndex,
+					slot.pendingBufferPublications.end());
+			}
+			catch (...)
+			{
+				InvalidateBufferAuthority(slot);
+				return RENDER_RESULT_OUT_OF_MEMORY;
+			}
 			slot.initializedBytes.clear();
-			slot.submissionInitializedBytes.clear();
-			slot.pendingBufferPublications.clear();
 			slot.authority = NATIVE_W3D_CONTENT_INVALID;
-			slot.submissionAuthority = NATIVE_W3D_CONTENT_INVALID;
 			slot.backendEpoch = 0;
-			slot.submissionBackendEpoch = 0;
 			slot.authorityFailure = true;
 			slot.authorityEpoch = NextAuthorityEpoch();
+			slot.pendingBufferPublications.swap(remainingPublications);
+			if (slot.pendingBufferPublications.empty())
+			{
+				slot.submissionInitializedBytes.clear();
+				slot.submissionAuthority = NATIVE_W3D_CONTENT_INVALID;
+				slot.submissionBackendEpoch = 0;
+			}
 			continue;
 		}
 
@@ -931,8 +956,22 @@ RenderResult NativeW3DResources::PublishThreadedCompletion(
 		}
 		if (resourceFailure)
 		{
-			slot.pendingTexturePublications.clear();
-			InvalidateTextureAuthority(slot);
+			std::vector<PendingTexturePublication> remainingPublications;
+			try
+			{
+				remainingPublications.assign(
+					slot.pendingTexturePublications.begin() + completedCount,
+					slot.pendingTexturePublications.end());
+			}
+			catch (...)
+			{
+				slot.pendingTexturePublications.clear();
+				InvalidateTextureAuthority(slot);
+				return RENDER_RESULT_OUT_OF_MEMORY;
+			}
+			slot.authority = NATIVE_W3D_CONTENT_INVALID;
+			slot.authorityEpoch = NextAuthorityEpoch();
+			slot.pendingTexturePublications.swap(remainingPublications);
 			continue;
 		}
 
@@ -1354,6 +1393,7 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 	std::vector<InitializedByteRange> nextRecoveryRanges;
 	std::vector<PendingBufferPublication> nextPublications;
 	NativeW3DContentAuthority nextAuthority = NATIVE_W3D_CONTENT_INVALID;
+	bool restoresAfterFailure = false;
 	try
 	{
 		if (slot->submissionBackendEpoch == bufferEpoch)
@@ -1384,11 +1424,26 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 		if (asynchronousPublication)
 		{
 			nextPublications = slot->pendingBufferPublications;
+			if (!nextPublications.empty() &&
+				nextPublications.back().sequence == submissionSequence)
+			{
+				restoresAfterFailure =
+					nextPublications.back().restoresAfterFailure;
+			}
+			if (mode == RENDER_BUFFER_UPDATE_DISCARD)
+			{
+				restoresAfterFailure = fullWrite;
+			}
+			else if (fullWrite)
+			{
+				restoresAfterFailure = true;
+			}
 			PendingBufferPublication publication;
 			publication.sequence = submissionSequence;
 			publication.initializedBytes = nextSubmissionRanges;
 			publication.authority = nextAuthority;
 			publication.backendEpoch = bufferEpoch;
+			publication.restoresAfterFailure = restoresAfterFailure;
 			if (!nextPublications.empty() &&
 				nextPublications.back().sequence == submissionSequence)
 			{
