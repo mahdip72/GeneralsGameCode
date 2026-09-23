@@ -3059,7 +3059,55 @@ public:
 			{
 				return RENDER_RESULT_INVALID_ARGUMENT;
 			}
-			for (unsigned int index = 0; index < indexCount; ++index)
+			// A contiguous initialized interval covering the actual min/max
+			// referenced vertices proves every indexed address is initialized.
+			// If that interval contains holes, retain the original per-index
+			// validation so unused holes never reject an otherwise valid draw.
+			bool intervalValidated = false;
+			if (indexCount != 0)
+			{
+				unsigned int minIndex = UINT_MAX;
+				unsigned int maxIndex = 0;
+				for (unsigned int index = 0; index < indexCount; ++index)
+				{
+					const size_t sourceOffset = firstIndexByte +
+						static_cast<size_t>(index) * indexSize;
+					unsigned int value = 0;
+					if (indexSize == 2)
+					{
+						unsigned short shortValue = 0;
+						memcpy(&shortValue, &(*indexBytes)[sourceOffset],
+							sizeof(shortValue));
+						value = shortValue;
+					}
+					else
+						memcpy(&value, &(*indexBytes)[sourceOffset], sizeof(value));
+					minIndex = (std::min)(minIndex, value);
+					maxIndex = (std::max)(maxIndex, value);
+				}
+				const long long minVertex =
+					static_cast<long long>(minIndex) + baseVertex;
+				const long long maxVertex =
+					static_cast<long long>(maxIndex) + baseVertex;
+				if (minVertex < 0 || maxVertex > UINT_MAX ||
+					!isElementRangeWithinBuffer(vertexSlot.byteCount,
+						m_boundVertexOffset, m_boundVertexStride,
+						static_cast<unsigned int>(minVertex), 1) ||
+					!isElementRangeWithinBuffer(vertexSlot.byteCount,
+						m_boundVertexOffset, m_boundVertexStride,
+						static_cast<unsigned int>(maxVertex), 1))
+					return RENDER_RESULT_INVALID_ARGUMENT;
+				const size_t vertexByteBegin = m_boundVertexOffset +
+					static_cast<size_t>(minVertex) * m_boundVertexStride;
+				const size_t vertexByteEnd = m_boundVertexOffset +
+					static_cast<size_t>(maxVertex) * m_boundVertexStride +
+					m_boundVertexStride;
+				intervalValidated = IsBufferRangeInitialized(
+					vertexSlot.initializedBufferRanges,
+					vertexByteBegin, vertexByteEnd);
+			}
+			for (unsigned int index = 0;
+				!intervalValidated && index < indexCount; ++index)
 			{
 				const size_t sourceOffset = firstIndexByte +
 					static_cast<size_t>(index) * indexSize;

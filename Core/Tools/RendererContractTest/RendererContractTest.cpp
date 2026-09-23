@@ -6220,6 +6220,166 @@ int testD3D11HeadlessDevice()
 			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
 		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK,
 		"post-recovery partial vertex/index preserves validate exact draw ranges");
+	// Min/max interval validation must accept contiguous published bytes,
+	// but an unused hole between referenced vertices still needs the exact
+	// per-index fallback. Referencing the hole itself remains invalid.
+	rts::render::BufferDescriptor intervalVertexDescriptor;
+	intervalVertexDescriptor.byteCount = 4 * 16;
+	intervalVertexDescriptor.stride = 16;
+	intervalVertexDescriptor.binding = rts::render::RENDER_BUFFER_VERTEX;
+	intervalVertexDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+	rts::render::BufferDescriptor intervalIndexDescriptor;
+	intervalIndexDescriptor.byteCount = 3 * sizeof(unsigned short);
+	intervalIndexDescriptor.stride = sizeof(unsigned short);
+	intervalIndexDescriptor.binding = rts::render::RENDER_BUFFER_INDEX;
+	intervalIndexDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
+	unsigned char intervalVertexBytes[16] = { 0 };
+	unsigned short intervalIndices[3] = { 0, 2, 0 };
+	rts::render::GpuHandle intervalVertexBuffer, intervalIndexBuffer;
+	result |= check(device->createBuffer(intervalVertexDescriptor, 0, 0,
+		&intervalVertexBuffer) == rts::render::RENDER_RESULT_OK &&
+		device->createBuffer(intervalIndexDescriptor, intervalIndices,
+			sizeof(intervalIndices), &intervalIndexBuffer) ==
+			rts::render::RENDER_RESULT_OK &&
+		device->updateBufferResource(intervalVertexBuffer, intervalVertexBytes,
+			sizeof(intervalVertexBytes), 0,
+			rts::render::RENDER_BUFFER_UPDATE_DISCARD) ==
+			rts::render::RENDER_RESULT_OK &&
+		device->updateBufferResource(intervalVertexBuffer, intervalVertexBytes,
+			sizeof(intervalVertexBytes), 2 * sizeof(intervalVertexBytes),
+			rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->beginFrame() == rts::render::RENDER_RESULT_OK &&
+		rangeContext->setLegacyState(recoveredIndexLogical,
+			rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setVertexBuffer(intervalVertexBuffer, 16, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setIndexBuffer(intervalIndexBuffer,
+			rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setPrimitiveTopology(
+			rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->drawIndexed(3, 0, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK,
+		"indexed validation accepts unused holes between initialized vertices");
+	intervalIndices[1] = 1;
+	result |= check(device->updateBufferResource(intervalIndexBuffer,
+		intervalIndices, sizeof(intervalIndices), 0,
+		rts::render::RENDER_BUFFER_UPDATE_PRESERVE) ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->beginFrame() == rts::render::RENDER_RESULT_OK &&
+		rangeContext->setLegacyState(recoveredIndexLogical,
+			rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setVertexBuffer(intervalVertexBuffer, 16, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setIndexBuffer(intervalIndexBuffer,
+			rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setPrimitiveTopology(
+			rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->drawIndexed(3, 0, 0) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK,
+		"indexed validation rejects referenced holes");
+	result |= check(device->updateBufferResource(intervalVertexBuffer,
+		intervalVertexBytes, sizeof(intervalVertexBytes),
+		sizeof(intervalVertexBytes),
+		rts::render::RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->beginFrame() == rts::render::RENDER_RESULT_OK &&
+		rangeContext->setLegacyState(recoveredIndexLogical,
+			rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setVertexBuffer(intervalVertexBuffer, 16, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setIndexBuffer(intervalIndexBuffer,
+			rts::render::RENDER_FORMAT_R16_UINT, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setPrimitiveTopology(
+			rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->drawIndexed(3, 0, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK,
+		"indexed validation accepts the fully initialized min/max interval");
+	// Signed base vertices, 32-bit indices, and empty draws must retain the
+	// same bounds contract when the interval fast path is available.
+	rts::render::BufferDescriptor wideIndexDescriptor = intervalIndexDescriptor;
+	wideIndexDescriptor.byteCount = 3 * sizeof(unsigned int);
+	wideIndexDescriptor.stride = sizeof(unsigned int);
+	unsigned int wideIndices[3] = { 1, 3, 1 };
+	rts::render::GpuHandle wideIndexBuffer;
+	result |= check(device->createBuffer(wideIndexDescriptor, wideIndices,
+		sizeof(wideIndices), &wideIndexBuffer) ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->beginFrame() == rts::render::RENDER_RESULT_OK &&
+		rangeContext->setLegacyState(recoveredIndexLogical,
+			rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setVertexBuffer(intervalVertexBuffer, 16, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setIndexBuffer(wideIndexBuffer,
+			rts::render::RENDER_FORMAT_R32_UINT, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setPrimitiveTopology(
+			rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->drawIndexed(3, 0, -1) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->drawIndexed(0, 0, -1) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK,
+		"indexed interval validation accepts signed base and rejects empty draws");
+	wideIndices[0] = 0;
+	result |= check(device->updateBufferResource(wideIndexBuffer,
+		wideIndices, sizeof(wideIndices), 0,
+		rts::render::RENDER_BUFFER_UPDATE_PRESERVE) ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->beginFrame() == rts::render::RENDER_RESULT_OK &&
+		rangeContext->setLegacyState(recoveredIndexLogical,
+			rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setVertexBuffer(intervalVertexBuffer, 16, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setIndexBuffer(wideIndexBuffer,
+			rts::render::RENDER_FORMAT_R32_UINT, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setPrimitiveTopology(
+			rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->drawIndexed(3, 0, -1) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK,
+		"indexed interval validation rejects negative addressed vertices");
+	wideIndices[0] = 0xffffffffU;
+	result |= check(device->updateBufferResource(wideIndexBuffer,
+		wideIndices, sizeof(wideIndices), 0,
+		rts::render::RENDER_BUFFER_UPDATE_PRESERVE) ==
+		rts::render::RENDER_RESULT_OK &&
+		rangeContext->beginFrame() == rts::render::RENDER_RESULT_OK &&
+		rangeContext->setLegacyState(recoveredIndexLogical,
+			rts::render::RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setVertexBuffer(intervalVertexBuffer, 16, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setIndexBuffer(wideIndexBuffer,
+			rts::render::RENDER_FORMAT_R32_UINT, 0) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->setPrimitiveTopology(
+			rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			rts::render::RENDER_RESULT_OK &&
+		rangeContext->drawIndexed(3, 0, 1) ==
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+		rangeContext->endFrame() == rts::render::RENDER_RESULT_OK &&
+		device->destroyResource(wideIndexBuffer) &&
+		device->destroyResource(intervalIndexBuffer) &&
+		device->destroyResource(intervalVertexBuffer),
+		"indexed interval validation rejects 32-bit address overflow");
 	result |= check(device->destroyResource(indexBuffer) &&
 		device->destroyResource(constantBuffer),
 		"dynamic range contract resources release cleanly");
