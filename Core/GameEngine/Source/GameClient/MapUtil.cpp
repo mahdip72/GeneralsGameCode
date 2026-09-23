@@ -148,6 +148,66 @@ Int GetMapSimulationSidecarMask(const AsciiString &mapName)
 	return mask;
 }
 
+#if defined(_WIN64)
+Bool GetMapSimulationSidecarCRC(const AsciiString &mapName, UnsignedInt *crcOut)
+{
+	if (crcOut == nullptr)
+		return FALSE;
+	*crcOut = 0U;
+	const AsciiString paths[] = {
+		GetINIFromMap(mapName), GetSoloINIFromMap(mapName),
+		GetAssetUsageFromMap(mapName)
+	};
+	CRC crc;
+	crc.clear();
+	const UnsignedByte domain[] = { 'M', 'A', 'P', 'S', 'I', 'M', 1 };
+	crc.computeCRC(domain, sizeof(domain));
+	for (Int i = 0; i < ARRAY_SIZE(paths); ++i)
+	{
+		const UnsignedByte kind = static_cast<UnsignedByte>(i + 1);
+		crc.computeCRC(&kind, 1);
+		File *file = TheFileSystem->openFile(paths[i].str(), File::READ);
+		const UnsignedByte present = file ? 1 : 0;
+		crc.computeCRC(&present, 1);
+		if (file)
+		{
+			const Int fileLength = file->size();
+			if (fileLength < 0)
+			{
+				file->close();
+				return FALSE;
+			}
+			const UnsignedInt length = static_cast<UnsignedInt>(fileLength);
+			const UnsignedByte lengthBytes[] = {
+				static_cast<UnsignedByte>(length),
+				static_cast<UnsignedByte>(length >> 8),
+				static_cast<UnsignedByte>(length >> 16),
+				static_cast<UnsignedByte>(length >> 24)
+			};
+			crc.computeCRC(lengthBytes, sizeof(lengthBytes));
+			UnsignedByte buffer[4096];
+			UnsignedInt remaining = length;
+			while (remaining > 0)
+			{
+				const Int wanted = remaining < sizeof(buffer) ?
+					static_cast<Int>(remaining) : static_cast<Int>(sizeof(buffer));
+				const Int count = file->read(buffer, wanted);
+				if (count <= 0 || count > wanted)
+				{
+					file->close();
+					return FALSE; // Incomplete content must never become a valid identity.
+				}
+				crc.computeCRC(buffer, count);
+				remaining -= static_cast<UnsignedInt>(count);
+			}
+			file->close();
+		}
+	}
+	*crcOut = crc.get();
+	return TRUE;
+}
+#endif
+
 static Bool ParseObjectDataChunk(DataChunkInput &file, DataChunkInfo *info, void *userData)
 {
 	Bool readDict = info->version >= K_OBJECTS_VERSION_2;

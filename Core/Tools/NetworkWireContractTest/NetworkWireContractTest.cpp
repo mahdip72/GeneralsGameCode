@@ -278,9 +278,11 @@ int TestNetworkHelloContract()
 	const unsigned ordinaryProductMask =
 		rts::lockstep_v2::ResolveProductPromotionKernelMask(
 			productPromotion, liveIntegratedMask);
-	const NetworkSimulationPolicyIdentity simulationPolicy =
+	NetworkSimulationPolicyIdentity simulationPolicy =
 		MakeNetworkSimulationPolicyIdentity(executableCrc, iniCrc,
 			0x10203040U, 0xa5U, nonProductTestMask);
+	simulationPolicy.sidecarMask = 1U | 4U | 16U;
+	simulationPolicy.sidecarCrc = 0x76543210U;
 	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> encoded =
 		EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U, sessionToken,
 			NetworkHelloKind::Hello, simulationPolicy);
@@ -302,6 +304,74 @@ int TestNetworkHelloContract()
 		!IsNetworkMapFileCRCValid(0x10203040U, 0U) &&
 		!IsNetworkMapFileCRCValid(0x10203040U, 0x10203041U),
 		"network start requires matching nonzero map file CRCs");
+	const std::uint32_t sidecarBits[] = {4U, 16U, 32U};
+	result |= Check(IsSameCanonicalNetworkMapPath("UserData\\Maps\\Map\\Map.map",
+		"userdata/maps/map/map.MAP") &&
+		!IsSameCanonicalNetworkMapPath("UserData\\Maps\\Other\\Other.map",
+			"userdata/maps/map/map.map") &&
+		!IsSameCanonicalNetworkMapPath("", "userdata/maps/map/map.map"),
+		"final transferred map is recognized across portable path casing");
+	std::uint32_t transferRecipients = AddNetworkMapTransferRecipient(0U,
+		1U, true, false);
+	transferRecipients = AddNetworkMapTransferRecipient(transferRecipients,
+		2U, false, true);
+	result |= Check(transferRecipients == ((1U << 1) | (1U << 2)) &&
+		AddNetworkMapTransferRecipient(transferRecipients, 3U, false, false) ==
+			transferRecipients &&
+		IsNetworkMapPackageReady(true, 0x10203040U, 0x10203040U,
+			1U | 4U, 0x12345678U, 1U | 4U, 0x12345678U),
+		"missing-map and sidecar-only peers share the final map ACK mask");
+	std::uint16_t nextCommandId = 0U;
+	result |= Check(ConsumeNetworkCommandID(nextCommandId) == 0U &&
+		nextCommandId == 1U, "file ID zero is a valid first transfer ID");
+	nextCommandId = UINT16_MAX;
+	result |= Check(ConsumeNetworkCommandID(nextCommandId) == UINT16_MAX &&
+		nextCommandId == 0U && ConsumeNetworkCommandID(nextCommandId) == 0U,
+		"file IDs wrap through zero without treating it as failure");
+	for (const std::uint32_t bit : sidecarBits)
+	{
+		result |= Check(IsMatchingNetworkSidecarIdentity(1U | bit,
+			0x12345678U, 1U | bit, 0x12345678U) &&
+			!IsMatchingNetworkSidecarIdentity(1U | bit,
+				0x12345678U, 1U | bit, 0x12345679U) &&
+			!IsMatchingNetworkSidecarIdentity(1U | bit,
+				0x12345678U, 1U, 0x12345678U) &&
+			!HasUntransferrableNetworkSidecars(1U | bit, 1U) &&
+			HasUntransferrableNetworkSidecars(1U, 1U | bit),
+			"simulation sidecar presence and bytes must match host or transfer");
+		result |= Check(DecideNetworkSidecarTransfer(1U | bit,
+			0x12345678U, 1U | bit, 0x12345678U, true) ==
+				NetworkSidecarTransferDecision::Ready &&
+			DecideNetworkSidecarTransfer(1U | bit,
+				0x12345678U, 1U | bit, 0x12345679U, true) ==
+				NetworkSidecarTransferDecision::Transfer &&
+			DecideNetworkSidecarTransfer(1U | bit,
+				0x12345678U, 1U, 0x87654321U, true) ==
+				NetworkSidecarTransferDecision::Transfer &&
+			DecideNetworkSidecarTransfer(1U,
+				0x12345678U, 1U | bit, 0x87654321U, true) ==
+				NetworkSidecarTransferDecision::Reject &&
+			DecideNetworkSidecarTransfer(1U | bit,
+				0x12345678U, 1U, 0x87654321U, false) ==
+				NetworkSidecarTransferDecision::Reject,
+			"sidecar repair needs a host sender and cannot remove client-only files");
+	}
+	result |= Check(IsMatchingNetworkSidecarIdentity(1U | 4U, 0U,
+		1U | 4U, 0U) &&
+		DecideNetworkSidecarTransfer(1U | 4U, 0U, 1U, 1U, true) ==
+			NetworkSidecarTransferDecision::Transfer &&
+		DecideNetworkSidecarTransfer(1U | 4U, 0U, 1U | 4U, 1U, true) ==
+			NetworkSidecarTransferDecision::Transfer,
+		"zero digest remains valid; empty-present and absent sidecars differ");
+	result |= Check(IsNetworkMapPackageReady(true, 0x10203040U,
+		0x10203040U, 1U | 4U, 0x12345678U, 1U | 4U, 0x12345678U) &&
+		!IsNetworkMapPackageReady(false, 0x10203040U,
+			0x10203040U, 1U | 4U, 0x12345678U, 1U | 4U, 0x12345678U) &&
+		!IsNetworkMapPackageReady(true, 0x10203040U,
+			0x10203041U, 1U | 4U, 0x12345678U, 1U | 4U, 0x12345678U) &&
+		!IsNetworkMapPackageReady(true, 0x10203040U,
+			0x10203040U, 1U | 4U, 0x12345678U, 1U | 4U, 0x12345679U),
+		"final map ACK requires complete write and exact package identity");
 	result |= Check(
 		rts::ResolveMultiplayerSimulationGeneratedReleaseProofMask(
 			absentProof, liveIntegratedMask) == 0,
@@ -310,7 +380,12 @@ int TestNetworkHelloContract()
 		"wire fixture uses an explicit non-product release-proof override");
 	result |= Check(ordinaryProductMask == liveIntegratedMask,
 		"reviewed lockstep-v2 promotion grants ordinary product authority");
-	result |= Check(kNetworkHelloWireSize == 80U, "NET3 policy hello uses the fixed 80-byte wire size");
+	result |= Check(kNetworkHelloWireSize == 88U, "NET3 policy hello binds sidecar identity");
+	result |= Check(ReadLittleEndian32(encoded.data() + kNetworkHelloSidecarMaskOffset) ==
+		(1U | 4U | 16U) &&
+		ReadLittleEndian32(encoded.data() + kNetworkHelloSidecarCrcOffset) ==
+		0x76543210U,
+		"NET3 hello carries sidecar presence and content CRC");
 	result |= Check(HasNetworkHelloMagic(encoded.data(), encoded.size()),
 		"NET3 hello carries its independent wire magic");
 	result |= Check(!HasNetworkHelloMagic(encoded.data(), encoded.size() - 1U),
@@ -332,6 +407,13 @@ int TestNetworkHelloContract()
 		prePolicyRecord.size()) &&
 		!HasNetworkHelloMagic(prePolicyRecord.data(), prePolicyRecord.size()),
 		"pre-policy 60-byte NET3 records cannot enter gameplay packet parsing");
+	std::array<rts::runtime_epoch::Byte, 80U> preSidecarRecord = {{}};
+	for (std::size_t index = 0; index < preSidecarRecord.size(); ++index)
+		preSidecarRecord[index] = encoded[index];
+	result |= Check(HasNetworkHelloPrefix(preSidecarRecord.data(),
+		preSidecarRecord.size()) &&
+		!HasNetworkHelloMagic(preSidecarRecord.data(), preSidecarRecord.size()),
+		"pre-sidecar 80-byte NET3 records cannot enter gameplay packet parsing");
 	result |= Check(encoded[4] == 0x01U && encoded[5] == 0x00U &&
 		encoded[6] == 0x00U && encoded[7] == 0x00U,
 		"NET3 schema version is little endian");
@@ -404,7 +486,11 @@ int TestNetworkHelloContract()
 		decodedSimulationPolicy.mapCrc == 0x10203040U &&
 		decodedSimulationPolicy.rosterMask == 0xa5U &&
 		decodedSimulationPolicy.provenKernelMask ==
-			nonProductTestMask,
+			nonProductTestMask &&
+		decodedSimulationPolicy.sidecarMask == (1U | 4U | 16U) &&
+		decodedSimulationPolicy.sidecarCrc == 0x76543210U &&
+		IsMatchingNetworkSimulationPolicyIdentity(
+			decodedSimulationPolicy, simulationPolicy),
 		"NET3 decoder reconstructs the authoritative simulation policy identity");
 	const NetworkSimulationPolicyIdentity defaultProductPolicy =
 		MakeNetworkSimulationPolicyIdentity(executableCrc, iniCrc,

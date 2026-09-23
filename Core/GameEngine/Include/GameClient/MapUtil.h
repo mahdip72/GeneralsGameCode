@@ -138,6 +138,9 @@ extern TechAndSupplyImages TheSupplyAndTechImageLocations;
 UnsignedInt GetMapFileCRC(const AsciiString &mapName);
 Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc);
 Int GetMapSimulationSidecarMask(const AsciiString &mapName);
+#if defined(_WIN64)
+Bool GetMapSimulationSidecarCRC(const AsciiString &mapName, UnsignedInt *crcOut);
+#endif
 
 // TheSuperHackers @refactor xezon 28/11/2025 Refactors the map list population implementation
 // by breaking it into smaller pieces to make it more maintainable.

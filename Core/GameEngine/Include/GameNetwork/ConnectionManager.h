@@ -85,6 +85,8 @@ public:
 	rts::MultiplayerSimulationPolicyStatus
 		getMultiplayerSimulationPolicyStatus() const;
 #if defined(_WIN64)
+	Bool getNetworkMapSidecarIdentity(Int slot, UnsignedInt *mask,
+		UnsignedInt *crc) const;
 	// A v2 proof is opt-in and remains inactive until the caller supplies the
 	// exact session contract.  The recorder is fed from the production command
 	// and frame/CRC boundaries; it never drives simulation or grants policy.
@@ -301,6 +303,8 @@ private:
 	UnsignedInt m_networkHelloAttempts;
 	UnsignedInt m_networkSimulationMapCrc;
 	Int m_networkSimulationMapContentsMask;
+	UnsignedInt m_networkSimulationSidecarMask;
+	UnsignedInt m_networkSimulationSidecarCrc;
 	UnsignedInt m_networkSimulationRosterMask;
 	Bool m_networkSimulationPolicyResolved;
 	rts::network_epoch::NetworkSimulationPolicyIdentity

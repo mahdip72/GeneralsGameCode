@@ -449,6 +449,7 @@ GameSpyStagingRoom::GameSpyStagingRoom()
 
 	setLocalIP(0);
 	m_transport = nullptr;
+	m_isQM = FALSE;
 
 	m_localName = "localhost";
 
@@ -834,7 +835,7 @@ void GameSpyStagingRoom::launchGame()
 		TheGameLogic->clearGameData();
 	}
 
-	Bool filesOk = DoAnyMapTransfers(this);
+	Bool filesOk = DoAnyMapTransfers(this, !isQMGame());
 
 	// see if we really have the map.  if not, back out.
 	TheMapCache->updateCache();
@@ -900,4 +901,5 @@ void GameSpyStagingRoom::reset()
 	}
 #endif
 	GameInfo::reset();
+	m_isQM = FALSE;
 }

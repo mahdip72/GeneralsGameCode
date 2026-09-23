@@ -114,6 +114,10 @@ public:
 	// behavior through the same interface.
 	virtual Bool isNetworkHelloReady() = 0;
 	virtual Bool hasNetworkHelloFailure() = 0;
+#if defined(_WIN64)
+	virtual Bool getNetworkMapSidecarIdentity(Int slot, UnsignedInt *mask,
+		UnsignedInt *crc) = 0;
+#endif
 	virtual Bool isNetworkSimulationPolicyUsable() = 0;
 	virtual Bool refreshNetworkSimulationPolicyForLockstepV2() = 0;
 	virtual Bool isMultiplayerSimulationKernelEnabled(

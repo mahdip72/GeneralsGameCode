@@ -105,7 +105,7 @@ UnsignedInt ResolveIP(AsciiString host)
 static UnsignedShort s_commandID = 0;
 UnsignedShort GenerateNextCommandID()
 {
-	return s_commandID++;
+	return rts::network_epoch::ConsumeNetworkCommandID(s_commandID);
 }
 
 /**

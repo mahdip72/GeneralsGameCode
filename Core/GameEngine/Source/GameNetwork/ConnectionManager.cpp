@@ -29,9 +29,11 @@
 #include "WWLib/strtok_r.h"
 #include "Common/AudioEventRTS.h"
 #include "Common/CRCDebug.h"
+#include "Common/crc.h"
 #include "Common/Debug.h"
 #include "Common/file.h"
 #include "Common/FileSystem.h"
+#include "Common/GameState.h"
 #include "Common/GameAudio.h"
 #include "Common/LocalFileSystem.h"
 #include "Common/Player.h"
@@ -41,6 +43,7 @@
 
 #include "GameClient/Diplomacy.h"
 #include "GameClient/GameText.h"
+#include "GameClient/MapUtil.h"
 #include "GameClient/MessageBox.h"
 #include "GameNetwork/ConnectionManager.h"
 #include "GameNetwork/LANAPICallbacks.h"
@@ -877,6 +880,26 @@ Bool ConnectionManager::hasNetworkHelloFailure() const
 #endif
 }
 
+#if defined(_WIN64)
+Bool ConnectionManager::getNetworkMapSidecarIdentity(Int slot,
+	UnsignedInt *mask, UnsignedInt *crc) const
+{
+	if (mask == nullptr || crc == nullptr || slot < 0 || slot >= MAX_SLOTS ||
+		!m_networkHelloStarted || !isNetworkHelloReady())
+		return FALSE;
+	const rts::network_epoch::NetworkSimulationPolicyIdentity *identity = nullptr;
+	if (slot == m_localSlot)
+		identity = &m_networkSimulationLocalIdentity;
+	else if (m_networkSimulationRemoteIdentityReceived[slot])
+		identity = &m_networkSimulationRemoteIdentity[slot];
+	if (identity == nullptr)
+		return FALSE;
+	*mask = identity->sidecarMask;
+	*crc = identity->sidecarCrc;
+	return TRUE;
+}
+#endif
+
 Bool ConnectionManager::isNetworkSimulationPolicyUsable() const
 {
 #if defined(_WIN64)
@@ -1078,6 +1101,8 @@ void ConnectionManager::clearNetworkSimulationPolicy()
 {
 	m_networkSimulationMapCrc = 0U;
 	m_networkSimulationMapContentsMask = 0;
+	m_networkSimulationSidecarMask = 0U;
+	m_networkSimulationSidecarCrc = 0U;
 	m_networkSimulationRosterMask = 0U;
 	m_networkSimulationPolicyResolved = FALSE;
 	m_networkSimulationLocalIdentity =
@@ -1245,9 +1270,9 @@ void ConnectionManager::beginNetworkHello()
 			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC);
 	}
 #endif
-	// NET3's map identity covers the .map bytes only. Map-specific INI files
-	// can affect simulation, so keep those sessions on the serial path. These
-	// fields come from the shared lobby state and agree before map transfer.
+	// Sidecar-bearing sessions retain the serial simulation policy until
+	// parallel-kernel release proof covers them. The .map CRC and host map
+	// mask still come from the shared lobby state before transfer.
 	if (!rts::network_epoch::IsNetworkMapPromotionEligible(
 		m_networkSimulationMapCrc,
 		static_cast<UnsignedInt>(m_networkSimulationMapContentsMask)))
@@ -1259,6 +1284,8 @@ void ConnectionManager::beginNetworkHello()
 			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
 			m_networkSimulationMapCrc, m_networkSimulationRosterMask,
 			candidateKernelMask);
+	m_networkSimulationLocalIdentity.sidecarMask = m_networkSimulationSidecarMask;
+	m_networkSimulationLocalIdentity.sidecarCrc = m_networkSimulationSidecarCrc;
 
 	if (!hasRemotePeer)
 		return;
@@ -2490,13 +2517,74 @@ void ConnectionManager::processChat(NetChatCommandMsg *msg)
 	}
 }
 
+#if defined(_WIN64)
+static Bool writeTransferredFileAtomically(const AsciiString &path,
+	const UnsignedByte *bytes, Int length)
+{
+	const char *separator = strrchr(path.str(), '\\');
+	if (separator == nullptr || length < 0)
+		return FALSE;
+	const size_t directoryLength = separator - path.str() + 1;
+	if (directoryLength >= MAX_PATH)
+		return FALSE;
+	char directory[MAX_PATH];
+	memcpy(directory, path.str(), directoryLength);
+	directory[directoryLength] = 0;
+	// A downloaded custom map may not have a destination directory yet.
+	// Create each component without opening or truncating any existing file.
+	size_t firstComponent = directory[1] == ':' ? 3U : 0U;
+	if (directory[0] == '\\' && directory[1] == '\\')
+	{
+		const char *serverEnd = strchr(directory + 2, '\\');
+		const char *shareEnd = serverEnd ? strchr(serverEnd + 1, '\\') : nullptr;
+		if (shareEnd == nullptr)
+			return FALSE;
+		firstComponent = static_cast<size_t>(shareEnd - directory + 1);
+	}
+	for (size_t i = firstComponent; i < directoryLength; ++i)
+	{
+		if (directory[i] != '\\' || i == 0)
+			continue;
+		const char separator = directory[i];
+		directory[i] = 0;
+		if (!CreateDirectoryA(directory, nullptr) &&
+			GetLastError() != ERROR_ALREADY_EXISTS)
+			return FALSE;
+		directory[i] = separator;
+	}
+	char temporary[MAX_PATH];
+	if (GetTempFileNameA(directory, "ggc", 0, temporary) == 0)
+		return FALSE;
+	HANDLE file = CreateFileA(temporary, GENERIC_WRITE, 0, nullptr,
+		TRUNCATE_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+		nullptr);
+	DWORD written = 0;
+	const Bool complete = file != INVALID_HANDLE_VALUE &&
+		(length == 0 || WriteFile(file, bytes, static_cast<DWORD>(length), &written, nullptr)) &&
+		written == static_cast<DWORD>(length) &&
+		FlushFileBuffers(file);
+	if (file != INVALID_HANDLE_VALUE)
+		CloseHandle(file);
+	if (!complete || !MoveFileExA(temporary, path.str(),
+		MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+	{
+		DeleteFileA(temporary);
+		return FALSE;
+	}
+	TheFileSystem->noteExternalFileReplacement(path.str());
+	return TRUE;
+}
+#endif
+
 void ConnectionManager::processFile(NetFileCommandMsg *msg)
 {
+#if !defined(_WIN64)
 	if (msg->getFileLength() == 0)
 	{
 		DEBUG_LOG(("Ignoring empty network file transfer"));
 		return;
 	}
+#endif
 #ifdef DEBUG_LOGGING
 	UnicodeString log;
 	log.format(L"Saw file transfer: '%hs' of %d bytes from %d", msg->getPortableFilename().str(), msg->getFileLength(), msg->getPlayerID());
@@ -2566,19 +2654,86 @@ void ConnectionManager::processFile(NetFileCommandMsg *msg)
 		return;
 	}
 
+#if defined(_WIN64)
+	const Bool selectedMap = TheGameInfo != nullptr &&
+		rts::network_epoch::IsSameCanonicalNetworkMapPath(
+			TheGameState->realMapPathToPortableMapPath(realFileName).str(),
+			TheGameState->realMapPathToPortableMapPath(TheGameInfo->getMap()).str());
+	if (selectedMap)
+	{
+		CRC transferredMapCrc;
+		transferredMapCrc.clear();
+		transferredMapCrc.computeCRC(buf, len);
+		UnsignedInt hostContentsMask = 0U;
+		UnsignedInt hostSidecarCrc = 0U;
+		UnsignedInt localSidecarCrc = 0U;
+		if (!getNetworkMapSidecarIdentity(0, &hostContentsMask,
+			&hostSidecarCrc) ||
+			!GetMapSimulationSidecarCRC(TheGameInfo->getMap(), &localSidecarCrc) ||
+			!rts::network_epoch::IsNetworkMapPackageReady(TRUE,
+				TheGameInfo->getMapCRC(), transferredMapCrc.get(),
+				hostContentsMask, hostSidecarCrc,
+				GetMapSimulationSidecarMask(TheGameInfo->getMap()),
+				localSidecarCrc))
+		{
+			DEBUG_LOG(("Transferred map bytes or sidecars fail NET3 host identity"));
+			return;
+		}
+	}
+#endif
+
+	Bool wroteFile = FALSE;
+#if defined(_WIN64)
+	wroteFile = writeTransferredFileAtomically(realFileName, buf, len);
+#else
 	File *fp = TheFileSystem->openFile(realFileName.str(), File::CREATE | File::BINARY | File::WRITE);
 	if (fp)
 	{
-		fp->write(buf, len);
+		wroteFile = fp->write(buf, len) == len;
 		fp->close();
 		fp = nullptr;
-		DEBUG_LOG(("Wrote %d bytes to file %s!", len, realFileName.str()));
+		if (wroteFile)
+			DEBUG_LOG(("Wrote %d bytes to file %s!", len, realFileName.str()));
 
 	}
 	else
 	{
 		DEBUG_LOG(("Cannot open file!"));
 	}
+#endif
+	if (!wroteFile)
+	{
+		DEBUG_LOG(("Failed to write complete network file '%s'", realFileName.str()));
+#ifdef COMPRESS_TARGAS
+		if (deleteBuf)
+			delete[] buf;
+#endif
+		return;
+	}
+
+#if defined(_WIN64)
+	// The selected .map is always transferred last. Its progress ACK is the
+	// host's proof that this recipient committed the complete simulation map
+	// package, including every advertised sidecar.
+	if (selectedMap)
+	{
+		UnsignedInt hostContentsMask = 0U;
+		UnsignedInt hostSidecarCrc = 0U;
+		UnsignedInt localSidecarCrc = 0U;
+		if (!getNetworkMapSidecarIdentity(0, &hostContentsMask,
+			&hostSidecarCrc) ||
+			!GetMapSimulationSidecarCRC(TheGameInfo->getMap(), &localSidecarCrc) ||
+			!rts::network_epoch::IsNetworkMapPackageReady(wroteFile,
+				TheGameInfo->getMapCRC(), GetMapFileCRC(TheGameInfo->getMap()),
+				hostContentsMask, hostSidecarCrc,
+				GetMapSimulationSidecarMask(TheGameInfo->getMap()),
+				localSidecarCrc))
+		{
+			DEBUG_LOG(("Transferred map package does not match NET3 host identity"));
+			return;
+		}
+	}
+#endif
 
 	DEBUG_LOG(("ConnectionManager::processFile() - sending a NetFileProgressCommandMsg"));
 
@@ -3896,7 +4051,14 @@ void ConnectionManager::parseUserList(const GameInfo *game)
 	clearNetworkSimulationPolicy();
 	m_networkSimulationMapCrc = game->getMapCRC();
 	m_networkSimulationMapContentsMask = game->getMapContentsMask();
+	m_networkSimulationSidecarMask =
+		(game->getMapContentsMask() & ~(4 | 16 | 32)) |
+		GetMapSimulationSidecarMask(game->getMap());
+	const Bool sidecarIdentityReadable =
+		GetMapSimulationSidecarCRC(game->getMap(), &m_networkSimulationSidecarCrc);
 	beginNetworkHello();
+	if (!sidecarIdentityReadable)
+		rejectNetworkHello(-1, "NET3 map sidecar read failed");
 #endif
 #ifdef MEMORYPOOL_DEBUG
 	TheMemoryPoolFactory->debugSetInitFillerIndex(m_localSlot);
@@ -4109,7 +4271,11 @@ UnsignedShort ConnectionManager::sendFileAnnounce(AsciiString path, UnsignedByte
 	#endif
 
 	File *theFile = TheLocalFileSystem->openFile(path.str());
+#if defined(_WIN64)
+	if (!theFile)
+#else
 	if (!theFile || !theFile->size())
+#endif
 	{
 		UnicodeString log;
 		log.format(L"Not sending file '%hs' to %X", path.str(), playerMask);
@@ -4155,7 +4321,11 @@ void ConnectionManager::sendFile(AsciiString path, UnsignedByte playerMask, Unsi
 	#endif
 
 	File *theFile = TheLocalFileSystem->openFile(path.str());
+#if defined(_WIN64)
+	if (!theFile)
+#else
 	if (!theFile || !theFile->size())
+#endif
 	{
 		UnicodeString log;
 		log.format(L"Not sending file '%hs' to %X", path.str(), playerMask);

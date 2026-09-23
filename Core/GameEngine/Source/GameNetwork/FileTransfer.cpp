@@ -31,10 +31,18 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "GameClient/LoadScreen.h"
+#include "GameClient/MapUtil.h"
 #include "GameClient/Shell.h"
+#if defined(_WIN64)
+#include "Common/LocalFileSystem.h"
+#include "Common/file.h"
+#endif
 #include "GameNetwork/FileTransfer.h"
 #include "GameNetwork/networkutil.h"
 #include "Lib/FileTransferTimeout.h"
+#if defined(_WIN64)
+#include "Lib/NetworkEpochHandshake.h"
+#endif
 
 //-------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------
@@ -47,6 +55,15 @@ static Bool doFileTransfer( AsciiString filename, MapTransferLoadScreen *ls, Int
 
 	if (mask)
 	{
+#if defined(_WIN64)
+		if (TheGameInfo->amIHost())
+		{
+			File *source = TheLocalFileSystem->openFile(filename.str(), File::READ);
+			if (source == nullptr)
+				return FALSE;
+			source->close();
+		}
+#endif
 		ls->setCurrentFilename(filename);
 		UnsignedInt startTime = timeGetTime();
 		const Int timeoutPeriod = 2*60*1000;
@@ -115,7 +132,7 @@ static Bool doFileTransfer( AsciiString filename, MapTransferLoadScreen *ls, Int
 			fileTransferPercent = 100;
 			for (i=1; i<MAX_SLOTS; ++i)
 			{
-				if (TheGameInfo->getConstSlot(i)->isHuman() && !TheGameInfo->getConstSlot(i)->hasMap())
+				if ((mask & (1 << i)) != 0)
 				{
 					Int slotTransferPercent = TheNetwork->getFileTransferProgress(i, filename);
 					fileTransferPercent = min(fileTransferPercent, slotTransferPercent);
@@ -275,42 +292,119 @@ AsciiString GetReadmeFromMap( AsciiString path )
 //-------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------
 
-Bool DoAnyMapTransfers(GameInfo *game)
+Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 {
 	TheGameInfo = game;
 	Int mask = 0;
 	Int i=0;
+#if defined(_WIN64)
+	// The hello carries each peer's actual sidecar identity. Wait for it
+	// before selecting transfer recipients, including Quick Match peers.
+	const UnsignedInt helloStart = timeGetTime();
+	while (!TheNetwork->isNetworkHelloReady())
+	{
+		if (TheNetwork->hasNetworkHelloFailure() ||
+			rts::file_transfer::IsTimedOut(timeGetTime(), helloStart, 11000U))
+			return FALSE;
+		TheNetwork->liteupdate();
+		Sleep(1);
+	}
+	UnsignedInt hostContentsMask = 0U;
+	UnsignedInt hostSidecarCRC = 0U;
+	if (!TheNetwork->getNetworkMapSidecarIdentity(0, &hostContentsMask,
+		&hostSidecarCRC))
+		return FALSE;
+	for (i = 1; i < MAX_SLOTS; ++i)
+	{
+		if (!game->getConstSlot(i)->isHuman())
+			continue;
+		UnsignedInt peerContentsMask = 0U;
+		UnsignedInt peerSidecarCRC = 0U;
+		if (!TheNetwork->getNetworkMapSidecarIdentity(i, &peerContentsMask,
+			&peerSidecarCRC))
+			return FALSE;
+		const rts::network_epoch::NetworkSidecarTransferDecision decision =
+			rts::network_epoch::DecideNetworkSidecarTransfer(
+				hostContentsMask, hostSidecarCRC,
+				peerContentsMask, peerSidecarCRC, allowSidecarTransfer);
+		// A host cannot transfer an absent sidecar. Quick Match has no
+		// authoritative file-transfer sender. Both cases fail before writing.
+		if (decision == rts::network_epoch::NetworkSidecarTransferDecision::Reject)
+			return FALSE;
+		if (decision == rts::network_epoch::NetworkSidecarTransferDecision::Transfer)
+			mask = static_cast<Int>(rts::network_epoch::AddNetworkMapTransferRecipient(
+				static_cast<UnsignedInt>(mask), i, false, true));
+	}
+#endif
 	for (i=1; i<MAX_SLOTS; ++i)
 	{
 		if (TheGameInfo->getConstSlot(i)->isHuman() && !TheGameInfo->getConstSlot(i)->hasMap())
 		{
+#if defined(_WIN64)
+			if (!allowSidecarTransfer)
+				return FALSE; // Quick Match has no authoritative transfer sender.
+#endif
 			DEBUG_LOG(("Adding player %d to transfer mask", i));
+#if defined(_WIN64)
+			mask = static_cast<Int>(rts::network_epoch::AddNetworkMapTransferRecipient(
+				static_cast<UnsignedInt>(mask), i, true, false));
+#else
 			mask |= (1<<i);
+#endif
 		}
 	}
 	if (!mask)
+	{
+#if defined(_WIN64)
+		UnsignedInt localSidecarCRC = 0U;
+		if (!GetMapSimulationSidecarCRC(game->getMap(), &localSidecarCRC))
+			return FALSE;
+		return rts::network_epoch::IsNetworkMapPackageReady(TRUE,
+			game->getMapCRC(), GetMapFileCRC(game->getMap()),
+			hostContentsMask, hostSidecarCRC,
+			GetMapSimulationSidecarMask(game->getMap()),
+			localSidecarCRC);
+#else
 		return TRUE;
+#endif
+	}
 
 	TheShell->hideShell();
 	MapTransferLoadScreen *ls = NEW MapTransferLoadScreen;
 	ls->init(TheGameInfo);
 	Bool ok = TRUE;
-	if (TheGameInfo->getMapContentsMask() & 2)
+	Int contentsMask = TheGameInfo->getMapContentsMask();
+#if defined(_WIN64)
+	contentsMask = static_cast<Int>(hostContentsMask);
+#endif
+	if (contentsMask & 2)
 		ok = doFileTransfer(GetPreviewFromMap(game->getMap()), ls, mask);
-	if (ok && TheGameInfo->getMapContentsMask() & 4)
+	if (ok && contentsMask & 4)
 		ok = doFileTransfer(GetINIFromMap(game->getMap()), ls, mask);
-	if (ok && TheGameInfo->getMapContentsMask() & 8)
+	if (ok && contentsMask & 8)
 		ok = doFileTransfer(GetStrFileFromMap(game->getMap()), ls, mask);
-	if (ok && TheGameInfo->getMapContentsMask() & 16)
+	if (ok && contentsMask & 16)
 		ok = doFileTransfer(GetSoloINIFromMap(game->getMap()), ls, mask);
-	if (ok && TheGameInfo->getMapContentsMask() & 32)
+	if (ok && contentsMask & 32)
 		ok = doFileTransfer(GetAssetUsageFromMap(game->getMap()), ls, mask);
-	if (ok && TheGameInfo->getMapContentsMask() & 64)
+	if (ok && contentsMask & 64)
 		ok = doFileTransfer(GetReadmeFromMap(game->getMap()), ls, mask);
 	if (ok)
 		ok = doFileTransfer(game->getMap(), ls, mask);
 	delete ls;
 	ls = nullptr;
+#if defined(_WIN64)
+	if (ok)
+	{
+		UnsignedInt localSidecarCRC = 0U;
+		ok = GetMapSimulationSidecarCRC(game->getMap(), &localSidecarCRC) &&
+			rts::network_epoch::IsNetworkMapPackageReady(TRUE,
+				game->getMapCRC(), GetMapFileCRC(game->getMap()),
+				hostContentsMask, hostSidecarCRC,
+				GetMapSimulationSidecarMask(game->getMap()),
+				localSidecarCRC);
+	}
+#endif
 	if (!ok)
 		TheShell->showShell();
 	return ok;

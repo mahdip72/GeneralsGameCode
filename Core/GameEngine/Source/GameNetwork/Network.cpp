@@ -174,6 +174,10 @@ public:
 	virtual Bool isPlayerConnected( Int playerID ) override;
 	virtual Bool isNetworkHelloReady() override;
 	virtual Bool hasNetworkHelloFailure() override;
+#if defined(_WIN64)
+	virtual Bool getNetworkMapSidecarIdentity(Int slot, UnsignedInt *mask,
+		UnsignedInt *crc) override;
+#endif
 	virtual Bool isNetworkSimulationPolicyUsable() override;
 	virtual Bool refreshNetworkSimulationPolicyForLockstepV2() override;
 	virtual Bool isMultiplayerSimulationKernelEnabled(
@@ -280,6 +284,15 @@ Bool Network::hasNetworkHelloFailure()
 {
 	return m_conMgr != nullptr && m_conMgr->hasNetworkHelloFailure();
 }
+
+#if defined(_WIN64)
+Bool Network::getNetworkMapSidecarIdentity(Int slot, UnsignedInt *mask,
+	UnsignedInt *crc)
+{
+	return m_conMgr != nullptr &&
+		m_conMgr->getNetworkMapSidecarIdentity(slot, mask, crc);
+}
+#endif
 
 Bool Network::isNetworkSimulationPolicyUsable()
 {
