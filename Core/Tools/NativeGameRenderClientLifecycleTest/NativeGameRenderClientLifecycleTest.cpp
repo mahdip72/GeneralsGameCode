@@ -363,8 +363,16 @@ int TestNativeLifecycle(HWND window)
 	const int fullscreenClientHeight = selectedMonitor.rcMonitor.bottom -
 		selectedMonitor.rcMonitor.top;
 	failures += !Check(rts::render::SetGameRenderDeviceByName(deviceName,
-		640, 480, 16, 0, true) == rts::render::RENDER_RESULT_OK,
-		"valid logical device name routes through bootstrap presentation");
+		640, 480, 16, 1, true) == rts::render::RENDER_RESULT_OK,
+		"logical device selection establishes the 640x480 windowed mode");
+	RECT savedWindowedWindowRect = { 0 };
+	failures += !Check(GetWindowRect(window, &savedWindowedWindowRect) &&
+		GetClientRect(window, &clientRect) && clientRect.right == 640 &&
+		clientRect.bottom == 480,
+		"capture the exact starting windowed placement and client dimensions");
+	failures += !Check(rts::render::ToggleGameRendererWindowed() ==
+		rts::render::RENDER_RESULT_OK,
+		"native toggle enters borderless fullscreen from the saved windowed mode");
 	POINT fullscreenClientOrigin = { 0, 0 };
 	failures += !Check(GetClientRect(window, &clientRect) &&
 		clientRect.right - clientRect.left == fullscreenClientWidth &&
@@ -383,10 +391,37 @@ int TestNativeLifecycle(HWND window)
 		width == fullscreenClientWidth && height == fullscreenClientHeight &&
 		bitDepth == 32 && !windowed,
 		"native fullscreen publishes client-sized dimensions for display and mouse input");
-	failures += !Check(rts::render::SetGameRenderDeviceByName(deviceName,
-		640, 480, 16, 1, true) == rts::render::RENDER_RESULT_OK,
-		"valid logical device name restores windowed presentation");
+	const rts::render::GameRenderColor toggleClearColor = { 0, 0, 0, 1 };
+	failures += !Check(rts::render::BeginGameRender(true, true,
+		toggleClearColor, 1.0f) == rts::render::RENDER_RESULT_OK,
+		"open frame establishes a fullscreen toggle rollback boundary");
+	failures += !Check(rts::render::ToggleGameRendererWindowed() ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"fullscreen toggle rejects a window transition during an open frame");
+	POINT failedToggleClientOrigin = { 0, 0 };
 	failures += !Check(GetClientRect(window, &clientRect) &&
+		clientRect.right - clientRect.left == fullscreenClientWidth &&
+		clientRect.bottom - clientRect.top == fullscreenClientHeight &&
+		ClientToScreen(window, &failedToggleClientOrigin) &&
+		failedToggleClientOrigin.x == selectedMonitor.rcMonitor.left &&
+		failedToggleClientOrigin.y == selectedMonitor.rcMonitor.top &&
+		rts::render::GetGameBackBufferInfo(&backBuffer) ==
+			rts::render::RENDER_RESULT_OK &&
+		backBuffer.width == static_cast<unsigned int>(fullscreenClientWidth) &&
+		backBuffer.height == static_cast<unsigned int>(fullscreenClientHeight) &&
+		rts::render::GetGameRendererResolution(&width, &height, &bitDepth,
+			&windowed) == rts::render::RENDER_RESULT_OK &&
+		width == fullscreenClientWidth && height == fullscreenClientHeight &&
+		!windowed,
+		"failed fullscreen toggle preserves borderless placement and monitor-sized target");
+	(void)rts::render::EndGameRender(false);
+	failures += !Check(rts::render::ToggleGameRendererWindowed() ==
+		rts::render::RENDER_RESULT_OK,
+		"native toggle restores the saved windowed mode after rollback");
+	RECT restoredWindowedWindowRect = { 0 };
+	failures += !Check(GetWindowRect(window, &restoredWindowedWindowRect) &&
+		EqualRect(&savedWindowedWindowRect, &restoredWindowedWindowRect) &&
+		GetClientRect(window, &clientRect) &&
 		clientRect.right - clientRect.left == 640 &&
 		clientRect.bottom - clientRect.top == 480 &&
 		rts::render::GetGameBackBufferInfo(&backBuffer) ==
@@ -395,7 +430,7 @@ int TestNativeLifecycle(HWND window)
 		rts::render::GetGameRendererResolution(&width, &height, &bitDepth,
 			&windowed) == rts::render::RENDER_RESULT_OK &&
 		width == 640 && height == 480 && windowed,
-		"windowed resolution restores the exact requested client and backbuffer dimensions");
+		"fullscreen toggle restores windowed client, backbuffer, resolution, and placement");
 	failures += !Check(rts::render::SetAnyGameRenderDevice() ==
 		rts::render::RENDER_RESULT_OK &&
 		rts::render::SetNextGameRenderDevice() ==
@@ -430,9 +465,48 @@ int TestNativeLifecycle(HWND window)
 		"resize cleanup callbacks can re-enter the native facade for shader rebuilds");
 
 	rts::render::SetGameCleanupHook(0);
+	failures += !Check(rts::render::SetGameRendererResolution(640, 480, 32,
+		1, true) == rts::render::RENDER_RESULT_OK,
+		"restore a matching windowed client before startup-mode recreation");
+	RECT startupWindowRect = { 0 };
+	failures += !Check(GetWindowRect(window, &startupWindowRect),
+		"capture placement before startup-mode recreation");
 	failures += !Check(rts::render::ShutdownGameRenderer() ==
 		rts::render::RENDER_RESULT_OK,
 		"native bootstrap shuts down after lifecycle coverage");
+	failures += !Check(rts::render::InitializeGameRenderer(window, 640, 480,
+		false, false) == rts::render::RENDER_RESULT_OK,
+		"native bootstrap seeds saved windowed dimensions from startup resolution");
+	failures += !Check(rts::render::ToggleGameRendererWindowed() ==
+		rts::render::RENDER_RESULT_OK,
+		"direct startup toggle enters fullscreen without prior mode selection");
+	failures += !Check(rts::render::GetGameBackBufferInfo(&backBuffer) ==
+		rts::render::RENDER_RESULT_OK &&
+		backBuffer.width == static_cast<unsigned int>(fullscreenClientWidth) &&
+		backBuffer.height == static_cast<unsigned int>(fullscreenClientHeight) &&
+		rts::render::GetGameRendererResolution(&width, &height, &bitDepth,
+			&windowed) == rts::render::RENDER_RESULT_OK &&
+		width == fullscreenClientWidth && height == fullscreenClientHeight &&
+		!windowed,
+		"direct startup fullscreen target matches the selected monitor");
+	failures += !Check(rts::render::ToggleGameRendererWindowed() ==
+		rts::render::RENDER_RESULT_OK,
+		"direct startup fullscreen toggle restores the initialized windowed mode");
+	RECT startupRestoredWindowRect = { 0 };
+	failures += !Check(GetWindowRect(window, &startupRestoredWindowRect) &&
+		EqualRect(&startupWindowRect, &startupRestoredWindowRect) &&
+		GetClientRect(window, &clientRect) && clientRect.right == 640 &&
+		clientRect.bottom == 480 &&
+		rts::render::GetGameBackBufferInfo(&backBuffer) ==
+			rts::render::RENDER_RESULT_OK && backBuffer.width == 640 &&
+		backBuffer.height == 480 &&
+		rts::render::GetGameRendererResolution(&width, &height, &bitDepth,
+			&windowed) == rts::render::RENDER_RESULT_OK &&
+		width == 640 && height == 480 && windowed,
+		"startup toggle returns with exact client, backbuffer, resolution, and placement");
+	failures += !Check(rts::render::ShutdownGameRenderer() ==
+		rts::render::RENDER_RESULT_OK,
+		"native bootstrap shuts down after startup toggle coverage");
 	return failures == 0 ? 0 : 1;
 }
 

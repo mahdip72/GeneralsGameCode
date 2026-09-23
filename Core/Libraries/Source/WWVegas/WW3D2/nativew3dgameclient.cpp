@@ -47,7 +47,7 @@ struct NativeGameRendererState
 	NativeGameRendererState() : aggregate(0), descriptorValid(false),
 		transitionInProgress(false), window(0), width(0), height(0),
 		lite(false), enableVsync(false), bitDepth(32), windowed(true),
-		ownerThread(0), presentation()
+		windowedWidth(0), windowedHeight(0), ownerThread(0), presentation()
 	{
 	}
 
@@ -61,6 +61,8 @@ struct NativeGameRendererState
 	bool enableVsync;
 	int bitDepth;
 	bool windowed;
+	unsigned int windowedWidth;
+	unsigned int windowedHeight;
 	unsigned long ownerThread;
 	WindowPresentationState presentation;
 };
@@ -353,6 +355,8 @@ void ResetRendererStateLocked()
 	g_renderer_state.enableVsync = false;
 	g_renderer_state.bitDepth = 32;
 	g_renderer_state.windowed = true;
+	g_renderer_state.windowedWidth = 0;
+	g_renderer_state.windowedHeight = 0;
 	g_renderer_state.ownerThread = 0;
 	g_renderer_state.presentation.clear();
 	rts::render::GameRenderer_IsWindowed = true;
@@ -366,7 +370,7 @@ bool IsRendererOwnerThreadLocked()
 }
 
 RenderResult ReadRendererState(int *width, int *height, int *bitDepth,
-	bool *windowed)
+	bool *windowed, int *savedWindowedWidth, int *savedWindowedHeight)
 {
 	if (width == 0 || height == 0 || bitDepth == 0 || windowed == 0)
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -378,6 +382,10 @@ RenderResult ReadRendererState(int *width, int *height, int *bitDepth,
 	*height = static_cast<int>(g_renderer_state.height);
 	*bitDepth = g_renderer_state.bitDepth;
 	*windowed = g_renderer_state.windowed;
+	if (savedWindowedWidth != 0)
+		*savedWindowedWidth = static_cast<int>(g_renderer_state.windowedWidth);
+	if (savedWindowedHeight != 0)
+		*savedWindowedHeight = static_cast<int>(g_renderer_state.windowedHeight);
 	return RENDER_RESULT_OK;
 }
 
@@ -603,6 +611,8 @@ RenderResult InitializeGameRenderer(void *window, unsigned int width,
 		g_renderer_state.enableVsync = enableVsync;
 		g_renderer_state.bitDepth = 32;
 		g_renderer_state.windowed = true;
+		g_renderer_state.windowedWidth = width;
+		g_renderer_state.windowedHeight = height;
 		g_renderer_state.ownerThread =
 			static_cast<unsigned long>(GetCurrentThreadId());
 		g_renderer_state.presentation.clear();
@@ -801,11 +811,20 @@ RenderResult ToggleGameRendererWindowed()
 	int width = 0;
 	int height = 0;
 	int bitDepth = 0;
+	int savedWindowedWidth = 0;
+	int savedWindowedHeight = 0;
 	bool windowed = false;
 	const RenderResult stateResult = ReadRendererState(&width, &height,
-		&bitDepth, &windowed);
+		&bitDepth, &windowed, &savedWindowedWidth, &savedWindowedHeight);
 	if (stateResult != RENDER_RESULT_OK)
 		return stateResult;
+	if (!windowed)
+	{
+		if (savedWindowedWidth <= 0 || savedWindowedHeight <= 0)
+			return Fail(0, RENDER_RESULT_INVALID_ARGUMENT);
+		width = savedWindowedWidth;
+		height = savedWindowedHeight;
+	}
 	return SetGameRendererResolution(width, height, bitDepth,
 		windowed ? 0 : 1, true);
 }
@@ -813,7 +832,7 @@ RenderResult ToggleGameRendererWindowed()
 RenderResult GetGameRendererResolution(int *width, int *height,
 	int *bitDepth, bool *windowed)
 {
-	return ReadRendererState(width, height, bitDepth, windowed);
+	return ReadRendererState(width, height, bitDepth, windowed, 0, 0);
 }
 
 RenderResult GetGameRendererTargetResolution(int *width, int *height,
@@ -986,6 +1005,13 @@ RenderResult SetGameRendererResolution(int width, int height, int bitDepth,
 				g_renderer_state.height = static_cast<unsigned int>(height);
 				g_renderer_state.bitDepth = bitDepth;
 				g_renderer_state.windowed = targetWindowed;
+				if (targetWindowed)
+				{
+					g_renderer_state.windowedWidth =
+						static_cast<unsigned int>(width);
+					g_renderer_state.windowedHeight =
+						static_cast<unsigned int>(height);
+				}
 				g_renderer_state.presentation = nextPresentation;
 				GameRenderer_IsWindowed = targetWindowed;
 			}
