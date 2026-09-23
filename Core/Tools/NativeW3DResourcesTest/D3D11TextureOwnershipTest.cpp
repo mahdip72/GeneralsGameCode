@@ -295,6 +295,35 @@ int TestNativeD3D11Ownership()
 		statistics.liveHandles == 1 && statistics.textureCount == 1 &&
 		statistics.recoveryShadowBytes == 48,
 		"typed refresh updates the recovery image without replacing ownership");
+	IRenderContext *refreshContext = device->immediateContext();
+	result |= Check(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND, 1,
+		RENDER_RESULT_FAILED) == RENDER_RESULT_OK &&
+		refreshContext != 0 &&
+		refreshContext->beginFrame() == RENDER_RESULT_OK,
+		"texture refresh fault starts inside an active frame");
+	bool stage0Bound = false;
+	bool stage1Bound = false;
+	result |= Check(refreshContext->setTexture(0, texture.resource) ==
+		RENDER_RESULT_OK &&
+		refreshContext->setTexture(1, texture.resource) ==
+		RENDER_RESULT_OK &&
+		device->getDebugTextureBinding(texture.resource, 0, &stage0Bound) ==
+		RENDER_RESULT_OK && stage0Bound &&
+		device->getDebugTextureBinding(texture.resource, 1, &stage1Bound) ==
+		RENDER_RESULT_OK && stage1Bound,
+		"both texture stages are physically bound before refresh failure");
+	stage0Bound = false;
+	stage1Bound = false;
+	result |= Check(device->refreshTexture(texture.resource, descriptor, data, 2) ==
+		RENDER_RESULT_FAILED &&
+		device->getDebugTextureBinding(texture.resource, 0, &stage0Bound) ==
+		RENDER_RESULT_OK && stage0Bound &&
+		device->getDebugTextureBinding(texture.resource, 1, &stage1Bound) ==
+		RENDER_RESULT_OK && stage1Bound,
+		"failed refresh preserves its error and restores every bound sampler stage");
+	result |= Check(refreshContext->endFrame() == RENDER_RESULT_OK,
+		"texture refresh fault leaves the frame closable");
 
 	for (unsigned int index = 0;
 		index < sizeof(creationFaults) / sizeof(creationFaults[0]); ++index)

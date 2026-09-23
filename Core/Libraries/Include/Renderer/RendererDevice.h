@@ -225,7 +225,9 @@ enum RenderResourceFaultPoint
 	RENDER_RESOURCE_FAULT_RESIZE_TARGETS,
 	RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK,
 	// Surface removal at ResizeBuffers, then fail the fresh device's retry.
-	RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS
+	RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS,
+	// Fail after a texture refresh has temporarily cleared its sampler stages.
+	RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND
 };
 
 struct RenderResourceStatistics
@@ -707,6 +709,14 @@ public:
 		RenderResult result);
 	virtual RenderResult getDebugResourceStatistics(
 		RenderResourceStatistics *statistics) const;
+	virtual RenderResult getDebugTextureBinding(GpuHandle texture,
+		unsigned int stage, bool *bound) const
+	{
+		(void)texture;
+		(void)stage;
+		if (bound != 0) *bound = false;
+		return RENDER_RESULT_UNSUPPORTED;
+	}
 	// Requests the D3D11 debug-layer live-object report while the device is
 	// still alive. The report is emitted through the normal graphics-debug
 	// output channel; retail devices without the optional SDK layer return

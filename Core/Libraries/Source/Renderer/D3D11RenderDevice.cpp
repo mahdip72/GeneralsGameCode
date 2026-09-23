@@ -1203,6 +1203,13 @@ public:
 		// only the stages that reference this texture so unrelated legacy stages
 		// remain intact across the refresh.
 		const unsigned int reboundStages = unbindTextureResource(texture);
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		if (consumeResourceFault(
+			RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND,
+			&injectedResult))
+		{
+			return failTextureRefresh(texture, reboundStages, injectedResult);
+		}
 
 		const unsigned int subresourceCount = descriptor.mipCount *
 			descriptor.arrayCount;
@@ -1227,13 +1234,15 @@ public:
 					// the native resource; do not let a later device recovery
 					// restore a mixed/obsolete image.
 					markTextureRecoverySourceUnavailable(slot);
-					return TranslateResult(mapResult);
+					return failTextureRefresh(texture, reboundStages,
+						TranslateResult(mapResult));
 				}
 				if (mapped.pData == 0 || mapped.RowPitch == 0)
 				{
 					m_context->Unmap(slot.resource, nativeSubresource);
 					markTextureRecoverySourceUnavailable(slot);
-					return RENDER_RESULT_FAILED;
+					return failTextureRefresh(texture, reboundStages,
+						RENDER_RESULT_FAILED);
 				}
 				const unsigned int mipWidth = mip < 32 ?
 					descriptor.width >> mip : 0;
@@ -1246,7 +1255,8 @@ public:
 				{
 					m_context->Unmap(slot.resource, nativeSubresource);
 					markTextureRecoverySourceUnavailable(slot);
-					return RENDER_RESULT_INVALID_ARGUMENT;
+					return failTextureRefresh(texture, reboundStages,
+						RENDER_RESULT_INVALID_ARGUMENT);
 				}
 				const unsigned char *source = static_cast<const unsigned char *>(
 					data[index].data);
@@ -1270,7 +1280,8 @@ public:
 				if (FAILED(deviceResult))
 				{
 					markTextureRecoverySourceUnavailable(slot);
-					return TranslateResult(deviceResult);
+					return failTextureRefresh(texture, reboundStages,
+						TranslateResult(deviceResult));
 				}
 			}
 		}
@@ -1295,7 +1306,8 @@ public:
 				copyBytes > slot.shadow.size() - offset)
 			{
 				markTextureRecoverySourceUnavailable(slot);
-				return RENDER_RESULT_FAILED;
+				return failTextureRefresh(texture, reboundStages,
+					RENDER_RESULT_FAILED);
 			}
 			memcpy(&slot.shadow[offset], data[index].data, copyBytes);
 		}
@@ -3273,7 +3285,7 @@ public:
 			return RENDER_RESULT_OK;
 		}
 		if (point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
-			point > RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS ||
+			point > RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND ||
 			failOnInvocation == 0 ||
 			(result != RENDER_RESULT_OUT_OF_MEMORY &&
 			 result != RENDER_RESULT_DEVICE_REMOVED &&
@@ -3809,6 +3821,31 @@ private:
 			}
 		}
 		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult getDebugTextureBinding(GpuHandle texture,
+		unsigned int stage, bool *bound) const
+	{
+		if (!isOwner() || bound == 0 || stage >= LEGACY_TEXTURE_STAGE_COUNT ||
+			!m_handles->isLive(texture) || m_context == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		const ResourceSlot &slot = m_resources[texture.index()];
+		if (slot.kind != RESOURCE_TEXTURE || slot.view == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		ID3D11ShaderResourceView *view = 0;
+		const unsigned int nativeStage = slot.textureDescriptor.dimension ==
+			RENDER_TEXTURE_CUBE ? 8 + stage : stage;
+		m_context->PSGetShaderResources(nativeStage, 1, &view);
+		*bound = view == slot.view;
+		if (view != 0) view->Release();
+		return RENDER_RESULT_OK;
+	}
+
+	RenderResult failTextureRefresh(GpuHandle texture,
+		unsigned int affectedStages, RenderResult failure)
+	{
+		(void)rebindTextureResource(texture, affectedStages);
+		return failure;
 	}
 
 	static bool isElementRangeWithinBuffer(size_t byteCapacity,
