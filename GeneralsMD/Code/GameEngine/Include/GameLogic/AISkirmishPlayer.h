@@ -310,7 +310,7 @@ protected:
 			alternateProbeAfterID(INVALID_ID),
 			alternateAttackIssuedTargetID(INVALID_ID),
 			tunnelPhaseDeadlineFrame(0), tunnelCooldownUntilFrame(0),
-			approachAttempt(0), tunnelTransitPhase(SKIRMISH_AI_TUNNEL_TRANSIT_NONE),
+			approachAttempt(0), tunnelTransitPhase(0),
 			tunnelMemberCount(0), tunnelPairCursor(0),
 			tunnelPairSweepRemaining(0), tunnelPairSweepStartFrame(0),
 			tunnelPairResumeAfterFrame(0), tunnelPairRetryAfterFrame(0),
