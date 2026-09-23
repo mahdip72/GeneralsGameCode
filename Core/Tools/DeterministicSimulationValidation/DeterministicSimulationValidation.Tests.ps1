@@ -9363,9 +9363,11 @@ try {
             crossEpochRejected = $true; contentMismatchRejected = $true
         }
         'combined-stage4-stage5-installed-runtime' = [ordered]@{
-            installedRuntime = $true; pipelineMode = 'parallel'; simulationMode = 'parallel'
-            workerPolicy = 'auto'; renderer = 'd3d11'; renderThread = 'dedicated'
-            bothTitlesPassed = $true
+            installedRuntime = $true; pipelineMode = 'serial'; simulationMode = 'serial'
+            requestedWorkers = '1'; workerPolicy = 'auto'
+            projectionSequence = 1
+            projectionSemantics = 'deterministic-lineage-pointer'
+            sourceChildCount = 253; bothTitlesPassed = $true
         }
         'premium-review' = [ordered]@{
             reviewedCommit = $sourceCommit; reviewRounds = 2; independentReviewers = 9

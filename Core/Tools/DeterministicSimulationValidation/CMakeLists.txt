@@ -63,6 +63,12 @@ if(WIN32)
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5ValidationPartitionSelection.Tests.ps1")
     set_tests_properties(core_stage5_validation_partition_selection_tests
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
+    add_test(NAME core_stage5_acceptance_corpus_reuse_tests
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5AcceptanceCorpusReuse.Tests.ps1"
+            -ScratchRoot "${_stage5_validation_test_scratch_root}/acceptance-corpus-reuse")
+    set_tests_properties(core_stage5_acceptance_corpus_reuse_tests
+        PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
     foreach(_stage5_partition IN ITEMS Plan Runtime Acceptance)
         string(TOLOWER "${_stage5_partition}" _stage5_partition_name)
         add_test(NAME core_deterministic_simulation_validation_${_stage5_partition_name}_tests
@@ -146,12 +152,6 @@ if(WIN32)
             -ScratchRoot "${_stage5_validation_test_scratch_root}")
     set_tests_properties(core_stage5_combined_host_runner_receipt_tests
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 120)
-    add_test(NAME core_stage5_acceptance_corpus_reuse_tests
-        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
-            -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5AcceptanceCorpusReuse.Tests.ps1"
-            -ScratchRoot "${_stage5_validation_test_scratch_root}/acceptance-corpus-reuse")
-    set_tests_properties(core_stage5_acceptance_corpus_reuse_tests
-        PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
     add_test(NAME core_stage5_development_readiness_bundle_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5DevelopmentReadinessBundle.Tests.ps1"

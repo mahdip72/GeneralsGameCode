@@ -33,6 +33,37 @@ try {
         throw "The Acceptance entrypoint does not parse: $($parseErrors[0].Message)"
     }
 
+    # Acceptance runs this receipt through the production validator only after
+    # constructing and hashing its full diagnostic corpus. Exercise this one
+    # cheap contract before that expensive path so stale synthetic evidence
+    # cannot consume the outer CTest timeout before reporting its real defect.
+    $detailsAssignments = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -ceq '$detailsByKind'
+    }, $true))
+    Assert-CorpusReuseTest ($detailsAssignments.Count -eq 1) `
+        'The Acceptance entrypoint must have one identifiable details fixture.'
+    $sourceCommit = 'a' * 40
+    $detailsByKind = Invoke-Expression $detailsAssignments[0].Right.Extent.Text
+    $installedRuntimeDetails = $detailsByKind[
+        'combined-stage4-stage5-installed-runtime']
+    Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') `
+        -Force
+    $evidenceModule = @(Get-Module | Where-Object {
+        $_.Name -ceq 'DeterministicSimulationEvidence'
+    })[0]
+    try {
+        & $evidenceModule {
+            param($Details)
+            Assert-Stage5FinalAcceptanceDetails `
+                'combined-stage4-stage5-installed-runtime' $Details ('a' * 40) @{}
+        } $installedRuntimeDetails
+    }
+    catch {
+        throw "The installed-runtime Acceptance fixture violates the production details contract: $($_.Exception.Message)"
+    }
+
     $helperNames = @(
         'Add-Stage5AcceptanceFileSnapshot',
         'Restore-Stage5AcceptanceFileSnapshot',
