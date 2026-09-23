@@ -58,6 +58,35 @@ public:
 			IsThreadedRenderDevice(renderer->m_state->Device());
 	}
 
+	static bool PopulateGpuOnlyTexture(NativeW3DRenderer *renderer)
+	{
+		if (renderer == 0 || renderer->m_state == 0)
+			return false;
+		IRenderDevice *device = renderer->m_state->Device();
+		RenderBackBufferInfo info;
+		if (device == 0 || device->getBackBufferInfo(&info) != RENDER_RESULT_OK)
+			return false;
+		TextureDescriptor descriptor;
+		descriptor.width = info.width;
+		descriptor.height = info.height;
+		descriptor.mipCount = 1;
+		descriptor.arrayCount = 1;
+		descriptor.dimension = RENDER_TEXTURE_2D;
+		descriptor.format = info.format;
+		descriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+		descriptor.usage = RENDER_USAGE_DEFAULT;
+		GpuHandle texture;
+		if (device->createTexture(descriptor, 0, 0, &texture) != RENDER_RESULT_OK ||
+			!texture.isValid() || renderer->BeginFrame() != RENDER_RESULT_OK)
+			return false;
+		const RenderResult copy = device->copyActiveColorTargetToTexture(texture);
+		const RenderResult end = renderer->EndFrame(false);
+		const RenderResult finalize = renderer->FinalizeEndedFrame(false);
+		return copy == RENDER_RESULT_OK && end == RENDER_RESULT_OK &&
+			finalize == RENDER_RESULT_OK &&
+			renderer->DrainThreaded() == RENDER_RESULT_OK;
+	}
+
 	static NativeW3DRenderState *RetainState(NativeW3DRenderer *renderer)
 	{
 		NativeW3DRenderState *state = renderer == 0 ? 0 : renderer->m_state;
@@ -1096,14 +1125,16 @@ int TestResizeRollback(HWND window)
 	const RenderResourceFaultPoint faults[] = {
 		RENDER_RESOURCE_FAULT_RESIZE_TARGETS,
 		RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK,
-		RENDER_RESOURCE_FAULT_RESIZE_TARGETS
+		RENDER_RESOURCE_FAULT_RESIZE_TARGETS,
+		RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS
 	};
 	const RenderResult injectedResults[] = {
 		RENDER_RESULT_OUT_OF_MEMORY,
 		RENDER_RESULT_OUT_OF_MEMORY,
-		RENDER_RESULT_DEVICE_REMOVED
+		RENDER_RESULT_DEVICE_REMOVED,
+		RENDER_RESULT_OUT_OF_MEMORY
 	};
-	for (unsigned int scenario = 0; scenario < 3; ++scenario)
+	for (unsigned int scenario = 0; scenario < 4; ++scenario)
 	{
 		NativeW3D2 owner;
 		CountingResizeHook hook;
@@ -1111,6 +1142,10 @@ int TestResizeRollback(HWND window)
 			"resize rollback fixture initializes native owner");
 		if (!owner.IsOperational()) continue;
 		owner.SetGameCleanupHook(&hook);
+		if (scenario == 3)
+			result |= Check(NativeW3DRecoveryTestAccess::PopulateGpuOnlyTexture(
+				&owner.Renderer()),
+				"recovery retry fixture populates a shader-only texture on the GPU");
 		result |= Check(NativeW3DRecoveryTestAccess::ConfigureResourceFault(
 			&owner.Renderer(), faults[scenario], 1,
 			injectedResults[scenario]) == RENDER_RESULT_OK,
@@ -1155,7 +1190,7 @@ int TestResizeRollback(HWND window)
 			result |= Check(resizeResult == injectedResults[scenario] &&
 				hook.releaseCalls == 1 && hook.reacquireCalls == 0 &&
 				!owner.IsOperational() && !owner.Renderer().IsInitialized(),
-				"failed rollback or device removal terminates the native facade");
+				"failed rollback or recovery retry terminates the native facade");
 		}
 		result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
 			"resize rollback fixture shuts down");

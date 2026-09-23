@@ -223,7 +223,9 @@ enum RenderResourceFaultPoint
 	RENDER_RESOURCE_FAULT_PRESENTATION_PASS,
 	// Fail the requested resize target rebuild, optionally including rollback.
 	RENDER_RESOURCE_FAULT_RESIZE_TARGETS,
-	RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK
+	RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK,
+	// Surface removal at ResizeBuffers, then fail the fresh device's retry.
+	RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS
 };
 
 struct RenderResourceStatistics

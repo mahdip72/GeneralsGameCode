@@ -1579,8 +1579,20 @@ public:
 			m_context->OMSetRenderTargets(0, 0, 0);
 			unbindTextureResources();
 			releaseBackBufferTargets();
-			HRESULT result = m_swapChain->ResizeBuffers(0, width, height,
-				DXGI_FORMAT_UNKNOWN, 0);
+			RenderResult retryFault = RENDER_RESULT_OK;
+			const bool injectRemoval = recoverOnDeviceRemoval &&
+				consumeResourceFault(
+					RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS,
+					&retryFault);
+			if (injectRemoval)
+			{
+				m_faultPoint = RENDER_RESOURCE_FAULT_RESIZE_TARGETS;
+				m_faultCountdown = 1;
+				m_faultResult = retryFault;
+			}
+			HRESULT result = injectRemoval ? DXGI_ERROR_DEVICE_REMOVED :
+				m_swapChain->ResizeBuffers(0, width, height,
+					DXGI_FORMAT_UNKNOWN, 0);
 			if (FAILED(result))
 			{
 				// ResizeBuffers is one of the DXGI calls that can first surface a
@@ -1600,7 +1612,16 @@ public:
 					{
 						return recoveryResult;
 					}
-					return resizeInternal(width, height, false);
+					const RenderResult retryResult =
+						resizeInternal(width, height, false);
+					if (retryResult != RENDER_RESULT_OK)
+					{
+						// Recovery replaced every native texture. The threaded wrapper
+						// cannot trust GPU-authored content after a failed retry, even
+						// when the old-size back buffer was restored.
+						shutdownInternal();
+					}
+					return retryResult;
 				}
 				if (SUCCEEDED(createBackBufferTargets(previousWidth,
 					previousHeight)))
@@ -3252,7 +3273,7 @@ public:
 			return RENDER_RESULT_OK;
 		}
 		if (point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
-			point > RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK ||
+			point > RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS ||
 			failOnInvocation == 0 ||
 			(result != RENDER_RESULT_OUT_OF_MEMORY &&
 			 result != RENDER_RESULT_DEVICE_REMOVED &&
