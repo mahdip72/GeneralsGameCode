@@ -787,7 +787,12 @@ void GameSpyStagingRoom::bindQuickMatchMapIdentity()
 	setMapContentsMask(mapCRC != 0U ? 1 | GetMapSimulationSidecarMask(getMap()) : 0);
 	const Int localSlot = getLocalSlotNum();
 	if (localSlot >= 0)
-		getSlot(localSlot)->setMapAvailability(mapCRC != 0U);
+	{
+		// The QM response has no per-player map availability. Its slots were
+		// historically all available, so no peer can act as a transfer sender.
+		// Keep that contract and let the CRC/start checks reject bad content.
+		getSlot(localSlot)->setMapAvailability(TRUE);
+	}
 }
 
 void GameSpyStagingRoom::launchGame()
