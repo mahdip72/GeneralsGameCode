@@ -558,12 +558,10 @@ int TestResourceLookupHints()
 	{
 		const NativeW3DResources &readOnly = resources;
 		for (unsigned int repeat = 0; repeat < 8; ++repeat)
-			result |= Check(readOnly.IsVertexRangeValidForSubmission(aligned,
-				sizeof(value), 0, 0, 1),
-				"aligned lookup preserves initialized range proof");
+			result |= Check(readOnly.IsValid(aligned),
+				"aligned lookup preserves resource identity");
 		const GpuHandle stale(aligned.index(), aligned.generation() + 1);
-		result |= Check(!readOnly.IsVertexRangeValidForSubmission(stale,
-			sizeof(value), 0, 0, 1),
+		result |= Check(!readOnly.IsValid(stale),
 			"lookup hint rejects a different handle generation");
 		result |= Check(resources.Destroy(aligned),
 			"aligned lookup still destroys the exact resource");
@@ -583,11 +581,9 @@ int TestResourceLookupHints()
 	{
 		const NativeW3DResources &readOnly = resources;
 		for (unsigned int repeat = 0; repeat < 8; ++repeat)
-			result |= Check(readOnly.IsVertexRangeValidForSubmission(misaligned,
-				sizeof(value), 0, 0, 1),
-				"fallback and repeated cache hits retain range proof");
-		result |= Check(!readOnly.IsVertexRangeValidForSubmission(external,
-			sizeof(value), 0, 0, 1),
+			result |= Check(readOnly.IsValid(misaligned),
+				"fallback and repeated cache hits retain resource identity");
+		result |= Check(!readOnly.IsValid(external),
 			"out-of-band backend handle is not a table resource");
 		result |= Check(resources.Destroy(misaligned),
 			"cached fallback lookup destroys the exact resource");
@@ -607,8 +603,7 @@ int TestResourceLookupHints()
 		"backend slot reuse advances the generation without moving table slot");
 	if (reusedCreated)
 	{
-		result |= Check(resources.IsVertexRangeValidForSubmission(reused,
-			sizeof(value), 0, 0, 1),
+		result |= Check(resources.IsValid(reused),
 			"stale cached generation falls back to the newly published resource");
 		result |= Check(resources.Destroy(reused),
 			"reused generation remains destructible");
