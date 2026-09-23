@@ -339,6 +339,8 @@ static void TestSkirmishAIReplayEpoch()
 	MarkReplayVersionForSkirmishAICurrentEpoch(marked);
 	CHECK(GetSkirmishAIReplayEpoch(marked) ==
 		SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
+	CHECK(GetSkirmishAIReplayRecordingEpoch() ==
+		GetSkirmishAIReplayEpoch(marked));
 	MarkReplayVersionForSkirmishAICurrentEpoch(marked);
 	CHECK(CountSkirmishAIReplayMarkers(marked.str(),
 		GetSkirmishAIReplayMarkerPrefix()) == 1);

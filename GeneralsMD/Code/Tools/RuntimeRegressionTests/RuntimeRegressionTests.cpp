@@ -3001,6 +3001,8 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(GetSkirmishAIReplayEpoch(architectureRecordingEpoch) ==
 		SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG);
 #endif
+	CHECK(GetSkirmishAIReplayRecordingEpoch() ==
+		GetSkirmishAIReplayEpoch(architectureRecordingEpoch));
 	// The recording header keeps the path marker first and the architecture's
 	// AI marker last. Playback must restamp each released epoch exactly.
 	for (Int supportsCounterRng = 0; supportsCounterRng < 2; ++supportsCounterRng)

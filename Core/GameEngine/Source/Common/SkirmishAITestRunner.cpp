@@ -6315,9 +6315,7 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 		else
 		{
 			s_runner.replayEpoch = GetSkirmishAIReplayEpoch(header.versionTimeString);
-			if (s_runner.replayEpoch != (BuildSupportsSkirmishAICounterRngPlanning() ?
-				SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG :
-				SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG))
+			if (s_runner.replayEpoch != GetSkirmishAIReplayRecordingEpoch())
 				FailSkirmishAITest("replay_epoch_mismatch");
 		}
 	}
@@ -6377,9 +6375,7 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 		strlcpy(receipt.replayPath, s_runner.retainedReplayPath,
 			ARRAY_SIZE(receipt.replayPath));
 		if (!IsValidSkirmishAITestReplayReceipt(receipt,
-			(BuildSupportsSkirmishAICounterRngPlanning() ?
-			SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG :
-			SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG)))
+			GetSkirmishAIReplayRecordingEpoch()))
 			FailSkirmishAITest("replay_receipt_invalid");
 	}
 

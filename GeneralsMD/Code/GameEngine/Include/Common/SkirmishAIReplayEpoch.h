@@ -248,6 +248,13 @@ inline Bool BuildSupportsSkirmishAICounterRngPlanning()
 #endif
 }
 
+inline Int GetSkirmishAIReplayRecordingEpoch()
+{
+	return BuildSupportsSkirmishAICounterRngPlanning() ?
+		SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG :
+		SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG;
+}
+
 inline void MarkReplayVersionForSkirmishAIRecordingEpoch(
 	UnicodeString& versionTimeString)
 {

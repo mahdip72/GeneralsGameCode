@@ -22,6 +22,11 @@ enum SkirmishAIReplayEpochType
 		SKIRMISH_AI_REPLAY_EPOCH_DETERMINISTIC_PLANNING
 };
 
+inline Int GetSkirmishAIReplayRecordingEpoch()
+{
+	return SKIRMISH_AI_REPLAY_EPOCH_CURRENT;
+}
+
 inline const WideChar *GetSkirmishAICurrentReplayMarker()
 {
 	return L" [GeneralsAIPlanningEpoch=1]";
