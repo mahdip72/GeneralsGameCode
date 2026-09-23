@@ -6357,10 +6357,28 @@ int checkW3DDisplayVideoBufferFormatSelection(
 	}
 
 	const std::string body = source.substr(method, methodEnd - method);
-	const std::string::size_type nativeGuard = body.find(
-		"rts::render::IsNativeGameRendererActive()");
+	const std::string::size_type displayFormatMap = body.find(
+		"format = W3DVideoBuffer::W3DFormatToType(displayFormat);");
+	const std::string::size_type displayFormatTextureQuery = body.find(
+		"Support_Texture_Format( displayFormat )", displayFormatMap);
+	const std::string::size_type displayFormatUnsupportedReset = body.find(
+		"format = VideoBuffer::TYPE_UNKNOWN;", displayFormatTextureQuery);
+	const std::string::size_type knownDisplayFormatGuard = body.rfind(
+		"if (format != VideoBuffer::TYPE_UNKNOWN &&",
+		displayFormatTextureQuery);
+	const std::string::size_type unsupportedDisplayFormatCondition =
+		body.find("!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( displayFormat )",
+			knownDisplayFormatGuard);
+	const std::string::size_type displayFormatRuntimeGuard = body.find(
+		"!rts::render::IsNativeGameRendererActive()", displayFormatMap);
+	const std::string::size_type displayFormatCompileGuard = body.rfind(
+		"#if !defined(_WIN64)", displayFormatTextureQuery);
+	const std::string::size_type displayFormatCompileGuardEnd = body.find(
+		"#endif", displayFormatTextureQuery);
 	const std::string::size_type nativeFallback = body.find(
-		"format = VideoBuffer::TYPE_X8R8G8B8;", nativeGuard);
+		"format = VideoBuffer::TYPE_X8R8G8B8;", displayFormatMap);
+	const std::string::size_type nativeGuard = body.rfind(
+		"if (format == VideoBuffer::TYPE_UNKNOWN &&", nativeFallback);
 	const std::string::size_type legacyGuard = body.find(
 		"!rts::render::IsNativeGameRendererActive()", nativeFallback);
 	const std::string::size_type legacyBranch = legacyGuard ==
@@ -6370,20 +6388,40 @@ int checkW3DDisplayVideoBufferFormatSelection(
 		"if (format == VideoBuffer::TYPE_UNKNOWN)", legacyGuard);
 	const std::string::size_type unknownReturn = body.find(
 		"return nullptr;", unknownCheck);
-	const std::string::size_type firstLegacyCapsQuery = body.find(
-		"DX8Wrapper::Get_Current_Caps()", 0);
+	const std::string::size_type firstFallbackCapsQuery = legacyBranch ==
+		std::string::npos ? std::string::npos : body.find(
+		"DX8Wrapper::Get_Current_Caps()", legacyBranch);
+
+	const std::string knownFormatFallbackMessage = std::string(titleName) +
+		" falls back when a mapped back-buffer format is not texture-supported";
+	result |= check(displayFormatMap != std::string::npos &&
+		displayFormatTextureQuery > displayFormatMap &&
+		knownDisplayFormatGuard > displayFormatMap &&
+		knownDisplayFormatGuard < displayFormatTextureQuery &&
+		unsupportedDisplayFormatCondition > knownDisplayFormatGuard &&
+		unsupportedDisplayFormatCondition < displayFormatUnsupportedReset &&
+		displayFormatUnsupportedReset > displayFormatTextureQuery &&
+		displayFormatUnsupportedReset < nativeFallback &&
+		displayFormatRuntimeGuard > displayFormatMap &&
+		displayFormatRuntimeGuard < displayFormatTextureQuery &&
+		displayFormatCompileGuard < displayFormatTextureQuery &&
+		displayFormatCompileGuardEnd > displayFormatTextureQuery,
+		knownFormatFallbackMessage.c_str());
 
 	const std::string nativeSelectionMessage = std::string(titleName) +
 		" keeps the canonical native X8R8G8B8 selection";
-	result |= check(nativeGuard != std::string::npos &&
-		nativeFallback > nativeGuard && legacyGuard > nativeFallback,
+	result |= check(nativeFallback != std::string::npos &&
+		nativeGuard != std::string::npos &&
+		nativeFallback > nativeGuard &&
+		body.find("rts::render::IsNativeGameRendererActive()", nativeGuard) <
+			nativeFallback && legacyGuard > nativeFallback,
 		nativeSelectionMessage.c_str());
 	const std::string legacyGuardMessage = std::string(titleName) +
 		" gates compatibility fallback away from native D3D11";
 	result |= check(legacyBranch != std::string::npos &&
 		unknownCheck > legacyGuard && unknownReturn > unknownCheck &&
-		firstLegacyCapsQuery >= legacyBranch &&
-		firstLegacyCapsQuery < unknownCheck,
+		firstFallbackCapsQuery >= legacyBranch &&
+		firstFallbackCapsQuery < unknownCheck,
 		legacyGuardMessage.c_str());
 
 	if (legacyBranch != std::string::npos && unknownCheck > legacyBranch)
@@ -6468,9 +6506,15 @@ int testW3DVideoBufferDirectPublicationLayout()
 			"W3DVideoBuffer::W3DFormatToType(");
 		const std::string formatMapBody = formatMap == std::string::npos ?
 			std::string() : source.substr(formatMap);
+		const std::string::size_type unknownFormatInitializer =
+			formatMapBody.find("Type format = TYPE_UNKNOWN;");
+		const std::string::size_type formatMapReturn =
+			formatMapBody.find("return format;", unknownFormatInitializer);
 		result |= check(formatMap != std::string::npos &&
 			formatMapBody.find("case WW3D_FORMAT_A8R8G8B8") ==
-				std::string::npos,
+				std::string::npos &&
+			unknownFormatInitializer != std::string::npos &&
+			formatMapReturn > unknownFormatInitializer,
 			"W3D video leaves negotiated A8R8G8B8 unknown for legacy fallback");
 		const char *mappedFormats[] = {
 			"WW3D_FORMAT_X8R8G8B8",

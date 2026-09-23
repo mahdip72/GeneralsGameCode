@@ -3104,7 +3104,19 @@ VideoBuffer*	W3DDisplay::createVideoBuffer()
 	// compatibility lane may still expose the historical packed formats.
 	WW3DFormat displayFormat = rts::render::GetGameBackBufferFormat();
 	if (displayFormat != WW3D_FORMAT_UNKNOWN)
+	{
 		format = W3DVideoBuffer::W3DFormatToType(displayFormat);
+#if !defined(_WIN64)
+		// A legacy back-buffer format is not necessarily usable as a texture.
+		// If not, let the caps-ordered compatibility fallback select a format.
+		if (format != VideoBuffer::TYPE_UNKNOWN &&
+			!rts::render::IsNativeGameRendererActive() &&
+			!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( displayFormat ))
+		{
+			format = VideoBuffer::TYPE_UNKNOWN;
+		}
+#endif
+	}
 
 	if (format == VideoBuffer::TYPE_UNKNOWN &&
 		rts::render::IsNativeGameRendererActive())
