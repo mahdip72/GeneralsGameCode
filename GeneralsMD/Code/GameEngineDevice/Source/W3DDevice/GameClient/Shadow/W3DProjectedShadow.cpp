@@ -471,6 +471,16 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 void W3DProjectedShadowManager::ReleaseResources()
 {
 	invalidateCachedLightPositions();	//textures need to be updated
+	#if defined(_WIN64)
+	// Projectors retain their temporary render-target references. Drop those
+	// references before a native device rebuild so the old color/depth pair
+	// cannot outlive the manager's resource release.
+	for (W3DProjectedShadow *shadow = m_shadowList; shadow; shadow = shadow->m_next)
+	{
+		if (shadow->m_shadowProjector != nullptr)
+			shadow->m_shadowProjector->Set_Render_Target(nullptr, nullptr);
+	}
+	#endif
 	REF_PTR_RELEASE(m_dynamicRenderTarget);	//need to create a new render target
 	REF_PTR_RELEASE(m_dynamicDepthTarget);
 	REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
@@ -2657,8 +2667,17 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 		// Compute_Texture owns the native copy and publication boundary.  A
 		// failed copy returns false and leaves the light history unchanged, so
 		// the next update retries without a second acquire of the same lease.
-		if (!m_shadowProjector->Compute_Texture(m_robj,context,
-				native_renderer_active ? shadow_texture : nullptr))
+		const bool computed = m_shadowProjector->Compute_Texture(m_robj,context,
+			native_renderer_active ? shadow_texture : nullptr);
+		if (native_renderer_active)
+		{
+			// Set_Render_Target also selects the shared scratch target as this
+			// projector material's sampler. The native capture is copied into a
+			// distinct per-shadow texture; restore that sampler before terrain
+			// and object shadow passes (including after a failed capture).
+			m_shadowProjector->Set_Texture(shadow_texture);
+		}
+		if (!computed)
 		{
 			return;
 		}
