@@ -1771,6 +1771,10 @@ RenderResult NativeW3DResources::CopyActiveColorTargetToTexture(
 		device->copyActiveColorTargetToTexture(handle));
 	if (result == RENDER_RESULT_OK)
 	{
+		// The copy executes after every earlier refresh packet drained above. It is
+		// the final mutation for this texture, so an older frame completion must
+		// not publish CPU authority over the newly issued GPU lease.
+		slot->pendingTexturePublications.clear();
 		slot->authority = NATIVE_W3D_CONTENT_GPU_RENDER_TARGET;
 		slot->authorityEpoch = NextAuthorityEpoch();
 		slot->backendEpoch = m_impl->state->BackendEpoch();

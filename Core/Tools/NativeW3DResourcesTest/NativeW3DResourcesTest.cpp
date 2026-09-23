@@ -299,9 +299,8 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		const unsigned int required = RENDER_TEXTURE_SHADER_RESOURCE |
-			RENDER_TEXTURE_RENDER_TARGET;
-		if ((resource->textureDescriptor.binding & required) != required ||
+		if ((resource->textureDescriptor.binding &
+			RENDER_TEXTURE_SHADER_RESOURCE) == 0 ||
 			resource->textureDescriptor.mipCount != 1 ||
 			resource->textureDescriptor.arrayCount != 1 ||
 			resource->textureDescriptor.usage == RENDER_USAGE_IMMUTABLE)
@@ -878,6 +877,52 @@ int TestThreadedResourceCompletion()
 		textureDescription.authority == NATIVE_W3D_CONTENT_CPU &&
 		textureDescription.authorityEpoch > textureCreateEpoch,
 		"matching completion publishes the coalesced texture refresh epoch");
+	const unsigned int cpuEpochBeforeCopy = textureDescription.authorityEpoch;
+	NativeW3DGpuContentLease refreshThenCopyLease;
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&firstRefreshData, 1) == RENDER_RESULT_OK &&
+		resources.CopyActiveColorTargetToTexture(streamTexture,
+			&refreshThenCopyLease) == RENDER_RESULT_OK &&
+		refreshThenCopyLease.isValid() &&
+		resources.DescribeTexture(streamTexture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority ==
+			NATIVE_W3D_CONTENT_GPU_RENDER_TARGET &&
+		textureDescription.authorityEpoch ==
+			refreshThenCopyLease.authorityEpoch &&
+		textureDescription.authorityEpoch > cpuEpochBeforeCopy &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_OK,
+		"same-frame GPU copy supersedes its earlier deferred CPU refresh");
+	ThreadedRenderFrameCompletion refreshThenCopyCompletion;
+	NativeW3DGpuContentLease validatedRefreshThenCopyLease =
+		refreshThenCopyLease;
+	result |= Check(PollThreadedRenderCompletion(device,
+		&refreshThenCopyCompletion) &&
+		!refreshThenCopyCompletion.resourceFailure &&
+		resources.PublishThreadedCompletion(
+			refreshThenCopyCompletion.sequence, false) == RENDER_RESULT_OK &&
+		resources.AcquireGpuContentLease(streamTexture,
+			&validatedRefreshThenCopyLease) == RENDER_RESULT_OK &&
+		validatedRefreshThenCopyLease.authorityEpoch ==
+			refreshThenCopyLease.authorityEpoch &&
+		resources.DescribeTexture(streamTexture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority ==
+			NATIVE_W3D_CONTENT_GPU_RENDER_TARGET &&
+		textureDescription.authorityEpoch ==
+			refreshThenCopyLease.authorityEpoch,
+		"refresh completion preserves the newer GPU-copy lease");
+	result |= Check(resources.RefreshTexture(streamTexture,
+		streamTextureDescriptor, &firstRefreshData, 1) == RENDER_RESULT_OK &&
+		resources.DescribeTexture(streamTexture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_CPU &&
+		textureDescription.authorityEpoch >
+			refreshThenCopyLease.authorityEpoch,
+		"synchronous CPU refresh restores the streaming fixture after GPU copy");
 	const long refreshCallsBeforeGlobalFailure =
 		ReadCount(&control.refreshCalls);
 	InterlockedExchange(&control.failRefreshOnCall,
@@ -1041,12 +1086,13 @@ int TestThreadedResourceCompletion()
 			&textureData, 1) == RENDER_RESULT_OK,
 		"synchronous refresh republishes CPU pixels after recovery");
 
+	const long copyCallsBeforeFailure = ReadCount(&control.copyCalls);
 	InterlockedExchange(&control.failCopy, 1);
 	NativeW3DGpuContentLease lease;
 	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
 		resources.CopyActiveColorTargetToTexture(texture, &lease) ==
 		RENDER_RESULT_FAILED && !lease.isValid() &&
-		ReadCount(&control.copyCalls) == 1 &&
+		ReadCount(&control.copyCalls) == copyCallsBeforeFailure + 1 &&
 		context->endFrame() == RENDER_RESULT_OK &&
 		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK,
 		"threaded copy failure never publishes a GPU lease");
