@@ -6051,6 +6051,68 @@ function Assert-Stage5FinalAcceptanceNativeCommandLine {
     return $argumentString
 }
 
+function Assert-Stage5FinalAcceptanceAttachmentBinding {
+    param(
+        [string]$Role,
+        [string]$Title,
+        [object]$TrustDomain,
+        [Collections.IDictionary]$AttachmentTrustDomains,
+        [string[]]$ExpectedBindings,
+        [Collections.Generic.List[string]]$SeenBindings,
+        [string]$Context
+    )
+    Assert-Stage5Condition ($TrustDomain -is [string] -and
+        $AttachmentTrustDomains.ContainsKey($Role) -and
+        $TrustDomain -ceq [string]$AttachmentTrustDomains[$Role]) `
+        "$Context '$Role' has the wrong trust domain."
+    $binding = "$Role|$Title"
+    Assert-Stage5Condition ($ExpectedBindings -ccontains $binding -and
+        -not ($SeenBindings -ccontains $binding)) `
+        "$Context repeats or does not authorize attachment '$binding'."
+    return $binding
+}
+
+function Assert-Stage5FinalAcceptanceReceiptTitleScope {
+    param([object]$ActualTitle, [string]$ExpectedTitle, [string]$Context)
+    Assert-Stage5Condition ($ActualTitle -is [string] -and
+        $ActualTitle -ceq $ExpectedTitle) `
+        "$Context title scope is substituted; expected '$ExpectedTitle'."
+}
+
+function Assert-Stage5FinalAcceptanceEvidenceTitleScope {
+    param([object]$ActualTitle, [string]$ExpectedTitle, [string]$Context)
+    Assert-Stage5Condition ($ActualTitle -is [string] -and
+        $ActualTitle -ceq $ExpectedTitle) `
+        "$Context must have exact title scope '$ExpectedTitle'."
+}
+
+function Assert-Stage5FinalAcceptanceEvidenceIdentity {
+    param(
+        [object]$SchemaVersion,
+        [object]$EvidenceKind,
+        [object]$Status,
+        [object]$SourceCommit,
+        [object]$Architecture,
+        [object]$ArtifactSetSha256,
+        [string]$ExpectedKind,
+        [string]$ExpectedSourceCommit,
+        [string]$ExpectedArtifactSetSha256
+    )
+    Assert-Stage5Condition ((Test-Stage5JsonInteger $SchemaVersion) -and
+        $SchemaVersion -eq 1 -and
+        $EvidenceKind -is [string] -and
+        $Status -is [string] -and
+        $SourceCommit -is [string] -and
+        $Architecture -is [string] -and
+        $ArtifactSetSha256 -is [string] -and
+        $EvidenceKind -ceq $ExpectedKind -and
+        $Status -ceq 'passed' -and
+        $SourceCommit -ceq $ExpectedSourceCommit -and
+        $Architecture -ceq 'x64' -and
+        $ArtifactSetSha256 -ceq $ExpectedArtifactSetSha256) `
+        "Evidence '$ExpectedKind' does not identify the same passed x64 commit and artifact set."
+}
+
 function Read-Stage5FinalAcceptanceImmutableReceipt {
     param(
         [string]$Path,
@@ -6187,8 +6249,7 @@ function Read-Stage5FinalAcceptanceImmutableReceipt {
     Assert-Stage5Condition ($sourceCommit -is [string] -and
         $sourceCommit -ceq $ExpectedSourceCommit) `
         "$context sourceCommit is stale or does not match the final acceptance commit."
-    Assert-Stage5Condition ($title -is [string] -and $title -ceq $EvidenceTitle) `
-        "$context title scope is substituted; expected '$EvidenceTitle'."
+    Assert-Stage5FinalAcceptanceReceiptTitleScope $title $EvidenceTitle $context
     Assert-Stage5Condition ($architecture -is [string] -and
         $architecture -ceq 'x64') "$context must identify x64 architecture."
     Assert-Stage5Condition ($artifactSetSha256 -is [string] -and
@@ -15567,19 +15628,14 @@ function Invoke-Stage5FinalAcceptanceAggregation {
             'architecture' "Evidence '$kind'"
         $evidenceArtifactSetSha256 = Get-Stage5JsonValue $evidenceDocument `
             'artifactSetSha256' "Evidence '$kind'"
-        Assert-Stage5Condition ((Test-Stage5JsonInteger $evidenceSchemaVersion) -and
-            $evidenceSchemaVersion -eq 1 -and
-            $evidenceKind -is [string] -and
-            $evidenceStatus -is [string] -and
-            $evidenceSourceCommit -is [string] -and
-            $evidenceArchitecture -is [string] -and
-            $evidenceArtifactSetSha256 -is [string] -and
-            $evidenceKind -ceq $kind -and
-            $evidenceStatus -ceq 'passed' -and
-            $evidenceSourceCommit -ceq $sourceCommit -and
-            $evidenceArchitecture -ceq 'x64' -and
-            $evidenceArtifactSetSha256 -ceq $artifactSetHash) `
-            "Evidence '$kind' does not identify the same passed x64 commit and artifact set."
+        Assert-Stage5FinalAcceptanceEvidenceIdentity `
+            -SchemaVersion $evidenceSchemaVersion `
+            -EvidenceKind $evidenceKind -Status $evidenceStatus `
+            -SourceCommit $evidenceSourceCommit `
+            -Architecture $evidenceArchitecture `
+            -ArtifactSetSha256 $evidenceArtifactSetSha256 `
+            -ExpectedKind $kind -ExpectedSourceCommit $sourceCommit `
+            -ExpectedArtifactSetSha256 $artifactSetHash
         $evidenceCohortNonce = Assert-Stage5CanonicalUuid `
             (Get-Stage5JsonValue $evidenceDocument 'cohortNonce' "Evidence '$kind'") `
             "Evidence '$kind' cohortNonce"
@@ -15595,9 +15651,8 @@ function Invoke-Stage5FinalAcceptanceAggregation {
             'Both'
         }
         else { 'ZeroHour' }
-        Assert-Stage5Condition ($title -is [string] -and
-            $title -ceq $expectedTitle) `
-            "Evidence '$kind' must have exact title scope '$expectedTitle'."
+        Assert-Stage5FinalAcceptanceEvidenceTitleScope $title `
+            $expectedTitle "Evidence '$kind'"
         $recordedUtc = Get-Stage5JsonValue $evidenceDocument 'recordedUtc' "Evidence '$kind'"
         [DateTimeOffset]$recorded = [DateTimeOffset]::MinValue
         Assert-Stage5Condition ($recordedUtc -is [string] -and
@@ -15741,15 +15796,12 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                 'role={1} title={2} index={3} total={4} elapsedMs={5}') -f
                 $kind, $role, $attachmentTitle, $attachmentIndex,
                 $attachments.Count, $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
-            Assert-Stage5Condition ($attachmentTrustDomains.ContainsKey($role) -and
-                $attachmentTrustDomain -is [string] -and
-                $attachmentTrustDomain -ceq [string]$attachmentTrustDomains[$role]) `
-                "Evidence '$kind' attachment '$role' has the wrong trust domain."
-            $attachmentBinding = "$role|$attachmentTitle"
-            Assert-Stage5Condition ($expectedAttachmentBindings -ccontains
-                    $attachmentBinding -and
-                -not ($seenBindings -ccontains $attachmentBinding)) `
-                "Evidence '$kind' repeats or does not authorize attachment '$attachmentBinding'."
+            $attachmentBinding = Assert-Stage5FinalAcceptanceAttachmentBinding `
+                -Role $role -Title $attachmentTitle -TrustDomain $attachmentTrustDomain `
+                -AttachmentTrustDomains $attachmentTrustDomains `
+                -ExpectedBindings $expectedAttachmentBindings `
+                -SeenBindings $seenBindings `
+                -Context "Evidence '$kind' attachment"
             $attachmentPath = Resolve-Stage5FinalAcceptanceFile $evidenceDirectory $relative `
                 "Evidence '$kind' attachment '$role'"
             Assert-Stage5Condition (-not ($seenPaths -contains $attachmentPath.ToLowerInvariant())) `

@@ -219,6 +219,181 @@ Import-Module $modulePath -Force
 $evidenceModule = Get-Module -Name 'DeterministicSimulationEvidence' | Where-Object { $_.Path -ceq ([IO.Path]::GetFullPath($modulePath)) } | Select-Object -First 1
 Assert-RelocationTest ($null -ne $evidenceModule) 'the source evidence module did not import'
 
+function Invoke-Stage5FinalAcceptanceBoundedGuardTests {
+    param([string]$RunRoot, [object]$EvidenceModule)
+
+    # These production guards are also exercised through the full Acceptance
+    # reader. Keep focused mutations here so each negative does not repeat a
+    # 253-child evidence-root traversal.
+$attachmentTrustDomains = @{
+    'replay-fixture-manifest' = 'host-runner'
+    'multiplayer-results' = 'host-runner'
+}
+$expectedReplayBindings = @(
+    'replay-fixture-manifest|Generals',
+    'replay-fixture-manifest|ZeroHour'
+)
+$seenReplayBindings = New-Object 'Collections.Generic.List[string]'
+$bindingResults = & $evidenceModule {
+    param($trustDomains, $expectedBindings, $seenBindings)
+    $first = Assert-Stage5FinalAcceptanceAttachmentBinding `
+        -Role 'replay-fixture-manifest' -Title 'Generals' `
+        -TrustDomain 'host-runner' -AttachmentTrustDomains $trustDomains `
+        -ExpectedBindings $expectedBindings -SeenBindings $seenBindings `
+        -Context 'bounded replay-fixture test'
+    $seenBindings.Add($first) | Out-Null
+    $second = Assert-Stage5FinalAcceptanceAttachmentBinding `
+        -Role 'replay-fixture-manifest' -Title 'ZeroHour' `
+        -TrustDomain 'host-runner' -AttachmentTrustDomains $trustDomains `
+        -ExpectedBindings $expectedBindings -SeenBindings $seenBindings `
+        -Context 'bounded replay-fixture test'
+    $seenBindings.Add($second) | Out-Null
+    @($first, $second)
+} $attachmentTrustDomains $expectedReplayBindings $seenReplayBindings
+Assert-RelocationTest (@($bindingResults).Count -eq 2 -and
+    @($seenReplayBindings.ToArray()).Count -eq 2) `
+    'the production attachment guard accepts distinct title-scoped bindings'
+Assert-RelocationThrows {
+    & $evidenceModule {
+        param($trustDomains, $expectedBindings, $seenBindings)
+        Assert-Stage5FinalAcceptanceAttachmentBinding `
+            -Role 'replay-fixture-manifest' -Title 'Generals' `
+            -TrustDomain 'host-runner' -AttachmentTrustDomains $trustDomains `
+            -ExpectedBindings $expectedBindings -SeenBindings $seenBindings `
+            -Context 'bounded replay-fixture test'
+    } $attachmentTrustDomains $expectedReplayBindings $seenReplayBindings | Out-Null
+} 'repeats or does not authorize attachment' `
+    'the production attachment guard rejects a duplicate role/title key'
+Assert-RelocationThrows {
+    & $evidenceModule {
+        param($trustDomains)
+        Assert-Stage5FinalAcceptanceAttachmentBinding `
+            -Role 'multiplayer-results' -Title 'Both' -TrustDomain 'executable' `
+            -AttachmentTrustDomains $trustDomains `
+            -ExpectedBindings @('multiplayer-results|Both') `
+            -SeenBindings (New-Object 'Collections.Generic.List[string]') `
+            -Context 'bounded trust-domain test'
+    } $attachmentTrustDomains | Out-Null
+} 'wrong trust domain' `
+    'the production attachment guard rejects an unauthorized trust domain'
+
+& $evidenceModule {
+    Assert-Stage5FinalAcceptanceReceiptTitleScope `
+        'Generals' 'Generals' 'bounded receipt-title test'
+} | Out-Null
+Assert-RelocationThrows {
+    & $evidenceModule {
+        Assert-Stage5FinalAcceptanceReceiptTitleScope `
+            'Generals' 'ZeroHour' 'bounded receipt-title test'
+    } | Out-Null
+} 'title scope is substituted' `
+    'the production immutable-receipt guard rejects a cross-title receipt'
+& $evidenceModule {
+    Assert-Stage5FinalAcceptanceEvidenceTitleScope `
+        'Both' 'Both' 'bounded evidence-envelope title test'
+} | Out-Null
+Assert-RelocationThrows {
+    & $evidenceModule {
+        Assert-Stage5FinalAcceptanceEvidenceTitleScope `
+            'Generals' 'Both' 'bounded evidence-envelope title test'
+    } | Out-Null
+} 'must have exact title scope' `
+    'the production evidence-envelope guard rejects an incorrectly scoped title'
+
+& $evidenceModule {
+    Assert-Stage5FinalAcceptanceEvidenceIdentity `
+        1 'deterministic-runtime' 'passed' ('a' * 40) 'x64' ('B' * 64) `
+        'deterministic-runtime' ('a' * 40) ('B' * 64)
+} | Out-Null
+Assert-RelocationThrows {
+    & $evidenceModule {
+        Assert-Stage5FinalAcceptanceEvidenceIdentity `
+            1 'deterministic-runtime' 'passed' ('a' * 40) 'x64' ('C' * 64) `
+            'deterministic-runtime' ('a' * 40) ('B' * 64)
+    } | Out-Null
+} 'does not identify the same passed x64 commit and artifact set' `
+    'the production evidence identity guard rejects a stale artifact-set binding'
+
+$snapshotPath = Join-Path $runRoot 'snapshot-hash-guard.txt'
+Write-RelocationText $snapshotPath 'snapshot guard bytes'
+$snapshot = Get-Stage5FinalAcceptanceFileSnapshot `
+    -Path $snapshotPath -Context 'bounded snapshot-hash test'
+Assert-RelocationThrows {
+    Assert-Stage5FinalAcceptanceSnapshotSha256 `
+        $snapshot ('0' * 64) 'bounded snapshot-hash test' | Out-Null
+} 'SHA-256 mismatch' `
+    'the production snapshot guard rejects a substituted attachment digest'
+
+$launcherRoot = Join-Path $runRoot 'launcher-canonical'
+$copiedLauncherRoot = Join-Path $runRoot 'launcher-copied'
+[IO.Directory]::CreateDirectory($launcherRoot) | Out-Null
+[IO.Directory]::CreateDirectory($copiedLauncherRoot) | Out-Null
+$canonicalExecutable = Join-Path $launcherRoot 'generals.exe'
+$canonicalLauncher = Join-Path $launcherRoot 'launcher.exe'
+$canonicalConfig = Join-Path $launcherRoot 'launcher.lcf'
+Write-RelocationText $canonicalExecutable 'canonical executable'
+Write-RelocationText $canonicalLauncher 'canonical launcher'
+Write-RelocationText $canonicalConfig 'canonical configuration'
+$launcherHashes = @{
+    'generals-executable' = Get-RelocationSha256 $canonicalExecutable
+    'generals-launcher' = Get-RelocationSha256 $canonicalLauncher
+    'generals-launcher-config' = Get-RelocationSha256 $canonicalConfig
+}
+$launcherPaths = @{
+    'generals-executable' = [IO.Path]::GetFullPath($canonicalExecutable)
+    'generals-launcher' = [IO.Path]::GetFullPath($canonicalLauncher)
+    'generals-launcher-config' = [IO.Path]::GetFullPath($canonicalConfig)
+}
+$launcherArguments = @('-simulationMode', 'parallel', '-workerPolicy', 'auto')
+$launcherContract = [ordered]@{
+    schemaVersion = 1; mode = 'headless-direct-exception'
+    configPath = [IO.Path]::GetFullPath($canonicalConfig)
+    configSha256 = $launcherHashes['generals-launcher-config']
+    launcherPath = [IO.Path]::GetFullPath($canonicalLauncher)
+    launcherSha256 = $launcherHashes['generals-launcher']
+    directory = '.'; executable = 'generals.exe'
+    launcherTarget = [IO.Path]::GetFullPath($canonicalExecutable)
+    launcherArguments = $launcherArguments
+    launcherWorkingDirectory = [IO.Path]::GetFullPath($launcherRoot)
+    directExecutable = [IO.Path]::GetFullPath($canonicalExecutable)
+    directWorkingDirectory = [IO.Path]::GetFullPath($launcherRoot)
+    directArguments = $launcherArguments; childExitCodeObserved = $true
+}
+& $evidenceModule {
+    param($contract, $hashes, $paths, $root)
+    Assert-Stage5LockstepLauncherContract $contract 'Generals' $hashes `
+        'bounded launcher path-binding test' $paths $root
+} $launcherContract $launcherHashes $launcherPaths $launcherRoot | Out-Null
+foreach ($leaf in @('generals.exe', 'launcher.exe', 'launcher.lcf')) {
+    Copy-Item -LiteralPath (Join-Path $launcherRoot $leaf) `
+        -Destination (Join-Path $copiedLauncherRoot $leaf)
+}
+$copiedLauncherContract = [ordered]@{}
+foreach ($field in $launcherContract.Keys) {
+    $copiedLauncherContract[$field] = $launcherContract[$field]
+}
+$copiedLauncherContract.configPath = [IO.Path]::GetFullPath(
+    (Join-Path $copiedLauncherRoot 'launcher.lcf'))
+$copiedLauncherContract.launcherPath = [IO.Path]::GetFullPath(
+    (Join-Path $copiedLauncherRoot 'launcher.exe'))
+$copiedLauncherContract.launcherTarget = [IO.Path]::GetFullPath(
+    (Join-Path $copiedLauncherRoot 'generals.exe'))
+$copiedLauncherContract.launcherWorkingDirectory = [IO.Path]::GetFullPath(
+    $copiedLauncherRoot)
+$copiedLauncherContract.directExecutable = [IO.Path]::GetFullPath(
+    (Join-Path $copiedLauncherRoot 'generals.exe'))
+$copiedLauncherContract.directWorkingDirectory = [IO.Path]::GetFullPath(
+    $copiedLauncherRoot)
+Assert-RelocationThrows {
+    & $evidenceModule {
+        param($contract, $hashes, $paths, $root)
+        Assert-Stage5LockstepLauncherContract $contract 'Generals' $hashes `
+            'bounded launcher path-binding test' $paths $root
+    } $copiedLauncherContract $launcherHashes $launcherPaths $launcherRoot | Out-Null
+} 'launch paths are not bound to the canonical artifact-set files' `
+    'the production launcher guard rejects a byte-identical copied runtime'
+}
+
 function Invoke-CandidateIndexLookup {
     param(
         [object]$Module,
@@ -284,6 +459,8 @@ Assert-RelocationTest ($noMatch.Count -eq 0) `
 
 $summary = $null
 try {
+    Invoke-Stage5FinalAcceptanceBoundedGuardTests $runRoot $evidenceModule
+
     $absoluteFixture = New-RelocationFixture -Mode absolute -Root (Join-Path $runRoot 'absolute')
     $absoluteFileCount = @(Get-ChildItem -LiteralPath $absoluteFixture.root -Recurse -File -Force).Count
     $counter = @{ count = 0 }
@@ -334,6 +511,10 @@ try {
         }
         relativeWinner = [string]$relativeRaw1.path
         checks = @(
+            'production acceptance role/title, trust, and duplicate-binding guards',
+            'production evidence identity and outer/immutable receipt title guards',
+            'production immutable snapshot digest rejection',
+            'production launcher canonical-path rejection for a copied runtime',
             'actual exported binding function invoked with real receipt/native/raw files',
             'all selected raw hashes validated, then mutation was re-read and rejected',
             'unique longest suffix winner',

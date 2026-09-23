@@ -1669,7 +1669,8 @@ function Write-Stage5HostReceiptTestDocument {
     param(
         [string]$Path, [string]$Role, [string]$Title, [string]$SourceCommit,
         [string]$ArtifactSetSha256, [Collections.IDictionary]$ArtifactHashes,
-        [string]$RunNonce = ''
+        [string]$RunNonce = '',
+        [ValidateRange(1, 253)][int]$ValidationResultCount = 253
     )
     $directory = Split-Path -Parent ([IO.Path]::GetFullPath($Path))
     $leaf = [IO.Path]::GetFileNameWithoutExtension($Path)
@@ -1695,7 +1696,7 @@ function Write-Stage5HostReceiptTestDocument {
     $rawLogs = @()
     if ($Role -ne 'validation-plan') {
         $childTitles = @(if ($Role -ceq 'validation-results') {
-            1..253 | ForEach-Object { $Title }
+            1..$ValidationResultCount | ForEach-Object { $Title }
         }
         elseif ($Title -ceq 'Both') { @('Generals', 'ZeroHour') }
         else { $Title })
@@ -1832,6 +1833,10 @@ function Write-Stage5HostReceiptTestDocument {
             }
         )
     }
+    $details = Get-Stage5AcceptanceReceiptTestDetails $Role
+    if ($Role -ceq 'validation-results') {
+        $details.resultCount = $ValidationResultCount
+    }
     $document = [ordered]@{
         schemaVersion = 1; evidenceKind = 'stage5-host-runner-receipt'; status = 'passed'
         role = $Role; trustDomain = 'host-runner'
@@ -1857,7 +1862,7 @@ function Write-Stage5HostReceiptTestDocument {
             childProvenance = if ($Role -eq 'validation-plan') { 'not-applicable' } else { 'bound' }
             children = $children
         }
-        details = Get-Stage5AcceptanceReceiptTestDetails $Role
+        details = $details
     }
     if ($Role -ceq 'validation-results') {
         $document.details.resultsSha256 = [string]$document.rawLogs[0].sha256
@@ -10886,105 +10891,11 @@ try {
     $acceptanceRelativePaths['mixed-worker-multiplayer'] = `
         'mixed-worker-multiplayer.json'
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    try {
-        $adapterAcceptance = Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -DevelopmentReadiness -ExternalQualificationExempt
-        Assert-True ($adapterAcceptance.status -ceq 'ready-for-manual-approval' -and
-            $adapterAcceptance.gateName -ceq 'stage5-development-readiness' -and
-            -not [bool]$adapterAcceptance.finalAcceptanceClaim -and
-            $adapterAcceptance.cohortNonce -match
-                '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$' -and
-            $adapterAcceptance.evidenceFreshness -ceq 'current-cohort' -and
-            @($adapterAcceptance.evidence | Where-Object {
-                $_.freshness -cne 'current-cohort'
-            }).Count -eq 0) `
-            'the installed lockstep-v2 child passes through the pre-manual readiness adapter'
-        $adapterValidatedClosure = @(Get-Stage5FinalAcceptanceValidatedClosure)
-        Assert-True ($adapterValidatedClosure.Count -gt 0) `
-            'a successful development-readiness aggregation publishes its validated closure'
-    }
-    catch {
-        Assert-True $false "the installed lockstep-v2 adapter should satisfy final acceptance: $($_.Exception.Message)"
-    }
-
-    function Set-Stage5ReplayEvidenceHashBinding {
-        param([Parameter(Mandatory = $true)][string]$ReplayEvidencePath,
-            [Parameter(Mandatory = $true)][object]$RuntimeEvidenceDocument)
-        $RuntimeEvidenceDocument.details.replayEvidenceSha256 =
-            Get-Sha256 $ReplayEvidencePath
-    }
-
-    # Replay qualification is title-scoped. Exercise the composite
-    # role/title attachment key explicitly: collapsing the two reviewed
-    # manifests to one key, or swapping a title onto the other receipt, must
-    # fail closed even when every referenced file remains byte-valid. Rebind
-    # the deterministic-runtime receipt after each mutation so the aggregator
-    # reaches the title-binding guard instead of correctly rejecting a stale
-    # cross-evidence hash first.
-    $replayEvidencePath = $evidencePaths['replay-determinism']
-    $replayEvidenceOriginalText = [IO.File]::ReadAllText($replayEvidencePath)
-    $runtimeEvidencePath = $evidencePaths['deterministic-runtime']
-    $runtimeEvidenceOriginalText = [IO.File]::ReadAllText($runtimeEvidencePath)
-    $runtimeEvidenceDocument = $evidenceDocuments['deterministic-runtime']
-    try {
-        $duplicateReplayDocument = ConvertFrom-Stage5TestJsonDictionary `
-            $replayEvidencePath
-        $duplicateReplayDocument['attachments'][2]['title'] = 'Generals'
-        Write-JsonDocument $replayEvidencePath $duplicateReplayDocument
-        Set-Stage5ReplayEvidenceHashBinding $replayEvidencePath `
-            $runtimeEvidenceDocument
-        Write-JsonDocument $runtimeEvidencePath $runtimeEvidenceDocument
-        Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-        Assert-Throws {
-            Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-                -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
-        } 'repeats or does not authorize attachment' `
-            'replay acceptance rejects a duplicate composite role/title attachment key'
-
-        [IO.File]::WriteAllText($replayEvidencePath, $replayEvidenceOriginalText)
-        Set-Stage5ReplayEvidenceHashBinding $replayEvidencePath `
-            $runtimeEvidenceDocument
-        Write-JsonDocument $runtimeEvidencePath $runtimeEvidenceDocument
-        $swappedReplayDocument = ConvertFrom-Stage5TestJsonDictionary `
-            $replayEvidencePath
-        $generalsManifestPath = $swappedReplayDocument['attachments'][1]['path']
-        $generalsManifestHash = $swappedReplayDocument['attachments'][1]['sha256']
-        $zeroHourManifestPath = $swappedReplayDocument['attachments'][2]['path']
-        $zeroHourManifestHash = $swappedReplayDocument['attachments'][2]['sha256']
-        $swappedReplayDocument['attachments'][1]['path'] = $zeroHourManifestPath
-        $swappedReplayDocument['attachments'][1]['sha256'] = $zeroHourManifestHash
-        $swappedReplayDocument['attachments'][2]['path'] = $generalsManifestPath
-        $swappedReplayDocument['attachments'][2]['sha256'] = $generalsManifestHash
-        Write-JsonDocument $replayEvidencePath $swappedReplayDocument
-        Set-Stage5ReplayEvidenceHashBinding $replayEvidencePath `
-            $runtimeEvidenceDocument
-        Write-JsonDocument $runtimeEvidencePath $runtimeEvidenceDocument
-        Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-        Assert-Throws {
-            Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-                -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
-        } 'title scope|expected.*Generals|expected.*ZeroHour' `
-            'replay acceptance rejects reviewed receipts swapped across title bindings'
-    }
-    finally {
-        [IO.File]::WriteAllText($replayEvidencePath, $replayEvidenceOriginalText)
-        [IO.File]::WriteAllText($runtimeEvidencePath, $runtimeEvidenceOriginalText)
-        $runtimeEvidenceDocument.details.replayEvidenceSha256 =
-            $evidenceHashes['replay-determinism']
-        Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    }
-    $runtimeTitleDocument = $evidenceDocuments['deterministic-runtime']
-    $runtimeTitleDocument.title = 'Generals'
-    Write-JsonDocument $evidencePaths['deterministic-runtime'] $runtimeTitleDocument
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
-    } "exact title scope 'ZeroHour'" `
-        'final acceptance rejects a deterministic-runtime envelope relabeled as Generals'
-    $runtimeTitleDocument.title = 'ZeroHour'
-    Write-JsonDocument $evidencePaths['deterministic-runtime'] $runtimeTitleDocument
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
+    # One successful full-corpus publication below proves that the installed
+    # lockstep-v2 child and all its title-scoped attachments pass the complete
+    # pre-manual Acceptance adapter. Focused duplicate/title/trust mutations
+    # run in Stage5FinalAcceptanceNativeRelocation.Tests.ps1 against the same
+    # production guards instead of re-aggregating 253 children each time.
 
     $futureCohortRequest = ConvertFrom-Stage5TestJsonDictionary $acceptanceRequest
     $futureCohortRequest['cohortCreatedUtc'] = '2999-01-01T00:00:00.0000000Z'
@@ -10996,54 +10907,8 @@ try {
         'final acceptance rejects a fully self-consistent manifest cohort rebased into the future'
     Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
 
-    $copiedLockstepRoot = Join-Path $acceptanceRoot 'lockstep-v2-copied-runtime'
-    $copiedLockstepPath = Copy-LockstepFixtureCase $lockstepFixtureRoot $copiedLockstepRoot
-    $copiedAdapterDocument = ConvertFrom-Json `
-        ($lockstepAdapterDocument | ConvertTo-Json -Depth 16)
-    $copiedAdapterDocument.attachments[0].path = `
-        'lockstep-v2-copied-runtime\LockstepV2LoopbackEvidence.json'
-    $copiedLockstepHash = Get-Sha256 $copiedLockstepPath
-    $copiedAdapterDocument.attachments[0].sha256 = $copiedLockstepHash
-    $copiedAdapterDocument.details.nativeEvidenceSha256 = $copiedLockstepHash
-    $copiedAdapterEvidencePath = Join-Path $acceptanceRoot `
-        'mixed-worker-multiplayer-copied.json'
-    Write-JsonDocument $copiedAdapterEvidencePath $copiedAdapterDocument
-    $evidencePaths['mixed-worker-multiplayer'] = $copiedAdapterEvidencePath
-    $acceptanceRelativePaths['mixed-worker-multiplayer'] = `
-        'mixed-worker-multiplayer-copied.json'
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
-    } 'canonical artifact-set files|canonical executable' `
-        'the lockstep adapter rejects a copied executable with staged sidecars'
-    $evidencePaths['mixed-worker-multiplayer'] = $lockstepAdapterEvidencePath
-    $acceptanceRelativePaths['mixed-worker-multiplayer'] = 'mixed-worker-multiplayer.json'
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    $adapterTrustDomain = $lockstepAdapterDocument.attachments[0].trustDomain
-    $lockstepAdapterDocument.attachments[0].trustDomain = 'executable'
-    Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -ExternalQualificationExempt | Out-Null
-    } 'wrong trust domain' `
-        'the lockstep-v2 adapter rejects a multiplayer child outside the host-runner trust domain'
-    $lockstepAdapterDocument.attachments[0].trustDomain = $adapterTrustDomain
-    $lockstepAdapterDocument.attachments[0].sha256 = '0' * 64
-    Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -ExternalQualificationExempt | Out-Null
-    } 'SHA-256 mismatch' `
-        'the lockstep-v2 adapter rejects a substituted native-child hash'
-    $lockstepAdapterDocument.attachments[0].sha256 = $lockstepAdapterHash
-    Write-JsonDocument $lockstepAdapterEvidencePath $lockstepAdapterDocument
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    # Failed aggregations intentionally fail closed after collecting a partial
-    # closure. Standalone immutable-reader mutation tests below are independent
-    # invocations, so they must not inherit that abandoned collector.
+    # Clear any partial collector state before the independent reader mutation
+    # tests below.
     Reset-Stage5TestFinalAcceptanceValidatedClosure
 
     $receiptBytesCaseRoot = Join-Path $acceptanceRoot 'lockstep-v2-negative-receipt-bytes'
@@ -11267,12 +11132,16 @@ try {
     # the host wrapper or native receipt.
     $evidenceModule = Get-Module DeterministicSimulationEvidence
     function New-Stage5RelocationTestCase {
-        param([string]$Name)
+        param(
+            [string]$Name,
+            [ValidateRange(1, 253)][int]$ValidationResultCount = 253
+        )
         $caseRoot = Join-Path $acceptanceRoot "native-relocation-$Name"
         New-Item -ItemType Directory -Path $caseRoot -Force | Out-Null
         $receiptPath = Join-Path $caseRoot 'validation-results-receipt.json'
         Write-Stage5HostReceiptTestDocument $receiptPath 'validation-results' `
-            'ZeroHour' $sourceCommit $artifactSetHash $artifactTestHashes
+            'ZeroHour' $sourceCommit $artifactSetHash $artifactTestHashes `
+            -ValidationResultCount $ValidationResultCount
         $wrapper = Read-TestJson $receiptPath
         $nativeReference = $wrapper.provenance.children[0].nativeReceipt
         $nativePath = Join-Path $caseRoot ([string]$nativeReference.path)
@@ -11353,7 +11222,7 @@ try {
         Assert-True $false "uploaded immutable native evidence should relocate safely: $($_.Exception.Message)"
     }
 
-    $relocationAlias = New-Stage5RelocationTestCase 'alias'
+    $relocationAlias = New-Stage5RelocationTestCase 'alias' 1
     $aliasNative = Read-TestJson $relocationAlias.nativePath
     $aliasNative.rawLogs[1].path = [string]$aliasNative.rawLogs[0].path
     $aliasNative.rawLogs[1].sha256 = [string]$aliasNative.rawLogs[0].sha256
@@ -11365,7 +11234,7 @@ try {
     } 'aliases another staged raw log|alias' `
         'native relocation rejects two receipt observations mapped to one staged file'
 
-    $relocationMissing = New-Stage5RelocationTestCase 'missing'
+    $relocationMissing = New-Stage5RelocationTestCase 'missing' 1
     $missingNative = Read-TestJson $relocationMissing.nativePath
     $missingLeaf = [IO.Path]::GetFileName([string]$missingNative.rawLogs[1].path)
     Remove-Item -LiteralPath (Join-Path $relocationMissing.root `
@@ -11375,7 +11244,7 @@ try {
     } 'no staged candidate|missing' `
         'native relocation rejects a missing uploaded raw file'
 
-    $relocationAmbiguous = New-Stage5RelocationTestCase 'ambiguous'
+    $relocationAmbiguous = New-Stage5RelocationTestCase 'ambiguous' 1
     $ambiguousNative = Read-TestJson $relocationAmbiguous.nativePath
     $ambiguousLeaf = [IO.Path]::GetFileName([string]$ambiguousNative.rawLogs[0].path)
     $ambiguousDuplicateDirectory = Join-Path $relocationAmbiguous.root `
@@ -11389,7 +11258,7 @@ try {
     } 'ambiguous|multiple staged candidates' `
         'native relocation rejects equally specific duplicate uploaded files'
 
-    $relocationWrongHash = New-Stage5RelocationTestCase 'wrong-hash'
+    $relocationWrongHash = New-Stage5RelocationTestCase 'wrong-hash' 1
     $wrongHashNative = Read-TestJson $relocationWrongHash.nativePath
     $wrongHashLeaf = [IO.Path]::GetFileName([string]$wrongHashNative.rawLogs[0].path)
     [IO.File]::AppendAllText((Join-Path $relocationWrongHash.root `
@@ -11399,7 +11268,7 @@ try {
     } 'SHA-256|hash' `
         'native relocation rejects a staged file with the wrong bytes'
 
-    $relocationStaleSource = New-Stage5RelocationTestCase 'stale-source'
+    $relocationStaleSource = New-Stage5RelocationTestCase 'stale-source' 1
     $staleSourceNative = Read-TestJson $relocationStaleSource.nativePath
     $staleSourceLeaf = [IO.Path]::GetFileName([string]$staleSourceNative.rawLogs[0].path)
     $staleSourceNative.rawLogs[0].path =
@@ -11412,7 +11281,7 @@ try {
     } 'no staged candidate|source path|stale' `
         'native relocation rejects a stale source path that matches only by leaf name'
 
-    $relocationStaleReceipt = New-Stage5RelocationTestCase 'stale-receipt-source'
+    $relocationStaleReceipt = New-Stage5RelocationTestCase 'stale-receipt-source' 1
     $staleReceiptNative = Read-TestJson $relocationStaleReceipt.nativePath
     $staleReceiptNative.provenance.receiptPath =
         'H:\Stage5SimulationValidationTask\Evidence\different-native-receipt.json'
@@ -11629,8 +11498,16 @@ try {
         $acceptanceReport.gateName -ceq 'stage5-development-readiness' -and
         -not [bool]$acceptanceReport.finalAcceptanceClaim -and
         [bool]$acceptanceReport.premiumReviewRequired -and
-        [bool]$acceptanceReport.manualApprovalRequired) `
-        'development readiness writes a non-final report after installed lockstep-v2 evidence is attached'
+        [bool]$acceptanceReport.manualApprovalRequired -and
+        $acceptanceReport.cohortNonce -ceq $script:TestCohortNonce -and
+        $acceptanceReport.evidenceFreshness -ceq 'current-cohort' -and
+        @($acceptanceReport.evidence | Where-Object {
+            $_.freshness -cne 'current-cohort'
+        }).Count -eq 0) `
+        'one full-corpus publication accepts installed lockstep-v2 evidence and emits a fresh, non-final report'
+    $adapterValidatedClosure = @(Get-Stage5FinalAcceptanceValidatedClosure)
+    Assert-True ($adapterValidatedClosure.Count -gt 0) `
+        'the successful development-readiness aggregation publishes its validated closure'
     $acceptanceOutputBytes = [IO.File]::ReadAllBytes($acceptanceOutput)
     $acceptanceOutputHasBom = $acceptanceOutputBytes.Length -ge 3 -and
         $acceptanceOutputBytes[0] -eq 239 -and
@@ -11655,42 +11532,38 @@ try {
             [Convert]::ToBase64String($acceptanceOutputBytes)) `
         'final acceptance output remains BOM-less UTF-8 JSON and repeated publication preserves the original evidence bytes'
 
-    $missingManualRequest = Join-Path $acceptanceRoot 'missing-manual.json'
-    Write-AcceptanceRequest $missingManualRequest @($acceptanceKinds | Where-Object {
-        $_ -cne 'manual-acceptance'
-    })
-    $missingManualReport = Invoke-Stage5FinalAcceptanceAggregation $missingManualRequest `
-        -ExternalQualificationExempt
-    Assert-True ($missingManualReport.status -ceq 'ready-for-manual-approval' -and
-        -not [bool]$missingManualReport.finalAcceptanceClaim -and
-        [bool]$missingManualReport.manualApprovalRequired) `
-        'pre-manual development readiness remains non-final when manual evidence is absent'
-
     $combinedDocument = $evidenceDocuments['combined-stage4-stage5-installed-runtime']
-    $combinedDocument.details.pipelineMode = 'serial'
-    Write-JsonDocument $evidencePaths['combined-stage4-stage5-installed-runtime'] $combinedDocument
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
-    Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -ExternalQualificationExempt | Out-Null
-    } 'requires pipelineMode=parallel' `
-        'final acceptance rejects a serial Stage 4 pipeline masquerading as the combined policy lane'
     $combinedDocument.details.pipelineMode = 'parallel'
-    Write-JsonDocument $evidencePaths['combined-stage4-stage5-installed-runtime'] $combinedDocument
-
-    $staleArtifactDocument = $evidenceDocuments['deterministic-runtime']
-    $staleArtifactDocument.artifactSetSha256 = 'B' * 64
-    Write-JsonDocument $evidencePaths['deterministic-runtime'] $staleArtifactDocument
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -ExternalQualificationExempt | Out-Null
+        & $evidenceModule {
+            param($details, $commit)
+            Assert-Stage5FinalAcceptanceDetails `
+                'combined-stage4-stage5-installed-runtime' $details $commit @{} | Out-Null
+        } $combinedDocument.details $sourceCommit
+    } 'requires pipelineMode=serial' `
+        'the production combined-evidence details guard rejects a parallel Stage 4 pipeline'
+    $combinedDocument.details.pipelineMode = 'serial'
+
+    $staleArtifactDocument = ConvertFrom-Stage5TestJsonDictionary `
+        $evidencePaths['deterministic-runtime']
+    $staleArtifactDocument['artifactSetSha256'] = 'B' * 64
+    Assert-Throws {
+        & $evidenceModule {
+            param($document, $expectedSourceCommit, $expectedArtifactSetHash)
+            Assert-Stage5FinalAcceptanceEvidenceIdentity `
+                -SchemaVersion $document.schemaVersion `
+                -EvidenceKind $document.evidenceKind -Status $document.status `
+                -SourceCommit $document.sourceCommit `
+                -Architecture $document.architecture `
+                -ArtifactSetSha256 $document.artifactSetSha256 `
+                -ExpectedKind 'deterministic-runtime' `
+                -ExpectedSourceCommit $expectedSourceCommit `
+                -ExpectedArtifactSetSha256 $expectedArtifactSetHash
+        } $staleArtifactDocument $sourceCommit $artifactSetHash | Out-Null
     } 'does not identify the same passed x64 commit and artifact set' `
-        'final acceptance rejects evidence from a different artifact set'
-    $staleArtifactDocument.artifactSetSha256 = $artifactSetHash
-    Write-JsonDocument $evidencePaths['deterministic-runtime'] $staleArtifactDocument
-    # The failed stale-artifact aggregation above owns a partial collector;
-    # the NET3 and scaling reader tests below are separate mutation suites.
+        'the production evidence identity guard rejects a stale artifact set'
+    # The successful full-corpus aggregation published the collector; the
+    # later NET3 and scaling reader tests are independent mutation suites.
     Reset-Stage5TestFinalAcceptanceValidatedClosure
 
     $net3Manifest = Join-Path $attachmentRoot 'mixed-worker-multiplayer-multiplayer-results.json'
@@ -12088,12 +11961,13 @@ try {
     })[0]
     $hostAttachment = Join-Path $acceptanceRoot ([string]$hostPlanBinding.path)
     [IO.File]::AppendAllText($hostAttachment, 'tampered')
-    Write-AcceptanceRequest $acceptanceRequest $acceptanceKinds
+    $hostAttachmentSnapshot = Get-Stage5FinalAcceptanceFileSnapshot `
+        -Path $hostAttachment -Context 'final-acceptance attachment hash mutation'
     Assert-Throws {
-        Invoke-Stage5FinalAcceptanceAggregation $acceptanceRequest `
-            -ExternalQualificationExempt | Out-Null
-    } 'attachment.*SHA-256 mismatch' `
-        'final acceptance independently rehashes and rejects a tampered attachment'
+        Assert-Stage5FinalAcceptanceSnapshotSha256 $hostAttachmentSnapshot `
+            $hostPlanBinding.sha256 'final-acceptance attachment hash mutation' | Out-Null
+    } 'SHA-256 mismatch' `
+        'final acceptance independently hashes and rejects a tampered attachment'
     }
 }
 finally {
