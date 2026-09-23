@@ -65,6 +65,22 @@ static void TestTerrainDrawSizing()
 	CHECK(width == 160);
 	CHECK(height == 140);
 
+	// The scripted Zero Hour shell camera exposes more than the legacy 129-cell
+	// window at 4:3, while a narrower vertical FOV needs less terrain at 16:9.
+	input = MakeTerrainInput();
+	input.cameraHeight = 618.125f;
+	input.cameraToPivotDistance = 782.0f;
+	input.mapWidth = 315;
+	input.mapHeight = 315;
+	input.verticalFovRadians = 0.672870f;
+	CHECK(rts::CalculateTerrainDrawSize(input, width, height));
+	CHECK(width == 315);
+	CHECK(height == 315);
+	input.verticalFovRadians = 0.513039f;
+	CHECK(rts::CalculateTerrainDrawSize(input, width, height));
+	CHECK(width == 257);
+	CHECK(height == 257);
+
 	input.worldUnitsPerCell = 0.0f;
 	CHECK(!rts::CalculateTerrainDrawSize(input, width, height));
 }

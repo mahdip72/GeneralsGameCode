@@ -3730,10 +3730,12 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 
 	const Real cameraPitch = asin(fabs(m_3DCamera->Get_Forward_Dir().Z));
 
-	if (!m_isUserControlled)
+	if (!m_isUserControlled &&
+		(!TheGameLogic || !TheGameLogic->isInGame() ||
+			TheGameLogic->getGameMode() != GAME_SHELL))
 	{
-		// TheSuperHackers @info The scripted camera always uses the regular draw sizes
-		// and uses terrain oversize if it needs to enlarge.
+		// Keep the regular draw size for gameplay cinematics. The shell camera
+		// can expose more terrain than this, so size it from the frustum below.
 		dimensions.x = WorldHeightMap::NORMAL_DRAW_WIDTH;
 		dimensions.y = WorldHeightMap::NORMAL_DRAW_HEIGHT;
 		return true;
