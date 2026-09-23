@@ -170,6 +170,20 @@ void TestNodeOrderingAndFlushBoundary()
 			CHECK(batch.states[0] == 10);
 			CHECK(batch.states[1] == 20);
 			CHECK(batch.states[2] == 30);
+			CHECK(batch.vertexOffsets.size() == 3);
+			CHECK(batch.startIndices.size() == 3);
+			CHECK(batch.indices.size() == 9);
+			if (batch.vertexOffsets.size() == 3 &&
+				batch.startIndices.size() == 3 && batch.indices.size() == 9)
+			{
+				for (unsigned int draw = 0; draw < 3; ++draw)
+				{
+					CHECK(batch.vertexOffsets[draw] == draw * 3 * sizeof(TestVertex));
+					CHECK(batch.startIndices[draw] == draw * 3);
+					for (unsigned int vertex = 0; vertex < 3; ++vertex)
+						CHECK(batch.indices[batch.startIndices[draw] + vertex] == vertex);
+				}
+			}
 		}
 	}
 	CHECK(renderer.Empty());

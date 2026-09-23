@@ -674,12 +674,11 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 					vertexBase + triangle.j > MAX_SORTING_INDEX_COUNT ||
 					vertexBase + triangle.k > MAX_SORTING_INDEX_COUNT)
 					return RENDER_RESULT_INVALID_ARGUMENT;
-				chunkIndices.push_back(static_cast<unsigned short>(
-					vertexBase + triangle.i));
-				chunkIndices.push_back(static_cast<unsigned short>(
-					vertexBase + triangle.j));
-				chunkIndices.push_back(static_cast<unsigned short>(
-					vertexBase + triangle.k));
+				// Each draw binds vertexOffset at the beginning of this submission.
+				// D3D11 adds the index to that offset, so indices stay local here.
+				chunkIndices.push_back(triangle.i);
+				chunkIndices.push_back(triangle.j);
+				chunkIndices.push_back(triangle.k);
 				if (vertexOffset > std::numeric_limits<unsigned int>::max())
 					return RENDER_RESULT_OUT_OF_MEMORY;
 				AddDrawRun(draws, runs, submission, submissionIndex, local,
