@@ -695,7 +695,9 @@ Stage 4/5 execution passing. This lane complements rather than replaces the
 serial-pipeline isolation matrix.
 
 Run the aggregator after the six local evidence kinds have been assembled and
-before handing the exact candidate to the user for manual testing:
+before handing the exact candidate to the user for manual testing. The output
+parent directory must already exist and must not be a reparse point; the script
+fails closed rather than creating missing directories:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass `

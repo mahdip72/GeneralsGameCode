@@ -46,7 +46,9 @@ installed-runtime lane. The combined lane must use `pipelineMode=parallel`,
 `simulationMode=parallel`, automatic workers, D3D11, and the dedicated render
 thread for both titles; it does not replace the serial-pipeline isolation
 matrix. Run the aggregator after those local artifacts have been assembled and
-before asking the user to manually test the candidate:
+before asking the user to manually test the candidate. The output parent
+directory must already exist and must not be a reparse point; the script fails
+closed instead of creating missing directories:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Invoke-Stage5FinalAcceptance.ps1 `

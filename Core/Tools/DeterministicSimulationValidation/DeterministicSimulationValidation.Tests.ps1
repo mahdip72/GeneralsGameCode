@@ -1243,13 +1243,19 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
     $reparseManifest = Join-Path $reparseRoot 'manifest'
     $reparseTarget = Join-Path $reparseRoot 'target'
     $reparseLink = Join-Path $reparseManifest 'linked'
-    New-Item -ItemType Directory -Path $reparseManifest, $reparseTarget `
+    $publicationSwapTarget = Join-Path $reparseRoot 'publication-swap-target'
+    $publicationSwapParent = Join-Path $reparseManifest 'publication-swap-parent'
+    $publicationSwapMovedParent = Join-Path $reparseManifest 'publication-swap-moved'
+    New-Item -ItemType Directory -Path $reparseManifest, $reparseTarget, `
+        $publicationSwapTarget, $publicationSwapParent `
         -Force | Out-Null
     try {
         $scriptPath = Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1'
         $scriptSource = Get-Content -LiteralPath $scriptPath -Raw
         Assert-True ($scriptSource -notmatch '\[IO\.File\]::WriteAllText' -and
             $scriptSource -match '(?s)\$reportJson\s*=\s*\$report\s*\|\s*ConvertTo-Json\s+-Depth\s+10\s*\$reportBytes\s*=\s*\(\[Text\.UTF8Encoding\]::new\(\$false\)\)\.GetBytes' -and
+            $scriptSource -match 'Assert-Stage5FinalAcceptanceNoReparsePath' -and
+            $scriptSource -notmatch 'Ensure-Stage5FinalAcceptanceOutputDirectory|Directory\]::CreateDirectory|New-Item' -and
             $scriptSource -match 'Write-Stage5FinalAcceptanceFileAtomically' -and
             $scriptSource -notmatch '\-ReplaceExisting') `
             'final acceptance output retains UTF-8-without-BOM JSON serialization and uses create-only atomic publication'
@@ -1279,8 +1285,70 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
                 -Filter '.stage5-write-*.tmp').Count -eq 0) `
             'create-only publication rejects a destination created after its precheck and preserves the concurrent bytes'
 
+        $publicationSwapPath = Join-Path $publicationSwapParent 'report.json'
+        $publicationSwapState = @{
+            hookRan = $false
+            moved = $false
+            moveError = 0
+            junctionCreated = $false
+        }
+        $publicationSwapFailure = $null
+        $publicationSwapPublished = $false
+        try {
+            $swapBytes = ([Text.UTF8Encoding]::new($false)).GetBytes(
+                '{"owner":"acceptance-writer"}')
+            Write-Stage5FinalAcceptanceFileAtomically -Path $publicationSwapPath `
+                -Bytes $swapBytes -Context 'Output ancestor swap regression' `
+                -BeforePublishTestHook {
+                    param($temporaryPath, $destinationPath)
+                    $publicationSwapState.hookRan = $true
+                    $sourcePath = '\\?\' + [IO.Path]::GetFullPath(
+                        $publicationSwapParent)
+                    $movedPath = '\\?\' + [IO.Path]::GetFullPath(
+                        $publicationSwapMovedParent)
+                    $publicationSwapState.moved =
+                        [Stage5FinalAcceptancePathNative]::MoveFileExW(
+                            $sourcePath, $movedPath, [UInt32]0x00000008)
+                    if (-not $publicationSwapState.moved) {
+                        $publicationSwapState.moveError =
+                            [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        return
+                    }
+                    New-Item -ItemType Junction -Path $publicationSwapParent `
+                        -Target $publicationSwapTarget -ErrorAction Stop | Out-Null
+                    $publicationSwapState.junctionCreated = $true
+                } | Out-Null
+            $publicationSwapPublished = $true
+        }
+        catch { $publicationSwapFailure = $_.Exception.Message }
+        $publicationSwapTargetHasArtifacts =
+            (Test-Path -LiteralPath (Join-Path $publicationSwapTarget 'report.json')) -or
+            @(Get-ChildItem -LiteralPath $publicationSwapTarget -File `
+                -Filter '.stage5-write-*.tmp' -ErrorAction SilentlyContinue).Count -gt 0
+        $publicationSwapMovedParentHasTemporary =
+            @(Get-ChildItem -LiteralPath $publicationSwapMovedParent -File `
+                -Filter '.stage5-write-*.tmp' -ErrorAction SilentlyContinue).Count -gt 0
+        $publicationSwapSafe = if ($publicationSwapState.moved -and
+                $publicationSwapState.junctionCreated) {
+            -not $publicationSwapPublished -and
+                -not [string]::IsNullOrWhiteSpace($publicationSwapFailure) -and
+                -not $publicationSwapTargetHasArtifacts -and
+                -not $publicationSwapMovedParentHasTemporary
+        }
+        else {
+            -not $publicationSwapState.moved -and
+                $publicationSwapState.moveError -ne 0 -and
+                $publicationSwapPublished -and
+                (Test-Path -LiteralPath $publicationSwapPath -PathType Leaf) -and
+                -not $publicationSwapTargetHasArtifacts -and
+                -not $publicationSwapMovedParentHasTemporary
+        }
+        Assert-True ($publicationSwapState.hookRan -and $publicationSwapSafe) `
+            'a late parent-to-junction swap is blocked during publication or fails closed without an external artifact'
+
         $normalOutputDirectory = Join-Path $root 'normal-output\nested'
         $normalOutputPath = Join-Path $normalOutputDirectory 'report.json'
+        New-Item -ItemType Directory -Path $normalOutputDirectory -Force | Out-Null
         $missingManifestRejected = $false
         try {
             & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
@@ -1291,7 +1359,23 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
         Assert-True ($missingManifestRejected -and
             (Test-Path -LiteralPath $normalOutputDirectory -PathType Container) -and
             -not (Test-Path -LiteralPath $normalOutputPath)) `
-            'final acceptance still creates a normal missing output directory before validating its manifest'
+            'final acceptance validates its manifest without altering an existing output directory'
+
+        $missingOutputDirectory = Join-Path $root 'missing-output-parent'
+        $missingOutputPath = Join-Path $missingOutputDirectory 'report.json'
+        $missingOutputError = $null
+        try {
+            & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
+                -AcceptanceManifestPath (Join-Path $root 'missing-manifest.json') `
+                -OutputPath $missingOutputPath -DevelopmentReadiness | Out-Null
+        }
+        catch { $missingOutputError = $_.Exception.Message }
+        Assert-True (-not [string]::IsNullOrWhiteSpace($missingOutputError) -and
+            $missingOutputError.IndexOf($missingOutputDirectory,
+                [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            -not (Test-Path -LiteralPath $missingOutputDirectory) -and
+            -not (Test-Path -LiteralPath $missingOutputPath)) `
+            'final acceptance rejects a missing output parent without creating it'
 
         $reparseCreated = $false
         try {
@@ -1337,6 +1421,10 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
         }
     }
     finally {
+        if ($publicationSwapState.junctionCreated) {
+            Remove-Stage5AcceptanceReparseFixtureLink -FixtureRoot $reparseRoot `
+                -LinkPath $publicationSwapParent
+        }
         Remove-Stage5AcceptanceReparseFixtureLink -FixtureRoot $reparseRoot `
             -LinkPath $reparseLink
         Assert-Stage5AcceptanceScratchTreeContainsNoReparsePoints -RootPath $root
