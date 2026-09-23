@@ -346,7 +346,7 @@ void XAudio2AudioManager::setAssetSource(AudioAssetSource *assetSource)
 	}
 	if (FileAudioAssetSource *source = dynamic_cast<FileAudioAssetSource *>(m_assetSource)) {
 		source->setSamplePcmCacheBudget(m_audioSettings != nullptr
-			? m_audioSettings->m_maxCacheSize : 0);
+			? m_audioSettings->nativeSamplePcmCacheBudgetInBytes() : 0);
 	}
 	if (reopen) {
 		openDevice();
@@ -405,7 +405,7 @@ void XAudio2AudioManager::init()
 	}
 	if (FileAudioAssetSource *source = dynamic_cast<FileAudioAssetSource *>(m_assetSource)) {
 		source->setSamplePcmCacheBudget(m_audioSettings != nullptr
-			? m_audioSettings->m_maxCacheSize : 0);
+			? m_audioSettings->nativeSamplePcmCacheBudgetInBytes() : 0);
 	}
 	openDevice();
 }

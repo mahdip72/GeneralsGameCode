@@ -1262,12 +1262,6 @@ FileAudioAssetSource::~FileAudioAssetSource() = default;
 
 void FileAudioAssetSource::setSamplePcmCacheBudget(std::size_t bytes) noexcept
 {
-#if defined(_WIN64)
-	// The installed Zero Hour INI specifies 4 MiB. Keep its native SFX PCM
-	// cache large enough for the measured working set without changing zero,
-	// non-4 MiB limits, or the legacy 32-bit lane.
-	if (bytes == 4U * 1024U * 1024U) bytes = 8U * 1024U * 1024U;
-#endif
 	if (m_samplePcmCache == nullptr && bytes != 0) {
 		try {
 			m_samplePcmCache = std::make_unique<SamplePcmCache>();

@@ -638,7 +638,7 @@ int runCatalogTest(int argc, char *argv[])
 #if defined(_WIN64)
 	BudgetVirtualAudioSource nativeBudgetArchive(readBinaryFile(twoSecondPath));
 	FileAudioAssetSource nativeBudgetSource(AsciiString(root.string().c_str()), &nativeBudgetArchive);
-	nativeBudgetSource.setSamplePcmCacheBudget(4U * 1024U * 1024U);
+	nativeBudgetSource.setSamplePcmCacheBudget(8U * 1024U * 1024U);
 	for (UnsignedInt index = 0; index < 11U; ++index) {
 		const std::string name = "archive\\budget-" + std::to_string(index) + ".wav";
 		check(nativeBudgetSource.openPcmSampleStream(AsciiString(name.c_str()), cachedFirst),
@@ -647,7 +647,7 @@ int runCatalogTest(int argc, char *argv[])
 	}
 	check(nativeBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst)
 		&& nativeBudgetArchive.getReadCalls() == 11U,
-		"native 8 MiB default retains eleven two-second samples beyond the shipped 4 MiB budget");
+		"explicit 8 MiB budget retains eleven two-second samples beyond 4 MiB");
 	cachedFirst.reset();
 	for (UnsignedInt index = 11U; index < 22U; ++index) {
 		const std::string name = "archive\\budget-" + std::to_string(index) + ".wav";
@@ -658,6 +658,19 @@ int runCatalogTest(int argc, char *argv[])
 	check(nativeBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-1.wav"), cachedFirst)
 		&& nativeBudgetArchive.getReadCalls() == 23U,
 		"native 8 MiB cache evicts its oldest unpinned sample at the byte bound");
+	cachedFirst.reset();
+	BudgetVirtualAudioSource exactFourArchive(readBinaryFile(twoSecondPath));
+	FileAudioAssetSource exactFourSource(AsciiString(root.string().c_str()), &exactFourArchive);
+	exactFourSource.setSamplePcmCacheBudget(4U * 1024U * 1024U);
+	for (UnsignedInt index = 0; index < 11U; ++index) {
+		const std::string name = "archive\\budget-" + std::to_string(index) + ".wav";
+		check(exactFourSource.openPcmSampleStream(AsciiString(name.c_str()), cachedFirst),
+			"exact 4 MiB cache opens each two-second sample");
+		cachedFirst.reset();
+	}
+	check(exactFourSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst)
+		&& exactFourArchive.getReadCalls() == 12U,
+		"direct 4 MiB setter evicts instead of silently growing to 8 MiB");
 	cachedFirst.reset();
 	BudgetVirtualAudioSource customBudgetArchive(readBinaryFile(twoSecondPath));
 	FileAudioAssetSource customBudgetSource(AsciiString(root.string().c_str()), &customBudgetArchive);

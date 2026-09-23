@@ -556,6 +556,24 @@ int main()
 #if defined(_MSC_VER)
 	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
+	AudioSettings cacheBudgetSettings;
+	cacheBudgetSettings.m_maxCacheSize = 4194304U;
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 8388608U,
+		"shipped legacy 4 MiB value defaults to an 8 MiB native SFX cache");
+	cacheBudgetSettings.m_hasNativeSamplePcmCacheBudget = TRUE;
+	cacheBudgetSettings.m_nativeSamplePcmCacheBudgetInBytes = 4194304U;
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 4194304U,
+		"explicit native 4 MiB override remains exact");
+	cacheBudgetSettings.m_nativeSamplePcmCacheBudgetInBytes = 0;
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 0,
+		"explicit native zero disables cache despite the legacy default");
+	cacheBudgetSettings.m_hasNativeSamplePcmCacheBudget = FALSE;
+	cacheBudgetSettings.m_maxCacheSize = 123456U;
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 123456U,
+		"non-default legacy cache budget remains exact");
+	cacheBudgetSettings.m_maxCacheSize = 0;
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 0,
+		"legacy zero cache budget remains disabled");
 	const std::filesystem::path realRoot = std::filesystem::temp_directory_path()
 		/ ("rts-native-audio-manager-real-source-" + std::to_string(GetCurrentProcessId()));
 	std::filesystem::create_directories(realRoot);

@@ -42,7 +42,21 @@ struct AudioSettings
 #elif RTS_ZEROHOUR
 		, m_defaultMoneyTransactionVolume(0.0f) // Uses zero volume by default because originally the money sounds did not work in Zero Hour
 #endif
+		, m_nativeSamplePcmCacheBudgetInBytes(0)
+		, m_hasNativeSamplePcmCacheBudget(FALSE)
 	{
+	}
+
+	UnsignedInt nativeSamplePcmCacheBudgetInBytes() const
+	{
+		if (m_hasNativeSamplePcmCacheBudget) return m_nativeSamplePcmCacheBudgetInBytes;
+		// The shipped AudioFootprintInBytes is 4 MiB; x64 native SFX uses an
+		// 8 MiB working set unless a distinct native override is supplied.
+#if defined(_WIN64)
+		return m_maxCacheSize == 4194304U ? 8388608U : m_maxCacheSize;
+#else
+		return m_maxCacheSize;
+#endif
 	}
 
 	AsciiString m_audioRoot;
@@ -102,4 +116,8 @@ struct AudioSettings
   //NOTE: The higher this value is, the lower normal sounds will be! If you specify a sound volume value of 25%, then sounds will play
 	//between 75% and 100%, not 100% to 125%!
   Real m_zoomSoundVolumePercentageAmount;	//The amount of sound volume dedicated to zooming.
+
+	// Optional native-only override; append to preserve offsets of legacy fields.
+	UnsignedInt m_nativeSamplePcmCacheBudgetInBytes;
+	Bool m_hasNativeSamplePcmCacheBudget;
 };
