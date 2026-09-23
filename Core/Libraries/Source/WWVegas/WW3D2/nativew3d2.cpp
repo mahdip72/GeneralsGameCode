@@ -412,6 +412,9 @@ NativeW3D2::NativeW3D2() : m_resourceHost(256), m_resources(4096),
 	m_gameVertexLayout(),
 	m_gameTopology(rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST),
 	m_gameVertexBound(false), m_gameIndexBound(false),
+	m_primitiveUpVertexBuffer(), m_primitiveUpVertexDescriptor(),
+	m_sortedVertexBuffer(), m_sortedVertexDescriptor(),
+	m_sortedIndexBuffer(), m_sortedIndexDescriptor(),
 	m_gameSortedVertexBytes(), m_gameSortedIndexBytes(),
 	m_gameSortedVertexMinimum(0), m_gameSortedVertexCount(0),
 	m_gameSortedVertexSourceOffset(0), m_gameSortedIndexStart(0),
@@ -1060,6 +1063,12 @@ rts::render::RenderResult NativeW3D2::Shutdown()
 		BindNativeResourceOwners(&m_resources);
 		return resourcesResult;
 	}
+	m_primitiveUpVertexBuffer = rts::render::GpuHandle();
+	m_primitiveUpVertexDescriptor = rts::render::BufferDescriptor();
+	m_sortedVertexBuffer = rts::render::GpuHandle();
+	m_sortedVertexDescriptor = rts::render::BufferDescriptor();
+	m_sortedIndexBuffer = rts::render::GpuHandle();
+	m_sortedIndexDescriptor = rts::render::BufferDescriptor();
 	m_renderer.m_recoveryResources = 0;
 	if (m_borrowedBackend)
 	{
@@ -2062,13 +2071,13 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			descriptor.stride = command.value2;
 			descriptor.binding = RENDER_BUFFER_VERTEX;
 			descriptor.usage = RENDER_USAGE_DYNAMIC;
-			GpuHandle temporary;
-			RenderResult result = m_resources.CreateBuffer(descriptor,
-				command.input, expectedBytes, &temporary);
+			RenderResult result = UploadTransientBuffer(descriptor, command.input,
+				expectedBytes, &m_primitiveUpVertexBuffer,
+				&m_primitiveUpVertexDescriptor);
 			if (result != RENDER_RESULT_OK)
 				return result;
 			NativeDrawPacket packet;
-			packet.vertexBuffer = temporary;
+			packet.vertexBuffer = m_primitiveUpVertexBuffer;
 			packet.vertexStride = command.value2;
 			packet.vertexFormat = RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1;
 			packet.vertexLayout = layout;
@@ -2079,8 +2088,6 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				++stage)
 				packet.textures[stage] = m_gameTextures[stage];
 			result = SubmitGamePacket(state, packet);
-			if (!m_resources.Destroy(temporary) && result == RENDER_RESULT_OK)
-				result = RENDER_RESULT_FAILED;
 			if (result != RENDER_RESULT_OK)
 				RecordGameFailure(result);
 			return result;
@@ -3114,6 +3121,49 @@ rts::render::RenderResult NativeW3D2::FlushGameSortedTriangles()
 	return result;
 }
 
+rts::render::RenderResult NativeW3D2::UploadTransientBuffer(
+	const rts::render::BufferDescriptor &descriptor, const void *data,
+	size_t dataBytes, rts::render::GpuHandle *buffer,
+	rts::render::BufferDescriptor *allocatedDescriptor)
+{
+	using namespace rts::render;
+	if (data == 0 || dataBytes == 0 || buffer == 0 ||
+		allocatedDescriptor == 0 || descriptor.byteCount != dataBytes)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (buffer->isValid() && allocatedDescriptor->binding == descriptor.binding &&
+		allocatedDescriptor->usage == descriptor.usage &&
+		allocatedDescriptor->stride == descriptor.stride &&
+		allocatedDescriptor->byteCount >= dataBytes)
+	{
+		return m_resources.UpdateBuffer(*buffer, data, dataBytes, 0,
+			RENDER_BUFFER_UPDATE_DISCARD);
+	}
+
+	GpuHandle replacement;
+	const RenderResult createResult = m_resources.CreateBuffer(descriptor, data,
+		dataBytes, &replacement);
+	if (createResult != RENDER_RESULT_OK)
+	{
+		return createResult;
+	}
+	if (buffer->isValid() && !m_resources.Destroy(*buffer))
+	{
+		// The old allocation is still the published scratch buffer. Roll the new
+		// candidate back so a resize failure cannot strand an unowned handle.
+		RecordGameFailure(RENDER_RESULT_FAILED);
+		if (!m_resources.Destroy(replacement))
+		{
+			RecordGameFailure(RENDER_RESULT_FAILED);
+		}
+		return RENDER_RESULT_FAILED;
+	}
+	*buffer = replacement;
+	*allocatedDescriptor = descriptor;
+	return RENDER_RESULT_OK;
+}
+
 rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 	const rts::render::NativeSortedDraw *draws, unsigned int drawCount,
 	const void *vertexData, size_t vertexBytes, const void *indexData,
@@ -3158,9 +3208,9 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 	vertexDescriptor.stride = firstPacket.vertexStride;
 	vertexDescriptor.binding = rts::render::RENDER_BUFFER_VERTEX;
 	vertexDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
-	rts::render::GpuHandle vertexHandle;
-	rts::render::RenderResult result = m_resources.CreateBuffer(vertexDescriptor,
-		vertexData, vertexBytes, &vertexHandle);
+	rts::render::RenderResult result = UploadTransientBuffer(vertexDescriptor,
+		vertexData, vertexBytes, &m_sortedVertexBuffer,
+		&m_sortedVertexDescriptor);
 	if (result != rts::render::RENDER_RESULT_OK)
 		return result;
 
@@ -3169,25 +3219,18 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 	indexDescriptor.stride = sizeof(unsigned short);
 	indexDescriptor.binding = rts::render::RENDER_BUFFER_INDEX;
 	indexDescriptor.usage = rts::render::RENDER_USAGE_DYNAMIC;
-	rts::render::GpuHandle indexHandle;
-	result = m_resources.CreateBuffer(indexDescriptor, indexData, indexBytes,
-		&indexHandle);
+	result = UploadTransientBuffer(indexDescriptor, indexData, indexBytes,
+		&m_sortedIndexBuffer, &m_sortedIndexDescriptor);
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
-		// The index allocation failed, but the vertex allocation still owns a
-		// native handle.  Always attempt that rollback and retain the original
-		// allocation result as the primary error.  A cleanup refusal is latched
-		// so the caller cannot mistake a partially rolled-back batch for success.
-		if (!m_resources.Destroy(vertexHandle))
-			RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
 		return result;
 	}
 
 	for (unsigned int drawIndex = 0; drawIndex < drawCount; ++drawIndex)
 	{
 		rts::render::NativeDrawPacket packet = draws[drawIndex].packet;
-		packet.vertexBuffer = vertexHandle;
-		packet.indexBuffer = indexHandle;
+		packet.vertexBuffer = m_sortedVertexBuffer;
+		packet.indexBuffer = m_sortedIndexBuffer;
 		packet.indexOffset = 0;
 		packet.startVertex = 0;
 		packet.minimumVertexIndex = 0;
@@ -3198,18 +3241,6 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 		++*submittedDrawCount;
 	}
 
-	// Both temporary handles must be released even when the first destruction
-	// refuses.  NativeW3DResources keeps a refused handle visible for owner
-	// shutdown/retry, so dropping the second attempt would leak a live native
-	// allocation and hide the authority failure from the frame result.
-	const bool indexDestroyed = m_resources.Destroy(indexHandle);
-	const bool vertexDestroyed = m_resources.Destroy(vertexHandle);
-	if (!indexDestroyed || !vertexDestroyed)
-	{
-		RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
-		if (result == rts::render::RENDER_RESULT_OK)
-			result = rts::render::RENDER_RESULT_FAILED;
-	}
 	return result;
 }
 

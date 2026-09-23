@@ -212,6 +212,14 @@ private:
 	rts::render::RenderPrimitiveTopology m_gameTopology;
 	bool m_gameVertexBound;
 	bool m_gameIndexBound;
+	// Immediate-mode and sorted draws reuse aggregate-owned dynamic uploads.
+	// Full DISCARD updates stay ordered before their draws in the threaded FIFO.
+	rts::render::GpuHandle m_primitiveUpVertexBuffer;
+	rts::render::BufferDescriptor m_primitiveUpVertexDescriptor;
+	rts::render::GpuHandle m_sortedVertexBuffer;
+	rts::render::BufferDescriptor m_sortedVertexDescriptor;
+	rts::render::GpuHandle m_sortedIndexBuffer;
+	rts::render::BufferDescriptor m_sortedIndexDescriptor;
 	std::vector<unsigned char> m_gameSortedVertexBytes;
 	std::vector<unsigned char> m_gameSortedIndexBytes;
 	unsigned int m_gameSortedVertexMinimum;
@@ -241,6 +249,10 @@ private:
 	rts::render::RenderResult PollThreadedCompletions(
 		rts::render::NativeW3DSubmissionSequence wanted = 0,
 		rts::render::ThreadedRenderFrameCompletion *matched = 0);
+	rts::render::RenderResult UploadTransientBuffer(
+		const rts::render::BufferDescriptor &descriptor, const void *data,
+		size_t dataBytes, rts::render::GpuHandle *buffer,
+		rts::render::BufferDescriptor *allocatedDescriptor);
 	void RememberThreadedFailure(
 		const rts::render::RenderFrameOutcome &outcome,
 		rts::render::NativeW3DSubmissionSequence sequence);

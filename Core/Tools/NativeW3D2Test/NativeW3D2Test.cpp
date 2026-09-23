@@ -668,6 +668,114 @@ void ConfigurePacket(rts::render::NativeDrawPacket *packet,
 	packet->vertexCount = 3;
 }
 
+bool HasNativeCapturePixel(unsigned int x, unsigned int y,
+	unsigned char blue, unsigned char green, unsigned char red)
+{
+	std::FILE *file = std::fopen("D3D11RendererCapture.tga", "rb");
+	if (file == 0)
+		return false;
+	unsigned char header[18] = {};
+	const bool validHeader = std::fread(header, 1, sizeof(header), file) ==
+		sizeof(header) && header[2] == 2 && header[16] == 24;
+	const unsigned int width = static_cast<unsigned int>(header[12]) |
+		(static_cast<unsigned int>(header[13]) << 8);
+	const unsigned int height = static_cast<unsigned int>(header[14]) |
+		(static_cast<unsigned int>(header[15]) << 8);
+	unsigned char pixel[3] = {};
+	const long offset = static_cast<long>(sizeof(header) +
+		(static_cast<size_t>(y) * width + x) * sizeof(pixel));
+	const bool readPixel = validHeader && x < width && y < height &&
+		std::fseek(file, offset, SEEK_SET) == 0 &&
+		std::fread(pixel, 1, sizeof(pixel), file) == sizeof(pixel);
+	std::fclose(file);
+	return readPixel && pixel[0] == blue && pixel[1] == green &&
+		pixel[2] == red;
+}
+
+int TestSortedScratchRendering(NativeW3D2 *owner)
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeSortedDraw draw;
+	draw.packet.vertexStride = sizeof(NativeVertex);
+	draw.packet.vertexLayout.stride = sizeof(NativeVertex);
+	draw.packet.vertexLayout.elementCount = 2;
+	draw.packet.vertexLayout.elements[0].semantic =
+		RENDER_VERTEX_SEMANTIC_POSITION;
+	draw.packet.vertexLayout.elements[0].format = RENDER_VERTEX_DATA_FLOAT3;
+	draw.packet.vertexLayout.elements[1].semantic =
+		RENDER_VERTEX_SEMANTIC_DIFFUSE;
+	draw.packet.vertexLayout.elements[1].format = RENDER_VERTEX_DATA_COLOR_BGRA8;
+	draw.packet.vertexLayout.elements[1].byteOffset = 12;
+	draw.packet.vertexCount = 3;
+	draw.packet.indexCount = 3;
+	draw.packet.indexed = true;
+	draw.state.pipeline.rasterizer.cullMode = RENDER_CULL_NONE;
+	const unsigned short indices[3] = { 0, 1, 2 };
+	const NativeVertex queuedVertices[3] = {
+		{ -0.8f, -0.8f, 0.0f, 0xff0000ffU },
+		{  0.0f,  0.8f, 0.0f, 0xff0000ffU },
+		{  0.8f, -0.8f, 0.0f, 0xff0000ffU }
+	};
+	unsigned int queuedDraws = 0;
+	const RenderResult queuedBegin = owner->Renderer().BeginFrame();
+	const RenderResult queuedSubmit = queuedBegin == RENDER_RESULT_OK ?
+		owner->SubmitNativeSortedBatch(&draw, 1, queuedVertices,
+			sizeof(queuedVertices), indices, sizeof(indices), &queuedDraws) :
+		RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult queuedEnd = queuedBegin == RENDER_RESULT_OK ?
+		owner->Renderer().EndFrame(false) : RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult queuedFinalize = queuedEnd == RENDER_RESULT_OK ?
+		owner->Renderer().FinalizeEndedFrame(false) : queuedEnd;
+	result |= Check(queuedSubmit == RENDER_RESULT_OK && queuedDraws == 1 &&
+		queuedFinalize == RENDER_RESULT_OK,
+		"native sorted scratch queues a prior frame before reuse");
+
+	const NativeVertex leftVertices[3] = {
+		{ -0.9f, -0.6f, 0.0f, 0xffff0000U },
+		{ -0.5f,  0.6f, 0.0f, 0xffff0000U },
+		{ -0.1f, -0.6f, 0.0f, 0xffff0000U }
+	};
+	const NativeVertex rightVertices[3] = {
+		{ 0.1f, -0.6f, 0.0f, 0xff00ff00U },
+		{ 0.5f,  0.6f, 0.0f, 0xff00ff00U },
+		{ 0.9f, -0.6f, 0.0f, 0xff00ff00U }
+	};
+	std::remove("D3D11RendererCapture.tga");
+	owner->RequestGameBackBufferCapture();
+	unsigned int leftDraws = 0;
+	unsigned int rightDraws = 0;
+	const RenderResult visibleBegin = owner->Renderer().BeginFrame();
+	const RenderResult viewportResult = visibleBegin == RENDER_RESULT_OK ?
+		owner->Renderer().SetViewport(RenderViewport(0.0f, 0.0f, 64.0f,
+			64.0f, 0.0f, 1.0f)) : RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult clearResult = viewportResult == RENDER_RESULT_OK ?
+		owner->Renderer().ClearExternal(RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH,
+			RenderFloat4(), 1.0f, 0) : RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult leftResult = clearResult == RENDER_RESULT_OK ?
+		owner->SubmitNativeSortedBatch(&draw, 1, leftVertices,
+			sizeof(leftVertices), indices, sizeof(indices), &leftDraws) :
+		RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult rightResult = leftResult == RENDER_RESULT_OK ?
+		owner->SubmitNativeSortedBatch(&draw, 1, rightVertices,
+			sizeof(rightVertices), indices, sizeof(indices), &rightDraws) :
+		RENDER_RESULT_INVALID_ARGUMENT;
+	GameRenderCommand endCommand = {};
+	endCommand.type = GAME_RENDER_COMMAND_END_RENDER;
+	endCommand.value0 = 1;
+	const RenderResult endResult = rightResult == RENDER_RESULT_OK ?
+		owner->ExecuteGameRenderCommand(endCommand) :
+		RENDER_RESULT_INVALID_ARGUMENT;
+	const bool captureSucceeded = owner->ConsumeGameBackBufferCaptureSuccess();
+	result |= Check(leftDraws == 1 && rightDraws == 1 &&
+		endResult == RENDER_RESULT_OK && captureSucceeded &&
+		HasNativeCapturePixel(16, 32, 0, 0, 255) &&
+		HasNativeCapturePixel(48, 32, 0, 255, 0),
+		"successive sorted scratch updates preserve both rendered batches");
+	std::remove("D3D11RendererCapture.tga");
+	return result;
+}
+
 int TestBorrowedThreadedCapture(HWND window)
 {
 	int result = 0;
@@ -2014,8 +2122,9 @@ int main()
 				w3d.SubmitNativeSortedBatch(&faultDraw, 1, vertices,
 					sizeof(vertices), faultIndices, sizeof(faultIndices),
 					&submittedFaultDraws);
-			// Temporary resource rollback is a synchronous owner transaction.
-			// Its refusal is returned by the batch and latched through frame end.
+			// A changed vertex shape grows the reusable scratch allocation. Its old
+			// handle retirement remains synchronous; refusal must fail the batch
+			// while the new candidate is rolled back.
 			// Always close the packet, even if an earlier assertion fails.
 			const rts::render::RenderResult faultEnd = w3d.Renderer().EndFrame(false);
 			const rts::render::RenderResult faultSubmit = faultEnd ==
@@ -2030,17 +2139,17 @@ int main()
 					cleanupFaultResult, submittedFaultDraws, faultEnd, faultSubmit, faultFence);
 			rts::render::RenderResourceStatistics afterCleanupFault;
 			result |= Check(cleanupFaultResult ==
-				rts::render::RENDER_RESULT_FAILED && submittedFaultDraws == 1 &&
+				rts::render::RENDER_RESULT_FAILED && submittedFaultDraws == 0 &&
 				faultEnd == rts::render::RENDER_RESULT_FAILED &&
 				faultSubmit == rts::render::RENDER_RESULT_FAILED &&
 				faultFence == rts::render::RENDER_RESULT_OK,
-				"native sorted cleanup refusal preserves submitted draw count and fails frame end");
+				"native sorted scratch retirement refusal rolls back growth and fails frame end");
 			result |= Check(rts::render::NativeW3DRecoveryTestAccess::
 				GetResourceStatistics(&w3d.Renderer(), &afterCleanupFault) ==
 					rts::render::RENDER_RESULT_OK &&
-					afterCleanupFault.liveHandles == beforeCleanupFault.liveHandles + 1U &&
-					afterCleanupFault.bufferCount == beforeCleanupFault.bufferCount + 1U,
-				"native sorted cleanup attempts both temporary destroys");
+					afterCleanupFault.liveHandles == beforeCleanupFault.liveHandles &&
+					afterCleanupFault.bufferCount == beforeCleanupFault.bufferCount,
+				"native sorted scratch growth rollback leaves no candidate allocation");
 			const rts::render::RenderResult faultBoundary = w3d.BeginGameDisplayIteration();
 			if (faultBoundary != rts::render::RENDER_RESULT_OK)
 				std::fprintf(stderr, "Sorted cleanup: display boundary=%d\n", faultBoundary);
@@ -2059,6 +2168,7 @@ int main()
 			"native WW3D2 bounds neutral vertex layout descriptors");
 		result |= Check(w3d.Renderer().EndFrame(true) == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 presents a hidden D3D11 frame");
+		result |= TestSortedScratchRendering(&w3d);
 		result |= Check(w3d.RecoverDevice() == rts::render::RENDER_RESULT_OK,
 			"native WW3D2 recovers a hidden D3D11 device");
 		result |= Check(w3d.Renderer().GetBackBufferInfo(&multisampleInfo) ==
