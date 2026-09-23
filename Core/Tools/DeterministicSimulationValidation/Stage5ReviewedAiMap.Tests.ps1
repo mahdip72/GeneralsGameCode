@@ -47,10 +47,26 @@ Read-Stage5ReviewedAiMap -Map $highMap -ManifestDirectory $ScratchRoot|Out-Null
 $target=Join-Path $ScratchRoot 'junction-target';[IO.Directory]::CreateDirectory($target)|Out-Null
 [IO.File]::WriteAllBytes((Join-Path $target 'fixture.map'),$bytes)
 $link=Join-Path $ScratchRoot 'junction'
-New-Item -ItemType Junction -Path $link -Target $target|Out-Null
-$reparsed=@{};foreach($k in $map.Keys){$reparsed[$k]=$map[$k]};$reparsed.source='junction/fixture.map'
-Reject {Read-Stage5ReviewedAiMap -Map $reparsed -ManifestDirectory $ScratchRoot} 'reparse'
-Reject {Copy-Stage5ReviewedAiMapSnapshot -ReviewedMap $bound -DestinationRoot $link} 'reparse'
+try {
+    New-Item -ItemType Junction -Path $link -Target $target|Out-Null
+    $linkItem=Get-Item -LiteralPath $link -Force
+    Check (($linkItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) 'Junction negative fixture was not created as a reparse point.'
+    $reparsed=@{};foreach($k in $map.Keys){$reparsed[$k]=$map[$k]};$reparsed.source='junction/fixture.map'
+    Reject {Read-Stage5ReviewedAiMap -Map $reparsed -ManifestDirectory $ScratchRoot} 'reparse'
+    Reject {Copy-Stage5ReviewedAiMapSnapshot -ReviewedMap $bound -DestinationRoot $link} 'reparse'
+}
+finally {
+    $linkItem=Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+    if($null-ne$linkItem){
+        if(($linkItem.Attributes -band [IO.FileAttributes]::ReparsePoint)-eq 0-or
+            ($linkItem.Attributes -band [IO.FileAttributes]::Directory)-eq 0){
+            throw "Refusing to remove a non-junction reviewed map fixture path: $link"
+        }
+        [IO.Directory]::Delete([IO.Path]::GetFullPath($link))
+    }
+    if(Test-Path -LiteralPath $link){throw "Reviewed map fixture junction remains after nonrecursive unlink: $link"}
+}
+Check (Test-Path -LiteralPath (Join-Path $target 'fixture.map') -PathType Leaf) 'Junction unlink removed its separate target fixture.'
 foreach($edit in @(@{byteCount='16384'},@{byteCount=1},@{crc='FFFFFFFF'},@{sha256=('FF'*32)},@{source='../fixture.map'},@{source='fixture.map:stream'},@{mapKey='Maps\..\evil.map'},@{mapKey='Maps\AiProof\different.map'},@{mapKey='Maps\Twilight Flame\Twilight Flame.map'})){
     $bad=@{};foreach($k in $map.Keys){$bad[$k]=$map[$k]};foreach($k in $edit.Keys){$bad[$k]=$edit[$k]}
     Reject {Read-Stage5ReviewedAiMap -Map $bad -ManifestDirectory $ScratchRoot} 'map|path|hash|SHA|integer|CRC|size|default'
