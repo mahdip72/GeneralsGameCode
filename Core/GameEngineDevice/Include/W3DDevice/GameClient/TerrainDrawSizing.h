@@ -26,10 +26,16 @@ namespace rts
 		int minimumHeight;
 		int tileLength;
 	};
+	struct TerrainCameraBasis
+	{
+		float forwardX, forwardY, forwardZ;
+		float rightX, rightY, rightZ;
+		float upX, upY, upZ;
+	};
 
 	bool CalculateTerrainDrawSize(const TerrainDrawSizingInput &input, int &width, int &height);
 	bool CalculateTerrainDrawSizeForCameraDirection(const TerrainDrawSizingInput &input,
-		float forwardX, float forwardY, int &width, int &height);
+		const TerrainCameraBasis &basis, int &width, int &height);
 	void StabilizeTerrainDrawSizeForMap(int currentWidth, int currentHeight,
 		int mapWidth, int mapHeight, int &width, int &height);
 }

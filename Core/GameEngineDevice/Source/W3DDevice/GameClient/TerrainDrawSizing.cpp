@@ -93,55 +93,65 @@ namespace rts
 	}
 
 	bool CalculateTerrainDrawSizeForCameraDirection(const TerrainDrawSizingInput &input,
-		float forwardX, float forwardY, int &width, int &height)
+		const TerrainCameraBasis &basis, int &width, int &height)
 	{
-		// Retain the conservative result for invalid inputs and near-horizon views.
+		// Retain the conservative result for invalid inputs.
 		if (!CalculateTerrainDrawSize(input, width, height))
 			return false;
-		if (!(forwardX > -FLT_MAX && forwardX < FLT_MAX &&
-			forwardY > -FLT_MAX && forwardY < FLT_MAX))
-			return true;
-
-		const float horizontalLength = (float)sqrt(forwardX * forwardX + forwardY * forwardY);
-		const float sinPitch = (float)sin(input.pitchRadians);
-		const float cosPitch = (float)cos(input.pitchRadians);
-		const float halfVerticalTangent = (float)tan(input.verticalFovRadians * 0.5f);
-		const float farDown = sinPitch - cosPitch * halfVerticalTangent;
-		if (!(horizontalLength > 0.0001f && horizontalLength < FLT_MAX) || farDown <= 0.01f)
-			return true;
-
-		forwardX /= horizontalLength;
-		forwardY /= horizontalLength;
-		const float rightX = forwardY;
-		const float rightY = -forwardX;
-		const float halfHorizontalTangent = (float)tan(input.horizontalFovRadians * 0.5f);
-		const float nearDown = sinPitch + cosPitch * halfVerticalTangent;
-		const float forwardDistances[2] = {
-			input.cameraHeight * (cosPitch - sinPitch * halfVerticalTangent) / nearDown,
-			input.cameraHeight * (cosPitch + sinPitch * halfVerticalTangent) / farDown
+		const float vectors[9] = {
+			basis.forwardX, basis.forwardY, basis.forwardZ,
+			basis.rightX, basis.rightY, basis.rightZ,
+			basis.upX, basis.upY, basis.upZ
 		};
-		const float halfWidths[2] = {
-			input.cameraHeight * halfHorizontalTangent / nearDown,
-			input.cameraHeight * halfHorizontalTangent / farDown
-		};
-		float minX = 0.0f, maxX = 0.0f, minY = 0.0f, maxY = 0.0f;
-		for (int end = 0; end < 2; ++end)
+		for (int i = 0; i < 9; ++i)
 		{
-			for (int side = -1; side <= 1; side += 2)
+			if (!(vectors[i] > -FLT_MAX && vectors[i] < FLT_MAX))
 			{
-				const float x = forwardDistances[end] * forwardX + side * halfWidths[end] * rightX;
-				const float y = forwardDistances[end] * forwardY + side * halfWidths[end] * rightY;
-				if (end == 0 && side == -1)
+				width = input.mapWidth;
+				height = input.mapHeight;
+				return true;
+			}
+		}
+
+		const float halfHorizontalTangent = (float)tan(input.horizontalFovRadians * 0.5f);
+		const float halfVerticalTangent = (float)tan(input.verticalFovRadians * 0.5f);
+		if (!(halfHorizontalTangent < FLT_MAX && halfVerticalTangent < FLT_MAX))
+		{
+			width = input.mapWidth;
+			height = input.mapHeight;
+			return true;
+		}
+		float minX = 0.0f, maxX = 0.0f, minY = 0.0f, maxY = 0.0f;
+		for (int vertical = -1; vertical <= 1; vertical += 2)
+		{
+			for (int horizontal = -1; horizontal <= 1; horizontal += 2)
+			{
+				const float x = basis.forwardX + horizontal * halfHorizontalTangent * basis.rightX +
+					vertical * halfVerticalTangent * basis.upX;
+				const float y = basis.forwardY + horizontal * halfHorizontalTangent * basis.rightY +
+					vertical * halfVerticalTangent * basis.upY;
+				const float z = basis.forwardZ + horizontal * halfHorizontalTangent * basis.rightZ +
+					vertical * halfVerticalTangent * basis.upZ;
+				if (!(z < -0.01f && x > -FLT_MAX && x < FLT_MAX &&
+					y > -FLT_MAX && y < FLT_MAX))
 				{
-					minX = maxX = x;
-					minY = maxY = y;
+					width = input.mapWidth;
+					height = input.mapHeight;
+					return true;
+				}
+				const float groundX = input.cameraHeight * x / -z;
+				const float groundY = input.cameraHeight * y / -z;
+				if (vertical == -1 && horizontal == -1)
+				{
+					minX = maxX = groundX;
+					minY = maxY = groundY;
 				}
 				else
 				{
-					if (x < minX) minX = x;
-					if (x > maxX) maxX = x;
-					if (y < minY) minY = y;
-					if (y > maxY) maxY = y;
+					if (groundX < minX) minX = groundX;
+					if (groundX > maxX) maxX = groundX;
+					if (groundY < minY) minY = groundY;
+					if (groundY > maxY) maxY = groundY;
 				}
 			}
 		}
@@ -159,8 +169,10 @@ namespace rts
 		int mapWidth, int mapHeight, int &width, int &height)
 	{
 		const int square = width > height ? width : height;
-		width = square > currentWidth ? square : currentWidth;
-		height = square > currentHeight ? square : currentHeight;
+		// Full-map draws can precede shell sizing, or be temporary for a low
+		// camera pitch. Do not permanently retain either as the shell floor.
+		width = currentWidth < mapWidth && currentWidth > square ? currentWidth : square;
+		height = currentHeight < mapHeight && currentHeight > square ? currentHeight : square;
 		if (width > mapWidth) width = mapWidth;
 		if (height > mapHeight) height = mapHeight;
 	}

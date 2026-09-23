@@ -3769,9 +3769,16 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 			bool haveDrawSize = false;
 			if (isShellCamera && cameraPitch > ViewDefaultLowPitchRadians)
 			{
-				const Vector3 forward = m_3DCamera->Get_Forward_Dir();
+				const Matrix3D &transform = m_3DCamera->Get_Transform();
+				const Vector3 forward = -transform.Get_Z_Vector();
+				const Vector3 right = transform.Get_X_Vector();
+				const Vector3 up = transform.Get_Y_Vector();
+				rts::TerrainCameraBasis basis;
+				basis.forwardX = forward.X; basis.forwardY = forward.Y; basis.forwardZ = forward.Z;
+				basis.rightX = right.X; basis.rightY = right.Y; basis.rightZ = right.Z;
+				basis.upX = up.X; basis.upY = up.Y; basis.upZ = up.Z;
 				haveDrawSize = rts::CalculateTerrainDrawSizeForCameraDirection(input,
-					forward.X, forward.Y, dimensions.x, dimensions.y);
+					basis, dimensions.x, dimensions.y);
 			}
 
 			if (!haveDrawSize)

@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <float.h>
+#include <math.h>
 
 static int s_failures = 0;
 
@@ -86,6 +87,25 @@ static void TestTerrainDrawSizing()
 	CHECK(!rts::CalculateTerrainDrawSize(input, width, height));
 }
 
+static rts::TerrainCameraBasis MakeTerrainBasis(float forwardX, float forwardY,
+	float pitchRadians)
+{
+	rts::TerrainCameraBasis basis;
+	const float horizontalLength = (float)sqrt(forwardX * forwardX + forwardY * forwardY);
+	const float sinPitch = (float)sin(pitchRadians);
+	const float cosPitch = (float)cos(pitchRadians);
+	basis.forwardX = forwardX;
+	basis.forwardY = forwardY;
+	basis.forwardZ = -sinPitch;
+	basis.rightX = forwardY / horizontalLength;
+	basis.rightY = -forwardX / horizontalLength;
+	basis.rightZ = 0.0f;
+	basis.upX = sinPitch * forwardX / horizontalLength;
+	basis.upY = sinPitch * forwardY / horizontalLength;
+	basis.upZ = cosPitch;
+	return basis;
+}
+
 static void TestShellTerrainDrawSizing()
 {
 	rts::TerrainDrawSizingInput input = MakeTerrainInput();
@@ -95,20 +115,42 @@ static void TestShellTerrainDrawSizing()
 	input.mapHeight = 315;
 	input.verticalFovRadians = 0.672870f;
 	int width = 0, height = 0;
+	rts::TerrainCameraBasis basis = MakeTerrainBasis(0.053675f, 0.791536f,
+		input.pitchRadians);
 
 	// Two recorded shell camera headings at 4:3 and the first at 16:9.
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
-		0.053675f, 0.791536f, width, height));
+		basis, width, height));
 	CHECK(width == 225 && height == 193);
-	rts::StabilizeTerrainDrawSizeForMap(129, 129, 315, 315, width, height);
+	// Roll rotates the screen edges even when forward remains unchanged.
+	const float roll = 0.087266f;
+	const float rollCos = (float)cos(roll), rollSin = (float)sin(roll);
+	rts::TerrainCameraBasis rolled = basis;
+	rolled.rightX = basis.rightX * rollCos + basis.upX * rollSin;
+	rolled.rightY = basis.rightY * rollCos + basis.upY * rollSin;
+	rolled.rightZ = basis.rightZ * rollCos + basis.upZ * rollSin;
+	rolled.upX = basis.upX * rollCos - basis.rightX * rollSin;
+	rolled.upY = basis.upY * rollCos - basis.rightY * rollSin;
+	rolled.upZ = basis.upZ * rollCos - basis.rightZ * rollSin;
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		rolled, width, height));
 	CHECK(width == 225 && height == 225);
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
-		0.611570f, 0.505363f, width, height));
+		basis, width, height));
+	rts::StabilizeTerrainDrawSizeForMap(129, 129, 315, 315, width, height);
+	CHECK(width == 225 && height == 225);
+	rts::StabilizeTerrainDrawSizeForMap(315, 315, 315, 315, width, height);
+	CHECK(width == 225 && height == 225);
+	width = 315; height = 315;
+	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, width, height);
+	CHECK(width == 315 && height == 315);
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		MakeTerrainBasis(0.611570f, 0.505363f, input.pitchRadians), width, height));
 	CHECK(width == 225 && height == 225);
 	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, width, height);
 	CHECK(width == 225 && height == 225);
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
-		0.053675f, 0.791536f, width, height));
+		basis, width, height));
 	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, width, height);
 	CHECK(width == 225 && height == 225);
 
@@ -116,7 +158,7 @@ static void TestShellTerrainDrawSizing()
 	// previous map's grow-only floor.
 	input.verticalFovRadians = 0.513039f;
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
-		0.053675f, 0.791536f, width, height));
+		basis, width, height));
 	CHECK(width == 193 && height == 161);
 	rts::StabilizeTerrainDrawSizeForMap(129, 129, 315, 315, width, height);
 	CHECK(width == 193 && height == 193);
@@ -126,24 +168,26 @@ static void TestShellTerrainDrawSizing()
 	input.mapHeight = 140;
 	input.pitchRadians = 0.30f;
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
-		0.053675f, 0.791536f, width, height));
+		basis, width, height));
 	CHECK(width == 160 && height == 140);
 	input.mapWidth = 315;
 	input.mapHeight = 315;
 	input.cameraHeight = FLT_MAX / 2.0f;
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
-		0.053675f, 0.791536f, width, height));
+		basis, width, height));
 	CHECK(width == 315 && height == 315);
 	input.cameraHeight = 618.125f;
 	input.pitchRadians = 0.65449846f;
+	rts::TerrainCameraBasis invalid = basis;
+	invalid.rightZ = FLT_MAX;
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
-		FLT_MAX, FLT_MAX, width, height));
-	CHECK(width == 257 && height == 257);
+		invalid, width, height));
+	CHECK(width == 315 && height == 315);
 
 	// A near-horizon view keeps the existing full-map fallback.
 	input.pitchRadians = 0.20f;
 	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
-		0.053675f, 0.791536f, width, height));
+		MakeTerrainBasis(0.053675f, 0.791536f, input.pitchRadians), width, height));
 	CHECK(width == 315 && height == 315);
 }
 
