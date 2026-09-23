@@ -300,6 +300,7 @@ private:
 	UnsignedInt m_networkHelloLastSend;
 	UnsignedInt m_networkHelloAttempts;
 	UnsignedInt m_networkSimulationMapCrc;
+	Int m_networkSimulationMapContentsMask;
 	UnsignedInt m_networkSimulationRosterMask;
 	Bool m_networkSimulationPolicyResolved;
 	rts::network_epoch::NetworkSimulationPolicyIdentity

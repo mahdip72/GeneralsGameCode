@@ -288,6 +288,15 @@ int TestNetworkHelloContract()
 	int result = 0;
 	const rts::MultiplayerSimulationGeneratedReleaseProof absentProof =
 		{ 0, "", "", "", "", "", liveIntegratedMask };
+	result |= Check(!IsNetworkMapPromotionEligible(0U, 1U),
+		"NET3 never promotes a map without a content CRC");
+	result |= Check(IsNetworkMapPromotionEligible(0x10203040U, 1U | 2U | 8U | 64U),
+		"NET3 map identity permits cosmetic map sidecars");
+	result |= Check(!IsNetworkMapPromotionEligible(0x10203040U, 0U) &&
+		!IsNetworkMapPromotionEligible(0x10203040U, 1U | 4U) &&
+		!IsNetworkMapPromotionEligible(0x10203040U, 1U | 16U) &&
+		!IsNetworkMapPromotionEligible(0x10203040U, 1U | 32U),
+		"NET3 remains serial when map bytes or simulation sidecars are unbound");
 	result |= Check(
 		rts::ResolveMultiplayerSimulationGeneratedReleaseProofMask(
 			absentProof, liveIntegratedMask) == 0,

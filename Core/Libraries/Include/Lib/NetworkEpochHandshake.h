@@ -130,6 +130,15 @@ inline bool IsMatchingNetworkSimulationPolicyIdentity(
 		left.provenKernelMask == right.provenKernelMask;
 }
 
+inline bool IsNetworkMapPromotionEligible(std::uint32_t mapCrc,
+	std::uint32_t mapContentsMask)
+{
+	// The NET3 identity carries only the .map CRC. INI and asset-usage
+	// sidecars may change simulation without changing that field.
+	return mapCrc != 0U && (mapContentsMask & 1U) != 0U &&
+		(mapContentsMask & (4U | 16U | 32U)) == 0U;
+}
+
 inline bool IsNetworkSimulationRosterIdentityValid(
 	std::uint32_t rosterMask,
 	std::uint32_t expectedRemoteMask,

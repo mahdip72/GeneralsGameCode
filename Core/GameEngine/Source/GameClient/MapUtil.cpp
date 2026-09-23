@@ -59,6 +59,7 @@
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/FPUControl.h"
 #include "GameNetwork/GameInfo.h"
+#include "GameNetwork/FileTransfer.h"
 #include "GameNetwork/NetworkDefs.h"
 
 
@@ -104,6 +105,35 @@ static UnsignedInt calcCRC( AsciiString fname )
 	fp = nullptr;
 
 	return theCRC.get();
+}
+
+UnsignedInt GetMapFileCRC(const AsciiString &mapName)
+{
+	File *file = TheFileSystem->openFile(mapName.str(), File::READ);
+	if (!file)
+		return 0;
+	file->close();
+	return calcCRC(mapName);
+}
+
+Int GetMapSimulationSidecarMask(const AsciiString &mapName)
+{
+	const AsciiString paths[] = {
+		GetINIFromMap(mapName), GetSoloINIFromMap(mapName),
+		GetAssetUsageFromMap(mapName)
+	};
+	const Int maskBits[] = { 4, 16, 32 };
+	Int mask = 0;
+	for (Int i = 0; i < ARRAY_SIZE(paths); ++i)
+	{
+		File *file = TheFileSystem->openFile(paths[i].str(), File::READ);
+		if (file)
+		{
+			file->close();
+			mask |= maskBits[i];
+		}
+	}
+	return mask;
 }
 
 static Bool ParseObjectDataChunk(DataChunkInput &file, DataChunkInfo *info, void *userData)

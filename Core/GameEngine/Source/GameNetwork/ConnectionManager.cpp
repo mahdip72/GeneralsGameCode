@@ -1077,6 +1077,7 @@ Bool ConnectionManager::isLockstepV2ProofActive() const
 void ConnectionManager::clearNetworkSimulationPolicy()
 {
 	m_networkSimulationMapCrc = 0U;
+	m_networkSimulationMapContentsMask = 0;
 	m_networkSimulationRosterMask = 0U;
 	m_networkSimulationPolicyResolved = FALSE;
 	m_networkSimulationLocalIdentity =
@@ -1244,6 +1245,15 @@ void ConnectionManager::beginNetworkHello()
 			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC);
 	}
 #endif
+	// NET3's map identity covers the .map bytes only. Map-specific INI files
+	// can affect simulation, so keep those sessions on the serial path. These
+	// fields come from the shared lobby state and agree before map transfer.
+	if (!rts::network_epoch::IsNetworkMapPromotionEligible(
+		m_networkSimulationMapCrc,
+		static_cast<UnsignedInt>(m_networkSimulationMapContentsMask)))
+	{
+		candidateKernelMask = 0U;
+	}
 	m_networkSimulationLocalIdentity =
 		rts::network_epoch::MakeNetworkSimulationPolicyIdentity(
 			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
@@ -3885,6 +3895,7 @@ void ConnectionManager::parseUserList(const GameInfo *game)
 #if defined(_WIN64)
 	clearNetworkSimulationPolicy();
 	m_networkSimulationMapCrc = game->getMapCRC();
+	m_networkSimulationMapContentsMask = game->getMapContentsMask();
 	beginNetworkHello();
 #endif
 #ifdef MEMORYPOOL_DEBUG

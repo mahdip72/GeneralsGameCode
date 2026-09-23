@@ -544,6 +544,14 @@ void GameSpyInfo::markAsStagingRoomHost()
 
 	TheMapCache->updateCache();
 	m_localStagingRoom.setMap(getDefaultMap(TRUE));
+	const MapMetaData *mapData = TheMapCache->findMap(m_localStagingRoom.getMap());
+	if (mapData)
+	{
+		m_localStagingRoom.setMapCRC(GetMapFileCRC(m_localStagingRoom.getMap()));
+		m_localStagingRoom.setMapSize(mapData->m_filesize);
+		m_localStagingRoom.getSlot(0)->setMapAvailability(
+			m_localStagingRoom.getMapCRC() != 0U);
+	}
 	m_localStagingRoom.adjustSlotsForMap(); // close slots that the map can't hold. BGC
 }
 

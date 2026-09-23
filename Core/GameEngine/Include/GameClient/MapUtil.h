@@ -134,6 +134,10 @@ private:
 extern MapCache *TheMapCache;
 extern TechAndSupplyImages TheSupplyAndTechImageLocations;
 
+// Read the current map file, rather than trusting the size-based map cache.
+UnsignedInt GetMapFileCRC(const AsciiString &mapName);
+Int GetMapSimulationSidecarMask(const AsciiString &mapName);
+
 // TheSuperHackers @refactor xezon 28/11/2025 Refactors the map list population implementation
 // by breaking it into smaller pieces to make it more maintainable.
 

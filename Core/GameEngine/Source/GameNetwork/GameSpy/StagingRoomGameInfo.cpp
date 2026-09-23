@@ -818,7 +818,11 @@ void GameSpyStagingRoom::launchGame()
 
 	// see if we really have the map.  if not, back out.
 	TheMapCache->updateCache();
-	if (!filesOk || TheMapCache->findMap(getMap()) == nullptr)
+	if (!filesOk || TheMapCache->findMap(getMap()) == nullptr ||
+		(getMapCRC() != 0U &&
+		 (GetMapFileCRC(getMap()) != getMapCRC() ||
+		  ((getMapContentsMask() & (4 | 16 | 32)) == 0 &&
+		   GetMapSimulationSidecarMask(getMap()) != 0))))
 	{
 		DEBUG_LOG(("After transfer, we didn't really have the map.  Bailing..."));
 
