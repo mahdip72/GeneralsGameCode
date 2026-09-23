@@ -146,7 +146,8 @@ enum Control { CONTROL_NONE, CONTROL_FENCE, CONTROL_CAPTURE,
 	CONTROL_RESIZE, CONTROL_RECOVER, CONTROL_DEBUG_COUNT, CONTROL_REPORT,
 	CONTROL_ROLLBACK_RESOURCE, CONTROL_SET_SWAP_INTERVAL,
 	CONTROL_GET_SWAP_INTERVAL, CONTROL_SET_GAMMA, CONTROL_GET_GAMMA,
-	CONTROL_CONFIGURE_RESOURCE_FAULT, CONTROL_GET_RESOURCE_STATISTICS };
+	CONTROL_CONFIGURE_RESOURCE_FAULT, CONTROL_GET_RESOURCE_STATISTICS,
+	CONTROL_RESOURCE_FENCE };
 
 struct Command
 {
@@ -392,6 +393,7 @@ public:
 	RenderResult submitFrame(bool);
 	RenderResult cancelFrame(RenderResult);
 	RenderResult drain();
+	RenderResult fenceResourceMutation();
 	RenderResult rollbackResource(GpuHandle);
 	bool poll(ThreadedRenderFrameCompletion *);
 	uint64_t lastSequence() const { return producer() ? m_lastSequence : 0; }
@@ -723,6 +725,14 @@ RenderResult ThreadedRenderDevice::drain()
 {
 	if (!usable()) return RENDER_RESULT_INVALID_ARGUMENT;
 	try { return sync(CONTROL_FENCE, std::make_shared<Reply>()); }
+	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__,
+		__LINE__, m_sequence); }
+}
+
+RenderResult ThreadedRenderDevice::fenceResourceMutation()
+{
+	if (!usable()) return RENDER_RESULT_INVALID_ARGUMENT;
+	try { return sync(CONTROL_RESOURCE_FENCE, std::make_shared<Reply>()); }
 	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__,
 		__LINE__, m_sequence); }
 }
@@ -1609,6 +1619,7 @@ void ThreadedRenderDevice::publishMetadata(RenderResult result, bool refreshInfo
 void ThreadedRenderDevice::execute(Packet &packet)
 {
 	RenderResult packetResult = packet.failure;
+	RenderResult resourceCommandResult = RENDER_RESULT_OK;
 	if (m_ownerFrameActive)
 	{
 		m_ownerFrameResult = FirstFailure(m_ownerFrameResult, packet.failure);
@@ -1623,6 +1634,8 @@ void ThreadedRenderDevice::execute(Packet &packet)
 		{
 			if (command.operation == OP_COPY_COLOR)
 			{
+				resourceCommandResult = FirstFailure(resourceCommandResult,
+					m_ownerFrameResult);
 				OwnerResource *slot = ownerResource(command.handle);
 				if (slot) { slot->contentValid = false; slot->writtenSequence = m_ownerSequence; }
 				m_ownerResourceFailure = true;
@@ -1634,6 +1647,10 @@ void ThreadedRenderDevice::execute(Packet &packet)
 		catch (const std::bad_alloc &) { result = RENDER_RESULT_OUT_OF_MEMORY; }
 		catch (...) { result = RENDER_RESULT_FAILED; }
 		packetResult = FirstFailure(packetResult, result);
+		if ((command.operation >= OP_CREATE_BUFFER &&
+			command.operation <= OP_UPDATE_BUFFER) ||
+			command.operation == OP_COPY_COLOR)
+			resourceCommandResult = FirstFailure(resourceCommandResult, result);
 		if (m_ownerFrameActive)
 		{
 			m_ownerFrameResult = FirstFailure(m_ownerFrameResult, result);
@@ -1783,6 +1800,12 @@ void ThreadedRenderDevice::execute(Packet &packet)
 			// repairs the device; otherwise a second lifecycle fence hides removal.
 			result = FirstFailure(m_drainFailure, FirstFailure(frameResult, m_outsideFailure));
 			m_drainFailure = RENDER_RESULT_OK;
+			break;
+		case CONTROL_RESOURCE_FENCE:
+			// The caller is publishing one resource mutation. A failed frame
+			// remains in the aggregate drain/completion path, but must not make
+			// a successful upload appear to have failed.
+			result = resourceCommandResult;
 			break;
 		default: break;
 		}
@@ -1946,6 +1969,12 @@ RenderResult DrainThreadedRenderDevice(IRenderDevice *device)
 {
 	ThreadedRenderDevice *threaded = dynamic_cast<ThreadedRenderDevice *>(device);
 	return threaded ? threaded->drain() : RENDER_RESULT_UNSUPPORTED;
+}
+RenderResult FenceThreadedRenderResourceMutation(IRenderDevice *device)
+{
+	ThreadedRenderDevice *threaded = dynamic_cast<ThreadedRenderDevice *>(device);
+	return threaded ? threaded->fenceResourceMutation() :
+		RENDER_RESULT_UNSUPPORTED;
 }
 RenderResult RollbackThreadedRenderResource(IRenderDevice *device,
 	GpuHandle handle)

@@ -508,7 +508,7 @@ RenderResult WaitForMutation(IRenderDevice *device, RenderResult result)
 	#if defined(RTS_RENDERER_HAS_D3D11)
 	if (IsThreadedRenderDevice(device))
 	{
-		return DrainThreadedRenderDevice(device);
+		return FenceThreadedRenderResourceMutation(device);
 	}
 	#endif
 	return result;

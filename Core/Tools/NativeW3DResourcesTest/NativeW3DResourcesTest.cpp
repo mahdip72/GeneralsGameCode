@@ -1391,6 +1391,160 @@ int TestThreadedNativeBufferOwnerFailureRecovery()
 	delete device;
 	return result;
 }
+
+int TestUnrelatedFrameFailureDoesNotInvalidateResourceMutation()
+{
+	int result = 0;
+	FakeRenderControl control;
+	ThreadedRenderOptions options;
+	options.serial = false;
+	options.resourceCapacity = 4;
+	IRenderDevice *device = CreateThreadedRenderDevice(
+		CreateThreadedFakeRenderDevice, &control, options);
+	if (device == 0)
+		return Check(false, "resource fence fixture allocates");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = reinterpret_cast<void *>(1);
+	parameters.width = 4;
+	parameters.height = 4;
+	if (device->initialize(parameters) != RENDER_RESULT_OK)
+	{
+		delete device;
+		return Check(false, "resource fence fixture initializes");
+	}
+	NativeW3DResourceHost host(4);
+	NativeW3DResources resources(4);
+	result |= Check(host.Attach(device, device->immediateContext()) ==
+		RENDER_RESULT_OK && resources.BindHost(&host) == RENDER_RESULT_OK,
+		"resource fence fixture binds a threaded host");
+	unsigned int bytes[4] = { 1, 2, 3, 4 };
+	BufferDescriptor bufferDescriptor;
+	bufferDescriptor.byteCount = sizeof(bytes);
+	bufferDescriptor.stride = sizeof(unsigned int);
+	bufferDescriptor.binding = RENDER_BUFFER_VERTEX;
+	bufferDescriptor.usage = RENDER_USAGE_DEFAULT;
+	GpuHandle buffer;
+	result |= Check(resources.CreateBuffer(bufferDescriptor, bytes,
+		sizeof(bytes), &buffer) == RENDER_RESULT_OK,
+		"resource fence fixture creates an unrelated vertex buffer");
+	unsigned int pixels[16] = { 0 };
+	TextureDescriptor textureDescriptor;
+	textureDescriptor.width = 4;
+	textureDescriptor.height = 4;
+	textureDescriptor.mipCount = 1;
+	textureDescriptor.arrayCount = 1;
+	textureDescriptor.dimension = RENDER_TEXTURE_2D;
+	textureDescriptor.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+	textureDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+	textureDescriptor.usage = RENDER_USAGE_DEFAULT;
+	TextureSubresourceData textureData;
+	textureData.data = pixels;
+	textureData.rowPitch = sizeof(unsigned int) * 4;
+	textureData.slicePitch = sizeof(pixels);
+	GpuHandle texture;
+	result |= Check(resources.CreateTexture(textureDescriptor, &textureData,
+		1, &texture) == RENDER_RESULT_OK,
+		"resource fence fixture creates a CPU texture");
+	GpuHandle validated;
+	NativeW3DTextureDescription textureDescription;
+	result |= Check(resources.AcquireVertexBufferRange(buffer,
+		sizeof(unsigned int), 0, 0, 4, &validated) == RENDER_RESULT_OK &&
+		validated == buffer &&
+		resources.DescribeTexture(texture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_CPU,
+		"both resources have authority before the unrelated frame fails");
+	IRenderContext *context = device->immediateContext();
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		CancelThreadedRenderFrame(device, RENDER_RESULT_FAILED) ==
+			RENDER_RESULT_OK,
+		"unrelated failed frame is accepted before the texture refresh");
+	const RenderResult refresh = resources.RefreshTexture(texture,
+		textureDescriptor, &textureData, 1);
+	result |= Check(ReadCount(&control.refreshCalls) == 1,
+		"render owner executed the texture refresh despite the failed frame");
+	validated = GpuHandle();
+	result |= Check(refresh == RENDER_RESULT_OK &&
+		resources.DescribeTexture(texture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_CPU &&
+		resources.AcquireVertexBufferRange(buffer, sizeof(unsigned int), 0,
+			0, 4, &validated) == RENDER_RESULT_OK && validated == buffer,
+		"successful refresh preserves texture and unrelated buffer authority");
+	ThreadedRenderFrameCompletion completion;
+	result |= Check(DrainThreadedRenderDevice(device) == RENDER_RESULT_FAILED &&
+		PollThreadedRenderCompletion(device, &completion) &&
+		completion.result == RENDER_RESULT_FAILED &&
+		!completion.resourceFailure &&
+		resources.PublishThreadedCompletion(completion.sequence, false) ==
+			RENDER_RESULT_OK,
+		"unrelated failed frame remains observable after resource completion");
+	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+		host.Detach() == RENDER_RESULT_OK,
+		"resource fence fixture releases only its resources");
+	device->shutdown();
+	delete device;
+	return result;
+}
+
+int TestSplitPacketResourceFenceReportsOwnerFailure()
+{
+	int result = 0;
+	FakeRenderControl control;
+	ThreadedRenderOptions options;
+	options.serial = false;
+	options.maxPacketCommands = 1;
+	options.resourceCapacity = 2;
+	IRenderDevice *device = CreateThreadedRenderDevice(
+		CreateThreadedFakeRenderDevice, &control, options);
+	if (device == 0)
+		return Check(false, "split resource fence fixture allocates");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = reinterpret_cast<void *>(1);
+	parameters.width = 4;
+	parameters.height = 4;
+	if (device->initialize(parameters) != RENDER_RESULT_OK)
+	{
+		delete device;
+		return Check(false, "split resource fence fixture initializes");
+	}
+	unsigned int pixels[16] = { 0 };
+	TextureDescriptor descriptor;
+	descriptor.width = 4;
+	descriptor.height = 4;
+	descriptor.mipCount = 1;
+	descriptor.arrayCount = 1;
+	descriptor.dimension = RENDER_TEXTURE_2D;
+	descriptor.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+	descriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+	descriptor.usage = RENDER_USAGE_DEFAULT;
+	TextureSubresourceData data;
+	data.data = pixels;
+	data.rowPitch = sizeof(unsigned int) * 4;
+	data.slicePitch = sizeof(pixels);
+	GpuHandle texture;
+	result |= Check(device->createTexture(descriptor, &data, 1,
+		&texture) == RENDER_RESULT_OK &&
+		FenceThreadedRenderResourceMutation(device) == RENDER_RESULT_OK,
+		"split resource fence fixture creates its native texture");
+	InterlockedExchange(&control.failRefresh, 1);
+	IRenderContext *context = device->immediateContext();
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		device->refreshTexture(texture, descriptor, &data, 1) ==
+			RENDER_RESULT_OK &&
+		FenceThreadedRenderResourceMutation(device) == RENDER_RESULT_FAILED &&
+		ReadCount(&control.refreshCalls) == 1,
+		"resource fence sees failed refresh after Begin forces a packet split");
+	result |= Check(context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_FAILED,
+		"split resource failure remains in the aggregate frame result");
+	device->shutdown();
+	delete device;
+	return result;
+}
 }
 
 int main()
@@ -2010,5 +2164,7 @@ int main()
 	result |= TestThreadedResourceCompletion();
 	result |= TestThreadedNativeBufferOwnerFailureRecovery();
 	result |= TestThreadedBetweenFrameBufferUpdates();
+	result |= TestUnrelatedFrameFailureDoesNotInvalidateResourceMutation();
+	result |= TestSplitPacketResourceFenceReportsOwnerFailure();
 	return result;
 }
