@@ -54,6 +54,11 @@ try {
         $node -is [Management.Automation.Language.CommandAst] -and
             $node.GetCommandName() -ceq 'New-CombinedHostProducerTestCase'
     }, $true))
+    $copyFunctions = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'New-CombinedHostProducerTestCase'
+    }, $true))
     $producerCalls = @($sourceAst.FindAll({
         param($node)
         $node -is [Management.Automation.Language.CommandAst] -and
@@ -66,13 +71,48 @@ try {
     }, $true))
     Assert-CorpusReuseTest ($copyCalls.Count -eq 1) `
         'Acceptance must create one relocated corpus for all combined producer cases.'
-    Assert-CorpusReuseTest ($producerCalls.Count -eq 7) `
-        'The Acceptance source must retain all seven producer call sites.'
-    $loopedProducerCalls = @($producerCalls | Where-Object {
-        $_.Extent.Text -match '\$pathMode\.mode'
+    Assert-CorpusReuseTest ($copyFunctions.Count -eq 1) `
+        'The corpus creation helper must be uniquely identifiable for scoped assertions.'
+    $copyFunctionText = $copyFunctions[0].Extent.Text
+    Assert-CorpusReuseTest ($copyFunctionText -match
+        '(?s)@\(\$template\.corpus\.children\)\.Count\s*-ne\s*253' -and
+        $copyFunctionText -match '\[int\]\$template\.corpus\.rawLogCount\s*-ne\s*507') `
+        'The corpus creation helper must retain its 253-child / 507-raw-log assertions.'
+
+    $pathModeLoops = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.ForEachStatementAst] -and
+            $node.Variable.Extent.Text -ceq '$pathMode'
+    }, $true))
+    Assert-CorpusReuseTest ($pathModeLoops.Count -eq 1) `
+        'The three unsafe native-path negatives must remain in one path-mode loop.'
+    $pathModeEntries = @($pathModeLoops[0].Condition.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.HashtableAst]
+    }, $true))
+    $pathModeNames = @($pathModeEntries | ForEach-Object {
+        $modeMatch = [regex]::Match($_.Extent.Text,
+            "(?i)\bmode\s*=\s*'([^']+)'\s*;")
+        if (-not $modeMatch.Success) {
+            throw "Path-mode loop entry has no literal mode: $($_.Extent.Text)"
+        }
+        $modeMatch.Groups[1].Value
     })
+    $expectedPathModeNames = @('traversal', 'ads', 'drive-relative')
+    Assert-CorpusReuseTest ($pathModeNames.Count -eq $expectedPathModeNames.Count -and
+        @($pathModeNames | Select-Object -Unique).Count -eq $expectedPathModeNames.Count -and
+        @((Compare-Object $expectedPathModeNames $pathModeNames)).Count -eq 0) `
+        'The path-mode loop must retain traversal, ADS, and drive-relative cases.'
+
+    $loopedProducerCalls = @($pathModeLoops[0].Body.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'Invoke-CombinedHostProducerTestCase'
+    }, $true))
+    $directProducerCallCount = $producerCalls.Count - $loopedProducerCalls.Count
     Assert-CorpusReuseTest ($loopedProducerCalls.Count -eq 1 -and
-        ($producerCalls.Count - $loopedProducerCalls.Count + 3) -eq 9) `
+        $directProducerCallCount -eq 6 -and
+        ($directProducerCallCount + $pathModeNames.Count) -eq 9) `
         'The producer call sites must still execute all nine full-corpus cases.'
     foreach ($call in $producerCalls) {
         Assert-CorpusReuseTest ($call.CommandElements.Count -ge 2 -and
@@ -81,10 +121,6 @@ try {
     }
     Assert-CorpusReuseTest ($mutationCalls.Count -eq 6) `
         'Every file-mutating case group must run inside the restore-on-exit helper.'
-    Assert-CorpusReuseTest ($sourceText -match
-        '(?s)@\(\$template\.corpus\.children\)\.Count\s*-ne\s*253' -and
-        $sourceText -match '\[int\]\$template\.corpus\.rawLogCount\s*-ne\s*507') `
-        'The full 253-child / 507-raw-log corpus assertions must remain intact.'
     Assert-CorpusReuseTest ($sourceText -match
         '(?s)combined-producer-output-\{0\}.*?combined-results\.json') `
         'Each producer invocation must retain a distinct output directory.'
