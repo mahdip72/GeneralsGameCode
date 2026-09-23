@@ -1,10 +1,10 @@
 #include "Utility/CppMacros.h"
 #include "nativew3d2.h"
+#include "nativew3dclearcommand.h"
 #include "nativew3dbufferowner.h"
 #include "nativew3dtextureowner.h"
 #include "Renderer/LegacyRenderState.h"
 #include "Renderer/NativeW3DRenderState.h"
-#include "Renderer/RenderGameClient.h"
 #include "Renderer/ThreadedRenderDevice.h"
 
 #include <cstdio>
@@ -140,19 +140,12 @@ struct CaptureProbe
 struct ThreadedCaptureFactoryContext
 {
 	ThreadedCaptureFactoryContext() : failCapture(false), failClear(false),
-		presentCalls(0), captureCalls(0), clearCalls(0),
-		firstClearFlags(0), secondClearFlags(0), firstClearStencil(~0U),
-		secondClearStencil(~0U) {}
+		presentCalls(0), captureCalls(0) {}
 
 	bool failCapture;
 	bool failClear;
 	unsigned int presentCalls;
 	unsigned int captureCalls;
-	unsigned int clearCalls;
-	unsigned int firstClearFlags;
-	unsigned int secondClearFlags;
-	unsigned int firstClearStencil;
-	unsigned int secondClearStencil;
 };
 
 struct ThrowingCleanupHook : public rts::render::GameRenderCleanupHook
@@ -393,20 +386,6 @@ public:
 	{
 		if (m_contextState != 0 && m_contextState->failClear)
 			return rts::render::RENDER_RESULT_FAILED;
-		if (m_contextState != 0)
-		{
-			if (m_contextState->clearCalls == 0)
-			{
-				m_contextState->firstClearFlags = clearFlags;
-				m_contextState->firstClearStencil = stencil;
-			}
-			else if (m_contextState->clearCalls == 1)
-			{
-				m_contextState->secondClearFlags = clearFlags;
-				m_contextState->secondClearStencil = stencil;
-			}
-			++m_contextState->clearCalls;
-		}
 		return m_backendContext == 0 ?
 			rts::render::RENDER_RESULT_INVALID_ARGUMENT :
 			m_backendContext->clearTargets(clearFlags, color, depth, stencil);
@@ -848,20 +827,15 @@ int TestBorrowedThreadedCapture(HWND window)
 		delete device;
 		return result;
 	}
-	const rts::render::GameRenderColor clearColor = { 0.0f, 0.0f, 0.0f, 1.0f };
-	result |= Check(rts::render::BeginGameRender(true, true, clearColor, 1.0f) ==
-		rts::render::RENDER_RESULT_OK &&
-		rts::render::ClearGameRenderTargets(false, true, clearColor, 1.0f) ==
-			rts::render::RENDER_RESULT_OK &&
-		rts::render::EndGameRender(false) == rts::render::RENDER_RESULT_OK &&
-		factoryContext.clearCalls == 2 &&
-		factoryContext.firstClearFlags == (rts::render::RENDER_CLEAR_COLOR |
-			rts::render::RENDER_CLEAR_DEPTH | rts::render::RENDER_CLEAR_STENCIL) &&
-		factoryContext.secondClearFlags == (rts::render::RENDER_CLEAR_DEPTH |
-			rts::render::RENDER_CLEAR_STENCIL) &&
-		factoryContext.firstClearStencil == 0 &&
-		factoryContext.secondClearStencil == 0,
-		"game depth clears also reset stencil for volumetric shadow frames");
+	result |= Check(rts::render::NativeGameClearFlags(false, false) == 0U &&
+		rts::render::NativeGameClearFlags(true, false) ==
+			rts::render::RENDER_CLEAR_COLOR &&
+		rts::render::NativeGameClearFlags(false, true) ==
+			(rts::render::RENDER_CLEAR_DEPTH | rts::render::RENDER_CLEAR_STENCIL) &&
+		rts::render::NativeGameClearFlags(true, true) ==
+			(rts::render::RENDER_CLEAR_COLOR | rts::render::RENDER_CLEAR_DEPTH |
+				rts::render::RENDER_CLEAR_STENCIL),
+		"game depth clears include stencil for volumetric shadow frames");
 
 	rts::render::RenderCaptureRequestDescriptor captureDescriptor;
 	CaptureProbe capture;

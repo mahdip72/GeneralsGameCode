@@ -17,6 +17,7 @@
 #include "Renderer/RenderTexturePublication.h"
 #include "dx8indexbuffer.h"
 #include "dx8vertexbuffer.h"
+#include "nativew3dclearcommand.h"
 #include "nativew3d2.h"
 #include "surfaceclass.h"
 #include "texture.h"
@@ -186,8 +187,7 @@ bool IsValidColor(const GameRenderColor &color)
 void SetClearCommandFields(GameRenderCommand *command, bool clear,
 	bool clearz, const GameRenderColor &color, float destinationAlpha)
 {
-	command->value0 = (clear ? RENDER_CLEAR_COLOR : 0U) |
-		(clearz ? (RENDER_CLEAR_DEPTH | RENDER_CLEAR_STENCIL) : 0U);
+	command->value0 = NativeGameClearFlags(clear, clearz);
 	command->value1 = 0;
 	command->float0 = color.red;
 	command->float1 = color.green;
