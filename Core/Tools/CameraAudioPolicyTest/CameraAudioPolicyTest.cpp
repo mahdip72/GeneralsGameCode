@@ -213,6 +213,50 @@ static void TestShellTerrainDrawSizing()
 	CHECK(width == 315 && height == 315);
 }
 
+static void TestShellTerrainFloorPolicy()
+{
+	int shellWidth = 0, shellHeight = 0;
+	int width = 193, height = 161;
+
+	// The first shell request must not inherit the user camera's 257-cell
+	// draw area at 16:9; only shell-chosen dimensions become its floor.
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 193 && height == 193);
+	shellWidth = width; shellHeight = height;
+	width = 225; height = 193;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 225 && height == 225);
+	shellWidth = width; shellHeight = height;
+	width = 193; height = 161;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 225 && height == 225);
+
+	// A map change or a return to user control clears the shell floor.
+	shellWidth = 0; shellHeight = 0;
+	width = 193; height = 161;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 193 && height == 193);
+
+	// The same first-shell rule contracts a 4:3 startup draw of 315.
+	shellWidth = 0; shellHeight = 0;
+	width = 225; height = 193;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 225 && height == 225);
+	shellWidth = width; shellHeight = height;
+	rts::StabilizeTerrainDrawSizeForMap(315, 315,
+		315, 315, true, width, height);
+	CHECK(width == 315 && height == 315);
+	width = 225; height = 193;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 225 && height == 225);
+}
+
 static void TestAudioChannelPolicy()
 {
 	CHECK(rts::GetAdaptive3DChannelTarget(25) == 64);
@@ -245,6 +289,7 @@ int main()
 {
 	TestTerrainDrawSizing();
 	TestShellTerrainDrawSizing();
+	TestShellTerrainFloorPolicy();
 	TestAudioChannelPolicy();
 
 	if (s_failures != 0)

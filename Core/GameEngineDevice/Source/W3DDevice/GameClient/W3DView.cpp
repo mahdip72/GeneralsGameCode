@@ -174,6 +174,9 @@ W3DView::W3DView()
 	m_FXPitch = 1.0f;
 	m_freezeTimeForCameraMovement = false;
 	m_lastScreenToTerrainValid = false;
+	m_shellTerrainSizedMap = nullptr;
+	m_shellTerrainDrawWidth = 0;
+	m_shellTerrainDrawHeight = 0;
 
 	//Enhancements from CNC3 WST 4/15/2003. JSC Integrated 5/20/03.
 	m_scriptedState = 0;
@@ -920,6 +923,9 @@ void W3DView::set3DCameraLookAt(const Coord3D &pos, const Coord3D &dir, Real rol
 void W3DView::reset()
 {
 	View::reset();
+	m_shellTerrainSizedMap = nullptr;
+	m_shellTerrainDrawWidth = 0;
+	m_shellTerrainDrawHeight = 0;
 
 	// Just in case...
 	setTimeMultiplier(1); // Set time rate back to 1.
@@ -3398,6 +3404,12 @@ void W3DView::pitchCameraOneFrame()
 //-------------------------------------------------------------------------------------------------
 void W3DView::setUserControlled(Bool value)
 {
+	if (value)
+	{
+		m_shellTerrainSizedMap = nullptr;
+		m_shellTerrainDrawWidth = 0;
+		m_shellTerrainDrawHeight = 0;
+	}
 	if (m_isUserControlled != value)
 	{
 		m_isUserControlled = value;
@@ -3712,10 +3724,13 @@ void W3DView::Add_Camera_Shake (const Coord3D & position,float radius,float dura
 	CameraShakerSystem.Add_Camera_Shake(vpos,radius,duration,power);
 }
 
-bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
+bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions)
 {
 	if (TheGlobalData && TheGlobalData->m_drawEntireTerrain)
 	{
+		m_shellTerrainSizedMap = nullptr;
+		m_shellTerrainDrawWidth = 0;
+		m_shellTerrainDrawHeight = 0;
 		DEBUG_ASSERTCRASH(TheTerrainRenderObject != nullptr, ("TheTerrainRenderObject is null"));
 
 		if (const WorldHeightMap *heightMap = TheTerrainRenderObject->getMap())
@@ -3731,6 +3746,12 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 	const Real cameraPitch = asin(fabs(m_3DCamera->Get_Forward_Dir().Z));
 	const Bool isShellCamera = !m_isUserControlled && TheGameLogic &&
 		TheGameLogic->isInGame() && TheGameLogic->getGameMode() == GAME_SHELL;
+	if (!isShellCamera)
+	{
+		m_shellTerrainSizedMap = nullptr;
+		m_shellTerrainDrawWidth = 0;
+		m_shellTerrainDrawHeight = 0;
+	}
 
 	if (!m_isUserControlled && !isShellCamera)
 	{
@@ -3746,6 +3767,12 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 		WorldHeightMap *heightMap = TheTerrainRenderObject->getMap();
 		if (heightMap)
 		{
+			if (isShellCamera && m_shellTerrainSizedMap != heightMap)
+			{
+				m_shellTerrainSizedMap = heightMap;
+				m_shellTerrainDrawWidth = 0;
+				m_shellTerrainDrawHeight = 0;
+			}
 			const Vector3 cameraPosition = m_3DCamera->Get_Position();
 			const Real cameraToPivotX = cameraPosition.X - m_pos.x;
 			const Real cameraToPivotY = cameraPosition.Y - m_pos.y;
@@ -3788,20 +3815,33 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 			{
 				if (isShellCamera)
 				{
-					// A square avoids width/height swaps as the shell camera turns.
-					// Keep the current draw area through a camera shake, then allow
-					// contraction from a transient full-map draw when it ends.
+					// Only shell-chosen sizes form the grow floor; the preceding
+					// user-controlled camera can leave a larger draw area on this map.
+					rts::StabilizeTerrainDrawSizeForMap(m_shellTerrainDrawWidth,
+						m_shellTerrainDrawHeight, heightMap->getXExtent(),
+						heightMap->getYExtent(), false, dimensions.x, dimensions.y);
+					m_shellTerrainDrawWidth = dimensions.x;
+					m_shellTerrainDrawHeight = dimensions.y;
+
+					// Retain the actual area through a shake without adding it to
+					// the shell floor; contract once the shake ends.
 					const bool deferFullShrink = CameraShakerSystem.IsCameraShaking() ||
 						m_shakeIntensity > 0.01f;
+					if (deferFullShrink)
+					{
 					rts::StabilizeTerrainDrawSizeForMap(heightMap->getDrawWidth(),
-						heightMap->getDrawHeight(), heightMap->getXExtent(),
-						heightMap->getYExtent(), deferFullShrink, dimensions.x, dimensions.y);
+							heightMap->getDrawHeight(), heightMap->getXExtent(),
+							heightMap->getYExtent(), true, dimensions.x, dimensions.y);
+					}
 				}
 				return true;
 			}
 		}
 	}
 
+	m_shellTerrainSizedMap = nullptr;
+	m_shellTerrainDrawWidth = 0;
+	m_shellTerrainDrawHeight = 0;
 	// TheSuperHackers @tweak xezon 31/12/2025 Increases visible terrain area when lowering the camera pitch.
 	// Note: The default camera pitch in Generals was 37.5, which we prefer to keep the normal draw size for.
 	dimensions.x = WorldHeightMap::LOW_ANGLE_DRAW_WIDTH;
