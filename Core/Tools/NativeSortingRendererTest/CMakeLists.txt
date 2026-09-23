@@ -7,6 +7,10 @@ target_include_directories(core_native_sorting_renderer_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2
 )
 
+target_compile_definitions(core_native_sorting_renderer_tests PRIVATE
+    RTS_NATIVE_SORTING_TESTS=1
+)
+
 target_link_libraries(core_native_sorting_renderer_tests PRIVATE
     core_renderer
     core_task_runtime

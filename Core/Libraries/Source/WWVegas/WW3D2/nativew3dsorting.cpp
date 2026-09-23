@@ -192,16 +192,22 @@ bool HasPendingTriangles(const SortedSubmission &submission)
 	return false;
 }
 
+struct CompletedSubmissionPredicate
+{
+	bool operator()(const SortedSubmission &submission) const
+	{
+		return !HasPendingTriangles(submission);
+	}
+};
+
 void RetireCompletedSubmissions(std::vector<SortedSubmission> &submissions)
 {
-	for (std::vector<SortedSubmission>::iterator submission =
-		submissions.begin(); submission != submissions.end(); )
-	{
-		if (!HasPendingTriangles(*submission))
-			submission = submissions.erase(submission);
-		else
-			++submission;
-	}
+	// remove_if preserves the relative order of pending submissions and moves
+	// survivors only once; erasing the tail releases completed submissions.
+	const std::vector<SortedSubmission>::iterator pendingEnd =
+		std::remove_if(submissions.begin(), submissions.end(),
+			CompletedSubmissionPredicate());
+	submissions.erase(pendingEnd, submissions.end());
 }
 
 void InsertSortedNode(std::vector<size_t> &order,
@@ -750,3 +756,58 @@ bool NativeSortingRenderer::Empty() const
 
 }
 }
+
+#if defined(RTS_NATIVE_SORTING_TESTS)
+bool NativeSortingRendererTestRetireAllComplete()
+{
+	std::vector<SortedSubmission> submissions(3);
+	for (size_t index = 0; index < submissions.size(); ++index)
+		submissions[index].submittedTriangles.assign(3, 1);
+	RetireCompletedSubmissions(submissions);
+	return submissions.empty();
+}
+
+bool NativeSortingRendererTestRetireMixedPending()
+{
+	std::vector<SortedSubmission> submissions(5);
+	for (size_t index = 0; index < submissions.size(); ++index)
+	{
+		submissions[index].insertionOrder = (index + 1) * 10;
+		submissions[index].state.pipeline.shaderBits =
+			static_cast<unsigned int>((index + 1) * 100);
+		submissions[index].vertices.push_back(
+			static_cast<unsigned char>(index + 1));
+		submissions[index].indices.push_back(
+			static_cast<unsigned short>(index + 11));
+	}
+	submissions[0].submittedTriangles.assign(2, 1);
+	submissions[1].submittedTriangles.push_back(1);
+	submissions[1].submittedTriangles.push_back(0);
+	submissions[2].submittedTriangles.assign(1, 1);
+	submissions[3].submittedTriangles.push_back(0);
+	submissions[3].submittedTriangles.push_back(1);
+	submissions[4].submittedTriangles.assign(2, 1);
+
+	RetireCompletedSubmissions(submissions);
+	if (submissions.size() != 2)
+		return false;
+	return submissions[0].insertionOrder == 20 &&
+		submissions[0].state.pipeline.shaderBits == 200 &&
+		submissions[0].submittedTriangles.size() == 2 &&
+		submissions[0].submittedTriangles[0] == 1 &&
+		submissions[0].submittedTriangles[1] == 0 &&
+		submissions[0].vertices.size() == 1 &&
+		submissions[0].vertices[0] == 2 &&
+		submissions[0].indices.size() == 1 &&
+		submissions[0].indices[0] == 12 &&
+		submissions[1].insertionOrder == 40 &&
+		submissions[1].state.pipeline.shaderBits == 400 &&
+		submissions[1].submittedTriangles.size() == 2 &&
+		submissions[1].submittedTriangles[0] == 0 &&
+		submissions[1].submittedTriangles[1] == 1 &&
+		submissions[1].vertices.size() == 1 &&
+		submissions[1].vertices[0] == 4 &&
+		submissions[1].indices.size() == 1 &&
+		submissions[1].indices[0] == 14;
+}
+#endif

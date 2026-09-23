@@ -12,6 +12,9 @@
 #include <string.h>
 #include <vector>
 
+bool NativeSortingRendererTestRetireAllComplete();
+bool NativeSortingRendererTestRetireMixedPending();
+
 namespace
 {
 
@@ -66,11 +69,23 @@ bool SameBatchGeometry(const NativeDrawPacket &left,
 
 struct CapturedBatch
 {
+	CapturedBatch() : acceptedDrawCount(0) {}
+
 	std::vector<unsigned int> states;
 	std::vector<unsigned int> indexCounts;
 	std::vector<unsigned int> startIndices;
 	std::vector<unsigned int> vertexOffsets;
+	std::vector<unsigned int> vertexStrides;
 	std::vector<unsigned short> indices;
+	std::vector<unsigned char> vertices;
+	unsigned int acceptedDrawCount;
+};
+
+struct CapturedDraw
+{
+	unsigned int state;
+	std::vector<unsigned short> indices;
+	std::vector<unsigned char> referencedVertices;
 };
 
 class RecordingSink : public NativeSortedGeometrySink
@@ -81,12 +96,14 @@ public:
 
 	virtual RenderResult SubmitNativeSortedBatch(
 		const NativeSortedDraw *draws, unsigned int drawCount,
-		const void *, size_t, const void *indexData, size_t indexBytes,
+		const void *vertexData, size_t vertexBytes,
+		const void *indexData, size_t indexBytes,
 		unsigned int *submittedDrawCount)
 	{
 		++calls;
 		if (submittedDrawCount == 0 || draws == 0 || drawCount == 0 ||
-			indexData == 0 || indexBytes % sizeof(unsigned short) != 0)
+			vertexData == 0 || vertexBytes == 0 || indexData == 0 ||
+			indexBytes % sizeof(unsigned short) != 0)
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		CapturedBatch batch;
 		for (unsigned int index = 0; index < drawCount; ++index)
@@ -95,31 +112,33 @@ public:
 			batch.indexCounts.push_back(draws[index].packet.indexCount);
 			batch.startIndices.push_back(draws[index].packet.startIndex);
 			batch.vertexOffsets.push_back(draws[index].packet.vertexOffset);
+			batch.vertexStrides.push_back(draws[index].packet.vertexStride);
 		}
+		const unsigned char *sourceVertices =
+			static_cast<const unsigned char *>(vertexData);
+		batch.vertices.assign(sourceVertices, sourceVertices + vertexBytes);
 		const unsigned short *sourceIndices =
 			static_cast<const unsigned short *>(indexData);
 		batch.indices.assign(sourceIndices,
 			sourceIndices + indexBytes / sizeof(unsigned short));
-		batches.push_back(batch);
 		if (requireHomogeneous)
 		{
 			for (unsigned int index = 1; index < drawCount; ++index)
 			{
 				if (!SameBatchGeometry(draws[0].packet, draws[index].packet))
 				{
+					batches.push_back(batch);
 					*submittedDrawCount = 0;
 					return RENDER_RESULT_INVALID_ARGUMENT;
 				}
 			}
 		}
-		if (failCall != 0 && calls == failCall)
-		{
-			*submittedDrawCount = acceptedOnFailure < drawCount ?
-				acceptedOnFailure : drawCount;
-			return RENDER_RESULT_FAILED;
-		}
-		*submittedDrawCount = drawCount;
-		return RENDER_RESULT_OK;
+		const bool fail = failCall != 0 && calls == failCall;
+		batch.acceptedDrawCount = fail && acceptedOnFailure < drawCount ?
+			acceptedOnFailure : drawCount;
+		batches.push_back(batch);
+		*submittedDrawCount = batch.acceptedDrawCount;
+		return fail ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
 	}
 
 	unsigned int calls;
@@ -128,6 +147,69 @@ public:
 	bool requireHomogeneous;
 	std::vector<CapturedBatch> batches;
 };
+
+bool CaptureAcceptedDrawStream(const RecordingSink &sink,
+	std::vector<CapturedDraw> &draws)
+{
+	draws.clear();
+	for (size_t batchIndex = 0; batchIndex < sink.batches.size(); ++batchIndex)
+	{
+		const CapturedBatch &batch = sink.batches[batchIndex];
+		if (batch.acceptedDrawCount > batch.states.size() ||
+			batch.states.size() != batch.indexCounts.size() ||
+			batch.states.size() != batch.startIndices.size() ||
+			batch.states.size() != batch.vertexOffsets.size() ||
+			batch.states.size() != batch.vertexStrides.size())
+			return false;
+
+		for (unsigned int drawIndex = 0;
+			drawIndex < batch.acceptedDrawCount; ++drawIndex)
+		{
+			const unsigned int startIndex = batch.startIndices[drawIndex];
+			const unsigned int indexCount = batch.indexCounts[drawIndex];
+			const unsigned int vertexOffset = batch.vertexOffsets[drawIndex];
+			const unsigned int stride = batch.vertexStrides[drawIndex];
+			if (stride == 0 || startIndex > batch.indices.size() ||
+				indexCount > batch.indices.size() - startIndex)
+				return false;
+
+			CapturedDraw captured;
+			captured.state = batch.states[drawIndex];
+			for (unsigned int index = 0; index < indexCount; ++index)
+			{
+				const unsigned short vertexIndex =
+					batch.indices[startIndex + index];
+				const size_t vertexByteOffset = static_cast<size_t>(vertexOffset) +
+					static_cast<size_t>(vertexIndex) * stride;
+				if (vertexByteOffset > batch.vertices.size() ||
+					stride > batch.vertices.size() - vertexByteOffset)
+					return false;
+				captured.indices.push_back(vertexIndex);
+				captured.referencedVertices.insert(
+					captured.referencedVertices.end(),
+					batch.vertices.begin() + vertexByteOffset,
+					batch.vertices.begin() + vertexByteOffset + stride);
+			}
+			draws.push_back(captured);
+		}
+	}
+	return true;
+}
+
+bool SameAcceptedDrawStream(const std::vector<CapturedDraw> &left,
+	const std::vector<CapturedDraw> &right)
+{
+	if (left.size() != right.size())
+		return false;
+	for (size_t index = 0; index < left.size(); ++index)
+	{
+		if (left[index].state != right[index].state ||
+			left[index].indices != right[index].indices ||
+			left[index].referencedVertices != right[index].referencedVertices)
+			return false;
+	}
+	return true;
+}
 
 NativeDrawPacket MakePacket(unsigned int vertexCount, unsigned int indexCount)
 {
@@ -368,6 +450,72 @@ void TestFailureAfterFirstChunkRetainsOnlyPendingGeometry()
 	CHECK(renderer.Empty());
 }
 
+void TestPartialDrawFailureRetryMatchesOneShotOutput()
+{
+	const unsigned short indices[] = {0, 1, 2};
+	TestVertex firstVertices[3] = {};
+	TestVertex secondVertices[3] = {};
+	for (unsigned int index = 0; index < 3; ++index)
+	{
+		firstVertices[index].x = static_cast<float>(index + 1);
+		firstVertices[index].y = static_cast<float>(index + 4);
+		firstVertices[index].z = 3.0f;
+		firstVertices[index].color = 0x10203040U + index;
+		secondVertices[index].x = static_cast<float>(index + 11);
+		secondVertices[index].y = static_cast<float>(index + 14);
+		secondVertices[index].z = 1.0f;
+		secondVertices[index].color = 0x50607080U + index;
+	}
+
+	NativeSortingRenderer baselineRenderer;
+	RecordingSink baselineSink;
+	LegacyLogicalState firstState;
+	firstState.pipeline.shaderBits = 101;
+	NativeDrawPacket packet = MakePacket(3, 3);
+	CHECK(baselineRenderer.Queue(firstState, packet, firstVertices,
+		sizeof(firstVertices), indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+	LegacyLogicalState secondState;
+	secondState.pipeline.shaderBits = 202;
+	CHECK(baselineRenderer.Queue(secondState, packet, secondVertices,
+		sizeof(secondVertices), indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+	CHECK(baselineRenderer.Flush(baselineSink) == RENDER_RESULT_OK);
+	CHECK(baselineRenderer.Empty());
+	CHECK(baselineSink.calls == 1);
+	CHECK(baselineSink.batches.size() == 1);
+	CHECK(baselineSink.batches.size() == 1 &&
+		baselineSink.batches[0].acceptedDrawCount == 2);
+
+	NativeSortingRenderer retryRenderer;
+	RecordingSink retrySink;
+	retrySink.failCall = 1;
+	retrySink.acceptedOnFailure = 1;
+	CHECK(retryRenderer.Queue(firstState, packet, firstVertices,
+		sizeof(firstVertices), indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+	CHECK(retryRenderer.Queue(secondState, packet, secondVertices,
+		sizeof(secondVertices), indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+	CHECK(retryRenderer.Flush(retrySink) == RENDER_RESULT_FAILED);
+	CHECK(!retryRenderer.Empty());
+	CHECK(retrySink.calls == 1);
+	CHECK(retrySink.batches.size() == 1 &&
+		retrySink.batches[0].acceptedDrawCount == 1);
+
+	retrySink.failCall = 0;
+	CHECK(retryRenderer.Flush(retrySink) == RENDER_RESULT_OK);
+	CHECK(retryRenderer.Empty());
+	CHECK(retrySink.calls == 2);
+	CHECK(retrySink.batches.size() == 2);
+	CHECK(retrySink.batches.size() == 2 &&
+		retrySink.batches[1].acceptedDrawCount == 1);
+
+	std::vector<CapturedDraw> baselineDraws;
+	std::vector<CapturedDraw> retriedDraws;
+	CHECK(CaptureAcceptedDrawStream(baselineSink, baselineDraws));
+	CHECK(CaptureAcceptedDrawStream(retrySink, retriedDraws));
+	CHECK(baselineDraws.size() == 2);
+	CHECK(retriedDraws.size() == 2);
+	CHECK(SameAcceptedDrawStream(baselineDraws, retriedDraws));
+}
+
 }
 
 int main()
@@ -379,5 +527,8 @@ int main()
 	TestPerTriangleDepthOrder();
 	TestMixedGeometryPreservesSortedOrder();
 	TestFailureAfterFirstChunkRetainsOnlyPendingGeometry();
+	TestPartialDrawFailureRetryMatchesOneShotOutput();
+	CHECK(NativeSortingRendererTestRetireAllComplete());
+	CHECK(NativeSortingRendererTestRetireMixedPending());
 	return failures == 0 ? 0 : 1;
 }
