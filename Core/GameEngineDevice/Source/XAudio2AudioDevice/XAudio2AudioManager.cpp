@@ -997,6 +997,14 @@ Bool XAudio2AudioManager::submitPhase(PlayingAudio &playing)
 		++playing.voiceSequence;
 		playing.pendingPcm = {};
 		playing.pendingPcmReady = FALSE;
+		// Accepted PCM is owned by the voice/owner queue. A finished sound
+		// effect no longer needs to pin its cached source while it plays.
+		if (playing.pcmStream != nullptr
+			&& playing.phaseSubmittedFrames == playing.phaseTotalFrames
+			&& playing.event != nullptr && playing.event->getAudioEventInfo() != nullptr
+			&& playing.event->getAudioEventInfo()->m_soundType == AT_SoundEffect) {
+			playing.pcmStream.reset();
+		}
 		m_service->setVoiceVolume(playing.voice, outputVolume(playing));
 	};
 	AsciiString fileName;
