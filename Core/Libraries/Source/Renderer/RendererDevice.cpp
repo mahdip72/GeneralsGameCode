@@ -2,6 +2,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <atomic>
 #endif
 #include <ctype.h>
 #include <limits.h>
@@ -72,6 +74,38 @@ unsigned long Current_Render_Thread_Id()
 #else
 	return 1;
 #endif
+}
+
+// A raw GpuHandle is exposed by resource tables and may outlive its backend.
+// Never reuse its generation in this process, even across allocator instances.
+unsigned int Next_Gpu_Handle_Generation()
+{
+#ifdef _WIN32
+	static volatile LONG lastGeneration = 0;
+	LONG current = InterlockedCompareExchange(&lastGeneration, 0, 0);
+	while (current < LONG_MAX)
+	{
+		const LONG next = current + 1;
+		const LONG observed = InterlockedCompareExchange(&lastGeneration,
+			next, current);
+		if (observed == current)
+		{
+			return static_cast<unsigned int>(next);
+		}
+		current = observed;
+	}
+#else
+	static std::atomic<unsigned int> lastGeneration(0);
+	unsigned int current = lastGeneration.load();
+	while (current < static_cast<unsigned int>(LONG_MAX))
+	{
+		if (lastGeneration.compare_exchange_weak(current, current + 1))
+		{
+			return current + 1;
+		}
+	}
+#endif
+	return 0;
 }
 }
 
@@ -1178,7 +1212,7 @@ bool GpuHandle::operator!=(const GpuHandle &other) const
 struct GpuHandleAllocator::Impl
 {
 	explicit Impl(unsigned int requestedCapacity) :
-		generations(requestedCapacity, 1), live(requestedCapacity, false),
+		generations(requestedCapacity, 0), live(requestedCapacity, false),
 		liveCount(0)
 	{
 		freeSlots.reserve(requestedCapacity);
@@ -1218,11 +1252,17 @@ GpuHandle GpuHandleAllocator::allocate()
 	{
 		return GpuHandle();
 	}
+	const unsigned int generation = Next_Gpu_Handle_Generation();
+	if (generation == 0)
+	{
+		return GpuHandle();
+	}
 	const unsigned int index = m_impl->freeSlots.back();
 	m_impl->freeSlots.pop_back();
+	m_impl->generations[index] = generation;
 	m_impl->live[index] = true;
 	++m_impl->liveCount;
-	return GpuHandle(index, m_impl->generations[index]);
+	return GpuHandle(index, generation);
 }
 
 bool GpuHandleAllocator::release(GpuHandle handle)
@@ -1234,11 +1274,6 @@ bool GpuHandleAllocator::release(GpuHandle handle)
 	const unsigned int index = handle.index();
 	m_impl->live[index] = false;
 	--m_impl->liveCount;
-	++m_impl->generations[index];
-	if (m_impl->generations[index] == 0)
-	{
-		m_impl->generations[index] = 1;
-	}
 	m_impl->freeSlots.push_back(index);
 	return true;
 }

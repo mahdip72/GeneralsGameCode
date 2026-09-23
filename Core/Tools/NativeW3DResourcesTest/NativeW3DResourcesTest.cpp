@@ -1631,11 +1631,79 @@ int TestSplitPacketResourceFenceReportsOwnerFailure()
 	delete device;
 	return result;
 }
+
+int TestRawHandlesAcrossFreshBackends()
+{
+	int result = 0;
+	NativeW3DResources resources(2);
+	FakeRenderDevice firstDevice;
+	NativeW3DResourceHost firstHost(2);
+	BufferDescriptor bufferDescriptor;
+	bufferDescriptor.byteCount = sizeof(unsigned int);
+	bufferDescriptor.stride = sizeof(unsigned int);
+	bufferDescriptor.binding = RENDER_BUFFER_VERTEX;
+	bufferDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	TextureDescriptor textureDescriptor;
+	textureDescriptor.width = 1;
+	textureDescriptor.height = 1;
+	textureDescriptor.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+	textureDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+	textureDescriptor.usage = RENDER_USAGE_DEFAULT;
+	const unsigned int firstValue = 7;
+	GpuHandle staleBuffer;
+	GpuHandle staleTexture;
+	result |= Check(firstHost.Attach(&firstDevice,
+		firstDevice.immediateContext()) == RENDER_RESULT_OK &&
+		resources.BindHost(&firstHost) == RENDER_RESULT_OK &&
+		resources.CreateBuffer(bufferDescriptor, &firstValue,
+			sizeof(firstValue), &staleBuffer) == RENDER_RESULT_OK &&
+		resources.CreateTexture(textureDescriptor, 0, 0,
+			&staleTexture) == RENDER_RESULT_OK,
+		"first backend publishes raw buffer and texture handles");
+	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+		firstHost.Detach() == RENDER_RESULT_OK &&
+		firstDevice.LiveCount() == 0,
+		"first backend drains before resource table rebind");
+
+	FakeRenderDevice secondDevice;
+	NativeW3DResourceHost secondHost(2);
+	const unsigned int secondValue = 19;
+	GpuHandle currentBuffer;
+	GpuHandle currentTexture;
+	result |= Check(secondHost.Attach(&secondDevice,
+		secondDevice.immediateContext()) == RENDER_RESULT_OK &&
+		resources.BindHost(&secondHost) == RENDER_RESULT_OK &&
+		resources.CreateBuffer(bufferDescriptor, &secondValue,
+			sizeof(secondValue), &currentBuffer) == RENDER_RESULT_OK &&
+		resources.CreateTexture(textureDescriptor, 0, 0,
+			&currentTexture) == RENDER_RESULT_OK,
+		"same resource table publishes handles from a fresh backend");
+	result |= Check(staleBuffer.index() == currentBuffer.index() &&
+		staleTexture.index() == currentTexture.index() &&
+		staleBuffer != currentBuffer && staleTexture != currentTexture &&
+		!resources.IsValid(staleBuffer) &&
+		!resources.IsValid(staleTexture) &&
+		!resources.Destroy(staleBuffer) && !resources.Destroy(staleTexture) &&
+		resources.UpdateBuffer(staleBuffer, &firstValue,
+			sizeof(firstValue), 0, RENDER_BUFFER_UPDATE_PRESERVE) ==
+			RENDER_RESULT_INVALID_ARGUMENT &&
+		secondDevice.BufferEquals(currentBuffer, &secondValue,
+			sizeof(secondValue)) &&
+		resources.IsValid(currentBuffer) && resources.IsValid(currentTexture) &&
+		secondDevice.LiveCount() == 2,
+		"stale raw handles cannot inspect or mutate same-index resources after rebind");
+	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+		secondHost.Detach() == RENDER_RESULT_OK &&
+		secondDevice.LiveCount() == 0,
+		"fresh backend resources drain normally");
+	return result;
+}
 }
 
 int main()
 {
 	int result = 0;
+	result |= TestRawHandlesAcrossFreshBackends();
 	NativeW3DResources unbound(2);
 	GpuHandle invalid;
 	BufferDescriptor emptyDescriptor;

@@ -752,6 +752,16 @@ int testGenerationSafeHandles()
 	result |= check(allocator.release(second) && allocator.release(replacement) &&
 		allocator.liveCount() == 0,
 		"every live handle can be drained deterministically");
+	rts::render::GpuHandleAllocator freshAllocator(1);
+	const rts::render::GpuHandle fresh = freshAllocator.allocate();
+	result |= check(fresh.isValid() && fresh.index() == first.index() &&
+		fresh != first && fresh != replacement &&
+		!freshAllocator.isLive(first) &&
+		!freshAllocator.isLive(replacement) &&
+		!freshAllocator.release(first) && freshAllocator.isLive(fresh),
+		"fresh allocator cannot accept stale same-index handles");
+	result |= check(freshAllocator.release(fresh),
+		"fresh allocator can release its own handle");
 	return result;
 }
 
