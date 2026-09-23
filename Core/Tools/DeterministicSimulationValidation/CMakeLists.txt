@@ -146,6 +146,12 @@ if(WIN32)
             -ScratchRoot "${_stage5_validation_test_scratch_root}")
     set_tests_properties(core_stage5_combined_host_runner_receipt_tests
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 120)
+    add_test(NAME core_stage5_acceptance_corpus_reuse_tests
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5AcceptanceCorpusReuse.Tests.ps1"
+            -ScratchRoot "${_stage5_validation_test_scratch_root}/acceptance-corpus-reuse")
+    set_tests_properties(core_stage5_acceptance_corpus_reuse_tests
+        PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
     add_test(NAME core_stage5_development_readiness_bundle_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5DevelopmentReadinessBundle.Tests.ps1"
@@ -345,6 +351,7 @@ if(WIN32)
         core_stage5_lockstep_numeric_type_tests
         core_stage5_performance_qualification_data_tests
         core_stage5_combined_host_runner_receipt_tests
+        core_stage5_acceptance_corpus_reuse_tests
         core_stage5_development_readiness_bundle_tests
         core_stage5_installed_lockstep_v2_session_tests
         core_stage5_suspended_process_powershell_tests

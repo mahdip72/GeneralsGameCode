@@ -105,6 +105,52 @@ function Get-Sha256Bytes {
     finally { $sha.Dispose() }
 }
 
+function Add-Stage5AcceptanceFileSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][Collections.IDictionary]$Snapshot,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if ($Snapshot.Contains($fullPath)) { return }
+    if (-not [IO.File]::Exists($fullPath)) {
+        throw "Acceptance mutation snapshot file is missing: $fullPath"
+    }
+    $item = Get-Item -LiteralPath $fullPath -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Acceptance mutation snapshot file is a reparse point: $fullPath"
+    }
+    $Snapshot[$fullPath] = [IO.File]::ReadAllBytes($fullPath)
+}
+
+function Restore-Stage5AcceptanceFileSnapshot {
+    param([Parameter(Mandatory = $true)][Collections.IDictionary]$Snapshot)
+    foreach ($path in @($Snapshot.Keys)) {
+        $fullPath = [string]$path
+        $item = Get-Item -LiteralPath $fullPath -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Acceptance mutation restore target is a reparse point: $fullPath"
+        }
+        $originalBytes = [byte[]]$Snapshot[$path]
+        [IO.File]::WriteAllBytes($fullPath, $originalBytes)
+        $restoredBytes = [IO.File]::ReadAllBytes($fullPath)
+        if ([Convert]::ToBase64String($restoredBytes) -cne
+            [Convert]::ToBase64String($originalBytes)) {
+            throw "Acceptance mutation fixture did not restore byte-identically: $fullPath"
+        }
+    }
+}
+
+function Invoke-Stage5AcceptanceMutationCase {
+    param([Parameter(Mandatory = $true)][scriptblock]$Action)
+    $snapshot = @{}
+    try {
+        & $Action $snapshot
+    }
+    finally {
+        Restore-Stage5AcceptanceFileSnapshot $snapshot
+    }
+}
+
 function Read-TestJson {
     param([Parameter(Mandatory = $true)][string]$Path)
     $json = Get-Content -LiteralPath $Path -Raw
@@ -9532,6 +9578,7 @@ try {
     function Invoke-CombinedHostProducerTestCase {
         param(
             [string]$CaseRoot,
+            [string]$CaseName,
             [string]$ExpectedGeneralsHash = $artifactTestHashes['generals-executable'],
             [string]$ExpectedZeroHourHash = $artifactTestHashes['zerohour-executable']
         )
@@ -9551,7 +9598,8 @@ try {
                 'reviewed\receipt.json') `
             -ZeroHourReviewedFixtureReceiptSha256 (Get-Sha256 (Join-Path `
                 $caseZeroHourRoot 'reviewed\receipt.json')) `
-            -OutputPath (Join-Path $CaseRoot 'combined-results.json') `
+            -OutputPath (Join-Path (Join-Path $CaseRoot `
+                ("combined-producer-output-{0}" -f $CaseName)) 'combined-results.json') `
             -ExpectedSourceCommit $sourceCommit `
             -ExpectedArtifactSetSha256 $artifactSetHash `
             -ExpectedGeneralsExecutableSha256 $ExpectedGeneralsHash `
@@ -9561,7 +9609,7 @@ try {
     }
     function New-CombinedHostProducerTestCase {
         param([string]$Name)
-        $caseRoot = Join-Path $acceptanceRoot "combined-producer-negative-$Name"
+        $caseRoot = Join-Path $acceptanceRoot "combined-producer-corpus-$Name"
         $caseSourceRoot = Join-Path $caseRoot 'combined-source-receipts'
         New-Item -ItemType Directory -Path $caseSourceRoot -Force | Out-Null
         foreach ($template in @(
@@ -9628,79 +9676,99 @@ try {
         }
         return $caseRoot
     }
-    $combinedForgedRoot = New-CombinedHostProducerTestCase 'forged'
-    $combinedForgedSource = Join-Path $combinedForgedRoot `
+    # Reuse one immutable relocated 253-child corpus across all producer cases.
+    # Each case snapshots and restores only the small JSON documents it mutates,
+    # preserving the complete producer path while avoiding repeated tree copies.
+    $combinedProducerRoot = New-CombinedHostProducerTestCase 'shared'
+    $combinedForgedSource = Join-Path $combinedProducerRoot `
         'combined-source-receipts\Generals\validation-results-receipt.json'
-    $combinedForgedDocument = Get-Content -LiteralPath $combinedForgedSource -Raw |
-        ConvertFrom-Json
-    $combinedForgedDocument.producer = 'installed-runtime-validation-plan-v2'
-    Write-JsonDocument $combinedForgedSource $combinedForgedDocument
-    Assert-Throws {
-        Invoke-CombinedHostProducerTestCase $combinedForgedRoot
-    } 'unregistered producer|allowlisted host-runner v2' `
-        'combined host producer rejects a forged source producer identity'
+    Invoke-Stage5AcceptanceMutationCase {
+        param($snapshot)
+        Add-Stage5AcceptanceFileSnapshot $snapshot $combinedForgedSource
+        $combinedForgedDocument = Get-Content -LiteralPath $combinedForgedSource -Raw |
+            ConvertFrom-Json
+        $combinedForgedDocument.producer = 'installed-runtime-validation-plan-v2'
+        Write-JsonDocument $combinedForgedSource $combinedForgedDocument
+        Assert-Throws {
+            Invoke-CombinedHostProducerTestCase $combinedProducerRoot 'forged'
+        } 'unregistered producer|allowlisted host-runner v2' `
+            'combined host producer rejects a forged source producer identity'
+    }
 
-    $combinedSingleTitleRoot = New-CombinedHostProducerTestCase 'single-title'
-    $combinedSingleTitleSource = Join-Path $combinedSingleTitleRoot `
+    $combinedSingleTitleSource = Join-Path $combinedProducerRoot `
         'combined-source-receipts\ZeroHour\validation-results-receipt.json'
-    $combinedSingleTitleDocument = Get-Content -LiteralPath $combinedSingleTitleSource -Raw |
-        ConvertFrom-Json
-    $combinedSingleTitleDocument.title = 'Generals'
-    Write-JsonDocument $combinedSingleTitleSource $combinedSingleTitleDocument
-    Assert-Throws {
-        Invoke-CombinedHostProducerTestCase $combinedSingleTitleRoot
-    } 'title scope is substituted|expected ''ZeroHour''' `
-        'combined host producer rejects a source receipt that covers the wrong title'
+    Invoke-Stage5AcceptanceMutationCase {
+        param($snapshot)
+        Add-Stage5AcceptanceFileSnapshot $snapshot $combinedSingleTitleSource
+        $combinedSingleTitleDocument = Get-Content -LiteralPath $combinedSingleTitleSource -Raw |
+            ConvertFrom-Json
+        $combinedSingleTitleDocument.title = 'Generals'
+        Write-JsonDocument $combinedSingleTitleSource $combinedSingleTitleDocument
+        Assert-Throws {
+            Invoke-CombinedHostProducerTestCase $combinedProducerRoot 'single-title'
+        } 'title scope is substituted|expected ''ZeroHour''' `
+            'combined host producer rejects a source receipt that covers the wrong title'
+    }
 
-    $combinedStaleRoot = New-CombinedHostProducerTestCase 'stale'
-    $combinedStaleSource = Join-Path $combinedStaleRoot `
+    $combinedStaleSource = Join-Path $combinedProducerRoot `
         'combined-source-receipts\Generals\validation-results-receipt.json'
-    $combinedStaleDocument = Get-Content -LiteralPath $combinedStaleSource -Raw |
-        ConvertFrom-Json
-    $combinedStaleDocument.sourceCommit = 'B' * 40
-    Write-JsonDocument $combinedStaleSource $combinedStaleDocument
-    Assert-Throws {
-        Invoke-CombinedHostProducerTestCase $combinedStaleRoot
-    } 'stale or does not match the final acceptance commit' `
-        'combined host producer rejects a source receipt from a stale commit'
+    Invoke-Stage5AcceptanceMutationCase {
+        param($snapshot)
+        Add-Stage5AcceptanceFileSnapshot $snapshot $combinedStaleSource
+        $combinedStaleDocument = Get-Content -LiteralPath $combinedStaleSource -Raw |
+            ConvertFrom-Json
+        $combinedStaleDocument.sourceCommit = 'B' * 40
+        Write-JsonDocument $combinedStaleSource $combinedStaleDocument
+        Assert-Throws {
+            Invoke-CombinedHostProducerTestCase $combinedProducerRoot 'stale'
+        } 'stale or does not match the final acceptance commit' `
+            'combined host producer rejects a source receipt from a stale commit'
+    }
 
-    $combinedHashRoot = New-CombinedHostProducerTestCase 'executable-hash'
     Assert-Throws {
-        Invoke-CombinedHostProducerTestCase $combinedHashRoot ('0' * 64)
+        Invoke-CombinedHostProducerTestCase $combinedProducerRoot 'executable-hash' ('0' * 64)
     } 'executable SHA-256 binding' `
         'combined host producer rejects a source receipt with a substituted executable hash'
 
-    $combinedNonceRoot = New-CombinedHostProducerTestCase 'duplicate-nonce'
-    $combinedNonceGeneralsSource = Join-Path $combinedNonceRoot `
+    $combinedNonceGeneralsSource = Join-Path $combinedProducerRoot `
         'combined-source-receipts\Generals\validation-results-receipt.json'
-    $combinedNonceZeroHourSource = Join-Path $combinedNonceRoot `
+    $combinedNonceZeroHourSource = Join-Path $combinedProducerRoot `
         'combined-source-receipts\ZeroHour\validation-results-receipt.json'
-    $combinedNonceGeneralsDocument = Get-Content -LiteralPath $combinedNonceGeneralsSource -Raw |
+    $combinedNonceZeroHourOriginal = Get-Content -LiteralPath $combinedNonceZeroHourSource -Raw |
         ConvertFrom-Json
-    $combinedNonceZeroHourDocument = Get-Content -LiteralPath $combinedNonceZeroHourSource -Raw |
-        ConvertFrom-Json
-    $combinedNonceZeroHourDocument.runNonce = $combinedNonceGeneralsDocument.runNonce
-    $combinedNonceZeroHourDocument.provenance.children[0].runNonce =
-        $combinedNonceGeneralsDocument.runNonce
-    $combinedNonceNativeReference =
-        $combinedNonceZeroHourDocument.provenance.children[0].nativeReceipt
+    $combinedNonceNativeReference = $combinedNonceZeroHourOriginal.provenance.children[0].nativeReceipt
     $combinedNonceNativePath = Join-Path (Split-Path -Parent $combinedNonceZeroHourSource) `
         ([string]$combinedNonceNativeReference.path)
-    $combinedNonceNativeDocument = Get-Content -LiteralPath $combinedNonceNativePath -Raw |
-        ConvertFrom-Json
-    $combinedNonceNativeDocument.runNonce = $combinedNonceGeneralsDocument.runNonce
-    Write-JsonDocument $combinedNonceNativePath $combinedNonceNativeDocument
-    $combinedNonceNativeReference.runNonce = $combinedNonceGeneralsDocument.runNonce
-    $combinedNonceNativeReference.sha256 = Get-Sha256 $combinedNonceNativePath
-    Write-JsonDocument $combinedNonceZeroHourSource $combinedNonceZeroHourDocument
-    Assert-Throws {
-        Invoke-CombinedHostProducerTestCase $combinedNonceRoot
-    } 'replayed.*runNonce|distinct run nonces|wrapper nonce distinct' `
-        'combined host producer rejects reused source run nonces'
+    Invoke-Stage5AcceptanceMutationCase {
+        param($snapshot)
+        Add-Stage5AcceptanceFileSnapshot $snapshot $combinedNonceZeroHourSource
+        Add-Stage5AcceptanceFileSnapshot $snapshot $combinedNonceNativePath
+        $combinedNonceGeneralsDocument = Get-Content -LiteralPath $combinedNonceGeneralsSource -Raw |
+            ConvertFrom-Json
+        $combinedNonceZeroHourDocument = Get-Content -LiteralPath $combinedNonceZeroHourSource -Raw |
+            ConvertFrom-Json
+        $combinedNonceZeroHourDocument.runNonce = $combinedNonceGeneralsDocument.runNonce
+        $combinedNonceZeroHourDocument.provenance.children[0].runNonce =
+            $combinedNonceGeneralsDocument.runNonce
+        $combinedNonceNativeReference =
+            $combinedNonceZeroHourDocument.provenance.children[0].nativeReceipt
+        $combinedNonceNativeDocument = Get-Content -LiteralPath $combinedNonceNativePath -Raw |
+            ConvertFrom-Json
+        $combinedNonceNativeDocument.runNonce = $combinedNonceGeneralsDocument.runNonce
+        Write-JsonDocument $combinedNonceNativePath $combinedNonceNativeDocument
+        $combinedNonceNativeReference.runNonce = $combinedNonceGeneralsDocument.runNonce
+        $combinedNonceNativeReference.sha256 = Get-Sha256 $combinedNonceNativePath
+        Write-JsonDocument $combinedNonceZeroHourSource $combinedNonceZeroHourDocument
+        Assert-Throws {
+            Invoke-CombinedHostProducerTestCase $combinedProducerRoot 'duplicate-nonce'
+        } 'replayed.*runNonce|distinct run nonces|wrapper nonce distinct' `
+            'combined host producer rejects reused source run nonces'
+    }
 
     function Set-CombinedNativeRawPathFixture {
         param(
             [string]$CaseRoot,
+            [Parameter(Mandatory = $true)][Collections.IDictionary]$Snapshot,
             [ValidateSet('absolute', 'upload-rebase', 'traversal', 'ads', 'drive-relative')]
             [string]$Mode,
             [ValidateSet('Generals', 'ZeroHour', 'Both')][string]$Title = 'Both'
@@ -9756,6 +9824,7 @@ try {
                 $nativeDocument.rawLogs[0].path = 'C:relative.raw.log'
                 $nativeDocument.rawEvidence.rawLogPath = 'C:relative.raw.log'
             }
+            Add-Stage5AcceptanceFileSnapshot $Snapshot $nativePath
             Write-JsonDocument $nativePath $nativeDocument
             $nativeHash = Get-Sha256 $nativePath
             $nativeReference.sha256 = $nativeHash
@@ -9774,6 +9843,7 @@ try {
                 }
             }
             $resultsPath = Join-Path $receiptDirectory 'validation-results.json'
+            Add-Stage5AcceptanceFileSnapshot $Snapshot $resultsPath
             $resultsDocument = Get-Content -LiteralPath $resultsPath -Raw | ConvertFrom-Json
             foreach ($result in @($resultsDocument)) {
                 if ($null -ne $result.executionProvenance -and
@@ -9795,7 +9865,9 @@ try {
                 if ($null -ne $receiptDocument.details.PSObject.Properties['resultsSha256']) {
                     $receiptDocument.details.resultsSha256 = $resultsHash
                 }
-                Write-JsonDocument (Join-Path $receiptDirectory $receiptName) $receiptDocument
+                $receiptPath = Join-Path $receiptDirectory $receiptName
+                Add-Stage5AcceptanceFileSnapshot $Snapshot $receiptPath
+                Write-JsonDocument $receiptPath $receiptDocument
             }
         }
     }
@@ -9804,52 +9876,61 @@ try {
     # Repeating the 253-child producer once per mode duplicates the expensive
     # immutable-read and staging matrix without covering a distinct code path;
     # the focused relocation suite retains exhaustive per-mode negatives.
-    $combinedPathModesRoot = New-CombinedHostProducerTestCase 'native-path-modes'
-    Set-CombinedNativeRawPathFixture $combinedPathModesRoot 'absolute' 'Generals'
-    Set-CombinedNativeRawPathFixture $combinedPathModesRoot 'upload-rebase' 'ZeroHour'
-    try {
-        Invoke-CombinedHostProducerTestCase $combinedPathModesRoot
-        $combinedPathModesDocument = Get-Content -LiteralPath `
-            (Join-Path $combinedPathModesRoot 'combined-results.json') -Raw |
-            ConvertFrom-Json
-        $combinedPathModeChildren = @($combinedPathModesDocument.provenance.children)
-        Assert-True ($combinedPathModeChildren.Count -eq 2 -and
-            @($combinedPathModeChildren | Where-Object {
-                [string]$_.title -ceq 'Generals' -and
-                @($_.nativeRawBindings).Count -eq 2 -and
-                @($_.nativeRawBindings | Where-Object {
-                    [string]$_.sourcePath -match '^[A-Za-z]:[\\/]' -and
-                    [string]$_.sourcePath -notmatch '^H:\\uploaded-stage5\\' -and
-                    [string]$_.path -notmatch '^[A-Za-z]:|^[\\/]' -and
-                    [string]$_.path -notmatch '(^|[\\/])\.\.([\\/]|$)'
-                }).Count -eq 2 -and
-                [string]$_.nativeReceiptSourcePath -match '^[A-Za-z]:[\\/]'
-            }).Count -eq 1 -and
-            @($combinedPathModeChildren | Where-Object {
-                [string]$_.title -ceq 'ZeroHour' -and
-                [string]$_.nativeReceiptSourcePath -match '^H:\\uploaded-stage5\\' -and
-                @($_.nativeRawBindings | Where-Object {
-                    [string]$_.sourcePath -match '^H:\\uploaded-stage5\\' -and
-                    [string]$_.path -notmatch '^[A-Za-z]:|^[\\/]' -and
-                    [string]$_.path -notmatch '(^|[\\/])\.\.([\\/]|$)'
-                }).Count -eq 2
-            }).Count -eq 1) `
-            'combined producer stages absolute and uploaded native provenance in one complete title-scoped corpus'
-    }
-    catch {
-        Assert-True $false "combined host producer accepts mixed absolute and uploaded native paths: $($_.Exception.Message)"
+    Invoke-Stage5AcceptanceMutationCase {
+        param($snapshot)
+        Set-CombinedNativeRawPathFixture $combinedProducerRoot $snapshot `
+            'absolute' 'Generals'
+        Set-CombinedNativeRawPathFixture $combinedProducerRoot $snapshot `
+            'upload-rebase' 'ZeroHour'
+        try {
+            Invoke-CombinedHostProducerTestCase $combinedProducerRoot 'native-path-modes'
+            $combinedPathModesDocument = Get-Content -LiteralPath `
+                (Join-Path $combinedProducerRoot `
+                    'combined-producer-output-native-path-modes\combined-results.json') -Raw |
+                ConvertFrom-Json
+            $combinedPathModeChildren = @($combinedPathModesDocument.provenance.children)
+            Assert-True ($combinedPathModeChildren.Count -eq 2 -and
+                @($combinedPathModeChildren | Where-Object {
+                    [string]$_.title -ceq 'Generals' -and
+                    @($_.nativeRawBindings).Count -eq 2 -and
+                    @($_.nativeRawBindings | Where-Object {
+                        [string]$_.sourcePath -match '^[A-Za-z]:[\\/]' -and
+                        [string]$_.sourcePath -notmatch '^H:\\uploaded-stage5\\' -and
+                        [string]$_.path -notmatch '^[A-Za-z]:|^[\\/]' -and
+                        [string]$_.path -notmatch '(^|[\\/])\.\.([\\/]|$)'
+                    }).Count -eq 2 -and
+                    [string]$_.nativeReceiptSourcePath -match '^[A-Za-z]:[\\/]'
+                }).Count -eq 1 -and
+                @($combinedPathModeChildren | Where-Object {
+                    [string]$_.title -ceq 'ZeroHour' -and
+                    [string]$_.nativeReceiptSourcePath -match '^H:\\uploaded-stage5\\' -and
+                    @($_.nativeRawBindings | Where-Object {
+                        [string]$_.sourcePath -match '^H:\\uploaded-stage5\\' -and
+                        [string]$_.path -notmatch '^[A-Za-z]:|^[\\/]' -and
+                        [string]$_.path -notmatch '(^|[\\/])\.\.([\\/]|$)'
+                    }).Count -eq 2
+                }).Count -eq 1) `
+                'combined producer stages absolute and uploaded native provenance in one complete title-scoped corpus'
+        }
+        catch {
+            Assert-True $false "combined host producer accepts mixed absolute and uploaded native paths: $($_.Exception.Message)"
+        }
     }
     foreach ($pathMode in @(
         @{ mode = 'traversal'; pattern = 'parent traversal' },
         @{ mode = 'ads'; pattern = 'alternate data stream|ADS' },
         @{ mode = 'drive-relative'; pattern = 'drive-relative' }
     )) {
-        $unsafeRoot = New-CombinedHostProducerTestCase "native-$($pathMode.mode)"
-        Set-CombinedNativeRawPathFixture $unsafeRoot $pathMode.mode
-        Assert-Throws {
-            Invoke-CombinedHostProducerTestCase $unsafeRoot
-        } $pathMode.pattern `
-            "combined host producer rejects native $($pathMode.mode) raw-log paths"
+        Invoke-Stage5AcceptanceMutationCase {
+            param($snapshot)
+            Set-CombinedNativeRawPathFixture $combinedProducerRoot $snapshot `
+                $pathMode.mode
+            Assert-Throws {
+                Invoke-CombinedHostProducerTestCase $combinedProducerRoot `
+                    "native-$($pathMode.mode)"
+            } $pathMode.pattern `
+                "combined host producer rejects native $($pathMode.mode) raw-log paths"
+        }
     }
 
     $deterministicKind = 'deterministic-runtime'
