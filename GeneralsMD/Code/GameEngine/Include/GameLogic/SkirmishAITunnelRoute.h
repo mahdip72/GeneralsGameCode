@@ -229,18 +229,18 @@ namespace SkirmishAITunnelRoute
 			!generatedTargetIDs || !exhaustedTargetIDs ||
 			FindFreeGeneratedForwardEndpointSlot(generatedEndpointIDs) < 0)
 			return FALSE;
-		for (Int i = 0; i < MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
-			if (exhaustedTargetIDs[i] == requestedTargetID)
+		for (Int exhaustedIndex = 0; exhaustedIndex < MAX_EXHAUSTED_FORWARD_TARGETS; ++exhaustedIndex)
+			if (exhaustedTargetIDs[exhaustedIndex] == requestedTargetID)
 				return FALSE;
-		for (Int i = 0; i < MAX_GENERATED_FORWARD_ENDPOINTS; ++i)
-			if (generatedEndpointIDs[i] != INVALID_ID &&
-				generatedTargetIDs[i] == requestedTargetID)
+		for (Int generatedIndex = 0; generatedIndex < MAX_GENERATED_FORWARD_ENDPOINTS; ++generatedIndex)
+			if (generatedEndpointIDs[generatedIndex] != INVALID_ID &&
+				generatedTargetIDs[generatedIndex] == requestedTargetID)
 				return FALSE;
 		if (!attempted || retryAvailable)
 			return TRUE;
 		Bool roomForHistory = FALSE;
-		for (Int i = 0; i < MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
-			if (exhaustedTargetIDs[i] == INVALID_ID) {
+		for (Int historyIndex = 0; historyIndex < MAX_EXHAUSTED_FORWARD_TARGETS; ++historyIndex)
+			if (exhaustedTargetIDs[historyIndex] == INVALID_ID) {
 				roomForHistory = TRUE;
 				break;
 			}
@@ -255,12 +255,12 @@ namespace SkirmishAITunnelRoute
 	{
 		if (targetID == INVALID_ID || !exhaustedTargetIDs)
 			return;
-		for (Int i = 0; i < MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
-			if (exhaustedTargetIDs[i] == targetID)
+		for (Int knownIndex = 0; knownIndex < MAX_EXHAUSTED_FORWARD_TARGETS; ++knownIndex)
+			if (exhaustedTargetIDs[knownIndex] == targetID)
 				return;
-		for (Int i = 0; i < MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
-			if (exhaustedTargetIDs[i] == INVALID_ID) {
-				exhaustedTargetIDs[i] = targetID;
+		for (Int freeIndex = 0; freeIndex < MAX_EXHAUSTED_FORWARD_TARGETS; ++freeIndex)
+			if (exhaustedTargetIDs[freeIndex] == INVALID_ID) {
+				exhaustedTargetIDs[freeIndex] = targetID;
 				return;
 			}
 	}
