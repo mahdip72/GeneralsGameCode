@@ -3820,18 +3820,21 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions)
 					rts::StabilizeTerrainDrawSizeForMap(m_shellTerrainDrawWidth,
 						m_shellTerrainDrawHeight, heightMap->getXExtent(),
 						heightMap->getYExtent(), false, dimensions.x, dimensions.y);
-					m_shellTerrainDrawWidth = dimensions.x;
-					m_shellTerrainDrawHeight = dimensions.y;
 
-					// Retain the actual area through a shake without adding it to
-					// the shell floor; contract once the shake ends.
+					// Retain the actual area through a shake without adding either
+					// its raw request or its current draw size to the shell floor.
 					const bool deferFullShrink = CameraShakerSystem.IsCameraShaking() ||
 						m_shakeIntensity > 0.01f;
 					if (deferFullShrink)
 					{
-					rts::StabilizeTerrainDrawSizeForMap(heightMap->getDrawWidth(),
+						rts::StabilizeTerrainDrawSizeForMap(heightMap->getDrawWidth(),
 							heightMap->getDrawHeight(), heightMap->getXExtent(),
 							heightMap->getYExtent(), true, dimensions.x, dimensions.y);
+					}
+					else
+					{
+						m_shellTerrainDrawWidth = dimensions.x;
+						m_shellTerrainDrawHeight = dimensions.y;
 					}
 				}
 				return true;
