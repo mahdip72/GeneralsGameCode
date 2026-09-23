@@ -71,10 +71,17 @@ if(WIN32)
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
     foreach(_stage5_partition IN ITEMS Plan Runtime Acceptance)
         string(TOLOWER "${_stage5_partition}" _stage5_partition_name)
+        set(_stage5_partition_verbosity_args)
+        if(_stage5_partition STREQUAL "Acceptance")
+            # Expose bounded Write-Verbose phase and receipt progress from the
+            # long acceptance matrix in CI, including its CTest timeout output.
+            list(APPEND _stage5_partition_verbosity_args -Verbose)
+        endif()
         add_test(NAME core_deterministic_simulation_validation_${_stage5_partition_name}_tests
             COMMAND powershell -NoProfile -ExecutionPolicy Bypass
                 -File "${CMAKE_CURRENT_SOURCE_DIR}/DeterministicSimulationValidation.Tests.ps1"
-                -ValidationPartition "${_stage5_partition}")
+                -ValidationPartition "${_stage5_partition}"
+                ${_stage5_partition_verbosity_args})
         set_tests_properties(core_deterministic_simulation_validation_${_stage5_partition_name}_tests
             PROPERTIES RUN_SERIAL TRUE PROCESSORS 1
                 ENVIRONMENT

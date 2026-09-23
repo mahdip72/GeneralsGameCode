@@ -19,12 +19,23 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') -Force
+if ($PSBoundParameters.ContainsKey('Verbose')) {
+    $stage5EvidenceModule = Get-Module DeterministicSimulationEvidence
+    & $stage5EvidenceModule { $VerbosePreference = 'Continue' }
+}
 
 $combinedPhaseStopwatch = [Diagnostics.Stopwatch]::StartNew()
 function Write-CombinedPhaseTiming {
-    param([string]$Phase, [ValidateSet('start', 'complete')][string]$State)
-    Write-Verbose ('STAGE5_COMBINED_PHASE phase={0} state={1} elapsedMs={2}' -f
-        $Phase, $State, $combinedPhaseStopwatch.ElapsedMilliseconds)
+    param(
+        [string]$Phase,
+        [ValidateSet('start', 'progress', 'complete')][string]$State,
+        [string]$Context = '',
+        [int]$Index = 0,
+        [int]$Total = 0
+    )
+    Write-Verbose (('STAGE5_COMBINED_PHASE phase={0} state={1} context={2} ' +
+        'index={3} total={4} elapsedMs={5}') -f $Phase, $State, $Context,
+        $Index, $Total, $combinedPhaseStopwatch.ElapsedMilliseconds)
 }
 
 function Assert-CombinedCondition {
@@ -1064,7 +1075,7 @@ Assert-CombinedCondition (-not ([string]$generalsChild.processId -eq [string]$ze
     [string]$generalsChild.processCreationUtc -ceq [string]$zeroHourChild.processCreationUtc)) `
     'Generals and Zero Hour source receipts must identify distinct child processes.'
 
-Write-CombinedPhaseTiming 'source-staging' 'start'
+Write-CombinedPhaseTiming 'source-directory-setup' 'start'
 $outputDirectory = Split-Path -Parent $outputFull
 if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
     New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
@@ -1079,8 +1090,9 @@ New-Item -ItemType Directory -Path $sourceStageRoot | Out-Null
 $generalsStageRoot = Join-Path $sourceStageRoot 'Generals'
 $zeroHourStageRoot = Join-Path $sourceStageRoot 'ZeroHour'
 New-Item -ItemType Directory -Path $generalsStageRoot, $zeroHourStageRoot | Out-Null
-Write-CombinedPhaseTiming 'source-staging' 'complete'
+Write-CombinedPhaseTiming 'source-directory-setup' 'complete'
 
+Write-CombinedPhaseTiming 'source-copy-and-stage' 'start'
 $generalsCopied = @{}
 $zeroHourCopied = @{}
 $generalsPathMap = @{}
@@ -1099,7 +1111,18 @@ foreach ($source in @(
         selectedRelocation = $zeroHourSelectedRelocation
         corpus = $sourceCorpora['ZeroHour'] }
 )) {
+    $sourceCopyPhase = "source-copy-$($source.title)"
+    $sourceCopyChildIndex = 0
+    $sourceCopyRawIndex = 0
+    Write-CombinedPhaseTiming $sourceCopyPhase 'start' $source.title `
+        0 $source.read.rawLogs.Count
     foreach ($raw in @($source.read.rawLogs)) {
+        ++$sourceCopyRawIndex
+        if ($sourceCopyRawIndex -eq 1 -or ($sourceCopyRawIndex % 128) -eq 0 -or
+            $sourceCopyRawIndex -eq $source.read.rawLogs.Count) {
+            Write-CombinedPhaseTiming "$sourceCopyPhase-raw-logs" 'progress' `
+                $source.title $sourceCopyRawIndex $source.read.rawLogs.Count
+        }
         $rawPath = [string]$raw.path
         $rawHash = [string]$raw.sha256
         $destinationRelative = Join-Path ('sources\' + $source.title) $rawPath
@@ -1154,6 +1177,13 @@ foreach ($source in @(
     Assert-CombinedCondition ($relocationsBySequence.Count -eq 253) `
         "$($source.title) source native relocation map is incomplete."
     foreach ($sourceChild in @($source.read.provenance.children)) {
+        ++$sourceCopyChildIndex
+        if ($sourceCopyChildIndex -eq 1 -or ($sourceCopyChildIndex % 32) -eq 0 -or
+            $sourceCopyChildIndex -eq 169 -or $sourceCopyChildIndex -eq 170 -or
+            $sourceCopyChildIndex -eq $source.read.provenance.children.Count) {
+            Write-CombinedPhaseTiming "$sourceCopyPhase-native-children" 'progress' `
+                $source.title $sourceCopyChildIndex $source.read.provenance.children.Count
+        }
         $sequence = [int](Get-Stage5JsonValue $sourceChild 'sequence' `
             "$($source.title) source child")
         Assert-CombinedCondition ($relocationsBySequence.ContainsKey($sequence)) `
@@ -1185,6 +1215,8 @@ foreach ($source in @(
                 $destinationRelative ([string]$native.sha256) `
                 "$($source.title) source child $sequence native receipt" $source.copied)
     }
+    Write-CombinedPhaseTiming $sourceCopyPhase 'complete' $source.title `
+        $sourceCopyChildIndex $source.read.provenance.children.Count
 }
 
 $stagedCorpora = [ordered]@{}
@@ -1243,6 +1275,7 @@ foreach ($source in @(
         receipts = @($receiptReferences.ToArray())
     }
 }
+Write-CombinedPhaseTiming 'source-copy-and-stage' 'complete'
 
 function New-CombinedChild {
     param(

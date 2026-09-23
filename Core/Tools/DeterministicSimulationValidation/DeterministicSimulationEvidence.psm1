@@ -4964,6 +4964,7 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
         [Collections.IDictionary]$GlobalNativePathOwners = $null,
         [string]$GlobalNativeTitle = ''
     )
+    $relocationStopwatch = [Diagnostics.Stopwatch]::StartNew()
     $context = "Final acceptance native relocation '$Path'"
     $receiptPath = [IO.Path]::GetFullPath($Path)
     $acceptanceDirectory = [IO.Path]::GetFullPath($EvidenceDirectory)
@@ -4988,7 +4989,12 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
         $children.Count -le 1024) `
         "$context requires a bounded non-empty set of bound native children."
 
+    Write-Verbose (('STAGE5_NATIVE_RELOCATION phase=bounded-file-enumeration state=start ' +
+        'path={0} children={1}') -f $receiptPath, $children.Count)
     $files = @(Get-Stage5FinalAcceptanceBoundedFiles $relocationRoot $context)
+    Write-Verbose (('STAGE5_NATIVE_RELOCATION phase=bounded-file-enumeration state=complete ' +
+        'path={0} files={1} elapsedMs={2}') -f $receiptPath, $files.Count,
+        $relocationStopwatch.ElapsedMilliseconds)
     $allBoundPaths = New-Object 'Collections.Generic.HashSet[string]' `
         ([StringComparer]::OrdinalIgnoreCase)
     $allNativePaths = New-Object 'Collections.Generic.HashSet[string]' `
@@ -4998,7 +5004,9 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
     $candidatePathRecords = $null
     $candidateSuffixIndex = $null
     $childBindings = New-Object 'Collections.Generic.List[object]'
+    $childIndex = 0
     foreach ($child in $children) {
+        ++$childIndex
         $childNonce = [string](Get-Stage5JsonValue $child 'runNonce' `
             "$context host child")
         $sequence = if (@($child.Keys | Where-Object {
@@ -5011,6 +5019,14 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
             "$context host child $sequence"
         }
         else { "$context host child '$childNonce'" }
+        if ($childIndex -eq 1 -or ($childIndex % 32) -eq 0 -or
+            $childIndex -eq 169 -or $childIndex -eq 170 -or
+            $childIndex -eq $children.Count) {
+            Write-Verbose (('STAGE5_NATIVE_RELOCATION phase=child state=start path={0} ' +
+                'sequence={1} index={2} total={3} elapsedMs={4}') -f $receiptPath,
+                $sequence, $childIndex, $children.Count,
+                $relocationStopwatch.ElapsedMilliseconds)
+        }
         $nativeReference = Get-Stage5JsonValue $child 'nativeReceipt' $childContext
         Assert-Stage5JsonShape $nativeReference @('path', 'sha256', 'producer',
             'runNonce', 'cohortNonce') "$childContext native receipt reference"
@@ -5100,6 +5116,10 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
                     $candidateSuffixIndex =
                         New-Stage5FinalAcceptanceCandidateSuffixIndex `
                             $candidatePathRecords.ToArray()
+                    Write-Verbose (('STAGE5_NATIVE_RELOCATION phase=candidate-path-index ' +
+                        'state=complete path={0} candidates={1} elapsedMs={2}') -f
+                        $receiptPath, $candidatePathRecords.Count,
+                        $relocationStopwatch.ElapsedMilliseconds)
                 }
                 $matches = New-Object 'Collections.Generic.List[object]'
                 foreach ($match in @(Find-Stage5FinalAcceptanceCandidateMatches `
@@ -5157,6 +5177,9 @@ function Get-Stage5FinalAcceptanceNativeRelocationBinding {
             nativeReceiptSourcePath = $nativeReceiptSourcePath
         }) | Out-Null
     }
+    Write-Verbose (('STAGE5_NATIVE_RELOCATION phase=children state=complete path={0} ' +
+        'index={1} total={2} elapsedMs={3}') -f $receiptPath, $childBindings.Count,
+        $children.Count, $relocationStopwatch.ElapsedMilliseconds)
     $result = [ordered]@{
         evidenceDirectory = $relocationRoot
         children = @($childBindings.ToArray())
@@ -15354,10 +15377,13 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     Assert-Stage5Condition ($DevelopmentReadiness -or
         $ReadinessMode -in @('development', 'development-readiness', 'pre-manual')) `
         "Unsupported Stage 5 acceptance readiness mode '$ReadinessMode'."
+    $aggregationDiagnosticStopwatch = [Diagnostics.Stopwatch]::StartNew()
     $script:Stage5FinalAcceptanceValidatedClosure =
         New-Object 'Collections.Generic.Dictionary[string,object]' `
             ([StringComparer]::OrdinalIgnoreCase)
     $requestPath = [IO.Path]::GetFullPath($AcceptanceManifestPath)
+    Write-Verbose ('STAGE5_FINAL_ACCEPTANCE phase=request state=start path={0} elapsedMs={1}' -f
+        $requestPath, $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
     Assert-Stage5Condition (Test-Path -LiteralPath $requestPath -PathType Leaf) `
         "Final acceptance manifest was not found: $requestPath"
     $requestDirectory = Split-Path -Parent $requestPath
@@ -15498,7 +15524,9 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     $evidenceByKind = @{}
     $evidenceHashes = @{}
     $evidencePaths = New-Object 'Collections.Generic.List[string]'
+    $evidenceEntryIndex = 0
     foreach ($entry in $evidenceEntries) {
+        ++$evidenceEntryIndex
         Assert-Stage5JsonShape $entry @('kind', 'path', 'sha256') 'Final acceptance evidence entry'
         $kind = Get-Stage5JsonValue $entry 'kind' 'Final acceptance evidence entry'
         $relative = Get-Stage5JsonValue $entry 'path' 'Final acceptance evidence entry'
@@ -15506,6 +15534,9 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         Assert-Stage5Condition ($kind -is [string] -and $relative -is [string] -and
             $expectedHash -is [string]) `
             'Final acceptance evidence kind, path, and hash must be JSON strings.'
+        Write-Verbose (('STAGE5_FINAL_ACCEPTANCE phase=evidence-document state=start kind={0} ' +
+            'index={1} total={2} elapsedMs={3}') -f $kind, $evidenceEntryIndex,
+            $evidenceEntries.Count, $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
         Assert-Stage5Condition ($requiredEvidenceKinds -ccontains $kind) `
             "Final acceptance evidence kind '$kind' is not part of the local pre-manual contract; premium review and manual approval are out-of-band."
         Assert-Stage5Condition (-not $evidenceByKind.ContainsKey($kind)) `
@@ -15590,6 +15621,9 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         }
         $evidenceHashes[$kind] = $evidenceHash
         $evidencePaths.Add($evidencePath.ToLowerInvariant()) | Out-Null
+        Write-Verbose (('STAGE5_FINAL_ACCEPTANCE phase=evidence-document state=complete kind={0} ' +
+            'index={1} total={2} elapsedMs={3}') -f $kind, $evidenceEntryIndex,
+            $evidenceEntries.Count, $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
     }
     foreach ($requiredKind in $requiredEvidenceKinds) {
         Assert-Stage5Condition ($evidenceByKind.ContainsKey($requiredKind)) `
@@ -15636,7 +15670,9 @@ function Invoke-Stage5FinalAcceptanceAggregation {
     $installedKernelExecutionDisposition = $null
     $installedKernelExecutionProof = $null
     $globalNativePathOwners = @{}
+    $evidenceKindIndex = 0
     foreach ($kind in $requiredEvidenceKinds) {
+        ++$evidenceKindIndex
         $record = $evidenceByKind[$kind]
         $document = $record.document
         $attachments = Get-Stage5JsonValue $document 'attachments' "Evidence '$kind'"
@@ -15654,6 +15690,10 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         $evidenceDirectory = Split-Path -Parent $record.fullPath
         $evidenceTitle = Get-Stage5JsonValue $document 'title' "Evidence '$kind'"
         $expectedAttachmentBindings = @($attachmentBindings[$kind])
+        Write-Verbose (('STAGE5_FINAL_ACCEPTANCE phase=kind-attachments state=start kind={0} ' +
+            'index={1} total={2} attachments={3} elapsedMs={4}') -f $kind,
+            $evidenceKindIndex, $requiredEvidenceKinds.Count, $attachments.Count,
+            $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
         if ($kind -ceq 'deterministic-runtime') {
             $runtimeDetails = Get-Stage5JsonValue $document 'details' `
                 "Evidence '$kind'"
@@ -15681,7 +15721,9 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                 throw "Evidence '$kind' installedKernelExecution status is invalid."
             }
         }
+        $attachmentIndex = 0
         foreach ($attachment in $attachments) {
+            ++$attachmentIndex
             Assert-Stage5JsonShape $attachment @('role', 'title', 'path',
                 'sha256', 'trustDomain') `
                 "Evidence '$kind' attachment"
@@ -15695,6 +15737,10 @@ function Invoke-Stage5FinalAcceptanceAggregation {
             Assert-Stage5Condition ($role -is [string] -and
                 $attachmentTitle -is [string] -and $relative -is [string]) `
                 "Evidence '$kind' attachment role, title, and path must be JSON strings."
+            Write-Verbose (('STAGE5_FINAL_ACCEPTANCE phase=attachment state=start kind={0} ' +
+                'role={1} title={2} index={3} total={4} elapsedMs={5}') -f
+                $kind, $role, $attachmentTitle, $attachmentIndex,
+                $attachments.Count, $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
             Assert-Stage5Condition ($attachmentTrustDomains.ContainsKey($role) -and
                 $attachmentTrustDomain -is [string] -and
                 $attachmentTrustDomain -ceq [string]$attachmentTrustDomains[$role]) `
@@ -15763,7 +15809,13 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                             }
                         }
                     }
+                    Write-Verbose (('STAGE5_FINAL_ACCEPTANCE phase=receipt-validation state=start ' +
+                        'kind={0} role={1} title={2} elapsedMs={3}') -f $kind, $role,
+                        $attachmentTitle, $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
                     $receipt = Read-Stage5FinalAcceptanceImmutableReceipt @receiptArguments
+                    Write-Verbose (('STAGE5_FINAL_ACCEPTANCE phase=receipt-validation state=complete ' +
+                        'kind={0} role={1} title={2} elapsedMs={3}') -f $kind, $role,
+                        $attachmentTitle, $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
                     if ($null -ne $receipt.acceptanceFailure) {
                         $receiptFailures.Add($receipt.acceptanceFailure) | Out-Null
                     }
@@ -15893,6 +15945,10 @@ function Invoke-Stage5FinalAcceptanceAggregation {
             recordedUtc = Get-Stage5JsonValue $document 'recordedUtc' "Evidence '$kind'"
             attachments = $attachmentReport.ToArray()
         }) | Out-Null
+        Write-Verbose (('STAGE5_FINAL_ACCEPTANCE phase=kind-attachments state=complete kind={0} ' +
+            'index={1} total={2} attachments={3} elapsedMs={4}') -f $kind,
+            $evidenceKindIndex, $requiredEvidenceKinds.Count, $attachmentIndex,
+            $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
     }
     if ($null -ne $lockstepV2Failure -and
         $lockstepV2Failure -match 'diagnostic NET3 v1') {
@@ -15995,6 +16051,9 @@ function Invoke-Stage5FinalAcceptanceAggregation {
         -ExpectedCurrentExecutablePath `
             $artifactPathsByRole['zerohour-executable'] `
         -RequireCurrentArtifactRelocation -ExpectedTitle 'ZeroHour')
+    Write-Verbose (('STAGE5_FINAL_ACCEPTANCE phase=aggregate-validation state=complete ' +
+        'path={0} elapsedMs={1}') -f $requestPath,
+        $aggregationDiagnosticStopwatch.ElapsedMilliseconds)
     return [pscustomobject]@{
         schemaVersion = 1
         gateName = 'stage5-development-readiness'

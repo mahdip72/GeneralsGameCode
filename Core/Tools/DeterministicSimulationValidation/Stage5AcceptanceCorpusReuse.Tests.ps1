@@ -396,6 +396,89 @@ try {
     Assert-CorpusReuseTest ($cmakeText -match
         '(?s)core_stage5_acceptance_corpus_reuse_tests.*?Stage5AcceptanceCorpusReuse\.Tests\.ps1.*?TIMEOUT 60') `
         'The focused corpus reuse self-test must be registered with a bounded CTest timeout.'
+    Assert-CorpusReuseTest ($cmakeText -match
+        '(?m)^\s*if\(_stage5_partition STREQUAL "Acceptance"\)\s*$' -and
+        $cmakeText -match
+        '(?m)^\s*list\(APPEND _stage5_partition_verbosity_args -Verbose\)\s*$' -and
+        $cmakeText -match
+        '(?m)^\s*add_test\(NAME core_deterministic_simulation_validation_\$\{_stage5_partition_name\}_tests\s*$' -and
+        $cmakeText -match
+        '(?m)^\s*-ValidationPartition "\$\{_stage5_partition\}"\s*$' -and
+        $cmakeText -match
+        '(?m)^\s*\$\{_stage5_partition_verbosity_args\}\)\s*$') `
+        'Only the Acceptance partition must opt in to verbose phase diagnostics through CTest.'
+    $acceptanceProgressDefinitions = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Write-Stage5AcceptanceProgress'
+    }, $true))
+    $acceptanceProgressCalls = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'Write-Stage5AcceptanceProgress'
+    }, $true))
+    $acceptanceVerboseCalls = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'Write-Verbose'
+    }, $true))
+    Assert-CorpusReuseTest ($acceptanceProgressDefinitions.Count -eq 1 -and
+        $acceptanceProgressCalls.Count -ge 6 -and
+        $acceptanceVerboseCalls.Count -ge 6) `
+        'The Acceptance harness must retain active AST-bound phase markers around corpus and producer work.'
+    $acceptanceModuleVerboseAssignments = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -ceq '$VerbosePreference' -and
+            $node.Right.Extent.Text -ceq "'Continue'"
+    }, $true))
+    Assert-CorpusReuseTest ($acceptanceModuleVerboseAssignments.Count -eq 1) `
+        'Acceptance -Verbose must explicitly enable diagnostics in the imported evidence module scope.'
+    $producerPath = Join-Path $PSScriptRoot 'New-Stage5CombinedHostRunnerReceipt.ps1'
+    $producerText = [IO.File]::ReadAllText($producerPath)
+    $producerTokens = $null
+    $producerParseErrors = $null
+    $producerAst = [Management.Automation.Language.Parser]::ParseInput(
+        $producerText, [ref]$producerTokens, [ref]$producerParseErrors)
+    Assert-CorpusReuseTest (@($producerParseErrors).Count -eq 0) `
+        'The combined producer with verbose diagnostics must parse.'
+    $producerModuleVerboseAssignments = @($producerAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -ceq '$VerbosePreference' -and
+            $node.Right.Extent.Text -ceq "'Continue'"
+    }, $true))
+    Assert-CorpusReuseTest ($producerModuleVerboseAssignments.Count -eq 1) `
+        'The combined producer -Verbose switch must explicitly enable evidence-module diagnostics.'
+    $evidenceModulePath = Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1'
+    $evidenceModuleText = [IO.File]::ReadAllText($evidenceModulePath)
+    $evidenceModuleTokens = $null
+    $evidenceModuleParseErrors = $null
+    $evidenceModuleAst = [Management.Automation.Language.Parser]::ParseInput(
+        $evidenceModuleText, [ref]$evidenceModuleTokens,
+        [ref]$evidenceModuleParseErrors)
+    Assert-CorpusReuseTest (@($evidenceModuleParseErrors).Count -eq 0) `
+        'The evidence module with bounded verbose diagnostics must parse.'
+    foreach ($functionName in @(
+            'Get-Stage5FinalAcceptanceNativeRelocationBinding',
+            'Invoke-Stage5FinalAcceptanceAggregation')) {
+        $functionDefinitions = @($evidenceModuleAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $node.Name -ceq $functionName
+        }, $true))
+        $functionVerboseCalls = if ($functionDefinitions.Count -eq 1) {
+            @($functionDefinitions[0].Body.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -ceq 'Write-Verbose'
+            }, $true))
+        }
+        else { @() }
+        Assert-CorpusReuseTest ($functionDefinitions.Count -eq 1 -and
+            $functionVerboseCalls.Count -ge 3) `
+            "The $functionName deep validation loop must emit active bounded phase diagnostics."
+    }
 
     $fixtureRoot = Join-Path $runRoot 'restore-contract'
     [IO.Directory]::CreateDirectory($fixtureRoot) | Out-Null

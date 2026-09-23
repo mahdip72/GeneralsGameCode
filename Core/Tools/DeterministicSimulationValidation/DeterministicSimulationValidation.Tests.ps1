@@ -71,6 +71,7 @@ if ($PartitionSelectionPreflightOnly) {
     return
 }
 $script:Failures = 0
+$script:AcceptancePhaseStopwatch = [Diagnostics.Stopwatch]::StartNew()
 $script:TestCohortNonce = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
 $script:TestCohortCreatedUtc = '2026-09-01T00:00:00.0000000Z'
 $script:TestRuntimeClosure = [ordered]@{
@@ -78,8 +79,26 @@ $script:TestRuntimeClosure = [ordered]@{
     closureSha256 = ('E' * 64)
 }
 
+function Write-Stage5AcceptanceProgress {
+    param(
+        [Parameter(Mandatory = $true)][string]$Phase,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('start', 'progress', 'complete')][string]$State,
+        [string]$Context = '',
+        [int]$Index = 0,
+        [int]$Total = 0
+    )
+    Write-Verbose (('STAGE5_ACCEPTANCE_PHASE phase={0} state={1} context={2} ' +
+        'index={3} total={4} elapsedMs={5}') -f $Phase, $State, $Context,
+        $Index, $Total, $script:AcceptancePhaseStopwatch.ElapsedMilliseconds)
+}
+
 Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') -Force
 Import-Module (Join-Path $PSScriptRoot 'Stage5ReplayCorpusExporter.psm1') -Force
+if ($PSBoundParameters.ContainsKey('Verbose')) {
+    $stage5EvidenceModule = Get-Module DeterministicSimulationEvidence
+    & $stage5EvidenceModule { $VerbosePreference = 'Continue' }
+}
 
 function Get-Sha256 {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -2010,7 +2029,10 @@ function New-Stage5SyntheticAcceptanceCorpus {
         [Collections.IDictionary]$ArtifactHashes,
         [string]$ExecutablePath
     )
+    $corpusStopwatch = [Diagnostics.Stopwatch]::StartNew()
     $sourceRoot = [IO.Path]::GetFullPath($Root)
+    Write-Verbose (('STAGE5_ACCEPTANCE_CORPUS phase=setup state=start title={0} ' +
+        'path={1}') -f $Title, $sourceRoot)
     New-Item -ItemType Directory -Path $sourceRoot -Force | Out-Null
     $executableRole = if ($Title -ceq 'Generals') {
         'generals-executable'
@@ -2197,6 +2219,9 @@ function New-Stage5SyntheticAcceptanceCorpus {
     $titleOffset = if ($Title -ceq 'Generals') { 100 } else { 200 }
     $children = New-Object 'Collections.Generic.List[object]'
     $results = New-Object 'Collections.Generic.List[object]'
+    Write-Verbose (('STAGE5_ACCEPTANCE_CORPUS phase=materialize state=start title={0} ' +
+        'index=0 total={1} elapsedMs={2}') -f $Title, $planEntries.Count,
+        $corpusStopwatch.ElapsedMilliseconds)
     foreach ($entry in $planEntries) {
         $sequence = [int]$entry.sequence
         $childNonce = New-Stage5SyntheticUuid (($titleOffset * 10000) + $sequence)
@@ -2338,7 +2363,18 @@ function New-Stage5SyntheticAcceptanceCorpus {
             $resultDocument.proofProfileId = [string]$entry.proofProfileId
         }
         $results.Add([pscustomobject]$resultDocument) | Out-Null
+        if ($sequence -eq 1 -or ($sequence % 32) -eq 0 -or
+            $sequence -eq 169 -or $sequence -eq 170 -or
+            $sequence -eq $planEntries.Count) {
+            Write-Verbose (('STAGE5_ACCEPTANCE_CORPUS phase=materialize state=progress ' +
+                'title={0} index={1} total={2} elapsedMs={3}') -f $Title,
+                $sequence, $planEntries.Count,
+                $corpusStopwatch.ElapsedMilliseconds)
+        }
     }
+    Write-Verbose (('STAGE5_ACCEPTANCE_CORPUS phase=materialize state=complete title={0} ' +
+        'index={1} total={1} elapsedMs={2}') -f $Title, $planEntries.Count,
+        $corpusStopwatch.ElapsedMilliseconds)
     $resultsPath = Join-Path $sourceRoot 'validation-results.json'
     Write-JsonDocument $resultsPath $results.ToArray()
     $resultsHash = Get-Sha256 $resultsPath
@@ -2369,6 +2405,9 @@ function New-Stage5SyntheticAcceptanceCorpus {
         [pscustomobject]@{ role = 'replay-results'; path = (Join-Path $sourceRoot 'replay-results-receipt.json'); nonce = New-Stage5SyntheticUuid (($wrapperBase * 10000) + 3); raw = @($rawResultBinding); details = [ordered]@{ uniqueReplayCount = 10; executionCount = 168; crcTreeSha256 = $replayTree; allExecutionsPassed = $true; qualificationData = $qualificationData } },
         [pscustomobject]@{ role = 'ai-results'; path = (Join-Path $sourceRoot 'ai-results-receipt.json'); nonce = New-Stage5SyntheticUuid (($wrapperBase * 10000) + 4); raw = @($rawResultBinding); details = [ordered]@{ scenarioCount = 2; distinctSeedCount = 3; repeatCount = 2; allGamesCompleted = $true; digestTreeSha256 = $aiTree; qualificationData = $qualificationData } }
     )
+    Write-Verbose (('STAGE5_ACCEPTANCE_CORPUS phase=receipts state=start title={0} ' +
+        'index=0 total={1} elapsedMs={2}') -f $Title, $receiptPlans.Count,
+        $corpusStopwatch.ElapsedMilliseconds)
     foreach ($receiptPlan in $receiptPlans) {
         $receiptChildren = @()
         $childProvenance = 'not-applicable'
@@ -2408,6 +2447,9 @@ function New-Stage5SyntheticAcceptanceCorpus {
         }
         Write-JsonDocument $receiptPlan.path $receiptDocument
     }
+    Write-Verbose (('STAGE5_ACCEPTANCE_CORPUS phase=receipts state=complete title={0} ' +
+        'index={1} total={1} elapsedMs={2}') -f $Title, $receiptPlans.Count,
+        $corpusStopwatch.ElapsedMilliseconds)
     $resultsReceipt = $receiptPlans[1]
     return [pscustomobject]@{
         title = $Title; sourceRoot = $sourceRoot
@@ -9443,14 +9485,18 @@ try {
     # synthetic corpus is deliberately rooted beside the acceptance fixtures;
     # it is test evidence only and never a production authority.
     $syntheticCorpusRoot = Join-Path $acceptanceRoot 'synthetic-corpus'
+    Write-Stage5AcceptanceProgress 'synthetic-corpus' 'start' 'Generals'
     $syntheticGenerals = New-Stage5SyntheticAcceptanceCorpus `
         (Join-Path $syntheticCorpusRoot 'Generals') 'Generals' $sourceCommit `
         $artifactSetHash $artifactTestHashes `
         $artifactTestPaths['generals-executable']
+    Write-Stage5AcceptanceProgress 'synthetic-corpus' 'complete' 'Generals'
+    Write-Stage5AcceptanceProgress 'synthetic-corpus' 'start' 'ZeroHour'
     $syntheticZeroHour = New-Stage5SyntheticAcceptanceCorpus `
         (Join-Path $syntheticCorpusRoot 'ZeroHour') 'ZeroHour' $sourceCommit `
         $artifactSetHash $artifactTestHashes `
         $artifactTestPaths['zerohour-executable']
+    Write-Stage5AcceptanceProgress 'synthetic-corpus' 'complete' 'ZeroHour'
     $syntheticZeroHourReceipts = [ordered]@{
         'validation-plan' = [string]$syntheticZeroHour.receiptPlans[0].path
         'validation-results' = [string]$syntheticZeroHour.validationReceiptPath
@@ -9623,6 +9669,7 @@ try {
                     }
                     $combinedGeneralsSource = [string]$syntheticGenerals.validationReceiptPath
                     $combinedZeroHourSource = [string]$syntheticZeroHour.validationReceiptPath
+                    Write-Stage5AcceptanceProgress 'combined-producer' 'start' 'primary-positive'
                     & (Join-Path $PSScriptRoot 'New-Stage5CombinedHostRunnerReceipt.ps1') `
                         -GeneralsReceiptPath $combinedGeneralsSource `
                         -ZeroHourReceiptPath $combinedZeroHourSource `
@@ -9636,7 +9683,9 @@ try {
                         -ExpectedGeneralsExecutableSha256 $artifactTestHashes['generals-executable'] `
                         -ExpectedZeroHourExecutableSha256 $artifactTestHashes['zerohour-executable'] `
                         -ExpectedCohortNonce $script:TestCohortNonce `
-                        -ExpectedCohortCreatedUtc $script:TestCohortCreatedUtc | Out-Null
+                        -ExpectedCohortCreatedUtc $script:TestCohortCreatedUtc `
+                        -Verbose | Out-Null
+                    Write-Stage5AcceptanceProgress 'combined-producer' 'complete' 'primary-positive'
                     $combinedWriterShape = Read-TestJson $attachmentPath
                     foreach ($sourcePath in @($combinedGeneralsSource,
                             $combinedZeroHourSource)) {
@@ -9728,6 +9777,7 @@ try {
         $caseSourceRoot = Join-Path $CaseRoot 'combined-source-receipts'
         $caseGeneralsRoot = Join-Path $caseSourceRoot 'Generals'
         $caseZeroHourRoot = Join-Path $caseSourceRoot 'ZeroHour'
+        Write-Stage5AcceptanceProgress 'combined-producer-case' 'start' $CaseName
         & $combinedProducerScript `
             -GeneralsReceiptPath (Join-Path $caseGeneralsRoot `
                 'validation-results-receipt.json') `
@@ -9748,7 +9798,9 @@ try {
             -ExpectedGeneralsExecutableSha256 $ExpectedGeneralsHash `
             -ExpectedZeroHourExecutableSha256 $ExpectedZeroHourHash `
             -ExpectedCohortNonce $script:TestCohortNonce `
-            -ExpectedCohortCreatedUtc $script:TestCohortCreatedUtc | Out-Null
+            -ExpectedCohortCreatedUtc $script:TestCohortCreatedUtc `
+            -Verbose | Out-Null
+        Write-Stage5AcceptanceProgress 'combined-producer-case' 'complete' $CaseName
     }
     function New-CombinedHostProducerTestCase {
         param([string]$Name)
