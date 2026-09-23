@@ -152,9 +152,19 @@ public:
 	Int getSkirmishAIReplayEpoch() const { return m_skirmishAIReplayEpoch; }
 	Bool replayUsesSkirmishAILivenessRecovery() const { return m_skirmishAIReplayEpoch >= SKIRMISH_AI_REPLAY_EPOCH_PR6_LIVENESS; }
 	Bool replayUsesSkirmishAICurrentBehavior() const { return
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
-	Bool replayUsesSkirmishAICounterRng() const { return m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
+	Bool replayUsesSkirmishAICounterRng() const {
+		return m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
 	Int getPathfindQueueReplayEpoch() const { return m_pathfindQueueReplayEpoch; }
 	Bool replayUsesPathfindQueueCapacity() const { return m_pathfindQueueReplayEpoch == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT; }
 	void initControls();															///< Show or Hide the Replay controls
@@ -178,6 +188,12 @@ public:
 	void setArchiveEnabled(Bool enable) { m_archiveReplays = enable; } ///< Enable or disable replay archiving.
 	void stopRecording();															///< Stop recording and close m_file.
 protected:
+	// Recorder.cpp keeps one unqualified stamping call for both recording and
+	// DEBUG_CRASHING compatibility checks. Playback can shadow that call here so
+	// an epoch-2 replay gets an exact epoch-2 allow-list candidate while the
+	// global helper continues to stamp new recordings with the latest epoch.
+	void MarkReplayVersionForSkirmishAICurrentEpoch(UnicodeString& versionTimeString);
+
 	void startRecording(GameDifficulty diff, Int originalGameMode, Int rankPoints, Int maxFPS);					///< Start recording to m_file.
 	void writeToFile(GameMessage *msg);								///< Write this GameMessage to m_file.
 	void archiveReplay(AsciiString fileName);					///< Move the specified replay file to the archive directory.
@@ -244,3 +260,12 @@ protected:
 
 extern RecorderClass *TheRecorder;
 RecorderClass *createRecorder();
+
+inline void RecorderClass::MarkReplayVersionForSkirmishAICurrentEpoch(
+	UnicodeString& versionTimeString)
+{
+	// startRecording() uses the architecture-specific writer directly. This
+	// member is for restamping a loaded header during playback validation.
+	MarkReplayVersionForSkirmishAIPlaybackCompatibilityEpoch(
+		versionTimeString, m_skirmishAIReplayEpoch);
+}

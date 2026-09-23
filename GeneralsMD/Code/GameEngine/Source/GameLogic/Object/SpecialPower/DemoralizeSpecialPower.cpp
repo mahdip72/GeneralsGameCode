@@ -98,17 +98,19 @@ DemoralizeSpecialPower::~DemoralizeSpecialPower()
 
 // ------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------
-void DemoralizeSpecialPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
+Bool DemoralizeSpecialPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
 {
 	if (getObject()->isDisabled())
-		return;
+		return false;
 
 	// sanity
 	if( loc == nullptr )
-		return;
+		return false;
 
 	// call the base class action cause we are *EXTENDING* functionality
-	SpecialPowerModule::doSpecialPowerAtLocation( loc, angle, commandOptions );
+	if (!SpecialPowerModule::doSpecialPowerAtLocation(
+			loc, angle, commandOptions))
+		return false;
 
 	// the source of my fiendish power
 	Object *source = getObject();
@@ -174,6 +176,7 @@ void DemoralizeSpecialPower::doSpecialPowerAtLocation( const Coord3D *loc, Real 
 		FXList::doFXPos( modData->m_fxList, loc );
 
 	}
+	return true;
 
 }
 

@@ -22,6 +22,48 @@ function(rts_producer_test_extract output text start_marker end_marker)
     set(${output} "${_body}" PARENT_SCOPE)
 endfunction()
 
+# The fresh receipt fixture runs in a small standalone shim. Preserve its
+# source-exact Stage 5 paths while omitting the orthogonal Stage 1 recovery
+# branches, whose live AI/world dependencies are covered by the recovery
+# regression lane rather than this receipt-lifetime shim.
+function(rts_producer_test_omit_span output text start_marker end_marker)
+    string(FIND "${text}" "${start_marker}" _start)
+    string(FIND "${text}" "${end_marker}" _end)
+    if(_start LESS 0 OR _end LESS _start)
+        message(FATAL_ERROR "Fresh producer fixture boundary missing or reversed: ${start_marker}")
+    endif()
+    string(SUBSTRING "${text}" ${_start} -1 _from_start)
+    string(LENGTH "${start_marker}" _start_length)
+    string(SUBSTRING "${_from_start}" ${_start_length} -1 _after_start)
+    string(FIND "${_after_start}" "${start_marker}" _duplicate_start)
+    string(SUBSTRING "${text}" ${_end} -1 _from_end)
+    string(LENGTH "${end_marker}" _end_length)
+    string(SUBSTRING "${_from_end}" ${_end_length} -1 _after_end)
+    string(FIND "${_after_end}" "${end_marker}" _duplicate_end)
+    if(NOT _duplicate_start EQUAL -1 OR NOT _duplicate_end EQUAL -1)
+        message(FATAL_ERROR "Fresh producer fixture boundary ambiguous: ${start_marker}")
+    endif()
+    string(SUBSTRING "${text}" 0 ${_start} _prefix)
+    string(SUBSTRING "${text}" ${_end} -1 _suffix)
+    set(${output} "${_prefix}${_suffix}" PARENT_SCOPE)
+endfunction()
+
+function(rts_producer_test_replace_once output text old new)
+    string(FIND "${text}" "${old}" _first)
+    if(_first LESS 0)
+        message(FATAL_ERROR "Fresh producer fixture source marker missing: ${old}")
+    endif()
+    string(SUBSTRING "${text}" ${_first} -1 _tail)
+    string(LENGTH "${old}" _old_length)
+    string(SUBSTRING "${_tail}" ${_old_length} -1 _after_first)
+    string(FIND "${_after_first}" "${old}" _duplicate)
+    if(NOT _duplicate EQUAL -1)
+        message(FATAL_ERROR "Fresh producer fixture source marker ambiguous: ${old}")
+    endif()
+    string(REPLACE "${old}" "${new}" _projected "${text}")
+    set(${output} "${_projected}" PARENT_SCOPE)
+endfunction()
+
 function(rts_add_performance_receipt_producer_test target title test_name)
     if(NOT title STREQUAL "Generals" AND NOT title STREQUAL "GeneralsMD")
         message(FATAL_ERROR "Producer fixture requires one exact native title")
@@ -169,9 +211,13 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     rts_producer_test_extract(_owner_methods "${_owner_text}"
         "bool GameLogic::isStage5PhaseGraphOwner("
         "bool GameLogic::validateStage5PhaseGraphCommit(")
-    rts_producer_test_extract(_runner_state "${_runner_text}"
+    rts_producer_test_extract(_runner_state_definition "${_runner_text}"
         "struct SkirmishAITestRunnerState"
-        "void CaptureSkirmishAITestSliceMetrics();")
+        "enum SkirmishAIRecoveryFixturePhase")
+    rts_producer_test_extract(_runner_state_values "${_runner_text}"
+        "SkirmishAITestRunnerState s_runner = {"
+        "SkirmishAIRecoveryFixtureState s_recovery;")
+    set(_runner_state "${_runner_state_definition}\n${_runner_state_values}")
     rts_producer_test_extract(_slice_capture "${_runner_text}"
         "void CaptureSkirmishAITestSliceMetrics()\n{"
         "void PrintJobMetric(")
@@ -181,20 +227,50 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     rts_producer_test_extract(_start "${_runner_text}"
         "Bool StartSkirmishAITestRunner()"
         "void UpdateSkirmishAITestRunner()")
+    rts_producer_test_omit_span(_start "${_start}"
+        "\tif (s_recovery.active)\n\t{\n#if !RTS_ZEROHOUR"
+        "#if defined(_WIN64)\n\tif (s_reviewedMapRequest.requested)\n\t{\n\t\tif (!IsSkirmishAITest4v2")
+    rts_producer_test_replace_once(_start "${_start}"
+        "\tif (!s_recovery.active &&\n\t\t!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) &&"
+        "\tif (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) &&")
+    rts_producer_test_omit_span(_start "${_start}"
+        "\tif (s_recovery.active)\n\t{\n\t\tprintf(\"SKIRMISH_AI_RECOVERY_START"
+        "\telse if (IsSkirmishAITest4v2(s_runner.scenario))")
+    rts_producer_test_replace_once(_start "${_start}"
+        "\telse if (IsSkirmishAITest4v2(s_runner.scenario))"
+        "\tif (IsSkirmishAITest4v2(s_runner.scenario))")
     rts_producer_test_extract(_fail "${_runner_text}"
         "void FailSkirmishAITest(const char *reason)"
         "void RequestSkirmishAITestStop()")
-    # The finalizer block is deliberately source-exact through EOF. The
-    # sentinel exists only in memory and remains subject to unique-boundary checks.
-    rts_producer_test_extract(_finalizers "${_runner_text}\nRTS_FRESH_PRODUCER_FIXTURE_EOF"
+    rts_producer_test_extract(_receipt_finalizers "${_runner_text}"
         "#if defined(_WIN64)\nvoid ObserveSkirmishAITestCompletedFrame("
+        "namespace\n{\n\nBool ObserveSkirmishAIRecoverySecondBuilderRoutePayment(")
+    rts_producer_test_extract(_terminal_prefix "${_runner_text}"
+        "Int FinalizeSkirmishAITestRunner(Int engineExitCode)"
+        "\tif (s_recovery.active)\n\t{\n\t\tif (s_runner.failed)")
+    rts_producer_test_extract(_terminal_suffix "${_runner_text}\nRTS_FRESH_PRODUCER_FIXTURE_EOF"
+        "\tAsciiString replayName = s_runner.replayFileName;"
         "RTS_FRESH_PRODUCER_FIXTURE_EOF")
+    set(_finalizers "${_receipt_finalizers}\n${_terminal_prefix}\n${_terminal_suffix}")
+    string(FIND "${_runner_state}${_start}${_finalizers}" "s_recovery" _recovery_leak)
+    if(NOT _recovery_leak EQUAL -1)
+        message(FATAL_ERROR "Fresh receipt fixture unexpectedly depends on Stage 1 recovery state")
+    endif()
     rts_producer_test_extract(_engine_destructor "${_engine_text}"
         "GameEngine::~GameEngine()"
         "Bool GameEngine::isTimeFrozen()")
     rts_producer_test_extract(_main_cleanup "${_main_text}"
         "\tif (IsSkirmishAITestRunnerArmed())"
         "\treturn exitcode;")
+    # Zero Hour's promoted owner-thread scope closes here; the Generals title
+    # has the earlier unwrapped shape. The shim is intentionally scope-free.
+    string(FIND "${_main_cleanup}"
+        "#endif\n\t}\n\n\t// since execute() returned" _owner_scope_close)
+    if(NOT _owner_scope_close EQUAL -1)
+        rts_producer_test_replace_once(_main_cleanup "${_main_cleanup}"
+            "#endif\n\t}\n\n\t// since execute() returned"
+            "#endif\n\n\t// since execute() returned")
+    endif()
     rts_producer_test_extract(_main_start "${_main_text}"
         "\tconst Bool canRun = !validationOptionsConflict && !net3ValidationRequested &&"
         "\tif (IsSkirmishAITestRunnerArmed())")

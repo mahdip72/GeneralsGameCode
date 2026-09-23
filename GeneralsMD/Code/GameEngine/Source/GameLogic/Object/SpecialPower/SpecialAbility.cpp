@@ -57,17 +57,18 @@ SpecialAbility::~SpecialAbility()
 
 // ------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------
-void SpecialAbility::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
+Bool SpecialAbility::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
 {
 	if (getObject()->isDisabled())
-		return;
+		return false;
 
 	// sanity
 	if( loc == nullptr )
-		return;
+		return false;
 
 	// call the base class action cause we are *EXTENDING* functionality
-	SpecialPowerModule::doSpecialPowerAtLocation( loc, angle, commandOptions );
+	return SpecialPowerModule::doSpecialPowerAtLocation(
+		loc, angle, commandOptions);
 }
 
 // ------------------------------------------------------------------------------------------------

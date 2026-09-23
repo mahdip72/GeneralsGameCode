@@ -5542,22 +5542,22 @@ void Object::doSpecialPowerAtObject( const SpecialPowerTemplate *specialPowerTem
 //-------------------------------------------------------------------------------------------------
 /** Execute special power */
 //-------------------------------------------------------------------------------------------------
-void Object::doSpecialPowerAtLocation( const SpecialPowerTemplate *specialPowerTemplate,
+Bool Object::doSpecialPowerAtLocation( const SpecialPowerTemplate *specialPowerTemplate,
 																			 const Coord3D *loc, Real angle, UnsignedInt commandOptions, Bool forced )
 {
 
 	if (isDisabled())
-		return;
+		return false;
 
 	// sanity
 	if( !forced && TheSpecialPowerStore->canUseSpecialPower( this, specialPowerTemplate ) == FALSE )
-		return;
+		return false;
 
 	// get the module and execute
 	SpecialPowerModuleInterface *mod = getSpecialPowerModule( specialPowerTemplate );
 	if( mod )
-		mod->doSpecialPowerAtLocation( loc, angle, commandOptions );
-
+		return mod->doSpecialPowerAtLocation( loc, angle, commandOptions );
+	return false;
 }
 
 //-------------------------------------------------------------------------------------------------

@@ -146,14 +146,14 @@ OCLSpecialPower::~OCLSpecialPower()
 //-------------------------------------------------------------------------------------------------
 /** Execute the power */
 //-------------------------------------------------------------------------------------------------
-void OCLSpecialPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
+Bool OCLSpecialPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
 {
 	if (getObject()->isDisabled())
-		return;
+		return false;
 
 	// sanity
 	if( loc == nullptr )
-		return;
+		return false;
 
 	// get the module data
 	const OCLSpecialPowerModuleData *modData = getOCLSpecialPowerModuleData();
@@ -174,12 +174,14 @@ void OCLSpecialPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, 
 	}
 
 	// call the base class action cause we are *EXTENDING* functionality
-	SpecialPowerModule::doSpecialPowerAtLocation( &targetCoord, angle, commandOptions );
+	if (!SpecialPowerModule::doSpecialPowerAtLocation(
+			&targetCoord, angle, commandOptions))
+		return false;
 
 #if RETAIL_COMPATIBLE_CRC
 	// TheSuperHackers @info we need to leave early if we are in the MissileLauncherBuildingUpdate crash fix codepath
 	if (m_availableOnFrame == 0xFFFFFFFF)
-		return;
+		return false;
 #endif
 
 	const ObjectCreationList* ocl = findOCL();
@@ -217,6 +219,7 @@ void OCLSpecialPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, 
 			ObjectCreationList::create( ocl, getObject(), &creationCoord, &targetCoord, angle );
 			break;
 	}
+	return true;
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -242,7 +245,9 @@ void OCLSpecialPower::doSpecialPower( UnsignedInt commandOptions )
 	creationCoord.set( *getObject()->getPosition() );
 
 	// call the base class action cause we are *EXTENDING* functionality
-	SpecialPowerModule::doSpecialPowerAtLocation( &creationCoord, INVALID_ANGLE, commandOptions );
+	if (!SpecialPowerModule::doSpecialPowerAtLocation(
+			&creationCoord, INVALID_ANGLE, commandOptions))
+		return;
 
 	const ObjectCreationList* ocl = findOCL();
 	ObjectCreationList::create( ocl, getObject(), &creationCoord, &creationCoord, false );

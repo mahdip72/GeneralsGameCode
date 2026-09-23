@@ -36,7 +36,9 @@
 #include "Common/INI.h"
 #include "Common/Player.h"
 #include "Common/PlayerList.h"
+#include "Common/Recorder.h"
 #include "Common/Science.h"
+#include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/SpecialPower.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
@@ -44,6 +46,7 @@
 
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
+#include "GameLogic/SkirmishAIRecovery.h"
 #include "GameLogic/Module/DeletionUpdate.h"
 #include "GameLogic/Module/UpdateModule.h"
 #include "GameLogic/Module/SpecialPowerModule.h"
@@ -53,6 +56,22 @@
 #include "GameClient/Eva.h"
 #include "GameClient/InGameUI.h"
 #include "GameClient/ControlBar.h"
+
+static Bool ShouldRequireAcceptedSpecialPowerIntent(const Object *source)
+{
+	if (!source || !TheGameLogic)
+		return false;
+	Player *owner = source->getControllingPlayer();
+	const Bool replay = TheGameLogic->isInReplayGame();
+	const Int gameMode = replay
+		? (TheRecorder ? TheRecorder->getGameMode() : GAME_NONE)
+		: TheGameLogic->getGameMode();
+	return owner && owner->isSkirmishAIPlayer() &&
+		IsSkirmishAIRecoveryGameMode(gameMode) &&
+		ShouldUseSkirmishAIProductionBehavior(replay,
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
 
 
 
@@ -505,6 +524,15 @@ void SpecialPowerModule::triggerSpecialPower( const Coord3D *location )
 
 	// we won't be able to use the power for X number of frames now
 	startPowerRecharge();
+	Player *owner = getObject()->getControllingPlayer();
+	if (owner)
+		owner->notifySkirmishSpecialPowerFired(
+			getObject(), getSpecialPowerModuleData()->m_specialPowerTemplate);
+}
+
+Bool SpecialPowerModule::isDispatchable() const
+{
+	return m_pausedCount <= 0 && !getObject()->isDisabled();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -732,21 +760,25 @@ void SpecialPowerModule::doSpecialPowerAtObject( Object *obj, UnsignedInt comman
 
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
-void SpecialPowerModule::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
+Bool SpecialPowerModule::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
 {
 	if (m_pausedCount > 0 || getObject()->isDisabled()) {
-		return;
+		return !ShouldRequireAcceptedSpecialPowerIntent(getObject());
 	}
 
 	//This tells the update module that we want to do our special power. The update modules
 	//will then start processing each frame.
-	initiateIntentToDoSpecialPower( nullptr, loc, nullptr, commandOptions );
+	const Bool intentAccepted = initiateIntentToDoSpecialPower(
+		nullptr, loc, nullptr, commandOptions );
 
 #if RETAIL_COMPATIBLE_CRC
 	// TheSuperHackers @info we need to leave early if we are in the MissileLauncherBuildingUpdate crash fix codepath
 	if (m_availableOnFrame == 0xFFFFFFFF)
-		return;
+		return !ShouldRequireAcceptedSpecialPowerIntent(getObject());
 #endif
+	if (getSpecialPowerModuleData()->m_updateModuleStartsAttack &&
+		!intentAccepted && ShouldRequireAcceptedSpecialPowerIntent(getObject()))
+		return false;
 
 	//Only trigger the special power immediately if the updatemodule doesn't start the attack.
 	//An example of a case that wouldn't trigger immediately is for a unit that needs to
@@ -756,6 +788,7 @@ void SpecialPowerModule::doSpecialPowerAtLocation( const Coord3D *loc, Real angl
 	{
 		triggerSpecialPower( loc );
 	}
+	return true;
 }
 
 //-------------------------------------------------------------------------------------------------

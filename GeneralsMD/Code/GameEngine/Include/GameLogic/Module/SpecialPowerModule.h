@@ -49,6 +49,7 @@ public:
 
 	virtual Bool isModuleForPower( const SpecialPowerTemplate *specialPowerTemplate ) const = 0;
 	virtual Bool isReady() const = 0;
+	virtual Bool isDispatchable() const = 0;
 //  This is the althernate way to one-at-a-time BlackLotus' specials; we'll keep it commented her until Dustin decides, or until 12/10/02
 //	virtual Bool isBusy() const = 0;
 	virtual Real getPercentReady() const = 0;
@@ -61,7 +62,7 @@ public:
 	virtual void pauseCountdown( Bool pause ) = 0;
 	virtual void doSpecialPower( UnsignedInt commandOptions ) = 0;
 	virtual void doSpecialPowerAtObject( Object *obj, UnsignedInt commandOptions ) = 0;
-	virtual void doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions ) = 0;
+	virtual Bool doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions ) = 0;
 	virtual void doSpecialPowerUsingWaypoints( const Waypoint *way, UnsignedInt commandOptions ) = 0;
 	virtual void markSpecialPowerTriggered( const Coord3D *location ) = 0;
 	virtual void startPowerRecharge() = 0;
@@ -111,6 +112,7 @@ public:
 
 	virtual Bool isModuleForPower( const SpecialPowerTemplate *specialPowerTemplate ) const override;	///< is this module for the specified special power
 	virtual Bool isReady() const override; 						///< is this special power available now
+	virtual Bool isDispatchable() const override;
 //  This is the althernate way to one-at-a-time BlackLotus' specials; we'll keep it commented her until Dustin decides, or until 12/10/02
 //	Bool isBusy() const { return FALSE; }
 
@@ -138,7 +140,7 @@ public:
 	//
 	virtual void doSpecialPower( UnsignedInt commandOptions ) override;
 	virtual void doSpecialPowerAtObject( Object *obj, UnsignedInt commandOptions ) override;
-	virtual void doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions ) override;
+	virtual Bool doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions ) override;
 	virtual void doSpecialPowerUsingWaypoints( const Waypoint *way, UnsignedInt commandOptions ) override;
 
 	/**

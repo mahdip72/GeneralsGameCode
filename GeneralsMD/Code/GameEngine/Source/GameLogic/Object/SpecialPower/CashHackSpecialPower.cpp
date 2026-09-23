@@ -97,12 +97,13 @@ CashHackSpecialPower::~CashHackSpecialPower()
 
 // ------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------
-void CashHackSpecialPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
+Bool CashHackSpecialPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
 {
 	if (getObject()->isDisabled())
-		return;
+		return false;
 
 	// only allowed at objects
+	return false;
 }
 
 //-------------------------------------------------------------------------------------------------

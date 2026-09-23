@@ -4620,7 +4620,7 @@ void GameLogic::update()
 		static_cast<UnsignedInt>(SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	if (!rts::ShouldUseLiveSimulationPhaseGraph(stage5CurrentRuntime != FALSE,
 		isInReplayGame() != FALSE, replayEpoch,
-		static_cast<UnsignedInt>(SKIRMISH_AI_REPLAY_EPOCH_CURRENT)))
+		static_cast<UnsignedInt>(SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG)))
 	{
 		// VC6 and legacy/unknown replay epochs retain the original direct tick.
 		runLegacyStage5Phases();

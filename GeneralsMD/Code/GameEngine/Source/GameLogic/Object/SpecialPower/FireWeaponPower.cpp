@@ -121,16 +121,18 @@ void FireWeaponPower::doSpecialPower( UnsignedInt commandOptions )
 }
 
 // ------------------------------------------------------------------------------------------------
-void FireWeaponPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
+Bool FireWeaponPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, UnsignedInt commandOptions )
 {
 	Object *self = getObject();
 	const FireWeaponPowerModuleData *data = getFireWeaponPowerModuleData();
 
 	if( self->isDisabled() )
-		return;
+		return false;
 
 	// call the base class action cause we are *EXTENDING* functionality
-	SpecialPowerModule::doSpecialPowerAtLocation( loc, angle, commandOptions );
+	if (!SpecialPowerModule::doSpecialPowerAtLocation(
+			loc, angle, commandOptions))
+		return false;
 
 	self->reloadAllAmmo( TRUE );
 
@@ -145,7 +147,7 @@ void FireWeaponPower::doSpecialPowerAtLocation( const Coord3D *loc, Real angle, 
 			ai->setTurretTargetPosition( (WhichTurretType)i, loc );
 		}
 	}
-
+	return true;
 }
 
 // ------------------------------------------------------------------------------------------------

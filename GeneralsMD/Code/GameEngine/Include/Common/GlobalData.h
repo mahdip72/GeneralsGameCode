@@ -73,6 +73,10 @@ public:
 		, m_hasSkirmishAITestHardAI2v6Request(false)
 		, m_skirmishAITestHardAI2v6Seed(0)
 		#endif
+		, m_hasSkirmishAIRecoveryTestRequest(false)
+		, m_skirmishAIRecoveryTestSeed(0)
+		, m_skirmishAIRecoveryFixtureCase(0)
+		, m_skirmishAIRecoveryFaction(0)
 	{}
 
 	Bool hasSkirmishAITestRequest() const { return m_hasSkirmishAITestRequest; }
@@ -80,7 +84,8 @@ public:
 	Bool requestSkirmishAITest(Int seed)
 	{
 		if (m_hasSkirmishAITestRequest || m_hasSkirmishAITest4v2Request ||
-			m_hasSkirmishAITestPractical1v7Request
+			m_hasSkirmishAITestPractical1v7Request ||
+			m_hasSkirmishAIRecoveryTestRequest
 		#if defined(_WIN64)
 			|| m_hasSkirmishAITestHardAI2v6Request
 		#endif
@@ -97,7 +102,8 @@ public:
 	Bool requestSkirmishAITest4v2(Int seed)
 	{
 		if (m_hasSkirmishAITestRequest || m_hasSkirmishAITest4v2Request ||
-			m_hasSkirmishAITestPractical1v7Request
+			m_hasSkirmishAITestPractical1v7Request ||
+			m_hasSkirmishAIRecoveryTestRequest
 		#if defined(_WIN64)
 			|| m_hasSkirmishAITestHardAI2v6Request
 		#endif
@@ -120,7 +126,8 @@ public:
 	Bool requestSkirmishAITestPractical1v7(Int seed)
 	{
 		if (m_hasSkirmishAITestRequest || m_hasSkirmishAITest4v2Request ||
-			m_hasSkirmishAITestPractical1v7Request
+			m_hasSkirmishAITestPractical1v7Request ||
+			m_hasSkirmishAIRecoveryTestRequest
 		#if defined(_WIN64)
 			|| m_hasSkirmishAITestHardAI2v6Request
 		#endif
@@ -145,7 +152,8 @@ public:
 	{
 		if (m_hasSkirmishAITestRequest || m_hasSkirmishAITest4v2Request ||
 			m_hasSkirmishAITestPractical1v7Request ||
-			m_hasSkirmishAITestHardAI2v6Request)
+			m_hasSkirmishAITestHardAI2v6Request ||
+			m_hasSkirmishAIRecoveryTestRequest)
 			return false;
 
 		m_hasSkirmishAITestHardAI2v6Request = true;
@@ -153,6 +161,27 @@ public:
 		return true;
 	}
 #endif
+	Bool hasSkirmishAIRecoveryTestRequest() const { return m_hasSkirmishAIRecoveryTestRequest; }
+	Int getSkirmishAIRecoveryTestSeed() const { return m_skirmishAIRecoveryTestSeed; }
+	Int getSkirmishAIRecoveryFixtureCase() const { return m_skirmishAIRecoveryFixtureCase; }
+	Int getSkirmishAIRecoveryFaction() const { return m_skirmishAIRecoveryFaction; }
+	Bool requestSkirmishAIRecoveryTest(Int seed, Int fixtureCase, Int faction)
+	{
+		if (m_hasSkirmishAITestRequest || m_hasSkirmishAITest4v2Request ||
+			m_hasSkirmishAITestPractical1v7Request ||
+			m_hasSkirmishAIRecoveryTestRequest
+		#if defined(_WIN64)
+			|| m_hasSkirmishAITestHardAI2v6Request
+		#endif
+			)
+			return false;
+
+		m_hasSkirmishAIRecoveryTestRequest = true;
+		m_skirmishAIRecoveryTestSeed = seed;
+		m_skirmishAIRecoveryFixtureCase = fixtureCase;
+		m_skirmishAIRecoveryFaction = faction;
+		return true;
+	}
 
 private:
 	Bool m_hasParsedCommandLineForStartup;
@@ -167,6 +196,10 @@ private:
 	Bool m_hasSkirmishAITestHardAI2v6Request;
 	Int m_skirmishAITestHardAI2v6Seed;
 #endif
+	Bool m_hasSkirmishAIRecoveryTestRequest;
+	Int m_skirmishAIRecoveryTestSeed;
+	Int m_skirmishAIRecoveryFixtureCase;
+	Int m_skirmishAIRecoveryFaction;
 };
 
 //-------------------------------------------------------------------------------------------------

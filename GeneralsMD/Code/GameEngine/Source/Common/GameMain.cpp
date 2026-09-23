@@ -39,6 +39,9 @@
 #include "Common/Stage5PerformanceFixtureRunner.h"
 #include "GameNetwork/InstalledLockstepV2Validation.h"
 #endif
+#if RTS_ZEROHOUR
+#include "Common/SkirmishAILegacySaveTest.h"
+#endif
 
 
 /**
@@ -53,6 +56,21 @@ Int GameMain()
 	TheFramePacer->enableFramesPerSecondLimit(TRUE);
 	TheGameEngine = CreateGameEngine();
 	TheGameEngine->init();
+
+#if RTS_ZEROHOUR
+	if (IsSkirmishAILegacySaveTestRequested())
+	{
+		// This utility owns the ordinary queued startup-load lifecycle. Command
+		// line validation rejects every other replay or validation lane with it.
+		if (!StartSkirmishAILegacySaveTest())
+			TheGameEngine->setQuitting(TRUE);
+		else
+			TheGameEngine->execute();
+		exitcode = FinalizeSkirmishAILegacySaveTest(exitcode);
+	}
+	else
+#endif
+	{
 	const Bool net3ValidationRequested = rts::IsInstalledNet3ValidationRequested();
 	Bool lockstepV2ValidationRequested = FALSE;
 	Bool performanceFixtureRequested = FALSE;
@@ -64,7 +82,8 @@ Int GameMain()
 	const Bool skirmishValidationRequested =
 		TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
 		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
-		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request()
+		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest()
 #if defined(_WIN64)
 		|| TheGlobalData->m_commandLineData.hasSkirmishAITestHardAI2v6Request()
 #endif
@@ -118,7 +137,12 @@ Int GameMain()
 #endif
 	if (!net3ValidationRequested && !lockstepV2ValidationRequested)
 	{
-		if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
+		if (TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest())
+			ArmSkirmishAIRecoveryFixtureRunner(
+				TheGlobalData->m_commandLineData.getSkirmishAIRecoveryTestSeed(),
+				TheGlobalData->m_commandLineData.getSkirmishAIRecoveryFixtureCase(),
+				TheGlobalData->m_commandLineData.getSkirmishAIRecoveryFaction());
+		else if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest())
 			ArmSkirmishAITestRunner(
 				TheGlobalData->m_commandLineData.getSkirmishAITestSeed(),
 				SKIRMISH_AI_TEST_SCENARIO_4V3);
@@ -165,6 +189,7 @@ Int GameMain()
 		exitcode = FinalizeStage5PerformanceFixtureRunner(exitcode);
 	ReleaseSkirmishAITestPerformanceReceiptOwner();
 #endif
+	}
 
 	// since execute() returned, we are exiting the game
 	delete TheFramePacer;
