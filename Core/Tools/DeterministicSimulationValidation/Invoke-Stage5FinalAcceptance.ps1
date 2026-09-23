@@ -21,6 +21,9 @@ $outputDirectory = Split-Path -Parent $outputFull
 if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
     New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 }
+Assert-Stage5FinalAcceptanceNoReparsePath `
+    ([IO.Path]::GetPathRoot($outputDirectory)) $outputDirectory `
+    'Final acceptance output'
 
 # The module validates and independently rehashes the artifact set, all
 # development evidence manifests, and every evidence attachment before
@@ -31,5 +34,8 @@ $report = Invoke-Stage5FinalAcceptanceAggregation `
     -ReadinessMode $ReadinessMode `
     -DevelopmentReadiness:$DevelopmentReadiness `
     -ExternalQualificationExempt:$ExternalQualificationExempt
-[IO.File]::WriteAllText($outputFull, ($report | ConvertTo-Json -Depth 10))
+$reportJson = $report | ConvertTo-Json -Depth 10
+$reportBytes = ([Text.UTF8Encoding]::new($false)).GetBytes([string]$reportJson)
+[void](Write-Stage5FinalAcceptanceFileAtomically -Path $outputFull `
+    -Bytes $reportBytes -Context 'Final acceptance output')
 Write-Output "Stage 5 development readiness passed for commit $($report.sourceCommit); final user manual approval remains required."

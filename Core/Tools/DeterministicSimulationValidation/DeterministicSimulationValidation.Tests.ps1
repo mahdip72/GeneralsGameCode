@@ -19,13 +19,16 @@ $focusedResultTreeDictionary =
     $FocusedAcceptanceCase -ceq 'ResultTreeDictionary'
 $focusedPerformanceScalingExport =
     $FocusedAcceptanceCase -ceq 'PerformanceScalingExport'
+$focusedFinalAcceptanceOutputPublication =
+    $FocusedAcceptanceCase -ceq 'FinalAcceptanceOutputPublication'
 if (-not [string]::IsNullOrWhiteSpace($FocusedAcceptanceCase) -and
     -not ($focusedQualificationData -or
         $focusedDevelopmentReadinessExecutionEvidence -or
         $focusedAiDeterminismGrouping -or
         $focusedLivePlanEntryIdentity -or
         $focusedResultTreeDictionary -or
-        $focusedPerformanceScalingExport)) {
+        $focusedPerformanceScalingExport -or
+        $focusedFinalAcceptanceOutputPublication)) {
     throw "Unknown focused acceptance case '$FocusedAcceptanceCase'."
 }
 if (($focusedQualificationData -or
@@ -33,7 +36,8 @@ if (($focusedQualificationData -or
         $focusedAiDeterminismGrouping -or
         $focusedLivePlanEntryIdentity -or
         $focusedResultTreeDictionary -or
-        $focusedPerformanceScalingExport) -and
+        $focusedPerformanceScalingExport -or
+        $focusedFinalAcceptanceOutputPublication) -and
     $ValidationPartition -notin @('All', 'Acceptance')) {
     throw 'Focused acceptance cases require ValidationPartition Acceptance or All.'
 }
@@ -42,7 +46,8 @@ $hasFocusedAcceptanceCase = $focusedQualificationData -or
     $focusedAiDeterminismGrouping -or
     $focusedLivePlanEntryIdentity -or
     $focusedResultTreeDictionary -or
-    $focusedPerformanceScalingExport
+    $focusedPerformanceScalingExport -or
+    $focusedFinalAcceptanceOutputPublication
 $runPlan = -not $hasFocusedAcceptanceCase -and
     ($ValidationPartition -eq 'All' -or $ValidationPartition -eq 'Plan')
 $runRuntime = -not $hasFocusedAcceptanceCase -and
@@ -56,7 +61,7 @@ $runAcceptance = $hasFocusedAcceptanceCase -or
 $expectedFocusedSelection = $focusedQualificationData -or
     $focusedDevelopmentReadinessExecutionEvidence -or $focusedAiDeterminismGrouping -or
     $focusedLivePlanEntryIdentity -or $focusedResultTreeDictionary -or
-    $focusedPerformanceScalingExport
+    $focusedPerformanceScalingExport -or $focusedFinalAcceptanceOutputPublication
 if ($runPlan -ne (($ValidationPartition -in @('All', 'Plan')) -and
         -not $expectedFocusedSelection) -or
     $runRuntime -ne (($ValidationPartition -in @('All', 'Runtime')) -and
@@ -1220,6 +1225,115 @@ function Invoke-Stage5ResultTreeDictionaryFocusedCase {
     Write-Output 'Focused Stage 5 dictionary result-tree proof passed.'
 }
 
+function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
+    param([Parameter(Mandatory = $true)][string]$ScratchRoot)
+    $scratchFull = [IO.Path]::GetFullPath($ScratchRoot)
+    $scratchItem = Get-Item -LiteralPath $scratchFull -Force -ErrorAction Stop
+    if (($scratchItem.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($scratchItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Final-acceptance output scratch root must be a normal directory: $scratchFull"
+    }
+    Assert-Stage5FinalAcceptanceNoReparsePath `
+        ([IO.Path]::GetPathRoot($scratchFull)) $scratchFull `
+        'Final-acceptance output test scratch'
+    $root = Join-Path $scratchFull ('GGC-Stage5FinalAcceptanceOutput-Test-{0}-{1}' -f
+        $PID, [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $root | Out-Null
+    $reparseRoot = Join-Path $root 'reparse'
+    $reparseManifest = Join-Path $reparseRoot 'manifest'
+    $reparseTarget = Join-Path $reparseRoot 'target'
+    $reparseLink = Join-Path $reparseManifest 'linked'
+    New-Item -ItemType Directory -Path $reparseManifest, $reparseTarget `
+        -Force | Out-Null
+    try {
+        $scriptPath = Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1'
+        $scriptSource = Get-Content -LiteralPath $scriptPath -Raw
+        Assert-True ($scriptSource -notmatch '\[IO\.File\]::WriteAllText' -and
+            $scriptSource -match '(?s)\$reportJson\s*=\s*\$report\s*\|\s*ConvertTo-Json\s+-Depth\s+10\s*\$reportBytes\s*=\s*\(\[Text\.UTF8Encoding\]::new\(\$false\)\)\.GetBytes' -and
+            $scriptSource -match 'Write-Stage5FinalAcceptanceFileAtomically' -and
+            $scriptSource -notmatch '\-ReplaceExisting') `
+            'final acceptance output retains UTF-8-without-BOM JSON serialization and uses create-only atomic publication'
+
+        $atomicRoot = Join-Path $root 'atomic'
+        New-Item -ItemType Directory -Path $atomicRoot | Out-Null
+        $racePath = Join-Path $atomicRoot 'create-only-race.json'
+        $collisionBytes = ([Text.UTF8Encoding]::new($false)).GetBytes(
+            '{"owner":"concurrent-writer"}')
+        $raceRejected = $false
+        try {
+            $candidateBytes = ([Text.UTF8Encoding]::new($false)).GetBytes(
+                '{"owner":"acceptance-writer"}')
+            Write-Stage5FinalAcceptanceFileAtomically -Path $racePath `
+                -Bytes $candidateBytes -Context 'Create-only race regression' `
+                -BeforePublishTestHook {
+                    param($temporaryPath, $destinationPath)
+                    [IO.File]::WriteAllBytes($destinationPath, $collisionBytes)
+                } | Out-Null
+        }
+        catch { $raceRejected = $true }
+        $collisionPreserved = (Test-Path -LiteralPath $racePath -PathType Leaf) -and
+            [Convert]::ToBase64String([IO.File]::ReadAllBytes($racePath)) -ceq
+            [Convert]::ToBase64String($collisionBytes)
+        Assert-True ($raceRejected -and $collisionPreserved -and
+            @(Get-ChildItem -LiteralPath $atomicRoot -File `
+                -Filter '.stage5-write-*.tmp').Count -eq 0) `
+            'create-only publication rejects a destination created after its precheck and preserves the concurrent bytes'
+
+        $reparseCreated = $false
+        try {
+            New-Item -ItemType Junction -Path $reparseLink `
+                -Target $reparseTarget -ErrorAction Stop | Out-Null
+            $reparseCreated = $true
+        }
+        catch {
+            Write-Warning 'Skipping atomic output reparse negative: this host does not permit junction creation.'
+        }
+        if ($reparseCreated) {
+            $wrapperReparsePath = Join-Path $reparseLink 'wrapper-report.json'
+            $wrapperReparseRejected = $false
+            try {
+                & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
+                    -AcceptanceManifestPath (Join-Path $root 'missing-manifest.json') `
+                    -OutputPath $wrapperReparsePath -DevelopmentReadiness | Out-Null
+            }
+            catch {
+                $wrapperReparseRejected = $_.Exception.Message -match 'reparse point'
+            }
+            Assert-True ($wrapperReparseRejected -and
+                -not (Test-Path -LiteralPath `
+                    (Join-Path $reparseTarget 'wrapper-report.json'))) `
+                'the final-acceptance entrypoint rejects a reparse-point output ancestor before aggregation or publication'
+
+            $reparseRejected = $false
+            try {
+                $reparseBytes = ([Text.UTF8Encoding]::new($false)).GetBytes(
+                    '{"mustNotExist":true}')
+                Write-Stage5FinalAcceptanceFileAtomically `
+                    -Path (Join-Path $reparseLink 'report.json') `
+                    -Bytes $reparseBytes -Context 'Reparse output regression' | Out-Null
+            }
+            catch { $reparseRejected = $_.Exception.Message -match 'reparse point' }
+            Assert-True ($reparseRejected -and
+                -not (Test-Path -LiteralPath `
+                    (Join-Path $reparseTarget 'report.json'))) `
+                'atomic output publication rejects a reparse-point ancestor before creating the report'
+        }
+    }
+    finally {
+        Remove-Stage5AcceptanceReparseFixtureLink -FixtureRoot $reparseRoot `
+            -LinkPath $reparseLink
+        Assert-Stage5AcceptanceScratchTreeContainsNoReparsePoints -RootPath $root
+        $rootFull = [IO.Path]::GetFullPath($root)
+        if (-not $rootFull.StartsWith($scratchFull + '\',
+                [StringComparison]::OrdinalIgnoreCase) -or
+            [IO.Path]::GetFileName($rootFull) -notlike `
+                'GGC-Stage5FinalAcceptanceOutput-Test-*') {
+            throw "Refusing unexpected focused output scratch cleanup: $rootFull"
+        }
+        Remove-Item -LiteralPath $rootFull -Recurse -Force
+    }
+}
+
 if ($focusedLivePlanEntryIdentity) {
     Invoke-Stage5LivePlanEntryIdentityFocusedCase
     return
@@ -1302,6 +1416,20 @@ if ($focusedDevelopmentReadinessExecutionEvidence) {
     } 'exactly one retained raw log named' `
         'focused development-readiness execution evidence rejects path-qualified raw-log names'
     Write-Output 'Focused Stage 5 development-readiness execution-evidence proof passed.'
+    return
+}
+if ($focusedFinalAcceptanceOutputPublication) {
+    $configuredScratchRoot = [Environment]::GetEnvironmentVariable(
+        'RTS_STAGE5_VALIDATION_SCRATCH_ROOT')
+    if ([string]::IsNullOrWhiteSpace($configuredScratchRoot)) {
+        throw 'RTS_STAGE5_VALIDATION_SCRATCH_ROOT must identify an explicit task-owned test scratch root.'
+    }
+    Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase `
+        -ScratchRoot $configuredScratchRoot
+    if ($script:Failures -ne 0) {
+        throw "$script:Failures final-acceptance output publication focused test(s) failed."
+    }
+    Write-Output 'Focused Stage 5 final-acceptance output publication proof passed.'
     return
 }
 if ($focusedAiDeterminismGrouping) {
@@ -9239,6 +9367,9 @@ try {
             '{"generation":2}' -and
         $replacementSnapshot.sha256 -ceq (Get-Sha256 $atomicReplacePath)) `
         'replace-existing publication works through the native durable atomic path'
+
+    Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase -ScratchRoot $root
+
     # Final acceptance is deliberately separate from the deterministic-runtime
     # replay/AI matrix. Build one complete, independently hashed diagnostic v1
     # evidence set, then prove that v1 is rejected until lockstep-v2 exists,
@@ -11394,6 +11525,29 @@ try {
         [bool]$acceptanceReport.premiumReviewRequired -and
         [bool]$acceptanceReport.manualApprovalRequired) `
         'development readiness writes a non-final report after installed lockstep-v2 evidence is attached'
+    $acceptanceOutputBytes = [IO.File]::ReadAllBytes($acceptanceOutput)
+    $acceptanceOutputHasBom = $acceptanceOutputBytes.Length -ge 3 -and
+        $acceptanceOutputBytes[0] -eq 239 -and
+        $acceptanceOutputBytes[1] -eq 187 -and
+        $acceptanceOutputBytes[2] -eq 191
+    $acceptanceOutputText = ([Text.UTF8Encoding]::new($false, $true)).GetString(
+        $acceptanceOutputBytes)
+    $repeatedAcceptanceRejected = $false
+    try {
+        & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
+            -AcceptanceManifestPath $acceptanceRequest -OutputPath $acceptanceOutput `
+            -DevelopmentReadiness -ExternalQualificationExempt | Out-Null
+    }
+    catch {
+        $repeatedAcceptanceRejected = $_.Exception.Message -match
+            'Final acceptance output already exists; refusing to overwrite evidence'
+    }
+    Assert-True (-not $acceptanceOutputHasBom -and
+        $acceptanceOutputText -ceq [IO.File]::ReadAllText($acceptanceOutput) -and
+        $repeatedAcceptanceRejected -and
+        [Convert]::ToBase64String([IO.File]::ReadAllBytes($acceptanceOutput)) -ceq
+            [Convert]::ToBase64String($acceptanceOutputBytes)) `
+        'final acceptance output remains BOM-less UTF-8 JSON and repeated publication preserves the original evidence bytes'
 
     $missingManualRequest = Join-Path $acceptanceRoot 'missing-manual.json'
     Write-AcceptanceRequest $missingManualRequest @($acceptanceKinds | Where-Object {
