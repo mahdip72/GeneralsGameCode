@@ -42,6 +42,7 @@
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "WinMain.h"
 #include "../../../Generals/Code/Main/WindowDpi.h"
+#include "GameClient/GameWindow.h"
 #include "Lib/BaseType.h"
 #include "Common/CommandLine.h"
 #include "Common/CriticalSection.h"
@@ -418,14 +419,15 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 			case WM_GETDPISCALEDSIZE:
 			{
 				gDpiPrechangeSizeTarget = 0;
+				SIZE *pendingSize = static_cast<SIZE *>(WindowMsgDataToPointer(
+					static_cast<WindowMsgData>(lParam)));
 				// Fullscreen sizing belongs to the display-mode owner; don't let
 				// Windows linearly scale its pending size during a monitor move.
 				if (!TheGlobalData || !TheGlobalData->m_windowed)
-					return WindowDpi::PreservePendingWindowSize(
-						reinterpret_cast<SIZE *>(lParam));
+					return WindowDpi::PreservePendingWindowSize(pendingSize);
 
 				const BOOL sizeAdjusted = WindowDpi::AdjustPendingWindowSizeForDpi(
-					hWnd, (UINT)wParam, reinterpret_cast<SIZE *>(lParam));
+					hWnd, (UINT)wParam, pendingSize);
 				if (sizeAdjusted)
 					gDpiPrechangeSizeTarget = (UINT)wParam;
 				return sizeAdjusted;
@@ -442,7 +444,8 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 				// retain the client render size and Windows' suggested position.
 				if (TheGlobalData && TheGlobalData->m_windowed)
 				{
-					const RECT *suggestedRect = reinterpret_cast<const RECT *>(lParam);
+					const RECT *suggestedRect = static_cast<const RECT *>(
+						WindowMsgDataToPointer(static_cast<WindowMsgData>(lParam)));
 					if (suggestedRect)
 					{
 						if (hasPmV2PrechangeSize)
