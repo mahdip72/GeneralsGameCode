@@ -26,8 +26,8 @@
 #include "Common/ThingTemplate.h"
 #if RTS_ZEROHOUR
 #include "GameLogic/AI.h"
-#include "GameLogic/AIPathfind.h"
 #endif
+#include "GameLogic/AIPathfind.h"
 #include "GameClient/MapUtil.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
