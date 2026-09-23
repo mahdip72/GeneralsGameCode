@@ -109,6 +109,76 @@ private:
 	GpuHandle m_textures[LEGACY_TEXTURE_STAGE_COUNT];
 };
 
+// Sorted batches submit a single indexed scratch buffer and topology through
+// one ordered context stream. Keep this cache local to that batch; other
+// renderer calls can change input-assembly state between batches.
+class NativeW3DSortedBatchBindingCache
+{
+public:
+	NativeW3DSortedBatchBindingCache()
+	{
+		Reset();
+	}
+
+	void Reset()
+	{
+		m_topologyKnown = false;
+		m_topology = RENDER_PRIMITIVE_TRIANGLE_LIST;
+		m_indexBufferKnown = false;
+		m_indexBuffer = GpuHandle();
+		m_indexFormat = RENDER_FORMAT_UNKNOWN;
+		m_indexOffset = 0;
+	}
+
+	template <class RenderContext>
+	RenderResult BindTopology(RenderContext *context,
+		RenderPrimitiveTopology topology)
+	{
+		if (context == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_topologyKnown && m_topology == topology)
+			return RENDER_RESULT_OK;
+
+		const RenderResult result = context->setPrimitiveTopology(topology);
+		if (result != RENDER_RESULT_OK)
+			return result;
+		m_topology = topology;
+		m_topologyKnown = true;
+		return RENDER_RESULT_OK;
+	}
+
+	template <class RenderContext>
+	RenderResult BindIndexBuffer(RenderContext *context, GpuHandle buffer,
+		RenderFormat format, unsigned int offset)
+	{
+		if (context == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_indexBufferKnown && m_indexBuffer == buffer &&
+			m_indexFormat == format && m_indexOffset == offset)
+		{
+			return RENDER_RESULT_OK;
+		}
+
+		const RenderResult result = context->setIndexBuffer(buffer, format,
+			offset);
+		if (result != RENDER_RESULT_OK)
+			return result;
+		m_indexBuffer = buffer;
+		m_indexFormat = format;
+		m_indexOffset = offset;
+		m_indexBufferKnown = true;
+		return RENDER_RESULT_OK;
+	}
+
+private:
+	bool m_topologyKnown;
+	RenderPrimitiveTopology m_topology;
+	bool m_indexBufferKnown;
+	GpuHandle m_indexBuffer;
+	RenderFormat m_indexFormat;
+	unsigned int m_indexOffset;
+};
+
 class NativeW3DRenderer
 {
 public:
@@ -209,7 +279,8 @@ private:
 	RenderResult SubmitInternal(const NativeW3DResources &resources,
 		const LegacyLogicalState &state, const NativeDrawPacket &packet,
 		bool requireFacadeFrame,
-		NativeW3DTextureBindingCache *textureBindingCache);
+		NativeW3DTextureBindingCache *textureBindingCache,
+		NativeW3DSortedBatchBindingCache *sortedBatchBindingCache);
 	RenderResult AttachBorrowedState(NativeW3DRenderState *state);
 	RenderResult DetachBorrowedState();
 	// Destruction can be initiated by a worker, but the backend and its

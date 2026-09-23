@@ -189,6 +189,148 @@ int TestTextureBindingCacheCommandTrace()
 	return result;
 }
 
+enum SortedBatchCommandType
+{
+	SORTED_BATCH_TOPOLOGY_COMMAND,
+	SORTED_BATCH_INDEX_BUFFER_COMMAND
+};
+
+struct SortedBatchCommand
+{
+	SortedBatchCommandType type;
+	rts::render::GpuHandle buffer;
+	rts::render::RenderFormat format;
+	unsigned int offset;
+	rts::render::RenderPrimitiveTopology topology;
+};
+
+class SortedBatchTraceContext
+{
+public:
+	SortedBatchTraceContext() : failNextTopology(false), failNextIndexBuffer(false),
+		commands()
+	{
+	}
+
+	rts::render::RenderResult setPrimitiveTopology(
+		rts::render::RenderPrimitiveTopology topology)
+	{
+		SortedBatchCommand command;
+		command.type = SORTED_BATCH_TOPOLOGY_COMMAND;
+		command.buffer = rts::render::GpuHandle();
+		command.format = rts::render::RENDER_FORMAT_UNKNOWN;
+		command.offset = 0;
+		command.topology = topology;
+		commands.push_back(command);
+		if (failNextTopology)
+		{
+			failNextTopology = false;
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		return rts::render::RENDER_RESULT_OK;
+	}
+
+	rts::render::RenderResult setIndexBuffer(rts::render::GpuHandle buffer,
+		rts::render::RenderFormat format, unsigned int offset)
+	{
+		SortedBatchCommand command;
+		command.type = SORTED_BATCH_INDEX_BUFFER_COMMAND;
+		command.buffer = buffer;
+		command.format = format;
+		command.offset = offset;
+		command.topology = rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST;
+		commands.push_back(command);
+		if (failNextIndexBuffer)
+		{
+			failNextIndexBuffer = false;
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		return rts::render::RENDER_RESULT_OK;
+	}
+
+	bool failNextTopology;
+	bool failNextIndexBuffer;
+	std::vector<SortedBatchCommand> commands;
+};
+
+int TestSortedBatchBindingCacheCommandTrace()
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3DSortedBatchBindingCache cache;
+	SortedBatchTraceContext trace;
+	const GpuHandle indexA(30, 4);
+	const GpuHandle indexANextGeneration(30, 5);
+
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+		RENDER_RESULT_OK && trace.commands.size() == 1 &&
+		trace.commands[0].type == SORTED_BATCH_TOPOLOGY_COMMAND,
+		"first sorted packet records its topology command");
+	result |= Check(cache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT,
+		0) == RENDER_RESULT_OK && trace.commands.size() == 2 &&
+		trace.commands[1].type == SORTED_BATCH_INDEX_BUFFER_COMMAND &&
+		trace.commands[1].buffer == indexA &&
+		trace.commands[1].format == RENDER_FORMAT_R16_UINT &&
+		trace.commands[1].offset == 0,
+		"first sorted packet records the full index binding tuple");
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+		RENDER_RESULT_OK && cache.BindIndexBuffer(&trace, indexA,
+		RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK &&
+		trace.commands.size() == 2,
+		"repeated topology and exact index bindings emit no commands");
+
+	result |= Check(cache.BindIndexBuffer(&trace, indexANextGeneration,
+		RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK &&
+		trace.commands.size() == 3 &&
+		trace.commands.back().buffer == indexANextGeneration,
+		"recycled index slots with a new generation are rebound");
+	result |= Check(cache.BindIndexBuffer(&trace, indexANextGeneration,
+		RENDER_FORMAT_R32_UINT, 0) == RENDER_RESULT_OK &&
+		trace.commands.size() == 4 &&
+		trace.commands.back().format == RENDER_FORMAT_R32_UINT,
+		"an index-format change is rebound");
+	result |= Check(cache.BindIndexBuffer(&trace, indexANextGeneration,
+		RENDER_FORMAT_R32_UINT, 4) == RENDER_RESULT_OK &&
+		trace.commands.size() == 5 && trace.commands.back().offset == 4,
+		"an index-offset change is rebound");
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_LINE_LIST) ==
+		RENDER_RESULT_OK && trace.commands.size() == 6 &&
+		trace.commands.back().topology == RENDER_PRIMITIVE_LINE_LIST,
+		"a topology change is rebound");
+
+	trace.failNextIndexBuffer = true;
+	result |= Check(cache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT,
+		0) == RENDER_RESULT_FAILED && trace.commands.size() == 7,
+		"a failed index bind is surfaced and not cached");
+	result |= Check(cache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT,
+		0) == RENDER_RESULT_OK && trace.commands.size() == 8 &&
+		trace.commands.back().buffer == indexA &&
+		cache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT, 0) ==
+			RENDER_RESULT_OK && trace.commands.size() == 8,
+		"the failed index bind is retried, then the successful tuple is cached");
+
+	trace.failNextTopology = true;
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_STRIP) ==
+		RENDER_RESULT_FAILED && trace.commands.size() == 9,
+		"a failed topology bind is surfaced and not cached");
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_STRIP) ==
+		RENDER_RESULT_OK && trace.commands.size() == 10 &&
+		cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_STRIP) ==
+			RENDER_RESULT_OK && trace.commands.size() == 10,
+		"the failed topology bind is retried, then the successful value is cached");
+
+	NativeW3DSortedBatchBindingCache nextBatchCache;
+	result |= Check(nextBatchCache.BindTopology(&trace,
+		RENDER_PRIMITIVE_TRIANGLE_STRIP) == RENDER_RESULT_OK &&
+		nextBatchCache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT,
+			0) == RENDER_RESULT_OK && trace.commands.size() == 12,
+		"a new sorted batch starts unknown and reissues both bindings");
+	std::fprintf(stdout,
+		"sorted batch binding trace counts: first=2 repeated=0 tuple-changes=4 "
+		"failed-bind-retries=2 batch-reset=2\n");
+	return result;
+}
+
 #if defined(_WIN32) && defined(RTS_RENDERER_HAS_D3D11)
 const wchar_t *kD3D11InputLayoutTestWindowClass =
 	L"GeneralsGameCodeD3D11InputLayoutTestWindow";
@@ -383,6 +525,7 @@ int main()
 	result |= TestTexturePublicationContract();
 	result |= TestTexturePublicationOperationalContract();
 	result |= TestTextureBindingCacheCommandTrace();
+	result |= TestSortedBatchBindingCacheCommandTrace();
 #if defined(_WIN32) && defined(RTS_RENDERER_HAS_D3D11)
 	result |= TestD3D11TexturedInputLayoutSafety();
 #endif

@@ -359,20 +359,21 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 	const LegacyLogicalState &state,
 	const NativeDrawPacket &packet)
 {
-	return SubmitInternal(resources, state, packet, true, 0);
+	return SubmitInternal(resources, state, packet, true, 0, 0);
 }
 
 RenderResult NativeW3DRenderer::SubmitExternal(
 	const NativeW3DResources &resources, const LegacyLogicalState &state,
 	const NativeDrawPacket &packet)
 {
-	return SubmitInternal(resources, state, packet, false, 0);
+	return SubmitInternal(resources, state, packet, false, 0, 0);
 }
 
 RenderResult NativeW3DRenderer::SubmitInternal(
 	const NativeW3DResources &resources, const LegacyLogicalState &state,
 	const NativeDrawPacket &packet, bool requireFacadeFrame,
-	NativeW3DTextureBindingCache *textureBindingCache)
+	NativeW3DTextureBindingCache *textureBindingCache,
+	NativeW3DSortedBatchBindingCache *sortedBatchBindingCache)
 {
 	IRenderContext *context = m_state == 0 ? 0 : m_state->Context();
 	if (context == 0 || (requireFacadeFrame && !m_frameOpen) ||
@@ -462,7 +463,9 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 			}
 		}
 	}
-	result = context->setPrimitiveTopology(packet.topology);
+	result = sortedBatchBindingCache != 0 ?
+		sortedBatchBindingCache->BindTopology(context, packet.topology) :
+		context->setPrimitiveTopology(packet.topology);
 	if (result != RENDER_RESULT_OK)
 	{
 		return result;
@@ -471,8 +474,11 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 	{
 		return context->draw(packet.vertexCount, packet.startVertex);
 	}
-	result = context->setIndexBuffer(packet.indexBuffer, packet.indexFormat,
-		packet.indexOffset);
+	result = sortedBatchBindingCache != 0 ?
+		sortedBatchBindingCache->BindIndexBuffer(context, packet.indexBuffer,
+			packet.indexFormat, packet.indexOffset) :
+		context->setIndexBuffer(packet.indexBuffer, packet.indexFormat,
+			packet.indexOffset);
 	if (result != RENDER_RESULT_OK)
 	{
 		return result;
