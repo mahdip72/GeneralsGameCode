@@ -31,6 +31,39 @@ struct TestVertex
 	unsigned int color;
 };
 
+struct TestVertexWide
+{
+	float x;
+	float y;
+	float z;
+	unsigned int color;
+	float u;
+	float v;
+};
+
+bool SameBatchGeometry(const NativeDrawPacket &left,
+	const NativeDrawPacket &right)
+{
+	const RenderVertexLayout &a = left.vertexLayout;
+	const RenderVertexLayout &b = right.vertexLayout;
+	if (left.vertexStride != right.vertexStride ||
+		left.vertexFormat != right.vertexFormat ||
+		left.topology != right.topology ||
+		left.indexFormat != right.indexFormat ||
+		a.stride != b.stride || a.elementCount != b.elementCount ||
+		a.preTransformed != b.preTransformed)
+		return false;
+	for (unsigned int index = 0; index < a.elementCount; ++index)
+	{
+		if (a.elements[index].semantic != b.elements[index].semantic ||
+			a.elements[index].semanticIndex != b.elements[index].semanticIndex ||
+			a.elements[index].format != b.elements[index].format ||
+			a.elements[index].byteOffset != b.elements[index].byteOffset)
+			return false;
+	}
+	return true;
+}
+
 struct CapturedBatch
 {
 	std::vector<unsigned int> states;
@@ -43,7 +76,8 @@ struct CapturedBatch
 class RecordingSink : public NativeSortedGeometrySink
 {
 public:
-	RecordingSink() : calls(0), failCall(0), acceptedOnFailure(0), batches() {}
+	RecordingSink() : calls(0), failCall(0), acceptedOnFailure(0),
+		requireHomogeneous(false), batches() {}
 
 	virtual RenderResult SubmitNativeSortedBatch(
 		const NativeSortedDraw *draws, unsigned int drawCount,
@@ -67,6 +101,17 @@ public:
 		batch.indices.assign(sourceIndices,
 			sourceIndices + indexBytes / sizeof(unsigned short));
 		batches.push_back(batch);
+		if (requireHomogeneous)
+		{
+			for (unsigned int index = 1; index < drawCount; ++index)
+			{
+				if (!SameBatchGeometry(draws[0].packet, draws[index].packet))
+				{
+					*submittedDrawCount = 0;
+					return RENDER_RESULT_INVALID_ARGUMENT;
+				}
+			}
+		}
 		if (failCall != 0 && calls == failCall)
 		{
 			*submittedDrawCount = acceptedOnFailure < drawCount ?
@@ -80,6 +125,7 @@ public:
 	unsigned int calls;
 	unsigned int failCall;
 	unsigned int acceptedOnFailure;
+	bool requireHomogeneous;
 	std::vector<CapturedBatch> batches;
 };
 
@@ -225,6 +271,67 @@ void TestPerTriangleDepthOrder()
 	}
 }
 
+void TestMixedGeometryPreservesSortedOrder()
+{
+	NativeSortingRenderer renderer;
+	RecordingSink sink;
+	sink.requireHomogeneous = true;
+	const unsigned short indices[] = {0, 1, 2};
+	TestVertex narrow[3] = {};
+	TestVertexWide wide[3] = {};
+	for (unsigned int index = 0; index < 3; ++index)
+	{
+		narrow[index].z = 1.0f;
+		wide[index].z = 2.0f;
+	}
+	LegacyLogicalState state;
+	NativeDrawPacket narrowPacket = MakePacket(3, 3);
+	state.pipeline.shaderBits = 10;
+	CHECK(renderer.Queue(state, narrowPacket, narrow, sizeof(narrow),
+		indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+
+	NativeDrawPacket widePacket = MakePacket(3, 3);
+	widePacket.vertexStride = sizeof(TestVertexWide);
+	widePacket.vertexLayout.stride = sizeof(TestVertexWide);
+	widePacket.vertexLayout.elementCount = 3;
+	widePacket.vertexLayout.elements[2].semantic =
+		RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE;
+	widePacket.vertexLayout.elements[2].semanticIndex = 0;
+	widePacket.vertexLayout.elements[2].format = RENDER_VERTEX_DATA_FLOAT2;
+	widePacket.vertexLayout.elements[2].byteOffset = sizeof(TestVertex);
+	state.pipeline.shaderBits = 20;
+	CHECK(renderer.Queue(state, widePacket, wide, sizeof(wide),
+		indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+
+	for (unsigned int index = 0; index < 3; ++index)
+		narrow[index].z = 3.0f;
+	NativeDrawPacket alternateLayout = narrowPacket;
+	alternateLayout.vertexLayout.elementCount = 1;
+	state.pipeline.shaderBits = 30;
+	CHECK(renderer.Queue(state, alternateLayout, narrow, sizeof(narrow),
+		indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+
+	for (unsigned int index = 0; index < 3; ++index)
+		narrow[index].z = 4.0f;
+	NativeDrawPacket alternateFormat = narrowPacket;
+	alternateFormat.vertexFormat = RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1;
+	state.pipeline.shaderBits = 40;
+	CHECK(renderer.Queue(state, alternateFormat, narrow, sizeof(narrow),
+		indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+
+	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
+	CHECK(sink.calls == 4);
+	CHECK(sink.batches.size() == 4);
+	if (sink.batches.size() == 4)
+	{
+		const unsigned int expected[] = {10, 20, 30, 40};
+		for (unsigned int index = 0; index < 4; ++index)
+			CHECK(sink.batches[index].states.size() == 1 &&
+				sink.batches[index].states[0] == expected[index]);
+	}
+	CHECK(renderer.Empty());
+}
+
 void TestFailureAfterFirstChunkRetainsOnlyPendingGeometry()
 {
 	NativeSortingRenderer renderer;
@@ -270,6 +377,7 @@ int main()
 	rts::JobSystem::setStartupWorkerCount(6);
 	TestNodeOrderingAndFlushBoundary();
 	TestPerTriangleDepthOrder();
+	TestMixedGeometryPreservesSortedOrder();
 	TestFailureAfterFirstChunkRetainsOnlyPendingGeometry();
 	return failures == 0 ? 0 : 1;
 }

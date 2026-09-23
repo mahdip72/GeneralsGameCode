@@ -383,6 +383,29 @@ void Sort(SortedTriangle *begin, SortedTriangle *end)
 	}
 }
 
+bool SameChunkGeometry(const NativeDrawPacket &left,
+	const NativeDrawPacket &right)
+{
+	const RenderVertexLayout &a = left.vertexLayout;
+	const RenderVertexLayout &b = right.vertexLayout;
+	if (left.vertexStride != right.vertexStride ||
+		left.vertexFormat != right.vertexFormat ||
+		left.topology != right.topology ||
+		left.indexFormat != right.indexFormat ||
+		a.stride != b.stride || a.elementCount != b.elementCount ||
+		a.preTransformed != b.preTransformed)
+		return false;
+	for (unsigned int index = 0; index < a.elementCount; ++index)
+	{
+		if (a.elements[index].semantic != b.elements[index].semantic ||
+			a.elements[index].semanticIndex != b.elements[index].semanticIndex ||
+			a.elements[index].format != b.elements[index].format ||
+			a.elements[index].byteOffset != b.elements[index].byteOffset)
+			return false;
+	}
+	return true;
+}
+
 void AddDrawRun(std::vector<NativeSortedDraw> &draws,
 	std::vector<DrawRun> &runs, const SortedSubmission &submission,
 	size_t submissionIndex, size_t localTriangle, size_t vertexOffset)
@@ -628,6 +651,7 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			std::vector<DrawRun> runs;
 			std::vector<size_t> vertexOffsets(m_impl->submissions.size(),
 				std::numeric_limits<size_t>::max());
+			const NativeDrawPacket *chunkPacket = 0;
 			const size_t maximumChunkEnd = std::min(triangles.size(),
 				chunkOffset + static_cast<size_t>(
 					MAX_SORTING_TRIANGLES_PER_CHUNK));
@@ -644,6 +668,11 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 					submissionIndex];
 				if (submissionIndex >= vertexOffsets.size())
 					return RENDER_RESULT_INVALID_ARGUMENT;
+				if (chunkPacket != 0 &&
+					!SameChunkGeometry(*chunkPacket, submission.packet))
+					break;
+				if (chunkPacket == 0)
+					chunkPacket = &submission.packet;
 
 				if (vertexOffsets[submissionIndex] ==
 					std::numeric_limits<size_t>::max())
