@@ -69,6 +69,7 @@ Render2DClass::Render2DClass( TextureClass* tex ) :
 	Texture(nullptr),
 	ZValue(0),
 	IsHidden( false ),
+	NativePixelCenters( false ),
 	IsGrayScale (false),
 	Indices(sizeof(PreAllocatedIndices)/sizeof(unsigned short),PreAllocatedIndices),
 	Vertices(sizeof(PreAllocatedVertices)/sizeof(Vector2),PreAllocatedVertices),
@@ -196,7 +197,11 @@ void	  Render2DClass::Update_Bias()
 
 	BiasedCoordinateOffset = CoordinateOffset;
 
-	if ( WW3D::Is_Screen_UV_Biased() ) {	// Global bais setting
+	// D3D11 samples at half-integer pixel centers. The D3D8 half-pixel
+	// correction would sample the neighboring atlas texel at every repeated
+	// UI tile edge (including button centers and loading bars).
+	if ( WW3D::Is_Screen_UV_Biased() &&
+		!(NativePixelCenters && rts::render::IsNativeGameRendererActive()) ) {
 		Vector2 bais_add( -0.5f ,-0.5f );	// offset by -0.5,-0.5 in pixels
 
 		// Convert from pixels to (-1,1)-(1,-1) units

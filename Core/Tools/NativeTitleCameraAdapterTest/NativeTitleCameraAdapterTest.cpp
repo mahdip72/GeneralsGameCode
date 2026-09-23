@@ -13,6 +13,8 @@
 #include "nativew3d2.h"
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
+#include "render2d.h"
+#include "ww3d.h"
 
 #include <cfenv>
 #include <cmath>
@@ -29,6 +31,61 @@ int Check(bool condition, const char *message)
 		return 0;
 	std::fprintf(stderr, "FAIL: %s\n", message);
 	return 1;
+}
+
+class InspectRender2D : public Render2DClass
+{
+public:
+	const Vector2 &Vertex(int index) const { return Vertices[index]; }
+};
+
+class InspectRender2DText : public Render2DTextClass
+{
+public:
+	const Vector2 &Vertex(int index) const { return Vertices[index]; }
+};
+
+int TestNative2DTileAlignment()
+{
+	int result = 0;
+	const bool previousBias = WW3D::Is_Screen_UV_Biased();
+	const RectClass previousResolution = Render2DClass::Get_Screen_Resolution();
+	WW3D::Set_Screen_UV_Bias(true);
+	const int widths[] = { 101, 800 };
+	const int heights[] = { 79, 600 };
+	for (int resolution = 0; resolution < 2; ++resolution)
+	{
+		const float width = static_cast<float>(widths[resolution]);
+		const float height = static_cast<float>(heights[resolution]);
+		Render2DClass::Set_Screen_Resolution(RectClass(0, 0, width, height));
+		InspectRender2D image;
+		image.Enable_Native_Pixel_Centers(true);
+		image.Set_Coordinate_Range(RectClass(0, 0, width, height));
+		image.Add_Quad(RectClass(10, 5, 20, 15));
+		image.Add_Quad(RectClass(20, 5, 30, 15));
+		const float left = 20.0f * 2.0f / width - 1.0f;
+		result |= Check(std::fabs(image.Vertex(2).X - left) < 0.00001f &&
+			std::fabs(image.Vertex(4).X - left) < 0.00001f,
+			"native repeated image tiles meet at the D3D11 pixel boundary");
+		result |= Check(std::fabs(image.Vertex(0).Y -
+			(1.0f - 5.0f * 2.0f / height)) < 0.00001f,
+			"native image top remains pixel aligned");
+		InspectRender2D legacyAligned;
+		legacyAligned.Set_Coordinate_Range(RectClass(0, 0, width, height));
+		legacyAligned.Add_Quad(RectClass(10, 5, 20, 15));
+		result |= Check(std::fabs(legacyAligned.Vertex(0).X -
+			(9.5f * 2.0f / width - 1.0f)) < 0.00001f,
+			"default 2D geometry retains its existing half-pixel offset");
+		InspectRender2DText text;
+		text.Set_Coordinate_Range(RectClass(0, 0, width, height));
+		text.Add_Quad(RectClass(10, 5, 20, 15));
+		result |= Check(std::fabs(text.Vertex(0).X -
+			(9.5f * 2.0f / width - 1.0f)) < 0.00001f,
+			"text geometry retains its existing half-pixel offset");
+	}
+	WW3D::Set_Screen_UV_Bias(previousBias);
+	Render2DClass::Set_Screen_Resolution(previousResolution);
+	return result;
 }
 
 const wchar_t *kWindowClassName = L"GeneralsGameCodeNativeTitleCameraAdapterTest";
@@ -1420,6 +1477,7 @@ int main()
 	}
 	if (actualOwner != 0)
 	{
+		result |= TestNative2DTileAlignment();
 		result |= TestCameraOutputs(&sink);
 		result |= TestCameraUsesSelectedTarget(&sink);
 		result |= TestCameraApplyOutputs(&sink);

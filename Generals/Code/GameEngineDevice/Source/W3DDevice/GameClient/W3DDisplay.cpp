@@ -901,6 +901,7 @@ void W3DDisplay::init()
 		// create a 2D renderer helper
 		m_2DRender = NEW Render2DClass;
 		DEBUG_ASSERTCRASH( m_2DRender, ("Cannot create Render2DClass") );
+		m_2DRender->Enable_Native_Pixel_Centers(TRUE);
 
 		WW3DErrorType renderDeviceError;
 		Int attempt = 0;
