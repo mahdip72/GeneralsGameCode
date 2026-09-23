@@ -22,8 +22,10 @@
 #include "Common/SkirmishAIReplayEpoch.h"
 #include "Common/PathfindQueueReplayEpoch.h"
 #include "GameLogic/SkirmishAIDecision.h"
+#include "GameLogic/SkirmishAIDefense.h"
 #include "GameLogic/SkirmishAIRecovery.h"
 #include "GameLogic/SkirmishAIStrategy.h"
+#include "GameLogic/SkirmishAITunnelRoute.h"
 #include "GameLogic/SkirmishAILiveness.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Module/RailedTransportDockUpdate.h"
@@ -1179,6 +1181,76 @@ static void TestSkirmishAIStrategyPolicies()
 	CHECK(decision.nextState.strategicTargetID == (ObjectID)123);
 	CHECK(decision.nextState.strategicTargetObserved);
 	CHECK(decision.nextState.strategicTargetLastSeenFrame == 0);
+
+	// The new route signal is opt-in.  Legacy callers keep their Assault
+	// decision, while a tactical caller uses the existing mode transition.
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	state.currentMode = SKIRMISH_STRATEGY_ASSAULT;
+	state.strategicTargetID = (ObjectID)123;
+	state.strategicTargetObserved = true;
+	metrics = MakeSkirmishStrategyMetrics();
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD, 0, true);
+	CHECK(!decision.modeChanged);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_ASSAULT);
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 0, true, true, false);
+	CHECK(decision.modeChanged);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_BALANCED);
+	CHECK(decision.reason ==
+		SKIRMISH_STRATEGY_REASON_BALANCED_TACTICAL_ROUTE_EXHAUSTED);
+	CHECK(decision.nextState.strategicTargetID == INVALID_ID);
+	state = decision.nextState;
+	state.nextEvaluationFrame = 5 * LOGICFRAMES_PER_SECOND;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD,
+		5 * LOGICFRAMES_PER_SECOND, true, true, false);
+	CHECK(!decision.modeChanged);
+	CHECK(decision.nextState.pendingMode != SKIRMISH_STRATEGY_ASSAULT);
+
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	state.currentMode = SKIRMISH_STRATEGY_ASSAULT;
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_HARD, 0, true, true, true);
+	CHECK(decision.modeChanged);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_FORTIFY);
+	CHECK(decision.reason ==
+		SKIRMISH_STRATEGY_REASON_FORTIFY_TACTICAL_ROUTE_EXHAUSTED);
+	CHECK(decision.nextState.fortifyAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_PENDING);
+	CHECK(decision.nextState.superweaponAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED);
+	CHECK(decision.nextState.assaultAssemblyDeadlineActive);
+	state = decision.nextState;
+	state.nextEvaluationFrame = 120 * LOGICFRAMES_PER_SECOND;
+	metrics.viableAssaultForceAssembled = true;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_HARD,
+		120 * LOGICFRAMES_PER_SECOND, true, true, true);
+	CHECK(decision.modeChanged);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_BALANCED);
+	CHECK(decision.reason == SKIRMISH_STRATEGY_REASON_BALANCED_FORTIFY_DEADLINE);
+	CHECK(decision.nextState.superweaponAttemptStatus ==
+		SKIRMISH_STRATEGY_ATTEMPT_FAILED);
+
+	// Once the caller clears the blocked-route signal after a successful
+	// superweapon strike, the normal Fortify-to-Assault confirmation can run.
+	InitializeOldSaveSkirmishStrategyState(&state, 0);
+	state.currentMode = SKIRMISH_STRATEGY_ASSAULT;
+	metrics = MakeSkirmishStrategyMetrics();
+	decision = EvaluateSkirmishStrategy(
+		state, metrics, DIFFICULTY_NORMAL, 0, true, true, true);
+	state = decision.nextState;
+	state.superweaponAttemptStatus = SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED;
+	state.nextEvaluationFrame = 120 * LOGICFRAMES_PER_SECOND;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_NORMAL,
+		120 * LOGICFRAMES_PER_SECOND, true, false, true);
+	CHECK(!decision.modeChanged);
+	CHECK(decision.nextState.pendingMode == SKIRMISH_STRATEGY_ASSAULT);
+	state = decision.nextState;
+	state.nextEvaluationFrame = 140 * LOGICFRAMES_PER_SECOND;
+	decision = EvaluateSkirmishStrategy(state, metrics, DIFFICULTY_NORMAL,
+		140 * LOGICFRAMES_PER_SECOND, true, false, true);
+	CHECK(decision.modeChanged);
+	CHECK(decision.nextState.currentMode == SKIRMISH_STRATEGY_ASSAULT);
+	CHECK(decision.reason == SKIRMISH_STRATEGY_REASON_ASSAULT_SUPERWEAPON_FIRED);
 
 	CHECK(!IsSkirmishStrategyFrameReached(UINT_MAX - 3, 5));
 	CHECK(IsSkirmishStrategyFrameReached(5, 5));
@@ -2575,26 +2647,28 @@ static void TestSkirmishAIReplayEpoch()
 
 	// Live games always use the current and recovery paths. Replays retain the
 	// behavior selected by their recording epoch; an unknown epoch is legacy.
-	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
 	const Bool expectedReplayCurrentBehavior[] =
-		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedReplayRecoveryBehavior[] =
-		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedRecoveryCRCFields[] =
-		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedCancellationOwnership[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedUnownedQueueFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedBoundedFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedResourceWorkerPreservation[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedStrategyBehavior[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedProductionBehavior[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
-	for (Int i = 0; i < 12; ++i)
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+	const Bool expectedTacticalBehavior[] =
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
+	for (Int i = 0; i < 13; ++i)
 	{
 		CHECK(ShouldUseSkirmishAICurrentBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(FALSE, replayEpochs[i]));
@@ -2614,6 +2688,10 @@ static void TestSkirmishAIReplayEpoch()
 			FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIStrategyBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldIncludeSkirmishAIStrategyCRCFields(FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAIProductionBehavior(FALSE, replayEpochs[i]));
+		CHECK(ShouldIncludeSkirmishAIProductionCRCFields(FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAITacticalBehavior(FALSE, replayEpochs[i]));
+		CHECK(ShouldIncludeSkirmishAITacticalCRCFields(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, replayEpochs[i])
 			== expectedReplayCurrentBehavior[i]);
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, replayEpochs[i])
@@ -2642,6 +2720,10 @@ static void TestSkirmishAIReplayEpoch()
 			== expectedProductionBehavior[i]);
 		CHECK(ShouldIncludeSkirmishAIProductionCRCFields(TRUE, replayEpochs[i])
 			== expectedProductionBehavior[i]);
+		CHECK(ShouldUseSkirmishAITacticalBehavior(TRUE, replayEpochs[i])
+			== expectedTacticalBehavior[i]);
+		CHECK(ShouldIncludeSkirmishAITacticalCRCFields(TRUE, replayEpochs[i])
+			== expectedTacticalBehavior[i]);
 	}
 
 	UnicodeString livenessOnly = unmarked;
@@ -2813,9 +2895,9 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(resourceWorkerPreservationEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=8]") == 0);
 
-	// Epoch 9 remains the strategy-controller compatibility epoch. New
-	// recordings use epoch 10 and add the Stage 3 production policy while
-	// retaining every earlier behavior and CRC field.
+	// Epoch 9 remains the strategy-controller compatibility epoch. Epoch 10
+	// preserves the Stage 3 production policy; new recordings use epoch 11 for
+	// Stage 4 tactical adaptation while retaining all earlier behavior.
 	UnicodeString strategyControllerEpoch = unmarked;
 	MarkReplayVersionForSkirmishAIStrategyControllerEpoch(strategyControllerEpoch);
 	CHECK(strategyControllerEpoch.compare(
@@ -2835,7 +2917,7 @@ static void TestSkirmishAIReplayEpoch()
 	CHECK(strategyControllerEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=9]") == 0);
 	UnicodeString productionEpoch = unmarked;
-	MarkReplayVersionForSkirmishAICurrentEpoch(productionEpoch);
+	MarkReplayVersionForSkirmishAIProductionEpoch(productionEpoch);
 	CHECK(productionEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=10]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(productionEpoch) ==
@@ -2852,9 +2934,33 @@ static void TestSkirmishAIReplayEpoch()
 		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
 	CHECK(ShouldIncludeSkirmishAIProductionCRCFields(
 		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
+	CHECK(!ShouldUseSkirmishAITacticalBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
+	CHECK(!ShouldIncludeSkirmishAITacticalCRCFields(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION));
 	MarkReplayVersionForSkirmishAIProductionEpoch(productionEpoch);
 	CHECK(productionEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=10]") == 0);
+
+	UnicodeString tacticalAdaptationEpoch = unmarked;
+	MarkReplayVersionForSkirmishAICurrentEpoch(tacticalAdaptationEpoch);
+	CHECK(tacticalAdaptationEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=11]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(tacticalAdaptationEpoch) ==
+		SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION);
+	CHECK(ShouldUseSkirmishAICurrentBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION));
+	CHECK(ShouldUseSkirmishAIRecoveryBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION));
+	CHECK(ShouldUseSkirmishAIStrategyBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION));
+	CHECK(ShouldUseSkirmishAIProductionBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION));
+	CHECK(ShouldIncludeSkirmishAITacticalCRCFields(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION));
+	MarkReplayVersionForSkirmishAITacticalAdaptationEpoch(tacticalAdaptationEpoch);
+	CHECK(tacticalAdaptationEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=11]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(resourceWorkerPreservationEpoch) ==
 		SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION);
 	CHECK(ShouldUseSkirmishAIRecoveryBoundedFailover(
@@ -2871,7 +2977,7 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=11]";
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=12]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -2976,14 +3082,15 @@ static void TestPathfindQueueReplayEpoch()
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=10]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=11]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(combined) ==
-		SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION);
+		SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION);
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
+	CHECK(ShouldUseSkirmishAITacticalBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=10]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=11]") == 0);
 
 	UnicodeString pathLiveness = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);
@@ -3640,6 +3747,647 @@ static void TestSkirmishAIStage3Policies()
 		SKIRMISH_STRATEGY_ATTEMPT_FAILED);
 	CHECK(firedAssault.nextState.superweaponAttemptStatus ==
 		SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED);
+}
+
+static void TestSkirmishAIStage4DefensePolicies()
+{
+	double radial = 0.0;
+	double lateral = 0.0;
+	GetSkirmishAIDefensePlacementPhase(0, 200.0, &radial, &lateral);
+	CHECK(radial == 0.0 && lateral == 0.0);
+	GetSkirmishAIDefensePlacementPhase(1, 200.0, &radial, &lateral);
+	CHECK(radial == 0.0 && lateral == 100.0);
+	GetSkirmishAIDefensePlacementPhase(7, 200.0, &radial, &lateral);
+	CHECK(radial == -105.0 && lateral == 100.0);
+	GetSkirmishAIDefensePlacementPhase(8, 200.0, &radial, &lateral);
+	CHECK(radial == 0.0 && lateral == 0.0);
+	SkirmishAIDefenseAnchor anchors[SKIRMISH_AI_DEFENSE_ROUTE_COUNT];
+	anchors[SKIRMISH_AI_DEFENSE_CENTER].x = 0;
+	anchors[SKIRMISH_AI_DEFENSE_CENTER].y = 100;
+	anchors[SKIRMISH_AI_DEFENSE_CENTER].available = true;
+	anchors[SKIRMISH_AI_DEFENSE_FLANK].x = -100;
+	anchors[SKIRMISH_AI_DEFENSE_FLANK].y = 0;
+	anchors[SKIRMISH_AI_DEFENSE_FLANK].available = true;
+	anchors[SKIRMISH_AI_DEFENSE_BACKDOOR].x = 100;
+	anchors[SKIRMISH_AI_DEFENSE_BACKDOOR].y = 0;
+	anchors[SKIRMISH_AI_DEFENSE_BACKDOOR].available = true;
+	// At the base center all route anchors are equally distant. The result
+	// must be independent of observation and container order.
+	CHECK(ClassifySkirmishAIDefenseRoute(0, 0, anchors) ==
+		SKIRMISH_AI_DEFENSE_CENTER);
+	CHECK(ClassifySkirmishAIDefenseRoute(-70, 0, anchors) ==
+		SKIRMISH_AI_DEFENSE_FLANK);
+	anchors[SKIRMISH_AI_DEFENSE_CENTER].available = false;
+	CHECK(ClassifySkirmishAIDefenseRoute(0, 0, anchors) ==
+		SKIRMISH_AI_DEFENSE_FLANK);
+	anchors[SKIRMISH_AI_DEFENSE_FLANK].available = false;
+	anchors[SKIRMISH_AI_DEFENSE_BACKDOOR].available = false;
+	CHECK(ClassifySkirmishAIDefenseRoute(0, 0, anchors) ==
+		SKIRMISH_AI_DEFENSE_NO_ROUTE);
+
+	SkirmishAIDefenseThreat threat;
+	ClearSkirmishAIDefenseThreat(&threat);
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_CENTER,
+		false, true, true, 1000);
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_CENTER,
+		true, false, true, 1000);
+	CHECK(SelectSkirmishAIDefenseRoute(&threat, 1) ==
+		SKIRMISH_AI_DEFENSE_NO_ROUTE);
+	CHECK(threat.visibleCount[SKIRMISH_AI_DEFENSE_CENTER] == 0);
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_CENTER,
+		true, true, false, 300);
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_FLANK,
+		true, true, true, 200);
+	CHECK(SelectSkirmishAIDefenseRoute(&threat, 1) ==
+		SKIRMISH_AI_DEFENSE_FLANK);
+	CHECK(GetSkirmishAIDefenseRouteScore(&threat,
+		SKIRMISH_AI_DEFENSE_FLANK) == 400);
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_CENTER,
+		true, true, false, 100);
+	CHECK(SelectSkirmishAIDefenseRoute(&threat, 1) ==
+		SKIRMISH_AI_DEFENSE_CENTER);
+
+	SkirmishAIDefenseBuildCounts counts;
+	for (int route = 0; route < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++route) {
+		counts.owned[route] = 0;
+		counts.queued[route] = 0;
+	}
+	CHECK(ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 300, 1, 2));
+	counts.queued[SKIRMISH_AI_DEFENSE_CENTER] = 1;
+	CHECK(!ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 300, 1, 2));
+	CHECK(ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_FLANK, 300, 1, 2));
+	counts.owned[SKIRMISH_AI_DEFENSE_BACKDOOR] = 1;
+	CHECK(!ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_FLANK, 300, 1, 2));
+	ClearSkirmishAIDefenseThreat(&threat);
+	CHECK(!ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 0, 2, 3));
+	// A single low-value contact does not unlock a second site. Penetration or
+	// a second contact raises the score to 200 and does.
+	for (int route = 0; route < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++route) {
+		counts.owned[route] = 0;
+		counts.queued[route] = 0;
+	}
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_CENTER,
+		true, true, false, 100);
+	CHECK(GetSkirmishAIDefenseRouteScore(&threat,
+		SKIRMISH_AI_DEFENSE_CENTER) == 100);
+	CHECK(SelectSkirmishAIDefenseRoute(&threat, 101) ==
+		SKIRMISH_AI_DEFENSE_NO_ROUTE);
+	CHECK(!ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 101, 2, 5));
+	CHECK(ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 100, 2, 5));
+	counts.queued[SKIRMISH_AI_DEFENSE_CENTER] = 1;
+	CHECK(ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 100, 2, 5));
+	CHECK(!ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 101, 2, 5));
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_CENTER,
+		true, true, false, 100);
+	CHECK(GetSkirmishAIDefenseRouteScore(&threat,
+		SKIRMISH_AI_DEFENSE_CENTER) == 200);
+	CHECK(ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 101, 2, 5));
+	counts.queued[SKIRMISH_AI_DEFENSE_CENTER] = 2;
+	CHECK(!ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 101, 2, 5));
+	CHECK(ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 101, 3, 5));
+	ClearSkirmishAIDefenseThreat(&threat);
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_CENTER,
+		true, true, true, 100);
+	CHECK(GetSkirmishAIDefenseRouteScore(&threat,
+		SKIRMISH_AI_DEFENSE_CENTER) == 200);
+	CHECK(!ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 101, 2, 5));
+	CHECK(ShouldQueueSkirmishAIDefense(&threat, &counts,
+		SKIRMISH_AI_DEFENSE_CENTER, 101, 3, 5));
+	ClearSkirmishAIDefenseThreat(&threat);
+
+	int pathQueries = 0;
+	CHECK(TryConsumeSkirmishAITacticalPathQuery(&pathQueries, 2));
+	CHECK(TryConsumeSkirmishAITacticalPathQuery(&pathQueries, 2));
+	CHECK(!TryConsumeSkirmishAITacticalPathQuery(&pathQueries, 2));
+	CHECK(pathQueries == 2);
+	CHECK(GetSkirmishAITacticalTeamProbeStartIndex(0, 3, 64) == 0);
+	CHECK(GetSkirmishAITacticalTeamProbeStartIndex(1, 3, 64) == 1);
+	CHECK(GetSkirmishAITacticalTeamProbeStartIndex(2, 3, 64) == 2);
+	CHECK(GetSkirmishAITacticalTeamProbeStartIndex(3, 3, 64) == 0);
+	CHECK(GetSkirmishAITacticalTeamProbeStartIndex(1, 65, 64) == 64);
+	CHECK(GetSkirmishAITacticalTeamProbeStartIndex(2, 65, 64) == 1);
+	CHECK(GetSkirmishAITacticalTeamProbeStartIndex(8, 512, 64) == 1);
+	CHECK(GetSkirmishAITacticalTeamProbeStartIndex(3, 0, 64) == 0);
+	CHECK(GetSkirmishAITacticalTeamProbeStartIndex(3, 3, 0) == 0);
+	// Model the first two teams exhausting a shared path-query budget. Every
+	// team must still lead a scan within a bounded number of 2-second ticks.
+	for (unsigned int teamCount = 1; teamCount <= 512; ++teamCount) {
+		bool visited[512] = {};
+		const unsigned int windowsPerSweep = (teamCount - 1) / 64 + 1;
+		const unsigned int sweeps = teamCount < 64 ? teamCount : 64;
+		for (unsigned int tick = 0; tick < windowsPerSweep * sweeps; ++tick) {
+			const unsigned int first =
+				GetSkirmishAITacticalTeamProbeStartIndex(tick, teamCount, 64);
+			visited[first] = true;
+			visited[(first + 1) % teamCount] = true;
+		}
+		for (unsigned int team = 0; team < teamCount; ++team)
+			CHECK(visited[team]);
+	}
+	CHECK(DoSkirmishAIDefenseFootprintsOverlap(0.0, 0.0, 20.0,
+		35.0, 0.0, 15.0));
+	CHECK(!DoSkirmishAIDefenseFootprintsOverlap(0.0, 0.0, 20.0,
+		35.1, 0.0, 15.0));
+	CHECK(!DoSkirmishAIDefenseFootprintsOverlap(0.0, 0.0, -1.0,
+		0.0, 0.0, 15.0));
+
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_CENTER,
+		true, true, false, 300);
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_FLANK,
+		true, true, false, 340);
+	CHECK(DecideSkirmishAIDefensePatrolRoute(&threat,
+		SKIRMISH_AI_DEFENSE_CENTER, true, true, 100, 50) ==
+		SKIRMISH_AI_DEFENSE_CENTER);
+	AddSkirmishAIDefenseObservation(&threat, SKIRMISH_AI_DEFENSE_FLANK,
+		true, true, false, 20);
+	CHECK(DecideSkirmishAIDefensePatrolRoute(&threat,
+		SKIRMISH_AI_DEFENSE_CENTER, true, true, 100, 50) ==
+		SKIRMISH_AI_DEFENSE_FLANK);
+	CHECK(DecideSkirmishAIDefensePatrolRoute(&threat,
+		SKIRMISH_AI_DEFENSE_CENTER, false, true, 100, 50) ==
+		SKIRMISH_AI_DEFENSE_CENTER);
+	CHECK(DecideSkirmishAIDefensePatrolRoute(&threat,
+		SKIRMISH_AI_DEFENSE_CENTER, true, false, 100, 50) ==
+		SKIRMISH_AI_DEFENSE_CENTER);
+	anchors[SKIRMISH_AI_DEFENSE_CENTER].available = true;
+	anchors[SKIRMISH_AI_DEFENSE_FLANK].available = true;
+	anchors[SKIRMISH_AI_DEFENSE_BACKDOOR].available = true;
+	CHECK(SelectQuietSkirmishAIDefenseRoute(anchors, 0, 0) ==
+		SKIRMISH_AI_DEFENSE_CENTER);
+	CHECK(SelectQuietSkirmishAIDefenseRoute(anchors, 1, 0) ==
+		SKIRMISH_AI_DEFENSE_FLANK);
+	CHECK(SelectQuietSkirmishAIDefenseRoute(anchors, 2, 0) ==
+		SKIRMISH_AI_DEFENSE_BACKDOOR);
+	CHECK(AdvanceQuietSkirmishAIDefenseRoute(anchors,
+		SKIRMISH_AI_DEFENSE_CENTER, 0, 0) == SKIRMISH_AI_DEFENSE_FLANK);
+	CHECK(ShouldHoldQuietSkirmishAIDefenseWaypoint(
+		true, true, true, false, 600.0f * 600.0f, 85.0f));
+	CHECK(!ShouldHoldQuietSkirmishAIDefenseWaypoint(
+		true, true, true, false, 60.0f * 60.0f, 85.0f));
+	CHECK(!ShouldHoldQuietSkirmishAIDefenseWaypoint(
+		true, true, true, true, 600.0f * 600.0f, 85.0f));
+	CHECK(!ShouldHoldQuietSkirmishAIDefenseWaypoint(
+		false, true, true, false, 600.0f * 600.0f, 85.0f));
+	CHECK(!ShouldHoldQuietSkirmishAIDefenseWaypoint(
+		true, false, true, false, 600.0f * 600.0f, 85.0f));
+	anchors[SKIRMISH_AI_DEFENSE_FLANK].available = false;
+	CHECK(SelectQuietSkirmishAIDefenseRoute(anchors, 1, 0) ==
+		SKIRMISH_AI_DEFENSE_BACKDOOR);
+	CHECK(AdvanceQuietSkirmishAIDefenseRoute(anchors,
+		SKIRMISH_AI_DEFENSE_CENTER, 0, 0) == SKIRMISH_AI_DEFENSE_BACKDOOR);
+	CHECK(IsSkirmishAIDefenseLinePosition(300, 0, 300, 40));
+	CHECK(!IsSkirmishAIDefenseLinePosition(900, 0, 300, 40));
+	CHECK(!IsSkirmishAIDefenseLinePosition(300, 400, 300, 40));
+	CHECK(!IsSkirmishAIDefenseLinePosition(100, 0, 300, 40));
+	CHECK(ShouldSkirmishAIDefenderPursue(
+		true, true, true, 300, 600, 500, 400));
+	CHECK(!ShouldSkirmishAIDefenderPursue(
+		false, true, true, 300, 600, 500, 400));
+	CHECK(!ShouldSkirmishAIDefenderPursue(
+		true, true, true, 451, 600, 500, 400));
+	CHECK(!ShouldSkirmishAIDefenderPursue(
+		true, true, true, 300, 600, 499, 400));
+	CHECK(!ShouldRecallSkirmishAIDefender(
+		true, true, true, true, true, 119, 120));
+	CHECK(ShouldRecallSkirmishAIDefender(
+		true, true, true, true, true, 120, 120));
+	CHECK(ShouldRecallSkirmishAIDefender(
+		true, false, true, true, true, 0, 120));
+}
+
+static void TestSkirmishAITunnelRoutePolicies()
+{
+	using namespace SkirmishAITunnelRoute;
+	CHECK(IsCorridorBlocker(0.0f, 0.0f, 2000.0f, 0.0f,
+		300.0f, 100.0f, 350.0f));
+	CHECK(!IsCorridorBlocker(0.0f, 0.0f, 2000.0f, 0.0f,
+		100.0f, 0.0f, 350.0f));
+	CHECK(!IsCorridorBlocker(0.0f, 0.0f, 2000.0f, 0.0f,
+		900.0f, 351.0f, 350.0f));
+	CHECK(!IsCorridorBlocker(0.0f, 0.0f, 0.0f, 0.0f,
+		0.0f, 0.0f, 350.0f));
+	Real approachX = 0.0f;
+	Real approachY = 0.0f;
+	CHECK(GetApproachPoint(100.0f, 100.0f, 300.0f, 100.0f,
+		40.0f, 20.0f, 0, &approachX, &approachY));
+	CHECK(approachX == 160.0f && approachY == 100.0f);
+	CHECK(GetApproachPoint(100.0f, 100.0f, 300.0f, 100.0f,
+		40.0f, 20.0f, 1, &approachX, &approachY));
+	CHECK(approachX == 100.0f && approachY == 160.0f);
+	CHECK(!GetApproachPoint(100.0f, 100.0f, 300.0f, 100.0f,
+		40.0f, 20.0f, 2, &approachX, &approachY));
+	CHECK(GetApproachPoint(100.0f, 100.0f, 100.0f, 100.0f,
+		40.0f, 20.0f, 0, &approachX, &approachY));
+	CHECK(approachX == 160.0f && approachY == 100.0f);
+	// A two-endpoint probe must eventually cover pairs that never coexist in
+	// a contiguous four-endpoint window, with a stable wrap order.
+	Bool seen[9][9] = { false };
+	for (UnsignedInt cursor = 0; cursor < 36; ++cursor) {
+		Int first = -1;
+		Int second = -1;
+		CHECK(SelectPairIndices(9, cursor, &first, &second));
+		CHECK(first >= 0 && first < second && second < 9);
+		CHECK(!seen[first][second]);
+		seen[first][second] = true;
+	}
+	for (Int first = 0; first < 8; ++first)
+		for (Int second = first + 1; second < 9; ++second)
+			CHECK(seen[first][second]);
+	Int wrappedFirst = -1;
+	Int wrappedSecond = -1;
+	CHECK(SelectPairIndices(9, 36, &wrappedFirst, &wrappedSecond));
+	CHECK(wrappedFirst == 0 && wrappedSecond == 1);
+	CHECK(!SelectPairIndices(1, 0, &wrappedFirst, &wrappedSecond));
+	Bool largeSweepSeen[32][32] = { FALSE };
+	for (UnsignedInt batch = 0; batch < 31; ++batch)
+		for (UnsignedInt probe = 0; probe < 16; ++probe) {
+			Int first = -1;
+			Int second = -1;
+			CHECK(SelectPairIndices(32, batch * 16 + probe, &first, &second));
+			CHECK(first >= 0 && first < second && second < 32);
+			CHECK(!largeSweepSeen[first][second]);
+			largeSweepSeen[first][second] = TRUE;
+		}
+	for (Int first = 0; first < 31; ++first)
+		for (Int second = first + 1; second < 32; ++second)
+			CHECK(largeSweepSeen[first][second]);
+	CHECK(SelectSiteIndex(0, 0) == -1);
+	Bool visitedSites[5] = { FALSE, FALSE, FALSE, FALSE, FALSE };
+	for (UnsignedInt siteCursor = 2; siteCursor < 7; ++siteCursor) {
+		const Int siteIndex = SelectSiteIndex(5, siteCursor);
+		CHECK(siteIndex >= 0 && siteIndex < 5);
+		CHECK(!visitedSites[siteIndex]);
+		visitedSites[siteIndex] = TRUE;
+	}
+	CHECK(SelectSiteIndex(5, 7) == SelectSiteIndex(5, 2));
+	UnsignedInt endpointCursor = 29;
+	UnsignedInt endpointRemaining = 32;
+	Bool endpointSeen[32] = { FALSE };
+	for (Int scan = 0; scan < 16; ++scan)
+		for (Int probe = 0; probe < 2; ++probe) {
+			const UnsignedInt index = endpointCursor % 32;
+			CHECK(!endpointSeen[index]);
+			endpointSeen[index] = TRUE;
+			CHECK(AdvanceEndpointSweep(&endpointCursor, &endpointRemaining));
+		}
+	CHECK(endpointRemaining == 0);
+	CHECK(!AdvanceEndpointSweep(&endpointCursor, &endpointRemaining));
+	CHECK(!ShouldRestartEndpointSweep(0, 599, 600));
+	CHECK(ShouldRestartEndpointSweep(0, 600, 600));
+	CHECK(!ShouldRestartEndpointSweep(1, 600, 600));
+	CHECK(!ShouldRestartEndpointSweep(0, 600, 0));
+	CHECK(ShouldRestartEndpointSweep(0, 2, 0xFFFFFFFEU));
+	// The same completed-sweep timer gates later pair retries, retaining the
+	// cursor so a retry begins with the next pair instead of a fixed prefix.
+	UnsignedInt pairCursorAfterSweep = 496;
+	CHECK(!ShouldRestartEndpointSweep(0, 1799, 1800));
+	CHECK(ShouldRestartEndpointSweep(0, 1800, 1800));
+	CHECK(SelectPairIndices(32, pairCursorAfterSweep,
+		&wrappedFirst, &wrappedSecond));
+	CHECK(wrappedFirst == 0 && wrappedSecond == 1);
+	for (Int endpointIndex = 0; endpointIndex < 32; ++endpointIndex)
+		CHECK(endpointSeen[endpointIndex]);
+	CHECK(BuilderWindowCount(17, 8) == 3);
+	CHECK(BuilderWindowCount(8, 8) == 1);
+	CHECK(BuilderWindowCount(0, 8) == 0);
+	Bool visitedBuilders[17] = { FALSE };
+	UnsignedInt builderCursor = 5;
+	for (UnsignedInt window = 0; window < BuilderWindowCount(17, 8);
+		++window, builderCursor += 8)
+		for (UnsignedInt slot = 0; slot < 8; ++slot)
+			visitedBuilders[(builderCursor + slot) % 17] = TRUE;
+	for (Int builderIndex = 0; builderIndex < 17; ++builderIndex)
+		CHECK(visitedBuilders[builderIndex]);
+	CHECK(ShouldReplaceLostEndpoint(TRUE, static_cast<ObjectID>(42), FALSE));
+	CHECK(!ShouldReplaceLostEndpoint(TRUE, static_cast<ObjectID>(42), TRUE));
+	CHECK(!ShouldReplaceLostEndpoint(FALSE, static_cast<ObjectID>(42), FALSE));
+	CHECK(!ShouldReplaceLostEndpoint(TRUE, INVALID_ID, FALSE));
+	CHECK(!ShouldConsumeHomeRetry(1)); // A surviving forward exit is not a home retry.
+	CHECK(ShouldConsumeHomeRetry(2));
+	// All three forward candidates clear the known Patriot footprint, even
+	// though its center lies inside the general 300-unit enemy safety radius.
+	CHECK(IsForwardSiteClearOfBlocker(0.0f, 0.0f, 200.0f, 0.0f,
+		47.0f, 0.0f, 12.0f, 30.0f, 25.0f, 10.0f));
+	CHECK(IsForwardSiteClearOfBlocker(0.0f, 0.0f, 200.0f, 0.0f,
+		47.0f, 50.0f, 12.0f, 30.0f, 25.0f, 10.0f));
+	CHECK(IsForwardSiteClearOfBlocker(0.0f, 0.0f, 200.0f, 0.0f,
+		47.0f, 100.0f, 12.0f, 30.0f, 25.0f, 10.0f));
+	CHECK(!IsForwardSiteClearOfBlocker(0.0f, 0.0f, 200.0f, 0.0f,
+		46.0f, 0.0f, 12.0f, 30.0f, 25.0f, 10.0f));
+	CHECK(!IsForwardSiteClearOfBlocker(0.0f, 0.0f, 200.0f, 0.0f,
+		160.0f, 0.0f, 12.0f, 30.0f, 25.0f, 10.0f));
+	ObjectID generatedIDs[MAX_GENERATED_FORWARD_ENDPOINTS] = {
+		INVALID_ID, INVALID_ID, INVALID_ID };
+	ObjectID generatedTargets[MAX_GENERATED_FORWARD_ENDPOINTS] = {
+		INVALID_ID, INVALID_ID, INVALID_ID };
+	ObjectID exhaustedTargets[MAX_EXHAUSTED_FORWARD_TARGETS];
+	for (Int i = 0; i < MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
+		exhaustedTargets[i] = INVALID_ID;
+	const ObjectID targetA = static_cast<ObjectID>(701);
+	const ObjectID targetB = static_cast<ObjectID>(702);
+	const ObjectID targetC = static_cast<ObjectID>(703);
+	const ObjectID targetD = static_cast<ObjectID>(704);
+	CHECK(CanAttemptForwardEndpoint(FALSE, INVALID_ID, INVALID_ID,
+		FALSE, targetA, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(RecordGeneratedForwardEndpoint(generatedIDs, generatedTargets,
+		static_cast<ObjectID>(801), targetA));
+	CHECK(!CanAttemptForwardEndpoint(TRUE, targetA, static_cast<ObjectID>(801),
+		TRUE, targetA, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	// The first completed exit permits one new target, even in a larger
+	// stock tunnel network; returning to A cannot duplicate its live exit.
+	CHECK(CanAttemptForwardEndpoint(TRUE, targetA, static_cast<ObjectID>(801),
+		TRUE, targetB, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(RecordGeneratedForwardEndpoint(generatedIDs, generatedTargets,
+		static_cast<ObjectID>(802), targetB));
+	CHECK(!CanAttemptForwardEndpoint(TRUE, targetB, static_cast<ObjectID>(802),
+		TRUE, targetA, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(CanAttemptForwardEndpoint(TRUE, targetB, static_cast<ObjectID>(802),
+		TRUE, targetC, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(RecordGeneratedForwardEndpoint(generatedIDs, generatedTargets,
+		static_cast<ObjectID>(803), targetC));
+	CHECK(!CanAttemptForwardEndpoint(TRUE, targetC, static_cast<ObjectID>(803),
+		TRUE, targetD, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(FindFreeGeneratedForwardEndpointSlot(generatedIDs) < 0);
+	// Destroying B frees exactly one generated slot and target B can be
+	// rebuilt, while the other live targets remain protected.
+	generatedIDs[1] = INVALID_ID;
+	generatedTargets[1] = INVALID_ID;
+	CHECK(CanAttemptForwardEndpoint(TRUE, targetC, static_cast<ObjectID>(803),
+		TRUE, targetB, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(!CanAttemptForwardEndpoint(TRUE, targetC, static_cast<ObjectID>(803),
+		TRUE, targetA, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(CanAttemptForwardEndpoint(TRUE, targetC, static_cast<ObjectID>(803),
+		FALSE, targetD, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(!CanAttemptForwardEndpoint(TRUE, targetC, static_cast<ObjectID>(803),
+		TRUE, targetC, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(IsTrackedGeneratedForwardEndpoint(static_cast<ObjectID>(801),
+		generatedIDs));
+	CHECK(!IsTrackedGeneratedForwardEndpoint(static_cast<ObjectID>(802),
+		generatedIDs));
+	// If the latest exit disappears, an older tracked exit still qualifies
+	// as the sole survivor that needs a replacement home tunnel.
+	generatedIDs[2] = INVALID_ID;
+	generatedTargets[2] = INVALID_ID;
+	CHECK(IsTrackedGeneratedForwardEndpoint(static_cast<ObjectID>(801),
+		generatedIDs));
+	CHECK(!IsTrackedGeneratedForwardEndpoint(INVALID_ID, generatedIDs));
+	// Two failed attempts on A do not consume B's own first attempt/retry,
+	// and returning to A cannot restart the failed pair.
+	generatedIDs[0] = INVALID_ID;
+	generatedTargets[0] = INVALID_ID;
+	RememberExhaustedForwardTarget(targetA, exhaustedTargets);
+	CHECK(!CanAttemptForwardEndpoint(TRUE, targetA, INVALID_ID, FALSE,
+		targetA, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(CanAttemptForwardEndpoint(TRUE, targetA, INVALID_ID, FALSE,
+		targetB, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(CanAttemptForwardEndpoint(TRUE, targetB, INVALID_ID, FALSE,
+		targetB, generatedIDs, generatedTargets, TRUE, exhaustedTargets));
+	RememberExhaustedForwardTarget(targetB, exhaustedTargets);
+	CHECK(!CanAttemptForwardEndpoint(TRUE, targetB, INVALID_ID, FALSE,
+		targetB, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	CHECK(!CanAttemptForwardEndpoint(TRUE, targetB, INVALID_ID, FALSE,
+		targetA, generatedIDs, generatedTargets, FALSE, exhaustedTargets));
+	for (Int i = 2; i < MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
+		RememberExhaustedForwardTarget(static_cast<ObjectID>(710 + i),
+			exhaustedTargets);
+	CHECK(!CanAttemptForwardEndpoint(TRUE, targetB, INVALID_ID, FALSE,
+		static_cast<ObjectID>(900), generatedIDs, generatedTargets,
+		FALSE, exhaustedTargets));
+	// A's completed exit must not consume B's first construction retry.
+	Bool retryConsumed = TRUE;
+	const Bool bRetry = IsForwardRetryForTarget(FALSE, targetA, targetB);
+	CHECK(!bRetry);
+	retryConsumed = bRetry;
+	CHECK(ShouldOfferForwardRetry(TRUE, retryConsumed));
+	CHECK(IsForwardRetryForTarget(TRUE, targetB, targetB));
+	CHECK(!IsForwardRetryForTarget(TRUE, targetB, targetC));
+	retryConsumed = IsForwardRetryForTarget(TRUE, targetB, targetB);
+	CHECK(!ShouldOfferForwardRetry(TRUE, retryConsumed));
+	CHECK(!ShouldOfferForwardRetry(FALSE, FALSE));
+	ObjectID capacityWaitTarget = INVALID_ID;
+	UnsignedInt capacityDeadline = 0;
+	CHECK(DeferFullTunnelCapacity(targetA, 100, 45 * 30,
+		&capacityWaitTarget, &capacityDeadline));
+	CHECK(capacityDeadline == 1450);
+	CHECK(DeferFullTunnelCapacity(targetA, 1449, 45 * 30,
+		&capacityWaitTarget, &capacityDeadline));
+	CHECK(!DeferFullTunnelCapacity(targetA, 1450, 45 * 30,
+		&capacityWaitTarget, &capacityDeadline));
+	CHECK(!DeferFullTunnelCapacity(targetA, 1451, 45 * 30,
+		&capacityWaitTarget, &capacityDeadline));
+	CHECK(!DeferFullTunnelCapacity(targetB, 1451, 45 * 30,
+		&capacityWaitTarget, &capacityDeadline));
+	CHECK(capacityWaitTarget == targetB && capacityDeadline == 1450);
+	capacityWaitTarget = INVALID_ID; // Capacity became available.
+	capacityDeadline = 0;
+	CHECK(DeferFullTunnelCapacity(targetA, 1452, 45 * 30,
+		&capacityWaitTarget, &capacityDeadline));
+	// An assault group inside a tunnel remains live combat strength with its
+	// observed target. Genuine force loss, target destruction, and emergency
+	// base pressure must still end or interrupt that assault.
+	SkirmishStrategyState transitStrategy;
+	InitializeSkirmishStrategyState(&transitStrategy, 0);
+	transitStrategy.currentMode = SKIRMISH_STRATEGY_ASSAULT;
+	transitStrategy.strategicTargetID = targetA;
+	transitStrategy.strategicTargetObserved = TRUE;
+	transitStrategy.assaultEntryCombatValue = 1000;
+	SkirmishStrategyMetrics transitMetrics = MakeSkirmishStrategyMetrics();
+	transitMetrics.armyReadiness = 70;
+	transitMetrics.availableCombatValue = 1000;
+	SkirmishStrategyDecision transitDecision = EvaluateSkirmishStrategy(
+		transitStrategy, transitMetrics, DIFFICULTY_HARD, 0, TRUE);
+	CHECK(transitDecision.nextState.currentMode == SKIRMISH_STRATEGY_ASSAULT);
+	CHECK(transitDecision.nextState.pendingMode == SKIRMISH_STRATEGY_NONE);
+	transitMetrics.assaultLostHalfForce = TRUE;
+	transitMetrics.availableCombatValue = 400;
+	transitDecision = EvaluateSkirmishStrategy(
+		transitStrategy, transitMetrics, DIFFICULTY_HARD, 0, TRUE);
+	CHECK(transitDecision.nextState.pendingMode == SKIRMISH_STRATEGY_BALANCED);
+	transitMetrics = MakeSkirmishStrategyMetrics();
+	transitMetrics.assaultObjectiveComplete = TRUE;
+	transitDecision = EvaluateSkirmishStrategy(
+		transitStrategy, transitMetrics, DIFFICULTY_HARD, 0, TRUE);
+	CHECK(transitDecision.nextState.currentMode == SKIRMISH_STRATEGY_BALANCED);
+	transitMetrics = MakeSkirmishStrategyMetrics();
+	transitMetrics.baseIntegrity = 30;
+	transitDecision = EvaluateSkirmishStrategy(
+		transitStrategy, transitMetrics, DIFFICULTY_HARD, 0, TRUE);
+	CHECK(transitDecision.nextState.currentMode == SKIRMISH_STRATEGY_FORTIFY);
+	transitMetrics = MakeSkirmishStrategyMetrics();
+	transitMetrics.immediateThreat = 90;
+	transitDecision = EvaluateSkirmishStrategy(
+		transitStrategy, transitMetrics, DIFFICULTY_HARD, 0, TRUE);
+	CHECK(transitDecision.nextState.currentMode == SKIRMISH_STRATEGY_FORTIFY);
+	CHECK(CanReservePairQueries(128, 128, 256, 256, 512));
+	CHECK(!CanReservePairQueries(128, 129, 256, 256, 512));
+	CHECK(!CanReservePairQueries(128, 0, 385, 256, 512));
+	CHECK(EndpointSideQueryAllowance(32) == 64);
+	CHECK(LivePairQueryAllowance(32) == 128);
+	CHECK(EndpointSideQueryAllowance(33) < 0);
+	CHECK(LivePairQueryAllowance(-1) < 0);
+	// Thirty-two endpoints need at most two side probes per member and
+	// endpoint in a stable epoch, independent of the 496 pair combinations.
+	Int cachedRoleQueries = 0;
+	Int roleProbeAttempts = 1;
+	for (Int role = 0; role < 32 * 2; ++role) {
+		if (!CanReservePairQueries(EndpointSideQueryAllowance(32),
+				cachedRoleQueries, 0, 256, 512)) {
+			++roleProbeAttempts;
+			cachedRoleQueries = 0;
+		}
+		CHECK(CanReservePairQueries(EndpointSideQueryAllowance(32),
+			cachedRoleQueries, 0, 256, 512));
+		cachedRoleQueries += EndpointSideQueryAllowance(32);
+	}
+	CHECK(roleProbeAttempts == 16);
+	CHECK(!ProbeEpochExpired(1799, 0, 1800));
+	CHECK(ProbeEpochExpired(1800, 0, 1800));
+	CHECK(ProbeEpochExpired(2, 0xFFFFFFFEU, 4));
+	CHECK(!ProbeEpochExpired(1, 0xFFFFFFFEU, 4));
+
+	Endpoint endpoints[2];
+	endpoints[0].objectID = static_cast<ObjectID>(10);
+	endpoints[0].x = 100.0f;
+	endpoints[0].y = 0.0f;
+	endpoints[0].usable = TRUE;
+	endpoints[0].groundApproachReachable = TRUE;
+	endpoints[0].groundExitReachable = TRUE;
+	endpoints[1].objectID = static_cast<ObjectID>(20);
+	endpoints[1].x = 900.0f;
+	endpoints[1].y = 0.0f;
+	endpoints[1].usable = TRUE;
+	endpoints[1].groundApproachReachable = TRUE;
+	endpoints[1].groundExitReachable = TRUE;
+	Plan plan;
+	Int directedEntry = -1;
+	Int directedExit = -1;
+	CHECK(SelectDirectedPair(endpoints, 1000.0f, 0.0f, 10000.0,
+		&directedEntry, &directedExit));
+	CHECK(directedEntry == 0 && directedExit == 1);
+	CHECK(!SelectDirectedPair(endpoints, 500.0f, 0.0f, 10000.0,
+		&directedEntry, &directedExit));
+
+	// The route helper is GLA-only, rejects air forces, and clears stale output
+	// whenever the request is ineligible.
+	CHECK(!SelectAssaultPlan(FALSE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	CHECK(!plan.found);
+	CHECK(plan.entryTunnelID == INVALID_ID);
+	CHECK(plan.exitTunnelID == INVALID_ID);
+	CHECK(!SelectAssaultPlan(TRUE, TRUE, TRUE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	CHECK(!SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, FALSE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+
+	// Entry and exit endpoints must both be usable and reachable by ground
+	// movement. Neither side of the pair can stand in for the other check.
+	endpoints[0].usable = FALSE;
+	CHECK(!SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	endpoints[0].usable = TRUE;
+	endpoints[1].usable = FALSE;
+	CHECK(!SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	endpoints[1].usable = TRUE;
+	endpoints[0].groundApproachReachable = FALSE;
+	CHECK(!SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	endpoints[0].groundApproachReachable = TRUE;
+	endpoints[1].groundExitReachable = FALSE;
+	CHECK(!SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	endpoints[1].groundExitReachable = TRUE;
+
+	// A valid plan uses distinct endpoints and exits closer to the target. A
+	// minimum gain can rule out a technically-progressing but negligible exit.
+	CHECK(SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	CHECK(plan.found);
+	CHECK(plan.entryTunnelID == 10);
+	CHECK(plan.exitTunnelID == 20);
+	// Retain a reachable entry-to-exit bypass when the exit is geometrically
+	// farther from the target than the assault's current position; this can
+	// still route around a blocked corridor.
+	CHECK(SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		950.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	CHECK(plan.entryTunnelID == 10);
+	CHECK(plan.exitTunnelID == 20);
+	CHECK(!SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 800000.0, endpoints, 2, &plan));
+	endpoints[0].objectID = static_cast<ObjectID>(30);
+	endpoints[1].objectID = static_cast<ObjectID>(30);
+	CHECK(!SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	endpoints[0].objectID = static_cast<ObjectID>(10);
+	endpoints[1].objectID = static_cast<ObjectID>(20);
+	endpoints[0].x = 900.0f;
+	endpoints[1].x = 100.0f;
+	CHECK(SelectDirectedPair(endpoints, 1000.0f, 0.0f, 10000.0,
+		&directedEntry, &directedExit));
+	CHECK(directedEntry == 1 && directedExit == 0);
+	CHECK(SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	CHECK(plan.entryTunnelID == 20);
+	CHECK(plan.exitTunnelID == 10);
+	endpoints[0].groundApproachReachable = FALSE;
+	endpoints[1].groundExitReachable = FALSE;
+	CHECK(SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0, endpoints, 2, &plan));
+	CHECK(plan.entryTunnelID == 20 && plan.exitTunnelID == 10);
+	endpoints[0].groundApproachReachable = TRUE;
+	endpoints[1].groundExitReachable = TRUE;
+
+	// Equal geometric scores resolve by ObjectID, independent of enumeration
+	// order, and no plan is returned when no exit path is viable.
+	Endpoint tiedEndpoints[4];
+	tiedEndpoints[0].objectID = static_cast<ObjectID>(40);
+	tiedEndpoints[0].x = 100.0f;
+	tiedEndpoints[0].y = 0.0f;
+	tiedEndpoints[0].usable = TRUE;
+	tiedEndpoints[0].groundApproachReachable = TRUE;
+	tiedEndpoints[0].groundExitReachable = TRUE;
+	tiedEndpoints[1].objectID = static_cast<ObjectID>(80);
+	tiedEndpoints[1].x = 900.0f;
+	tiedEndpoints[1].y = 0.0f;
+	tiedEndpoints[1].usable = TRUE;
+	tiedEndpoints[1].groundApproachReachable = TRUE;
+	tiedEndpoints[1].groundExitReachable = TRUE;
+	tiedEndpoints[2].objectID = static_cast<ObjectID>(30);
+	tiedEndpoints[2].x = 100.0f;
+	tiedEndpoints[2].y = 0.0f;
+	tiedEndpoints[2].usable = TRUE;
+	tiedEndpoints[2].groundApproachReachable = TRUE;
+	tiedEndpoints[2].groundExitReachable = TRUE;
+	tiedEndpoints[3].objectID = static_cast<ObjectID>(70);
+	tiedEndpoints[3].x = 900.0f;
+	tiedEndpoints[3].y = 0.0f;
+	tiedEndpoints[3].usable = TRUE;
+	tiedEndpoints[3].groundApproachReachable = TRUE;
+	tiedEndpoints[3].groundExitReachable = TRUE;
+	CHECK(SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0,
+		tiedEndpoints, 4, &plan));
+	CHECK(plan.entryTunnelID == 30);
+	CHECK(plan.exitTunnelID == 70);
+	tiedEndpoints[1].groundExitReachable = FALSE;
+	tiedEndpoints[3].groundExitReachable = FALSE;
+	CHECK(!SelectAssaultPlan(TRUE, TRUE, FALSE, TRUE, TRUE,
+		0.0f, 0.0f, 1000.0f, 0.0f, 0.0,
+		tiedEndpoints, 4, &plan));
+	CHECK(!plan.found);
 }
 
 static void TestSkirmishAITargetingPolicies()
@@ -4309,6 +5057,21 @@ int main(int argc, char **argv)
 		shutdownMemoryManager();
 		return 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-stage4") == 0)
+	{
+		TestSkirmishAIReplayEpoch();
+		TestSkirmishAIStage4DefensePolicies();
+		TestSkirmishAITunnelRoutePolicies();
+		if (s_failures != 0)
+		{
+			printf("%d skirmish AI Stage 4 test(s) failed.\n", s_failures);
+			shutdownMemoryManager();
+			return 1;
+		}
+		printf("All skirmish AI Stage 4 tests passed.\n");
+		shutdownMemoryManager();
+		return 0;
+	}
 
 	TestNetworkValidation();
 	TestPacketRouterFallbackSelection();
@@ -4328,6 +5091,8 @@ int main(int argc, char **argv)
 	TestSkirmishAICorrectnessPolicies();
 	TestSkirmishAIProductionPolicies();
 	TestSkirmishAIStage3Policies();
+	TestSkirmishAIStage4DefensePolicies();
+	TestSkirmishAITunnelRoutePolicies();
 	TestSkirmishAITargetingPolicies();
 	TestSkirmishAIFeedbackPolicies();
 	TestSkirmishAILegacySaveCandidateSelection();
