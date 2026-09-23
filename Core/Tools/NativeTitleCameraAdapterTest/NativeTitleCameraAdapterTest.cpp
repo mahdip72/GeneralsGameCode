@@ -17,6 +17,7 @@
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <windows.h>
 
@@ -1164,6 +1165,8 @@ int TestSortedFacadeAndStrip(HWND window)
 	result |= Check(vbHandle.index() == 0 && vbHandle.generation() != 0 &&
 		owner.Resources().IsValid(vbHandle),
 		"strip fixture exercises a live native allocation in slot zero");
+	unsigned char referencePixels[64 * 64 * 4] = {};
+	bool haveReferencePixels = false;
 	auto begin = [&]() {
 		result |= Check(owner.Renderer().BeginFrame() == RENDER_RESULT_OK,
 			"sorting facade begins a frame");
@@ -1185,7 +1188,7 @@ int TestSortedFacadeAndStrip(HWND window)
 		pipeline.textureStages[0].colorArgument1 = RENDER_TEXTURE_ARG_DIFFUSE;
 		TrackLegacyPipelineState(pipeline);
 	};
-	auto finish = [&]() {
+	auto finish = [&](bool compareSortedPixels) {
 		const RenderResult end = owner.Renderer().EndFrame(false);
 		result |= Check(end == RENDER_RESULT_OK, "sorting facade frame retains valid commands");
 		if (end == RENDER_RESULT_OK)
@@ -1202,6 +1205,18 @@ int TestSortedFacadeAndStrip(HWND window)
 			if (pixels[i + 1] > 128 && pixels[i] < 40 && pixels[i + 2] < 40) ++green;
 		result |= Check(capture == RENDER_RESULT_OK && green > 16,
 			"sorting facade selects the visible base-offset vertices, not the offscreen prefix");
+		if (capture == RENDER_RESULT_OK && compareSortedPixels)
+		{
+			if (!haveReferencePixels)
+			{
+				std::memcpy(referencePixels, pixels, sizeof(pixels));
+				haveReferencePixels = true;
+			}
+			else
+				result |= Check(std::memcmp(referencePixels, pixels,
+					sizeof(pixels)) == 0,
+					"sorted snapshot rebinds preserve exact rendered pixels");
+		}
 	};
 	SortingVertexBufferClass *staticVB = new SortingVertexBufferClass(6);
 	SortingIndexBufferClass *staticIB = new SortingIndexBufferClass(6);
@@ -1219,7 +1234,7 @@ int TestSortedFacadeAndStrip(HWND window)
 	DrawGameSortedTriangles(0, 1, 0, 3);
 	result |= Check(FlushGameSortedTriangles() == RENDER_RESULT_OK,
 		"static sorting facade accepts initialized prefixes and a nonzero vertex base");
-	finish();
+	finish(true);
 	staticVB->Release_Ref();
 	staticIB->Release_Ref();
 	for (unsigned int allocation = 0; allocation < 2; ++allocation)
@@ -1244,11 +1259,46 @@ int TestSortedFacadeAndStrip(HWND window)
 		DrawGameSortedTriangles(0, 1, 0, 3);
 		result |= Check(FlushGameSortedTriangles() == RENDER_RESULT_OK,
 			"dynamic sorting draws use relative indices and the current vertex base");
-		finish();
+		finish(true);
 	}
-	DynamicVBAccessClass::_Deinit();
-	DynamicIBAccessClass::_Deinit();
-
+	const unsigned short repeatedIndices[6] = { 0, 1, 2, 0, 1, 2 };
+	for (unsigned int iteration = 0; iteration < 4; ++iteration)
+	{
+		const unsigned short vertexCount = (iteration & 1U) ? 3 : 6;
+		const unsigned short indexCount = (iteration & 1U) ? 3 : 6;
+		DynamicVBAccessClass vb(BUFFER_TYPE_DYNAMIC_SORTING,
+			GAME_VERTEX_XYZNDUV2, vertexCount);
+		DynamicIBAccessClass ib(BUFFER_TYPE_DYNAMIC_SORTING, indexCount);
+		{
+			DynamicVBAccessClass::WriteLockClass lock(&vb);
+			if (lock.Get_Formatted_Vertex_Array() != 0)
+				std::memcpy(lock.Get_Formatted_Vertex_Array(),
+					vertexCount == 6 ? vertices : vertices + 3,
+					vertexCount * sizeof(vertices[0]));
+			result |= Check(lock.Commit(), "variable-size sorted vertices are initialized");
+			DynamicIBAccessClass::WriteLockClass indexLock(&ib);
+			if (indexLock.Get_Index_Array() != 0)
+				std::memcpy(indexLock.Get_Index_Array(), repeatedIndices,
+					indexCount * sizeof(indices[0]));
+			result |= Check(indexLock.Commit(), "variable-size sorted indices are initialized");
+		}
+		begin();
+		result |= Check(SetGameVertexBuffer(vb) &&
+			SetGameIndexBuffer(ib, vertexCount == 6 ? 3 : 0),
+			"variable-size sorted snapshots bind on repeated frames");
+		if (iteration == 3)
+		{
+			// The owner must retain its own bytes before the caller reuses them.
+			std::memset(const_cast<void *>(vb.Get_Sorted_Vertex_Data()), 0,
+				vertexCount * sizeof(vertices[0]));
+			std::memset(const_cast<unsigned short *>(ib.Get_Sorted_Index_Data()),
+				0, indexCount * sizeof(indices[0]));
+		}
+		DrawGameSortedTriangles(0, 1, 0, 3);
+		result |= Check(FlushGameSortedTriangles() == RENDER_RESULT_OK,
+			"variable-size sorted snapshots keep draw order and indices");
+		finish(true);
+	}
 	begin();
 	GameRenderCommand command = {};
 	command.type = GAME_RENDER_COMMAND_SET_VERTEX_BUFFER;
@@ -1271,8 +1321,49 @@ int TestSortedFacadeAndStrip(HWND window)
 	command.value0 = RENDER_FORMAT_R16_UINT;
 	result |= Check(owner.ExecuteGameRenderCommand(command) == RENDER_RESULT_OK, "strip binds its index buffer");
 	DrawGameStrip(0, 1, 0, 3);
-	finish();
+	finish(false);
 	begin();
+	{
+		DynamicVBAccessClass vb(BUFFER_TYPE_DYNAMIC_SORTING,
+			GAME_VERTEX_XYZNDUV2, 6);
+		DynamicIBAccessClass ib(BUFFER_TYPE_DYNAMIC_SORTING, 3);
+		{
+			DynamicVBAccessClass::WriteLockClass lock(&vb);
+			if (lock.Get_Formatted_Vertex_Array() != 0)
+				std::memcpy(lock.Get_Formatted_Vertex_Array(), vertices,
+					sizeof(vertices));
+			result |= Check(lock.Commit(), "retained sorted vertex snapshot is initialized");
+			DynamicIBAccessClass::WriteLockClass indexLock(&ib);
+			if (indexLock.Get_Index_Array() != 0)
+				std::memcpy(indexLock.Get_Index_Array(), indices,
+					sizeof(indices));
+			result |= Check(indexLock.Commit(), "retained sorted index snapshot is initialized");
+		}
+		result |= Check(SetGameVertexBuffer(vb) && SetGameIndexBuffer(ib, 3),
+			"valid sorted snapshot binds before invalid replacements");
+		GameRenderCommand rejected = {};
+		rejected.type = GAME_RENDER_COMMAND_SET_VERTEX_BUFFER;
+		rejected.value0 = GAME_VERTEX_XYZNDUV2;
+		rejected.value1 = sizeof(VertexFormatXYZNDUV2);
+		rejected.value3 = 6;
+		rejected.input = vb.Get_Sorted_Vertex_Data();
+		rejected.inputBytes = 6 * sizeof(VertexFormatXYZNDUV2) - 1;
+		result |= Check(owner.ExecuteGameRenderCommand(rejected) ==
+			RENDER_RESULT_INVALID_ARGUMENT,
+			"invalid sorted vertex size rejects replacement");
+		rejected = GameRenderCommand();
+		rejected.type = GAME_RENDER_COMMAND_SET_INDEX_BUFFER;
+		rejected.value0 = RENDER_FORMAT_R16_UINT;
+		rejected.value2 = 3;
+		rejected.input = ib.Get_Sorted_Index_Data();
+		rejected.inputBytes = sizeof(indices) - 1;
+		result |= Check(owner.ExecuteGameRenderCommand(rejected) ==
+			RENDER_RESULT_INVALID_ARGUMENT,
+			"invalid sorted index size rejects replacement");
+		DrawGameSortedTriangles(0, 1, 0, 3);
+		result |= Check(FlushGameSortedTriangles() == RENDER_RESULT_OK,
+			"invalid sorted replacements preserve the prior draw binding");
+	}
 	command = GameRenderCommand();
 	command.type = GAME_RENDER_COMMAND_DRAW_STRIP; command.value3 = 3;
 	result |= Check(owner.ExecuteGameRenderCommand(command) == RENDER_RESULT_INVALID_ARGUMENT,
@@ -1294,6 +1385,8 @@ int TestSortedFacadeAndStrip(HWND window)
 	result |= Check(owner.Renderer().EndFrame(false) == RENDER_RESULT_INVALID_ARGUMENT,
 		"invalid strip commands remain frame failures");
 	owner.Renderer().DrainThreaded();
+	DynamicVBAccessClass::_Deinit();
+	DynamicIBAccessClass::_Deinit();
 	owner.Resources().Destroy(vbHandle); owner.Resources().Destroy(ibHandle);
 	result |= Check(owner.Shutdown() == RENDER_RESULT_OK, "sorting facade fixture shuts down");
 	return result;

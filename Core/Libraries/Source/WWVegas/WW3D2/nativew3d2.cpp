@@ -40,6 +40,24 @@ private:
 	const rts::render::GameRenderCommand *m_previous;
 };
 
+void CopySortedCommandBytes(std::vector<unsigned char> &target,
+	const void *source, size_t byteCount)
+{
+	if (byteCount > target.capacity())
+	{
+		// Keep the previous binding intact if growth allocation fails.
+		std::vector<unsigned char> replacement(byteCount);
+		memcpy(replacement.data(), source, byteCount);
+		target.swap(replacement);
+		return;
+	}
+	if (byteCount > target.size())
+		target.resize(byteCount);
+	// The source may refer to the previous owner snapshot.
+	memmove(target.data(), source, byteCount);
+	target.resize(byteCount);
+}
+
 uint64_t PackTraceHandle(const rts::render::GameRenderHandle &handle)
 {
 	return (static_cast<uint64_t>(handle.index) << 32) | handle.generation;
@@ -1677,9 +1695,8 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					goto invalid_command;
 				try
 				{
-					std::vector<unsigned char> copied(expectedBytes);
-					memcpy(copied.data(), command.input, expectedBytes);
-					m_gameSortedVertexBytes.swap(copied);
+					CopySortedCommandBytes(m_gameSortedVertexBytes,
+						command.input, expectedBytes);
 				}
 				catch (const std::bad_alloc &)
 				{
@@ -1763,9 +1780,8 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					goto invalid_command;
 				try
 				{
-					std::vector<unsigned char> copied(expectedBytes);
-					memcpy(copied.data(), command.input, expectedBytes);
-					m_gameSortedIndexBytes.swap(copied);
+					CopySortedCommandBytes(m_gameSortedIndexBytes,
+						command.input, expectedBytes);
 				}
 				catch (const std::bad_alloc &)
 				{
