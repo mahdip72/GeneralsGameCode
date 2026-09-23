@@ -1850,9 +1850,9 @@ m_curRightFlankRightDefenseAngle(0),
 		m_tunnelGeneratedForwardEndpointIDs[i] = INVALID_ID;
 		m_tunnelGeneratedForwardTargetIDs[i] = INVALID_ID;
 	}
-	for (Int i = 0; i < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS;
-		++i)
-		m_tunnelExhaustedForwardTargetIDs[i] = INVALID_ID;
+	for (Int exhaustedIndex = 0; exhaustedIndex < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS;
+		++exhaustedIndex)
+		m_tunnelExhaustedForwardTargetIDs[exhaustedIndex] = INVALID_ID;
 	m_defenseBuildLockedLocation.zero();
 	m_defenseQuietPatrolWaypoint.zero();
 	InitializeSkirmishStrategyState(
@@ -7914,22 +7914,22 @@ void AISkirmishPlayer::updateTacticalTeams()
 				approaches[2].y -= forwardX * 250.0f;
 				approaches[3].x -= forwardX * 250.0f;
 				approaches[3].y -= forwardY * 250.0f;
-				for (Int j = state.approachAttempt; j < 4; ++j) {
+				for (Int approachIndex = state.approachAttempt; approachIndex < 4; ++approachIndex) {
 					if (!TryConsumeSkirmishAITacticalPathQuery(
 							&tacticalQuickPathQueryCount,
 							MAX_SKIRMISH_AI_TACTICAL_QUICK_PATH_QUERIES_PER_UPDATE)) {
 						pathProbeDeferred = true;
 						break;
 					}
-					approaches[j].z = TheTerrainLogic->getGroundHeight(
-						approaches[j].x, approaches[j].y);
+					approaches[approachIndex].z = TheTerrainLogic->getGroundHeight(
+						approaches[approachIndex].x, approaches[approachIndex].y);
 					const Bool reachable =
 						TheAI->pathfinder()->clientSafeQuickDoesPathExist(
 							representative->getAIUpdateInterface()->getLocomotorSet(),
-							representative->getPosition(), &approaches[j]);
-					state.approachAttempt = j + 1;
+							representative->getPosition(), &approaches[approachIndex]);
+					state.approachAttempt = approachIndex + 1;
 					if (reachable) {
-						group->groupAttackMoveToPosition(&approaches[j],
+						group->groupAttackMoveToPosition(&approaches[approachIndex],
 							NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
 						state.lastProgressFrame = now;
 						state.blockedSinceFrame = 0;
@@ -8534,8 +8534,8 @@ Bool AISkirmishPlayer::tryTunnelBypass(
 	// A failed approach belongs to the unit positions where it was tested.
 	// Quantize motion so tiny movement does not restart a large pair sweep.
 	UnsignedInt movementSignature = (UnsignedInt)members.size();
-	for (size_t i = 0; i < members.size(); ++i) {
-		const Coord3D *position = members[i]->getPosition();
+	for (size_t movementMemberIndex = 0; movementMemberIndex < members.size(); ++movementMemberIndex) {
+		const Coord3D *position = members[movementMemberIndex]->getPosition();
 		movementSignature = movementSignature * 33u +
 			(UnsignedInt)(Int)(position->x / 80.0f);
 		movementSignature = movementSignature * 33u +
@@ -8555,8 +8555,8 @@ Bool AISkirmishPlayer::tryTunnelBypass(
 				cacheIdentityChanged = TRUE;
 				break;
 			}
-		for (size_t i = 0; i < members.size(); ++i)
-			if (state.tunnelProbeMemberIDs[i] != members[i]->getID()) {
+		for (size_t identityMemberIndex = 0; identityMemberIndex < members.size(); ++identityMemberIndex)
+			if (state.tunnelProbeMemberIDs[identityMemberIndex] != members[identityMemberIndex]->getID()) {
 				cacheIdentityChanged = TRUE;
 				break;
 			}
@@ -8580,9 +8580,9 @@ Bool AISkirmishPlayer::tryTunnelBypass(
 		for (size_t i = 0; i < members.size(); ++i)
 			state.tunnelProbeMemberIDs[i] = members[i]->getID();
 		state.tunnelEndpointProbes.clear();
-		for (size_t i = 0; i < tunnelObjects.size(); ++i) {
+		for (size_t probeEndpointIndex = 0; probeEndpointIndex < tunnelObjects.size(); ++probeEndpointIndex) {
 			TacticalTeamState::TunnelEndpointProbe probe;
-			probe.objectID = tunnelObjects[i]->getID();
+			probe.objectID = tunnelObjects[probeEndpointIndex]->getID();
 			state.tunnelEndpointProbes.push_back(probe);
 		}
 	}
@@ -8943,10 +8943,10 @@ void AISkirmishPlayer::updateTunnelTransit(
 	}
 
 	Int containedCount = 0;
-	for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex) {
+	for (size_t containmentMemberIndex = 0; containmentMemberIndex < members.size(); ++containmentMemberIndex) {
 		const Bool contained = tracker
-			? tracker->isInContainer(members[memberIndex])
-			: members[memberIndex]->isContained();
+			? tracker->isInContainer(members[containmentMemberIndex])
+			: members[containmentMemberIndex]->isContained();
 		if (contained)
 			++containedCount;
 	}
@@ -10113,8 +10113,8 @@ static Bool QueueSkirmishAIDefenseLine(
 		routeOrder[j] = route;
 	}
 	Int total = 0;
-	for (Int i = 0; i < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++i)
-		total += counts.owned[i] + counts.queued[i];
+	for (Int totalRouteIndex = 0; totalRouteIndex < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++totalRouteIndex)
+		total += counts.owned[totalRouteIndex] + counts.queued[totalRouteIndex];
 	if (total >= 5)
 		return false;
 	const Real structureRadius =
@@ -10855,9 +10855,9 @@ void AISkirmishPlayer::newMap()
 		m_tunnelGeneratedForwardEndpointIDs[i] = INVALID_ID;
 		m_tunnelGeneratedForwardTargetIDs[i] = INVALID_ID;
 	}
-	for (Int i = 0; i < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS;
-		++i)
-		m_tunnelExhaustedForwardTargetIDs[i] = INVALID_ID;
+	for (Int exhaustedIndex = 0; exhaustedIndex < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS;
+		++exhaustedIndex)
+		m_tunnelExhaustedForwardTargetIDs[exhaustedIndex] = INVALID_ID;
 	m_tunnelBuildBuilderID = INVALID_ID;
 	m_tunnelBuildTargetID = INVALID_ID;
 	m_tunnelBuildBlockerID = INVALID_ID;
@@ -11336,10 +11336,10 @@ Bool AISkirmishPlayer::tryQueueTunnelEndpoint(
 				(UnsignedInt)(Int)(position->y / 80.0f);
 		}
 		entrySignature = entrySignature * 33u + (UnsignedInt)members.size();
-		for (size_t i = 0; i < members.size(); ++i) {
-			const Coord3D *position = members[i]->getPosition();
+		for (size_t entryMemberIndex = 0; entryMemberIndex < members.size(); ++entryMemberIndex) {
+			const Coord3D *position = members[entryMemberIndex]->getPosition();
 			entrySignature = entrySignature * 33u +
-				(UnsignedInt)members[i]->getID();
+				(UnsignedInt)members[entryMemberIndex]->getID();
 			entrySignature = entrySignature * 33u +
 				(UnsignedInt)(Int)(position->x / 80.0f);
 			entrySignature = entrySignature * 33u +
@@ -11466,10 +11466,10 @@ Bool AISkirmishPlayer::tryQueueTunnelEndpoint(
 	}
 
 	std::vector<Object *> builders;
-	for (Object *object = TheGameLogic->getFirstObject(); object;
-		object = object->getNextObject()) {
-		if (isTunnelBuildBuilderAvailable(object))
-			builders.push_back(object);
+	for (Object *builderScanObject = TheGameLogic->getFirstObject(); builderScanObject;
+		builderScanObject = builderScanObject->getNextObject()) {
+		if (isTunnelBuildBuilderAvailable(builderScanObject))
+			builders.push_back(builderScanObject);
 	}
 	std::sort(builders.begin(), builders.end(),
 		IsSkirmishAIStrategyObjectIDBefore);
@@ -11845,10 +11845,10 @@ void AISkirmishPlayer::xferTunnelEndpointProbes(
 		throw XFER_INVALID_PARAMETERS;
 	if (xfer->getXferMode() == XFER_LOAD)
 		state.tunnelEndpointProbes.clear();
-	for (UnsignedInt i = 0; i < count; ++i) {
+	for (UnsignedInt endpointProbeIndex = 0; endpointProbeIndex < count; ++endpointProbeIndex) {
 		TacticalTeamState::TunnelEndpointProbe probe;
 		if (xfer->getXferMode() != XFER_LOAD)
-			probe = state.tunnelEndpointProbes[i];
+			probe = state.tunnelEndpointProbes[endpointProbeIndex];
 		xfer->xferObjectID(&probe.objectID);
 		xfer->xferInt(&probe.entryResult);
 		xfer->xferInt(&probe.exitResult);
@@ -12186,9 +12186,9 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 			xfer->xferObjectID(&m_tunnelGeneratedForwardTargetIDs[i]);
 		}
 		xfer->xferBool(&m_tunnelForwardRetryConsumed);
-		for (Int i = 0;
-			i < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
-			xfer->xferObjectID(&m_tunnelExhaustedForwardTargetIDs[i]);
+		for (Int exhaustedIndex = 0;
+			exhaustedIndex < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS; ++exhaustedIndex)
+			xfer->xferObjectID(&m_tunnelExhaustedForwardTargetIDs[exhaustedIndex]);
 	}
 	if (ShouldIncludeSkirmishAIProductionCRCFields(replay, replayEpoch)) {
 		xfer->xferInt(&m_strategyProductionReserveCost);
