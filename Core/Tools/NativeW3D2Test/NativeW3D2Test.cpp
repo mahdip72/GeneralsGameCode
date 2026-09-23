@@ -1368,6 +1368,78 @@ int TestNativeCommandsPreservePipelineState(NativeW3D2 *owner)
 	return result;
 }
 
+int TestGetTransformWithInvalidPipeline(NativeW3D2 *owner)
+{
+	int result = 0;
+	if (owner == 0 || !owner->IsOperational())
+		return Check(false, "transform read fixture has an operational owner");
+
+	using namespace rts::render;
+	ResetTrackedLegacyState();
+	LegacyLogicalState logical;
+	GameRenderCommand command = {};
+	command.type = GAME_RENDER_COMMAND_GET_TRANSFORM;
+	command.value0 = LEGACY_TRANSFORM_VIEW;
+	RenderMatrix4 actual;
+	command.output = &actual;
+	command.outputBytes = sizeof(actual);
+	RenderMatrix4 identity;
+	result |= Check(!GetTrackedLegacyLogicalState(&logical) &&
+		owner->ExecuteGameRenderCommand(command) == RENDER_RESULT_OK &&
+		std::memcmp(actual.values, identity.values, sizeof(identity.values)) == 0,
+		"transform read returns identity after reset while pipeline state is invalid");
+	result |= Check(!GetTrackedLegacyTransform(
+		static_cast<LegacyTransformSlot>(LEGACY_TRANSFORM_COUNT), &actual) &&
+		!GetTrackedLegacyTransform(LEGACY_TRANSFORM_VIEW, 0),
+		"transform tracker rejects invalid slots and null outputs");
+
+	RenderMatrix4 expected;
+	for (unsigned int index = 0; index != 16; ++index)
+		expected.values[index] = static_cast<float>(index + 1U);
+	command = GameRenderCommand();
+	command.type = GAME_RENDER_COMMAND_SET_TRANSFORM;
+	command.value0 = LEGACY_TRANSFORM_VIEW;
+	command.input = &expected;
+	command.inputBytes = sizeof(expected);
+	result |= Check(owner->ExecuteGameRenderCommand(command) == RENDER_RESULT_OK,
+		"transform read fixture publishes a known view matrix");
+
+	TrackLegacyShaderBits(0xffffffffU);
+	result |= Check(!GetTrackedLegacyLogicalState(&logical),
+		"invalid shader bits keep the logical pipeline unavailable");
+
+	command = GameRenderCommand();
+	command.type = GAME_RENDER_COMMAND_GET_TRANSFORM;
+	command.value0 = LEGACY_TRANSFORM_VIEW;
+	command.output = &actual;
+	command.outputBytes = sizeof(actual);
+	const RenderResult getResult = owner->ExecuteGameRenderCommand(command);
+	result |= Check(getResult == RENDER_RESULT_OK &&
+		std::memcmp(actual.values, expected.values, sizeof(expected.values)) == 0 &&
+		!GetTrackedLegacyLogicalState(&logical),
+		"transform read preserves the exact view matrix without revalidating invalid pipeline state");
+
+	const float vertices[9] = {
+		0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f
+	};
+	command = GameRenderCommand();
+	command.type = GAME_RENDER_COMMAND_DRAW_PRIMITIVE_UP;
+	command.value0 = GAME_PRIMITIVE_TRIANGLE_LIST;
+	command.value1 = 1U;
+	command.value2 = 3U * sizeof(float);
+	command.value3 = GAME_VERTEX_XYZ;
+	command.input = vertices;
+	command.inputBytes = sizeof(vertices);
+	result |= Check(owner->ExecuteGameRenderCommand(command) ==
+		RENDER_RESULT_INVALID_ARGUMENT && !GetTrackedLegacyLogicalState(&logical),
+		"draw submission remains rejected while the tracked pipeline is invalid");
+
+	owner->BeginGameDisplayIteration();
+	ResetTrackedLegacyState();
+	SeedTrackedLegacyPipelineState();
+	return result;
+}
+
 int TestPlainTransformRejectsNonfiniteValues(NativeW3D2 *owner)
 {
 	int result = 0;
@@ -1703,6 +1775,7 @@ int main()
 		result |= TestNativeHardwareZBias(&w3d);
 		result |= TestNativeCameraBiasSequences(&w3d);
 		result |= TestNativeCommandsPreservePipelineState(&w3d);
+		result |= TestGetTransformWithInvalidPipeline(&w3d);
 		{
 			using namespace rts::render;
 			LegacyPipelineState saved;

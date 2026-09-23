@@ -1419,25 +1419,13 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		{
-			LegacyLogicalState logical;
-			if (!GetTrackedLegacyLogicalState(&logical))
+			if (!GetTrackedLegacyTransform(
+					static_cast<LegacyTransformSlot>(command.value0),
+					static_cast<RenderMatrix4 *>(command.output)))
 			{
 				RecordGameFailure(RENDER_RESULT_FAILED);
 				return RENDER_RESULT_FAILED;
 			}
-			const RenderMatrix4 *source = 0;
-			switch (command.value0)
-			{
-			case LEGACY_TRANSFORM_WORLD: source = &logical.constants.world; break;
-			case LEGACY_TRANSFORM_VIEW: source = &logical.constants.view; break;
-			case LEGACY_TRANSFORM_PROJECTION:
-				source = &logical.constants.projection; break;
-			default:
-				source = &logical.constants.textureTransforms[
-					command.value0 - LEGACY_TRANSFORM_TEXTURE0];
-				break;
-			}
-			*static_cast<RenderMatrix4 *>(command.output) = *source;
 		}
 		return RENDER_RESULT_OK;
 

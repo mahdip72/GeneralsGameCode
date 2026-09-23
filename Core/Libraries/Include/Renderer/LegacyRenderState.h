@@ -471,6 +471,8 @@ void TrackLegacyCullState(bool enabled, bool frontCounterClockwise);
 void TrackLegacyPipelineState(const LegacyPipelineState &state);
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state);
 bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values);
+bool GetTrackedLegacyTransform(LegacyTransformSlot slot,
+	RenderMatrix4 *transform);
 bool TrackLegacyVertexShaderConstants(unsigned int startRegister,
 	const float *values, unsigned int registerCount);
 bool TrackLegacyPixelShaderConstants(unsigned int startRegister,

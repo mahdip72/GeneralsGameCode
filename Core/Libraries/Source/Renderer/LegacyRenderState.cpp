@@ -616,6 +616,34 @@ bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values)
 	return true;
 }
 
+bool GetTrackedLegacyTransform(LegacyTransformSlot slot,
+	RenderMatrix4 *transform)
+{
+	if (transform == 0 || slot < LEGACY_TRANSFORM_WORLD ||
+		slot >= LEGACY_TRANSFORM_COUNT)
+	{
+		return false;
+	}
+	if (slot == LEGACY_TRANSFORM_WORLD)
+	{
+		*transform = g_trackedLogicalState.constants.world;
+	}
+	else if (slot == LEGACY_TRANSFORM_VIEW)
+	{
+		*transform = g_trackedLogicalState.constants.view;
+	}
+	else if (slot == LEGACY_TRANSFORM_PROJECTION)
+	{
+		*transform = g_trackedLogicalState.constants.projection;
+	}
+	else
+	{
+		*transform = g_trackedLogicalState.constants.textureTransforms[
+			static_cast<unsigned int>(slot) - LEGACY_TRANSFORM_TEXTURE0];
+	}
+	return true;
+}
+
 bool TrackLegacyVertexShaderConstants(unsigned int startRegister,
 	const float *values, unsigned int registerCount)
 {
