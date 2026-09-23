@@ -10636,6 +10636,13 @@ try {
     catch {
         Assert-True $false "a complete lockstep-v2 fixture should be accepted: $($_.Exception.Message)"
     }
+    $wrongExpectedLockstepHashArgs = @{} + $lockstepPositiveArgs
+    $wrongExpectedLockstepHashArgs.ExpectedEvidenceSha256 = '0' * 64
+    Assert-Throws {
+        Read-Stage5LockstepV2Evidence @wrongExpectedLockstepHashArgs | Out-Null
+    } 'Lockstep-v2 multiplayer evidence SHA-256 mismatch' `
+        'lockstep-v2 reader rejects an evidence document detached from its independent expected hash'
+
     $missingQualificationBindingRoot = Join-Path $acceptanceRoot `
         'lockstep-v2-negative-missing-qualification-binding'
     $missingQualificationBindingPath = Copy-LockstepFixtureCase $lockstepFixtureRoot `
@@ -11425,6 +11432,12 @@ try {
     Assert-True ($reviewedRead.trustDomain -ceq 'reviewed-fixture' -and
         $reviewedRead.protection.kind -ceq 'external-reviewed-fixture-attestation') `
         'reviewed fixture receipts use the external reviewed-fixture trust domain'
+    $crossTitleReviewedArgs = @{} + $reviewedArgs
+    $crossTitleReviewedArgs.EvidenceTitle = 'Generals'
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @crossTitleReviewedArgs | Out-Null
+    } 'title scope is substituted; expected ''Generals''' `
+        'the immutable-receipt reader rejects a valid ZeroHour reviewed fixture under Generals scope'
     $reviewedManifestPath = [string]$syntheticZeroHour.reviewed.manifestPath
     $reviewedManifestText = [IO.File]::ReadAllText($reviewedManifestPath)
     $reviewedReceiptText = [IO.File]::ReadAllText($reviewedReceiptPath)

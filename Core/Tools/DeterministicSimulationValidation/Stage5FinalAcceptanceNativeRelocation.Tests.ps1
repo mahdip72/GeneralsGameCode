@@ -226,7 +226,7 @@ function Invoke-Stage5FinalAcceptanceBoundedGuardTests {
     # reader. Keep focused mutations here so each negative does not repeat a
     # 253-child evidence-root traversal.
 $attachmentTrustDomains = @{
-    'replay-fixture-manifest' = 'host-runner'
+    'replay-fixture-manifest' = 'reviewed-fixture'
     'multiplayer-results' = 'host-runner'
 }
 $expectedReplayBindings = @(
@@ -238,13 +238,13 @@ $bindingResults = & $evidenceModule {
     param($trustDomains, $expectedBindings, $seenBindings)
     $first = Assert-Stage5FinalAcceptanceAttachmentBinding `
         -Role 'replay-fixture-manifest' -Title 'Generals' `
-        -TrustDomain 'host-runner' -AttachmentTrustDomains $trustDomains `
+        -TrustDomain 'reviewed-fixture' -AttachmentTrustDomains $trustDomains `
         -ExpectedBindings $expectedBindings -SeenBindings $seenBindings `
         -Context 'bounded replay-fixture test'
     $seenBindings.Add($first) | Out-Null
     $second = Assert-Stage5FinalAcceptanceAttachmentBinding `
         -Role 'replay-fixture-manifest' -Title 'ZeroHour' `
-        -TrustDomain 'host-runner' -AttachmentTrustDomains $trustDomains `
+        -TrustDomain 'reviewed-fixture' -AttachmentTrustDomains $trustDomains `
         -ExpectedBindings $expectedBindings -SeenBindings $seenBindings `
         -Context 'bounded replay-fixture test'
     $seenBindings.Add($second) | Out-Null
@@ -258,12 +258,24 @@ Assert-RelocationThrows {
         param($trustDomains, $expectedBindings, $seenBindings)
         Assert-Stage5FinalAcceptanceAttachmentBinding `
             -Role 'replay-fixture-manifest' -Title 'Generals' `
-            -TrustDomain 'host-runner' -AttachmentTrustDomains $trustDomains `
+            -TrustDomain 'reviewed-fixture' -AttachmentTrustDomains $trustDomains `
             -ExpectedBindings $expectedBindings -SeenBindings $seenBindings `
             -Context 'bounded replay-fixture test'
     } $attachmentTrustDomains $expectedReplayBindings $seenReplayBindings | Out-Null
 } 'repeats or does not authorize attachment' `
     'the production attachment guard rejects a duplicate role/title key'
+Assert-RelocationThrows {
+    & $evidenceModule {
+        param($trustDomains, $expectedBindings)
+        Assert-Stage5FinalAcceptanceAttachmentBinding `
+            -Role 'replay-fixture-manifest' -Title 'Generals' `
+            -TrustDomain 'host-runner' -AttachmentTrustDomains $trustDomains `
+            -ExpectedBindings $expectedBindings `
+            -SeenBindings (New-Object 'Collections.Generic.List[string]') `
+            -Context 'bounded reviewed-fixture trust-domain test'
+    } $attachmentTrustDomains $expectedReplayBindings | Out-Null
+} 'wrong trust domain' `
+    'the production attachment guard rejects a replay fixture mislabeled as host-runner evidence'
 Assert-RelocationThrows {
     & $evidenceModule {
         param($trustDomains)
@@ -323,6 +335,20 @@ Assert-RelocationThrows {
         $snapshot ('0' * 64) 'bounded snapshot-hash test' | Out-Null
 } 'SHA-256 mismatch' `
     'the production snapshot guard rejects a substituted attachment digest'
+$wrongExpectedLockstepHashArgs = @{
+    Path = $snapshotPath
+    ExpectedSourceCommit = 'a' * 40
+    ExpectedArtifactSetSha256 = 'B' * 64
+    ArtifactHashes = @{
+        'generals-executable' = 'C' * 64
+        'zerohour-executable' = 'D' * 64
+    }
+    ExpectedEvidenceSha256 = '0' * 64
+}
+Assert-RelocationThrows {
+    Read-Stage5LockstepV2Evidence @wrongExpectedLockstepHashArgs | Out-Null
+} 'Lockstep-v2 multiplayer evidence SHA-256 mismatch' `
+    'the production lockstep-v2 reader rejects bytes detached from the independent expected hash'
 
 $launcherRoot = Join-Path $runRoot 'launcher-canonical'
 $copiedLauncherRoot = Join-Path $runRoot 'launcher-copied'
@@ -513,7 +539,7 @@ try {
         checks = @(
             'production acceptance role/title, trust, and duplicate-binding guards',
             'production evidence identity and outer/immutable receipt title guards',
-            'production immutable snapshot digest rejection',
+            'production immutable snapshot and lockstep reader digest rejection',
             'production launcher canonical-path rejection for a copied runtime',
             'actual exported binding function invoked with real receipt/native/raw files',
             'all selected raw hashes validated, then mutation was re-read and rejected',
