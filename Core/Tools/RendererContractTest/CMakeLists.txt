@@ -149,3 +149,10 @@ add_test(NAME core_renderer_contract_tests
     COMMAND core_renderer_contract_tests
 )
 set_tests_properties(core_renderer_contract_tests PROPERTIES TIMEOUT 30)
+
+add_test(NAME core_w3d_video_buffer_format_selection_tests
+    COMMAND core_renderer_contract_tests --w3d-video-buffer-format-selection
+)
+set_tests_properties(core_w3d_video_buffer_format_selection_tests PROPERTIES
+    TIMEOUT 30
+)

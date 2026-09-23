@@ -6333,6 +6333,109 @@ int testD3D11HeadlessDevice()
 
 #endif
 
+int checkW3DDisplayVideoBufferFormatSelection(
+	const char *sourcePath, const char *titleName)
+{
+	int result = 0;
+	std::string source;
+	result |= check(ReadSourceText(sourcePath, &source),
+		"title W3D display source is available");
+	if (source.empty())
+	{
+		return result;
+	}
+
+	const std::string::size_type method = source.find(
+		"W3DDisplay::createVideoBuffer()");
+	const std::string::size_type methodEnd = source.find(
+		"// W3DDisplay::drawScaledVideoBuffer", method);
+	result |= check(method != std::string::npos && methodEnd > method,
+		"title video-buffer selection method is source-addressable");
+	if (method == std::string::npos || methodEnd <= method)
+	{
+		return result;
+	}
+
+	const std::string body = source.substr(method, methodEnd - method);
+	const std::string::size_type nativeGuard = body.find(
+		"rts::render::IsNativeGameRendererActive()");
+	const std::string::size_type nativeFallback = body.find(
+		"format = VideoBuffer::TYPE_X8R8G8B8;", nativeGuard);
+	const std::string::size_type legacyGuard = body.find(
+		"!rts::render::IsNativeGameRendererActive()", nativeFallback);
+	const std::string::size_type legacyBranch = legacyGuard ==
+		std::string::npos ? std::string::npos : body.rfind(
+		"if (format == VideoBuffer::TYPE_UNKNOWN &&", legacyGuard);
+	const std::string::size_type unknownCheck = body.find(
+		"if (format == VideoBuffer::TYPE_UNKNOWN)", legacyGuard);
+	const std::string::size_type unknownReturn = body.find(
+		"return nullptr;", unknownCheck);
+	const std::string::size_type firstLegacyCapsQuery = body.find(
+		"DX8Wrapper::Get_Current_Caps()", 0);
+
+	const std::string nativeSelectionMessage = std::string(titleName) +
+		" keeps the canonical native X8R8G8B8 selection";
+	result |= check(nativeGuard != std::string::npos &&
+		nativeFallback > nativeGuard && legacyGuard > nativeFallback,
+		nativeSelectionMessage.c_str());
+	const std::string legacyGuardMessage = std::string(titleName) +
+		" gates compatibility fallback away from native D3D11";
+	result |= check(legacyBranch != std::string::npos &&
+		unknownCheck > legacyGuard && unknownReturn > unknownCheck &&
+		firstLegacyCapsQuery >= legacyBranch &&
+		firstLegacyCapsQuery < unknownCheck,
+		legacyGuardMessage.c_str());
+
+	if (legacyBranch != std::string::npos && unknownCheck > legacyBranch)
+	{
+		const std::string legacyFallback = body.substr(legacyBranch,
+			unknownCheck - legacyBranch);
+		const char *formats[] = {
+			"WW3D_FORMAT_X8R8G8B8",
+			"WW3D_FORMAT_R8G8B8",
+			"WW3D_FORMAT_R5G6B5",
+			"WW3D_FORMAT_X1R5G5B5"
+		};
+		const char *types[] = {
+			"VideoBuffer::TYPE_X8R8G8B8",
+			"VideoBuffer::TYPE_R8G8B8",
+			"VideoBuffer::TYPE_R5G6B5",
+			"VideoBuffer::TYPE_X1R5G5B5"
+		};
+		std::string::size_type cursor = 0;
+		for (unsigned int i = 0; i != sizeof(formats) / sizeof(formats[0]); ++i)
+		{
+			const std::string::size_type support = legacyFallback.find(
+				"Support_Texture_Format", cursor);
+			const std::string::size_type format = legacyFallback.find(
+				formats[i], cursor);
+			const std::string::size_type assignment = format ==
+				std::string::npos ? std::string::npos : legacyFallback.find(
+				"format = ", format);
+			const std::string::size_type nextFormat = i + 1 ==
+				sizeof(formats) / sizeof(formats[0]) ?
+				legacyFallback.size() : legacyFallback.find(formats[i + 1], format);
+			const std::string formatMessage = std::string(titleName) +
+				" checks legacy format " + formats[i] + " in preference order";
+			const std::string typeMessage = std::string(titleName) +
+				" maps legacy format to " + types[i];
+			result |= check(support != std::string::npos &&
+				format > support && nextFormat > format,
+				formatMessage.c_str());
+			result |= check(assignment != std::string::npos &&
+				assignment < nextFormat && legacyFallback.find(types[i],
+					assignment) < nextFormat,
+				typeMessage.c_str());
+			if (format == std::string::npos)
+			{
+				break;
+			}
+			cursor = format + strlen(formats[i]);
+		}
+	}
+	return result;
+}
+
 int testW3DVideoBufferDirectPublicationLayout()
 {
 	int result = 0;
@@ -6361,6 +6464,28 @@ int testW3DVideoBufferDirectPublicationLayout()
 		&source), "W3D video source is available for policy-contract checks");
 	if (!source.empty())
 	{
+		const std::string::size_type formatMap = source.find(
+			"W3DVideoBuffer::W3DFormatToType(");
+		const std::string formatMapBody = formatMap == std::string::npos ?
+			std::string() : source.substr(formatMap);
+		result |= check(formatMap != std::string::npos &&
+			formatMapBody.find("case WW3D_FORMAT_A8R8G8B8") ==
+				std::string::npos,
+			"W3D video leaves negotiated A8R8G8B8 unknown for legacy fallback");
+		const char *mappedFormats[] = {
+			"WW3D_FORMAT_X8R8G8B8",
+			"WW3D_FORMAT_R8G8B8",
+			"WW3D_FORMAT_R5G6B5",
+			"WW3D_FORMAT_X1R5G5B5"
+		};
+		for (unsigned int i = 0; i != sizeof(mappedFormats) /
+			sizeof(mappedFormats[0]); ++i)
+		{
+			result |= check(formatMapBody.find(mappedFormats[i]) !=
+				std::string::npos,
+				"W3D video maps a legacy fallback format to a buffer type");
+		}
+
 		const std::string::size_type method = source.find(
 			"Bool W3DVideoBuffer::UsesNativeD3D11PublicationPath()");
 		const std::string::size_type methodEnd = source.find(
@@ -6390,6 +6515,12 @@ int testW3DVideoBufferDirectPublicationLayout()
 			std::string::npos,
 			"W3D video retains the SurfaceClass unlock publication boundary");
 	}
+	result |= checkW3DDisplayVideoBufferFormatSelection(
+		"Generals/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp",
+		"Generals");
+	result |= checkW3DDisplayVideoBufferFormatSelection(
+		"GeneralsMD/Code/GameEngineDevice/Source/W3DDevice/GameClient/W3DDisplay.cpp",
+		"Zero Hour");
 
 	const unsigned int width = 16;
 	const unsigned int height = 9;
@@ -6901,8 +7032,19 @@ int RunLegacyShaderAssetContractTests();
 #endif
 #endif
 
-int main()
+int main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1],
+		"--w3d-video-buffer-format-selection") == 0)
+	{
+		const int result = testW3DVideoBufferDirectPublicationLayout();
+		if (result == 0)
+		{
+			printf("W3D video-buffer format selection tests passed.\n");
+		}
+		return result;
+	}
+
 	int result = 0;
 #if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	result |= TestLegacyResetResources();
