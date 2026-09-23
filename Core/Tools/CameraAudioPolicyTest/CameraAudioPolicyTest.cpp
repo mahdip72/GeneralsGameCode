@@ -283,6 +283,34 @@ static void TestShellTerrainFloorPolicy()
 	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
 		315, 315, false, width, height);
 	CHECK(width == 193 && height == 193);
+
+	// Unlike a full-map request, a below-map transient would be retained if
+	// the shake result were accidentally written into the shell floor.
+	shellWidth = 225; shellHeight = 225;
+	width = 289; height = 289;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	rts::StabilizeTerrainDrawSizeForMap(225, 225,
+		315, 315, true, width, height);
+	CHECK(width == 289 && height == 289);
+	CHECK(shellWidth == 225 && shellHeight == 225);
+	width = 225; height = 193;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 225 && height == 225);
+
+	shellWidth = 193; shellHeight = 193;
+	width = 257; height = 257;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	rts::StabilizeTerrainDrawSizeForMap(193, 193,
+		315, 315, true, width, height);
+	CHECK(width == 257 && height == 257);
+	CHECK(shellWidth == 193 && shellHeight == 193);
+	width = 193; height = 161;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 193 && height == 193);
 }
 
 static void TestAudioChannelPolicy()
