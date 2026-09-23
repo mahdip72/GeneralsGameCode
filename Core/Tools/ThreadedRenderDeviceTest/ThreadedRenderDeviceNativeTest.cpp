@@ -285,6 +285,123 @@ Pixels runBufferPreserveRegression(bool threaded, bool serial,
 	return pixels;
 }
 
+Pixels runUnrelatedBufferDestroyRegression(bool threaded,
+	bool destroyVertexBuffer)
+{
+	HiddenWindow window;
+	NativeFactoryState factory;
+	ThreadedRenderOptions options;
+	options.serial = false;
+	options.maxFramesInFlight = 2;
+	std::unique_ptr<IRenderDevice> device(threaded ?
+		CreateThreadedRenderDevice(nativeFactory, &factory, options) :
+		CreateD3D11RenderDevice());
+	require(device.get() != 0, "create unrelated-buffer-destroy native device");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = window.value;
+	parameters.width = parameters.height = 64;
+	parameters.enableDebugLayer = true;
+	parameters.enableVsync = false;
+	require(device->initialize(parameters) == RENDER_RESULT_OK,
+		"initialize unrelated-buffer-destroy native swap chain");
+	if (threaded)
+	{
+		require(factory.owner.load(),
+			"unrelated-buffer-destroy backend factory executes on render owner");
+	}
+	IRenderContext *context = device->immediateContext();
+	require(context != 0, "unrelated-buffer-destroy native context exists");
+	struct Vertex { float x, y, z; unsigned int color; };
+	const Vertex vertices[3] = {
+		{ -0.8f, -0.8f, 0.0f, 0xffff0000U },
+		{ 0.8f, -0.8f, 0.0f, 0xffff0000U },
+		{ 0.0f, 0.8f, 0.0f, 0xffff0000U }
+	};
+	BufferDescriptor vertexDescriptor;
+	vertexDescriptor.byteCount = sizeof(vertices);
+	vertexDescriptor.stride = sizeof(Vertex);
+	vertexDescriptor.binding = RENDER_BUFFER_VERTEX;
+	vertexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle boundVertexBuffer;
+	require(device->createBuffer(vertexDescriptor, vertices, sizeof(vertices),
+		&boundVertexBuffer) == RENDER_RESULT_OK,
+		"create bound vertex buffer A");
+	GpuHandle unrelatedBuffer;
+	GpuHandle boundIndexBuffer;
+	if (destroyVertexBuffer)
+	{
+		require(device->createBuffer(vertexDescriptor, vertices, sizeof(vertices),
+			&unrelatedBuffer) == RENDER_RESULT_OK,
+			"create unrelated vertex buffer B");
+	}
+	else
+	{
+		const unsigned short indices[3] = { 0, 1, 2 };
+		BufferDescriptor indexDescriptor;
+		indexDescriptor.byteCount = sizeof(indices);
+		indexDescriptor.stride = sizeof(unsigned short);
+		indexDescriptor.binding = RENDER_BUFFER_INDEX;
+		indexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+		require(device->createBuffer(indexDescriptor, indices, sizeof(indices),
+			&boundIndexBuffer) == RENDER_RESULT_OK,
+			"create bound index buffer A");
+		require(device->createBuffer(indexDescriptor, indices, sizeof(indices),
+			&unrelatedBuffer) == RENDER_RESULT_OK,
+			"create unrelated index buffer B");
+	}
+	LegacyLogicalState logical;
+	logical.pipeline.rasterizer.cullMode = RENDER_CULL_NONE;
+	require(context->beginFrame() == RENDER_RESULT_OK &&
+		context->clear(RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f), 1.0f, 0) ==
+			RENDER_RESULT_OK &&
+		context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+			RENDER_RESULT_OK &&
+		context->setLegacyState(logical, RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			RENDER_RESULT_OK &&
+		context->setVertexBuffer(boundVertexBuffer, sizeof(Vertex), 0) ==
+			RENDER_RESULT_OK &&
+		(destroyVertexBuffer || context->setIndexBuffer(boundIndexBuffer,
+			RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK) &&
+		context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK,
+		"bind buffer A before destroying unrelated buffer B");
+	require(device->destroyResource(unrelatedBuffer),
+		"destroy unrelated buffer B mid-frame");
+	require((destroyVertexBuffer ? context->draw(3, 0) :
+		context->drawIndexed(3, 0, 0)) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK,
+		"draw bound buffer A after unrelated buffer B is destroyed");
+	Pixels pixels(64 * 64 * 4);
+	RenderFormat format = RENDER_FORMAT_UNKNOWN;
+	require(device->captureBackBuffer(pixels.data(), pixels.size(), 64 * 4,
+		&format) == RENDER_RESULT_OK && format == RENDER_FORMAT_B8G8R8A8_UNORM,
+		"capture unrelated-buffer-destroy regression frame");
+	const unsigned char *center = &pixels[(32 * 64 + 32) * 4];
+	require(center[0] < 16 && center[1] < 16 && center[2] > 240,
+		"draw after unrelated destruction still uses the bound red buffer A");
+	require(device->present() == RENDER_RESULT_OK,
+		"present unrelated-buffer-destroy regression frame");
+	if (threaded)
+	{
+		require(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK,
+			"drain unrelated-buffer-destroy commands");
+		ThreadedRenderFrameCompletion completion;
+		require(PollThreadedRenderCompletion(device.get(), &completion) &&
+			completion.result == RENDER_RESULT_OK && completion.presented &&
+			completion.operational && !completion.resourceFailure,
+			"unrelated-buffer-destroy frame completes without resource failure");
+	}
+	require(device->destroyResource(boundVertexBuffer) &&
+		(!boundIndexBuffer.isValid() || device->destroyResource(boundIndexBuffer)),
+		"destroy remaining unrelated-buffer-destroy resources");
+	if (threaded)
+		require(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK,
+			"drain unrelated-buffer-destroy resource cleanup");
+	device->shutdown();
+	return pixels;
+}
+
 std::vector<Pixels> runTexturePipeline(bool threaded, bool serial,
 	unsigned frameSlots)
 {
@@ -691,6 +808,16 @@ int main()
 		require(runBufferPreserveRegression(true, false, 2) ==
 			preserveReference,
 			"queued direct and threaded overlapping-preserve pixels match");
+		const Pixels unrelatedVertexReference =
+			runUnrelatedBufferDestroyRegression(false, true);
+		require(runUnrelatedBufferDestroyRegression(true, true) ==
+			unrelatedVertexReference,
+			"direct and threaded draws survive unrelated vertex-buffer destruction");
+		const Pixels unrelatedIndexReference =
+			runUnrelatedBufferDestroyRegression(false, false);
+		require(runUnrelatedBufferDestroyRegression(true, false) ==
+			unrelatedIndexReference,
+			"direct and threaded draws survive unrelated index-buffer destruction");
 		const std::vector<Pixels> textureReference = runTexturePipeline(false, false, 2);
 		require(runTexturePipeline(true, true, 2) == textureReference,
 			"serial native texture/copy pixels equal direct D3D11 reference");
