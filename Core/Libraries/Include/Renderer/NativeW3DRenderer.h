@@ -61,6 +61,54 @@ struct NativeDrawPacket
 	bool indexed;
 };
 
+// Only retain texture slots across a caller-defined sequence with no
+// intervening out-of-band texture binds. Sorted submission creates one cache
+// per batch, so frame, owner, and device lifecycle changes always start unknown.
+class NativeW3DTextureBindingCache
+{
+public:
+	NativeW3DTextureBindingCache()
+	{
+		Reset();
+	}
+
+	void Reset()
+	{
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
+			++stage)
+		{
+			m_isKnown[stage] = false;
+			m_textures[stage] = GpuHandle();
+		}
+	}
+
+	template <class RenderContext>
+	RenderResult Bind(RenderContext *context, const GpuHandle *textures)
+	{
+		if (context == 0 || textures == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
+			++stage)
+		{
+			if (!m_isKnown[stage] || m_textures[stage] != textures[stage])
+			{
+				const RenderResult result = context->setTexture(stage,
+					textures[stage]);
+				if (result != RENDER_RESULT_OK)
+					return result;
+				m_textures[stage] = textures[stage];
+				m_isKnown[stage] = true;
+			}
+		}
+		return RENDER_RESULT_OK;
+	}
+
+private:
+	bool m_isKnown[LEGACY_TEXTURE_STAGE_COUNT];
+	GpuHandle m_textures[LEGACY_TEXTURE_STAGE_COUNT];
+};
+
 class NativeW3DRenderer
 {
 public:
@@ -160,7 +208,8 @@ private:
 		bool requireFacadeFrame);
 	RenderResult SubmitInternal(const NativeW3DResources &resources,
 		const LegacyLogicalState &state, const NativeDrawPacket &packet,
-		bool requireFacadeFrame);
+		bool requireFacadeFrame,
+		NativeW3DTextureBindingCache *textureBindingCache);
 	RenderResult AttachBorrowedState(NativeW3DRenderState *state);
 	RenderResult DetachBorrowedState();
 	// Destruction can be initiated by a worker, but the backend and its

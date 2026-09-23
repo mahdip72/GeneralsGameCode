@@ -359,19 +359,20 @@ RenderResult NativeW3DRenderer::Submit(const NativeW3DResources &resources,
 	const LegacyLogicalState &state,
 	const NativeDrawPacket &packet)
 {
-	return SubmitInternal(resources, state, packet, true);
+	return SubmitInternal(resources, state, packet, true, 0);
 }
 
 RenderResult NativeW3DRenderer::SubmitExternal(
 	const NativeW3DResources &resources, const LegacyLogicalState &state,
 	const NativeDrawPacket &packet)
 {
-	return SubmitInternal(resources, state, packet, false);
+	return SubmitInternal(resources, state, packet, false, 0);
 }
 
 RenderResult NativeW3DRenderer::SubmitInternal(
 	const NativeW3DResources &resources, const LegacyLogicalState &state,
-	const NativeDrawPacket &packet, bool requireFacadeFrame)
+	const NativeDrawPacket &packet, bool requireFacadeFrame,
+	NativeW3DTextureBindingCache *textureBindingCache)
 {
 	IRenderContext *context = m_state == 0 ? 0 : m_state->Context();
 	if (context == 0 || (requireFacadeFrame && !m_frameOpen) ||
@@ -440,14 +441,25 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 	{
 		return result;
 	}
-	for (unsigned int textureStage = 0;
-		textureStage < LEGACY_TEXTURE_STAGE_COUNT; ++textureStage)
+	if (textureBindingCache != 0)
 	{
-		result = context->setTexture(textureStage,
-			packet.textures[textureStage]);
+		result = textureBindingCache->Bind(context, packet.textures);
 		if (result != RENDER_RESULT_OK)
 		{
 			return result;
+		}
+	}
+	else
+	{
+		for (unsigned int textureStage = 0;
+			textureStage < LEGACY_TEXTURE_STAGE_COUNT; ++textureStage)
+		{
+			result = context->setTexture(textureStage,
+				packet.textures[textureStage]);
+			if (result != RENDER_RESULT_OK)
+			{
+				return result;
+			}
 		}
 	}
 	result = context->setPrimitiveTopology(packet.topology);

@@ -286,7 +286,8 @@ private:
 
 	rts::render::RenderResult SubmitGamePacket(
 		const rts::render::LegacyLogicalState &state,
-		const rts::render::NativeDrawPacket &packet);
+		const rts::render::NativeDrawPacket &packet,
+		rts::render::NativeW3DTextureBindingCache *textureBindingCache = 0);
 };
 
 #endif

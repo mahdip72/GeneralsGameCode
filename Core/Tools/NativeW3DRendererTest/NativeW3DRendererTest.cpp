@@ -3,6 +3,7 @@
 #include "Renderer/RenderTexturePublication.h"
 
 #include <cstdio>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -76,6 +77,115 @@ int TestTexturePublicationOperationalContract()
 		!rts::render::IsRenderTexturePublicationOperationalState(
 			true, false, true, false),
 		"native publication is suppressed while the bridge is inactive");
+	return result;
+}
+
+struct TextureStageCommand
+{
+	unsigned int stage;
+	rts::render::GpuHandle texture;
+};
+
+class TextureStageTraceContext
+{
+public:
+	TextureStageTraceContext() : failStage(-1), failNext(false), commands()
+	{
+	}
+
+	rts::render::RenderResult setTexture(unsigned int stage,
+		rts::render::GpuHandle texture)
+	{
+		TextureStageCommand command;
+		command.stage = stage;
+		command.texture = texture;
+		commands.push_back(command);
+		if (failNext && static_cast<int>(stage) == failStage)
+		{
+			failNext = false;
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		return rts::render::RENDER_RESULT_OK;
+	}
+
+	int failStage;
+	bool failNext;
+	std::vector<TextureStageCommand> commands;
+};
+
+int TestTextureBindingCacheCommandTrace()
+{
+	using namespace rts::render;
+	int result = 0;
+	GpuHandle textures[LEGACY_TEXTURE_STAGE_COUNT];
+	textures[1] = GpuHandle(4, 7);
+	textures[5] = GpuHandle(9, 2);
+	NativeW3DTextureBindingCache cache;
+	TextureStageTraceContext trace;
+	const unsigned int stageCount = LEGACY_TEXTURE_STAGE_COUNT;
+
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount,
+		"first sorted packet submits one texture command for each unknown stage");
+	bool orderedStages = trace.commands.size() == stageCount;
+	for (unsigned int stage = 0; orderedStages && stage < stageCount; ++stage)
+	{
+		orderedStages = trace.commands[stage].stage == stage &&
+			trace.commands[stage].texture == textures[stage];
+	}
+	result |= Check(orderedStages,
+		"first texture command trace preserves stage order and full handles");
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount,
+		"identical consecutive texture bindings emit no extra commands");
+
+	textures[1] = GpuHandle(4, 8);
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount + 1 &&
+		trace.commands.back().stage == 1 &&
+		trace.commands.back().texture == textures[1],
+		"a reused texture slot with a new generation is submitted");
+
+	const GpuHandle textureA = textures[1];
+	textures[1] = GpuHandle();
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount + 2 &&
+		trace.commands.back().stage == 1 &&
+		!trace.commands.back().texture.isValid(),
+		"A-to-null transition submits the required unbind");
+	textures[1] = textureA;
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount + 3 &&
+		trace.commands.back().stage == 1 &&
+		trace.commands.back().texture == textureA,
+		"null-to-A transition submits the required rebind");
+
+	NativeW3DTextureBindingCache failureCache;
+	TextureStageTraceContext failureTrace;
+	failureTrace.failStage = 3;
+	failureTrace.failNext = true;
+	GpuHandle failureTextures[LEGACY_TEXTURE_STAGE_COUNT];
+	failureTextures[0] = GpuHandle(20, 1);
+	failureTextures[1] = GpuHandle(21, 1);
+	failureTextures[2] = GpuHandle(22, 1);
+	failureTextures[3] = GpuHandle(23, 1);
+	result |= Check(failureCache.Bind(&failureTrace, failureTextures) ==
+		RENDER_RESULT_FAILED && failureTrace.commands.size() == 4,
+		"a failed texture command stops the current batch immediately");
+	result |= Check(failureCache.Bind(&failureTrace, failureTextures) ==
+		RENDER_RESULT_OK && failureTrace.commands.size() == 9 &&
+		failureTrace.commands[4].stage == 3,
+		"a failed stage is retried while earlier successful stages stay cached");
+
+	NativeW3DTextureBindingCache nextBatchCache;
+	const size_t beforeNextBatch = trace.commands.size();
+	result |= Check(nextBatchCache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == beforeNextBatch + stageCount,
+		"each sorted batch starts unknown and rebinds all stages");
+	std::fprintf(stdout,
+		"texture binding trace counts: first=%u repeat=0 generation=1 "
+		"A-null-A=2 failed-attempt=4 retry=5 batch-reset=%u\n",
+		stageCount, stageCount);
 	return result;
 }
 
@@ -272,6 +382,7 @@ int main()
 	int result = 0;
 	result |= TestTexturePublicationContract();
 	result |= TestTexturePublicationOperationalContract();
+	result |= TestTextureBindingCacheCommandTrace();
 #if defined(_WIN32) && defined(RTS_RENDERER_HAS_D3D11)
 	result |= TestD3D11TexturedInputLayoutSafety();
 #endif

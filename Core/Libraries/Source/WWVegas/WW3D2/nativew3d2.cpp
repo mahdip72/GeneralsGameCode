@@ -3056,7 +3056,8 @@ rts::render::RenderResult NativeW3D2::SetGameViewport(
 
 rts::render::RenderResult NativeW3D2::SubmitGamePacket(
 	const rts::render::LegacyLogicalState &state,
-	const rts::render::NativeDrawPacket &packet)
+	const rts::render::NativeDrawPacket &packet,
+	rts::render::NativeW3DTextureBindingCache *textureBindingCache)
 {
 	// Logical state and target selection may be prepared between frames, but a
 	// draw is only valid inside the frame that owns the backend command stream.
@@ -3064,6 +3065,11 @@ rts::render::RenderResult NativeW3D2::SubmitGamePacket(
 	// owner write to an indeterminate target.
 	if (!IsOperational() || !m_renderer.IsFrameOpen())
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	if (textureBindingCache != 0)
+	{
+		return m_renderer.SubmitInternal(m_resources, state, packet, true,
+			textureBindingCache);
+	}
 	return m_renderer.Submit(m_resources, state, packet);
 }
 
@@ -3214,6 +3220,7 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 		return result;
 	}
 
+	rts::render::NativeW3DTextureBindingCache textureBindingCache;
 	for (unsigned int drawIndex = 0; drawIndex < drawCount; ++drawIndex)
 	{
 		rts::render::NativeDrawPacket packet = draws[drawIndex].packet;
@@ -3223,7 +3230,8 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 		packet.startVertex = 0;
 		packet.minimumVertexIndex = 0;
 		packet.baseVertex = 0;
-		result = SubmitGamePacket(draws[drawIndex].state, packet);
+		result = SubmitGamePacket(draws[drawIndex].state, packet,
+			&textureBindingCache);
 		if (result != rts::render::RENDER_RESULT_OK)
 			break;
 		++*submittedDrawCount;
