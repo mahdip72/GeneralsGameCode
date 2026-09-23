@@ -54,7 +54,9 @@ enum SkirmishStrategyReason
 	SKIRMISH_STRATEGY_REASON_BALANCED_ASSAULT_TARGET_UNAVAILABLE,
 
 	SKIRMISH_STRATEGY_REASON_ASSAULT_FORTIFY_DEADLINE,
-	SKIRMISH_STRATEGY_REASON_BALANCED_FORTIFY_DEADLINE
+	SKIRMISH_STRATEGY_REASON_BALANCED_FORTIFY_DEADLINE,
+	SKIRMISH_STRATEGY_REASON_FORTIFY_TACTICAL_ROUTE_EXHAUSTED,
+	SKIRMISH_STRATEGY_REASON_BALANCED_TACTICAL_ROUTE_EXHAUSTED
 };
 
 struct SkirmishStrategyMetrics
@@ -125,6 +127,9 @@ void InitializeOldSaveSkirmishStrategyState( SkirmishStrategyState *state, Unsig
 void ArmOldSaveSkirmishFortifyDeadline( SkirmishStrategyState *state,
 	GameDifficulty difficulty, UnsignedInt currentFrame );
 
+// Pass tacticalRouteExhausted only for the tactical replay epoch.  The caller
+// supplies an observed, viable superweapon source or construction plan.
 SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &state,
 	const SkirmishStrategyMetrics &metrics, GameDifficulty difficulty, UnsignedInt currentFrame,
-	Bool useProductionBehavior = false );
+	Bool useProductionBehavior = false, Bool tacticalRouteExhausted = false,
+	Bool viableSuperweaponPlan = false );

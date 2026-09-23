@@ -24,7 +24,7 @@ jobs:
   build:
     name: ${{ inputs.preset }}
     runs-on: windows-2022
-    timeout-minutes: 15
+    timeout-minutes: ${{ inputs.preset == 'vc6-releaselog+t+e' && 75 || 15 }}
     env:
       GAME_PATH: C:\GameData
       GENERALS_PATH: C:\GameData\Generals
@@ -153,6 +153,7 @@ jobs:
           Write-Host "Registry key set: $regPath -> InstallPath = $installPath"
 
       - name: Move Replays and Maps to User Dir
+        if: ${{ inputs.preset != 'vc6-releaselog+t+e' }}
         shell: pwsh
         run: |
           # These files are expected in the user dir, so we move them here.
@@ -170,6 +171,7 @@ jobs:
           Move-Item -Path "$source\*" -Destination $destination -Force
 
       - name: Run Replay Compatibility Tests
+        if: ${{ inputs.preset != 'vc6-releaselog+t+e' }}
         shell: pwsh
         run: |
           $exePath = "build/generalszh.exe"
@@ -231,6 +233,29 @@ jobs:
           }
 
           Write-Host "Success!"
+
+      - name: Run Optimized VC6 Replay Oracle
+        if: ${{ inputs.preset == 'vc6-releaselog+t+e' }}
+        shell: pwsh
+        run: |
+          ./.github/scripts/check-replay-oracle.ps1 `
+            -ExecutablePath build/generalszh.exe `
+            -UserdataPath '${{ inputs.userdata }}' `
+            -OutputDirectory build/replay-oracle
+
+      - name: Upload Replay Oracle Results
+        if: ${{ always() && inputs.preset == 'vc6-releaselog+t+e' }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: Replay-Oracle-${{ inputs.preset }}
+          path: |
+            build/replay-oracle/results.json
+            build/replay-oracle/run-*/stdout.log
+            build/replay-oracle/run-*/stderr.log
+            build/replay-oracle/run-*/DebugLogFile*.txt
+            build/replay-oracle/run-*/crc-manifest.txt
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Upload Debug Log
         if: always()

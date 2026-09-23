@@ -29,6 +29,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include <algorithm>
+#include <vector>
 
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
@@ -41,6 +42,7 @@
 #include "Common/BuildAssistant.h"
 #include "Common/SpecialPower.h"
 #include "Common/ThingTemplate.h"
+#include "Common/TunnelTracker.h"
 #include "Common/Upgrade.h"
 #include "Common/WellKnownKeys.h"
 #include "Common/Xfer.h"
@@ -64,7 +66,9 @@
 #include "GameLogic/PartitionManager.h"
 #include "GameLogic/ScriptEngine.h"
 #include "GameLogic/SkirmishAIDecision.h"
+#include "GameLogic/SkirmishAIDefense.h"
 #include "GameLogic/SkirmishAIRecovery.h"
+#include "GameLogic/SkirmishAITunnelRoute.h"
 #include "GameLogic/Weapon.h"
 #include "GameLogic/WeaponSet.h"
 #include "GameLogic/Module/ProductionUpdate.h"
@@ -74,6 +78,18 @@
 
 
 #define USE_DOZER 1
+
+struct SkirmishAIDefenseContext;
+
+static void CollectSkirmishAIDefenseSupplyPositions(
+	Player *player, std::vector<Coord2D> *positions);
+static Bool IsSkirmishAIDefenseLineSite(
+	const Coord3D &baseCenter, Real baseRadius,
+	const SkirmishAIDefenseContext &context, const Coord3D &position,
+	Real structureRadius, const std::vector<Coord2D> &supplyPositions);
+static Bool IsSkirmishAIDefenseSiteOverlappingPendingBuild(
+	Player *player, const Coord3D &position, Real structureRadius,
+	const BuildListInfo *ignoreInfo = nullptr);
 
 static Bool ShouldUseCurrentSkirmishAIBehavior()
 {
@@ -93,6 +109,14 @@ static Bool ShouldUseCurrentSkirmishAIStrategyControllerBehavior()
 static Bool ShouldUseCurrentSkirmishAIProductionBehavior()
 {
 	return TheGameLogic && ShouldUseSkirmishAIProductionBehavior(
+		TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+static Bool ShouldUseCurrentSkirmishAITacticalBehavior()
+{
+	return TheGameLogic && ShouldUseSkirmishAITacticalBehavior(
 		TheGameLogic->isInReplayGame(),
 		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
 			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -419,7 +443,9 @@ static Bool IsSkirmishStrategyStaticTarget(const Object *object)
 enum {
 	MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES = 4,
 	MAX_SKIRMISH_STRATEGY_GROUND_PROBES_PER_TARGET = 4,
-	MAX_SKIRMISH_STRATEGY_QUICK_PATH_QUERIES = 16
+	MAX_SKIRMISH_STRATEGY_QUICK_PATH_QUERIES = 16,
+	MAX_SKIRMISH_AI_TACTICAL_QUICK_PATH_QUERIES_PER_UPDATE = 16,
+	MAX_SKIRMISH_AI_TACTICAL_RETREAT_PATH_QUERIES_PER_TEAM = 10
 };
 
 struct SkirmishStrategyCapabilityCandidate
@@ -457,6 +483,236 @@ static Bool IsSkirmishStrategyPotentialOffensiveRecipient(
 		IsSkirmishStrategyCombatObject(object) && object->getAIUpdateInterface();
 }
 
+static Bool HasSkirmishStrategyPotentialOffensiveRecipient(
+	Team *team, Player *player)
+{
+	if (!team || !player)
+		return false;
+	for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+		!member.done(); member.advance()) {
+		if (IsSkirmishStrategyPotentialOffensiveRecipient(
+				member.cur(), player, team))
+			return true;
+	}
+	return false;
+}
+
+static const Int MAX_SKIRMISH_AI_TUNNEL_MEMBERS = 32;
+static const UnsignedInt MAX_SKIRMISH_AI_TUNNEL_ENDPOINT_PROBES = 512;
+static const UnsignedInt MAX_SKIRMISH_AI_TACTICAL_TEAMS = 512;
+static const Int MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_ATTEMPT = 256;
+static const Int MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_UPDATE = 512;
+static const UnsignedInt SKIRMISH_AI_TUNNEL_TRANSIT_TIMEOUT_SECONDS = 30;
+static const UnsignedInt SKIRMISH_AI_TUNNEL_RETRY_COOLDOWN_SECONDS = 20;
+static const UnsignedInt SKIRMISH_AI_TUNNEL_CAPACITY_WAIT_SECONDS = 45;
+static const UnsignedInt SKIRMISH_AI_TUNNEL_PAIR_PROBE_SECONDS = 2;
+static const UnsignedInt SKIRMISH_AI_TUNNEL_SUCCESS_COOLDOWN_SECONDS = 45;
+
+static Bool GetSkirmishAIStrategyGroundApproach(
+	const Coord3D *origin, Object *structure, Int candidate,
+	Coord3D *approach)
+{
+	if (!origin || !structure || !approach || !TheTerrainLogic)
+		return false;
+	*approach = *structure->getPosition();
+	const Real radius = structure->getTemplate()
+		? structure->getTemplate()->getTemplateGeometryInfo()
+			.getBoundingCircleRadius() : 0.0f;
+	if (!SkirmishAITunnelRoute::GetApproachPoint(
+			approach->x, approach->y, origin->x, origin->y,
+			radius, 2.0f * PATHFIND_CELL_SIZE_F,
+			candidate, &approach->x, &approach->y))
+		return false;
+	approach->z = TheTerrainLogic->getGroundHeight(approach->x, approach->y);
+	return true;
+}
+
+static Bool ProbeSkirmishAITunnelQuickPath(
+	const LocomotorSet &locomotorSet, const Coord3D *from,
+	const Coord3D *to, Int *attemptQueries, Int *aggregateQueries)
+{
+	if (!from || !to || !attemptQueries || !aggregateQueries ||
+		!TheAI || !TheAI->pathfinder() ||
+		*attemptQueries >= MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_ATTEMPT ||
+		*aggregateQueries >= MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_UPDATE)
+		return false;
+	++(*attemptQueries);
+	++(*aggregateQueries);
+	return TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+		locomotorSet, from, to);
+}
+
+// A result covers the entire team at the positions sampled in this sweep.
+// The caller reserves the maximum two probes per member before invoking it.
+static Int ProbeSkirmishAITunnelEndpointRole(
+	const std::vector<Object *> &members, Object *endpoint, Object *target,
+	Bool entryRole, Int *attemptQueries, Int *aggregateQueries)
+{
+	if (!endpoint || !target)
+		return -1;
+	for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex) {
+		Object *member = members[memberIndex];
+		AIUpdateInterface *ai = member ? member->getAIUpdateInterface() : nullptr;
+		if (!ai)
+			return -1;
+		Bool reachable = FALSE;
+		for (Int candidate = 0; candidate < 2 && !reachable; ++candidate) {
+			Coord3D from;
+			Coord3D to;
+			if (entryRole) {
+				if (!GetSkirmishAIStrategyGroundApproach(
+						member->getPosition(), endpoint, candidate, &to))
+					continue;
+				from = *member->getPosition();
+			} else {
+				if (!GetSkirmishAIStrategyGroundApproach(
+						target->getPosition(), endpoint, candidate, &from) ||
+					!GetSkirmishAIStrategyGroundApproach(
+						endpoint->getPosition(), target, candidate, &to))
+					continue;
+			}
+			reachable = ProbeSkirmishAITunnelQuickPath(
+				ai->getLocomotorSet(), &from, &to,
+				attemptQueries, aggregateQueries);
+		}
+		if (!reachable)
+			return -1;
+	}
+	return 1;
+}
+
+static Bool IsSkirmishAIStrategyObjectIDBefore(
+	const Object *left, const Object *right)
+{
+	return left && right && left->getID() < right->getID();
+}
+
+static Bool IsSkirmishAIStrategyTunnelTransitMember(
+	Object *object, Player *player, Team *team, Bool allowContained)
+{
+	return object && player && team &&
+		object->getControllingPlayer() == player && object->getTeam() == team &&
+		!object->isEffectivelyDead() && !object->isDestroyed() &&
+		!object->testStatus(OBJECT_STATUS_SOLD) &&
+		!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+		object->isMobile() && (allowContained || !object->isContained()) &&
+		IsSkirmishStrategyCombatObject(object) &&
+		object->getAIUpdateInterface() != nullptr;
+}
+
+static Bool IsSkirmishAIStrategyTunnelEndpointLive(
+	Object *object, Player *owner)
+{
+	ContainModuleInterface *contain = object ? object->getContain() : nullptr;
+	return object && owner && object->getControllingPlayer() == owner &&
+		!object->isEffectivelyDead() && !object->isDestroyed() &&
+		!object->testStatus(OBJECT_STATUS_SOLD) &&
+		!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+		!object->testStatus(OBJECT_STATUS_RECONSTRUCTING) && contain &&
+		contain->isTunnelContain();
+}
+
+static Bool HasSkirmishAIStrategyTunnelRouteInfrastructure(
+	Player *owner, TunnelTracker *tracker, Bool canBuildMissingEndpoints)
+{
+	if (!owner || !tracker)
+		return false;
+	const std::list<ObjectID> *endpointIDs = tracker->getContainerList();
+	if (!endpointIDs)
+		return canBuildMissingEndpoints;
+	Int liveEndpointCount = 0;
+	ObjectID firstEndpointID = INVALID_ID;
+	for (std::list<ObjectID>::const_iterator endpointID = endpointIDs->begin();
+		endpointID != endpointIDs->end(); ++endpointID) {
+		Object *endpoint = TheGameLogic
+			? TheGameLogic->findObjectByID(*endpointID) : nullptr;
+		if (!IsSkirmishAIStrategyTunnelEndpointLive(endpoint, owner) ||
+			endpoint->getID() == firstEndpointID)
+			continue;
+		if (firstEndpointID == INVALID_ID)
+			firstEndpointID = endpoint->getID();
+		if (++liveEndpointCount >= 2)
+			return true;
+	}
+	return canBuildMissingEndpoints;
+}
+
+static Bool IsSkirmishAIStrategyTunnelEndpointRegistered(
+	Object *object, Player *owner, TunnelTracker *tracker)
+{
+	if (!tracker || !IsSkirmishAIStrategyTunnelEndpointLive(object, owner))
+		return false;
+	const std::list<ObjectID> *tunnelIDs = tracker->getContainerList();
+	if (!tunnelIDs)
+		return false;
+	std::list<ObjectID>::const_iterator tunnelID;
+	for (tunnelID = tunnelIDs->begin(); tunnelID != tunnelIDs->end(); ++tunnelID) {
+		if (*tunnelID == object->getID())
+			return true;
+	}
+	return false;
+}
+
+static Bool IsSkirmishAISupportedGLASide(const AsciiString &side)
+{
+	return side == AsciiString("GLA") ||
+		side == AsciiString("GLADemolitionGeneral") ||
+		side == AsciiString("GLAStealthGeneral") ||
+		side == AsciiString("GLAToxinGeneral");
+}
+
+static Bool IsSkirmishAIStrategyTunnelTemplate(const ThingTemplate *plan)
+{
+	if (!plan || !plan->isKindOf(KINDOF_STRUCTURE))
+		return false;
+	const ModuleInfo &modules = plan->getBehaviorModuleInfo();
+	for (Int i = 0; i < modules.getCount(); ++i) {
+		if (modules.getNthName(i) == AsciiString("TunnelContain"))
+			return true;
+	}
+	return false;
+}
+
+static Bool IsSkirmishAIStrategyTunnelSiteVisible(
+	Player *player, const Coord3D &position)
+{
+	if (!player || !ThePartitionManager)
+		return false;
+	const ObjectShroudStatus shroud =
+		ThePartitionManager->getPropShroudStatusForPlayer(
+			player->getPlayerIndex(), &position);
+	return shroud == OBJECTSHROUD_CLEAR ||
+		shroud == OBJECTSHROUD_PARTIAL_CLEAR;
+}
+
+static Object *SelectSkirmishAIStrategyFallbackTunnel(
+	Player *owner, TunnelTracker *tracker, ObjectID afterID,
+	ObjectID preferredID)
+{
+	if (!owner || !tracker || !TheGameLogic)
+		return nullptr;
+	const std::list<ObjectID> *ids = tracker->getContainerList();
+	if (!ids)
+		return nullptr;
+	Object *first = nullptr;
+	Object *next = nullptr;
+	Object *preferred = nullptr;
+	for (std::list<ObjectID>::const_iterator it = ids->begin();
+		it != ids->end(); ++it) {
+		Object *candidate = TheGameLogic->findObjectByID(*it);
+		if (!IsSkirmishAIStrategyTunnelEndpointLive(candidate, owner))
+			continue;
+		if (!first || candidate->getID() < first->getID())
+			first = candidate;
+		if (candidate->getID() == preferredID)
+			preferred = candidate;
+		if (afterID != INVALID_ID && candidate->getID() > afterID &&
+			(!next || candidate->getID() < next->getID()))
+			next = candidate;
+	}
+	return preferred ? preferred : (next ? next : first);
+}
+
 static Bool IsSkirmishStrategyOffensiveRecipient(
 	Object *object, Player *player)
 {
@@ -491,6 +747,35 @@ static void InsertSkirmishStrategyTargetCandidate(
 		++(*candidateCount);
 }
 
+static Bool IsSkirmishStrategyTopTargetCandidate(
+	Object *object, const SkirmishStrategyCapabilityCandidate *candidates,
+	Int candidateCount)
+{
+	for (Int index = 0; index < candidateCount; ++index) {
+		if (candidates[index].object == object)
+			return true;
+	}
+	return false;
+}
+
+static void InsertSkirmishStrategyTargetByID(
+	Object **candidates, Int *candidateCount, Object *object)
+{
+	Int insertAt = 0;
+	while (insertAt < *candidateCount &&
+		candidates[insertAt]->getID() < object->getID())
+		++insertAt;
+	if (insertAt >= MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES)
+		return;
+	const Int last = *candidateCount < MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES ?
+		*candidateCount : MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES - 1;
+	for (Int index = last; index > insertAt; --index)
+		candidates[index] = candidates[index - 1];
+	candidates[insertAt] = object;
+	if (*candidateCount < MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES)
+		++(*candidateCount);
+}
+
 static Bool IsSkirmishStrategyCapabilityCandidateBefore(
 	const SkirmishStrategyCapabilityCandidate &left,
 	const SkirmishStrategyCapabilityCandidate &right)
@@ -519,6 +804,19 @@ static void AppendSkirmishStrategyCapabilityCandidate(
 	candidate.object = object;
 	candidate.value = value;
 	candidates->push_back(candidate);
+}
+
+static Bool IsSkirmishStrategyTunnelTeamIDBefore(Team *left, Team *right)
+{
+	return left->getID() < right->getID();
+}
+
+static void AppendSkirmishStrategyTunnelTeamCandidate(
+	std::vector<Team *> *teams, Team *team)
+{
+	if (!teams || !team)
+		return;
+	teams->push_back(team);
 }
 
 static Bool IsSkirmishStrategyReadyTeamActivationDue(
@@ -556,7 +854,7 @@ static Bool HasSkirmishStrategyTargetCapability(
 	Object *target,
 	const std::vector<SkirmishStrategyCapabilityCandidate> &airAttackers,
 	const std::vector<SkirmishStrategyCapabilityCandidate> &groundAttackers,
-	Int *quickPathQueryCount)
+	Int *quickPathQueryCount, Bool rotateGroundProbes)
 {
 	size_t index;
 	for (index = 0; index < airAttackers.size(); ++index) {
@@ -566,9 +864,17 @@ static Bool HasSkirmishStrategyTargetCapability(
 	}
 	if (!TheAI || !TheAI->pathfinder())
 		return false;
+	// The old replays use the highest-value prefix. Current games rotate the
+	// same four-query budget so lower-ranked, reachable units get a turn.
+	const size_t firstGroundIndex = rotateGroundProbes &&
+		groundAttackers.size() > MAX_SKIRMISH_STRATEGY_GROUND_PROBES_PER_TARGET
+		? (TheGameLogic->getFrame() / (LOGICFRAMES_PER_SECOND + 1)) %
+			groundAttackers.size() : 0;
 	Int capableGroundProbeCount = 0;
 	for (index = 0; index < groundAttackers.size(); ++index) {
-		Object *attacker = groundAttackers[index].object;
+		const size_t candidateIndex =
+			(firstGroundIndex + index) % groundAttackers.size();
+		Object *attacker = groundAttackers[candidateIndex].object;
 		if (attacker->getAbleToAttackSpecificObject(
 				ATTACK_NEW_TARGET, target, CMD_FROM_AI) == ATTACKRESULT_NOT_POSSIBLE)
 			continue;
@@ -620,6 +926,271 @@ static Bool IsSkirmishStrategyIntelEligible(
 		object->testStatus(OBJECT_STATUS_STEALTHED),
 		object->testStatus(OBJECT_STATUS_DETECTED),
 		object->testStatus(OBJECT_STATUS_MASKED));
+}
+
+static Bool IsSkirmishAIStrategyTunnelTargetUsable(
+	Object *target, Player *owner, Player *enemy);
+
+// The known defense is the obstacle being bypassed. Exempt only that
+// currently observed object from the normal enemy exclusion radius; all
+// other visible enemies still veto the forward tunnel site.
+static Bool IsSkirmishAIForwardTunnelLocationSafe(Player *owner,
+	Player *enemy, const Coord3D *position, const ThingTemplate *plan,
+	Object *blocker, Object *target)
+{
+	if (!owner || !enemy || !position || !plan || !blocker ||
+		!TheAI || !ThePartitionManager ||
+		!IsSkirmishAIStrategyTunnelTargetUsable(target, owner, enemy) ||
+		blocker->getControllingPlayer() != enemy ||
+		!blocker->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
+		blocker->isEffectivelyDead() || blocker->isDestroyed() ||
+		blocker->testStatus(OBJECT_STATUS_SOLD) ||
+		!IsSkirmishStrategyIntelEligible(blocker, owner) ||
+		!IsSkirmishAIStrategyTunnelSiteVisible(owner, *position))
+		return false;
+	const Real tunnelRadius = plan->getTemplateGeometryInfo()
+		.getBoundingCircleRadius();
+	const Real blockerRadius = blocker->getTemplate()
+		? blocker->getTemplate()->getTemplateGeometryInfo()
+			.getBoundingCircleRadius() : 0.0f;
+	const Real targetRadius = target->getTemplate()
+		? target->getTemplate()->getTemplateGeometryInfo()
+			.getBoundingCircleRadius() : 0.0f;
+	if (!SkirmishAITunnelRoute::IsForwardSiteClearOfBlocker(
+			blocker->getPosition()->x, blocker->getPosition()->y,
+			target->getPosition()->x, target->getPosition()->y,
+			position->x, position->y, blockerRadius, targetRadius,
+			tunnelRadius, PATHFIND_CELL_SIZE_F))
+		return false;
+	const Real radius = TheAI->getAiData()->m_supplyCenterSafeRadius +
+		tunnelRadius;
+	PartitionFilterPlayerAffiliation filterTeam(
+		owner, (ALLOW_ALLIES | ALLOW_NEUTRAL), false);
+	PartitionFilterAlive filterAlive;
+	PartitionFilterRejectByObjectStatus filterStealth(
+		MAKE_OBJECT_STATUS_MASK(OBJECT_STATUS_STEALTHED),
+		MAKE_OBJECT_STATUS_MASK2(OBJECT_STATUS_DETECTED,
+			OBJECT_STATUS_DISGUISED));
+	PartitionFilterInsignificantBuildings filterInsignificant(true, false);
+	PartitionFilterRejectByKindOf filterHarvesters(
+		MAKE_KINDOF_MASK(KINDOF_HARVESTER), KINDOFMASK_NONE);
+	PartitionFilterRejectByKindOf filterDozer(
+		MAKE_KINDOF_MASK(KINDOF_DOZER), KINDOFMASK_NONE);
+	PartitionFilter *filters[] = {
+		&filterTeam, &filterAlive, &filterStealth, &filterInsignificant,
+		&filterHarvesters, &filterDozer, nullptr
+	};
+	ObjectIterator *iter = ThePartitionManager->iterateObjectsInRange(
+		position, radius, FROM_BOUNDINGSPHERE_2D, filters);
+	MemoryPoolObjectHolder hold(iter);
+	for (Object *object = iter->first(); object; object = iter->next()) {
+		if (object != blocker && IsSkirmishStrategyIntelEligible(object, owner))
+			return false;
+	}
+	return true;
+}
+
+static Bool HasSkirmishAIStrategyTunnelTargetCapability(
+	Object *target, Player *owner, Player *enemy,
+	const std::vector<Team *> &candidateTeams,
+	const std::vector<Object *> &visibleDefenseBlockers,
+	TunnelTracker *tracker, Bool hasTunnelRouteInfrastructure,
+	UnsignedInt probeEpoch)
+{
+	if (!target || !owner || !enemy || !tracker ||
+		!hasTunnelRouteInfrastructure || visibleDefenseBlockers.empty() ||
+		!IsSkirmishStrategyIntelEligible(target, owner) ||
+		target->getControllingPlayer() != enemy ||
+		!IsSkirmishStrategyStaticTarget(target) ||
+		target->isEffectivelyDead() || target->isDestroyed() ||
+		target->testStatus(OBJECT_STATUS_SOLD))
+		return false;
+
+	const Int tunnelCapacity = tracker->getContainMax();
+	if (tunnelCapacity <= 0 || candidateTeams.empty())
+		return false;
+	// Target qualification is called for up to four structures per strategy
+	// evaluation. Rotate a small window over stable team IDs so a large army
+	// cannot multiply the full member and blocker scans on every evaluation.
+	const size_t maxTeamProbes = 8;
+	const size_t teamProbeCount = candidateTeams.size() < maxTeamProbes ?
+		candidateTeams.size() : maxTeamProbes;
+	const size_t firstTeamIndex = candidateTeams.size() > teamProbeCount ?
+		((size_t)probeEpoch * maxTeamProbes) % candidateTeams.size() : 0;
+	for (size_t teamOffset = 0; teamOffset < teamProbeCount; ++teamOffset) {
+		Team *team = candidateTeams[
+			(firstTeamIndex + teamOffset) % candidateTeams.size()];
+		if (!IsSkirmishStrategyOffensiveTeam(team, owner))
+			continue;
+		std::vector<Object *> members;
+		Bool eligibleGroundTeam = true;
+		Bool canAttackTarget = false;
+		for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+			!member.done(); member.advance()) {
+			Object *object = member.cur();
+			if (!IsSkirmishStrategyPotentialOffensiveRecipient(
+					object, owner, team))
+				continue;
+			if (object->isKindOf(KINDOF_AIRCRAFT) ||
+				!IsSkirmishAIStrategyTunnelTransitMember(
+					object, owner, team, false)) {
+				eligibleGroundTeam = false;
+				break;
+			}
+			members.push_back(object);
+			if (object->getAbleToAttackSpecificObject(
+					ATTACK_NEW_TARGET, target, CMD_FROM_AI) !=
+					ATTACKRESULT_NOT_POSSIBLE)
+				canAttackTarget = true;
+			if (members.size() > MAX_SKIRMISH_AI_TUNNEL_MEMBERS) {
+				eligibleGroundTeam = false;
+				break;
+			}
+		}
+		// Current occupancy is transient. Keep the target eligible while the
+		// tactical tunnel controller waits for capacity to become available.
+		if (!eligibleGroundTeam || members.empty() || !canAttackTarget ||
+			members.size() > (size_t)tunnelCapacity)
+			continue;
+		std::sort(members.begin(), members.end(),
+			IsSkirmishAIStrategyObjectIDBefore);
+		Bool containerCompatible = true;
+		for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex) {
+			if (!tracker->isValidContainerFor(members[memberIndex], false)) {
+				containerCompatible = false;
+				break;
+			}
+		}
+		if (!containerCompatible)
+			continue;
+		// The executable bypass needs a visible defense near this team's
+		// approach corridor, not merely a tunnel-capable target.
+		Bool hasBlocker = false;
+		for (size_t blockerIndex = 0;
+			blockerIndex < visibleDefenseBlockers.size(); ++blockerIndex) {
+			Object *candidate = visibleDefenseBlockers[blockerIndex];
+			if (SkirmishAITunnelRoute::IsCorridorBlocker(
+					members[0]->getPosition()->x,
+					members[0]->getPosition()->y,
+					target->getPosition()->x, target->getPosition()->y,
+					candidate->getPosition()->x, candidate->getPosition()->y,
+					350.0f)) {
+				hasBlocker = true;
+				break;
+			}
+		}
+		if (!hasBlocker)
+			continue;
+		return true;
+	}
+	return false;
+}
+
+struct SkirmishAIDefenseContext
+{
+	SkirmishAIDefenseAnchor anchors[SKIRMISH_AI_DEFENSE_ROUTE_COUNT];
+	Coord2D direction[SKIRMISH_AI_DEFENSE_ROUTE_COUNT];
+	SkirmishAIDefenseThreat threat;
+};
+
+static Bool IsSkirmishAIDefenseLineSite(
+	const Coord3D &baseCenter, Real baseRadius,
+	const SkirmishAIDefenseContext &context, const Coord3D &position,
+	Real structureRadius, const std::vector<Coord2D> &supplyPositions);
+
+static void CollectSkirmishAIDefenseContext(
+	Player *player, const Coord3D &baseCenter, Real baseRadius,
+	SkirmishAIDefenseContext *context)
+{
+	if (!context) return;
+	ClearSkirmishAIDefenseThreat(&context->threat);
+	const Char *labels[SKIRMISH_AI_DEFENSE_ROUTE_COUNT] = {
+		SKIRMISH_CENTER, SKIRMISH_FLANK, SKIRMISH_BACKDOOR };
+	for (Int route = 0; route < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++route) {
+		context->anchors[route].available = false;
+		context->anchors[route].x = context->anchors[route].y = 0;
+		context->direction[route].x = context->direction[route].y = 0.0f;
+		if (!player || !TheTerrainLogic) continue;
+		AsciiString label;
+		label.format("%s%d", labels[route], player->getMpStartIndex() + 1);
+		Coord3D origin = baseCenter;
+		Waypoint *way = TheTerrainLogic->getClosestWaypointOnPath(&origin, label);
+		if (!way) continue;
+		const Real dx = way->getLocation()->x - baseCenter.x;
+		const Real dy = way->getLocation()->y - baseCenter.y;
+		const Real length = sqrt(dx * dx + dy * dy);
+		if (length < 1.0f) continue;
+		context->direction[route].x = dx / length;
+		context->direction[route].y = dy / length;
+		context->anchors[route].x =
+			(Int)(context->direction[route].x * 1000.0f);
+		context->anchors[route].y =
+			(Int)(context->direction[route].y * 1000.0f);
+		context->anchors[route].available = true;
+	}
+	// Custom maps need not provide approach paths. Map bounds are public and
+	// stable; never infer a missing entrance from hidden enemy structures.
+	if (TheTerrainLogic) {
+		Real centerX = context->direction[SKIRMISH_AI_DEFENSE_CENTER].x;
+		Real centerY = context->direction[SKIRMISH_AI_DEFENSE_CENTER].y;
+		if (!context->anchors[SKIRMISH_AI_DEFENSE_CENTER].available) {
+			Region3D bounds;
+			TheTerrainLogic->getMaximumPathfindExtent(&bounds);
+			centerX = bounds.lo.x + bounds.width() * 0.5f - baseCenter.x;
+			centerY = bounds.lo.y + bounds.height() * 0.5f - baseCenter.y;
+			Real length = sqrt(centerX * centerX + centerY * centerY);
+			if (length < 1.0f) { centerX = 1.0f; centerY = 0.0f; }
+			else { centerX /= length; centerY /= length; }
+		}
+		for (Int route = 0; route < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++route) {
+			if (context->anchors[route].available) continue;
+			Real x = centerX;
+			Real y = centerY;
+			if (route == SKIRMISH_AI_DEFENSE_FLANK) {
+				x = -0.5f * centerX - 0.8660254f * centerY;
+				y =  0.8660254f * centerX - 0.5f * centerY;
+			} else if (route == SKIRMISH_AI_DEFENSE_BACKDOOR) {
+				x = -0.5f * centerX + 0.8660254f * centerY;
+				y = -0.8660254f * centerX - 0.5f * centerY;
+			}
+			context->direction[route].x = x;
+			context->direction[route].y = y;
+			context->anchors[route].x = (Int)(x * 1000.0f);
+			context->anchors[route].y = (Int)(y * 1000.0f);
+			context->anchors[route].available = true;
+		}
+	}
+	if (!player || !TheGameLogic) return;
+	Real outerRadius = baseRadius + 400.0f;
+	if (outerRadius < 500.0f) outerRadius = 500.0f;
+	if (outerRadius > 1200.0f) outerRadius = 1200.0f;
+	Real innerRadius = baseRadius * 0.8f;
+	if (innerRadius < 160.0f) innerRadius = 160.0f;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		Player *owner = object->getControllingPlayer();
+		if (!owner || !owner->getDefaultTeam() ||
+			player->getRelationship(owner->getDefaultTeam()) != ENEMIES ||
+			!IsSkirmishStrategyIntelEligible(object, player) ||
+			!IsSkirmishStrategyCombatObject(object) || object->isContained() ||
+			object->isKindOf(KINDOF_AIRCRAFT) || object->isEffectivelyDead() ||
+			object->isDestroyed())
+			continue;
+		const Real dx = object->getPosition()->x - baseCenter.x;
+		const Real dy = object->getPosition()->y - baseCenter.y;
+		const Real distanceSqr = dx * dx + dy * dy;
+		if (distanceSqr > outerRadius * outerRadius) continue;
+		const Int route = ClassifySkirmishAIDefenseRoute(
+			(Int)dx, (Int)dy, context->anchors);
+		if (!IsSkirmishAIDefenseRoute(route)) continue;
+		const Int cost = object->getTemplate()->calcCostToBuild(owner);
+		Int value = cost > 0
+			? (Int)((__int64)cost * GetSkirmishStrategyHealthPercent(object) / 100)
+			: 0;
+		if (value < 100) value = 100;
+		AddSkirmishAIDefenseObservation(&context->threat, route,
+			true, true, distanceSqr <= innerRadius * innerRadius, value);
+	}
 }
 
 struct SkirmishStrategyExpectedAssets
@@ -1214,6 +1785,9 @@ m_curRightFlankRightDefenseAngle(0),
 	m_frameToCheckEnemy(0),
 	m_currentEnemy(nullptr),
 	m_currentEnemyPlayerIndex(-1),
+	m_strategyTargetFallbackPending(false),
+	m_strategyTargetFallbackAfterID(INVALID_ID),
+	m_strategyTargetFallbackEnemyIndex(-1),
 	m_strategyProductionReserveCost(0),
 	m_strategySuperweaponID(INVALID_ID),
 	m_strategyAuthorizedThing(nullptr),
@@ -1224,6 +1798,35 @@ m_curRightFlankRightDefenseAngle(0),
 	m_strategyLockedSourceID(INVALID_ID),
 	m_strategyLockedPowerID(0),
 	m_reinforcementRoundRobinCursor(0),
+	m_tacticalNextTeamScanFrame(0),
+	m_tunnelBuildPhase(SKIRMISH_AI_TUNNEL_BUILD_NONE),
+	m_tunnelHomeAttempted(false),
+	m_tunnelForwardAttempted(false),
+	m_tunnelForwardRetryConsumed(false),
+	m_tunnelHomeEndpointID(INVALID_ID),
+	m_tunnelForwardEndpointID(INVALID_ID),
+	m_tunnelForwardAttemptTargetID(INVALID_ID),
+	m_tunnelBuildBuilderID(INVALID_ID),
+	m_tunnelBuildTargetID(INVALID_ID),
+	m_tunnelBuildBlockerID(INVALID_ID),
+	m_tunnelBuildObjectID(INVALID_ID),
+	m_tunnelBuildLockedBuilderID(INVALID_ID),
+	m_tunnelPendingBuilderCursor(0),
+	m_defenseBuildLockedBuilderID(INVALID_ID),
+	m_tunnelBuildDeadlineFrame(0),
+	m_tunnelBuildCooldownUntilFrame(0),
+	m_defensePatrolRoute(SKIRMISH_AI_DEFENSE_NO_ROUTE),
+	m_defensePatrolTeamID(0),
+	m_defensePatrolObjectID(INVALID_ID),
+	m_defenseNextPatrolFrame(0),
+	m_defenseQuietPatrolDeadlineFrame(0),
+	m_defensePlacementAttempt(0),
+	m_defensePlacementNextFrame(0),
+	m_defensePursuitTargetID(INVALID_ID),
+	m_defensePursuitStartFrame(0),
+	m_defenseInterceptProbeAfterID(INVALID_ID),
+	m_defensePatrolRouteMemberAfterID(INVALID_ID),
+	m_defenseInterceptMemberAfterID(INVALID_ID),
 	m_recoveryEverCompleted(false),
 	m_recoveryImpossible(false),
 	m_recoveryConstructionID(INVALID_ID),
@@ -1241,6 +1844,17 @@ m_curRightFlankRightDefenseAngle(0),
 	m_frameLastBuildingBuilt = TheGameLogic->getFrame();
 	m_recoveryLocation.zero();
 	m_recoveryAngle = 0.0f;
+	m_tunnelBuildLocation.zero();
+	for (Int i = 0; i < SkirmishAITunnelRoute::MAX_GENERATED_FORWARD_ENDPOINTS;
+		++i) {
+		m_tunnelGeneratedForwardEndpointIDs[i] = INVALID_ID;
+		m_tunnelGeneratedForwardTargetIDs[i] = INVALID_ID;
+	}
+	for (Int exhaustedIndex = 0; exhaustedIndex < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS;
+		++exhaustedIndex)
+		m_tunnelExhaustedForwardTargetIDs[exhaustedIndex] = INVALID_ID;
+	m_defenseBuildLockedLocation.zero();
+	m_defenseQuietPatrolWaypoint.zero();
 	InitializeSkirmishStrategyState(
 		&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
 	p->setCanBuildUnits(true); // turn on ai production by default.
@@ -4009,6 +4623,109 @@ void AISkirmishPlayer::updateCriticalRecovery()
 }
 
 
+template <class GeneratedDefenseMarker>
+static Bool MatchesGeneratedDefenseBuild(
+	const GeneratedDefenseMarker &marker, const BuildListInfo *info)
+{
+	if (!info || !info->getLocation())
+		return false;
+	const Coord3D *location = info->getLocation();
+	return marker.templateName == info->getTemplateName() &&
+		marker.location.x == location->x &&
+		marker.location.y == location->y && marker.angle == info->getAngle();
+}
+
+template <class GeneratedDefenseMarkers>
+static Bool IsGeneratedDefenseBuildInfo(
+	const GeneratedDefenseMarkers &markers, const BuildListInfo *info)
+{
+	for (UnsignedInt i = 0; i < markers.size(); ++i) {
+		if (MatchesGeneratedDefenseBuild(markers[i], info))
+			return true;
+	}
+	return false;
+}
+
+template <class GeneratedDefenseMarkers>
+static void EraseGeneratedDefenseBuildInfo(
+	GeneratedDefenseMarkers *markers, const BuildListInfo *info)
+{
+	if (!markers || !info)
+		return;
+	for (UnsignedInt i = 0; i < markers->size(); ++i) {
+		if (MatchesGeneratedDefenseBuild((*markers)[i], info)) {
+			markers->erase(markers->begin() + i);
+			return;
+		}
+	}
+}
+
+template <class GeneratedDefenseMarkers>
+static void PruneGeneratedDefenseBuildMarkers(
+	GeneratedDefenseMarkers *markers, Player *player)
+{
+	if (!markers || !player)
+		return;
+	for (UnsignedInt i = 0; i < markers->size();) {
+		Bool stillQueued = false;
+		for (BuildListInfo *info = player->getBuildList(); info;
+			info = info->getNext()) {
+			if (info->getNumRebuilds() != 0 &&
+				MatchesGeneratedDefenseBuild((*markers)[i], info)) {
+				stillQueued = true;
+				break;
+			}
+		}
+		if (stillQueued)
+			++i;
+		else
+			markers->erase(markers->begin() + i);
+	}
+}
+
+static Bool IsAvailableSkirmishAIDefenseBuilder(
+	Object *candidate, Player *player, const ThingTemplate *plan,
+	ObjectID excludedBuilderID)
+{
+	if (!candidate || !player || !plan || !TheBuildAssistant ||
+		candidate->getControllingPlayer() != player ||
+		!candidate->isKindOf(KINDOF_DOZER) || candidate->isContained() ||
+		candidate->isEffectivelyDead() || candidate->isDestroyed() ||
+		candidate->isDisabledByType(DISABLED_UNMANNED) ||
+		candidate->getID() == excludedBuilderID)
+		return false;
+	AIUpdateInterface *ai = candidate->getAIUpdateInterface();
+	DozerAIInterface *dozerAI = ai ? ai->getDozerAIInterface() : nullptr;
+	// The build command idles its chosen dozer. Do not cancel a pending repair,
+	// move, or supply task just because it is not a construction task.
+	if (!dozerAI || !ai->isIdle() || dozerAI->isAnyTaskPending())
+		return false;
+	SupplyTruckAIInterface *supplyAI = ai->getSupplyTruckAIInterface();
+	if (supplyAI && (supplyAI->isCurrentlyFerryingSupplies() ||
+		supplyAI->isForcedIntoWantingState()))
+		return false;
+	return TheBuildAssistant->canMakeUnit(candidate, plan) == CANMAKE_OK;
+}
+
+static Bool HasAvailableSkirmishAIDefenseBuilder(
+	Player *player, const ThingTemplate *plan, ObjectID excludedBuilderID,
+	Bool *hasLivingBuilder)
+{
+	if (hasLivingBuilder) *hasLivingBuilder = false;
+	if (!TheGameLogic) return false;
+	for (Object *candidate = TheGameLogic->getFirstObject(); candidate;
+		candidate = candidate->getNextObject()) {
+		if (hasLivingBuilder && candidate->getControllingPlayer() == player &&
+			candidate->isKindOf(KINDOF_DOZER) && !candidate->isContained() &&
+			!candidate->isEffectivelyDead() && !candidate->isDestroyed())
+			*hasLivingBuilder = true;
+		if (IsAvailableSkirmishAIDefenseBuilder(
+				candidate, player, plan, excludedBuilderID))
+			return true;
+	}
+	return false;
+}
+
 /**
  * Build our base.
  */
@@ -4042,6 +4759,41 @@ void AISkirmishPlayer::processBaseBuilding()
 		!m_recoveryImpossible && m_recoveryConstructionID == INVALID_ID &&
 		m_recoveryReserveCost > 0)
 		return;
+	const Bool queuedTunnelBuild =
+		m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
+		m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED;
+	if (queuedTunnelBuild && m_player && TheGameLogic && TheThingFactory) {
+		const UnsignedInt now = TheGameLogic->getFrame();
+		const ThingTemplate *tunnelPlan = findTunnelContainBuildTemplate();
+		Bool pendingInfoFound = false;
+		for (BuildListInfo *info = m_player->getBuildList(); info;
+			info = info->getNext()) {
+			const ThingTemplate *plan = TheThingFactory->findTemplate(
+				info->getTemplateName());
+			if (isPendingTunnelBuildInfo(info, plan)) {
+				pendingInfoFound = true;
+				break;
+			}
+		}
+		Object *target = m_tunnelBuildTargetID != INVALID_ID
+			? TheGameLogic->findObjectByID(m_tunnelBuildTargetID) : nullptr;
+		Object *blocker = m_tunnelBuildBlockerID != INVALID_ID
+			? TheGameLogic->findObjectByID(m_tunnelBuildBlockerID) : nullptr;
+		const Bool invalidPendingPlan =
+			!pendingInfoFound || !tunnelPlan ||
+			m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
+			m_strategyState.strategicTargetID != m_tunnelBuildTargetID ||
+			!IsSkirmishAIStrategyTunnelTargetUsable(
+				target, m_player, m_currentEnemy) ||
+			!blocker || blocker->getControllingPlayer() != m_currentEnemy ||
+			!blocker->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
+			blocker->isEffectivelyDead() || blocker->isDestroyed() ||
+			blocker->testStatus(OBJECT_STATUS_SOLD) ||
+			!IsSkirmishStrategyIntelEligible(blocker, m_player) ||
+			IsSkirmishStrategyFrameReached(now, m_tunnelBuildDeadlineFrame);
+		if (invalidPendingPlan)
+			abandonTunnelBuildPlan(now, TRUE);
+	}
 	//
 	// Refresh base buildings. Scan through list, if a building is missing,
 	// rebuild it, unless it's rebuild count is zero.
@@ -4133,7 +4885,31 @@ void AISkirmishPlayer::processBaseBuilding()
 					}
 				}
 			}
-			if (info->getObjectID()==INVALID_ID && info->getObjectTimestamp()>0) {
+			const Bool queuedGeneratedDefense =
+				ShouldUseCurrentSkirmishAITacticalBehavior() &&
+				info->isPriorityBuild() &&
+				curPlan->isKindOf(KINDOF_FS_BASE_DEFENSE) &&
+				IsGeneratedDefenseBuildInfo(m_generatedDefenseBuilds, info);
+			if (queuedGeneratedDefense && info->getObjectID() == INVALID_ID) {
+				// Reuse the saved build-list timestamp as this queued site's age.
+				// A permanently busy builder must not occupy a defense slot forever.
+				if (info->getObjectTimestamp() == 0)
+					info->setObjectTimestamp(TheGameLogic->getFrame() + 1);
+				if (IsSkirmishStrategyFrameReached(TheGameLogic->getFrame(),
+						info->getObjectTimestamp() +
+						60 * LOGICFRAMES_PER_SECOND)) {
+					info->setNumRebuilds(0);
+					EraseGeneratedDefenseBuildInfo(&m_generatedDefenseBuilds, info);
+					m_defensePlacementNextFrame = TheGameLogic->getFrame() +
+						10 * LOGICFRAMES_PER_SECOND;
+					continue;
+				}
+				// A path-probe budget may defer this generated entry. Let other
+				// build-list work run until its next short retry; keep its age intact.
+				if (!IsSkirmishStrategyFrameReached(TheGameLogic->getFrame(),
+						m_defensePlacementNextFrame))
+					continue;
+			} else if (info->getObjectID()==INVALID_ID && info->getObjectTimestamp()>0) {
 				// this object was built at some time, and got destroyed at or near objectTimestamp.
 				// Wait a few seconds before initiating a rebuild.
 				if (info->getObjectTimestamp()+TheAI->getAiData()->m_rebuildDelaySeconds*LOGICFRAMES_PER_SECOND > TheGameLogic->getFrame()) {
@@ -4180,9 +4956,48 @@ void AISkirmishPlayer::processBaseBuilding()
 					SKIRMISH_STRATEGY_ATTEMPT_NOT_STARTED;
 			if (isAutomaticSuperweapon && !admittedSuperweapon)
 				continue;
+			const Bool pendingTunnelBuild =
+				isPendingTunnelBuildInfo(info, curPlan);
+			if (pendingTunnelBuild &&
+				(m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
+				 m_strategyState.strategicTargetID != m_tunnelBuildTargetID)) {
+				abandonTunnelBuildPlan(TheGameLogic->getFrame(), TRUE);
+				continue;
+			}
+			if (pendingTunnelBuild &&
+				IsSkirmishStrategyFrameReached(
+					TheGameLogic->getFrame(), m_tunnelBuildDeadlineFrame)) {
+				abandonTunnelBuildPlan(TheGameLogic->getFrame(), TRUE);
+				continue;
+			}
+			if (pendingTunnelBuild && !IsSkirmishStrategyFrameReached(
+					TheGameLogic->getFrame(), m_tunnelBuildCooldownUntilFrame))
+				continue;
+			if (pendingTunnelBuild)
+				m_tunnelBuildCooldownUntilFrame = TheGameLogic->getFrame() +
+					2 * LOGICFRAMES_PER_SECOND;
+			// A generated defense can wait for a busy builder without holding up
+			// another affordable structure in this build pass.
+			Bool livingDefenseBuilder = false;
+			if (queuedGeneratedDefense &&
+				!HasAvailableSkirmishAIDefenseBuilder(
+					m_player, curPlan, m_repairDozer,
+					&livingDefenseBuilder) && livingDefenseBuilder)
+				continue;
 
 			// Make sure it is safe to build here.
-			if (!isLocationSafe(info->getLocation(), curPlan)) {
+			const Bool forwardTunnelBuild = pendingTunnelBuild &&
+				(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED ||
+				 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_CONSTRUCTING);
+			Object *forwardBlocker = forwardTunnelBuild && TheGameLogic
+				? TheGameLogic->findObjectByID(m_tunnelBuildBlockerID) : nullptr;
+			Object *forwardTarget = forwardTunnelBuild && TheGameLogic
+				? TheGameLogic->findObjectByID(m_tunnelBuildTargetID) : nullptr;
+			if (forwardTunnelBuild
+				? !IsSkirmishAIForwardTunnelLocationSafe(m_player,
+					m_currentEnemy, info->getLocation(), curPlan,
+					forwardBlocker, forwardTarget)
+				: !isLocationSafe(info->getLocation(), curPlan)) {
 				continue;
 			}
 			if (ShouldUseCurrentSkirmishAIBehavior() && !ShouldSkirmishAIConsiderRebuild(
@@ -4209,15 +5024,29 @@ void AISkirmishPlayer::processBaseBuilding()
 				}
 			}
 			if (!info->isAutomaticBuild() &&
-				(!productionBehavior || !info->isPriorityBuild())) {
+				(!productionBehavior || !info->isPriorityBuild()) &&
+				!pendingTunnelBuild) {
 				continue; // marked to not build automatically.
 			}
-			Object *dozer = findDozer(info->getLocation());
-			const Bool authorizedWithoutBuilder = productionBehavior &&
+			Object *dozer = nullptr;
+			if (pendingTunnelBuild) {
+				Bool permanentFailure = FALSE;
+				if (!validatePendingTunnelBuild(
+						info, curPlan, &dozer, &permanentFailure)) {
+					if (permanentFailure)
+						abandonTunnelBuildPlan(
+							TheGameLogic->getFrame(), TRUE);
+					continue;
+				}
+			} else {
+				dozer = findDozer(info->getLocation());
+			}
+			const Bool authorizedWithoutBuilder = !pendingTunnelBuild &&
+				productionBehavior &&
 				info->isBuildable() &&
 				(info->isPriorityBuild() ||
 				 IsSkirmishAIStrategyAuthorizedStructure(curPlan));
-			if (dozer==nullptr) {
+			if (dozer==nullptr && !pendingTunnelBuild) {
 				if (!authorizedWithoutBuilder && (isUnderPowered ||
 					(productionBehavior && info->isBuildable()))) {
 					queueDozer();
@@ -4225,7 +5054,8 @@ void AISkirmishPlayer::processBaseBuilding()
 				if (!authorizedWithoutBuilder)
 					continue;
 			}
-			if (dozer && TheBuildAssistant->canMakeUnit(dozer,
+			if (dozer && !pendingTunnelBuild &&
+				TheBuildAssistant->canMakeUnit(dozer,
 					GetSkirmishAutomaticConstructionPlan(curPlan, bldgPlan))!=CANMAKE_OK) {
 				if (info->isBuildable()) {
 					AsciiString bldgName = info->getTemplateName();
@@ -4239,10 +5069,10 @@ void AISkirmishPlayer::processBaseBuilding()
 					m_strategyAuthorizedThing;
 				const SkirmishAISpendAuthorization previousAuthorizationClass =
 					m_strategySpendAuthorization;
-				const Bool authorizeCriticalCandidate =
-					info->isPriorityBuild() ||
-					(IsSkirmishAIStrategyAuthorizedStructure(curPlan) &&
-					 (!dozer || canStartCriticalRebuildNow(info, curPlan)));
+				const Bool authorizeCriticalCandidate = !pendingTunnelBuild &&
+					(info->isPriorityBuild() ||
+					 (IsSkirmishAIStrategyAuthorizedStructure(curPlan) &&
+					  (!dozer || canStartCriticalRebuildNow(info, curPlan))));
 				m_strategyAuthorizedThing = authorizeCriticalCandidate
 					? curPlan : nullptr;
 				m_strategySpendAuthorization = authorizeCriticalCandidate
@@ -4305,12 +5135,138 @@ void AISkirmishPlayer::processBaseBuilding()
 		}
 		if (bldgPlan && bldgInfo) {
 #ifdef USE_DOZER
-			if (!findDozer(bldgInfo->getLocation())) {
-				queueAuthorizedStrategyBuilder(bldgPlan);
-				return;
+			PruneGeneratedDefenseBuildMarkers(
+				&m_generatedDefenseBuilds, m_player);
+			const Bool pendingTunnelBuild =
+				isPendingTunnelBuildInfo(bldgInfo, bldgPlan);
+			const Bool priorityDefenseBuild =
+				ShouldUseCurrentSkirmishAITacticalBehavior() &&
+				m_baseCenterSet && bldgInfo->isPriorityBuild() &&
+				bldgPlan->isKindOf(KINDOF_FS_BASE_DEFENSE) &&
+				IsGeneratedDefenseBuildInfo(
+					m_generatedDefenseBuilds, bldgInfo);
+			Object *selectedBuilder = nullptr;
+			if (pendingTunnelBuild) {
+				Bool permanentFailure = FALSE;
+				if (!validatePendingTunnelBuild(
+						bldgInfo, bldgPlan, &selectedBuilder,
+						&permanentFailure)) {
+					if (permanentFailure)
+						abandonTunnelBuildPlan(
+							TheGameLogic->getFrame(), TRUE);
+					return;
+				}
+				if (!canSpendForCriticalRecovery(
+						bldgPlan->calcCostToBuild(m_player),
+						bldgPlan, false, false))
+					return;
+			} else if (!priorityDefenseBuild) {
+				selectedBuilder = findDozer(bldgInfo->getLocation());
+				if (!selectedBuilder) {
+					queueAuthorizedStrategyBuilder(bldgPlan);
+					return;
+				}
+			}
+			if (priorityDefenseBuild) {
+				SkirmishAIDefenseContext defenseContext;
+				CollectSkirmishAIDefenseContext(m_player, m_baseCenter,
+					m_baseRadius, &defenseContext);
+				const Real defenseRadius = bldgPlan->getTemplateGeometryInfo()
+					.getBoundingCircleRadius();
+				std::vector<Coord2D> supplyPositions;
+				CollectSkirmishAIDefenseSupplyPositions(m_player,
+					&supplyPositions);
+				if (!IsSkirmishAIDefenseLineSite(m_baseCenter,
+					m_baseRadius, defenseContext, *bldgInfo->getLocation(),
+					defenseRadius, supplyPositions) ||
+					IsSkirmishAIDefenseSiteOverlappingPendingBuild(m_player,
+						*bldgInfo->getLocation(), defenseRadius, bldgInfo)) {
+					bldgInfo->setNumRebuilds(0);
+					EraseGeneratedDefenseBuildInfo(
+						&m_generatedDefenseBuilds, bldgInfo);
+					m_defensePlacementNextFrame = TheGameLogic->getFrame() +
+						10 * LOGICFRAMES_PER_SECOND;
+					return;
+				}
+				// A supply site added after this priority defense was queued must
+				// not let the inherited quick-path failure teleport its builder.
+				Coord3D buildPosition = *bldgInfo->getLocation();
+				buildPosition.z += TheTerrainLogic->getGroundHeight(
+					buildPosition.x, buildPosition.y);
+				std::vector<Object *> eligibleBuilders;
+				for (Object *candidate = TheGameLogic->getFirstObject(); candidate;
+					candidate = candidate->getNextObject()) {
+					if (!IsAvailableSkirmishAIDefenseBuilder(
+							candidate, m_player, bldgPlan, m_repairDozer)) continue;
+					eligibleBuilders.push_back(candidate);
+				}
+				std::sort(eligibleBuilders.begin(), eligibleBuilders.end(),
+					IsSkirmishAIStrategyObjectIDBefore);
+				Object *reachableBuilder = nullptr;
+				Real bestDistanceSqr = 0.0f;
+				const UnsignedInt markerAge = IsSkirmishStrategyFrameReached(
+					TheGameLogic->getFrame(), bldgInfo->getObjectTimestamp())
+					? TheGameLogic->getFrame() - bldgInfo->getObjectTimestamp() : 0;
+				const UnsignedInt window = markerAge /
+					(2 * LOGICFRAMES_PER_SECOND);
+				const size_t candidateCount = eligibleBuilders.size();
+				const size_t start = candidateCount ?
+					(static_cast<size_t>(window) * 16) % candidateCount : 0;
+				const size_t probes = candidateCount < 16 ? candidateCount : 16;
+				for (size_t index = 0; index < probes; ++index) {
+					Object *candidate = eligibleBuilders[(start + index) % candidateCount];
+					AIUpdateInterface *candidateAI = candidate->getAIUpdateInterface();
+					if (!TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+							candidateAI->getLocomotorSet(), candidate->getPosition(),
+							&buildPosition))
+						continue;
+					const Real dx = buildPosition.x - candidate->getPosition()->x;
+					const Real dy = buildPosition.y - candidate->getPosition()->y;
+					const Real distanceSqr = dx * dx + dy * dy;
+					if (!reachableBuilder || distanceSqr < bestDistanceSqr ||
+						(distanceSqr == bestDistanceSqr &&
+						 candidate->getID() < reachableBuilder->getID())) {
+						reachableBuilder = candidate;
+						bestDistanceSqr = distanceSqr;
+					}
+				}
+				if (!reachableBuilder) {
+					if (candidateCount > probes) {
+						// The unprobed builders may still reach this site. Retry a
+						// different ID window after the next two-second build pass,
+						// so other structures can build in that pass.
+						m_defensePlacementNextFrame = TheGameLogic->getFrame() +
+							3 * LOGICFRAMES_PER_SECOND;
+						return;
+					}
+					// Abandon this unreachable site and let other queued work proceed.
+					bldgInfo->setNumRebuilds(0);
+					EraseGeneratedDefenseBuildInfo(
+						&m_generatedDefenseBuilds, bldgInfo);
+					m_defensePlacementNextFrame = TheGameLogic->getFrame() +
+						10 * LOGICFRAMES_PER_SECOND;
+					return;
+				}
+				selectedBuilder = reachableBuilder;
+				const Bool legal = TheBuildAssistant->isLocationLegalToBuild(
+					&buildPosition, bldgPlan, bldgInfo->getAngle(),
+					BuildAssistant::CLEAR_PATH |
+					BuildAssistant::TERRAIN_RESTRICTIONS |
+					BuildAssistant::NO_OBJECT_OVERLAP,
+					selectedBuilder, m_player) == LBC_OK;
+				if (TheTerrainVisual) TheTerrainVisual->removeAllBibs();
+				if (!legal) {
+					bldgInfo->setNumRebuilds(0);
+					EraseGeneratedDefenseBuildInfo(
+						&m_generatedDefenseBuilds, bldgInfo);
+					m_defensePlacementNextFrame = TheGameLogic->getFrame() +
+						10 * LOGICFRAMES_PER_SECOND;
+					return;
+				}
 			}
 			// dozer-construct the building
-			const Bool authorizeCriticalBuild = usesProductionBehavior() &&
+			const Bool authorizeCriticalBuild = !pendingTunnelBuild &&
+				usesProductionBehavior() &&
 				(bldgInfo->isPriorityBuild() ||
 				 (IsSkirmishAIStrategyAuthorizedStructure(bldgPlan) &&
 				  canStartCriticalRebuildNow(bldgInfo, bldgPlan)));
@@ -4323,14 +5279,46 @@ void AISkirmishPlayer::processBaseBuilding()
 			m_strategySpendAuthorization = authorizeCriticalBuild
 				? SKIRMISH_AI_SPEND_AUTHORIZATION_PRIORITY_STRUCTURE
 				: SKIRMISH_AI_SPEND_AUTHORIZATION_NONE;
-			bldg = buildStructureWithDozer(bldgPlan, bldgInfo);
+			const ObjectID previousTunnelBuildLock = m_tunnelBuildLockedBuilderID;
+			const ObjectID previousDefenseBuildLock = m_defenseBuildLockedBuilderID;
+			const Coord3D previousDefenseBuildLocation = m_defenseBuildLockedLocation;
+			if (pendingTunnelBuild)
+				m_tunnelBuildLockedBuilderID = selectedBuilder->getID();
+			if (priorityDefenseBuild) {
+				m_defenseBuildLockedBuilderID = selectedBuilder->getID();
+				m_defenseBuildLockedLocation = *bldgInfo->getLocation();
+			}
+			bldg = pendingTunnelBuild || priorityDefenseBuild
+				? buildStructureWithDozer(bldgPlan, bldgInfo, FALSE, FALSE)
+				: buildStructureWithDozer(bldgPlan, bldgInfo);
+			m_tunnelBuildLockedBuilderID = previousTunnelBuildLock;
+			m_defenseBuildLockedBuilderID = previousDefenseBuildLock;
+			m_defenseBuildLockedLocation = previousDefenseBuildLocation;
 			m_strategyAuthorizedThing = previousAuthorization;
 			m_strategySpendAuthorization = previousAuthorizationClass;
+			if (pendingTunnelBuild && !bldg)
+				abandonTunnelBuildPlan(TheGameLogic->getFrame(), TRUE);
 			// store the object with the build order
 			if (bldg)
 			{
 				bldgInfo->setObjectID( bldg->getID() );
 				bldgInfo->decrementNumRebuilds();
+				// Keep the marker while this priority entry has rebuilds left.
+				// A later rebuild must use the same site and reachable-builder
+				// checks as the first construction.
+				if (priorityDefenseBuild && bldgInfo->getNumRebuilds() == 0)
+					EraseGeneratedDefenseBuildInfo(
+						&m_generatedDefenseBuilds, bldgInfo);
+				if (pendingTunnelBuild) {
+					m_tunnelBuildPhase = m_tunnelBuildPhase ==
+						SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED
+						? SKIRMISH_AI_TUNNEL_BUILD_HOME_CONSTRUCTING
+						: SKIRMISH_AI_TUNNEL_BUILD_FORWARD_CONSTRUCTING;
+					m_tunnelBuildObjectID = bldg->getID();
+					m_tunnelBuildBuilderID = INVALID_ID;
+					m_tunnelBuildDeadlineFrame = TheGameLogic->getFrame() +
+						120 * LOGICFRAMES_PER_SECOND;
+				}
 				if (usesProductionBehavior() &&
 					bldgPlan->isKindOf(KINDOF_FS_SUPERWEAPON) &&
 					m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
@@ -5581,13 +6569,39 @@ void AISkirmishPlayer::collectStrategyMetrics(
 	Int enemyCombatValue = 0;
 	Int enemyLocalCombatValue = 0;
 	Int knownOpportunityValue = 0;
+	const Bool targetFallbackEnabled =
+		ShouldUseCurrentSkirmishAITacticalBehavior();
+	const Bool tunnelTargetBootstrapEnabled =
+		targetFallbackEnabled && m_player &&
+		IsSkirmishAISupportedGLASide(m_player->getSide());
+	// A strategy evaluation is scheduled at this difficulty-specific interval.
+	// Advancing by one full team window per evaluation visits every team ID.
+	const UnsignedInt tunnelProbeInterval =
+		(m_difficulty == DIFFICULTY_EASY ? 20 :
+			m_difficulty == DIFFICULTY_HARD ? 5 : 10) *
+		LOGICFRAMES_PER_SECOND;
+	const UnsignedInt tunnelProbeEpoch =
+		TheGameLogic->getFrame() / tunnelProbeInterval;
 	std::vector<SkirmishStrategyCapabilityCandidate> groundAttackers;
 	std::vector<SkirmishStrategyCapabilityCandidate> airAttackers;
+	std::vector<Team *> tunnelCandidateTeams;
+	std::vector<Object *> visibleDefenseBlockers;
+	TunnelTracker *activeTransitTracker = targetFallbackEnabled && m_player
+		? m_player->getTunnelSystem() : nullptr;
+	Bool activeTransitForPersistedTarget = FALSE;
 	SkirmishStrategyCapabilityCandidate
 		targetCandidates[MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES];
 	Int targetCandidateCount = 0;
+	Int staticTargetCount = 0;
 	Object *persistedTarget = nullptr;
 	Player *enemy = m_currentEnemy;
+	const Int enemyIndex = enemy ? enemy->getPlayerIndex() : -1;
+	if (targetFallbackEnabled &&
+		m_strategyTargetFallbackEnemyIndex != enemyIndex) {
+		m_strategyTargetFallbackEnemyIndex = enemyIndex;
+		m_strategyTargetFallbackPending = false;
+		m_strategyTargetFallbackAfterID = INVALID_ID;
+	}
 	const Bool retainObservedTarget =
 		m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
 		m_strategyState.strategicTargetID != INVALID_ID &&
@@ -5636,25 +6650,66 @@ void AISkirmishPlayer::collectStrategyMetrics(
 				object->isKindOf(KINDOF_FS_AIRFIELD))
 				productionHealth = AddSkirmishStrategyValue(productionHealth, health);
 
-			if (IsSkirmishStrategyCombatObject(object) && !object->isContained()) {
+			Bool trackedTunnelPassenger = FALSE;
+			if (object->isContained() && activeTransitTracker &&
+				activeTransitTracker->isInContainer(object)) {
+				Team *team = object->getTeam();
+				if (team) {
+					std::map<UnsignedInt, TacticalTeamState>::const_iterator transit =
+						m_tacticalTeams.find(team->getID());
+					if (transit != m_tacticalTeams.end() &&
+						transit->second.tunnelTransitPhase !=
+							SKIRMISH_AI_TUNNEL_TRANSIT_NONE &&
+						IsSkirmishAIStrategyTunnelTransitMember(
+							object, m_player, team, TRUE)) {
+						const TacticalTeamState &transitState = transit->second;
+						for (Int memberIndex = 0;
+							memberIndex < transitState.tunnelMemberCount &&
+							memberIndex < MAX_SKIRMISH_AI_TUNNEL_MEMBERS;
+							++memberIndex)
+							if (transitState.tunnelMemberIDs[memberIndex] ==
+								object->getID()) {
+								trackedTunnelPassenger = TRUE;
+								if (m_strategyState.currentMode ==
+										SKIRMISH_STRATEGY_ASSAULT &&
+									m_strategyState.strategicTargetObserved &&
+									transitState.tunnelTransitPhase !=
+										SKIRMISH_AI_TUNNEL_TRANSIT_FALLBACK_EXIT &&
+									transitState.tunnelTargetID ==
+										m_strategyState.strategicTargetID &&
+									transitState.tunnelStrategicTargetID ==
+										m_strategyState.strategicTargetID)
+									activeTransitForPersistedTarget = TRUE;
+								break;
+							}
+					}
+				}
+			}
+			if (IsSkirmishStrategyCombatObject(object) &&
+				(!object->isContained() || trackedTunnelPassenger)) {
 				const Int cost = object->getTemplate()->calcCostToBuild(m_player);
 				const Int value = cost > 0 ?
 					(Int)((__int64)cost * health / 100) : 0;
 				ownCombatValue = AddSkirmishStrategyValue(ownCombatValue, value);
-				if (m_baseCenterSet) {
+				if (!object->isContained() && m_baseCenterSet) {
 					const Real dx = object->getPosition()->x - m_baseCenter.x;
 					const Real dy = object->getPosition()->y - m_baseCenter.y;
 					if (dx * dx + dy * dy <= threatRadiusSquared)
 						ownLocalCombatValue = AddSkirmishStrategyValue(
 							ownLocalCombatValue, value);
 				}
-				if (IsSkirmishStrategyOffensiveRecipient(object, m_player)) {
+				if (!object->isContained() &&
+					IsSkirmishStrategyOffensiveRecipient(object, m_player)) {
 					if (object->isKindOf(KINDOF_AIRCRAFT))
 						AppendSkirmishStrategyCapabilityCandidate(
 							&airAttackers, object, value);
-					else
+					else {
 						AppendSkirmishStrategyCapabilityCandidate(
 							&groundAttackers, object, value);
+						if (tunnelTargetBootstrapEnabled)
+							AppendSkirmishStrategyTunnelTeamCandidate(
+								&tunnelCandidateTeams, object->getTeam());
+					}
 				}
 			}
 			continue;
@@ -5678,6 +6733,9 @@ void AISkirmishPlayer::collectStrategyMetrics(
 		}
 		if (!enemy || owner != enemy)
 			continue;
+		if (tunnelTargetBootstrapEnabled &&
+			object->isKindOf(KINDOF_FS_BASE_DEFENSE))
+			visibleDefenseBlockers.push_back(object);
 		if (IsSkirmishStrategyCombatObject(object))
 			enemyCombatValue = AddSkirmishStrategyValue(enemyCombatValue, value);
 		if (object->isKindOf(KINDOF_STRUCTURE) ||
@@ -5685,9 +6743,17 @@ void AISkirmishPlayer::collectStrategyMetrics(
 			knownOpportunityValue = AddSkirmishStrategyValue(
 				knownOpportunityValue, value);
 		if (IsSkirmishStrategyStaticTarget(object)) {
+			if (staticTargetCount <= MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES)
+				++staticTargetCount;
 			InsertSkirmishStrategyTargetCandidate(
 				targetCandidates, &targetCandidateCount, object, value);
 		}
+	}
+	if (tunnelCandidateTeams.size() > 1) {
+		std::sort(tunnelCandidateTeams.begin(), tunnelCandidateTeams.end(),
+			IsSkirmishStrategyTunnelTeamIDBefore);
+		tunnelCandidateTeams.erase(std::unique(tunnelCandidateTeams.begin(),
+			tunnelCandidateTeams.end()), tunnelCandidateTeams.end());
 	}
 	if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY) {
 		for (DLINK_ITERATOR<TeamInQueue> ready = iterate_TeamReadyQueue();
@@ -5792,31 +6858,124 @@ void AISkirmishPlayer::collectStrategyMetrics(
 	Object *selectedTarget = nullptr;
 	Int quickPathQueryCount = 0;
 	Int targetAttemptCount = 0;
+	Bool tunnelInfrastructureChecked = false;
+	Bool hasTunnelRouteInfrastructure = false;
+	TunnelTracker *tunnelTracker = nullptr;
+	const ThingTemplate *tunnelPlan = nullptr;
 	if (!preserveHiddenTarget && persistedTarget) {
 		++targetAttemptCount;
-		if (HasSkirmishStrategyTargetCapability(
+		Bool targetCapability = activeTransitForPersistedTarget &&
+			IsSkirmishAIStrategyTunnelTargetUsable(
+				persistedTarget, m_player, enemy);
+		if (!targetCapability)
+			targetCapability = HasSkirmishStrategyTargetCapability(
 				persistedTarget, airAttackers, groundAttackers,
-				&quickPathQueryCount))
+				&quickPathQueryCount, targetFallbackEnabled);
+		if (!targetCapability && tunnelTargetBootstrapEnabled) {
+			if (!tunnelInfrastructureChecked) {
+				tunnelInfrastructureChecked = true;
+				tunnelTracker = m_player->getTunnelSystem();
+				tunnelPlan = findTunnelContainBuildTemplate();
+				hasTunnelRouteInfrastructure =
+					HasSkirmishAIStrategyTunnelRouteInfrastructure(
+						m_player, tunnelTracker,
+						m_baseCenterSet && tunnelPlan &&
+						IsSkirmishAIStrategyTunnelTemplate(tunnelPlan));
+			}
+			targetCapability = HasSkirmishAIStrategyTunnelTargetCapability(
+				persistedTarget, m_player, enemy, tunnelCandidateTeams,
+				visibleDefenseBlockers,
+				tunnelTracker, hasTunnelRouteInfrastructure, tunnelProbeEpoch);
+		}
+		if (targetCapability)
 			selectedTarget = persistedTarget;
 	}
 	if (!preserveHiddenTarget && !selectedTarget) {
-		Int candidateIndex;
-		for (candidateIndex = 0;
-			candidateIndex < targetCandidateCount &&
-				targetAttemptCount < MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES;
+		Object *targetBatch[MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES];
+		Int targetBatchCount = 0;
+		const Bool fallbackPass = targetFallbackEnabled &&
+			m_strategyTargetFallbackPending;
+		if (fallbackPass) {
+			// Keep the expensive capability probes bounded while rotating through
+			// targets ranked below the four most valuable visible structures.
+			Object *afterCursor[MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES];
+			Object *wrapped[MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES];
+			Int afterCount = 0;
+			Int wrappedCount = 0;
+			Int batchIndex;
+			for (Object *fallbackObject = TheGameLogic->getFirstObject();
+				fallbackObject; fallbackObject = fallbackObject->getNextObject()) {
+				if (fallbackObject->getControllingPlayer() != enemy ||
+					!IsSkirmishStrategyIntelEligible(fallbackObject, m_player) ||
+					fallbackObject->isEffectivelyDead() ||
+					fallbackObject->isDestroyed() ||
+					fallbackObject->testStatus(OBJECT_STATUS_SOLD) ||
+					!IsSkirmishStrategyStaticTarget(fallbackObject) ||
+					IsSkirmishStrategyTopTargetCandidate(
+						fallbackObject, targetCandidates, targetCandidateCount))
+					continue;
+				if (m_strategyTargetFallbackAfterID == INVALID_ID ||
+					fallbackObject->getID() > m_strategyTargetFallbackAfterID)
+					InsertSkirmishStrategyTargetByID(
+						afterCursor, &afterCount, fallbackObject);
+				else
+					InsertSkirmishStrategyTargetByID(
+						wrapped, &wrappedCount, fallbackObject);
+			}
+			for (batchIndex = 0; batchIndex < afterCount &&
+				targetBatchCount < MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES;
+				++batchIndex)
+				targetBatch[targetBatchCount++] = afterCursor[batchIndex];
+			for (batchIndex = 0; batchIndex < wrappedCount &&
+				targetBatchCount < MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES;
+				++batchIndex)
+				targetBatch[targetBatchCount++] = wrapped[batchIndex];
+		} else {
+			for (Int index = 0; index < targetCandidateCount; ++index)
+				targetBatch[targetBatchCount++] = targetCandidates[index].object;
+		}
+		for (Int candidateIndex = 0;
+			candidateIndex < targetBatchCount &&
+			targetAttemptCount < MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES;
 			++candidateIndex) {
-			Object *candidate = targetCandidates[candidateIndex].object;
+			Object *candidate = targetBatch[candidateIndex];
 			if (candidate == persistedTarget)
 				continue;
 			++targetAttemptCount;
-			if (HasSkirmishStrategyTargetCapability(
+			if (fallbackPass)
+				m_strategyTargetFallbackAfterID = candidate->getID();
+			Bool targetCapability = HasSkirmishStrategyTargetCapability(
 					candidate, airAttackers, groundAttackers,
-					&quickPathQueryCount)) {
+					&quickPathQueryCount, targetFallbackEnabled);
+			if (!targetCapability && tunnelTargetBootstrapEnabled) {
+				if (!tunnelInfrastructureChecked) {
+					tunnelInfrastructureChecked = true;
+					tunnelTracker = m_player->getTunnelSystem();
+					tunnelPlan = findTunnelContainBuildTemplate();
+					hasTunnelRouteInfrastructure =
+						HasSkirmishAIStrategyTunnelRouteInfrastructure(
+							m_player, tunnelTracker,
+							m_baseCenterSet && tunnelPlan &&
+							IsSkirmishAIStrategyTunnelTemplate(tunnelPlan));
+				}
+				targetCapability = HasSkirmishAIStrategyTunnelTargetCapability(
+					candidate, m_player, enemy, tunnelCandidateTeams,
+					visibleDefenseBlockers,
+					tunnelTracker, hasTunnelRouteInfrastructure, tunnelProbeEpoch);
+			}
+			if (targetCapability) {
 				selectedTarget = candidate;
 				break;
 			}
 		}
+		// A failed top-four pass earns one rotating fallback pass. Then return
+		// to the highest-value targets, so newly reachable priorities are retried.
+		if (targetFallbackEnabled)
+			m_strategyTargetFallbackPending = !fallbackPass &&
+				!selectedTarget && staticTargetCount > targetCandidateCount;
 	}
+	if (targetFallbackEnabled && selectedTarget)
+		m_strategyTargetFallbackPending = false;
 	const Bool routeAvailable = selectedTarget != nullptr;
 	const Bool hasVisibleTargetCandidate =
 		persistedTarget != nullptr || targetCandidateCount > 0;
@@ -5830,6 +6989,2230 @@ void AISkirmishPlayer::collectStrategyMetrics(
 	metrics->hasStrategicTarget = preserveHiddenTarget || routeAvailable;
 	if (routeAvailable)
 		*strategicTargetID = selectedTarget->getID();
+}
+
+static Bool IsSkirmishTacticalRetreatPointSafe(
+	const Coord3D *start, const Coord3D *destination,
+	const std::vector<Object *> &hazards);
+
+static Bool IsSkirmishAIStrategyTunnelTargetUsable(
+	Object *target, Player *owner, Player *enemy)
+{
+	return target && owner && enemy &&
+		IsSkirmishStrategyIntelEligible(target, owner) &&
+		target->getControllingPlayer() == enemy &&
+		IsSkirmishStrategyStaticTarget(target) &&
+		!target->isEffectivelyDead() && !target->isDestroyed() &&
+		!target->testStatus(OBJECT_STATUS_SOLD);
+}
+
+static Bool IsSkirmishAIDefenseTeamScriptFree(const TeamTemplateInfo *info)
+{
+	if (!info || !(info->m_isBaseDefense || info->m_isPerimeterDefense) ||
+		info->m_executeActions ||
+		!info->m_scriptOnCreate.isEmpty() || !info->m_scriptOnIdle.isEmpty() ||
+		!info->m_scriptOnEnemySighted.isEmpty() ||
+		!info->m_scriptOnAllClear.isEmpty() ||
+		!info->m_scriptOnUnitDestroyed.isEmpty() ||
+		!info->m_scriptOnDestroyed.isEmpty())
+		return false;
+	for (Int script = 0; script < MAX_GENERIC_SCRIPTS; ++script) {
+		if (!info->m_teamGenericScripts[script].isEmpty()) return false;
+	}
+	return true;
+}
+
+static size_t GetSkirmishAIPatrolDefenderStart(
+	const std::vector<Object *> &defenders, ObjectID afterID)
+{
+	if (afterID == INVALID_ID) return 0;
+	size_t start = 0;
+	while (start < defenders.size() && defenders[start]->getID() <= afterID)
+		++start;
+	return start == defenders.size() ? 0 : start;
+}
+
+void AISkirmishPlayer::updateDefensePatrol()
+{
+	if (!ShouldUseCurrentSkirmishAITacticalBehavior() || !usesStrategyBehavior() ||
+		!m_player || !m_baseCenterSet || !TheAI || !TheAI->pathfinder() ||
+		!TheTerrainLogic || !TheGameLogic)
+		return;
+	const UnsignedInt now = TheGameLogic->getFrame();
+	if (m_defensePursuitTargetID != INVALID_ID) {
+		Real leash = m_baseRadius + 250.0f;
+		if (leash > 800.0f) leash = 800.0f;
+		if (leash < 300.0f) leash = 300.0f;
+		Team *ownedTeam = nullptr;
+		for (Player::PlayerTeamList::const_iterator prototype =
+				m_player->getPlayerTeams()->begin();
+			prototype != m_player->getPlayerTeams()->end() && !ownedTeam;
+			++prototype) {
+			if (!IsSkirmishAIDefenseTeamScriptFree(
+					(*prototype)->getTemplateInfo())) continue;
+			for (DLINK_ITERATOR<Team> instance =
+					(*prototype)->iterate_TeamInstanceList();
+				!instance.done(); instance.advance()) {
+				if (instance.cur()->getID() == m_defensePatrolTeamID) {
+					ownedTeam = instance.cur();
+					break;
+				}
+			}
+		}
+		Object *ownedObject = m_defensePatrolObjectID != INVALID_ID ?
+			TheGameLogic->findObjectByID(m_defensePatrolObjectID) : nullptr;
+		const Bool legacyTeamPatrol = m_defensePatrolObjectID == INVALID_ID &&
+			ownedTeam != nullptr;
+		const Bool ownedMemberValid = ownedObject &&
+			ownedObject->getControllingPlayer() == m_player &&
+			!ownedObject->isEffectivelyDead() && !ownedObject->isDestroyed() &&
+			(m_defensePatrolTeamID == 0 ?
+				ownedObject->getTeam() == m_player->getDefaultTeam() :
+				ownedTeam && ownedObject->getTeam() == ownedTeam);
+		Object *target = TheGameLogic->findObjectByID(m_defensePursuitTargetID);
+		Bool teamInside = legacyTeamPatrol || ownedMemberValid;
+		Int ownValue = 0;
+		if (legacyTeamPatrol) {
+			for (DLINK_ITERATOR<Object> member =
+					ownedTeam->iterate_TeamMemberList();
+				!member.done(); member.advance()) {
+				Object *object = member.cur();
+				if (!object || object->getControllingPlayer() != m_player ||
+					object->isEffectivelyDead() || object->isDestroyed()) continue;
+				const Real dx = object->getPosition()->x - m_baseCenter.x;
+				const Real dy = object->getPosition()->y - m_baseCenter.y;
+				if (dx * dx + dy * dy >= leash * leash) teamInside = false;
+				const Int cost = object->getTemplate()->calcCostToBuild(m_player);
+				if (cost > 0) ownValue = AddSkirmishStrategyValue(ownValue,
+					(Int)((__int64)cost * GetSkirmishStrategyHealthPercent(object) / 100));
+			}
+		} else if (ownedMemberValid) {
+			const Real dx = ownedObject->getPosition()->x - m_baseCenter.x;
+			const Real dy = ownedObject->getPosition()->y - m_baseCenter.y;
+			teamInside = dx * dx + dy * dy < leash * leash;
+			const Int cost = ownedObject->getTemplate()->calcCostToBuild(m_player);
+			if (cost > 0) ownValue =
+				(Int)((__int64)cost * GetSkirmishStrategyHealthPercent(ownedObject) / 100);
+		} else teamInside = false;
+		const Bool targetValid = target && !target->isEffectivelyDead() &&
+			!target->isDestroyed() && IsSkirmishStrategyIntelEligible(target, m_player) &&
+			IsSkirmishStrategyCombatObject(target) &&
+			target->getControllingPlayer() &&
+			target->getControllingPlayer()->getDefaultTeam() &&
+			m_player->getRelationship(
+				target->getControllingPlayer()->getDefaultTeam()) == ENEMIES;
+		Bool targetInside = false;
+		Bool targetPenetrated = false;
+		if (targetValid) {
+			const Real dx = target->getPosition()->x - m_baseCenter.x;
+			const Real dy = target->getPosition()->y - m_baseCenter.y;
+			targetInside = dx * dx + dy * dy < (leash - 50.0f) * (leash - 50.0f);
+			targetPenetrated = dx * dx + dy * dy <
+				(0.7f * m_baseRadius) * (0.7f * m_baseRadius);
+		}
+		const UnsignedInt attackedFrame = m_player->getAttackedFrame();
+		const Bool recentBasePressure = attackedFrame != 0 &&
+			now - attackedFrame < 3 * LOGICFRAMES_PER_SECOND;
+		const Bool baseSafe = !m_recoveryImpossible &&
+			(!recentBasePressure || targetPenetrated);
+		const Bool immediateRecall = !targetValid || !teamInside ||
+			!targetInside || !baseSafe ||
+			now - m_defensePursuitStartFrame >= 4 * LOGICFRAMES_PER_SECOND;
+		if (!immediateRecall &&
+			!IsSkirmishStrategyFrameReached(now, m_defenseNextPatrolFrame))
+			return;
+		m_defenseNextPatrolFrame = now + LOGICFRAMES_PER_SECOND;
+		Int enemyValue = 0;
+		if (!immediateRecall) {
+			for (Object *enemy = TheGameLogic->getFirstObject(); enemy;
+				enemy = enemy->getNextObject()) {
+				Player *owner = enemy->getControllingPlayer();
+				if (!owner || !owner->getDefaultTeam() ||
+					m_player->getRelationship(owner->getDefaultTeam()) != ENEMIES ||
+					!IsSkirmishStrategyIntelEligible(enemy, m_player) ||
+					!IsSkirmishStrategyCombatObject(enemy) ||
+					enemy->isEffectivelyDead()) continue;
+				const Real ex = enemy->getPosition()->x - target->getPosition()->x;
+				const Real ey = enemy->getPosition()->y - target->getPosition()->y;
+				if (ex * ex + ey * ey > 250.0f * 250.0f) continue;
+				const Int cost = enemy->getTemplate()->calcCostToBuild(owner);
+				if (cost > 0) enemyValue = AddSkirmishStrategyValue(enemyValue,
+					(Int)((__int64)cost * GetSkirmishStrategyHealthPercent(enemy) / 100));
+			}
+		}
+		if (ShouldRecallSkirmishAIDefender(targetValid, teamInside,
+			targetInside, (__int64)ownValue * 4 >= (__int64)enemyValue * 5 &&
+				enemyValue > 0,
+			baseSafe,
+			now - m_defensePursuitStartFrame, 4 * LOGICFRAMES_PER_SECOND)) {
+			AIGroupPtr group = TheAI->createGroup();
+			if (group) {
+				if (legacyTeamPatrol) {
+#if RETAIL_COMPATIBLE_AIGROUP
+					ownedTeam->getTeamAsAIGroup(group);
+#else
+					ownedTeam->getTeamAsAIGroup(group.Peek());
+#endif
+				} else if (ownedMemberValid)
+					group->add(ownedObject);
+				if (legacyTeamPatrol || ownedMemberValid)
+					group->groupGuardPosition(&m_baseCenter,
+						GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+			}
+			m_defensePursuitTargetID = INVALID_ID;
+			m_defensePursuitStartFrame = 0;
+			m_defenseNextPatrolFrame = now + 12 * LOGICFRAMES_PER_SECOND;
+			m_defenseQuietPatrolDeadlineFrame = 0;
+		}
+		return;
+	}
+	if (!IsSkirmishStrategyFrameReached(now, m_defenseNextPatrolFrame))
+		return;
+	m_defenseNextPatrolFrame = now + 10 * LOGICFRAMES_PER_SECOND;
+	SkirmishAIDefenseContext context;
+	CollectSkirmishAIDefenseContext(m_player, m_baseCenter,
+		m_baseRadius, &context);
+	Int route = DecideSkirmishAIDefensePatrolRoute(
+		&context.threat, m_defensePatrolRoute, true, true, 100, 150);
+	const Bool quietPatrol = !IsSkirmishAIDefenseRoute(route);
+	if (quietPatrol) {
+		if (IsSkirmishAIDefenseRoute(m_defensePatrolRoute) &&
+			context.anchors[m_defensePatrolRoute].available)
+			route = m_defensePatrolRoute;
+		else
+			route = SelectQuietSkirmishAIDefenseRoute(context.anchors,
+				now / (10 * LOGICFRAMES_PER_SECOND), m_player->getPlayerIndex());
+	}
+	if (!IsSkirmishAIDefenseRoute(route) ||
+		!context.anchors[route].available) {
+		m_defensePatrolRoute = SKIRMISH_AI_DEFENSE_NO_ROUTE;
+		m_defensePatrolTeamID = 0;
+		m_defensePatrolObjectID = INVALID_ID;
+		m_defenseQuietPatrolDeadlineFrame = 0;
+		return;
+	}
+	Real leash = m_baseRadius + 250.0f;
+	if (leash > 800.0f) leash = 800.0f;
+	if (leash < 300.0f) leash = 300.0f;
+	const Real leashSqr = leash * leash;
+	Team *selectedTeam = nullptr;
+	Object *representative = nullptr;
+	Player::PlayerTeamList::const_iterator prototype;
+	for (prototype = m_player->getPlayerTeams()->begin();
+		prototype != m_player->getPlayerTeams()->end(); ++prototype) {
+		const TeamTemplateInfo *info = (*prototype)->getTemplateInfo();
+		if (!IsSkirmishAIDefenseTeamScriptFree(info)) continue;
+		for (DLINK_ITERATOR<Team> instance =
+			(*prototype)->iterate_TeamInstanceList();
+			!instance.done(); instance.advance()) {
+			Team *team = instance.cur();
+			if (!team || team == m_player->getDefaultTeam() ||
+				!team->isActive() || !team->hasAnyObjects() ||
+				(team->getID() != m_defensePatrolTeamID && !team->isIdle()))
+				continue;
+			Object *first = nullptr;
+			Bool safe = true;
+			for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+				!member.done(); member.advance()) {
+				Object *object = member.cur();
+				if (!object || object->isEffectivelyDead() || object->isDestroyed())
+					continue;
+				const Real dx = object->getPosition()->x - m_baseCenter.x;
+				const Real dy = object->getPosition()->y - m_baseCenter.y;
+				if (object->getControllingPlayer() != m_player ||
+					object->isContained() || object->isKindOf(KINDOF_AIRCRAFT) ||
+					!IsSkirmishStrategyCombatObject(object) ||
+					!object->getAIUpdateInterface() || dx * dx + dy * dy > leashSqr) {
+					safe = false;
+					break;
+				}
+				if (!first || object->getID() < first->getID()) first = object;
+			}
+			if (!safe || !first) continue;
+			if (!selectedTeam || team->getID() < selectedTeam->getID()) {
+				selectedTeam = team;
+				representative = first;
+			}
+		}
+	}
+	Object *fallback = nullptr;
+	if (!selectedTeam) {
+		// Default-team combat units have no team script. Borrow one idle unit,
+		// never a builder, collector, aircraft, or an active attack recipient.
+		for (Object *object = TheGameLogic->getFirstObject(); object;
+			object = object->getNextObject()) {
+			AIUpdateInterface *ai = object->getAIUpdateInterface();
+			if (object->getControllingPlayer() != m_player ||
+				object->getTeam() != m_player->getDefaultTeam() ||
+				!IsSkirmishStrategyCombatObject(object) ||
+				object->isKindOf(KINDOF_AIRCRAFT) || object->isContained() ||
+				object->isEffectivelyDead() || object->isDestroyed() ||
+				!ai || (object->getID() != m_defensePatrolObjectID &&
+					!ai->isIdle()))
+				continue;
+			const Real dx = object->getPosition()->x - m_baseCenter.x;
+			const Real dy = object->getPosition()->y - m_baseCenter.y;
+			if (dx * dx + dy * dy > leashSqr) continue;
+			if (!fallback || object->getID() < fallback->getID())
+				fallback = object;
+		}
+		representative = fallback;
+	}
+	if (!representative) {
+		m_defensePatrolTeamID = 0;
+		m_defensePatrolObjectID = INVALID_ID;
+		m_defenseQuietPatrolDeadlineFrame = 0;
+		return;
+	}
+	std::vector<Object *> patrolDefenders;
+	if (selectedTeam) {
+		for (DLINK_ITERATOR<Object> member =
+				selectedTeam->iterate_TeamMemberList();
+			!member.done(); member.advance()) {
+			Object *object = member.cur();
+			if (!object || object->getControllingPlayer() != m_player ||
+				object->isEffectivelyDead() || object->isDestroyed() ||
+				object->isContained() || object->isKindOf(KINDOF_AIRCRAFT) ||
+				!IsSkirmishStrategyCombatObject(object) ||
+				!object->getAIUpdateInterface())
+				continue;
+			const Real dx = object->getPosition()->x - m_baseCenter.x;
+			const Real dy = object->getPosition()->y - m_baseCenter.y;
+			if (dx * dx + dy * dy > leashSqr)
+				continue;
+			patrolDefenders.push_back(object);
+		}
+	} else if (fallback) {
+		patrolDefenders.push_back(fallback);
+	}
+	std::sort(patrolDefenders.begin(), patrolDefenders.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+	if (patrolDefenders.empty()) {
+		m_defensePatrolTeamID = 0;
+		m_defensePatrolObjectID = INVALID_ID;
+		m_defenseQuietPatrolDeadlineFrame = 0;
+		return;
+	}
+	representative = patrolDefenders[0];
+	Bool samePatrolDefender = false;
+	if (selectedTeam && selectedTeam->getID() == m_defensePatrolTeamID) {
+		for (size_t defender = 0; defender < patrolDefenders.size(); ++defender) {
+			if (patrolDefenders[defender]->getID() == m_defensePatrolObjectID) {
+				representative = patrolDefenders[defender];
+				samePatrolDefender = true;
+				break;
+			}
+		}
+	} else if (!selectedTeam && fallback && m_defensePatrolTeamID == 0 &&
+		fallback->getID() == m_defensePatrolObjectID)
+		samePatrolDefender = true;
+	const Bool defenderMoving =
+		!representative->getAIUpdateInterface()->isIdle();
+	if (quietPatrol && m_defenseQuietPatrolDeadlineFrame != 0 &&
+		route == m_defensePatrolRoute) {
+		const Real waypointDx = representative->getPosition()->x -
+			m_defenseQuietPatrolWaypoint.x;
+		const Real waypointDy = representative->getPosition()->y -
+			m_defenseQuietPatrolWaypoint.y;
+		if (ShouldHoldQuietSkirmishAIDefenseWaypoint(true,
+			samePatrolDefender && defenderMoving,
+			context.anchors[route].available,
+			IsSkirmishStrategyFrameReached(now,
+				m_defenseQuietPatrolDeadlineFrame),
+			waypointDx * waypointDx + waypointDy * waypointDy, 85.0f))
+			return;
+		if (samePatrolDefender)
+			route = AdvanceQuietSkirmishAIDefenseRoute(context.anchors,
+				route, now / (10 * LOGICFRAMES_PER_SECOND),
+				m_player->getPlayerIndex());
+	}
+	Int tacticalQuickPathQueryCount = 0;
+	Real radius = m_baseRadius + 50.0f;
+	if (radius > leash - 80.0f) radius = leash - 80.0f;
+	if (radius < 120.0f) radius = 120.0f;
+	const Real side = (now / (10 * LOGICFRAMES_PER_SECOND)) & 1 ?
+		60.0f : -60.0f;
+	Coord3D destination = m_baseCenter;
+	Bool reachableRoute = false;
+	Int routePathQueries = 0;
+	Object *selectedRouteDefender = nullptr;
+	const size_t routeDefenderStart = GetSkirmishAIPatrolDefenderStart(
+		patrolDefenders, m_defensePatrolRouteMemberAfterID);
+	for (Int attempt = 0; attempt < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++attempt) {
+		const Int candidateRoute = (route + attempt) % SKIRMISH_AI_DEFENSE_ROUTE_COUNT;
+		if (!context.anchors[candidateRoute].available)
+			continue;
+		Coord3D candidate = m_baseCenter;
+		candidate.x += context.direction[candidateRoute].x * radius -
+			context.direction[candidateRoute].y * side;
+		candidate.y += context.direction[candidateRoute].y * radius +
+			context.direction[candidateRoute].x * side;
+		candidate.z = TheTerrainLogic->getGroundHeight(candidate.x, candidate.y);
+		const Real dx = candidate.x - m_baseCenter.x;
+		const Real dy = candidate.y - m_baseCenter.y;
+		if (dx * dx + dy * dy > leashSqr)
+			continue;
+		Bool candidateReachable = false;
+		// Reserve one query for each remaining route, including routes whose
+		// anchors may prove unavailable, so the first lane cannot use all four.
+		const Int candidateQueryAllowance = 4 - routePathQueries -
+			(SKIRMISH_AI_DEFENSE_ROUTE_COUNT - attempt - 1);
+		Int candidateQueries = 0;
+		for (size_t defender = 0; defender < patrolDefenders.size(); ++defender) {
+			if (candidateQueries >= candidateQueryAllowance ||
+				routePathQueries >= 4 ||
+				!TryConsumeSkirmishAITacticalPathQuery(
+					&tacticalQuickPathQueryCount,
+					MAX_SKIRMISH_AI_TACTICAL_QUICK_PATH_QUERIES_PER_UPDATE))
+				break;
+			// Rotate across the whole team, including failed probes on other lanes.
+			Object *pathDefender = patrolDefenders[
+				(routeDefenderStart + routePathQueries) % patrolDefenders.size()];
+			m_defensePatrolRouteMemberAfterID = pathDefender->getID();
+			AIUpdateInterface *pathDefenderAI =
+				pathDefender->getAIUpdateInterface();
+			++routePathQueries;
+			++candidateQueries;
+			if (pathDefenderAI &&
+				TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+					pathDefenderAI->getLocomotorSet(),
+					pathDefender->getPosition(), &candidate)) {
+				selectedRouteDefender = pathDefender;
+				candidateReachable = true;
+				break;
+			}
+		}
+		if (!candidateReachable)
+			continue;
+		route = candidateRoute;
+		destination = candidate;
+		reachableRoute = true;
+		break;
+	}
+	if (!reachableRoute || !selectedRouteDefender)
+		return;
+	AIGroupPtr group = TheAI->createGroup();
+	if (!group) return;
+	// A reachable team member does not prove the rest of a mixed team can move here.
+	group->add(selectedRouteDefender);
+	m_defensePatrolTeamID = selectedTeam ? selectedTeam->getID() : 0;
+	m_defensePatrolObjectID = selectedRouteDefender->getID();
+	std::vector<Object *> contacts;
+	for (Object *enemy = TheGameLogic->getFirstObject(); enemy;
+		enemy = enemy->getNextObject()) {
+		Player *owner = enemy->getControllingPlayer();
+		if (!owner || !owner->getDefaultTeam() ||
+			m_player->getRelationship(owner->getDefaultTeam()) != ENEMIES ||
+			!IsSkirmishStrategyIntelEligible(enemy, m_player) ||
+			!IsSkirmishStrategyCombatObject(enemy) ||
+			enemy->isKindOf(KINDOF_AIRCRAFT) || enemy->isContained() ||
+			enemy->isEffectivelyDead() || enemy->isDestroyed()) continue;
+		const Real ex = enemy->getPosition()->x - m_baseCenter.x;
+		const Real ey = enemy->getPosition()->y - m_baseCenter.y;
+		if (ex * ex + ey * ey > (leash - 150.0f) * (leash - 150.0f) ||
+			ClassifySkirmishAIDefenseRoute((Int)ex, (Int)ey,
+				context.anchors) != route) continue;
+		contacts.push_back(enemy);
+	}
+	std::sort(contacts.begin(), contacts.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+	const UnsignedInt attackedFrame = m_player->getAttackedFrame();
+	const Bool recentBasePressure = attackedFrame != 0 &&
+		now - attackedFrame < 3 * LOGICFRAMES_PER_SECOND;
+	if (!contacts.empty() && !m_recoveryImpossible) {
+		Int ownValue = 0;
+		const Int cost = selectedRouteDefender->getTemplate()->calcCostToBuild(m_player);
+		if (cost > 0) ownValue =
+			(Int)((__int64)cost * GetSkirmishStrategyHealthPercent(
+				selectedRouteDefender) / 100);
+		size_t start = 0;
+		if (m_defenseInterceptProbeAfterID != INVALID_ID) {
+			while (start < contacts.size() &&
+				contacts[start]->getID() <= m_defenseInterceptProbeAfterID)
+				++start;
+			if (start == contacts.size()) start = 0;
+		}
+		Int memberProbes = 0;
+		for (size_t offset = 0; offset < contacts.size() &&
+			memberProbes < MAX_SKIRMISH_AI_TACTICAL_QUICK_PATH_QUERIES_PER_UPDATE &&
+			tacticalQuickPathQueryCount <
+				MAX_SKIRMISH_AI_TACTICAL_QUICK_PATH_QUERIES_PER_UPDATE;
+			++offset) {
+			Object *intercept = contacts[(start + offset) % contacts.size()];
+			m_defenseInterceptProbeAfterID = intercept->getID();
+			const Real ex = intercept->getPosition()->x - m_baseCenter.x;
+			const Real ey = intercept->getPosition()->y - m_baseCenter.y;
+			const Bool targetPenetrated = ex * ex + ey * ey <
+				(0.7f * m_baseRadius) * (0.7f * m_baseRadius);
+			if (recentBasePressure && !targetPenetrated)
+				continue;
+			++memberProbes;
+			m_defenseInterceptMemberAfterID = selectedRouteDefender->getID();
+			if (selectedRouteDefender->getAbleToAttackSpecificObject(
+					ATTACK_NEW_TARGET, intercept, CMD_FROM_AI) ==
+				ATTACKRESULT_NOT_POSSIBLE)
+				continue;
+			if (!TryConsumeSkirmishAITacticalPathQuery(
+					&tacticalQuickPathQueryCount,
+					MAX_SKIRMISH_AI_TACTICAL_QUICK_PATH_QUERIES_PER_UPDATE))
+				break;
+			AIUpdateInterface *pathDefenderAI =
+				selectedRouteDefender->getAIUpdateInterface();
+			if (!pathDefenderAI ||
+				!TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+					pathDefenderAI->getLocomotorSet(),
+					selectedRouteDefender->getPosition(),
+					intercept->getPosition()))
+				continue;
+			Int enemyValue = 0;
+			for (Object *enemy = TheGameLogic->getFirstObject(); enemy;
+				enemy = enemy->getNextObject()) {
+				Player *owner = enemy->getControllingPlayer();
+				if (!owner || !owner->getDefaultTeam() ||
+					m_player->getRelationship(owner->getDefaultTeam()) != ENEMIES ||
+					!IsSkirmishStrategyIntelEligible(enemy, m_player) ||
+					!IsSkirmishStrategyCombatObject(enemy) ||
+					enemy->isEffectivelyDead()) continue;
+				const Real enemyDx = enemy->getPosition()->x - intercept->getPosition()->x;
+				const Real enemyDy = enemy->getPosition()->y - intercept->getPosition()->y;
+				if (enemyDx * enemyDx + enemyDy * enemyDy > 250.0f * 250.0f) continue;
+				const Int cost = enemy->getTemplate()->calcCostToBuild(owner);
+				if (cost > 0) enemyValue = AddSkirmishStrategyValue(enemyValue,
+					(Int)((__int64)cost * GetSkirmishStrategyHealthPercent(enemy) / 100));
+			}
+			if (ShouldSkirmishAIDefenderPursue(true, true, true,
+				(Int)sqrt(ex * ex + ey * ey), (Int)leash,
+				ownValue, enemyValue)) {
+				group->groupAttackObject(intercept, NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+				m_defensePursuitTargetID = intercept->getID();
+				m_defensePursuitStartFrame = now;
+				m_defenseNextPatrolFrame = now + LOGICFRAMES_PER_SECOND;
+				m_defensePatrolRoute = route;
+				m_defenseQuietPatrolDeadlineFrame = 0;
+				return;
+			}
+		}
+	}
+	group->groupGuardPosition(&destination,
+		GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+	m_defensePatrolRoute = route;
+	if (quietPatrol) {
+		m_defenseQuietPatrolWaypoint = destination;
+		m_defenseQuietPatrolDeadlineFrame = now +
+			90 * LOGICFRAMES_PER_SECOND;
+	} else m_defenseQuietPatrolDeadlineFrame = 0;
+}
+
+static Bool IsSkirmishAITacticalTeamBefore(Team *left, Team *right)
+{
+	return left->getID() < right->getID();
+}
+
+enum {
+	MAX_SKIRMISH_AI_TACTICAL_TEAM_EVALUATIONS_PER_UPDATE = 64,
+	MAX_SKIRMISH_AI_TACTICAL_RETREAT_PATH_QUERIES_PER_UPDATE = 32
+};
+
+void AISkirmishPlayer::updateTacticalTeams()
+{
+	if (!ShouldUseCurrentSkirmishAITacticalBehavior() || !usesStrategyBehavior() ||
+		!m_player || !TheAI ||
+		!TheAI->pathfinder() || !m_baseCenterSet)
+		return;
+	const UnsignedInt now = TheGameLogic->getFrame();
+	if (!IsSkirmishStrategyFrameReached(now, m_tacticalNextTeamScanFrame))
+		return;
+	m_tacticalNextTeamScanFrame = now + 2 * LOGICFRAMES_PER_SECOND;
+	Int aggregateTunnelPathQueryCount = 0;
+	Int tacticalQuickPathQueryCount = 0;
+	Int retreatPathQueryCount = 0;
+	std::vector<Team *> teams;
+	Player::PlayerTeamList::const_iterator prototype;
+	for (prototype = m_player->getPlayerTeams()->begin();
+		prototype != m_player->getPlayerTeams()->end(); ++prototype) {
+		for (DLINK_ITERATOR<Team> instance = (*prototype)->iterate_TeamInstanceList();
+			!instance.done(); instance.advance()) {
+			Team *team = instance.cur();
+			if (!IsSkirmishStrategyOffensiveTeam(team, m_player))
+				continue;
+			std::map<UnsignedInt, TacticalTeamState>::const_iterator previous =
+				m_tacticalTeams.find(team->getID());
+			const Bool activeTunnelTransit =
+				previous != m_tacticalTeams.end() &&
+				previous->second.tunnelTransitPhase !=
+					SKIRMISH_AI_TUNNEL_TRANSIT_NONE;
+			if (activeTunnelTransit ||
+				HasSkirmishStrategyPotentialOffensiveRecipient(team, m_player))
+				teams.push_back(team);
+		}
+	}
+	std::sort(teams.begin(), teams.end(), IsSkirmishAITacticalTeamBefore);
+	// The world list is stable during this synchronous update. Filter once so
+	// each team's tactical decisions walk only the relevant known objects.
+	std::vector<Object *> visibleCombatEnemies;
+	std::vector<Object *> retreatHazards;
+	std::vector<Object *> alternateTargets;
+	std::vector<Object *> corridorDefenses;
+	std::vector<Object *> retreatFacilities;
+	if (!teams.empty() &&
+		m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT) {
+		for (Object *object = TheGameLogic->getFirstObject(); object;
+			object = object->getNextObject()) {
+			Player *owner = object->getControllingPlayer();
+			if (owner == m_player) {
+				if (!object->isEffectivelyDead() && !object->isDestroyed() &&
+					!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+					(object->isKindOf(KINDOF_REPAIR_PAD) ||
+					 object->isKindOf(KINDOF_HEAL_PAD) ||
+					 object->isKindOf(KINDOF_FS_AIRFIELD) ||
+					 object->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
+					 object->isKindOf(KINDOF_FS_BARRACKS) ||
+					 object->isKindOf(KINDOF_FS_WARFACTORY)))
+					retreatFacilities.push_back(object);
+				continue;
+			}
+			if (!owner || !owner->getDefaultTeam() ||
+				m_player->getRelationship(owner->getDefaultTeam()) != ENEMIES ||
+				!IsSkirmishStrategyIntelEligible(object, m_player) ||
+				object->isEffectivelyDead() || object->isDestroyed())
+				continue;
+			const Bool combat = IsSkirmishStrategyCombatObject(object);
+			const Bool armedStructure = object->isKindOf(KINDOF_STRUCTURE) &&
+				!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+				!object->testStatus(OBJECT_STATUS_SOLD) &&
+				object->getLargestWeaponRange() > 0.0f;
+			if (combat)
+				visibleCombatEnemies.push_back(object);
+			if (combat || armedStructure)
+				retreatHazards.push_back(object);
+			if (owner == m_currentEnemy &&
+				!object->testStatus(OBJECT_STATUS_SOLD)) {
+				if (IsSkirmishStrategyStaticTarget(object))
+					alternateTargets.push_back(object);
+				if (object->isKindOf(KINDOF_FS_BASE_DEFENSE))
+					corridorDefenses.push_back(object);
+			}
+		}
+	}
+	size_t active = 0;
+	for (std::map<UnsignedInt, TacticalTeamState>::iterator old = m_tacticalTeams.begin();
+		old != m_tacticalTeams.end();) {
+		while (active < teams.size() && teams[active]->getID() < old->first)
+			++active;
+		if (active == teams.size() || teams[active]->getID() != old->first)
+			m_tacticalTeams.erase(old++);
+		else
+			++old;
+	}
+	// Visit a complete set of windows before shifting their boundaries. The
+	// one-team shift lets every team lead a budget-limited scan over time.
+	const UnsignedInt scanTick = now / (2 * LOGICFRAMES_PER_SECOND);
+	const size_t firstTeamIndex = (size_t)
+		GetSkirmishAITacticalTeamProbeStartIndex(
+			scanTick, (unsigned int)teams.size(),
+			MAX_SKIRMISH_AI_TACTICAL_TEAM_EVALUATIONS_PER_UPDATE);
+	Int evaluatedTeams = 0;
+	for (size_t offset = 0; offset < teams.size(); ++offset) {
+		const size_t i = (firstTeamIndex + offset) % teams.size();
+		Team *team = teams[i];
+		std::map<UnsignedInt, TacticalTeamState>::iterator existing =
+			m_tacticalTeams.find(team->getID());
+		if (existing != m_tacticalTeams.end() &&
+			existing->second.tunnelTransitPhase !=
+				SKIRMISH_AI_TUNNEL_TRANSIT_NONE) {
+			TacticalTeamState &transit = existing->second;
+			if (IsSkirmishStrategyFrameReached(now, transit.nextCheckFrame)) {
+				transit.nextCheckFrame = now + 2 * LOGICFRAMES_PER_SECOND;
+				updateTunnelTransit(team, transit, now);
+			}
+			continue;
+		}
+		if (evaluatedTeams >=
+			MAX_SKIRMISH_AI_TACTICAL_TEAM_EVALUATIONS_PER_UPDATE)
+			continue;
+		const Bool newTacticalTeam =
+			existing == m_tacticalTeams.end();
+		if (newTacticalTeam &&
+			m_tacticalTeams.size() >= MAX_SKIRMISH_AI_TACTICAL_TEAMS)
+			continue;
+		TacticalTeamState &state = m_tacticalTeams[team->getID()];
+		if (newTacticalTeam)
+			state.tunnelCooldownUntilFrame = now +
+				(team->getID() % 4) * 2 * LOGICFRAMES_PER_SECOND;
+		if (!IsSkirmishStrategyFrameReached(now, state.nextCheckFrame))
+			continue;
+		state.nextCheckFrame = now + 2 * LOGICFRAMES_PER_SECOND;
+		++evaluatedTeams;
+		Int health = 0;
+		Int teamCombatValue = 0;
+		Int memberCount = 0;
+		Object *representative = nullptr;
+		Bool hasAircraft = false;
+		Bool hasArtillery = false;
+		for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+			!member.done(); member.advance()) {
+			Object *object = member.cur();
+			if (!IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team))
+				continue;
+			++memberCount;
+			const Int memberHealth = GetSkirmishStrategyHealthPercent(object);
+			health += memberHealth;
+			const Int cost = object->getTemplate()->calcCostToBuild(m_player);
+			if (cost > 0)
+				teamCombatValue = AddSkirmishStrategyValue(teamCombatValue,
+					(Int)((__int64)cost * memberHealth / 100));
+			if (!representative ||
+				(representative->isKindOf(KINDOF_AIRCRAFT) &&
+				 !object->isKindOf(KINDOF_AIRCRAFT)) ||
+				(representative->isKindOf(KINDOF_AIRCRAFT) ==
+				 object->isKindOf(KINDOF_AIRCRAFT) &&
+				 object->getID() < representative->getID()))
+				representative = object;
+			if (object->isKindOf(KINDOF_AIRCRAFT))
+				hasAircraft = true;
+			else if (object->getLargestWeaponRange() >= 250.0f)
+				hasArtillery = true;
+		}
+		// Balanced and Fortify hand control back to the native team scripts.
+		// A wounded team must not remain in the tactical regroup loop forever.
+		if (m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT) {
+			state.retreating = false;
+			state.woundedReserve = false;
+			state.alternateAttackIssuedTargetID = INVALID_ID;
+			continue;
+		}
+		if (!representative || !memberCount)
+			continue;
+		const Int averageHealth = health / memberCount;
+		Bool reengage = false;
+		if (state.woundedReserve) {
+			if (averageHealth < 50)
+				continue;
+			state.woundedReserve = false;
+			state.nextRetreatFrame = now + 20 * LOGICFRAMES_PER_SECOND;
+			reengage = true;
+		}
+		if (state.retreating && !IsSkirmishStrategyFrameReached(now, state.regroupUntilFrame))
+			continue;
+		if (state.retreating && averageHealth < 50) {
+			if (now - state.retreatStartFrame >= 30 * LOGICFRAMES_PER_SECOND) {
+				// Stay on the safe guard order as a defensive reserve until healed
+				// or a mode change gives control back to the team script.
+				state.retreating = false;
+				state.woundedReserve = true;
+				continue;
+			}
+			state.regroupUntilFrame = now + 8 * LOGICFRAMES_PER_SECOND;
+			continue;
+		}
+		if (state.retreating &&
+			state.routeExhaustedTargetID == m_strategyState.strategicTargetID &&
+			state.routeExhaustedTargetID != INVALID_ID &&
+			!IsSkirmishStrategyFrameReached(now, state.routeExhaustedUntilFrame)) {
+			state.regroupUntilFrame = now + 8 * LOGICFRAMES_PER_SECOND;
+			continue;
+		}
+		if (state.retreating) {
+			state.retreating = false;
+			state.nextRetreatFrame = now + 20 * LOGICFRAMES_PER_SECOND;
+			reengage = true;
+		}
+		Object *target = state.targetID != INVALID_ID
+			? TheGameLogic->findObjectByID(state.targetID) : nullptr;
+		if (target && (!IsSkirmishStrategyIntelEligible(target, m_player) ||
+			target->getControllingPlayer() != m_currentEnemy ||
+			!IsSkirmishStrategyStaticTarget(target) ||
+			target->isEffectivelyDead() || target->isDestroyed() ||
+			target->testStatus(OBJECT_STATUS_SOLD)))
+			target = nullptr;
+		if (!target && m_strategyState.strategicTargetID != INVALID_ID) {
+			target = TheGameLogic->findObjectByID(m_strategyState.strategicTargetID);
+			if (target && (!IsSkirmishStrategyIntelEligible(target, m_player) ||
+				target->getControllingPlayer() != m_currentEnemy ||
+				!IsSkirmishStrategyStaticTarget(target) ||
+				target->isEffectivelyDead() || target->isDestroyed() ||
+				target->testStatus(OBJECT_STATUS_SOLD)))
+				target = nullptr;
+		}
+		Object *threat = nullptr;
+		Int visibleThreatValue = 0;
+		Real threatDistance = 350.0f * 350.0f;
+		for (size_t enemyIndex = 0;
+			enemyIndex < visibleCombatEnemies.size(); ++enemyIndex) {
+			Object *enemy = visibleCombatEnemies[enemyIndex];
+			Player *owner = enemy->getControllingPlayer();
+			const Real dx = enemy->getPosition()->x - representative->getPosition()->x;
+			const Real dy = enemy->getPosition()->y - representative->getPosition()->y;
+			const Real distance = dx * dx + dy * dy;
+			if (distance <= 350.0f * 350.0f) {
+				const Int cost = enemy->getTemplate()->calcCostToBuild(owner);
+				if (cost > 0)
+					visibleThreatValue = AddSkirmishStrategyValue(visibleThreatValue,
+						(Int)((__int64)cost * GetSkirmishStrategyHealthPercent(enemy) / 100));
+			}
+			if (distance < threatDistance ||
+				(distance == threatDistance && threat && enemy->getID() < threat->getID())) {
+				threat = enemy;
+				threatDistance = distance;
+			}
+		}
+		Int threatCapableCount = 0;
+		if (threat) {
+			for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+				!member.done(); member.advance()) {
+				Object *object = member.cur();
+				if (IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team) &&
+					object->getAbleToAttackSpecificObject(ATTACK_NEW_TARGET, threat,
+						CMD_FROM_AI) != ATTACKRESULT_NOT_POSSIBLE)
+					++threatCapableCount;
+			}
+		}
+		Int targetCapableCount = 0;
+		if (target) {
+			for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+				!member.done(); member.advance()) {
+				Object *object = member.cur();
+				if (IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team) &&
+					object->getAbleToAttackSpecificObject(ATTACK_NEW_TARGET, target,
+						CMD_FROM_AI) != ATTACKRESULT_NOT_POSSIBLE)
+					++targetCapableCount;
+			}
+		}
+		Bool stalled = false;
+		if (target && m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT) {
+			const Real dx = target->getPosition()->x - representative->getPosition()->x;
+			const Real dy = target->getPosition()->y - representative->getPosition()->y;
+			const Real distance = dx * dx + dy * dy;
+			const Real targetHealth = target->getBodyModule()
+				? target->getBodyModule()->getHealth() : 0.0f;
+			if (state.targetID != target->getID()) {
+				state.targetID = target->getID();
+				state.targetHealth = targetHealth;
+				state.distanceToTargetSqr = distance;
+				state.lastProgressFrame = now;
+				state.blockedSinceFrame = 0;
+				state.approachAttempt = 0;
+				state.alternateProbeAfterID = INVALID_ID;
+				state.alternateAttackIssuedTargetID = INVALID_ID;
+				state.tunnelBuilderWaitUntilFrame = 0;
+				state.tunnelBuilderWindowsRemaining = 0;
+				state.routeExhaustedTargetID = INVALID_ID;
+				state.routeExhaustedUntilFrame = 0;
+			} else {
+				if (targetHealth < state.targetHealth ||
+					distance + 40.0f * 40.0f < state.distanceToTargetSqr) {
+					state.lastProgressFrame = now;
+					state.distanceToTargetSqr = distance;
+					state.routeExhaustedTargetID = INVALID_ID;
+					state.routeExhaustedUntilFrame = 0;
+					state.alternateProbeAfterID = INVALID_ID;
+				}
+				state.targetHealth = targetHealth;
+				AIUpdateInterface *ai = representative->getAIUpdateInterface();
+				if (ai && (ai->isBlockedAndStuck() ||
+					ai->getNumFramesBlocked() > 2 * LOGICFRAMES_PER_SECOND)) {
+					if (!state.blockedSinceFrame)
+						state.blockedSinceFrame = now;
+				} else {
+					state.blockedSinceFrame = 0;
+				}
+				stalled = targetCapableCount == 0 ||
+					now - state.lastProgressFrame >= 12 * LOGICFRAMES_PER_SECOND ||
+					(state.blockedSinceFrame &&
+					 now - state.blockedSinceFrame >= 6 * LOGICFRAMES_PER_SECOND);
+			}
+		} else {
+			state.targetID = INVALID_ID;
+			state.blockedSinceFrame = 0;
+			state.alternateAttackIssuedTargetID = INVALID_ID;
+		}
+		if (stalled && !IsSkirmishStrategyFrameReached(now, state.regroupUntilFrame))
+			stalled = false;
+		const Bool outmatched = teamCombatValue > 0 &&
+			(__int64)visibleThreatValue * 2 >= (__int64)teamCombatValue * 5;
+		const Bool retreat = IsSkirmishStrategyFrameReached(now, state.nextRetreatFrame) &&
+			(averageHealth < 35 || (threat && threatCapableCount == 0) || outmatched);
+		Bool alternateReady = false;
+		if (target && target->getID() != m_strategyState.strategicTargetID &&
+			targetCapableCount > 0) {
+			const Real dx = target->getPosition()->x - representative->getPosition()->x;
+			const Real dy = target->getPosition()->y - representative->getPosition()->y;
+			const Real radius = target->getTemplate()->getTemplateGeometryInfo()
+				.getBoundingCircleRadius();
+			const Real closeEnough = radius +
+				max(representative->getLargestWeaponRange(), 150.0f) +
+				2.0f * PATHFIND_CELL_SIZE_F;
+			alternateReady = dx * dx + dy * dy <= closeEnough * closeEnough;
+		}
+		if (!alternateReady || retreat)
+			state.alternateAttackIssuedTargetID = INVALID_ID;
+		if (!retreat && !stalled && !reengage &&
+			(!alternateReady || state.alternateAttackIssuedTargetID == target->getID()))
+			continue;
+		AIGroupPtr group = TheAI->createGroup();
+		if (!group)
+			continue;
+#if RETAIL_COMPATIBLE_AIGROUP
+		AIGroup *groupObject = group;
+#else
+		AIGroup *groupObject = group.Peek();
+#endif
+		SkirmishStrategyGroupRecipientContext context;
+		context.player = m_player;
+		context.group = groupObject;
+		context.found = false;
+		team->iterateObjects(CollectSkirmishStrategyGroupRecipient, &context);
+		if (!context.found)
+			continue;
+		if (alternateReady && !retreat) {
+			if (state.alternateAttackIssuedTargetID != target->getID()) {
+				group->groupAttackObject(target, NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+				state.alternateAttackIssuedTargetID = target->getID();
+				state.targetHealth = target->getBodyModule()
+					? target->getBodyModule()->getHealth() : 0.0f;
+				const Real targetDX = target->getPosition()->x -
+					representative->getPosition()->x;
+				const Real targetDY = target->getPosition()->y -
+					representative->getPosition()->y;
+				state.distanceToTargetSqr =
+					targetDX * targetDX + targetDY * targetDY;
+				state.lastProgressFrame = now;
+				state.blockedSinceFrame = 0;
+				state.regroupUntilFrame = now +
+					12 * LOGICFRAMES_PER_SECOND;
+				continue;
+			}
+			if (!stalled && !reengage)
+				continue;
+		}
+		if (reengage && !retreat && !stalled) {
+			if (target && m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT)
+				group->groupAttackMoveToPosition(target->getPosition(),
+					NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+			else if (m_strategyState.currentMode == SKIRMISH_STRATEGY_BALANCED)
+				group->groupIdle(CMD_FROM_AI);
+			continue;
+		}
+		if (stalled && !retreat) {
+			Bool approachIssued = false;
+			Bool pathProbeDeferred = false;
+			if (target && !representative->isKindOf(KINDOF_AIRCRAFT) &&
+				state.approachAttempt < 4) {
+				const Real dx = representative->getPosition()->x - target->getPosition()->x;
+				const Real dy = representative->getPosition()->y - target->getPosition()->y;
+				const Real length = sqrt(dx * dx + dy * dy);
+				const Real forwardX = length > 1.0f ? dx / length : 1.0f;
+				const Real forwardY = length > 1.0f ? dy / length : 0.0f;
+				Coord3D approaches[4];
+				for (Int j = 0; j < 4; ++j)
+					approaches[j] = *target->getPosition();
+				approaches[0].x += forwardX * 250.0f;
+				approaches[0].y += forwardY * 250.0f;
+				approaches[1].x -= forwardY * 250.0f;
+				approaches[1].y += forwardX * 250.0f;
+				approaches[2].x += forwardY * 250.0f;
+				approaches[2].y -= forwardX * 250.0f;
+				approaches[3].x -= forwardX * 250.0f;
+				approaches[3].y -= forwardY * 250.0f;
+				for (Int approachIndex = state.approachAttempt; approachIndex < 4; ++approachIndex) {
+					if (!TryConsumeSkirmishAITacticalPathQuery(
+							&tacticalQuickPathQueryCount,
+							MAX_SKIRMISH_AI_TACTICAL_QUICK_PATH_QUERIES_PER_UPDATE)) {
+						pathProbeDeferred = true;
+						break;
+					}
+					approaches[approachIndex].z = TheTerrainLogic->getGroundHeight(
+						approaches[approachIndex].x, approaches[approachIndex].y);
+					const Bool reachable =
+						TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+							representative->getAIUpdateInterface()->getLocomotorSet(),
+							representative->getPosition(), &approaches[approachIndex]);
+					state.approachAttempt = approachIndex + 1;
+					if (reachable) {
+						group->groupAttackMoveToPosition(&approaches[approachIndex],
+							NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+						state.lastProgressFrame = now;
+						state.blockedSinceFrame = 0;
+						state.regroupUntilFrame = now + 12 * LOGICFRAMES_PER_SECOND;
+						approachIssued = true;
+						break;
+					}
+				}
+			}
+			if (approachIssued)
+				continue;
+			Object *candidates[4] = { nullptr, nullptr, nullptr, nullptr };
+			Bool moreCandidates = false;
+			for (size_t candidateIndex = 0;
+				candidateIndex < alternateTargets.size(); ++candidateIndex) {
+				Object *candidate = alternateTargets[candidateIndex];
+				if (candidate == target || candidate->getControllingPlayer() != m_currentEnemy ||
+					(state.alternateProbeAfterID != INVALID_ID &&
+					 candidate->getID() <= state.alternateProbeAfterID) ||
+					(representative->getAbleToAttackSpecificObject(ATTACK_NEW_TARGET,
+						candidate, CMD_FROM_AI) == ATTACKRESULT_NOT_POSSIBLE))
+					continue;
+				if (candidates[3] && candidate->getID() > candidates[3]->getID()) {
+					moreCandidates = true;
+					continue;
+				}
+				for (Int j = 0; j < 4; ++j) {
+					if (!candidates[j] || candidate->getID() < candidates[j]->getID()) {
+						if (candidates[3])
+							moreCandidates = true;
+						for (Int k = 3; k > j; --k)
+							candidates[k] = candidates[k - 1];
+						candidates[j] = candidate;
+						break;
+					}
+				}
+			}
+			Object *alternate = nullptr;
+			Coord3D alternateApproach;
+			ObjectID lastAlternateProbeID = INVALID_ID;
+			for (Int j = 0; j < 4 && candidates[j]; ++j) {
+				for (Int candidate = 0; candidate < 2; ++candidate) {
+					Coord3D approach;
+					if (!GetSkirmishAIStrategyGroundApproach(
+							representative->getPosition(), candidates[j],
+							candidate, &approach))
+						continue;
+					if (!TryConsumeSkirmishAITacticalPathQuery(
+							&tacticalQuickPathQueryCount,
+								MAX_SKIRMISH_AI_TACTICAL_QUICK_PATH_QUERIES_PER_UPDATE)) {
+						pathProbeDeferred = true;
+						break;
+					}
+					if (TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+							representative->getAIUpdateInterface()->getLocomotorSet(),
+							representative->getPosition(), &approach)) {
+						alternate = candidates[j];
+						alternateApproach = approach;
+						break;
+					}
+				}
+				if (pathProbeDeferred || alternate)
+					break;
+				lastAlternateProbeID = candidates[j]->getID();
+			}
+			if (lastAlternateProbeID != INVALID_ID)
+				state.alternateProbeAfterID = lastAlternateProbeID;
+			if (alternate) {
+				group->groupAttackMoveToPosition(&alternateApproach,
+					NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+				state.alternateAttackIssuedTargetID = INVALID_ID;
+				state.targetID = alternate->getID();
+				state.targetHealth = alternate->getBodyModule()
+					? alternate->getBodyModule()->getHealth() : 0.0f;
+				const Real alternateDX = alternate->getPosition()->x -
+					representative->getPosition()->x;
+				const Real alternateDY = alternate->getPosition()->y -
+					representative->getPosition()->y;
+				state.distanceToTargetSqr =
+					alternateDX * alternateDX + alternateDY * alternateDY;
+				state.approachAttempt = 0;
+				state.alternateProbeAfterID = INVALID_ID;
+				state.routeExhaustedTargetID = INVALID_ID;
+				state.routeExhaustedUntilFrame = 0;
+				state.lastProgressFrame = now;
+				state.blockedSinceFrame = 0;
+				state.regroupUntilFrame = now + 20 * LOGICFRAMES_PER_SECOND;
+				continue;
+			}
+			Object *blockingDefense = nullptr;
+			double blockingDistance = 0.0;
+			if (target) {
+				const double lineX = (double)target->getPosition()->x -
+					representative->getPosition()->x;
+				const double lineY = (double)target->getPosition()->y -
+					representative->getPosition()->y;
+				for (size_t candidateIndex = 0;
+					candidateIndex < corridorDefenses.size(); ++candidateIndex) {
+					Object *candidate = corridorDefenses[candidateIndex];
+					if (!SkirmishAITunnelRoute::IsCorridorBlocker(
+							representative->getPosition()->x,
+							representative->getPosition()->y,
+							target->getPosition()->x, target->getPosition()->y,
+							candidate->getPosition()->x,
+							candidate->getPosition()->y, 350.0f))
+						continue;
+					const double dx = (double)candidate->getPosition()->x -
+						representative->getPosition()->x;
+					const double dy = (double)candidate->getPosition()->y -
+						representative->getPosition()->y;
+					const double cross = dx * lineY - dy * lineX;
+					const double distance = cross * cross;
+					if (!blockingDefense || distance < blockingDistance ||
+						(distance == blockingDistance && blockingDefense &&
+						 candidate->getID() < blockingDefense->getID())) {
+						blockingDefense = candidate;
+						blockingDistance = distance;
+					}
+				}
+			}
+			Bool tunnelBypassHandled = false;
+			if (blockingDefense)
+				tunnelBypassHandled = tryTunnelBypass(team, target,
+					blockingDefense, groupObject, state, representative,
+					hasAircraft, memberCount, now,
+					&aggregateTunnelPathQueryCount);
+			if (state.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE)
+				continue;
+			if (blockingDefense && (hasAircraft || hasArtillery)) {
+				AIGroupPtr strike = TheAI->createGroup();
+				if (strike) {
+					Bool hasStrike = false;
+					for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+						!member.done(); member.advance()) {
+						Object *object = member.cur();
+						const Bool aircraftExposed = object &&
+							object->isKindOf(KINDOF_AIRCRAFT) &&
+							blockingDefense->getAbleToAttackSpecificObject(
+								ATTACK_NEW_TARGET, object, CMD_FROM_AI) != ATTACKRESULT_NOT_POSSIBLE;
+						if (IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team) &&
+							(object->isKindOf(KINDOF_AIRCRAFT) ||
+							 object->getLargestWeaponRange() >= 250.0f) &&
+							!aircraftExposed &&
+							object->getAbleToAttackSpecificObject(ATTACK_NEW_TARGET,
+								blockingDefense, CMD_FROM_AI) != ATTACKRESULT_NOT_POSSIBLE) {
+							strike->add(object);
+							hasStrike = true;
+						}
+					}
+					if (hasStrike) {
+						strike->groupAttackObject(blockingDefense,
+							NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+						state.lastProgressFrame = now;
+						state.blockedSinceFrame = 0;
+						state.regroupUntilFrame = now + 20 * LOGICFRAMES_PER_SECOND;
+						continue;
+					}
+				}
+			}
+			if (tunnelBypassHandled)
+				continue;
+			// A deferred path probe is still eligible on the next scan. The
+			// defense bypass and strike opportunities above have already run.
+			if (pathProbeDeferred)
+				continue;
+			if (!moreCandidates && target &&
+				target->getID() == m_strategyState.strategicTargetID) {
+				state.routeExhaustedTargetID = target->getID();
+				state.routeExhaustedUntilFrame = now +
+					60 * LOGICFRAMES_PER_SECOND;
+				state.alternateProbeAfterID = INVALID_ID;
+			}
+		}
+		std::vector<Object *> retreatObjects[3];
+		for (size_t facilityIndex = 0;
+			facilityIndex < retreatFacilities.size(); ++facilityIndex) {
+			Object *friendly = retreatFacilities[facilityIndex];
+			Int kind = -1;
+			if ((representative->isKindOf(KINDOF_VEHICLE) &&
+				friendly->isKindOf(KINDOF_REPAIR_PAD)) ||
+				(representative->isKindOf(KINDOF_INFANTRY) &&
+				 friendly->isKindOf(KINDOF_HEAL_PAD)) ||
+				(representative->isKindOf(KINDOF_AIRCRAFT) &&
+				 friendly->isKindOf(KINDOF_FS_AIRFIELD)))
+				kind = 0;
+			else if (friendly->isKindOf(KINDOF_FS_BASE_DEFENSE))
+				kind = 1;
+			else if (friendly->isKindOf(KINDOF_FS_BARRACKS) ||
+				friendly->isKindOf(KINDOF_FS_WARFACTORY) ||
+				friendly->isKindOf(KINDOF_FS_AIRFIELD))
+				kind = 2;
+			if (kind >= 0)
+				retreatObjects[kind].push_back(friendly);
+		}
+		UnsignedInt facilityCount = 0;
+		for (Int kind = 0; kind < 3; ++kind) {
+			std::sort(retreatObjects[kind].begin(), retreatObjects[kind].end(),
+				IsSkirmishAIProducerIDBefore);
+			facilityCount += (UnsignedInt)retreatObjects[kind].size();
+		}
+		AIUpdateInterface *ai = representative->getAIUpdateInterface();
+		Bool foundRetreat = false;
+		Int teamRetreatPathQueryCount = 0;
+		Bool retreatProbeDeferred = false;
+		// Resume after the last deferred probe so a large set of blocked
+		// facilities cannot hide a later reachable one behind the team budget.
+		UnsignedInt start = state.retreatProbeCursor <= facilityCount
+			? state.retreatProbeCursor : 0;
+		for (UnsignedInt index = start;
+			index < facilityCount && !foundRetreat; ++index) {
+			UnsignedInt site = index;
+			Int kind = 0;
+			while (kind < 2 && site >= retreatObjects[kind].size()) {
+				site -= (UnsignedInt)retreatObjects[kind].size();
+				++kind;
+			}
+			Coord3D destination =
+				*retreatObjects[kind][site]->getPosition();
+			Real dx = representative->getPosition()->x - destination.x;
+			Real dy = representative->getPosition()->y - destination.y;
+			Real length = sqrt(dx * dx + dy * dy);
+			if (length > 1.0f) {
+				destination.x += dx * 100.0f / length;
+				destination.y += dy * 100.0f / length;
+			}
+			destination.z = TheTerrainLogic->getGroundHeight(
+				destination.x, destination.y);
+			if (!IsSkirmishTacticalRetreatPointSafe(
+					representative->getPosition(), &destination,
+					retreatHazards) || !ai)
+				continue;
+			if (teamRetreatPathQueryCount >=
+					MAX_SKIRMISH_AI_TACTICAL_RETREAT_PATH_QUERIES_PER_TEAM ||
+				retreatPathQueryCount >=
+					MAX_SKIRMISH_AI_TACTICAL_RETREAT_PATH_QUERIES_PER_UPDATE) {
+				state.retreatProbeCursor = index;
+				retreatProbeDeferred = true;
+				break;
+			}
+			++retreatPathQueryCount;
+			++teamRetreatPathQueryCount;
+			if (!TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+						ai->getLocomotorSet(), representative->getPosition(),
+						&destination))
+				continue;
+			group->groupGuardPosition(&destination,
+				GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+			foundRetreat = true;
+		}
+		if (retreatProbeDeferred)
+			continue;
+		// The base center is tried only after the facility sweep. A separate
+		// cursor value preserves that pending attempt when the shared budget ends.
+		if (!foundRetreat && ai &&
+			IsSkirmishTacticalRetreatPointSafe(
+				representative->getPosition(), &m_baseCenter, retreatHazards)) {
+			if (teamRetreatPathQueryCount >=
+					MAX_SKIRMISH_AI_TACTICAL_RETREAT_PATH_QUERIES_PER_TEAM ||
+				retreatPathQueryCount >=
+					MAX_SKIRMISH_AI_TACTICAL_RETREAT_PATH_QUERIES_PER_UPDATE) {
+				state.retreatProbeCursor = facilityCount;
+				continue;
+			}
+			++retreatPathQueryCount;
+			++teamRetreatPathQueryCount;
+			if (TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+						ai->getLocomotorSet(), representative->getPosition(),
+						&m_baseCenter)) {
+				group->groupGuardPosition(&m_baseCenter,
+					GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+				foundRetreat = true;
+			}
+		}
+		state.retreatProbeCursor = 0;
+		if (!foundRetreat)
+			group->groupGuardPosition(representative->getPosition(),
+				GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+		state.retreating = true;
+		state.retreatStartFrame = now;
+		// A failed objective waits for a full strategy window before another
+		// assault attempt. Health/counter retreats can regroup sooner.
+		state.regroupUntilFrame = now +
+			(stalled && !retreat ? 45 : 8) * LOGICFRAMES_PER_SECOND;
+		state.lastProgressFrame = now;
+		state.blockedSinceFrame = 0;
+	}
+}
+
+Bool AISkirmishPlayer::tryTunnelBypass(
+	Team *team, Object *target, Object *blockingDefense, AIGroup *group,
+	TacticalTeamState &state, Object *representative,
+	Bool hasAircraft, Int memberCount, UnsignedInt now,
+	Int *aggregatePathQueryCount)
+{
+	Int tunnelAttemptPathQueryCount = 0;
+	if (!team || !target || !blockingDefense || !group || !representative ||
+		!aggregatePathQueryCount ||
+		!m_player || !TheGameLogic || !TheAI || !TheAI->pathfinder() ||
+		!IsSkirmishAISupportedGLASide(m_player->getSide()) || hasAircraft ||
+		memberCount <= 0 || memberCount > MAX_SKIRMISH_AI_TUNNEL_MEMBERS ||
+		state.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE ||
+		m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
+		!IsSkirmishAIStrategyTunnelTargetUsable(target, m_player, m_currentEnemy) ||
+		blockingDefense->getControllingPlayer() != m_currentEnemy ||
+		!blockingDefense->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
+		blockingDefense->isEffectivelyDead() || blockingDefense->isDestroyed() ||
+		blockingDefense->testStatus(OBJECT_STATUS_SOLD) ||
+		!IsSkirmishStrategyIntelEligible(blockingDefense, m_player))
+		return false;
+	// A cooldown belongs to the team, not the target that initiated it. If
+	// strategy switches targets during the wait, defer that blocked target too;
+	// otherwise the caller would mark its untried bypass as exhausted.
+	if (!IsSkirmishStrategyFrameReached(now, state.tunnelCooldownUntilFrame))
+		return true;
+	state.tunnelWaitTargetID = INVALID_ID;
+
+	// Only one assault team may reserve the shared tunnel capacity at a time.
+	// This also makes simultaneous attempts deterministic in team-ID order.
+	std::map<UnsignedInt, TacticalTeamState>::const_iterator otherState;
+	for (otherState = m_tacticalTeams.begin(); otherState != m_tacticalTeams.end();
+		++otherState) {
+		if (otherState->first != team->getID() &&
+			otherState->second.tunnelTransitPhase !=
+				SKIRMISH_AI_TUNNEL_TRANSIT_NONE) {
+			state.tunnelCooldownUntilFrame = now +
+				SKIRMISH_AI_TUNNEL_RETRY_COOLDOWN_SECONDS * LOGICFRAMES_PER_SECOND;
+			state.tunnelWaitTargetID = target->getID();
+			return true;
+		}
+	}
+
+	std::vector<Object *> members;
+	for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+		!member.done(); member.advance()) {
+		Object *object = member.cur();
+		if (!IsSkirmishAIStrategyTunnelTransitMember(
+				object, m_player, team, false))
+			continue;
+		if (object->isKindOf(KINDOF_AIRCRAFT))
+			return false;
+		members.push_back(object);
+	}
+	std::sort(members.begin(), members.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+	if (members.empty() || (Int)members.size() != memberCount)
+		return false;
+
+	TunnelTracker *tracker = m_player->getTunnelSystem();
+	if (!tracker)
+		return false;
+	const Int tunnelCapacity = tracker->getContainMax();
+	if (tunnelCapacity <= 0 || members.size() > (UnsignedInt)tunnelCapacity)
+		return false;
+	if (tracker->getContainCount() + members.size() >
+		(UnsignedInt)tunnelCapacity) {
+		if (SkirmishAITunnelRoute::DeferFullTunnelCapacity(
+				target->getID(), now,
+				SKIRMISH_AI_TUNNEL_CAPACITY_WAIT_SECONDS *
+					LOGICFRAMES_PER_SECOND,
+				&state.tunnelCapacityWaitTargetID,
+				&state.tunnelCapacityWaitDeadlineFrame)) {
+			state.tunnelCooldownUntilFrame = now +
+				SKIRMISH_AI_TUNNEL_PAIR_PROBE_SECONDS *
+					LOGICFRAMES_PER_SECOND;
+			state.tunnelWaitTargetID = target->getID();
+			return true;
+		}
+		return false;
+	}
+	state.tunnelCapacityWaitTargetID = INVALID_ID;
+	state.tunnelCapacityWaitDeadlineFrame = 0;
+	for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex) {
+		if (!tracker->isValidContainerFor(members[memberIndex], false))
+			return false;
+	}
+
+	std::vector<Object *> tunnelObjects;
+	const std::list<ObjectID> *registeredIDs = tracker->getContainerList();
+	if (!registeredIDs)
+		return false;
+	std::list<ObjectID>::const_iterator tunnelID;
+	for (tunnelID = registeredIDs->begin(); tunnelID != registeredIDs->end();
+		tunnelID++) {
+		Object *object = TheGameLogic->findObjectByID(*tunnelID);
+		if (IsSkirmishAIStrategyTunnelEndpointLive(object, m_player))
+			tunnelObjects.push_back(object);
+	}
+	std::sort(tunnelObjects.begin(), tunnelObjects.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+	for (Int slot = 0;
+		slot < SkirmishAITunnelRoute::MAX_GENERATED_FORWARD_ENDPOINTS;
+		++slot) {
+		const ObjectID generatedID = m_tunnelGeneratedForwardEndpointIDs[slot];
+		Object *generated = generatedID != INVALID_ID
+			? TheGameLogic->findObjectByID(generatedID) : nullptr;
+		if (!generated || generated->getControllingPlayer() != m_player ||
+			generated->isEffectivelyDead() || generated->isDestroyed() ||
+			generated->testStatus(OBJECT_STATUS_SOLD)) {
+			m_tunnelGeneratedForwardEndpointIDs[slot] = INVALID_ID;
+			m_tunnelGeneratedForwardTargetIDs[slot] = INVALID_ID;
+		}
+	}
+	Object *homeEndpoint = m_tunnelHomeEndpointID != INVALID_ID ?
+		TheGameLogic->findObjectByID(m_tunnelHomeEndpointID) : nullptr;
+	if (SkirmishAITunnelRoute::ShouldReplaceLostEndpoint(
+			m_tunnelHomeAttempted, m_tunnelHomeEndpointID,
+			IsSkirmishAIStrategyTunnelEndpointLive(homeEndpoint, m_player))) {
+		m_tunnelHomeAttempted = FALSE;
+		m_tunnelHomeEndpointID = INVALID_ID;
+		m_tunnelBuildCooldownUntilFrame = now +
+			SKIRMISH_AI_TUNNEL_RETRY_COOLDOWN_SECONDS * LOGICFRAMES_PER_SECOND;
+	}
+	Object *forwardEndpoint = m_tunnelForwardEndpointID != INVALID_ID ?
+		TheGameLogic->findObjectByID(m_tunnelForwardEndpointID) : nullptr;
+	if (SkirmishAITunnelRoute::ShouldReplaceLostEndpoint(
+			m_tunnelForwardAttempted, m_tunnelForwardEndpointID,
+			IsSkirmishAIStrategyTunnelEndpointLive(forwardEndpoint, m_player))) {
+		m_tunnelForwardAttempted = FALSE;
+		m_tunnelForwardEndpointID = INVALID_ID;
+		m_tunnelForwardAttemptTargetID = INVALID_ID;
+		m_tunnelBuildCooldownUntilFrame = now +
+			SKIRMISH_AI_TUNNEL_RETRY_COOLDOWN_SECONDS * LOGICFRAMES_PER_SECOND;
+	}
+	if (m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_CONSTRUCTING ||
+		m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_CONSTRUCTING) {
+		Bool endpointRegistered = false;
+		for (size_t i = 0; i < tunnelObjects.size(); ++i) {
+			if (tunnelObjects[i]->getID() == m_tunnelBuildObjectID) {
+				endpointRegistered = true;
+				break;
+			}
+		}
+		if (endpointRegistered) {
+			if (m_tunnelBuildPhase ==
+					SKIRMISH_AI_TUNNEL_BUILD_HOME_CONSTRUCTING) {
+				m_tunnelHomeAttempted = TRUE;
+				m_tunnelHomeEndpointID = m_tunnelBuildObjectID;
+			} else {
+				m_tunnelForwardAttempted = TRUE;
+				m_tunnelForwardEndpointID = m_tunnelBuildObjectID;
+				SkirmishAITunnelRoute::RecordGeneratedForwardEndpoint(
+					m_tunnelGeneratedForwardEndpointIDs,
+					m_tunnelGeneratedForwardTargetIDs,
+					m_tunnelBuildObjectID, m_tunnelBuildTargetID);
+			}
+			m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_NONE;
+			m_tunnelBuildBuilderID = INVALID_ID;
+			m_tunnelBuildTargetID = INVALID_ID;
+			m_tunnelBuildBlockerID = INVALID_ID;
+			m_tunnelBuildObjectID = INVALID_ID;
+			m_tunnelBuildDeadlineFrame = 0;
+			m_tunnelBuildLocation.zero();
+			m_tunnelPendingBuilderCursor = 0;
+		} else {
+			Object *construction = m_tunnelBuildObjectID != INVALID_ID
+				? TheGameLogic->findObjectByID(m_tunnelBuildObjectID) : nullptr;
+			const Bool constructionAlive = construction &&
+				!construction->isEffectivelyDead() && !construction->isDestroyed();
+			if (!constructionAlive)
+				abandonTunnelBuildPlan(now, TRUE);
+			else if (IsSkirmishStrategyFrameReached(
+					now, m_tunnelBuildDeadlineFrame)) {
+				const Bool homeScaffold = m_tunnelBuildPhase ==
+					SKIRMISH_AI_TUNNEL_BUILD_HOME_CONSTRUCTING;
+				const ObjectID scaffoldID = m_tunnelBuildObjectID;
+				const ObjectID scaffoldTargetID = m_tunnelBuildTargetID;
+				abandonTunnelBuildPlan(now, TRUE);
+				m_tunnelBuildPhase = homeScaffold ?
+					SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE :
+					SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE;
+				m_tunnelBuildObjectID = scaffoldID;
+				m_tunnelBuildTargetID = scaffoldTargetID;
+				m_tunnelBuildDeadlineFrame = now +
+					120 * LOGICFRAMES_PER_SECOND;
+				return scaffoldTargetID == target->getID();
+			}
+			else if (m_tunnelBuildTargetID == target->getID())
+				return true;
+		}
+	}
+	if ((m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE ||
+		 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE) &&
+		m_tunnelBuildObjectID != INVALID_ID) {
+		Object *scaffold = TheGameLogic->findObjectByID(m_tunnelBuildObjectID);
+		Bool scaffoldRegistered = false;
+		for (size_t i = 0; i < tunnelObjects.size(); ++i)
+			if (tunnelObjects[i]->getID() == m_tunnelBuildObjectID) {
+				scaffoldRegistered = true;
+				break;
+			}
+		if (scaffoldRegistered) {
+			if (m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE) {
+				m_tunnelHomeAttempted = TRUE;
+				m_tunnelHomeEndpointID = m_tunnelBuildObjectID;
+			} else {
+				m_tunnelForwardAttempted = TRUE;
+				m_tunnelForwardEndpointID = m_tunnelBuildObjectID;
+				SkirmishAITunnelRoute::RecordGeneratedForwardEndpoint(
+					m_tunnelGeneratedForwardEndpointIDs,
+					m_tunnelGeneratedForwardTargetIDs,
+					m_tunnelBuildObjectID, m_tunnelBuildTargetID);
+			}
+			m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_NONE;
+			m_tunnelBuildBuilderID = INVALID_ID;
+			m_tunnelBuildTargetID = INVALID_ID;
+			m_tunnelBuildBlockerID = INVALID_ID;
+			m_tunnelBuildObjectID = INVALID_ID;
+			m_tunnelBuildDeadlineFrame = 0;
+			m_tunnelBuildLocation.zero();
+			m_tunnelPendingBuilderCursor = 0;
+		} else if (scaffold && !scaffold->isEffectivelyDead() &&
+			!scaffold->isDestroyed()) {
+			if (!IsSkirmishStrategyFrameReached(
+					now, m_tunnelBuildDeadlineFrame))
+				return m_tunnelBuildTargetID == target->getID();
+			// This owned scaffold has exhausted its registration grace. Carry
+			// the deadline into the generic unregistered-scaffold guard so it
+			// cannot start another wait for the same object.
+			state.tunnelScaffoldWaitObjectID = m_tunnelBuildObjectID;
+			state.tunnelScaffoldWaitUntilFrame = m_tunnelBuildDeadlineFrame;
+		} else {
+			m_tunnelBuildObjectID = INVALID_ID;
+			m_tunnelBuildDeadlineFrame = 0;
+		}
+	}
+	if (m_tunnelBuildPhase ==
+			SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE &&
+		SkirmishAITunnelRoute::ShouldConsumeHomeRetry(
+			(UnsignedInt)tunnelObjects.size())) {
+		m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_NONE;
+		m_tunnelHomeAttempted = TRUE;
+		m_tunnelBuildTargetID = INVALID_ID;
+		m_tunnelBuildBlockerID = INVALID_ID;
+		m_tunnelBuildDeadlineFrame = 0;
+	}
+	if (m_tunnelBuildPhase ==
+			SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE &&
+		tunnelObjects.empty()) {
+		m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_NONE;
+		m_tunnelForwardAttempted = TRUE;
+		m_tunnelBuildTargetID = INVALID_ID;
+		m_tunnelBuildBlockerID = INVALID_ID;
+		m_tunnelBuildDeadlineFrame = 0;
+	}
+	if (tunnelObjects.size() < 2) {
+		Bool queuedTunnel = false;
+		Bool deferredBuild = false;
+		const Bool needsHomeReplacement =
+			m_tunnelHomeEndpointID == INVALID_ID &&
+			tunnelObjects.size() == 1 &&
+			SkirmishAITunnelRoute::IsTrackedGeneratedForwardEndpoint(
+				tunnelObjects[0]->getID(),
+				m_tunnelGeneratedForwardEndpointIDs);
+		if ((tunnelObjects.empty() || needsHomeReplacement) &&
+			(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_NONE ||
+			 m_tunnelBuildPhase ==
+				SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE))
+			queuedTunnel = tryQueueTunnelEndpoint(
+				team, target, blockingDefense, TRUE, now,
+				&tunnelAttemptPathQueryCount, aggregatePathQueryCount,
+				state, &deferredBuild);
+		else if (!tunnelObjects.empty() &&
+			(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_NONE ||
+			 m_tunnelBuildPhase ==
+				SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE))
+			queuedTunnel = tryQueueTunnelEndpoint(
+				team, target, blockingDefense, FALSE, now,
+				&tunnelAttemptPathQueryCount, aggregatePathQueryCount,
+				state, &deferredBuild);
+		const Bool pendingBuildForTarget =
+			m_tunnelBuildTargetID == target->getID() &&
+			(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
+			 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED ||
+			 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_CONSTRUCTING ||
+			 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_CONSTRUCTING);
+		const Bool retryCooldownPending =
+			((m_tunnelBuildPhase ==
+				SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE &&
+				m_tunnelBuildTargetID == target->getID()) ||
+			 (m_tunnelBuildPhase ==
+				SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE &&
+				m_tunnelBuildTargetID == target->getID())) &&
+			!IsSkirmishStrategyFrameReached(
+				now, m_tunnelBuildCooldownUntilFrame);
+		return queuedTunnel || deferredBuild || pendingBuildForTarget || retryCooldownPending;
+	}
+
+	if (tunnelObjects.size() > MAX_SKIRMISH_AI_TUNNEL_ENDPOINT_PROBES) {
+		// A scripted network can exceed the saveable cache bound. Keep ground
+		// tactics available without creating state that cannot be serialized.
+		state.tunnelEndpointProbes.clear();
+		state.tunnelPairSweepTargetID = INVALID_ID;
+		return false;
+	}
+
+	// Cache team reachability by endpoint for this bounded sweep. Unit motion
+	// does not restart the cursor; the selected route is probed again live.
+	UnsignedInt endpointSignature = (UnsignedInt)tunnelObjects.size();
+	for (size_t i = 0; i < tunnelObjects.size(); ++i)
+		endpointSignature = endpointSignature * 33u +
+			(UnsignedInt)tunnelObjects[i]->getID();
+	// A failed approach belongs to the unit positions where it was tested.
+	// Quantize motion so tiny movement does not restart a large pair sweep.
+	UnsignedInt movementSignature = (UnsignedInt)members.size();
+	for (size_t movementMemberIndex = 0; movementMemberIndex < members.size(); ++movementMemberIndex) {
+		const Coord3D *position = members[movementMemberIndex]->getPosition();
+		movementSignature = movementSignature * 33u +
+			(UnsignedInt)(Int)(position->x / 80.0f);
+		movementSignature = movementSignature * 33u +
+			(UnsignedInt)(Int)(position->y / 80.0f);
+	}
+	const UnsignedInt pairCount = (UnsignedInt)(
+		tunnelObjects.size() * (tunnelObjects.size() - 1) / 2);
+	Bool cacheIdentityChanged =
+		state.tunnelPairSweepTargetID != target->getID() ||
+		state.tunnelPairEndpointSignature != endpointSignature ||
+		state.tunnelEndpointProbes.size() != tunnelObjects.size() ||
+		state.tunnelProbeMemberCount != (Int)members.size();
+	if (!cacheIdentityChanged) {
+		for (size_t i = 0; i < tunnelObjects.size(); ++i)
+			if (state.tunnelEndpointProbes[i].objectID !=
+				tunnelObjects[i]->getID()) {
+				cacheIdentityChanged = TRUE;
+				break;
+			}
+		for (size_t identityMemberIndex = 0; identityMemberIndex < members.size(); ++identityMemberIndex)
+			if (state.tunnelProbeMemberIDs[identityMemberIndex] != members[identityMemberIndex]->getID()) {
+				cacheIdentityChanged = TRUE;
+				break;
+			}
+	}
+	if (cacheIdentityChanged) {
+		state.tunnelPairSweepTargetID = target->getID();
+		state.tunnelPairEndpointSignature = endpointSignature;
+		state.tunnelProbeMovementSignature = movementSignature;
+		state.tunnelPairSweepRemaining = pairCount;
+		state.tunnelPairSweepStartFrame = now;
+		state.tunnelPairResumeAfterFrame = 0;
+		state.tunnelPairRetryAfterFrame = 0;
+		state.tunnelPairRefreshCursor = state.tunnelPairCursor;
+		state.tunnelPairRefreshRemaining = pairCount;
+		state.tunnelPairRefreshAfterFrame = now +
+			15 * LOGICFRAMES_PER_SECOND;
+		state.tunnelPairRefreshCacheAfterFrame =
+			state.tunnelPairRefreshAfterFrame;
+		state.tunnelPairRefreshYieldMain = FALSE;
+		state.tunnelProbeMemberCount = (Int)members.size();
+		for (size_t i = 0; i < members.size(); ++i)
+			state.tunnelProbeMemberIDs[i] = members[i]->getID();
+		state.tunnelEndpointProbes.clear();
+		for (size_t probeEndpointIndex = 0; probeEndpointIndex < tunnelObjects.size(); ++probeEndpointIndex) {
+			TacticalTeamState::TunnelEndpointProbe probe;
+			probe.objectID = tunnelObjects[probeEndpointIndex]->getID();
+			state.tunnelEndpointProbes.push_back(probe);
+		}
+	}
+	if (!cacheIdentityChanged &&
+		state.tunnelProbeMovementSignature != movementSignature)
+		state.tunnelPairRefreshAfterFrame = now;
+	if (state.tunnelPairSweepRemaining > pairCount)
+		state.tunnelPairSweepRemaining = pairCount;
+	if (state.tunnelPairRefreshRemaining > pairCount)
+		state.tunnelPairRefreshRemaining = pairCount;
+	if (SkirmishAITunnelRoute::ShouldRestartEndpointSweep(
+			state.tunnelPairSweepRemaining, now,
+			state.tunnelPairRetryAfterFrame)) {
+		state.tunnelPairSweepRemaining = pairCount;
+		state.tunnelPairSweepStartFrame = now;
+		state.tunnelPairResumeAfterFrame = 0;
+		state.tunnelPairRetryAfterFrame = 0;
+		for (size_t i = 0; i < state.tunnelEndpointProbes.size(); ++i) {
+			state.tunnelEndpointProbes[i].entryResult = 0;
+			state.tunnelEndpointProbes[i].exitResult = 0;
+		}
+	}
+	if (state.tunnelPairSweepRemaining &&
+		state.tunnelPairResumeAfterFrame &&
+		!IsSkirmishStrategyFrameReached(
+			now, state.tunnelPairResumeAfterFrame))
+		return false;
+	if (state.tunnelPairResumeAfterFrame) {
+		state.tunnelPairResumeAfterFrame = 0;
+		state.tunnelPairSweepStartFrame = now;
+	}
+	if (state.tunnelPairSweepRemaining &&
+		SkirmishAITunnelRoute::ProbeEpochExpired(now,
+			state.tunnelPairSweepStartFrame,
+			60 * LOGICFRAMES_PER_SECOND)) {
+		// Let normal tactical recovery run while retaining the saved pair cursor.
+		state.tunnelPairResumeAfterFrame = now +
+			45 * LOGICFRAMES_PER_SECOND;
+		for (size_t i = 0; i < state.tunnelEndpointProbes.size(); ++i) {
+			state.tunnelEndpointProbes[i].entryResult = 0;
+			state.tunnelEndpointProbes[i].exitResult = 0;
+		}
+		return false;
+	}
+	// Revisit earlier pairs on a separate cursor. This notices changed paths
+	// without restarting or starving the main finite sweep.
+	Bool refreshTurn = FALSE;
+	if (state.tunnelPairRefreshYieldMain)
+		state.tunnelPairRefreshYieldMain = FALSE;
+	else if (IsSkirmishStrategyFrameReached(
+			now, state.tunnelPairRefreshAfterFrame)) {
+		refreshTurn = TRUE;
+		state.tunnelPairRefreshYieldMain = TRUE;
+		state.tunnelPairRefreshAfterFrame = now +
+			4 * LOGICFRAMES_PER_SECOND;
+		if (!state.tunnelPairRefreshRemaining)
+			state.tunnelPairRefreshRemaining = pairCount;
+		if (state.tunnelProbeMovementSignature != movementSignature ||
+			IsSkirmishStrategyFrameReached(
+				now, state.tunnelPairRefreshCacheAfterFrame)) {
+			state.tunnelProbeMovementSignature = movementSignature;
+			state.tunnelPairRefreshCacheAfterFrame = now +
+				15 * LOGICFRAMES_PER_SECOND;
+			for (size_t i = 0; i < state.tunnelEndpointProbes.size(); ++i) {
+				if (state.tunnelEndpointProbes[i].entryResult < 0)
+					state.tunnelEndpointProbes[i].entryResult = 0;
+				if (state.tunnelEndpointProbes[i].exitResult < 0)
+					state.tunnelEndpointProbes[i].exitResult = 0;
+			}
+		}
+	}
+	// Geometry is cheap; keep a CPU cap while endpoint path results are reused.
+	for (Int pairProbe = 0; pairProbe < 256; ++pairProbe) {
+	const Bool refreshPair = refreshTurn && pairProbe < 128 &&
+		state.tunnelPairRefreshRemaining > 0;
+	if (!refreshPair && state.tunnelPairSweepRemaining == 0)
+		break;
+	UnsignedInt *pairCursor = refreshPair
+		? &state.tunnelPairRefreshCursor : &state.tunnelPairCursor;
+	UnsignedInt *pairRemaining = refreshPair
+		? &state.tunnelPairRefreshRemaining : &state.tunnelPairSweepRemaining;
+	Int firstIndex = 0;
+	Int secondIndex = 0;
+	if (!SkirmishAITunnelRoute::SelectPairIndices(
+			(Int)tunnelObjects.size(), *pairCursor,
+			&firstIndex, &secondIndex))
+		return false;
+	SkirmishAITunnelRoute::Endpoint pairEndpoints[2];
+	for (Int endpointIndex = 0; endpointIndex < 2; ++endpointIndex) {
+		Object *object = endpointIndex == 0 ?
+			tunnelObjects[firstIndex] : tunnelObjects[secondIndex];
+		pairEndpoints[endpointIndex].objectID = object->getID();
+		pairEndpoints[endpointIndex].x = object->getPosition()->x;
+		pairEndpoints[endpointIndex].y = object->getPosition()->y;
+		pairEndpoints[endpointIndex].usable = TRUE;
+		pairEndpoints[endpointIndex].groundApproachReachable = FALSE;
+		pairEndpoints[endpointIndex].groundExitReachable = FALSE;
+	}
+	Int entryIndex = 0;
+	Int exitIndex = 0;
+	if (!SkirmishAITunnelRoute::SelectDirectedPair(pairEndpoints,
+			target->getPosition()->x, target->getPosition()->y, 10000.0,
+			&entryIndex, &exitIndex)) {
+		++*pairCursor;
+		--*pairRemaining;
+		continue;
+	}
+	const Int entryObjectIndex = entryIndex == 0 ? firstIndex : secondIndex;
+	const Int exitObjectIndex = exitIndex == 0 ? firstIndex : secondIndex;
+	Object *entryObject = tunnelObjects[entryObjectIndex];
+	Object *exitObject = tunnelObjects[exitObjectIndex];
+	TacticalTeamState::TunnelEndpointProbe &entryProbe =
+		state.tunnelEndpointProbes[entryObjectIndex];
+	TacticalTeamState::TunnelEndpointProbe &exitProbe =
+		state.tunnelEndpointProbes[exitObjectIndex];
+	const Int sideAllowance = SkirmishAITunnelRoute::
+		EndpointSideQueryAllowance((Int)members.size());
+	if (entryProbe.entryResult == 0) {
+		if (!SkirmishAITunnelRoute::CanReservePairQueries(
+				sideAllowance, tunnelAttemptPathQueryCount,
+				*aggregatePathQueryCount,
+				MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_ATTEMPT,
+				MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_UPDATE)) {
+			state.tunnelCooldownUntilFrame = now +
+				SKIRMISH_AI_TUNNEL_PAIR_PROBE_SECONDS * LOGICFRAMES_PER_SECOND;
+			return true;
+		}
+		entryProbe.entryResult = ProbeSkirmishAITunnelEndpointRole(
+			members, entryObject, target, TRUE,
+			&tunnelAttemptPathQueryCount, aggregatePathQueryCount);
+	}
+	if (entryProbe.entryResult < 0) {
+		++*pairCursor;
+		--*pairRemaining;
+		continue;
+	}
+	if (exitProbe.exitResult == 0) {
+		if (!SkirmishAITunnelRoute::CanReservePairQueries(
+				sideAllowance, tunnelAttemptPathQueryCount,
+				*aggregatePathQueryCount,
+				MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_ATTEMPT,
+				MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_UPDATE)) {
+			state.tunnelCooldownUntilFrame = now +
+				SKIRMISH_AI_TUNNEL_PAIR_PROBE_SECONDS * LOGICFRAMES_PER_SECOND;
+			return true;
+		}
+		exitProbe.exitResult = ProbeSkirmishAITunnelEndpointRole(
+			members, exitObject, target, FALSE,
+			&tunnelAttemptPathQueryCount, aggregatePathQueryCount);
+	}
+	if (exitProbe.exitResult < 0) {
+		++*pairCursor;
+		--*pairRemaining;
+		continue;
+	}
+	pairEndpoints[entryIndex].groundApproachReachable = TRUE;
+	pairEndpoints[exitIndex].groundExitReachable = TRUE;
+
+	SkirmishAITunnelRoute::Plan plan;
+	if (!SkirmishAITunnelRoute::SelectAssaultPlan(
+			TRUE, TRUE, FALSE, TRUE, TRUE,
+			representative->getPosition()->x,
+			representative->getPosition()->y,
+			target->getPosition()->x, target->getPosition()->y,
+			10000.0, pairEndpoints, 2, &plan))
+	{
+		++*pairCursor;
+		--*pairRemaining;
+		continue;
+	}
+	Object *entry = TheGameLogic->findObjectByID(plan.entryTunnelID);
+	Object *exit = TheGameLogic->findObjectByID(plan.exitTunnelID);
+	if (!IsSkirmishAIStrategyTunnelEndpointRegistered(entry, m_player, tracker) ||
+		!IsSkirmishAIStrategyTunnelEndpointRegistered(exit, m_player, tracker) ||
+		tracker->getContainCount() + members.size() > (UnsignedInt)tunnelCapacity) {
+		++*pairCursor;
+		--*pairRemaining;
+		continue;
+	}
+	// Cached results are only a search hint. Validate every current member
+	// immediately before the group enters, without losing this pair on budget.
+	if (!SkirmishAITunnelRoute::CanReservePairQueries(
+			SkirmishAITunnelRoute::LivePairQueryAllowance(
+				(Int)members.size()), tunnelAttemptPathQueryCount,
+			*aggregatePathQueryCount,
+			MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_ATTEMPT,
+			MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_UPDATE)) {
+		state.tunnelCooldownUntilFrame = now +
+			SKIRMISH_AI_TUNNEL_PAIR_PROBE_SECONDS * LOGICFRAMES_PER_SECOND;
+		return true;
+	}
+	const Int liveEntry = ProbeSkirmishAITunnelEndpointRole(
+		members, entry, target, TRUE,
+		&tunnelAttemptPathQueryCount, aggregatePathQueryCount);
+	const Int liveExit = liveEntry > 0 ?
+		ProbeSkirmishAITunnelEndpointRole(members, exit, target, FALSE,
+			&tunnelAttemptPathQueryCount, aggregatePathQueryCount) : 0;
+	++*pairCursor;
+	--*pairRemaining;
+	if (liveEntry < 0 || liveExit < 0) {
+		if (liveEntry < 0)
+			entryProbe.entryResult = -1;
+		if (liveExit < 0)
+			exitProbe.exitResult = -1;
+		continue;
+	}
+
+	state.tunnelTransitPhase = SKIRMISH_AI_TUNNEL_TRANSIT_ENTERING;
+	state.tunnelPhaseDeadlineFrame = now +
+		SKIRMISH_AI_TUNNEL_TRANSIT_TIMEOUT_SECONDS * LOGICFRAMES_PER_SECOND;
+	state.tunnelCooldownUntilFrame = now +
+		SKIRMISH_AI_TUNNEL_SUCCESS_COOLDOWN_SECONDS * LOGICFRAMES_PER_SECOND;
+	state.tunnelMemberCount = (Int)members.size();
+	for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex)
+		state.tunnelMemberIDs[memberIndex] = members[memberIndex]->getID();
+	state.tunnelEntryID = entry->getID();
+	state.tunnelExitID = exit->getID();
+	state.tunnelTargetID = target->getID();
+	state.tunnelCommittedTargetLastSeenFrame = now;
+	state.tunnelWaitTargetID = target->getID();
+	state.tunnelStrategicTargetID = m_strategyState.strategicTargetID;
+	state.targetID = target->getID();
+	state.lastProgressFrame = now;
+	state.blockedSinceFrame = 0;
+	state.tunnelPairSweepTargetID = INVALID_ID;
+	group->groupEnter(entry, CMD_FROM_AI);
+	return true;
+	}
+	if (state.tunnelPairSweepRemaining == 0) {
+		if (!state.tunnelPairRetryAfterFrame) {
+			state.tunnelPairRetryAfterFrame = now +
+				60 * LOGICFRAMES_PER_SECOND;
+			if (!state.tunnelPairRetryAfterFrame)
+				state.tunnelPairRetryAfterFrame = 1;
+		}
+		Bool queuedTunnel = false;
+		Bool deferredBuild = false;
+		if (m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_NONE ||
+			m_tunnelBuildPhase ==
+				SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE)
+			queuedTunnel = tryQueueTunnelEndpoint(
+				team, target, blockingDefense, FALSE, now,
+				&tunnelAttemptPathQueryCount, aggregatePathQueryCount,
+				state, &deferredBuild);
+		const Bool pendingBuildForTarget =
+			m_tunnelBuildTargetID == target->getID() &&
+			(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
+			 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED ||
+			 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_CONSTRUCTING ||
+			 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_CONSTRUCTING);
+		const Bool retryCooldownPending =
+			m_tunnelBuildPhase ==
+				SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE &&
+			m_tunnelBuildTargetID == target->getID() &&
+			!IsSkirmishStrategyFrameReached(
+				now, m_tunnelBuildCooldownUntilFrame);
+		return queuedTunnel || deferredBuild || pendingBuildForTarget ||
+			retryCooldownPending;
+	}
+	state.tunnelCooldownUntilFrame = now +
+		SKIRMISH_AI_TUNNEL_PAIR_PROBE_SECONDS * LOGICFRAMES_PER_SECOND;
+	return true;
+}
+
+static void ExitContainedSkirmishAITunnelMembers(
+	const std::vector<Object *> &members, TunnelTracker *tracker,
+	Object *tunnel)
+{
+	for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex) {
+		Object *member = members[memberIndex];
+		const Bool contained = tracker ? tracker->isInContainer(member) :
+			member && member->isContained();
+		AIUpdateInterface *ai = member ? member->getAIUpdateInterface() : nullptr;
+		if (contained && ai)
+			ai->aiExit(tunnel, CMD_FROM_AI);
+	}
+}
+
+void AISkirmishPlayer::updateTunnelTransit(
+	Team *team, TacticalTeamState &state, UnsignedInt now)
+{
+	if (!team || !TheGameLogic ||
+		state.tunnelTransitPhase == SKIRMISH_AI_TUNNEL_TRANSIT_NONE)
+		return;
+
+	std::vector<Object *> members;
+	Bool memberSetStable = state.tunnelMemberCount > 0;
+	TunnelTracker *tracker = m_player ? m_player->getTunnelSystem() : nullptr;
+	for (Int memberIndex = 0; memberIndex < state.tunnelMemberCount; ++memberIndex) {
+		Object *object = TheGameLogic->findObjectByID(
+			state.tunnelMemberIDs[memberIndex]);
+		if (!object || object->isEffectivelyDead() || object->isDestroyed() ||
+			object->getControllingPlayer() != m_player) {
+			memberSetStable = false;
+			continue;
+		}
+		if (!IsSkirmishAIStrategyTunnelTransitMember(
+				object, m_player, team, true) ||
+			object->isKindOf(KINDOF_AIRCRAFT)) {
+			memberSetStable = false;
+			// A saved passenger can change teams while contained. Keep it in
+			// the exit accounting, but never issue the former team's orders.
+			const Bool contained = tracker ? tracker->isInContainer(object) :
+				object->isContained();
+			if (contained && object->getTeam() != team)
+				members.push_back(object);
+			continue;
+		}
+		// A selected member entering another container has left the planned
+		// tunnel route, even though it still belongs to this team.
+		if (tracker && object->isContained() &&
+			!tracker->isInContainer(object))
+			memberSetStable = false;
+		members.push_back(object);
+	}
+	Int currentTeamMembers = 0;
+	for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+		!member.done(); member.advance()) {
+		Object *object = member.cur();
+		if (!IsSkirmishAIStrategyTunnelTransitMember(
+				object, m_player, team, true) ||
+			object->isKindOf(KINDOF_AIRCRAFT))
+			continue;
+		const Bool contained = tracker ? tracker->isInContainer(object) :
+			object->isContained();
+		// Cargo inside a selected transport shares its team, but was never
+		// selected to enter the tunnel as a separate member.
+		if (object->isContained() && !contained)
+			continue;
+		++currentTeamMembers;
+		if (!contained)
+			continue;
+		Bool alreadyTracked = FALSE;
+		for (size_t i = 0; i < members.size(); ++i)
+			if (members[i]->getID() == object->getID()) {
+				alreadyTracked = TRUE;
+				break;
+			}
+		if (!alreadyTracked)
+			members.push_back(object);
+	}
+	if (currentTeamMembers != state.tunnelMemberCount)
+		memberSetStable = false;
+	std::sort(members.begin(), members.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+
+	AIGroupPtr group = TheAI ? TheAI->createGroup() : nullptr;
+	AIGroup *groupObject = nullptr;
+	if (group) {
+#if RETAIL_COMPATIBLE_AIGROUP
+		groupObject = group;
+#else
+		groupObject = group.Peek();
+#endif
+		for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex)
+			if (members[memberIndex]->getTeam() == team)
+				groupObject->add(members[memberIndex]);
+	}
+
+	Int containedCount = 0;
+	for (size_t containmentMemberIndex = 0; containmentMemberIndex < members.size(); ++containmentMemberIndex) {
+		const Bool contained = tracker
+			? tracker->isInContainer(members[containmentMemberIndex])
+			: members[containmentMemberIndex]->isContained();
+		if (contained)
+			++containedCount;
+	}
+	const Bool allContained = memberSetStable && !members.empty() &&
+		containedCount == state.tunnelMemberCount;
+	const Bool allOut = containedCount == 0;
+
+	Object *target = state.tunnelTargetID != INVALID_ID
+		? TheGameLogic->findObjectByID(state.tunnelTargetID) : nullptr;
+	const Bool targetUnchanged =
+		m_strategyState.strategicTargetID == state.tunnelStrategicTargetID;
+	const Bool targetVisibleUsable = IsSkirmishAIStrategyTunnelTargetUsable(
+		target, m_player, m_currentEnemy);
+	// Boarding can remove the team's only vision of its already committed
+	// objective. Let it finish the planned transit while that observation is
+	// fresh, but never use a hidden target for a new attack order.
+	const ObjectShroudStatus targetShroud = target && m_player
+		? target->getShroudedStatus(m_player->getPlayerIndex())
+		: OBJECTSHROUD_CLEAR;
+	const Bool targetHiddenByFog = target && m_player &&
+		targetShroud != OBJECTSHROUD_CLEAR &&
+		targetShroud != OBJECTSHROUD_PARTIAL_CLEAR;
+	const Bool targetLiveEnemyStatic = target && m_player && m_currentEnemy &&
+		target->getControllingPlayer() == m_currentEnemy &&
+		IsSkirmishStrategyStaticTarget(target) &&
+		!target->isEffectivelyDead() && !target->isDestroyed() &&
+		!target->testStatus(OBJECT_STATUS_SOLD);
+	const Bool targetWouldBeIntelEligible = target &&
+		IsSkirmishAIIntelEligible(target->isKindOf(KINDOF_STRUCTURE), TRUE,
+			FALSE, target->testStatus(OBJECT_STATUS_STEALTHED),
+			target->testStatus(OBJECT_STATUS_DETECTED),
+			target->testStatus(OBJECT_STATUS_MASKED));
+	const Bool targetGraceUsable = targetUnchanged &&
+		targetHiddenByFog && targetLiveEnemyStatic &&
+		targetWouldBeIntelEligible &&
+		(state.tunnelTargetID == state.tunnelStrategicTargetID
+			? IsSkirmishStrategyTargetObservationAvailable(
+				m_strategyState.strategicTargetObserved, now,
+				m_strategyState.strategicTargetLastSeenFrame)
+			: IsSkirmishStrategyTargetObservationAvailable(TRUE, now,
+				state.tunnelCommittedTargetLastSeenFrame));
+	const Bool targetUsable = m_strategyState.currentMode ==
+		SKIRMISH_STRATEGY_ASSAULT && targetUnchanged &&
+		(targetVisibleUsable || targetGraceUsable);
+	Object *currentTarget = m_strategyState.strategicTargetID != INVALID_ID
+		? TheGameLogic->findObjectByID(m_strategyState.strategicTargetID) : nullptr;
+	if (!IsSkirmishAIStrategyTunnelTargetUsable(
+			currentTarget, m_player, m_currentEnemy))
+		currentTarget = nullptr;
+
+	Object *entry = state.tunnelEntryID != INVALID_ID
+		? TheGameLogic->findObjectByID(state.tunnelEntryID) : nullptr;
+	Object *exit = state.tunnelExitID != INVALID_ID
+		? TheGameLogic->findObjectByID(state.tunnelExitID) : nullptr;
+	const Bool entryRegistered = IsSkirmishAIStrategyTunnelEndpointRegistered(
+		entry, m_player, tracker);
+	const Bool exitRegistered = IsSkirmishAIStrategyTunnelEndpointRegistered(
+		exit, m_player, tracker);
+
+	if (members.empty()) {
+		state.tunnelWaitTargetID = targetVisibleUsable && targetUsable
+			? state.tunnelTargetID : INVALID_ID;
+		state.tunnelTransitPhase = SKIRMISH_AI_TUNNEL_TRANSIT_NONE;
+		state.tunnelPhaseDeadlineFrame = 0;
+		state.tunnelMemberCount = 0;
+		for (Int i = 0; i < MAX_SKIRMISH_AI_TUNNEL_MEMBERS; ++i)
+			state.tunnelMemberIDs[i] = INVALID_ID;
+		state.tunnelEntryID = INVALID_ID;
+		state.tunnelExitID = INVALID_ID;
+		state.tunnelTargetID = INVALID_ID;
+		state.tunnelStrategicTargetID = INVALID_ID;
+		state.tunnelCommittedTargetLastSeenFrame = 0;
+		state.tunnelCooldownUntilFrame = now +
+			SKIRMISH_AI_TUNNEL_SUCCESS_COOLDOWN_SECONDS * LOGICFRAMES_PER_SECOND;
+		return;
+	}
+
+	Bool abortTransit = !memberSetStable || !targetUsable;
+	if (state.tunnelTransitPhase == SKIRMISH_AI_TUNNEL_TRANSIT_ENTERING) {
+		const Int capacity = tracker ? tracker->getContainMax() : 0;
+		const Int remaining = state.tunnelMemberCount - containedCount;
+		const Bool capacityAvailable = tracker && capacity > 0 && remaining >= 0 &&
+			tracker->getContainCount() + (UnsignedInt)remaining <=
+				(UnsignedInt)capacity;
+		if (!entryRegistered || !capacityAvailable ||
+			IsSkirmishStrategyFrameReached(now, state.tunnelPhaseDeadlineFrame))
+			abortTransit = true;
+		if (!abortTransit && allContained) {
+			if (exitRegistered && targetUsable) {
+				if (groupObject)
+					groupObject->groupExit(exit, CMD_FROM_AI);
+				else {
+					for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex) {
+						AIUpdateInterface *ai = members[memberIndex]->getAIUpdateInterface();
+						if (ai && tracker->isInContainer(members[memberIndex]))
+							ai->aiExit(exit, CMD_FROM_AI);
+					}
+				}
+				state.tunnelTransitPhase = SKIRMISH_AI_TUNNEL_TRANSIT_EXITING;
+				state.tunnelPhaseDeadlineFrame = now +
+					SKIRMISH_AI_TUNNEL_TRANSIT_TIMEOUT_SECONDS * LOGICFRAMES_PER_SECOND;
+				return;
+			}
+			abortTransit = true;
+		}
+		if (!abortTransit)
+			return;
+	} else if (state.tunnelTransitPhase == SKIRMISH_AI_TUNNEL_TRANSIT_EXITING) {
+		if (allOut) {
+			abortTransit = false;
+		} else if (!exitRegistered ||
+			IsSkirmishStrategyFrameReached(now, state.tunnelPhaseDeadlineFrame)) {
+			abortTransit = true;
+		} else {
+			return;
+		}
+	} else if (state.tunnelTransitPhase ==
+			SKIRMISH_AI_TUNNEL_TRANSIT_FALLBACK_EXIT) {
+		if (!allOut) {
+			if (IsSkirmishStrategyFrameReached(now, state.tunnelPhaseDeadlineFrame)) {
+				Object *fallbackExit = SelectSkirmishAIStrategyFallbackTunnel(
+					m_player, tracker, state.tunnelExitID, INVALID_ID);
+				state.tunnelExitID = fallbackExit ? fallbackExit->getID() : INVALID_ID;
+				ExitContainedSkirmishAITunnelMembers(
+					members, tracker, fallbackExit);
+				state.tunnelPhaseDeadlineFrame = now +
+					SKIRMISH_AI_TUNNEL_TRANSIT_TIMEOUT_SECONDS * LOGICFRAMES_PER_SECOND;
+			}
+			return;
+		}
+	} else {
+		abortTransit = true;
+	}
+
+	if (abortTransit && !allOut) {
+		if (state.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_FALLBACK_EXIT) {
+			Object *fallbackExit = SelectSkirmishAIStrategyFallbackTunnel(
+				m_player, tracker, INVALID_ID, state.tunnelEntryID);
+			state.tunnelExitID = fallbackExit ? fallbackExit->getID() : INVALID_ID;
+			ExitContainedSkirmishAITunnelMembers(
+				members, tracker, fallbackExit);
+			state.tunnelTransitPhase = SKIRMISH_AI_TUNNEL_TRANSIT_FALLBACK_EXIT;
+			state.tunnelPhaseDeadlineFrame = now +
+				SKIRMISH_AI_TUNNEL_TRANSIT_TIMEOUT_SECONDS * LOGICFRAMES_PER_SECOND;
+			state.tunnelCooldownUntilFrame = now +
+				SKIRMISH_AI_TUNNEL_SUCCESS_COOLDOWN_SECONDS * 2 *
+				LOGICFRAMES_PER_SECOND;
+		}
+		return;
+	}
+
+	const Bool completedAtPlannedExit =
+		state.tunnelTransitPhase == SKIRMISH_AI_TUNNEL_TRANSIT_EXITING &&
+		targetUsable && exitRegistered;
+	state.tunnelWaitTargetID = targetVisibleUsable && targetUsable
+		? state.tunnelTargetID : INVALID_ID;
+	state.tunnelTransitPhase = SKIRMISH_AI_TUNNEL_TRANSIT_NONE;
+	state.tunnelPhaseDeadlineFrame = 0;
+	state.tunnelMemberCount = 0;
+	for (Int i = 0; i < MAX_SKIRMISH_AI_TUNNEL_MEMBERS; ++i)
+		state.tunnelMemberIDs[i] = INVALID_ID;
+	state.tunnelEntryID = INVALID_ID;
+	state.tunnelExitID = INVALID_ID;
+	state.tunnelTargetID = INVALID_ID;
+	state.tunnelStrategicTargetID = INVALID_ID;
+	state.tunnelCommittedTargetLastSeenFrame = 0;
+	state.tunnelCooldownUntilFrame = now +
+		(completedAtPlannedExit ? SKIRMISH_AI_TUNNEL_SUCCESS_COOLDOWN_SECONDS :
+			SKIRMISH_AI_TUNNEL_SUCCESS_COOLDOWN_SECONDS * 2) *
+		LOGICFRAMES_PER_SECOND;
+	state.lastProgressFrame = now;
+	state.blockedSinceFrame = 0;
+	state.regroupUntilFrame = now + 8 * LOGICFRAMES_PER_SECOND;
+	if (!targetUnchanged) {
+		state.targetID = INVALID_ID;
+		state.targetHealth = 0.0f;
+		state.distanceToTargetSqr = 0.0f;
+		state.approachAttempt = 0;
+		state.alternateProbeAfterID = INVALID_ID;
+		state.routeExhaustedTargetID = INVALID_ID;
+		state.routeExhaustedUntilFrame = 0;
+	}
+
+	if (m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+		!currentTarget && targetVisibleUsable && targetUsable)
+		currentTarget = target;
+	if (groupObject) {
+		if (m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT && currentTarget)
+			groupObject->groupAttackMoveToPosition(currentTarget->getPosition(),
+				NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+		else if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+			m_baseCenterSet)
+			groupObject->groupGuardPosition(&m_baseCenter,
+				GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+		else
+			groupObject->groupIdle(CMD_FROM_AI);
+	} else {
+		for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex) {
+			if (members[memberIndex]->getTeam() != team)
+				continue;
+			AIUpdateInterface *ai = members[memberIndex]->getAIUpdateInterface();
+			if (!ai)
+				continue;
+			if (m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+				currentTarget)
+				ai->aiAttackMoveToPosition(currentTarget->getPosition(),
+					NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
+			else if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+				m_baseCenterSet)
+				ai->aiGuardPosition(&m_baseCenter,
+					GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+			else
+				ai->aiIdle(CMD_FROM_AI);
+		}
+	}
+}
+
+static Bool IsSkirmishTacticalRetreatPointSafe(
+	const Coord3D *start, const Coord3D *destination,
+	const std::vector<Object *> &hazards)
+{
+	if (!start || !destination)
+		return false;
+	const Real segmentX = destination->x - start->x;
+	const Real segmentY = destination->y - start->y;
+	const Real segmentLengthSqr = segmentX * segmentX + segmentY * segmentY;
+	for (size_t hazardIndex = 0; hazardIndex < hazards.size(); ++hazardIndex) {
+		Object *enemy = hazards[hazardIndex];
+		const Bool armedStructure = enemy->isKindOf(KINDOF_STRUCTURE) &&
+			!enemy->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+			!enemy->testStatus(OBJECT_STATUS_SOLD) &&
+			enemy->getLargestWeaponRange() > 0.0f;
+		Real destinationClearance = 225.0f;
+		Real corridorClearance = 150.0f;
+		if (armedStructure) {
+			const Real weaponClearance = enemy->getLargestWeaponRange() + 50.0f;
+			if (weaponClearance > destinationClearance)
+				destinationClearance = weaponClearance;
+			if (weaponClearance > corridorClearance)
+				corridorClearance = weaponClearance;
+			if (destinationClearance > 800.0f) destinationClearance = 800.0f;
+			if (corridorClearance > 800.0f) corridorClearance = 800.0f;
+		}
+		const Real dx = enemy->getPosition()->x - destination->x;
+		const Real dy = enemy->getPosition()->y - destination->y;
+		if (dx * dx + dy * dy < destinationClearance * destinationClearance)
+			return false;
+		if (segmentLengthSqr > 1.0f) {
+			const Real fromStartX = enemy->getPosition()->x - start->x;
+			const Real fromStartY = enemy->getPosition()->y - start->y;
+			const Real fraction = (fromStartX * segmentX +
+				fromStartY * segmentY) / segmentLengthSqr;
+			// A turret at or behind the start cannot get closer along this path.
+			// Let the team escape its current range, but reject turrets ahead.
+			// Mobile threats still allow the initial contested tenth.
+			if ((armedStructure ? fraction > 0.0f : fraction >= 0.1f) &&
+				fraction <= 1.0f) {
+				const Real lateralX = fromStartX - fraction * segmentX;
+				const Real lateralY = fromStartY - fraction * segmentY;
+				if (lateralX * lateralX + lateralY * lateralY <
+					corridorClearance * corridorClearance)
+					return false;
+			}
+		}
+	}
+	return true;
 }
 
 void AISkirmishPlayer::commandOffensiveTeams(
@@ -5915,6 +9298,26 @@ void AISkirmishPlayer::applyStrategyMode(
 		(currentMode != SKIRMISH_STRATEGY_ASSAULT ||
 		 previousTargetID == m_strategyState.strategicTargetID))
 		return;
+	if (ShouldUseCurrentSkirmishAITacticalBehavior() &&
+		currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+		previousTargetID != m_strategyState.strategicTargetID) {
+		const UnsignedInt now = TheGameLogic->getFrame();
+		for (std::map<UnsignedInt, TacticalTeamState>::iterator it =
+				m_tacticalTeams.begin(); it != m_tacticalTeams.end(); ++it) {
+			TacticalTeamState &state = it->second;
+			if (state.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE)
+				continue;
+			state.targetID = INVALID_ID;
+			state.targetHealth = 0.0f;
+			state.distanceToTargetSqr = 0.0f;
+			state.lastProgressFrame = now;
+			state.blockedSinceFrame = 0;
+			state.approachAttempt = 0;
+			state.alternateProbeAfterID = INVALID_ID;
+			state.routeExhaustedTargetID = INVALID_ID;
+			state.routeExhaustedUntilFrame = 0;
+		}
+	}
 	Object *target = currentMode == SKIRMISH_STRATEGY_ASSAULT &&
 		m_strategyState.strategicTargetID != INVALID_ID
 		? TheGameLogic->findObjectByID(m_strategyState.strategicTargetID) : nullptr;
@@ -5939,10 +9342,72 @@ Bool AISkirmishPlayer::updateStrategy()
 	SkirmishStrategyMetrics metrics;
 	ObjectID targetID = INVALID_ID;
 	collectStrategyMetrics(&metrics, &targetID);
+	const Bool tunnelBuildPendingForTarget = targetID != INVALID_ID &&
+		m_tunnelBuildTargetID == targetID &&
+		(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
+		 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED ||
+		 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_CONSTRUCTING ||
+		 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_CONSTRUCTING);
+	Bool tacticalRouteExhausted = false;
+	Bool viableSuperweaponPlan = false;
+	if (ShouldUseCurrentSkirmishAITacticalBehavior()) {
+		Int exhaustedTeams = 0;
+		Int availableTeams = 0;
+		Int regroupingTeams = 0;
+		Player::PlayerTeamList::const_iterator prototype;
+		for (prototype = m_player->getPlayerTeams()->begin();
+			prototype != m_player->getPlayerTeams()->end(); ++prototype) {
+			for (DLINK_ITERATOR<Team> instance = (*prototype)->iterate_TeamInstanceList();
+				!instance.done(); instance.advance()) {
+				Team *team = instance.cur();
+				if (!IsSkirmishStrategyOffensiveTeam(team, m_player))
+					continue;
+				std::map<UnsignedInt, TacticalTeamState>::iterator it =
+					m_tacticalTeams.find(team->getID());
+				const Bool hasState = it != m_tacticalTeams.end();
+				if (!HasSkirmishStrategyPotentialOffensiveRecipient(team, m_player) &&
+					(!hasState || it->second.tunnelTransitPhase ==
+						SKIRMISH_AI_TUNNEL_TRANSIT_NONE))
+					continue;
+				if (!hasState) {
+					++availableTeams;
+					continue;
+				}
+				TacticalTeamState &teamState = it->second;
+			if (teamState.routeExhaustedTargetID != INVALID_ID &&
+				(tunnelBuildPendingForTarget ||
+				 teamState.routeExhaustedTargetID != targetID ||
+				 IsSkirmishStrategyFrameReached(currentFrame,
+					teamState.routeExhaustedUntilFrame) ||
+				 m_strategyState.superweaponAttemptStatus ==
+					SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED)) {
+				teamState.routeExhaustedTargetID = INVALID_ID;
+				teamState.routeExhaustedUntilFrame = 0;
+			}
+			if (targetID != INVALID_ID &&
+				teamState.routeExhaustedTargetID == targetID)
+				++exhaustedTeams;
+			else if (teamState.retreating || teamState.woundedReserve)
+				++regroupingTeams;
+			else
+				++availableTeams;
+			}
+		}
+		tacticalRouteExhausted = targetID != INVALID_ID &&
+			exhaustedTeams > 0 && availableTeams == 0 &&
+			regroupingTeams == 0 && !tunnelBuildPendingForTarget;
+		if (m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+			availableTeams == 0 && regroupingTeams > 0)
+			metrics.assaultLostHalfForce = true;
+		if (tacticalRouteExhausted && usesProductionBehavior())
+			viableSuperweaponPlan =
+				FindSkirmishAIStrategicSource(m_player, nullptr) != nullptr ||
+				FindSkirmishAISuperweaponConstruction(m_player) != nullptr;
+	}
 	const SkirmishStrategyMode previousMode = m_strategyState.currentMode;
 	SkirmishStrategyDecision decision = EvaluateSkirmishStrategy(
 		m_strategyState, metrics, m_difficulty, currentFrame,
-		usesProductionBehavior());
+		usesProductionBehavior(), tacticalRouteExhausted, viableSuperweaponPlan);
 	const Bool leftAssault = previousMode == SKIRMISH_STRATEGY_ASSAULT &&
 		decision.nextState.currentMode != SKIRMISH_STRATEGY_ASSAULT;
 	if (leftAssault) {
@@ -5960,6 +9425,11 @@ Bool AISkirmishPlayer::updateStrategy()
 		ClearSkirmishStrategyTargetObservation(&decision.nextState);
 	}
 	m_strategyState = decision.nextState;
+	if ((m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
+		 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED) &&
+		(m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
+		 m_strategyState.strategicTargetID != m_tunnelBuildTargetID))
+		abandonTunnelBuildPlan(currentFrame, TRUE);
 	if (previousMode != SKIRMISH_STRATEGY_FORTIFY &&
 		m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY)
 		clearStrategySourceCommandLock();
@@ -6416,6 +9886,337 @@ Player *AISkirmishPlayer::getAiEnemy()
 /**
 	Build base defense structures on the front or flank of the base.
 */
+static void CollectSkirmishAIDefenseSupplyPositions(
+	Player *player, std::vector<Coord2D> *positions)
+{
+	positions->clear();
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (object->isEffectivelyDead() || object->isDestroyed() ||
+			!(object->isKindOf(KINDOF_SUPPLY_SOURCE) ||
+			 (object->getControllingPlayer() == player &&
+			  object->isKindOf(KINDOF_FS_SUPPLY_CENTER))))
+			continue;
+		Coord2D supplyPosition;
+		supplyPosition.x = object->getPosition()->x;
+		supplyPosition.y = object->getPosition()->y;
+		positions->push_back(supplyPosition);
+	}
+	for (BuildListInfo *info = player->getBuildList(); info;
+		info = info->getNext()) {
+		const ThingTemplate *plan = TheThingFactory->findTemplate(
+			info->getTemplateName());
+		if (!plan || !plan->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+			!info->isBuildable())
+			continue;
+		Coord2D supplyPosition;
+		supplyPosition.x = info->getLocation()->x;
+		supplyPosition.y = info->getLocation()->y;
+		positions->push_back(supplyPosition);
+	}
+}
+
+static Bool IsSkirmishAIDefenseNearSupply(
+	const std::vector<Coord2D> &supplyPositions,
+	const Coord3D &position, Real structureRadius);
+
+static Bool IsSkirmishAIDefenseLineSite(
+	const Coord3D &baseCenter, Real baseRadius,
+	const SkirmishAIDefenseContext &context, const Coord3D &position,
+	Real structureRadius, const std::vector<Coord2D> &supplyPositions)
+{
+	const Real dx = position.x - baseCenter.x;
+	const Real dy = position.y - baseCenter.y;
+	const Int route = ClassifySkirmishAIDefenseRoute(
+		(Int)dx, (Int)dy, context.anchors);
+	if (!IsSkirmishAIDefenseRoute(route)) return false;
+	const Real along = dx * context.direction[route].x +
+		dy * context.direction[route].y;
+	const Real lateral = dx * context.direction[route].y -
+		dy * context.direction[route].x;
+	if (!IsSkirmishAIDefenseLinePosition(
+			(Int)along, (Int)lateral, (Int)baseRadius,
+			(Int)structureRadius))
+		return false;
+	return !IsSkirmishAIDefenseNearSupply(supplyPositions, position,
+		structureRadius);
+}
+
+static void CountSkirmishAIDefenseLine(
+	Player *player, const Coord3D &baseCenter, Real baseRadius,
+	const SkirmishAIDefenseContext &context,
+	const std::vector<Coord2D> &supplyPositions,
+	SkirmishAIDefenseBuildCounts *counts)
+{
+	for (Int route = 0; route < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++route) {
+		counts->owned[route] = 0;
+		counts->queued[route] = 0;
+	}
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (object->getControllingPlayer() != player ||
+			!object->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
+			object->isEffectivelyDead() || object->isDestroyed() ||
+			!IsSkirmishAIDefenseLineSite(baseCenter, baseRadius,
+				context, *object->getPosition(),
+				object->getTemplate()->getTemplateGeometryInfo().getBoundingCircleRadius(),
+				supplyPositions))
+			continue;
+		const Int route = ClassifySkirmishAIDefenseRoute(
+			(Int)(object->getPosition()->x - baseCenter.x),
+			(Int)(object->getPosition()->y - baseCenter.y), context.anchors);
+		if (IsSkirmishAIDefenseRoute(route)) ++counts->owned[route];
+	}
+	for (BuildListInfo *info = player->getBuildList(); info;
+		info = info->getNext()) {
+		const ThingTemplate *plan = TheThingFactory->findTemplate(
+			info->getTemplateName());
+		if (!plan || !plan->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
+			!info->isBuildable() ||
+			!IsSkirmishAIDefenseLineSite(baseCenter, baseRadius,
+				context, *info->getLocation(),
+				plan->getTemplateGeometryInfo().getBoundingCircleRadius(),
+				supplyPositions))
+			continue;
+		// A live structure was counted above. An unstarted priority entry
+		// with INVALID_ID reserves a line slot immediately.
+		Object *built = info->getObjectID() == INVALID_ID ? nullptr :
+			TheGameLogic->findObjectByID(info->getObjectID());
+		if (built && built->getControllingPlayer() == player &&
+			!built->isEffectivelyDead())
+			continue;
+		const Int route = ClassifySkirmishAIDefenseRoute(
+			(Int)(info->getLocation()->x - baseCenter.x),
+			(Int)(info->getLocation()->y - baseCenter.y), context.anchors);
+		if (IsSkirmishAIDefenseRoute(route)) ++counts->queued[route];
+	}
+}
+
+static Bool IsSkirmishAIDefenseNearSupply(
+	const std::vector<Coord2D> &supplyPositions,
+	const Coord3D &position, Real structureRadius)
+{
+	Real clearance = structureRadius + 160.0f;
+	if (clearance < 220.0f) clearance = 220.0f;
+	const Real clearanceSqr = clearance * clearance;
+	for (size_t i = 0; i < supplyPositions.size(); ++i) {
+		const Real dx = supplyPositions[i].x - position.x;
+		const Real dy = supplyPositions[i].y - position.y;
+		if (dx * dx + dy * dy < clearanceSqr) return true;
+	}
+	return false;
+}
+
+static Bool IsSkirmishAIDefenseSiteOverlappingPendingBuild(
+	Player *player, const Coord3D &position, Real structureRadius,
+	const BuildListInfo *ignoreInfo)
+{
+	if (!player || !TheThingFactory)
+		return false;
+	for (BuildListInfo *info = player->getBuildList(); info;
+		info = info->getNext()) {
+		if (info == ignoreInfo) continue;
+		if (!info->isBuildable())
+			continue;
+		const ThingTemplate *pendingPlan = TheThingFactory->findTemplate(
+			info->getTemplateName());
+		if (!pendingPlan || !pendingPlan->isKindOf(KINDOF_STRUCTURE))
+			continue;
+		Object *built = info->getObjectID() == INVALID_ID ? nullptr :
+			TheGameLogic->findObjectByID(info->getObjectID());
+		if (built && built->getControllingPlayer() == player &&
+			!built->isEffectivelyDead() && !built->isDestroyed())
+			continue;
+		const Real pendingRadius = pendingPlan->getTemplateGeometryInfo()
+			.getBoundingCircleRadius();
+		if (DoSkirmishAIDefenseFootprintsOverlap(
+				position.x, position.y, structureRadius,
+				info->getLocation()->x, info->getLocation()->y, pendingRadius))
+			return true;
+	}
+	return false;
+}
+
+static Bool HasReachableSkirmishAIDefenseBuilder(
+	const std::vector<Object *> &builders, const Coord3D &position,
+	size_t startIndex, Int *pathQueriesUsed)
+{
+	if (!TheAI || !TheAI->pathfinder()) return false;
+	for (size_t offset = 0; offset < builders.size(); ++offset) {
+		Object *object = builders[(startIndex + offset) % builders.size()];
+		AIUpdateInterface *ai = object->getAIUpdateInterface();
+		if (!ai || !ai->getDozerAIInterface()) continue;
+		if (!TryConsumeSkirmishAITacticalPathQuery(pathQueriesUsed, 16))
+			return false;
+		if (TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+				ai->getLocomotorSet(), object->getPosition(), &position))
+			return true;
+	}
+	return false;
+}
+
+static Bool QueueSkirmishAIDefenseLine(
+	Player *player, const Coord3D &baseCenter, Real baseRadius,
+	const ThingTemplate *plan, const AsciiString &thingName,
+	Bool flank, Int flankCounter, UnsignedInt placementAttempt,
+	ObjectID excludedBuilderID)
+{
+	if (!player || !plan || !TheAI || !TheGameLogic || !TheBuildAssistant ||
+		!TheTerrainLogic || !TheTerrainVisual || baseRadius <= 0.0f)
+		return false;
+	SkirmishAIDefenseContext context;
+	CollectSkirmishAIDefenseContext(player, baseCenter, baseRadius, &context);
+	std::vector<Coord2D> supplyPositions;
+	CollectSkirmishAIDefenseSupplyPositions(player, &supplyPositions);
+	SkirmishAIDefenseBuildCounts counts;
+	CountSkirmishAIDefenseLine(player, baseCenter, baseRadius,
+		context, supplyPositions, &counts);
+	Int routeOrder[SKIRMISH_AI_DEFENSE_ROUTE_COUNT] = {
+		SKIRMISH_AI_DEFENSE_CENTER, SKIRMISH_AI_DEFENSE_FLANK,
+		SKIRMISH_AI_DEFENSE_BACKDOOR };
+	if (flank) {
+		const Int flankScore = GetSkirmishAIDefenseRouteScore(
+			&context.threat, SKIRMISH_AI_DEFENSE_FLANK);
+		const Int backdoorScore = GetSkirmishAIDefenseRouteScore(
+			&context.threat, SKIRMISH_AI_DEFENSE_BACKDOOR);
+		Int preferredFlank = SKIRMISH_AI_DEFENSE_FLANK;
+		if (flankScore != backdoorScore)
+			preferredFlank = flankScore > backdoorScore ?
+				SKIRMISH_AI_DEFENSE_FLANK : SKIRMISH_AI_DEFENSE_BACKDOOR;
+		else {
+			const Int flankCount = counts.owned[SKIRMISH_AI_DEFENSE_FLANK] +
+				counts.queued[SKIRMISH_AI_DEFENSE_FLANK];
+			const Int backdoorCount = counts.owned[SKIRMISH_AI_DEFENSE_BACKDOOR] +
+				counts.queued[SKIRMISH_AI_DEFENSE_BACKDOOR];
+			preferredFlank = flankCount != backdoorCount ?
+				(flankCount < backdoorCount ? SKIRMISH_AI_DEFENSE_FLANK :
+				 SKIRMISH_AI_DEFENSE_BACKDOOR) :
+				(flankCounter & 1 ? SKIRMISH_AI_DEFENSE_FLANK :
+				 SKIRMISH_AI_DEFENSE_BACKDOOR);
+		}
+		routeOrder[0] = preferredFlank;
+		routeOrder[1] = preferredFlank == SKIRMISH_AI_DEFENSE_FLANK ?
+			SKIRMISH_AI_DEFENSE_BACKDOOR : SKIRMISH_AI_DEFENSE_FLANK;
+		routeOrder[2] = SKIRMISH_AI_DEFENSE_CENTER;
+	}
+	// Stable score ordering gives an active center, flank, or backdoor threat
+	// first choice; the requested front/flank side breaks equal-score ties.
+	for (Int i = 1; i < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++i) {
+		const Int route = routeOrder[i];
+		const Int score = GetSkirmishAIDefenseRouteScore(&context.threat, route);
+		Int j = i;
+		while (j > 0 && score > GetSkirmishAIDefenseRouteScore(
+				&context.threat, routeOrder[j - 1])) {
+			routeOrder[j] = routeOrder[j - 1];
+			--j;
+		}
+		routeOrder[j] = route;
+	}
+	Int total = 0;
+	for (Int totalRouteIndex = 0; totalRouteIndex < SKIRMISH_AI_DEFENSE_ROUTE_COUNT; ++totalRouteIndex)
+		total += counts.owned[totalRouteIndex] + counts.queued[totalRouteIndex];
+	if (total >= 5)
+		return false;
+	const Real structureRadius =
+		plan->getTemplateGeometryInfo().getBoundingCircleRadius();
+	const Real sideStep = structureRadius * 2.0f + 60.0f;
+	const Int sideOrder[5] = { 0, -1, 1, -2, 2 };
+	const Real radialOrder[3] = { 0.0f, 70.0f, -70.0f };
+	double phaseRadial = 0.0;
+	double phaseSide = 0.0;
+	// A site starts every attempt. The extra phase step gives every site all
+	// eight offsets over time, despite forty-five candidate slots per pass.
+	const UnsignedInt phase = placementAttempt % 8 +
+		(placementAttempt / 45) % 8;
+	GetSkirmishAIDefensePlacementPhase(phase, sideStep,
+		&phaseRadial, &phaseSide);
+	std::vector<Object *> builders;
+	for (Object *candidate = TheGameLogic->getFirstObject(); candidate;
+		candidate = candidate->getNextObject()) {
+		if (IsAvailableSkirmishAIDefenseBuilder(candidate, player, plan,
+				excludedBuilderID))
+			builders.push_back(candidate);
+	}
+	if (builders.empty()) return false;
+	std::sort(builders.begin(), builders.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+	Int pathQueriesUsed = 0;
+	const Int siteCount = 15 * SKIRMISH_AI_DEFENSE_ROUTE_COUNT;
+	const Int siteStart = placementAttempt % 15;
+	for (Int slot = 0; slot < siteCount && pathQueriesUsed < 16; ++slot) {
+		const Int routeIndex = slot % SKIRMISH_AI_DEFENSE_ROUTE_COUNT;
+		const Int siteIndex = (siteStart +
+			slot / SKIRMISH_AI_DEFENSE_ROUTE_COUNT) % 15;
+		const Int radial = siteIndex / 5;
+		const Int side = siteIndex % 5;
+		const Int route = routeOrder[routeIndex];
+		if (!context.anchors[route].available)
+			continue;
+		const Int routeScore = GetSkirmishAIDefenseRouteScore(
+			&context.threat, route);
+		const Int localCount = counts.owned[route] + counts.queued[route];
+		const Bool penetrated = context.threat.penetrationScore[route] > 0;
+		const Int perRouteCap = penetrated ? 3 : 2;
+		// Penetration permits one extra inner site; the global cap stays at five.
+		const Int minimumScore = localCount >= 2 && penetrated ? 1 :
+			(localCount > 0 ? 101 : 100);
+		if (routeScore == 0 ? localCount >= 1 :
+			!ShouldQueueSkirmishAIDefense(&context.threat, &counts,
+				route, minimumScore, perRouteCap, 5))
+			continue;
+		Real lineDistance = baseRadius +
+			TheAI->getAiData()->m_skirmishBaseDefenseExtraDistance;
+		if (context.threat.penetrationScore[route] > 0) {
+			lineDistance -= 120.0f;
+			if (lineDistance < baseRadius * 0.7f)
+				lineDistance = baseRadius * 0.7f;
+		}
+		if (lineDistance < structureRadius * 2.0f + 80.0f)
+			lineDistance = structureRadius * 2.0f + 80.0f;
+		Coord3D position = baseCenter;
+		const Real distance = lineDistance + radialOrder[radial] +
+			(Real)phaseRadial;
+		if (distance < structureRadius * 2.0f + 80.0f ||
+			distance > baseRadius + 250.0f) continue;
+		const Real lateral = sideStep * sideOrder[side] + phaseSide;
+		position.x += context.direction[route].x * distance -
+			context.direction[route].y * lateral;
+		position.y += context.direction[route].y * distance +
+			context.direction[route].x * lateral;
+		position.z = TheTerrainLogic->getGroundHeight(position.x, position.y);
+		if (IsSkirmishAIDefenseNearSupply(supplyPositions, position,
+			structureRadius)) continue;
+		if (IsSkirmishAIDefenseSiteOverlappingPendingBuild(
+				player, position, structureRadius)) continue;
+		if (ClassifySkirmishAIDefenseRoute(
+				(Int)(position.x - baseCenter.x),
+				(Int)(position.y - baseCenter.y), context.anchors) != route ||
+			!IsSkirmishAIDefenseLineSite(baseCenter, baseRadius,
+				context, position, structureRadius, supplyPositions))
+			continue;
+		const size_t builderStart =
+			((placementAttempt / 240) + (placementAttempt % 240) +
+			 siteIndex + routeIndex * 15) % builders.size();
+		if (!HasReachableSkirmishAIDefenseBuilder(builders, position,
+			builderStart, &pathQueriesUsed))
+			continue;
+		const Real angle = plan->getPlacementViewAngle();
+		const Bool legal = LBC_OK == TheBuildAssistant->isLocationLegalToBuild(
+			&position, plan, angle,
+			BuildAssistant::CLEAR_PATH |
+			BuildAssistant::TERRAIN_RESTRICTIONS |
+			BuildAssistant::NO_OBJECT_OVERLAP, nullptr, player);
+		TheTerrainVisual->removeAllBibs();
+		if (!legal) continue;
+		// buildStructureWithDozer adds terrain height to BuildListInfo.z.
+		Coord3D queuedPosition = position;
+		queuedPosition.z = 0.0f;
+		player->addToPriorityBuildList(thingName, &queuedPosition, angle);
+		return true;
+	}
+	return false;
+}
+
 void AISkirmishPlayer::buildAIBaseDefense(Bool flank)
 {
 	const AISideInfo *resInfo = TheAI->getAiData()->m_sideInfo;
@@ -6459,6 +10260,41 @@ void AISkirmishPlayer::buildAIBaseDefenseStructure(const AsciiString &thingName,
 	const ThingTemplate *tTemplate = TheThingFactory->findTemplate(thingName);
 	if (tTemplate==nullptr) {
 		DEBUG_CRASH(("Couldn't find base defense structure '%s' for side %s", thingName.str(), m_player->getSide().str()));
+		return;
+	}
+	if (ShouldUseCurrentSkirmishAITacticalBehavior() &&
+		tTemplate->isKindOf(KINDOF_FS_BASE_DEFENSE)) {
+		const UnsignedInt now = TheGameLogic->getFrame();
+		if (!IsSkirmishStrategyFrameReached(
+				now, m_defensePlacementNextFrame))
+			return;
+		PruneGeneratedDefenseBuildMarkers(
+			&m_generatedDefenseBuilds, m_player);
+		Bool queued = false;
+		if (m_generatedDefenseBuilds.size() < 5)
+			queued = QueueSkirmishAIDefenseLine(
+				m_player, m_baseCenter, m_baseRadius, tTemplate, thingName,
+				flank, m_curFlankBaseDefense, m_defensePlacementAttempt,
+				m_repairDozer);
+		if (queued) {
+			BuildListInfo *queuedInfo = m_player->getBuildList();
+			if (queuedInfo && queuedInfo->getLocation()) {
+				GeneratedDefenseBuild marker;
+				marker.templateName = queuedInfo->getTemplateName();
+				marker.location.x = queuedInfo->getLocation()->x;
+				marker.location.y = queuedInfo->getLocation()->y;
+				marker.angle = queuedInfo->getAngle();
+				m_generatedDefenseBuilds.push_back(marker);
+				queuedInfo->setObjectTimestamp(now + 1);
+			}
+		}
+		++m_defensePlacementAttempt;
+		m_defensePlacementNextFrame = queued ? now :
+			now + 10 * LOGICFRAMES_PER_SECOND;
+		if (queued) {
+			if (flank) ++m_curFlankBaseDefense;
+			else ++m_curFrontBaseDefense;
+		}
 		return;
 	}
 	do {
@@ -6871,6 +10707,10 @@ void AISkirmishPlayer::update()
 		strategyAllowedAfterRecovery)
 		applyStrategyMode(
 			previousMode, m_strategyState.currentMode, previousTargetID);
+	if (strategyAllowedAfterRecovery)
+		updateTacticalTeams();
+	if (strategyAllowedAfterRecovery)
+		updateDefensePatrol();
 }
 
 //----------------------------------------------------------------------------------------------------------
@@ -6991,6 +10831,9 @@ void AISkirmishPlayer::newMap()
 {
 	InitializeSkirmishStrategyState(
 		&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
+	m_strategyTargetFallbackPending = false;
+	m_strategyTargetFallbackAfterID = INVALID_ID;
+	m_strategyTargetFallbackEnemyIndex = -1;
 	m_strategyProductionReserveCost = 0;
 	m_strategySuperweaponID = INVALID_ID;
 	m_strategyAuthorizedThing = nullptr;
@@ -6998,6 +10841,47 @@ void AISkirmishPlayer::newMap()
 	m_strategyProductionReserveRefreshing = false;
 	clearStrategySourceCommandLock();
 	m_reinforcementRoundRobinCursor = 0;
+	m_tacticalTeams.clear();
+	m_tacticalNextTeamScanFrame = 0;
+	m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_NONE;
+	m_tunnelHomeAttempted = false;
+	m_tunnelForwardAttempted = false;
+	m_tunnelForwardRetryConsumed = false;
+	m_tunnelHomeEndpointID = INVALID_ID;
+	m_tunnelForwardEndpointID = INVALID_ID;
+	m_tunnelForwardAttemptTargetID = INVALID_ID;
+	for (Int i = 0; i < SkirmishAITunnelRoute::MAX_GENERATED_FORWARD_ENDPOINTS;
+		++i) {
+		m_tunnelGeneratedForwardEndpointIDs[i] = INVALID_ID;
+		m_tunnelGeneratedForwardTargetIDs[i] = INVALID_ID;
+	}
+	for (Int exhaustedIndex = 0; exhaustedIndex < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS;
+		++exhaustedIndex)
+		m_tunnelExhaustedForwardTargetIDs[exhaustedIndex] = INVALID_ID;
+	m_tunnelBuildBuilderID = INVALID_ID;
+	m_tunnelBuildTargetID = INVALID_ID;
+	m_tunnelBuildBlockerID = INVALID_ID;
+	m_tunnelBuildObjectID = INVALID_ID;
+	m_tunnelBuildLockedBuilderID = INVALID_ID;
+	m_tunnelPendingBuilderCursor = 0;
+	m_tunnelBuildLocation.zero();
+	m_defenseBuildLockedBuilderID = INVALID_ID;
+	m_defenseBuildLockedLocation.zero();
+	m_tunnelBuildDeadlineFrame = 0;
+	m_tunnelBuildCooldownUntilFrame = 0;
+	m_defensePatrolRoute = SKIRMISH_AI_DEFENSE_NO_ROUTE;
+	m_defensePatrolTeamID = 0;
+	m_defensePatrolObjectID = INVALID_ID;
+	m_defenseNextPatrolFrame = 0;
+	m_defenseQuietPatrolWaypoint.zero();
+	m_defenseQuietPatrolDeadlineFrame = 0;
+	m_defensePlacementAttempt = 0;
+	m_defensePlacementNextFrame = 0;
+	m_defensePursuitTargetID = INVALID_ID;
+	m_defensePursuitStartFrame = 0;
+	m_defenseInterceptProbeAfterID = INVALID_ID;
+	m_defensePatrolRouteMemberAfterID = INVALID_ID;
+	m_defenseInterceptMemberAfterID = INVALID_ID;
 
 	/* Get our proper build list. */
 	AsciiString mySide = m_player->getSide();
@@ -7055,6 +10939,754 @@ void AISkirmishPlayer::newMap()
 	}
 }
 
+const ThingTemplate *AISkirmishPlayer::findTunnelContainBuildTemplate() const
+{
+	if (!m_player || !IsSkirmishAISupportedGLASide(m_player->getSide()) ||
+		!TheThingFactory)
+		return nullptr;
+	for (BuildListInfo *info = m_player->getBuildList(); info;
+		info = info->getNext()) {
+		const AsciiString name = info->getTemplateName();
+		if (name.isEmpty())
+			continue;
+		const ThingTemplate *plan = TheThingFactory->findTemplate(name);
+		if (IsSkirmishAIStrategyTunnelTemplate(plan))
+			return plan;
+	}
+	return nullptr;
+}
+
+Bool AISkirmishPlayer::isTunnelBuildBuilderAvailable(Object *builder) const
+{
+	if (!builder || !m_player || !TheGameLogic ||
+		builder->getControllingPlayer() != m_player ||
+		!builder->isKindOf(KINDOF_DOZER) ||
+		builder->isContained() ||
+		builder->getID() == m_repairDozer ||
+		builder->isEffectivelyDead() || builder->isDestroyed() ||
+		builder->isDisabledByType(DISABLED_UNMANNED))
+		return false;
+	AIUpdateInterface *ai = builder->getAIUpdateInterface();
+	DozerAIInterface *dozer = ai ? ai->getDozerAIInterface() : nullptr;
+	if (!ai || !dozer || !ai->isIdle() || dozer->isAnyTaskPending())
+		return false;
+	SupplyTruckAIInterface *supply = ai->getSupplyTruckAIInterface();
+	if (supply && (supply->isCurrentlyFerryingSupplies() ||
+		supply->isForcedIntoWantingState()))
+		return false;
+	return true;
+}
+
+Bool AISkirmishPlayer::isPendingTunnelBuildInfo(
+	const BuildListInfo *info, const ThingTemplate *plan) const
+{
+	if (!info ||
+		(m_tunnelBuildPhase != SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED &&
+		 m_tunnelBuildPhase != SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED))
+		return false;
+	const Coord3D *location = info->getLocation();
+	const ThingTemplate *expected = findTunnelContainBuildTemplate();
+	return plan && expected && plan->isEquivalentTo(expected) &&
+		IsSkirmishAIStrategyTunnelTemplate(plan) &&
+		info->getTemplateName() == plan->getName() && location &&
+		location->x == m_tunnelBuildLocation.x &&
+		location->y == m_tunnelBuildLocation.y;
+}
+
+Bool AISkirmishPlayer::validatePendingTunnelBuild(
+	BuildListInfo *info, const ThingTemplate *plan, Object **builderOut,
+	Bool *permanentFailure)
+{
+	if (builderOut)
+		*builderOut = nullptr;
+	if (permanentFailure)
+		*permanentFailure = FALSE;
+	if (!isPendingTunnelBuildInfo(info, plan)) {
+		if (permanentFailure)
+			*permanentFailure = TRUE;
+		return false;
+	}
+	if (!m_player || !TheGameLogic || !TheAI || !TheAI->pathfinder() ||
+		!TheBuildAssistant || !TheTerrainLogic)
+		return false;
+	const ThingTemplate *activeTunnelPlan = findTunnelContainBuildTemplate();
+	if (!activeTunnelPlan || !plan->isEquivalentTo(activeTunnelPlan) ||
+		!IsSkirmishAIStrategyTunnelTemplate(plan)) {
+		if (permanentFailure)
+			*permanentFailure = TRUE;
+		return false;
+	}
+	Object *target = m_tunnelBuildTargetID != INVALID_ID
+		? TheGameLogic->findObjectByID(m_tunnelBuildTargetID) : nullptr;
+	Object *blocker = m_tunnelBuildBlockerID != INVALID_ID
+		? TheGameLogic->findObjectByID(m_tunnelBuildBlockerID) : nullptr;
+	if (!IsSkirmishAIStrategyTunnelTargetUsable(
+			target, m_player, m_currentEnemy) ||
+		m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
+		m_strategyState.strategicTargetID != m_tunnelBuildTargetID ||
+		!blocker || blocker->getControllingPlayer() != m_currentEnemy ||
+		!blocker->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
+		blocker->isEffectivelyDead() || blocker->isDestroyed() ||
+		blocker->testStatus(OBJECT_STATUS_SOLD) ||
+		!IsSkirmishStrategyIntelEligible(blocker, m_player) ||
+		IsSkirmishStrategyFrameReached(
+			TheGameLogic->getFrame(), m_tunnelBuildDeadlineFrame)) {
+		if (permanentFailure)
+			*permanentFailure = TRUE;
+		return false;
+	}
+	Coord3D buildPosition = *info->getLocation();
+	buildPosition.z = TheTerrainLogic->getGroundHeight(
+		buildPosition.x, buildPosition.y);
+	std::vector<Object *> builders;
+	for (Object *candidate = TheGameLogic->getFirstObject(); candidate;
+		candidate = candidate->getNextObject()) {
+		if (isTunnelBuildBuilderAvailable(candidate))
+			builders.push_back(candidate);
+	}
+	std::sort(builders.begin(), builders.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+	Object *builder = nullptr;
+	const size_t builderLimit = min((size_t)8, builders.size());
+	const size_t builderStart = builders.empty() ? 0 :
+		(size_t)(m_tunnelPendingBuilderCursor % (UnsignedInt)builders.size());
+	m_tunnelPendingBuilderCursor += (UnsignedInt)builderLimit;
+	for (size_t pass = 0; pass < builderLimit; ++pass) {
+		Object *candidate = builders[(builderStart + pass) % builders.size()];
+		AIUpdateInterface *candidateAI = candidate->getAIUpdateInterface();
+		if (!candidateAI ||
+			TheBuildAssistant->canMakeUnit(candidate, plan) != CANMAKE_OK ||
+			!TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+				candidateAI->getLocomotorSet(), candidate->getPosition(),
+				&buildPosition))
+			continue;
+		builder = candidate;
+		break;
+	}
+	if (!builder)
+		return false;
+	m_tunnelBuildBuilderID = builder->getID();
+	if (!IsSkirmishAIStrategyTunnelSiteVisible(
+			m_player, *info->getLocation())) {
+		if (permanentFailure)
+			*permanentFailure = TRUE;
+		return false;
+	}
+	Object *forwardBlocker = m_tunnelBuildPhase ==
+		SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED ? blocker : nullptr;
+	if ((forwardBlocker
+		? !IsSkirmishAIForwardTunnelLocationSafe(m_player, m_currentEnemy,
+			&buildPosition, plan, forwardBlocker, target)
+		: !isLocationSafe(&buildPosition, plan)) ||
+		TheBuildAssistant->isLocationLegalToBuild(
+			&buildPosition, plan, info->getAngle(),
+			BuildAssistant::CLEAR_PATH |
+			BuildAssistant::TERRAIN_RESTRICTIONS |
+			BuildAssistant::NO_OBJECT_OVERLAP,
+			builder, m_player) != LBC_OK) {
+		if (TheTerrainVisual)
+			TheTerrainVisual->removeAllBibs();
+		if (permanentFailure)
+			*permanentFailure = TRUE;
+		return false;
+	}
+	if (TheTerrainVisual)
+		TheTerrainVisual->removeAllBibs();
+	if (builderOut)
+		*builderOut = builder;
+	return true;
+}
+
+void AISkirmishPlayer::abandonTunnelBuildPlan(
+	UnsignedInt now, Bool allowRetry)
+{
+	const Bool homeEndpoint =
+		m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
+		m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_CONSTRUCTING;
+	const Bool forwardEndpoint =
+		m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED ||
+		m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_CONSTRUCTING;
+	if (m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
+		m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED) {
+		for (BuildListInfo *info = m_player ? m_player->getBuildList() : nullptr;
+			info; info = info->getNext()) {
+			const ThingTemplate *plan = TheThingFactory
+				? TheThingFactory->findTemplate(info->getTemplateName()) : nullptr;
+			if (isPendingTunnelBuildInfo(info, plan) &&
+				info->getObjectID() == INVALID_ID)
+				info->setNumRebuilds(0);
+		}
+	}
+	if (homeEndpoint && allowRetry && !m_tunnelHomeAttempted) {
+		m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE;
+		m_tunnelBuildBuilderID = INVALID_ID;
+		m_tunnelBuildBlockerID = INVALID_ID;
+		m_tunnelBuildObjectID = INVALID_ID;
+		m_tunnelBuildDeadlineFrame = 0;
+		m_tunnelBuildLocation.zero();
+	} else if (forwardEndpoint &&
+		SkirmishAITunnelRoute::ShouldOfferForwardRetry(
+			allowRetry, m_tunnelForwardRetryConsumed)) {
+		m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE;
+		m_tunnelBuildBuilderID = INVALID_ID;
+		m_tunnelBuildBlockerID = INVALID_ID;
+		m_tunnelBuildObjectID = INVALID_ID;
+		m_tunnelBuildDeadlineFrame = 0;
+		m_tunnelBuildLocation.zero();
+	} else {
+		if (homeEndpoint)
+			m_tunnelHomeAttempted = TRUE;
+		else if (forwardEndpoint)
+		{
+			m_tunnelForwardAttempted = TRUE;
+			SkirmishAITunnelRoute::RememberExhaustedForwardTarget(
+				m_tunnelBuildTargetID, m_tunnelExhaustedForwardTargetIDs);
+		}
+		m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_NONE;
+		m_tunnelBuildTargetID = INVALID_ID;
+		m_tunnelBuildBuilderID = INVALID_ID;
+		m_tunnelBuildBlockerID = INVALID_ID;
+		m_tunnelBuildObjectID = INVALID_ID;
+		m_tunnelBuildDeadlineFrame = 0;
+		m_tunnelBuildLocation.zero();
+	}
+	m_tunnelBuildCooldownUntilFrame = now +
+		SKIRMISH_AI_TUNNEL_RETRY_COOLDOWN_SECONDS * LOGICFRAMES_PER_SECOND;
+}
+
+Bool AISkirmishPlayer::tryQueueTunnelEndpoint(
+	Team *team, Object *target, Object *blockingDefense,
+	Bool homeEndpoint, UnsignedInt now,
+	Int *attemptPathQueryCount, Int *aggregatePathQueryCount,
+	TacticalTeamState &state, Bool *deferred)
+{
+	if (deferred) *deferred = FALSE;
+	const Int retryPhase = homeEndpoint
+		? SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE
+		: SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE;
+	const Bool retryAvailable = m_tunnelBuildPhase == retryPhase;
+	const Bool forwardRetryForTarget = !homeEndpoint &&
+		SkirmishAITunnelRoute::IsForwardRetryForTarget(
+			retryAvailable, m_tunnelBuildTargetID,
+			target ? target->getID() : INVALID_ID);
+	if (m_tunnelBuildObjectID != INVALID_ID && TheGameLogic) {
+		Object *scaffold = TheGameLogic->findObjectByID(m_tunnelBuildObjectID);
+		if (scaffold && !scaffold->isEffectivelyDead() &&
+			!scaffold->isDestroyed()) {
+			if (!IsSkirmishStrategyFrameReached(
+					now, m_tunnelBuildDeadlineFrame)) {
+				if (deferred && target &&
+					m_tunnelBuildTargetID == target->getID())
+					*deferred = TRUE;
+				return false;
+			}
+			state.tunnelScaffoldWaitObjectID = m_tunnelBuildObjectID;
+			state.tunnelScaffoldWaitUntilFrame = m_tunnelBuildDeadlineFrame;
+		}
+	}
+	if (!team || !target || !blockingDefense || !m_player ||
+		!attemptPathQueryCount || !aggregatePathQueryCount ||
+		!TheGameLogic || !TheTerrainLogic || !TheBuildAssistant || !TheAI ||
+		!TheAI->pathfinder() || !IsSkirmishAISupportedGLASide(m_player->getSide()) ||
+		(m_tunnelBuildPhase != SKIRMISH_AI_TUNNEL_BUILD_NONE && !retryAvailable) ||
+		(homeEndpoint && m_tunnelHomeAttempted && !retryAvailable) ||
+		!IsSkirmishAIStrategyTunnelTargetUsable(
+			target, m_player, m_currentEnemy) ||
+		m_strategyState.strategicTargetID != target->getID() ||
+		blockingDefense->getControllingPlayer() != m_currentEnemy ||
+		!blockingDefense->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
+		blockingDefense->isEffectivelyDead() || blockingDefense->isDestroyed() ||
+		blockingDefense->testStatus(OBJECT_STATUS_SOLD) ||
+		!IsSkirmishStrategyIntelEligible(blockingDefense, m_player))
+		return false;
+	if (!IsSkirmishStrategyFrameReached(now,
+		m_tunnelBuildCooldownUntilFrame)) {
+		if (deferred) *deferred = TRUE;
+		return false;
+	}
+
+	const ThingTemplate *plan = findTunnelContainBuildTemplate();
+	if (!plan || !m_baseCenterSet || !IsSkirmishAIStrategyTunnelTemplate(plan))
+		return false;
+
+	TunnelTracker *tracker = m_player->getTunnelSystem();
+	if (!tracker)
+		return false;
+	std::vector<Object *> endpoints;
+	const std::list<ObjectID> *registeredIDs = tracker->getContainerList();
+	if (registeredIDs) {
+		for (std::list<ObjectID>::const_iterator id = registeredIDs->begin();
+			id != registeredIDs->end(); ++id) {
+			Object *object = TheGameLogic->findObjectByID(*id);
+			if (IsSkirmishAIStrategyTunnelEndpointLive(object, m_player))
+				endpoints.push_back(object);
+		}
+	}
+	std::sort(endpoints.begin(), endpoints.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+	if (!homeEndpoint) {
+		Bool latestEndpointLive = FALSE;
+		for (size_t i = 0; i < endpoints.size(); ++i)
+			if (endpoints[i]->getID() == m_tunnelForwardEndpointID) {
+				latestEndpointLive = TRUE;
+				break;
+			}
+		if (!SkirmishAITunnelRoute::CanAttemptForwardEndpoint(
+				m_tunnelForwardAttempted, m_tunnelForwardAttemptTargetID,
+				m_tunnelForwardEndpointID, latestEndpointLive,
+				target->getID(), m_tunnelGeneratedForwardEndpointIDs,
+				m_tunnelGeneratedForwardTargetIDs, forwardRetryForTarget,
+				m_tunnelExhaustedForwardTargetIDs))
+			return false;
+	}
+	const Bool replacingHome = homeEndpoint &&
+		m_tunnelHomeEndpointID == INVALID_ID &&
+		endpoints.size() == 1 &&
+		SkirmishAITunnelRoute::IsTrackedGeneratedForwardEndpoint(
+			endpoints[0]->getID(),
+			m_tunnelGeneratedForwardEndpointIDs);
+	if (homeEndpoint && !endpoints.empty() && !replacingHome)
+		return false;
+	if (!homeEndpoint && endpoints.empty())
+		return false;
+	if (!homeEndpoint) {
+		// A stock or scripted scaffold may be alive before TunnelTracker
+		// registers it. Do not queue a third endpoint beside that scaffold.
+		ObjectID unregisteredID = INVALID_ID;
+		for (Object *object = TheGameLogic->getFirstObject(); object;
+			object = object->getNextObject()) {
+			if (object->getControllingPlayer() != m_player ||
+				object->isEffectivelyDead() || object->isDestroyed() ||
+				object->testStatus(OBJECT_STATUS_SOLD) ||
+				!IsSkirmishAIStrategyTunnelTemplate(object->getTemplate()))
+				continue;
+			Bool registered = FALSE;
+			for (size_t i = 0; i < endpoints.size(); ++i)
+				if (endpoints[i]->getID() == object->getID()) {
+					registered = TRUE;
+					break;
+				}
+			if (!registered && (unregisteredID == INVALID_ID ||
+				object->getID() < unregisteredID))
+				unregisteredID = object->getID();
+		}
+		if (unregisteredID != INVALID_ID) {
+			if (state.tunnelScaffoldWaitObjectID != unregisteredID) {
+				state.tunnelScaffoldWaitObjectID = unregisteredID;
+				state.tunnelScaffoldWaitUntilFrame = now +
+					120 * LOGICFRAMES_PER_SECOND;
+			}
+			if (!IsSkirmishStrategyFrameReached(
+					now, state.tunnelScaffoldWaitUntilFrame)) {
+				if (deferred) *deferred = TRUE;
+				return false;
+			}
+		} else {
+			state.tunnelScaffoldWaitObjectID = INVALID_ID;
+			state.tunnelScaffoldWaitUntilFrame = 0;
+		}
+	}
+	Bool hasAvailableBuilder = FALSE;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (isTunnelBuildBuilderAvailable(object)) {
+			hasAvailableBuilder = TRUE;
+			break;
+		}
+	}
+	if (!hasAvailableBuilder) {
+		if (!state.tunnelBuilderWaitUntilFrame)
+			state.tunnelBuilderWaitUntilFrame = now +
+				120 * LOGICFRAMES_PER_SECOND;
+		if (deferred) *deferred = !IsSkirmishStrategyFrameReached(
+			now, state.tunnelBuilderWaitUntilFrame);
+		return false;
+	}
+	state.tunnelBuilderWaitUntilFrame = 0;
+
+	// Match the exposed assault subset selected by tryTunnelBypass. Scripted
+	// extras and members already contained do not veto this group's route.
+	// A forward exit still requires every selected member to reach an entry.
+	std::vector<Object *> members;
+	for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+		!member.done(); member.advance()) {
+		Object *object = member.cur();
+		if (!IsSkirmishAIStrategyTunnelTransitMember(
+				object, m_player, team, false))
+			continue;
+		if (object->isKindOf(KINDOF_AIRCRAFT))
+			return false;
+		members.push_back(object);
+	}
+	std::sort(members.begin(), members.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+	if (members.empty() || members.size() > MAX_SKIRMISH_AI_TUNNEL_MEMBERS)
+		return false;
+	if (!homeEndpoint) {
+		Bool reachableEntry = false;
+		// Reserve half of the 256-query attempt for candidate sites and builders.
+		UnsignedInt entrySignature = (UnsignedInt)endpoints.size();
+		for (size_t i = 0; i < endpoints.size(); ++i) {
+			const Coord3D *position = endpoints[i]->getPosition();
+			entrySignature = entrySignature * 33u +
+				(UnsignedInt)endpoints[i]->getID();
+			entrySignature = entrySignature * 33u +
+				(UnsignedInt)(Int)(position->x / 80.0f);
+			entrySignature = entrySignature * 33u +
+				(UnsignedInt)(Int)(position->y / 80.0f);
+		}
+		entrySignature = entrySignature * 33u + (UnsignedInt)members.size();
+		for (size_t entryMemberIndex = 0; entryMemberIndex < members.size(); ++entryMemberIndex) {
+			const Coord3D *position = members[entryMemberIndex]->getPosition();
+			entrySignature = entrySignature * 33u +
+				(UnsignedInt)members[entryMemberIndex]->getID();
+			entrySignature = entrySignature * 33u +
+				(UnsignedInt)(Int)(position->x / 80.0f);
+			entrySignature = entrySignature * 33u +
+				(UnsignedInt)(Int)(position->y / 80.0f);
+		}
+		if (state.tunnelForwardEntryTargetID != target->getID()) {
+			state.tunnelForwardEntryTargetID = target->getID();
+			state.tunnelForwardEntrySignature = entrySignature;
+			state.tunnelForwardEntryCursor = (UnsignedInt)team->getID();
+			state.tunnelForwardEntryRemaining = (UnsignedInt)endpoints.size();
+			state.tunnelForwardEntryRetryAfterFrame = 0;
+		}
+		if (state.tunnelForwardEntryRemaining > endpoints.size())
+			state.tunnelForwardEntryRemaining = (UnsignedInt)endpoints.size();
+		// Finish an active sweep even when the group moves. A failed sweep
+		// refreshes after 15 seconds for changed paths, or after five seconds
+		// when a member or endpoint crosses an 80-unit position cell.
+		const Bool changedEntry =
+			state.tunnelForwardEntrySignature != entrySignature;
+		const Bool refreshEntry =
+			SkirmishAITunnelRoute::ShouldRestartEndpointSweep(
+				state.tunnelForwardEntryRemaining, now,
+				state.tunnelForwardEntryRetryAfterFrame) ||
+			(changedEntry &&
+				SkirmishAITunnelRoute::ShouldRestartEndpointSweep(
+					state.tunnelForwardEntryRemaining,
+					now + 10 * LOGICFRAMES_PER_SECOND,
+					state.tunnelForwardEntryRetryAfterFrame));
+		if (refreshEntry) {
+			state.tunnelForwardEntrySignature = entrySignature;
+			state.tunnelForwardEntryRemaining = (UnsignedInt)endpoints.size();
+			state.tunnelForwardEntryRetryAfterFrame = 0;
+		}
+		const size_t entryLimit = min((size_t)2,
+			(size_t)state.tunnelForwardEntryRemaining);
+		for (size_t probe = 0; probe < entryLimit &&
+			!reachableEntry; ++probe) {
+			const Int requiredQueries = (Int)(members.size() * 2);
+			if (!SkirmishAITunnelRoute::CanReservePairQueries(
+					requiredQueries, *attemptPathQueryCount,
+					*aggregatePathQueryCount,
+					MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_ATTEMPT,
+					MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_UPDATE)) {
+				if (deferred) *deferred = TRUE;
+				return false;
+			}
+			const size_t endpointIndex =
+				state.tunnelForwardEntryCursor % endpoints.size();
+			Bool allReachable = true;
+			for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex) {
+				AIUpdateInterface *ai = members[memberIndex]->getAIUpdateInterface();
+				Bool memberReachable = FALSE;
+				for (Int candidate = 0; candidate < 2 && ai &&
+					!memberReachable; ++candidate) {
+					Coord3D entryApproach;
+					if (GetSkirmishAIStrategyGroundApproach(
+							members[memberIndex]->getPosition(),
+							endpoints[endpointIndex], candidate,
+							&entryApproach))
+						memberReachable = ProbeSkirmishAITunnelQuickPath(
+							ai->getLocomotorSet(),
+							members[memberIndex]->getPosition(), &entryApproach,
+							attemptPathQueryCount, aggregatePathQueryCount);
+				}
+				if (!memberReachable) {
+					allReachable = false;
+					break;
+				}
+			}
+			reachableEntry = allReachable;
+			if (!reachableEntry)
+				SkirmishAITunnelRoute::AdvanceEndpointSweep(
+					&state.tunnelForwardEntryCursor,
+					&state.tunnelForwardEntryRemaining);
+		}
+		if (!reachableEntry && state.tunnelForwardEntryRemaining) {
+			m_tunnelBuildCooldownUntilFrame = now +
+				SKIRMISH_AI_TUNNEL_PAIR_PROBE_SECONDS * LOGICFRAMES_PER_SECOND;
+			if (deferred) *deferred = TRUE;
+			return false;
+		}
+		if (!reachableEntry) {
+			if (!state.tunnelForwardEntryRemaining &&
+				!state.tunnelForwardEntryRetryAfterFrame) {
+				state.tunnelForwardEntryRetryAfterFrame = now +
+					15 * LOGICFRAMES_PER_SECOND;
+				if (!state.tunnelForwardEntryRetryAfterFrame)
+					state.tunnelForwardEntryRetryAfterFrame = 1;
+			}
+			return false;
+		}
+	}
+
+	// Do not build a duplicate home endpoint when a stock/scripted tunnel is
+	// already being placed but has not registered with TunnelTracker yet.
+	if (homeEndpoint) {
+		ObjectID unregisteredID = INVALID_ID;
+		for (Object *object = TheGameLogic->getFirstObject(); object;
+			object = object->getNextObject()) {
+			if (object->getControllingPlayer() == m_player &&
+				(!replacingHome || object->getID() !=
+					endpoints[0]->getID()) &&
+				!object->isEffectivelyDead() && !object->isDestroyed() &&
+				IsSkirmishAIStrategyTunnelTemplate(object->getTemplate()) &&
+				(unregisteredID == INVALID_ID ||
+					object->getID() < unregisteredID))
+				unregisteredID = object->getID();
+		}
+		if (unregisteredID != INVALID_ID) {
+			if (state.tunnelScaffoldWaitObjectID != unregisteredID) {
+				state.tunnelScaffoldWaitObjectID = unregisteredID;
+				state.tunnelScaffoldWaitUntilFrame = now +
+					120 * LOGICFRAMES_PER_SECOND;
+			}
+			if (!IsSkirmishStrategyFrameReached(
+					now, state.tunnelScaffoldWaitUntilFrame)) {
+				if (deferred) *deferred = TRUE;
+				return false;
+			}
+		} else {
+			state.tunnelScaffoldWaitObjectID = INVALID_ID;
+			state.tunnelScaffoldWaitUntilFrame = 0;
+		}
+	}
+
+	std::vector<Object *> builders;
+	for (Object *builderScanObject = TheGameLogic->getFirstObject(); builderScanObject;
+		builderScanObject = builderScanObject->getNextObject()) {
+		if (isTunnelBuildBuilderAvailable(builderScanObject))
+			builders.push_back(builderScanObject);
+	}
+	std::sort(builders.begin(), builders.end(),
+		IsSkirmishAIStrategyObjectIDBefore);
+	if (builders.empty())
+	{
+		if (!state.tunnelBuilderWaitUntilFrame)
+			state.tunnelBuilderWaitUntilFrame = now +
+				120 * LOGICFRAMES_PER_SECOND;
+		if (deferred) *deferred = !IsSkirmishStrategyFrameReached(
+			now, state.tunnelBuilderWaitUntilFrame);
+		return false;
+	}
+	const size_t builderProbeCount = min((size_t)8, builders.size());
+	UnsignedInt builderSignature = (UnsignedInt)builders.size();
+	for (size_t builderIndex = 0; builderIndex < builders.size(); ++builderIndex)
+		builderSignature = builderSignature * 33u +
+			(UnsignedInt)builders[builderIndex]->getID();
+	if (state.tunnelBuilderSignature != builderSignature ||
+		!state.tunnelBuilderWindowsRemaining) {
+		state.tunnelBuilderSignature = builderSignature;
+		state.tunnelBuilderWindowsRemaining =
+			SkirmishAITunnelRoute::BuilderWindowCount(
+				(UnsignedInt)builders.size(), 8);
+	}
+	const size_t builderStart =
+		(size_t)(state.tunnelBuilderCursor % (UnsignedInt)builders.size());
+
+	const Real tunnelRadius = max(
+		plan->getTemplateGeometryInfo().getBoundingCircleRadius(),
+		PATHFIND_CELL_SIZE_F);
+	Coord3D candidates[5];
+	Int candidateCount = 0;
+	if (homeEndpoint) {
+		const Real offset = max(m_baseRadius, 0.0f) + tunnelRadius +
+			2.0f * PATHFIND_CELL_SIZE_F;
+		const Real offsets[5][2] = {
+			{ 1.0f, 0.0f }, { 0.0f, 1.0f }, { -1.0f, 0.0f },
+			{ 0.0f, -1.0f }, { 0.70710678f, 0.70710678f }
+		};
+		for (Int i = 0; i < 5; ++i) {
+			candidates[candidateCount] = m_baseCenter;
+			candidates[candidateCount].x += offsets[i][0] * offset;
+			candidates[candidateCount].y += offsets[i][1] * offset;
+			candidates[candidateCount].z = 0.0f;
+			++candidateCount;
+		}
+	} else {
+		const Real dx = target->getPosition()->x - blockingDefense->getPosition()->x;
+		const Real dy = target->getPosition()->y - blockingDefense->getPosition()->y;
+		const Real length = sqrt(dx * dx + dy * dy);
+		if (length <= 1.0f)
+			return false;
+		const Real ux = dx / length;
+		const Real uy = dy / length;
+		const Real defenseRadius = blockingDefense->getTemplate()
+			? blockingDefense->getTemplate()->getTemplateGeometryInfo()
+				.getBoundingCircleRadius() : 0.0f;
+		const Real targetRadius = target->getTemplate()
+			? target->getTemplate()->getTemplateGeometryInfo()
+				.getBoundingCircleRadius() : 0.0f;
+		const Real forward = defenseRadius + tunnelRadius + PATHFIND_CELL_SIZE_F;
+		const Real targetClearance = targetRadius + tunnelRadius + PATHFIND_CELL_SIZE_F;
+		if (length <= forward + targetClearance)
+			return false;
+		const Real lateralOffsets[5] = { 0.0f, 2.0f * tunnelRadius,
+			-2.0f * tunnelRadius, 4.0f * tunnelRadius,
+			-4.0f * tunnelRadius };
+		for (Int i = 0; i < 5; ++i) {
+			candidates[candidateCount] = *blockingDefense->getPosition();
+			candidates[candidateCount].x += ux * forward - uy * lateralOffsets[i];
+			candidates[candidateCount].y += uy * forward + ux * lateralOffsets[i];
+			candidates[candidateCount].z = 0.0f;
+			++candidateCount;
+		}
+	}
+
+	Bool eligibleSiteFound = FALSE;
+	for (Int siteAttempt = 0; siteAttempt < candidateCount; ++siteAttempt) {
+		const Int siteIndex = SkirmishAITunnelRoute::SelectSiteIndex(
+			candidateCount, state.tunnelSiteCursor);
+		if (*attemptPathQueryCount >=
+			MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_ATTEMPT ||
+			*aggregatePathQueryCount >=
+			MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_UPDATE) {
+			if (deferred) *deferred = TRUE;
+			return false;
+		}
+		// A site may consume the full path budget; resume at the next one.
+		++state.tunnelSiteCursor;
+		Coord3D buildPosition = candidates[siteIndex];
+		if (!IsSkirmishAIStrategyTunnelSiteVisible(m_player, buildPosition))
+			continue;
+		buildPosition.z = TheTerrainLogic->getGroundHeight(
+			buildPosition.x, buildPosition.y);
+		if (homeEndpoint
+			? !isLocationSafe(&buildPosition, plan)
+			: !IsSkirmishAIForwardTunnelLocationSafe(m_player,
+				m_currentEnemy, &buildPosition, plan,
+				blockingDefense, target))
+			continue;
+		Bool groupRoute = true;
+		for (size_t memberIndex = 0; memberIndex < members.size(); ++memberIndex) {
+			AIUpdateInterface *ai = members[memberIndex]->getAIUpdateInterface();
+			Bool memberRoute = FALSE;
+			for (Int candidate = 0; candidate < 2 && ai &&
+				!memberRoute; ++candidate) {
+				const Coord3D *approachOrigin = homeEndpoint
+					? members[memberIndex]->getPosition() : target->getPosition();
+				Coord3D tunnelApproach = buildPosition;
+				if (!SkirmishAITunnelRoute::GetApproachPoint(
+						buildPosition.x, buildPosition.y,
+						approachOrigin->x, approachOrigin->y,
+						tunnelRadius, 2.0f * PATHFIND_CELL_SIZE_F,
+						candidate, &tunnelApproach.x, &tunnelApproach.y))
+					continue;
+				tunnelApproach.z = TheTerrainLogic->getGroundHeight(
+					tunnelApproach.x, tunnelApproach.y);
+				Coord3D targetApproach;
+				if (!homeEndpoint && !GetSkirmishAIStrategyGroundApproach(
+						&buildPosition, target, candidate, &targetApproach))
+					continue;
+				memberRoute = ProbeSkirmishAITunnelQuickPath(
+					ai->getLocomotorSet(),
+					homeEndpoint ? members[memberIndex]->getPosition()
+						: &tunnelApproach,
+					homeEndpoint ? &tunnelApproach : &targetApproach,
+					attemptPathQueryCount, aggregatePathQueryCount);
+			}
+			if (!memberRoute) {
+				if (*attemptPathQueryCount >=
+					MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_ATTEMPT ||
+					*aggregatePathQueryCount >=
+					MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_UPDATE) {
+					if (deferred) *deferred = TRUE;
+					return false;
+				}
+				groupRoute = false;
+				break;
+			}
+		}
+		if (!groupRoute)
+			continue;
+		eligibleSiteFound = TRUE;
+		for (size_t builderIndex = 0; builderIndex < builderProbeCount;
+			++builderIndex) {
+			if (*attemptPathQueryCount >=
+				MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_ATTEMPT ||
+				*aggregatePathQueryCount >=
+				MAX_SKIRMISH_AI_TUNNEL_PATH_QUERIES_PER_UPDATE) {
+				if (deferred) *deferred = TRUE;
+				return false;
+			}
+			Object *builder = builders[(builderStart + builderIndex) %
+				builders.size()];
+			if (!isTunnelBuildBuilderAvailable(builder) ||
+				TheBuildAssistant->canMakeUnit(builder, plan) != CANMAKE_OK)
+				continue;
+			AIUpdateInterface *builderAI = builder->getAIUpdateInterface();
+			if (!builderAI || !ProbeSkirmishAITunnelQuickPath(
+					builderAI->getLocomotorSet(), builder->getPosition(),
+					&buildPosition, attemptPathQueryCount,
+					aggregatePathQueryCount))
+				continue;
+			const Bool legal = TheBuildAssistant->isLocationLegalToBuild(
+				&buildPosition, plan, plan->getPlacementViewAngle(),
+				BuildAssistant::CLEAR_PATH |
+				BuildAssistant::TERRAIN_RESTRICTIONS |
+				BuildAssistant::NO_OBJECT_OVERLAP,
+				builder, m_player) == LBC_OK;
+			if (TheTerrainVisual)
+				TheTerrainVisual->removeAllBibs();
+			if (!legal)
+				continue;
+
+			Coord3D queuedPosition = candidates[siteIndex];
+			queuedPosition.z = 0.0f;
+			m_player->addToPriorityBuildList(
+				plan->getName(), &queuedPosition, plan->getPlacementViewAngle());
+			m_tunnelBuildPhase = homeEndpoint
+				? SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED
+				: SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED;
+			if (homeEndpoint && retryAvailable)
+				m_tunnelHomeAttempted = TRUE;
+			if (!homeEndpoint) {
+				m_tunnelForwardRetryConsumed = forwardRetryForTarget;
+				if (forwardRetryForTarget)
+					m_tunnelForwardAttempted = TRUE;
+			}
+			m_tunnelBuildBuilderID = builder->getID();
+			m_tunnelPendingBuilderCursor = 0;
+			m_tunnelBuildTargetID = target->getID();
+			if (!homeEndpoint)
+				m_tunnelForwardAttemptTargetID = target->getID();
+			m_tunnelBuildBlockerID = blockingDefense->getID();
+			m_tunnelBuildObjectID = INVALID_ID;
+			m_tunnelBuildLocation = queuedPosition;
+			m_tunnelBuildDeadlineFrame = now +
+				120 * LOGICFRAMES_PER_SECOND;
+			m_tunnelBuildCooldownUntilFrame = now;
+			return true;
+		}
+	}
+	if (eligibleSiteFound && builders.size() > builderProbeCount &&
+		state.tunnelBuilderWindowsRemaining > 1) {
+		--state.tunnelBuilderWindowsRemaining;
+		state.tunnelBuilderCursor += (UnsignedInt)builderProbeCount;
+		m_tunnelBuildCooldownUntilFrame = now +
+			SKIRMISH_AI_TUNNEL_PAIR_PROBE_SECONDS * LOGICFRAMES_PER_SECOND;
+		if (deferred) *deferred = TRUE;
+		return false;
+	}
+	state.tunnelBuilderWindowsRemaining = 0;
+	m_tunnelBuildCooldownUntilFrame = now +
+		SKIRMISH_AI_TUNNEL_RETRY_COOLDOWN_SECONDS * LOGICFRAMES_PER_SECOND;
+	return false;
+}
+
 //----------------------------------------------------------------------------------------------------------
 /**
  * Queues up a dozer.
@@ -7070,6 +11702,22 @@ void AISkirmishPlayer::queueDozer()
  */
 Object * AISkirmishPlayer::findDozer( const Coord3D *pos )
 {
+	if (m_defenseBuildLockedBuilderID != INVALID_ID && pos &&
+		pos->x == m_defenseBuildLockedLocation.x &&
+		pos->y == m_defenseBuildLockedLocation.y) {
+		Object *builder = TheGameLogic
+			? TheGameLogic->findObjectByID(m_defenseBuildLockedBuilderID) : nullptr;
+		return builder && builder->getControllingPlayer() == m_player &&
+			!builder->isEffectivelyDead() && !builder->isDestroyed()
+			? builder : nullptr;
+	}
+	if (m_tunnelBuildLockedBuilderID != INVALID_ID && pos &&
+		pos->x == m_tunnelBuildLocation.x &&
+		pos->y == m_tunnelBuildLocation.y) {
+		Object *builder = TheGameLogic
+			? TheGameLogic->findObjectByID(m_tunnelBuildLockedBuilderID) : nullptr;
+		return isTunnelBuildBuilderAvailable(builder) ? builder : nullptr;
+	}
 	return AIPlayer::findDozer(pos);
 }
 
@@ -7177,6 +11825,292 @@ static void XferSkirmishStrategyState(
 // ------------------------------------------------------------------------------------------------
 /** CRC */
 // ------------------------------------------------------------------------------------------------
+void AISkirmishPlayer::xferTunnelEndpointProbes(
+	Xfer *xfer, TacticalTeamState &state)
+{
+	xfer->xferUnsignedInt(&state.tunnelPairRefreshCursor);
+	xfer->xferUnsignedInt(&state.tunnelPairRefreshRemaining);
+	xfer->xferUnsignedInt(&state.tunnelPairRefreshAfterFrame);
+	xfer->xferUnsignedInt(&state.tunnelPairRefreshCacheAfterFrame);
+	xfer->xferBool(&state.tunnelPairRefreshYieldMain);
+	xfer->xferUnsignedInt(&state.tunnelProbeMovementSignature);
+	xfer->xferUnsignedInt(&state.tunnelScaffoldWaitUntilFrame);
+	xfer->xferObjectID(&state.tunnelScaffoldWaitObjectID);
+	xfer->xferInt(&state.tunnelProbeMemberCount);
+	for (Int i = 0; i < MAX_SKIRMISH_AI_TUNNEL_MEMBERS; ++i)
+		xfer->xferObjectID(&state.tunnelProbeMemberIDs[i]);
+	UnsignedInt count = (UnsignedInt)state.tunnelEndpointProbes.size();
+	xfer->xferUnsignedInt(&count);
+	if (count > MAX_SKIRMISH_AI_TUNNEL_ENDPOINT_PROBES)
+		throw XFER_INVALID_PARAMETERS;
+	if (xfer->getXferMode() == XFER_LOAD)
+		state.tunnelEndpointProbes.clear();
+	for (UnsignedInt endpointProbeIndex = 0; endpointProbeIndex < count; ++endpointProbeIndex) {
+		TacticalTeamState::TunnelEndpointProbe probe;
+		if (xfer->getXferMode() != XFER_LOAD)
+			probe = state.tunnelEndpointProbes[endpointProbeIndex];
+		xfer->xferObjectID(&probe.objectID);
+		xfer->xferInt(&probe.entryResult);
+		xfer->xferInt(&probe.exitResult);
+		if (xfer->getXferMode() == XFER_LOAD)
+			state.tunnelEndpointProbes.push_back(probe);
+	}
+	if (xfer->getXferMode() == XFER_LOAD &&
+		(state.tunnelProbeMemberCount < 0 ||
+		 state.tunnelProbeMemberCount > MAX_SKIRMISH_AI_TUNNEL_MEMBERS)) {
+		state.tunnelProbeMemberCount = 0;
+		state.tunnelEndpointProbes.clear();
+	}
+}
+
+void AISkirmishPlayer::xferGeneratedDefenseBuilds(Xfer *xfer)
+{
+	UnsignedInt count = (UnsignedInt)m_generatedDefenseBuilds.size();
+	xfer->xferUnsignedInt(&count);
+	if (count > 5)
+		throw XFER_INVALID_PARAMETERS;
+	if (xfer->getXferMode() == XFER_LOAD)
+		m_generatedDefenseBuilds.clear();
+	for (UnsignedInt i = 0; i < count; ++i) {
+		GeneratedDefenseBuild build;
+		if (xfer->getXferMode() != XFER_LOAD)
+			build = m_generatedDefenseBuilds[i];
+		xfer->xferAsciiString(&build.templateName);
+		xfer->xferReal(&build.location.x);
+		xfer->xferReal(&build.location.y);
+		xfer->xferReal(&build.angle);
+		if (xfer->getXferMode() == XFER_LOAD && i < 5)
+			m_generatedDefenseBuilds.push_back(build);
+	}
+}
+
+void AISkirmishPlayer::xferTacticalTeams(Xfer *xfer, XferVersion version)
+{
+	UnsignedInt count = static_cast<UnsignedInt>(m_tacticalTeams.size());
+	xfer->xferUnsignedInt(&count);
+	if (count > MAX_SKIRMISH_AI_TACTICAL_TEAMS)
+		throw XFER_INVALID_PARAMETERS;
+	if (xfer->getXferMode() == XFER_LOAD)
+		m_tacticalTeams.clear();
+	if (xfer->getXferMode() == XFER_SAVE) {
+		for (std::map<UnsignedInt, TacticalTeamState>::iterator it =
+				m_tacticalTeams.begin(); it != m_tacticalTeams.end(); ++it) {
+			UnsignedInt teamID = it->first;
+			TacticalTeamState &state = it->second;
+			xfer->xferUnsignedInt(&teamID);
+			xfer->xferObjectID(&state.targetID);
+			xfer->xferReal(&state.targetHealth);
+			xfer->xferReal(&state.distanceToTargetSqr);
+			xfer->xferUnsignedInt(&state.lastProgressFrame);
+			xfer->xferUnsignedInt(&state.nextCheckFrame);
+			xfer->xferUnsignedInt(&state.regroupUntilFrame);
+			xfer->xferUnsignedInt(&state.blockedSinceFrame);
+			xfer->xferUnsignedInt(&state.retreatStartFrame);
+			xfer->xferUnsignedInt(&state.nextRetreatFrame);
+			if (version >= 15)
+				xfer->xferUnsignedInt(&state.retreatProbeCursor);
+			xfer->xferUnsignedInt(&state.routeExhaustedUntilFrame);
+			xfer->xferObjectID(&state.routeExhaustedTargetID);
+			xfer->xferObjectID(&state.alternateProbeAfterID);
+			xfer->xferObjectID(&state.alternateAttackIssuedTargetID);
+			xfer->xferInt(&state.approachAttempt);
+			xfer->xferBool(&state.retreating);
+			xfer->xferBool(&state.woundedReserve);
+			xfer->xferInt(&state.tunnelTransitPhase);
+			xfer->xferInt(&state.tunnelMemberCount);
+			for (Int memberIndex = 0; memberIndex < MAX_SKIRMISH_AI_TUNNEL_MEMBERS;
+				++memberIndex)
+				xfer->xferObjectID(&state.tunnelMemberIDs[memberIndex]);
+			xfer->xferUnsignedInt(&state.tunnelPairCursor);
+			xfer->xferUnsignedInt(&state.tunnelPairSweepRemaining);
+			xfer->xferUnsignedInt(&state.tunnelPairSweepStartFrame);
+			xfer->xferUnsignedInt(&state.tunnelPairResumeAfterFrame);
+			xfer->xferUnsignedInt(&state.tunnelPairRetryAfterFrame);
+			xfer->xferUnsignedInt(&state.tunnelPairEndpointSignature);
+			xfer->xferObjectID(&state.tunnelPairSweepTargetID);
+			xfer->xferObjectID(&state.tunnelWaitTargetID);
+			xfer->xferUnsignedInt(&state.tunnelSiteCursor);
+			xfer->xferUnsignedInt(&state.tunnelBuilderWaitUntilFrame);
+			xfer->xferUnsignedInt(&state.tunnelBuilderCursor);
+			xfer->xferUnsignedInt(&state.tunnelBuilderSignature);
+			xfer->xferUnsignedInt(&state.tunnelBuilderWindowsRemaining);
+			xfer->xferUnsignedInt(&state.tunnelForwardEntryCursor);
+			xfer->xferUnsignedInt(&state.tunnelForwardEntryRemaining);
+			xfer->xferUnsignedInt(&state.tunnelForwardEntrySignature);
+			xfer->xferObjectID(&state.tunnelForwardEntryTargetID);
+			xfer->xferUnsignedInt(&state.tunnelForwardEntryRetryAfterFrame);
+			xfer->xferObjectID(&state.tunnelEntryID);
+			xfer->xferObjectID(&state.tunnelExitID);
+			xfer->xferObjectID(&state.tunnelTargetID);
+			xfer->xferObjectID(&state.tunnelStrategicTargetID);
+			xfer->xferUnsignedInt(&state.tunnelPhaseDeadlineFrame);
+			xfer->xferUnsignedInt(&state.tunnelCooldownUntilFrame);
+			if (version >= 14)
+				xferTunnelEndpointProbes(xfer, state);
+			if (version >= 18) {
+				xfer->xferObjectID(&state.tunnelCapacityWaitTargetID);
+				xfer->xferUnsignedInt(&state.tunnelCapacityWaitDeadlineFrame);
+			}
+			if (version >= 19)
+				xfer->xferUnsignedInt(
+					&state.tunnelCommittedTargetLastSeenFrame);
+		}
+	} else {
+		for (UnsignedInt i = 0; i < count; ++i) {
+			UnsignedInt teamID = 0;
+			TacticalTeamState state;
+			xfer->xferUnsignedInt(&teamID);
+			xfer->xferObjectID(&state.targetID);
+			xfer->xferReal(&state.targetHealth);
+			xfer->xferReal(&state.distanceToTargetSqr);
+			xfer->xferUnsignedInt(&state.lastProgressFrame);
+			xfer->xferUnsignedInt(&state.nextCheckFrame);
+			xfer->xferUnsignedInt(&state.regroupUntilFrame);
+			xfer->xferUnsignedInt(&state.blockedSinceFrame);
+			xfer->xferUnsignedInt(&state.retreatStartFrame);
+			xfer->xferUnsignedInt(&state.nextRetreatFrame);
+			if (version >= 15)
+				xfer->xferUnsignedInt(&state.retreatProbeCursor);
+			xfer->xferUnsignedInt(&state.routeExhaustedUntilFrame);
+			xfer->xferObjectID(&state.routeExhaustedTargetID);
+			xfer->xferObjectID(&state.alternateProbeAfterID);
+			xfer->xferObjectID(&state.alternateAttackIssuedTargetID);
+			xfer->xferInt(&state.approachAttempt);
+			xfer->xferBool(&state.retreating);
+			xfer->xferBool(&state.woundedReserve);
+			xfer->xferInt(&state.tunnelTransitPhase);
+			xfer->xferInt(&state.tunnelMemberCount);
+			for (Int memberIndex = 0; memberIndex < MAX_SKIRMISH_AI_TUNNEL_MEMBERS;
+				++memberIndex)
+				xfer->xferObjectID(&state.tunnelMemberIDs[memberIndex]);
+			xfer->xferUnsignedInt(&state.tunnelPairCursor);
+			xfer->xferUnsignedInt(&state.tunnelPairSweepRemaining);
+			xfer->xferUnsignedInt(&state.tunnelPairSweepStartFrame);
+			xfer->xferUnsignedInt(&state.tunnelPairResumeAfterFrame);
+			xfer->xferUnsignedInt(&state.tunnelPairRetryAfterFrame);
+			xfer->xferUnsignedInt(&state.tunnelPairEndpointSignature);
+			xfer->xferObjectID(&state.tunnelPairSweepTargetID);
+			xfer->xferObjectID(&state.tunnelWaitTargetID);
+			xfer->xferUnsignedInt(&state.tunnelSiteCursor);
+			xfer->xferUnsignedInt(&state.tunnelBuilderWaitUntilFrame);
+			xfer->xferUnsignedInt(&state.tunnelBuilderCursor);
+			xfer->xferUnsignedInt(&state.tunnelBuilderSignature);
+			xfer->xferUnsignedInt(&state.tunnelBuilderWindowsRemaining);
+			xfer->xferUnsignedInt(&state.tunnelForwardEntryCursor);
+			xfer->xferUnsignedInt(&state.tunnelForwardEntryRemaining);
+			xfer->xferUnsignedInt(&state.tunnelForwardEntrySignature);
+			xfer->xferObjectID(&state.tunnelForwardEntryTargetID);
+			xfer->xferUnsignedInt(&state.tunnelForwardEntryRetryAfterFrame);
+			xfer->xferObjectID(&state.tunnelEntryID);
+			xfer->xferObjectID(&state.tunnelExitID);
+			xfer->xferObjectID(&state.tunnelTargetID);
+			xfer->xferObjectID(&state.tunnelStrategicTargetID);
+			xfer->xferUnsignedInt(&state.tunnelPhaseDeadlineFrame);
+			xfer->xferUnsignedInt(&state.tunnelCooldownUntilFrame);
+			if (version >= 14)
+				xferTunnelEndpointProbes(xfer, state);
+			if (version >= 18) {
+				xfer->xferObjectID(&state.tunnelCapacityWaitTargetID);
+				xfer->xferUnsignedInt(&state.tunnelCapacityWaitDeadlineFrame);
+			}
+			if (version >= 19)
+				xfer->xferUnsignedInt(
+					&state.tunnelCommittedTargetLastSeenFrame);
+			// Team instances can be restored after the player snapshot.
+			if (teamID) {
+				if (state.approachAttempt < 0 || state.approachAttempt > 4)
+					state.approachAttempt = 0;
+				if (state.tunnelTransitPhase <
+						SKIRMISH_AI_TUNNEL_TRANSIT_NONE ||
+					state.tunnelTransitPhase >
+						SKIRMISH_AI_TUNNEL_TRANSIT_FALLBACK_EXIT ||
+					state.tunnelMemberCount < 0 ||
+					state.tunnelMemberCount > MAX_SKIRMISH_AI_TUNNEL_MEMBERS) {
+					state.tunnelTransitPhase =
+						SKIRMISH_AI_TUNNEL_TRANSIT_NONE;
+					state.tunnelMemberCount = 0;
+				}
+				if (state.tunnelTransitPhase ==
+						SKIRMISH_AI_TUNNEL_TRANSIT_NONE) {
+					for (Int memberIndex = 0;
+						memberIndex < MAX_SKIRMISH_AI_TUNNEL_MEMBERS;
+						++memberIndex)
+						state.tunnelMemberIDs[memberIndex] = INVALID_ID;
+					state.tunnelEntryID = INVALID_ID;
+					state.tunnelExitID = INVALID_ID;
+					state.tunnelTargetID = INVALID_ID;
+					state.tunnelStrategicTargetID = INVALID_ID;
+					state.tunnelCommittedTargetLastSeenFrame = 0;
+					state.tunnelPhaseDeadlineFrame = 0;
+				}
+				m_tacticalTeams[teamID] = state;
+			}
+		}
+	}
+}
+
+void AISkirmishPlayer::crcTacticalTeams(Xfer *xfer)
+{
+	UnsignedInt count = static_cast<UnsignedInt>(m_tacticalTeams.size());
+	xfer->xferUnsignedInt(&count);
+	for (std::map<UnsignedInt, TacticalTeamState>::iterator it =
+			m_tacticalTeams.begin(); it != m_tacticalTeams.end(); ++it) {
+		UnsignedInt teamID = it->first;
+		TacticalTeamState &state = it->second;
+		xfer->xferUnsignedInt(&teamID);
+		xfer->xferObjectID(&state.targetID);
+		xfer->xferReal(&state.targetHealth);
+		xfer->xferReal(&state.distanceToTargetSqr);
+		xfer->xferUnsignedInt(&state.lastProgressFrame);
+		xfer->xferUnsignedInt(&state.nextCheckFrame);
+		xfer->xferUnsignedInt(&state.regroupUntilFrame);
+		xfer->xferUnsignedInt(&state.blockedSinceFrame);
+		xfer->xferUnsignedInt(&state.retreatStartFrame);
+		xfer->xferUnsignedInt(&state.nextRetreatFrame);
+		xfer->xferUnsignedInt(&state.retreatProbeCursor);
+		xfer->xferUnsignedInt(&state.routeExhaustedUntilFrame);
+		xfer->xferObjectID(&state.routeExhaustedTargetID);
+		xfer->xferObjectID(&state.alternateProbeAfterID);
+		xfer->xferObjectID(&state.alternateAttackIssuedTargetID);
+		xfer->xferInt(&state.approachAttempt);
+		xfer->xferBool(&state.retreating);
+		xfer->xferBool(&state.woundedReserve);
+		xfer->xferInt(&state.tunnelTransitPhase);
+		xfer->xferInt(&state.tunnelMemberCount);
+		for (Int memberIndex = 0; memberIndex < MAX_SKIRMISH_AI_TUNNEL_MEMBERS;
+			++memberIndex)
+			xfer->xferObjectID(&state.tunnelMemberIDs[memberIndex]);
+		xfer->xferUnsignedInt(&state.tunnelPairCursor);
+		xfer->xferUnsignedInt(&state.tunnelPairSweepRemaining);
+		xfer->xferUnsignedInt(&state.tunnelPairSweepStartFrame);
+		xfer->xferUnsignedInt(&state.tunnelPairResumeAfterFrame);
+		xfer->xferUnsignedInt(&state.tunnelPairRetryAfterFrame);
+		xfer->xferUnsignedInt(&state.tunnelPairEndpointSignature);
+		xfer->xferObjectID(&state.tunnelPairSweepTargetID);
+		xfer->xferObjectID(&state.tunnelWaitTargetID);
+		xfer->xferUnsignedInt(&state.tunnelSiteCursor);
+		xfer->xferUnsignedInt(&state.tunnelBuilderWaitUntilFrame);
+		xfer->xferUnsignedInt(&state.tunnelBuilderCursor);
+		xfer->xferUnsignedInt(&state.tunnelBuilderSignature);
+		xfer->xferUnsignedInt(&state.tunnelBuilderWindowsRemaining);
+		xfer->xferUnsignedInt(&state.tunnelForwardEntryCursor);
+		xfer->xferUnsignedInt(&state.tunnelForwardEntryRemaining);
+		xfer->xferUnsignedInt(&state.tunnelForwardEntrySignature);
+		xfer->xferObjectID(&state.tunnelForwardEntryTargetID);
+		xfer->xferUnsignedInt(&state.tunnelForwardEntryRetryAfterFrame);
+		xfer->xferObjectID(&state.tunnelEntryID);
+		xfer->xferObjectID(&state.tunnelExitID);
+		xfer->xferObjectID(&state.tunnelTargetID);
+		xfer->xferObjectID(&state.tunnelStrategicTargetID);
+		xfer->xferUnsignedInt(&state.tunnelPhaseDeadlineFrame);
+		xfer->xferUnsignedInt(&state.tunnelCooldownUntilFrame);
+		xferTunnelEndpointProbes(xfer, state);
+		xfer->xferObjectID(&state.tunnelCapacityWaitTargetID);
+		xfer->xferUnsignedInt(&state.tunnelCapacityWaitDeadlineFrame);
+		xfer->xferUnsignedInt(&state.tunnelCommittedTargetLastSeenFrame);
+	}
+}
+
 void AISkirmishPlayer::crc( Xfer *xfer )
 {
 	if (!usesCriticalRecoveryBehavior() && !usesProductionBehavior())
@@ -7212,6 +12146,50 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	xfer->xferInt(&m_recoveryReserveCost);
 	if (ShouldIncludeSkirmishAIStrategyCRCFields(replay, replayEpoch))
 		XferSkirmishStrategyState(xfer, &m_strategyState);
+	if (ShouldIncludeSkirmishAITacticalCRCFields(replay, replayEpoch)) {
+		xfer->xferBool(&m_strategyTargetFallbackPending);
+		xfer->xferObjectID(&m_strategyTargetFallbackAfterID);
+		xfer->xferInt(&m_strategyTargetFallbackEnemyIndex);
+		xfer->xferUnsignedInt(&m_tacticalNextTeamScanFrame);
+		crcTacticalTeams(xfer);
+		xferGeneratedDefenseBuilds(xfer);
+		xfer->xferInt(&m_defensePatrolRoute);
+		xfer->xferUnsignedInt(&m_defensePatrolTeamID);
+		xfer->xferObjectID(&m_defensePatrolObjectID);
+		xfer->xferUnsignedInt(&m_defenseNextPatrolFrame);
+		xfer->xferCoord3D(&m_defenseQuietPatrolWaypoint);
+		xfer->xferUnsignedInt(&m_defenseQuietPatrolDeadlineFrame);
+		xfer->xferUnsignedInt(&m_defensePlacementAttempt);
+		xfer->xferUnsignedInt(&m_defensePlacementNextFrame);
+		xfer->xferObjectID(&m_defensePursuitTargetID);
+		xfer->xferUnsignedInt(&m_defensePursuitStartFrame);
+		xfer->xferObjectID(&m_defenseInterceptProbeAfterID);
+		xfer->xferObjectID(&m_defensePatrolRouteMemberAfterID);
+		xfer->xferObjectID(&m_defenseInterceptMemberAfterID);
+		xfer->xferInt(&m_tunnelBuildPhase);
+		xfer->xferBool(&m_tunnelHomeAttempted);
+		xfer->xferBool(&m_tunnelForwardAttempted);
+		xfer->xferObjectID(&m_tunnelHomeEndpointID);
+		xfer->xferObjectID(&m_tunnelForwardEndpointID);
+		xfer->xferObjectID(&m_tunnelBuildBuilderID);
+		xfer->xferObjectID(&m_tunnelBuildTargetID);
+		xfer->xferObjectID(&m_tunnelBuildBlockerID);
+		xfer->xferObjectID(&m_tunnelBuildObjectID);
+		xfer->xferUnsignedInt(&m_tunnelPendingBuilderCursor);
+		xfer->xferCoord3D(&m_tunnelBuildLocation);
+		xfer->xferUnsignedInt(&m_tunnelBuildDeadlineFrame);
+		xfer->xferUnsignedInt(&m_tunnelBuildCooldownUntilFrame);
+		xfer->xferObjectID(&m_tunnelForwardAttemptTargetID);
+		for (Int i = 0;
+			i < SkirmishAITunnelRoute::MAX_GENERATED_FORWARD_ENDPOINTS; ++i) {
+			xfer->xferObjectID(&m_tunnelGeneratedForwardEndpointIDs[i]);
+			xfer->xferObjectID(&m_tunnelGeneratedForwardTargetIDs[i]);
+		}
+		xfer->xferBool(&m_tunnelForwardRetryConsumed);
+		for (Int exhaustedIndex = 0;
+			exhaustedIndex < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS; ++exhaustedIndex)
+			xfer->xferObjectID(&m_tunnelExhaustedForwardTargetIDs[exhaustedIndex]);
+	}
 	if (ShouldIncludeSkirmishAIProductionCRCFields(replay, replayEpoch)) {
 		xfer->xferInt(&m_strategyProductionReserveCost);
 		xfer->xferObjectID(&m_strategySuperweaponID);
@@ -7248,13 +12226,21 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	 * 9: Stage 3 production reserve and Fortify superweapon identity
 	 * 10: One-shot Fortify strategic-source command lock
 	 * 11: Exact strategic command identity and reinforcement fairness cursor
-	 * 12: Stage 3 worker collector roles, keyed by ObjectID */
+	 * 12: Stage 3 worker collector roles, keyed by ObjectID
+	 * 13: Stage 4 tactical progress, regroup, and tunnel transit state
+	 * 14: Tunnel endpoint probe cache, generated defense identity, and
+	 *     rotating strategic target fallback
+	 * 15: Rotating tactical retreat facility coverage
+	 * 16: Quiet defense patrol waypoint and bounded hold deadline
+	 * 17: Generated forward tunnel targets and bounded live exits
+	 * 18: Per-target forward retry and bounded full-tunnel wait
+	 * 19: Exhausted forward targets and committed alternate-target observation */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 12;
+	XferVersion currentVersion = 19;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -7405,7 +12391,186 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 			}
 		}
 	}
+	if (version >= 13) {
+		xfer->xferUnsignedInt(&m_tacticalNextTeamScanFrame);
+		xferTacticalTeams(xfer, version);
+		if (version >= 14) {
+			xfer->xferBool(&m_strategyTargetFallbackPending);
+			xfer->xferObjectID(&m_strategyTargetFallbackAfterID);
+			xfer->xferInt(&m_strategyTargetFallbackEnemyIndex);
+		} else if (xfer->getXferMode() == XFER_LOAD) {
+			m_strategyTargetFallbackPending = false;
+			m_strategyTargetFallbackAfterID = INVALID_ID;
+			m_strategyTargetFallbackEnemyIndex = -1;
+		}
+		xfer->xferInt(&m_defensePatrolRoute);
+		xfer->xferUnsignedInt(&m_defensePatrolTeamID);
+		xfer->xferObjectID(&m_defensePatrolObjectID);
+		xfer->xferUnsignedInt(&m_defenseNextPatrolFrame);
+		if (version >= 16) {
+			xfer->xferCoord3D(&m_defenseQuietPatrolWaypoint);
+			xfer->xferUnsignedInt(&m_defenseQuietPatrolDeadlineFrame);
+		} else if (xfer->getXferMode() == XFER_LOAD) {
+			m_defenseQuietPatrolWaypoint.zero();
+			m_defenseQuietPatrolDeadlineFrame = 0;
+		}
+		xfer->xferUnsignedInt(&m_defensePlacementAttempt);
+		xfer->xferUnsignedInt(&m_defensePlacementNextFrame);
+		xfer->xferObjectID(&m_defensePursuitTargetID);
+		xfer->xferUnsignedInt(&m_defensePursuitStartFrame);
+		xfer->xferObjectID(&m_defenseInterceptProbeAfterID);
+		if (version >= 14) {
+			xfer->xferObjectID(&m_defensePatrolRouteMemberAfterID);
+			xfer->xferObjectID(&m_defenseInterceptMemberAfterID);
+		}
+		xfer->xferInt(&m_tunnelBuildPhase);
+		xfer->xferBool(&m_tunnelHomeAttempted);
+		xfer->xferBool(&m_tunnelForwardAttempted);
+		xfer->xferObjectID(&m_tunnelHomeEndpointID);
+		xfer->xferObjectID(&m_tunnelForwardEndpointID);
+		xfer->xferObjectID(&m_tunnelBuildBuilderID);
+		xfer->xferObjectID(&m_tunnelBuildTargetID);
+		xfer->xferObjectID(&m_tunnelBuildBlockerID);
+		xfer->xferObjectID(&m_tunnelBuildObjectID);
+		xfer->xferUnsignedInt(&m_tunnelPendingBuilderCursor);
+		xfer->xferCoord3D(&m_tunnelBuildLocation);
+		xfer->xferUnsignedInt(&m_tunnelBuildDeadlineFrame);
+		xfer->xferUnsignedInt(&m_tunnelBuildCooldownUntilFrame);
+		if (version >= 17) {
+			xfer->xferObjectID(&m_tunnelForwardAttemptTargetID);
+			for (Int i = 0;
+				i < SkirmishAITunnelRoute::MAX_GENERATED_FORWARD_ENDPOINTS;
+				++i) {
+				xfer->xferObjectID(&m_tunnelGeneratedForwardEndpointIDs[i]);
+				xfer->xferObjectID(&m_tunnelGeneratedForwardTargetIDs[i]);
+			}
+		} else if (xfer->getXferMode() == XFER_LOAD) {
+			// Older saves know only the latest AI-built forward endpoint.
+			// Its target is unavailable, but the live exit still consumes a slot.
+			m_tunnelForwardAttemptTargetID = INVALID_ID;
+			for (Int i = 0;
+				i < SkirmishAITunnelRoute::MAX_GENERATED_FORWARD_ENDPOINTS;
+				++i) {
+				m_tunnelGeneratedForwardEndpointIDs[i] = INVALID_ID;
+				m_tunnelGeneratedForwardTargetIDs[i] = INVALID_ID;
+			}
+			if (m_tunnelForwardAttempted &&
+				m_tunnelForwardEndpointID != INVALID_ID)
+				m_tunnelGeneratedForwardEndpointIDs[0] =
+					m_tunnelForwardEndpointID;
+		}
+		if (version >= 18)
+			xfer->xferBool(&m_tunnelForwardRetryConsumed);
+		else if (xfer->getXferMode() == XFER_LOAD)
+			m_tunnelForwardRetryConsumed = m_tunnelForwardAttempted;
+		if (version >= 19) {
+			for (Int i = 0;
+				i < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
+				xfer->xferObjectID(&m_tunnelExhaustedForwardTargetIDs[i]);
+		} else if (xfer->getXferMode() == XFER_LOAD) {
+			for (Int i = 0;
+				i < SkirmishAITunnelRoute::MAX_EXHAUSTED_FORWARD_TARGETS; ++i)
+				m_tunnelExhaustedForwardTargetIDs[i] = INVALID_ID;
+		}
+		if (xfer->getXferMode() == XFER_LOAD) {
+			if (m_tunnelBuildPhase < SKIRMISH_AI_TUNNEL_BUILD_NONE ||
+				m_tunnelBuildPhase >
+					SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE ||
+				(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED &&
+				 (m_tunnelBuildBuilderID == INVALID_ID ||
+				  m_tunnelBuildTargetID == INVALID_ID ||
+				  m_tunnelBuildBlockerID == INVALID_ID)) ||
+				(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED &&
+				 (m_tunnelBuildBuilderID == INVALID_ID ||
+				  m_tunnelBuildTargetID == INVALID_ID ||
+				  m_tunnelBuildBlockerID == INVALID_ID)) ||
+				((m_tunnelBuildPhase ==
+					SKIRMISH_AI_TUNNEL_BUILD_HOME_CONSTRUCTING ||
+				  m_tunnelBuildPhase ==
+					SKIRMISH_AI_TUNNEL_BUILD_FORWARD_CONSTRUCTING) &&
+				 m_tunnelBuildObjectID == INVALID_ID) ||
+				(m_tunnelBuildPhase ==
+					SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE &&
+				 m_tunnelBuildTargetID == INVALID_ID) ||
+				(m_tunnelBuildPhase ==
+					SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE &&
+				 m_tunnelBuildTargetID == INVALID_ID)) {
+				m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_NONE;
+				m_tunnelBuildBuilderID = INVALID_ID;
+				m_tunnelBuildTargetID = INVALID_ID;
+				m_tunnelBuildBlockerID = INVALID_ID;
+				m_tunnelBuildObjectID = INVALID_ID;
+				m_tunnelBuildDeadlineFrame = 0;
+				m_tunnelBuildLocation.zero();
+				m_tunnelPendingBuilderCursor = 0;
+			}
+			if (m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_NONE) {
+				m_tunnelBuildBuilderID = INVALID_ID;
+				m_tunnelBuildTargetID = INVALID_ID;
+				m_tunnelBuildBlockerID = INVALID_ID;
+				m_tunnelBuildObjectID = INVALID_ID;
+				m_tunnelBuildDeadlineFrame = 0;
+				m_tunnelBuildLocation.zero();
+				m_tunnelPendingBuilderCursor = 0;
+			} else if (m_tunnelBuildPhase ==
+					SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE ||
+				m_tunnelBuildPhase ==
+					SKIRMISH_AI_TUNNEL_BUILD_FORWARD_RETRY_AVAILABLE) {
+				m_tunnelBuildBuilderID = INVALID_ID;
+				m_tunnelBuildBlockerID = INVALID_ID;
+				if (m_tunnelBuildObjectID == INVALID_ID)
+					m_tunnelBuildDeadlineFrame = 0;
+				m_tunnelBuildLocation.zero();
+			}
+		}
+	} else if (xfer->getXferMode() == XFER_LOAD) {
+		m_tacticalTeams.clear();
+		m_tacticalNextTeamScanFrame = 0;
+		m_strategyTargetFallbackPending = false;
+		m_strategyTargetFallbackAfterID = INVALID_ID;
+		m_strategyTargetFallbackEnemyIndex = -1;
+		m_tunnelBuildPhase = SKIRMISH_AI_TUNNEL_BUILD_NONE;
+		m_tunnelHomeAttempted = false;
+		m_tunnelForwardAttempted = false;
+		m_tunnelForwardRetryConsumed = false;
+		m_tunnelHomeEndpointID = INVALID_ID;
+		m_tunnelForwardEndpointID = INVALID_ID;
+		m_tunnelForwardAttemptTargetID = INVALID_ID;
+		for (Int i = 0;
+			i < SkirmishAITunnelRoute::MAX_GENERATED_FORWARD_ENDPOINTS; ++i) {
+			m_tunnelGeneratedForwardEndpointIDs[i] = INVALID_ID;
+			m_tunnelGeneratedForwardTargetIDs[i] = INVALID_ID;
+		}
+		m_tunnelBuildBuilderID = INVALID_ID;
+		m_tunnelBuildTargetID = INVALID_ID;
+		m_tunnelBuildBlockerID = INVALID_ID;
+		m_tunnelBuildObjectID = INVALID_ID;
+		m_tunnelPendingBuilderCursor = 0;
+		m_tunnelBuildLocation.zero();
+		m_tunnelBuildDeadlineFrame = 0;
+		m_tunnelBuildCooldownUntilFrame = 0;
+		m_defensePatrolRoute = SKIRMISH_AI_DEFENSE_NO_ROUTE;
+		m_defensePatrolTeamID = 0;
+		m_defensePatrolObjectID = INVALID_ID;
+		m_defenseNextPatrolFrame = 0;
+		m_defenseQuietPatrolWaypoint.zero();
+		m_defenseQuietPatrolDeadlineFrame = 0;
+		m_defensePlacementAttempt = 0;
+		m_defensePlacementNextFrame = 0;
+		m_defensePursuitTargetID = INVALID_ID;
+		m_defensePursuitStartFrame = 0;
+		m_defenseInterceptProbeAfterID = INVALID_ID;
+		m_defensePatrolRouteMemberAfterID = INVALID_ID;
+		m_defenseInterceptMemberAfterID = INVALID_ID;
+	}
+	if (version >= 14)
+		xferGeneratedDefenseBuilds(xfer);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		m_generatedDefenseBuilds.clear();
 	if (xfer->getXferMode() == XFER_LOAD) {
+		m_tunnelBuildLockedBuilderID = INVALID_ID;
+		m_defenseBuildLockedBuilderID = INVALID_ID;
+		m_defenseBuildLockedLocation.zero();
 		m_strategyProductionReserveLoaded = version >= 9;
 	}
 	m_recoveryAuthorizedThing = nullptr;
