@@ -238,8 +238,8 @@ public:
 
 	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd)
 	{
-		return PrepareProjectedTerrainGridRows(m_snapshot, m_vertices,
-			m_indices, rowBegin, rowEnd);
+		return PrepareProjectedTerrainGridRowsFromValidatedInput(
+			m_snapshot, m_vertices, m_indices, rowBegin, rowEnd);
 	}
 
 private:
@@ -1291,7 +1291,11 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
  */
 void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 {
-	if (queueDecalParallel(shadow) >= 0)
+	if (rts::UseParallelPipelines() &&
+		GetRadarTerrainPrepareService().isInitialized() &&
+		(shadow == 0 || ProjectedTerrainGridMayReachParallelThreshold(
+			shadow->m_decalSizeX, shadow->m_decalSizeY, MAP_XY_FACTOR)) &&
+	queueDecalParallel(shadow) >= 0)
 		return;
 
 	int i,j,k;

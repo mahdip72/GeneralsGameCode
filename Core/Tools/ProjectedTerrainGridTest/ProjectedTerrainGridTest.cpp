@@ -39,8 +39,8 @@ public:
 	}
 	virtual bool executeRows(unsigned begin, unsigned end)
 	{
-		return PrepareProjectedTerrainGridRows(m_snapshot, m_vertices,
-			m_indices, begin, end);
+		return PrepareProjectedTerrainGridRowsFromValidatedInput(
+			m_snapshot, m_vertices, m_indices, begin, end);
 	}
 private:
 	ProjectedTerrainGridWork(const ProjectedTerrainGridWork &);
@@ -237,6 +237,8 @@ static int prepareThroughService(Fixture *fixture,
 {
 	ProjectedTerrainGridWork work(fixture->snapshot,
 		fixture->scratch.vertices(), fixture->scratch.indices());
+	CHECK(ValidateProjectedTerrainGridInput(fixture->snapshot,
+		fixture->scratch.vertices(), fixture->scratch.indices()));
 	memset(fixture->scratch.vertices(), 0xA5,
 		fixture->expectedVertices.size() * sizeof(ProjectedTerrainGridVertex));
 	memset(fixture->scratch.indices(), 0xA5,
@@ -334,6 +336,22 @@ static int invalidAndReuse()
 	invalid.cellWidth = 0;
 	CHECK(!ValidateProjectedTerrainGridInput(invalid,
 		fixture.scratch.vertices(), fixture.scratch.indices()));
+	CHECK(!ProjectedTerrainGridMayReachParallelThreshold(25.0f, 25.0f,
+		10.0f));
+	CHECK(!ProjectedTerrainGridMayReachParallelThreshold(100.0f, 100.0f,
+		10.0f));
+	CHECK(ProjectedTerrainGridMayReachParallelThreshold(110.0f, 110.0f,
+		10.0f));
+	CHECK(ProjectedTerrainGridMayReachParallelThreshold(1.0f, 1.0f,
+		0.0f));
+	CHECK(ValidateProjectedTerrainGridInput(fixture.snapshot,
+		fixture.scratch.vertices(), fixture.scratch.indices()));
+	CHECK(!PrepareProjectedTerrainGridRowsFromValidatedInput(
+		fixture.snapshot, fixture.scratch.vertices(),
+		fixture.scratch.indices(), 4, 4));
+	CHECK(!PrepareProjectedTerrainGridRowsFromValidatedInput(
+		fixture.snapshot, fixture.scratch.vertices(),
+		fixture.scratch.indices(), 0, fixture.height + 1));
 	return 0;
 }
 
@@ -345,6 +363,8 @@ static int faultFallback(RadarTerrainPrepareService &service)
 	CHECK(prepareSerial(&fixture) == 0);
 	ProjectedTerrainGridWork workStorage(fixture.snapshot,
 		fixture.scratch.vertices(), fixture.scratch.indices());
+	CHECK(ValidateProjectedTerrainGridInput(fixture.snapshot,
+		fixture.scratch.vertices(), fixture.scratch.indices()));
 	memset(fixture.scratch.vertices(), 0xA5,
 		fixture.expectedVertices.size() * sizeof(ProjectedTerrainGridVertex));
 	memset(fixture.scratch.indices(), 0xA5,

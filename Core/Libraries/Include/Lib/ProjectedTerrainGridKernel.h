@@ -62,6 +62,12 @@ enum
 	PROJECTED_TERRAIN_GRID_MAX_BYTES = 8u * 1024u * 1024u
 };
 
+/* Returns false only when a yaw-rotated decal rectangle is guaranteed to
+ * cover fewer than the parallel-cell threshold. Invalid or overflowing
+ * dimensions conservatively return true. */
+bool ProjectedTerrainGridMayReachParallelThreshold(
+	Real sizeX, Real sizeY, Real mapXYFactor);
+
 /* Owner-side reusable bounded scratch.  No pointer returned by this object
  * may outlive the synchronous preparation call that borrowed it. */
 class ProjectedTerrainGridScratch
@@ -108,6 +114,18 @@ bool ValidateProjectedTerrainGridInput(
 /* Write vertex rows [rowBegin,rowEnd).  Cell indices for those rows are also
  * written, with each cell row owning one exclusive output range. */
 bool PrepareProjectedTerrainGridRows(
+	const ProjectedTerrainGridSnapshot &snapshot,
+	ProjectedTerrainGridVertex *vertices,
+	UnsignedShort *indices,
+	unsigned rowBegin, unsigned rowEnd);
+
+/* Fast worker entry point for a synchronous batch whose owner has already
+ * called ValidateProjectedTerrainGridInput for this exact snapshot and input
+ * storage. The owner must keep the snapshot, heights, flips, and output
+ * storage unchanged except for disjoint output rows until all workers finish.
+ * This checks the structural/range contract but skips repeating the complete
+ * finite-height and flip scan for every worker row range. */
+bool PrepareProjectedTerrainGridRowsFromValidatedInput(
 	const ProjectedTerrainGridSnapshot &snapshot,
 	ProjectedTerrainGridVertex *vertices,
 	UnsignedShort *indices,
