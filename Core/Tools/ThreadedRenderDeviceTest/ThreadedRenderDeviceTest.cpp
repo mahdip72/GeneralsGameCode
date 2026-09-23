@@ -49,7 +49,8 @@ struct Fixture
 		stateValue(0), layoutStride(0), layoutOffset(0), window(0), proxy(0),
 		swapIntervalSetCalls(0), swapIntervalGetCalls(0),
 		gammaSetCalls(0), gammaGetCalls(0), faultConfigCalls(0),
-		resourceStatisticsCalls(0),
+		resourceStatisticsCalls(0), lastFaultPoint(RENDER_RESOURCE_FAULT_NONE),
+		lastFaultInvocation(0), lastFaultResult(RENDER_RESULT_FAILED),
 		sentMessages(0), postedMessages(0), reentrantRejected(true)
 	{ events.reserve(4096); }
 	std::mutex mutex;
@@ -67,6 +68,9 @@ struct Fixture
 	unsigned int swapIntervalSetCalls, swapIntervalGetCalls;
 	unsigned int gammaSetCalls, gammaGetCalls;
 	unsigned int faultConfigCalls, resourceStatisticsCalls;
+	RenderResourceFaultPoint lastFaultPoint;
+	unsigned int lastFaultInvocation;
+	RenderResult lastFaultResult;
 	RenderTargetBinding targets;
 	void *window;
 	IRenderDevice *proxy;
@@ -253,6 +257,9 @@ public:
 		f.event(FAULT_CONFIG);
 		CHECK(!open);
 		++f.faultConfigCalls;
+		f.lastFaultPoint = point;
+		f.lastFaultInvocation = failOnInvocation;
+		f.lastFaultResult = result;
 		faultPointValue = point;
 		faultFailOnInvocationValue = failOnInvocation;
 		faultResultValue = result;
@@ -535,6 +542,18 @@ void DebugResourceOwnerTransport()
 	CHECK(offOwnerFault == RENDER_RESULT_INVALID_ARGUMENT &&
 		offOwnerStatisticsResult == RENDER_RESULT_INVALID_ARGUMENT &&
 		f.faultConfigCalls == 3 && f.resourceStatisticsCalls == 2);
+	CHECK(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND, 1,
+		RENDER_RESULT_FAILED) == RENDER_RESULT_OK &&
+		f.faultConfigCalls == 4 &&
+		f.lastFaultPoint == RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND &&
+		f.lastFaultInvocation == 1 &&
+		f.lastFaultResult == RENDER_RESULT_FAILED);
+	CHECK(device->configureResourceFaultInjection(
+		static_cast<RenderResourceFaultPoint>(
+			RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND + 1), 1,
+		RENDER_RESULT_FAILED) == RENDER_RESULT_INVALID_ARGUMENT &&
+		f.faultConfigCalls == 4);
 }
 
 void OwnershipAndDeepCopy()
