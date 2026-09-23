@@ -1148,6 +1148,22 @@ int TestSortedFacadeAndStrip(HWND window)
 		vertices[i].diffuse = 0xff00ff00U;
 	}
 	const unsigned short indices[3] = { 0, 1, 2 };
+	// Keep this first: sorted flushes below retain two transient native buffers.
+	BufferDescriptor vbDescriptor;
+	vbDescriptor.byteCount = 3 * sizeof(VertexFormatXYZNDUV2);
+	vbDescriptor.stride = sizeof(VertexFormatXYZNDUV2);
+	vbDescriptor.binding = RENDER_BUFFER_VERTEX;
+	BufferDescriptor ibDescriptor;
+	ibDescriptor.byteCount = sizeof(indices);
+	ibDescriptor.stride = sizeof(unsigned short);
+	ibDescriptor.binding = RENDER_BUFFER_INDEX;
+	GpuHandle vbHandle, ibHandle;
+	result |= Check(owner.Resources().CreateBuffer(vbDescriptor, vertices + 3, vbDescriptor.byteCount, &vbHandle) == RENDER_RESULT_OK &&
+		owner.Resources().CreateBuffer(ibDescriptor, indices, sizeof(indices), &ibHandle) == RENDER_RESULT_OK,
+		"strip fixture creates exactly three indices");
+	result |= Check(vbHandle.index() == 0 && vbHandle.generation() != 0 &&
+		owner.Resources().IsValid(vbHandle),
+		"strip fixture exercises a live native allocation in slot zero");
 	auto begin = [&]() {
 		result |= Check(owner.Renderer().BeginFrame() == RENDER_RESULT_OK,
 			"sorting facade begins a frame");
@@ -1233,20 +1249,6 @@ int TestSortedFacadeAndStrip(HWND window)
 	DynamicVBAccessClass::_Deinit();
 	DynamicIBAccessClass::_Deinit();
 
-	BufferDescriptor vbDescriptor;
-	vbDescriptor.byteCount = 3 * sizeof(VertexFormatXYZNDUV2);
-	vbDescriptor.stride = sizeof(VertexFormatXYZNDUV2);
-	vbDescriptor.binding = RENDER_BUFFER_VERTEX;
-	BufferDescriptor ibDescriptor;
-	ibDescriptor.byteCount = sizeof(indices);
-	ibDescriptor.stride = sizeof(unsigned short);
-	ibDescriptor.binding = RENDER_BUFFER_INDEX;
-	GpuHandle vbHandle, ibHandle;
-	result |= Check(owner.Resources().CreateBuffer(vbDescriptor, vertices + 3, vbDescriptor.byteCount, &vbHandle) == RENDER_RESULT_OK &&
-		owner.Resources().CreateBuffer(ibDescriptor, indices, sizeof(indices), &ibHandle) == RENDER_RESULT_OK,
-		"strip fixture creates exactly three indices");
-	result |= Check(vbHandle.index() == 0 && vbHandle.generation() != 0,
-		"strip fixture exercises a live native allocation in slot zero");
 	begin();
 	GameRenderCommand command = {};
 	command.type = GAME_RENDER_COMMAND_SET_VERTEX_BUFFER;
