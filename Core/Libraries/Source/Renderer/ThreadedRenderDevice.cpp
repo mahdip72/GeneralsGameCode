@@ -319,6 +319,7 @@ public:
 			m_packets.emplace_back(new Packet);
 			m_free.push_back(m_packets.back().get());
 		}
+		invalidateProducerTextureCache();
 	}
 	~ThreadedRenderDevice() override { shutdown(); }
 	RenderBackend backend() const override { return RENDER_BACKEND_D3D11; }
@@ -453,6 +454,12 @@ private:
 	size_t copyPayload(const void *data, size_t bytes);
 	RenderResult append(Command command, const void *payload = 0, size_t bytes = 0,
 		bool requireFrame = true);
+	void invalidateProducerTextureCache()
+	{
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
+			++stage)
+			m_cachedTextureKnown[stage] = false;
+	}
 	RenderResult textureCommand(Operation, GpuHandle, const TextureDescriptor &,
 		const TextureSubresourceData *, unsigned int);
 	RenderResult bufferUpdateCommand(GpuHandle, const void *, size_t, size_t,
@@ -502,6 +509,10 @@ private:
 	std::vector<ProducerResource> m_producerResources;
 	std::vector<OwnerResource> m_ownerResources;
 	RenderTargetBinding m_targets;
+	// Producer-only mirror of the ordered texture command stream. A frame or
+	// operation that can alter owner SRV bindings always makes it unknown.
+	GpuHandle m_cachedTextures[LEGACY_TEXTURE_STAGE_COUNT];
+	bool m_cachedTextureKnown[LEGACY_TEXTURE_STAGE_COUNT];
 	bool m_recording, m_ended;
 	uint64_t m_nextSequence, m_sequence, m_lastSequence;
 	RenderResult m_producerFailure;
@@ -603,6 +614,26 @@ RenderResult ThreadedRenderDevice::append(Command command, const void *payload,
 		m_options.maxPacketBytes, m_current == 0 ? 0U : m_current->bytes.size());
 	command.payloadOffset = copyPayload(payload, bytes);
 	m_current->commands.push_back(command);
+	// Only these operations preserve the owner's current SRV bindings. All
+	// target, texture mutation, copy, and lifecycle commands fail closed.
+	switch (command.operation)
+	{
+	case OP_TEXTURE:
+	case OP_UPDATE_BUFFER:
+	case OP_CLEAR:
+	case OP_VIEWPORT:
+	case OP_LEGACY_STATE:
+	case OP_LEGACY_LAYOUT:
+	case OP_VERTEX_BUFFER:
+	case OP_INDEX_BUFFER:
+	case OP_TOPOLOGY:
+	case OP_DRAW:
+	case OP_DRAW_INDEXED:
+		break;
+	default:
+		invalidateProducerTextureCache();
+		break;
+	}
 	return RENDER_RESULT_OK;
 }
 
@@ -658,6 +689,8 @@ RenderResult ThreadedRenderDevice::endFrame()
 RenderResult ThreadedRenderDevice::flush(Control control,
 	const std::shared_ptr<Reply> &reply, bool finalFrame, bool visible)
 {
+	if (control != CONTROL_NONE || finalFrame || visible)
+		invalidateProducerTextureCache();
 	acquire();
 	m_current->control = control;
 	m_current->reply = reply;
@@ -1035,6 +1068,7 @@ RenderResult ThreadedRenderDevice::textureCommand(Operation operation, GpuHandle
 		std::memcpy(m_current->bytes.data() + command.dataOffset + i * sizeof(span), &span, sizeof(span));
 	}
 	m_current->commands.push_back(command);
+	invalidateProducerTextureCache();
 	return RENDER_RESULT_OK;
 }
 
@@ -1224,7 +1258,25 @@ RenderResult ThreadedRenderDevice::setTexture(unsigned int stage, GpuHandle hand
 		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
 			stage, PackHandle(handle), LEGACY_TEXTURE_STAGE_COUNT,
 			usable() ? 1U : 0U);
-	Command command(OP_TEXTURE); command.handle = handle; command.integers[0] = stage; return append(command);
+	// Preserve the frame-state and handle checks even for a duplicate. A target
+	// alias must still reach the owner so its exact rejection is not hidden.
+	const bool aliasesTarget = handle.isValid() &&
+		((m_targets.hasColor && !m_targets.useBackBufferColor &&
+			m_targets.color.resource == handle) ||
+		 (m_targets.hasDepth && !m_targets.useBackBufferDepth &&
+			m_targets.depth.resource == handle));
+	if (m_recording && !m_ended && !aliasesTarget &&
+		m_producerFailure == RENDER_RESULT_OK &&
+		m_cachedTextureKnown[stage] && m_cachedTextures[stage] == handle)
+		return RENDER_RESULT_OK;
+	Command command(OP_TEXTURE); command.handle = handle; command.integers[0] = stage;
+	const RenderResult result = append(command);
+	if (result == RENDER_RESULT_OK && !aliasesTarget)
+	{
+		m_cachedTextures[stage] = handle;
+		m_cachedTextureKnown[stage] = true;
+	}
+	return result;
 }
 RenderResult ThreadedRenderDevice::setPrimitiveTopology(RenderPrimitiveTopology topology)
 {

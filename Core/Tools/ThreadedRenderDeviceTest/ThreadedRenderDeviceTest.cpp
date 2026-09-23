@@ -372,6 +372,60 @@ void EmptyFrame(IRenderDevice *device, bool visible = true)
 	CHECK(SubmitThreadedRenderFrame(device, visible) == RENDER_RESULT_OK);
 }
 
+void ProducerTextureBindingCachePreservesOrderedInvalidation()
+{
+	Fixture f;
+	auto device = Device(f);
+	TextureDescriptor descriptor;
+	descriptor.width = descriptor.height = 1;
+	descriptor.format = RENDER_FORMAT_B8G8R8A8_UNORM;
+	descriptor.usage = RENDER_USAGE_DEFAULT;
+	descriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE |
+		RENDER_TEXTURE_RENDER_TARGET;
+	unsigned int pixel = 0xffffffffU;
+	TextureSubresourceData data;
+	data.data = &pixel; data.rowPitch = data.slicePitch = sizeof(pixel);
+	GpuHandle first, second;
+	CHECK(device->createTexture(descriptor, &data, 1, &first) == RENDER_RESULT_OK);
+	CHECK(device->createTexture(descriptor, &data, 1, &second) == RENDER_RESULT_OK);
+	IRenderContext *context = device->immediateContext();
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->draw(3, 0) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(1, second) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(1, second) == RENDER_RESULT_OK);
+	CHECK(context->setRenderTargets(first, GpuHandle()) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->setRenderTargets(GpuHandle(), GpuHandle()) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(device->copyActiveColorTargetToTexture(second) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), true) == RENDER_RESULT_OK);
+	CHECK(Complete(device.get()).presented);
+	CHECK(std::count(f.events.begin(), f.events.end(), BIND_TEXTURE) == 6);
+
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(device->refreshTexture(first, descriptor, &data, 1) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->setTexture(0, first) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), true) == RENDER_RESULT_OK);
+	CHECK(Complete(device.get()).presented);
+	CHECK(std::count(f.events.begin(), f.events.end(), BIND_TEXTURE) == 8);
+	CHECK(device->destroyResource(second));
+	CHECK(context->setTexture(1, second) == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+}
+
 void SwapIntervalOwnerTransport()
 {
 	Fixture f;
@@ -1281,6 +1335,7 @@ int main()
 	try
 	{
 		CHECK(rts::JobSystem::instance().registerCurrentThread(rts::JOB_OWNER_GAME));
+		ProducerTextureBindingCachePreservesOrderedInvalidation();
 		SwapIntervalOwnerTransport();
 		GammaOwnerTransport();
 		TextureFilterCapabilitiesArePublishedFromOwner();
