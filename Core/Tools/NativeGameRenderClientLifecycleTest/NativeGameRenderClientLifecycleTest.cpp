@@ -358,16 +358,44 @@ int TestNativeLifecycle(HWND window)
 		rts::render::GAME_RENDER_MULTISAMPLE_4X,
 		"native resize preserves the effective 4x D3D11 scene target");
 
+	const int fullscreenClientWidth = selectedMonitor.rcMonitor.right -
+		selectedMonitor.rcMonitor.left;
+	const int fullscreenClientHeight = selectedMonitor.rcMonitor.bottom -
+		selectedMonitor.rcMonitor.top;
 	failures += !Check(rts::render::SetGameRenderDeviceByName(deviceName,
 		640, 480, 16, 0, true) == rts::render::RENDER_RESULT_OK,
 		"valid logical device name routes through bootstrap presentation");
+	POINT fullscreenClientOrigin = { 0, 0 };
+	failures += !Check(GetClientRect(window, &clientRect) &&
+		clientRect.right - clientRect.left == fullscreenClientWidth &&
+		clientRect.bottom - clientRect.top == fullscreenClientHeight &&
+		ClientToScreen(window, &fullscreenClientOrigin) &&
+		fullscreenClientOrigin.x == selectedMonitor.rcMonitor.left &&
+		fullscreenClientOrigin.y == selectedMonitor.rcMonitor.top,
+		"borderless client exactly covers the selected monitor");
+	failures += !Check(rts::render::GetGameBackBufferInfo(&backBuffer) ==
+		rts::render::RENDER_RESULT_OK &&
+		backBuffer.width == static_cast<unsigned int>(fullscreenClientWidth) &&
+		backBuffer.height == static_cast<unsigned int>(fullscreenClientHeight),
+		"fullscreen backbuffer matches the monitor client without stretching a mismatched request");
 	failures += !Check(rts::render::GetGameRendererResolution(&width, &height,
 		&bitDepth, &windowed) == rts::render::RENDER_RESULT_OK &&
-		width == 640 && height == 480 && bitDepth == 32 && !windowed,
-		"native name selection reports borderless presentation state");
+		width == fullscreenClientWidth && height == fullscreenClientHeight &&
+		bitDepth == 32 && !windowed,
+		"native fullscreen publishes client-sized dimensions for display and mouse input");
 	failures += !Check(rts::render::SetGameRenderDeviceByName(deviceName,
 		640, 480, 16, 1, true) == rts::render::RENDER_RESULT_OK,
 		"valid logical device name restores windowed presentation");
+	failures += !Check(GetClientRect(window, &clientRect) &&
+		clientRect.right - clientRect.left == 640 &&
+		clientRect.bottom - clientRect.top == 480 &&
+		rts::render::GetGameBackBufferInfo(&backBuffer) ==
+			rts::render::RENDER_RESULT_OK && backBuffer.width == 640 &&
+		backBuffer.height == 480 &&
+		rts::render::GetGameRendererResolution(&width, &height, &bitDepth,
+			&windowed) == rts::render::RENDER_RESULT_OK &&
+		width == 640 && height == 480 && windowed,
+		"windowed resolution restores the exact requested client and backbuffer dimensions");
 	failures += !Check(rts::render::SetAnyGameRenderDevice() ==
 		rts::render::RENDER_RESULT_OK &&
 		rts::render::SetNextGameRenderDevice() ==

@@ -921,6 +921,34 @@ RenderResult SetGameRendererResolution(int width, int height, int bitDepth,
 	}
 	if (result == RENDER_RESULT_OK && resizeClient)
 		result = ResizeWindowClient(nativeWindow, width, height);
+	if (result == RENDER_RESULT_OK && !targetWindowed)
+	{
+		// Native fullscreen is borderless and keeps the desktop mode. Match the
+		// renderer target to the resulting client area so presentation does not
+		// stretch a smaller requested resolution across the selected monitor.
+		RECT clientRect = { 0 };
+		if (!::GetClientRect(nativeWindow, &clientRect))
+		{
+			result = RENDER_RESULT_FAILED;
+		}
+		else
+		{
+			const long long clientWidth = static_cast<long long>(clientRect.right) -
+				clientRect.left;
+			const long long clientHeight = static_cast<long long>(clientRect.bottom) -
+				clientRect.top;
+			if (clientWidth <= 0 || clientHeight <= 0 ||
+				clientWidth > INT_MAX || clientHeight > INT_MAX)
+			{
+				result = RENDER_RESULT_FAILED;
+			}
+			else
+			{
+				width = static_cast<int>(clientWidth);
+				height = static_cast<int>(clientHeight);
+			}
+		}
+	}
 	if (result == RENDER_RESULT_OK)
 	{
 		GameRenderCommand command;
