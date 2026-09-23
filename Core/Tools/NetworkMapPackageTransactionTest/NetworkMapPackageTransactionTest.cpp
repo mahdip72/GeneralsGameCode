@@ -137,6 +137,21 @@ int main(int argc, char **argv)
 		Read(ini) == oldIni && Read(map) == oldMap,
 		"incomplete journal blocks replacement without touching installed bytes") && ok;
 	DeleteFileA(incompleteJournal.c_str());
+	const std::string sentinel = folder + ".sentinel";
+	const std::string nested = folder + "\\ggc";
+	const std::string sentinelName = sentinel.substr(sentinel.find_last_of("\\/") + 1);
+	const std::string traversingBackup = nested + "/../../" + sentinelName;
+	const std::string forgedJournal = "GGCNET31\n1\n1\t" + map +
+		"\t" + traversingBackup + "\n";
+	ok = Check(Write(sentinel, "outside-untouched") &&
+		CreateDirectoryA(nested.c_str(), nullptr) &&
+		Write(incompleteJournal, forgedJournal) &&
+		!NetworkMapPackageTransaction::recover(map.c_str()) &&
+		Read(map) == oldMap && Read(sentinel) == "outside-untouched",
+		"forged forward-slash backup traversal is rejected before external read") && ok;
+	DeleteFileA(incompleteJournal.c_str());
+	RemoveDirectoryA(nested.c_str());
+	DeleteFileA(sentinel.c_str());
 	char executable[MAX_PATH];
 	STARTUPINFOA startup = {};
 	startup.cb = sizeof(startup);

@@ -119,7 +119,9 @@ public:
 				return false;
 			disk[i].hadOriginal = text[at] == '1';
 			targets[i] = text.substr(at + 2, separator - at - 2);
-			disk[i].backup = text.substr(separator + 1, end - separator - 1);
+			const std::string recordedBackup =
+				text.substr(separator + 1, end - separator - 1);
+			disk[i].backup = normalizePath(recordedBackup.c_str());
 			if (!allowedTarget(map, targets[i].c_str()) ||
 				(disk[i].hadOriginal ?
 					!allowedBackup(map, disk[i].backup.c_str()) :
@@ -281,12 +283,24 @@ private:
 		if (separator == nullptr)
 			return false;
 		const std::string directory(map, separator - map + 1);
-		if (strlen(backup) <= directory.size())
+		const std::string normalized = normalizePath(backup);
+		if (normalized.size() != directory.size() + 11U ||
+			_strnicmp(normalized.c_str(), directory.c_str(), directory.size()) != 0)
 			return false;
-		const char *name = backup + directory.size();
-		return _strnicmp(backup, directory.c_str(), directory.size()) == 0 &&
-			_strnicmp(name, "ggc", 3) == 0 &&
-			strchr(name, '\\') == nullptr && strlen(name) < 32;
+		// GetTempFileNameA("ggc") creates exactly ggcXXXX.tmp in this folder.
+		// An arbitrary or traversing journal path must not become a CopyFileA
+		// source or a cleanup deletion target during restart recovery.
+		const char *name = normalized.c_str() + directory.size();
+		if (_strnicmp(name, "ggc", 3) != 0 || _stricmp(name + 7, ".tmp") != 0)
+			return false;
+		for (std::size_t i = 3; i < 7; ++i)
+		{
+			const char ch = name[i];
+			if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F') ||
+				(ch >= 'a' && ch <= 'f')))
+				return false;
+		}
+		return true;
 	}
 
 	static bool safePath(const char *path)
