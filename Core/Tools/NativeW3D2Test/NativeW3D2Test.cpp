@@ -183,6 +183,15 @@ struct ThrowingCleanupHook : public rts::render::GameRenderCleanupHook
 	rts::render::RenderResult reacquireShutdownResult;
 };
 
+struct CountingResizeHook : public rts::render::GameRenderCleanupHook
+{
+	CountingResizeHook() : releaseCalls(0), reacquireCalls(0) {}
+	virtual void ReleaseResources() { ++releaseCalls; }
+	virtual void ReAcquireResources() { ++reacquireCalls; }
+	unsigned int releaseCalls;
+	unsigned int reacquireCalls;
+};
+
 // The borrowed-threaded capture test keeps the real D3D11 device while
 // injecting only the capture result. The wrapper is created on the threaded
 // owner, so every forwarded backend call retains the same owner affinity as
@@ -1070,6 +1079,90 @@ int TestPublicFrameResetRecoversRemovedDevice(HWND window)
 	return result;
 }
 
+int TestResizeRollback(HWND window)
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3DRendererDescriptor descriptor;
+	descriptor.width = 64;
+	descriptor.height = 64;
+	descriptor.enableVsync = false;
+	descriptor.allowSoftwareFallback = true;
+	GameRenderCommand resizeCommand = {};
+	resizeCommand.type = GAME_RENDER_COMMAND_SET_RESOLUTION;
+	resizeCommand.value0 = 80;
+	resizeCommand.value1 = 72;
+	resizeCommand.value2 = 1;
+	const RenderResourceFaultPoint faults[] = {
+		RENDER_RESOURCE_FAULT_RESIZE_TARGETS,
+		RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK,
+		RENDER_RESOURCE_FAULT_RESIZE_TARGETS
+	};
+	const RenderResult injectedResults[] = {
+		RENDER_RESULT_OUT_OF_MEMORY,
+		RENDER_RESULT_OUT_OF_MEMORY,
+		RENDER_RESULT_DEVICE_REMOVED
+	};
+	for (unsigned int scenario = 0; scenario < 3; ++scenario)
+	{
+		NativeW3D2 owner;
+		CountingResizeHook hook;
+		result |= Check(owner.Initialize(window, descriptor) == RENDER_RESULT_OK,
+			"resize rollback fixture initializes native owner");
+		if (!owner.IsOperational()) continue;
+		owner.SetGameCleanupHook(&hook);
+		result |= Check(NativeW3DRecoveryTestAccess::ConfigureResourceFault(
+			&owner.Renderer(), faults[scenario], 1,
+			injectedResults[scenario]) == RENDER_RESULT_OK,
+			"resize rollback fixture arms target failure");
+		const RenderResult resizeResult =
+			owner.ExecuteGameRenderCommand(resizeCommand);
+		RenderBackBufferInfo info;
+		if (scenario == 0)
+		{
+			result |= Check(resizeResult == RENDER_RESULT_OUT_OF_MEMORY &&
+				hook.releaseCalls == 1 && hook.reacquireCalls == 1 &&
+				owner.IsOperational() && owner.Renderer().GetBackBufferInfo(&info) ==
+					RENDER_RESULT_OK && info.width == 64 && info.height == 64,
+				"failed target creation restores old targets and title resources");
+			GameRenderCommand begin = {};
+			begin.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+			begin.value0 = RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH;
+			begin.float3 = 1.0f;
+			begin.float4 = 1.0f;
+			GameRenderCommand end = {};
+			end.type = GAME_RENDER_COMMAND_END_RENDER;
+			end.value0 = 1;
+			GameRenderCommand retryOldSize = resizeCommand;
+			retryOldSize.value0 = 64;
+			retryOldSize.value1 = 64;
+			result |= Check(owner.ExecuteGameRenderCommand(retryOldSize) ==
+				RENDER_RESULT_OK && hook.releaseCalls == 2 &&
+				hook.reacquireCalls == 2 && owner.IsOperational(),
+				"retrying the old resolution leaves title resources operational");
+			result |= Check(owner.Renderer().DrainThreaded() ==
+				RENDER_RESULT_OUT_OF_MEMORY,
+				"resize failure remains visible at the next threaded fence");
+			const RenderResult beginResult = owner.ExecuteGameRenderCommand(begin);
+			const RenderResult endResult = owner.ExecuteGameRenderCommand(end);
+			const RenderResult drainResult = owner.Renderer().DrainThreaded();
+			result |= Check(beginResult == RENDER_RESULT_OK &&
+				endResult == RENDER_RESULT_OK && drainResult == RENDER_RESULT_OK,
+				"old-size rendering and presentation continue after resize rollback");
+		}
+		else
+		{
+			result |= Check(resizeResult == injectedResults[scenario] &&
+				hook.releaseCalls == 1 && hook.reacquireCalls == 0 &&
+				!owner.IsOperational() && !owner.Renderer().IsInitialized(),
+				"failed rollback or device removal terminates the native facade");
+		}
+		result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
+			"resize rollback fixture shuts down");
+	}
+	return result;
+}
+
 int TestReacquireFailureFailClosed(HWND window)
 {
 	int result = 0;
@@ -1787,6 +1880,7 @@ int main()
 	}
 	result |= threadedResult;
 	result |= TestPublicFrameResetRecoversRemovedDevice(window);
+	result |= TestResizeRollback(window);
 	result |= TestReacquireFailureFailClosed(window);
 	const rts::render::RenderResult initializeResult = w3d.Initialize(window, descriptor);
 	if (initializeResult == rts::render::RENDER_RESULT_UNSUPPORTED)

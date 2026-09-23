@@ -1613,7 +1613,15 @@ public:
 				}
 				return translatedResult;
 			}
-			result = createBackBufferTargets(width, height);
+			RenderResult injectedResult = RENDER_RESULT_OK;
+			const bool failRollback = consumeResourceFault(
+				RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK,
+				&injectedResult);
+			if (failRollback || consumeResourceFault(
+				RENDER_RESOURCE_FAULT_RESIZE_TARGETS, &injectedResult))
+				result = TranslateInjectedFault(injectedResult);
+			else
+				result = createBackBufferTargets(width, height);
 			if (FAILED(result))
 			{
 				m_activeRenderTarget = 0;
@@ -1623,6 +1631,7 @@ public:
 				releaseBackBufferTargets();
 				if (SUCCEEDED(m_swapChain->ResizeBuffers(0, previousWidth,
 					previousHeight, DXGI_FORMAT_UNKNOWN, 0)) &&
+					!failRollback &&
 					SUCCEEDED(createBackBufferTargets(previousWidth,
 						previousHeight)))
 				{
@@ -3243,7 +3252,7 @@ public:
 			return RENDER_RESULT_OK;
 		}
 		if (point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
-			point > RENDER_RESOURCE_FAULT_PRESENTATION_PASS ||
+			point > RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK ||
 			failOnInvocation == 0 ||
 			(result != RENDER_RESULT_OUT_OF_MEMORY &&
 			 result != RENDER_RESULT_DEVICE_REMOVED &&

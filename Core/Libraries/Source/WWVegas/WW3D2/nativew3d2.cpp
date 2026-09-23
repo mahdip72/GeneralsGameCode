@@ -2271,6 +2271,9 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			rts::render::NativeGameRenderOwnerLifecycleScope resizeLifecycleScope;
 			if (!ownerAlreadyPinned && !resizeLifecycleScope.IsAcquired())
 				return RENDER_RESULT_INVALID_ARGUMENT;
+			RenderBackBufferInfo previousInfo;
+			const bool havePreviousInfo =
+				m_renderer.GetBackBufferInfo(&previousInfo) == RENDER_RESULT_OK;
 			m_rebuildingResources = true;
 			m_gameResourcesOperational = false;
 			m_activeRenderTargetKind = GAME_RENDER_TARGET_UNKNOWN;
@@ -2291,7 +2294,16 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			}
 			RenderResult result = m_renderer.Resize(command.value0,
 				command.value1);
-			if (result == RENDER_RESULT_OK)
+			const RenderResult resizeResult = result;
+			RenderBackBufferInfo currentInfo;
+			const bool restoredPreviousTargets =
+				result != RENDER_RESULT_OK &&
+				result != RENDER_RESULT_DEVICE_REMOVED && havePreviousInfo &&
+				m_renderer.IsBackendOperational() &&
+				m_renderer.GetBackBufferInfo(&currentInfo) == RENDER_RESULT_OK &&
+				currentInfo.width == previousInfo.width &&
+				currentInfo.height == previousInfo.height;
+			if (result == RENDER_RESULT_OK || restoredPreviousTargets)
 			{
 				result = ReAcquireGameResources();
 				if (result != RENDER_RESULT_OK)
@@ -2312,6 +2324,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				// the title must explicitly select it again after reacquire.
 				m_activeRenderTargetKind = GAME_RENDER_TARGET_BACK_BUFFER;
 				m_gameResourcesOperational = true;
+				result = resizeResult;
 			}
 			else
 			{

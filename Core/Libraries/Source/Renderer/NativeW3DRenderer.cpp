@@ -671,12 +671,37 @@ RenderResult NativeW3DRenderer::Resize(unsigned int width, unsigned int height)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	RenderBackBufferInfo previousInfo;
+	const bool havePreviousInfo =
+		device->getBackBufferInfo(&previousInfo) == RENDER_RESULT_OK;
 	RenderResult result = device->resize(width, height);
-	if (result == RENDER_RESULT_OK && width != 0 && height != 0 &&
+	bool restoredPreviousTargets = false;
+	if (result != RENDER_RESULT_OK && result != RENDER_RESULT_DEVICE_REMOVED &&
+		havePreviousInfo && m_state->IsOperational() &&
+		device->isOperational() && device->immediateContext() != 0)
+	{
+		RenderBackBufferInfo currentInfo;
+		restoredPreviousTargets =
+			device->getBackBufferInfo(&currentInfo) == RENDER_RESULT_OK &&
+			currentInfo.width == previousInfo.width &&
+			currentInfo.height == previousInfo.height;
+	}
+	bool resourcesPublished = true;
+	if ((result == RENDER_RESULT_OK || restoredPreviousTargets) &&
+		width != 0 && height != 0 &&
 		m_recoveryResources != 0)
 	{
-		result = m_recoveryResources->RepublishStaticBuffersAfterResize();
+		const RenderResult publicationResult =
+			m_recoveryResources->RepublishStaticBuffersAfterResize();
+		resourcesPublished = publicationResult == RENDER_RESULT_OK;
+		if (!resourcesPublished)
+			result = publicationResult;
 	}
+	// A failed resize can still have restored the old native targets. Recheck
+	// static buffer publication because ResizeBuffers may have recovered a
+	// removed device before its one permitted retry failed.
+	if (restoredPreviousTargets && resourcesPublished)
+		return result;
 	if (result != RENDER_RESULT_OK)
 	{
 		unsigned int drained = 0;

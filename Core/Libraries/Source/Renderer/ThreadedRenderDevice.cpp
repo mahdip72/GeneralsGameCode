@@ -860,7 +860,7 @@ RenderResult ThreadedRenderDevice::configureResourceFaultInjection(
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	if (point != RENDER_RESOURCE_FAULT_NONE &&
 		(point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
-		 point > RENDER_RESOURCE_FAULT_PRESENTATION_PASS ||
+		 point > RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK ||
 		 failOnInvocation == 0 ||
 		 (result != RENDER_RESULT_OUT_OF_MEMORY &&
 		  result != RENDER_RESULT_DEVICE_REMOVED &&

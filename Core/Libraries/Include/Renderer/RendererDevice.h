@@ -220,7 +220,10 @@ enum RenderResourceFaultPoint
 	// A presentation-pass failure is injected after the optional postprocess
 	// draw but before DXGI Present, allowing native tests to read the transformed
 	// back buffer without depending on the flip queue.
-	RENDER_RESOURCE_FAULT_PRESENTATION_PASS
+	RENDER_RESOURCE_FAULT_PRESENTATION_PASS,
+	// Fail the requested resize target rebuild, optionally including rollback.
+	RENDER_RESOURCE_FAULT_RESIZE_TARGETS,
+	RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK
 };
 
 struct RenderResourceStatistics
