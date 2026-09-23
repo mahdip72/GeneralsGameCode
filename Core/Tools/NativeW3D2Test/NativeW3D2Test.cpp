@@ -988,6 +988,35 @@ int TestPublicFrameResetRecoversRemovedDevice(HWND window)
 		"public frame recovery exercises asynchronous rendering");
 	result |= Check(owner.Renderer().SetGamma(1.1f, 0.0f, 1.0f, false, true) ==
 		RENDER_RESULT_OK, "public frame recovery enables the presentation pass");
+	NativeDrawPacket sortedPacket;
+	sortedPacket.vertexStride = sizeof(NativeVertex);
+	sortedPacket.vertexLayout.stride = sizeof(NativeVertex);
+	sortedPacket.vertexLayout.elementCount = 2;
+	sortedPacket.vertexLayout.elements[0].semantic =
+		RENDER_VERTEX_SEMANTIC_POSITION;
+	sortedPacket.vertexLayout.elements[0].format = RENDER_VERTEX_DATA_FLOAT3;
+	sortedPacket.vertexLayout.elements[1].semantic =
+		RENDER_VERTEX_SEMANTIC_DIFFUSE;
+	sortedPacket.vertexLayout.elements[1].format = RENDER_VERTEX_DATA_COLOR_BGRA8;
+	sortedPacket.vertexLayout.elements[1].byteOffset = 12;
+	sortedPacket.vertexCount = 3;
+	sortedPacket.indexCount = 3;
+	sortedPacket.indexed = true;
+	const NativeVertex sortedVertices[3] = {
+		{ -0.8f, -0.8f, 0.0f, 0xff0000ffU },
+		{  0.0f,  0.8f, 0.0f, 0xff0000ffU },
+		{  0.8f, -0.8f, 0.0f, 0xff0000ffU }
+	};
+	const unsigned short sortedIndices[3] = { 0, 1, 2 };
+	LegacyLogicalState staleState;
+	staleState.constants.world.values[0] =
+		std::numeric_limits<float>::quiet_NaN();
+	result |= Check(owner.QueueGameSortedTriangles(staleState, sortedPacket,
+		sortedVertices, sizeof(sortedVertices), sortedIndices,
+		sizeof(sortedIndices), 0) == RENDER_RESULT_OK &&
+		owner.FlushGameSortedTriangles() == RENDER_RESULT_INVALID_ARGUMENT &&
+		owner.FlushGameSortedTriangles() == RENDER_RESULT_INVALID_ARGUMENT,
+		"failed sorted flush retains its copied packet before recovery");
 	result |= Check(NativeW3DRecoveryTestAccess::ConfigureResourceFault(
 		&owner.Renderer(), RENDER_RESOURCE_FAULT_PRESENTATION_PASS, 1,
 		RENDER_RESULT_DEVICE_REMOVED) == RENDER_RESULT_OK,
@@ -1028,6 +1057,8 @@ int TestPublicFrameResetRecoversRemovedDevice(HWND window)
 		const RenderResult healthyBoundary = BeginGameDisplayIteration();
 		result |= Check(healthyBoundary == RENDER_RESULT_OK,
 			"public display boundary clears the deferred failure for the following frame");
+		result |= Check(owner.FlushGameSortedTriangles() == RENDER_RESULT_OK,
+			"device recovery discards the stale sorted packet");
 		result |= Check(healthyBoundary == RENDER_RESULT_OK &&
 			owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
 			owner.ExecuteGameRenderCommand(end) == RENDER_RESULT_OK &&

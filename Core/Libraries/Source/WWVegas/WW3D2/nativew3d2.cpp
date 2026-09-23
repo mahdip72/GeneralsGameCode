@@ -675,6 +675,7 @@ rts::render::RenderResult NativeW3D2::ReplaceBackendContext(
 		// A borrowed context replacement is the bridge's recovery boundary. The
 		// old output views no longer describe the new context, so only the default
 		// swap-chain binding may be carried into the next owner frame.
+		m_nativeSortingRenderer.Clear();
 		m_gameRenderTargetBinding = rts::render::RenderTargetBinding();
 		m_activeRenderTargetKind =
 			rts::render::GAME_RENDER_TARGET_BACK_BUFFER;
@@ -930,6 +931,10 @@ rts::render::RenderResult NativeW3D2::RecoverOwnedDevice()
 	if (m_borrowedBackend || !m_resources.IsOwnerThread() ||
 		!m_renderer.CanRecoverDevice())
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	// Sorted submissions copy logical handles from the old device epoch. A
+	// failed flush may retain them for a same-device retry, but recovery must
+	// retire them before title resources are released and reacquired.
+	m_nativeSortingRenderer.Clear();
 	m_gameResourcesOperational = false;
 	m_activeRenderTargetKind = rts::render::GAME_RENDER_TARGET_UNKNOWN;
 	m_gameRenderTargetBinding = rts::render::RenderTargetBinding();
