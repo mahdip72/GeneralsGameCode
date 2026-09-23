@@ -1,0 +1,17 @@
+add_executable(core_water_track_texture_bind_tests
+	WaterTrackTextureBindTest.cpp
+)
+
+target_include_directories(core_water_track_texture_bind_tests PRIVATE
+	${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include
+)
+
+set_target_properties(core_water_track_texture_bind_tests PROPERTIES
+	CXX_STANDARD 20
+	CXX_STANDARD_REQUIRED YES
+	CXX_EXTENSIONS NO
+)
+
+add_test(NAME core_water_track_texture_bind_tests
+	COMMAND core_water_track_texture_bind_tests)
+set_tests_properties(core_water_track_texture_bind_tests PROPERTIES TIMEOUT 30)

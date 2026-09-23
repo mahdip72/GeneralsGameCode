@@ -114,10 +114,15 @@ void enabled(const std::string& directory, __int64 frequency)
 		};
 		for (std::size_t phase = 0; phase < sizeof(simulationPhases) / sizeof(simulationPhases[0]); ++phase)
 			capture.add(simulationPhases[phase], frequency / 2000);
+		capture.add(rts::frame_timing::WaterTrackTextureBind,
+			frequency / 1000);
+		for (int module = 0; module < 3; ++module)
+			capture.add(rts::frame_timing::WaterTrackModuleRender,
+				frequency / 2000);
 		capture.endFrame(1000); // Forces the headless periodic bucket without sleeping.
 		std::vector<Row> data = rows(directory);
-		check(data.size() == 13, "periodic flush writes frame, logic, and simulation phases before session ends");
-		if (data.size() == 13)
+		check(data.size() == 15, "periodic flush writes frame, logic, simulation, and water-track phases before session ends");
+		if (data.size() == 15)
 		{
 			const Row& logic = data[1];
 			check(strcmp(logic.phase, "logic") == 0 && logic.samples == 20, "logic sample count");
@@ -137,6 +142,10 @@ void enabled(const std::string& directory, __int64 frequency)
 				check(strcmp(data[phase + 2].phase, simulationNames[phase]) == 0 &&
 					data[phase + 2].samples == 1, "simulation phase name and sample count");
 			}
+			check(strcmp(data[13].phase, "water_track_texture_bind") == 0 &&
+				data[13].samples == 1, "water track texture bind phase and sample count");
+			check(strcmp(data[14].phase, "water_track_module_render") == 0 &&
+				data[14].samples == 3, "water track module count and phase name");
 		}
 		capture.beginFrame(1000);
 		capture.endFrame(1005);
@@ -144,7 +153,7 @@ void enabled(const std::string& directory, __int64 frequency)
 		capture.endFrame(0); // Game teardown can reset GameLogic before EndFrame.
 		capture.endSession();
 		data = rows(directory);
-		check(data.size() == 14 && data.back().frames == 5 &&
+		check(data.size() == 16 && data.back().frames == 5 &&
 			data.back().first == 1000 && data.back().last == 1005,
 			"session end preserves the final pre-reset frame range");
 		capture.beginSession("interactive");
@@ -153,7 +162,7 @@ void enabled(const std::string& directory, __int64 frequency)
 		// Destructor must retain this final partial bucket without endSession.
 	}
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 15 && data.back().session == 2 && data.back().frames == 1 &&
+	check(data.size() == 17 && data.back().session == 2 && data.back().frames == 1 &&
 		strcmp(data.back().mode, "interactive") == 0, "destructor/session reset retains only new frame counts");
 }
 

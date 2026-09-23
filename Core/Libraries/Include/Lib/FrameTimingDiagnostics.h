@@ -14,6 +14,7 @@ enum Phase
 	RecorderUpdate, RecorderEncode, RecorderFlush,
 	AudioVoiceCreate, AudioVoiceDestroy, AudioDecodeOpen, AudioDecodeRead,
 	RendererPresent, RendererTextureCollect, RendererTexturePrune,
+	WaterTrackTextureBind, WaterTrackModuleRender,
 	PhaseCount
 };
 
@@ -327,7 +328,8 @@ private:
 			"collision_commit_prepare",
 			"recorder_update", "recorder_encode", "recorder_flush",
 			"audio_voice_create", "audio_voice_destroy", "audio_decode_open", "audio_decode_read",
-			"renderer_present", "renderer_texture_collect", "renderer_texture_prune"
+			"renderer_present", "renderer_texture_collect", "renderer_texture_prune",
+			"water_track_texture_bind", "water_track_module_render"
 		};
 		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)

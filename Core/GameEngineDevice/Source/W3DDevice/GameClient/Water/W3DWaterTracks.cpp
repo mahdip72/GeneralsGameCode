@@ -55,6 +55,7 @@
 #include "Common/UnicodeString.h"
 #include "Common/file.h"
 #include "Common/FileSystem.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "WW3D2/texture.h"
 #include "WWMath/colmath.h"
 #include "WW3D2/coltest.h"
@@ -82,6 +83,35 @@ using rts::render::RENDER_COMPARE_LESS_EQUAL;
 using rts::render::RENDER_TEXTURE_OP_MODULATE;
 
 #include "WW3D2/nativew3dbuffercompat.h"
+#include "W3DDevice/GameClient/W3DWaterTrackTextureBindCache.h"
+
+#if defined(_WIN64)
+namespace
+{
+	class WaterTracksTimingScope
+	{
+	public:
+		WaterTracksTimingScope(rts::frame_timing::Capture &capture,
+			rts::frame_timing::Phase phase, bool enabled)
+			: m_capture(capture), m_phase(phase),
+			m_start(enabled ? rts::frame_timing::Capture::clock() : 0) {}
+
+		~WaterTracksTimingScope()
+		{
+			if (m_start != 0)
+				m_capture.add(m_phase,
+					rts::frame_timing::Capture::clock() - m_start);
+		}
+
+	private:
+		rts::frame_timing::Capture &m_capture;
+		rts::frame_timing::Phase m_phase;
+		__int64 m_start;
+		WaterTracksTimingScope(const WaterTracksTimingScope &);
+		WaterTracksTimingScope &operator=(const WaterTracksTimingScope &);
+	};
+}
+#endif
 
 //number of vertex pages allocated - allows double buffering of vertex updates.
 //while one is being rendered, another is being updated.  Improves HW parallelism.
@@ -951,16 +981,36 @@ Try improving the fit to vertical surfaces like cliffs.
 		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION, RENDER_COMPARE_LESS_EQUAL);
 	}
 
-	Int LastTextureType=-1;
+	W3DWaterTrackTextureBindCache textureBindCache;
+	#if defined(_WIN64)
+	rts::frame_timing::Capture &frameTimingCapture =
+		rts::frame_timing::Capture::instance();
+	const bool frameTimingActive = frameTimingCapture.isActive();
+	#endif
 
 	WaterTracksObj *mod=m_usedModules;
 
 	while( mod )
 	{
-		if (LastTextureType != mod->m_type)
+		if (textureBindCache.ShouldBind(mod->m_stageZeroTexture))
+		{
+#if defined(_WIN64)
+			WaterTracksTimingScope textureBindTiming(frameTimingCapture,
+				rts::frame_timing::WaterTrackTextureBind, frameTimingActive);
+#endif
 			rts::render::SetGameTexture(0,mod->m_stageZeroTexture);
+		}
 
-		Int vertsRendered=mod->render(m_vertexBuffer,m_batchStart);
+		Int vertsRendered;
+#if defined(_WIN64)
+		{
+			WaterTracksTimingScope moduleRenderTiming(frameTimingCapture,
+				rts::frame_timing::WaterTrackModuleRender, frameTimingActive);
+			vertsRendered=mod->render(m_vertexBuffer,m_batchStart);
+		}
+#else
+		vertsRendered=mod->render(m_vertexBuffer,m_batchStart);
+#endif
 
 		m_batchStart = vertsRendered;	//advance past vertices already in buffer
 
