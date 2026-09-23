@@ -13,10 +13,15 @@ inline bool IsReplayPathSeparator(char value)
 	return value == '\\' || value == '/';
 }
 
+inline bool IsReplayPathTraversalComponent(const char *value, size_t length)
+{
+	return (length == 1 && value[0] == '.') ||
+		(length == 2 && value[0] == '.' && value[1] == '.');
+}
+
 inline bool IsReplayPathConcreteComponent(const char *value, size_t length)
 {
-	return length != 0 && !(length == 1 && value[0] == '.') &&
-		!(length == 2 && value[0] == '.' && value[1] == '.');
+	return length != 0 && !IsReplayPathTraversalComponent(value, length);
 }
 
 // Callers provide separate input/output storage. Failure always clears a
@@ -85,8 +90,19 @@ inline bool ResolveReplayPlaybackPath(const char *replayDirectory,
 		{
 			// A colon cannot name a relative replay file; in particular, never
 			// interpret a drive-relative or alternate-stream name as a root.
-			for (size_t relativeIndex = 0; relativeIndex < filenameLength; ++relativeIndex)
-				if (filename[relativeIndex] == ':') return false;
+			// Keep relative components inside the replay directory after path
+			// normalization by rejecting explicit current/parent components.
+			size_t component = 0;
+			for (size_t relativeIndex = 0; relativeIndex <= filenameLength; ++relativeIndex)
+			{
+				if (relativeIndex < filenameLength && filename[relativeIndex] == ':') return false;
+				if (relativeIndex == filenameLength || IsReplayPathSeparator(filename[relativeIndex]))
+				{
+					if (IsReplayPathTraversalComponent(filename + component, relativeIndex - component))
+						return false;
+					component = relativeIndex + 1;
+				}
+			}
 		}
 	}
 	size_t directoryLength = 0;

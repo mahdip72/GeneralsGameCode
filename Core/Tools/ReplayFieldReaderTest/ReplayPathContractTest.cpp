@@ -55,6 +55,8 @@ int TestRelativeAndLegacyResolution()
 		"R:\\profile\\Replays\\match.rep", "native relative replay retains replay-directory lookup");
 	result |= CheckResolved("fixtures/match.rep", true,
 		"R:\\profile\\Replays\\fixtures/match.rep", "relative separators are not normalized");
+	result |= CheckResolved("fixtures\\match.rep", true,
+		"R:\\profile\\Replays\\fixtures\\match.rep", "native backslash-relative lookup stays under replay directory");
 	result |= CheckResolved("fixtures/*.rep", true,
 		"R:\\profile\\Replays\\fixtures/*.rep", "existing relative wildcard discovery keeps its input");
 	result |= CheckResolved("R:\\fixtures\\match.rep", false,
@@ -63,6 +65,22 @@ int TestRelativeAndLegacyResolution()
 		"R:\\profile\\Replays\\\\\\server\\share\\match.rep", "interactive and legacy UNC semantics remain unchanged");
 	result |= CheckResolved("fixtures/../match.rep", false,
 		"R:\\profile\\Replays\\fixtures/../match.rep", "legacy relative bytes are unchanged");
+	result |= CheckResolved("fixtures\\..\\match.rep", false,
+		"R:\\profile\\Replays\\fixtures\\..\\match.rep", "legacy backslash-relative bytes are unchanged");
+	return result;
+}
+
+int TestRejectedNativeRelativeTraversalComponents()
+{
+	const char *rejected[] = {
+		".", "..", "./outside.rep", "../outside.rep", ".\\outside.rep",
+		"..\\outside.rep", "fixtures/../outside.rep", "fixtures\\..\\outside.rep",
+		"fixtures/..\\outside.rep", "fixtures\\../outside.rep",
+		"fixtures/./match.rep", "fixtures\\.\\match.rep"
+	};
+	int result = 0;
+	for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i)
+		result |= CheckRejected(rejected[i], rejected[i]);
 	return result;
 }
 
@@ -122,5 +140,6 @@ int TestBoundedOutput()
 int main()
 {
 	return TestNativeConcreteAbsolutePaths() | TestRelativeAndLegacyResolution() |
+		TestRejectedNativeRelativeTraversalComponents() |
 		TestRejectedNativeRootedForms() | TestBoundedOutput();
 }
