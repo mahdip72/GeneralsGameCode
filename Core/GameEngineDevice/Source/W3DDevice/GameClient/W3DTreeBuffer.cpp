@@ -694,6 +694,7 @@ void W3DTreeBuffer::setTextureLOD(Int lod)
 //=============================================================================
 UnsignedInt W3DTreeBuffer::doLighting(const Vector3 *normal,
 															const GlobalData::TerrainLighting	*objectLighting,
+															const Vector3 *lightRays,
 															const Vector3 *emissive, UnsignedInt vertDiffuse, Real scale) const
 {
 
@@ -705,10 +706,7 @@ UnsignedInt W3DTreeBuffer::doLighting(const Vector3 *normal,
 
 	Int i;
 	for	(i=0; i<MAX_GLOBAL_LIGHTS; i++) {
-		Vector3 lightDirection(objectLighting[i].lightPos.x, objectLighting[i].lightPos.y, objectLighting[i].lightPos.z);
-		lightDirection.Normalize();
-		Vector3 lightRay(-lightDirection.X, -lightDirection.Y, -lightDirection.Z);
-		shade = Vector3::Dot_Product(lightRay, *normal);
+		shade = Vector3::Dot_Product(lightRays[i], *normal);
 
 		if (shade > 1.0) shade = 1.0;
 		if(shade < 0.0f) shade = 0.0f;
@@ -777,6 +775,18 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 	Int curTree=0;
 	Int bNdx;
 	const GlobalData::TerrainLighting *objectLighting = TheGlobalData->m_terrainObjectsLighting[TheGlobalData->m_timeOfDay];
+	// Every rebuilt vertex uses the same terrain-light directions. Normalize
+	// them once per rebuild instead of once for every tree vertex; keeping the
+	// original normalization operation and dot-product order preserves the
+	// resulting vertex colors.
+	Vector3 lightRays[MAX_GLOBAL_LIGHTS];
+	for (Int lightIndex = 0; lightIndex < MAX_GLOBAL_LIGHTS; ++lightIndex) {
+		Vector3 lightDirection(objectLighting[lightIndex].lightPos.x,
+			objectLighting[lightIndex].lightPos.y,
+			objectLighting[lightIndex].lightPos.z);
+		lightDirection.Normalize();
+		lightRays[lightIndex].Set(-lightDirection.X, -lightDirection.Y, -lightDirection.Z);
+	}
 	for (bNdx=0; bNdx<MAX_BUFFERS; bNdx++) {
 		m_curNumTreeVertices[bNdx] = 0;
 		m_curNumTreeIndices[bNdx] = 0;
@@ -888,7 +898,7 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 			if (normals == nullptr) {
 				doVertexLighting = false;
 				Vector3 normal(0.0f,0.0f,1.0f);
-				diffuse = doLighting(&normal, objectLighting, &emissive, 0xFFFFFFFF, 1.0f);
+				diffuse = doLighting(&normal, objectLighting, lightRays, &emissive, 0xFFFFFFFF, 1.0f);
 			}
 
 			Real Uscale = m_treeTypes[type].m_tileWidth * (Real)TILE_PIXEL_EXTENT / (Real)m_textureWidth;
@@ -962,8 +972,8 @@ void W3DTreeBuffer::loadTreesInVertexAndIndexBuffers(RefRenderObjListIterator *p
 					} else {
 						vertexDiffuse = 0xffffffff;
 					}
-					curVb->diffuse = doLighting(&normal, objectLighting, &emissive,
-														vertexDiffuse, 1.0f);
+					curVb->diffuse = doLighting(&normal, objectLighting, lightRays,
+										&emissive, vertexDiffuse, 1.0f);
 				} else {
 					curVb->diffuse = diffuse;
 				}
