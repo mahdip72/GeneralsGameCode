@@ -177,6 +177,7 @@ W3DView::W3DView()
 	m_shellTerrainSizedMap = nullptr;
 	m_shellTerrainDrawWidth = 0;
 	m_shellTerrainDrawHeight = 0;
+	m_shellTerrainViewportAspect = 0.0f;
 
 	//Enhancements from CNC3 WST 4/15/2003. JSC Integrated 5/20/03.
 	m_scriptedState = 0;
@@ -926,6 +927,7 @@ void W3DView::reset()
 	m_shellTerrainSizedMap = nullptr;
 	m_shellTerrainDrawWidth = 0;
 	m_shellTerrainDrawHeight = 0;
+	m_shellTerrainViewportAspect = 0.0f;
 
 	// Just in case...
 	setTimeMultiplier(1); // Set time rate back to 1.
@@ -3409,6 +3411,7 @@ void W3DView::setUserControlled(Bool value)
 		m_shellTerrainSizedMap = nullptr;
 		m_shellTerrainDrawWidth = 0;
 		m_shellTerrainDrawHeight = 0;
+		m_shellTerrainViewportAspect = 0.0f;
 	}
 	if (m_isUserControlled != value)
 	{
@@ -3731,6 +3734,7 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions)
 		m_shellTerrainSizedMap = nullptr;
 		m_shellTerrainDrawWidth = 0;
 		m_shellTerrainDrawHeight = 0;
+		m_shellTerrainViewportAspect = 0.0f;
 		DEBUG_ASSERTCRASH(TheTerrainRenderObject != nullptr, ("TheTerrainRenderObject is null"));
 
 		if (const WorldHeightMap *heightMap = TheTerrainRenderObject->getMap())
@@ -3751,6 +3755,7 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions)
 		m_shellTerrainSizedMap = nullptr;
 		m_shellTerrainDrawWidth = 0;
 		m_shellTerrainDrawHeight = 0;
+		m_shellTerrainViewportAspect = 0.0f;
 	}
 
 	if (!m_isUserControlled && !isShellCamera)
@@ -3772,7 +3777,13 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions)
 				m_shellTerrainSizedMap = heightMap;
 				m_shellTerrainDrawWidth = 0;
 				m_shellTerrainDrawHeight = 0;
+				m_shellTerrainViewportAspect = 0.0f;
 			}
+			const Real viewportAspect = getHeight() > 0 ?
+				(Real)getWidth() / (Real)getHeight() : 0.0f;
+			rts::ResetTerrainDrawSizeFloorForViewportAspectChange(viewportAspect,
+				m_shellTerrainViewportAspect, m_shellTerrainDrawWidth,
+				m_shellTerrainDrawHeight);
 			const Vector3 cameraPosition = m_3DCamera->Get_Position();
 			const Real cameraToPivotX = cameraPosition.X - m_pos.x;
 			const Real cameraToPivotY = cameraPosition.Y - m_pos.y;
@@ -3845,6 +3856,7 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions)
 	m_shellTerrainSizedMap = nullptr;
 	m_shellTerrainDrawWidth = 0;
 	m_shellTerrainDrawHeight = 0;
+	m_shellTerrainViewportAspect = 0.0f;
 	// TheSuperHackers @tweak xezon 31/12/2025 Increases visible terrain area when lowering the camera pitch.
 	// Note: The default camera pitch in Generals was 37.5, which we prefer to keep the normal draw size for.
 	dimensions.x = WorldHeightMap::LOW_ANGLE_DRAW_WIDTH;

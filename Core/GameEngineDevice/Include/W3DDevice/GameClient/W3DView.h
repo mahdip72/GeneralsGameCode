@@ -287,6 +287,7 @@ private:
 	const WorldHeightMap *m_shellTerrainSizedMap;
 	Int			m_shellTerrainDrawWidth;
 	Int			m_shellTerrainDrawHeight;
+	float		m_shellTerrainViewportAspect;
 
 	Coord3D m_previousLookAtPosition;
 	Coord2D m_scrollAmount;													///< scroll speed

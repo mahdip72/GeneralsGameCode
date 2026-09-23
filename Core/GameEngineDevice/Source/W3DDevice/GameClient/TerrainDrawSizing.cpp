@@ -197,4 +197,22 @@ namespace rts
 		if (width > mapWidth) width = mapWidth;
 		if (height > mapHeight) height = mapHeight;
 	}
+
+	bool ResetTerrainDrawSizeFloorForViewportAspectChange(float viewportAspect,
+		float &floorViewportAspect, int &floorWidth, int &floorHeight)
+	{
+		if (!(viewportAspect > 0.0f && viewportAspect < FLT_MAX))
+			return false;
+
+		if (!(floorViewportAspect > 0.0f && floorViewportAspect < FLT_MAX) ||
+			fabs(viewportAspect - floorViewportAspect) > 0.0001f)
+		{
+			floorViewportAspect = viewportAspect;
+			floorWidth = 0;
+			floorHeight = 0;
+			return true;
+		}
+
+		return false;
+	}
 }

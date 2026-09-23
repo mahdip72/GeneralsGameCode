@@ -313,6 +313,55 @@ static void TestShellTerrainFloorPolicy()
 	CHECK(width == 193 && height == 193);
 }
 
+static void TestShellTerrainFloorViewportEpoch()
+{
+	float shellAspect = 4.0f / 3.0f;
+	int shellWidth = 225, shellHeight = 225;
+	int width = 257, height = 225;
+
+	// A wider viewport starts a fresh floor so returning to 4:3 can contract it.
+	CHECK(rts::ResetTerrainDrawSizeFloorForViewportAspectChange(16.0f / 9.0f,
+		shellAspect, shellWidth, shellHeight));
+	CHECK(shellWidth == 0 && shellHeight == 0);
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 257 && height == 257);
+	shellWidth = width; shellHeight = height;
+
+	// Camera animation and a shake within the same 16:9 epoch keep the shell floor,
+	// while the temporary actual full-map draw is visible only for the shake.
+	CHECK(!rts::ResetTerrainDrawSizeFloorForViewportAspectChange(16.0f / 9.0f,
+		shellAspect, shellWidth, shellHeight));
+	width = 315; height = 315;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, true, width, height);
+	CHECK(width == 315 && height == 315);
+	CHECK(shellWidth == 257 && shellHeight == 257);
+	width = 129; height = 129;
+	CHECK(!rts::ResetTerrainDrawSizeFloorForViewportAspectChange(16.0f / 9.0f,
+		shellAspect, shellWidth, shellHeight));
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 257 && height == 257);
+
+	CHECK(rts::ResetTerrainDrawSizeFloorForViewportAspectChange(4.0f / 3.0f,
+		shellAspect, shellWidth, shellHeight));
+	CHECK(shellWidth == 0 && shellHeight == 0);
+	width = 225; height = 193;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 225 && height == 225);
+	shellWidth = width; shellHeight = height;
+	CHECK(!rts::ResetTerrainDrawSizeFloorForViewportAspectChange(4.0f / 3.0f,
+		shellAspect, shellWidth, shellHeight));
+	width = 193; height = 161;
+	rts::StabilizeTerrainDrawSizeForMap(shellWidth, shellHeight,
+		315, 315, false, width, height);
+	CHECK(width == 225 && height == 225);
+}
+
 static void TestAudioChannelPolicy()
 {
 	CHECK(rts::GetAdaptive3DChannelTarget(25) == 64);
@@ -346,6 +395,7 @@ int main()
 	TestTerrainDrawSizing();
 	TestShellTerrainDrawSizing();
 	TestShellTerrainFloorPolicy();
+	TestShellTerrainFloorViewportEpoch();
 	TestAudioChannelPolicy();
 
 	if (s_failures != 0)

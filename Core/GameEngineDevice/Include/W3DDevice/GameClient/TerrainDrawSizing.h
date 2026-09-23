@@ -39,4 +39,6 @@ namespace rts
 		const TerrainCameraBasis &basis, int &width, int &height);
 	void StabilizeTerrainDrawSizeForMap(int currentWidth, int currentHeight,
 		int mapWidth, int mapHeight, bool deferFullShrink, int &width, int &height);
+	bool ResetTerrainDrawSizeFloorForViewportAspectChange(float viewportAspect,
+		float &floorViewportAspect, int &floorWidth, int &floorHeight);
 }
