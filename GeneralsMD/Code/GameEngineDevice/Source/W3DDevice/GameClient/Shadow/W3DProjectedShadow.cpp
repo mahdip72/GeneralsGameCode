@@ -339,6 +339,8 @@ W3DProjectedShadowManager::W3DProjectedShadowManager()
 	m_numDecalShadows = 0;
 	m_numProjectionShadows  = 0;
 	m_W3DShadowTextureManager = nullptr;
+	m_dynamicRenderTarget = nullptr;
+	m_dynamicDepthTarget = nullptr;
 	m_shadowCamera = nullptr;
 	m_shadowContext= nullptr;
 	m_drawEdgeX = 0;
@@ -352,6 +354,7 @@ W3DProjectedShadowManager::~W3DProjectedShadowManager()
 
 	ReleaseResources();
 	m_dynamicRenderTarget = nullptr;
+	m_dynamicDepthTarget = nullptr;
 	m_renderTargetHasAlpha = FALSE;
 	delete m_shadowContext;
 	REF_PTR_RELEASE(m_shadowCamera);
@@ -391,27 +394,47 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 
 	///@todo: We should allocate our render target pool here.
 
-	DEBUG_ASSERTCRASH(m_dynamicRenderTarget == nullptr, ("Acquire of existing shadow render target"));
+	DEBUG_ASSERTCRASH(m_dynamicRenderTarget == nullptr &&
+		m_dynamicDepthTarget == nullptr, ("Acquire of existing shadow render target"));
 
 	m_renderTargetHasAlpha=TRUE;
-	if ((m_dynamicRenderTarget=rts::render::CreateGameRenderTarget(
-		DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT,
-		WW3D_FORMAT_A8R8G8B8)) == nullptr)
+	#if defined(_WIN64)
 	{
+		// A color-only target disables depth testing for the native capture;
+		// the swap-chain depth target cannot attach to this smaller surface.
+		// Keep the capture's color and depth attachments the same size.
+		// Select this at build time: resource reacquisition runs while the
+		// native owner is initialized but deliberately not operational.
+		(void)rts::render::CreateGameRenderTargetPair(
+			DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT,
+			WW3D_FORMAT_A8R8G8B8, WW3D_ZFORMAT_D24S8,
+			&m_dynamicRenderTarget, &m_dynamicDepthTarget);
+	}
+	#else
+	{
+		m_dynamicRenderTarget=rts::render::CreateGameRenderTarget(
+			DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT,
+			WW3D_FORMAT_A8R8G8B8);
+		if (m_dynamicRenderTarget == nullptr)
+		{
 			m_renderTargetHasAlpha=FALSE;
-
-			//failed to get a render target with alpha.
-			//try again without.
 			m_dynamicRenderTarget=rts::render::CreateGameRenderTarget(
 				DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT,
 				WW3D_FORMAT_UNKNOWN);
+		}
 	}
+	#endif
 
 	if (m_dynamicRenderTarget == nullptr ||
 		!m_dynamicRenderTarget->Is_Initialized() ||
+		#if defined(_WIN64)
+		(m_dynamicDepthTarget == nullptr ||
+		 !m_dynamicDepthTarget->Is_Initialized()) ||
+		#endif
 		!rts::render::IsGameRendererInitialized())
 	{
 		REF_PTR_RELEASE(m_dynamicRenderTarget);
+		REF_PTR_RELEASE(m_dynamicDepthTarget);
 		return FALSE;
 	}
 
@@ -449,6 +472,7 @@ void W3DProjectedShadowManager::ReleaseResources()
 {
 	invalidateCachedLightPositions();	//textures need to be updated
 	REF_PTR_RELEASE(m_dynamicRenderTarget);	//need to create a new render target
+	REF_PTR_RELEASE(m_dynamicDepthTarget);
 	REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
 	REF_PTR_RELEASE(shadowDecalVertexBufferOwner);
 }
@@ -2617,7 +2641,9 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 		objToLight =  objPos + objToLight * 2000.0f;
 
 		m_shadowProjector->Compute_Perspective_Projection(m_robj,objToLight);
-		m_shadowProjector->Set_Render_Target(TheW3DProjectedShadowManager->getRenderTarget());
+		m_shadowProjector->Set_Render_Target(
+			TheW3DProjectedShadowManager->getRenderTarget(),
+			TheW3DProjectedShadowManager->getDepthTarget());
 
 		//Set ambient to 0, so we get a black shadow on solid background
 

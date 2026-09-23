@@ -41,6 +41,7 @@ class W3DShadowTextureManager;	//forward reference
 class Drawable;	//forward reference
 class W3DProjectedShadow; //forward reference.
 class TexProjectClass;
+class ZTextureClass;
 
 class W3DProjectedShadowManager	: public ProjectedShadowManager
 {
@@ -69,6 +70,7 @@ class W3DProjectedShadowManager	: public ProjectedShadowManager
 		void removeShadow (W3DProjectedShadow *shadow);
 		void removeAllShadows(); ///< Remove all shadows.
 		TextureClass *getRenderTarget()	{ return m_dynamicRenderTarget;}
+		ZTextureClass *getDepthTarget()	{ return m_dynamicDepthTarget;}
 		SpecialRenderInfoClass *getRenderContext()	{ return m_shadowContext;}
 		void updateRenderTargetTextures();	///<render into any textures that need updating.
 		void queueDecal(W3DProjectedShadow *shadow);	///<add shadow decal to render list - decal conforms to terrain.
@@ -85,6 +87,7 @@ class W3DProjectedShadowManager	: public ProjectedShadowManager
 		W3DProjectedShadow *m_shadowList;
 		W3DProjectedShadow *m_decalList;
 		TextureClass	*m_dynamicRenderTarget;	///<offscreen video memory texture used to render all shadow textures.
+		ZTextureClass *m_dynamicDepthTarget;	///<matching native depth target for projected-shadow capture.
 		Bool m_renderTargetHasAlpha;					///<does render target have destination alpha support?
 		CameraClass		*m_shadowCamera;					///<camera used to render all shadow textures - configured by projector
 		LightEnvironmentClass m_shadowLightEnv;
