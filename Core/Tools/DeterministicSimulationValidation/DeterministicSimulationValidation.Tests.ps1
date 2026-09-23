@@ -151,6 +151,90 @@ function Invoke-Stage5AcceptanceMutationCase {
     }
 }
 
+function Remove-Stage5AcceptanceReparseFixtureLink {
+    param(
+        [Parameter(Mandatory = $true)][string]$FixtureRoot,
+        [Parameter(Mandatory = $true)][string]$LinkPath
+    )
+    $fixtureFull = [IO.Path]::GetFullPath($FixtureRoot)
+    $fixtureItem = Get-Item -LiteralPath $fixtureFull -Force -ErrorAction Stop
+    if (($fixtureItem.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($fixtureItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Acceptance reparse fixture root must be a normal directory: $fixtureFull"
+    }
+
+    $linkFull = [IO.Path]::GetFullPath($LinkPath)
+    $separator = [IO.Path]::DirectorySeparatorChar.ToString()
+    $fixturePrefix = if ($fixtureFull.EndsWith($separator,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        $fixtureFull
+    }
+    else { $fixtureFull + $separator }
+    if (-not $linkFull.StartsWith($fixturePrefix,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Acceptance reparse fixture link is outside its owned root: $linkFull"
+    }
+
+    $parentFull = [IO.Path]::GetDirectoryName($linkFull)
+    if (-not [String]::Equals([IO.Path]::GetDirectoryName($parentFull),
+            $fixtureFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Acceptance reparse fixture link must be directly inside its owned manifest directory: $linkFull"
+    }
+    $parentItem = Get-Item -LiteralPath $parentFull -Force -ErrorAction Stop
+    if (($parentItem.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($parentItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Acceptance reparse fixture parent must be a normal directory: $parentFull"
+    }
+
+    # Unlink only this exact reparse object; never traverse its target.
+    $linkItem = Get-Item -LiteralPath $linkFull -Force -ErrorAction SilentlyContinue
+    if ($null -eq $linkItem) {
+        if ([IO.File]::Exists($linkFull) -or [IO.Directory]::Exists($linkFull)) {
+            throw "Acceptance reparse fixture link could not be inspected safely: $linkFull"
+        }
+        return
+    }
+    if (($linkItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+        throw "Acceptance reparse fixture cleanup refused a non-reparse path: $linkFull"
+    }
+    if (($linkItem.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+        [IO.Directory]::Delete($linkFull)
+    }
+    else {
+        [IO.File]::Delete($linkFull)
+    }
+
+    $remainingItem = Get-Item -LiteralPath $linkFull -Force -ErrorAction SilentlyContinue
+    if ($null -ne $remainingItem -or [IO.File]::Exists($linkFull) -or
+        [IO.Directory]::Exists($linkFull)) {
+        throw "Acceptance reparse fixture link remains after nonrecursive unlink: $linkFull"
+    }
+}
+
+function Assert-Stage5AcceptanceScratchTreeContainsNoReparsePoints {
+    param([Parameter(Mandatory = $true)][string]$RootPath)
+    $rootFull = [IO.Path]::GetFullPath($RootPath)
+    $rootItem = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+    if (($rootItem.Attributes -band [IO.FileAttributes]::Directory) -eq 0 -or
+        ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Acceptance scratch root is not a normal directory: $rootFull"
+    }
+
+    $directories = New-Object 'Collections.Generic.Stack[string]'
+    $directories.Push($rootFull)
+    while ($directories.Count -gt 0) {
+        $directory = $directories.Pop()
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)) {
+            if (($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Acceptance scratch tree contains a reparse point: $($child.FullName)"
+            }
+            if (($child.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
+                $directories.Push($child.FullName)
+            }
+        }
+    }
+}
+
 function Read-TestJson {
     param([Parameter(Mandatory = $true)][string]$Path)
     $json = Get-Content -LiteralPath $Path -Raw
@@ -9033,6 +9117,63 @@ try {
 
     }
     if ($runAcceptance) {
+    $evidenceModule = Get-Module -Name DeterministicSimulationEvidence
+    Assert-True ($null -ne $evidenceModule) `
+        'the final-acceptance snapshot tests can access the evidence module boundary'
+
+    # Keep the only temporary reparse fixture at the front of the long
+    # Acceptance partition. A later CTest timeout must not interrupt the test
+    # while this link is present in the shared scratch tree.
+    $reparseRoot = Join-Path $root 'reparse-negative'
+    $reparseBase = Join-Path $reparseRoot 'manifest'
+    $reparseTarget = Join-Path $reparseRoot 'outside'
+    New-Item -ItemType Directory -Path $reparseBase, $reparseTarget -Force | Out-Null
+    $reparseTargetFile = Join-Path $reparseTarget 'outside.json'
+    Write-JsonDocument $reparseTargetFile ([ordered]@{ marker = 'outside' })
+    $reparseDirectoryLink = Join-Path $reparseBase 'linked'
+    $reparseFileLink = Join-Path $reparseBase 'linked.json'
+    $reparseLink = $reparseDirectoryLink
+    $reparseRelative = 'linked\outside.json'
+    $reparseCreated = $false
+    try {
+        try {
+            New-Item -ItemType Junction -Path $reparseDirectoryLink `
+                -Target $reparseTarget -ErrorAction Stop | Out-Null
+            $reparseCreated = $true
+        }
+        catch {
+            $reparseLink = $reparseFileLink
+            $reparseRelative = 'linked.json'
+            try {
+                New-Item -ItemType SymbolicLink -Path $reparseFileLink `
+                    -Target $reparseTargetFile -ErrorAction Stop | Out-Null
+                $reparseCreated = $true
+            }
+            catch {
+                Write-Warning 'Skipping reparse-path negative: this host does not permit junction or symbolic-link creation.'
+            }
+        }
+        if ($reparseCreated) {
+            $reparseError = $null
+            try {
+                & $evidenceModule {
+                    param($baseDirectory, $relativePath)
+                    Resolve-Stage5FinalAcceptanceFile $baseDirectory $relativePath `
+                        'reparse path negative'
+                } $reparseBase $reparseRelative | Out-Null
+            }
+            catch { $reparseError = $_.Exception.Message }
+            Assert-True ($reparseError -match 'reparse point') `
+                'final-acceptance evidence rejects a junction or symbolic-link path escape'
+        }
+    }
+    finally {
+        Remove-Stage5AcceptanceReparseFixtureLink -FixtureRoot $reparseRoot `
+            -LinkPath $reparseDirectoryLink
+        Remove-Stage5AcceptanceReparseFixtureLink -FixtureRoot $reparseRoot `
+            -LinkPath $reparseFileLink
+    }
+
     Assert-Stage5FinalAcceptanceEvidenceSchemaContract
     $deterministicRunnerSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot `
         'Run-DeterministicSimulationValidation.ps1') -Raw
@@ -11597,9 +11738,6 @@ try {
     } 'phase-baseline|profile|reviewed hash' `
         'scaling evidence rejects a phase baseline profile detached from independent review'
 
-    $evidenceModule = Get-Module -Name DeterministicSimulationEvidence
-    Assert-True ($null -ne $evidenceModule) `
-        'the final-acceptance snapshot tests can access the evidence module boundary'
     $snapshotPath = Join-Path $attachmentRoot 'snapshot-mutation.json'
     Write-JsonDocument $snapshotPath ([ordered]@{ marker = 'original'; value = 17 })
     $snapshot = & $evidenceModule {
@@ -11633,62 +11771,6 @@ try {
     }
     finally { $identityStream.Dispose() }
 
-    $reparseRoot = Join-Path $root 'reparse-negative'
-    $reparseBase = Join-Path $reparseRoot 'manifest'
-    $reparseTarget = Join-Path $reparseRoot 'outside'
-    New-Item -ItemType Directory -Path $reparseBase, $reparseTarget -Force | Out-Null
-    $reparseTargetFile = Join-Path $reparseTarget 'outside.json'
-    Write-JsonDocument $reparseTargetFile ([ordered]@{ marker = 'outside' })
-    $reparseLink = Join-Path $reparseBase 'linked'
-    $reparseRelative = 'linked\outside.json'
-    $reparseCreated = $false
-    try {
-        New-Item -ItemType Junction -Path $reparseLink -Target $reparseTarget `
-            -ErrorAction Stop | Out-Null
-        $reparseCreated = $true
-    }
-    catch {
-        $reparseLink = Join-Path $reparseBase 'linked.json'
-        $reparseRelative = 'linked.json'
-        try {
-            New-Item -ItemType SymbolicLink -Path $reparseLink -Target $reparseTargetFile `
-                -ErrorAction Stop | Out-Null
-            $reparseCreated = $true
-        }
-        catch {
-            Write-Warning 'Skipping reparse-path negative: this host does not permit junction or symbolic-link creation.'
-        }
-    }
-    if ($reparseCreated) {
-        $reparseError = $null
-        try {
-            & $evidenceModule {
-                param($baseDirectory, $relativePath)
-                Resolve-Stage5FinalAcceptanceFile $baseDirectory $relativePath `
-                    'reparse path negative'
-            } $reparseBase $reparseRelative | Out-Null
-        }
-        catch { $reparseError = $_.Exception.Message }
-        Assert-True ($reparseError -match 'reparse point') `
-            'final-acceptance evidence rejects a junction or symbolic-link path escape'
-        try {
-            $reparseLinkItem = Get-Item -LiteralPath $reparseLink -Force `
-                -ErrorAction SilentlyContinue
-            if ($null -ne $reparseLinkItem) {
-                if (($reparseLinkItem.Attributes -band [IO.FileAttributes]::Directory) -ne 0) {
-                    [IO.Directory]::Delete($reparseLink)
-                }
-                else {
-                    [IO.File]::Delete($reparseLink)
-                }
-            }
-        }
-        catch {
-            # Windows PowerShell 5.1 can throw while Remove-Item tears down a
-            # junction; the outer fixture cleanup remains the final fallback.
-        }
-    }
-
     $hostPlanBinding = @($deterministicDocument.attachments | Where-Object {
         [string]$_.role -ceq 'validation-plan'
     })[0]
@@ -11706,6 +11788,7 @@ finally {
     $rootFull = [IO.Path]::GetFullPath($root)
     if ($rootFull.StartsWith($temporaryBase, [StringComparison]::OrdinalIgnoreCase) -and
         [IO.Path]::GetFileName($rootFull) -like 'GGC-Stage5Validation-Test-*') {
+        Assert-Stage5AcceptanceScratchTreeContainsNoReparsePoints -RootPath $rootFull
         Remove-Item -LiteralPath $rootFull -Recurse -Force
     }
 }

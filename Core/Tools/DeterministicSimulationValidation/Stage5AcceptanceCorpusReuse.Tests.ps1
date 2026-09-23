@@ -48,6 +48,132 @@ try {
         throw "The Acceptance entrypoint does not parse: $($parseErrors[0].Message)"
     }
 
+    $reparseCleanupDefinitions = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Remove-Stage5AcceptanceReparseFixtureLink'
+    }, $true))
+    Assert-CorpusReuseTest ($reparseCleanupDefinitions.Count -eq 1) `
+        'Acceptance must define one exact-path reparse fixture cleanup helper.'
+    Invoke-Expression $reparseCleanupDefinitions[0].Extent.Text
+    $scratchTreeGuardDefinitions = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-Stage5AcceptanceScratchTreeContainsNoReparsePoints'
+    }, $true))
+    Assert-CorpusReuseTest ($scratchTreeGuardDefinitions.Count -eq 1) `
+        'Acceptance scratch cleanup must define one fail-closed reparse preflight.'
+    Invoke-Expression $scratchTreeGuardDefinitions[0].Extent.Text
+
+    $reparseRootAssignments = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -ceq '$reparseRoot'
+    }, $true))
+    $acceptanceSchemaCalls = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'Assert-Stage5FinalAcceptanceEvidenceSchemaContract'
+    }, $true))
+    $reparseJunctionCreates = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'New-Item' -and
+            $node.Extent.Text -match '-ItemType\s+Junction'
+    }, $true))
+    $sharedProducerCalls = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'New-CombinedHostProducerTestCase' -and
+            $node.Extent.Text -match "'shared'"
+    }, $true))
+    Assert-CorpusReuseTest ($reparseRootAssignments.Count -eq 1 -and
+        $acceptanceSchemaCalls.Count -eq 1 -and
+        $reparseJunctionCreates.Count -eq 1 -and $sharedProducerCalls.Count -eq 1 -and
+        $reparseRootAssignments[0].Extent.StartOffset -lt
+            $acceptanceSchemaCalls[0].Extent.StartOffset -and
+        $reparseJunctionCreates[0].Extent.StartOffset -lt
+            $acceptanceSchemaCalls[0].Extent.StartOffset -and
+        $reparseJunctionCreates[0].Extent.StartOffset -lt
+            $sharedProducerCalls[0].Extent.StartOffset) `
+        'The reparse-negative fixture must run before the long Acceptance and shared-producer work.'
+    $reparseFixtureTryBlocks = @($sourceAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.TryStatementAst] -and
+            $null -ne $node.Finally -and
+            $node.Body.Extent.Text -match '-ItemType\s+Junction' -and
+            @($node.Finally.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                    $candidate.GetCommandName() -ceq 'Remove-Stage5AcceptanceReparseFixtureLink'
+            }, $true)).Count -eq 2
+    }, $true))
+    $reparseCleanupCalls = if ($reparseFixtureTryBlocks.Count -eq 1) {
+        @($reparseFixtureTryBlocks[0].Finally.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and
+                $node.GetCommandName() -ceq 'Remove-Stage5AcceptanceReparseFixtureLink'
+        }, $true))
+    }
+    else { @() }
+    Assert-CorpusReuseTest ($reparseFixtureTryBlocks.Count -eq 1 -and
+        $reparseCleanupCalls.Count -eq 2) `
+        'The reparse-negative fixture must unlink both known link candidates in its finally block.'
+
+    $reparseCleanupProbeRoot = Join-Path $runRoot 'reparse-cleanup-probe'
+    $reparseProbeManifest = Join-Path $reparseCleanupProbeRoot 'manifest'
+    $reparseProbeTarget = Join-Path $reparseCleanupProbeRoot 'outside'
+    [IO.Directory]::CreateDirectory($reparseProbeManifest) | Out-Null
+    [IO.Directory]::CreateDirectory($reparseProbeTarget) | Out-Null
+    $reparseProbeTargetFile = Join-Path $reparseProbeTarget 'sentinel.txt'
+    [IO.File]::WriteAllText($reparseProbeTargetFile, 'outside target remains intact')
+    $reparseProbeLink = Join-Path $reparseProbeManifest 'linked'
+    New-Item -ItemType Junction -Path $reparseProbeLink `
+        -Target $reparseProbeTarget -ErrorAction Stop | Out-Null
+    $reparseProbeLinkItem = Get-Item -LiteralPath $reparseProbeLink -Force
+    Assert-CorpusReuseTest (($reparseProbeLinkItem.Attributes -band
+            [IO.FileAttributes]::ReparsePoint) -ne 0) `
+        'The cleanup regression probe must create a real directory reparse point.'
+    $outsideProbeFile = Join-Path $runRoot 'outside-reparse-probe.txt'
+    [IO.File]::WriteAllText($outsideProbeFile, 'must not be removed')
+    $outsidePathRejected = $false
+    try {
+        Remove-Stage5AcceptanceReparseFixtureLink -FixtureRoot $reparseCleanupProbeRoot `
+            -LinkPath $outsideProbeFile
+    }
+    catch { $outsidePathRejected = $_.Exception.Message -match 'outside its owned root' }
+    Assert-CorpusReuseTest ($outsidePathRejected -and [IO.File]::Exists($outsideProbeFile)) `
+        'Exact-link cleanup must reject and preserve a path outside its fixture root.'
+    $ordinaryDirectory = Join-Path $reparseProbeManifest 'ordinary-directory'
+    [IO.Directory]::CreateDirectory($ordinaryDirectory) | Out-Null
+    $ordinaryPathRejected = $false
+    try {
+        Remove-Stage5AcceptanceReparseFixtureLink -FixtureRoot $reparseCleanupProbeRoot `
+            -LinkPath $ordinaryDirectory
+    }
+    catch { $ordinaryPathRejected = $_.Exception.Message -match 'non-reparse path' }
+    Assert-CorpusReuseTest ($ordinaryPathRejected -and
+        [IO.Directory]::Exists($ordinaryDirectory)) `
+        'Exact-link cleanup must reject and preserve a normal directory.'
+    $scratchTreeRejected = $false
+    try {
+        Assert-Stage5AcceptanceScratchTreeContainsNoReparsePoints `
+            -RootPath $reparseCleanupProbeRoot
+    }
+    catch { $scratchTreeRejected = $_.Exception.Message -match 'contains a reparse point' }
+    Assert-CorpusReuseTest ($scratchTreeRejected -and
+        [IO.File]::ReadAllText($reparseProbeTargetFile) -ceq
+            'outside target remains intact') `
+        'Scratch-tree cleanup preflight must refuse a junction without traversing or changing its target.'
+    Remove-Stage5AcceptanceReparseFixtureLink -FixtureRoot $reparseCleanupProbeRoot `
+        -LinkPath $reparseProbeLink
+    Assert-CorpusReuseTest (-not (Test-Path -LiteralPath $reparseProbeLink) -and
+        [IO.File]::ReadAllText($reparseProbeTargetFile) -ceq
+            'outside target remains intact') `
+        'Nonrecursive unlink must remove only the junction object and preserve target contents.'
+    Assert-Stage5AcceptanceScratchTreeContainsNoReparsePoints `
+        -RootPath $reparseCleanupProbeRoot
+
     # Acceptance runs this receipt through the production validator only after
     # constructing and hashing its full diagnostic corpus. Exercise this one
     # cheap contract before that expensive path so stale synthetic evidence
@@ -318,12 +444,18 @@ try {
     Assert-CorpusReuseTest ([Convert]::ToBase64String([IO.File]::ReadAllBytes($firstPath)) -ceq
         $firstOriginal) 'A successful case must also restore its source document byte-for-byte.'
 
-    Write-Output 'Stage 5 Acceptance preflight self-test passed: installed-runtime/replay bindings, one full corpus, nine producer cases, and byte-identical mutation restores.'
+    Write-Output 'Stage 5 Acceptance preflight self-test passed: early reparse fixture cleanup, installed-runtime/replay bindings, one full corpus, nine producer cases, and byte-identical mutation restores.'
 }
 finally {
-    $runItem = Get-Item -LiteralPath $runRoot -Force
-    if (($runItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "Refusing to remove Acceptance corpus reuse reparse point: $runRoot"
+    if ($null -ne (Get-Command Assert-Stage5AcceptanceScratchTreeContainsNoReparsePoints `
+            -ErrorAction SilentlyContinue)) {
+        Assert-Stage5AcceptanceScratchTreeContainsNoReparsePoints -RootPath $runRoot
+    }
+    else {
+        $runItem = Get-Item -LiteralPath $runRoot -Force
+        if (($runItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Refusing to remove Acceptance corpus reuse reparse point: $runRoot"
+        }
     }
     Remove-Item -LiteralPath $runRoot -Recurse -Force
 }
