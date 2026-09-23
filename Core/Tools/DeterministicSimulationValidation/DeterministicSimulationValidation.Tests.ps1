@@ -1279,6 +1279,20 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
                 -Filter '.stage5-write-*.tmp').Count -eq 0) `
             'create-only publication rejects a destination created after its precheck and preserves the concurrent bytes'
 
+        $normalOutputDirectory = Join-Path $root 'normal-output\nested'
+        $normalOutputPath = Join-Path $normalOutputDirectory 'report.json'
+        $missingManifestRejected = $false
+        try {
+            & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
+                -AcceptanceManifestPath (Join-Path $root 'missing-manifest.json') `
+                -OutputPath $normalOutputPath -DevelopmentReadiness | Out-Null
+        }
+        catch { $missingManifestRejected = $true }
+        Assert-True ($missingManifestRejected -and
+            (Test-Path -LiteralPath $normalOutputDirectory -PathType Container) -and
+            -not (Test-Path -LiteralPath $normalOutputPath)) `
+            'final acceptance still creates a normal missing output directory before validating its manifest'
+
         $reparseCreated = $false
         try {
             New-Item -ItemType Junction -Path $reparseLink `
@@ -1289,7 +1303,8 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
             Write-Warning 'Skipping atomic output reparse negative: this host does not permit junction creation.'
         }
         if ($reparseCreated) {
-            $wrapperReparsePath = Join-Path $reparseLink 'wrapper-report.json'
+            $wrapperReparsePath = Join-Path $reparseLink `
+                'missing-child\wrapper-report.json'
             $wrapperReparseRejected = $false
             try {
                 & (Join-Path $PSScriptRoot 'Invoke-Stage5FinalAcceptance.ps1') `
@@ -1301,8 +1316,10 @@ function Invoke-Stage5FinalAcceptanceOutputPublicationFocusedCase {
             }
             Assert-True ($wrapperReparseRejected -and
                 -not (Test-Path -LiteralPath `
-                    (Join-Path $reparseTarget 'wrapper-report.json'))) `
-                'the final-acceptance entrypoint rejects a reparse-point output ancestor before aggregation or publication'
+                    (Join-Path $reparseTarget 'missing-child') -PathType Container) -and
+                -not (Test-Path -LiteralPath `
+                    (Join-Path $reparseTarget 'missing-child\wrapper-report.json'))) `
+                'the final-acceptance entrypoint rejects a reparse ancestor before creating a missing child or publishing the report'
 
             $reparseRejected = $false
             try {

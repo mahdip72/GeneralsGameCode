@@ -18,6 +18,28 @@ if (Test-Path -LiteralPath $outputFull) {
     throw "Final acceptance output already exists; refusing to overwrite evidence: $outputFull"
 }
 $outputDirectory = Split-Path -Parent $outputFull
+$existingOutputParent = $outputDirectory
+while (-not (Test-Path -LiteralPath $existingOutputParent -PathType Container)) {
+    $parent = Split-Path -Parent $existingOutputParent
+    if ([string]::IsNullOrWhiteSpace($parent) -or
+        [String]::Equals($parent, $existingOutputParent,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Final acceptance output has no existing directory ancestor: $outputDirectory"
+    }
+    $existingOutputParent = $parent
+}
+$outputRoot = [IO.Path]::GetPathRoot($existingOutputParent)
+if ([String]::Equals($existingOutputParent, $outputRoot,
+        [StringComparison]::OrdinalIgnoreCase)) {
+    $outputRootItem = Get-Item -LiteralPath $outputRoot -Force -ErrorAction Stop
+    if (($outputRootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Final acceptance output volume root is a reparse point: $outputRoot"
+    }
+}
+else {
+    Assert-Stage5FinalAcceptanceNoReparsePath `
+        $outputRoot $existingOutputParent 'Final acceptance output existing parent'
+}
 if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
     New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 }
