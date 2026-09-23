@@ -1325,6 +1325,7 @@ void WOLQuickMatchMenuUpdate( WindowLayout * layout, void *userData)
 								}
 							}
 
+							TheGameSpyGame->bindQuickMatchMapIdentity();
 							DEBUG_LOG(("Starting a QM game: options=[%s]", GameInfoToAsciiString(TheGameSpyGame).str()));
 							SendStatsToOtherPlayers(TheGameSpyGame);
 							TheGameSpyGame->startGame(0);

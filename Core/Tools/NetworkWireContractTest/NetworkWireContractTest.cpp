@@ -297,6 +297,11 @@ int TestNetworkHelloContract()
 		!IsNetworkMapPromotionEligible(0x10203040U, 1U | 16U) &&
 		!IsNetworkMapPromotionEligible(0x10203040U, 1U | 32U),
 		"NET3 remains serial when map bytes or simulation sidecars are unbound");
+	result |= Check(IsNetworkMapFileCRCValid(0x10203040U, 0x10203040U) &&
+		!IsNetworkMapFileCRCValid(0U, 0x10203040U) &&
+		!IsNetworkMapFileCRCValid(0x10203040U, 0U) &&
+		!IsNetworkMapFileCRCValid(0x10203040U, 0x10203041U),
+		"network start requires matching nonzero map file CRCs");
 	result |= Check(
 		rts::ResolveMultiplayerSimulationGeneratedReleaseProofMask(
 			absentProof, liveIntegratedMask) == 0,

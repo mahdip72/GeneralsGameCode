@@ -61,6 +61,9 @@
 #include "GameNetwork/GameInfo.h"
 #include "GameNetwork/FileTransfer.h"
 #include "GameNetwork/NetworkDefs.h"
+#if defined(_WIN64)
+#include "Lib/NetworkEpochHandshake.h"
+#endif
 
 
 //-------------------------------------------------------------------------------
@@ -114,6 +117,15 @@ UnsignedInt GetMapFileCRC(const AsciiString &mapName)
 		return 0;
 	file->close();
 	return calcCRC(mapName);
+}
+
+Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc)
+{
+#if defined(_WIN64)
+	return rts::network_epoch::IsNetworkMapFileCRCValid(expectedCrc, localCrc);
+#else
+	return expectedCrc != 0U && localCrc != 0U && expectedCrc == localCrc;
+#endif
 }
 
 Int GetMapSimulationSidecarMask(const AsciiString &mapName)

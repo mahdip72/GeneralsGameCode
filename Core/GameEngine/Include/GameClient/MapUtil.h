@@ -136,6 +136,7 @@ extern TechAndSupplyImages TheSupplyAndTechImageLocations;
 
 // Read the current map file, rather than trusting the size-based map cache.
 UnsignedInt GetMapFileCRC(const AsciiString &mapName);
+Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc);
 Int GetMapSimulationSidecarMask(const AsciiString &mapName);
 
 // TheSuperHackers @refactor xezon 28/11/2025 Refactors the map list population implementation

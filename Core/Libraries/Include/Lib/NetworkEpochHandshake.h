@@ -139,6 +139,12 @@ inline bool IsNetworkMapPromotionEligible(std::uint32_t mapCrc,
 		(mapContentsMask & (4U | 16U | 32U)) == 0U;
 }
 
+inline bool IsNetworkMapFileCRCValid(std::uint32_t expectedCrc,
+	std::uint32_t localCrc)
+{
+	return expectedCrc != 0U && localCrc != 0U && expectedCrc == localCrc;
+}
+
 inline bool IsNetworkSimulationRosterIdentityValid(
 	std::uint32_t rosterMask,
 	std::uint32_t expectedRemoteMask,

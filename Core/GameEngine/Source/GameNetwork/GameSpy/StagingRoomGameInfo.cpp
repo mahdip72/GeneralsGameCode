@@ -775,6 +775,21 @@ AsciiString GameSpyStagingRoom::generateLadderGameResultsPacket()
 	return results;
 }
 
+void GameSpyStagingRoom::bindQuickMatchMapIdentity()
+{
+	const MapMetaData *mapData = TheMapCache ? TheMapCache->findMap(getMap()) : nullptr;
+	const UnsignedInt mapCRC = mapData ? GetMapFileCRC(getMap()) : 0U;
+	setMapCRC(mapCRC);
+	setMapSize(mapData ? mapData->m_filesize : 0U);
+	// Quick Match gets a map index, not the custom-match map package mask.
+	// Bind only the local map and simulation sidecar presence. Missing or
+	// different map bytes will fail the NET3 identity exchange.
+	setMapContentsMask(mapCRC != 0U ? 1 | GetMapSimulationSidecarMask(getMap()) : 0);
+	const Int localSlot = getLocalSlotNum();
+	if (localSlot >= 0)
+		getSlot(localSlot)->setMapAvailability(mapCRC != 0U);
+}
+
 void GameSpyStagingRoom::launchGame()
 {
 	setGameInProgress(TRUE);
@@ -818,11 +833,13 @@ void GameSpyStagingRoom::launchGame()
 
 	// see if we really have the map.  if not, back out.
 	TheMapCache->updateCache();
+	// Every current host path supplies a map-file CRC. An unknown value cannot
+	// bind the selected map, even when the cache has an entry for its name.
 	if (!filesOk || TheMapCache->findMap(getMap()) == nullptr ||
-		(getMapCRC() != 0U &&
-		 (GetMapFileCRC(getMap()) != getMapCRC() ||
-		  ((getMapContentsMask() & (4 | 16 | 32)) == 0 &&
-		   GetMapSimulationSidecarMask(getMap()) != 0))))
+		!IsNetworkMapFileCRCValid(
+			getMapCRC(), GetMapFileCRC(getMap())) ||
+		((getMapContentsMask() & (4 | 16 | 32)) == 0 &&
+		 GetMapSimulationSidecarMask(getMap()) != 0))
 	{
 		DEBUG_LOG(("After transfer, we didn't really have the map.  Bailing..."));
 
