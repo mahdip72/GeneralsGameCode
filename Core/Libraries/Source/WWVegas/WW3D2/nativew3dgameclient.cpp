@@ -294,7 +294,7 @@ void SetClearCommandFields(GameRenderCommand *command, bool clear,
 	bool clearz, const GameRenderColor &color, float destinationAlpha)
 {
 	command->value0 = (clear ? RENDER_CLEAR_COLOR : 0U) |
-		(clearz ? RENDER_CLEAR_DEPTH : 0U);
+		(clearz ? (RENDER_CLEAR_DEPTH | RENDER_CLEAR_STENCIL) : 0U);
 	command->value1 = 0;
 	command->float0 = color.red;
 	command->float1 = color.green;
