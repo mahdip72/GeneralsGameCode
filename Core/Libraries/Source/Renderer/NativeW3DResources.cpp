@@ -296,6 +296,13 @@ struct PendingBufferPublication
 	unsigned int backendEpoch;
 };
 
+struct PendingTexturePublication
+{
+	PendingTexturePublication() : sequence(0), backendEpoch(0) {}
+	NativeW3DSubmissionSequence sequence;
+	unsigned int backendEpoch;
+};
+
 struct NativeW3DResources::Slot
 {
 	Slot() : kind(0), authority(NATIVE_W3D_CONTENT_INVALID),
@@ -323,6 +330,10 @@ struct NativeW3DResources::Slot
 	NativeW3DContentAuthority submissionAuthority;
 	unsigned int submissionBackendEpoch;
 	std::vector<PendingBufferPublication> pendingBufferPublications;
+	// CPU-authoritative texture refreshes accepted inside a threaded frame are
+	// already ordered before dependent draws by the command packet. Publish the
+	// registry epoch only when that frame completes instead of fencing each upload.
+	std::vector<PendingTexturePublication> pendingTexturePublications;
 	// DEFAULT buffers retain an independent authoritative CPU-range map. It is
 	// not discarded when an asynchronous GPU upload fails and is the source for
 	// explicit recovery publication.
@@ -898,6 +909,52 @@ RenderResult NativeW3DResources::PublishThreadedCompletion(
 			slot.submissionAuthority = slot.authority;
 			slot.submissionBackendEpoch = slot.backendEpoch;
 		}
+	}
+	for (size_t slotIndex = 0; slotIndex < m_impl->slots.size(); ++slotIndex)
+	{
+		Slot &slot = m_impl->slots[slotIndex];
+		if (!slot.handle.isValid() || slot.kind != 2 || slot.retired ||
+			slot.pendingTexturePublications.empty())
+		{
+			continue;
+		}
+		size_t completedCount = 0;
+		while (completedCount < slot.pendingTexturePublications.size() &&
+			slot.pendingTexturePublications[completedCount].sequence <=
+				submissionSequence)
+		{
+			++completedCount;
+		}
+		if (completedCount == 0)
+		{
+			continue;
+		}
+		if (resourceFailure)
+		{
+			slot.pendingTexturePublications.clear();
+			InvalidateTextureAuthority(slot);
+			continue;
+		}
+
+		const PendingTexturePublication &published =
+			slot.pendingTexturePublications[completedCount - 1];
+		std::vector<PendingTexturePublication> remainingPublications;
+		try
+		{
+			remainingPublications.assign(
+				slot.pendingTexturePublications.begin() + completedCount,
+				slot.pendingTexturePublications.end());
+		}
+		catch (...)
+		{
+			slot.pendingTexturePublications.clear();
+			InvalidateTextureAuthority(slot);
+			return RENDER_RESULT_OUT_OF_MEMORY;
+		}
+		slot.authority = NATIVE_W3D_CONTENT_CPU;
+		slot.backendEpoch = published.backendEpoch;
+		slot.authorityEpoch = NextAuthorityEpoch();
+		slot.pendingTexturePublications.swap(remainingPublications);
 	}
 	m_impl->lastThreadedCompletionSequence = submissionSequence;
 	if (resourceFailure)
@@ -1569,9 +1626,66 @@ RenderResult NativeW3DResources::RefreshTexture(GpuHandle handle,
 	{
 		return validationResult;
 	}
-	const RenderResult result = CompleteMutation(device,
-		device->refreshTexture(handle, descriptor, subresources,
-			subresourceCount));
+	NativeW3DSubmissionSequence submissionSequence = 0;
+#if defined(RTS_RENDERER_HAS_D3D11)
+	// Render targets retain the synchronous path because a later GPU write in
+	// the same frame can replace CPU authority before this refresh completes.
+	if (IsThreadedRenderDevice(device) &&
+		slot->authority == NATIVE_W3D_CONTENT_CPU &&
+		(descriptor.binding & RENDER_TEXTURE_RENDER_TARGET) == 0)
+	{
+		submissionSequence = static_cast<NativeW3DSubmissionSequence>(
+			CurrentThreadedRenderFrameSequence(device));
+	}
+#endif
+	const bool asynchronousPublication = submissionSequence != 0;
+	if (!asynchronousPublication && !slot->pendingTexturePublications.empty())
+	{
+		if (m_impl->completionFence != 0)
+		{
+			const RenderResult fenced = m_impl->completionFence(
+				m_impl->completionOwner);
+			if (fenced != RENDER_RESULT_OK)
+				return fenced;
+			slot = Find(handle);
+			if (slot == 0)
+				return RENDER_RESULT_FAILED;
+		}
+		if (!slot->pendingTexturePublications.empty())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	std::vector<PendingTexturePublication> nextPublications;
+	if (asynchronousPublication)
+	{
+		try
+		{
+			nextPublications = slot->pendingTexturePublications;
+			PendingTexturePublication publication;
+			publication.sequence = submissionSequence;
+			publication.backendEpoch = m_impl->state->BackendEpoch();
+			if (!nextPublications.empty() &&
+				nextPublications.back().sequence == submissionSequence)
+			{
+				nextPublications.back() = publication;
+			}
+			else
+			{
+				nextPublications.push_back(publication);
+			}
+		}
+		catch (...)
+		{
+			return RENDER_RESULT_OUT_OF_MEMORY;
+		}
+	}
+	const RenderResult accepted = device->refreshTexture(handle, descriptor,
+		subresources, subresourceCount);
+	if (asynchronousPublication && accepted == RENDER_RESULT_OK)
+	{
+		slot->pendingTexturePublications.swap(nextPublications);
+		return RENDER_RESULT_OK;
+	}
+	const RenderResult result = CompleteMutation(device, accepted);
 	if (result == RENDER_RESULT_OK)
 	{
 		slot->authority = NATIVE_W3D_CONTENT_CPU;
@@ -2522,6 +2636,7 @@ void NativeW3DResources::InvalidateTextureAuthority(Slot &slot)
 	{
 		return;
 	}
+	slot.pendingTexturePublications.clear();
 	slot.authority = NATIVE_W3D_CONTENT_INVALID;
 	slot.authorityEpoch = NextAuthorityEpoch();
 }

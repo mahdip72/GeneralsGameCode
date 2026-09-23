@@ -30,16 +30,19 @@ class FakeRenderDevice;
 struct FakeRenderControl
 {
 	FakeRenderControl() : failCreate(0), failUpdate(0), failRefresh(0),
+		failRefreshOnCall(0),
 		failCopy(0), createCalls(0), updateCalls(0), refreshCalls(0),
-		copyCalls(0) {}
+		copyCalls(0), refreshPixelSequence(0) {}
 	volatile long failCreate;
 	volatile long failUpdate;
 	volatile long failRefresh;
+	volatile long failRefreshOnCall;
 	volatile long failCopy;
 	volatile long createCalls;
 	volatile long updateCalls;
 	volatile long refreshCalls;
 	volatile long copyCalls;
+	volatile long refreshPixelSequence;
 };
 
 bool IsSet(volatile long *value)
@@ -250,8 +253,10 @@ public:
 	{
 		if (m_control != 0)
 		{
-			InterlockedIncrement(&m_control->refreshCalls);
-			if (IsSet(&m_control->failRefresh))
+			const long invocation =
+				InterlockedIncrement(&m_control->refreshCalls);
+			if (IsSet(&m_control->failRefresh) ||
+				invocation == ReadCount(&m_control->failRefreshOnCall))
 			{
 				return RENDER_RESULT_FAILED;
 			}
@@ -266,6 +271,13 @@ public:
 			descriptor.usage == RENDER_USAGE_IMMUTABLE)
 		{
 			return RENDER_RESULT_UNSUPPORTED;
+		}
+		if (m_control != 0 && dataCount != 0 && data[0].data != 0)
+		{
+			const long pixel = *static_cast<const unsigned char *>(data[0].data);
+			const long previous = ReadCount(&m_control->refreshPixelSequence);
+			InterlockedExchange(&m_control->refreshPixelSequence,
+				previous * 257 + pixel);
 		}
 		++m_refreshCount;
 		resource->gpuAuthority = false;
@@ -538,7 +550,7 @@ int TestThreadedResourceCompletion()
 	options.maxFramesInFlight = 2;
 	options.maxPacketBytes = 1024 * 1024;
 	options.maxPacketCommands = 128;
-	options.resourceCapacity = 2;
+	options.resourceCapacity = 3;
 	IRenderDevice *device = CreateThreadedRenderDevice(
 		CreateThreadedFakeRenderDevice, &control, options);
 	result |= Check(device != 0, "threaded resource fixture allocates");
@@ -560,7 +572,7 @@ int TestThreadedResourceCompletion()
 	}
 
 	NativeW3DResourceHost host(8);
-	NativeW3DResources resources(2);
+	NativeW3DResources resources(3);
 	result |= Check(host.Attach(device, device->immediateContext()) ==
 		RENDER_RESULT_OK && resources.BindHost(&host) == RENDER_RESULT_OK,
 		"resource host borrows the threaded producer facade");
@@ -784,7 +796,9 @@ int TestThreadedResourceCompletion()
 	GpuHandle replacementBuffer;
 	result |= Check(resources.CreateBuffer(bufferDescriptor, bytes,
 		sizeof(bytes), &replacementBuffer) == RENDER_RESULT_OK &&
-		resources.Destroy(replacementBuffer),
+		resources.Destroy(replacementBuffer) &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes), 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK,
 		"failed threaded create rolls back its logical slot before reuse");
 
 	unsigned int texturePixels[16] = { 0 };
@@ -806,12 +820,176 @@ int TestThreadedResourceCompletion()
 	result |= Check(resources.CreateTexture(textureDescriptor, &textureData, 1,
 		&texture) == RENDER_RESULT_OK,
 		"threaded texture create completes before publication");
+	TextureDescriptor streamTextureDescriptor = textureDescriptor;
+	streamTextureDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+	GpuHandle streamTexture;
+	result |= Check(resources.CreateTexture(streamTextureDescriptor, &textureData,
+		1, &streamTexture) == RENDER_RESULT_OK,
+		"threaded streaming texture completes before publication");
+	NativeW3DTextureDescription textureDescription;
+	result |= Check(resources.DescribeTexture(streamTexture,
+		&textureDescription) ==
+		RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_CPU,
+		"threaded texture starts with confirmed CPU authority");
+	const unsigned int textureCreateEpoch = textureDescription.authorityEpoch;
+	unsigned int firstRefreshPixels[16];
+	unsigned int secondRefreshPixels[16];
+	std::memset(firstRefreshPixels, 0x11, sizeof(firstRefreshPixels));
+	std::memset(secondRefreshPixels, 0x22, sizeof(secondRefreshPixels));
+	TextureSubresourceData firstRefreshData = textureData;
+	TextureSubresourceData secondRefreshData = textureData;
+	firstRefreshData.data = firstRefreshPixels;
+	secondRefreshData.data = secondRefreshPixels;
+	const long refreshCallsBeforeFrame = ReadCount(&control.refreshCalls);
+	InterlockedExchange(&control.refreshPixelSequence, 0);
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&firstRefreshData, 1) == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&secondRefreshData, 1) == RENDER_RESULT_OK &&
+		ReadCount(&control.refreshCalls) == refreshCallsBeforeFrame &&
+		context->setLegacyStateForLayout(drawState, drawLayout, 0) ==
+			RENDER_RESULT_OK &&
+		context->setVertexBuffer(buffer, sizeof(unsigned int), 0) ==
+			RENDER_RESULT_OK &&
+		context->setTexture(0, streamTexture) == RENDER_RESULT_OK &&
+		context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK && context->draw(3, 0) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK,
+		"in-frame texture refreshes and dependent draw enqueue without a fence");
+	result |= Check(resources.DescribeTexture(streamTexture,
+		&textureDescription) ==
+		RENDER_RESULT_OK &&
+		textureDescription.authorityEpoch == textureCreateEpoch &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_OK &&
+		ReadCount(&control.refreshCalls) == refreshCallsBeforeFrame + 2 &&
+		ReadCount(&control.refreshPixelSequence) == 0x11 * 257 + 0x22,
+		"threaded owner consumes distinct refresh pixels in FIFO order");
+	ThreadedRenderFrameCompletion textureRefreshCompletion;
+	result |= Check(PollThreadedRenderCompletion(device,
+		&textureRefreshCompletion) &&
+		!textureRefreshCompletion.resourceFailure &&
+		resources.PublishThreadedCompletion(textureRefreshCompletion.sequence,
+			false) == RENDER_RESULT_OK &&
+		resources.DescribeTexture(streamTexture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_CPU &&
+		textureDescription.authorityEpoch > textureCreateEpoch,
+		"matching completion publishes the coalesced texture refresh epoch");
+	const long refreshCallsBeforeGlobalFailure =
+		ReadCount(&control.refreshCalls);
+	InterlockedExchange(&control.failRefreshOnCall,
+		refreshCallsBeforeGlobalFailure + 2);
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&firstRefreshData, 1) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		resources.RefreshTexture(texture, textureDescriptor, &textureData, 1) ==
+			RENDER_RESULT_FAILED,
+		"synchronous owner failure drains an older accepted texture refresh");
+	ThreadedRenderFrameCompletion preFailureTextureCompletion;
+	result |= Check(PollThreadedRenderCompletion(device,
+		&preFailureTextureCompletion) &&
+		!preFailureTextureCompletion.resourceFailure &&
+		resources.PublishThreadedCompletion(
+			preFailureTextureCompletion.sequence, false) == RENDER_RESULT_OK &&
+		resources.DescribeTexture(streamTexture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_INVALID,
+		"global mutation failure clears pending texture publication before completion");
+	InterlockedExchange(&control.failRefreshOnCall, 0);
+	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
+		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes), 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		resources.RefreshTexture(texture, textureDescriptor,
+			&textureData, 1) == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&firstRefreshData, 1) == RENDER_RESULT_OK &&
+		resources.DescribeTexture(streamTexture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_CPU,
+		"texture fixture republishes CPU authority after global failure");
+	const unsigned int firstPublishedTextureEpoch =
+		textureDescription.authorityEpoch;
+	const long refreshCallsBeforeQueuedFrames = ReadCount(&control.refreshCalls);
+	InterlockedExchange(&control.refreshPixelSequence, 0);
+	InterlockedExchange(&control.failRefreshOnCall,
+		refreshCallsBeforeQueuedFrames + 2);
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&firstRefreshData, 1) == RENDER_RESULT_OK &&
+		context->setLegacyStateForLayout(drawState, drawLayout, 0) ==
+			RENDER_RESULT_OK &&
+		context->setVertexBuffer(buffer, sizeof(unsigned int), 0) ==
+			RENDER_RESULT_OK &&
+		context->setTexture(0, streamTexture) == RENDER_RESULT_OK &&
+		context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK && context->draw(3, 0) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		context->beginFrame() == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&secondRefreshData, 1) == RENDER_RESULT_OK &&
+		context->setLegacyStateForLayout(drawState, drawLayout, 0) ==
+			RENDER_RESULT_OK &&
+		context->setVertexBuffer(buffer, sizeof(unsigned int), 0) ==
+			RENDER_RESULT_OK &&
+		context->setTexture(0, streamTexture) == RENDER_RESULT_OK &&
+		context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK && context->draw(3, 0) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK,
+		"successive texture frames enqueue distinct refresh-and-draw packets");
+	result |= Check(resources.DescribeTexture(streamTexture,
+		&textureDescription) == RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_CPU &&
+		textureDescription.authorityEpoch == firstPublishedTextureEpoch &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_FAILED &&
+		ReadCount(&control.refreshCalls) == refreshCallsBeforeQueuedFrames + 2 &&
+		ReadCount(&control.refreshPixelSequence) == 0x11,
+		"queued texture epochs remain unpublished while the second owner refresh fails");
+	ThreadedRenderFrameCompletion firstQueuedTextureCompletion;
+	ThreadedRenderFrameCompletion failedQueuedTextureCompletion;
+	result |= Check(PollThreadedRenderCompletion(device,
+		&firstQueuedTextureCompletion) &&
+		PollThreadedRenderCompletion(device, &failedQueuedTextureCompletion) &&
+		!firstQueuedTextureCompletion.resourceFailure &&
+		failedQueuedTextureCompletion.resourceFailure &&
+		firstQueuedTextureCompletion.sequence <
+			failedQueuedTextureCompletion.sequence &&
+		resources.PublishThreadedCompletion(
+			firstQueuedTextureCompletion.sequence, false) == RENDER_RESULT_OK &&
+		resources.DescribeTexture(streamTexture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_CPU &&
+		textureDescription.authorityEpoch > firstPublishedTextureEpoch,
+		"first completion publishes A while failed B remains pending");
+	result |= Check(resources.PublishThreadedCompletion(
+		failedQueuedTextureCompletion.sequence, true) == RENDER_RESULT_OK &&
+		resources.DescribeTexture(streamTexture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_INVALID,
+		"second completion invalidates the failed pending texture epoch");
+	InterlockedExchange(&control.failRefreshOnCall, 0);
+	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
+		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes), 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&firstRefreshData, 1) == RENDER_RESULT_OK,
+		"texture publication fixture recovers after a queued refresh failure");
 
 	InterlockedExchange(&control.failRefresh, 1);
-	NativeW3DTextureDescription textureDescription;
+	const long refreshCallsBeforeFailure = ReadCount(&control.refreshCalls);
 	result |= Check(resources.RefreshTexture(texture, textureDescriptor,
 		&textureData, 1) == RENDER_RESULT_FAILED &&
-		ReadCount(&control.refreshCalls) == 1 &&
+		ReadCount(&control.refreshCalls) == refreshCallsBeforeFailure + 1 &&
 		resources.DescribeTexture(texture, &textureDescription) ==
 		RENDER_RESULT_OK &&
 		textureDescription.authority == NATIVE_W3D_CONTENT_INVALID,
@@ -819,8 +997,49 @@ int TestThreadedResourceCompletion()
 	InterlockedExchange(&control.failRefresh, 0);
 	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
 		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
-		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK,
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes), 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		resources.RefreshTexture(texture, textureDescriptor,
+			&firstRefreshData, 1) == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&firstRefreshData, 1) == RENDER_RESULT_OK,
 		"threaded owner recovers after an asynchronous refresh failure");
+
+	InterlockedExchange(&control.failRefresh, 1);
+	const long refreshCallsBeforeAsyncFailure = ReadCount(&control.refreshCalls);
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.RefreshTexture(streamTexture, streamTextureDescriptor,
+			&secondRefreshData, 1) == RENDER_RESULT_OK &&
+		ReadCount(&control.refreshCalls) == refreshCallsBeforeAsyncFailure &&
+		context->setLegacyStateForLayout(drawState, drawLayout, 0) ==
+			RENDER_RESULT_OK &&
+		context->setVertexBuffer(buffer, sizeof(unsigned int), 0) ==
+			RENDER_RESULT_OK &&
+		context->setTexture(0, streamTexture) == RENDER_RESULT_OK &&
+		context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK && context->draw(3, 0) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_FAILED,
+		"owner-side refresh failure remains deferred to frame completion");
+	ThreadedRenderFrameCompletion failedTextureRefreshCompletion;
+	result |= Check(PollThreadedRenderCompletion(device,
+		&failedTextureRefreshCompletion) &&
+		failedTextureRefreshCompletion.resourceFailure &&
+		resources.PublishThreadedCompletion(
+			failedTextureRefreshCompletion.sequence, true) == RENDER_RESULT_OK &&
+		resources.DescribeTexture(streamTexture, &textureDescription) ==
+			RENDER_RESULT_OK &&
+		textureDescription.authority == NATIVE_W3D_CONTENT_INVALID,
+		"failed completion invalidates its pending texture publication");
+	InterlockedExchange(&control.failRefresh, 0);
+	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
+		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
+		resources.RefreshTexture(texture, textureDescriptor,
+			&textureData, 1) == RENDER_RESULT_OK,
+		"synchronous refresh republishes CPU pixels after recovery");
 
 	InterlockedExchange(&control.failCopy, 1);
 	NativeW3DGpuContentLease lease;

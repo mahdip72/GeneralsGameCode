@@ -163,10 +163,10 @@ public:
 		void *owner);
 	RenderResult Shutdown();
 	// Publish render-owner completion in strictly increasing submission order.
-	// A successful completion publishes accepted in-frame buffer ranges.
-	// Aggregate render failure invalidates only buffer slots with pending writes
-	// through that sequence, plus GPU-produced texture authority. Resource
-	// commands outside a frame retain the synchronous lifecycle path.
+	// A successful completion publishes accepted in-frame buffer ranges and
+	// CPU-texture refresh epochs. Aggregate render failure invalidates only slots
+	// with pending writes through that sequence, plus GPU-produced texture
+	// authority. Resource commands outside a frame retain the synchronous path.
 	RenderResult PublishThreadedCompletion(
 		NativeW3DSubmissionSequence submissionSequence,
 		bool resourceFailure);
