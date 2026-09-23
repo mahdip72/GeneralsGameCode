@@ -93,6 +93,30 @@ static void Check(Bool result, const char *expression, Int line)
 	}
 }
 
+#if defined(_WIN64)
+static void TestResolutionArchivePolicy()
+{
+	CHECK(!ArchiveFileSystem::isArchiveEligibleForResolution(
+		"340_ControlBarPro-Fix2160ZH.big", 1920, 1080));
+	CHECK(!ArchiveFileSystem::isArchiveEligibleForResolution(
+		"H:\\Game\\340_ControlBarPro2160ZH.big", 1920, 1080));
+	CHECK(!ArchiveFileSystem::isArchiveEligibleForResolution(
+		"340_ControlBarPro-Fix2160ZH.big", 3839, 2160));
+	CHECK(!ArchiveFileSystem::isArchiveEligibleForResolution(
+		"340_ControlBarPro2160ZH.big", 3840, 2159));
+	CHECK(ArchiveFileSystem::isArchiveEligibleForResolution(
+		"340_ControlBarPro-Fix2160ZH.big", 3840, 2160));
+	CHECK(ArchiveFileSystem::isArchiveEligibleForResolution(
+		"H:/Game/340_controlbarpro2160zh.BIG", 3840, 2160));
+	CHECK(ArchiveFileSystem::isArchiveEligibleForResolution(
+		"340_ControlBarProZH.big", 1920, 1080));
+	CHECK(ArchiveFileSystem::isArchiveEligibleForResolution(
+		"EnglishZH.big", 1920, 1080));
+	CHECK(ArchiveFileSystem::isArchiveEligibleForResolution(
+		"Other340_ControlBarPro2160ZH.big", 1920, 1080));
+}
+#endif
+
 class SkirmishAITestGameText : public GameTextInterface
 {
 public:
@@ -5475,6 +5499,12 @@ int main(int argc, char **argv)
 		return result;
 	}
 #if defined(_WIN64)
+	if (argc == 2 && strcmp(argv[1], "--resolution-archive-policy") == 0)
+	{
+		TestResolutionArchivePolicy();
+		shutdownMemoryManager();
+		return s_failures != 0 ? 1 : 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--native-logical-audio") == 0)
 	{
 		printf("Running 36 production-linked, device-free logical audio cases.\n");

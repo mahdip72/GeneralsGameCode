@@ -59,6 +59,9 @@ add_test(NAME z_skirmish_ai_legacy_save_selection_tests COMMAND z_runtime_regres
 set_tests_properties(z_skirmish_ai_legacy_save_selection_tests PROPERTIES TIMEOUT 30)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+	add_test(NAME z_resolution_archive_policy_tests
+		COMMAND z_runtime_regression_tests --resolution-archive-policy)
+	set_tests_properties(z_resolution_archive_policy_tests PROPERTIES TIMEOUT 30)
 	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/HeadlessMetricStartupTitleTest.cmake")
 	rts_add_headless_metric_startup_test(z_runtime_regression_tests
 		GeneralsMD z_headless_metric_startup_tests)

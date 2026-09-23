@@ -50,6 +50,15 @@
 #include "Common/ArchiveFileSystem.h"
 #include "Common/AsciiString.h"
 #include "Common/PerfTimer.h"
+#if defined(_WIN64) && RTS_ZEROHOUR
+#include "Common/GlobalData.h"
+
+namespace
+{
+	const Int kControlBarPro2160Width = 3840;
+	const Int kControlBarPro2160Height = 2160;
+}
+#endif
 
 
 //----------------------------------------------------------------------------
@@ -117,6 +126,13 @@ ArchiveFileSystem::~ArchiveFileSystem()
 
 void ArchiveFileSystem::loadIntoDirectoryTree(ArchiveFile *archiveFile, Bool overwrite)
 {
+#if defined(_WIN64) && RTS_ZEROHOUR
+	const AsciiString archiveName = archiveFile->getName();
+	if (!isArchiveEligibleForResolution(archiveName, 0, 0))
+		m_2160Archives.insert(archiveFile);
+	if (archiveName.find('\\') == nullptr && archiveName.find('/') == nullptr)
+		m_zeroHourRootArchives.insert(archiveFile);
+#endif
 
 	FilenameList filenameList;
 
@@ -238,6 +254,9 @@ void ArchiveFileSystem::loadMods()
 
 Bool ArchiveFileSystem::doesFileExist(const Char *filename, FileInstance instance) const
 {
+#if defined(_WIN64) && RTS_ZEROHOUR
+	return getArchiveFile(filename, instance) != nullptr;
+#else
 	ArchivedDirectoryInfoResult result = const_cast<ArchiveFileSystem*>(this)->getArchivedDirectoryInfo(filename);
 
 	if (!result.valid())
@@ -246,6 +265,7 @@ Bool ArchiveFileSystem::doesFileExist(const Char *filename, FileInstance instanc
 	stl::const_range<ArchivedFileLocationMap> range = stl::get_range(result.dirInfo->m_files, result.lastToken, instance);
 
 	return range.valid();
+#endif
 }
 
 ArchivedDirectoryInfo* ArchiveFileSystem::friend_getArchivedDirectoryInfo(const Char* directory)
@@ -322,13 +342,81 @@ ArchiveFile* ArchiveFileSystem::getArchiveFile(const AsciiString& filename, File
 	if (!result.valid())
 		return nullptr;
 
-	stl::const_range<ArchivedFileLocationMap> range = stl::get_range(result.dirInfo->m_files, result.lastToken, instance);
+#if defined(_WIN64) && RTS_ZEROHOUR
+	stl::const_range<ArchivedFileLocationMap> range =
+		stl::get_range(result.dirInfo->m_files, result.lastToken);
+#else
+	stl::const_range<ArchivedFileLocationMap> range =
+		stl::get_range(result.dirInfo->m_files, result.lastToken, instance);
+#endif
 
 	if (!range.valid())
 		return nullptr;
-	
+
+#if defined(_WIN64) && RTS_ZEROHOUR
+	const Int width = TheGlobalData ? TheGlobalData->m_xResolution : 0;
+	const Int height = TheGlobalData ? TheGlobalData->m_yResolution : 0;
+	// All archive instances retain their legacy ordering at UHD. At lower
+	// resolutions, most files have no 2160p override; keep that hot path O(1).
+	if (width >= kControlBarPro2160Width && height >= kControlBarPro2160Height)
+	{
+		const stl::const_range<ArchivedFileLocationMap> original =
+			stl::get_range(result.dirInfo->m_files, result.lastToken, instance);
+		return original.valid() ? original.get()->second : nullptr;
+	}
+	if (instance == 0 && m_2160Archives.find(range.begin->second) == m_2160Archives.end())
+		return range.begin->second;
+
+	Bool hasRootAlternative = FALSE;
+	for (ArchivedFileLocationMap::const_iterator it = range.begin; it != range.end; ++it)
+	{
+		if (m_2160Archives.find(it->second) != m_2160Archives.end())
+			continue;
+		// Root archives belong to this title. The paired Generals install may
+		// contain an older localized file with the same path; it is not a
+		// replacement for a Zero Hour-specific 2160p localization.
+		if (m_zeroHourRootArchives.find(it->second) != m_zeroHourRootArchives.end())
+		{
+			hasRootAlternative = TRUE;
+			break;
+		}
+	}
+	if (!hasRootAlternative)
+	{
+		const stl::const_range<ArchivedFileLocationMap> original =
+			stl::get_range(result.dirInfo->m_files, result.lastToken, instance);
+		return original.valid() ? original.get()->second : nullptr;
+	}
+	for (ArchivedFileLocationMap::const_iterator it = range.begin; it != range.end; ++it)
+	{
+		if (m_2160Archives.find(it->second) != m_2160Archives.end())
+			continue;
+		if (instance == 0)
+			return it->second;
+		--instance;
+	}
+	return nullptr;
+#else
 	return range.get()->second;
+#endif
 }
+
+#if defined(_WIN64) && RTS_ZEROHOUR
+Bool ArchiveFileSystem::isArchiveEligibleForResolution(
+	const AsciiString& archiveName, Int width, Int height)
+{
+	const Char *basename = archiveName.str();
+	for (const Char *p = basename; *p != 0; ++p)
+	{
+		if (*p == '\\' || *p == '/')
+			basename = p + 1;
+	}
+	if (_stricmp(basename, "340_ControlBarPro-Fix2160ZH.big") == 0 ||
+		_stricmp(basename, "340_ControlBarPro2160ZH.big") == 0)
+		return width >= kControlBarPro2160Width && height >= kControlBarPro2160Height;
+	return TRUE;
+}
+#endif
 
 void ArchiveFileSystem::getFileListInDirectory(const AsciiString& currentDirectory, const AsciiString& originalDirectory, const AsciiString& searchName, FilenameList &filenameList, Bool searchSubdirectories) const
 {

@@ -208,7 +208,19 @@ HeaderTemplate *HeaderTemplateManager::getNextHeader( HeaderTemplate *ht )
 
 void HeaderTemplateManager::onResolutionChanged()
 {
+#if defined(_WIN64) && RTS_ZEROHOUR
+	// At 2160p the archive lookup can select a different localized template
+	// file. Re-read its point sizes before recreating the shell windows.
+	HeaderTemplateListIt it = m_headerTemplateList.begin();
+	while (it != m_headerTemplateList.end())
+	{
+		delete *it;
+		it = m_headerTemplateList.erase(it);
+	}
+	init();
+#else
 	populateGameFonts();
+#endif
 }
 //-----------------------------------------------------------------------------
 // PRIVATE FUNCTIONS //////////////////////////////////////////////////////////
