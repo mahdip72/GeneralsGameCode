@@ -3729,10 +3729,10 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 	}
 
 	const Real cameraPitch = asin(fabs(m_3DCamera->Get_Forward_Dir().Z));
+	const Bool isShellCamera = !m_isUserControlled && TheGameLogic &&
+		TheGameLogic->isInGame() && TheGameLogic->getGameMode() == GAME_SHELL;
 
-	if (!m_isUserControlled &&
-		(!TheGameLogic || !TheGameLogic->isInGame() ||
-			TheGameLogic->getGameMode() != GAME_SHELL))
+	if (!m_isUserControlled && !isShellCamera)
 	{
 		// Keep the regular draw size for gameplay cinematics. The shell camera
 		// can expose more terrain than this, so size it from the frustum below.
@@ -3743,7 +3743,7 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 
 	if (TheTerrainRenderObject)
 	{
-		const WorldHeightMap *heightMap = TheTerrainRenderObject->getMap();
+		WorldHeightMap *heightMap = TheTerrainRenderObject->getMap();
 		if (heightMap)
 		{
 			const Vector3 cameraPosition = m_3DCamera->Get_Position();
@@ -3763,8 +3763,30 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 			input.minimumHeight = WorldHeightMap::NORMAL_DRAW_HEIGHT;
 			input.tileLength = VERTEX_BUFFER_TILE_LENGTH;
 
-			if (rts::CalculateTerrainDrawSize(input, dimensions.x, dimensions.y))
+			// The shell's high-pitch camera is centered on its visible terrain by
+			// HeightMap::updateCenter, so its draw window can follow the rotated
+			// frustum footprint instead of the larger pivot-centered circle.
+			bool haveDrawSize = false;
+			if (isShellCamera && cameraPitch > ViewDefaultLowPitchRadians)
 			{
+				const Vector3 forward = m_3DCamera->Get_Forward_Dir();
+				haveDrawSize = rts::CalculateTerrainDrawSizeForCameraDirection(input,
+					forward.X, forward.Y, dimensions.x, dimensions.y);
+			}
+
+			if (!haveDrawSize)
+				haveDrawSize = rts::CalculateTerrainDrawSize(input, dimensions.x, dimensions.y);
+			if (haveDrawSize)
+			{
+				if (isShellCamera)
+				{
+					// A square avoids width/height swaps as the shell camera turns.
+					// This map's current draw area is a floor until the next map loads;
+					// shrinking it would rebuild terrain and shroud each time.
+					rts::StabilizeTerrainDrawSizeForMap(heightMap->getDrawWidth(),
+						heightMap->getDrawHeight(), heightMap->getXExtent(),
+						heightMap->getYExtent(), dimensions.x, dimensions.y);
+				}
 				return true;
 			}
 		}

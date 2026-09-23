@@ -2,6 +2,7 @@
 #include "W3DDevice/GameClient/TerrainDrawSizing.h"
 
 #include <stdio.h>
+#include <float.h>
 
 static int s_failures = 0;
 
@@ -85,6 +86,67 @@ static void TestTerrainDrawSizing()
 	CHECK(!rts::CalculateTerrainDrawSize(input, width, height));
 }
 
+static void TestShellTerrainDrawSizing()
+{
+	rts::TerrainDrawSizingInput input = MakeTerrainInput();
+	input.cameraHeight = 618.125f;
+	input.cameraToPivotDistance = 782.0f;
+	input.mapWidth = 315;
+	input.mapHeight = 315;
+	input.verticalFovRadians = 0.672870f;
+	int width = 0, height = 0;
+
+	// Two recorded shell camera headings at 4:3 and the first at 16:9.
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		0.053675f, 0.791536f, width, height));
+	CHECK(width == 225 && height == 193);
+	rts::StabilizeTerrainDrawSizeForMap(129, 129, 315, 315, width, height);
+	CHECK(width == 225 && height == 225);
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		0.611570f, 0.505363f, width, height));
+	CHECK(width == 225 && height == 225);
+	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, width, height);
+	CHECK(width == 225 && height == 225);
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		0.053675f, 0.791536f, width, height));
+	rts::StabilizeTerrainDrawSizeForMap(225, 225, 315, 315, width, height);
+	CHECK(width == 225 && height == 225);
+
+	// A newly constructed map starts with a new 129-cell draw area, not the
+	// previous map's grow-only floor.
+	input.verticalFovRadians = 0.513039f;
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		0.053675f, 0.791536f, width, height));
+	CHECK(width == 193 && height == 161);
+	rts::StabilizeTerrainDrawSizeForMap(129, 129, 315, 315, width, height);
+	CHECK(width == 193 && height == 193);
+
+	// A smaller map and an extreme finite view clamp before float-to-int.
+	input.mapWidth = 160;
+	input.mapHeight = 140;
+	input.pitchRadians = 0.30f;
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		0.053675f, 0.791536f, width, height));
+	CHECK(width == 160 && height == 140);
+	input.mapWidth = 315;
+	input.mapHeight = 315;
+	input.cameraHeight = FLT_MAX / 2.0f;
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		0.053675f, 0.791536f, width, height));
+	CHECK(width == 315 && height == 315);
+	input.cameraHeight = 618.125f;
+	input.pitchRadians = 0.65449846f;
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		FLT_MAX, FLT_MAX, width, height));
+	CHECK(width == 257 && height == 257);
+
+	// A near-horizon view keeps the existing full-map fallback.
+	input.pitchRadians = 0.20f;
+	CHECK(rts::CalculateTerrainDrawSizeForCameraDirection(input,
+		0.053675f, 0.791536f, width, height));
+	CHECK(width == 315 && height == 315);
+}
+
 static void TestAudioChannelPolicy()
 {
 	CHECK(rts::GetAdaptive3DChannelTarget(25) == 64);
@@ -116,6 +178,7 @@ static void TestAudioChannelPolicy()
 int main()
 {
 	TestTerrainDrawSizing();
+	TestShellTerrainDrawSizing();
 	TestAudioChannelPolicy();
 
 	if (s_failures != 0)
