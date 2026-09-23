@@ -511,6 +511,89 @@ int runCatalogTest(int argc, char *argv[])
 		"new loose overrides invalidate virtual cache hits while active archive PCM stays immutable");
 	cachedFirst.reset();
 	cachedSecond.reset();
+	const std::filesystem::path twoSecondPath = root / "two-second.wav";
+	writeWaveFile(twoSecondPath, 2000U);
+	MemoryVirtualAudioSource twoSecondArchive("archive\\two-second.wav",
+		readBinaryFile(twoSecondPath));
+	twoSecondArchive.setAlias("archive\\two-second-alias.wav");
+	FileAudioAssetSource twoSecondSource(AsciiString(root.string().c_str()), &twoSecondArchive);
+	const AsciiString twoSecondName("archive\\two-second.wav");
+	const AsciiString twoSecondAlias("archive\\two-second-alias.wav");
+	constexpr std::size_t twoSecondPcmBytes = 2000U * 48U * 4U;
+	twoSecondSource.setSamplePcmCacheBudget(twoSecondPcmBytes);
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedFirst)
+		&& twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& twoSecondArchive.getReadCalls() == 1U,
+		"two-second sample reuses one bounded PCM cache entry across concurrent voices");
+	AudioPcmChunk firstSecond, secondSecond;
+	check(cachedFirst->readPcm(firstSecond, 48000U)
+		&& cachedSecond->readPcm(secondSecond, 48000U)
+		&& firstSecond.data == secondSecond.data
+		&& firstSecond.startSample == 0 && secondSecond.startSample == 0,
+		"concurrent two-second voices have independent matching first chunks");
+	check(cachedFirst->readPcm(firstSecond, 48000U)
+		&& firstSecond.startSample == 48000 && !cachedSecond->isEnded()
+		&& cachedSecond->readPcm(secondSecond, 48000U)
+		&& secondSecond.startSample == 48000 && firstSecond.data == secondSecond.data
+		&& cachedFirst->isEnded() && cachedSecond->isEnded(),
+		"both cached voices preserve complete second chunks and independent cursors");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	check(twoSecondSource.openPcmSampleStream(twoSecondAlias, cachedFirst)
+		&& twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& twoSecondArchive.getReadCalls() == 3U,
+		"a one-sample budget evicts unpinned two-second PCM without exceeding its cap");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	twoSecondSource.setSamplePcmCacheBudget(twoSecondPcmBytes - 1U);
+	const UnsignedInt readsBeforeBudgetRefusal = twoSecondArchive.getReadCalls();
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedFirst)
+		&& twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& twoSecondArchive.getReadCalls() == readsBeforeBudgetRefusal + 2U,
+		"a two-second sample larger than the byte budget remains uncached");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	twoSecondSource.setSamplePcmCacheBudget(twoSecondPcmBytes);
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedFirst),
+		"two-second PCM can be pinned by an active voice before source replacement");
+	const std::filesystem::path replacementPath = root / "replacement-second.wav";
+	writeWaveFile(replacementPath, 1500U);
+	MemoryVirtualAudioSource twoSecondReplacement("archive\\two-second.wav",
+		readBinaryFile(replacementPath));
+	twoSecondSource.setVirtualFileSource(&twoSecondReplacement);
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& cachedFirst->durationMS() == 2000.0f
+		&& cachedSecond->durationMS() == 1500.0f
+		&& twoSecondReplacement.getReadCalls() == 1U,
+		"source mutation leaves active two-second PCM immutable and opens new bytes");
+	cachedSecond.reset();
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& twoSecondReplacement.getReadCalls() == 2U,
+		"pinned old PCM retains its charge so the replacement stays uncached");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	const std::filesystem::path threeSecondPath = root / "three-second.wav";
+	writeWaveFile(threeSecondPath, 3000U);
+	MemoryVirtualAudioSource threeSecondArchive("archive\\three-second.wav",
+		readBinaryFile(threeSecondPath));
+	FileAudioAssetSource threeSecondSource(AsciiString(root.string().c_str()), &threeSecondArchive);
+	threeSecondSource.setSamplePcmCacheBudget(4194304U);
+	const AsciiString threeSecondName("archive\\three-second.wav");
+	check(threeSecondSource.openPcmSampleStream(threeSecondName, cachedFirst)
+		&& threeSecondSource.openPcmSampleStream(threeSecondName, cachedSecond)
+		&& threeSecondArchive.getReadCalls() == 1U
+		&& cachedFirst->durationMS() == 3000.0f,
+		"three-second cap admits complete multi-chunk PCM within the installed byte budget");
+	for (UnsignedInt second = 0; second < 3U; ++second) {
+		AudioPcmChunk chunk;
+		check(cachedFirst->readPcm(chunk, 48000U)
+			&& chunk.frameCount == 48000U && chunk.startSample == second * 48000U,
+			"three-second cached playback retains every ordered output chunk");
+	}
+	check(cachedFirst->isEnded() && cachedSecond->durationMS() == 3000.0f,
+		"three-second cached playback ends only after the full source duration");
+	cachedFirst.reset();
+	cachedSecond.reset();
 #if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
 	cachedSource.setVirtualFileSource(&cachedArchive);
 	cachedSource.setSamplePcmCacheBudget(192000U);
