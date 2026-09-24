@@ -747,6 +747,47 @@ int runCatalogTest(int argc, char *argv[])
 		"cached ambience ends after its full five-second duration");
 	cachedFirst.reset();
 	cachedSecond.reset();
+	const std::filesystem::path exactCacheLimitPath = root / "exact-cache-limit.wav";
+	writeWaveFile(exactCacheLimitPath, 8000U);
+	MemoryVirtualAudioSource exactCacheLimitArchive("archive\\exact-cache-limit.wav",
+		readBinaryFile(exactCacheLimitPath));
+	FileAudioAssetSource exactCacheLimitSource(AsciiString(root.string().c_str()),
+		&exactCacheLimitArchive);
+	exactCacheLimitSource.setSamplePcmCacheBudget(8U * 1024U * 1024U);
+	check(exactCacheLimitSource.openPcmSampleStream(
+		AsciiString("archive\\exact-cache-limit.wav"), cachedFirst)
+		&& exactCacheLimitSource.openPcmSampleStream(
+			AsciiString("archive\\exact-cache-limit.wav"), cachedSecond)
+		&& exactCacheLimitArchive.getReadCalls() == 1U
+		&& cachedFirst->durationMS() == 8000.0f && cachedSecond->durationMS() == 8000.0f,
+		"an eight-second sample at the duration limit is cached and shared");
+	for (UnsignedInt second = 0; second < 8U; ++second) {
+		check(cachedFirst->readPcm(ambientFirst, 48000U)
+			&& cachedSecond->readPcm(ambientSecond, 48000U)
+			&& ambientFirst.startSample == second * 48000U
+			&& ambientFirst.data == ambientSecond.data,
+			"cached eight-second boundary streams preserve every matching PCM chunk");
+	}
+	check(cachedFirst->isEnded() && cachedSecond->isEnded(),
+		"cached eight-second boundary streams end after all eight chunks");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	const std::filesystem::path justOverCacheLimitPath = root / "just-over-cache-limit.wav";
+	writeWaveFile(justOverCacheLimitPath, 8001U);
+	MemoryVirtualAudioSource justOverCacheLimitArchive("archive\\just-over-cache-limit.wav",
+		readBinaryFile(justOverCacheLimitPath));
+	FileAudioAssetSource justOverCacheLimitSource(AsciiString(root.string().c_str()),
+		&justOverCacheLimitArchive);
+	justOverCacheLimitSource.setSamplePcmCacheBudget(8U * 1024U * 1024U);
+	check(justOverCacheLimitSource.openPcmSampleStream(
+		AsciiString("archive\\just-over-cache-limit.wav"), cachedFirst)
+		&& justOverCacheLimitSource.openPcmSampleStream(
+			AsciiString("archive\\just-over-cache-limit.wav"), cachedSecond)
+		&& justOverCacheLimitArchive.getReadCalls() == 2U
+		&& cachedFirst->durationMS() > 8000.0f && cachedSecond->durationMS() > 8000.0f,
+		"a sample one millisecond above the duration limit remains an uncached stream");
+	cachedFirst.reset();
+	cachedSecond.reset();
 	const std::filesystem::path overLimitPath = root / "over-limit.wav";
 	writeWaveFile(overLimitPath, 9000U);
 	MemoryVirtualAudioSource overLimitArchive("archive\\over-limit.wav",
