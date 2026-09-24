@@ -400,6 +400,7 @@ struct InputLayoutEntry
 {
 	LegacyVertexLayout descriptor;
 	ID3D11InputLayout *layout;
+	unsigned int layoutFlags;
 	unsigned int lastUsedSerial;
 };
 
@@ -449,6 +450,42 @@ bool EqualVertexLayouts(const LegacyVertexLayout &left,
 		}
 	}
 	return true;
+}
+
+unsigned int LegacyVertexLayoutFlags(const LegacyVertexLayout &layout)
+{
+	unsigned int flags = 0;
+	for (unsigned int index = 0; index < layout.elementCount; ++index)
+	{
+		switch (layout.elements[index].semantic)
+		{
+		case RENDER_VERTEX_SEMANTIC_NORMAL: flags |= 1U; break;
+		case RENDER_VERTEX_SEMANTIC_DIFFUSE: flags |= 2U; break;
+		case RENDER_VERTEX_SEMANTIC_SPECULAR: flags |= 4U; break;
+		case RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT:
+			if (layout.elements[index].semanticIndex == 0U)
+			{
+				flags |= LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT0;
+			}
+			else if (layout.elements[index].semanticIndex == 1U)
+			{
+				flags |= LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT1;
+			}
+			break;
+		case RENDER_VERTEX_SEMANTIC_BLEND_INDEX:
+			flags |= LEGACY_VERTEX_LAYOUT_BLEND_INDEX;
+			break;
+		case RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE:
+			flags |= 1U << (8 + layout.elements[index].semanticIndex);
+			break;
+		default: break;
+		}
+	}
+	if (layout.preTransformed)
+	{
+		flags |= LEGACY_VERTEX_LAYOUT_PRETRANSFORMED;
+	}
+	return flags;
 }
 
 bool HasBlendVertexSemantics(const LegacyVertexLayout &layout)
@@ -2749,6 +2786,7 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		ID3D11InputLayout *inputLayout = 0;
+		unsigned int layoutFlags = 0;
 		HRESULT layoutResult = S_OK;
 		if (state.pipeline.vertexProgram == RENDER_LEGACY_VERTEX_WATER_SEA)
 		{
@@ -2758,47 +2796,16 @@ public:
 				return RENDER_RESULT_INVALID_ARGUMENT;
 			}
 			inputLayout = m_seaWaveLayout;
+			layoutFlags = LegacyVertexLayoutFlags(vertexLayout);
 		}
 		else
 		{
 			layoutResult = findOrCreateInputLayout(vertexLayout,
-				&inputLayout);
+				&inputLayout, &layoutFlags);
 		}
 		if (FAILED(layoutResult))
 		{
 			return TranslateResult(layoutResult);
-		}
-		unsigned int layoutFlags = 0;
-		for (unsigned int index = 0; index < vertexLayout.elementCount; ++index)
-		{
-			switch (vertexLayout.elements[index].semantic)
-			{
-			case RENDER_VERTEX_SEMANTIC_NORMAL: layoutFlags |= 1U; break;
-			case RENDER_VERTEX_SEMANTIC_DIFFUSE: layoutFlags |= 2U; break;
-			case RENDER_VERTEX_SEMANTIC_SPECULAR: layoutFlags |= 4U; break;
-			case RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT:
-				if (vertexLayout.elements[index].semanticIndex == 0U)
-				{
-					layoutFlags |= LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT0;
-				}
-				else if (vertexLayout.elements[index].semanticIndex == 1U)
-				{
-					layoutFlags |= LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT1;
-				}
-				break;
-			case RENDER_VERTEX_SEMANTIC_BLEND_INDEX:
-				layoutFlags |= LEGACY_VERTEX_LAYOUT_BLEND_INDEX;
-				break;
-			case RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE:
-				layoutFlags |= 1U << (8 +
-					vertexLayout.elements[index].semanticIndex);
-				break;
-			default: break;
-			}
-		}
-		if (vertexLayout.preTransformed)
-		{
-			layoutFlags |= LEGACY_VERTEX_LAYOUT_PRETRANSFORMED;
 		}
 		m_hasVertexLayoutFlagsOverride = true;
 		m_vertexLayoutFlagsOverride = layoutFlags;
@@ -5322,9 +5329,9 @@ private:
 	}
 
 	HRESULT findOrCreateInputLayout(const LegacyVertexLayout &descriptor,
-		ID3D11InputLayout **layout)
+		ID3D11InputLayout **layout, unsigned int *layoutFlags)
 	{
-		if (layout == 0 || descriptor.stride == 0 ||
+		if (layout == 0 || layoutFlags == 0 || descriptor.stride == 0 ||
 			descriptor.elementCount == 0 ||
 			descriptor.elementCount > LegacyVertexLayout::MAX_ELEMENT_COUNT)
 		{
@@ -5340,6 +5347,7 @@ private:
 			InputLayoutEntry &entry = m_inputLayouts[m_lastInputLayoutIndex];
 			entry.lastUsedSerial = nextStateUseSerial();
 			*layout = entry.layout;
+			*layoutFlags = entry.layoutFlags;
 			return S_OK;
 		}
 		for (unsigned int cached = 0; cached < m_inputLayouts.size(); ++cached)
@@ -5349,6 +5357,7 @@ private:
 				m_inputLayouts[cached].lastUsedSerial = nextStateUseSerial();
 				m_lastInputLayoutIndex = cached;
 				*layout = m_inputLayouts[cached].layout;
+				*layoutFlags = m_inputLayouts[cached].layoutFlags;
 				return S_OK;
 			}
 		}
@@ -5604,6 +5613,7 @@ private:
 		InputLayoutEntry entry;
 		entry.descriptor = descriptor;
 		entry.layout = 0;
+		entry.layoutFlags = LegacyVertexLayoutFlags(descriptor);
 		entry.lastUsedSerial = nextStateUseSerial();
 		const void *vertexShaderBytecode = weightedVertexInput ?
 			static_cast<const void *>(g_LegacyTexturedVS) :
@@ -5629,6 +5639,7 @@ private:
 		m_lastInputLayoutIndex =
 			static_cast<unsigned int>(m_inputLayouts.size() - 1);
 		*layout = entry.layout;
+		*layoutFlags = entry.layoutFlags;
 		return S_OK;
 	}
 

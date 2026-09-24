@@ -3481,9 +3481,15 @@ int testD3D11HiddenSwapChain()
 			rts::render::RenderFloat4(0.0f, 0.0f, 1.0f, 0.0f);
 		logicalState.constants.vertexShaderConstants[10] =
 			rts::render::RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f);
+		rts::render::LegacyVertexLayout malformedSeaLayout = seaLayout;
+		malformedSeaLayout.elements[2].semanticIndex = 1;
 		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
 			context->clear(clearColor, 1.0f, 0) == rts::render::RENDER_RESULT_OK &&
 			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(logicalState, malformedSeaLayout,
+				3) == rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			context->setLegacyStateForLayout(logicalState, seaLayout, 3) ==
 				rts::render::RENDER_RESULT_OK &&
 			context->setLegacyStateForLayout(logicalState, seaLayout, 3) ==
 				rts::render::RENDER_RESULT_OK &&
@@ -4341,21 +4347,35 @@ int testD3D11HiddenSwapChain()
 		missingCoordinateLayout.elementCount = 3;
 		const bool missingCoordinateFrameStarted = context->beginFrame() ==
 			rts::render::RENDER_RESULT_OK;
+		bool missingCoordinateStateReady = false;
+		bool missingCoordinateDrawCompleted = false;
 		if (missingCoordinateFrameStarted)
 		{
 			context->clear(clearColor, 1.0f, 0);
 			context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f);
-			context->setLegacyStateForLayout(logicalState,
-				missingCoordinateLayout, 2);
+			// Alternate descriptors whose TEXCOORD1 flags differ, then draw with
+			// the cached missing-coordinate layout. A stale cached flag would
+			// sample the position alias instead of the fixed-function UV default.
+			missingCoordinateStateReady =
+				context->setLegacyStateForLayout(logicalState,
+					flexibleLayout, 2) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(logicalState,
+					missingCoordinateLayout, 2) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(logicalState,
+					flexibleLayout, 2) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(logicalState,
+					missingCoordinateLayout, 2) == rts::render::RENDER_RESULT_OK;
 			context->setVertexBuffer(missingCoordinateBuffer,
 				sizeof(FlexibleVertex), 0);
 			context->setTexture(1, uvSelectionTexture);
 			context->setPrimitiveTopology(
 				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST);
-			context->draw(3, 0);
+			missingCoordinateDrawCompleted = missingCoordinateStateReady &&
+				context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
 			context->endFrame();
 		}
 		result |= check(missingCoordinateFrameStarted &&
+			missingCoordinateDrawCompleted &&
 			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
 				&captureFormat) == rts::render::RENDER_RESULT_OK,
 			"D3D11 parity pipeline accepts a layout with an absent texture coordinate");
@@ -4402,6 +4422,7 @@ int testD3D11HiddenSwapChain()
 		bool layoutCacheFrameStarted = context->beginFrame() ==
 			rts::render::RENDER_RESULT_OK;
 		bool layoutCacheSucceeded = false;
+		bool malformedLayoutRejected = false;
 		if (layoutCacheFrameStarted)
 		{
 			layoutCacheSucceeded =
@@ -4417,6 +4438,12 @@ int testD3D11HiddenSwapChain()
 					alternateLayout, 0) == rts::render::RENDER_RESULT_OK &&
 				context->setLegacyStateForLayout(layoutCacheState,
 					alternateLayout, 0) == rts::render::RENDER_RESULT_OK;
+			rts::render::LegacyVertexLayout malformedLayout = texturedLayout;
+			malformedLayout.elements[3].semanticIndex = 8;
+			malformedLayoutRejected =
+				context->setLegacyStateForLayout(layoutCacheState,
+					malformedLayout, 0) ==
+					rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 			for (unsigned int index = 0; layoutCacheSucceeded && index < 260;
 				++index)
 			{
@@ -4439,10 +4466,10 @@ int testD3D11HiddenSwapChain()
 			layoutCacheSucceeded = context->endFrame() ==
 				rts::render::RENDER_RESULT_OK && layoutCacheSucceeded;
 		}
-		result |= check(layoutCacheSucceeded &&
+		result |= check(layoutCacheSucceeded && malformedLayoutRejected &&
 			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
 				&captureFormat) == rts::render::RENDER_RESULT_OK,
-			"D3D11 input-layout cache handles repeat, alternation, and eviction");
+			"D3D11 input-layout cache handles repeat, alternation, malformed input, and eviction");
 		center = &pixels[4 * (32 * 64 + 32)];
 		result |= check(layoutCacheSucceeded && center[0] > 240 &&
 			center[1] > 240 && center[2] > 240,
