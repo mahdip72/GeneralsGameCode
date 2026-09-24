@@ -409,6 +409,33 @@ static int kernelParity(RadarTerrainPrepareService *service,
 	return 0;
 }
 
+static int singleRangeServiceParity(RadarTerrainPrepareService &service,
+	unsigned workerCount)
+{
+	const unsigned kinds[] = {
+		PROJECTED_TERRAIN_GRID_SHADOW, PROJECTED_TERRAIN_GRID_DECAL
+	};
+	unsigned kind;
+	CHECK(rts::UseParallelPipelines());
+	CHECK(rts::JobSystem::chooseRangeCount(9,
+		ProjectedTerrainGridMinimumRowsPerTask(64), workerCount) == 1);
+	for (kind = 0; kind < sizeof(kinds) / sizeof(kinds[0]); ++kind)
+	{
+		Fixture fixture(65, 9, kinds[kind]);
+		bool ranParallel = true;
+		const rts::JobMetricCounter submittedBefore =
+			rts::JobSystem::instance().metrics().submittedJobCount;
+		CHECK(initializeFixture(&fixture) == 0);
+		CHECK(prepareSerial(&fixture) == 0);
+		CHECK(prepareThroughService(&fixture, service, 180 + kind,
+			&ranParallel) == 0);
+		CHECK(!ranParallel);
+		CHECK(rts::JobSystem::instance().metrics().submittedJobCount ==
+			submittedBefore + 1);
+	}
+	return 0;
+}
+
 static int invalidAndReuse()
 {
 	Fixture fixture(65, 33, PROJECTED_TERRAIN_GRID_DECAL);
@@ -555,6 +582,7 @@ int main(int argc, char **argv)
 		bool sawMultiRange = false;
 		CHECK(service.initialize(16, 128));
 		CHECK(kernelParity(&service, &sawMultiRange) == 0);
+		CHECK(singleRangeServiceParity(service, system.workerCount()) == 0);
 		CHECK(invalidAndReuse() == 0);
 #if defined(RTS_BUILD_CORE_EXTRAS)
 		CHECK(faultFallback(service) == 0);

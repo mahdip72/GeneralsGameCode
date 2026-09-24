@@ -245,12 +245,12 @@ private:
 	UnsignedShort *m_indices;
 };
 
-bool ProjectedTerrainGridHasParallelCapacity(unsigned rowCount,
-	unsigned cellWidth)
+bool ProjectedTerrainGridCanAttemptParallel()
 {
 	RadarTerrainPrepareService &service = GetRadarTerrainPrepareService();
-	return service.warmup() && ProjectedTerrainGridHasMultipleRowRanges(
-		rowCount, cellWidth, rts::JobSystem::instance().workerCount());
+	/* A valid one-range grid still uses the native batched path. runRows owns
+	 * job admission and retains serial recovery when scheduling fails. */
+	return service.warmup();
 }
 
 bool RunProjectedTerrainGridParallel(
@@ -545,9 +545,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 		static_cast<unsigned>(endY - startY);
 	if (cellCount < PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS)
 		return result;
-	if (!ProjectedTerrainGridHasParallelCapacity(
-		static_cast<unsigned>(vertsPerColumn),
-		static_cast<unsigned>(endX - startX)))
+	if (!ProjectedTerrainGridCanAttemptParallel())
 		return result;
 
 	memset(&snapshot, 0, sizeof(snapshot));
@@ -1186,9 +1184,7 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 		nShadowDecalIndicesInBuf > SHADOW_DECAL_INDEX_SIZE - numIndex ||
 		nShadowDecalVertsInBatch > SHADOW_DECAL_VERTEX_SIZE - numVerts)
 		return -1;
-	if (!ProjectedTerrainGridHasParallelCapacity(
-		static_cast<unsigned>(vertsPerColumn),
-		static_cast<unsigned>(endX - startX)))
+	if (!ProjectedTerrainGridCanAttemptParallel())
 		return -1;
 
 	memset(&snapshot, 0, sizeof(snapshot));
