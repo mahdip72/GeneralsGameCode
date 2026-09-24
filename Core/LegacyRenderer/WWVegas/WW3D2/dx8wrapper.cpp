@@ -1568,8 +1568,11 @@ bool DX8Wrapper::Resize_And_Position_Window(bool use_restored_width,
 		DWORD dwstyle = 0;
 		if (_UseD3D11Backend)
 		{
+			DWORD dwexstyle = 0;
 			if (!rts::render::ReadWindowStyle(_Hwnd, GWL_STYLE, &dwstyle) ||
-				!AdjustWindowRect(&rect, dwstyle, FALSE))
+				!rts::render::ReadWindowStyle(_Hwnd, GWL_EXSTYLE, &dwexstyle) ||
+				!rts::render::AdjustWindowRectForWindowDpi(_Hwnd, &rect,
+					dwstyle, dwexstyle))
 			{
 				return d3d11_windowed_restore_pending ?
 					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;

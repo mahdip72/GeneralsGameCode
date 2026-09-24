@@ -48,6 +48,7 @@
 #include "GameClient/Gadget.h"
 #include "GameClient/GameText.h"
 #include "GameClient/HeaderTemplate.h"
+#include "GameClient/GlobalLanguage.h"
 #include "GameClient/MapUtil.h"
 #include "GameClient/Shell.h"
 #include "GameClient/ShellHooks.h"
@@ -678,6 +679,9 @@ void DeclineResolution()
 		TheWritableGlobalData->m_xResolution = newDispSettings.xRes;
 		TheWritableGlobalData->m_yResolution = newDispSettings.yRes;
 
+#if defined(_WIN64)
+		TheGlobalLanguageData->onResolutionChanged();
+#endif
 		TheHeaderTemplateManager->onResolutionChanged();
 		TheMouse->onResolutionChanged();
 

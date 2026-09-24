@@ -157,6 +157,37 @@ int testWindowPresentationPolicy()
 	return 0;
 }
 
+int testWindowedClientSizeAtCurrentDpi()
+{
+	typedef HANDLE (WINAPI *SetThreadDpiAwarenessContextProc)(HANDLE);
+	SetThreadDpiAwarenessContextProc setDpiContext =
+		reinterpret_cast<SetThreadDpiAwarenessContextProc>(GetProcAddress(
+			GetModuleHandleA("user32.dll"), "SetThreadDpiAwarenessContext"));
+	HANDLE previousContext = setDpiContext != 0 ?
+		setDpiContext(reinterpret_cast<HANDLE>(-4)) : 0;
+	const DWORD style = WS_OVERLAPPEDWINDOW;
+	const DWORD exStyle = WS_EX_CLIENTEDGE;
+	HWND window = CreateWindowExA(exStyle, "STATIC", "", style,
+		0, 0, 100, 100, 0, 0, GetModuleHandleA(0), 0);
+	RECT outer = { 0, 0, 640, 480 };
+	RECT client = { 0 };
+	const bool exactClient = window != 0 &&
+		rts::render::AdjustWindowRectForWindowDpi(window, &outer,
+			style, exStyle) &&
+		SetWindowPos(window, 0, 0, 0, outer.right - outer.left,
+			outer.bottom - outer.top, SWP_NOZORDER | SWP_NOMOVE |
+			SWP_NOACTIVATE) &&
+		GetClientRect(window, &client) && client.right == 640 &&
+		client.bottom == 480;
+	if (window != 0)
+		DestroyWindow(window);
+	if (previousContext != 0)
+		setDpiContext(previousContext);
+	CHECK("D3D11 window frame preserves client pixels at current DPI",
+		exactClient);
+	return 0;
+}
+
 int testCheckedIndexedSubmissionBounds()
 {
 	unsigned int index_count = 0;
@@ -366,6 +397,8 @@ int main()
 	if (testCaptureFrameGate() != 0)
 		return 1;
 	if (testWindowPresentationPolicy() != 0)
+		return 1;
+	if (testWindowedClientSizeAtCurrentDpi() != 0)
 		return 1;
 	if (testCheckedIndexedSubmissionBounds() != 0)
 		return 1;
