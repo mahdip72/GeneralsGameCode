@@ -176,6 +176,7 @@ int main(int argc, char **argv)
 		}
 		else
 		{
+			SetEnvironmentVariableA("GGC_NET3_TEST_TRANSIENT_RESTORE", "1");
 			SetEnvironmentVariableA("GGC_NET3_TEST_CRASH_ROLLBACK_CLEANUP", "1");
 			child.commit(Invalid, nullptr);
 		}

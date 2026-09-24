@@ -371,7 +371,7 @@ public:
 		{
 			if (!writeJournal(journal, disk, false, true))
 			{
-				m_rollbackComplete = recoverLocked(map.c_str(), journal,
+				m_rollbackComplete = rollbackWithRetryLocked(map.c_str(), journal,
 					notify, context);
 				--commitDepth();
 				cleanup(disk, !m_rollbackComplete);
@@ -395,7 +395,7 @@ public:
 			return true;
 		}
 
-		m_rollbackComplete = recoverLocked(map.c_str(), journal, notify, context);
+		m_rollbackComplete = rollbackWithRetryLocked(map.c_str(), journal, notify, context);
 		--commitDepth();
 		// Retain backups if recovery failed; the caller must fail closed.
 		cleanup(disk, !m_rollbackComplete);
@@ -406,6 +406,24 @@ public:
 	static bool isCommitting() { return commitDepth() != 0; }
 
 private:
+	static bool rollbackWithRetryLocked(const char *map,
+		const std::string &journal, NotifyReplacement notify, void *context)
+	{
+		// A scanner may briefly deny a newly created backup or journal its
+		// replacement handle. Replaying rollback is safe while the backup is
+		// retained and the map mutex is held; a persistent failure still leaves
+		// the journal and backups for a later recovery.
+		const DWORD delays[] = { 10U, 20U, 40U, 80U, 160U, 320U, 640U };
+		for (std::size_t attempt = 0; ; ++attempt)
+		{
+			if (recoverLocked(map, journal, notify, context))
+				return true;
+			if (attempt >= sizeof(delays) / sizeof(delays[0]))
+				return false;
+			Sleep(delays[attempt]);
+		}
+	}
+
 	static std::string normalizePath(const char *path)
 	{
 		std::string normalized(path);
@@ -635,6 +653,16 @@ private:
 
 	static bool restoreBackup(const std::string &backup, const std::string &target)
 	{
+#if defined(GGC_NET3_TEST_CRASH_CLEANUP)
+		static bool injectedSharingFailure = false;
+		if (!injectedSharingFailure &&
+			GetEnvironmentVariableA("GGC_NET3_TEST_TRANSIENT_RESTORE", nullptr, 0) != 0)
+		{
+			injectedSharingFailure = true;
+			SetLastError(ERROR_SHARING_VIOLATION);
+			return false;
+		}
+#endif
 		const std::size_t separator = target.find_last_of('\\');
 		if (separator == std::string::npos)
 			return false;

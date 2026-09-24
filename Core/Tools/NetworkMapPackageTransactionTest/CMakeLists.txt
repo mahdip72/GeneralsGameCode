@@ -15,4 +15,4 @@ set_target_properties(core_network_map_package_transaction_tests PROPERTIES
 add_test(NAME core_network_map_package_transaction_tests
     COMMAND core_network_map_package_transaction_tests
 )
-set_tests_properties(core_network_map_package_transaction_tests PROPERTIES TIMEOUT 30)
+set_tests_properties(core_network_map_package_transaction_tests PROPERTIES TIMEOUT 90)
