@@ -2448,7 +2448,7 @@ function New-Stage5SyntheticAcceptanceCorpus {
         fixtureManifest = [IO.Path]::GetFullPath($reviewed.manifestPath)
         validationSet = 'All'; replayCorpusRequired = $true; replayFixtureCount = 10
         replayMatrixRepeats = 2; stressRepeats = 3; x64Required = $true
-        performanceRequested = $true; performanceRequiredForDeterministicRuntimeGate = $true
+        performanceRequested = $true; performanceRequiredForDeterministicRuntimeGate = $false
         performanceMeasurementScope = 'aggregate-stage5-stress-replay-throughput'
         collisionSpecificReplayPerformanceClaim = $false; diagnosticNonAcceptance = $false
         diagnosticWorkerConfiguration = $null; directExecutionExceptionRequested = $false
@@ -4583,6 +4583,19 @@ function Write-TestManifest {
         }
     }
     [IO.File]::WriteAllText($Path, ($manifest | ConvertTo-Json -Depth 8))
+}
+
+function Write-MinimalX64PeTestImage {
+    param([Parameter(Mandatory)][string]$Path)
+    $image = New-Object byte[] 512
+    $image[0] = 0x4D
+    $image[1] = 0x5A
+    $image[0x3C] = 0x80
+    $image[0x80] = 0x50
+    $image[0x81] = 0x45
+    $image[0x84] = 0x64
+    $image[0x85] = 0x86
+    [IO.File]::WriteAllBytes($Path, $image)
 }
 
 function Write-StandardTestManifest {
@@ -7016,13 +7029,51 @@ try {
     Assert-True (-not $functionalOnlyPlan.deterministicRuntimeEligible -and
         -not $functionalOnlyPlan.finalAcceptanceEligible -and
         -not $functionalOnlyPlan.performanceRequested -and
-        $functionalOnlyPlan.performanceRequiredForDeterministicRuntimeGate) `
-        'an All matrix without enforced Stage 3 performance evidence is not a passing deterministic-runtime gate'
+        -not $functionalOnlyPlan.performanceRequiredForDeterministicRuntimeGate -and
+        -not $functionalOnlyPlan.acceptanceReceiptEligible) `
+        'an All matrix without native x64 validation remains ineligible for deterministic-runtime acceptance'
     Assert-True (@($functionalOnlyPlan.entries | Where-Object { $_.kind -ceq 'replay' }).Count -eq 168) `
         'the focused functional plan still proves the exact 24-execution replay matrix for all seven configurations'
     Assert-True ($functionalOnlyStdout -match 'focused/diagnostic deterministic-runtime' -and
         $functionalOnlyStdout -notmatch '\bpassed\b') `
-        'an All plan without performance prints an explicit focused result and never a passed banner'
+        'an All plan without native x64 validation prints an explicit focused result and never a passed banner'
+
+    $nativeRuntime = Join-Path $root 'native-x64-runtime'
+    New-Item -ItemType Directory -Path $nativeRuntime | Out-Null
+    # PlanOnly verifies only the PE signature and machine field; no fixture
+    # executable is launched in this test.
+    Write-MinimalX64PeTestImage (Join-Path $nativeRuntime 'generalszh.exe')
+    Copy-Item -LiteralPath (Join-Path $runtime 'launcher.exe') `
+        -Destination (Join-Path $nativeRuntime 'launcher.exe')
+    Copy-Item -LiteralPath (Join-Path $runtime 'launcher.lcf') `
+        -Destination (Join-Path $nativeRuntime 'launcher.lcf')
+    $nativeManifest = Join-Path $root 'standard-native-x64-manifest.json'
+    $nativeManifestDocument = Get-Content -LiteralPath $standardManifest -Raw | ConvertFrom-Json
+    $nativeManifestDocument.executableSha256 = Get-Sha256 `
+        (Join-Path $nativeRuntime 'generalszh.exe')
+    [IO.File]::WriteAllText($nativeManifest, `
+        ($nativeManifestDocument | ConvertTo-Json -Depth 12))
+    $nativeX64Output = Join-Path $root 'native-x64-no-performance-plan-output'
+    $nativeX64Stdout = @(& $scriptPath -RuntimeRoot $nativeRuntime `
+        -FixtureManifestPath $nativeManifest -OutputRoot $nativeX64Output `
+        -ValidationSet All -ReplayMatrixRepeats 2 -StressRepeats 3 `
+        -MinimumFreeBytes 1 -RequireX64 -PlanOnly) -join "`n"
+    $nativeX64Plan = Get-Content -LiteralPath `
+        (Join-Path $nativeX64Output 'validation-plan.json') -Raw | ConvertFrom-Json
+    Assert-True ($nativeX64Plan.deterministicRuntimeEligible -and
+        -not $nativeX64Plan.finalAcceptanceEligible -and
+        $nativeX64Plan.x64Required -and
+        -not $nativeX64Plan.performanceRequested -and
+        -not $nativeX64Plan.performanceRequiredForDeterministicRuntimeGate -and
+        $nativeX64Plan.physicalCoreCount -eq 0 -and
+        -not $nativeX64Plan.acceptanceReceiptRequested -and
+        -not $nativeX64Plan.acceptanceReceiptEligible) `
+        'a complete x64 All plan passes deterministic-runtime eligibility without claiming performance or bound acceptance receipts'
+    Assert-True ($nativeX64Stdout -match 'Stage 5 deterministic-runtime plan passed:' -and
+        (Test-Path -LiteralPath (Join-Path $nativeX64Output 'validation-plan.json')) -and
+        -not (Test-Path -LiteralPath (Join-Path $nativeX64Output 'performance-report.json')) -and
+        -not (Test-Path -LiteralPath (Join-Path $nativeX64Output 'validation-plan-receipt.json'))) `
+        'x64 correctness planning is independently eligible while performance and acceptance receipts remain absent when not requested/bound'
 
     $aiOnlyOutput = Join-Path $root 'ai-only-plan-output'
     & $scriptPath -RuntimeRoot $runtime -FixtureManifestPath $manifest -OutputRoot $aiOnlyOutput `

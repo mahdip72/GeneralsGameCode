@@ -3664,7 +3664,13 @@ if ($ValidationSet -ne 'Replay') {
     Assert-Condition (@($regularAiKeys | Sort-Object -Unique).Count -eq $regularAiKeys.Count) `
         'AI validation plan contains a duplicate scenario/seed/configuration/repeat entry.'
 }
-$deterministicRuntimeEligible = $deterministicRuntimeContractRequested -and [bool]$EnforcePerformance
+# The canonical deterministic-runtime contract is an x64 correctness/evidence
+# gate. Stage 3-baseline performance enforcement is a separate qualification
+# that is optional in this runner (and is performed on its own eligible host).
+# Requiring -EnforcePerformance here prevented the standard x64 replay workflow
+# from emitting its source/artifact/runtime-bound results receipts.
+$deterministicRuntimeEligible = $deterministicRuntimeContractRequested -and
+    [bool]($RequireX64 -or $EnforcePerformance)
 $planDocument = [pscustomobject]@{
     schemaVersion = $manifestData.schemaVersion
     gateName = 'deterministic-runtime'
@@ -3688,7 +3694,7 @@ $planDocument = [pscustomobject]@{
     stressRepeats = $StressRepeats
     x64Required = [bool]($RequireX64 -or $EnforcePerformance)
     performanceRequested = [bool]$EnforcePerformance
-    performanceRequiredForDeterministicRuntimeGate = $true
+    performanceRequiredForDeterministicRuntimeGate = $false
     performanceMeasurementScope = 'aggregate-stage5-stress-replay-throughput'
     collisionSpecificReplayPerformanceClaim = $false
     diagnosticNonAcceptance = $diagnosticNonAcceptanceRequested
