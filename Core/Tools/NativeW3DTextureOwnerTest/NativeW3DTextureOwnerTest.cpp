@@ -1420,7 +1420,15 @@ int TestFailedRecoveryTicketLifetime()
 		reboundOwner.PublishCandidate(&reboundPublication, 0) == RENDER_RESULT_OK &&
 		reboundOwner.AcquireForSampling(&reboundTexture) == RENDER_RESULT_OK &&
 		reboundOwner.AcquireSurface(0, 0, &reboundSurface) == RENDER_RESULT_OK &&
-		reboundTexture.resource == staleTexture.resource &&
+		reboundTexture.resource.index() == staleTexture.resource.index() &&
+		!resources.IsValid(staleTexture) && !resources.IsValid(staleSurface) &&
+		replacementDevice->LiveCount() == 1,
+		"fresh host reuses the native slot and rejects original stale tokens");
+	// Raw GPU generations are process-wide, so model a backend that reused the
+	// exact raw handle to exercise the independent typed attachment epoch.
+	staleTexture.resource = reboundTexture.resource;
+	staleSurface.texture.resource = reboundTexture.resource;
+	result |= Check(staleTexture.resource == reboundTexture.resource &&
 		reboundTexture.attachmentGeneration != staleTexture.attachmentGeneration &&
 		!resources.IsValid(staleTexture) && !resources.IsValid(staleSurface) &&
 		resources.IsValid(reboundTexture) && resources.IsValid(reboundSurface) &&
