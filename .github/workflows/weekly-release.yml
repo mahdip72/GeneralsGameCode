@@ -348,7 +348,7 @@ jobs:
           fi
           printf -v body '%s### Changelog\n%s\n' "$body" "$CHANGELOG"
           delimiter="GGC_RELEASE_BODY_$(openssl rand -hex 16)"
-          while grep -Fqx "$delimiter" <<< "$body"; do
+          while grep -Fqx "$delimiter" <<< "${body//$'\r'/}"; do
             delimiter="GGC_RELEASE_BODY_$(openssl rand -hex 16)"
           done
           {
