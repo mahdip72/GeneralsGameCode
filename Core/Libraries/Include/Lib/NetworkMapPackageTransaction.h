@@ -16,8 +16,8 @@ namespace rts { namespace network_epoch {
 class NetworkMapPackageTransaction
 {
 private:
-	// Serialize the journal check and every transaction phase across processes.
-	// A kernel mutex needs no write access to the map directory.
+	// Serialize the journal check and every transaction phase among processes
+	// in this game session, without requiring writes to the map directory.
 	class MapMutex
 	{
 	public:
@@ -37,7 +37,7 @@ private:
 				hash ^= ch;
 				hash *= 1099511628211ULL;
 			}
-			std::string name = "Global\\GGCNET3-";
+			std::string name = "Local\\GGCNET3-";
 			const char digits[] = "0123456789ABCDEF";
 			for (int shift = 60; shift >= 0; shift -= 4)
 				name += digits[(hash >> shift) & 15];
