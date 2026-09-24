@@ -373,7 +373,7 @@ private:
 		// Antivirus/indexing software can briefly hold a just-flushed temporary
 		// file without FILE_SHARE_DELETE. Retry only that transient condition;
 		// all other errors and exhausted retries remain fail-closed.
-		const DWORD delays[] = { 10U, 20U, 40U, 80U, 160U };
+		const DWORD delays[] = { 10U, 20U, 40U, 80U, 160U, 320U, 640U };
 		for (std::size_t attempt = 0; ; ++attempt)
 		{
 			if (MoveFileExA(temporary.c_str(), journal.c_str(),
