@@ -12,3 +12,10 @@ inline bool ProjectedShadowQueueAttemptCompleted(int result)
 {
 	return result == PROJECTED_SHADOW_QUEUE_COMPLETED;
 }
+
+/* A terrain-volume attempt owns the render only for nonnegative results.
+ * Zero is a valid handled no-op; negative values request the serial path. */
+inline bool ProjectedShadowParallelAttemptHandled(int result)
+{
+	return result >= 0;
+}

@@ -623,7 +623,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
 				NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvVertices)))
-				return 0;
+				return result;
 			nShadowVertsInBuf = 0;
 			nShadowStartBatchVertex = 0;
 		}
@@ -634,12 +634,12 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
 				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvVertices)))
-				return 0;
+				return result;
 		}
 		if (pvVertices == 0)
 		{
 			shadowVertexBufferOwner->Unlock_Buffer();
-			return 0;
+			return result;
 		}
 		for (row = 0; row < static_cast<unsigned>(vertsPerColumn); ++row)
 		{
@@ -655,7 +655,8 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 				++pvVertices;
 			}
 		}
-		shadowVertexBufferOwner->Unlock_Buffer();
+		if (!shadowVertexBufferOwner->Unlock_Buffer())
+			return result;
 
 		if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE - numIndex))
 		{
@@ -663,7 +664,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 				numIndex * sizeof(UnsignedShort),
 				NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvIndices)))
-				return 0;
+				return result;
 			nShadowIndicesInBuf = 0;
 			nShadowStartBatchIndex = 0;
 		}
@@ -674,17 +675,18 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 				numIndex * sizeof(UnsignedShort),
 				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvIndices)))
-				return 0;
+				return result;
 		}
 		if (pvIndices == 0)
 		{
 			shadowIndexBufferOwner->Unlock_Buffer();
-			return 0;
+			return result;
 		}
 		indexStart = pvIndices;
 		memcpy(indexStart, s_projectedTerrainGridScratch.indices(),
 			static_cast<size_t>(numIndex) * sizeof(UnsignedShort));
-		shadowIndexBufferOwner->Unlock_Buffer();
+		if (!shadowIndexBufferOwner->Unlock_Buffer())
+			return result;
 
 		rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
 			static_cast<unsigned short>(nShadowStartBatchVertex));
@@ -753,7 +755,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *shadow, AABoxClass &box)
 {
 	const Int parallelResult = renderProjectedTerrainShadowParallel(shadow, box);
-	if (parallelResult >= 0)
+	if (ProjectedShadowParallelAttemptHandled(parallelResult))
 		return parallelResult;
 
 	static	Matrix4x4 mWorld(true);	//initialize to identity matrix
@@ -1275,7 +1277,8 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 		}
 		memcpy(pvVertices, s_projectedTerrainGridScratch.vertices(),
 			static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
-		shadowDecalVertexBufferOwner->Unlock_Buffer();
+		if (!shadowDecalVertexBufferOwner->Unlock_Buffer())
+			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
 
 		if (!shadowDecalIndexBufferOwner->Lock_Buffer(
 			nShadowDecalIndicesInBuf * sizeof(UnsignedShort),
@@ -1292,7 +1295,8 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 			pvIndices[index] = static_cast<UnsignedShort>(
 				s_projectedTerrainGridScratch.indices()[index] +
 				nShadowDecalVertsInBatch);
-		shadowDecalIndexBufferOwner->Unlock_Buffer();
+		if (!shadowDecalIndexBufferOwner->Unlock_Buffer())
+			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
 
 		nShadowDecalPolysInBatch += static_cast<Int>(cellCount * 2);
 		nShadowDecalVertsInBuf += numVerts;

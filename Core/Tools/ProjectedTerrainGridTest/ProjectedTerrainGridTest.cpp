@@ -456,6 +456,9 @@ static int projectedShadowQueueFallbackPolicy()
 	CHECK(!ProjectedShadowQueueAttemptCompleted(2));
 	CHECK(ProjectedShadowQueueAttemptCompleted(
 		PROJECTED_SHADOW_QUEUE_COMPLETED));
+	CHECK(!ProjectedShadowParallelAttemptHandled(-1));
+	CHECK(ProjectedShadowParallelAttemptHandled(0));
+	CHECK(ProjectedShadowParallelAttemptHandled(1));
 	return 0;
 }
 
