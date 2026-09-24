@@ -19,6 +19,25 @@ function Assert-TokenCount {
     }
 }
 
+function Assert-TargetLinkTokenCount {
+    param(
+        [string]$Content,
+        [string]$TargetName,
+        [string]$Pattern,
+        [int]$ExpectedCount,
+        [string]$FailureMessage
+    )
+
+    $targetNamePattern = [regex]::Escape($TargetName)
+    $linkBlockPattern = '(?ms)^[\t ]*target_link_libraries\([\t ]*' +
+        $targetNamePattern + '[\t ]+PRIVATE\b(?<libraries>.*?)^[\t ]*\)'
+    $linkBlocks = [regex]::Matches($Content, $linkBlockPattern)
+    $targetLinkContent = [string]::Join("`n", @($linkBlocks | ForEach-Object {
+        $_.Groups['libraries'].Value
+    }))
+    Assert-TokenCount $targetLinkContent $Pattern $ExpectedCount $FailureMessage
+}
+
 function Assert-ExactConditionalBlock {
     param(
         [string]$Content,
@@ -203,6 +222,35 @@ if ($SelfTest) {
         throw 'Negative conditional self-test did not reject a duplicate block.'
     } catch {
         if ($_.Exception.Message -ne 'Duplicate conditional block was accepted.') { throw }
+    }
+
+    $runtimeTargetLinks = @'
+target_link_libraries(z_runtime_regression_tests PRIVATE
+    rts_product_runtime
+    z_gameengine
+)
+target_link_libraries(z_point_group_startup_tests PRIVATE
+    rts_product_runtime
+)
+'@
+    Assert-TargetLinkTokenCount $runtimeTargetLinks 'z_runtime_regression_tests' `
+        'rts_product_runtime' 1 'Valid runtime-regression product boundary was rejected.'
+
+    $duplicateRuntimeTargetLinks = @'
+target_link_libraries(z_runtime_regression_tests PRIVATE
+    rts_product_runtime
+    rts_product_runtime
+)
+target_link_libraries(z_point_group_startup_tests PRIVATE
+    rts_product_runtime
+)
+'@
+    try {
+        Assert-TargetLinkTokenCount $duplicateRuntimeTargetLinks 'z_runtime_regression_tests' `
+            'rts_product_runtime' 1 'Duplicate runtime-regression product boundary was accepted.'
+        throw 'Negative target-ownership self-test did not reject duplicate product links.'
+    } catch {
+        if ($_.Exception.Message -ne 'Duplicate runtime-regression product boundary was accepted.') { throw }
     }
 
     $validInstall = @'
@@ -396,7 +444,8 @@ if ($runtimeTestsCMake -notmatch '\brts_product_runtime\b' -or
     $runtimeTestsCMake -match '\bbinkstub\b') {
     throw 'Zero Hour runtime regression tests bypass architecture-selected Bink ownership.'
 }
-Assert-TokenCount $runtimeTestsCMake 'rts_product_runtime' 1 'Zero Hour runtime regression product-boundary ownership is ambiguous.'
+Assert-TargetLinkTokenCount $runtimeTestsCMake 'z_runtime_regression_tests' `
+    'rts_product_runtime' 1 'Zero Hour runtime regression product-boundary ownership is ambiguous.'
 
 $audioContractFiles = @(
     'Core/GameEngine/Include/Common/GameAudio.h',
