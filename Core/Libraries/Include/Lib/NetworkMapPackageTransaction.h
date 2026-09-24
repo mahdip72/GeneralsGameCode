@@ -15,6 +15,31 @@ namespace rts { namespace network_epoch {
 // package until the host's map and sidecar identities have been checked.
 class NetworkMapPackageTransaction
 {
+private:
+	// An exclusive delete-on-close file separates live preparation from
+	// restart recovery, including across processes and after a hard exit.
+	class MapLock
+	{
+	public:
+		explicit MapLock(const std::string &map) : m_handle(INVALID_HANDLE_VALUE)
+		{
+			const std::string path = map + ".ggclock";
+			m_handle = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
+				0, nullptr, OPEN_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+		}
+		~MapLock()
+		{
+			if (m_handle != INVALID_HANDLE_VALUE)
+				CloseHandle(m_handle);
+		}
+		bool valid() const { return m_handle != INVALID_HANDLE_VALUE; }
+	private:
+		MapLock(const MapLock &);
+		MapLock &operator=(const MapLock &);
+		HANDLE m_handle;
+	};
+
 public:
 	typedef bool (*ValidateInstalled)(void *context);
 	typedef void (*NotifyReplacement)(const char *path, void *context);
@@ -80,6 +105,17 @@ public:
 		const std::string journal = journalPath(map);
 		if (journal.empty())
 			return false;
+		MapLock lock(map);
+		if (!lock.valid())
+			return GetLastError() == ERROR_FILE_NOT_FOUND ||
+				GetLastError() == ERROR_PATH_NOT_FOUND;
+		return recoverLocked(map, journal, notify, context);
+	}
+
+private:
+	static bool recoverLocked(const char *map, const std::string &journal,
+		NotifyReplacement notify, void *context)
+	{
 		HANDLE handle = CreateFileA(journal.c_str(), GENERIC_READ,
 			FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 		if (handle == INVALID_HANDLE_VALUE)
@@ -98,12 +134,15 @@ public:
 			&read, nullptr) != 0;
 		CloseHandle(handle);
 		if (!readOk || read != size ||
-			(text.compare(0, 9, "GGCNET32\n") != 0 &&
+			(text.compare(0, 9, "GGCNET34\n") != 0 &&
+			text.compare(0, 9, "GGCNET33\n") != 0 &&
+			text.compare(0, 9, "GGCNET32\n") != 0 &&
 			text.compare(0, 9, "GGCNET31\n") != 0 &&
 			text.compare(0, 9, "GGCNET30\n") != 0))
 			return false;
 		const bool preparing = text[7] == '0';
-		const bool recordedTemporaries = text[7] != '1';
+		const bool cleanupOnly = text[7] == '3' || text[7] == '4';
+		const bool recordedTemporaries = text[7] != '1' && text[7] != '4';
 		std::size_t at = 9;
 		const std::size_t countEnd = text.find('\n', at);
 		if (countEnd == std::string::npos || countEnd != at + 1 ||
@@ -149,10 +188,10 @@ public:
 		}
 		if (at != text.size())
 			return false;
-		if (preparing)
+		if (preparing || cleanupOnly)
 		{
-			// No installed file can change before the active journal is published.
-			// Keep the record until all prepared bytes have been removed.
+			// Preparing has not touched installed files. Cleanup-only means the
+			// validated package or complete rollback is already on disk.
 			if (!cleanup(disk, false) || !retireJournal(journal))
 				return false;
 			return true;
@@ -169,15 +208,19 @@ public:
 			if (notify != nullptr)
 				notify(targets[i].c_str(), context);
 		}
-		// Keep the rollback record (and its backups) until every restored file is
-		// on disk. Retiring by a write-through rename also prevents a power loss
-		// from resurrecting a deleted journal after its backups are removed.
-		if (!retireJournal(journal))
+		// Rollback is complete. Record that only cleanup remains before deleting
+		// any backup, so a restart cannot roll the package back a second time.
+		text[7] = recordedTemporaries ? '3' : '4';
+		if (!writeJournalText(journal, text, true))
 			return false;
-		cleanup(disk, false);
-		return true;
+#if defined(GGC_NET3_TEST_CRASH_CLEANUP)
+		if (GetEnvironmentVariableA("GGC_NET3_TEST_CRASH_ROLLBACK_CLEANUP", nullptr, 0) != 0)
+			ExitProcess(93);
+#endif
+		return cleanup(disk, false) && retireJournal(journal);
 	}
 
+public:
 	bool commit(ValidateInstalled validate, void *context,
 		NotifyReplacement notify = nullptr,
 		ContinueCommit continueCommit = nullptr)
@@ -194,6 +237,12 @@ public:
 			if (!allowedTarget(map.c_str(), m_files[i].path.c_str()))
 				return false;
 		}
+		std::string mapDirectory;
+		if (!createDirectoryTree(map.c_str(), mapDirectory))
+			return false;
+		MapLock lock(map);
+		if (!lock.valid())
+			return false;
 		std::vector<DiskFile> disk(m_files.size());
 		for (std::size_t i = 0; i < m_files.size(); ++i)
 		{
@@ -222,6 +271,22 @@ public:
 #if defined(GGC_NET3_TEST_CRASH_PREPARE)
 			if (GetEnvironmentVariableA("GGC_NET3_TEST_CRASH_PREPARE", nullptr, 0) != 0)
 				ExitProcess(91);
+#endif
+#if defined(GGC_NET3_TEST_HOLD_PREPARE)
+			if (i == 0 &&
+				GetEnvironmentVariableA("GGC_NET3_TEST_HOLD_PREPARE", nullptr, 0) != 0)
+			{
+				const std::string ready = m_files[i].path + ".ready";
+				const std::string release = m_files[i].path + ".release";
+				HANDLE marker = CreateFileA(ready.c_str(), GENERIC_WRITE, 0,
+					nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+				if (marker != INVALID_HANDLE_VALUE)
+					CloseHandle(marker);
+				for (int attempt = 0; attempt < 3000 &&
+					GetFileAttributesA(release.c_str()) == INVALID_FILE_ATTRIBUTES;
+					++attempt)
+					Sleep(10);
+			}
 #endif
 		}
 		if (!writeJournal(journal, disk, false))
@@ -254,21 +319,33 @@ public:
 
 		if (allowed && committed == disk.size() && validate(context))
 		{
-			if (!retireJournal(journal))
+			if (!writeJournal(journal, disk, false, true))
 			{
-				m_rollbackComplete = recover(map.c_str(), notify, context);
+				m_rollbackComplete = recoverLocked(map.c_str(), journal,
+					notify, context);
 				--commitDepth();
 				cleanup(disk, !m_rollbackComplete);
 				clear();
 				return false;
 			}
+#if defined(GGC_NET3_TEST_CRASH_CLEANUP)
+			char crashMode[16] = {};
+			if (GetEnvironmentVariableA("GGC_NET3_TEST_CRASH_COMMIT_CLEANUP",
+				crashMode, sizeof(crashMode)) != 0)
+			{
+				if (strcmp(crashMode, "readonly") == 0)
+					SetFileAttributesA(disk[0].backup.c_str(), FILE_ATTRIBUTE_READONLY);
+				ExitProcess(92);
+			}
+#endif
 			--commitDepth();
-			cleanup(disk, false);
+			if (cleanup(disk, false))
+				retireJournal(journal);
 			clear();
 			return true;
 		}
 
-		m_rollbackComplete = recover(map.c_str(), notify, context);
+		m_rollbackComplete = recoverLocked(map.c_str(), journal, notify, context);
 		--commitDepth();
 		// Retain backups if recovery failed; the caller must fail closed.
 		cleanup(disk, !m_rollbackComplete);
@@ -383,9 +460,11 @@ private:
 	}
 
 	bool writeJournal(const std::string &path,
-		const std::vector<DiskFile> &disk, bool preparing) const
+		const std::vector<DiskFile> &disk, bool preparing,
+		bool cleanupOnly = false) const
 	{
-		std::string contents = preparing ? "GGCNET30\n" : "GGCNET32\n";
+		std::string contents = preparing ? "GGCNET30\n" :
+			(cleanupOnly ? "GGCNET33\n" : "GGCNET32\n");
 		contents += static_cast<char>('0' + disk.size());
 		contents += '\n';
 		for (std::size_t i = 0; i < disk.size(); ++i)
@@ -399,6 +478,12 @@ private:
 			contents += disk[i].backup;
 			contents += '\n';
 		}
+		return writeJournalText(path, contents, !preparing);
+	}
+
+	static bool writeJournalText(const std::string &path,
+		const std::string &contents, bool replace)
+	{
 		const std::size_t separator = path.find_last_of('\\');
 		if (separator == std::string::npos)
 			return false;
@@ -419,7 +504,7 @@ private:
 			written == contents.size() && FlushFileBuffers(handle) != 0;
 		CloseHandle(handle);
 		const bool published = complete && publishJournal(temporary, path,
-			!preparing);
+			replace);
 		if (!published)
 			DeleteFileA(temporary.c_str());
 		return published;

@@ -1,4 +1,6 @@
 #define GGC_NET3_TEST_CRASH_PREPARE 1
+#define GGC_NET3_TEST_CRASH_CLEANUP 1
+#define GGC_NET3_TEST_HOLD_PREPARE 1
 #include "Lib/NetworkMapPackageTransaction.h"
 
 #include <cstdio>
@@ -38,6 +40,28 @@ static bool NoTemps(const std::string &folder)
 		return GetLastError() == ERROR_FILE_NOT_FOUND;
 	FindClose(found);
 	return false;
+}
+
+static bool ClearReadonlyTemps(const std::string &folder)
+{
+	WIN32_FIND_DATAA data;
+	HANDLE found = FindFirstFileA((folder + "\\ggc*.tmp").c_str(), &data);
+	if (found == INVALID_HANDLE_VALUE)
+		return false;
+	bool cleared = false;
+	do
+	{
+		if ((data.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0)
+		{
+			DWORD attributes = data.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY;
+			if (attributes == 0)
+				attributes = FILE_ATTRIBUTE_NORMAL;
+			cleared = SetFileAttributesA((folder + "\\" + data.cFileName).c_str(),
+				attributes) != 0;
+		}
+	} while (FindNextFileA(found, &data));
+	FindClose(found);
+	return cleared;
 }
 
 static bool Valid(void *) { return true; }
@@ -131,6 +155,46 @@ int main(int argc, char **argv)
 		SetEnvironmentVariableA("GGC_NET3_TEST_CRASH_PREPARE", "1");
 		child.commit(Valid, nullptr);
 		return 3;
+	}
+	if (argc == 3 && (std::string(argv[1]) == "--crash-cleanup-commit" ||
+		std::string(argv[1]) == "--crash-cleanup-rollback"))
+	{
+		const std::string folder = argv[2];
+		const std::string ini = folder + "\\map.ini";
+		const std::string map = folder + "\\cleanup.map";
+		const std::string bytes = "cleanup-phase-new";
+		NetworkMapPackageTransaction child;
+		if (!child.stage(ini.c_str(),
+			reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size()) ||
+			!child.stage(map.c_str(),
+				reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size()))
+			return 2;
+		if (std::string(argv[1]) == "--crash-cleanup-commit")
+		{
+			SetEnvironmentVariableA("GGC_NET3_TEST_CRASH_COMMIT_CLEANUP", "readonly");
+			child.commit(Valid, nullptr);
+		}
+		else
+		{
+			SetEnvironmentVariableA("GGC_NET3_TEST_CRASH_ROLLBACK_CLEANUP", "1");
+			child.commit(Invalid, nullptr);
+		}
+		return 3;
+	}
+	if (argc == 3 && std::string(argv[1]) == "--hold-prepare")
+	{
+		const std::string folder = argv[2];
+		const std::string ini = folder + "\\map.ini";
+		const std::string map = folder + "\\hold.map";
+		const std::string bytes = "hold-phase-new";
+		NetworkMapPackageTransaction child;
+		if (!child.stage(ini.c_str(),
+			reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size()) ||
+			!child.stage(map.c_str(),
+				reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size()))
+			return 2;
+		SetEnvironmentVariableA("GGC_NET3_TEST_HOLD_PREPARE", "1");
+		return child.commit(Valid, nullptr) ? 0 : 3;
 	}
 	char current[MAX_PATH];
 	if (GetCurrentDirectoryA(MAX_PATH, current) == 0)
@@ -395,7 +459,110 @@ int main(int argc, char **argv)
 		GetFileAttributesA(newMapPath.c_str()) == INVALID_FILE_ATTRIBUTES &&
 		Read(ini) == newIni,
 		"rejected package removes a newly created map and restores prior sidecar") && ok;
+	const std::string cleanupMap = folder + "\\cleanup.map";
+	const std::string cleanupJournal = cleanupMap + ".ggctxn";
+	const std::string cleanupBytes = "cleanup-phase-new";
+	std::string cleanupCommand = "\"" + std::string(executable) +
+		"\" --crash-cleanup-commit \"" + folder + "\"";
+	std::vector<char> cleanupCommandLine(cleanupCommand.begin(), cleanupCommand.end());
+	cleanupCommandLine.push_back(0);
+	PROCESS_INFORMATION cleanupProcess = {};
+	const bool cleanupLaunched = CreateProcessA(nullptr, cleanupCommandLine.data(),
+		nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+		&startup, &cleanupProcess) != 0;
+	DWORD cleanupCode = 0;
+	if (cleanupLaunched)
+	{
+		WaitForSingleObject(cleanupProcess.hProcess, 30000);
+		GetExitCodeProcess(cleanupProcess.hProcess, &cleanupCode);
+		CloseHandle(cleanupProcess.hThread);
+		CloseHandle(cleanupProcess.hProcess);
+	}
+	ok = Check(cleanupLaunched && cleanupCode == 92 &&
+		Read(cleanupJournal).compare(0, 9, "GGCNET33\n") == 0 &&
+		Read(cleanupMap) == cleanupBytes && Read(ini) == cleanupBytes,
+		"committed package survives crash before backup cleanup") && ok;
+	ok = Check(!NetworkMapPackageTransaction::recover(cleanupMap.c_str()) &&
+		Read(cleanupMap) == cleanupBytes && Read(ini) == cleanupBytes &&
+		Read(cleanupJournal).compare(0, 9, "GGCNET33\n") == 0,
+		"failed backup deletion retains cleanup-only journal") && ok;
+	ok = Check(ClearReadonlyTemps(folder) &&
+		NetworkMapPackageTransaction::recover(cleanupMap.c_str()) &&
+		Read(cleanupMap) == cleanupBytes && Read(ini) == cleanupBytes &&
+		NoTemps(folder),
+		"retry finishes cleanup without rolling back committed package") && ok;
+	std::string rollbackCommand = "\"" + std::string(executable) +
+		"\" --crash-cleanup-rollback \"" + folder + "\"";
+	std::vector<char> rollbackCommandLine(rollbackCommand.begin(),
+		rollbackCommand.end());
+	rollbackCommandLine.push_back(0);
+	PROCESS_INFORMATION rollbackProcess = {};
+	const bool rollbackLaunched = CreateProcessA(nullptr,
+		rollbackCommandLine.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+		nullptr, nullptr, &startup, &rollbackProcess) != 0;
+	DWORD rollbackCode = 0;
+	if (rollbackLaunched)
+	{
+		WaitForSingleObject(rollbackProcess.hProcess, 30000);
+		GetExitCodeProcess(rollbackProcess.hProcess, &rollbackCode);
+		CloseHandle(rollbackProcess.hThread);
+		CloseHandle(rollbackProcess.hProcess);
+	}
+	ok = Check(rollbackLaunched && rollbackCode == 93 &&
+		Read(cleanupJournal).compare(0, 9, "GGCNET33\n") == 0 &&
+		Read(cleanupMap) == cleanupBytes && Read(ini) == cleanupBytes &&
+		NetworkMapPackageTransaction::recover(cleanupMap.c_str()) &&
+		Read(cleanupMap) == cleanupBytes && Read(ini) == cleanupBytes &&
+		NoTemps(folder),
+		"rolled-back package survives crash before backup cleanup") && ok;
+	const std::string holdMap = folder + "\\hold.map";
+	const std::string ready = ini + ".ready";
+	const std::string release = ini + ".release";
+	std::string holdCommand = "\"" + std::string(executable) +
+		"\" --hold-prepare \"" + folder + "\"";
+	std::vector<char> holdCommandLine(holdCommand.begin(), holdCommand.end());
+	holdCommandLine.push_back(0);
+	PROCESS_INFORMATION holdProcess = {};
+	const bool holdLaunched = CreateProcessA(nullptr, holdCommandLine.data(),
+		nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+		&startup, &holdProcess) != 0;
+	bool readySeen = false;
+	if (holdLaunched)
+	{
+		for (int attempt = 0; attempt < 1000; ++attempt)
+		{
+			if (GetFileAttributesA(ready.c_str()) != INVALID_FILE_ATTRIBUTES)
+			{
+				readySeen = true;
+				break;
+			}
+			Sleep(10);
+		}
+	}
+	ok = Check(readySeen &&
+		Read(holdMap + ".ggctxn").compare(0, 9, "GGCNET30\n") == 0 &&
+		!NetworkMapPackageTransaction::recover(holdMap.c_str()) &&
+		Read(ini) == cleanupBytes,
+		"another process cannot recover a live preparation") && ok;
+	Write(release, "go");
+	DWORD holdCode = 0;
+	if (holdLaunched)
+	{
+		WaitForSingleObject(holdProcess.hProcess, 30000);
+		GetExitCodeProcess(holdProcess.hProcess, &holdCode);
+		CloseHandle(holdProcess.hThread);
+		CloseHandle(holdProcess.hProcess);
+	}
+	ok = Check(holdLaunched && holdCode == 0 &&
+		Read(ini) == "hold-phase-new" && Read(holdMap) == "hold-phase-new" &&
+		NoTemps(folder) &&
+		GetFileAttributesA((holdMap + ".ggclock").c_str()) == INVALID_FILE_ATTRIBUTES,
+		"live preparation completes after competing recovery is rejected") && ok;
+	DeleteFileA(ready.c_str());
+	DeleteFileA(release.c_str());
 
+	DeleteFileA(holdMap.c_str());
+	DeleteFileA(cleanupMap.c_str());
 	DeleteFileA(ini.c_str());
 	DeleteFileA(map.c_str());
 	DeleteFileA(preview.c_str());
