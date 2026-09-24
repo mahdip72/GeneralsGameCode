@@ -1265,11 +1265,9 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 	HeightMapDynamicLightBounds lightBounds[MAX_ENABLED_DYNAMIC_LIGHTS];
 	HeightMapDynamicLightSceneLight fullLightSnapshots[
 		MAX_ENABLED_DYNAMIC_LIGHTS];
-	HeightMapDynamicLightSceneLight contributingLightSnapshots[
-		MAX_ENABLED_DYNAMIC_LIGHTS];
+	HeightMapDynamicLightVertexBounds vertexBounds;
 	unsigned contributingLightCount = 0;
-	Int xCoords[VERTEX_BUFFER_TILE_LENGTH];
-	Int yCoords[VERTEX_BUFFER_TILE_LENGTH];
+	bool hasVertexBounds = false;
 
 	if (!data || !m_map || !pLights || width == 0 || height == 0 ||
 		x0 < originX || y0 < originY ||
@@ -1334,23 +1332,10 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 		captured.ambientBlue = ambient.Z;
 	}
 	if (!ValidateHeightMapDynamicLightSceneLights(fullLightSnapshots,
-		static_cast<unsigned>(numLights)))
-		return false;
-	for (Int column = 0; column < static_cast<Int>(width); ++column)
-		xCoords[column] = getXWithOrigin(x0 + column) +
-			m_map->getDrawOrgX() - m_map->getBorderSizeInline();
-	for (Int row = 0; row < static_cast<Int>(height); ++row)
-		yCoords[row] = getYWithOrigin(y0 + row) +
-			m_map->getDrawOrgY() - m_map->getBorderSizeInline();
-	if (!HeightMapSelectDynamicLightContributors(fullLightSnapshots,
-		lightBounds, static_cast<unsigned>(numLights), xCoords, width, yCoords,
-		height, contributingLightSnapshots, &contributingLightCount) ||
-		!batch.initialize(width, height, contributingLightCount,
+		static_cast<unsigned>(numLights)) ||
+		!batch.initialize(width, height, 0,
 			static_cast<unsigned>(numLights)))
 		return false;
-	if (contributingLightCount != 0)
-		memcpy(batch.lights(), contributingLightSnapshots,
-			contributingLightCount * sizeof(contributingLightSnapshots[0]));
 
 	for (Int row = y0; row < y1; ++row)
 	{
@@ -1401,6 +1386,22 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 				captured[corner].x = source.x;
 				captured[corner].y = source.y;
 				captured[corner].z = source.z;
+				if (!hasVertexBounds)
+				{
+					vertexBounds.minX = vertexBounds.maxX = source.x;
+					vertexBounds.minY = vertexBounds.maxY = source.y;
+					vertexBounds.minZ = vertexBounds.maxZ = source.z;
+					hasVertexBounds = true;
+				}
+				else
+				{
+					if (source.x < vertexBounds.minX) vertexBounds.minX = source.x;
+					if (source.x > vertexBounds.maxX) vertexBounds.maxX = source.x;
+					if (source.y < vertexBounds.minY) vertexBounds.minY = source.y;
+					if (source.y > vertexBounds.maxY) vertexBounds.maxY = source.y;
+					if (source.z < vertexBounds.minZ) vertexBounds.minZ = source.z;
+					if (source.z > vertexBounds.maxZ) vertexBounds.maxZ = source.z;
+				}
 				captured[corner].diffuse = source.diffuse;
 				captured[corner].applyLighting = intersects ? 1 : 0;
 				if (!intersects)
@@ -1457,6 +1458,11 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 			++cellIndex;
 		}
 	}
+	if (!hasVertexBounds || !HeightMapSelectDynamicLightContributors(
+		fullLightSnapshots, static_cast<unsigned>(numLights), vertexBounds,
+		batch.lights(), &contributingLightCount))
+		return false;
+	batch.snapshot().lightCount = contributingLightCount;
 
 	return cellIndex == batch.snapshot().width * batch.snapshot().height;
 }

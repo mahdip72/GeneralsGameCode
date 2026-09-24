@@ -307,6 +307,15 @@ static unsigned computeDiffuse(const HeightMapDynamicLightVertex &vertex,
 		(alpha << 24);
 }
 
+static Real nearestDistanceToAxis(Real point, Real minimum, Real maximum)
+{
+	if (point < minimum)
+		return minimum - point;
+	if (point > maximum)
+		return point - maximum;
+	return 0.0f;
+}
+
 } // namespace
 
 bool ValidateHeightMapDynamicLightSceneLights(
@@ -319,6 +328,48 @@ bool ValidateHeightMapDynamicLightSceneLights(
 		if (!validLight(lights[index]))
 			return false;
 	return true;
+}
+
+bool HeightMapDynamicLightMayContributeToVertexBounds(
+	const HeightMapDynamicLightSceneLight &light,
+	const HeightMapDynamicLightVertexBounds &vertexBounds)
+{
+	Real dx;
+	Real dy;
+	Real dz;
+	Real distanceSquared;
+	Real distance;
+
+	/* Invalid input fails open. Production validates the full light list before
+	 * selection and independently validates captured vertices before publish. */
+	if (!validLight(light) || !finiteReal(vertexBounds.minX) ||
+		!finiteReal(vertexBounds.minY) || !finiteReal(vertexBounds.minZ) ||
+		!finiteReal(vertexBounds.maxX) || !finiteReal(vertexBounds.maxY) ||
+		!finiteReal(vertexBounds.maxZ) ||
+		vertexBounds.minX > vertexBounds.maxX ||
+		vertexBounds.minY > vertexBounds.maxY ||
+		vertexBounds.minZ > vertexBounds.maxZ)
+		return true;
+	if (light.type != HEIGHTMAP_DYNAMIC_LIGHT_POINT &&
+		light.type != HEIGHTMAP_DYNAMIC_LIGHT_SPOT)
+		return true;
+	if (!light.enabled || light.range <= 0.0 || light.midRange < 0.1)
+		return false;
+
+	/* Each component is the minimum possible float displacement from the
+	 * light to any captured vertex in that axis. Float multiply/add and sqrt
+	 * then follow the same monotone arithmetic as computeDiffuse, so rejecting
+	 * only when this lower-bound distance is outside the double range cannot
+	 * discard a contributing vertex (including float-vs-double edge cases). */
+	dx = nearestDistanceToAxis(light.positionX, vertexBounds.minX,
+		vertexBounds.maxX);
+	dy = nearestDistanceToAxis(light.positionY, vertexBounds.minY,
+		vertexBounds.maxY);
+	dz = nearestDistanceToAxis(light.positionZ, vertexBounds.minZ,
+		vertexBounds.maxZ);
+	distanceSquared = dx * dx + dy * dy + dz * dz;
+	distance = dynamicLightSqrt(distanceSquared);
+	return static_cast<double>(distance) < light.range;
 }
 
 bool PrepareHeightMapDynamicLightRows(

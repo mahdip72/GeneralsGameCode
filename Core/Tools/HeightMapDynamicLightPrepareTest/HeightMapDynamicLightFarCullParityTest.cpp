@@ -99,6 +99,27 @@ static HeightMapDynamicLightBounds boundsForLight(
     return bounds;
 }
 
+static HeightMapDynamicLightVertexBounds boundsForVertices(
+    const std::vector<HeightMapDynamicLightVertex> &vertices)
+{
+    HeightMapDynamicLightVertexBounds bounds = {};
+    if (vertices.empty())
+        return bounds;
+    bounds.minX = bounds.maxX = vertices[0].x;
+    bounds.minY = bounds.maxY = vertices[0].y;
+    bounds.minZ = bounds.maxZ = vertices[0].z;
+    for (size_t index = 1; index < vertices.size(); ++index)
+    {
+        if (vertices[index].x < bounds.minX) bounds.minX = vertices[index].x;
+        if (vertices[index].x > bounds.maxX) bounds.maxX = vertices[index].x;
+        if (vertices[index].y < bounds.minY) bounds.minY = vertices[index].y;
+        if (vertices[index].y > bounds.maxY) bounds.maxY = vertices[index].y;
+        if (vertices[index].z < bounds.minZ) bounds.minZ = vertices[index].z;
+        if (vertices[index].z > bounds.maxZ) bounds.maxZ = vertices[index].z;
+    }
+    return bounds;
+}
+
 static bool tilePruningParity()
 {
     const unsigned width = 8, height = 8;
@@ -163,9 +184,11 @@ static bool tilePruningParity()
         }
 
     HeightMapDynamicLightSceneLight selectedStorage[6];
-    if (!HeightMapSelectDynamicLightContributors(lights.data(), bounds,
-            static_cast<unsigned>(lights.size()), xCoords, width, yCoords,
-            height, selectedStorage, &selectedCount))
+    const HeightMapDynamicLightVertexBounds vertexBounds =
+        boundsForVertices(input);
+    if (!HeightMapSelectDynamicLightContributors(lights.data(),
+            static_cast<unsigned>(lights.size()), vertexBounds,
+            selectedStorage, &selectedCount))
         return false;
     paritySelectedCount = selectedCount;
     const unsigned expectedIndices[] = {0, 2, 3, 5};
@@ -210,9 +233,9 @@ static bool tilePruningParity()
         return false;
     lights[1].ambientRed = 0.1f;
     lights[1].type = 99;
-    if (!HeightMapSelectDynamicLightContributors(lights.data(), bounds,
-            static_cast<unsigned>(lights.size()), xCoords, width, yCoords,
-            height, selectedStorage, &selectedCount) ||
+    if (!HeightMapSelectDynamicLightContributors(lights.data(),
+            static_cast<unsigned>(lights.size()), vertexBounds,
+            selectedStorage, &selectedCount) ||
         selectedCount != 5 ||
         selectedStorage[1].type != 99 ||
         ValidateHeightMapDynamicLightSceneLights(lights.data(),
@@ -223,19 +246,166 @@ static bool tilePruningParity()
     // inclusive axis predicate as the tile rewrite mask.
     {
         const int wrappedX[] = {30, 31, 0, 1};
-        const int wrappedY[] = {8, 9};
         HeightMapDynamicLightBounds wrapped = {0, 8, 2, 10, 50, 50, 52, 52};
-        if (!HeightMapDynamicLightCurrentBoundsHitTile(wrapped, wrappedX, 4,
-                wrappedY, 2))
+        if (!HeightMapDynamicLightAxisHit(wrapped.minX, wrapped.maxX,
+                wrappedX[2]))
             return false;
         wrapped.minX = 10;
         wrapped.maxX = 12;
-        if (HeightMapDynamicLightCurrentBoundsHitTile(wrapped, wrappedX, 4,
-                wrappedY, 2))
+        if (HeightMapDynamicLightAxisHit(wrapped.minX, wrapped.maxX,
+                wrappedX[2]))
             return false;
     }
     printf("tile_pruning lights=%u->%u byte_mismatches=0 fallback=preserved\n",
         static_cast<unsigned>(lights.size()), paritySelectedCount);
+    return true;
+}
+
+static bool negativeCoordinateBoundaryReproducer()
+{
+    const unsigned width = 1, height = 1;
+    std::vector<HeightMapDynamicLightSceneLight> lights(2);
+    std::vector<HeightMapDynamicLightSceneLight> legacySelected(1);
+    HeightMapDynamicLightSceneLight selectedStorage[2];
+    std::vector<HeightMapDynamicLightVertex> input(4);
+    std::vector<HeightMapDynamicLightVertex> baseline(4);
+    std::vector<HeightMapDynamicLightVertex> full(4);
+    std::vector<HeightMapDynamicLightVertex> legacy(4);
+    std::vector<HeightMapDynamicLightVertex> pruned(4);
+    HeightMapDynamicLightSnapshot fullSnapshot, legacySnapshot, prunedSnapshot;
+    HeightMapDynamicLightBounds bounds[2];
+    const int xCoord = -2;
+    const int yCoord = 0;
+    unsigned selectedCount = 0;
+
+    // The float map bound truncates to zero, while the captured double range
+    // and kernel's float distance let the right vertex contribute narrowly.
+    lights[0] = pointLight(6.050000190734863f, 0.0f, 0.0f,
+        16.049999247060548, 16.049999227060548);
+    lights[0].diffuseRed = 1.0f;
+    lights[0].diffuseGreen = lights[0].diffuseBlue = 0.0f;
+    lights[0].ambientRed = lights[0].ambientGreen =
+        lights[0].ambientBlue = 0.0f;
+    lights[1] = pointLight(-15.0f, 5.0f, 0.0f, 20.0, 5.0);
+    lights[1].diffuseRed = lights[1].diffuseGreen =
+        lights[1].diffuseBlue = 0.0f;
+    lights[1].ambientRed = lights[1].ambientGreen =
+        lights[1].ambientBlue = 0.0f;
+    for (unsigned index = 0; index < 2; ++index)
+        bounds[index] = boundsForLight(lights[index]);
+
+    // Light 0 misses the legacy integer current-bounds test at cell -2;
+    // light 1 triggers the rewrite, exposing light 0 to the full kernel list.
+    if (HeightMapDynamicLightAxisHit(bounds[0].minX, bounds[0].maxX, xCoord) ||
+        !HeightMapDynamicLightCellHit(bounds[1], xCoord, yCoord) ||
+        !ValidateHeightMapDynamicLightSceneLights(lights.data(), 2))
+        return false;
+    for (unsigned corner = 0; corner < 4; ++corner)
+    {
+        HeightMapDynamicLightVertex &vertex = input[corner];
+        memset(&vertex, 0, sizeof(vertex));
+        vertex.x = (corner & 1u) ? -10.0f : -20.0f;
+        vertex.y = (corner & 2u) ? 10.0f : 0.0f;
+        vertex.z = 0.0f;
+        vertex.diffuse = 0xFF000000u;
+        vertex.applyLighting = HeightMapDynamicLightCellHit(bounds[1],
+            xCoord, yCoord) ? 1 : 0;
+        vertex.normalX = 1.0f;
+    }
+
+    const HeightMapDynamicLightVertexBounds vertexBounds =
+        boundsForVertices(input);
+    if (!HeightMapSelectDynamicLightContributors(lights.data(),
+            static_cast<unsigned>(lights.size()), vertexBounds,
+            selectedStorage, &selectedCount) || selectedCount != 2 ||
+        memcmp(selectedStorage, lights.data(),
+            selectedCount * sizeof(selectedStorage[0])) != 0)
+        return false;
+
+    legacySelected[0] = lights[1];
+    setupSnapshot(&fullSnapshot, input, lights, width, height);
+    setupSnapshot(&legacySnapshot, input, legacySelected, width, height);
+    std::vector<HeightMapDynamicLightSceneLight> selected(
+        selectedStorage, selectedStorage + selectedCount);
+    setupSnapshot(&prunedSnapshot, input, selected, width, height);
+    if (!BaselinePrepareHeightMapDynamicLightRows(fullSnapshot,
+            baseline.data(), 0, height) ||
+        !PrepareHeightMapDynamicLightRows(fullSnapshot, full.data(), 0, height) ||
+        !PrepareHeightMapDynamicLightRows(legacySnapshot, legacy.data(),
+            0, height) ||
+        !PrepareHeightMapDynamicLightRows(prunedSnapshot, pruned.data(),
+            0, height) ||
+        memcmp(baseline.data(), full.data(), fullSnapshot.outputCapacityBytes) != 0 ||
+        memcmp(full.data(), pruned.data(), fullSnapshot.outputCapacityBytes) != 0 ||
+        memcmp(full.data(), legacy.data(), fullSnapshot.outputCapacityBytes) == 0)
+        return false;
+
+    printf("negative_boundary legacy_selector_dropped_contributor=1 "
+        "two_light_rewrite_byte_mismatch=1 fixed_selector_byte_mismatches=0\n");
+    return true;
+}
+
+static bool previousFootprintRewriteParity()
+{
+    const unsigned width = 1, height = 1;
+    std::vector<HeightMapDynamicLightSceneLight> lights(2);
+    std::vector<HeightMapDynamicLightSceneLight> noContributors;
+    std::vector<HeightMapDynamicLightVertex> input(4);
+    std::vector<HeightMapDynamicLightVertex> baseline(4);
+    std::vector<HeightMapDynamicLightVertex> full(4);
+    std::vector<HeightMapDynamicLightVertex> pruned(4);
+    HeightMapDynamicLightSnapshot fullSnapshot, prunedSnapshot;
+    HeightMapDynamicLightBounds bounds[2];
+    HeightMapDynamicLightSceneLight selectedStorage[2];
+    const int xCoord = -2;
+    const int yCoord = 0;
+    unsigned selectedCount = 0;
+
+    lights[0] = pointLight(1000.0f, 1000.0f, 0.0f, 10.0, 5.0);
+    lights[1] = pointLight(2000.0f, 2000.0f, 0.0f, 10.0, 5.0);
+    for (unsigned index = 0; index < 2; ++index)
+        bounds[index] = boundsForLight(lights[index]);
+    bounds[0].prevMinX = -2;
+    bounds[0].prevMaxX = -1;
+    bounds[0].prevMinY = 0;
+    bounds[0].prevMaxY = 1;
+    if (HeightMapDynamicLightAxisHit(bounds[0].minX, bounds[0].maxX,
+            xCoord) ||
+        !HeightMapDynamicLightCellHit(bounds[0], xCoord, yCoord))
+        return false;
+
+    for (unsigned corner = 0; corner < 4; ++corner)
+    {
+        HeightMapDynamicLightVertex &vertex = input[corner];
+        memset(&vertex, 0, sizeof(vertex));
+        vertex.x = (corner & 1u) ? -10.0f : -20.0f;
+        vertex.y = (corner & 2u) ? 10.0f : 0.0f;
+        vertex.z = 0.0f;
+        vertex.diffuse = 0xFF5A6B7Cu;
+        vertex.applyLighting = HeightMapDynamicLightCellHit(bounds[0],
+            xCoord, yCoord) ? 1 : 0;
+        vertex.normalZ = 1.0f;
+    }
+
+    const HeightMapDynamicLightVertexBounds vertexBounds =
+        boundsForVertices(input);
+    if (!HeightMapSelectDynamicLightContributors(lights.data(),
+            static_cast<unsigned>(lights.size()), vertexBounds,
+            selectedStorage, &selectedCount) || selectedCount != 0)
+        return false;
+    setupSnapshot(&fullSnapshot, input, lights, width, height);
+    setupSnapshot(&prunedSnapshot, input, noContributors, width, height);
+    if (!BaselinePrepareHeightMapDynamicLightRows(fullSnapshot,
+            baseline.data(), 0, height) ||
+        !PrepareHeightMapDynamicLightRows(fullSnapshot, full.data(), 0, height) ||
+        !PrepareHeightMapDynamicLightRows(prunedSnapshot, pruned.data(),
+            0, height) ||
+        memcmp(baseline.data(), full.data(), fullSnapshot.outputCapacityBytes) != 0 ||
+        memcmp(full.data(), pruned.data(), fullSnapshot.outputCapacityBytes) != 0)
+        return false;
+
+    printf("previous_footprint_rewrite=1 zero_current_contributors=1 "
+        "byte_mismatches=0\n");
     return true;
 }
 
@@ -247,6 +417,7 @@ struct TilePerfCase
     std::vector<HeightMapDynamicLightVertex> fullOutput;
     std::vector<HeightMapDynamicLightVertex> prunedOutput;
     HeightMapDynamicLightSnapshot snapshot;
+    HeightMapDynamicLightVertexBounds vertexBounds;
 };
 
 static int tilePruningBenchmark(const char *name, bool dense)
@@ -307,6 +478,7 @@ static int tilePruningBenchmark(const char *name, bool dense)
                     }
                 }
             setupSnapshot(&tile.snapshot, tile.input, lights, width, height);
+            tile.vertexBounds = boundsForVertices(tile.input);
         }
 
     // Verify exact full-versus-pruned output before collecting timings.
@@ -316,9 +488,8 @@ static int tilePruningBenchmark(const char *name, bool dense)
         HeightMapDynamicLightSceneLight selected[17];
         unsigned selectedCount = 0;
         if (!HeightMapSelectDynamicLightContributors(lights.data(),
-                bounds.data(), static_cast<unsigned>(lights.size()),
-                tile.xCoords, width, tile.yCoords, height, selected,
-                &selectedCount))
+                static_cast<unsigned>(lights.size()), tile.vertexBounds,
+                selected, &selectedCount))
             return 1;
         HeightMapDynamicLightSnapshot pruned = tile.snapshot;
         pruned.lights = selectedCount ? selected : 0;
@@ -368,9 +539,9 @@ static int tilePruningBenchmark(const char *name, bool dense)
                                 lights.data(),
                                 static_cast<unsigned>(lights.size())) ||
                             !HeightMapSelectDynamicLightContributors(
-                                lights.data(), bounds.data(),
+                                lights.data(),
                                 static_cast<unsigned>(lights.size()),
-                                tile.xCoords, width, tile.yCoords, height,
+                                tile.vertexBounds,
                                 selected, &selectedCount))
                             return 4;
                         for (unsigned index = 0; index < selectedCount; ++index)
@@ -636,6 +807,10 @@ int main(int argc, char **argv)
 {
     if (!tilePruningParity())
         return 9;
+    if (!negativeCoordinateBoundaryReproducer())
+        return 11;
+    if (!previousFootprintRewriteParity())
+        return 12;
     const int edge = edgeParity();
     if (edge)
         return edge;
