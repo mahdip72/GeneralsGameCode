@@ -48,6 +48,7 @@
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "Common/GlobalData.h"
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
+#include "W3DDevice/Common/ShadowDecalTransform.h"
 #include "WW3D2/statistics.h"
 #include "Common/Debug.h"
 #include "GameLogic/Object.h"
@@ -1112,7 +1113,7 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 	else
 	{
 		objPos.Set(shadow->m_x, shadow->m_y, shadow->m_z);
-		objXform.Rotate_Z(shadow->m_localAngle);
+		ApplyShadowDecalLocalAngle(objXform, shadow->m_localAngle);
 	}
 
 	objPos.Z = 0.0f;
@@ -1341,7 +1342,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		else
 		{	//no render object so use shadow's local position and default orientation
 			objPos.Set(shadow->m_x,shadow->m_y,shadow->m_z);
-			objXform.Rotate_Z(shadow->m_localAngle);
+			ApplyShadowDecalLocalAngle(objXform, shadow->m_localAngle);
 		}
 
 		//Find size of heightmap sub-rectangle affected by shadow

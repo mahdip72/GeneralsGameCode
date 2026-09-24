@@ -5,6 +5,7 @@ add_executable(projected_terrain_grid_tests
 
 target_include_directories(projected_terrain_grid_tests PRIVATE
     ../../Libraries/Include
+    ../../Libraries/Source/WWVegas
     ../../GameEngineDevice/Include
 )
 

@@ -2,7 +2,9 @@
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/ProjectedTerrainGridKernel.h"
 #include "../TestSupport/LocalCapacityTestLane.h"
+#include "W3DDevice/Common/ShadowDecalTransform.h"
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
+#include "WWMath/matrix3d.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -209,6 +211,97 @@ static int prepareReference(Fixture *fixture)
 	return 0;
 }
 
+static bool sameMatrixBytes(const Matrix3D &first, const Matrix3D &second)
+{
+	Int row;
+	Int column;
+	for (row = 0; row < 3; ++row)
+	{
+		for (column = 0; column < 4; ++column)
+		{
+			const Real firstValue = first[row][column];
+			const Real secondValue = second[row][column];
+			if (memcmp(&firstValue, &secondValue, sizeof(Real)) != 0)
+				return false;
+		}
+	}
+	return true;
+}
+
+static void setTreeShadowProjectionAxes(Fixture *fixture,
+	const Matrix3D &transform, Real size)
+{
+	Vector3 uVector = transform.Get_X_Vector();
+	Vector3 vVector;
+	uVector.Z = 0.0f;
+	/* A zero-angle tree decal starts from identity, whose X axis has exact
+	 * length one; this is the same normalization result as queueDecal. */
+	uVector *= 1.0f;
+	vVector = uVector;
+	vVector.Rotate_Z(-1.0f, 0.0f);
+	uVector *= 1.0f / size;
+	vVector *= 1.0f / size;
+	fixture->snapshot.uAxisX = uVector.X;
+	fixture->snapshot.uAxisY = uVector.Y;
+	fixture->snapshot.vAxisX = vVector.X;
+	fixture->snapshot.vAxisY = vVector.Y;
+	fixture->snapshot.objectX = -21.5f;
+	fixture->snapshot.objectY = 43.25f;
+	fixture->snapshot.uOffset = 0.5f;
+	fixture->snapshot.vOffset = 0.5f;
+}
+
+/* The tree buffer's shared, unbound shadow begins at positive zero and only
+ * changes size/position. Compare its legacy Rotate_Z stream with the
+ * production skip helper, then verify the resulting projected grid emits
+ * byte-identical vertices and indices. Negative zero must still call through. */
+static int prepareSerial(Fixture *fixture);
+
+static int prepareTreeZeroAngleRegression()
+{
+	Fixture legacyFixture(9, 7, PROJECTED_TERRAIN_GRID_DECAL);
+	Fixture optimizedFixture(9, 7, PROJECTED_TERRAIN_GRID_DECAL);
+	const Real positiveZero = 0.0f;
+	const Real negativeZero = -0.0f;
+	const Real shadowSize = 37.25f;
+	Matrix3D legacyTransform(1);
+	Matrix3D optimizedTransform(1);
+	Matrix3D negativeZeroTransform(1);
+	Matrix3D negativeZeroLegacyTransform(1);
+
+	CHECK(initializeFixture(&legacyFixture) == 0);
+	CHECK(initializeFixture(&optimizedFixture) == 0);
+	legacyFixture.snapshot.clampToLayerHeight = 0;
+	optimizedFixture.snapshot.clampToLayerHeight = 0;
+	legacyFixture.snapshot.layerHeight = 0.0f;
+	optimizedFixture.snapshot.layerHeight = 0.0f;
+	legacyFixture.snapshot.heightBias = 0.1f;
+	optimizedFixture.snapshot.heightBias = 0.1f;
+	legacyFixture.snapshot.diffuse = 0xffffffffu;
+	optimizedFixture.snapshot.diffuse = 0xffffffffu;
+	legacyTransform.Rotate_Z(positiveZero);
+	CHECK(!ApplyShadowDecalLocalAngle(optimizedTransform, positiveZero));
+	CHECK(sameMatrixBytes(legacyTransform, optimizedTransform));
+
+	setTreeShadowProjectionAxes(&legacyFixture, legacyTransform, shadowSize);
+	setTreeShadowProjectionAxes(&optimizedFixture, optimizedTransform, shadowSize);
+	CHECK(prepareSerial(&legacyFixture) == 0);
+	CHECK(prepareSerial(&optimizedFixture) == 0);
+	CHECK(memcmp(legacyFixture.scratch.vertices(),
+		optimizedFixture.scratch.vertices(),
+		legacyFixture.expectedVertices.size() *
+			sizeof(ProjectedTerrainGridVertex)) == 0);
+	CHECK(memcmp(legacyFixture.scratch.indices(),
+		optimizedFixture.scratch.indices(),
+		legacyFixture.expectedIndices.size() * sizeof(UnsignedShort)) == 0);
+
+	negativeZeroLegacyTransform.Rotate_Z(negativeZero);
+	CHECK(ApplyShadowDecalLocalAngle(negativeZeroTransform, negativeZero));
+	CHECK(sameMatrixBytes(negativeZeroLegacyTransform,
+		negativeZeroTransform));
+	return 0;
+}
+
 static int comparePrepared(Fixture *fixture);
 
 static int prepareSerial(Fixture *fixture)
@@ -410,6 +503,7 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);
+	CHECK(prepareTreeZeroAngleRegression() == 0);
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
 	unsigned worker;
 	rts::JobSystem &system = rts::JobSystem::instance();
