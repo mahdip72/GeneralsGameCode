@@ -768,9 +768,11 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 		return RENDER_RESULT_FAILED;
 	}
 
-	RetireCompletedSubmissions(m_impl->submissions);
-	return m_impl->submissions.empty() ? RENDER_RESULT_OK :
-		RENDER_RESULT_FAILED;
+	// Reaching this point means every chunk was fully acknowledged. Failures
+	// return above with their unacknowledged triangles retained for retry, so
+	// scanning every acknowledgement byte again here is unnecessary.
+	m_impl->submissions.clear();
+	return RENDER_RESULT_OK;
 }
 
 void NativeSortingRenderer::Clear()

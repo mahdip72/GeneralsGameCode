@@ -432,6 +432,32 @@ void TestNodeOrderingAndFlushBoundary()
 	CHECK(renderer.Empty());
 	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
 	CHECK(sink.calls == 1);
+
+	std::vector<TestVertex> nextVertices = vertices;
+	for (size_t index = 0; index < nextVertices.size(); ++index)
+		nextVertices[index].color = 0x12345678U +
+			static_cast<unsigned int>(index);
+	QueueOne(renderer, 40, nextVertices, indices, 0);
+	CHECK(!renderer.Empty());
+	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
+	CHECK(renderer.Empty());
+	CHECK(sink.calls == 2);
+	CHECK(sink.batches.size() == 2);
+	if (sink.batches.size() == 2)
+	{
+		CHECK(sink.batches[1].states.size() == 1 &&
+			sink.batches[1].states[0] == 40);
+		CHECK(sink.batches[1].indices.size() == indices.size());
+		if (sink.batches[1].indices.size() == indices.size())
+			CHECK(memcmp(sink.batches[1].indices.data(), indices.data(),
+				indices.size() * sizeof(unsigned short)) == 0);
+		CHECK(sink.batches[1].vertices.size() ==
+			nextVertices.size() * sizeof(TestVertex));
+		if (sink.batches[1].vertices.size() ==
+			nextVertices.size() * sizeof(TestVertex))
+			CHECK(memcmp(sink.batches[1].vertices.data(), nextVertices.data(),
+				nextVertices.size() * sizeof(TestVertex)) == 0);
+	}
 }
 
 void TestStableNodeOrderingPreservesEqualDepthAndSplice()
