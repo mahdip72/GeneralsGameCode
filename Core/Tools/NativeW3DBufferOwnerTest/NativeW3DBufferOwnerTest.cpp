@@ -811,6 +811,10 @@ int main()
 		&rejectedHandle) == RENDER_RESULT_OK &&
 		rejectedHandle == staticHandle,
 		"one buffer mutation failure preserves unrelated static authority");
+	result |= Check(dynamicBuffer.Lock(8, 4,
+		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &bytes) == RENDER_RESULT_FAILED &&
+		bytes == nullptr,
+		"a failed publication cannot be retried through the stale range in the same frame");
 	result |= Check(dynamicBuffer.Lock(0, 16,
 		RENDER_BUFFER_UPDATE_PRESERVE, &bytes) == RENDER_RESULT_FAILED &&
 		bytes == nullptr,

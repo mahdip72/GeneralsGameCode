@@ -807,7 +807,8 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 			}
 		}
 
-		shadowVertexBufferOwner->Unlock_Buffer();
+		if (!shadowVertexBufferOwner->Unlock_Buffer())
+			return 0;
 
 		Int numIndex=(endX - startX) * (endY-startY)*6;	//6 indices per terrain cell (2 triangles).
 
@@ -872,7 +873,8 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 				}
 		}
 
-		shadowIndexBufferOwner->Unlock_Buffer();
+		if (!shadowIndexBufferOwner->Unlock_Buffer())
+			return 0;
 
 		rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
 			static_cast<unsigned short>(nShadowStartBatchVertex));
@@ -1553,7 +1555,8 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			}
 		}
 
-		shadowDecalVertexBufferOwner->Unlock_Buffer();
+		if (!shadowDecalVertexBufferOwner->Unlock_Buffer())
+			return;
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
@@ -1606,7 +1609,8 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 			}
 		}
 
-		shadowDecalIndexBufferOwner->Unlock_Buffer();
+		if (!shadowDecalIndexBufferOwner->Unlock_Buffer())
+			return;
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
 		nShadowDecalPolysInBatch += numPolys;
@@ -1728,7 +1732,8 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			pvVertices++;
 		}
 
-		shadowDecalVertexBufferOwner->Unlock_Buffer();
+		if (!shadowDecalVertexBufferOwner->Unlock_Buffer())
+			return;
 
 		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
@@ -1762,7 +1767,8 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 			pvIndices += 6;
 		}
 
-		shadowDecalIndexBufferOwner->Unlock_Buffer();
+		if (!shadowDecalIndexBufferOwner->Unlock_Buffer())
+			return;
 
 		Int numPolys = 2;	//2 triangles per decal
 		nShadowDecalPolysInBatch += numPolys;
