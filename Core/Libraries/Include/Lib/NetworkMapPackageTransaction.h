@@ -16,13 +16,21 @@ namespace rts { namespace network_epoch {
 class NetworkMapPackageTransaction
 {
 private:
-	// Serialize the journal check and every transaction phase among processes
-	// in this game session, without requiring writes to the map directory.
-	class MapMutex
+	// A tiny per-user temp file permits concurrent map readers while an
+	// exclusive writer/recovery lock covers every transaction phase. Windows
+	// releases byte-range locks if a process crashes. Do not delete the file
+	// while in use: recreating it would split the lock identity.
+	class MapLock
 	{
 	public:
-		explicit MapMutex(const std::string &map) : m_handle(nullptr), m_owned(false)
+		MapLock(const std::string &map, bool exclusive, bool insideCommit = false) :
+			m_handle(INVALID_HANDLE_VALUE), m_owned(false), m_insideCommit(insideCommit)
 		{
+			if (insideCommit)
+			{
+				m_owned = true;
+				return;
+			}
 			if (map.empty())
 				return;
 			char absolute[MAX_PATH];
@@ -39,32 +47,56 @@ private:
 				hash ^= ch;
 				hash *= 1099511628211ULL;
 			}
-			std::string name = "Local\\GGCNET3-";
+			char tempDirectory[MAX_PATH];
+			const DWORD tempLength = GetTempPathA(MAX_PATH, tempDirectory);
+			if (tempLength == 0 || tempLength >= MAX_PATH)
+				return;
+			std::string name = std::string(tempDirectory) + "GGCNET3-";
 			const char digits[] = "0123456789ABCDEF";
 			for (int shift = 60; shift >= 0; shift -= 4)
 				name += digits[(hash >> shift) & 15];
-			m_handle = CreateMutexA(nullptr, FALSE, name.c_str());
-			if (m_handle != nullptr)
-			{
-				const DWORD result = WaitForSingleObject(m_handle, 0);
-				m_owned = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
-			}
+			name += ".lock";
+			m_handle = CreateFileA(name.c_str(), GENERIC_READ | GENERIC_WRITE,
+				FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
+				FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (m_handle != INVALID_HANDLE_VALUE)
+				lock(exclusive);
 		}
-		~MapMutex()
+		~MapLock()
 		{
-			if (m_handle != nullptr)
-			{
-				if (m_owned)
-					ReleaseMutex(m_handle);
+			unlock();
+			if (m_handle != INVALID_HANDLE_VALUE)
 				CloseHandle(m_handle);
+		}
+		bool lock(bool exclusive)
+		{
+			if (m_owned || m_insideCommit)
+				return m_owned;
+			if (m_handle == INVALID_HANDLE_VALUE)
+				return false;
+			OVERLAPPED overlapped = {};
+			m_owned = LockFileEx(m_handle,
+				LOCKFILE_FAIL_IMMEDIATELY |
+				(exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0),
+				0, 1, 0, &overlapped) != 0;
+			return m_owned;
+		}
+		void unlock()
+		{
+			if (m_owned && !m_insideCommit)
+			{
+				OVERLAPPED overlapped = {};
+				UnlockFileEx(m_handle, 0, 1, 0, &overlapped);
 			}
+			m_owned = false;
 		}
 		bool valid() const { return m_owned; }
 	private:
-		MapMutex(const MapMutex &);
-		MapMutex &operator=(const MapMutex &);
+		MapLock(const MapLock &);
+		MapLock &operator=(const MapLock &);
 		HANDLE m_handle;
 		bool m_owned;
+		bool m_insideCommit;
 	};
 
 public:
@@ -80,21 +112,47 @@ public:
 		ReadGuard(const char *map, NotifyReplacement notify = nullptr,
 			void *context = nullptr) :
 			m_map(map != nullptr ? normalizePath(map) : std::string()),
-			m_mutex(m_map), m_ready(false)
+			m_lock(m_map, false, isCommitting()), m_ready(false)
 		{
-			if (!safePath(map) || !m_mutex.valid())
+			if (!safePath(map) || !m_lock.valid())
 				return;
+			if (isCommitting())
+			{
+				m_ready = true;
+				return;
+			}
 			const std::string journal = journalPath(m_map.c_str());
-			if (!journal.empty())
-				m_ready = isCommitting() ||
-					recoverLocked(m_map.c_str(), journal, notify, context);
+			if (journal.empty())
+				return;
+			const DWORD attributes = GetFileAttributesA(journal.c_str());
+			if (attributes == INVALID_FILE_ATTRIBUTES &&
+				(GetLastError() == ERROR_FILE_NOT_FOUND ||
+				GetLastError() == ERROR_PATH_NOT_FOUND))
+			{
+				m_ready = true;
+				return;
+			}
+			m_lock.unlock();
+			MapLock recovery(m_map, true);
+			if (!recovery.valid() ||
+				!recoverLocked(m_map.c_str(), journal, notify, context))
+				return;
+			recovery.unlock();
+			// Recheck after reacquiring shared ownership: a writer may have
+			// published a new journal between recovery and this read lock.
+			if (!m_lock.lock(false))
+				return;
+			const DWORD current = GetFileAttributesA(journal.c_str());
+			m_ready = current == INVALID_FILE_ATTRIBUTES &&
+				(GetLastError() == ERROR_FILE_NOT_FOUND ||
+				GetLastError() == ERROR_PATH_NOT_FOUND);
 		}
 		bool ready() const { return m_ready; }
 	private:
 		ReadGuard(const ReadGuard &);
 		ReadGuard &operator=(const ReadGuard &);
 		std::string m_map;
-		MapMutex m_mutex;
+		MapLock m_lock;
 		bool m_ready;
 	};
 
@@ -156,7 +214,7 @@ public:
 		const std::string journal = journalPath(map);
 		if (journal.empty())
 			return false;
-		MapMutex lock(map);
+		MapLock lock(map, true);
 		if (!lock.valid())
 			return false;
 		return recoverLocked(map, journal, notify, context);
@@ -290,7 +348,7 @@ public:
 		std::string mapDirectory;
 		if (!createDirectoryTree(map.c_str(), mapDirectory))
 			return false;
-		MapMutex lock(map);
+		MapLock lock(map, true);
 		if (!lock.valid())
 			return false;
 		std::vector<DiskFile> disk(m_files.size());

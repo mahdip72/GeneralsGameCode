@@ -139,6 +139,9 @@ UnsignedInt GetMapFileCRC(const AsciiString &mapName);
 Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc);
 Int GetMapSimulationSidecarMask(const AsciiString &mapName);
 #if defined(_WIN64)
+#include "Lib/NetworkMapPackageTransaction.h"
+typedef rts::network_epoch::NetworkMapPackageTransaction::ReadGuard NetworkMapReadGuard;
+void noteRecoveredMapFile(const char *path, void *context);
 Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName);
 Bool GetCurrentMapTransferContentsMask(const AsciiString &mapName,
 	UnsignedInt *maskOut);

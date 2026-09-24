@@ -114,14 +114,11 @@ static UnsignedInt calcCRC( AsciiString fname )
 }
 
 #if defined(_WIN64)
-static void noteRecoveredMapFile(const char *path, void *)
+void noteRecoveredMapFile(const char *path, void *)
 {
 	if (TheFileSystem != nullptr)
 		TheFileSystem->noteExternalFileReplacement(path);
 }
-
-typedef rts::network_epoch::NetworkMapPackageTransaction::ReadGuard
-	NetworkMapReadGuard;
 
 Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName)
 {

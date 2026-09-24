@@ -4079,16 +4079,24 @@ void ConnectionManager::parseUserList(const GameInfo *game)
 	clearNetworkSimulationPolicy();
 	m_networkSimulationMapCrc = game->getMapCRC();
 	UnsignedInt currentContentsMask = 0U;
-	const Bool contentsReadable =
-		GetCurrentMapTransferContentsMask(game->getMap(), &currentContentsMask);
+	Bool contentsReadable = FALSE;
+	Bool sidecarIdentityReadable = FALSE;
+	{
+		NetworkMapReadGuard mapRead(game->getMap().str(), noteRecoveredMapFile);
+		if (mapRead.ready())
+		{
+			contentsReadable = GetCurrentMapTransferContentsMask(
+				game->getMap(), &currentContentsMask);
+			sidecarIdentityReadable = GetNetworkMapPackageCompanionCRC(
+				game->getMap(), &m_networkMapPackageCompanionMask,
+				&m_networkMapPackageCompanionCrc);
+		}
+	}
 	// The lobby's map mask remains the shared simulation-policy input, but
 	// current local simulation sidecars must never gain parallel authority.
 	m_networkSimulationMapContentsMask = game->getMapContentsMask() |
 		static_cast<Int>(currentContentsMask &
 			rts::network_epoch::kNetworkSimulationSidecarMask);
-	const Bool sidecarIdentityReadable = GetNetworkMapPackageCompanionCRC(
-		game->getMap(), &m_networkMapPackageCompanionMask,
-		&m_networkMapPackageCompanionCrc);
 	beginNetworkHello();
 	if (!contentsReadable || !sidecarIdentityReadable)
 		rejectNetworkHello(-1, "NET3 map package read failed");

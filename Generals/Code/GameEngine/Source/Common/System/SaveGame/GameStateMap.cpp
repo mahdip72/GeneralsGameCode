@@ -72,7 +72,8 @@ GameStateMap::~GameStateMap()
 static void embedPristineMap( AsciiString map, Xfer *xfer )
 {
 #if defined(_WIN64)
-	if (!RecoverInterruptedNetworkMapPackage(map))
+	NetworkMapReadGuard mapRead(map.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
 		throw SC_INVALID_DATA;
 #endif
 

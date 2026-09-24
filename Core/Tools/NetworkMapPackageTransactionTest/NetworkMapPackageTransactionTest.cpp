@@ -237,6 +237,13 @@ int main(int argc, char **argv)
 		GetFileAttributesA((map + ".ggclock").c_str()) == INVALID_FILE_ATTRIBUTES &&
 		Read(map) == oldMap,
 		"map without a journal remains readable without directory writes") && ok;
+	const bool madeReadonly = SetFileAttributesA(map.c_str(), FILE_ATTRIBUTE_READONLY) != 0;
+	{
+		NetworkMapPackageTransaction::ReadGuard readonlyRead(map.c_str());
+		ok = Check(madeReadonly && readonlyRead.ready() && Read(map) == oldMap,
+			"read-only map remains readable through the shared guard") && ok;
+	}
+	SetFileAttributesA(map.c_str(), FILE_ATTRIBUTE_NORMAL);
 	const std::string newIni = "new=2\r\n";
 	const std::string newMap("new-map\0bytes", 13);
 	const std::string rogue = folder + "\\rogue.dat";
@@ -613,6 +620,12 @@ int main(int argc, char **argv)
 			}
 			Sleep(10);
 		}
+	}
+	{
+		NetworkMapPackageTransaction::ReadGuard secondReader(readMap.c_str());
+		ok = Check(readReady && secondReader.ready() &&
+			Read(ini) == "read-old" && Read(readMap) == "read-old",
+			"separate processes read the same package concurrently") && ok;
 	}
 	NetworkMapPackageTransaction pendingReadCommit;
 	ok = Check(readReady && pendingReadCommit.stage(ini.c_str(),

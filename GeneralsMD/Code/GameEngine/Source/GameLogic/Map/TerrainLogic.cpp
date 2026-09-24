@@ -1254,7 +1254,8 @@ Bool TerrainLogic::loadMap( AsciiString filename, Bool query )
 	if( filename.isEmpty() )
 		return FALSE;
 #if defined(_WIN64)
-	if (!RecoverInterruptedNetworkMapPackage(filename))
+	NetworkMapReadGuard mapRead(filename.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
 		return FALSE;
 #endif
 

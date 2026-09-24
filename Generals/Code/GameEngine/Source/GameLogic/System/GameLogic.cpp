@@ -2062,11 +2062,20 @@ void GameLogic::tryStartNewGame( Bool loadingSaveGame )
 
 	DEBUG_ASSERTCRASH(m_frame == 0, ("framecounter expected to be 0 here"));
 
+#if defined(_WIN64)
+	{
+		NetworkMapReadGuard mapRead(TheGlobalData->m_mapName.str(), noteRecoveredMapFile);
+		if (!mapRead.ready())
+			throw SC_INVALID_DATA;
+#endif
 	// before loading the map, load the map.ini file in the same directory.
 	loadMapINI( TheGlobalData->m_mapName );
 
 	// load a map
 	TheTerrainLogic->loadMap( TheGlobalData->m_mapName, false );
+#if defined(_WIN64)
+	}
+#endif
 	// anytime the world's size changes, must reset the partition mgr
 	//ThePartitionManager->init();
 
@@ -3064,7 +3073,8 @@ void GameLogic::loadMapINI( AsciiString mapName )
 #if defined(_WIN64)
 	// Map INI, strings, and asset-use data are read before TerrainLogic loads
 	// the .map. Recover an interrupted NET3 package before any companion read.
-	if (!RecoverInterruptedNetworkMapPackage(AsciiString(pristineMapName)))
+	NetworkMapReadGuard mapRead(pristineMapName, noteRecoveredMapFile);
+	if (!mapRead.ready())
 		throw SC_INVALID_DATA;
 #endif
 

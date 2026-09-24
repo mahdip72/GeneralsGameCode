@@ -308,10 +308,6 @@ Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 #if defined(_WIN64)
 	if (game == nullptr)
 		return FALSE;
-	rts::network_epoch::NetworkMapPackageTransaction::ReadGuard mapRead(
-		game->getMap().str(), noteRecoveredTransferMapFile);
-	if (!mapRead.ready())
-		return FALSE;
 #endif
 	Int mask = 0;
 	Int i=0;
@@ -327,6 +323,12 @@ Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 		TheNetwork->liteupdate();
 		Sleep(1);
 	}
+	// The network hello may take eleven seconds. Only hold the package read
+	// lock while selecting and streaming actual installed map bytes.
+	rts::network_epoch::NetworkMapPackageTransaction::ReadGuard mapRead(
+		game->getMap().str(), noteRecoveredTransferMapFile);
+	if (!mapRead.ready())
+		return FALSE;
 	UnsignedInt hostContentsMask = 0U;
 	UnsignedInt hostSidecarCRC = 0U;
 	if (!TheNetwork->getNetworkMapSidecarIdentity(0, &hostContentsMask,
