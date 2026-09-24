@@ -68,6 +68,13 @@ enum
 bool ProjectedTerrainGridMayReachParallelThreshold(
 	Real sizeX, Real sizeY, Real mapXYFactor);
 
+/* The row grain and range decision shared by projected-shadow preparation
+ * and its tests. Keeping the scheduler decision here lets the owner skip
+ * validation/task admission when the grid can produce only one range. */
+unsigned ProjectedTerrainGridMinimumRowsPerTask(unsigned cellWidth);
+bool ProjectedTerrainGridHasMultipleRowRanges(unsigned rowCount,
+	unsigned cellWidth, unsigned workerCount);
+
 /* Owner-side reusable bounded scratch.  No pointer returned by this object
  * may outlive the synchronous preparation call that borrowed it. */
 class ProjectedTerrainGridScratch

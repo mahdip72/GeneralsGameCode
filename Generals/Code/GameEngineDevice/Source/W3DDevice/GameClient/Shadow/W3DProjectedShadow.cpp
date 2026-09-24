@@ -57,6 +57,7 @@
 #include "W3DDevice/GameClient/Module/W3DModelDraw.h"
 #include "W3DDevice/GameClient/W3DShadow.h"
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
+#include "W3DDevice/Common/ProjectedShadowQueuePolicy.h"
 #include "Lib/ProjectedTerrainGridKernel.h"
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Renderer/RenderGameClient.h"
@@ -225,10 +226,8 @@ public:
 
 	virtual unsigned minimumRowsPerTask() const
 	{
-		if (m_snapshot.cellWidth == 0)
-			return 1;
-		return (PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS +
-			m_snapshot.cellWidth - 1) / m_snapshot.cellWidth;
+		return ProjectedTerrainGridMinimumRowsPerTask(
+			m_snapshot.cellWidth);
 	}
 
 	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd)
@@ -245,6 +244,14 @@ private:
 	ProjectedTerrainGridVertex *m_vertices;
 	UnsignedShort *m_indices;
 };
+
+bool ProjectedTerrainGridHasParallelCapacity(unsigned rowCount,
+	unsigned cellWidth)
+{
+	RadarTerrainPrepareService &service = GetRadarTerrainPrepareService();
+	return service.warmup() && ProjectedTerrainGridHasMultipleRowRanges(
+		rowCount, cellWidth, rts::JobSystem::instance().workerCount());
+}
 
 bool RunProjectedTerrainGridParallel(
 	const ProjectedTerrainGridSnapshot &snapshot,
@@ -537,6 +544,10 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 	cellCount = static_cast<unsigned>(endX - startX) *
 		static_cast<unsigned>(endY - startY);
 	if (cellCount < PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS)
+		return result;
+	if (!ProjectedTerrainGridHasParallelCapacity(
+		static_cast<unsigned>(vertsPerColumn),
+		static_cast<unsigned>(endX - startX)))
 		return result;
 
 	memset(&snapshot, 0, sizeof(snapshot));
@@ -1171,6 +1182,10 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 		nShadowDecalIndicesInBuf > SHADOW_DECAL_INDEX_SIZE - numIndex ||
 		nShadowDecalVertsInBatch > SHADOW_DECAL_VERTEX_SIZE - numVerts)
 		return -1;
+	if (!ProjectedTerrainGridHasParallelCapacity(
+		static_cast<unsigned>(vertsPerColumn),
+		static_cast<unsigned>(endX - startX)))
+		return -1;
 
 	memset(&snapshot, 0, sizeof(snapshot));
 	snapshot.width = static_cast<unsigned>(vertsPerRow);
@@ -1210,11 +1225,11 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 			numVerts * sizeof(SHADOW_DECAL_VERTEX),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 			reinterpret_cast<void **>(&pvVertices)))
-			return 0;
+			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
 		if (pvVertices == 0)
 		{
 			shadowDecalVertexBufferOwner->Unlock_Buffer();
-			return 0;
+			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
 		}
 		memcpy(pvVertices, s_projectedTerrainGridScratch.vertices(),
 			static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
@@ -1225,11 +1240,11 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 			numIndex * sizeof(UnsignedShort),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 			reinterpret_cast<void **>(&pvIndices)))
-			return 0;
+			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
 		if (pvIndices == 0)
 		{
 			shadowDecalIndexBufferOwner->Unlock_Buffer();
-			return 0;
+			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
 		}
 		for (index = 0; index < static_cast<unsigned>(numIndex); ++index)
 			pvIndices[index] = static_cast<UnsignedShort>(
@@ -1242,7 +1257,7 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 		nShadowDecalVertsInBatch += numVerts;
 		nShadowDecalIndicesInBuf += numIndex;
 	}
-	return 1;
+	return PROJECTED_SHADOW_QUEUE_COMPLETED;
 }
 /**Decals have a low poly count so its better to render large numbers at once.  This system will queue them
  up until the buffers fill up.  It will then flush the buffer (draw decals) and be ready for new decals.  This
@@ -1254,7 +1269,7 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		GetRadarTerrainPrepareService().isInitialized() &&
 		(shadow == 0 || ProjectedTerrainGridMayReachParallelThreshold(
 			shadow->m_decalSizeX, shadow->m_decalSizeY, MAP_XY_FACTOR)) &&
-		queueDecalParallel(shadow) >= 0)
+		ProjectedShadowQueueAttemptCompleted(queueDecalParallel(shadow)))
 		return;
 
 	int i,j,k;

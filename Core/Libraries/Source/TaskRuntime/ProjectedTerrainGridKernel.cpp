@@ -1,4 +1,5 @@
 #include "Lib/ProjectedTerrainGridKernel.h"
+#include "Lib/JobSystem.h"
 
 #include <float.h>
 #include <limits.h>
@@ -331,6 +332,23 @@ bool ProjectedTerrainGridMayReachParallelThreshold(
 		return true;
 	return maxCellCount >=
 		static_cast<Real>(PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS);
+}
+
+unsigned ProjectedTerrainGridMinimumRowsPerTask(unsigned cellWidth)
+{
+	if (cellWidth == 0)
+		return 1;
+	return PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS / cellWidth +
+		(PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS % cellWidth != 0 ? 1 : 0);
+}
+
+bool ProjectedTerrainGridHasMultipleRowRanges(unsigned rowCount,
+	unsigned cellWidth, unsigned workerCount)
+{
+	if (rowCount == 0 || cellWidth == 0)
+		return false;
+	return rts::JobSystem::chooseRangeCount(rowCount,
+		ProjectedTerrainGridMinimumRowsPerTask(cellWidth), workerCount) > 1;
 }
 
 bool ProjectedTerrainGridScratch::ensure(unsigned width, unsigned height)

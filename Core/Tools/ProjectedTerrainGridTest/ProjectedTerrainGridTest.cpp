@@ -4,6 +4,7 @@
 #include "../TestSupport/LocalCapacityTestLane.h"
 #include "W3DDevice/Common/ShadowDecalTransform.h"
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
+#include "W3DDevice/Common/ProjectedShadowQueuePolicy.h"
 #include "WWMath/matrix3d.h"
 
 #include <stdio.h>
@@ -35,9 +36,8 @@ public:
 	}
 	virtual unsigned minimumRowsPerTask() const
 	{
-		return m_snapshot.cellWidth == 0 ? 1 :
-			(PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS +
-			 m_snapshot.cellWidth - 1) / m_snapshot.cellWidth;
+		return ProjectedTerrainGridMinimumRowsPerTask(
+			m_snapshot.cellWidth);
 	}
 	virtual bool executeRows(unsigned begin, unsigned end)
 	{
@@ -448,6 +448,30 @@ static int invalidAndReuse()
 	return 0;
 }
 
+static int projectedShadowQueueFallbackPolicy()
+{
+	CHECK(!ProjectedShadowQueueAttemptCompleted(
+		PROJECTED_SHADOW_QUEUE_RETRY_SERIAL));
+	CHECK(!ProjectedShadowQueueAttemptCompleted(0));
+	CHECK(!ProjectedShadowQueueAttemptCompleted(2));
+	CHECK(ProjectedShadowQueueAttemptCompleted(
+		PROJECTED_SHADOW_QUEUE_COMPLETED));
+	return 0;
+}
+
+static int projectedTerrainSingleRangePolicy()
+{
+	/* A 64-by-8-cell shallow patch reaches the 512-cell admission threshold,
+	 * but its nine vertex rows still form only one useful grain-8 range. */
+	CHECK(ProjectedTerrainGridMinimumRowsPerTask(64) == 8);
+	CHECK(!ProjectedTerrainGridHasMultipleRowRanges(9, 64, 6));
+	CHECK(ProjectedTerrainGridHasMultipleRowRanges(16, 64, 6));
+	CHECK(!ProjectedTerrainGridHasMultipleRowRanges(16, 64, 1));
+	CHECK(!ProjectedTerrainGridHasMultipleRowRanges(0, 64, 6));
+	CHECK(ProjectedTerrainGridMinimumRowsPerTask(0) == 1);
+	return 0;
+}
+
 #if defined(RTS_BUILD_CORE_EXTRAS)
 static int faultFallback(RadarTerrainPrepareService &service)
 {
@@ -504,6 +528,8 @@ int main(int argc, char **argv)
 	}
 	rts_test::PrintTestCapacityLane(localCapacity);
 	CHECK(prepareTreeZeroAngleRegression() == 0);
+	CHECK(projectedShadowQueueFallbackPolicy() == 0);
+	CHECK(projectedTerrainSingleRangePolicy() == 0);
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
 	unsigned worker;
 	rts::JobSystem &system = rts::JobSystem::instance();
