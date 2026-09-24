@@ -35,6 +35,15 @@ add_test(NAME height_map_dynamic_light_prepare_tests
     COMMAND height_map_dynamic_light_prepare_tests)
 set_tests_properties(height_map_dynamic_light_prepare_tests PROPERTIES TIMEOUT 30)
 
+add_executable(height_map_dynamic_light_envelope_tests
+    HeightMapDynamicLightEnvelopeTest.cpp)
+set_target_properties(height_map_dynamic_light_envelope_tests PROPERTIES
+    CXX_STANDARD 98 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+add_test(NAME height_map_dynamic_light_envelope_tests
+    COMMAND height_map_dynamic_light_envelope_tests)
+set_tests_properties(height_map_dynamic_light_envelope_tests
+    PROPERTIES TIMEOUT 30)
+
 if(WIN32 AND MSVC)
     add_executable(height_map_dynamic_light_far_cull_parity_tests
         HeightMapDynamicLightFarCullParityTest.cpp

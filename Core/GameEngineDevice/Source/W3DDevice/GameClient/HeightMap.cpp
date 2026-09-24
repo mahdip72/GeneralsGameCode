@@ -85,6 +85,7 @@
 #include "W3DDevice/GameClient/W3DShadow.h"
 #include "W3DDevice/GameClient/W3DWater.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
+#include "HeightMapDynamicLightEnvelope.h"
 #include "Renderer/RenderGameClient.h"
 
 // Keep the source-level contract explicit without importing the renderer namespace.
@@ -1261,6 +1262,7 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 	const unsigned verticesPerRow = VERTEX_BUFFER_TILE_LENGTH * 4;
 	unsigned lightIndex;
 	unsigned cellIndex = 0;
+	HeightMapDynamicLightBounds lightBounds[MAX_ENABLED_DYNAMIC_LIGHTS];
 
 	if (!data || !m_map || !pLights || width == 0 || height == 0 ||
 		x0 < originX || y0 < originY ||
@@ -1286,6 +1288,14 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 
 		if (!light)
 			return false;
+		lightBounds[lightIndex].minX = light->m_minX;
+		lightBounds[lightIndex].minY = light->m_minY;
+		lightBounds[lightIndex].maxX = light->m_maxX;
+		lightBounds[lightIndex].maxY = light->m_maxY;
+		lightBounds[lightIndex].prevMinX = light->m_prevMinX;
+		lightBounds[lightIndex].prevMinY = light->m_prevMinY;
+		lightBounds[lightIndex].prevMaxX = light->m_prevMaxX;
+		lightBounds[lightIndex].prevMaxY = light->m_prevMaxY;
 		lightType = light->Get_Type();
 		if (lightType == LightClass::POINT)
 			captured.type = HEIGHTMAP_DYNAMIC_LIGHT_POINT;
@@ -1349,15 +1359,8 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 				nextX = m_map->getXExtent() - m_map->getDrawOrgX() - 1;
 			for (maskIndex = 0; maskIndex < numLights; ++maskIndex)
 			{
-				W3DDynamicLight *light = pLights[maskIndex];
-				if ((light->m_minX <= xCoord + 1 &&
-					light->m_maxX >= xCoord &&
-					light->m_minY <= yCoord + 1 &&
-					light->m_maxY >= yCoord) ||
-					(light->m_prevMinX <= xCoord + 1 &&
-					light->m_prevMaxX >= xCoord &&
-					light->m_prevMinY <= yCoord + 1 &&
-					light->m_prevMaxY >= yCoord))
+				if (HeightMapDynamicLightCellHit(lightBounds[maskIndex],
+					xCoord, yCoord))
 				{
 					intersects = true;
 					break;
@@ -2069,6 +2072,20 @@ void HeightMapRenderObjClass::On_Frame_Update()
 		pLight->m_priorEnable = pLight->m_enabled;
 	}
 	if (numDynaLights > 0) {
+#if !OPTIMIZED_HEIGHTMAP_LIGHTING && !defined(USE_NORMALS)
+		HeightMapDynamicLightBounds lightBounds[MAX_ENABLED_DYNAMIC_LIGHTS];
+		for (k = 0; k < numDynaLights; ++k)
+		{
+			lightBounds[k].minX = enabledLights[k]->m_minX;
+			lightBounds[k].minY = enabledLights[k]->m_minY;
+			lightBounds[k].maxX = enabledLights[k]->m_maxX;
+			lightBounds[k].maxY = enabledLights[k]->m_maxY;
+			lightBounds[k].prevMinX = enabledLights[k]->m_prevMinX;
+			lightBounds[k].prevMinY = enabledLights[k]->m_prevMinY;
+			lightBounds[k].prevMaxX = enabledLights[k]->m_prevMaxX;
+			lightBounds[k].prevMaxY = enabledLights[k]->m_prevMaxY;
+		}
+#endif
 		//step through each vertex buffer that needs updating
 		for (j=0; j<m_numVBTilesY; j++)
 		{
@@ -2160,6 +2177,30 @@ void HeightMapRenderObjClass::On_Frame_Update()
 				if (!intersect) {
 					continue;
 				}
+#if !OPTIMIZED_HEIGHTMAP_LIGHTING && !defined(USE_NORMALS)
+				int xCoords[VERTEX_BUFFER_TILE_LENGTH];
+				int yCoords[VERTEX_BUFFER_TILE_LENGTH];
+				for (k = 0; k < VERTEX_BUFFER_TILE_LENGTH; ++k)
+				{
+					xCoords[k] = getXWithOrigin(originX + k) +
+						m_map->getDrawOrgX() - m_map->getBorderSizeInline();
+					yCoords[k] = getYWithOrigin(originY + k) +
+						m_map->getDrawOrgY() - m_map->getBorderSizeInline();
+				}
+				HeightMapDynamicLightEnvelope envelope;
+				if (HeightMapFindDynamicLightEnvelope(xCoords,
+					VERTEX_BUFFER_TILE_LENGTH, yCoords,
+					VERTEX_BUFFER_TILE_LENGTH, lightBounds, numDynaLights,
+					envelope))
+				{
+					xMin = originX + envelope.x0;
+					xMax = originX + envelope.x1;
+					yMin = originY + envelope.y0;
+					yMax = originY + envelope.y1;
+				}
+				// An empty tile still takes the old lock/Commit path so a failed
+				// buffer can request a full update.
+#endif
 				DX8VertexBufferClass *pVB = getVertexBufferTile(i, j);
 				VERTEX_FORMAT *pData = getVertexBufferBackup(i, j);
 				RadarTerrainPrepareService &lightService =
