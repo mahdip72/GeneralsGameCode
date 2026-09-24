@@ -16,6 +16,7 @@ bool NativeSortingRendererTestRetireAllComplete();
 bool NativeSortingRendererTestRetireMixedPending();
 unsigned int NativeSortingRendererTestLastFlushScratchAllocationCount();
 unsigned int NativeSortingRendererTestLastFlushPreparedGrowthCount();
+unsigned long long NativeSortingRendererTestLastFlushWorkspaceCapacityBytes();
 
 namespace
 {
@@ -211,6 +212,18 @@ bool SameAcceptedDrawStream(const std::vector<CapturedDraw> &left,
 			return false;
 	}
 	return true;
+}
+
+bool SameCapturedBatchBytes(const CapturedBatch &left,
+	const CapturedBatch &right)
+{
+	return left.states == right.states &&
+		left.indexCounts == right.indexCounts &&
+		left.startIndices == right.startIndices &&
+		left.vertexOffsets == right.vertexOffsets &&
+		left.vertexStrides == right.vertexStrides &&
+		left.indices == right.indices && left.vertices == right.vertices &&
+		left.acceptedDrawCount == right.acceptedDrawCount;
 }
 
 NativeDrawPacket MakePacket(unsigned int vertexCount, unsigned int indexCount)
@@ -777,18 +790,54 @@ void TestFlushLocalScratchReuseMixedSizesAndRetry()
 	QueueMixedSizeScratchReuseFixture(retryRenderer);
 	CHECK(retryRenderer.Flush(retrySink) == RENDER_RESULT_FAILED);
 	CHECK(!retryRenderer.Empty());
+	const unsigned long long retainedAfterFailure =
+		NativeSortingRendererTestLastFlushWorkspaceCapacityBytes();
+	CHECK(retainedAfterFailure <= 24ULL * 1024ULL * 1024ULL);
 	CHECK(NativeSortingRendererTestLastFlushScratchAllocationCount() == 1);
 	CHECK(NativeSortingRendererTestLastFlushPreparedGrowthCount() == 1);
 
 	retrySink.failCall = 0;
 	CHECK(retryRenderer.Flush(retrySink) == RENDER_RESULT_OK);
 	CHECK(retryRenderer.Empty());
+	CHECK(NativeSortingRendererTestLastFlushWorkspaceCapacityBytes() ==
+		retainedAfterFailure);
 	CHECK(NativeSortingRendererTestLastFlushScratchAllocationCount() == 1);
-	CHECK(NativeSortingRendererTestLastFlushPreparedGrowthCount() == 1);
+	CHECK(NativeSortingRendererTestLastFlushPreparedGrowthCount() == 0);
 	std::vector<CapturedDraw> retriedDraws;
 	CHECK(CaptureAcceptedDrawStream(retrySink, retriedDraws));
 	CheckMixedSizeScratchReuseStream(retriedDraws);
 	CHECK(SameAcceptedDrawStream(baselineDraws, retriedDraws));
+}
+
+void TestFlushWorkspaceReusePreservesRepeatedBatchBytes()
+{
+	NativeSortingRenderer baselineRenderer;
+	RecordingSink baselineSink;
+	QueueMixedSizeScratchReuseFixture(baselineRenderer);
+	CHECK(baselineRenderer.Flush(baselineSink) == RENDER_RESULT_OK);
+	CHECK(baselineSink.batches.size() == 1);
+
+	NativeSortingRenderer reuseRenderer;
+	RecordingSink reuseSink;
+	QueueMixedSizeScratchReuseFixture(reuseRenderer);
+	CHECK(reuseRenderer.Flush(reuseSink) == RENDER_RESULT_OK);
+	const unsigned long long warmCapacityBytes =
+		NativeSortingRendererTestLastFlushWorkspaceCapacityBytes();
+	CHECK(warmCapacityBytes > 0);
+	CHECK(warmCapacityBytes <= 24ULL * 1024ULL * 1024ULL);
+	QueueMixedSizeScratchReuseFixture(reuseRenderer);
+	CHECK(reuseRenderer.Flush(reuseSink) == RENDER_RESULT_OK);
+	CHECK(NativeSortingRendererTestLastFlushWorkspaceCapacityBytes() ==
+		warmCapacityBytes);
+	CHECK(reuseSink.batches.size() == 2);
+	if (baselineSink.batches.size() == 1 && reuseSink.batches.size() == 2)
+	{
+		CHECK(SameCapturedBatchBytes(baselineSink.batches[0],
+			reuseSink.batches[0]));
+		CHECK(SameCapturedBatchBytes(baselineSink.batches[0],
+			reuseSink.batches[1]));
+	}
+	CHECK(reuseRenderer.Empty());
 }
 
 void TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput()
@@ -840,6 +889,7 @@ int main()
 	TestFailureAfterFirstChunkRetainsOnlyPendingGeometry();
 	TestPartialDrawFailureRetryMatchesOneShotOutput();
 	TestFlushLocalScratchReuseMixedSizesAndRetry();
+	TestFlushWorkspaceReusePreservesRepeatedBatchBytes();
 	TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput();
 	CHECK(NativeSortingRendererTestRetireAllComplete());
 	CHECK(NativeSortingRendererTestRetireMixedPending());

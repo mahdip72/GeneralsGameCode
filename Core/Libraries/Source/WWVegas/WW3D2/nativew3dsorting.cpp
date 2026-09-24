@@ -32,6 +32,8 @@ const unsigned int MAX_SORTING_VERTEX_CAPACITY = 65536U;
 const unsigned int MAX_SORTING_TRIANGLES_PER_CHUNK =
 	MAX_SORTING_INDEX_COUNT / 3U;
 const unsigned int MAX_SORTING_TRIANGLES_PER_KERNEL_CALL = 65535U;
+const unsigned long long MAX_RETAINED_FLUSH_WORKSPACE_BYTES =
+	24ULL * 1024ULL * 1024ULL;
 
 struct SortedSubmission
 {
@@ -82,6 +84,83 @@ struct DrawRun
 	size_t triangleCount;
 };
 
+struct FlushWorkspace
+{
+	std::vector<rts::SortingTriangleOutput> prepared;
+	std::vector<SortedNode> nodes;
+	std::vector<size_t> positiveNodes;
+	std::vector<size_t> unsortedNodes;
+	std::vector<size_t> nodeOrder;
+	std::vector<SortedTriangle> triangles;
+	std::vector<unsigned char> chunkVertices;
+	std::vector<unsigned short> chunkIndices;
+	std::vector<NativeSortedDraw> draws;
+	std::vector<DrawRun> runs;
+
+	void Clear()
+	{
+		prepared.clear();
+		nodes.clear();
+		positiveNodes.clear();
+		unsortedNodes.clear();
+		nodeOrder.clear();
+		triangles.clear();
+		chunkVertices.clear();
+		chunkIndices.clear();
+		draws.clear();
+		runs.clear();
+	}
+
+	unsigned long long RetainedCapacityBytes() const
+	{
+		return VectorCapacityBytes(prepared) + VectorCapacityBytes(nodes) +
+			VectorCapacityBytes(positiveNodes) +
+			VectorCapacityBytes(unsortedNodes) +
+			VectorCapacityBytes(nodeOrder) + VectorCapacityBytes(triangles) +
+			VectorCapacityBytes(chunkVertices) +
+			VectorCapacityBytes(chunkIndices) + VectorCapacityBytes(draws) +
+			VectorCapacityBytes(runs);
+	}
+
+	void TrimToRetainedCapacityBudget()
+	{
+		unsigned long long retainedBytes = RetainedCapacityBytes();
+		if (retainedBytes <= MAX_RETAINED_FLUSH_WORKSPACE_BYTES)
+			return;
+		ReleaseCapacity(draws, retainedBytes);
+		ReleaseCapacity(triangles, retainedBytes);
+		ReleaseCapacity(prepared, retainedBytes);
+		ReleaseCapacity(chunkVertices, retainedBytes);
+		ReleaseCapacity(chunkIndices, retainedBytes);
+		ReleaseCapacity(runs, retainedBytes);
+		ReleaseCapacity(nodes, retainedBytes);
+		ReleaseCapacity(positiveNodes, retainedBytes);
+		ReleaseCapacity(unsortedNodes, retainedBytes);
+		ReleaseCapacity(nodeOrder, retainedBytes);
+	}
+
+private:
+	template <typename T>
+	static unsigned long long VectorCapacityBytes(const std::vector<T> &value)
+	{
+		return static_cast<unsigned long long>(value.capacity()) * sizeof(T);
+	}
+
+	template <typename T>
+	static void ReleaseCapacity(std::vector<T> &value,
+		unsigned long long &retainedBytes)
+	{
+		if (retainedBytes <= MAX_RETAINED_FLUSH_WORKSPACE_BYTES)
+			return;
+		const unsigned long long capacityBytes = VectorCapacityBytes(value);
+		if (capacityBytes == 0)
+			return;
+		std::vector<T> empty;
+		value.swap(empty);
+		retainedBytes -= capacityBytes;
+	}
+};
+
 struct FlushScope
 {
 	explicit FlushScope(bool &activeFlag) : active(activeFlag)
@@ -98,7 +177,31 @@ struct FlushScope
 #if defined(RTS_NATIVE_SORTING_TESTS)
 unsigned int g_nativeSortingLastFlushScratchAllocationCount = 0;
 unsigned int g_nativeSortingLastFlushPreparedGrowthCount = 0;
+unsigned long long g_nativeSortingLastFlushWorkspaceCapacityBytes = 0;
 #endif
+
+class FlushWorkspaceScope
+{
+public:
+	explicit FlushWorkspaceScope(FlushWorkspace &workspace)
+		: workspace(workspace)
+	{
+		this->workspace.Clear();
+	}
+
+	~FlushWorkspaceScope()
+	{
+		workspace.Clear();
+		workspace.TrimToRetainedCapacityBudget();
+#if defined(RTS_NATIVE_SORTING_TESTS)
+		g_nativeSortingLastFlushWorkspaceCapacityBytes =
+			workspace.RetainedCapacityBytes();
+#endif
+	}
+
+private:
+	FlushWorkspace &workspace;
+};
 
 bool IsFiniteFloat(float value)
 {
@@ -522,10 +625,12 @@ namespace render
 struct NativeSortingRenderer::Impl
 {
 	std::vector<SortedSubmission> submissions;
+	FlushWorkspace workspace;
 	size_t nextInsertionOrder;
 	bool flushing;
 
-	Impl() : submissions(), nextInsertionOrder(1), flushing(false) {}
+	Impl() : submissions(), workspace(), nextInsertionOrder(1),
+		flushing(false) {}
 };
 
 NativeSortingRenderer::NativeSortingRenderer() : m_impl(new Impl())
@@ -593,16 +698,18 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 	if (m_impl->flushing)
 		return RENDER_RESULT_FAILED;
 	FlushScope flushScope(m_impl->flushing);
+	FlushWorkspaceScope workspaceScope(m_impl->workspace);
 
 	try
 	{
 		// SortingTriangleScratchLease is synchronously fenced by each kernel
-		// call, so one Flush-local workspace safely serves every sorted node.
+		// call, so one workspace safely serves every sorted node and Flush.
 		rts::SortingTriangleScratchLease scratch;
-		std::vector<rts::SortingTriangleOutput> prepared;
-		std::vector<SortedNode> nodes;
-		std::vector<size_t> positiveNodes;
-		std::vector<size_t> unsortedNodes;
+		std::vector<rts::SortingTriangleOutput> &prepared =
+			m_impl->workspace.prepared;
+		std::vector<SortedNode> &nodes = m_impl->workspace.nodes;
+		std::vector<size_t> &positiveNodes = m_impl->workspace.positiveNodes;
+		std::vector<size_t> &unsortedNodes = m_impl->workspace.unsortedNodes;
 		nodes.reserve(m_impl->submissions.size());
 		for (size_t index = 0; index < m_impl->submissions.size(); ++index)
 		{
@@ -646,7 +753,7 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 				break;
 			}
 		}
-		std::vector<size_t> nodeOrder;
+		std::vector<size_t> &nodeOrder = m_impl->workspace.nodeOrder;
 		nodeOrder.reserve(nodes.size());
 		nodeOrder.insert(nodeOrder.end(), positiveNodes.begin(),
 			positiveNodes.begin() + splice);
@@ -655,7 +762,7 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 		nodeOrder.insert(nodeOrder.end(), positiveNodes.begin() + splice,
 			positiveNodes.end());
 
-		std::vector<SortedTriangle> triangles;
+		std::vector<SortedTriangle> &triangles = m_impl->workspace.triangles;
 		for (size_t order = 0; order < nodeOrder.size(); ++order)
 		{
 			const SortedNode &node = nodes[nodeOrder[order]];
@@ -681,10 +788,16 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 
 		for (size_t chunkOffset = 0; chunkOffset < triangles.size(); )
 		{
-			std::vector<unsigned char> chunkVertices;
-			std::vector<unsigned short> chunkIndices;
-			std::vector<NativeSortedDraw> draws;
-			std::vector<DrawRun> runs;
+			std::vector<unsigned char> &chunkVertices =
+				m_impl->workspace.chunkVertices;
+			std::vector<unsigned short> &chunkIndices =
+				m_impl->workspace.chunkIndices;
+			std::vector<NativeSortedDraw> &draws = m_impl->workspace.draws;
+			std::vector<DrawRun> &runs = m_impl->workspace.runs;
+			chunkVertices.clear();
+			chunkIndices.clear();
+			draws.clear();
+			runs.clear();
 			std::vector<size_t> vertexOffsets(m_impl->submissions.size(),
 				std::numeric_limits<size_t>::max());
 			const NativeDrawPacket *chunkPacket = 0;
@@ -798,6 +911,11 @@ unsigned int NativeSortingRendererTestLastFlushScratchAllocationCount()
 unsigned int NativeSortingRendererTestLastFlushPreparedGrowthCount()
 {
 	return g_nativeSortingLastFlushPreparedGrowthCount;
+}
+
+unsigned long long NativeSortingRendererTestLastFlushWorkspaceCapacityBytes()
+{
+	return g_nativeSortingLastFlushWorkspaceCapacityBytes;
 }
 
 bool NativeSortingRendererTestRetireAllComplete()
