@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Lib/RuntimeEpochContract.h"
+#include "Lib/MultiplayerSimulationPolicy.h"
 
 #include <array>
 #include <algorithm>
@@ -15,6 +16,9 @@ namespace rts
 namespace network_epoch
 {
 
+static_assert(MULTIPLAYER_SIMULATION_ENGINE_EPOCH ==
+	static_cast<int>(runtime_epoch::kCurrentEngineEpoch));
+
 // The gameplay transport carries this record as an opaque byte sequence.  It
 // must never be replaced with sizeof(NetworkHello): NetworkHello is a logical
 // contract, while the wire representation is the fixed NET3 encoding owned by
@@ -27,14 +31,16 @@ namespace network_epoch
 // in the identity because NAT may rewrite them. The transport owner separately
 // binds the observed source to its post-NAT peer endpoint before validation.
 //
-// This tokenized 60-byte record is mandatory for the clean Stage 3 runtime
-// epoch. Earlier 52-byte development records and pre-epoch peers are
+// This tokenized, policy-bearing 88-byte record is mandatory for the Stage 5
+// runtime epoch. Earlier 80-byte/60-byte/52-byte development records and pre-epoch peers are
 // intentionally unsupported and are dropped by their NET3 prefix.
 constexpr std::size_t kNetworkHelloKindSize = sizeof(std::uint32_t);
 constexpr std::size_t kNetworkHelloIdentitySize = 8U;
 constexpr std::size_t kNetworkHelloSessionTokenSize = sizeof(std::uint64_t);
+constexpr std::size_t kNetworkHelloSimulationPolicySize = 7U * sizeof(std::uint32_t);
 constexpr std::size_t kNetworkHelloPayloadSize =
-	kNetworkHelloKindSize + kNetworkHelloIdentitySize + kNetworkHelloSessionTokenSize;
+	kNetworkHelloKindSize + kNetworkHelloIdentitySize + kNetworkHelloSessionTokenSize +
+	kNetworkHelloSimulationPolicySize;
 constexpr std::size_t kNetworkHelloWireSize =
 	runtime_epoch::kHeaderSize + kNetworkHelloPayloadSize;
 constexpr std::size_t kNetworkHelloKindOffset = runtime_epoch::kHeaderSize;
@@ -44,8 +50,22 @@ constexpr std::size_t kNetworkHelloRecipientSlotOffset =
 	kNetworkHelloSenderSlotOffset + sizeof(std::uint32_t);
 constexpr std::size_t kNetworkHelloSessionTokenOffset =
 	kNetworkHelloRecipientSlotOffset + sizeof(std::uint32_t);
+constexpr std::size_t kNetworkHelloPolicySchemaOffset =
+	kNetworkHelloSessionTokenOffset + kNetworkHelloSessionTokenSize;
+constexpr std::size_t kNetworkHelloDeterminismEpochOffset =
+	kNetworkHelloPolicySchemaOffset + sizeof(std::uint32_t);
+constexpr std::size_t kNetworkHelloMapCrcOffset =
+	kNetworkHelloDeterminismEpochOffset + sizeof(std::uint32_t);
+constexpr std::size_t kNetworkHelloRosterMaskOffset =
+	kNetworkHelloMapCrcOffset + sizeof(std::uint32_t);
+constexpr std::size_t kNetworkHelloProvenKernelMaskOffset =
+	kNetworkHelloRosterMaskOffset + sizeof(std::uint32_t);
+constexpr std::size_t kNetworkHelloSidecarMaskOffset =
+	kNetworkHelloProvenKernelMaskOffset + sizeof(std::uint32_t);
+constexpr std::size_t kNetworkHelloSidecarCrcOffset =
+	kNetworkHelloSidecarMaskOffset + sizeof(std::uint32_t);
 constexpr std::uint64_t kAnyNetworkHelloSessionToken = 0U;
-static_assert(kNetworkHelloSessionTokenOffset + kNetworkHelloSessionTokenSize ==
+static_assert(kNetworkHelloSidecarCrcOffset + sizeof(std::uint32_t) ==
 	kNetworkHelloWireSize);
 
 enum class NetworkHelloKind : std::uint32_t
@@ -70,6 +90,175 @@ struct NetworkHelloIdentity
 	std::uint32_t senderSlot;
 	std::uint32_t recipientSlot;
 };
+
+struct NetworkSimulationPolicyIdentity
+{
+	std::uint32_t schema = MULTIPLAYER_SIMULATION_POLICY_SCHEMA;
+	std::uint32_t engineEpoch = runtime_epoch::kCurrentEngineEpoch;
+	std::uint32_t determinismEpoch =
+		MULTIPLAYER_SIMULATION_DETERMINISM_EPOCH;
+	std::uint32_t buildCompatibilityCrc = 0U;
+	std::uint32_t contentCrc = 0U;
+	std::uint32_t mapCrc = 0U;
+	std::uint32_t rosterMask = 0U;
+	std::uint32_t provenKernelMask = 0U;
+	// The wire-compatible sidecar fields bind all transferable map companions
+	// (preview, INI, STR, solo INI, asset usage, and readme). Only the narrower
+	// kNetworkSimulationSidecarMask participates in simulation eligibility.
+	std::uint32_t sidecarMask = 0U;
+	std::uint32_t sidecarCrc = 0U;
+};
+
+inline NetworkSimulationPolicyIdentity MakeNetworkSimulationPolicyIdentity(
+	std::uint32_t executableCrc,
+	std::uint32_t iniCrc,
+	std::uint32_t mapCrc,
+	std::uint32_t rosterMask,
+	std::uint32_t provenKernelMask)
+{
+	NetworkSimulationPolicyIdentity identity;
+	identity.buildCompatibilityCrc = executableCrc;
+	identity.contentCrc = iniCrc;
+	identity.mapCrc = mapCrc;
+	identity.rosterMask = rosterMask;
+	identity.provenKernelMask = provenKernelMask;
+	return identity;
+}
+
+inline bool IsMatchingNetworkSimulationPolicyIdentity(
+	const NetworkSimulationPolicyIdentity &left,
+	const NetworkSimulationPolicyIdentity &right)
+{
+	return left.schema == right.schema &&
+		left.engineEpoch == right.engineEpoch &&
+		left.determinismEpoch == right.determinismEpoch &&
+		left.buildCompatibilityCrc == right.buildCompatibilityCrc &&
+		left.contentCrc == right.contentCrc &&
+		left.mapCrc == right.mapCrc &&
+		left.rosterMask == right.rosterMask &&
+		left.provenKernelMask == right.provenKernelMask &&
+		left.sidecarMask == right.sidecarMask &&
+		left.sidecarCrc == right.sidecarCrc;
+}
+
+inline bool IsNetworkMapPromotionEligible(std::uint32_t mapCrc,
+	std::uint32_t mapContentsMask)
+{
+	// The NET3 sidecar identity secures startup, but parallel-kernel release
+	// proof does not yet qualify sessions with simulation sidecars.
+	return mapCrc != 0U && (mapContentsMask & 1U) != 0U &&
+		(mapContentsMask & (4U | 16U | 32U)) == 0U;
+}
+
+inline bool IsNetworkMapFileCRCValid(std::uint32_t expectedCrc,
+	std::uint32_t localCrc)
+{
+	return expectedCrc != 0U && localCrc != 0U && expectedCrc == localCrc;
+}
+
+// The complete set of transferable map companions. Map bytes are separately
+// identified by the map CRC; these companions are all bound to the NET3
+// package identity, including visual and documentation files.
+constexpr std::uint32_t kNetworkMapPackageCompanionMask =
+	2U | 4U | 8U | 16U | 32U | 64U;
+// Only these companions affect deterministic simulation and parallel-kernel
+// eligibility. Keep this narrower than the transfer/identity mask above.
+constexpr std::uint32_t kNetworkSimulationSidecarMask = 4U | 16U | 32U;
+
+inline bool IsSameCanonicalNetworkMapPath(const char *left, const char *right)
+{
+	if (left == nullptr || right == nullptr || *left == 0 || *right == 0)
+		return false;
+	while (*left != 0 && *right != 0)
+	{
+		const char leftChar = *left == '/' ? '\\' :
+			(*left >= 'A' && *left <= 'Z' ? *left + ('a' - 'A') : *left);
+		const char rightChar = *right == '/' ? '\\' :
+			(*right >= 'A' && *right <= 'Z' ? *right + ('a' - 'A') : *right);
+		if (leftChar != rightChar)
+			return false;
+		++left;
+		++right;
+	}
+	return *left == 0 && *right == 0;
+}
+
+// File-command IDs use the complete legacy 16-bit range, including zero.
+inline std::uint16_t ConsumeNetworkCommandID(std::uint16_t &next)
+{
+	const std::uint16_t current = next;
+	next = static_cast<std::uint16_t>(next + 1U);
+	return current;
+}
+
+// Sidecar identity/transfer decisions cover all companions above. The
+// narrower simulation-sidecar mask remains dedicated to worker eligibility.
+inline bool HasUntransferrableNetworkSidecars(std::uint32_t hostMask,
+	std::uint32_t peerMask)
+{
+	return (peerMask & kNetworkMapPackageCompanionMask & ~hostMask) != 0U;
+}
+
+inline bool IsMatchingNetworkSidecarIdentity(std::uint32_t hostMask,
+	std::uint32_t hostCrc, std::uint32_t peerMask, std::uint32_t peerCrc)
+{
+	return (hostMask & kNetworkMapPackageCompanionMask) ==
+		(peerMask & kNetworkMapPackageCompanionMask) && hostCrc == peerCrc;
+}
+
+enum class NetworkSidecarTransferDecision
+{
+	Ready,
+	Transfer,
+	Reject
+};
+
+inline std::uint32_t AddNetworkMapTransferRecipient(std::uint32_t mask,
+	unsigned slot, bool needsMap, bool needsSidecar)
+{
+	return slot < 32U && (needsMap || needsSidecar) ?
+		mask | (1U << slot) : mask;
+}
+
+inline NetworkSidecarTransferDecision DecideNetworkSidecarTransfer(
+	std::uint32_t hostMask, std::uint32_t hostCrc,
+	std::uint32_t peerMask, std::uint32_t peerCrc,
+	bool hasTransferSender)
+{
+	if (HasUntransferrableNetworkSidecars(hostMask, peerMask))
+		return NetworkSidecarTransferDecision::Reject;
+	if (IsMatchingNetworkSidecarIdentity(hostMask, hostCrc,
+		peerMask, peerCrc))
+		return NetworkSidecarTransferDecision::Ready;
+	return hasTransferSender ?
+		NetworkSidecarTransferDecision::Transfer :
+		NetworkSidecarTransferDecision::Reject;
+}
+
+inline bool IsNetworkMapPackageReady(bool committed,
+	std::uint32_t expectedMapCrc, std::uint32_t localMapCrc,
+	std::uint32_t hostMask, std::uint32_t hostSidecarCrc,
+	std::uint32_t localMask, std::uint32_t localSidecarCrc)
+{
+	return committed && IsNetworkMapFileCRCValid(expectedMapCrc, localMapCrc) &&
+		IsMatchingNetworkSidecarIdentity(hostMask, hostSidecarCrc,
+			localMask, localSidecarCrc);
+}
+
+inline bool IsNetworkSimulationRosterIdentityValid(
+	std::uint32_t rosterMask,
+	std::uint32_t expectedRemoteMask,
+	std::uint32_t localSlot,
+	std::uint32_t maxSlots)
+{
+	if (maxSlots == 0U || maxSlots > 32U || localSlot >= maxSlots)
+		return false;
+	const std::uint32_t validSlotMask = maxSlots == 32U ? 0xffffffffU :
+		((1U << maxSlots) - 1U);
+	return (expectedRemoteMask & ~validSlotMask) == 0U &&
+		(expectedRemoteMask & (1U << localSlot)) == 0U &&
+		rosterMask == (expectedRemoteMask | (1U << localSlot));
+}
 
 inline bool IsMatchingNetworkPeerEndpoint(std::uint32_t observedAddress,
 	std::uint16_t observedPort,
@@ -505,7 +694,8 @@ inline std::array<runtime_epoch::Byte, kNetworkHelloWireSize> EncodeNetworkHello
 	std::uint32_t senderSlot,
 	std::uint32_t recipientSlot,
 	std::uint64_t sessionToken,
-	NetworkHelloKind kind = NetworkHelloKind::Hello)
+	NetworkHelloKind kind,
+	const NetworkSimulationPolicyIdentity &simulationPolicy)
 {
 	std::array<runtime_epoch::Byte, kNetworkHelloWireSize> output = {{}};
 	WriteLittleEndian32(output.data() + kNetworkHelloKindOffset,
@@ -513,12 +703,40 @@ inline std::array<runtime_epoch::Byte, kNetworkHelloWireSize> EncodeNetworkHello
 	WriteLittleEndian32(output.data() + kNetworkHelloSenderSlotOffset, senderSlot);
 	WriteLittleEndian32(output.data() + kNetworkHelloRecipientSlotOffset, recipientSlot);
 	WriteLittleEndian64(output.data() + kNetworkHelloSessionTokenOffset, sessionToken);
+	WriteLittleEndian32(output.data() + kNetworkHelloPolicySchemaOffset,
+		simulationPolicy.schema);
+	WriteLittleEndian32(output.data() + kNetworkHelloDeterminismEpochOffset,
+		simulationPolicy.determinismEpoch);
+	WriteLittleEndian32(output.data() + kNetworkHelloMapCrcOffset,
+		simulationPolicy.mapCrc);
+	WriteLittleEndian32(output.data() + kNetworkHelloRosterMaskOffset,
+		simulationPolicy.rosterMask);
+	WriteLittleEndian32(output.data() + kNetworkHelloProvenKernelMaskOffset,
+		simulationPolicy.provenKernelMask);
+	WriteLittleEndian32(output.data() + kNetworkHelloSidecarMaskOffset,
+		simulationPolicy.sidecarMask);
+	WriteLittleEndian32(output.data() + kNetworkHelloSidecarCrcOffset,
+		simulationPolicy.sidecarCrc);
 	const std::array<runtime_epoch::Byte, runtime_epoch::kHeaderSize> header =
 		runtime_epoch::Encode(MakeNetworkHello(executableCrc, iniCrc,
 			output.data() + kNetworkHelloKindOffset));
 	for (std::size_t index = 0; index < header.size(); ++index)
 		output[index] = header[index];
 	return output;
+}
+
+inline std::array<runtime_epoch::Byte, kNetworkHelloWireSize> EncodeNetworkHello(
+	std::uint32_t executableCrc,
+	std::uint32_t iniCrc,
+	std::uint32_t senderSlot,
+	std::uint32_t recipientSlot,
+	std::uint64_t sessionToken,
+	NetworkHelloKind kind = NetworkHelloKind::Hello)
+{
+	const NetworkSimulationPolicyIdentity simulationPolicy =
+		MakeNetworkSimulationPolicyIdentity(executableCrc, iniCrc, 0U, 0U, 0U);
+	return EncodeNetworkHello(executableCrc, iniCrc, senderSlot, recipientSlot,
+		sessionToken, kind, simulationPolicy);
 }
 
 inline runtime_epoch::ValidationResult DecodeAndValidateNetworkHelloRecord(
@@ -529,7 +747,8 @@ inline runtime_epoch::ValidationResult DecodeAndValidateNetworkHelloRecord(
 	runtime_epoch::NetworkHello *hello,
 	NetworkHelloKind *kind,
 	NetworkHelloIdentity *identity,
-	std::uint64_t *sessionToken)
+	std::uint64_t *sessionToken,
+	NetworkSimulationPolicyIdentity *simulationPolicy = nullptr)
 {
 	if (input == nullptr || inputSize != kNetworkHelloWireSize || hello == nullptr ||
 		kind == nullptr || identity == nullptr || sessionToken == nullptr)
@@ -561,6 +780,28 @@ inline runtime_epoch::ValidationResult DecodeAndValidateNetworkHelloRecord(
 	*kind = decodedKind;
 	*identity = decodedIdentity;
 	*sessionToken = decodedSessionToken;
+	if (simulationPolicy != nullptr)
+	{
+		simulationPolicy->schema = ReadLittleEndian32(
+			input + kNetworkHelloPolicySchemaOffset);
+		simulationPolicy->engineEpoch = hello->engineEpoch;
+		simulationPolicy->determinismEpoch = ReadLittleEndian32(
+			input + kNetworkHelloDeterminismEpochOffset);
+		simulationPolicy->buildCompatibilityCrc = static_cast<std::uint32_t>(
+			hello->buildCompatibilityId);
+		simulationPolicy->contentCrc = static_cast<std::uint32_t>(
+			hello->contentHash);
+		simulationPolicy->mapCrc = ReadLittleEndian32(
+			input + kNetworkHelloMapCrcOffset);
+		simulationPolicy->rosterMask = ReadLittleEndian32(
+			input + kNetworkHelloRosterMaskOffset);
+		simulationPolicy->provenKernelMask = ReadLittleEndian32(
+			input + kNetworkHelloProvenKernelMaskOffset);
+		simulationPolicy->sidecarMask = ReadLittleEndian32(
+			input + kNetworkHelloSidecarMaskOffset);
+		simulationPolicy->sidecarCrc = ReadLittleEndian32(
+			input + kNetworkHelloSidecarCrcOffset);
+	}
 	return {};
 }
 

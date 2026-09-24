@@ -1,7 +1,13 @@
 #include "Renderer/NativeW3DRenderer.h"
 #include "Renderer/NativeW3DResources.h"
+#include "Renderer/RenderTexturePublication.h"
 
 #include <cstdio>
+#include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace
 {
@@ -14,19 +20,545 @@ int Check(bool condition, const char *message)
 	std::fprintf(stderr, "FAIL: %s\n", message);
 	return 1;
 }
+
+int TestTexturePublicationContract()
+{
+	int result = 0;
+	int sentinel = 0;
+	TextureBaseClass *texture =
+		reinterpret_cast<TextureBaseClass *>(&sentinel);
+	TextureClass *textureClass = reinterpret_cast<TextureClass *>(&sentinel);
+	rts::render::ResetTrackedLegacyState();
+	rts::render::SeedTrackedLegacyPipelineState();
+	rts::render::PublishTextureStage(0, texture);
+	rts::render::LegacyLogicalState state;
+	result |= Check(rts::render::GetPublishedTextureStage(0) == texture,
+		"native texture publication retains the typed stage source");
+	result |= Check(rts::render::GetTrackedLegacyLogicalState(&state) &&
+		(state.texturePresenceMask & 1U) != 0,
+		"native texture publication updates neutral texture presence");
+	rts::render::PublishTextureStage(
+		rts::render::LEGACY_TEXTURE_STAGE_COUNT, texture);
+	result |= Check(rts::render::GetPublishedTextureStage(
+		rts::render::LEGACY_TEXTURE_STAGE_COUNT) == 0,
+		"native texture publication rejects an out-of-range stage");
+	rts::render::RecordTextureUse(textureClass);
+	result |= Check(rts::render::GetTextureUseCount() == 1,
+		"native texture publication records one stage use");
+	rts::render::UnpublishTexture(texture);
+	result |= Check(rts::render::GetPublishedTextureStage(0) == 0,
+		"native texture unpublication clears the stage source");
+	result |= Check(rts::render::GetTrackedLegacyLogicalState(&state) &&
+		(state.texturePresenceMask & 1U) == 0,
+		"native texture unpublication clears neutral texture presence");
+	return result;
+}
+
+int TestTexturePublicationOperationalContract()
+{
+	int result = 0;
+	result |= Check(
+		rts::render::IsRenderTexturePublicationOperationalState(
+			true, false, false, false),
+		"legacy publication remains operational before a scene frame");
+	result |= Check(
+		!rts::render::IsRenderTexturePublicationOperationalState(
+			true, true, false, false),
+		"legacy publication is suppressed while the device is lost or resetting");
+	result |= Check(
+		!rts::render::IsRenderTexturePublicationOperationalState(
+			false, false, false, false),
+		"publication is suppressed after renderer shutdown");
+	result |= Check(
+		rts::render::IsRenderTexturePublicationOperationalState(
+			true, false, true, true),
+		"native publication is operational after bridge recovery");
+	result |= Check(
+		!rts::render::IsRenderTexturePublicationOperationalState(
+			true, false, true, false),
+		"native publication is suppressed while the bridge is inactive");
+	return result;
+}
+
+struct TextureStageCommand
+{
+	unsigned int stage;
+	rts::render::GpuHandle texture;
+};
+
+class TextureStageTraceContext
+{
+public:
+	TextureStageTraceContext() : failStage(-1), failNext(false), commands()
+	{
+	}
+
+	rts::render::RenderResult setTexture(unsigned int stage,
+		rts::render::GpuHandle texture)
+	{
+		TextureStageCommand command;
+		command.stage = stage;
+		command.texture = texture;
+		commands.push_back(command);
+		if (failNext && static_cast<int>(stage) == failStage)
+		{
+			failNext = false;
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		return rts::render::RENDER_RESULT_OK;
+	}
+
+	int failStage;
+	bool failNext;
+	std::vector<TextureStageCommand> commands;
+};
+
+int TestTextureBindingCacheCommandTrace()
+{
+	using namespace rts::render;
+	int result = 0;
+	GpuHandle textures[LEGACY_TEXTURE_STAGE_COUNT];
+	textures[1] = GpuHandle(4, 7);
+	textures[5] = GpuHandle(9, 2);
+	NativeW3DTextureBindingCache cache;
+	TextureStageTraceContext trace;
+	const unsigned int stageCount = LEGACY_TEXTURE_STAGE_COUNT;
+
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount,
+		"first sorted packet submits one texture command for each unknown stage");
+	bool orderedStages = trace.commands.size() == stageCount;
+	for (unsigned int stage = 0; orderedStages && stage < stageCount; ++stage)
+	{
+		orderedStages = trace.commands[stage].stage == stage &&
+			trace.commands[stage].texture == textures[stage];
+	}
+	result |= Check(orderedStages,
+		"first texture command trace preserves stage order and full handles");
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount,
+		"identical consecutive texture bindings emit no extra commands");
+
+	textures[1] = GpuHandle(4, 8);
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount + 1 &&
+		trace.commands.back().stage == 1 &&
+		trace.commands.back().texture == textures[1],
+		"a reused texture slot with a new generation is submitted");
+
+	const GpuHandle textureA = textures[1];
+	textures[1] = GpuHandle();
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount + 2 &&
+		trace.commands.back().stage == 1 &&
+		!trace.commands.back().texture.isValid(),
+		"A-to-null transition submits the required unbind");
+	textures[1] = textureA;
+	result |= Check(cache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == stageCount + 3 &&
+		trace.commands.back().stage == 1 &&
+		trace.commands.back().texture == textureA,
+		"null-to-A transition submits the required rebind");
+
+	NativeW3DTextureBindingCache failureCache;
+	TextureStageTraceContext failureTrace;
+	failureTrace.failStage = 3;
+	failureTrace.failNext = true;
+	GpuHandle failureTextures[LEGACY_TEXTURE_STAGE_COUNT];
+	failureTextures[0] = GpuHandle(20, 1);
+	failureTextures[1] = GpuHandle(21, 1);
+	failureTextures[2] = GpuHandle(22, 1);
+	failureTextures[3] = GpuHandle(23, 1);
+	result |= Check(failureCache.Bind(&failureTrace, failureTextures) ==
+		RENDER_RESULT_FAILED && failureTrace.commands.size() == 4,
+		"a failed texture command stops the current batch immediately");
+	result |= Check(failureCache.Bind(&failureTrace, failureTextures) ==
+		RENDER_RESULT_OK && failureTrace.commands.size() == 9 &&
+		failureTrace.commands[4].stage == 3,
+		"a failed stage is retried while earlier successful stages stay cached");
+
+	NativeW3DTextureBindingCache nextBatchCache;
+	const size_t beforeNextBatch = trace.commands.size();
+	result |= Check(nextBatchCache.Bind(&trace, textures) == RENDER_RESULT_OK &&
+		trace.commands.size() == beforeNextBatch + stageCount,
+		"each sorted batch starts unknown and rebinds all stages");
+	std::fprintf(stdout,
+		"texture binding trace counts: first=%u repeat=0 generation=1 "
+		"A-null-A=2 failed-attempt=4 retry=5 batch-reset=%u\n",
+		stageCount, stageCount);
+	return result;
+}
+
+enum SortedBatchCommandType
+{
+	SORTED_BATCH_TOPOLOGY_COMMAND,
+	SORTED_BATCH_INDEX_BUFFER_COMMAND
+};
+
+struct SortedBatchCommand
+{
+	SortedBatchCommandType type;
+	rts::render::GpuHandle buffer;
+	rts::render::RenderFormat format;
+	unsigned int offset;
+	rts::render::RenderPrimitiveTopology topology;
+};
+
+class SortedBatchTraceContext
+{
+public:
+	SortedBatchTraceContext() : failNextTopology(false), failNextIndexBuffer(false),
+		commands()
+	{
+	}
+
+	rts::render::RenderResult setPrimitiveTopology(
+		rts::render::RenderPrimitiveTopology topology)
+	{
+		SortedBatchCommand command;
+		command.type = SORTED_BATCH_TOPOLOGY_COMMAND;
+		command.buffer = rts::render::GpuHandle();
+		command.format = rts::render::RENDER_FORMAT_UNKNOWN;
+		command.offset = 0;
+		command.topology = topology;
+		commands.push_back(command);
+		if (failNextTopology)
+		{
+			failNextTopology = false;
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		return rts::render::RENDER_RESULT_OK;
+	}
+
+	rts::render::RenderResult setIndexBuffer(rts::render::GpuHandle buffer,
+		rts::render::RenderFormat format, unsigned int offset)
+	{
+		SortedBatchCommand command;
+		command.type = SORTED_BATCH_INDEX_BUFFER_COMMAND;
+		command.buffer = buffer;
+		command.format = format;
+		command.offset = offset;
+		command.topology = rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST;
+		commands.push_back(command);
+		if (failNextIndexBuffer)
+		{
+			failNextIndexBuffer = false;
+			return rts::render::RENDER_RESULT_FAILED;
+		}
+		return rts::render::RENDER_RESULT_OK;
+	}
+
+	bool failNextTopology;
+	bool failNextIndexBuffer;
+	std::vector<SortedBatchCommand> commands;
+};
+
+int TestSortedBatchBindingCacheCommandTrace()
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3DSortedBatchBindingCache cache;
+	SortedBatchTraceContext trace;
+	const GpuHandle indexA(30, 4);
+	const GpuHandle indexANextGeneration(30, 5);
+
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+		RENDER_RESULT_OK && trace.commands.size() == 1 &&
+		trace.commands[0].type == SORTED_BATCH_TOPOLOGY_COMMAND,
+		"first sorted packet records its topology command");
+	result |= Check(cache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT,
+		0) == RENDER_RESULT_OK && trace.commands.size() == 2 &&
+		trace.commands[1].type == SORTED_BATCH_INDEX_BUFFER_COMMAND &&
+		trace.commands[1].buffer == indexA &&
+		trace.commands[1].format == RENDER_FORMAT_R16_UINT &&
+		trace.commands[1].offset == 0,
+		"first sorted packet records the full index binding tuple");
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+		RENDER_RESULT_OK && cache.BindIndexBuffer(&trace, indexA,
+		RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK &&
+		trace.commands.size() == 2,
+		"repeated topology and exact index bindings emit no commands");
+
+	result |= Check(cache.BindIndexBuffer(&trace, indexANextGeneration,
+		RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK &&
+		trace.commands.size() == 3 &&
+		trace.commands.back().buffer == indexANextGeneration,
+		"recycled index slots with a new generation are rebound");
+	result |= Check(cache.BindIndexBuffer(&trace, indexANextGeneration,
+		RENDER_FORMAT_R32_UINT, 0) == RENDER_RESULT_OK &&
+		trace.commands.size() == 4 &&
+		trace.commands.back().format == RENDER_FORMAT_R32_UINT,
+		"an index-format change is rebound");
+	result |= Check(cache.BindIndexBuffer(&trace, indexANextGeneration,
+		RENDER_FORMAT_R32_UINT, 4) == RENDER_RESULT_OK &&
+		trace.commands.size() == 5 && trace.commands.back().offset == 4,
+		"an index-offset change is rebound");
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_LINE_LIST) ==
+		RENDER_RESULT_OK && trace.commands.size() == 6 &&
+		trace.commands.back().topology == RENDER_PRIMITIVE_LINE_LIST,
+		"a topology change is rebound");
+
+	trace.failNextIndexBuffer = true;
+	result |= Check(cache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT,
+		0) == RENDER_RESULT_FAILED && trace.commands.size() == 7,
+		"a failed index bind is surfaced and not cached");
+	result |= Check(cache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT,
+		0) == RENDER_RESULT_OK && trace.commands.size() == 8 &&
+		trace.commands.back().buffer == indexA &&
+		cache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT, 0) ==
+			RENDER_RESULT_OK && trace.commands.size() == 8,
+		"the failed index bind is retried, then the successful tuple is cached");
+
+	trace.failNextTopology = true;
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_STRIP) ==
+		RENDER_RESULT_FAILED && trace.commands.size() == 9,
+		"a failed topology bind is surfaced and not cached");
+	result |= Check(cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_STRIP) ==
+		RENDER_RESULT_OK && trace.commands.size() == 10 &&
+		cache.BindTopology(&trace, RENDER_PRIMITIVE_TRIANGLE_STRIP) ==
+			RENDER_RESULT_OK && trace.commands.size() == 10,
+		"the failed topology bind is retried, then the successful value is cached");
+
+	NativeW3DSortedBatchBindingCache nextBatchCache;
+	result |= Check(nextBatchCache.BindTopology(&trace,
+		RENDER_PRIMITIVE_TRIANGLE_STRIP) == RENDER_RESULT_OK &&
+		nextBatchCache.BindIndexBuffer(&trace, indexA, RENDER_FORMAT_R16_UINT,
+			0) == RENDER_RESULT_OK && trace.commands.size() == 12,
+		"a new sorted batch starts unknown and reissues both bindings");
+	std::fprintf(stdout,
+		"sorted batch binding trace counts: first=2 repeated=0 tuple-changes=4 "
+		"failed-bind-retries=2 batch-reset=2\n");
+	return result;
+}
+
+#if defined(_WIN32) && defined(RTS_RENDERER_HAS_D3D11)
+const wchar_t *kD3D11InputLayoutTestWindowClass =
+	L"GeneralsGameCodeD3D11InputLayoutTestWindow";
+
+LRESULT CALLBACK D3D11InputLayoutTestWindowProcedure(HWND window,
+	UINT message, WPARAM wparam, LPARAM lparam)
+{
+	return DefWindowProcW(window, message, wparam, lparam);
+}
+
+int TestD3D11TexturedInputLayoutSafety()
+{
+	using namespace rts::render;
+	WNDCLASSEXW windowClass;
+	ZeroMemory(&windowClass, sizeof(windowClass));
+	windowClass.cbSize = sizeof(windowClass);
+	windowClass.lpfnWndProc = D3D11InputLayoutTestWindowProcedure;
+	windowClass.hInstance = GetModuleHandleW(0);
+	windowClass.lpszClassName = kD3D11InputLayoutTestWindowClass;
+	const ATOM classAtom = RegisterClassExW(&windowClass);
+	if (classAtom == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+	{
+		return Check(false, "D3D11 input-layout test registers its window class");
+	}
+	HWND window = CreateWindowExW(0, kD3D11InputLayoutTestWindowClass,
+		L"D3D11 input-layout safety", WS_OVERLAPPED, 0, 0, 64, 64, 0, 0,
+		windowClass.hInstance, 0);
+	if (window == 0)
+	{
+		return Check(false, "D3D11 input-layout test creates a hidden window");
+	}
+
+	IRenderDevice *device = CreateD3D11RenderDevice();
+	int result = Check(device != 0,
+		"D3D11 input-layout test creates a native device");
+	if (device == 0)
+	{
+		DestroyWindow(window);
+		return result;
+	}
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = window;
+	parameters.width = 64;
+	parameters.height = 64;
+	parameters.enableVsync = false;
+	parameters.allowSoftwareFallback = true;
+	const RenderResult initializeResult = device->initialize(parameters);
+	result |= Check(initializeResult == RENDER_RESULT_OK,
+		"D3D11 input-layout test initializes its native device");
+	if (initializeResult != RENDER_RESULT_OK)
+	{
+		device->shutdown();
+		delete device;
+		DestroyWindow(window);
+		return result;
+	}
+
+	struct XYZVertex
+	{
+		float x;
+		float y;
+		float z;
+	};
+	const XYZVertex xyzVertices[3] = {
+		{ -0.5f, -0.5f, 0.0f },
+		{ 0.0f, 0.5f, 0.0f },
+		{ 0.5f, -0.5f, 0.0f }
+	};
+	BufferDescriptor xyzDescriptor;
+	xyzDescriptor.byteCount = sizeof(xyzVertices);
+	xyzDescriptor.stride = sizeof(XYZVertex);
+	xyzDescriptor.binding = RENDER_BUFFER_VERTEX;
+	xyzDescriptor.usage = RENDER_USAGE_IMMUTABLE;
+	GpuHandle xyzBuffer;
+	result |= Check(device->createBuffer(xyzDescriptor, xyzVertices,
+		sizeof(xyzVertices), &xyzBuffer) == RENDER_RESULT_OK,
+		"plain XYZ input fixture creates a 12-byte vertex stream");
+
+	LegacyVertexLayout xyzLayout;
+	xyzLayout.stride = sizeof(XYZVertex);
+	xyzLayout.elementCount = 1;
+	xyzLayout.elements[0].semantic = RENDER_VERTEX_SEMANTIC_POSITION;
+	xyzLayout.elements[0].semanticIndex = 0;
+	xyzLayout.elements[0].format = RENDER_VERTEX_DATA_FLOAT3;
+	xyzLayout.elements[0].byteOffset = 0;
+	LegacyLogicalState state;
+	IRenderContext *context = device->immediateContext();
+	bool frameStarted = context != 0 &&
+		context->beginFrame() == RENDER_RESULT_OK;
+	result |= Check(frameStarted,
+		"plain XYZ input fixture begins a D3D11 frame");
+	if (frameStarted)
+	{
+		const RenderResult layoutResult = context->setLegacyStateForLayout(
+			state, xyzLayout, 0);
+		result |= Check(layoutResult == RENDER_RESULT_OK,
+			"plain XYZ selects the unweighted shader and bounded layout");
+		result |= Check(context->setVertexBuffer(xyzBuffer,
+			sizeof(XYZVertex), 0) == RENDER_RESULT_OK,
+			"plain XYZ binds its exact 12-byte source stride");
+		result |= Check(context->setPrimitiveTopology(
+			RENDER_PRIMITIVE_TRIANGLE_LIST) == RENDER_RESULT_OK &&
+			context->draw(3, 0) == RENDER_RESULT_OK,
+			"plain XYZ draws without a synthesized 16-byte read");
+		result |= Check(context->endFrame() == RENDER_RESULT_OK,
+			"plain XYZ input fixture ends its D3D11 frame");
+	}
+
+	struct WeightedVertex
+	{
+		float x;
+		float y;
+		float z;
+		float weight0[4];
+	};
+	const WeightedVertex weightedVertices[3] = {
+		{ -0.5f, -0.5f, 0.0f, { 1.0f, 0.0f, 0.0f, 0.0f } },
+		{ 0.0f, 0.5f, 0.0f, { 1.0f, 0.0f, 0.0f, 0.0f } },
+		{ 0.5f, -0.5f, 0.0f, { 1.0f, 0.0f, 0.0f, 0.0f } }
+	};
+	BufferDescriptor weightedDescriptor;
+	weightedDescriptor.byteCount = sizeof(weightedVertices);
+	weightedDescriptor.stride = sizeof(WeightedVertex);
+	weightedDescriptor.binding = RENDER_BUFFER_VERTEX;
+	weightedDescriptor.usage = RENDER_USAGE_IMMUTABLE;
+	GpuHandle weightedBuffer;
+	result |= Check(device->createBuffer(weightedDescriptor, weightedVertices,
+		sizeof(weightedVertices), &weightedBuffer) == RENDER_RESULT_OK,
+		"weighted input fixture creates its source stream");
+	LegacyVertexLayout weightedLayout = xyzLayout;
+	weightedLayout.stride = sizeof(WeightedVertex);
+	weightedLayout.elementCount = 2;
+	weightedLayout.elements[1].semantic = RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT;
+	weightedLayout.elements[1].semanticIndex = 0;
+	weightedLayout.elements[1].format = RENDER_VERTEX_DATA_FLOAT4;
+	weightedLayout.elements[1].byteOffset = 12;
+	frameStarted = context->beginFrame() == RENDER_RESULT_OK;
+	result |= Check(frameStarted,
+		"weighted input fixture begins a D3D11 frame");
+	if (frameStarted)
+	{
+		const RenderResult layoutResult = context->setLegacyStateForLayout(
+			state, weightedLayout, 0);
+		result |= Check(layoutResult == RENDER_RESULT_OK,
+			"weighted XYZ selects the weighted shader and layout");
+		result |= Check(context->setVertexBuffer(weightedBuffer,
+			sizeof(WeightedVertex), 0) == RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				RENDER_PRIMITIVE_TRIANGLE_LIST) == RENDER_RESULT_OK &&
+			context->draw(3, 0) == RENDER_RESULT_OK,
+			"weighted XYZ draws through its explicit blend declaration");
+		result |= Check(context->endFrame() == RENDER_RESULT_OK,
+			"weighted input fixture ends its D3D11 frame");
+	}
+
+	LegacyVertexLayout shortLayout = xyzLayout;
+	shortLayout.stride = 8;
+	frameStarted = context->beginFrame() == RENDER_RESULT_OK;
+	result |= Check(frameStarted,
+		"short XYZ input fixture begins a D3D11 frame");
+	if (frameStarted)
+	{
+		result |= Check(context->setLegacyStateForLayout(state, shortLayout, 0) ==
+			RENDER_RESULT_INVALID_ARGUMENT,
+			"short XYZ rejects a position declaration outside its source stride");
+		result |= Check(context->endFrame() == RENDER_RESULT_OK,
+			"short XYZ input fixture ends its D3D11 frame");
+	}
+
+	if (xyzBuffer.isValid())
+	{
+		result |= Check(device->destroyResource(xyzBuffer),
+			"plain XYZ input fixture releases its buffer");
+	}
+	if (weightedBuffer.isValid())
+	{
+		result |= Check(device->destroyResource(weightedBuffer),
+			"weighted input fixture releases its buffer");
+	}
+	device->shutdown();
+	delete device;
+	DestroyWindow(window);
+	return result;
+}
+#endif
 }
 
 int main()
 {
 	int result = 0;
+	result |= TestTexturePublicationContract();
+	result |= TestTexturePublicationOperationalContract();
+	result |= TestTextureBindingCacheCommandTrace();
+	result |= TestSortedBatchBindingCacheCommandTrace();
+#if defined(_WIN32) && defined(RTS_RENDERER_HAS_D3D11)
+	result |= TestD3D11TexturedInputLayoutSafety();
+#endif
 	rts::render::NativeW3DRenderer renderer;
 	rts::render::NativeW3DResources resources;
 	rts::render::NativeW3DRendererDescriptor descriptor;
 	rts::render::NativeDrawPacket packet;
 	rts::render::LegacyLogicalState state;
+	rts::render::RenderViewport viewport(0.0f, 0.0f, 640.0f, 480.0f,
+		0.0f, 1.0f);
+	rts::render::RenderVertexLayout layout;
+	rts::render::RenderMatrix4 matrix;
+	result |= Check(layout.elements[0].format ==
+		rts::render::RENDER_VERTEX_DATA_FLOAT3,
+		"neutral position elements preserve the legacy FLOAT3 default");
+
+	layout.stride = 16;
+	layout.elementCount = 1;
+	layout.elements[0].semantic = rts::render::RENDER_VERTEX_SEMANTIC_POSITION;
+	layout.elements[0].format = rts::render::RENDER_VERTEX_DATA_FLOAT3;
+	result |= Check(layout.elements[0].semantic ==
+		rts::render::RENDER_VERTEX_SEMANTIC_POSITION &&
+		viewport.width == 640.0f && viewport.maximumDepth == 1.0f &&
+		matrix.values[0] == 1.0f && matrix.values[15] == 1.0f &&
+		packet.indexFormat == rts::render::RENDER_FORMAT_R16_UINT &&
+		packet.topology == rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST,
+		"native vocabulary has stable neutral defaults");
 
 	result |= Check(renderer.BeginFrame() == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 		"cannot begin a native frame before initialization");
+	result |= Check(renderer.SetViewport(viewport) ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"cannot set a native viewport before initialization");
 	result |= Check(renderer.EndFrame(false) == rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 		"cannot end a native frame before initialization");
 	result |= Check(renderer.Submit(resources, state, packet) == rts::render::RENDER_RESULT_INVALID_ARGUMENT,

@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "PerformanceScalingEvidence.schema.json",
+  "title": "Stage 5 physical-core scaling acceptance evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "evidenceKind", "status", "recordedUtc", "cohortNonce", "cohortCreatedUtc", "qualificationMode", "referencePolicy", "sourceCommit", "artifactSetSha256", "runtimeClosure", "title", "executableSha256", "stage3SourceCommit", "stage3ExecutableSha256", "stage3BaselineSha256", "measurementMode", "installedRuntime", "hostQualification", "phaseBaselineProfile", "performanceData", "stage3Baseline", "rawSampleManifest", "topology", "selectedLanes", "oneWorkerPhases", "amdahl", "kernelTimings", "fixtures"],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 2 },
+    "evidenceKind": { "type": "string", "const": "stage5-performance-scaling" },
+    "status": { "type": "string", "const": "passed" },
+    "recordedUtc": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{7}Z$" },
+    "cohortNonce": { "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$" },
+    "cohortCreatedUtc": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{7}Z$" },
+    "qualificationMode": { "type": "string", "const": "External16Core" },
+    "referencePolicy": { "type": "string", "const": "paired-serial-oracle-v1" },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "runtimeClosure": { "$ref": "#/$defs/runtimeClosure" },
+    "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+    "executableSha256": { "$ref": "#/$defs/sha256" },
+    "stage3SourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "stage3ExecutableSha256": { "$ref": "#/$defs/sha256" },
+    "stage3BaselineSha256": { "$ref": "#/$defs/sha256" },
+    "measurementMode": { "type": "string", "const": "headless-throughput" },
+    "installedRuntime": { "const": true },
+    "hostQualification": { "$ref": "#/$defs/evidenceFile" },
+    "phaseBaselineProfile": { "$ref": "#/$defs/evidenceFile" },
+    "performanceData": { "$ref": "#/$defs/performanceData" },
+    "stage3Baseline": { "$ref": "#/$defs/evidenceFile" },
+    "rawSampleManifest": { "$ref": "#/$defs/evidenceFile" },
+    "topology": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "topologySha256", "physicalCoreCount", "logicalProcessorCount"],
+      "properties": {
+        "source": { "type": "string", "const": "GetSystemCpuSetInformation" },
+        "topologySha256": { "$ref": "#/$defs/sha256" },
+        "physicalCoreCount": { "type": "integer", "minimum": 16 },
+        "logicalProcessorCount": { "type": "integer", "minimum": 16 }
+      }
+    },
+    "selectedLanes": { "type": "array", "minItems": 3, "maxItems": 3, "items": { "$ref": "#/$defs/lane" } },
+    "oneWorkerPhases": { "type": "array", "minItems": 5, "maxItems": 5, "items": { "$ref": "#/$defs/phase" } },
+    "amdahl": {
+      "type": "object", "additionalProperties": false,
+      "required": ["totalOneWorkerMilliseconds", "totalSerialMilliseconds", "serialFraction", "maximumSpeedup", "reachesTwoX"],
+      "properties": {
+        "totalOneWorkerMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "totalSerialMilliseconds": { "type": "number", "minimum": 0 },
+        "serialFraction": { "type": "number", "minimum": 0, "maximum": 0.5 },
+        "maximumSpeedup": { "type": "number", "minimum": 2 },
+        "reachesTwoX": { "const": true }
+      }
+    },
+    "kernelTimings": { "type": "array", "minItems": 6, "maxItems": 6, "items": { "$ref": "#/$defs/kernel" } },
+    "fixtures": { "type": "array", "minItems": 4, "maxItems": 4, "items": { "$ref": "#/$defs/fixture" } }
+  },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9A-F]{64}$" },
+    "runtimeClosure": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dependencyManifestSha256", "closureSha256"],
+      "properties": {
+        "dependencyManifestSha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "evidenceFile": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "performanceData": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "sha256", "closureSha256", "fileCount"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" },
+        "fileCount": { "type": "integer", "minimum": 6 }
+      }
+    },
+    "lane": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "requestedWorkers", "selectedLogicalProcessors", "selectedDistinctPhysicalCores", "selectedPhysicalCoreMask"],
+      "properties": {
+        "name": { "type": "string", "enum": ["forced-one", "physical-8", "physical-16"] },
+        "requestedWorkers": { "enum": [1, 8, 16] },
+        "selectedLogicalProcessors": { "enum": [1, 8, 16] },
+        "selectedDistinctPhysicalCores": { "enum": [1, 8, 16] },
+        "selectedPhysicalCoreMask": { "type": "string", "pattern": "^[0-9A-F]{16}$" }
+      }
+    },
+    "phase": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "elapsedMilliseconds", "serialMilliseconds", "serialMillisecondsKnown"],
+      "properties": {
+        "name": { "type": "string", "enum": ["owner-intake", "legacy-mutable-island", "spatial-work", "owner-tail", "verification-publication"] },
+        "elapsedMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "serialMilliseconds": { "type": "number", "minimum": 0 },
+        "serialMillisecondsKnown": { "const": true }
+      }
+    },
+    "kernel": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "admittedSlices", "captureMilliseconds", "scheduleMilliseconds", "waitMilliseconds", "validateMilliseconds", "commitMilliseconds", "totalParallelMilliseconds", "exactSerialOperationMilliseconds", "exactSerialOperationMillisecondsKnown", "timingAttribution", "netSpeedup"],
+      "properties": {
+        "name": { "type": "string", "enum": ["physics", "status", "collision", "ai-planning", "spatial", "path"] },
+        "admittedSlices": { "type": "integer", "minimum": 1 },
+        "captureMilliseconds": { "type": "number", "minimum": 0 },
+        "scheduleMilliseconds": { "type": "number", "minimum": 0 },
+        "waitMilliseconds": { "type": "number", "minimum": 0 },
+        "validateMilliseconds": { "type": "number", "minimum": 0 },
+        "commitMilliseconds": { "type": "number", "minimum": 0 },
+        "totalParallelMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "exactSerialOperationMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "exactSerialOperationMillisecondsKnown": { "const": true },
+        "timingAttribution": { "type": "string", "const": "owner-stack-exclusive-v1" },
+        "netSpeedup": { "type": "number", "exclusiveMinimum": 1 }
+      }
+    },
+    "fixture": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "playerCount", "peakUnitCount", "requestedMinimumUnitCount", "minimumInitialUnitCount", "repeats", "stage3OneWorkerMilliseconds", "stage5OneWorkerMilliseconds", "eightPhysicalCoreMilliseconds", "sixteenPhysicalCoreMilliseconds", "oneWorkerRegressionRatio", "eightPhysicalCoreSpeedup", "eightToSixteenSpeedup"],
+      "properties": {
+        "name": { "type": "string", "enum": ["one-thousand-units", "four-thousand-units", "eight-thousand-units", "dense-eight-player"] },
+        "playerCount": { "const": 8 },
+        "peakUnitCount": { "type": "integer", "minimum": 1000 },
+        "requestedMinimumUnitCount": { "type": "integer", "minimum": 1000 },
+        "minimumInitialUnitCount": { "type": "integer", "minimum": 1000 },
+        "repeats": { "type": "integer", "minimum": 3 },
+        "stage3OneWorkerMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "stage5OneWorkerMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "eightPhysicalCoreMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "sixteenPhysicalCoreMilliseconds": { "type": "number", "exclusiveMinimum": 0 },
+        "oneWorkerRegressionRatio": { "type": "number", "exclusiveMinimum": 0, "maximum": 1.05 },
+        "eightPhysicalCoreSpeedup": { "type": "number", "minimum": 2 },
+        "eightToSixteenSpeedup": { "type": "number", "exclusiveMinimum": 1 }
+      }
+    }
+  }
+}

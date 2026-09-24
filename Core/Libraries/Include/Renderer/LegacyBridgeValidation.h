@@ -52,21 +52,22 @@ inline bool Is_D3D11_Local_Viewer_Value_Supported(unsigned int value)
 
 inline bool Is_D3D11_Patch_Segments_Value_Supported(unsigned int value)
 {
-	// D3DRS_PATCHSEGMENTS is a float bit pattern. 1.0f is the no-N-patch
-	// neutral value used by the legacy shader path.
+	// The historical patch-segment state is a float bit pattern. 1.0f is the
+	// no-N-patch neutral value used by the compatibility shader path.
 	return value == 0x3f800000U;
 }
 
 inline bool Is_D3D11_Clip_Plane_Mask_Supported(unsigned int value)
 {
-	// D3D8 exposes six user clip planes. Do not silently discard upper bits.
+	// The legacy API exposes six user clip planes. Do not silently discard
+	// upper bits.
 	return (value & ~0x3fU) == 0U;
 }
 
 inline bool Is_D3D11_Shade_Mode_Value_Supported(unsigned int value)
 {
-	// D3DSHADE_GOURAUD is the interpolated color route used by the neutral
-	// shader. D3DSHADE_FLAT needs a provoking-vertex shader/input contract.
+	// The interpolated shade mode is the color route used by the neutral shader.
+	// Flat shading needs a provoking-vertex shader/input contract.
 	return value == 2U;
 }
 
@@ -95,8 +96,8 @@ enum LegacyVolumetricShadowShadeMode
 // The volumetric-shadow final quad writes one identical shadow color at every
 // vertex, and the normal volume pass suppresses color writes (its release FVF
 // is position-only).  Those are the only cases allowed to replace legacy Flat
-// shading with the neutral renderer's Gouraud path.  Keep the D3D8 value when
-// equivalence is not proven so the legacy backend retains its exact behavior.
+// shading with the neutral renderer's Gouraud path. Keep the source API value
+// when equivalence is not proven so the legacy backend retains exact behavior.
 inline unsigned int Select_D3D11_Volumetric_Shadow_Shade_Mode(
 	bool d3d11Active, bool vertexColorsEquivalent)
 {
@@ -108,7 +109,7 @@ inline unsigned int Select_D3D11_Volumetric_Shadow_Shade_Mode(
 // These are the only legacy primitive types accepted by the neutral indexed
 // draw path.  Keep the arithmetic checked before converting to D3D11's
 // unsigned draw count.
-inline bool Checked_D3D8_Primitive_Index_Count(unsigned int primitive_type,
+inline bool Checked_Legacy_Primitive_Index_Count(unsigned int primitive_type,
 	unsigned int primitive_count, unsigned int *index_count)
 {
 	if (index_count == 0)
@@ -161,7 +162,7 @@ inline bool Checked_D3D8_Primitive_Index_Count(unsigned int primitive_type,
 	return true;
 }
 
-inline bool Is_D3D8_Indexed_Range_Valid(unsigned long index_capacity,
+inline bool Is_Legacy_Indexed_Range_Valid(unsigned long index_capacity,
 	unsigned int start_index, unsigned int index_count)
 {
 	const unsigned long start = static_cast<unsigned long>(start_index);
@@ -169,7 +170,7 @@ inline bool Is_D3D8_Indexed_Range_Valid(unsigned long index_capacity,
 	return start <= index_capacity && count <= index_capacity - start;
 }
 
-inline bool Is_D3D8_Vertex_Range_Valid(unsigned long vertex_capacity,
+inline bool Is_Legacy_Vertex_Range_Valid(unsigned long vertex_capacity,
 	unsigned int base_vertex, unsigned int min_vertex_index,
 	unsigned int vertex_count)
 {

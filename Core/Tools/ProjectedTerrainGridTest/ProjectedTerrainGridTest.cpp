@@ -1,7 +1,11 @@
 #include "Lib/JobSystem.h"
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/ProjectedTerrainGridKernel.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
+#include "W3DDevice/Common/ShadowDecalTransform.h"
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
+#include "W3DDevice/Common/ProjectedShadowQueuePolicy.h"
+#include "WWMath/matrix3d.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -32,14 +36,13 @@ public:
 	}
 	virtual unsigned minimumRowsPerTask() const
 	{
-		return m_snapshot.cellWidth == 0 ? 1 :
-			(PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS +
-			 m_snapshot.cellWidth - 1) / m_snapshot.cellWidth;
+		return ProjectedTerrainGridMinimumRowsPerTask(
+			m_snapshot.cellWidth);
 	}
 	virtual bool executeRows(unsigned begin, unsigned end)
 	{
-		return PrepareProjectedTerrainGridRows(m_snapshot, m_vertices,
-			m_indices, begin, end);
+		return PrepareProjectedTerrainGridRowsFromValidatedInput(
+			m_snapshot, m_vertices, m_indices, begin, end);
 	}
 private:
 	ProjectedTerrainGridWork(const ProjectedTerrainGridWork &);
@@ -208,6 +211,97 @@ static int prepareReference(Fixture *fixture)
 	return 0;
 }
 
+static bool sameMatrixBytes(const Matrix3D &first, const Matrix3D &second)
+{
+	Int row;
+	Int column;
+	for (row = 0; row < 3; ++row)
+	{
+		for (column = 0; column < 4; ++column)
+		{
+			const Real firstValue = first[row][column];
+			const Real secondValue = second[row][column];
+			if (memcmp(&firstValue, &secondValue, sizeof(Real)) != 0)
+				return false;
+		}
+	}
+	return true;
+}
+
+static void setTreeShadowProjectionAxes(Fixture *fixture,
+	const Matrix3D &transform, Real size)
+{
+	Vector3 uVector = transform.Get_X_Vector();
+	Vector3 vVector;
+	uVector.Z = 0.0f;
+	/* A zero-angle tree decal starts from identity, whose X axis has exact
+	 * length one; this is the same normalization result as queueDecal. */
+	uVector *= 1.0f;
+	vVector = uVector;
+	vVector.Rotate_Z(-1.0f, 0.0f);
+	uVector *= 1.0f / size;
+	vVector *= 1.0f / size;
+	fixture->snapshot.uAxisX = uVector.X;
+	fixture->snapshot.uAxisY = uVector.Y;
+	fixture->snapshot.vAxisX = vVector.X;
+	fixture->snapshot.vAxisY = vVector.Y;
+	fixture->snapshot.objectX = -21.5f;
+	fixture->snapshot.objectY = 43.25f;
+	fixture->snapshot.uOffset = 0.5f;
+	fixture->snapshot.vOffset = 0.5f;
+}
+
+/* The tree buffer's shared, unbound shadow begins at positive zero and only
+ * changes size/position. Compare its legacy Rotate_Z stream with the
+ * production skip helper, then verify the resulting projected grid emits
+ * byte-identical vertices and indices. Negative zero must still call through. */
+static int prepareSerial(Fixture *fixture);
+
+static int prepareTreeZeroAngleRegression()
+{
+	Fixture legacyFixture(9, 7, PROJECTED_TERRAIN_GRID_DECAL);
+	Fixture optimizedFixture(9, 7, PROJECTED_TERRAIN_GRID_DECAL);
+	const Real positiveZero = 0.0f;
+	const Real negativeZero = -0.0f;
+	const Real shadowSize = 37.25f;
+	Matrix3D legacyTransform(1);
+	Matrix3D optimizedTransform(1);
+	Matrix3D negativeZeroTransform(1);
+	Matrix3D negativeZeroLegacyTransform(1);
+
+	CHECK(initializeFixture(&legacyFixture) == 0);
+	CHECK(initializeFixture(&optimizedFixture) == 0);
+	legacyFixture.snapshot.clampToLayerHeight = 0;
+	optimizedFixture.snapshot.clampToLayerHeight = 0;
+	legacyFixture.snapshot.layerHeight = 0.0f;
+	optimizedFixture.snapshot.layerHeight = 0.0f;
+	legacyFixture.snapshot.heightBias = 0.1f;
+	optimizedFixture.snapshot.heightBias = 0.1f;
+	legacyFixture.snapshot.diffuse = 0xffffffffu;
+	optimizedFixture.snapshot.diffuse = 0xffffffffu;
+	legacyTransform.Rotate_Z(positiveZero);
+	CHECK(!ApplyShadowDecalLocalAngle(optimizedTransform, positiveZero));
+	CHECK(sameMatrixBytes(legacyTransform, optimizedTransform));
+
+	setTreeShadowProjectionAxes(&legacyFixture, legacyTransform, shadowSize);
+	setTreeShadowProjectionAxes(&optimizedFixture, optimizedTransform, shadowSize);
+	CHECK(prepareSerial(&legacyFixture) == 0);
+	CHECK(prepareSerial(&optimizedFixture) == 0);
+	CHECK(memcmp(legacyFixture.scratch.vertices(),
+		optimizedFixture.scratch.vertices(),
+		legacyFixture.expectedVertices.size() *
+			sizeof(ProjectedTerrainGridVertex)) == 0);
+	CHECK(memcmp(legacyFixture.scratch.indices(),
+		optimizedFixture.scratch.indices(),
+		legacyFixture.expectedIndices.size() * sizeof(UnsignedShort)) == 0);
+
+	negativeZeroLegacyTransform.Rotate_Z(negativeZero);
+	CHECK(ApplyShadowDecalLocalAngle(negativeZeroTransform, negativeZero));
+	CHECK(sameMatrixBytes(negativeZeroLegacyTransform,
+		negativeZeroTransform));
+	return 0;
+}
+
 static int comparePrepared(Fixture *fixture);
 
 static int prepareSerial(Fixture *fixture)
@@ -236,6 +330,8 @@ static int prepareThroughService(Fixture *fixture,
 {
 	ProjectedTerrainGridWork work(fixture->snapshot,
 		fixture->scratch.vertices(), fixture->scratch.indices());
+	CHECK(ValidateProjectedTerrainGridInput(fixture->snapshot,
+		fixture->scratch.vertices(), fixture->scratch.indices()));
 	memset(fixture->scratch.vertices(), 0xA5,
 		fixture->expectedVertices.size() * sizeof(ProjectedTerrainGridVertex));
 	memset(fixture->scratch.indices(), 0xA5,
@@ -313,6 +409,33 @@ static int kernelParity(RadarTerrainPrepareService *service,
 	return 0;
 }
 
+static int singleRangeServiceParity(RadarTerrainPrepareService &service,
+	unsigned workerCount)
+{
+	const unsigned kinds[] = {
+		PROJECTED_TERRAIN_GRID_SHADOW, PROJECTED_TERRAIN_GRID_DECAL
+	};
+	unsigned kind;
+	CHECK(rts::UseParallelPipelines());
+	CHECK(rts::JobSystem::chooseRangeCount(9,
+		ProjectedTerrainGridMinimumRowsPerTask(64), workerCount) == 1);
+	for (kind = 0; kind < sizeof(kinds) / sizeof(kinds[0]); ++kind)
+	{
+		Fixture fixture(65, 9, kinds[kind]);
+		bool ranParallel = true;
+		const rts::JobMetricCounter submittedBefore =
+			rts::JobSystem::instance().metrics().submittedJobCount;
+		CHECK(initializeFixture(&fixture) == 0);
+		CHECK(prepareSerial(&fixture) == 0);
+		CHECK(prepareThroughService(&fixture, service, 180 + kind,
+			&ranParallel) == 0);
+		CHECK(!ranParallel);
+		CHECK(rts::JobSystem::instance().metrics().submittedJobCount ==
+			submittedBefore + 1);
+	}
+	return 0;
+}
+
 static int invalidAndReuse()
 {
 	Fixture fixture(65, 33, PROJECTED_TERRAIN_GRID_DECAL);
@@ -333,6 +456,49 @@ static int invalidAndReuse()
 	invalid.cellWidth = 0;
 	CHECK(!ValidateProjectedTerrainGridInput(invalid,
 		fixture.scratch.vertices(), fixture.scratch.indices()));
+	CHECK(!ProjectedTerrainGridMayReachParallelThreshold(25.0f, 25.0f,
+		10.0f));
+	CHECK(!ProjectedTerrainGridMayReachParallelThreshold(100.0f, 100.0f,
+		10.0f));
+	CHECK(ProjectedTerrainGridMayReachParallelThreshold(110.0f, 110.0f,
+		10.0f));
+	CHECK(ProjectedTerrainGridMayReachParallelThreshold(1.0f, 1.0f,
+		0.0f));
+	CHECK(ValidateProjectedTerrainGridInput(fixture.snapshot,
+		fixture.scratch.vertices(), fixture.scratch.indices()));
+	CHECK(!PrepareProjectedTerrainGridRowsFromValidatedInput(
+		fixture.snapshot, fixture.scratch.vertices(),
+		fixture.scratch.indices(), 4, 4));
+	CHECK(!PrepareProjectedTerrainGridRowsFromValidatedInput(
+		fixture.snapshot, fixture.scratch.vertices(),
+		fixture.scratch.indices(), 0, fixture.height + 1));
+	return 0;
+}
+
+static int projectedShadowQueueFallbackPolicy()
+{
+	CHECK(!ProjectedShadowQueueAttemptCompleted(
+		PROJECTED_SHADOW_QUEUE_RETRY_SERIAL));
+	CHECK(!ProjectedShadowQueueAttemptCompleted(0));
+	CHECK(!ProjectedShadowQueueAttemptCompleted(2));
+	CHECK(ProjectedShadowQueueAttemptCompleted(
+		PROJECTED_SHADOW_QUEUE_COMPLETED));
+	CHECK(!ProjectedShadowParallelAttemptHandled(-1));
+	CHECK(ProjectedShadowParallelAttemptHandled(0));
+	CHECK(ProjectedShadowParallelAttemptHandled(1));
+	return 0;
+}
+
+static int projectedTerrainSingleRangePolicy()
+{
+	/* A 64-by-8-cell shallow patch reaches the 512-cell admission threshold,
+	 * but its nine vertex rows still form only one useful grain-8 range. */
+	CHECK(ProjectedTerrainGridMinimumRowsPerTask(64) == 8);
+	CHECK(!ProjectedTerrainGridHasMultipleRowRanges(9, 64, 6));
+	CHECK(ProjectedTerrainGridHasMultipleRowRanges(16, 64, 6));
+	CHECK(!ProjectedTerrainGridHasMultipleRowRanges(16, 64, 1));
+	CHECK(!ProjectedTerrainGridHasMultipleRowRanges(0, 64, 6));
+	CHECK(ProjectedTerrainGridMinimumRowsPerTask(0) == 1);
 	return 0;
 }
 
@@ -344,6 +510,8 @@ static int faultFallback(RadarTerrainPrepareService &service)
 	CHECK(prepareSerial(&fixture) == 0);
 	ProjectedTerrainGridWork workStorage(fixture.snapshot,
 		fixture.scratch.vertices(), fixture.scratch.indices());
+	CHECK(ValidateProjectedTerrainGridInput(fixture.snapshot,
+		fixture.scratch.vertices(), fixture.scratch.indices()));
 	memset(fixture.scratch.vertices(), 0xA5,
 		fixture.expectedVertices.size() * sizeof(ProjectedTerrainGridVertex));
 	memset(fixture.scratch.indices(), 0xA5,
@@ -379,16 +547,33 @@ static int serialPolicy()
 
 int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	bool serialPipelines = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity,
+		&serialPipelines, "--serial"))
+	{
+		fprintf(stderr, "Usage: projected_terrain_grid_tests "
+			"[--local-capacity|--external-qualification] [--serial]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
+	CHECK(prepareTreeZeroAngleRegression() == 0);
+	CHECK(projectedShadowQueueFallbackPolicy() == 0);
+	CHECK(projectedTerrainSingleRangePolicy() == 0);
 	const unsigned workers[] = { 1, 2, 4, 8, 16, 0 };
 	unsigned worker;
 	rts::JobSystem &system = rts::JobSystem::instance();
-	if (argc > 1 && strcmp(argv[1], "--serial") == 0)
+	if (serialPipelines)
 		return serialPolicy();
 
 	for (worker = 0; worker < sizeof(workers) / sizeof(workers[0]); ++worker)
 	{
+		const unsigned effectiveWorkerCount =
+			rts_test::ResolveActualWorkerCount(workers[worker], localCapacity);
+		rts_test::PrintWorkerCountSubstitution("projected terrain grid",
+			workers[worker], effectiveWorkerCount, localCapacity);
 		rts::JobSystemConfig config = rts::JobSystem::startupConfig();
-		config.workerCount = workers[worker];
+		config.workerCount = effectiveWorkerCount;
 		config.queueCapacity = 128;
 		config.scratchBytesPerWorker = 4096;
 		config.pinWorkers = false;
@@ -397,6 +582,7 @@ int main(int argc, char **argv)
 		bool sawMultiRange = false;
 		CHECK(service.initialize(16, 128));
 		CHECK(kernelParity(&service, &sawMultiRange) == 0);
+		CHECK(singleRangeServiceParity(service, system.workerCount()) == 0);
 		CHECK(invalidAndReuse() == 0);
 #if defined(RTS_BUILD_CORE_EXTRAS)
 		CHECK(faultFallback(service) == 0);

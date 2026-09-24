@@ -1406,8 +1406,9 @@ void WOLGameSetupMenuInit( WindowLayout *layout, void *userData )
 		if (it != TheMapCache->end())
 		{
 			hostSlot->setMapAvailability(TRUE);
-			game->setMapCRC( it->second.m_CRC );
+			game->setMapCRC( GetMapFileCRC(game->getMap()) );
 			game->setMapSize( it->second.m_filesize );
+			hostSlot->setMapAvailability(game->getMapCRC() != 0U);
 
 			game->adjustSlotsForMap(); // BGC- adjust the slots for the new map.
 		}

@@ -1,0 +1,824 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-immutable-evidence-receipt.json",
+  "title": "GeneralsGameCode Stage 5 trust-domain evidence receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion", "evidenceKind", "status", "role", "trustDomain",
+    "producer", "producerVersion", "sourceCommit", "title", "architecture",
+    "artifactSetSha256", "recordedUtc", "cohortNonce", "runtimeClosure",
+    "details", "provenance"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "evidenceKind": {
+      "type": "string",
+      "enum": [
+        "stage5-executable-originated-receipt",
+        "stage5-host-runner-receipt",
+        "stage5-reviewed-fixture-receipt",
+        "stage5-premium-review-receipt",
+        "stage5-manual-approval-receipt"
+      ]
+    },
+    "status": { "type": "string", "const": "passed" },
+    "role": {
+      "type": "string",
+      "enum": [
+        "validation-plan", "validation-results", "replay-results",
+        "replay-fixture-manifest", "ai-results", "performance-report",
+        "combined-results", "premium-review-results", "manual-checklist"
+      ]
+    },
+    "trustDomain": {
+      "type": "string",
+      "enum": [
+        "executable", "host-runner", "reviewed-fixture", "premium-review",
+        "manual-approval"
+      ]
+    },
+    "producer": {
+      "type": "string",
+      "enum": [
+        "installed-runtime-validation-plan-v2",
+        "installed-runtime-validation-results-v2",
+        "installed-runtime-replay-results-v2",
+        "installed-runtime-ai-results-v2",
+        "installed-runtime-performance-report-v2",
+        "installed-runtime-combined-results-v2",
+        "reviewed-replay-fixture-manifest-v2",
+        "stage5-premium-review-receipt-v2",
+        "installed-runtime-manual-acceptance-v2",
+        "game-executable-stage5-performance-report-v5"
+      ]
+    },
+    "producerVersion": { "type": "string", "enum": ["2", "5"] },
+    "runNonce": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sourceCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "title": { "type": "string", "enum": ["Generals", "ZeroHour", "Both"] },
+    "architecture": { "type": "string", "const": "x64" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "executableSha256": {
+      "oneOf": [
+        { "$ref": "#/$defs/sha256" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["Generals", "ZeroHour"],
+          "properties": {
+            "Generals": { "$ref": "#/$defs/sha256" },
+            "ZeroHour": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    },
+    "recordedUtc": { "type": "string", "format": "date-time" },
+    "cohortNonce": { "type": "string", "format": "uuid" },
+    "runtimeClosure": { "$ref": "#/$defs/runtimeClosureBinding" },
+    "rawLogs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/rawLog" }
+    },
+    "details": { "type": "object" },
+    "provenance": { "type": "object" },
+    "protection": { "$ref": "#/$defs/protection" }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/hostRunnerReceipt" },
+    { "$ref": "#/$defs/executableReceipt" },
+    { "$ref": "#/$defs/reviewedFixtureReceipt" },
+    { "$ref": "#/$defs/premiumReviewReceipt" },
+    { "$ref": "#/$defs/manualApprovalReceipt" }
+  ],
+  "allOf": [
+    {
+      "if": { "properties": { "trustDomain": { "type": "string", "const": "executable" } } },
+      "then": {
+        "properties": {
+          "schemaVersion": { "type": "integer", "const": 1 },
+          "producerVersion": { "type": "string", "const": "5" }
+        }
+      },
+      "else": {
+        "properties": {
+          "schemaVersion": { "type": "integer", "const": 1 },
+          "producerVersion": { "type": "string", "const": "2" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!.*:)(?!\\.{1,2}(?:[\\\\/]|$))(?!.*[\\\\/]\\.{1,2}(?:[\\\\/]|$))(?!.*[ .](?:[\\\\/]|$))[^\\\\/\\u0000-\\u001F\\u007F]+(?:[\\\\/][^\\\\/\\u0000-\\u001F\\u007F]+)*$"
+    },
+    "absoluteWindowsPath": {
+      "type": "string",
+      "minLength": 4,
+      "pattern": "^[A-Za-z]:[\\\\/](?!\\.\\.(?:[\\\\/]|$))(?!.*[\\\\/]\\.\\.(?:[\\\\/]|$))(?!.*:).+$"
+    },
+    "rawLog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "sha256"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "runtimeClosureBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependencyManifestSha256", "closureSha256"],
+      "properties": {
+        "dependencyManifestSha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "childStream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "nativeReceiptReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "producer", "runNonce", "cohortNonce"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "producer": {
+          "type": "string",
+          "const": "game-executable-stage5-performance-report-v5"
+        },
+        "runNonce": { "type": "string", "format": "uuid" },
+        "cohortNonce": { "type": "string", "format": "uuid" }
+      }
+    },
+    "nativeRawBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "sourcePath", "path", "sha256"],
+      "properties": {
+        "name": { "type": "string", "enum": ["raw-log", "timing"] },
+        "sourcePath": {
+          "oneOf": [
+            { "$ref": "#/$defs/relativePath" },
+            { "$ref": "#/$defs/absoluteWindowsPath" }
+          ]
+        },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "hostChild": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role", "title", "runNonce", "processId", "processCreationUtc",
+        "executablePath", "executableSha256", "commandLine", "exitCode",
+        "stdout", "stderr", "nativeReceipt"
+      ],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "sourceSequence": { "type": "integer", "minimum": 1 },
+        "role": { "type": "string", "minLength": 1 },
+        "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+        "runNonce": { "type": "string", "format": "uuid" },
+        "processId": { "type": "integer", "minimum": 1 },
+        "processCreationUtc": { "type": "string", "format": "date-time" },
+        "executablePath": { "type": "string", "minLength": 1 },
+        "executableSha256": { "$ref": "#/$defs/sha256" },
+        "commandLine": { "type": "string", "minLength": 1 },
+        "arguments": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "exitCode": { "const": 0 },
+        "qualificationData": {
+          "$ref": "#/$defs/simulationQualificationDataBinding"
+        },
+        "stdout": { "$ref": "#/$defs/childStream" },
+        "stderr": { "$ref": "#/$defs/childStream" },
+        "nativeReceipt": { "$ref": "#/$defs/nativeReceiptReference" },
+        "nativeReceiptSourcePath": { "type": "string", "minLength": 1 },
+        "nativeRawBindings": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "items": { "$ref": "#/$defs/nativeRawBinding" },
+          "allOf": [
+            {
+              "contains": {
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "type": "string", "const": "raw-log" } }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            },
+            {
+              "contains": {
+                "type": "object",
+                "required": ["name"],
+                "properties": { "name": { "type": "string", "const": "timing" } }
+              },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          ]
+        }
+      }
+    },
+    "validationResultHostChild": {
+      "allOf": [
+        { "$ref": "#/$defs/hostChild" },
+        { "required": ["sequence", "arguments", "qualificationData"] }
+      ]
+    },
+    "combinedHostChild": {
+      "allOf": [
+        { "$ref": "#/$defs/hostChild" },
+        {
+          "required": [
+            "sourceSequence", "qualificationData", "nativeReceiptSourcePath",
+            "nativeRawBindings"
+          ],
+          "properties": {
+            "role": { "type": "string", "const": "combined-results" },
+            "sourceSequence": { "const": 1 },
+            "nativeReceiptSourcePath": {
+              "oneOf": [
+                { "$ref": "#/$defs/relativePath" },
+                { "$ref": "#/$defs/absoluteWindowsPath" }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "hostProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "runner", "runnerVersion", "childProvenance", "children"],
+      "properties": {
+        "kind": { "type": "string", "const": "host-runner-observation" },
+        "runner": { "type": "string", "minLength": 1 },
+        "runnerVersion": { "type": "string", "const": "1" },
+        "childProvenance": { "type": "string", "enum": ["bound", "not-applicable"] },
+        "children": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/hostChild" }
+        }
+      }
+    },
+    "boundHostProvenance": {
+      "allOf": [
+        { "$ref": "#/$defs/hostProvenance" },
+        {
+          "properties": {
+            "childProvenance": { "type": "string", "const": "bound" },
+            "children": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "items": {
+                "allOf": [
+                  { "$ref": "#/$defs/hostChild" },
+                  {
+                    "required": ["qualificationData"],
+                    "not": {
+                      "anyOf": [
+                        { "required": ["nativeReceiptSourcePath"] },
+                        { "required": ["nativeRawBindings"] }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "validationResultsHostProvenance": {
+      "allOf": [
+        { "$ref": "#/$defs/hostProvenance" },
+        {
+          "properties": {
+            "childProvenance": { "type": "string", "const": "bound" },
+            "children": {
+              "type": "array",
+              "minItems": 253,
+              "maxItems": 253,
+              "items": { "$ref": "#/$defs/validationResultHostChild" }
+            }
+          }
+        }
+      ]
+    },
+    "planHostProvenance": {
+      "allOf": [
+        { "$ref": "#/$defs/hostProvenance" },
+        {
+          "properties": {
+            "childProvenance": { "type": "string", "const": "not-applicable" },
+            "children": { "type": "array", "maxItems": 0 }
+          }
+        }
+      ]
+    },
+    "combinedHostProvenance": {
+      "allOf": [
+        { "$ref": "#/$defs/hostProvenance" },
+        {
+          "properties": {
+            "childProvenance": { "type": "string", "const": "bound" },
+            "children": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "allOf": [
+                    { "$ref": "#/$defs/combinedHostChild" },
+                    {
+                      "properties": {
+                        "title": { "type": "string", "const": "Generals" },
+                        "qualificationData": {
+                          "properties": { "title": { "type": "string", "const": "Generals" } }
+                        }
+                      }
+                    }
+                  ]
+                },
+                {
+                  "allOf": [
+                    { "$ref": "#/$defs/combinedHostChild" },
+                    {
+                      "properties": {
+                        "title": { "type": "string", "const": "ZeroHour" },
+                        "qualificationData": {
+                          "properties": { "title": { "type": "string", "const": "ZeroHour" } }
+                        }
+                      }
+                    }
+                  ]
+                }
+              ],
+              "items": false
+            }
+          }
+        }
+      ]
+    },
+    "nativeProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind", "receiptPath", "receiptSha256", "processId",
+        "processCreationUtc", "executablePath", "executableSha256",
+        "commandLine", "exitCode"
+      ],
+      "properties": {
+        "kind": { "type": "string", "const": "native-executable-observation" },
+        "receiptPath": {
+          "oneOf": [
+            { "$ref": "#/$defs/relativePath" },
+            { "$ref": "#/$defs/absoluteWindowsPath" }
+          ]
+        },
+        "receiptSha256": { "$ref": "#/$defs/sha256" },
+        "processId": { "type": "integer", "minimum": 1 },
+        "processCreationUtc": { "type": "string", "format": "date-time" },
+        "executablePath": { "type": "string", "minLength": 1 },
+        "executableSha256": { "$ref": "#/$defs/sha256" },
+        "commandLine": { "type": "string", "minLength": 1 },
+        "exitCode": { "const": 0 }
+      }
+    },
+    "reviewedFixtureProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "reviewedBy", "reviewedUtc", "fixtureManifest"],
+      "properties": {
+        "kind": { "type": "string", "const": "reviewed-fixture" },
+        "reviewedBy": { "type": "string", "minLength": 1 },
+        "reviewedUtc": { "type": "string", "format": "date-time" },
+        "fixtureManifest": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": { "$ref": "#/$defs/relativePath" },
+            "sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      }
+    },
+    "externalProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "reviewedBy", "reviewedUtc"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["premium-review", "manual-approval"] },
+        "reviewedBy": { "type": "string", "minLength": 1 },
+        "reviewedUtc": { "type": "string", "format": "date-time" }
+      }
+    },
+    "protection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "path", "sha256"],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "external-reviewed-fixture-attestation",
+            "external-premium-review-attestation",
+            "external-user-manual-approval-attestation"
+          ]
+        },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "combinedSourceReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "role", "path", "sha256", "runNonce", "cohortNonce"
+      ],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": [
+            "validation-plan", "validation-results", "replay-results",
+            "ai-results"
+          ]
+        },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "runNonce": { "type": "string", "format": "uuid" },
+        "cohortNonce": { "type": "string", "format": "uuid" }
+      }
+    },
+    "simulationQualificationDataBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path", "title", "manifestSha256", "closureSha256", "fileCount"
+      ],
+      "properties": {
+        "path": { "type": "string", "const": "QualificationData.json" },
+        "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+        "manifestSha256": {
+          "type": "string",
+          "pattern": "^[0-9A-F]{64}$"
+        },
+        "closureSha256": {
+          "type": "string",
+          "pattern": "^[0-9A-F]{64}$"
+        },
+        "fileCount": { "const": 6 }
+      }
+    },
+    "qualifiedHostDetails": {
+      "type": "object",
+      "required": ["qualificationData"],
+      "properties": {
+        "qualificationData": {
+          "$ref": "#/$defs/simulationQualificationDataBinding"
+        }
+      }
+    },
+    "combinedSourceCorpus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "title", "sourceChildCount", "reviewedFixture", "qualificationData",
+        "receipts"
+      ],
+      "properties": {
+        "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+        "sourceChildCount": { "const": 253 },
+        "reviewedFixture": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "receipt", "protection", "manifest", "fileCount", "closureSha256"
+          ],
+          "properties": {
+            "receipt": { "$ref": "#/$defs/childStream" },
+            "protection": { "$ref": "#/$defs/childStream" },
+            "manifest": { "$ref": "#/$defs/childStream" },
+            "fileCount": { "const": 13 },
+            "closureSha256": { "$ref": "#/$defs/sha256" }
+          }
+        },
+        "qualificationData": {
+          "$ref": "#/$defs/simulationQualificationDataBinding"
+        },
+        "receipts": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceReceipt" },
+                { "properties": { "role": { "type": "string", "const": "validation-plan" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceReceipt" },
+                { "properties": { "role": { "type": "string", "const": "validation-results" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceReceipt" },
+                { "properties": { "role": { "type": "string", "const": "replay-results" } } }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceReceipt" },
+                { "properties": { "role": { "type": "string", "const": "ai-results" } } }
+              ]
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "combinedDetails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pipelineMode", "simulationMode", "requestedWorkers", "workerPolicy",
+        "projectionSequence", "projectionSemantics", "sourceChildCount",
+        "bothTitlesPassed", "sourceCorpora"
+      ],
+      "properties": {
+        "pipelineMode": { "type": "string", "const": "serial" },
+        "simulationMode": { "type": "string", "const": "serial" },
+        "requestedWorkers": { "type": "string", "const": "1" },
+        "workerPolicy": { "type": "string", "const": "auto" },
+        "projectionSequence": { "const": 1 },
+        "projectionSemantics": { "type": "string", "const": "deterministic-lineage-pointer" },
+        "sourceChildCount": { "const": 253 },
+        "bothTitlesPassed": { "const": true },
+        "sourceCorpora": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceCorpus" },
+                {
+                  "properties": {
+                    "title": { "type": "string", "const": "Generals" },
+                    "qualificationData": {
+                      "properties": { "title": { "type": "string", "const": "Generals" } }
+                    },
+                    "receipts": {
+                      "prefixItems": [
+                        { "properties": { "path": { "type": "string", "const": "sources\\Generals\\validation-plan-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\Generals\\validation-results-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\Generals\\replay-results-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\Generals\\ai-results-receipt.json" } } }
+                      ]
+                    }
+                  }
+                }
+              ]
+            },
+            {
+              "allOf": [
+                { "$ref": "#/$defs/combinedSourceCorpus" },
+                {
+                  "properties": {
+                    "title": { "type": "string", "const": "ZeroHour" },
+                    "qualificationData": {
+                      "properties": { "title": { "type": "string", "const": "ZeroHour" } }
+                    },
+                    "receipts": {
+                      "prefixItems": [
+                        { "properties": { "path": { "type": "string", "const": "sources\\ZeroHour\\validation-plan-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\ZeroHour\\validation-results-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\ZeroHour\\replay-results-receipt.json" } } },
+                        { "properties": { "path": { "type": "string", "const": "sources\\ZeroHour\\ai-results-receipt.json" } } }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          ],
+          "items": false
+        }
+      }
+    },
+    "commonHostProperties": {
+      "type": "object",
+      "properties": {
+        "trustDomain": { "type": "string", "const": "host-runner" },
+        "evidenceKind": { "type": "string", "const": "stage5-host-runner-receipt" },
+        "producerVersion": { "type": "string", "const": "2" },
+        "provenance": { "$ref": "#/$defs/hostProvenance" }
+      }
+    },
+    "hostRunnerReceipt": {
+      "allOf": [
+        { "$ref": "#/$defs/commonHostProperties" },
+        {
+          "type": "object",
+          "required": [
+            "runNonce", "executableSha256", "rawLogs", "provenance"
+          ],
+          "oneOf": [
+            {
+              "required": ["role", "producer"],
+              "properties": {
+                "role": { "type": "string", "const": "validation-plan" },
+                "producer": { "type": "string", "const": "installed-runtime-validation-plan-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/planHostProvenance" }
+              }
+            },
+            {
+              "required": ["role", "producer"],
+              "properties": {
+                "role": { "type": "string", "const": "validation-results" },
+                "producer": { "type": "string", "const": "installed-runtime-validation-results-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/validationResultsHostProvenance" }
+              }
+            },
+            {
+              "required": ["role", "producer"],
+              "properties": {
+                "role": { "type": "string", "const": "replay-results" },
+                "producer": { "type": "string", "const": "installed-runtime-replay-results-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/boundHostProvenance" }
+              }
+            },
+            {
+              "required": ["role", "producer"],
+              "properties": {
+                "role": { "type": "string", "const": "ai-results" },
+                "producer": { "type": "string", "const": "installed-runtime-ai-results-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/boundHostProvenance" }
+              }
+            },
+            {
+              "required": ["role", "producer"],
+              "properties": {
+                "role": { "type": "string", "const": "performance-report" },
+                "producer": { "type": "string", "const": "installed-runtime-performance-report-v2" },
+                "details": { "$ref": "#/$defs/qualifiedHostDetails" },
+                "provenance": { "$ref": "#/$defs/boundHostProvenance" }
+              }
+            },
+            {
+              "required": ["role", "producer"],
+              "properties": {
+                "role": { "type": "string", "const": "combined-results" },
+                "producer": { "type": "string", "const": "installed-runtime-combined-results-v2" },
+                "details": { "$ref": "#/$defs/combinedDetails" },
+                "provenance": { "$ref": "#/$defs/combinedHostProvenance" }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "executableReceipt": {
+      "type": "object",
+      "required": [
+        "runNonce", "executableSha256", "rawLogs", "provenance"
+      ],
+      "properties": {
+        "trustDomain": { "type": "string", "const": "executable" },
+        "evidenceKind": { "type": "string", "const": "stage5-executable-originated-receipt" },
+        "role": {
+          "type": "string",
+          "enum": [
+            "validation-results", "replay-results", "ai-results",
+            "performance-report"
+          ]
+        },
+        "producer": {
+          "type": "string",
+          "const": "game-executable-stage5-performance-report-v5"
+        },
+        "provenance": { "$ref": "#/$defs/nativeProvenance" }
+      },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "role": { "type": "string", "const": "validation-results" },
+                "producer": { "type": "string", "const": "game-executable-stage5-performance-report-v5" }
+              }
+            },
+            {
+              "properties": {
+                "role": { "type": "string", "const": "replay-results" },
+                "producer": { "type": "string", "const": "game-executable-stage5-performance-report-v5" }
+              }
+            },
+            {
+              "properties": {
+                "role": { "type": "string", "const": "ai-results" },
+                "producer": { "type": "string", "const": "game-executable-stage5-performance-report-v5" }
+              }
+            },
+            {
+              "properties": {
+                "role": { "type": "string", "const": "performance-report" },
+                "producer": { "type": "string", "const": "game-executable-stage5-performance-report-v5" }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "reviewedFixtureReceipt": {
+      "type": "object",
+      "required": ["provenance", "protection"],
+      "properties": {
+        "trustDomain": { "type": "string", "const": "reviewed-fixture" },
+        "evidenceKind": { "type": "string", "const": "stage5-reviewed-fixture-receipt" },
+        "role": { "type": "string", "const": "replay-fixture-manifest" },
+        "producer": { "type": "string", "const": "reviewed-replay-fixture-manifest-v2" },
+        "provenance": { "$ref": "#/$defs/reviewedFixtureProvenance" },
+        "protection": {
+          "allOf": [
+            { "$ref": "#/$defs/protection" },
+            { "properties": { "kind": { "type": "string", "const": "external-reviewed-fixture-attestation" } } }
+          ]
+        }
+      }
+    },
+    "premiumReviewReceipt": {
+      "type": "object",
+      "required": ["provenance", "protection"],
+      "properties": {
+        "trustDomain": { "type": "string", "const": "premium-review" },
+        "evidenceKind": { "type": "string", "const": "stage5-premium-review-receipt" },
+        "role": { "type": "string", "const": "premium-review-results" },
+        "producer": { "type": "string", "const": "stage5-premium-review-receipt-v2" },
+        "provenance": { "$ref": "#/$defs/externalProvenance" },
+        "protection": {
+          "allOf": [
+            { "$ref": "#/$defs/protection" },
+            { "properties": { "kind": { "type": "string", "const": "external-premium-review-attestation" } } }
+          ]
+        }
+      }
+    },
+    "manualApprovalReceipt": {
+      "type": "object",
+      "required": ["provenance", "protection"],
+      "properties": {
+        "trustDomain": { "type": "string", "const": "manual-approval" },
+        "evidenceKind": { "type": "string", "const": "stage5-manual-approval-receipt" },
+        "role": { "type": "string", "const": "manual-checklist" },
+        "producer": { "type": "string", "const": "installed-runtime-manual-acceptance-v2" },
+        "provenance": { "$ref": "#/$defs/externalProvenance" },
+        "protection": {
+          "allOf": [
+            { "$ref": "#/$defs/protection" },
+            { "properties": { "kind": { "type": "string", "const": "external-user-manual-approval-attestation" } } }
+          ]
+        }
+      }
+    }
+  }
+}

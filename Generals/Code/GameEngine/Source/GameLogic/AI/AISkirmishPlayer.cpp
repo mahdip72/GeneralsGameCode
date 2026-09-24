@@ -41,6 +41,9 @@
 #include "Common/WellKnownKeys.h"
 #include "Common/Xfer.h"
 #include "GameLogic/GameLogic.h"
+#if defined(_WIN64)
+#include "GameLogic/GeneralsAIPlanningPolicy.h"
+#endif
 #include "GameLogic/Object.h"
 #include "GameLogic/AISkirmishPlayer.h"
 #include "GameLogic/SidesList.h"
@@ -465,6 +468,151 @@ Int AISkirmishPlayer::getMyEnemyPlayerIndex() {
 	}
 	return playerNdx;
 }
+
+#if defined(_WIN64)
+Bool AISkirmishPlayer::isEnemyPlanningDue() const
+{
+	if (TheGameLogic->getFrame() < m_frameToCheckEnemy)
+		return false;
+	// Retail Generals retains a healthy current enemy without evaluating the
+	// rest of the player list. Leave that exact fast path to getAiEnemy().
+	return !m_currentEnemy || !m_currentEnemy->hasAnyUnits() ||
+		!m_currentEnemy->hasAnyBuildFacility();
+}
+
+//-------------------------------------------------------------------------------------------------
+/** Capture Generals target observations in stable PlayerList order. */
+//-------------------------------------------------------------------------------------------------
+Bool AISkirmishPlayer::captureEnemyPlanningSnapshot(
+	GeneralsAIEnemyPlanningSnapshot *snapshot) const
+{
+	if (!snapshot || ThePlayerList->getPlayerCount() >
+			GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS)
+		return false;
+	ClearGeneralsAIEnemyPlanningSnapshot(snapshot);
+	snapshot->frame = (UnsignedInt)TheGameLogic->getFrame();
+	snapshot->ownerPlayerIndex = (UnsignedInt)m_player->getPlayerIndex();
+	snapshot->initialBestDistanceSquared = HUGE_DIST * HUGE_DIST;
+
+	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i)
+	{
+		Player *candidatePlayer = ThePlayerList->getNthPlayer(i);
+		if (!candidatePlayer ||
+			m_player->getRelationship(candidatePlayer->getDefaultTeam()) != ENEMIES ||
+			!candidatePlayer->hasAnyObjects())
+		{
+			continue;
+		}
+		if (snapshot->candidateCount >= GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS)
+			return false;
+
+		GeneralsAIEnemyCandidateFact &fact =
+			snapshot->candidates[snapshot->candidateCount++];
+		fact.sourceOrdinal = (UnsignedInt)i;
+		fact.playerIndex = candidatePlayer->getPlayerIndex();
+
+		Coord3D enemyPosition = m_baseCenter;
+		Region2D bounds;
+		getPlayerStructureBounds(&bounds, i);
+		enemyPosition.x = bounds.lo.x + bounds.width() / 2;
+		enemyPosition.y = bounds.lo.y + bounds.height() / 2;
+		fact.baseDistanceSquared =
+			sqr(enemyPosition.x - m_baseCenter.x) +
+			sqr(enemyPosition.y - m_baseCenter.y);
+		if (!candidatePlayer->hasAnyUnits() ||
+			!candidatePlayer->hasAnyBuildFacility())
+		{
+			fact.baseDistanceSquared = HUGE_DIST * HUGE_DIST * 0.5f;
+		}
+
+		for (Int k = 0; k < ThePlayerList->getPlayerCount(); ++k)
+		{
+			if (k == i)
+				continue;
+			Player *other = ThePlayerList->getNthPlayer(k);
+			if (!other || !other->isSkirmishAIPlayer())
+				continue;
+			const UnsignedInt bit = 1U << (UnsignedInt)k;
+			if (other->getCachedCurrentEnemy() == candidatePlayer)
+				fact.targetingCandidateMask |= bit;
+			if (other->getCachedCurrentEnemy() == m_player)
+				fact.targetingOwnerMask |= bit;
+		}
+	}
+	return ValidateGeneralsAIEnemyPlanningSnapshot(*snapshot);
+}
+
+Bool AISkirmishPlayer::resolveEnemyPlanningCommit(
+	const GeneralsAIEnemyPlanningSnapshot &snapshot,
+	const GeneralsAIEnemyPlanningResult &result,
+	Player **resolvedEnemy) const
+{
+	// The Generals batch executor performs the single canonical numeric
+	// validation before this owner commit. Keep this boundary structural and
+	// live-state aware so normal mode does not recompute the enemy oracle twice.
+	if (!resolvedEnemy || result.valid != 1U ||
+		snapshot.frame != (UnsignedInt)TheGameLogic->getFrame() ||
+		snapshot.ownerPlayerIndex != (UnsignedInt)m_player->getPlayerIndex() ||
+		result.orderKey.frame != snapshot.frame ||
+		result.orderKey.playerIndex != snapshot.ownerPlayerIndex ||
+		result.orderKey.subphase != rts::AI_PLANNING_SUBPHASE_ENEMY_TARGET ||
+		result.orderKey.emissionOrdinal != 0U ||
+		snapshot.candidateCount > GENERALS_AI_ENEMY_PLANNING_MAX_PLAYERS)
+	{
+		return false;
+	}
+	*resolvedEnemy = nullptr;
+	if (result.selectedPlayerIndex < 0)
+	{
+		return result.selectedPlayerIndex == -1 &&
+			result.orderKey.sourceOrdinal == rts::AI_PLANNING_INVALID_ORDINAL;
+	}
+
+	Bool snapshotMember = false;
+	for (UnsignedInt i = 0U; i < snapshot.candidateCount; ++i)
+	{
+		const GeneralsAIEnemyCandidateFact &candidate = snapshot.candidates[i];
+		if (candidate.playerIndex == result.selectedPlayerIndex &&
+			candidate.sourceOrdinal == result.orderKey.sourceOrdinal)
+		{
+			snapshotMember = true;
+			break;
+		}
+	}
+	if (!snapshotMember || result.orderKey.sourceOrdinal >=
+		(UnsignedInt)ThePlayerList->getPlayerCount())
+	{
+		return false;
+	}
+
+	Player *candidate = ThePlayerList->getNthPlayer(
+		(Int)result.orderKey.sourceOrdinal);
+	if (!candidate || candidate->getPlayerIndex() != result.selectedPlayerIndex ||
+		m_player->getRelationship(candidate->getDefaultTeam()) != ENEMIES ||
+		!candidate->hasAnyObjects())
+	{
+		return false;
+	}
+	*resolvedEnemy = candidate;
+	return true;
+}
+
+void AISkirmishPlayer::applyEnemyPlanningCommit(Player *resolvedEnemy)
+{
+	m_frameToCheckEnemy = TheGameLogic->getFrame() +
+		5 * LOGICFRAMES_PER_SECOND;
+	if (resolvedEnemy && resolvedEnemy != m_currentEnemy)
+	{
+		m_currentEnemy = resolvedEnemy;
+		AsciiString message = TheNameKeyGenerator->keyToName(
+			m_player->getPlayerNameKey());
+		message.concat(" acquiring target enemy player: ");
+		message.concat(TheNameKeyGenerator->keyToName(
+			m_currentEnemy->getPlayerNameKey()));
+		TheScriptEngine->AppendDebugMessage(message, false);
+	}
+}
+#endif
 
 /**
 	Get the AI's enemy.  Recalc if it has been a while (5 seconds.)
@@ -927,9 +1075,19 @@ void AISkirmishPlayer::doTeamBuilding()
 		// happens, like a building is added or a unit finished, the timers are shortcut.
 		m_teamDelay--;
 		if (m_teamDelay<1) {
+			#if defined(_WIN64)
+			if (!consumeProductionPlanningQueue())
+				queueUnits(); // update the queues.
+			#else
 			queueUnits(); // update the queues.
+			#endif
 			if (m_readyToBuildTeam) {
+				#if defined(_WIN64)
+				if (!consumeProductionPlanningHandled())
+					processTeamBuilding();
+				#else
 				processTeamBuilding();
+				#endif
 			}
 			m_teamDelay = 2*LOGICFRAMES_PER_SECOND; // check again in 5 seconds.
 			// Note that this timer gets shortcut when a unit or building is completed.

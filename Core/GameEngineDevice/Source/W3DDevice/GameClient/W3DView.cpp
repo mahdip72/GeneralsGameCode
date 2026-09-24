@@ -89,8 +89,8 @@
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "W3DDevice/GameClient/Module/W3DModelDraw.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
+#include "Renderer/RenderGameClient.h"
 
-#include "WW3D2/dx8renderer.h"
 #include "WW3D2/light.h"
 #include "WW3D2/predlod.h"
 #include "WW3D2/ww3d.h"
@@ -174,6 +174,10 @@ W3DView::W3DView()
 	m_FXPitch = 1.0f;
 	m_freezeTimeForCameraMovement = false;
 	m_lastScreenToTerrainValid = false;
+	m_shellTerrainSizedMap = nullptr;
+	m_shellTerrainDrawWidth = 0;
+	m_shellTerrainDrawHeight = 0;
+	m_shellTerrainViewportAspect = 0.0f;
 
 	//Enhancements from CNC3 WST 4/15/2003. JSC Integrated 5/20/03.
 	m_scriptedState = 0;
@@ -920,6 +924,10 @@ void W3DView::set3DCameraLookAt(const Coord3D &pos, const Coord3D &dir, Real rol
 void W3DView::reset()
 {
 	View::reset();
+	m_shellTerrainSizedMap = nullptr;
+	m_shellTerrainDrawWidth = 0;
+	m_shellTerrainDrawHeight = 0;
+	m_shellTerrainViewportAspect = 0.0f;
 
 	// Just in case...
 	setTimeMultiplier(1); // Set time rate back to 1.
@@ -1892,7 +1900,8 @@ void W3DView::draw()
 				RenderInfoClass rinfo(*m_3DCamera);
 				// Apply the camera and viewport (including depth range)
 				m_3DCamera->Apply();
-				TheDX8MeshRenderer.Set_Camera(&rinfo.Camera);
+				rts::render::SetGameRenderCamera(
+					static_cast<void *>(&rinfo.Camera));
 				W3DDisplay::m_3DScene->renderSpecificDrawables(rinfo, 1, &drawable);
 				WW3D::Flush(rinfo);
 			}
@@ -1914,7 +1923,14 @@ void W3DView::draw()
 		//The pass that rendered into a texture may have left the z-buffer in a weird state
 		//so clear it before rendering normal scene.
 		///@todo: Don't clear z-buffer unless shader uses z-bias or anything else that would cause <= z to fail on normal render.
-		DX8Wrapper::Clear(false, true, Vector3(0.0f,0.0f,0.0f), TheWaterTransparency->m_minWaterOpacity);	// Clear z but not color
+		rts::render::GameRenderColor clearColor;
+		clearColor.red = 0.0f;
+		clearColor.green = 0.0f;
+		clearColor.blue = 0.0f;
+		clearColor.alpha = 0.0f;
+		(void)rts::render::ClearGameRenderTargets(
+			false, true, clearColor,
+			TheWaterTransparency->m_minWaterOpacity);	// Clear z but not color
 		W3DDisplay::m_3DScene->setCustomPassMode(SCENE_PASS_DEFAULT);
 		W3DDisplay::m_3DScene->doRender( m_3DCamera );
 		Coord2D deltaScroll;
@@ -3390,6 +3406,13 @@ void W3DView::pitchCameraOneFrame()
 //-------------------------------------------------------------------------------------------------
 void W3DView::setUserControlled(Bool value)
 {
+	if (value)
+	{
+		m_shellTerrainSizedMap = nullptr;
+		m_shellTerrainDrawWidth = 0;
+		m_shellTerrainDrawHeight = 0;
+		m_shellTerrainViewportAspect = 0.0f;
+	}
 	if (m_isUserControlled != value)
 	{
 		m_isUserControlled = value;
@@ -3704,10 +3727,14 @@ void W3DView::Add_Camera_Shake (const Coord3D & position,float radius,float dura
 	CameraShakerSystem.Add_Camera_Shake(vpos,radius,duration,power);
 }
 
-bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
+bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions)
 {
 	if (TheGlobalData && TheGlobalData->m_drawEntireTerrain)
 	{
+		m_shellTerrainSizedMap = nullptr;
+		m_shellTerrainDrawWidth = 0;
+		m_shellTerrainDrawHeight = 0;
+		m_shellTerrainViewportAspect = 0.0f;
 		DEBUG_ASSERTCRASH(TheTerrainRenderObject != nullptr, ("TheTerrainRenderObject is null"));
 
 		if (const WorldHeightMap *heightMap = TheTerrainRenderObject->getMap())
@@ -3721,11 +3748,20 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 	}
 
 	const Real cameraPitch = asin(fabs(m_3DCamera->Get_Forward_Dir().Z));
-
-	if (!m_isUserControlled)
+	const Bool isShellCamera = !m_isUserControlled && TheGameLogic &&
+		TheGameLogic->isInGame() && TheGameLogic->getGameMode() == GAME_SHELL;
+	if (!isShellCamera)
 	{
-		// TheSuperHackers @info The scripted camera always uses the regular draw sizes
-		// and uses terrain oversize if it needs to enlarge.
+		m_shellTerrainSizedMap = nullptr;
+		m_shellTerrainDrawWidth = 0;
+		m_shellTerrainDrawHeight = 0;
+		m_shellTerrainViewportAspect = 0.0f;
+	}
+
+	if (!m_isUserControlled && !isShellCamera)
+	{
+		// Keep the regular draw size for gameplay cinematics. The shell camera
+		// can expose more terrain than this, so size it from the frustum below.
 		dimensions.x = WorldHeightMap::NORMAL_DRAW_WIDTH;
 		dimensions.y = WorldHeightMap::NORMAL_DRAW_HEIGHT;
 		return true;
@@ -3733,14 +3769,27 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 
 	if (TheTerrainRenderObject)
 	{
-		const WorldHeightMap *heightMap = TheTerrainRenderObject->getMap();
+		WorldHeightMap *heightMap = TheTerrainRenderObject->getMap();
 		if (heightMap)
 		{
+			if (isShellCamera && m_shellTerrainSizedMap != heightMap)
+			{
+				m_shellTerrainSizedMap = heightMap;
+				m_shellTerrainDrawWidth = 0;
+				m_shellTerrainDrawHeight = 0;
+				m_shellTerrainViewportAspect = 0.0f;
+			}
+			const Real viewportAspect = getHeight() > 0 ?
+				(Real)getWidth() / (Real)getHeight() : 0.0f;
+			rts::ResetTerrainDrawSizeFloorForViewportAspectChange(viewportAspect,
+				m_shellTerrainViewportAspect, m_shellTerrainDrawWidth,
+				m_shellTerrainDrawHeight);
 			const Vector3 cameraPosition = m_3DCamera->Get_Position();
 			const Real cameraToPivotX = cameraPosition.X - m_pos.x;
 			const Real cameraToPivotY = cameraPosition.Y - m_pos.y;
 			rts::TerrainDrawSizingInput input;
 			input.cameraHeight = cameraPosition.Z - TheTerrainRenderObject->getMinHeight();
+			input.cameraHeightAboveMax = cameraPosition.Z - TheTerrainRenderObject->getMaxHeight();
 			input.cameraToPivotDistance = sqrt(
 				cameraToPivotX * cameraToPivotX + cameraToPivotY * cameraToPivotY);
 			input.pitchRadians = cameraPitch;
@@ -3753,13 +3802,61 @@ bool W3DView::getDesiredTerrainDrawSize(ICoord2D &dimensions) const
 			input.minimumHeight = WorldHeightMap::NORMAL_DRAW_HEIGHT;
 			input.tileLength = VERTEX_BUFFER_TILE_LENGTH;
 
-			if (rts::CalculateTerrainDrawSize(input, dimensions.x, dimensions.y))
+			// The shell's high-pitch camera is centered on its visible terrain by
+			// HeightMap::updateCenter, so its draw window can follow the rotated
+			// frustum footprint instead of the larger pivot-centered circle.
+			bool haveDrawSize = false;
+			if (isShellCamera && cameraPitch > ViewDefaultLowPitchRadians)
 			{
+				const Matrix3D &transform = m_3DCamera->Get_Transform();
+				const Vector3 forward = -transform.Get_Z_Vector();
+				const Vector3 right = transform.Get_X_Vector();
+				const Vector3 up = transform.Get_Y_Vector();
+				rts::TerrainCameraBasis basis;
+				basis.forwardX = forward.X; basis.forwardY = forward.Y; basis.forwardZ = forward.Z;
+				basis.rightX = right.X; basis.rightY = right.Y; basis.rightZ = right.Z;
+				basis.upX = up.X; basis.upY = up.Y; basis.upZ = up.Z;
+				haveDrawSize = rts::CalculateTerrainDrawSizeForCameraDirection(input,
+					basis, dimensions.x, dimensions.y);
+			}
+
+			if (!haveDrawSize)
+				haveDrawSize = rts::CalculateTerrainDrawSize(input, dimensions.x, dimensions.y);
+			if (haveDrawSize)
+			{
+				if (isShellCamera)
+				{
+					// Only shell-chosen sizes form the grow floor; the preceding
+					// user-controlled camera can leave a larger draw area on this map.
+					rts::StabilizeTerrainDrawSizeForMap(m_shellTerrainDrawWidth,
+						m_shellTerrainDrawHeight, heightMap->getXExtent(),
+						heightMap->getYExtent(), false, dimensions.x, dimensions.y);
+
+					// Retain the actual area through a shake without adding either
+					// its raw request or its current draw size to the shell floor.
+					const bool deferFullShrink = CameraShakerSystem.IsCameraShaking() ||
+						m_shakeIntensity > 0.01f;
+					if (deferFullShrink)
+					{
+						rts::StabilizeTerrainDrawSizeForMap(heightMap->getDrawWidth(),
+							heightMap->getDrawHeight(), heightMap->getXExtent(),
+							heightMap->getYExtent(), true, dimensions.x, dimensions.y);
+					}
+					else
+					{
+						m_shellTerrainDrawWidth = dimensions.x;
+						m_shellTerrainDrawHeight = dimensions.y;
+					}
+				}
 				return true;
 			}
 		}
 	}
 
+	m_shellTerrainSizedMap = nullptr;
+	m_shellTerrainDrawWidth = 0;
+	m_shellTerrainDrawHeight = 0;
+	m_shellTerrainViewportAspect = 0.0f;
 	// TheSuperHackers @tweak xezon 31/12/2025 Increases visible terrain area when lowering the camera pitch.
 	// Note: The default camera pitch in Generals was 37.5, which we prefer to keep the normal draw size for.
 	dimensions.x = WorldHeightMap::LOW_ANGLE_DRAW_WIDTH;

@@ -80,7 +80,15 @@
 #include "W3DDevice/GameClient/W3DShadow.h"
 #include "W3DDevice/GameClient/W3DWater.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
-#include "WW3D2/dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
+
+// Keep the source-level contract explicit without importing the renderer namespace.
+using rts::render::GAME_COLOR_WRITE_BLUE;
+using rts::render::GAME_COLOR_WRITE_GREEN;
+using rts::render::GAME_COLOR_WRITE_RED;
+using rts::render::GAME_RENDER_STATE_COLOR_WRITE_MASK;
+using rts::render::GAME_TRANSFORM_WORLD;
+
 #include "WW3D2/light.h"
 #include "WW3D2/scene.h"
 #include "W3DDevice/GameClient/W3DPoly.h"
@@ -480,25 +488,25 @@ void FlatHeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 #endif
 
 #ifdef EXTENDED_STATS
-	if (DX8Wrapper::stats.m_disableTerrain) {
+	if (rts::render::IsGameTerrainRenderingDisabled()) {
 		return;
 	}
 #endif
 
-	DX8Wrapper::Set_Light_Environment(rinfo.light_environment);
+	rts::render::SetGameLightEnvironment(rinfo.light_environment);
 
 	// Force shaders to update.
 	m_stageTwoTexture->restore();
-	DX8Wrapper::Set_Texture(0,nullptr);
-	DX8Wrapper::Set_Texture(1,nullptr);
+	rts::render::SetGameTexture(0,nullptr);
+	rts::render::SetGameTexture(1,nullptr);
 	ShaderClass::Invalidate();
 
 	//	tm.Scale(ObjSpaceExtent);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,tm);
+	rts::render::SetGameTransform(GAME_TRANSFORM_WORLD,tm);
 
 
-	DX8Wrapper::Set_Material(m_vertexMaterialClass);
-	DX8Wrapper::Set_Shader(m_shaderClass);
+	rts::render::SetGameMaterial(m_vertexMaterialClass);
+	rts::render::SetGameShader(m_shaderClass);
 
  	st=W3DShaderManager::ST_FLAT_TERRAIN_BASE; //set default shader
 
@@ -536,8 +544,8 @@ void FlatHeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
  	W3DShaderManager::setTexture(2,m_stageTwoTexture);	//cloud
  	W3DShaderManager::setTexture(3,m_stageThreeTexture);//noise
 	//Disable writes to destination alpha channel (if there is one)
-	if (DX8Wrapper::getBackBufferFormat() == WW3D_FORMAT_A8R8G8B8) {
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_BLUE|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_RED);
+	if (rts::render::GetGameBackBufferFormat() == WW3D_FORMAT_A8R8G8B8) {
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_COLOR_WRITE_MASK,GAME_COLOR_WRITE_BLUE|GAME_COLOR_WRITE_GREEN|GAME_COLOR_WRITE_RED);
 	}
 
 	Int pass;
@@ -548,8 +556,8 @@ void FlatHeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
  	for (pass=0; pass<devicePasses; pass++) {
 		Bool disableTex = m_disableTextures;
 		if (m_disableTextures ) {
-			DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaque2DShader);
-			DX8Wrapper::Set_Texture(0,nullptr);
+			rts::render::SetGameShader(ShaderClass::_PresetOpaque2DShader);
+			rts::render::SetGameTexture(0,nullptr);
 		} else {
 			W3DShaderManager::setShader(st, pass);
 		}
@@ -588,13 +596,13 @@ void FlatHeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 	renderShoreLines(&rinfo.Camera);
 
 #ifdef DO_ROADS
-	DX8Wrapper::Set_Texture(0,nullptr);
-	DX8Wrapper::Set_Texture(1,nullptr);
+	rts::render::SetGameTexture(0,nullptr);
+	rts::render::SetGameTexture(1,nullptr);
 	m_stageTwoTexture->restore();
 
 	ShaderClass::Invalidate();
 	if (!ShaderClass::Is_Backface_Culling_Inverted()) {
-		DX8Wrapper::Set_Material(m_vertexMaterialClass);
+		rts::render::SetGameMaterial(m_vertexMaterialClass);
 		if (Scene) {
 			RTS3DScene *pMyScene = (RTS3DScene *)Scene;
 			RefRenderObjListIterator pDynamicLightsIterator(pMyScene->getDynamicLights());
@@ -604,17 +612,17 @@ void FlatHeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 	}
 #endif
 
-	DX8Wrapper::Set_Texture(0,nullptr);
-	DX8Wrapper::Set_Texture(1,nullptr);
+	rts::render::SetGameTexture(0,nullptr);
+	rts::render::SetGameTexture(1,nullptr);
 	m_stageTwoTexture->restore();
 
 	drawScorches();
 
-	DX8Wrapper::Set_Texture(0,nullptr);
-	DX8Wrapper::Set_Texture(1,nullptr);
+	rts::render::SetGameTexture(0,nullptr);
+	rts::render::SetGameTexture(1,nullptr);
 	m_stageTwoTexture->restore();
 	ShaderClass::Invalidate();
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 	m_bridgeBuffer->drawBridges(&rinfo.Camera, m_disableTextures, m_stageTwoTexture);
 
@@ -622,18 +630,18 @@ void FlatHeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 		TheTerrainTracksRenderObjClassSystem->flush();
 
 	ShaderClass::Invalidate();
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 	m_waypointBuffer->drawWaypoints(rinfo);
 
 	m_bibBuffer->renderBibs();
 #endif
 	// We do some custom blending, so tell the shader class to reset everything.
-	DX8Wrapper::Set_Texture(0,nullptr);
-	DX8Wrapper::Set_Texture(1,nullptr);
+	rts::render::SetGameTexture(0,nullptr);
+	rts::render::SetGameTexture(1,nullptr);
 	m_stageTwoTexture->restore();
 	ShaderClass::Invalidate();
-	DX8Wrapper::Set_Material(nullptr);
+	rts::render::SetGameMaterial(nullptr);
 
 }
 

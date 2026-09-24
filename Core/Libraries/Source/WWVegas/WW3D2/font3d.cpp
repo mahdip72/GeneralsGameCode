@@ -39,11 +39,11 @@
 
 #include "font3d.h"
 #include "assetmgr.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include <assert.h>
 #include <WWDebug/wwdebug.h>
-#include "surfaceclass.h"
-#include "texture.h"
+#include "WW3D2/surfaceclass.h"
+#include "WW3D2/texture.h"
 #include "WWMath/vector2i.h"
 
 static	SurfaceClass	*_surface;

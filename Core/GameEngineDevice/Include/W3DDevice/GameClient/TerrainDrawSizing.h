@@ -15,6 +15,7 @@ namespace rts
 	struct TerrainDrawSizingInput
 	{
 		float cameraHeight;
+		float cameraHeightAboveMax;
 		float cameraToPivotDistance;
 		float pitchRadians;
 		float horizontalFovRadians;
@@ -26,6 +27,18 @@ namespace rts
 		int minimumHeight;
 		int tileLength;
 	};
+	struct TerrainCameraBasis
+	{
+		float forwardX, forwardY, forwardZ;
+		float rightX, rightY, rightZ;
+		float upX, upY, upZ;
+	};
 
 	bool CalculateTerrainDrawSize(const TerrainDrawSizingInput &input, int &width, int &height);
+	bool CalculateTerrainDrawSizeForCameraDirection(const TerrainDrawSizingInput &input,
+		const TerrainCameraBasis &basis, int &width, int &height);
+	void StabilizeTerrainDrawSizeForMap(int currentWidth, int currentHeight,
+		int mapWidth, int mapHeight, bool deferFullShrink, int &width, int &height);
+	bool ResetTerrainDrawSizeFloorForViewportAspectChange(float viewportAspect,
+		float &floorViewportAspect, int &floorWidth, int &floorHeight);
 }

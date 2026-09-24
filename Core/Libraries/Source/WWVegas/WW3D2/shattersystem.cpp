@@ -47,6 +47,7 @@
 #include "WWLib/wwstring.h"
 #include "WWMath/vp.h"
 #include "meshmatdesc.h"
+#include "Renderer/LegacyColorPacking.h"
 #include <stdlib.h>
 
 /*
@@ -69,6 +70,19 @@
 #define BPT_BOTH						0x08
 #define BPT_EPSILON					0.0001f
 #define BPT_COINCIDENCE_EPSILON	0.000001f
+
+static Vector4 Unpack_Shatter_Color(unsigned color)
+{
+	const rts::render::LegacyPackedColor unpacked =
+		rts::render::UnpackLegacyARGB(color);
+	return Vector4(unpacked.red, unpacked.green, unpacked.blue,
+		unpacked.alpha);
+}
+
+static unsigned Pack_Shatter_Color(const Vector4 &color)
+{
+	return rts::render::PackLegacyARGB(color.X, color.Y, color.Z, color.W);
+}
 
 
 /**
@@ -339,12 +353,14 @@ void VertexClass::Lerp
 
 	// interpolate material properies
 	for (int ipass=0; ipass<v0.PassCount; ipass++) {
-		Vector4 dcg_v0=DX8Wrapper::Convert_Color(v0.DCG[ipass]);
-		Vector4 dcg_v1=DX8Wrapper::Convert_Color(v1.DCG[ipass]);
-		Vector4 dig_v0=DX8Wrapper::Convert_Color(v0.DIG[ipass]);
-		Vector4 dig_v1=DX8Wrapper::Convert_Color(v1.DIG[ipass]);
-		Vector4::Lerp(dcg_v0,dcg_v1,res->DCG[ipass]);
-		Vector4::Lerp(dig_v0,dig_v1,res->DIG[ipass]);
+		const Vector4 dcg_v0=Unpack_Shatter_Color(v0.DCG[ipass]);
+		const Vector4 dcg_v1=Unpack_Shatter_Color(v1.DCG[ipass]);
+		const Vector4 dig_v0=Unpack_Shatter_Color(v0.DIG[ipass]);
+		const Vector4 dig_v1=Unpack_Shatter_Color(v1.DIG[ipass]);
+		const Vector4 dcg = Vector4::Lerp(dcg_v0,dcg_v1,lerp);
+		const Vector4 dig = Vector4::Lerp(dig_v0,dig_v1,lerp);
+		res->DCG[ipass]=Pack_Shatter_Color(dcg);
+		res->DIG[ipass]=Pack_Shatter_Color(dig);
 //		Vector4::Lerp(v0.DCG[ipass],v1.DCG[ipass],lerp,&(res->DCG[ipass]));
 //		Vector4::Lerp(v0.DIG[ipass],v1.DIG[ipass],lerp,&(res->DIG[ipass]));
 		for (int istage=0; istage<MeshMatDescClass::MAX_TEX_STAGES; istage++) {
@@ -1204,10 +1220,10 @@ void ShatterSystem::Process_Clip_Pools
 						// HY- Multiplying DIG with DCG as in meshmdlio
 						if (mtl_params.DIG[ipass] != nullptr) {
 							SHATTER_DEBUG_SAY(("DIG: pass:%d: %f %f %f",ipass,vert.DIG[ipass].X,vert.DIG[ipass].Y,vert.DIG[ipass].Z));
-							Vector4 mc=DX8Wrapper::Convert_Color(mycolor);
-							Vector4 dc=DX8Wrapper::Convert_Color(vert.DIG[ipass]);
+							Vector4 mc=Unpack_Shatter_Color(mycolor);
+							Vector4 dc=Unpack_Shatter_Color(vert.DIG[ipass]);
 							mc=Vector4(mc.X*dc.X,mc.Y*dc.Y,mc.Z*dc.Z,mc.W);
-							mycolor=DX8Wrapper::Convert_Color(mc);
+							mycolor=Pack_Shatter_Color(mc);
 						}
 
 						new_mesh->Color(mycolor);

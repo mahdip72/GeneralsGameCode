@@ -1,52 +1,40 @@
+add_library(z_xcrc OBJECT
+    "${CMAKE_SOURCE_DIR}/Core/Tools/XferCrcSnapshotTest/XferCrcSnapshotTest.cpp"
+)
+target_include_directories(z_xcrc PRIVATE
+    "${CMAKE_SOURCE_DIR}/Core/Tools/XferCrcSnapshotTest"
+)
+target_link_libraries(z_xcrc PRIVATE
+    z_gameengine
+    zi_always
+)
+set_target_properties(z_xcrc PROPERTIES DISABLE_PRECOMPILE_HEADERS ON)
+
 add_executable(z_runtime_regression_tests)
 
 target_sources(z_runtime_regression_tests PRIVATE
     RuntimeRegressionTests.cpp
+    $<TARGET_OBJECTS:z_xcrc>
 )
 
-if(CMAKE_SIZEOF_VOID_P EQUAL 4)
-	target_link_libraries(z_runtime_regression_tests PRIVATE
-		comctl32
-		core_debug
-		core_profile_legacy
-		d3d8
-		d3dx8
-		dinput8
-		dxguid
-		imm32
-		milesstub
-		vfw32
-		winmm
-		z_gameengine
-		z_gameenginedevice
-		zi_always
-	)
+target_include_directories(z_runtime_regression_tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/Core/Tools/XferCrcSnapshotTest"
+)
 
-	if(NOT RTS_BUILD_OPTION_FFMPEG)
-		target_link_libraries(z_runtime_regression_tests PRIVATE binkstub)
-	endif()
-else()
-	# The native x64 utility exercises production runtime contracts. Keep it
-	# on the product's modern dependency boundary and do not pull the legacy
-	# D3D8, Miles, or Bink import libraries into the test executable.
-	#
-	# rts_d3d8_headers is intentionally allowed in this staging graph: it is a
-	# header-only compatibility boundary for the temporary parity sources, not
-	# a D3D8 import/library dependency.  The graph audit rejects d3d8, d3dx8,
-	# rts_d3d8lib, Miles, and Bink while explicitly permitting that interface.
-	target_link_libraries(z_runtime_regression_tests PRIVATE
-		comctl32
-		core_debug
-		core_profile_legacy
-		imm32
-		rts_legacy_product_runtime
-		vfw32
-		winmm
-		z_gameengine
-		z_gameenginedevice
-		zi_always
-	)
-endif()
+# Exercise the same native runtime boundary as the title executable. On a
+# historical non-product x86 graph this interface intentionally has no payload.
+target_link_libraries(z_runtime_regression_tests PRIVATE
+	comctl32
+	core_debug
+	core_profile_legacy
+	imm32
+	rts_product_runtime
+	vfw32
+	winmm
+	z_gameengine
+	z_gameenginedevice
+	zi_always
+)
 
 add_test(NAME z_skirmish_ai_replay_epoch_tests COMMAND z_runtime_regression_tests --skirmish-ai-replay-epoch)
 set_tests_properties(z_skirmish_ai_replay_epoch_tests PROPERTIES TIMEOUT 30)
@@ -63,10 +51,129 @@ set_tests_properties(z_skirmish_ai_stage3_tests PROPERTIES TIMEOUT 30)
 add_test(NAME z_skirmish_ai_runner_contract_tests COMMAND z_runtime_regression_tests --skirmish-ai-runner-contract)
 set_tests_properties(z_skirmish_ai_runner_contract_tests PROPERTIES TIMEOUT 30)
 
+add_test(NAME z_xfer_crc_snapshot_tests
+    COMMAND z_runtime_regression_tests --xfer-crc-snapshot)
+set_tests_properties(z_xfer_crc_snapshot_tests PROPERTIES TIMEOUT 30)
+
 add_test(NAME z_skirmish_ai_legacy_save_selection_tests COMMAND z_runtime_regression_tests --skirmish-ai-legacy-save-selection)
 set_tests_properties(z_skirmish_ai_legacy_save_selection_tests PROPERTIES TIMEOUT 30)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
+	add_test(NAME z_resolution_archive_policy_tests
+		COMMAND z_runtime_regression_tests --resolution-archive-policy)
+	set_tests_properties(z_resolution_archive_policy_tests PROPERTIES TIMEOUT 30)
+	add_executable(z_point_group_startup_tests
+		"${CMAKE_SOURCE_DIR}/Generals/Code/Tools/RuntimeRegressionTests/PointGroupStartupTest.cpp"
+	)
+	target_include_directories(z_point_group_startup_tests PRIVATE
+		"${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2"
+	)
+	target_link_libraries(z_point_group_startup_tests PRIVATE
+		comctl32
+		core_debug
+		core_profile_legacy
+		core_ww3d2_native
+		imm32
+		rts_product_runtime
+		vfw32
+		winmm
+		z_gameengine
+		z_gameenginedevice
+		zi_always
+	)
+	add_test(NAME z_point_group_startup_tests
+		COMMAND z_point_group_startup_tests)
+	set_tests_properties(z_point_group_startup_tests PROPERTIES TIMEOUT 30)
+	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/HeadlessMetricStartupTitleTest.cmake")
+	rts_add_headless_metric_startup_test(z_runtime_regression_tests
+		GeneralsMD z_headless_metric_startup_tests)
+	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/PerformanceReceiptOwnerBridgeTitleTest.cmake")
+	rts_add_performance_receipt_owner_bridge_test(z_runtime_regression_tests
+		GeneralsMD z_performance_receipt_owner_bridge_tests)
+	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/PerformanceReceiptProducerTitleTest.cmake")
+	rts_add_performance_receipt_producer_test(z_runtime_regression_tests
+		GeneralsMD z_performance_receipt_producer_tests)
+	rts_add_performance_receipt_fresh_producer_test(z_runtime_regression_tests
+		GeneralsMD z_performance_receipt_fresh_producer_tests)
+	rts_add_performance_receipt_attempt_test(z_runtime_regression_tests
+		GeneralsMD z_performance_receipt_attempt_tests)
+	rts_add_performance_receipt_bootstrap_test(z_runtime_regression_tests
+		GeneralsMD z_performance_receipt_bootstrap_tests)
+	rts_add_performance_receipt_policy_test(z_runtime_regression_tests
+		z_performance_receipt_policy_tests)
+	rts_add_performance_receipt_mode_test(z_runtime_regression_tests
+		z_performance_receipt_mode_tests)
+	rts_add_performance_receipt_wide_path_test(z_runtime_regression_tests
+		z_performance_receipt_wide_path_tests)
+	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/NativeReceiptTraceFileTest.cmake")
+	rts_add_native_receipt_trace_file_test(z_runtime_regression_tests)
+	add_test(NAME z_performance_receipt_consume_wide_path_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-consume-wide-path)
+	set_tests_properties(z_performance_receipt_consume_wide_path_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-wide-path")
+	add_test(NAME z_performance_receipt_replay_caller_fence_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-replay-caller-fence)
+	set_tests_properties(z_performance_receipt_replay_caller_fence_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-producer")
+	add_test(NAME z_performance_receipt_fresh_caller_fence_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-fresh-caller-fence)
+	set_tests_properties(z_performance_receipt_fresh_caller_fence_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-fresh-producer")
+	add_test(NAME z_performance_receipt_replay_owner_shape_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-replay-owner-shape)
+	set_tests_properties(z_performance_receipt_replay_owner_shape_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-producer")
+	add_test(NAME z_performance_receipt_practical_owner_shape_tests
+		COMMAND z_runtime_regression_tests --performance-receipt-practical-owner-shape)
+	set_tests_properties(z_performance_receipt_practical_owner_shape_tests PROPERTIES
+		TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-fresh-producer")
+	add_executable(z_native_render_target_texture_tests
+		"${CMAKE_SOURCE_DIR}/Core/Tools/NativeW3DTextureOwnerTest/NativeRenderTargetTextureTest.cpp"
+	)
+	target_include_directories(z_native_render_target_texture_tests PRIVATE
+		"${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2"
+	)
+	target_link_libraries(z_native_render_target_texture_tests PRIVATE
+		core_wwstub
+		core_ww3d2_native
+		z_ww3d2
+		vfw32
+		winmm
+	)
+	set_target_properties(z_native_render_target_texture_tests PROPERTIES
+		CXX_STANDARD 20
+		CXX_STANDARD_REQUIRED YES
+		CXX_EXTENSIONS NO
+	)
+	add_test(NAME z_native_render_target_texture_tests
+		COMMAND z_native_render_target_texture_tests)
+	set_tests_properties(z_native_render_target_texture_tests PROPERTIES TIMEOUT 30)
+
+	add_executable(z_native_line3d_render_tests
+		"${CMAKE_SOURCE_DIR}/Core/Tools/NativeW3DLineTest/line3dprod.cpp"
+	)
+	target_include_directories(z_native_line3d_render_tests PRIVATE
+		"${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas"
+		"${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2"
+		"${CMAKE_SOURCE_DIR}/GeneralsMD/Code/Libraries/Source/WWVegas"
+		"${CMAKE_SOURCE_DIR}/GeneralsMD/Code/Libraries/Source/WWVegas/WW3D2"
+	)
+	target_link_libraries(z_native_line3d_render_tests PRIVATE
+		core_wwstub
+		core_ww3d2_native
+		z_ww3d2
+		vfw32
+		winmm
+	)
+	set_target_properties(z_native_line3d_render_tests PROPERTIES
+		CXX_STANDARD 20
+		CXX_STANDARD_REQUIRED YES
+		CXX_EXTENSIONS NO
+	)
+	add_test(NAME z_native_line3d_render_tests
+		COMMAND z_native_line3d_render_tests)
+	set_tests_properties(z_native_line3d_render_tests PROPERTIES TIMEOUT 60)
+
 	# Exercise the real product AudioEventRTS/GameAudio implementations, not the
 	# isolated manager fixture's runtime substitutes. The hook only sets capacity.
 	target_link_libraries(z_runtime_regression_tests PRIVATE rts_native_audio_manager)

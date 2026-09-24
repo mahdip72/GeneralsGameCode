@@ -43,7 +43,13 @@ enum SkirmishAIReplayEpochType
 	SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER = 9,
 	// Epoch 10 adds the Stage 3 production policy and its persisted CRC
 	// fields while inheriting all behavior introduced by epochs 1 through 9.
-	SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION = 10
+	SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION = 10,
+	// Epochs 2 and 3 were already assigned before Stage 5 introduced its
+	// deterministic planning modes. Keep the released meanings above intact
+	// and allocate new, non-colliding markers for the Stage 5 RNG contracts.
+	SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG = 11,
+	SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG = 12,
+	SKIRMISH_AI_REPLAY_EPOCH_LATEST = SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG
 };
 
 inline const WideChar *GetSkirmishAILivenessReplayMarker()
@@ -94,6 +100,16 @@ inline const WideChar *GetSkirmishAIStrategyControllerReplayMarker()
 inline const WideChar *GetSkirmishAIProductionReplayMarker()
 {
 	return L" [SkirmishAIEpoch=10]";
+}
+
+inline const WideChar *GetSkirmishAIAdaptiveGlobalRngReplayMarker()
+{
+	return L" [SkirmishAIEpoch=11]";
+}
+
+inline const WideChar *GetSkirmishAICounterRngReplayMarker()
+{
+	return L" [SkirmishAIEpoch=12]";
 }
 
 inline const WideChar *GetSkirmishAIReplayMarkerPrefix()
@@ -180,12 +196,28 @@ inline void MarkReplayVersionForSkirmishAIProductionEpoch(
 		versionTimeString.concat(GetSkirmishAIProductionReplayMarker());
 }
 
+inline void MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(
+	UnicodeString& versionTimeString)
+{
+	if (CountSkirmishAIReplayMarkers(
+			versionTimeString, GetSkirmishAIReplayMarkerPrefix()) == 0)
+		versionTimeString.concat(GetSkirmishAIAdaptiveGlobalRngReplayMarker());
+}
+
+inline void MarkReplayVersionForSkirmishAICounterRngEpoch(
+	UnicodeString& versionTimeString)
+{
+	if (CountSkirmishAIReplayMarkers(
+			versionTimeString, GetSkirmishAIReplayMarkerPrefix()) == 0)
+		versionTimeString.concat(GetSkirmishAICounterRngReplayMarker());
+}
+
 // Global writer helper. RecorderClass shadows its unchanged member call only
 // for playback compatibility checks; this helper keeps new recordings at the
 // latest AI behavior and CRC epoch.
 inline void MarkReplayVersionForSkirmishAICurrentEpoch(UnicodeString& versionTimeString)
 {
-	MarkReplayVersionForSkirmishAIProductionEpoch(versionTimeString);
+	MarkReplayVersionForSkirmishAICounterRngEpoch(versionTimeString);
 }
 
 // Compatibility-only stamp for the already-shipped epoch-2 behavior. The
@@ -196,6 +228,69 @@ inline void MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(UnicodeStrin
 {
 	if (CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAIReplayMarkerPrefix()) == 0)
 		versionTimeString.concat(GetSkirmishAICurrentReplayMarker());
+}
+
+inline void MarkReplayVersionForSkirmishAIRecordingCapability(
+	UnicodeString& versionTimeString, Bool supportsCounterRngPlanning)
+{
+	if (supportsCounterRngPlanning)
+		MarkReplayVersionForSkirmishAICounterRngEpoch(versionTimeString);
+	else
+		MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(versionTimeString);
+}
+
+inline Bool BuildSupportsSkirmishAICounterRngPlanning()
+{
+#if defined(_WIN64)
+	return TRUE;
+#else
+	return FALSE;
+#endif
+}
+
+inline Int GetSkirmishAIReplayRecordingEpoch()
+{
+	return BuildSupportsSkirmishAICounterRngPlanning() ?
+		SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG :
+		SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG;
+}
+
+inline void MarkReplayVersionForSkirmishAIRecordingEpoch(
+	UnicodeString& versionTimeString)
+{
+	MarkReplayVersionForSkirmishAIRecordingCapability(
+		versionTimeString, BuildSupportsSkirmishAICounterRngPlanning());
+}
+
+// Playback compares a recorded header against the build-time string with the
+// same known marker. Unknown/unmarked headers get the latest writer stamp.
+inline void MarkReplayVersionForSkirmishAIPlaybackCompatibilityEpoch(
+	UnicodeString& versionTimeString, Int replayEpoch)
+{
+	if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT)
+		MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY)
+		MarkReplayVersionForSkirmishAIRecoveryEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC)
+		MarkReplayVersionForSkirmishAIRecoveryCRCEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP)
+		MarkReplayVersionForSkirmishAIRecoveryOwnershipEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER)
+		MarkReplayVersionForSkirmishAINonCancellingFailoverEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER)
+		MarkReplayVersionForSkirmishAIBoundedFailoverEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION)
+		MarkReplayVersionForSkirmishAIResourceWorkerPreservationEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER)
+		MarkReplayVersionForSkirmishAIStrategyControllerEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION)
+		MarkReplayVersionForSkirmishAIProductionEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG)
+		MarkReplayVersionForSkirmishAIAdaptiveGlobalRngEpoch(versionTimeString);
+	else if (replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG)
+		MarkReplayVersionForSkirmishAICounterRngEpoch(versionTimeString);
+	else
+		MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
 }
 
 inline Int GetSkirmishAIReplayEpoch(const UnicodeString& versionTimeString)
@@ -216,14 +311,24 @@ inline Int GetSkirmishAIReplayEpoch(const UnicodeString& versionTimeString)
 		versionTimeString, GetSkirmishAIStrategyControllerReplayMarker());
 	Int productionMarkerCount = CountSkirmishAIReplayMarkers(
 		versionTimeString, GetSkirmishAIProductionReplayMarker());
+	Int adaptiveMarkerCount = CountSkirmishAIReplayMarkers(
+		versionTimeString, GetSkirmishAIAdaptiveGlobalRngReplayMarker());
+	Int counterMarkerCount = CountSkirmishAIReplayMarkers(
+		versionTimeString, GetSkirmishAICounterRngReplayMarker());
 	Int markerLikeCount = CountSkirmishAIReplayMarkers(versionTimeString, GetSkirmishAIReplayMarkerPrefix());
 	if (markerLikeCount != 1 ||
 		livenessMarkerCount + currentMarkerCount + recoveryMarkerCount +
 			recoveryCRCMarkerCount + recoveryOwnershipMarkerCount +
 			nonCancellingFailoverMarkerCount + boundedFailoverMarkerCount +
 			resourceWorkerPreservationMarkerCount + strategyControllerMarkerCount +
-			productionMarkerCount != 1)
+			productionMarkerCount + adaptiveMarkerCount + counterMarkerCount != 1)
 		return SKIRMISH_AI_REPLAY_EPOCH_LEGACY;
+	if (counterMarkerCount == 1 &&
+		versionTimeString.endsWith(GetSkirmishAICounterRngReplayMarker()))
+		return SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
+	if (adaptiveMarkerCount == 1 &&
+		versionTimeString.endsWith(GetSkirmishAIAdaptiveGlobalRngReplayMarker()))
+		return SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG;
 	if (productionMarkerCount == 1 &&
 		versionTimeString.endsWith(GetSkirmishAIProductionReplayMarker()))
 		return SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
@@ -270,7 +375,9 @@ inline Bool ShouldUseSkirmishAICurrentBehavior(Bool isReplayGame, Int replayEpoc
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryBehavior(Bool isReplayGame, Int replayEpoch)
@@ -283,7 +390,9 @@ inline Bool ShouldUseSkirmishAIRecoveryBehavior(Bool isReplayGame, Int replayEpo
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryNativeHoleOwnership(Bool isReplayGame, Int replayEpoch)
@@ -295,7 +404,9 @@ inline Bool ShouldUseSkirmishAIRecoveryNativeHoleOwnership(Bool isReplayGame, In
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }
 
 inline Bool ShouldIncludeSkirmishAIRecoveryCRCFields(Bool isReplayGame, Int replayEpoch)
@@ -312,7 +423,9 @@ inline Bool ShouldUseSkirmishAIRecoveryCancellationOwnership(
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
@@ -323,7 +436,9 @@ inline Bool ShouldUseSkirmishAIRecoveryUnownedQueueFailover(
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryBoundedFailover(
@@ -333,7 +448,9 @@ inline Bool ShouldUseSkirmishAIRecoveryBoundedFailover(
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }
 
 inline Bool ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
@@ -342,7 +459,9 @@ inline Bool ShouldUseSkirmishAIRecoveryResourceWorkerPreservation(
 	return !isReplayGame ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }
 
 inline Bool ShouldUseSkirmishAIStrategyBehavior(
@@ -350,7 +469,9 @@ inline Bool ShouldUseSkirmishAIStrategyBehavior(
 {
 	return !isReplayGame ||
 		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }
 
 inline Bool ShouldIncludeSkirmishAIStrategyCRCFields(
@@ -377,11 +498,26 @@ inline Bool ShouldUseSkirmishAIProductionBehavior(
 	Bool isReplayGame, Int replayEpoch)
 {
 	return !isReplayGame ||
-		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION;
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }
 
 inline Bool ShouldIncludeSkirmishAIProductionCRCFields(
 	Bool isReplayGame, Int replayEpoch)
 {
 	return ShouldUseSkirmishAIProductionBehavior(isReplayGame, replayEpoch);
+}
+
+inline Bool ShouldUseSkirmishAIAdaptiveGlobalRng(
+	Bool isReplayGame, Int replayEpoch)
+{
+	return !isReplayGame ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
+}
+
+inline Bool ShouldUseSkirmishAICounterRng(Bool isReplayGame, Int replayEpoch)
+{
+	return !isReplayGame || replayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG;
 }

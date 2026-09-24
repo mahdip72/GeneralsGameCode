@@ -40,10 +40,10 @@
 #include "bmp2d.h"
 #include "WWMath/pot.h"
 #include "ww3d.h"
-#include "texture.h"
-#include "surfaceclass.h"
+#include "WW3D2/texture.h"
+#include "WW3D2/surfaceclass.h"
 #include "assetmgr.h"
-#include "textureloader.h"
+#include "WW3D2/textureloader.h"
 #include "ww3dformat.h"
 
 Bitmap2DObjClass::Bitmap2DObjClass

@@ -60,7 +60,7 @@ inline RenderSubmissionDecision ChooseVisibleSubmissionBackend(
 }
 
 // Presentation ownership is latched at the beginning of the scene.  If D3D11
-// owned that scene, a later bridge shutdown must not make the hidden D3D8
+// owned that scene, a later bridge shutdown must not make the hidden compatibility
 // differential swap chain visible for the same frame.
 inline bool ShouldPresentLegacyFrame(bool d3d11FrameStarted,
 	bool d3d11BridgeActive)
@@ -68,7 +68,7 @@ inline bool ShouldPresentLegacyFrame(bool d3d11FrameStarted,
 	return !d3d11FrameStarted && !d3d11BridgeActive;
 }
 
-// The pre-transformed terrain path submits raw D3D8 ProcessVertices work and
+// The pre-transformed terrain path submits raw compatibility ProcessVertices work and
 // is only valid when the legacy backend owns the visible frame. D3D11 must
 // use the normal vertex-buffer path so the bridge can track every binding.
 inline bool UseLegacyPreTransformVertexPath(bool d3d11BackendActive)

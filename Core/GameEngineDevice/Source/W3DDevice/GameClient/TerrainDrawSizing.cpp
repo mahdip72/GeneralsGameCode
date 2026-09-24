@@ -1,6 +1,7 @@
 #include "W3DDevice/GameClient/TerrainDrawSizing.h"
 
 #include <math.h>
+#include <float.h>
 
 namespace
 {
@@ -79,7 +80,7 @@ namespace rts
 		const float safetyMarginCells = (float)input.tileLength;
 		const float requiredCells = footprintDiameter / input.worldUnitsPerCell + safetyMarginCells;
 		const int largerMapExtent = input.mapWidth > input.mapHeight ? input.mapWidth : input.mapHeight;
-		if (requiredCells >= (float)largerMapExtent)
+		if (!(requiredCells < (float)largerMapExtent))
 		{
 			width = input.mapWidth;
 			height = input.mapHeight;
@@ -89,5 +90,129 @@ namespace rts
 		width = ClampDrawSize(requiredCells, input.minimumWidth, input.tileLength, input.mapWidth);
 		height = ClampDrawSize(requiredCells, input.minimumHeight, input.tileLength, input.mapHeight);
 		return true;
+	}
+
+	bool CalculateTerrainDrawSizeForCameraDirection(const TerrainDrawSizingInput &input,
+		const TerrainCameraBasis &basis, int &width, int &height)
+	{
+		// Retain the conservative result for invalid inputs.
+		if (!CalculateTerrainDrawSize(input, width, height))
+			return false;
+		if (!(input.cameraHeightAboveMax > 0.0f &&
+			input.cameraHeightAboveMax <= input.cameraHeight &&
+			input.cameraHeightAboveMax < FLT_MAX))
+		{
+			width = input.mapWidth;
+			height = input.mapHeight;
+			return true;
+		}
+		const float vectors[9] = {
+			basis.forwardX, basis.forwardY, basis.forwardZ,
+			basis.rightX, basis.rightY, basis.rightZ,
+			basis.upX, basis.upY, basis.upZ
+		};
+		for (int i = 0; i < 9; ++i)
+		{
+			if (!(vectors[i] > -FLT_MAX && vectors[i] < FLT_MAX))
+			{
+				width = input.mapWidth;
+				height = input.mapHeight;
+				return true;
+			}
+		}
+
+		const float halfHorizontalTangent = (float)tan(input.horizontalFovRadians * 0.5f);
+		const float halfVerticalTangent = (float)tan(input.verticalFovRadians * 0.5f);
+		if (!(halfHorizontalTangent < FLT_MAX && halfVerticalTangent < FLT_MAX))
+		{
+			width = input.mapWidth;
+			height = input.mapHeight;
+			return true;
+		}
+		float minX = 0.0f, maxX = 0.0f, minY = 0.0f, maxY = 0.0f;
+		for (int vertical = -1; vertical <= 1; vertical += 2)
+		{
+			for (int horizontal = -1; horizontal <= 1; horizontal += 2)
+			{
+				const float x = basis.forwardX + horizontal * halfHorizontalTangent * basis.rightX +
+					vertical * halfVerticalTangent * basis.upX;
+				const float y = basis.forwardY + horizontal * halfHorizontalTangent * basis.rightY +
+					vertical * halfVerticalTangent * basis.upY;
+				const float z = basis.forwardZ + horizontal * halfHorizontalTangent * basis.rightZ +
+					vertical * halfVerticalTangent * basis.upZ;
+				if (!(z < -0.01f && x > -FLT_MAX && x < FLT_MAX &&
+					y > -FLT_MAX && y < FLT_MAX))
+				{
+					width = input.mapWidth;
+					height = input.mapHeight;
+					return true;
+				}
+				// Every height between the terrain extrema intersects this ray
+				// between these two endpoints.
+				const float heights[2] = {input.cameraHeight, input.cameraHeightAboveMax};
+				for (int plane = 0; plane < 2; ++plane)
+				{
+					const float groundX = heights[plane] * x / -z;
+					const float groundY = heights[plane] * y / -z;
+					if (!(groundX > -FLT_MAX && groundX < FLT_MAX &&
+						groundY > -FLT_MAX && groundY < FLT_MAX))
+					{
+						width = input.mapWidth;
+						height = input.mapHeight;
+						return true;
+					}
+					if (vertical == -1 && horizontal == -1 && plane == 0)
+					{
+						minX = maxX = groundX;
+						minY = maxY = groundY;
+					}
+					else
+					{
+						if (groundX < minX) minX = groundX;
+						if (groundX > maxX) maxX = groundX;
+						if (groundY < minY) minY = groundY;
+						if (groundY > maxY) maxY = groundY;
+					}
+				}
+			}
+		}
+
+		const float requiredWidth = (maxX - minX) / input.worldUnitsPerCell + input.tileLength;
+		const float requiredHeight = (maxY - minY) / input.worldUnitsPerCell + input.tileLength;
+		width = !(requiredWidth < (float)input.mapWidth) ? input.mapWidth :
+			ClampDrawSize(requiredWidth, input.minimumWidth, input.tileLength, input.mapWidth);
+		height = !(requiredHeight < (float)input.mapHeight) ? input.mapHeight :
+			ClampDrawSize(requiredHeight, input.minimumHeight, input.tileLength, input.mapHeight);
+		return true;
+	}
+
+	void StabilizeTerrainDrawSizeForMap(int currentWidth, int currentHeight,
+		int mapWidth, int mapHeight, bool deferFullShrink, int &width, int &height)
+	{
+		const int square = width > height ? width : height;
+		// Full-map draws can precede shell sizing, or be temporary for a low
+		// camera pitch. Retain them only until an active shake ends.
+		width = (deferFullShrink || currentWidth < mapWidth) && currentWidth > square ? currentWidth : square;
+		height = (deferFullShrink || currentHeight < mapHeight) && currentHeight > square ? currentHeight : square;
+		if (width > mapWidth) width = mapWidth;
+		if (height > mapHeight) height = mapHeight;
+	}
+
+	bool ResetTerrainDrawSizeFloorForViewportAspectChange(float viewportAspect,
+		float &floorViewportAspect, int &floorWidth, int &floorHeight)
+	{
+		if (!(viewportAspect > 0.0f && viewportAspect < FLT_MAX))
+			return false;
+
+		if (!(floorViewportAspect > 0.0f && floorViewportAspect < FLT_MAX) ||
+			fabs(viewportAspect - floorViewportAspect) > 0.0001f)
+		{
+			floorViewportAspect = viewportAspect;
+			floorWidth = 0;
+			floorHeight = 0;
+			return true;
+		}
+
+		return false;
 	}
 }

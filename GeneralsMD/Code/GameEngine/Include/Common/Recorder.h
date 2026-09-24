@@ -160,7 +160,11 @@ public:
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
-		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION; }
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
+	Bool replayUsesSkirmishAICounterRng() const {
+		return m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
 	Int getPathfindQueueReplayEpoch() const { return m_pathfindQueueReplayEpoch; }
 	Bool replayUsesPathfindQueueCapacity() const { return m_pathfindQueueReplayEpoch == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT; }
 	void initControls();															///< Show or Hide the Replay controls
@@ -260,26 +264,8 @@ RecorderClass *createRecorder();
 inline void RecorderClass::MarkReplayVersionForSkirmishAICurrentEpoch(
 	UnicodeString& versionTimeString)
 {
-	// startRecording() resets this field before writing a new header. Loaded
-	// Earlier known headers retain their original compatibility stamps.
-	if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT)
-		MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(versionTimeString);
-	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY)
-		MarkReplayVersionForSkirmishAIRecoveryEpoch(versionTimeString);
-	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_CRC)
-		MarkReplayVersionForSkirmishAIRecoveryCRCEpoch(versionTimeString);
-	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RECOVERY_OWNERSHIP)
-		MarkReplayVersionForSkirmishAIRecoveryOwnershipEpoch(versionTimeString);
-	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_NONCANCELLING_FAILOVER)
-		MarkReplayVersionForSkirmishAINonCancellingFailoverEpoch(versionTimeString);
-	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_BOUNDED_FAILOVER)
-		MarkReplayVersionForSkirmishAIBoundedFailoverEpoch(versionTimeString);
-	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION)
-		MarkReplayVersionForSkirmishAIResourceWorkerPreservationEpoch(versionTimeString);
-	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER)
-		MarkReplayVersionForSkirmishAIStrategyControllerEpoch(versionTimeString);
-	else if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION)
-		MarkReplayVersionForSkirmishAIProductionEpoch(versionTimeString);
-	else
-		::MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
+	// startRecording() uses the architecture-specific writer directly. This
+	// member is for restamping a loaded header during playback validation.
+	MarkReplayVersionForSkirmishAIPlaybackCompatibilityEpoch(
+		versionTimeString, m_skirmishAIReplayEpoch);
 }

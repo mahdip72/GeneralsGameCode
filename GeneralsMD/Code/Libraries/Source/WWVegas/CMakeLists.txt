@@ -3,7 +3,7 @@ add_library(z_wwcommon INTERFACE)
 
 target_link_libraries(z_wwcommon INTERFACE
     core_wwcommon
-    rts_legacy_product_runtime
+    rts_product_runtime
     stlport
 )
 

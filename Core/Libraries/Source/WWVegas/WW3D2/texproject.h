@@ -162,7 +162,7 @@ public:
 	TextureClass*			Peek_Render_Target(TextureClass** rtarget=nullptr, ZTextureClass** ztarget=nullptr);
 
 	bool						Compute_Texture(RenderObjClass * model,SpecialRenderInfoClass * context,
-		TextureClass * d3d11_copy_target = nullptr);
+		TextureClass * native_copy_target = nullptr);
 
 	/*
 	** Prep for rendering, called by the scene prior to usage.

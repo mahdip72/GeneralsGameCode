@@ -21,7 +21,11 @@ set(GAMEENGINE_SRC
 #    Include/Common/BuildAssistant.h
 #    Include/Common/ClientUpdateModule.h
     Include/Common/CommandLine.h
+    Include/Common/DeterministicCrcLiveVerifier.h
     Include/Common/SkirmishAITestRunner.h
+    Include/Common/Stage5PerformanceFixtureContract.h
+    Include/Common/Stage5PerformanceFixtureRunner.h
+    Include/GameLogic/ImmutableSpatialQueryRuntime.h
     Include/Common/crc.h
     Include/Common/CRCDebug.h
 #    Include/Common/CriticalSection.h
@@ -140,6 +144,7 @@ set(GAMEENGINE_SRC
     Include/Common/WorkerProcess.h
     Include/Common/Xfer.h
     Include/Common/XferCRC.h
+    Include/Common/XferCRCSnapshot.h
     Include/Common/XferDeepCRC.h
     Include/Common/XferLoad.h
     Include/Common/XferSave.h
@@ -508,6 +513,7 @@ set(GAMEENGINE_SRC
 #    Include/GameLogic/WeaponStatus.h
     Include/GameNetwork/Connection.h
     Include/GameNetwork/ConnectionManager.h
+    Include/GameNetwork/InstalledNet3Validation.h
     Include/GameNetwork/DisconnectManager.h
     Include/GameNetwork/DownloadManager.h
     Include/GameNetwork/FileTransfer.h
@@ -553,6 +559,7 @@ set(GAMEENGINE_SRC
     Include/GameNetwork/NetPacketStructs.h
     Include/GameNetwork/NetworkDefs.h
     Include/GameNetwork/NetworkInterface.h
+    Include/GameNetwork/MultiplayerSimulationRuntimePolicy.h
     Include/GameNetwork/networkutil.h
     Include/GameNetwork/RankPointValue.h
     Include/GameNetwork/Transport.h
@@ -575,6 +582,7 @@ set(GAMEENGINE_SRC
 #    Source/Common/BitFlags.cpp
     Source/Common/CommandLine.cpp
     Source/Common/SkirmishAITestRunner.cpp
+    Source/Common/Stage5PerformanceFixtureRunner.cpp
     Source/Common/crc.cpp
     Source/Common/CRCDebug.cpp
     Source/Common/DamageFX.cpp
@@ -686,6 +694,8 @@ set(GAMEENGINE_SRC
 #    Source/Common/System/Upgrade.cpp
     Source/Common/System/Xfer.cpp
     Source/Common/System/XferCRC.cpp
+    Source/Common/System/DeterministicCrcLiveVerifier.cpp
+    Source/Common/System/XferCRCSnapshot.cpp
     Source/Common/System/XferLoad.cpp
     Source/Common/System/XferSave.cpp
     Source/Common/TerrainTypes.cpp
@@ -1104,9 +1114,11 @@ set(GAMEENGINE_SRC
     Source/GameLogic/System/Damage.cpp
 #    Source/GameLogic/System/GameLogic.cpp
     Source/GameLogic/System/GameLogicDispatch.cpp
+    Source/GameLogic/System/ImmutableSpatialQueryRuntime.cpp
     Source/GameLogic/System/RankInfo.cpp
     Source/GameNetwork/Connection.cpp
     Source/GameNetwork/ConnectionManager.cpp
+    Source/GameNetwork/InstalledNet3Validation.cpp
     Source/GameNetwork/DisconnectManager.cpp
     Source/GameNetwork/DownloadManager.cpp
     Source/GameNetwork/FileTransfer.cpp
@@ -1155,6 +1167,15 @@ set(GAMEENGINE_SRC
     Source/GameNetwork/WOLBrowser/WebBrowser.cpp
     Source/Precompiled/PreRTS.cpp
 )
+
+# Installed lockstep-v2 is a native x64 qualification lane only.  Keep the
+# legacy GameEngine source graph unchanged for Win32 and the VC6 oracle.
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT IS_VS6_BUILD)
+    list(APPEND GAMEENGINE_SRC
+        Include/GameNetwork/InstalledLockstepV2Validation.h
+        Source/GameNetwork/InstalledLockstepV2Validation.cpp
+    )
+endif()
 
 if(RTS_GAMEMEMORY_ENABLE)
     # Uses the original Game Memory implementation.
@@ -1209,7 +1230,7 @@ target_link_libraries(corei_gameengine_public INTERFACE
     core_compression
     core_browserdispatch
     #core_wwvegas
-    rts_legacy_product_runtime
+    rts_product_runtime
     gamespy::gamespy
     stlport
 )

@@ -449,6 +449,7 @@ GameSpyStagingRoom::GameSpyStagingRoom()
 
 	setLocalIP(0);
 	m_transport = nullptr;
+	m_isQM = FALSE;
 
 	m_localName = "localhost";
 
@@ -775,6 +776,26 @@ AsciiString GameSpyStagingRoom::generateLadderGameResultsPacket()
 	return results;
 }
 
+void GameSpyStagingRoom::bindQuickMatchMapIdentity()
+{
+	const MapMetaData *mapData = TheMapCache ? TheMapCache->findMap(getMap()) : nullptr;
+	const UnsignedInt mapCRC = mapData ? GetMapFileCRC(getMap()) : 0U;
+	setMapCRC(mapCRC);
+	setMapSize(mapData ? mapData->m_filesize : 0U);
+	// Quick Match gets a map index, not the custom-match map package mask.
+	// Bind only the local map and simulation sidecar presence. Missing or
+	// different map bytes will fail the NET3 identity exchange.
+	setMapContentsMask(mapCRC != 0U ? 1 | GetMapSimulationSidecarMask(getMap()) : 0);
+	const Int localSlot = getLocalSlotNum();
+	if (localSlot >= 0)
+	{
+		// The QM response has no per-player map availability. Its slots were
+		// historically all available, so no peer can act as a transfer sender.
+		// Keep that contract and let the CRC/start checks reject bad content.
+		getSlot(localSlot)->setMapAvailability(TRUE);
+	}
+}
+
 void GameSpyStagingRoom::launchGame()
 {
 	setGameInProgress(TRUE);
@@ -814,11 +835,17 @@ void GameSpyStagingRoom::launchGame()
 		TheGameLogic->clearGameData();
 	}
 
-	Bool filesOk = DoAnyMapTransfers(this);
+	Bool filesOk = DoAnyMapTransfers(this, !isQMGame());
 
 	// see if we really have the map.  if not, back out.
 	TheMapCache->updateCache();
-	if (!filesOk || TheMapCache->findMap(getMap()) == nullptr)
+	// Every current host path supplies a map-file CRC. An unknown value cannot
+	// bind the selected map, even when the cache has an entry for its name.
+	if (!filesOk || TheMapCache->findMap(getMap()) == nullptr ||
+		!IsNetworkMapFileCRCValid(
+			getMapCRC(), GetMapFileCRC(getMap())) ||
+		((getMapContentsMask() & (4 | 16 | 32)) == 0 &&
+		 GetMapSimulationSidecarMask(getMap()) != 0))
 	{
 		DEBUG_LOG(("After transfer, we didn't really have the map.  Bailing..."));
 
@@ -874,4 +901,5 @@ void GameSpyStagingRoom::reset()
 	}
 #endif
 	GameInfo::reset();
+	m_isQM = FALSE;
 }

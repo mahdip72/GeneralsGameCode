@@ -30,6 +30,9 @@
 
 #include "Common/GameMemory.h"
 #include "GameLogic/AIPlayer.h"
+#if defined(_WIN64)
+#include "GameLogic/GeneralsAIPlanningPolicy.h"
+#endif
 
 class BuildListInfo;
 class SpecialPowerTemplate;
@@ -71,6 +74,18 @@ public:	// AIPlayer interface methods.
 	virtual Bool checkBridges(Object *unit, Waypoint *way) override;
 
 	virtual Player *getAiEnemy() override;	///< Solo AI attacks based on scripting.  Only skirmish auto-acquires an enemy at this point.  jba.
+	virtual Player *getCachedAiEnemy() const override { return m_currentEnemy; }
+
+#if defined(_WIN64)
+	Bool isEnemyPlanningDue() const;
+	Bool captureEnemyPlanningSnapshot(
+		GeneralsAIEnemyPlanningSnapshot *snapshot) const;
+	Bool resolveEnemyPlanningCommit(
+		const GeneralsAIEnemyPlanningSnapshot &snapshot,
+		const GeneralsAIEnemyPlanningResult &result,
+		Player **resolvedEnemy) const;
+	void applyEnemyPlanningCommit(Player *resolvedEnemy);
+#endif
 
 protected:
 

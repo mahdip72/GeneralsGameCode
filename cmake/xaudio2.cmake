@@ -1,5 +1,5 @@
-# Native XAudio2 platform boundary.  The legacy Win32 product remains on
-# Miles, so this target is intentionally absent from every 32-bit graph.
+# Native XAudio2 product boundary. Historical 32-bit authoring graphs retain
+# their Miles-based diagnostic code, so this target is x64-only.
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT WIN32
 	AND (RTS_BUILD_PRODUCT OR RTS_BUILD_CORE_EXTRAS))
     message(FATAL_ERROR

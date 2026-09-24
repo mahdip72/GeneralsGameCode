@@ -10,6 +10,87 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      stage5_fixture_manifest:
+        description: "Zero Hour-only repository-relative Stage 5 replay fixture manifest"
+        required: false
+        type: string
+        default: ""
+      stage5_performance_baseline:
+        description: "Zero Hour-only repository-relative Stage 3 performance baseline JSON"
+        required: false
+        type: string
+        default: ""
+      stage5_expected_stage3_executable_sha256:
+        description: "Independently recorded Stage 3 x64 Zero Hour executable SHA-256"
+        required: false
+        type: string
+        default: ""
+      stage5_generals_fixture_manifest:
+        description: "Generals-only repository-relative Stage 5 replay fixture manifest"
+        required: false
+        type: string
+        default: ""
+      stage5_acceptance_manifest:
+        description: "Repository-relative reviewed final Stage 5 acceptance manifest"
+        required: false
+        type: string
+        default: ""
+      stage5_lockstep_v2_qualification:
+        description: "Run the external installed lockstep-v2 release qualification"
+        required: false
+        type: boolean
+        default: false
+      stage5_lockstep_v2_map_name:
+        description: "Reviewed lockstep-v2 qualification map name"
+        required: false
+        type: string
+        default: ""
+      stage5_lockstep_v2_generals_map_crc:
+        description: "Reviewed nonzero Generals lockstep-v2 qualification map CRC (decimal)"
+        required: false
+        type: string
+        default: ""
+      stage5_lockstep_v2_zerohour_map_crc:
+        description: "Reviewed nonzero Zero Hour lockstep-v2 qualification map CRC (decimal)"
+        required: false
+        type: string
+        default: ""
+      stage5_external_performance_qualification:
+        description: "Run the external installed 16-physical-core Stage 5 performance qualification"
+        required: false
+        type: boolean
+        default: false
+      stage5_performance_scaling_fixture_manifest:
+        description: "Repository-relative reviewed Zero Hour Stage 5 performance-scaling fixture manifest"
+        required: false
+        type: string
+        default: ""
+      stage5_expected_performance_scaling_fixture_manifest_sha256:
+        description: "Independently recorded uppercase SHA-256 of the reviewed performance-scaling fixture manifest"
+        required: false
+        type: string
+        default: ""
+      stage5_performance_phase_baseline_profile:
+        description: "Repository-relative reviewed single-object dense-eight-player forced-one phase-baseline profile JSON"
+        required: false
+        type: string
+        default: ""
+      stage5_expected_performance_phase_baseline_profile_sha256:
+        description: "Independently recorded uppercase SHA-256 of the reviewed performance phase-baseline profile"
+        required: false
+        type: string
+        default: ""
+      stage5_expected_stage3_performance_baseline_sha256:
+        description: "Independently recorded uppercase SHA-256 of the Zero Hour Stage 3 performance baseline"
+        required: false
+        type: string
+        default: ""
+      stage5_expected_stage3_source_commit:
+        description: "Independently recorded lowercase source commit for the Zero Hour Stage 3 baseline"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -24,6 +105,7 @@ jobs:
       generals: ${{ steps.filter.outputs.generals }}
       generalsmd: ${{ steps.filter.outputs.generalsmd }}
       shared: ${{ steps.filter.outputs.shared }}
+      stage5: ${{ steps.filter.outputs.stage5 }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -48,6 +130,18 @@ jobs:
               - 'cmake/**'
               - 'Core/**'
               - 'Dependencies/**'
+            stage5:
+              - '.github/workflows/**'
+              - 'CMakeLists.txt'
+              - 'CMakePresets.json'
+              - 'cmake/**'
+              - 'vcpkg.json'
+              - 'vcpkg-lock.json'
+              - 'triplets/**'
+              - 'Core/**'
+              - 'Dependencies/**'
+              - 'Generals/**'
+              - 'GeneralsMD/**'
 
       - name: Changes Summary
         run: |
@@ -55,6 +149,7 @@ jobs:
           echo "- Generals: ${{ steps.filter.outputs.generals == 'true' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
           echo "- GeneralsMD: ${{ steps.filter.outputs.generalsmd == 'true' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
           echo "- Shared: ${{ steps.filter.outputs.shared == 'true' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Stage 5: ${{ steps.filter.outputs.stage5 == 'true' && '✅' || '❌' }}" >> $GITHUB_STEP_SUMMARY
 
   build-generals:
     name: Build Generals${{ matrix.preset && '' }}
@@ -63,24 +158,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - preset: "vc6"
+          - preset: "win32-generals-authoring"
             tools: true
-            extras: true
-          - preset: "vc6-profile"
-            tools: true
-            extras: true
-          - preset: "vc6-debug"
-            tools: true
-            extras: true
-          - preset: "win32"
-            tools: true
-            extras: true
-          - preset: "win32-profile"
-            tools: true
-            extras: true
-          - preset: "win32-debug"
-            tools: true
-            extras: true
+            extras: false
+            product: false
           #- preset: "win32-vcpkg"
           #  tools: true
           #  extras: true
@@ -97,49 +178,78 @@ jobs:
       preset: ${{ matrix.preset }}
       tools: ${{ matrix.tools }}
       extras: ${{ matrix.extras }}
+      product: ${{ matrix.product }}
     secrets: inherit
 
   build-generals-x64:
     name: Build Generals x64
     needs: detect-changes
-    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' || needs.detect-changes.outputs.stage5 == 'true' }}
     uses: ./.github/workflows/build-toolchain.yml
     with:
       game: "Generals"
-      preset: "x64-vcpkg"
+      preset: "x64-generals-vcpkg-product"
       tools: false
       extras: true
     secrets: inherit
 
-  # Note build-generalsmd is split into two jobs for vc6 and win32 because replaycheck-generalsmd
-  # only requires the vc6 build and compiling vc6 is much faster than win32
-  build-generalsmd-vc6:
-    name: Build GeneralsMD${{ matrix.preset && '' }}
+  stage5-combined-native-path-modes:
+    name: Stage 5 Combined Native Path Modes
     needs: detect-changes
-    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
-    strategy:
-      matrix:
-        include:
-          - preset: "vc6"
-            tools: true
-            extras: true
-          - preset: "vc6-profile"
-            tools: true
-            extras: true
-          - preset: "vc6-debug"
-            tools: true
-            extras: true
-          - preset: "vc6-releaselog"
-            tools: true
-            extras: true
-      fail-fast: false
-    uses: ./.github/workflows/build-toolchain.yml
-    with:
-      game: "GeneralsMD"
-      preset: ${{ matrix.preset }}
-      tools: ${{ matrix.tools }}
-      extras: ${{ matrix.extras }}
-    secrets: inherit
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' || needs.detect-changes.outputs.stage5 == 'true' }}
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Provision Stage 5 native-path scratch
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token "${{ github.run_id }}-${{ github.run_attempt }}-combined-native-paths"
+          if (-not $?) { throw 'Stage 5 native-path scratch provisioning failed.' }
+
+      - name: Validate complete mixed native-path corpus
+        shell: pwsh
+        timeout-minutes: 120
+        run: |
+          $scratchRoot = $env:RTS_STAGE5_VALIDATION_SCRATCH_ROOT
+          if ([string]::IsNullOrWhiteSpace($scratchRoot) -or
+              -not $scratchRoot.StartsWith('H:\', [StringComparison]::OrdinalIgnoreCase) -or
+              -not (Test-Path -LiteralPath $scratchRoot -PathType Container)) {
+            throw "Stage 5 native-path scratch root is not an existing H: directory: $scratchRoot"
+          }
+          $originalPsModulePath = $env:PSModulePath
+          $testExitCode = 1
+          try {
+            Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/DeterministicSimulationValidation.Tests.ps1" `
+              -ValidationPartition Acceptance `
+              -FocusedAcceptanceCase CombinedNativePathModes -Verbose
+            $testExitCode = $LASTEXITCODE
+          }
+          finally {
+            if ($null -eq $originalPsModulePath) {
+              Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+            } else {
+              $env:PSModulePath = $originalPsModulePath
+            }
+          }
+          exit $testExitCode
+
+      - name: Clean Stage 5 native-path scratch
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token "${{ github.run_id }}-${{ github.run_attempt }}-combined-native-paths"
+          if (-not $?) { throw 'Stage 5 native-path scratch cleanup failed.' }
 
   build-generalsmd-win32:
     name: Build GeneralsMD${{ matrix.preset && '' }}
@@ -148,15 +258,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - preset: "win32"
+          - preset: "win32-zerohour-authoring"
             tools: true
-            extras: true
-          - preset: "win32-profile"
-            tools: true
-            extras: true
-          - preset: "win32-debug"
-            tools: true
-            extras: true
+            extras: false
+            product: false
           #- preset: "win32-vcpkg"
           #  tools: true
           #  extras: true
@@ -173,33 +278,966 @@ jobs:
       preset: ${{ matrix.preset }}
       tools: ${{ matrix.tools }}
       extras: ${{ matrix.extras }}
+      product: ${{ matrix.product }}
     secrets: inherit
 
   build-generalsmd-x64:
     name: Build GeneralsMD x64
     needs: [detect-changes, build-generals-x64]
-    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' || needs.detect-changes.outputs.stage5 == 'true' }}
     uses: ./.github/workflows/build-toolchain.yml
     with:
       game: "GeneralsMD"
-      preset: "x64-vcpkg"
+      preset: "x64-zerohour-vcpkg-product"
       tools: false
       extras: true
     secrets: inherit
 
-  replaycheck-generalsmd:
-    name: Replay Check GeneralsMD${{ matrix.preset && '' }}
-    needs: [detect-changes, build-generalsmd-vc6]
-    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+  stage5-lockstep-v2-qualification:
+    name: Stage 5 Installed Lockstep-v2 Release Qualification
+    needs: [build-generals-x64, build-generalsmd-x64, stage5-execution-cohort]
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_lockstep_v2_qualification == true }}
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      STAGE5_QUALIFICATION_ROOT: 'H:\Stage5WeeklyPromotionQualification'
+      STAGE5_LOCKSTEP_V2_MAP_NAME: ${{ inputs.stage5_lockstep_v2_map_name }}
+      STAGE5_LOCKSTEP_V2_GENERALS_MAP_CRC: ${{ inputs.stage5_lockstep_v2_generals_map_crc }}
+      STAGE5_LOCKSTEP_V2_ZEROHOUR_MAP_CRC: ${{ inputs.stage5_lockstep_v2_zerohour_map_crc }}
+      STAGE5_COHORT_NONCE: ${{ needs['stage5-execution-cohort'].outputs.nonce }}
+      STAGE5_COHORT_CREATED_UTC: ${{ needs['stage5-execution-cohort'].outputs.created_utc }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Provision canonical Stage 5 qualification root
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token ('{0}-{1}-lockstep-v2' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 lockstep-v2 validation volume provisioning failed.' }
+          if (Test-Path -LiteralPath $env:STAGE5_QUALIFICATION_ROOT) {
+            throw "Stage 5 lockstep-v2 qualification root is not fresh: $env:STAGE5_QUALIFICATION_ROOT"
+          }
+          [IO.Directory]::CreateDirectory($env:STAGE5_QUALIFICATION_ROOT) | Out-Null
+
+      - name: Download exact Generals x64 product
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Generals-x64-generals-vcpkg-product+e
+          path: H:\Stage5WeeklyPromotionQualification\GeneralsRuntime
+
+      - name: Download exact Zero Hour x64 product
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: GeneralsMD-x64-zerohour-vcpkg-product+e
+          path: H:\Stage5WeeklyPromotionQualification\ZeroHourRuntime
+
+      - name: Produce exact Stage 5 runtime manifests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/New-Stage5RuntimeManifests.ps1" `
+            -QualificationRoot $env:STAGE5_QUALIFICATION_ROOT `
+            -SourceCommit $env:GITHUB_SHA.ToLowerInvariant() `
+            -OutputEnvironmentFile $env:GITHUB_ENV
+          if (-not $?) { throw 'Stage 5 runtime-manifest production failed.' }
+
+      - name: Provision verified trimmed qualification data
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [uint32]$generalsMapCrc = 0
+          [uint32]$zeroHourMapCrc = 0
+          if (-not [uint32]::TryParse($env:STAGE5_LOCKSTEP_V2_GENERALS_MAP_CRC,
+              [Globalization.NumberStyles]::None,
+              [Globalization.CultureInfo]::InvariantCulture, [ref]$generalsMapCrc) -or
+              -not [uint32]::TryParse($env:STAGE5_LOCKSTEP_V2_ZEROHOUR_MAP_CRC,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$zeroHourMapCrc) -or
+              $generalsMapCrc -eq 0 -or $zeroHourMapCrc -eq 0) {
+            throw 'Both reviewed map CRCs must be nonzero decimal UInt32 values.'
+          }
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Install-Stage5QualificationData.ps1" `
+            -QualificationRoot $env:STAGE5_QUALIFICATION_ROOT `
+            -SourceCommit $env:GITHUB_SHA.ToLowerInvariant() `
+            -MapName $env:STAGE5_LOCKSTEP_V2_MAP_NAME `
+            -GeneralsMapCrc $generalsMapCrc `
+            -ZeroHourMapCrc $zeroHourMapCrc `
+            -AwsEndpointUrl $env:AWS_ENDPOINT_URL `
+            -OutputEnvironmentFile $env:GITHUB_ENV
+          if (-not $?) { throw 'Stage 5 qualification-data provisioning failed.' }
+
+      - name: Run installed lockstep-v2 qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:STAGE5_LOCKSTEP_V2_MAP_NAME)) {
+            throw 'stage5_lockstep_v2_map_name is required when qualification is enabled.'
+          }
+          [uint32]$generalsMapCrc = 0
+          [uint32]$zeroHourMapCrc = 0
+          if (-not [uint32]::TryParse($env:STAGE5_LOCKSTEP_V2_GENERALS_MAP_CRC,
+              [Globalization.NumberStyles]::None,
+              [Globalization.CultureInfo]::InvariantCulture, [ref]$generalsMapCrc) -or
+              -not [uint32]::TryParse($env:STAGE5_LOCKSTEP_V2_ZEROHOUR_MAP_CRC,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$zeroHourMapCrc) -or
+              $generalsMapCrc -eq 0 -or $zeroHourMapCrc -eq 0) {
+            throw 'Both title-specific lockstep-v2 map CRCs must be nonzero decimal UInt32 values when qualification is enabled.'
+          }
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Invoke-InstalledLockstepV2Validation.ps1" `
+            -GeneralsExecutable $env:STAGE5_LOCKSTEP_V2_GENERALS_EXECUTABLE `
+            -ZeroHourExecutable $env:STAGE5_LOCKSTEP_V2_ZEROHOUR_EXECUTABLE `
+            -ArtifactSetManifestPath "$env:STAGE5_QUALIFICATION_ROOT/Stage5ArtifactSet.json" `
+            -SourceCommit $env:GITHUB_SHA.ToLowerInvariant() `
+            -OutputDirectory "$env:STAGE5_QUALIFICATION_ROOT/Evidence" `
+            -MapName $env:STAGE5_LOCKSTEP_V2_MAP_NAME `
+            -GeneralsMapCrc $generalsMapCrc `
+            -ZeroHourMapCrc $zeroHourMapCrc `
+            -PeerCount 2 `
+            -Seed 23063 `
+            -ExecutionCohortNonce $env:STAGE5_COHORT_NONCE `
+            -ExecutionCohortCreatedUtc $env:STAGE5_COHORT_CREATED_UTC `
+            -RuntimeClosureDependencyManifestSha256 $env:STAGE5_LOCKSTEP_V2_RUNTIME_MANIFEST_SHA256 `
+            -RuntimeClosureSha256 $env:STAGE5_LOCKSTEP_V2_RUNTIME_CLOSURE_SHA256 `
+            -QualificationDataManifestPath "$env:STAGE5_QUALIFICATION_ROOT/Stage5QualificationData.json" `
+            -QualificationDataManifestSha256 $env:STAGE5_LOCKSTEP_V2_DATA_MANIFEST_SHA256 `
+            -QualificationDataClosureSha256 $env:STAGE5_LOCKSTEP_V2_DATA_CLOSURE_SHA256 `
+            -AllowHeadlessDirectExecution
+          if (-not $?) { throw 'Stage 5 installed lockstep-v2 qualification failed.' }
+
+      - name: Upload installed lockstep-v2 qualification
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: Stage5-LockstepV2-Qualification
+          path: |
+            H:\Stage5WeeklyPromotionQualification\Stage5ArtifactSet.json
+            H:\Stage5WeeklyPromotionQualification\Stage5RuntimeDependencies.json
+            H:\Stage5WeeklyPromotionQualification\Stage5QualificationData.json
+            H:\Stage5WeeklyPromotionQualification\Evidence
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Clean Stage 5 lockstep-v2 validation volume
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token ('{0}-{1}-lockstep-v2' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 lockstep-v2 validation volume cleanup failed.' }
+
+  stage5-performance-scaling-qualification:
+    name: Stage 5 External 16-Core Performance Qualification
+    needs: [build-generals-x64, build-generalsmd-x64, stage5-execution-cohort, stage5-lockstep-v2-qualification]
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_lockstep_v2_qualification == true &&
+          inputs.stage5_external_performance_qualification == true &&
+          inputs.stage5_performance_scaling_fixture_manifest != '' &&
+          inputs.stage5_expected_performance_scaling_fixture_manifest_sha256 != '' &&
+          inputs.stage5_performance_phase_baseline_profile != '' &&
+          inputs.stage5_expected_performance_phase_baseline_profile_sha256 != '' &&
+          inputs.stage5_performance_baseline != '' &&
+          inputs.stage5_expected_stage3_performance_baseline_sha256 != '' &&
+          inputs.stage5_expected_stage3_executable_sha256 != '' &&
+          inputs.stage5_expected_stage3_source_commit != '' }}
+    runs-on: [self-hosted, windows, x64, stage5-16-physical-core]
+    timeout-minutes: 360
+    concurrency:
+      group: stage5-external-16-core-performance-qualification
+      cancel-in-progress: false
+    env:
+      STAGE5_QUALIFICATION_ROOT: 'H:\Stage5WeeklyPromotionQualification'
+      STAGE5_PERFORMANCE_TASK_ROOT: H:\Stage5ExternalPerformanceQualification-${{ github.run_id }}-${{ github.run_attempt }}
+      STAGE5_PERFORMANCE_DATA_TASK_ROOT: H:\Stage5ExternalPerformanceData-${{ github.run_id }}-${{ github.run_attempt }}
+      STAGE5_PERFORMANCE_FIXTURE_MANIFEST: ${{ inputs.stage5_performance_scaling_fixture_manifest }}
+      STAGE5_EXPECTED_PERFORMANCE_FIXTURE_MANIFEST_SHA256: ${{ inputs.stage5_expected_performance_scaling_fixture_manifest_sha256 }}
+      STAGE5_PERFORMANCE_PHASE_BASELINE_PROFILE: ${{ inputs.stage5_performance_phase_baseline_profile }}
+      STAGE5_EXPECTED_PERFORMANCE_PHASE_BASELINE_PROFILE_SHA256: ${{ inputs.stage5_expected_performance_phase_baseline_profile_sha256 }}
+      STAGE5_STAGE3_BASELINE: ${{ inputs.stage5_performance_baseline }}
+      STAGE5_EXPECTED_STAGE3_BASELINE_SHA256: ${{ inputs.stage5_expected_stage3_performance_baseline_sha256 }}
+      STAGE5_EXPECTED_STAGE3_EXECUTABLE_SHA256: ${{ inputs.stage5_expected_stage3_executable_sha256 }}
+      STAGE5_EXPECTED_STAGE3_SOURCE_COMMIT: ${{ inputs.stage5_expected_stage3_source_commit }}
+      STAGE5_COHORT_NONCE: ${{ needs['stage5-execution-cohort'].outputs.nonce }}
+      STAGE5_COHORT_CREATED_UTC: ${{ needs['stage5-execution-cohort'].outputs.created_utc }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Require fresh external qualification roots
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath 'H:\')) {
+            throw 'The dedicated Stage 5 external qualification runner must provide H:.'
+          }
+          if (Test-Path -LiteralPath $env:STAGE5_QUALIFICATION_ROOT) {
+            throw "The canonical Stage 5 qualification root is not fresh: $env:STAGE5_QUALIFICATION_ROOT"
+          }
+          if (Test-Path -LiteralPath $env:STAGE5_PERFORMANCE_TASK_ROOT) {
+            throw "The Stage 5 performance task root is not fresh: $env:STAGE5_PERFORMANCE_TASK_ROOT"
+          }
+          if (Test-Path -LiteralPath $env:STAGE5_PERFORMANCE_DATA_TASK_ROOT) {
+            throw "The Stage 5 performance data root is not fresh: $env:STAGE5_PERFORMANCE_DATA_TASK_ROOT"
+          }
+          [IO.Directory]::CreateDirectory($env:STAGE5_QUALIFICATION_ROOT) | Out-Null
+          "STAGE5_EXTERNAL_CLEANUP_OWNER=$env:GITHUB_RUN_ID`:$env:GITHUB_RUN_ATTEMPT" >> `
+            $env:GITHUB_ENV
+
+      - name: Download exact lockstep-v2 artifact closure
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-LockstepV2-Qualification
+          path: H:\Stage5WeeklyPromotionQualification
+
+      - name: Download exact Generals x64 product
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Generals-x64-generals-vcpkg-product+e
+          path: H:\Stage5WeeklyPromotionQualification\GeneralsRuntime
+
+      - name: Download exact Zero Hour x64 product
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: GeneralsMD-x64-zerohour-vcpkg-product+e
+          path: H:\Stage5WeeklyPromotionQualification\ZeroHourRuntime
+
+      - name: Provision verified Zero Hour performance data
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($secretName in @('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
+              'AWS_ENDPOINT_URL')) {
+            if ([string]::IsNullOrWhiteSpace(
+                [Environment]::GetEnvironmentVariable($secretName))) {
+              throw "External performance qualification requires secret $secretName."
+            }
+          }
+          [IO.Directory]::CreateDirectory(
+            $env:STAGE5_PERFORMANCE_DATA_TASK_ROOT) | Out-Null
+          $archivePath = Join-Path $env:STAGE5_PERFORMANCE_DATA_TASK_ROOT `
+            'zerohour104_gamedata_trimmed.7z'
+          & aws s3 cp 's3://github-ci/zerohour104_gamedata_trimmed.7z' `
+            $archivePath --endpoint-url $env:AWS_ENDPOINT_URL
+          if ($LASTEXITCODE -ne 0 -or
+              -not (Test-Path -LiteralPath $archivePath -PathType Leaf)) {
+            throw 'The reviewed Zero Hour performance-data archive is unavailable.'
+          }
+          $manifestPath = Join-Path $env:STAGE5_PERFORMANCE_DATA_TASK_ROOT `
+            'Stage5PerformanceQualificationData.json'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/New-Stage5PerformanceQualificationData.ps1" `
+            -ArchivePath "$env:STAGE5_PERFORMANCE_DATA_TASK_ROOT\zerohour104_gamedata_trimmed.7z" `
+            -ExpectedArchiveSha256 "6837FE1E3009A4C239406C39B1598216C0943EE8ED46BB10626767029AC05E21" `
+            -TaskRoot "$env:STAGE5_PERFORMANCE_DATA_TASK_ROOT" `
+            -RuntimeRoot "$env:STAGE5_QUALIFICATION_ROOT\ZeroHourRuntime" `
+            -OutputPath "$env:STAGE5_PERFORMANCE_DATA_TASK_ROOT\Stage5PerformanceQualificationData.json" `
+            -ExpectedSourceCommit $env:GITHUB_SHA.ToLowerInvariant() `
+            -SevenZipPath "C:\Program Files\7-Zip\7z.exe"
+          if (-not $?) { throw 'Stage 5 performance-data production failed.' }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw |
+            ConvertFrom-Json
+          $manifestSha256 = (Get-FileHash -LiteralPath $manifestPath `
+            -Algorithm SHA256).Hash.ToUpperInvariant()
+          $closureSha256 = [string]$manifest.closureSha256
+          if ($manifestSha256 -cnotmatch '^[0-9A-F]{64}$' -or
+              $closureSha256 -cnotmatch '^[0-9A-F]{64}$') {
+            throw 'Stage 5 performance-data producer emitted malformed bindings.'
+          }
+          "STAGE5_PERFORMANCE_DATA_MANIFEST_PATH=$manifestPath" >> $env:GITHUB_ENV
+          "STAGE5_PERFORMANCE_DATA_MANIFEST_SHA256=$manifestSha256" >> $env:GITHUB_ENV
+          "STAGE5_PERFORMANCE_DATA_CLOSURE_SHA256=$closureSha256" >> $env:GITHUB_ENV
+
+      - name: Provision verified Generals base data
+        shell: pwsh
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Install-Stage5SimulationQualificationData.ps1" `
+            -RuntimeRoot (Join-Path $env:STAGE5_QUALIFICATION_ROOT 'GeneralsRuntime') `
+            -TaskRoot 'H:\Stage5SimulationValidationTask' `
+            -SourceCommit $env:GITHUB_SHA.ToLowerInvariant() -Title 'Generals' `
+            -AwsEndpointUrl $env:AWS_ENDPOINT_URL -OutputEnvironmentFile $env:GITHUB_ENV
+          if (-not $?) { throw 'External performance base data provisioning failed.' }
+          "STAGE5_BASE_SIMULATION_CLEANUP_OWNER=$env:GITHUB_RUN_ID`:$env:GITHUB_RUN_ATTEMPT" >> $env:GITHUB_ENV
+
+      - name: Run external Stage 5 performance qualification
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Resolve-Stage5RepositoryFile {
+            param([string]$Root, [string]$RelativePath, [string]$Context)
+            $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+            if ([string]::IsNullOrWhiteSpace($RelativePath) -or
+                [IO.Path]::IsPathRooted($RelativePath) -or
+                $RelativePath -match ':' -or
+                $RelativePath -match '[\x00-\x1F\x7F]' -or
+                $RelativePath -match '(^|[\\/])\.{1,2}([\\/]|$)') {
+              throw "$Context must be a canonical repository-relative path."
+            }
+            $rootItem = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+            if (-not $rootItem.PSIsContainer -or
+                ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "$Context trusted root is not a regular directory."
+            }
+            $candidate = [IO.Path]::GetFullPath((Join-Path $rootFull $RelativePath))
+            if (-not $candidate.StartsWith(
+                  $rootFull + [IO.Path]::DirectorySeparatorChar,
+                  [StringComparison]::OrdinalIgnoreCase) -or
+                -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              throw "$Context must resolve to a file below its trusted root."
+            }
+            $current = $rootFull
+            foreach ($segment in @($candidate.Substring($rootFull.Length + 1) -split '[\\/]')) {
+              $current = Join-Path $current $segment
+              $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Context contains a reparse-point path component."
+              }
+            }
+            return $candidate
+          }
+
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\', '/')
+          $fixtureManifest = Resolve-Stage5RepositoryFile $workspace `
+            $env:STAGE5_PERFORMANCE_FIXTURE_MANIFEST `
+            'Stage 5 performance-scaling fixture manifest'
+          $stage3Baseline = Resolve-Stage5RepositoryFile $workspace `
+            $env:STAGE5_STAGE3_BASELINE 'Stage 3 performance baseline'
+          $phaseBaselineProfilePath = Resolve-Stage5RepositoryFile $workspace `
+            $env:STAGE5_PERFORMANCE_PHASE_BASELINE_PROFILE `
+            'Stage 5 performance phase-baseline profile'
+          if ([IO.Path]::GetFileName($fixtureManifest) -match '(?i)\.(?:example|sample)\.' -or
+              [IO.Path]::GetFileName($stage3Baseline) -match '(?i)\.(?:example|sample)\.' -or
+              [IO.Path]::GetFileName($phaseBaselineProfilePath) -match '(?i)\.(?:example|sample)\.') {
+            throw 'External performance qualification rejects example/sample inputs.'
+          }
+          foreach ($binding in @(
+              [pscustomobject]@{ path = $fixtureManifest; expected = $env:STAGE5_EXPECTED_PERFORMANCE_FIXTURE_MANIFEST_SHA256; context = 'performance-scaling fixture manifest' },
+              [pscustomobject]@{ path = $stage3Baseline; expected = $env:STAGE5_EXPECTED_STAGE3_BASELINE_SHA256; context = 'Stage 3 performance baseline' },
+              [pscustomobject]@{ path = $phaseBaselineProfilePath; expected = $env:STAGE5_EXPECTED_PERFORMANCE_PHASE_BASELINE_PROFILE_SHA256; context = 'performance phase-baseline profile' })) {
+            $expected = [string]$binding.expected
+            if ($expected -cnotmatch '^[0-9A-F]{64}$' -or
+                (Get-FileHash -LiteralPath ([string]$binding.path) -Algorithm SHA256).Hash -cne $expected) {
+              throw "The independently supplied $($binding.context) SHA-256 does not match."
+            }
+          }
+          if ($env:STAGE5_EXPECTED_STAGE3_EXECUTABLE_SHA256 -cnotmatch '^[0-9A-F]{64}$' -or
+              $env:STAGE5_EXPECTED_STAGE3_SOURCE_COMMIT -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'External performance qualification requires canonical independent Stage 3 identity inputs.'
+          }
+          $phaseBaselineProfile = Get-Content -LiteralPath `
+            $phaseBaselineProfilePath -Raw | ConvertFrom-Json -NoEnumerate
+          if ($null -eq $phaseBaselineProfile -or
+              $phaseBaselineProfile -is [Array]) {
+            throw 'The reviewed performance phase-baseline profile must be one top-level JSON object.'
+          }
+
+          $artifactSetPath = Join-Path $env:STAGE5_QUALIFICATION_ROOT 'Stage5ArtifactSet.json'
+          $artifactSetSha256 = (Get-FileHash -LiteralPath $artifactSetPath -Algorithm SHA256).Hash
+          $zeroHourExecutables = @(Get-ChildItem -LiteralPath `
+            (Join-Path $env:STAGE5_QUALIFICATION_ROOT 'ZeroHourRuntime') `
+            -Recurse -File -Filter 'generalszh.exe')
+          if ($zeroHourExecutables.Count -ne 1) {
+            throw 'External performance qualification requires exactly one installed generalszh.exe.'
+          }
+          $executablePath = $zeroHourExecutables[0].FullName
+          $executableSha256 = (Get-FileHash -LiteralPath $executablePath -Algorithm SHA256).Hash
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Invoke-Stage5PerformanceScalingValidation.ps1" `
+            -Title ZeroHour `
+            -InstalledExecutablePath $executablePath `
+            -ExpectedExecutableSha256 $executableSha256 `
+            -ExpectedSourceCommit $env:GITHUB_SHA.ToLowerInvariant() `
+            -ExpectedArtifactSetSha256 $artifactSetSha256 `
+            -ArtifactSetManifestPath $artifactSetPath `
+            -GeneralsQualificationDataManifestPath $env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_PATH `
+            -GeneralsQualificationDataManifestSha256 $env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_SHA256 `
+            -AllowHeadlessDirectExecution `
+            -FixtureManifestPath $fixtureManifest `
+            -ExpectedFixtureManifestSha256 $env:STAGE5_EXPECTED_PERFORMANCE_FIXTURE_MANIFEST_SHA256 `
+            -Stage3BaselinePath $stage3Baseline `
+            -ExpectedStage3BaselineSha256 $env:STAGE5_EXPECTED_STAGE3_BASELINE_SHA256 `
+            -ExpectedStage3ExecutableSha256 $env:STAGE5_EXPECTED_STAGE3_EXECUTABLE_SHA256 `
+            -ExpectedStage3SourceCommit $env:STAGE5_EXPECTED_STAGE3_SOURCE_COMMIT `
+            -TaskRoot $env:STAGE5_PERFORMANCE_TASK_ROOT `
+            -MeasuredRuns 3 `
+            -QualificationMode External16Core `
+            -ReferencePolicy paired-serial-oracle-v1 `
+            -PhaseBaselineProfiles @($phaseBaselineProfile) `
+            -PhaseBaselineProfilePath $phaseBaselineProfilePath `
+            -ExpectedPhaseBaselineProfileSha256 $env:STAGE5_EXPECTED_PERFORMANCE_PHASE_BASELINE_PROFILE_SHA256 `
+            -PerformanceDataManifestPath $env:STAGE5_PERFORMANCE_DATA_MANIFEST_PATH `
+            -ExpectedPerformanceDataManifestSha256 $env:STAGE5_PERFORMANCE_DATA_MANIFEST_SHA256 `
+            -ExpectedPerformanceDataClosureSha256 $env:STAGE5_PERFORMANCE_DATA_CLOSURE_SHA256 `
+            -ExecutionCohortNonce $env:STAGE5_COHORT_NONCE `
+            -ExecutionCohortCreatedUtc $env:STAGE5_COHORT_CREATED_UTC
+          if (-not $?) { throw 'Stage 5 external performance qualification failed.' }
+          $sourceDataManifest = Join-Path $env:STAGE5_PERFORMANCE_DATA_TASK_ROOT `
+            'Stage5PerformanceQualificationData.json'
+          if ([IO.Path]::GetFullPath($env:STAGE5_PERFORMANCE_DATA_MANIFEST_PATH) -cne
+              [IO.Path]::GetFullPath($sourceDataManifest)) {
+            throw 'Stage 5 external performance data manifest left its dedicated data task root.'
+          }
+          $retainedDataManifest = Join-Path $env:STAGE5_PERFORMANCE_TASK_ROOT `
+            'Stage5PerformanceQualificationData.json'
+          $report = Join-Path $env:STAGE5_PERFORMANCE_TASK_ROOT `
+            'Stage5PerformanceScalingQualification.json'
+          $rawSamples = Join-Path $env:STAGE5_PERFORMANCE_TASK_ROOT `
+            'Stage5PerformanceScalingRawSamples.json'
+          $authoritativeEvidence = Join-Path $env:STAGE5_PERFORMANCE_TASK_ROOT `
+            'Stage5PerformanceScaling.json'
+          foreach ($requiredOutput in @($sourceDataManifest, $retainedDataManifest,
+              $report, $rawSamples, $authoritativeEvidence)) {
+            if (-not (Test-Path -LiteralPath $requiredOutput -PathType Leaf)) {
+              throw "Stage 5 external performance qualification omitted: $requiredOutput"
+            }
+          }
+
+      - name: Upload external Stage 5 performance qualification
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: Stage5-Performance-Scaling-Qualification
+          path: H:\Stage5ExternalPerformanceQualification-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Clean dedicated external qualification roots
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          STAGE5_BASE_CONSUMERS_STATUS: ${{ job.status }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $expectedOwner = "$env:GITHUB_RUN_ID`:$env:GITHUB_RUN_ATTEMPT"
+          if ($env:STAGE5_EXTERNAL_CLEANUP_OWNER -cne $expectedOwner) {
+            Write-Host 'No roots were acquired by this job; skipping external qualification cleanup.'
+            exit 0
+          }
+          $runningTitles = @(Get-Process -Name generalsv, generalszh `
+            -ErrorAction SilentlyContinue)
+          if ($runningTitles.Count -ne 0) {
+            throw 'Refusing external qualification cleanup while a title process remains.'
+          }
+          $expectedRoot = 'H:\Stage5WeeklyPromotionQualification'
+          if ([IO.Path]::GetFullPath($env:STAGE5_QUALIFICATION_ROOT).TrimEnd('\') -cne
+              $expectedRoot) {
+            throw 'Refusing cleanup of a noncanonical qualification root.'
+          }
+          $expectedPerformanceTaskRoot =
+            "H:\Stage5ExternalPerformanceQualification-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $expectedPerformanceDataRoot =
+            "H:\Stage5ExternalPerformanceData-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if ([IO.Path]::GetFullPath($env:STAGE5_PERFORMANCE_TASK_ROOT).TrimEnd('\') -cne
+              $expectedPerformanceTaskRoot -or
+              [IO.Path]::GetFullPath($env:STAGE5_PERFORMANCE_DATA_TASK_ROOT).TrimEnd('\') -cne
+              $expectedPerformanceDataRoot) {
+            throw 'Refusing cleanup of external roots not owned by this run attempt.'
+          }
+          foreach ($taskRoot in @($env:STAGE5_PERFORMANCE_TASK_ROOT,
+              $env:STAGE5_PERFORMANCE_DATA_TASK_ROOT)) {
+            $taskRootFull = [IO.Path]::GetFullPath($taskRoot).TrimEnd('\')
+            if ($taskRootFull -cnotmatch
+                '^H:\\Stage5ExternalPerformance(?:Qualification|Data)-[0-9]+-[0-9]+$') {
+              throw "Refusing cleanup of an unexpected external task root: $taskRootFull"
+            }
+          }
+          foreach ($ownedRoot in @($env:STAGE5_QUALIFICATION_ROOT,
+              $env:STAGE5_PERFORMANCE_TASK_ROOT,
+              $env:STAGE5_PERFORMANCE_DATA_TASK_ROOT)) {
+            if (-not (Test-Path -LiteralPath $ownedRoot)) { continue }
+            $item = Get-Item -LiteralPath $ownedRoot -Force
+            if (-not $item.PSIsContainer -or
+                ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Refusing cleanup of a replaced or reparse-point root: $ownedRoot"
+            }
+            Remove-Item -LiteralPath $ownedRoot -Recurse -Force
+            if (Test-Path -LiteralPath $ownedRoot) {
+              throw "External qualification cleanup did not remove: $ownedRoot"
+            }
+          }
+          if ($env:STAGE5_BASE_CONSUMERS_STATUS -ceq 'success' -and
+              $env:STAGE5_BASE_SIMULATION_CLEANUP_OWNER -ceq $expectedOwner) {
+            $simulationRoot = 'H:\Stage5SimulationValidationTask'
+            $simulationManifest = Join-Path $simulationRoot 'QualificationData.json'
+            if ([IO.Path]::GetFullPath($env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_PATH) -cne $simulationManifest) {
+              throw 'Base simulation cleanup manifest path differs from its successful producer binding.'
+            }
+            $simulationItem = Get-Item -LiteralPath $simulationRoot -Force
+            $simulationFiles = @(Get-ChildItem -LiteralPath $simulationRoot -Force)
+            if (-not $simulationItem.PSIsContainer -or
+                ($simulationItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $simulationFiles.Count -ne 1 -or $simulationFiles[0].PSIsContainer -or
+                ($simulationFiles[0].Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+                $simulationFiles[0].FullName -cne $simulationManifest -or
+                (Get-FileHash -LiteralPath $simulationManifest -Algorithm SHA256).Hash -cne $env:STAGE5_SIMULATION_QUALIFICATION_DATA_MANIFEST_SHA256) {
+              throw 'Base simulation cleanup no longer owns the exact retained manifest.'
+            }
+            Remove-Item -LiteralPath $simulationManifest -Force
+            [IO.Directory]::Delete($simulationRoot, $false)
+          }
+
+  stage5-combined-host-runner:
+    name: Stage 5 Combined Host-Runner Receipt
+    needs: [stage5-execution-cohort, stage5-replaycheck-generalsmd-x64, stage5-replaycheck-generals-x64]
+    if: >-
+      ${{ always() && github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_fixture_manifest != '' &&
+          inputs.stage5_generals_fixture_manifest != '' &&
+          inputs.stage5_acceptance_manifest != '' &&
+          needs['stage5-execution-cohort'].result == 'success' &&
+          needs['stage5-replaycheck-generalsmd-x64'].result == 'success' &&
+          needs['stage5-replaycheck-generals-x64'].result == 'success' }}
+    runs-on: windows-2022
+    timeout-minutes: 15
+    env:
+      STAGE5_ACCEPTANCE_MANIFEST: ${{ inputs.stage5_acceptance_manifest }}
+      STAGE5_COHORT_NONCE: ${{ needs['stage5-execution-cohort'].outputs.nonce }}
+      STAGE5_COHORT_CREATED_UTC: ${{ needs['stage5-execution-cohort'].outputs.created_utc }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Provision isolated Stage 5 volume
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token ('{0}-{1}-combined-host-runner' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 combined host-runner validation volume provisioning failed.' }
+
+      - name: Download Generals Stage 5 evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-Simulation-Validation-Generals-x64-generals-vcpkg-product+e
+          path: ${{ runner.temp }}\Stage5CombinedSources\Generals
+
+      - name: Download Zero Hour Stage 5 evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-Simulation-Validation-GeneralsMD-x64-zerohour-vcpkg-product+e
+          path: ${{ runner.temp }}\Stage5CombinedSources\ZeroHour
+
+      - name: Produce combined host-runner receipt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Resolve-Stage5RepositoryFile {
+            param([string]$Root, [string]$RelativePath, [string]$Context)
+            $rootFull = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+            if ([string]::IsNullOrWhiteSpace($RelativePath) -or
+                [IO.Path]::IsPathRooted($RelativePath) -or
+                $RelativePath -match ':' -or
+                $RelativePath -match '[\x00-\x1F\x7F]' -or
+                $RelativePath -match '(^|[\\/])\.{1,2}([\\/]|$)') {
+              throw "$Context must be a canonical repository-relative path."
+            }
+            $rootItem = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+            if (-not $rootItem.PSIsContainer -or
+                ($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "$Context trusted root is not a regular directory."
+            }
+            $candidate = [IO.Path]::GetFullPath((Join-Path $rootFull $RelativePath))
+            if (-not $candidate.StartsWith(
+                  $rootFull + [IO.Path]::DirectorySeparatorChar,
+                  [StringComparison]::OrdinalIgnoreCase) -or
+                -not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              throw "$Context must resolve to a file below its trusted root."
+            }
+            $current = $rootFull
+            foreach ($segment in @($candidate.Substring($rootFull.Length + 1) -split '[\\/]')) {
+              $current = Join-Path $current $segment
+              $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+              if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Context contains a reparse-point path component."
+              }
+            }
+            return $candidate
+          }
+
+          $workspace = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE).TrimEnd('\', '/')
+          $acceptancePath = Resolve-Stage5RepositoryFile $workspace `
+            $env:STAGE5_ACCEPTANCE_MANIFEST 'Stage 5 acceptance manifest'
+          $acceptance = Get-Content -LiteralPath $acceptancePath -Raw | ConvertFrom-Json
+          $sourceCommit = ([string]$acceptance.sourceCommit).ToLowerInvariant()
+          if ($sourceCommit -notmatch '^[0-9a-f]{40}$' -or $sourceCommit -cne $env:GITHUB_SHA.ToLowerInvariant()) { throw 'Stage 5 acceptance sourceCommit is stale.' }
+          $artifactPath = Resolve-Stage5RepositoryFile `
+            (Split-Path -Parent $acceptancePath) `
+            ([string]$acceptance.artifactSet.path) `
+            'Stage 5 acceptance artifact-set manifest'
+          $artifactHash = (Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256).Hash
+          if ($artifactHash -cne ([string]$acceptance.artifactSet.sha256).ToUpperInvariant()) { throw 'Stage 5 artifact-set hash is stale.' }
+          $artifactSet = Get-Content -LiteralPath $artifactPath -Raw | ConvertFrom-Json
+          $artifactByRole = @{}
+          foreach ($artifact in @($artifactSet.artifacts)) { $artifactByRole[[string]$artifact.role] = [string]$artifact.sha256 }
+          $replayEntries = @($acceptance.evidence | Where-Object { [string]$_.kind -ceq 'replay-determinism' })
+          if ($replayEntries.Count -ne 1) { throw 'Stage 5 acceptance requires one replay-determinism envelope.' }
+          $replayEnvelopePath = Resolve-Stage5RepositoryFile `
+            (Split-Path -Parent $acceptancePath) ([string]$replayEntries[0].path) `
+            'Stage 5 replay-determinism envelope'
+          $replayEnvelopeHash = (Get-FileHash -LiteralPath $replayEnvelopePath -Algorithm SHA256).Hash
+          if ($replayEnvelopeHash -cne ([string]$replayEntries[0].sha256).ToUpperInvariant()) { throw 'Stage 5 replay-determinism envelope hash is stale.' }
+          $replayEnvelope = Get-Content -LiteralPath $replayEnvelopePath -Raw | ConvertFrom-Json
+          $reviewedAttachments = @($replayEnvelope.attachments | Where-Object { [string]$_.role -ceq 'replay-fixture-manifest' -and [string]$_.trustDomain -ceq 'reviewed-fixture' })
+          $generalsReviewedAttachments = @($reviewedAttachments | Where-Object { [string]$_.title -ceq 'Generals' })
+          $zeroHourReviewedAttachments = @($reviewedAttachments | Where-Object { [string]$_.title -ceq 'ZeroHour' })
+          if ($reviewedAttachments.Count -ne 2 -or $generalsReviewedAttachments.Count -ne 1 -or $zeroHourReviewedAttachments.Count -ne 1) { throw 'Stage 5 acceptance requires one protected reviewed-fixture receipt for each title.' }
+          $generalsReviewedFixtureReceipt = Resolve-Stage5RepositoryFile `
+            (Split-Path -Parent $replayEnvelopePath) ([string]$generalsReviewedAttachments[0].path) `
+            'Generals protected reviewed-fixture receipt'
+          $zeroHourReviewedFixtureReceipt = Resolve-Stage5RepositoryFile `
+            (Split-Path -Parent $replayEnvelopePath) ([string]$zeroHourReviewedAttachments[0].path) `
+            'Zero Hour protected reviewed-fixture receipt'
+          $generalsReviewedFixtureReceiptSha256 = ([string]$generalsReviewedAttachments[0].sha256).ToUpperInvariant()
+          $zeroHourReviewedFixtureReceiptSha256 = ([string]$zeroHourReviewedAttachments[0].sha256).ToUpperInvariant()
+          if ((Get-FileHash -LiteralPath $generalsReviewedFixtureReceipt -Algorithm SHA256).Hash -cne $generalsReviewedFixtureReceiptSha256 -or (Get-FileHash -LiteralPath $zeroHourReviewedFixtureReceipt -Algorithm SHA256).Hash -cne $zeroHourReviewedFixtureReceiptSha256) { throw 'A protected reviewed-fixture receipt hash is stale.' }
+          $generalsReceipts = @(Get-ChildItem -LiteralPath "${{ runner.temp }}\Stage5CombinedSources\Generals" -Recurse -Filter 'validation-results-receipt.json' -File)
+          $zeroHourReceipts = @(Get-ChildItem -LiteralPath "${{ runner.temp }}\Stage5CombinedSources\ZeroHour" -Recurse -Filter 'validation-results-receipt.json' -File)
+          if ($generalsReceipts.Count -ne 1 -or $zeroHourReceipts.Count -ne 1) { throw 'Stage 5 combined producer requires exactly one fresh receipt for each title.' }
+          $combinedOutput = 'H:\Stage5CombinedSimulationTask\Evidence\combined-results-receipt.json'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/New-Stage5CombinedHostRunnerReceipt.ps1" `
+            -GeneralsReceiptPath $generalsReceipts[0].FullName `
+            -ZeroHourReceiptPath $zeroHourReceipts[0].FullName `
+            -GeneralsReviewedFixtureReceiptPath $generalsReviewedFixtureReceipt `
+            -GeneralsReviewedFixtureReceiptSha256 $generalsReviewedFixtureReceiptSha256 `
+            -ZeroHourReviewedFixtureReceiptPath $zeroHourReviewedFixtureReceipt `
+            -ZeroHourReviewedFixtureReceiptSha256 $zeroHourReviewedFixtureReceiptSha256 `
+            -OutputPath $combinedOutput `
+            -ExpectedSourceCommit $sourceCommit `
+            -ExpectedArtifactSetSha256 $artifactHash `
+            -ExpectedGeneralsExecutableSha256 ([string]$artifactByRole['generals-executable']) `
+            -ExpectedZeroHourExecutableSha256 ([string]$artifactByRole['zerohour-executable']) `
+            -ExpectedCohortNonce $env:STAGE5_COHORT_NONCE `
+            -ExpectedCohortCreatedUtc $env:STAGE5_COHORT_CREATED_UTC
+          if (-not $?) { throw 'Stage 5 combined host-runner producer failed.' }
+          Write-Host 'Stage 5 combined host-runner receipt is ready for cross-title pre-manual aggregation.'
+
+      - name: Upload combined Stage 5 evidence
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: Stage5-Simulation-Validation-combined
+          path: H:\Stage5CombinedSimulationTask\Evidence
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Clean Stage 5 combined host-runner validation volume
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token ('{0}-{1}-combined-host-runner' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 combined host-runner validation volume cleanup failed.' }
+
+  stage5-development-readiness:
+    name: Stage 5 Development Readiness
+    needs: [stage5-execution-cohort, stage5-replaycheck-generalsmd-x64, stage5-replaycheck-generals-x64, stage5-combined-host-runner, stage5-lockstep-v2-qualification, stage5-performance-scaling-qualification]
+    if: >-
+      ${{ always() && github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_lockstep_v2_qualification == true &&
+          inputs.stage5_external_performance_qualification == true &&
+          inputs.stage5_acceptance_manifest != '' &&
+          needs['stage5-execution-cohort'].result == 'success' &&
+          needs['stage5-replaycheck-generalsmd-x64'].result == 'success' &&
+          needs['stage5-replaycheck-generals-x64'].result == 'success' &&
+          needs['stage5-combined-host-runner'].result == 'success' &&
+          needs['stage5-lockstep-v2-qualification'].result == 'success' &&
+          needs['stage5-performance-scaling-qualification'].result == 'success' }}
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      STAGE5_ACCEPTANCE_TEMPLATE: ${{ inputs.stage5_acceptance_manifest }}
+      STAGE5_COHORT_NONCE: ${{ needs['stage5-execution-cohort'].outputs.nonce }}
+      STAGE5_COHORT_CREATED_UTC: ${{ needs['stage5-execution-cohort'].outputs.created_utc }}
+      STAGE5_EXPECTED_PERFORMANCE_PHASE_BASELINE_PROFILE_SHA256: ${{ inputs.stage5_expected_performance_phase_baseline_profile_sha256 }}
+      STAGE5_READINESS_ROOT: 'H:\Stage5WeeklyPromotionQualification'
+      STAGE5_PERFORMANCE_ROOT: H:\Stage5ExternalPerformanceQualification-${{ github.run_id }}-${{ github.run_attempt }}
+      STAGE5_SOURCE_ROOT: H:\Stage5DevelopmentReadinessSources-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Provision isolated Stage 5 readiness volume
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token ('{0}-{1}-development-readiness' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 development-readiness validation volume provisioning failed.' }
+          foreach ($freshRoot in @($env:STAGE5_READINESS_ROOT,
+              $env:STAGE5_PERFORMANCE_ROOT, $env:STAGE5_SOURCE_ROOT)) {
+            if (Test-Path -LiteralPath $freshRoot) {
+              throw "Stage 5 readiness root is not fresh: $freshRoot"
+            }
+          }
+          [IO.Directory]::CreateDirectory($env:STAGE5_READINESS_ROOT) | Out-Null
+          [IO.Directory]::CreateDirectory($env:STAGE5_SOURCE_ROOT) | Out-Null
+
+      - name: Download exact lockstep-v2 closure
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-LockstepV2-Qualification
+          path: H:\Stage5WeeklyPromotionQualification
+
+      - name: Download exact Generals x64 product for closure validation
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Generals-x64-generals-vcpkg-product+e
+          path: H:\Stage5WeeklyPromotionQualification\GeneralsRuntime
+
+      - name: Download exact Zero Hour x64 product for closure validation
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: GeneralsMD-x64-zerohour-vcpkg-product+e
+          path: H:\Stage5WeeklyPromotionQualification\ZeroHourRuntime
+
+      - name: Download Generals Stage 5 evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-Simulation-Validation-Generals-x64-generals-vcpkg-product+e
+          path: H:\Stage5DevelopmentReadinessSources-${{ github.run_id }}-${{ github.run_attempt }}\Generals
+
+      - name: Download Zero Hour Stage 5 evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-Simulation-Validation-GeneralsMD-x64-zerohour-vcpkg-product+e
+          path: H:\Stage5DevelopmentReadinessSources-${{ github.run_id }}-${{ github.run_attempt }}\ZeroHour
+
+      - name: Download combined Stage 5 evidence
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-Simulation-Validation-combined
+          path: H:\Stage5DevelopmentReadinessSources-${{ github.run_id }}-${{ github.run_attempt }}\Combined
+
+      - name: Download external Stage 5 performance qualification
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: Stage5-Performance-Scaling-Qualification
+          path: H:\Stage5ExternalPerformanceQualification-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Assemble trusted Stage 5 development-readiness bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/New-Stage5DevelopmentReadinessBundle.ps1" `
+            -AcceptanceTemplateRoot $env:GITHUB_WORKSPACE `
+            -AcceptanceTemplatePath $env:STAGE5_ACCEPTANCE_TEMPLATE `
+            -GeneralsEvidenceRoot "$env:STAGE5_SOURCE_ROOT/Generals" `
+            -ZeroHourEvidenceRoot "$env:STAGE5_SOURCE_ROOT/ZeroHour" `
+            -CombinedEvidenceRoot "$env:STAGE5_SOURCE_ROOT/Combined" `
+            -LockstepEvidenceRoot $env:STAGE5_READINESS_ROOT `
+            -PerformanceEvidenceRoot $env:STAGE5_PERFORMANCE_ROOT `
+            -ExternalQualificationExempt `
+            -OutputRoot $env:STAGE5_READINESS_ROOT `
+            -ExpectedSourceCommit $env:GITHUB_SHA.ToLowerInvariant() `
+            -ExpectedPhaseBaselineProfileSha256 $env:STAGE5_EXPECTED_PERFORMANCE_PHASE_BASELINE_PROFILE_SHA256 `
+            -ExpectedCohortNonce $env:STAGE5_COHORT_NONCE `
+            -ExpectedCohortCreatedUtc $env:STAGE5_COHORT_CREATED_UTC
+          if (-not $?) { throw 'Stage 5 development-readiness assembly failed.' }
+
+      - name: Run Stage 5 final pre-manual acceptance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/DeterministicSimulationEvidence.psm1" `
+            -Force
+          $manifest = Join-Path $env:STAGE5_READINESS_ROOT `
+            'FinalAcceptanceManifest.json'
+          $output = Join-Path $env:STAGE5_READINESS_ROOT `
+            'Stage5DevelopmentReadiness.json'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Invoke-Stage5FinalAcceptance.ps1" `
+            -AcceptanceManifestPath $manifest `
+            -OutputPath $output `
+            -ReadinessMode development-readiness `
+            -DevelopmentReadiness `
+            -ExternalQualificationExempt
+          if (-not $?) { throw 'Stage 5 final pre-manual acceptance failed.' }
+          $report = Get-Content -LiteralPath $output -Raw | ConvertFrom-Json
+          if (-not (Test-Stage5JsonInteger $report.schemaVersion) -or
+              $report.schemaVersion -ne 1 -or
+              [string]$report.gateName -cne 'stage5-development-readiness' -or
+              [string]$report.status -cne 'ready-for-manual-approval' -or
+              [string]$report.readiness -cne 'pre-manual' -or
+              [string]$report.sourceCommit -cne $env:GITHUB_SHA.ToLowerInvariant() -or
+              [string]$report.cohortNonce -cne $env:STAGE5_COHORT_NONCE -or
+              [string]$report.cohortCreatedUtc -cne $env:STAGE5_COHORT_CREATED_UTC -or
+              $report.premiumReviewRequired -isnot [bool] -or
+              -not $report.premiumReviewRequired -or
+              $report.manualApprovalRequired -isnot [bool] -or
+              -not $report.manualApprovalRequired -or
+              $report.finalAcceptanceClaim -isnot [bool] -or
+              [bool]$report.finalAcceptanceClaim) {
+            throw 'Stage 5 final acceptance did not emit the exact pre-manual readiness contract.'
+          }
+
+      - name: Seal Stage 5 development-readiness bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/Seal-Stage5DevelopmentReadinessBundle.ps1" `
+            -AcceptanceManifestPath "$env:STAGE5_READINESS_ROOT/FinalAcceptanceManifest.json" `
+            -ReadinessReportPath "$env:STAGE5_READINESS_ROOT/Stage5DevelopmentReadiness.json" `
+            -OutputPath "$env:STAGE5_READINESS_ROOT/Stage5DevelopmentReadinessBundle.zip" `
+            -ExpectedSourceCommit $env:GITHUB_SHA.ToLowerInvariant() `
+            -ExpectedCohortNonce $env:STAGE5_COHORT_NONCE `
+            -ExpectedCohortCreatedUtc $env:STAGE5_COHORT_CREATED_UTC `
+            -ExternalQualificationExempt
+          if (-not $?) { throw 'Stage 5 development-readiness sealing failed.' }
+
+      - name: Upload Stage 5 development-readiness evidence
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: Stage5-Development-Readiness
+          path: H:\Stage5WeeklyPromotionQualification\Stage5DevelopmentReadinessBundle.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Clean Stage 5 development-readiness validation volume
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token ('{0}-{1}-development-readiness' -f $env:GITHUB_RUN_ID,
+              $env:GITHUB_RUN_ATTEMPT)
+          if (-not $?) { throw 'Stage 5 development-readiness validation volume cleanup failed.' }
+
+  build-native-x64-focused-runtime:
+    name: Native x64 ${{ matrix.preset }} Shared Runtime Focus
+    needs: detect-changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}
     strategy:
+      fail-fast: false
+      max-parallel: 2
       matrix:
         include:
-          - preset: "vc6+t+e"
-          - preset: "vc6-releaselog+t+e" # optimized build with logging and crashing enabled should be compatible, so we test that here.
-      fail-fast: false
+          - preset: "x64-debug-core"
+          - preset: "x64-profile-core"
+          - preset: "x64-asan-core"
+    uses: ./.github/workflows/build-toolchain.yml
+    with:
+      game: "Generals"
+      preset: ${{ matrix.preset }}
+      tools: false
+      extras: true
+      product: false
+      focused_targets: "core_deterministic_simulation_tests,core_job_system_tests,core_pipeline_execution_policy_tests"
+      focused_test_regex: '^core_(deterministic_simulation(_.*)?test|job_system_tests|pipeline_execution_policy_(parser|owner|compute|race)_test)$'
+    secrets: inherit
+
+  stage5-workflow-contract:
+    name: Stage 5 Workflow Contract
+    needs: detect-changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.stage5 == 'true' }}
+    runs-on: windows-2022
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Validate Stage 5 workflow contract
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5WorkflowContract.ps1" `
+            -SourceRoot "$env:GITHUB_WORKSPACE"
+
+      - name: Validate Stage 5 workflow contract self-test
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5WorkflowContract.ps1" -SelfTest
+
+      - name: Validate weekly release promotion attestation self-test
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Validate-Stage5WeeklyPromotionAttestation.ps1" -SelfTest
+  stage5-execution-cohort:
+    name: Stage 5 Fresh Execution Cohort
+    needs: detect-changes
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          (inputs.stage5_lockstep_v2_qualification == true ||
+           inputs.stage5_external_performance_qualification == true ||
+           (inputs.stage5_acceptance_manifest != '' &&
+            (inputs.stage5_fixture_manifest != '' || inputs.stage5_generals_fixture_manifest != ''))) }}
+    runs-on: windows-2022
+    timeout-minutes: 5
+    outputs:
+      nonce: ${{ steps.mint.outputs.nonce }}
+      created_utc: ${{ steps.mint.outputs.created_utc }}
+    steps:
+      - name: Mint fresh execution cohort
+        id: mint
+        shell: pwsh
+        run: |
+          $nonce = [Guid]::NewGuid().ToString('D').ToLowerInvariant()
+          $created = [DateTime]::UtcNow.ToString('o', [Globalization.CultureInfo]::InvariantCulture)
+          "nonce=$nonce" >> $env:GITHUB_OUTPUT
+          "created_utc=$created" >> $env:GITHUB_OUTPUT
+
+  stage5-replaycheck-generalsmd-x64:
+    name: Stage 5 Installed Runtime Replay Matrix GeneralsMD x64
+    needs: [detect-changes, build-generalsmd-x64, stage5-execution-cohort]
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_fixture_manifest != '' &&
+          inputs.stage5_acceptance_manifest != '' }}
     uses: ./.github/workflows/check-replays.yml
     with:
       game: "GeneralsMD"
-      userdata: "GeneralsReplays/GeneralsZH/1.04"
-      preset: ${{ matrix.preset }}
+      preset: "x64-zerohour-vcpkg-product+e"
+      stage5: true
+      stage5_require_x64: true
+      stage5_fixture_manifest: ${{ inputs.stage5_fixture_manifest }}
+      stage5_acceptance_manifest: ${{ inputs.stage5_acceptance_manifest }}
+      stage5_execution_cohort_nonce: ${{ needs['stage5-execution-cohort'].outputs.nonce }}
+      stage5_execution_cohort_created_utc: ${{ needs['stage5-execution-cohort'].outputs.created_utc }}
+      stage5_replay_matrix_repeats: 2
+      stage5_stress_repeats: 3
+    secrets: inherit
+
+  stage5-replaycheck-generals-x64:
+    name: Stage 5 Installed Runtime Replay Matrix Generals x64
+    needs: [detect-changes, build-generals-x64, build-generalsmd-x64, stage5-execution-cohort]
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          inputs.stage5_generals_fixture_manifest != '' &&
+          inputs.stage5_acceptance_manifest != '' }}
+    uses: ./.github/workflows/check-replays.yml
+    with:
+      game: "Generals"
+      preset: "x64-generals-vcpkg-product+e"
+      stage5: true
+      stage5_require_x64: true
+      stage5_fixture_manifest: ${{ inputs.stage5_generals_fixture_manifest }}
+      stage5_acceptance_manifest: ${{ inputs.stage5_acceptance_manifest }}
+      stage5_execution_cohort_nonce: ${{ needs['stage5-execution-cohort'].outputs.nonce }}
+      stage5_execution_cohort_created_utc: ${{ needs['stage5-execution-cohort'].outputs.created_utc }}
+      stage5_replay_matrix_repeats: 2
+      stage5_stress_repeats: 3
     secrets: inherit

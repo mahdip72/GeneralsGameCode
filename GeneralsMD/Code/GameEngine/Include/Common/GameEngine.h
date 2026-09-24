@@ -62,7 +62,8 @@ public:
 	virtual void update() override;							///< per frame update
 
 	virtual void execute();											/**< The "main loop" of the game engine.
-																								 It will not return until the game exits. */
+																	 It will not return until the game exits. */
+	Bool prepareHeadlessSimulationJobsForInstalledQualification();
 
 	static Bool isTimeFrozen(); ///< Returns true if a script has frozen time.
 	static Bool isGameHalted(); ///< Returns true if the game is paused or the network is stalling.

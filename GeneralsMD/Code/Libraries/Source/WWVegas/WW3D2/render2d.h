@@ -110,6 +110,7 @@ public:
 	void	Enable_Alpha(bool b);
 	void	Enable_Grayscale(bool b);///<added for generals to draw disabled button states - MW
 	void  Enable_Texturing(bool b);
+	void  Enable_Native_Pixel_Centers(bool b) { NativePixelCenters = b; }
 
 	ShaderClass *			Get_Shader() { return &Shader; }
 	static ShaderClass	Get_Default_Shader();
@@ -172,6 +173,7 @@ protected:
 	DynamicVectorClass<unsigned long>		Colors;
 	unsigned long								PreAllocatedColors[60];
 	bool											IsHidden;
+	bool											NativePixelCenters;
 	bool											IsGrayScale;
 	float											ZValue;
 

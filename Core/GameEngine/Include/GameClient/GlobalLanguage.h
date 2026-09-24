@@ -85,6 +85,7 @@ public:
 	virtual ~GlobalLanguage() override;
 
 	virtual void init() override;
+	void onResolutionChanged();
 	virtual void reset() override;
 	virtual void update() override {}
 

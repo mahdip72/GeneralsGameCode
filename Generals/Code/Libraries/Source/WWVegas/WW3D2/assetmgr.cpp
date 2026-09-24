@@ -87,7 +87,7 @@
 
 #include "htreemgr.h"
 #include "hanimmgr.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "font3d.h"
 #include "render2dsentence.h"		// for FontCharsClass
 #include "proto.h"
@@ -105,8 +105,7 @@
 #include "WWLib/wwstring.h"
 #include "WWDebug/wwmemlog.h"
 #include "dazzle.h"
-#include "dx8wrapper.h"
-#include "dx8renderer.h"
+#include "Renderer/RenderGameClient.h"
 #include "metalmap.h"
 #include "w3dexclusionlist.h"
 #include <WWLib/INI.h>
@@ -468,8 +467,11 @@ void WW3DAssetManager::Release_Unused_Assets()
  *=============================================================================================*/
 void WW3DAssetManager::Free_Assets_With_Exclusion_List(const DynamicVectorClass<StringClass> & exclusion_names)
 {
-	// Reset the dx8 mesh renderer
-	TheDX8MeshRenderer.Invalidate();
+	// Invalidate the active renderer's mesh/category cache before releasing
+	// prototypes. The selected backend owns the cache generation; the x86
+	// compatibility implementation forwards this request to its legacy mesh
+	// renderer while the native implementation drains its own submissions.
+	rts::render::InvalidateGameMeshRendererCache();
 
 	// Build an exclusion list object that will do the real filtering work for us
 	W3DExclusionListClass exclusion_list(exclusion_names);

@@ -5,6 +5,7 @@
 #include <d3d11sdklayers.h>
 #include <dxgi1_2.h>
 
+#include "D3D11ResultTranslation.h"
 #include "LegacyFixedFunctionPS.h"
 #include "LegacyFixedFunctionVS.h"
 #include "LegacyWaterFlatPS.h"
@@ -23,7 +24,11 @@
 #include "LegacyTexturedFixed2PS.h"
 #include "LegacyTexturedPS.h"
 #include "LegacyTexturedVS.h"
+#include "LegacyTexturedUnweightedVS.h"
+#include "PresentationColorTransformPS.h"
+#include "PresentationColorTransformVS.h"
 
+#include <algorithm>
 #include <float.h>
 #include <limits.h>
 #include <new>
@@ -41,6 +46,12 @@ const unsigned int STATE_CACHE_CAPACITY = 256;
 const unsigned int TRANSFORM_CONSTANT_BUFFER_COUNT = 64;
 const unsigned int TERRAIN_PIXEL_PROGRAM_COUNT = 8;
 const unsigned int LEGACY_VERTEX_LAYOUT_PRETRANSFORMED = 0x80000000U;
+// The low layout-flag bits retain the historical normal/diffuse/specular
+// contract. Weighted stream presence is carried in the high byte which is
+// published to the shader through VertexLayoutParameters.w.
+const unsigned int LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT0 = 1U << 16;
+const unsigned int LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT1 = 1U << 17;
+const unsigned int LEGACY_VERTEX_LAYOUT_BLEND_INDEX = 1U << 18;
 const unsigned int MAX_TEXTURE_REFRESH_SUBRESOURCES = 4096;
 const size_t MAX_TEXTURE_REFRESH_BYTES = 256U * 1024U * 1024U;
 
@@ -62,31 +73,144 @@ enum ResourceKind
 	RESOURCE_TEXTURE
 };
 
+struct BufferByteRange
+{
+	size_t begin;
+	size_t end;
+};
+
+bool IsBufferRangeInitialized(const std::vector<BufferByteRange> &ranges,
+	size_t begin, size_t end)
+{
+	for (size_t index = 0; index < ranges.size(); ++index)
+	{
+		if (ranges[index].begin <= begin && ranges[index].end >= end)
+		{
+			return true;
+		}
+		if (ranges[index].begin > begin)
+		{
+			return false;
+		}
+	}
+	return false;
+}
+
+bool PrepareBufferRangeUpdate(std::vector<BufferByteRange> *ranges,
+	size_t begin, size_t end, bool discard)
+{
+	if (ranges == 0 || begin >= end)
+	{
+		return false;
+	}
+	size_t requiredCapacity = discard ? 1 : ranges->size();
+	bool mergesExisting = false;
+	if (!discard && !ranges->empty())
+	{
+		const BufferByteRange &last = ranges->back();
+		if (begin >= last.begin && begin <= last.end)
+		{
+			mergesExisting = true;
+		}
+		else
+		{
+			for (size_t index = 0; index < ranges->size(); ++index)
+			{
+				if ((*ranges)[index].end >= begin &&
+					(*ranges)[index].begin <= end)
+				{
+					mergesExisting = true;
+					break;
+				}
+			}
+		}
+	}
+	if (!discard && !mergesExisting)
+	{
+		++requiredCapacity;
+	}
+	try
+	{
+		if (ranges->capacity() < requiredCapacity)
+		{
+			ranges->reserve(requiredCapacity);
+		}
+	}
+	catch (...)
+	{
+		return false;
+	}
+	return true;
+}
+
+void ApplyBufferRangeUpdate(std::vector<BufferByteRange> *ranges,
+	size_t begin, size_t end, bool discard)
+{
+	if (discard)
+	{
+		ranges->clear();
+		ranges->push_back(BufferByteRange{ begin, end });
+		return;
+	}
+	if (!ranges->empty())
+	{
+		BufferByteRange &last = ranges->back();
+		if (begin >= last.begin && begin <= last.end)
+		{
+			if (end > last.end) last.end = end;
+			return;
+		}
+	}
+	size_t first = 0;
+	while (first < ranges->size() && (*ranges)[first].end < begin)
+	{
+		++first;
+	}
+	size_t mergedBegin = begin;
+	size_t mergedEnd = end;
+	size_t last = first;
+	while (last < ranges->size() && (*ranges)[last].begin <= mergedEnd)
+	{
+		if ((*ranges)[last].begin < mergedBegin)
+		{
+			mergedBegin = (*ranges)[last].begin;
+		}
+		if ((*ranges)[last].end > mergedEnd)
+		{
+			mergedEnd = (*ranges)[last].end;
+		}
+		++last;
+	}
+	if (first == last)
+	{
+		ranges->insert(ranges->begin() + first,
+			BufferByteRange{ begin, end });
+		return;
+	}
+	(*ranges)[first] = BufferByteRange{ mergedBegin, mergedEnd };
+	ranges->erase(ranges->begin() + first + 1, ranges->begin() + last);
+}
+
 RenderResult TranslateResult(HRESULT result)
 {
-	if (SUCCEEDED(result))
+	return detail::TranslateD3D11Result(result);
+}
+
+HRESULT TranslateInjectedFault(RenderResult result)
+{
+	switch (result)
 	{
-		return RENDER_RESULT_OK;
+	case RENDER_RESULT_INVALID_ARGUMENT:
+		return E_INVALIDARG;
+	case RENDER_RESULT_UNSUPPORTED:
+		return DXGI_ERROR_UNSUPPORTED;
+	case RENDER_RESULT_OUT_OF_MEMORY:
+		return E_OUTOFMEMORY;
+	case RENDER_RESULT_DEVICE_REMOVED:
+		return DXGI_ERROR_DEVICE_REMOVED;
+	default:
+		return E_FAIL;
 	}
-	if (result == E_INVALIDARG)
-	{
-		return RENDER_RESULT_INVALID_ARGUMENT;
-	}
-	if (result == E_OUTOFMEMORY)
-	{
-		return RENDER_RESULT_OUT_OF_MEMORY;
-	}
-	if (result == DXGI_ERROR_UNSUPPORTED)
-	{
-		return RENDER_RESULT_UNSUPPORTED;
-	}
-	if (result == DXGI_ERROR_DEVICE_HUNG ||
-		result == DXGI_ERROR_DEVICE_REMOVED ||
-		result == DXGI_ERROR_DEVICE_RESET)
-	{
-		return RENDER_RESULT_DEVICE_REMOVED;
-	}
-	return RENDER_RESULT_FAILED;
 }
 
 DXGI_FORMAT TranslateFormat(RenderFormat format)
@@ -276,6 +400,7 @@ struct InputLayoutEntry
 {
 	LegacyVertexLayout descriptor;
 	ID3D11InputLayout *layout;
+	unsigned int layoutFlags;
 	unsigned int lastUsedSerial;
 };
 
@@ -288,13 +413,18 @@ DXGI_FORMAT TranslateVertexDataFormat(LegacyVertexDataFormat format)
 	case RENDER_VERTEX_DATA_FLOAT3: return DXGI_FORMAT_R32G32B32_FLOAT;
 	case RENDER_VERTEX_DATA_FLOAT4: return DXGI_FORMAT_R32G32B32A32_FLOAT;
 	case RENDER_VERTEX_DATA_COLOR_BGRA8: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case RENDER_VERTEX_DATA_UBYTE4: return DXGI_FORMAT_R8G8B8A8_UINT;
+	// DXGI has no B8G8R8A8_UINT variant. LASTBETA packed-color is a four-byte
+	// integer stream, so bind it as the byte-equivalent UINT declaration; the
+	// neutral decoder keeps the source spelling distinct from UBYTE4.
+	case RENDER_VERTEX_DATA_PACKED_COLOR: return DXGI_FORMAT_R8G8B8A8_UINT;
 	default: return DXGI_FORMAT_UNKNOWN;
 	}
 }
 
 unsigned int VertexDataByteCount(LegacyVertexDataFormat format)
 {
-	static const unsigned int sizes[] = { 4, 8, 12, 16, 4 };
+	static const unsigned int sizes[] = { 4, 8, 12, 16, 4, 4, 4 };
 	return static_cast<unsigned int>(format) <
 		static_cast<unsigned int>(sizeof(sizes) / sizeof(sizes[0])) ?
 		sizes[format] : 0;
@@ -322,12 +452,67 @@ bool EqualVertexLayouts(const LegacyVertexLayout &left,
 	return true;
 }
 
+unsigned int LegacyVertexLayoutFlags(const LegacyVertexLayout &layout)
+{
+	unsigned int flags = 0;
+	for (unsigned int index = 0; index < layout.elementCount; ++index)
+	{
+		switch (layout.elements[index].semantic)
+		{
+		case RENDER_VERTEX_SEMANTIC_NORMAL: flags |= 1U; break;
+		case RENDER_VERTEX_SEMANTIC_DIFFUSE: flags |= 2U; break;
+		case RENDER_VERTEX_SEMANTIC_SPECULAR: flags |= 4U; break;
+		case RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT:
+			if (layout.elements[index].semanticIndex == 0U)
+			{
+				flags |= LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT0;
+			}
+			else if (layout.elements[index].semanticIndex == 1U)
+			{
+				flags |= LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT1;
+			}
+			break;
+		case RENDER_VERTEX_SEMANTIC_BLEND_INDEX:
+			flags |= LEGACY_VERTEX_LAYOUT_BLEND_INDEX;
+			break;
+		case RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE:
+			flags |= 1U << (8 + layout.elements[index].semanticIndex);
+			break;
+		default: break;
+		}
+	}
+	if (layout.preTransformed)
+	{
+		flags |= LEGACY_VERTEX_LAYOUT_PRETRANSFORMED;
+	}
+	return flags;
+}
+
+bool HasBlendVertexSemantics(const LegacyVertexLayout &layout)
+{
+	for (unsigned int index = 0; index < layout.elementCount; ++index)
+	{
+		if (layout.elements[index].semantic == RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT ||
+			layout.elements[index].semantic == RENDER_VERTEX_SEMANTIC_BLEND_INDEX)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool FitsVertexStride(const LegacyVertexLayout &layout, unsigned int offset,
+	unsigned int byteCount)
+{
+	return offset <= layout.stride && byteCount <= layout.stride - offset;
+}
+
 struct ResourceSlot
 {
 	ResourceSlot() : resource(0), view(0), renderTarget(0), depthStencil(0),
 		kind(RESOURCE_NONE),
 		usage(RENDER_USAGE_DEFAULT), binding(0), byteCount(0),
-		gpuAuthoritative(false)
+		gpuAuthoritative(false), bufferContentValid(false)
 	{
 	}
 
@@ -343,8 +528,18 @@ struct ResourceSlot
 	// that distinction explicit so device recovery cannot silently restore the
 	// texture contents from data that predates the copy.
 	bool gpuAuthoritative;
+	// Buffer descriptors survive recovery, but their bytes do not. Consumers
+	// must republish before a recovered buffer can be rebound.
+	bool bufferContentValid;
 	BufferDescriptor bufferDescriptor;
 	TextureDescriptor textureDescriptor;
+	// Immutable buffers cannot be republished through updateBufferResource.
+	// Retain their explicit creation source only; mutable buffers retain none.
+	std::vector<unsigned char> immutableBufferRecoverySource;
+	// Mutable image supports safe dynamic PRESERVE uploads and exact draw-range
+	// validation. It is discarded on recovery and is not a recovery source.
+	std::vector<unsigned char> bufferImage;
+	std::vector<BufferByteRange> initializedBufferRanges;
 	std::vector<unsigned char> shadow;
 	std::vector<size_t> subresourceOffsets;
 	std::vector<size_t> subresourceRowPitches;
@@ -393,6 +588,14 @@ struct LegacyTransformConstants
 	float clipPlanes[LEGACY_CLIP_PLANE_COUNT][4];
 	unsigned int clipPlaneParameters[4];
 	unsigned int fogStateParameters[4];
+};
+
+struct PresentationColorConstants
+{
+	float gamma;
+	float brightness;
+	float contrast;
+	float limit;
 };
 
 void MultiplyMatrices(const float *left, const float *right, float *product)
@@ -485,21 +688,35 @@ bool CanDisableLegacyPixelShader(const LegacyPipelineState &pipeline)
 class D3D11RenderDevice : public IRenderDevice, public IRenderContext
 {
 public:
-	D3D11RenderDevice() : m_device(0), m_context(0), m_debugLayer(0),
+	D3D11RenderDevice() : m_device(0), m_context(0),
+		m_featureLevel(D3D_FEATURE_LEVEL_9_1), m_debugLayer(0),
 		m_debugLayerActive(false), m_swapChain(0),
-		m_renderTarget(0), m_renderTargetResource(0), m_depthTexture(0), m_depthStencil(0),
+		m_renderTarget(0), m_renderTargetResource(0),
+		m_multisampleColorTexture(0), m_multisampleRenderTarget(0),
+		m_presentationSource(0), m_presentationSourceView(0),
+		m_depthTexture(0), m_depthStencil(0),
+		m_multisampleDepthTexture(0), m_multisampleDepthStencil(0),
 		m_activeRenderTarget(0), m_activeDepthStencil(0),
 		m_activeColorResource(0), m_activeDepthResource(0),
 		m_vertexShader(0), m_pixelShader(0), m_positionColorLayout(0),
 		m_texturedVertexShader(0), m_texturedPixelShader(0),
+		m_texturedUnweightedVertexShader(0),
 		m_texturedFixed1PixelShader(0), m_texturedFixed2PixelShader(0),
 		m_waterFlatPixelShader(0), m_waterRiverPixelShader(0),
 		m_seaWaveVertexShader(0), m_seaWavePixelShader(0),
-		m_seaWaveLayout(0),
-		m_handles(0), m_stateUseSerial(0), m_ownerThread(0), m_initialized(false),
+		m_seaWaveLayout(0), m_presentationVertexShader(0),
+		m_presentationPixelShader(0), m_presentationConstants(0),
+		m_presentationSampler(0),
+		m_handles(0), m_faultPoint(RENDER_RESOURCE_FAULT_NONE),
+		m_faultCountdown(0), m_faultResult(RENDER_RESULT_FAILED),
+		m_lastInputLayoutIndex(UINT_MAX), m_stateUseSerial(0),
+		m_ownerThread(0), m_initialized(false),
 		m_frameOpen(false), m_pipelineBound(false), m_vertexBufferBound(false),
 		m_indexBufferBound(false), m_topologyBound(false),
-		m_enableVsync(true), m_transformConstantCursor(0), m_width(0), m_height(0),
+		m_swapInterval(1), m_gamma(1.0f), m_brightness(0.0f),
+		m_contrast(1.0f), m_gammaCalibrate(false), m_gammaUseLimit(true),
+		m_transformConstantCursor(0), m_width(0), m_height(0),
+		m_multisampleCount(1),
 		m_viewportX(0.0f), m_viewportY(0.0f), m_viewportWidth(0.0f),
 		m_viewportHeight(0.0f), m_hasVertexLayoutFlagsOverride(false),
 		m_vertexLayoutFlagsOverride(0), m_parameters(),
@@ -588,9 +805,10 @@ public:
 		}
 
 		m_ownerThread = GetCurrentThreadId();
-		m_enableVsync = parameters.enableVsync;
+		m_swapInterval = parameters.enableVsync ? 1 : 0;
 		m_width = parameters.width;
 		m_height = parameters.height;
+		m_parameters = parameters;
 		if (parameters.window != 0)
 		{
 			result = createSwapChain(static_cast<HWND>(parameters.window));
@@ -613,7 +831,6 @@ public:
 			return TranslateResult(result);
 		}
 		m_initialized = true;
-		m_parameters = parameters;
 		return RENDER_RESULT_OK;
 	}
 
@@ -688,18 +905,35 @@ public:
 		slot.binding = descriptor.binding;
 		slot.byteCount = descriptor.byteCount;
 		slot.bufferDescriptor = descriptor;
-		try
+		slot.bufferContentValid = initialData != 0 &&
+			initialDataBytes == descriptor.byteCount;
+		if (slot.bufferContentValid)
 		{
-			slot.shadow.assign(descriptor.byteCount, 0);
-			if (initialData != 0)
+			try
 			{
-				memcpy(&slot.shadow[0], initialData, descriptor.byteCount);
+				slot.initializedBufferRanges.push_back(
+					BufferByteRange{ 0, descriptor.byteCount });
+				if (descriptor.usage == RENDER_USAGE_IMMUTABLE)
+				{
+					slot.immutableBufferRecoverySource.assign(
+						static_cast<const unsigned char *>(initialData),
+						static_cast<const unsigned char *>(initialData) +
+							descriptor.byteCount);
+				}
+				else if (descriptor.usage == RENDER_USAGE_DYNAMIC ||
+					(descriptor.binding & RENDER_BUFFER_INDEX) != 0)
+				{
+					slot.bufferImage.assign(
+						static_cast<const unsigned char *>(initialData),
+						static_cast<const unsigned char *>(initialData) +
+							descriptor.byteCount);
+				}
 			}
-		}
-		catch (...)
-		{
-			releaseSlot(handle, slot);
-			return RENDER_RESULT_OUT_OF_MEMORY;
+			catch (...)
+			{
+				releaseSlot(handle, slot);
+				return RENDER_RESULT_OUT_OF_MEMORY;
+			}
 		}
 		*buffer = handle;
 		return RENDER_RESULT_OK;
@@ -709,36 +943,31 @@ public:
 		const TextureSubresourceData *initialData,
 		unsigned int initialDataCount, GpuHandle *texture)
 	{
-		const DXGI_FORMAT format = TranslateFormat(descriptor.format);
-		if (descriptor.arrayCount != 0 &&
-			descriptor.mipCount > UINT_MAX / descriptor.arrayCount)
-		{
-			return RENDER_RESULT_INVALID_ARGUMENT;
-		}
-		const unsigned int subresourceCount = descriptor.mipCount * descriptor.arrayCount;
-		if (!isOwner() || texture == 0 || descriptor.width == 0 ||
-			descriptor.height == 0 || descriptor.mipCount == 0 ||
-			descriptor.arrayCount == 0 || format == DXGI_FORMAT_UNKNOWN ||
-			(descriptor.dimension != RENDER_TEXTURE_2D &&
-				descriptor.dimension != RENDER_TEXTURE_CUBE) ||
-			// The fixed-function shader contract exposes Texture2D and TextureCube
-			// resources only.  Do not create native array resources that would bind
-			// successfully but fail validation (or sample as black) at draw time.
-			(descriptor.dimension == RENDER_TEXTURE_2D &&
-				descriptor.arrayCount != 1) ||
-			(descriptor.dimension == RENDER_TEXTURE_CUBE &&
-				(descriptor.width != descriptor.height ||
-				descriptor.arrayCount != 6 ||
-				(descriptor.binding & (RENDER_TEXTURE_RENDER_TARGET |
-					RENDER_TEXTURE_DEPTH_STENCIL)) != 0)) ||
-			descriptor.binding == 0 ||
-			(initialData == 0 && initialDataCount != 0) ||
-			(initialData != 0 && initialDataCount != subresourceCount) ||
-			(descriptor.usage == RENDER_USAGE_IMMUTABLE && initialData == 0))
+		if (texture == 0)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		*texture = GpuHandle();
+		size_t uploadBytes = 0;
+		const RenderResult validationResult = ValidateTextureUpload(descriptor,
+			initialData, initialDataCount, false, MAX_TEXTURE_REFRESH_BYTES,
+			&uploadBytes);
+		const DXGI_FORMAT format = TranslateFormat(descriptor.format);
+		if (!isOwner() || validationResult != RENDER_RESULT_OK)
+		{
+			return !isOwner() ? RENDER_RESULT_INVALID_ARGUMENT : validationResult;
+		}
+		const unsigned int subresourceCount = descriptor.mipCount * descriptor.arrayCount;
+		if (format == DXGI_FORMAT_UNKNOWN)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		if (consumeResourceFault(RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION,
+			&injectedResult))
+		{
+			return injectedResult;
+		}
 
 		D3D11_TEXTURE2D_DESC nativeDescriptor;
 		memset(&nativeDescriptor, 0, sizeof(nativeDescriptor));
@@ -835,6 +1064,12 @@ public:
 		slot.binding = descriptor.binding;
 		slot.byteCount = 0;
 		slot.textureDescriptor = descriptor;
+		if (consumeResourceFault(RENDER_RESOURCE_FAULT_TEXTURE_VIEW,
+			&injectedResult))
+		{
+			releaseSlot(handle, slot);
+			return injectedResult;
+		}
 		if ((descriptor.binding & RENDER_TEXTURE_SHADER_RESOURCE) != 0)
 		{
 			D3D11_SHADER_RESOURCE_VIEW_DESC viewDescriptor;
@@ -887,6 +1122,12 @@ public:
 				releaseSlot(handle, slot);
 				return TranslateResult(viewResult);
 			}
+		}
+		if (consumeResourceFault(RENDER_RESOURCE_FAULT_TEXTURE_SHADOW,
+			&injectedResult))
+		{
+			releaseSlot(handle, slot);
+			return injectedResult;
 		}
 		if (initialData != 0)
 		{
@@ -957,6 +1198,12 @@ public:
 		{
 			return RENDER_RESULT_UNSUPPORTED;
 		}
+		if ((slot.binding & RENDER_TEXTURE_DEPTH_STENCIL) != 0)
+		{
+			// UpdateSubresource is illegal for depth-stencil resources. Reject the
+			// capability before preparing a shadow or touching backend state.
+			return RENDER_RESULT_UNSUPPORTED;
+		}
 		if (slot.resource == m_activeColorResource ||
 			slot.resource == m_activeDepthResource)
 		{
@@ -967,6 +1214,13 @@ public:
 		if (m_context == 0)
 		{
 			return RENDER_RESULT_FAILED;
+		}
+		size_t uploadBytes = 0;
+		const RenderResult validationResult = ValidateTextureUpload(descriptor,
+			data, dataCount, true, MAX_TEXTURE_REFRESH_BYTES, &uploadBytes);
+		if (validationResult != RENDER_RESULT_OK)
+		{
+			return validationResult;
 		}
 
 		// Keep the recovery shadow attached to the logical resource.  The movie
@@ -987,6 +1241,13 @@ public:
 		// only the stages that reference this texture so unrelated legacy stages
 		// remain intact across the refresh.
 		const unsigned int reboundStages = unbindTextureResource(texture);
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		if (consumeResourceFault(
+			RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND,
+			&injectedResult))
+		{
+			return failTextureRefresh(texture, reboundStages, injectedResult);
+		}
 
 		const unsigned int subresourceCount = descriptor.mipCount *
 			descriptor.arrayCount;
@@ -1011,13 +1272,15 @@ public:
 					// the native resource; do not let a later device recovery
 					// restore a mixed/obsolete image.
 					markTextureRecoverySourceUnavailable(slot);
-					return TranslateResult(mapResult);
+					return failTextureRefresh(texture, reboundStages,
+						TranslateResult(mapResult));
 				}
 				if (mapped.pData == 0 || mapped.RowPitch == 0)
 				{
 					m_context->Unmap(slot.resource, nativeSubresource);
 					markTextureRecoverySourceUnavailable(slot);
-					return RENDER_RESULT_FAILED;
+					return failTextureRefresh(texture, reboundStages,
+						RENDER_RESULT_FAILED);
 				}
 				const unsigned int mipWidth = mip < 32 ?
 					descriptor.width >> mip : 0;
@@ -1030,7 +1293,8 @@ public:
 				{
 					m_context->Unmap(slot.resource, nativeSubresource);
 					markTextureRecoverySourceUnavailable(slot);
-					return RENDER_RESULT_INVALID_ARGUMENT;
+					return failTextureRefresh(texture, reboundStages,
+						RENDER_RESULT_INVALID_ARGUMENT);
 				}
 				const unsigned char *source = static_cast<const unsigned char *>(
 					data[index].data);
@@ -1054,7 +1318,8 @@ public:
 				if (FAILED(deviceResult))
 				{
 					markTextureRecoverySourceUnavailable(slot);
-					return TranslateResult(deviceResult);
+					return failTextureRefresh(texture, reboundStages,
+						TranslateResult(deviceResult));
 				}
 			}
 		}
@@ -1079,7 +1344,8 @@ public:
 				copyBytes > slot.shadow.size() - offset)
 			{
 				markTextureRecoverySourceUnavailable(slot);
-				return RENDER_RESULT_FAILED;
+				return failTextureRefresh(texture, reboundStages,
+					RENDER_RESULT_FAILED);
 			}
 			memcpy(&slot.shadow[offset], data[index].data, copyBytes);
 		}
@@ -1100,7 +1366,6 @@ public:
 		ResourceSlot &destination = m_resources[texture.index()];
 		if (destination.kind != RESOURCE_TEXTURE || destination.resource == 0 ||
 			(destination.binding & RENDER_TEXTURE_SHADER_RESOURCE) == 0 ||
-			(destination.binding & RENDER_TEXTURE_RENDER_TARGET) == 0 ||
 			destination.textureDescriptor.mipCount != 1 ||
 			destination.textureDescriptor.arrayCount != 1 ||
 			destination.textureDescriptor.usage == RENDER_USAGE_IMMUTABLE)
@@ -1144,14 +1409,18 @@ public:
 		D3D11_TEXTURE2D_DESC destinationDescriptor;
 		sourceTexture->GetDesc(&sourceDescriptor);
 		destinationTexture->GetDesc(&destinationDescriptor);
-		const bool compatible = sourceDescriptor.Width == destinationDescriptor.Width &&
+		const bool matchingShape = sourceDescriptor.Width == destinationDescriptor.Width &&
 			sourceDescriptor.Height == destinationDescriptor.Height &&
 			sourceDescriptor.MipLevels == 1 && destinationDescriptor.MipLevels == 1 &&
 			sourceDescriptor.ArraySize == 1 && destinationDescriptor.ArraySize == 1 &&
-			sourceDescriptor.Format == destinationDescriptor.Format &&
+			sourceDescriptor.Format == destinationDescriptor.Format;
+		const bool copyCompatible = matchingShape &&
 			sourceDescriptor.SampleDesc.Count == destinationDescriptor.SampleDesc.Count &&
 			sourceDescriptor.SampleDesc.Quality == destinationDescriptor.SampleDesc.Quality;
-		if (!compatible)
+		const bool resolveCompatible = matchingShape &&
+			sourceDescriptor.SampleDesc.Count > 1 &&
+			destinationDescriptor.SampleDesc.Count == 1;
+		if (!copyCompatible && !resolveCompatible)
 		{
 			destinationTexture->Release();
 			sourceTexture->Release();
@@ -1162,7 +1431,15 @@ public:
 		// Preserve every unrelated stage and restore the destination stages after
 		// the copy completes.
 		const unsigned int reboundStages = unbindTextureResource(texture);
-		m_context->CopyResource(destinationTexture, sourceTexture);
+		if (resolveCompatible)
+		{
+			m_context->ResolveSubresource(destinationTexture, 0, sourceTexture, 0,
+				sourceDescriptor.Format);
+		}
+		else
+		{
+			m_context->CopyResource(destinationTexture, sourceTexture);
+		}
 		const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
 		destinationTexture->Release();
 		sourceTexture->Release();
@@ -1191,31 +1468,27 @@ public:
 			return false;
 		}
 		ResourceSlot &slot = m_resources[resource.index()];
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		if ((slot.kind == RESOURCE_TEXTURE && consumeResourceFault(
+			RENDER_RESOURCE_FAULT_TEXTURE_DESTRUCTION, &injectedResult)) ||
+			(slot.kind == RESOURCE_BUFFER && consumeResourceFault(
+				RENDER_RESOURCE_FAULT_BUFFER_DESTRUCTION, &injectedResult)))
+		{
+			return false;
+		}
 		if (slot.kind == RESOURCE_TEXTURE)
 		{
 			unbindTextureResource(resource);
 			if (slot.renderTarget == m_activeRenderTarget ||
 				slot.depthStencil == m_activeDepthStencil)
 			{
-				if (m_renderTarget != 0)
-				{
-					m_context->OMSetRenderTargets(1, &m_renderTarget,
-						m_depthStencil);
-				}
-				else
-				{
-					m_context->OMSetRenderTargets(0, 0, 0);
-				}
-				m_activeRenderTarget = m_renderTarget;
-				m_activeDepthStencil = m_depthStencil;
-				m_activeColorResource = m_renderTargetResource;
-				m_activeDepthResource = m_depthTexture;
-				m_renderTargetsBound = true;
+				bindDefaultRenderTargets();
 			}
 		}
 		else if (slot.kind == RESOURCE_BUFFER)
 		{
-			if ((slot.binding & RENDER_BUFFER_VERTEX) != 0)
+			if ((slot.binding & RENDER_BUFFER_VERTEX) != 0 &&
+				m_boundVertexBuffer == resource)
 			{
 				ID3D11Buffer *emptyBuffer = 0;
 				const UINT zero = 0;
@@ -1223,7 +1496,8 @@ public:
 				m_vertexBufferBound = false;
 				m_boundVertexBuffer = GpuHandle();
 			}
-			if ((slot.binding & RENDER_BUFFER_INDEX) != 0)
+			if ((slot.binding & RENDER_BUFFER_INDEX) != 0 &&
+				m_boundIndexBuffer == resource)
 			{
 				m_context->IASetIndexBuffer(0, DXGI_FORMAT_UNKNOWN, 0);
 				m_indexBufferBound = false;
@@ -1280,7 +1554,21 @@ public:
 			ResourceSlot &slot = m_resources[i];
 			if (slot.kind == RESOURCE_BUFFER)
 			{
+				if (slot.bufferDescriptor.usage != RENDER_USAGE_IMMUTABLE)
+				{
+					std::vector<unsigned char>().swap(slot.bufferImage);
+					std::vector<BufferByteRange>().swap(
+						slot.initializedBufferRanges);
+					slot.bufferContentValid = false;
+				}
 				result = recreateBuffer(slot);
+				if (SUCCEEDED(result))
+				{
+					slot.bufferContentValid =
+						slot.bufferDescriptor.usage == RENDER_USAGE_IMMUTABLE &&
+						slot.immutableBufferRecoverySource.size() ==
+							slot.bufferDescriptor.byteCount;
+				}
 			}
 			else if (slot.kind == RESOURCE_TEXTURE)
 			{
@@ -1304,33 +1592,19 @@ public:
 			shutdownInternal();
 			return TranslateResult(result);
 		}
-		m_activeRenderTarget = m_renderTarget;
-		m_activeDepthStencil = m_depthStencil;
-		m_activeColorResource = m_renderTargetResource;
-		m_activeDepthResource = m_depthTexture;
-		if (m_renderTarget != 0)
-		{
-			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
-		}
-		else
-		{
-			// A headless device can still render to logical targets.  Ensure the
-			// recreated context starts with no output when there is no swap-chain
-			// target to restore.
-			m_context->OMSetRenderTargets(0, 0, 0);
-		}
+		bindDefaultRenderTargets();
 		m_pipelineBound = false;
 		m_vertexBufferBound = false;
 		m_indexBufferBound = false;
 		m_topologyBound = false;
-		m_renderTargetsBound = m_renderTarget != 0;
+		m_renderTargetsBound = defaultRenderTarget() != 0;
 		markTextureBindingsEmpty();
-		m_viewportBound = m_renderTarget != 0;
+		m_viewportBound = defaultRenderTarget() != 0;
 		return RENDER_RESULT_OK;
 	}
 
 	RenderResult resizeInternal(unsigned int width, unsigned int height,
-		bool recoverOnDeviceRemoval)
+		bool recoverOnDeviceRemoval, bool *recovered)
 	{
 		if (!isOwner() || m_frameOpen)
 		{
@@ -1355,8 +1629,20 @@ public:
 			m_context->OMSetRenderTargets(0, 0, 0);
 			unbindTextureResources();
 			releaseBackBufferTargets();
-			HRESULT result = m_swapChain->ResizeBuffers(0, width, height,
-				DXGI_FORMAT_UNKNOWN, 0);
+			RenderResult retryFault = RENDER_RESULT_OK;
+			const bool injectRemoval = recoverOnDeviceRemoval &&
+				consumeResourceFault(
+					RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS,
+					&retryFault);
+			if (injectRemoval)
+			{
+				m_faultPoint = RENDER_RESOURCE_FAULT_RESIZE_TARGETS;
+				m_faultCountdown = 1;
+				m_faultResult = retryFault;
+			}
+			HRESULT result = injectRemoval ? DXGI_ERROR_DEVICE_REMOVED :
+				m_swapChain->ResizeBuffers(0, width, height,
+					DXGI_FORMAT_UNKNOWN, 0);
 			if (FAILED(result))
 			{
 				// ResizeBuffers is one of the DXGI calls that can first surface a
@@ -1371,23 +1657,12 @@ public:
 				if (translatedResult == RENDER_RESULT_DEVICE_REMOVED &&
 					recoverOnDeviceRemoval)
 				{
-					const RenderResult recoveryResult = recoverDevice();
-					if (recoveryResult != RENDER_RESULT_OK)
-					{
-						return recoveryResult;
-					}
-					return resizeInternal(width, height, false);
+					return recoverAndRetryResize(width, height, recovered);
 				}
 				if (SUCCEEDED(createBackBufferTargets(previousWidth,
 					previousHeight)))
 				{
-					m_activeRenderTarget = m_renderTarget;
-					m_activeDepthStencil = m_depthStencil;
-					m_activeColorResource = m_renderTargetResource;
-					m_activeDepthResource = m_depthTexture;
-					m_renderTargetsBound = true;
-					m_context->OMSetRenderTargets(1, &m_renderTarget,
-						m_depthStencil);
+					bindDefaultRenderTargets();
 				}
 				else
 				{
@@ -1395,7 +1670,27 @@ public:
 				}
 				return translatedResult;
 			}
-			result = createBackBufferTargets(width, height);
+			RenderResult injectedResult = RENDER_RESULT_OK;
+			const bool failRecovery = recoverOnDeviceRemoval &&
+				consumeResourceFault(
+					RENDER_RESOURCE_FAULT_RESIZE_TARGETS_RECOVERY_FAILURE,
+					&injectedResult);
+			if (failRecovery)
+			{
+				m_faultPoint = RENDER_RESOURCE_FAULT_TEXTURE_RECOVERY;
+				m_faultCountdown = 1;
+				m_faultResult = injectedResult;
+			}
+			const bool failRollback = consumeResourceFault(
+				RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK,
+				&injectedResult);
+			if (failRecovery)
+				result = DXGI_ERROR_DEVICE_REMOVED;
+			else if (failRollback || consumeResourceFault(
+				RENDER_RESOURCE_FAULT_RESIZE_TARGETS, &injectedResult))
+				result = TranslateInjectedFault(injectedResult);
+			else
+				result = createBackBufferTargets(width, height);
 			if (FAILED(result))
 			{
 				m_activeRenderTarget = 0;
@@ -1403,8 +1698,17 @@ public:
 				m_activeColorResource = 0;
 				m_activeDepthResource = 0;
 				releaseBackBufferTargets();
+				// ResizeBuffers succeeded, but acquiring a view can be the first
+				// operation to report removal. The resized swap chain and its old
+				// targets cannot be used for rollback on that device.
+				if (TranslateResult(result) == RENDER_RESULT_DEVICE_REMOVED &&
+					recoverOnDeviceRemoval)
+				{
+					return recoverAndRetryResize(width, height, recovered);
+				}
 				if (SUCCEEDED(m_swapChain->ResizeBuffers(0, previousWidth,
 					previousHeight, DXGI_FORMAT_UNKNOWN, 0)) &&
+					!failRollback &&
 					SUCCEEDED(createBackBufferTargets(previousWidth,
 						previousHeight)))
 				{
@@ -1412,13 +1716,7 @@ public:
 					m_height = previousHeight;
 					m_parameters.width = previousWidth;
 					m_parameters.height = previousHeight;
-					m_activeRenderTarget = m_renderTarget;
-					m_activeDepthStencil = m_depthStencil;
-					m_activeColorResource = m_renderTargetResource;
-					m_activeDepthResource = m_depthTexture;
-					m_renderTargetsBound = true;
-					m_context->OMSetRenderTargets(1, &m_renderTarget,
-						m_depthStencil);
+					bindDefaultRenderTargets();
 				}
 				else
 				{
@@ -1428,12 +1726,7 @@ public:
 			}
 			m_width = width;
 			m_height = height;
-			m_activeRenderTarget = m_renderTarget;
-			m_activeDepthStencil = m_depthStencil;
-			m_activeColorResource = m_renderTargetResource;
-			m_activeDepthResource = m_depthTexture;
-			m_renderTargetsBound = true;
-			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
+			bindDefaultRenderTargets();
 			m_parameters.width = width;
 			m_parameters.height = height;
 		}
@@ -1447,9 +1740,41 @@ public:
 		return RENDER_RESULT_OK;
 	}
 
+	RenderResult recoverAndRetryResize(unsigned int width, unsigned int height,
+		bool *recovered)
+	{
+		const RenderResult recoveryResult = recoverDevice();
+		if (recoveryResult != RENDER_RESULT_OK)
+		{
+			return recoveryResult;
+		}
+		if (recovered != 0)
+			*recovered = true;
+		const RenderResult retryResult = resizeInternal(width, height, false,
+			recovered);
+		if (retryResult != RENDER_RESULT_OK)
+		{
+			// Recovery replaced every native texture. The threaded wrapper
+			// cannot trust GPU-authored content after a failed retry, even
+			// when the old-size back buffer was restored.
+			shutdownInternal();
+		}
+		return retryResult;
+	}
+
 	virtual RenderResult resize(unsigned int width, unsigned int height)
 	{
-		return resizeInternal(width, height, true);
+		bool recovered = false;
+		return resizeWithRecovery(width, height, &recovered);
+	}
+
+	virtual RenderResult resizeWithRecovery(unsigned int width,
+		unsigned int height, bool *recovered)
+	{
+		if (recovered == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		*recovered = false;
+		return resizeInternal(width, height, true, recovered);
 	}
 
 	virtual RenderResult present()
@@ -1465,13 +1790,85 @@ public:
 			// silently reporting success after a lost GPU.
 			return TranslateResult(m_device->GetDeviceRemovedReason());
 		}
+		const RenderResult resolveResult = resolveBackBuffer();
+		if (resolveResult != RENDER_RESULT_OK)
+			return resolveResult;
+		if (!isPresentationIdentity() && isDefaultBackBufferTarget())
+		{
+			const RenderResult transformResult = applyPresentationGamma();
+			if (transformResult != RENDER_RESULT_OK)
+				return transformResult;
+		}
 		const HRESULT presentResult = m_swapChain->Present(
-			m_enableVsync ? 1 : 0, 0);
+			m_swapInterval, 0);
 		if (FAILED(presentResult))
 		{
 			return TranslateResult(presentResult);
 		}
 		return TranslateResult(m_device->GetDeviceRemovedReason());
+	}
+
+	virtual RenderResult setSwapInterval(unsigned int interval)
+	{
+		if (interval > RENDER_SWAP_INTERVAL_MAX || !isOwner() || m_frameOpen)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (!isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_swapChain == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		m_swapInterval = interval;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult getSwapInterval(unsigned int *interval) const
+	{
+		if (interval == 0 || !isOwner() || m_frameOpen)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (!isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_swapChain == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		*interval = m_swapInterval;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult setGamma(float gamma, float brightness, float contrast,
+		bool calibrate, bool useLimit)
+	{
+		if (!isOwner() || m_frameOpen || !isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_swapChain == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		if (gamma != gamma || brightness != brightness || contrast != contrast)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		// Match DX8Wrapper::Set_Gamma: finite values outside the legacy UI
+		// range are clamped, while NaN is rejected instead of propagating an
+		// undefined pow() result into the presentation shader.
+		m_gamma = gamma < 0.6f ? 0.6f : (gamma > 6.0f ? 6.0f : gamma);
+		m_brightness = brightness < -0.5f ? -0.5f :
+			(brightness > 0.5f ? 0.5f : brightness);
+		m_contrast = contrast < 0.5f ? 0.5f :
+			(contrast > 2.0f ? 2.0f : contrast);
+		m_gammaCalibrate = calibrate;
+		m_gammaUseLimit = useLimit;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult getGamma(float *gamma, float *brightness,
+		float *contrast, bool *calibrate, bool *useLimit) const
+	{
+		if (gamma == 0 || brightness == 0 || contrast == 0 ||
+			calibrate == 0 || useLimit == 0 || !isOwner() || m_frameOpen ||
+			!isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (m_swapChain == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		*gamma = m_gamma;
+		*brightness = m_brightness;
+		*contrast = m_contrast;
+		*calibrate = m_gammaCalibrate;
+		*useLimit = m_gammaUseLimit;
+		return RENDER_RESULT_OK;
 	}
 
 	virtual RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const
@@ -1498,6 +1895,7 @@ public:
 		}
 		info->width = descriptor.Width;
 		info->height = descriptor.Height;
+		info->multisampleCount = m_multisampleCount;
 		info->format = format;
 		return RENDER_RESULT_OK;
 	}
@@ -1508,22 +1906,8 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		if (m_renderTarget != 0)
-		{
-			m_context->OMSetRenderTargets(1, &m_renderTarget, m_depthStencil);
-		}
-		else
-		{
-			// A headless device may have used a logical target in the previous
-			// frame.  Do not leave that native RTV bound when the neutral frame
-			// begins without a swap-chain output.
-			m_context->OMSetRenderTargets(0, 0, 0);
-		}
-		m_activeRenderTarget = m_renderTarget;
-		m_activeDepthStencil = m_depthStencil;
-		m_activeColorResource = m_renderTargetResource;
-		m_activeDepthResource = m_depthTexture;
-		m_renderTargetsBound = m_renderTarget != 0;
+		bindDefaultRenderTargets();
+		bindDefaultViewport(m_width, m_height);
 		bool needsTextureReset = !m_textureBindingsValid;
 		for (unsigned int stage = 0; !needsTextureReset &&
 			stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
@@ -1548,7 +1932,19 @@ public:
 		size_t byteCount, size_t destinationOffset,
 		RenderBufferUpdateMode mode)
 	{
-		if (!isOwner() || !m_frameOpen || data == 0 || byteCount == 0 ||
+		if (!m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		return updateBufferResource(buffer, data, byteCount,
+			destinationOffset, mode);
+	}
+
+	virtual RenderResult updateBufferResource(GpuHandle buffer,
+		const void *data, size_t byteCount, size_t destinationOffset,
+		RenderBufferUpdateMode mode)
+	{
+		if (!isOwner() || data == 0 || byteCount == 0 ||
 			!m_handles->isLive(buffer))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
@@ -1577,10 +1973,41 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		memcpy(&slot.shadow[destinationOffset], data, byteCount);
+		const size_t destinationEnd = destinationOffset + byteCount;
+		if (!PrepareBufferRangeUpdate(&slot.initializedBufferRanges,
+			destinationOffset, destinationEnd,
+			mode == RENDER_BUFFER_UPDATE_DISCARD))
+		{
+			return RENDER_RESULT_OUT_OF_MEMORY;
+		}
+		const bool maintainImage =
+			(slot.binding & RENDER_BUFFER_INDEX) != 0 ||
+			(slot.usage == RENDER_USAGE_DYNAMIC &&
+			 (slot.binding & (RENDER_BUFFER_VERTEX | RENDER_BUFFER_INDEX)) != 0);
+		if (maintainImage && slot.bufferImage.size() != slot.byteCount)
+		{
+			try
+			{
+				slot.bufferImage.assign(slot.byteCount, 0);
+			}
+			catch (...)
+			{
+				return RENDER_RESULT_OUT_OF_MEMORY;
+			}
+		}
 		if (slot.usage == RENDER_USAGE_DYNAMIC)
 		{
 			D3D11_MAPPED_SUBRESOURCE mapped;
+			const bool fullWrite = destinationOffset == 0 &&
+				byteCount == slot.byteCount;
+			if (mode == RENDER_BUFFER_UPDATE_PRESERVE && !fullWrite &&
+				(slot.binding & (RENDER_BUFFER_VERTEX | RENDER_BUFFER_INDEX)) == 0)
+			{
+				return RENDER_RESULT_UNSUPPORTED;
+			}
+			// NO_OVERWRITE is the only operation that promises the written range
+			// does not overlap queued GPU reads. PRESERVE must use a fresh backing
+			// allocation and republish the CPU image; it cannot assume a fence.
 			const D3D11_MAP mapMode = mode == RENDER_BUFFER_UPDATE_NO_OVERWRITE ?
 				D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD;
 			const HRESULT result = m_context->Map(slot.resource, 0,
@@ -1594,9 +2021,11 @@ public:
 				m_context->Unmap(slot.resource, 0);
 				return RENDER_RESULT_FAILED;
 			}
-			if (mode == RENDER_BUFFER_UPDATE_PRESERVE)
+			if (mode == RENDER_BUFFER_UPDATE_PRESERVE && !fullWrite)
 			{
-				memcpy(mapped.pData, &slot.shadow[0], slot.byteCount);
+				memcpy(mapped.pData, &slot.bufferImage[0], slot.byteCount);
+				memcpy(static_cast<unsigned char *>(mapped.pData) +
+					destinationOffset, data, byteCount);
 			}
 			else
 			{
@@ -1604,6 +2033,18 @@ public:
 					destinationOffset, data, byteCount);
 			}
 			m_context->Unmap(slot.resource, 0);
+			if (maintainImage)
+			{
+				if (mode == RENDER_BUFFER_UPDATE_DISCARD)
+				{
+					std::fill(slot.bufferImage.begin(), slot.bufferImage.end(), 0);
+				}
+				memcpy(&slot.bufferImage[destinationOffset], data, byteCount);
+			}
+			ApplyBufferRangeUpdate(&slot.initializedBufferRanges,
+				destinationOffset, destinationEnd,
+				mode == RENDER_BUFFER_UPDATE_DISCARD);
+			slot.bufferContentValid = !slot.initializedBufferRanges.empty();
 			return RENDER_RESULT_OK;
 		}
 
@@ -1615,6 +2056,14 @@ public:
 		destination.front = 0;
 		destination.back = 1;
 		m_context->UpdateSubresource(slot.resource, 0, &destination, data, 0, 0);
+		if (maintainImage)
+		{
+			memcpy(&slot.bufferImage[destinationOffset], data, byteCount);
+		}
+		ApplyBufferRangeUpdate(&slot.initializedBufferRanges,
+			destinationOffset, destinationEnd,
+			mode == RENDER_BUFFER_UPDATE_DISCARD);
+		slot.bufferContentValid = !slot.initializedBufferRanges.empty();
 		return RENDER_RESULT_OK;
 	}
 
@@ -1735,12 +2184,12 @@ public:
 		ID3D11Resource *colorResource = 0;
 		if (binding.useBackBufferColor)
 		{
-			if (m_renderTarget == 0)
+			if (defaultRenderTarget() == 0)
 			{
 				return RENDER_RESULT_UNSUPPORTED;
 			}
-			colorView = m_renderTarget;
-			colorResource = m_renderTargetResource;
+			colorView = defaultRenderTarget();
+			colorResource = defaultColorResource();
 		}
 		else if (binding.hasColor)
 		{
@@ -1763,12 +2212,17 @@ public:
 		ID3D11Resource *depthResource = 0;
 		if (binding.useBackBufferDepth)
 		{
-			if (m_depthStencil == 0)
+			const bool customSingleSampleColor = colorResource != 0 &&
+				colorResource != defaultColorResource();
+			depthView = customSingleSampleColor ? m_depthStencil :
+				defaultDepthStencil();
+			depthResource = customSingleSampleColor ?
+				static_cast<ID3D11Resource *>(m_depthTexture) :
+				defaultDepthResource();
+			if (depthView == 0)
 			{
 				return RENDER_RESULT_UNSUPPORTED;
 			}
-			depthView = m_depthStencil;
-			depthResource = m_depthTexture;
 		}
 		else if (binding.hasDepth)
 		{
@@ -1952,7 +2406,11 @@ public:
 		m_viewportMinimumDepth = minimumDepth;
 		m_viewportMaximumDepth = maximumDepth;
 		m_viewportBound = true;
-		m_cachedLegacyStateValid = false;
+		// Viewport coordinates are part of the transform constant payload, not
+		// the native pipeline object.  Keep the published logical state cached so
+		// the draw boundary can republish those constants without rebuilding the
+		// entire pipeline.
+		m_transformConstantsChanged = true;
 		return RENDER_RESULT_OK;
 	}
 
@@ -2153,6 +2611,12 @@ public:
 		rasterizerDescriptor.DepthClipEnable = true;
 		rasterizerDescriptor.ScissorEnable =
 			state.pipeline.rasterizer.scissorEnable;
+		// MultisampleEnable controls the line rasterization algorithm even on
+		// feature level 11.  Key it to the negotiated device sample count rather
+		// than the request; D3D11 ignores this flag on the single-sample RTTs used
+		// by the legacy render-to-texture passes, while cached pipeline state stays
+		// valid when those passes switch back to the multisampled scene target.
+		rasterizerDescriptor.MultisampleEnable = m_multisampleCount > 1;
 		ID3D11RasterizerState *rasterizerState = 0;
 		result = findOrCreateRasterizerState(rasterizerDescriptor, &rasterizerState);
 		if (FAILED(result))
@@ -2197,8 +2661,8 @@ public:
 				}
 				else
 				{
-					// D3DTSS_MAXMIPLEVEL excludes higher-detail levels.  D3D11's
-					// equivalent is a minimum LOD, not a maximum LOD.
+					// The historical maximum-mip-level state excludes higher-detail
+					// levels. The native equivalent is a minimum LOD, not a maximum LOD.
 					samplerDescriptor.MinLOD =
 						static_cast<float>(sampler.maximumMipLevel);
 					samplerDescriptor.MaxLOD = FLT_MAX;
@@ -2212,9 +2676,14 @@ public:
 			}
 		}
 
+		const bool weightedVertexInput = (vertexLayoutFlags &
+			(LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT0 |
+			 LEGACY_VERTEX_LAYOUT_BLEND_WEIGHT1 |
+			 LEGACY_VERTEX_LAYOUT_BLEND_INDEX)) != 0U;
 		ID3D11VertexShader *vertexShader = useSeaWavePipeline ?
 			m_seaWaveVertexShader : (useFullPipeline ?
-			m_texturedVertexShader : m_vertexShader);
+			(weightedVertexInput ? m_texturedVertexShader :
+			 m_texturedUnweightedVertexShader) : m_vertexShader);
 		ID3D11PixelShader *pixelShader = useSeaWavePipeline ?
 			m_seaWavePixelShader : (useFullPipeline ?
 			m_texturedPixelShader : m_pixelShader);
@@ -2355,6 +2824,7 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		ID3D11InputLayout *inputLayout = 0;
+		unsigned int layoutFlags = 0;
 		HRESULT layoutResult = S_OK;
 		if (state.pipeline.vertexProgram == RENDER_LEGACY_VERTEX_WATER_SEA)
 		{
@@ -2364,34 +2834,16 @@ public:
 				return RENDER_RESULT_INVALID_ARGUMENT;
 			}
 			inputLayout = m_seaWaveLayout;
+			layoutFlags = LegacyVertexLayoutFlags(vertexLayout);
 		}
 		else
 		{
 			layoutResult = findOrCreateInputLayout(vertexLayout,
-				&inputLayout);
+				&inputLayout, &layoutFlags);
 		}
 		if (FAILED(layoutResult))
 		{
 			return TranslateResult(layoutResult);
-		}
-		unsigned int layoutFlags = 0;
-		for (unsigned int index = 0; index < vertexLayout.elementCount; ++index)
-		{
-			switch (vertexLayout.elements[index].semantic)
-			{
-			case RENDER_VERTEX_SEMANTIC_NORMAL: layoutFlags |= 1U; break;
-			case RENDER_VERTEX_SEMANTIC_DIFFUSE: layoutFlags |= 2U; break;
-			case RENDER_VERTEX_SEMANTIC_SPECULAR: layoutFlags |= 4U; break;
-			case RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE:
-				layoutFlags |= 1U << (8 +
-					vertexLayout.elements[index].semanticIndex);
-				break;
-			default: break;
-			}
-		}
-		if (vertexLayout.preTransformed)
-		{
-			layoutFlags |= LEGACY_VERTEX_LAYOUT_PRETRANSFORMED;
 		}
 		m_hasVertexLayoutFlagsOverride = true;
 		m_vertexLayoutFlagsOverride = layoutFlags;
@@ -2415,7 +2867,7 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		ResourceSlot &slot = m_resources[buffer.index()];
-		if (slot.kind != RESOURCE_BUFFER ||
+		if (slot.kind != RESOURCE_BUFFER || !slot.bufferContentValid ||
 			(slot.binding & RENDER_BUFFER_VERTEX) == 0 || offset >= slot.byteCount)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
@@ -2449,7 +2901,7 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		ResourceSlot &slot = m_resources[buffer.index()];
-		if (slot.kind != RESOURCE_BUFFER ||
+		if (slot.kind != RESOURCE_BUFFER || !slot.bufferContentValid ||
 			(slot.binding & RENDER_BUFFER_INDEX) == 0 || offset >= slot.byteCount ||
 			(offset % indexSize) != 0)
 		{
@@ -2487,9 +2939,11 @@ public:
 			m_context->PSSetShaderResources(stage, 1, &emptyView);
 			m_context->PSSetShaderResources(8 + stage, 1, &emptyView);
 			m_boundTextures[stage] = GpuHandle();
+			const bool typeChanged = ((m_boundCubeTextureMask |
+				m_boundSignedTextureMask) & (1U << stage)) != 0U;
 			m_boundCubeTextureMask &= ~(1U << stage);
 			m_boundSignedTextureMask &= ~(1U << stage);
-			m_transformConstantsChanged = true;
+			if (typeChanged) m_transformConstantsChanged = true;
 			m_textureBindingsValid = true;
 			return RENDER_RESULT_OK;
 		}
@@ -2544,7 +2998,12 @@ public:
 		}
 		m_boundTextures[stage] = texture;
 		m_textureBindingsValid = true;
-		m_transformConstantsChanged = true;
+		// The SRV was rebound above. Only its cube/signed type bits enter the
+		// transform payload; a same-type replacement leaves those bytes intact.
+		if (wasCube != isCube || wasSigned != isSigned)
+		{
+			m_transformConstantsChanged = true;
+		}
 		return RENDER_RESULT_OK;
 	}
 
@@ -2596,6 +3055,20 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		const size_t firstVertexByte = m_boundVertexOffset +
+			static_cast<size_t>(startVertex) * m_boundVertexStride;
+		const size_t vertexByteEnd = firstVertexByte +
+			static_cast<size_t>(vertexCount) * m_boundVertexStride;
+		if (!IsBufferRangeInitialized(vertexSlot.initializedBufferRanges,
+			firstVertexByte, vertexByteEnd))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const RenderResult transformResult = refreshTransformConstantsForDraw();
+		if (transformResult != RENDER_RESULT_OK)
+		{
+			return transformResult;
+		}
 		m_context->Draw(vertexCount, startVertex);
 		return RENDER_RESULT_OK;
 	}
@@ -2617,6 +3090,114 @@ public:
 			m_boundIndexOffset, indexSize, startIndex, indexCount))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const size_t firstIndexByte = m_boundIndexOffset +
+			static_cast<size_t>(startIndex) * indexSize;
+		const size_t indexByteEnd = firstIndexByte +
+			static_cast<size_t>(indexCount) * indexSize;
+		if (!IsBufferRangeInitialized(indexSlot.initializedBufferRanges,
+			firstIndexByte, indexByteEnd))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const ResourceSlot &vertexSlot =
+			m_resources[m_boundVertexBuffer.index()];
+		if (!IsBufferRangeInitialized(vertexSlot.initializedBufferRanges,
+			m_boundVertexOffset, vertexSlot.byteCount))
+		{
+			const std::vector<unsigned char> *indexBytes =
+				indexSlot.usage == RENDER_USAGE_IMMUTABLE ?
+				&indexSlot.immutableBufferRecoverySource : &indexSlot.bufferImage;
+			if (indexBytes->size() != indexSlot.byteCount)
+			{
+				return RENDER_RESULT_INVALID_ARGUMENT;
+			}
+			// A contiguous initialized interval covering the actual min/max
+			// referenced vertices proves every indexed address is initialized.
+			// If that interval contains holes, retain the original per-index
+			// validation so unused holes never reject an otherwise valid draw.
+			bool intervalValidated = false;
+			if (indexCount != 0)
+			{
+				unsigned int minIndex = UINT_MAX;
+				unsigned int maxIndex = 0;
+				for (unsigned int index = 0; index < indexCount; ++index)
+				{
+					const size_t sourceOffset = firstIndexByte +
+						static_cast<size_t>(index) * indexSize;
+					unsigned int value = 0;
+					if (indexSize == 2)
+					{
+						unsigned short shortValue = 0;
+						memcpy(&shortValue, &(*indexBytes)[sourceOffset],
+							sizeof(shortValue));
+						value = shortValue;
+					}
+					else
+						memcpy(&value, &(*indexBytes)[sourceOffset], sizeof(value));
+					minIndex = (std::min)(minIndex, value);
+					maxIndex = (std::max)(maxIndex, value);
+				}
+				const long long minVertex =
+					static_cast<long long>(minIndex) + baseVertex;
+				const long long maxVertex =
+					static_cast<long long>(maxIndex) + baseVertex;
+				if (minVertex < 0 || maxVertex > UINT_MAX ||
+					!isElementRangeWithinBuffer(vertexSlot.byteCount,
+						m_boundVertexOffset, m_boundVertexStride,
+						static_cast<unsigned int>(minVertex), 1) ||
+					!isElementRangeWithinBuffer(vertexSlot.byteCount,
+						m_boundVertexOffset, m_boundVertexStride,
+						static_cast<unsigned int>(maxVertex), 1))
+					return RENDER_RESULT_INVALID_ARGUMENT;
+				const size_t vertexByteBegin = m_boundVertexOffset +
+					static_cast<size_t>(minVertex) * m_boundVertexStride;
+				const size_t vertexByteEnd = m_boundVertexOffset +
+					static_cast<size_t>(maxVertex) * m_boundVertexStride +
+					m_boundVertexStride;
+				intervalValidated = IsBufferRangeInitialized(
+					vertexSlot.initializedBufferRanges,
+					vertexByteBegin, vertexByteEnd);
+			}
+			for (unsigned int index = 0;
+				!intervalValidated && index < indexCount; ++index)
+			{
+				const size_t sourceOffset = firstIndexByte +
+					static_cast<size_t>(index) * indexSize;
+				unsigned int vertexIndex = 0;
+				if (indexSize == 2)
+				{
+					unsigned short value = 0;
+					memcpy(&value, &(*indexBytes)[sourceOffset], sizeof(value));
+					vertexIndex = value;
+				}
+				else
+				{
+					memcpy(&vertexIndex, &(*indexBytes)[sourceOffset],
+						sizeof(vertexIndex));
+				}
+				const long long addressedVertex =
+					static_cast<long long>(vertexIndex) + baseVertex;
+				if (addressedVertex < 0 || addressedVertex > UINT_MAX ||
+					!isElementRangeWithinBuffer(vertexSlot.byteCount,
+						m_boundVertexOffset, m_boundVertexStride,
+						static_cast<unsigned int>(addressedVertex), 1))
+				{
+					return RENDER_RESULT_INVALID_ARGUMENT;
+				}
+				const size_t vertexByteBegin = m_boundVertexOffset +
+					static_cast<size_t>(addressedVertex) * m_boundVertexStride;
+				if (!IsBufferRangeInitialized(vertexSlot.initializedBufferRanges,
+					vertexByteBegin, vertexByteBegin + m_boundVertexStride))
+				{
+					return RENDER_RESULT_INVALID_ARGUMENT;
+				}
+			}
+		}
+		const RenderResult transformResult = refreshTransformConstantsForDraw();
+		if (transformResult != RENDER_RESULT_OK)
+		{
+			return transformResult;
 		}
 		m_context->DrawIndexed(indexCount, startIndex, baseVertex);
 		return RENDER_RESULT_OK;
@@ -2649,6 +3230,9 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		const RenderResult resolveResult = resolveBackBuffer();
+		if (resolveResult != RENDER_RESULT_OK)
+			return resolveResult;
 		ID3D11Texture2D *backBuffer = 0;
 		HRESULT result = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
 			reinterpret_cast<void **>(&backBuffer));
@@ -2762,6 +3346,120 @@ public:
 		return RENDER_RESULT_OK;
 	}
 
+	virtual RenderResult getTextureFilterCapabilities(
+		RenderTextureFilterCapabilities *capabilities) const
+	{
+		if (capabilities == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		*capabilities = RenderTextureFilterCapabilities();
+		if (!isOwner() || !isOperational())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+
+		// This renderer requests feature level 11_0 and rejects lower levels in
+		// createNativeDevice.  D3D11 feature level 11_0 guarantees point and
+		// linear sampler filtering; D3D11_REQ_MAXANISOTROPY is the API minimum
+		// contract for the sampler MaxAnisotropy field.  Keep the capability
+		// derivation here, beside the actual device and obtained feature level,
+		// so the game-owner layer never invents a backend limit.
+		if (m_featureLevel < D3D_FEATURE_LEVEL_11_0)
+			return RENDER_RESULT_UNSUPPORTED;
+		capabilities->supportsPoint = true;
+		capabilities->supportsLinear = true;
+		capabilities->supportsAnisotropic = true;
+		capabilities->maxAnisotropy = D3D11_REQ_MAXANISOTROPY;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult configureResourceFaultInjection(
+		RenderResourceFaultPoint point, unsigned int failOnInvocation,
+		RenderResult result)
+	{
+		if (!isOwner() || m_frameOpen)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		if (point == RENDER_RESOURCE_FAULT_NONE)
+		{
+			m_faultPoint = RENDER_RESOURCE_FAULT_NONE;
+			m_faultCountdown = 0;
+			m_faultResult = RENDER_RESULT_FAILED;
+			return RENDER_RESULT_OK;
+		}
+		if (point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
+			point > RENDER_RESOURCE_FAULT_RESIZE_TARGETS_RECOVERY_FAILURE ||
+			failOnInvocation == 0 ||
+			(result != RENDER_RESULT_OUT_OF_MEMORY &&
+			 result != RENDER_RESULT_DEVICE_REMOVED &&
+			 result != RENDER_RESULT_FAILED))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		m_faultPoint = point;
+		m_faultCountdown = failOnInvocation;
+		m_faultResult = result;
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult getDebugResourceStatistics(
+		RenderResourceStatistics *statistics) const
+	{
+		if (!isOwner() || statistics == 0 || m_handles == 0)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		*statistics = RenderResourceStatistics();
+		statistics->liveHandles = m_handles->liveCount();
+		for (unsigned int index = 0; index < m_resources.size(); ++index)
+		{
+			const ResourceSlot &slot = m_resources[index];
+			if (slot.kind == RESOURCE_BUFFER)
+			{
+				++statistics->bufferCount;
+			}
+			else if (slot.kind == RESOURCE_TEXTURE)
+			{
+				++statistics->textureCount;
+			}
+			if (slot.resource != 0)
+			{
+				++statistics->nativeResourceCount;
+			}
+			if (slot.view != 0)
+			{
+				++statistics->shaderResourceViewCount;
+			}
+			if (slot.renderTarget != 0)
+			{
+				++statistics->renderTargetViewCount;
+			}
+			if (slot.depthStencil != 0)
+			{
+				++statistics->depthStencilViewCount;
+			}
+			if (slot.kind == RESOURCE_TEXTURE &&
+				slot.shadow.size() > (size_t)-1 -
+				statistics->recoveryShadowBytes)
+			{
+				return RENDER_RESULT_FAILED;
+			}
+			if (slot.kind == RESOURCE_TEXTURE)
+			{
+				statistics->recoveryShadowBytes += slot.shadow.size();
+			}
+			if (slot.kind == RESOURCE_BUFFER)
+			{
+				if (slot.immutableBufferRecoverySource.size() > (size_t)-1 -
+					statistics->recoveryShadowBytes)
+				{
+					return RENDER_RESULT_FAILED;
+				}
+				statistics->recoveryShadowBytes +=
+					slot.immutableBufferRecoverySource.size();
+			}
+		}
+		return RENDER_RESULT_OK;
+	}
+
 	virtual RenderResult reportDebugLiveObjects()
 	{
 		if (!isOwner() || m_frameOpen)
@@ -2772,6 +3470,253 @@ public:
 	}
 
 private:
+	ID3D11RenderTargetView *defaultRenderTarget() const
+	{
+		return m_multisampleRenderTarget != 0 ?
+			m_multisampleRenderTarget : m_renderTarget;
+	}
+
+	ID3D11Resource *defaultColorResource() const
+	{
+		return m_multisampleColorTexture != 0 ?
+			static_cast<ID3D11Resource *>(m_multisampleColorTexture) :
+			m_renderTargetResource;
+	}
+
+	ID3D11DepthStencilView *defaultDepthStencil() const
+	{
+		return m_multisampleDepthStencil != 0 ?
+			m_multisampleDepthStencil : m_depthStencil;
+	}
+
+	ID3D11Resource *defaultDepthResource() const
+	{
+		return m_multisampleDepthTexture != 0 ?
+			static_cast<ID3D11Resource *>(m_multisampleDepthTexture) :
+			static_cast<ID3D11Resource *>(m_depthTexture);
+	}
+
+	void bindDefaultRenderTargets()
+	{
+		ID3D11RenderTargetView *colorView = defaultRenderTarget();
+		ID3D11DepthStencilView *depthView = defaultDepthStencil();
+		if (colorView != 0)
+			m_context->OMSetRenderTargets(1, &colorView, depthView);
+		else
+			m_context->OMSetRenderTargets(0, 0, 0);
+		m_activeRenderTarget = colorView;
+		m_activeDepthStencil = depthView;
+		m_activeColorResource = defaultColorResource();
+		m_activeDepthResource = defaultDepthResource();
+		m_renderTargetsBound = colorView != 0;
+	}
+
+	void bindDefaultViewport(unsigned int width, unsigned int height)
+	{
+		if (defaultRenderTarget() == 0 || width == 0 || height == 0)
+		{
+			m_viewportBound = false;
+			return;
+		}
+		D3D11_VIEWPORT viewport;
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = static_cast<float>(width);
+		viewport.Height = static_cast<float>(height);
+		viewport.MinDepth = 0.0f;
+		viewport.MaxDepth = 1.0f;
+		m_context->RSSetViewports(1, &viewport);
+		m_viewportX = viewport.TopLeftX;
+		m_viewportY = viewport.TopLeftY;
+		m_viewportWidth = viewport.Width;
+		m_viewportHeight = viewport.Height;
+		m_viewportMinimumDepth = viewport.MinDepth;
+		m_viewportMaximumDepth = viewport.MaxDepth;
+		m_viewportBound = true;
+		m_transformConstantsChanged = true;
+	}
+
+	RenderResult resolveBackBuffer()
+	{
+		if (m_multisampleCount == 1)
+			return RENDER_RESULT_OK;
+		if (m_context == 0 || m_device == 0 ||
+			m_multisampleColorTexture == 0 || m_renderTargetResource == 0)
+		{
+			return RENDER_RESULT_FAILED;
+		}
+		m_context->ResolveSubresource(m_renderTargetResource, 0,
+			m_multisampleColorTexture, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+		return TranslateResult(m_device->GetDeviceRemovedReason());
+	}
+
+	bool isPresentationIdentity() const
+	{
+		return m_gamma == 1.0f && m_brightness == 0.0f &&
+			m_contrast == 1.0f;
+	}
+
+	bool isDefaultBackBufferTarget() const
+	{
+		return defaultRenderTarget() != 0 && defaultColorResource() != 0 &&
+			m_activeRenderTarget == defaultRenderTarget() &&
+			m_activeColorResource == defaultColorResource();
+	}
+
+	HRESULT createPresentationResources()
+	{
+		if (m_presentationSource != 0 && m_presentationSourceView != 0)
+			return S_OK;
+		if (m_device == 0 || m_width == 0 || m_height == 0)
+			return E_INVALIDARG;
+		releasePresentationResources();
+		D3D11_TEXTURE2D_DESC descriptor;
+		memset(&descriptor, 0, sizeof(descriptor));
+		descriptor.Width = m_width;
+		descriptor.Height = m_height;
+		descriptor.MipLevels = 1;
+		descriptor.ArraySize = 1;
+		descriptor.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		descriptor.SampleDesc.Count = 1;
+		descriptor.Usage = D3D11_USAGE_DEFAULT;
+		descriptor.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		HRESULT result = m_device->CreateTexture2D(&descriptor, 0,
+			&m_presentationSource);
+		if (FAILED(result))
+			return result;
+
+		D3D11_SHADER_RESOURCE_VIEW_DESC viewDescriptor;
+		memset(&viewDescriptor, 0, sizeof(viewDescriptor));
+		viewDescriptor.Format = descriptor.Format;
+		viewDescriptor.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		viewDescriptor.Texture2D.MipLevels = 1;
+		result = m_device->CreateShaderResourceView(m_presentationSource,
+			&viewDescriptor, &m_presentationSourceView);
+		if (FAILED(result))
+			releasePresentationResources();
+		return result;
+	}
+
+	void releasePresentationResources()
+	{
+		if (m_presentationSourceView != 0)
+		{
+			m_presentationSourceView->Release();
+			m_presentationSourceView = 0;
+		}
+		if (m_presentationSource != 0)
+		{
+			m_presentationSource->Release();
+			m_presentationSource = 0;
+		}
+	}
+
+	void clearPresentationBindings()
+	{
+		if (m_context == 0)
+			return;
+		ID3D11ShaderResourceView *emptyViews[LEGACY_TEXTURE_STAGE_COUNT * 2] =
+			{ 0 };
+		m_context->PSSetShaderResources(0, LEGACY_TEXTURE_STAGE_COUNT * 2,
+			emptyViews);
+		ID3D11SamplerState *emptySamplers[LEGACY_TEXTURE_STAGE_COUNT] = { 0 };
+		m_context->PSSetSamplers(0, LEGACY_TEXTURE_STAGE_COUNT,
+			emptySamplers);
+		ID3D11Buffer *emptyConstantBuffer = 0;
+		m_context->VSSetConstantBuffers(0, 1, &emptyConstantBuffer);
+		m_context->PSSetConstantBuffers(0, 1, &emptyConstantBuffer);
+		m_context->VSSetShader(0, 0, 0);
+		m_context->PSSetShader(0, 0, 0);
+		m_context->IASetInputLayout(0);
+		ID3D11Buffer *emptyBuffers[1] = { 0 };
+		const UINT zero = 0;
+		m_context->IASetVertexBuffers(0, 1, emptyBuffers, &zero, &zero);
+		m_context->IASetIndexBuffer(0, DXGI_FORMAT_UNKNOWN, 0);
+		m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED);
+		const float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		m_context->OMSetBlendState(0, blendFactor, 0xffffffffU);
+		m_context->OMSetDepthStencilState(0, 0);
+		m_context->RSSetState(0);
+		m_context->OMSetRenderTargets(0, 0, 0);
+		m_context->RSSetViewports(0, 0);
+		invalidateContextBindings();
+	}
+
+	RenderResult applyPresentationGamma()
+	{
+		if (m_device == 0 || m_context == 0 || m_renderTarget == 0 ||
+			m_renderTargetResource == 0 || m_presentationVertexShader == 0 ||
+			m_presentationPixelShader == 0 || m_presentationConstants == 0 ||
+			m_presentationSampler == 0)
+			return RENDER_RESULT_UNSUPPORTED;
+		HRESULT result = createPresentationResources();
+		if (FAILED(result))
+			return TranslateResult(result);
+
+		D3D11_MAPPED_SUBRESOURCE mapped;
+		result = m_context->Map(m_presentationConstants, 0,
+			D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+		if (FAILED(result))
+			return TranslateResult(result);
+		if (mapped.pData == 0)
+		{
+			m_context->Unmap(m_presentationConstants, 0);
+			return RENDER_RESULT_FAILED;
+		}
+		PresentationColorConstants *constants =
+			static_cast<PresentationColorConstants *>(mapped.pData);
+		constants->gamma = m_gamma;
+		constants->brightness = m_brightness;
+		constants->contrast = m_contrast;
+		constants->limit = m_gammaUseLimit ?
+			(m_contrast - 1.0f) / 2.0f * m_contrast : 0.0f;
+		m_context->Unmap(m_presentationConstants, 0);
+
+		m_context->CopyResource(m_presentationSource, m_renderTargetResource);
+		result = m_device->GetDeviceRemovedReason();
+		if (FAILED(result))
+			return TranslateResult(result);
+
+		// The swap-chain resource was the current output, so no legacy SRV may
+		// remain bound while the intermediate is sampled into that output.
+		unbindTextureResources();
+		const float blendFactor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+		m_context->OMSetBlendState(0, blendFactor, 0xffffffffU);
+		m_context->OMSetDepthStencilState(0, 0);
+		m_context->RSSetState(0);
+		m_context->OMSetRenderTargets(1, &m_renderTarget, 0);
+		m_context->IASetInputLayout(0);
+		ID3D11Buffer *emptyBuffers[1] = { 0 };
+		const UINT zero = 0;
+		m_context->IASetVertexBuffers(0, 1, emptyBuffers, &zero, &zero);
+		m_context->IASetIndexBuffer(0, DXGI_FORMAT_UNKNOWN, 0);
+		m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		m_context->VSSetShader(m_presentationVertexShader, 0, 0);
+		m_context->PSSetShader(m_presentationPixelShader, 0, 0);
+		m_context->VSSetConstantBuffers(0, 1, &m_presentationConstants);
+		m_context->PSSetConstantBuffers(0, 1, &m_presentationConstants);
+		m_context->PSSetShaderResources(0, 1, &m_presentationSourceView);
+		m_context->PSSetSamplers(0, 1, &m_presentationSampler);
+		D3D11_VIEWPORT viewport;
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = static_cast<float>(m_width);
+		viewport.Height = static_cast<float>(m_height);
+		viewport.MinDepth = 0.0f;
+		viewport.MaxDepth = 1.0f;
+		m_context->RSSetViewports(1, &viewport);
+		m_context->Draw(3, 0);
+		RenderResult passResult = TranslateResult(
+			m_device->GetDeviceRemovedReason());
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		const bool injected = consumeResourceFault(
+			RENDER_RESOURCE_FAULT_PRESENTATION_PASS, &injectedResult);
+		clearPresentationBindings();
+		if (injected)
+			return injectedResult;
+		return passResult;
+	}
+
 	RenderResult reportLiveObjects()
 	{
 		if (!m_debugLayerActive || m_debugLayer == 0)
@@ -2794,6 +3739,56 @@ private:
 	bool isOwner() const
 	{
 		return m_initialized && GetCurrentThreadId() == m_ownerThread;
+	}
+
+	bool consumeResourceFault(RenderResourceFaultPoint point,
+		RenderResult *result)
+	{
+		if (result == 0 || point == RENDER_RESOURCE_FAULT_NONE ||
+			m_faultPoint != point || m_faultCountdown == 0)
+		{
+			return false;
+		}
+		--m_faultCountdown;
+		if (m_faultCountdown != 0)
+		{
+			return false;
+		}
+		*result = m_faultResult;
+		m_faultPoint = RENDER_RESOURCE_FAULT_NONE;
+		m_faultResult = RENDER_RESULT_FAILED;
+		return true;
+	}
+
+	RenderResult refreshTransformConstantsForDraw()
+	{
+		if (!m_transformConstantsChanged)
+		{
+			return RENDER_RESULT_OK;
+		}
+		if (!m_cachedLegacyStateValid)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		// The cached state is deliberately byte storage to avoid imposing an
+		// alignment requirement on the member.  Copy it into a typed value before
+		// handing it back to the constant-packing routine.
+		LegacyLogicalState state;
+		memcpy(&state, m_cachedLegacyState, sizeof(state));
+		const HRESULT result = updateTransformConstants(state,
+			m_cachedLegacyVertexLayoutFlags,
+			m_cachedLegacyTexturePresenceMask, m_boundCubeTextureMask);
+		if (FAILED(result))
+		{
+			return TranslateResult(result);
+		}
+		// The native SRV bindings are now represented by the published constants;
+		// retain the logical-state cache so a later setLegacyState can stay on its
+		// cached path instead of forcing a redundant pipeline bind.
+		m_cachedLegacyCubeTextureMask = m_boundCubeTextureMask;
+		m_cachedLegacySignedTextureMask = m_boundSignedTextureMask;
+		m_transformConstantsChanged = false;
+		return RENDER_RESULT_OK;
 	}
 
 	void cacheLegacyState(const LegacyLogicalState &state,
@@ -2927,6 +3922,31 @@ private:
 			}
 		}
 		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult getDebugTextureBinding(GpuHandle texture,
+		unsigned int stage, bool *bound) const
+	{
+		if (!isOwner() || bound == 0 || stage >= LEGACY_TEXTURE_STAGE_COUNT ||
+			!m_handles->isLive(texture) || m_context == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		const ResourceSlot &slot = m_resources[texture.index()];
+		if (slot.kind != RESOURCE_TEXTURE || slot.view == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		ID3D11ShaderResourceView *view = 0;
+		const unsigned int nativeStage = slot.textureDescriptor.dimension ==
+			RENDER_TEXTURE_CUBE ? 8 + stage : stage;
+		m_context->PSGetShaderResources(nativeStage, 1, &view);
+		*bound = view == slot.view;
+		if (view != 0) view->Release();
+		return RENDER_RESULT_OK;
+	}
+
+	RenderResult failTextureRefresh(GpuHandle texture,
+		unsigned int affectedStages, RenderResult failure)
+	{
+		(void)rebindTextureResource(texture, affectedStages);
+		return failure;
 	}
 
 	static bool isElementRangeWithinBuffer(size_t byteCapacity,
@@ -3165,6 +4185,13 @@ private:
 		{
 			return result;
 		}
+		result = m_device->CreateVertexShader(g_LegacyTexturedUnweightedVS,
+			sizeof(g_LegacyTexturedUnweightedVS), 0,
+			&m_texturedUnweightedVertexShader);
+		if (FAILED(result))
+		{
+			return result;
+		}
 	result = m_device->CreatePixelShader(g_LegacyTexturedPS,
 		 sizeof(g_LegacyTexturedPS), 0, &m_texturedPixelShader);
 	if (FAILED(result))
@@ -3244,8 +4271,52 @@ private:
 	};
 	result = m_device->CreateInputLayout(seaWaveElements,
 		static_cast<UINT>(sizeof(seaWaveElements) /
-			sizeof(seaWaveElements[0])), g_LegacySeaWaveVS,
-		sizeof(g_LegacySeaWaveVS), &m_seaWaveLayout);
+			 sizeof(seaWaveElements[0])), g_LegacySeaWaveVS,
+		 sizeof(g_LegacySeaWaveVS), &m_seaWaveLayout);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	result = m_device->CreateVertexShader(g_PresentationColorTransformVS,
+		sizeof(g_PresentationColorTransformVS), 0,
+		&m_presentationVertexShader);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	result = m_device->CreatePixelShader(g_PresentationColorTransformPS,
+		sizeof(g_PresentationColorTransformPS), 0,
+		&m_presentationPixelShader);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	D3D11_BUFFER_DESC presentationConstantsDescriptor;
+	memset(&presentationConstantsDescriptor, 0,
+		sizeof(presentationConstantsDescriptor));
+	presentationConstantsDescriptor.ByteWidth =
+		static_cast<UINT>(sizeof(PresentationColorConstants));
+	presentationConstantsDescriptor.Usage = D3D11_USAGE_DYNAMIC;
+	presentationConstantsDescriptor.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	presentationConstantsDescriptor.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+	result = m_device->CreateBuffer(&presentationConstantsDescriptor, 0,
+		&m_presentationConstants);
+	if (FAILED(result))
+	{
+		return result;
+	}
+	D3D11_SAMPLER_DESC presentationSamplerDescriptor;
+	memset(&presentationSamplerDescriptor, 0,
+		sizeof(presentationSamplerDescriptor));
+	presentationSamplerDescriptor.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+	presentationSamplerDescriptor.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+	presentationSamplerDescriptor.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+	presentationSamplerDescriptor.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+	presentationSamplerDescriptor.ComparisonFunc = D3D11_COMPARISON_NEVER;
+	presentationSamplerDescriptor.MinLOD = 0.0f;
+	presentationSamplerDescriptor.MaxLOD = FLT_MAX;
+	result = m_device->CreateSamplerState(&presentationSamplerDescriptor,
+		&m_presentationSampler);
 	if (FAILED(result))
 	{
 		return result;
@@ -3574,6 +4645,13 @@ private:
 	HRESULT recreateBuffer(ResourceSlot &slot)
 	{
 		const BufferDescriptor &descriptor = slot.bufferDescriptor;
+		const bool immutable = descriptor.usage == RENDER_USAGE_IMMUTABLE;
+		if ((immutable && slot.immutableBufferRecoverySource.size() !=
+			descriptor.byteCount) ||
+			(!immutable && !slot.immutableBufferRecoverySource.empty()))
+		{
+			return E_FAIL;
+		}
 		D3D11_BUFFER_DESC nativeDescriptor;
 		memset(&nativeDescriptor, 0, sizeof(nativeDescriptor));
 		nativeDescriptor.ByteWidth = static_cast<UINT>(descriptor.byteCount);
@@ -3593,7 +4671,8 @@ private:
 			&nativeDescriptor.CPUAccessFlags);
 		D3D11_SUBRESOURCE_DATA initialData;
 		memset(&initialData, 0, sizeof(initialData));
-		initialData.pSysMem = slot.shadow.empty() ? 0 : &slot.shadow[0];
+		initialData.pSysMem = immutable ?
+			&slot.immutableBufferRecoverySource[0] : 0;
 		return m_device->CreateBuffer(&nativeDescriptor,
 			initialData.pSysMem == 0 ? 0 : &initialData,
 			reinterpret_cast<ID3D11Buffer **>(&slot.resource));
@@ -3601,6 +4680,12 @@ private:
 
 	HRESULT recreateTexture(ResourceSlot &slot)
 	{
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		if (consumeResourceFault(RENDER_RESOURCE_FAULT_TEXTURE_RECOVERY,
+			&injectedResult))
+		{
+			return TranslateInjectedFault(injectedResult);
+		}
 		const TextureDescriptor &descriptor = slot.textureDescriptor;
 		if ((descriptor.dimension != RENDER_TEXTURE_2D &&
 			descriptor.dimension != RENDER_TEXTURE_CUBE) ||
@@ -3760,6 +4845,7 @@ private:
 		{
 			return result;
 		}
+		m_multisampleCount = 1;
 
 		D3D11_TEXTURE2D_DESC depthDescriptor;
 		memset(&depthDescriptor, 0, sizeof(depthDescriptor));
@@ -3777,6 +4863,98 @@ private:
 			result = m_device->CreateDepthStencilView(m_depthTexture, 0,
 				&m_depthStencil);
 		}
+		unsigned int requestedMultisampleCount = m_parameters.multisampleCount;
+		if (requestedMultisampleCount != 2 && requestedMultisampleCount != 4 &&
+			requestedMultisampleCount != 8)
+		{
+			requestedMultisampleCount = 1;
+		}
+		for (unsigned int sampleCount = requestedMultisampleCount;
+			SUCCEEDED(result) && sampleCount >= 2; sampleCount /= 2)
+		{
+			UINT colorQualityLevels = 0;
+			UINT depthQualityLevels = 0;
+			HRESULT colorQualityResult = m_device->CheckMultisampleQualityLevels(
+				DXGI_FORMAT_B8G8R8A8_UNORM, sampleCount, &colorQualityLevels);
+			HRESULT depthQualityResult = m_device->CheckMultisampleQualityLevels(
+				DXGI_FORMAT_D24_UNORM_S8_UINT, sampleCount, &depthQualityLevels);
+			if (FAILED(colorQualityResult) || FAILED(depthQualityResult))
+			{
+				const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+				if (FAILED(deviceResult))
+				{
+					result = deviceResult;
+					break;
+				}
+				continue;
+			}
+			const UINT commonQualityLevels = colorQualityLevels < depthQualityLevels ?
+				colorQualityLevels : depthQualityLevels;
+			if (commonQualityLevels == 0)
+				continue;
+
+			D3D11_TEXTURE2D_DESC colorDescriptor;
+			memset(&colorDescriptor, 0, sizeof(colorDescriptor));
+			colorDescriptor.Width = width;
+			colorDescriptor.Height = height;
+			colorDescriptor.MipLevels = 1;
+			colorDescriptor.ArraySize = 1;
+			colorDescriptor.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			colorDescriptor.SampleDesc.Count = sampleCount;
+			colorDescriptor.SampleDesc.Quality = commonQualityLevels - 1;
+			colorDescriptor.Usage = D3D11_USAGE_DEFAULT;
+			colorDescriptor.BindFlags = D3D11_BIND_RENDER_TARGET;
+			HRESULT multisampleResult = m_device->CreateTexture2D(&colorDescriptor,
+				0, &m_multisampleColorTexture);
+			if (SUCCEEDED(multisampleResult))
+			{
+				multisampleResult = m_device->CreateRenderTargetView(
+					m_multisampleColorTexture, 0, &m_multisampleRenderTarget);
+			}
+			D3D11_TEXTURE2D_DESC multisampleDepthDescriptor = depthDescriptor;
+			multisampleDepthDescriptor.SampleDesc = colorDescriptor.SampleDesc;
+			if (SUCCEEDED(multisampleResult))
+			{
+				multisampleResult = m_device->CreateTexture2D(
+					&multisampleDepthDescriptor, 0, &m_multisampleDepthTexture);
+			}
+			if (SUCCEEDED(multisampleResult))
+			{
+				multisampleResult = m_device->CreateDepthStencilView(
+					m_multisampleDepthTexture, 0, &m_multisampleDepthStencil);
+			}
+			if (SUCCEEDED(multisampleResult))
+			{
+				m_multisampleCount = sampleCount;
+				break;
+			}
+			if (m_multisampleDepthStencil != 0)
+			{
+				m_multisampleDepthStencil->Release();
+				m_multisampleDepthStencil = 0;
+			}
+			if (m_multisampleDepthTexture != 0)
+			{
+				m_multisampleDepthTexture->Release();
+				m_multisampleDepthTexture = 0;
+			}
+			if (m_multisampleRenderTarget != 0)
+			{
+				m_multisampleRenderTarget->Release();
+				m_multisampleRenderTarget = 0;
+			}
+			if (m_multisampleColorTexture != 0)
+			{
+				m_multisampleColorTexture->Release();
+				m_multisampleColorTexture = 0;
+			}
+			const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+			if (FAILED(deviceResult))
+			{
+				result = deviceResult;
+				break;
+			}
+		}
 		if (FAILED(result))
 		{
 			releaseBackBufferTargets();
@@ -3786,27 +4964,14 @@ private:
 			// The legacy API publishes a full-back-buffer viewport when a device or reset
 			// completes. Mirror that default here because the legacy state cache
 			// may suppress its first SetViewport call after this backend starts.
-			D3D11_VIEWPORT viewport;
-			viewport.TopLeftX = 0.0f;
-			viewport.TopLeftY = 0.0f;
-			viewport.Width = static_cast<float>(width);
-			viewport.Height = static_cast<float>(height);
-			viewport.MinDepth = 0.0f;
-			viewport.MaxDepth = 1.0f;
-			m_context->RSSetViewports(1, &viewport);
-			m_viewportX = 0.0f;
-			m_viewportY = 0.0f;
-			m_viewportWidth = static_cast<float>(width);
-			m_viewportHeight = static_cast<float>(height);
-			m_viewportMinimumDepth = 0.0f;
-			m_viewportMaximumDepth = 1.0f;
-			m_viewportBound = true;
+			bindDefaultViewport(width, height);
 		}
 		return result;
 	}
 
 	void releaseBackBufferTargets()
 	{
+		releasePresentationResources();
 		m_activeRenderTarget = 0;
 		m_activeDepthStencil = 0;
 		m_activeColorResource = 0;
@@ -3823,6 +4988,26 @@ private:
 			m_depthTexture->Release();
 			m_depthTexture = 0;
 		}
+		if (m_multisampleDepthStencil != 0)
+		{
+			m_multisampleDepthStencil->Release();
+			m_multisampleDepthStencil = 0;
+		}
+		if (m_multisampleDepthTexture != 0)
+		{
+			m_multisampleDepthTexture->Release();
+			m_multisampleDepthTexture = 0;
+		}
+		if (m_multisampleRenderTarget != 0)
+		{
+			m_multisampleRenderTarget->Release();
+			m_multisampleRenderTarget = 0;
+		}
+		if (m_multisampleColorTexture != 0)
+		{
+			m_multisampleColorTexture->Release();
+			m_multisampleColorTexture = 0;
+		}
 		if (m_renderTarget != 0)
 		{
 			m_renderTarget->Release();
@@ -3833,6 +5018,7 @@ private:
 			m_renderTargetResource->Release();
 			m_renderTargetResource = 0;
 		}
+		m_multisampleCount = 1;
 	}
 
 	unsigned int nextStateUseSerial()
@@ -4020,6 +5206,7 @@ private:
 		}
 		m_inputLayouts[oldest].layout->Release();
 		m_inputLayouts.erase(m_inputLayouts.begin() + oldest);
+		m_lastInputLayoutIndex = UINT_MAX;
 		return true;
 	}
 
@@ -4180,20 +5367,35 @@ private:
 	}
 
 	HRESULT findOrCreateInputLayout(const LegacyVertexLayout &descriptor,
-		ID3D11InputLayout **layout)
+		ID3D11InputLayout **layout, unsigned int *layoutFlags)
 	{
-		if (layout == 0 || descriptor.stride == 0 ||
+		if (layout == 0 || layoutFlags == 0 || descriptor.stride == 0 ||
 			descriptor.elementCount == 0 ||
 			descriptor.elementCount > LegacyVertexLayout::MAX_ELEMENT_COUNT)
 		{
 			return E_INVALIDARG;
+		}
+		// The cache is ordered by insertion, not recent use. The last matching
+		// index avoids a linear scan for repeated layouts, but always rechecks
+		// the complete descriptor before using the current native entry.
+		if (m_lastInputLayoutIndex < m_inputLayouts.size() &&
+			EqualVertexLayouts(m_inputLayouts[m_lastInputLayoutIndex].descriptor,
+				descriptor))
+		{
+			InputLayoutEntry &entry = m_inputLayouts[m_lastInputLayoutIndex];
+			entry.lastUsedSerial = nextStateUseSerial();
+			*layout = entry.layout;
+			*layoutFlags = entry.layoutFlags;
+			return S_OK;
 		}
 		for (unsigned int cached = 0; cached < m_inputLayouts.size(); ++cached)
 		{
 			if (EqualVertexLayouts(m_inputLayouts[cached].descriptor, descriptor))
 			{
 				m_inputLayouts[cached].lastUsedSerial = nextStateUseSerial();
+				m_lastInputLayoutIndex = cached;
 				*layout = m_inputLayouts[cached].layout;
+				*layoutFlags = m_inputLayouts[cached].layoutFlags;
 				return S_OK;
 			}
 		}
@@ -4201,12 +5403,15 @@ private:
 		{
 			return E_OUTOFMEMORY;
 		}
+		const bool weightedVertexInput = HasBlendVertexSemantics(descriptor);
 		D3D11_INPUT_ELEMENT_DESC nativeElements[
-			LegacyVertexLayout::MAX_ELEMENT_COUNT + LEGACY_TEXTURE_STAGE_COUNT + 3];
+			LegacyVertexLayout::MAX_ELEMENT_COUNT + LEGACY_TEXTURE_STAGE_COUNT + 6];
 		bool hasPosition = false;
 		bool hasNormal = false;
 		bool hasDiffuse = false;
 		bool hasSpecular = false;
+		bool hasBlendWeight[2] = { false, false };
+		bool hasBlendIndex = false;
 		bool hasTextureCoordinate[LEGACY_TEXTURE_STAGE_COUNT] = { false };
 		unsigned int positionOffset = 0;
 		for (unsigned int index = 0; index < descriptor.elementCount; ++index)
@@ -4262,6 +5467,28 @@ private:
 				semanticName = "COLOR";
 				semanticIndex = 1;
 				break;
+			case RENDER_VERTEX_SEMANTIC_BLEND_WEIGHT:
+				if (semanticIndex >= 2U || hasBlendWeight[semanticIndex] ||
+					(element.format != RENDER_VERTEX_DATA_FLOAT1 &&
+					 element.format != RENDER_VERTEX_DATA_FLOAT2 &&
+					 element.format != RENDER_VERTEX_DATA_FLOAT3 &&
+					 element.format != RENDER_VERTEX_DATA_FLOAT4))
+				{
+					return E_INVALIDARG;
+				}
+				hasBlendWeight[semanticIndex] = true;
+				semanticName = "BLENDWEIGHT";
+				break;
+			case RENDER_VERTEX_SEMANTIC_BLEND_INDEX:
+				if (hasBlendIndex || semanticIndex != 0U ||
+					(element.format != RENDER_VERTEX_DATA_UBYTE4 &&
+						 element.format != RENDER_VERTEX_DATA_PACKED_COLOR))
+				{
+					return E_INVALIDARG;
+				}
+				hasBlendIndex = true;
+				semanticName = "BLENDINDICES";
+				break;
 			case RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE:
 				if (semanticIndex >= LEGACY_TEXTURE_STAGE_COUNT ||
 					hasTextureCoordinate[semanticIndex] ||
@@ -4286,6 +5513,10 @@ private:
 			nativeElements[index].SemanticName = semanticName;
 			nativeElements[index].SemanticIndex = semanticIndex;
 			nativeElements[index].Format = TranslateVertexDataFormat(element.format);
+			if (nativeElements[index].Format == DXGI_FORMAT_UNKNOWN)
+			{
+				return E_INVALIDARG;
+			}
 			nativeElements[index].InputSlot = 0;
 			nativeElements[index].AlignedByteOffset = element.byteOffset;
 			nativeElements[index].InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
@@ -4298,6 +5529,10 @@ private:
 		unsigned int nativeElementCount = descriptor.elementCount;
 		if (!hasNormal)
 		{
+			if (!FitsVertexStride(descriptor, positionOffset, 3U * sizeof(float)))
+			{
+				return E_INVALIDARG;
+			}
 			D3D11_INPUT_ELEMENT_DESC &element =
 				nativeElements[nativeElementCount++];
 			element.SemanticName = "NORMAL";
@@ -4310,6 +5545,10 @@ private:
 		}
 		if (!hasDiffuse)
 		{
+			if (!FitsVertexStride(descriptor, positionOffset, 3U * sizeof(float)))
+			{
+				return E_INVALIDARG;
+			}
 			D3D11_INPUT_ELEMENT_DESC &element =
 				nativeElements[nativeElementCount++];
 			element.SemanticName = "COLOR";
@@ -4322,6 +5561,10 @@ private:
 		}
 		if (!hasSpecular)
 		{
+			if (!FitsVertexStride(descriptor, positionOffset, 3U * sizeof(float)))
+			{
+				return E_INVALIDARG;
+			}
 			D3D11_INPUT_ELEMENT_DESC &element =
 				nativeElements[nativeElementCount++];
 			element.SemanticName = "COLOR";
@@ -4332,11 +5575,68 @@ private:
 			element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
 			element.InstanceDataStepRate = 0;
 		}
+		if (weightedVertexInput)
+		{
+			if (!hasBlendWeight[0])
+			{
+				if (!FitsVertexStride(descriptor, positionOffset,
+					4U * sizeof(float)))
+				{
+					return E_INVALIDARG;
+				}
+				D3D11_INPUT_ELEMENT_DESC &element =
+					nativeElements[nativeElementCount++];
+				element.SemanticName = "BLENDWEIGHT";
+				element.SemanticIndex = 0;
+				element.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+				element.InputSlot = 0;
+				element.AlignedByteOffset = positionOffset;
+				element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+				element.InstanceDataStepRate = 0;
+			}
+			if (!hasBlendWeight[1])
+			{
+				if (!FitsVertexStride(descriptor, positionOffset, sizeof(float)))
+				{
+					return E_INVALIDARG;
+				}
+				D3D11_INPUT_ELEMENT_DESC &element =
+					nativeElements[nativeElementCount++];
+				element.SemanticName = "BLENDWEIGHT";
+				element.SemanticIndex = 1;
+				element.Format = DXGI_FORMAT_R32_FLOAT;
+				element.InputSlot = 0;
+				element.AlignedByteOffset = positionOffset;
+				element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+				element.InstanceDataStepRate = 0;
+			}
+			if (!hasBlendIndex)
+			{
+				if (!FitsVertexStride(descriptor, positionOffset, sizeof(unsigned int)))
+				{
+					return E_INVALIDARG;
+				}
+				D3D11_INPUT_ELEMENT_DESC &element =
+					nativeElements[nativeElementCount++];
+				element.SemanticName = "BLENDINDICES";
+				element.SemanticIndex = 0;
+				element.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+				element.InputSlot = 0;
+				element.AlignedByteOffset = positionOffset;
+				element.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
+				element.InstanceDataStepRate = 0;
+			}
+		}
 		for (unsigned int coordinate = 0;
 			coordinate < LEGACY_TEXTURE_STAGE_COUNT; ++coordinate)
 		{
 			if (!hasTextureCoordinate[coordinate])
 			{
+				if (!FitsVertexStride(descriptor, positionOffset,
+					3U * sizeof(float)))
+				{
+					return E_INVALIDARG;
+				}
 				D3D11_INPUT_ELEMENT_DESC &element =
 					nativeElements[nativeElementCount++];
 				element.SemanticName = "TEXCOORD";
@@ -4351,10 +5651,16 @@ private:
 		InputLayoutEntry entry;
 		entry.descriptor = descriptor;
 		entry.layout = 0;
+		entry.layoutFlags = LegacyVertexLayoutFlags(descriptor);
 		entry.lastUsedSerial = nextStateUseSerial();
+		const void *vertexShaderBytecode = weightedVertexInput ?
+			static_cast<const void *>(g_LegacyTexturedVS) :
+			static_cast<const void *>(g_LegacyTexturedUnweightedVS);
+		const size_t vertexShaderBytecodeSize = weightedVertexInput ?
+			sizeof(g_LegacyTexturedVS) : sizeof(g_LegacyTexturedUnweightedVS);
 		HRESULT result = m_device->CreateInputLayout(nativeElements,
-			nativeElementCount, g_LegacyTexturedVS,
-			sizeof(g_LegacyTexturedVS), &entry.layout);
+			nativeElementCount, vertexShaderBytecode, vertexShaderBytecodeSize,
+			&entry.layout);
 		if (FAILED(result))
 		{
 			return result;
@@ -4368,7 +5674,10 @@ private:
 			entry.layout->Release();
 			return E_OUTOFMEMORY;
 		}
+		m_lastInputLayoutIndex =
+			static_cast<unsigned int>(m_inputLayouts.size() - 1);
 		*layout = entry.layout;
+		*layoutFlags = entry.layoutFlags;
 		return S_OK;
 	}
 
@@ -4498,6 +5807,7 @@ private:
 		}
 		if (SUCCEEDED(result))
 		{
+			m_featureLevel = obtainedLevel;
 			m_debugLayerActive = false;
 			if ((flags & D3D11_CREATE_DEVICE_DEBUG) != 0)
 			{
@@ -4540,8 +5850,13 @@ private:
 		slot.binding = 0;
 		slot.byteCount = 0;
 		slot.gpuAuthoritative = false;
+		slot.bufferContentValid = false;
+		slot.bufferDescriptor = BufferDescriptor();
 		// This logical resource is gone, unlike an in-place refresh or device
 		// recovery. Do not retain its largest CPU shadow in the reusable slot.
+		std::vector<unsigned char>().swap(slot.immutableBufferRecoverySource);
+		std::vector<unsigned char>().swap(slot.bufferImage);
+		std::vector<BufferByteRange>().swap(slot.initializedBufferRanges);
 		std::vector<unsigned char>().swap(slot.shadow);
 		std::vector<size_t>().swap(slot.subresourceOffsets);
 		std::vector<size_t>().swap(slot.subresourceRowPitches);
@@ -4600,10 +5915,20 @@ private:
 		reportLiveObjects();
 		releaseDeviceObjects();
 		m_ownerThread = 0;
+		m_featureLevel = D3D_FEATURE_LEVEL_9_1;
 		m_activeRenderTarget = 0;
 		m_activeDepthStencil = 0;
 		m_activeColorResource = 0;
 		m_activeDepthResource = 0;
+		m_faultPoint = RENDER_RESOURCE_FAULT_NONE;
+		m_faultCountdown = 0;
+		m_faultResult = RENDER_RESULT_FAILED;
+		m_swapInterval = 1;
+		m_gamma = 1.0f;
+		m_brightness = 0.0f;
+		m_contrast = 1.0f;
+		m_gammaCalibrate = false;
+		m_gammaUseLimit = true;
 		m_initialized = false;
 		m_width = 0;
 		m_height = 0;
@@ -4611,11 +5936,32 @@ private:
 
 	void releasePipelineResources()
 	{
+		if (m_presentationSampler != 0)
+		{
+			m_presentationSampler->Release();
+			m_presentationSampler = 0;
+		}
+		if (m_presentationConstants != 0)
+		{
+			m_presentationConstants->Release();
+			m_presentationConstants = 0;
+		}
+		if (m_presentationPixelShader != 0)
+		{
+			m_presentationPixelShader->Release();
+			m_presentationPixelShader = 0;
+		}
+		if (m_presentationVertexShader != 0)
+		{
+			m_presentationVertexShader->Release();
+			m_presentationVertexShader = 0;
+		}
 		for (unsigned int index = 0; index < m_inputLayouts.size(); ++index)
 		{
 			m_inputLayouts[index].layout->Release();
 		}
 		m_inputLayouts.clear();
+		m_lastInputLayoutIndex = UINT_MAX;
 		for (unsigned int index = 0; index < m_blendStates.size(); ++index)
 		{
 			m_blendStates[index].state->Release();
@@ -4674,6 +6020,11 @@ private:
 		{
 			m_texturedVertexShader->Release();
 			m_texturedVertexShader = 0;
+		}
+		if (m_texturedUnweightedVertexShader != 0)
+		{
+			m_texturedUnweightedVertexShader->Release();
+			m_texturedUnweightedVertexShader = 0;
 		}
 		if (m_waterRiverPixelShader != 0)
 		{
@@ -4755,13 +6106,20 @@ private:
 
 	ID3D11Device *m_device;
 	ID3D11DeviceContext *m_context;
+	D3D_FEATURE_LEVEL m_featureLevel;
 	ID3D11Debug *m_debugLayer;
 	bool m_debugLayerActive;
 	IDXGISwapChain1 *m_swapChain;
 	ID3D11RenderTargetView *m_renderTarget;
 	ID3D11Resource *m_renderTargetResource;
+	ID3D11Texture2D *m_multisampleColorTexture;
+	ID3D11RenderTargetView *m_multisampleRenderTarget;
+	ID3D11Texture2D *m_presentationSource;
+	ID3D11ShaderResourceView *m_presentationSourceView;
 	ID3D11Texture2D *m_depthTexture;
 	ID3D11DepthStencilView *m_depthStencil;
+	ID3D11Texture2D *m_multisampleDepthTexture;
+	ID3D11DepthStencilView *m_multisampleDepthStencil;
 	ID3D11RenderTargetView *m_activeRenderTarget;
 	ID3D11DepthStencilView *m_activeDepthStencil;
 	ID3D11Resource *m_activeColorResource;
@@ -4771,6 +6129,7 @@ private:
 	ID3D11PixelShader *m_pixelShader;
 	ID3D11InputLayout *m_positionColorLayout;
 	ID3D11VertexShader *m_texturedVertexShader;
+	ID3D11VertexShader *m_texturedUnweightedVertexShader;
 	ID3D11PixelShader *m_texturedPixelShader;
 	ID3D11PixelShader *m_texturedFixed1PixelShader;
 	ID3D11PixelShader *m_texturedFixed2PixelShader;
@@ -4780,13 +6139,21 @@ private:
 	ID3D11VertexShader *m_seaWaveVertexShader;
 	ID3D11PixelShader *m_seaWavePixelShader;
 	ID3D11InputLayout *m_seaWaveLayout;
+	ID3D11VertexShader *m_presentationVertexShader;
+	ID3D11PixelShader *m_presentationPixelShader;
+	ID3D11Buffer *m_presentationConstants;
+	ID3D11SamplerState *m_presentationSampler;
 	GpuHandleAllocator *m_handles;
+	RenderResourceFaultPoint m_faultPoint;
+	unsigned int m_faultCountdown;
+	RenderResult m_faultResult;
 	std::vector<ResourceSlot> m_resources;
 	std::vector<BlendStateEntry> m_blendStates;
 	std::vector<DepthStencilStateEntry> m_depthStates;
 	std::vector<RasterizerStateEntry> m_rasterizerStates;
 	std::vector<SamplerStateEntry> m_samplerStates;
 	std::vector<InputLayoutEntry> m_inputLayouts;
+	unsigned int m_lastInputLayoutIndex;
 	unsigned int m_stateUseSerial;
 	DWORD m_ownerThread;
 	bool m_initialized;
@@ -4795,10 +6162,16 @@ private:
 	bool m_vertexBufferBound;
 	bool m_indexBufferBound;
 	bool m_topologyBound;
-	bool m_enableVsync;
+	unsigned int m_swapInterval;
+	float m_gamma;
+	float m_brightness;
+	float m_contrast;
+	bool m_gammaCalibrate;
+	bool m_gammaUseLimit;
 	unsigned int m_transformConstantCursor;
 	unsigned int m_width;
 	unsigned int m_height;
+	unsigned int m_multisampleCount;
 	float m_viewportX;
 	float m_viewportY;
 	float m_viewportWidth;

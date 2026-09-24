@@ -2,6 +2,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <atomic>
 #endif
 #include <ctype.h>
 #include <limits.h>
@@ -16,7 +18,11 @@ namespace render
 {
 namespace
 {
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+RenderBackend g_requestedBackend = RENDER_BACKEND_D3D11;
+#else
 RenderBackend g_requestedBackend = RENDER_BACKEND_DX8;
+#endif
 
 bool EqualIgnoringCase(const char *left, const char *right)
 {
@@ -44,6 +50,23 @@ bool Checked_Multiply(size_t left, size_t right, size_t *result)
 	return true;
 }
 
+unsigned int Texture_Bytes_Per_Pixel(RenderFormat format)
+{
+	switch (format)
+	{
+	case RENDER_FORMAT_R8G8B8A8_UNORM:
+	case RENDER_FORMAT_B8G8R8A8_UNORM:
+	case RENDER_FORMAT_D24_UNORM_S8_UINT:
+	case RENDER_FORMAT_R32_UINT:
+		return 4;
+	case RENDER_FORMAT_R16_UINT:
+	case RENDER_FORMAT_R8G8_SNORM:
+		return 2;
+	default:
+		return 0;
+	}
+}
+
 unsigned long Current_Render_Thread_Id()
 {
 #ifdef _WIN32
@@ -52,6 +75,64 @@ unsigned long Current_Render_Thread_Id()
 	return 1;
 #endif
 }
+
+// A raw GpuHandle is exposed by resource tables and may outlive its backend.
+// Never reuse its generation in this process, even across allocator instances.
+unsigned int Next_Gpu_Handle_Generation()
+{
+#ifdef _WIN32
+	static volatile LONG lastGeneration = 0;
+	LONG current = InterlockedCompareExchange(&lastGeneration, 0, 0);
+	while (current < LONG_MAX)
+	{
+		const LONG next = current + 1;
+		const LONG observed = InterlockedCompareExchange(&lastGeneration,
+			next, current);
+		if (observed == current)
+		{
+			return static_cast<unsigned int>(next);
+		}
+		current = observed;
+	}
+#else
+	static std::atomic<unsigned int> lastGeneration(0);
+	unsigned int current = lastGeneration.load();
+	while (current < static_cast<unsigned int>(LONG_MAX))
+	{
+		if (lastGeneration.compare_exchange_weak(current, current + 1))
+		{
+			return current + 1;
+		}
+	}
+#endif
+	return 0;
+}
+}
+
+RenderBackend DefaultRenderBackend()
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return RENDER_BACKEND_D3D11;
+#else
+	return RENDER_BACKEND_DX8;
+#endif
+}
+
+bool IsRenderBackendSupported(RenderBackend backend)
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return backend == RENDER_BACKEND_D3D11;
+#else
+	if (backend == RENDER_BACKEND_DX8)
+	{
+		return true;
+	}
+#if defined(RTS_RENDERER_HAS_D3D11)
+	return backend == RENDER_BACKEND_D3D11;
+#else
+	return false;
+#endif
+#endif
 }
 
 void SetRequestedRenderBackend(RenderBackend backend)
@@ -94,6 +175,116 @@ bool ParseRenderBackend(const char *name, RenderBackend *backend)
 		return true;
 	}
 	return false;
+}
+
+RenderResult ValidateTextureUpload(const TextureDescriptor &descriptor,
+	const TextureSubresourceData *data, unsigned int dataCount,
+	bool dataRequired, size_t maximumUploadBytes, size_t *uploadBytes)
+{
+	if (uploadBytes == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*uploadBytes = 0;
+	const unsigned int bytesPerPixel =
+		Texture_Bytes_Per_Pixel(descriptor.format);
+	const unsigned int knownBindings = RENDER_TEXTURE_SHADER_RESOURCE |
+		RENDER_TEXTURE_RENDER_TARGET | RENDER_TEXTURE_DEPTH_STENCIL;
+	if (descriptor.width == 0 || descriptor.height == 0 ||
+		descriptor.mipCount == 0 || descriptor.arrayCount == 0 ||
+		bytesPerPixel == 0 || descriptor.binding == 0 ||
+		(descriptor.binding & ~knownBindings) != 0 ||
+		(descriptor.usage != RENDER_USAGE_IMMUTABLE &&
+		 descriptor.usage != RENDER_USAGE_DYNAMIC &&
+		 descriptor.usage != RENDER_USAGE_DEFAULT) ||
+		(descriptor.dimension != RENDER_TEXTURE_2D &&
+		 descriptor.dimension != RENDER_TEXTURE_CUBE) ||
+		(descriptor.dimension == RENDER_TEXTURE_2D &&
+		 descriptor.arrayCount != 1) ||
+		(descriptor.dimension == RENDER_TEXTURE_CUBE &&
+		 (descriptor.width != descriptor.height || descriptor.arrayCount != 6 ||
+		  (descriptor.binding & (RENDER_TEXTURE_RENDER_TARGET |
+			  RENDER_TEXTURE_DEPTH_STENCIL)) != 0)) ||
+		(descriptor.usage == RENDER_USAGE_DYNAMIC &&
+		 (descriptor.dimension != RENDER_TEXTURE_2D ||
+		  descriptor.mipCount != 1 || descriptor.arrayCount != 1)) ||
+		((descriptor.binding & (RENDER_TEXTURE_RENDER_TARGET |
+			RENDER_TEXTURE_DEPTH_STENCIL)) != 0 && descriptor.mipCount != 1) ||
+		((descriptor.binding & RENDER_TEXTURE_DEPTH_STENCIL) != 0 &&
+		 (descriptor.binding != RENDER_TEXTURE_DEPTH_STENCIL ||
+		  descriptor.format != RENDER_FORMAT_D24_UNORM_S8_UINT)) ||
+		(descriptor.format == RENDER_FORMAT_D24_UNORM_S8_UINT &&
+		 descriptor.binding != RENDER_TEXTURE_DEPTH_STENCIL) ||
+		(descriptor.usage != RENDER_USAGE_DEFAULT &&
+		 (descriptor.binding & (RENDER_TEXTURE_RENDER_TARGET |
+			 RENDER_TEXTURE_DEPTH_STENCIL)) != 0))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+
+	unsigned int maximumMipCount = 1;
+	unsigned int maximumDimension = descriptor.width > descriptor.height ?
+		descriptor.width : descriptor.height;
+	while (maximumDimension > 1)
+	{
+		maximumDimension >>= 1;
+		++maximumMipCount;
+	}
+	if (descriptor.mipCount > maximumMipCount ||
+		descriptor.mipCount > UINT_MAX / descriptor.arrayCount)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	const unsigned int subresourceCount = descriptor.mipCount *
+		descriptor.arrayCount;
+	if ((data == 0 && dataCount != 0) ||
+		(data != 0 && dataCount != subresourceCount) ||
+		(dataRequired && data == 0) ||
+		(descriptor.usage == RENDER_USAGE_IMMUTABLE && data == 0))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (data == 0)
+	{
+		return RENDER_RESULT_OK;
+	}
+
+	size_t totalBytes = 0;
+	for (unsigned int index = 0; index < subresourceCount; ++index)
+	{
+		const unsigned int mipLevel = index % descriptor.mipCount;
+		const size_t width = descriptor.width >> mipLevel;
+		const size_t height = descriptor.height >> mipLevel;
+		size_t minimumRowPitch = 0;
+		size_t minimumSlicePitch = 0;
+		if (data[index].data == 0 || data[index].rowPitch == 0 ||
+			data[index].rowPitch > UINT_MAX ||
+			data[index].slicePitch > UINT_MAX ||
+			!Checked_Multiply(width == 0 ? 1 : width, bytesPerPixel,
+				&minimumRowPitch) || data[index].rowPitch < minimumRowPitch ||
+			!Checked_Multiply(height == 0 ? 1 : height,
+				data[index].rowPitch, &minimumSlicePitch) ||
+			(data[index].slicePitch != 0 &&
+			 data[index].slicePitch < minimumSlicePitch))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const size_t subresourceBytes = data[index].slicePitch != 0 ?
+			data[index].slicePitch : minimumSlicePitch;
+		if (subresourceBytes > (size_t)-1 - totalBytes)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		if (maximumUploadBytes != 0 &&
+			(subresourceBytes > maximumUploadBytes ||
+			 totalBytes > maximumUploadBytes - subresourceBytes))
+		{
+			return RENDER_RESULT_OUT_OF_MEMORY;
+		}
+		totalBytes += subresourceBytes;
+	}
+	*uploadBytes = totalBytes;
+	return RENDER_RESULT_OK;
 }
 
 RenderFrameFailureLatch::RenderFrameFailureLatch() :
@@ -323,16 +514,6 @@ RenderResult RenderFrameOutcome::result() const
 
 RenderCaptureRequest::RenderCaptureRequest() :
 	m_requested(false), m_failureCount(0)
-{
-}
-
-RenderBackBufferInfo::RenderBackBufferInfo() :
-	width(0), height(0), format(RENDER_FORMAT_UNKNOWN)
-{
-}
-
-RenderCaptureHandle::RenderCaptureHandle() :
-	kind(RENDER_CAPTURE_COMPRESSED_SCREENSHOT), requestId(0), generation(0)
 {
 }
 
@@ -1031,7 +1212,7 @@ bool GpuHandle::operator!=(const GpuHandle &other) const
 struct GpuHandleAllocator::Impl
 {
 	explicit Impl(unsigned int requestedCapacity) :
-		generations(requestedCapacity, 1), live(requestedCapacity, false),
+		generations(requestedCapacity, 0), live(requestedCapacity, false),
 		liveCount(0)
 	{
 		freeSlots.reserve(requestedCapacity);
@@ -1071,11 +1252,17 @@ GpuHandle GpuHandleAllocator::allocate()
 	{
 		return GpuHandle();
 	}
+	const unsigned int generation = Next_Gpu_Handle_Generation();
+	if (generation == 0)
+	{
+		return GpuHandle();
+	}
 	const unsigned int index = m_impl->freeSlots.back();
 	m_impl->freeSlots.pop_back();
+	m_impl->generations[index] = generation;
 	m_impl->live[index] = true;
 	++m_impl->liveCount;
-	return GpuHandle(index, m_impl->generations[index]);
+	return GpuHandle(index, generation);
 }
 
 bool GpuHandleAllocator::release(GpuHandle handle)
@@ -1087,11 +1274,6 @@ bool GpuHandleAllocator::release(GpuHandle handle)
 	const unsigned int index = handle.index();
 	m_impl->live[index] = false;
 	--m_impl->liveCount;
-	++m_impl->generations[index];
-	if (m_impl->generations[index] == 0)
-	{
-		m_impl->generations[index] = 1;
-	}
 	m_impl->freeSlots.push_back(index);
 	return true;
 }
@@ -1117,7 +1299,7 @@ unsigned int GpuHandleAllocator::liveCount() const
 RenderDeviceParameters::RenderDeviceParameters() :
 	backend(RENDER_BACKEND_DX8), window(0), width(0), height(0),
 	adapterIndex(UINT_MAX), enableDebugLayer(false), enableVsync(true),
-	allowSoftwareFallback(true)
+	allowSoftwareFallback(true), multisampleCount(1)
 {
 }
 
@@ -1137,6 +1319,31 @@ TextureDescriptor::TextureDescriptor() :
 	format(RENDER_FORMAT_UNKNOWN), binding(RENDER_TEXTURE_SHADER_RESOURCE),
 	usage(RENDER_USAGE_IMMUTABLE)
 {
+}
+
+RenderResourceStatistics::RenderResourceStatistics() :
+	liveHandles(0), bufferCount(0), textureCount(0),
+	nativeResourceCount(0), shaderResourceViewCount(0),
+	renderTargetViewCount(0), depthStencilViewCount(0),
+	recoveryShadowBytes(0)
+{
+}
+
+RenderResult IRenderDevice::configureResourceFaultInjection(
+	RenderResourceFaultPoint, unsigned int, RenderResult)
+{
+	return RENDER_RESULT_UNSUPPORTED;
+}
+
+RenderResult IRenderDevice::getDebugResourceStatistics(
+	RenderResourceStatistics *statistics) const
+{
+	if (statistics == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*statistics = RenderResourceStatistics();
+	return RENDER_RESULT_UNSUPPORTED;
 }
 
 RenderTargetSubresource::RenderTargetSubresource() :

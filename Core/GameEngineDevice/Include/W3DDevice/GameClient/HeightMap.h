@@ -29,7 +29,6 @@
 #include "WW3D2/w3d_file.h"
 #include "WW3D2/dx8vertexbuffer.h"
 #include "WW3D2/dx8indexbuffer.h"
-#include "WW3D2/dx8wrapper.h"
 #include "WW3D2/shader.h"
 #include "WW3D2/vertmaterial.h"
 #include "Lib/BaseType.h"
@@ -64,8 +63,8 @@ public:
 	HeightMapRenderObjClass();
 	virtual ~HeightMapRenderObjClass() override;
 
-	// DX8_CleanupHook methods
-	virtual void ReleaseResources() override;	///< Release all dx8 resources so the device can be reset.
+	// Renderer cleanup-hook methods.
+	virtual void ReleaseResources() override;	///< Release all renderer resources so the device can be reset.
 	virtual void ReAcquireResources() override;  ///< Reacquire all resources after device reset.
 
 

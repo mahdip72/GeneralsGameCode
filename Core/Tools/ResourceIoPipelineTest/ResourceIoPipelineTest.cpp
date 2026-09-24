@@ -1,4 +1,5 @@
 #include "Lib/ResourceIoPipeline.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -345,11 +346,29 @@ void testOwnedNativeRange()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		std::fprintf(stderr, "Usage: core_resource_io_pipeline_tests "
+			"[--local-capacity|--external-qualification]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	owner = std::this_thread::get_id();
 	const unsigned workers[] = {1, 2, 4, 8, 16, 0};
-	for (unsigned count : workers) testParity(count);
+	const unsigned localWorkers[] = {1, 2, 4, 8, 12};
+	if (localCapacity)
+	{
+		std::printf("resource IO lane: local-capacity (explicit workers 1, 2, 4, 8, 12; "
+			"external high-core/automatic lane excluded)\n");
+		for (unsigned count : localWorkers) testParity(count);
+	}
+	else
+	{
+		for (unsigned count : workers) testParity(count);
+	}
 	testFaultsAndPressure();
 	testOverlapCancellationAndShutdown();
 	testSerialFallback();

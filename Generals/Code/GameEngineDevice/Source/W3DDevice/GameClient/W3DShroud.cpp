@@ -27,18 +27,21 @@
 // Desc:      Code to support rendering of shrouded units/terrain.
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+#include <mmsystem.h>
+
 #include "Lib/BaseType.h"
 #include "WW3D2/camera.h"
 #include "WWLib/simplevec.h"
-#include "WW3D2/dx8wrapper.h"
 #include "Common/MapObject.h"
 #include "Common/PerfTimer.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/GameClient/W3DPoly.h"
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "WW3D2/assetmgr.h"
+#include "WW3D2/surfaceclass.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "W3DDevice/Common/W3DShroudRenderPolicy.h"
+#include "Renderer/RenderTexturePublication.h"
 #include "WW3D2/textureloader.h"
 #include "Common/GlobalData.h"
 #include "GameLogic/PartitionManager.h"
@@ -95,8 +98,7 @@ W3DShroud::~W3DShroud()
 {
 	ReleaseResources();
 
-	if (m_pSrcTexture)
-		m_pSrcTexture->Release();
+	REF_PTR_RELEASE(m_pSrcTexture);
 	delete [] static_cast<Byte *>(m_srcTextureData);
 
 	delete [] m_finalFogData;
@@ -158,12 +160,19 @@ void W3DShroud::init(WorldHeightMap *pMap, Real worldCellSizeX, Real worldCellSi
  	memset(m_finalFogData,0,srcWidth*srcHeight);
 #endif
 
+#if defined(_WIN64)
+	m_pSrcTexture = NEW_REF(SurfaceClass,
+		(srcWidth, srcHeight, WW3D_FORMAT_A8R8G8B8));
+#else
 #if defined(RTS_DEBUG)
 	if (TheGlobalData && TheGlobalData->m_fogOfWarOn)
-		m_pSrcTexture = DX8Wrapper::_Create_DX8_Surface(srcWidth,srcHeight, WW3D_FORMAT_A4R4G4B4);
+		m_pSrcTexture = NEW_REF(SurfaceClass,
+			(srcWidth, srcHeight, WW3D_FORMAT_A4R4G4B4));
 	else
 #endif
-		m_pSrcTexture = DX8Wrapper::_Create_DX8_Surface(srcWidth,srcHeight, WW3D_FORMAT_R5G6B5);
+		m_pSrcTexture = NEW_REF(SurfaceClass,
+			(srcWidth, srcHeight, WW3D_FORMAT_R5G6B5));
+#endif
 
 	DEBUG_ASSERTCRASH( m_pSrcTexture != nullptr, ("Failed to Allocate Shroud Src Surface"));
 
@@ -202,11 +211,7 @@ void W3DShroud::init(WorldHeightMap *pMap, Real worldCellSizeX, Real worldCellSi
 void W3DShroud::reset()
 {
 	//Free old shroud data since it may no longer fit new map.
-	if (m_pSrcTexture)
-	{
-		m_pSrcTexture->Release();
-		m_pSrcTexture=nullptr;
-	}
+	REF_PTR_RELEASE(m_pSrcTexture);
 	delete [] static_cast<Byte *>(m_srcTextureData);
 	m_srcTextureData=nullptr;
 	m_srcTexturePitch=0;
@@ -222,14 +227,14 @@ void W3DShroud::reset()
 }
 
 //-----------------------------------------------------------------------------
-///Release any resources that can't survive a D3D device reset.
+///Release any resources that can't survive a graphics-device reset.
 void W3DShroud::ReleaseResources()
 {
 	REF_PTR_RELEASE (m_pDstTexture);
 }
 
 //-----------------------------------------------------------------------------
-///Restore resources that are lost on D3D device reset.
+///Restore resources that are lost on a graphics-device reset.
 Bool W3DShroud::ReAcquireResources()
 {
 		if (!m_dstTextureWidth)
@@ -246,10 +251,12 @@ Bool W3DShroud::ReAcquireResources()
 #endif
 			m_pDstTexture = MSGNEW("TextureClass") TextureClass(m_dstTextureWidth,m_dstTextureHeight,WW3D_FORMAT_R5G6B5,MIP_LEVELS_1, TextureClass::POOL_DEFAULT);
 
-		DEBUG_ASSERTCRASH( m_pDstTexture != nullptr, ("Failed ReAcquire of shroud texture"));
+		DEBUG_ASSERTCRASH( m_pDstTexture != nullptr && m_pDstTexture->Is_Initialized(),
+			("Failed ReAcquire of shroud texture"));
 
-		if (!m_pDstTexture)
+		if (!m_pDstTexture || !m_pDstTexture->Is_Initialized())
 		{	//could not create a valid texture
+			REF_PTR_RELEASE(m_pDstTexture);
 			m_dstTextureWidth = 0;
 			m_dstTextureHeight = 0;
 			return FALSE;
@@ -266,32 +273,82 @@ Bool W3DShroud::ReAcquireResources()
 //-----------------------------------------------------------------------------
 // Upload the CPU-owned source image while the legacy surface is locked. The
 // surface pointer is deliberately scoped to this operation; callers never
-// retain D3DLOCKED_RECT::pBits after UnlockRect().
+// retain the mapped pixel pointer after the texture is unlocked.
 Bool W3DShroud::syncSourceTexture()
 {
 	if (!m_srcTextureDirty || !m_pSrcTexture || !m_srcTextureData)
 		return TRUE;
 
-	D3DLOCKED_RECT rect;
-	HRESULT res=m_pSrcTexture->LockRect(&rect,nullptr,D3DLOCK_NO_DIRTY_UPDATE);
-	if (res != D3D_OK || rect.pBits == nullptr || rect.Pitch < (Int)m_srcTexturePitch)
+	Int destinationPitch = 0;
+	Byte *destination = static_cast<Byte *>(m_pSrcTexture->Lock(
+		&destinationPitch));
+#if defined(_WIN64)
+	const Int requiredDestinationPitch = m_numCellsX * 4;
+#else
+	const Int requiredDestinationPitch = (Int)m_srcTexturePitch;
+#endif
+	if (destination == nullptr || destinationPitch < requiredDestinationPitch)
 	{
-		if (res == D3D_OK)
-			m_pSrcTexture->UnlockRect();
+		if (destination != nullptr) m_pSrcTexture->Unlock();
 		return FALSE;
 	}
 
 	const UnsignedInt srcHeight=(UnsignedInt)m_numCellsY+1;
 	Byte *source=(Byte *)m_srcTextureData;
-	Byte *destination=(Byte *)rect.pBits;
+#if defined(_WIN64)
+	for (UnsignedInt y=0; y<srcHeight; ++y)
+	{
+		const UnsignedShort *sourcePixels =
+			reinterpret_cast<const UnsignedShort *>(source);
+		Byte *destinationPixels = destination;
+		for (UnsignedInt x=0; x<(UnsignedInt)m_numCellsX; ++x)
+		{
+			const UnsignedShort pixel = sourcePixels[x];
+#if defined(RTS_DEBUG)
+			if (TheGlobalData && TheGlobalData->m_fogOfWarOn)
+			{
+				destinationPixels[0] = (pixel & 0x000f) * 17;
+				destinationPixels[1] = ((pixel >> 4) & 0x000f) * 17;
+				destinationPixels[2] = ((pixel >> 8) & 0x000f) * 17;
+				destinationPixels[3] = ((pixel >> 12) & 0x000f) * 17;
+			}
+			else
+#endif
+			{
+				const UnsignedInt blue = pixel & 0x001f;
+				const UnsignedInt green = (pixel >> 5) & 0x003f;
+				const UnsignedInt red = (pixel >> 11) & 0x001f;
+				destinationPixels[0] = (blue << 3) | (blue >> 2);
+				destinationPixels[1] = (green << 2) | (green >> 4);
+				destinationPixels[2] = (red << 3) | (red >> 2);
+				destinationPixels[3] = 0xff;
+			}
+			destinationPixels += 4;
+		}
+		destination+=destinationPitch;
+		source+=m_srcTexturePitch;
+	}
+#else
 	for (UnsignedInt y=0; y<srcHeight; ++y)
 	{
 		memcpy(destination,source,m_srcTexturePitch);
-		destination+=rect.Pitch;
+		destination+=destinationPitch;
 		source+=m_srcTexturePitch;
 	}
+#endif
 
-	m_pSrcTexture->UnlockRect();
+	Bool publicationSucceeded = TRUE;
+#if defined(_WIN64)
+	publicationSucceeded = m_pSrcTexture->Unlock_Native_Surface() ? TRUE : FALSE;
+#else
+	m_pSrcTexture->Unlock();
+#endif
+	if (!publicationSucceeded)
+	{
+		// Keep the CPU-owned source image dirty. SurfaceClass retains the
+		// converted bytes, so the next render can retry after device recovery.
+		return FALSE;
+	}
 	m_srcTextureDirty=FALSE;
 	return TRUE;
 }
@@ -452,11 +509,11 @@ void W3DShroud::fillShroudData(W3DShroudLevel level)
 	m_srcTextureDirty=TRUE;
 }
 
-void W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface)
+Bool W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface)
 {
 	if (!pDestSurface || m_numCellsX <= 0 ||
 		m_dstTextureWidth <= 0 || m_dstTextureHeight <= 0)
-		return;
+		return FALSE;
 
 	Int x,y;
 	UnsignedShort pixel;
@@ -499,7 +556,7 @@ void W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSu
 			ptr[x]=pixel;
 	m_srcTextureDirty=TRUE;
 	if (!syncSourceTexture())
-		return;
+		return FALSE;
 
 	//Fill destination texture with border color
 
@@ -526,27 +583,44 @@ void W3DShroud::fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSu
 		{
 			dstPoint.x = x * srcRect.right;	//advance to next set of pixel in row.
 
-			DX8Wrapper::_Copy_DX8_Rects(
-				m_pSrcTexture,
-				&srcRect,
-				1,
-				pDestSurface->Peek_D3D_Surface(),
-				&dstPoint);
+#if defined(_WIN64)
+			if (!pDestSurface->Copy_Native_No_Publish(dstPoint.x, dstPoint.y, srcRect.left,
+				srcRect.top, srcRect.right - srcRect.left, 1,
+				m_pSrcTexture))
+			{
+				return FALSE;
+			}
+#else
+			pDestSurface->Copy(dstPoint.x, dstPoint.y, srcRect.left,
+				srcRect.top, srcRect.right - srcRect.left, 1,
+				m_pSrcTexture);
+#endif
 		}
 		if (numExtraPixels)
 		{	Int oldVal=srcRect.right;
 			dstPoint.x = numFullCopies * oldVal;
 			srcRect.right = numExtraPixels;
-			DX8Wrapper::_Copy_DX8_Rects(
-				m_pSrcTexture,
-				&srcRect,
-				1,
-				pDestSurface->Peek_D3D_Surface(),
-				&dstPoint);
+#if defined(_WIN64)
+			if (!pDestSurface->Copy_Native_No_Publish(dstPoint.x, dstPoint.y, srcRect.left,
+				srcRect.top, srcRect.right - srcRect.left, 1,
+				m_pSrcTexture))
+			{
+				return FALSE;
+			}
+#else
+			pDestSurface->Copy(dstPoint.x, dstPoint.y, srcRect.left,
+				srcRect.top, srcRect.right - srcRect.left, 1,
+				m_pSrcTexture);
+#endif
 			srcRect.right = oldVal;
 		}
 	}
 
+#if defined(_WIN64)
+	return pDestSurface->Publish_Native_Changes();
+#else
+	return TRUE;
+#endif
 }
 
 /**Set the shroud color within the border area of the map*/
@@ -572,8 +646,14 @@ void W3DShroud::render(CameraClass *cam)
 	if (!m_pSrcTexture)
 		return; //nothing to update from.  Must be in reset state.
 
-	if (!DX8Wrapper::Is_Initted() || DX8Wrapper::Is_Device_Lost())
-		return;	//device not ready to render anything
+	// Shroud updates are published before WW3D::Begin_Render brackets the
+	// scene.  The publication owner, rather than the transient scene flag,
+	// reports whether the backend/device is initialized and operational; the
+	// destination texture must still own an initialized resource.
+	if (!rts::render::IsRenderTexturePublicationOperational() ||
+		!m_pDstTexture ||
+		!m_pDstTexture->Is_Initialized())
+		return;
 
 #if defined(RTS_DEBUG)
 	if (TheGlobalData && TheGlobalData->m_fogOfWarOn != m_drawFogOfWar)
@@ -769,25 +849,38 @@ void W3DShroud::render(CameraClass *cam)
 	if (destinationBorderDirty)
 	{	//we need to clear unused parts of the destination texture to a known
 		//color in order to keep map border in the state we want.
+		if (!fillBorderShroudData(m_boderShroudLevel, pDestSurface))
+		{
+			REF_PTR_RELEASE(pDestSurface);
+			return;
+		}
+		// Clear the retry latch only after every native border publication has
+		// succeeded. A failed copy leaves the CPU source and destination work
+		// dirty for the next render.
 		m_clearDstTexture=FALSE;
-
-		fillBorderShroudData(m_boderShroudLevel, pDestSurface);
 	}
 
 	if (updateDecision.copySource)
 	{
 		//USE_PERF_TIMER(shroudCopy)
-		DX8Wrapper::_Copy_DX8_Rects(
-				m_pSrcTexture,
-				&srcRect,
-				1,
-				pDestSurface->Peek_D3D_Surface(),
-				&dstPoint);
+#if defined(_WIN64)
+		if (!pDestSurface->Copy_Native(dstPoint.x, dstPoint.y, srcRect.left,
+			srcRect.top, srcRect.right - srcRect.left,
+			srcRect.bottom - srcRect.top, m_pSrcTexture))
+		{
+			m_clearDstTexture = TRUE;
+			REF_PTR_RELEASE(pDestSurface);
+			return;
+		}
+#else
+		pDestSurface->Copy(dstPoint.x, dstPoint.y, srcRect.left,
+			srcRect.top, srcRect.right - srcRect.left,
+			srcRect.bottom - srcRect.top, m_pSrcTexture);
+#endif
 	}
 	if (updateDecision.notifyTexture)
 	{
-		Notify_Render_Texture_Changed(
-			m_pDstTexture->Peek_D3D_Base_Texture());
+		Notify_Render_Texture_Changed(m_pDstTexture);
 	}
 
 	REF_PTR_RELEASE (pDestSurface);

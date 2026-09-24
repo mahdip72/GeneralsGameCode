@@ -1130,6 +1130,14 @@ Player  *Player::getCurrentEnemy()
 }
 
 //-------------------------------------------------------------------------------------------------
+/** Observe this player's current enemy without advancing AI planning state. */
+//-------------------------------------------------------------------------------------------------
+Player *Player::getCachedCurrentEnemy() const
+{
+	return m_ai ? m_ai->getCachedAiEnemy() : nullptr;
+}
+
+//-------------------------------------------------------------------------------------------------
 // PlayerObjectFindInfo is used to find a player's object. For example, we iterate through
 // to find a player's command center, or a specific building capable of firing the specified
 // special power.

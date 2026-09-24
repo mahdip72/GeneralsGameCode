@@ -59,7 +59,14 @@
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/FPUControl.h"
 #include "GameNetwork/GameInfo.h"
+#include "GameNetwork/FileTransfer.h"
 #include "GameNetwork/NetworkDefs.h"
+#if defined(_WIN64)
+#include "Lib/NetworkEpochHandshake.h"
+#include "Lib/NetworkMapPackageIdentity.h"
+#include "Lib/NetworkMapPackageTransaction.h"
+#include <cstring>
+#endif
 
 
 //-------------------------------------------------------------------------------
@@ -105,6 +112,230 @@ static UnsignedInt calcCRC( AsciiString fname )
 
 	return theCRC.get();
 }
+
+#if defined(_WIN64)
+void noteRecoveredMapFile(const char *path, void *)
+{
+	if (TheFileSystem != nullptr)
+		TheFileSystem->noteExternalFileReplacement(path);
+}
+
+Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName)
+{
+	return rts::network_epoch::NetworkMapPackageTransaction::isCommitting() ||
+		rts::network_epoch::NetworkMapPackageTransaction::recover(
+			mapName.str(), noteRecoveredMapFile);
+}
+
+Bool GetCurrentMapTransferContentsMask(const AsciiString &mapName,
+	UnsignedInt *maskOut)
+{
+	if (maskOut == nullptr)
+		return FALSE;
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
+		return FALSE;
+	*maskOut = 0U;
+	const AsciiString paths[] = {
+		mapName, GetPreviewFromMap(mapName), GetINIFromMap(mapName),
+		GetStrFileFromMap(mapName), GetSoloINIFromMap(mapName),
+		GetAssetUsageFromMap(mapName), GetReadmeFromMap(mapName)
+	};
+	for (Int i = 0; i < ARRAY_SIZE(paths); ++i)
+	{
+		File *file = TheFileSystem->openFile(paths[i].str(), File::READ);
+		if (file != nullptr)
+		{
+			*maskOut |= 1U << i;
+			file->close();
+		}
+	}
+	return TRUE;
+}
+#endif
+
+UnsignedInt GetMapFileCRC(const AsciiString &mapName)
+{
+#if defined(_WIN64)
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
+		return 0U;
+#endif
+	File *file = TheFileSystem->openFile(mapName.str(), File::READ);
+	if (!file)
+		return 0;
+	file->close();
+	return calcCRC(mapName);
+}
+
+Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc)
+{
+#if defined(_WIN64)
+	return rts::network_epoch::IsNetworkMapFileCRCValid(expectedCrc, localCrc);
+#else
+	return expectedCrc != 0U && localCrc != 0U && expectedCrc == localCrc;
+#endif
+}
+
+Int GetMapSimulationSidecarMask(const AsciiString &mapName)
+{
+#if defined(_WIN64)
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
+		return 0;
+#endif
+	const AsciiString paths[] = {
+		GetINIFromMap(mapName), GetSoloINIFromMap(mapName),
+		GetAssetUsageFromMap(mapName)
+	};
+	const Int maskBits[] = { 4, 16, 32 };
+	Int mask = 0;
+	for (Int i = 0; i < ARRAY_SIZE(paths); ++i)
+	{
+		File *file = TheFileSystem->openFile(paths[i].str(), File::READ);
+		if (file)
+		{
+			file->close();
+			mask |= maskBits[i];
+		}
+	}
+	return mask;
+}
+
+#if defined(_WIN64)
+namespace
+{
+
+class NetworkMapPackageCompanionReader
+{
+public:
+	NetworkMapPackageCompanionReader(const AsciiString *paths,
+		NetworkMapPackageCompanionOverride overrideFile, void *context)
+		: m_paths(paths), m_overrideFile(overrideFile), m_context(context),
+		  m_file(nullptr), m_stagedBytes(nullptr), m_stagedLength(0U),
+		  m_stagedOffset(0U), m_staged(false)
+	{}
+
+	int open(std::size_t index, std::uint32_t *lengthOut)
+	{
+		close();
+		if (m_paths == nullptr || lengthOut == nullptr ||
+			index >= rts::network_epoch::kNetworkMapPackageCompanionCount)
+			return -1;
+
+		const UnsignedByte *stagedBytes = nullptr;
+		UnsignedInt stagedLength = 0U;
+		if (m_overrideFile != nullptr &&
+			m_overrideFile(m_paths[index], &stagedBytes, &stagedLength, m_context))
+		{
+			if (stagedLength > 0x7fffffffU ||
+				(stagedLength != 0U && stagedBytes == nullptr))
+				return -1;
+			m_staged = true;
+			m_stagedBytes = stagedBytes;
+			m_stagedLength = stagedLength;
+			*lengthOut = stagedLength;
+			return 1;
+		}
+
+		if (TheFileSystem == nullptr)
+			return -1;
+		m_file = TheFileSystem->openFile(m_paths[index].str(), File::READ);
+		if (m_file == nullptr)
+			return 0;
+		const Int fileLength = m_file->size();
+		if (fileLength < 0)
+		{
+			close();
+			return -1;
+		}
+		*lengthOut = static_cast<std::uint32_t>(fileLength);
+		return 1;
+	}
+
+	int read(unsigned char *buffer, int requested)
+	{
+		if (buffer == nullptr || requested <= 0)
+			return -1;
+		if (m_staged)
+		{
+			if (m_stagedOffset > m_stagedLength)
+				return -1;
+			const UnsignedInt remaining = m_stagedLength - m_stagedOffset;
+			const UnsignedInt count = remaining < static_cast<UnsignedInt>(requested) ?
+				remaining : static_cast<UnsignedInt>(requested);
+			if (count == 0U)
+				return 0;
+			std::memcpy(buffer, m_stagedBytes + m_stagedOffset, count);
+			m_stagedOffset += count;
+			return static_cast<int>(count);
+		}
+		return m_file != nullptr ? m_file->read(buffer, requested) : -1;
+	}
+
+	void close()
+	{
+		if (m_file != nullptr)
+		{
+			m_file->close();
+			m_file = nullptr;
+		}
+		m_stagedBytes = nullptr;
+		m_stagedLength = 0U;
+		m_stagedOffset = 0U;
+		m_staged = false;
+	}
+
+private:
+	const AsciiString *m_paths;
+	NetworkMapPackageCompanionOverride m_overrideFile;
+	void *m_context;
+	File *m_file;
+	const UnsignedByte *m_stagedBytes;
+	UnsignedInt m_stagedLength;
+	UnsignedInt m_stagedOffset;
+	Bool m_staged;
+};
+
+} // namespace
+
+Bool GetNetworkMapPackageCompanionCRC(const AsciiString &mapName,
+	UnsignedInt *maskOut, UnsignedInt *crcOut)
+{
+	return GetProjectedNetworkMapPackageCompanionCRC(mapName, nullptr, nullptr,
+		maskOut, crcOut);
+}
+
+Bool GetProjectedNetworkMapPackageCompanionCRC(const AsciiString &mapName,
+	NetworkMapPackageCompanionOverride overrideFile, void *context,
+	UnsignedInt *maskOut, UnsignedInt *crcOut)
+{
+	if (crcOut == nullptr)
+		return FALSE;
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
+		return FALSE;
+	*crcOut = 0U;
+	if (maskOut != nullptr)
+		*maskOut = 0U;
+	const AsciiString paths[] = {
+		GetPreviewFromMap(mapName), GetINIFromMap(mapName),
+		GetStrFileFromMap(mapName), GetSoloINIFromMap(mapName),
+		GetAssetUsageFromMap(mapName), GetReadmeFromMap(mapName)
+	};
+	NetworkMapPackageCompanionReader reader(paths, overrideFile, context);
+	CRC crc;
+	std::uint32_t companionMask = 0U;
+	std::uint32_t companionCrc = 0U;
+	if (!rts::network_epoch::ComputeNetworkMapPackageIdentity(reader, crc,
+		&companionMask, &companionCrc))
+		return FALSE;
+	if (maskOut != nullptr)
+		*maskOut = static_cast<UnsignedInt>(companionMask);
+	*crcOut = static_cast<UnsignedInt>(companionCrc);
+	return TRUE;
+}
+#endif
 
 static Bool ParseObjectDataChunk(DataChunkInput &file, DataChunkInfo *info, void *userData)
 {
@@ -217,6 +448,11 @@ static Bool ParseSizeOnlyInChunk(DataChunkInput &file, DataChunkInfo *info, void
 
 static Bool loadMap( AsciiString filename )
 {
+#if defined(_WIN64)
+	NetworkMapReadGuard mapRead(filename.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
+		return FALSE;
+#endif
 	CachedFileInputStream fileStrm;
 
 	if( !fileStrm.open(filename) )
@@ -555,6 +791,13 @@ Bool MapCache::loadMapsFromDisk( const AsciiString &mapDir, Bool isOfficial, Boo
 			continue;
 		}
 
+#if defined(_WIN64)
+		// A crash may have replaced the .map itself before the journal was
+		// removed. Restore it before the cache records size or timestamp.
+		NetworkMapReadGuard mapRead(filepathIt->str(), noteRecoveredMapFile);
+		if (!mapRead.ready())
+			continue;
+#endif
 		if (!TheFileSystem->getFileInfo(*filepathIt, &fileInfo))
 		{
 			DEBUG_CRASH(("Could not get file info for map %s", filepathIt->str()));
@@ -579,6 +822,11 @@ Bool MapCache::addMap(
 	FileInfo &fileInfo,
 	Bool isOfficial)
 {
+#if defined(_WIN64)
+	NetworkMapReadGuard mapRead(fname.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
+		return FALSE;
+#endif
 	MapCache::iterator it = find(lowerFname);
 	if (it != end())
 	{
@@ -1143,6 +1391,11 @@ Image *getMapPreviewImage( AsciiString mapName )
 {
 	if(!TheGlobalData)
 		return nullptr;
+#if defined(_WIN64)
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
+		return nullptr;
+#endif
 	DEBUG_LOG(("%s Map Name", mapName.str()));
 	AsciiString tgaName = mapName;
 	AsciiString name;

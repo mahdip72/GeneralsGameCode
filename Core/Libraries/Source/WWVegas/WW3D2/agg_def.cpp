@@ -40,7 +40,7 @@
 #include "WWDebug/wwdebug.h"
 #include "assetmgr.h"
 #include "matinfo.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "WWLib/wwstring.h"
 
 #include <windows.h>

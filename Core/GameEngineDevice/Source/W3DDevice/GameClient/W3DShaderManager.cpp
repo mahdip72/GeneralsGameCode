@@ -38,7 +38,7 @@
 //
 // Created:   Mark Wilczynski, August 2001
 //
-// Desc:      Perform tests on currently selected WW3D/D3D device to determine
+// Desc:      Perform tests on the currently selected renderer to determine
 //			  which of our rendering features are supported.  The system allows
 //			  setting up a few custom shaders that are selected based on video
 //			  card features.
@@ -53,13 +53,96 @@
 //
 //-----------------------------------------------------------------------------
 
-#include "WW3D2/dx8wrapper.h"
-#include "Renderer/LegacyD3DMath.h"
+#include "Renderer/RenderGameClient.h"
+#include "WWLib/cpudetect.h"
+
+// Keep the source-level contract explicit without importing the renderer namespace.
+using rts::render::GAME_COLOR_WRITE_ALPHA;
+using rts::render::GAME_COLOR_WRITE_BLUE;
+using rts::render::GAME_COLOR_WRITE_GREEN;
+using rts::render::GAME_COLOR_WRITE_RED;
+using rts::render::GAME_PRIMITIVE_TRIANGLE_STRIP;
+using rts::render::GAME_RENDER_STATE_ALPHA_BLEND_ENABLE;
+using rts::render::GAME_RENDER_STATE_COLOR_WRITE_MASK;
+using rts::render::GAME_RENDER_STATE_DEPTH_FUNCTION;
+using rts::render::GAME_RENDER_STATE_DEPTH_WRITE;
+using rts::render::GAME_RENDER_STATE_DESTINATION_BLEND;
+using rts::render::GAME_RENDER_STATE_LIGHTING;
+using rts::render::GAME_RENDER_STATE_SOURCE_BLEND;
+using rts::render::GAME_RENDER_STATE_TEXTURE_FACTOR;
+using rts::render::GAME_TEXTURE_ARGUMENT_ALPHA_REPLICATE;
+using rts::render::GAME_TEXTURE_ARGUMENT_COMPLEMENT;
+using rts::render::GAME_TEXTURE_ARGUMENT_CURRENT;
+using rts::render::GAME_TEXTURE_ARGUMENT_DIFFUSE;
+using rts::render::GAME_TEXTURE_ARGUMENT_FACTOR;
+using rts::render::GAME_TEXTURE_ARGUMENT_TEXTURE;
+using rts::render::GAME_TEXTURE_COORDINATE_CAMERA_POSITION;
+using rts::render::GAME_TEXTURE_COORDINATE_PASSTHROUGH;
+using rts::render::GAME_TEXTURE_STAGE_ADDRESS_U;
+using rts::render::GAME_TEXTURE_STAGE_ADDRESS_V;
+using rts::render::GAME_TEXTURE_STAGE_ADDRESS_W;
+using rts::render::GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1;
+using rts::render::GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2;
+using rts::render::GAME_TEXTURE_STAGE_ALPHA_OPERATION;
+using rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT0;
+using rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT1;
+using rts::render::GAME_TEXTURE_STAGE_COLOR_ARGUMENT2;
+using rts::render::GAME_TEXTURE_STAGE_COLOR_OPERATION;
+using rts::render::GAME_TEXTURE_STAGE_COORDINATE_INDEX;
+using rts::render::GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER;
+using rts::render::GAME_TEXTURE_STAGE_MINIFICATION_FILTER;
+using rts::render::GAME_TEXTURE_STAGE_MIP_FILTER;
+using rts::render::GAME_TEXTURE_STAGE_TRANSFORM_FLAGS;
+using rts::render::GAME_TEXTURE_TRANSFORM_COUNT2;
+using rts::render::GAME_TEXTURE_TRANSFORM_DISABLED;
+using rts::render::GAME_TRANSFORM_TEXTURE0;
+using rts::render::GAME_TRANSFORM_TEXTURE1;
+using rts::render::GAME_TRANSFORM_TEXTURE2;
+using rts::render::GAME_TRANSFORM_TEXTURE3;
+using rts::render::GAME_TRANSFORM_VIEW;
+using rts::render::GAME_VERTEX_DIFFUSE;
+using rts::render::GAME_VERTEX_TEX1;
+using rts::render::GAME_VERTEX_TEX2;
+using rts::render::GAME_VERTEX_XYZRHW;
+using rts::render::RENDER_BLEND_DESTINATION_COLOR;
+using rts::render::RENDER_BLEND_INVERSE_SOURCE_ALPHA;
+using rts::render::RENDER_BLEND_ONE;
+using rts::render::RENDER_BLEND_SOURCE_ALPHA;
+using rts::render::RENDER_BLEND_SOURCE_COLOR;
+using rts::render::RENDER_BLEND_ZERO;
+using rts::render::RENDER_COMPARE_ALWAYS;
+using rts::render::RENDER_COMPARE_EQUAL;
+using rts::render::RENDER_COMPARE_LESS_EQUAL;
+using rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION;
+using rts::render::RENDER_LEGACY_PIXEL_FLAT_TERRAIN_BASE;
+using rts::render::RENDER_LEGACY_PIXEL_FLAT_TERRAIN_BASE0;
+using rts::render::RENDER_LEGACY_PIXEL_FLAT_TERRAIN_NOISE;
+using rts::render::RENDER_LEGACY_PIXEL_FLAT_TERRAIN_NOISE2;
+using rts::render::RENDER_LEGACY_PIXEL_MONOCHROME;
+using rts::render::RENDER_LEGACY_PIXEL_ROAD_NOISE2;
+using rts::render::RENDER_LEGACY_PIXEL_TERRAIN_BASE;
+using rts::render::RENDER_LEGACY_PIXEL_TERRAIN_NOISE;
+using rts::render::RENDER_LEGACY_PIXEL_TERRAIN_NOISE2;
+using rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION;
+using rts::render::RENDER_TEXTURE_ADDRESS_CLAMP;
+using rts::render::RENDER_TEXTURE_ADDRESS_WRAP;
+using rts::render::RENDER_TEXTURE_FILTER_LINEAR;
+using rts::render::RENDER_TEXTURE_FILTER_NONE;
+using rts::render::RENDER_TEXTURE_FILTER_POINT;
+using rts::render::RENDER_TEXTURE_OP_ADD;
+using rts::render::RENDER_TEXTURE_OP_BLEND_CURRENT_ALPHA;
+using rts::render::RENDER_TEXTURE_OP_DISABLE;
+using rts::render::RENDER_TEXTURE_OP_DOT_PRODUCT_3;
+using rts::render::RENDER_TEXTURE_OP_MODULATE;
+using rts::render::RENDER_TEXTURE_OP_MULTIPLY_ADD;
+using rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+using rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
+
+#include "Renderer/RenderMatrixMath.h"
 #include "WW3D2/assetmgr.h"
 #include "Lib/BaseType.h"
-#include "Common/file.h"
-#include "Common/FileSystem.h"
 #include "W3DDevice/GameClient/W3DShaderManager.h"
+#include "WW3D2/camera.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/GameClient/W3DCustomScene.h"
@@ -71,7 +154,6 @@
 #include "GameLogic/GameLogic.h"
 #include "Common/GlobalData.h"
 #include "Common/GameLOD.h"
-#include "WW3D2/dx8caps.h"
 
 
 // Turn this on to turn off pixel shaders. jba[4/3/2003]
@@ -88,8 +170,8 @@ public:
 	 ///do any custom resetting necessary to bring W3D in sync.
 	virtual void reset() {
 		ShaderClass::Invalidate();
-		DX8Wrapper::Set_DX8_Texture(0, nullptr);
-		DX8Wrapper::Set_DX8_Texture(1, nullptr);};
+		rts::render::SetGameTexture(0, nullptr);
+		rts::render::SetGameTexture(1, nullptr);};
 	virtual Int init() = 0;			///<perform any one time initialization and validation
 	virtual Int shutdown() { return TRUE;};			///<release resources used by shader
 protected:
@@ -109,10 +191,20 @@ GraphicsVenderID W3DShaderManager::m_currentVendor;
 __int64 W3DShaderManager::m_driverVersion;
 
 Bool W3DShaderManager::m_renderingToTexture = false;
-IDirect3DSurface8 *W3DShaderManager::m_oldRenderSurface=nullptr;	///<previous render target
-IDirect3DTexture8 *W3DShaderManager::m_renderTexture=nullptr;		///<texture into which rendering will be redirected.
-IDirect3DSurface8 *W3DShaderManager::m_newRenderSurface=nullptr;	///<new render target inside m_renderTexture
-IDirect3DSurface8 *W3DShaderManager::m_oldDepthSurface=nullptr;	///<previous depth buffer surface
+Bool W3DShaderManager::m_renderTargetAvailable = false;	///<native owner published a valid RTT target
+TextureClass *W3DShaderManager::m_renderTexture=nullptr;		///<texture into which rendering will be redirected.
+
+// Filter quads are intentionally submitted through the same immediate-mode
+// seam used by the rest of GameEngineDevice.  The helper keeps the compact
+// quad call sites readable while preserving the failure latch: a rejected
+// submission must not be reported as a successfully rendered filter pass.
+static Bool DrawGameTriangleStrip(const void *vertices, unsigned int stride,
+	unsigned int vertexFormat)
+{
+	return rts::render::DrawGamePrimitiveUP(
+		rts::render::GAME_PRIMITIVE_TRIANGLE_STRIP, 2, vertices, stride,
+		vertexFormat) == rts::render::RENDER_RESULT_OK;
+}
 /*===========================================================================================*/
 /*=========      Screen Shaders	=============================================================*/
 /*===========================================================================================*/
@@ -148,7 +240,7 @@ Int ScreenDefaultFilter::init()
 	}
 
 	//Can render to texture, but we don't know if it can read and write to the same texture.
-	//Since there is no D3D caps bit to tell you this, we will just hard-code some specific
+	//Since there is no renderer capability bit to tell you this, we will just hard-code some specific
 	//cards that we know should work.
 
 	Int res;
@@ -182,10 +274,18 @@ Bool ScreenDefaultFilter::preRender(Bool &skipRender, CustomScenePassModes &scen
 
 Bool ScreenDefaultFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doExtraRender)
 {
-	IDirect3DTexture8 * tex =	W3DShaderManager::endRenderToTexture();
+	TextureClass * tex =	W3DShaderManager::endRenderToTexture();
 	DEBUG_ASSERTCRASH(tex, ("Require rendered texture."));
-	if (!tex) return false;
-	if (!set(mode)) return false;
+	if (!tex)
+	{
+		reset();
+		return false;
+	}
+	if (!set(mode))
+	{
+		reset();
+		return false;
+	}
 
 	struct _TRANS_LIT_TEX_VERTEX {
 		Vector4 p;
@@ -196,7 +296,7 @@ Bool ScreenDefaultFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool
 
 	Int xpos, ypos, width, height;
 
-	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
+	rts::render::SetGameTexture(0,tex);	//previously rendered frame inside this texture
 	TheTacticalView->getOrigin(&xpos,&ypos);
 	width=TheTacticalView->getWidth();
 	height=TheTacticalView->getHeight();
@@ -220,13 +320,18 @@ Bool ScreenDefaultFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	DX8Wrapper::Set_Legacy_Vertex_Program(
+	rts::render::SetGameLegacyVertexProgram(
 		rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-	DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	rts::render::SetGameVertexShader(GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1);
 
-	DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	if (!DrawGameTriangleStrip(v, sizeof(_TRANS_LIT_TEX_VERTEX),
+		GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1))
+	{
+		reset();
+		return false;
+	}
 
 	reset();
 	return true;
@@ -235,31 +340,31 @@ Bool ScreenDefaultFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool
 Int ScreenDefaultFilter::set(FilterModes mode)
 {
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(vmat);
+	rts::render::SetGameMaterial(vmat);
 	REF_PTR_RELEASE(vmat);	//no need to keep a reference since it's a preset.
-	DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
-	DX8Wrapper::Set_Legacy_Vertex_Program(
+	rts::render::SetGameShader(ShaderClass::_PresetOpaqueShader);
+	rts::render::SetGameLegacyVertexProgram(
 		rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-	DX8Wrapper::Set_Texture(0,nullptr);
-	DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+	rts::render::SetGameTexture(0,nullptr);
+	rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_ALWAYS);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,FALSE);
-	DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_ALWAYS);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_WRITE,FALSE);
+	rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 
 	return true;
 }
 
 void ScreenDefaultFilter::reset()
 {
-	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
-	DX8Wrapper::Set_Legacy_Vertex_Program(
+	rts::render::SetGameTexture(0,nullptr);	//previously rendered frame inside this texture
+	rts::render::SetGameLegacyVertexProgram(
 		rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::InvalidateGameRenderStateCache();
 }
 
 /*=========  ScreenBWFilter	=============================================================*/
@@ -284,7 +389,6 @@ W3DFilterInterface *ScreenBWFilterList[]=
 Int ScreenBWFilter::init()
 {
 	Int res;
-	HRESULT hr;
 
 	m_dwBWPixelShader = 0;
 	m_curFadeFrame = 0;
@@ -298,20 +402,10 @@ Int ScreenBWFilter::init()
 	{
 		if (res >= DC_GENERIC_PIXEL_SHADER_1_1)
 		{
-			//this shader needs some assets that need to be loaded
-			//shader decleration
-			DWORD Declaration[]=
-			{
-				(D3DVSD_STREAM(0)),
-				(D3DVSD_REG(0, D3DVSDT_FLOAT3)), // Position
-				(D3DVSD_REG(1, D3DVSDT_D3DCOLOR)), // Diffuse
-				(D3DVSD_REG(2, D3DVSDT_FLOAT2)), //  Texture Coordinates
-				(D3DVSD_END())
-			};
-
 			//Monochrome pixel shader.
-			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\monochrome.pso", &Declaration[0], 0, false, &m_dwBWPixelShader);
-			if (FAILED(hr))
+			if (rts::render::CreateGameShaderFromAsset(
+				"shaders\\monochrome.pso", false, nullptr, 0, 0,
+				&m_dwBWPixelShader) != rts::render::RENDER_RESULT_OK)
 				return FALSE;
 
 			W3DFilters[FT_VIEW_BW_FILTER]=&screenBWFilter;
@@ -326,15 +420,23 @@ Bool ScreenBWFilter::preRender(Bool &skipRender, CustomScenePassModes &scenePass
 {
 	skipRender = false;
 	W3DShaderManager::startRenderToTexture();
-	return true;
+	return W3DShaderManager::isRenderingToTexture();
 }
 
 Bool ScreenBWFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doExtraRender)
 {
-	IDirect3DTexture8 * tex =	W3DShaderManager::endRenderToTexture();
+	TextureClass * tex =	W3DShaderManager::endRenderToTexture();
 	DEBUG_ASSERTCRASH(tex, ("Require rendered texture."));
-	if (!tex) return false;
-	if (!set(mode)) return false;
+	if (!tex)
+	{
+		reset();
+		return false;
+	}
+	if (!set(mode))
+	{
+		reset();
+		return false;
+	}
 
 	struct _TRANS_LIT_TEX_VERTEX {
 		Vector4 p;
@@ -345,7 +447,7 @@ Bool ScreenBWFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doE
 
 	Int xpos, ypos, width, height;
 
-	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
+	rts::render::SetGameTexture(0,tex);	//previously rendered frame inside this texture
 	TheTacticalView->getOrigin(&xpos,&ypos);
 	width=TheTacticalView->getWidth();
 	height=TheTacticalView->getHeight();
@@ -369,9 +471,14 @@ Bool ScreenBWFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doE
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	rts::render::SetGameVertexShader(GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1);
 
-	DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	if (!DrawGameTriangleStrip(v, sizeof(_TRANS_LIT_TEX_VERTEX),
+		GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1))
+	{
+		reset();
+		return false;
+	}
 
 	reset();
 	return true;
@@ -379,8 +486,6 @@ Bool ScreenBWFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doE
 
 Int ScreenBWFilter::set(FilterModes mode)
 {
-	HRESULT hr;
-
 	if (mode > FM_NULL_MODE)
 	{	//rendering a quad with redirected rendering surface tinted by pixel shader
 
@@ -419,24 +524,23 @@ Int ScreenBWFilter::set(FilterModes mode)
 		}
 
 		VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-		DX8Wrapper::Set_Material(vmat);
+		rts::render::SetGameMaterial(vmat);
 		REF_PTR_RELEASE(vmat);	//no need to keep a reference since it's a preset.
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Set_Legacy_Vertex_Program(
+		rts::render::SetGameShader(ShaderClass::_PresetOpaqueShader);
+		rts::render::SetGameLegacyVertexProgram(
 			rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-		DX8Wrapper::Set_Texture(0,nullptr);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+		rts::render::SetGameTexture(0,nullptr);
+		rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_ALWAYS);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,FALSE);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_ALWAYS);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_WRITE,FALSE);
+		rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 
-		DX8Wrapper::Set_Pixel_Shader(m_dwBWPixelShader);
-		DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::SetGamePixelShader(m_dwBWPixelShader);
+		rts::render::SetGameLegacyPixelProgram(
 			rts::render::RENDER_LEGACY_PIXEL_MONOCHROME);
-		hr = S_OK;
 		Vector4 lumaWeights(0.3f, 0.59f, 0.11f, 1.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(0, &lumaWeights, 1);
+		rts::render::SetGamePixelShaderConstant(0, &lumaWeights, 1);
 
 		Vector4	color(1.0f,1.0f,1.0f,1.0f);	//multiply color
 
@@ -464,9 +568,9 @@ Int ScreenBWFilter::set(FilterModes mode)
 			color.Z = 0.0f;
 		}
 
-		DX8Wrapper::Set_Pixel_Shader_Constant(1, &color, 1);
+		rts::render::SetGamePixelShaderConstant(1, &color, 1);
 		Vector4 fade(m_curFadeValue, m_curFadeValue, m_curFadeValue, 1.0f);
-		DX8Wrapper::Set_Pixel_Shader_Constant(2, &fade, 1);
+		rts::render::SetGamePixelShaderConstant(2, &fade, 1);
 		return true;
 	}
 	return false;
@@ -474,19 +578,19 @@ Int ScreenBWFilter::set(FilterModes mode)
 
 void ScreenBWFilter::reset()
 {
-	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
-	DX8Wrapper::Set_Pixel_Shader(0);
-	DX8Wrapper::Set_Legacy_Vertex_Program(
+	rts::render::SetGameTexture(0,nullptr);	//previously rendered frame inside this texture
+	rts::render::SetGamePixelShader(0);
+	rts::render::SetGameLegacyVertexProgram(
 		rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::InvalidateGameRenderStateCache();
 }
 
 Int ScreenBWFilter::shutdown()
 {
 	if (m_dwBWPixelShader)
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_dwBWPixelShader);
+		(void)rts::render::DeleteGameShader(false, m_dwBWPixelShader);
 
 	m_dwBWPixelShader=0;
 
@@ -517,15 +621,23 @@ Bool ScreenBWFilterDOT3::preRender(Bool &skipRender, CustomScenePassModes &scene
 {
 	skipRender = false;
 	W3DShaderManager::startRenderToTexture();
-	return true;
+	return W3DShaderManager::isRenderingToTexture();
 }
 
 Bool ScreenBWFilterDOT3::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doExtraRender)
 {
-	IDirect3DTexture8 * tex =	W3DShaderManager::endRenderToTexture();
+	TextureClass * tex =	W3DShaderManager::endRenderToTexture();
 	DEBUG_ASSERTCRASH(tex, ("Require rendered texture."));
-	if (!tex) return false;
-	if (!set(mode)) return false;
+	if (!tex)
+	{
+		reset();
+		return false;
+	}
+	if (!set(mode))
+	{
+		reset();
+		return false;
+	}
 
 	struct _TRANS_LIT_TEX_VERTEX {
 		Vector4 p;
@@ -562,42 +674,52 @@ Bool ScreenBWFilterDOT3::postRender(FilterModes mode, Coord2D &scrollDelta,Bool 
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	rts::render::SetGameVertexShader(GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1);
 
 	//Draw B&W version first
-	if (DX8Wrapper::Get_Current_Caps()->Support_Dot3())
+	if (rts::render::GameRendererSupportsDot3())
 	{	//Override W3D states with customizations for grayscale
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_TEXTUREFACTOR, 0x80A5CA8E);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG0, D3DTA_TFACTOR | D3DTA_ALPHAREPLICATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_TFACTOR | D3DTA_ALPHAREPLICATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP, D3DTOP_MULTIPLYADD);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_CURRENT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP, D3DTOP_DOTPRODUCT3);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_TEXTURE_FACTOR, 0x80A5CA8E);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT0, GAME_TEXTURE_ARGUMENT_FACTOR | GAME_TEXTURE_ARGUMENT_ALPHA_REPLICATE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR | GAME_TEXTURE_ARGUMENT_ALPHA_REPLICATE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_MULTIPLY_ADD);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_CURRENT);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_DOT_PRODUCT_3);
 	}
 	else
 	{	//doesn't have DOT3 blend mode so fake it another way.
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_TEXTUREFACTOR, 0x60606060);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_TEXTURE_FACTOR, 0x60606060);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_MODULATE);
 	}
 
-	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
+	rts::render::SetGameTexture(0,tex);	//previously rendered frame inside this texture
 
-	DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	if (!DrawGameTriangleStrip(v, sizeof(_TRANS_LIT_TEX_VERTEX),
+		GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1))
+	{
+		reset();
+		return false;
+	}
 
 	//Draw normal view blended by current fade level
 	ShaderClass::Invalidate();	//reset DOT3 blend from above.
 	ShaderClass shader=ShaderClass::_PresetAlphaShader;
 	shader.Set_Depth_Compare(ShaderClass::PASS_ALWAYS);
-	DX8Wrapper::Set_Shader(shader);
-	DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+	rts::render::SetGameShader(shader);
+	rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 	//replace texture alpha with vertex alpha
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG2);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION, RENDER_TEXTURE_OP_SELECT_ARGUMENT_2);
 
-	DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	if (!DrawGameTriangleStrip(v, sizeof(_TRANS_LIT_TEX_VERTEX),
+		GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1))
+	{
+		reset();
+		return false;
+	}
 
 	reset();
 	return true;
@@ -643,19 +765,19 @@ Int ScreenBWFilterDOT3::set(FilterModes mode)
 		}
 
 		VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-		DX8Wrapper::Set_Material(vmat);
+		rts::render::SetGameMaterial(vmat);
 		REF_PTR_RELEASE(vmat);	//no need to keep a reference since it's a preset.
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Set_Legacy_Vertex_Program(
+		rts::render::SetGameShader(ShaderClass::_PresetOpaqueShader);
+		rts::render::SetGameLegacyVertexProgram(
 			rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-		DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::SetGameLegacyPixelProgram(
 			rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-		DX8Wrapper::Set_Texture(0,nullptr);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+		rts::render::SetGameTexture(0,nullptr);
+		rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_ALWAYS);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,FALSE);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_ALWAYS);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_WRITE,FALSE);
+		rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 
 		return true;
 	}
@@ -664,12 +786,12 @@ Int ScreenBWFilterDOT3::set(FilterModes mode)
 
 void ScreenBWFilterDOT3::reset()
 {
-	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
-	DX8Wrapper::Set_Legacy_Vertex_Program(
+	rts::render::SetGameTexture(0,nullptr);	//previously rendered frame inside this texture
+	rts::render::SetGameLegacyVertexProgram(
 		rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::InvalidateGameRenderStateCache();
 }
 
 Int ScreenBWFilterDOT3::shutdown()
@@ -766,6 +888,11 @@ Bool ScreenCrossFadeFilter::preRender(Bool &skipRender, CustomScenePassModes &sc
 	if (updateFadeLevel())
 	{	//if fade has not completed
 		W3DShaderManager::startRenderToTexture();
+		if (!W3DShaderManager::isRenderingToTexture())
+		{
+			m_skipRender = false;
+			return false;
+		}
 		scenePassMode=SCENE_PASS_ALPHA_MASK;
 		skipRender = false;
 		m_skipRender=true;	//tell the postRender function not to draw into framebuffer yet.
@@ -777,7 +904,7 @@ Bool ScreenCrossFadeFilter::preRender(Bool &skipRender, CustomScenePassModes &sc
 
 Bool ScreenCrossFadeFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doExtraRender)
 {
-	IDirect3DTexture8 * tex;
+	TextureClass * tex;
 
 	if (m_skipRender)
 	{
@@ -792,8 +919,16 @@ Bool ScreenCrossFadeFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bo
 	tex=W3DShaderManager::getRenderTexture();
 
 	DEBUG_ASSERTCRASH(tex, ("Require last rendered texture."));
-	if (!tex) return false;
-	if (!set(mode)) return false;
+	if (!tex)
+	{
+		reset();
+		return false;
+	}
+	if (!set(mode))
+	{
+		reset();
+		return false;
+	}
 
 	struct _TRANS_LIT_TEX_VERTEX {
 		Vector4 p;
@@ -807,9 +942,9 @@ Bool ScreenCrossFadeFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bo
 	Int xpos, ypos, width, height;
 	Real radius = 0.0f;
 
-	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
+	rts::render::SetGameTexture(0,tex);	//previously rendered frame inside this texture
 	if (mode == FM_VIEW_CROSSFADE_CIRCLE)
-	{	DX8Wrapper::Set_DX8_Texture(1,m_fadePatternTexture->Peek_D3D_Texture());
+	{	rts::render::SetGameTexture(1, m_fadePatternTexture);
 		//Use the current fade level to scale the mask texture, for other modes the texture
 		//comes pre-scaled so doesn't require uv scaling.
 		radius = (1.0f-m_curFadeValue)*2.0f;
@@ -853,12 +988,14 @@ Bool ScreenCrossFadeFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bo
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX2);
+	rts::render::SetGameVertexShader(GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX2);
 
-//		m_pDev->SetTextureStageState(0,D3DTSS_MAGFILTER,D3DTEXF_POINT);
-//		m_pDev->SetTextureStageState(0,D3DTSS_MINFILTER,D3DTEXF_POINT);
-
-	DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	if (!DrawGameTriangleStrip(v, sizeof(_TRANS_LIT_TEX_VERTEX),
+		GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX2))
+	{
+		reset();
+		return false;
+	}
 
 	reset();
 	return true;
@@ -869,36 +1006,36 @@ Int ScreenCrossFadeFilter::set(FilterModes mode)
 	if (mode > FM_NULL_MODE)
 	{	//rendering a quad with redirected rendering surface
 		VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-		DX8Wrapper::Set_Material(vmat);
+		rts::render::SetGameMaterial(vmat);
 		REF_PTR_RELEASE(vmat);	//no need to keep a reference since it's a preset.
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetAlphaShader);
-		DX8Wrapper::Set_Legacy_Vertex_Program(
+		rts::render::SetGameShader(ShaderClass::_PresetAlphaShader);
+		rts::render::SetGameLegacyVertexProgram(
 			rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-		DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::SetGameLegacyPixelProgram(
 			rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-		DX8Wrapper::Set_Texture(0,nullptr);
-		DX8Wrapper::Set_Texture(1,nullptr);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+		rts::render::SetGameTexture(0,nullptr);
+		rts::render::SetGameTexture(1,nullptr);
+		rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
 
 		if (mode == FM_VIEW_CROSSFADE_CIRCLE)
 		{	//cross-fading using circle mask stored in stage 1
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_CURRENT );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAARG2, D3DTA_CURRENT );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_MODULATE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, 1 );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_MIPFILTER, D3DTEXF_NONE);
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 1 );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_NONE);
 		}
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_ALWAYS);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,FALSE);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_ALWAYS);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_WRITE,FALSE);
 
 		return true;
 	}
@@ -907,14 +1044,14 @@ Int ScreenCrossFadeFilter::set(FilterModes mode)
 
 void ScreenCrossFadeFilter::reset()
 {
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
-	DX8Wrapper::Set_Legacy_Vertex_Program(
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+	rts::render::SetGameTexture(0,nullptr);	//previously rendered frame inside this texture
+	rts::render::SetGameLegacyVertexProgram(
 		rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::InvalidateGameRenderStateCache();
 }
 
 Int ScreenCrossFadeFilter::shutdown()
@@ -960,15 +1097,28 @@ Bool ScreenMotionBlurFilter::preRender(Bool &skipRender, CustomScenePassModes &s
 {
 	skipRender = m_skipRender;
 	W3DShaderManager::startRenderToTexture();
+	if (!W3DShaderManager::isRenderingToTexture())
+	{
+		skipRender = false;
+		return false;
+	}
 	return true;
 }
 
 Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,Bool &doExtraRender)
 {
-	IDirect3DTexture8 * tex =	W3DShaderManager::endRenderToTexture();
+	TextureClass * tex =	W3DShaderManager::endRenderToTexture();
 	DEBUG_ASSERTCRASH(tex, ("Require rendered texture."));
-	if (!tex) return false;
-	if (!set(mode)) return false;
+	if (!tex)
+	{
+		reset();
+		return false;
+	}
+	if (!set(mode))
+	{
+		reset();
+		return false;
+	}
 
 	Bool continueEffect = true;
 	struct _TRANS_LIT_TEX_VERTEX {
@@ -980,7 +1130,7 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 
 	Int xpos, ypos, width, height;
 
-	DX8Wrapper::Set_DX8_Texture(0,tex);	//previously rendered frame inside this texture
+	rts::render::SetGameTexture(0,tex);	//previously rendered frame inside this texture
 	TheTacticalView->getOrigin(&xpos,&ypos);
 	width=TheTacticalView->getWidth();
 	height=TheTacticalView->getHeight();
@@ -1004,17 +1154,17 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 
 
 	if (m_additive) {
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_ONE);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_SOURCE_BLEND,RENDER_BLEND_SOURCE_ALPHA);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DESTINATION_BLEND,RENDER_BLEND_ONE);
 	} else {
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_SOURCE_BLEND,RENDER_BLEND_SOURCE_ALPHA);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DESTINATION_BLEND,RENDER_BLEND_INVERSE_SOURCE_ALPHA);
 	}
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,false);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE,false);
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	DX8Wrapper::Apply_Render_State_Changes();
-	DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	rts::render::ApplyGameRenderStateChanges();
+	rts::render::SetGameVertexShader(GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1);
 
 	Coord2D center;
 	center.x = 0.5f;
@@ -1034,8 +1184,11 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 		m_priorDelta = scrollDelta;
 	} else if (mode == FM_VIEW_MB_END_PAN_ALPHA) {
 		Real len = sqrt(m_priorDelta.x*m_priorDelta.x + m_priorDelta.y*m_priorDelta.y);
-		center.x += 0.5f * (m_priorDelta.x/len);
-		center.y -= 0.5f * (m_priorDelta.y/len);
+		if (len > 0.0f)
+		{
+			center.x += 0.5f * (m_priorDelta.x/len);
+			center.y -= 0.5f * (m_priorDelta.y/len);
+		}
 		m_decrement = false;
 		m_maxCount--;
 		if (m_maxCount<2) {
@@ -1078,13 +1231,18 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 			v[i].v = ((v[i].v-center.y)*factor) + center.y;
 		}
 	}
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAARG1, D3DTA_CURRENT);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAARG2, D3DTA_TEXTURE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-	DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,true);
+	rts::render::SetGameTextureStageState(0,GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_CURRENT);
+	rts::render::SetGameTextureStageState(0,GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_TEXTURE);
+	rts::render::SetGameTextureStageState(0,GAME_TEXTURE_STAGE_ALPHA_OPERATION, RENDER_TEXTURE_OP_SELECT_ARGUMENT_1);
+	if (!DrawGameTriangleStrip(v, sizeof(_TRANS_LIT_TEX_VERTEX),
+		GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1))
+	{
+		reset();
+		return false;
+	}
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE,true);
 
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 	{
 		Int limit = m_maxCount;
 		if (m_maxCount>30) limit = 30;
@@ -1109,7 +1267,12 @@ Bool ScreenMotionBlurFilter::postRender(FilterModes mode, Coord2D &scrollDelta,B
 					v[i].v = ((v[i].v-center.y)*factor) + center.y;
 				}
 			}
-			DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+			if (!DrawGameTriangleStrip(v, sizeof(_TRANS_LIT_TEX_VERTEX),
+				GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1))
+			{
+				reset();
+				return false;
+			}
 
 		}
 	}
@@ -1165,32 +1328,32 @@ Int ScreenMotionBlurFilter::set(FilterModes mode)
 	{	//rendering a quad with redirected rendering surface motion blurred
 
 		VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-		DX8Wrapper::Set_Material(vmat);
+		rts::render::SetGameMaterial(vmat);
 		REF_PTR_RELEASE(vmat);	//no need to keep a reference since it's a preset.
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Set_Legacy_Vertex_Program(
+		rts::render::SetGameShader(ShaderClass::_PresetOpaqueShader);
+		rts::render::SetGameLegacyVertexProgram(
 			rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-		DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::SetGameLegacyPixelProgram(
 			rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-		DX8Wrapper::Set_Texture(0,nullptr);
-		DX8Wrapper::Set_Texture(1,nullptr);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+		rts::render::SetGameTexture(0,nullptr);
+		rts::render::SetGameTexture(1,nullptr);
+		rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_ALWAYS);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,FALSE);
-		DX8Wrapper::Apply_Render_State_Changes();	//force update of view and projection matrices
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_ALWAYS);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_WRITE,FALSE);
+		rts::render::ApplyGameRenderStateChanges();	//force update of view and projection matrices
 	}
 	return TRUE;
 }
 
 void ScreenMotionBlurFilter::reset()
 {
-	DX8Wrapper::Set_DX8_Texture(0,nullptr);	//previously rendered frame inside this texture
-	DX8Wrapper::Set_Legacy_Vertex_Program(
+	rts::render::SetGameTexture(0,nullptr);	//previously rendered frame inside this texture
+	rts::render::SetGameLegacyVertexProgram(
 		rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::InvalidateGameRenderStateCache();
 }
 
 Int ScreenMotionBlurFilter::shutdown()
@@ -1233,40 +1396,40 @@ Int ShroudTextureShader::set(Int stage)
 {
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(vmat);
+	rts::render::SetGameMaterial(vmat);
 	REF_PTR_RELEASE(vmat);	//no need to keep a reference since it's a preset.
-	DX8Wrapper::Set_Texture(stage, W3DShaderManager::getShaderTexture(0));	//shroud always stored in texture 0
+	rts::render::SetGameTexture(stage, W3DShaderManager::getShaderTexture(0));	//shroud always stored in texture 0
 
 	if (stage == 0)
 	{
 #if defined(RTS_DEBUG)
 	if (TheGlobalData && TheGlobalData->m_fogOfWarOn)
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetAlphaSpriteShader);
+		rts::render::SetGameShader(ShaderClass::_PresetAlphaSpriteShader);
 	else
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetMultiplicativeSpriteShader);
+		rts::render::SetGameShader(ShaderClass::_PresetMultiplicativeSpriteShader);
 #else
-	DX8Wrapper::Set_Shader(ShaderClass::_PresetMultiplicativeSpriteShader);
+	rts::render::SetGameShader(ShaderClass::_PresetMultiplicativeSpriteShader);
 #endif
 	}
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_EQUAL);
+	rts::render::SetGameTextureStageState(stage,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
+	rts::render::SetGameTextureStageState(stage,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_EQUAL);
 
 	//We need to scale so shroud texel stretches over one full terrain cell.  Each texel
 	//is 1/128 the size of full texture. (assuming 128x128 vid-mem texture).
 	W3DShroud *shroud;
 	if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr)
 	{	///@todo: All this code really only need to be done once per camera/view.  Find a way to optimize it out.
-		D3DMATRIX curView;
-		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+		RenderMatrix4x4 curView;
+		rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 		float det;
-		LegacyD3DMatrixInverse(&inv, &det, &curView);
+		RenderMatrixInverse(&inv, &det, &curView);
 
-		D3DMATRIX scale,offset;
+		RenderMatrix4x4 scale,offset;
 
 		//We need to make all world coordinates be relative to the heightmap data origin since that
 		//is where the shroud begins.
@@ -1282,14 +1445,14 @@ D3DMATRIX inv;
 			yoffset = -(float)shroud->getDrawOriginY() + height;
 		}
 
-		LegacyD3DMatrixTranslation(&offset, xoffset, yoffset,0);
+		RenderMatrixTranslation(&offset, xoffset, yoffset,0);
 
 		width = 1.0f/(width*shroud->getTextureWidth());
 		height = 1.0f/(height*shroud->getTextureHeight());
-		LegacyD3DMatrixScaling(&scale, width, height, 1);
-		LegacyD3DMatrixMultiply(&curView, &inv, &offset);
-		LegacyD3DMatrixMultiply(&curView, &curView, &scale);
-		DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0+stage), curView);
+		RenderMatrixScaling(&scale, width, height, 1);
+		RenderMatrixMultiply(&curView, &inv, &offset);
+		RenderMatrixMultiply(&curView, &curView, &scale);
+		rts::render::SetGameTransform(static_cast<rts::render::GameRenderTransformSlot>(GAME_TRANSFORM_TEXTURE0+stage), &curView);
 	}
 	m_stageOfSet=stage;
 	return TRUE;
@@ -1297,10 +1460,10 @@ D3DMATRIX inv;
 
 void ShroudTextureShader::reset()
 {
-	DX8Wrapper::Set_Texture(m_stageOfSet,nullptr);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(m_stageOfSet,  D3DTSS_TEXCOORDINDEX, m_stageOfSet);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(m_stageOfSet,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+	rts::render::SetGameTexture(m_stageOfSet,nullptr);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_LESS_EQUAL);
+	rts::render::SetGameTextureStageState(m_stageOfSet,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, m_stageOfSet);
+	rts::render::SetGameTextureStageState(m_stageOfSet,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
 }
 
 ///Shroud layer rendering shader
@@ -1334,32 +1497,32 @@ Int FlatShroudTextureShader::set(Int stage)
 {
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
 	if (stage < 2)
-		DX8Wrapper::Set_Texture(stage, W3DShaderManager::getShaderTexture(stage));
-	else	//stages larger than 1 are not supported by W3D so set them directly
-		DX8Wrapper::Set_DX8_Texture(stage, W3DShaderManager::getShaderTexture(stage)->Peek_D3D_Texture());
+		rts::render::SetGameTexture(stage, W3DShaderManager::getShaderTexture(stage));
+	else
+		rts::render::SetGameTexture(stage, W3DShaderManager::getShaderTexture(stage));
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_COLORARG2, D3DTA_CURRENT );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-	//DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+	//rts::render::ApplyGameRenderStateChanges();
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+	rts::render::SetGameTextureStageState(stage,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
+	rts::render::SetGameTextureStageState(stage,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
 	//We need to scale so shroud texel stretches over one full terrain cell.  Each texel
 	//is 1/128 the size of full texture. (assuming 128x128 vid-mem texture).
 	W3DShroud *shroud;
 	if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr)
 	{	///@todo: All this code really only need to be done once per camera/view.  Find a way to optimize it out.
-D3DMATRIX curView;
-		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+		rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 		float det;
-		LegacyD3DMatrixInverse(&inv, &det, &curView);
+		RenderMatrixInverse(&inv, &det, &curView);
 
-		D3DMATRIX scale,offset;
+		RenderMatrix4x4 scale,offset;
 
 		//We need to make all world coordinates be relative to the heightmap data origin since that
 		//is where the shroud begins.
@@ -1375,14 +1538,14 @@ D3DMATRIX inv;
 			yoffset = -(float)shroud->getDrawOriginY() + height;
 		}
 
-		LegacyD3DMatrixTranslation(&offset, xoffset, yoffset,0);
+		RenderMatrixTranslation(&offset, xoffset, yoffset,0);
 
 		width = 1.0f/(width*shroud->getTextureWidth());
 		height = 1.0f/(height*shroud->getTextureHeight());
-		LegacyD3DMatrixScaling(&scale, width, height, 1);
-		LegacyD3DMatrixMultiply(&curView, &inv, &offset);
-		LegacyD3DMatrixMultiply(&curView, &curView, &scale);
-		DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0+stage), curView);
+		RenderMatrixScaling(&scale, width, height, 1);
+		RenderMatrixMultiply(&curView, &inv, &offset);
+		RenderMatrixMultiply(&curView, &curView, &scale);
+		rts::render::SetGameTransform(static_cast<rts::render::GameRenderTransformSlot>(GAME_TRANSFORM_TEXTURE0+stage), &curView);
 	}
 	m_stageOfSet=stage;
 	return TRUE;
@@ -1390,11 +1553,11 @@ D3DMATRIX inv;
 
 void FlatShroudTextureShader::reset()
 {
-	if (m_stageOfSet < MAX_TEXTURE_STAGES)
-		DX8Wrapper::Set_Texture(m_stageOfSet,nullptr);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(m_stageOfSet,  D3DTSS_TEXCOORDINDEX, m_stageOfSet);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(m_stageOfSet,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+	if (m_stageOfSet < static_cast<Int>(rts::render::GetGameMaxTexturesPerPass()))
+		rts::render::SetGameTexture(m_stageOfSet,nullptr);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_LESS_EQUAL);
+	rts::render::SetGameTextureStageState(m_stageOfSet,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, m_stageOfSet);
+	rts::render::SetGameTextureStageState(m_stageOfSet,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
 }
 
 ///Mask layer rendering shader
@@ -1432,29 +1595,29 @@ Int MaskTextureShader::set(Int pass)
 
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(vmat);
+	rts::render::SetGameMaterial(vmat);
 	REF_PTR_RELEASE(vmat);	//no need to keep a reference since it's a preset.
 
 	//For now we're always going to project the texture coming from the crossfade effect
-	DX8Wrapper::Set_Texture(0, ScreenCrossFadeFilter::getCurrentMaskTexture());
+	rts::render::SetGameTexture(0, ScreenCrossFadeFilter::getCurrentMaskTexture());
 	ShaderClass shader=ShaderClass::_PresetOpaqueShader;
 	shader.Set_Primary_Gradient(ShaderClass::GRADIENT_DISABLE);
-	DX8Wrapper::Set_Shader(shader);
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::SetGameShader(shader);
+	rts::render::ApplyGameRenderStateChanges();
 
-D3DMATRIX curView;
-	DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+						rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+	rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
+	rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 	float det;
 
 	//Get inverse view matrix so we can transform camera space points back to world space
-	LegacyD3DMatrixInverse(&inv, &det, &curView);
+	RenderMatrixInverse(&inv, &det, &curView);
 
-	D3DMATRIX scale,offset,offsetTextureCenter;
+	RenderMatrix4x4 scale,offset,offsetTextureCenter;
 	Coord3D centerPos;
 	centerPos.zero();
 
@@ -1471,9 +1634,9 @@ D3DMATRIX inv;
 		TheTacticalView->screenToTerrain(&screenPos,&centerPos);
 	}
 
-	LegacyD3DMatrixTranslation(&offset, -centerPos.x, -centerPos.y,0);
+	RenderMatrixTranslation(&offset, -centerPos.x, -centerPos.y,0);
 
-	LegacyD3DMatrixTranslation(&offsetTextureCenter, 0.5f, 0.5f, 0);	//shift coordinates so center of projection falls at uv 0.5,0.5
+	RenderMatrixTranslation(&offsetTextureCenter, 0.5f, 0.5f, 0);	//shift coordinates so center of projection falls at uv 0.5,0.5
 
 	Real worldTexelWidth=(1.0f-fadeLevel)*25.0f;	//9 worked well for circle but weird shape requires more stretch to cover.
 	Real worldTexelHeight=(1.0f-fadeLevel)*25.0f;
@@ -1483,28 +1646,28 @@ D3DMATRIX inv;
 	{
 		Real widthScale = 1.0f/(worldTexelWidth*128.0f);
 		Real heightScale = 1.0f/(worldTexelHeight*128.0f);
-		LegacyD3DMatrixScaling(&scale, widthScale, heightScale, 1);
-		LegacyD3DMatrixMultiply(&curView, &inv, &offset);
-		LegacyD3DMatrixMultiply(&curView, &curView, &scale);
-		LegacyD3DMatrixMultiply(&curView, &curView, &offsetTextureCenter);
+		RenderMatrixScaling(&scale, widthScale, heightScale, 1);
+		RenderMatrixMultiply(&curView, &inv, &offset);
+		RenderMatrixMultiply(&curView, &curView, &scale);
+		RenderMatrixMultiply(&curView, &curView, &offsetTextureCenter);
 	}
 	else
 	{
-		LegacyD3DMatrixScaling(&scale, 0, 0, 1);	//scaling by 0 will set uv coordinates to 0,0
-		LegacyD3DMatrixMultiply(&curView, &inv, &offset);
-		LegacyD3DMatrixMultiply(&curView, &curView, &scale);
+		RenderMatrixScaling(&scale, 0, 0, 1);	//scaling by 0 will set uv coordinates to 0,0
+		RenderMatrixMultiply(&curView, &inv, &offset);
+		RenderMatrixMultiply(&curView, &curView, &scale);
 	}
 
-	DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE0, curView);
+	rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE0, &curView);
 
 	return TRUE;
 }
 
 void MaskTextureShader::reset()
 {
-	DX8Wrapper::Set_Texture(0,nullptr);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, 0);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+	rts::render::SetGameTexture(0,nullptr);
+	rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0);
+	rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
 }
 
 /*===========================================================================================*/
@@ -1525,8 +1688,8 @@ public:
 	virtual void reset() override;		///<do any custom resetting necessary to bring W3D in sync.
 
 	void updateCloud();
-void updateNoise1 (D3DMATRIX *destMatrix,D3DMATRIX *curViewInverse, Bool doUpdate=true);	///<generate the uv coordinates for Noise1 (i.e clouds)
-void updateNoise2 (D3DMATRIX *destMatrix,D3DMATRIX *curViewInverse, Bool doUpdate=true);	///<generate the uv coordinates for Noise2 (i.e lightmap)
+void updateNoise1 (RenderMatrix4x4 *destMatrix,RenderMatrix4x4 *curViewInverse, Bool doUpdate=true);	///<generate the uv coordinates for Noise1 (i.e clouds)
+void updateNoise2 (RenderMatrix4x4 *destMatrix,RenderMatrix4x4 *curViewInverse, Bool doUpdate=true);	///<generate the uv coordinates for Noise2 (i.e lightmap)
 } terrainShader2Stage;
 
 ///regular terrain shader that should work on all multi-texture video cards (slowest version)
@@ -1542,10 +1705,10 @@ public:
 class FlatTerrainShaderPixelShader : public W3DShaderInterface
 {
 public:
-	DWORD					m_dwBasePixelShader;	///<handle to terrain D3D pixel shader
-	DWORD					m_dwBaseNoise1PixelShader;	///<handle to terrain/single noise D3D pixel shader
-	DWORD					m_dwBaseNoise2PixelShader;	///<handle to terrain/double noise D3D pixel shader
-	DWORD					m_dwBase0PixelShader;	///<handle to terrain only pixel shader
+	unsigned int				m_dwBasePixelShader;	///<opaque handle to terrain pixel program
+	unsigned int				m_dwBaseNoise1PixelShader;	///<opaque handle to terrain/single noise program
+	unsigned int				m_dwBaseNoise2PixelShader;	///<opaque handle to terrain/double noise program
+	unsigned int				m_dwBase0PixelShader;	///<handle to terrain only pixel shader
 	virtual Int set(Int pass) override;		///<setup shader for the specified rendering pass.
 	virtual Int init() override;			///<perform any one time initialization and validation
 	virtual void reset() override;		///<do any custom resetting necessary to bring W3D in sync.
@@ -1566,9 +1729,9 @@ class TerrainShader8Stage : public W3DShaderInterface
 ///Pixel shader based terrain shader - fastest method for the newest cards.
 class TerrainShaderPixelShader : public W3DShaderInterface
 {
-	DWORD					m_dwBasePixelShader;	///<handle to terrain D3D pixel shader
-	DWORD					m_dwBaseNoise1PixelShader;	///<handle to terrain/single noise D3D pixel shader
-	DWORD					m_dwBaseNoise2PixelShader;	///<handle to terrain/double noise D3D pixel shader
+	unsigned int				m_dwBasePixelShader;	///<opaque handle to terrain pixel program
+	unsigned int				m_dwBaseNoise1PixelShader;	///<opaque handle to terrain/single noise program
+	unsigned int				m_dwBaseNoise2PixelShader;	///<opaque handle to terrain/double noise program
 
 	virtual Int set(Int pass) override;		///<setup shader for the specified rendering pass.
 	virtual void reset() override;		///<do any custom resetting necessary to bring W3D in sync.
@@ -1620,14 +1783,14 @@ void TerrainShader2Stage::reset()
 	ShaderClass::Invalidate();
 
 	//Free references to textures
-	DX8Wrapper::Set_DX8_Texture(0, nullptr);
-	DX8Wrapper::Set_DX8_Texture(1, nullptr);
+	rts::render::SetGameTexture(0, nullptr);
+	rts::render::SetGameTexture(1, nullptr);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|0);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|1);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|1);
 }
 
 void TerrainShader2Stage::updateCloud()
@@ -1641,168 +1804,168 @@ void TerrainShader2Stage::updateCloud()
 	m_yOffset -= (Int)m_yOffset;
 }
 
-void TerrainShader2Stage::updateNoise1(D3DMATRIX *destMatrix,D3DMATRIX *curViewInverse, Bool doUpdate)
+void TerrainShader2Stage::updateNoise1(RenderMatrix4x4 *destMatrix,RenderMatrix4x4 *curViewInverse, Bool doUpdate)
 {
 	#define STRETCH_FACTOR ((float)(1/(63.0*MAP_XY_FACTOR/2))) /* covers 63/2 tiles */
 
-	D3DMATRIX scale;
+	RenderMatrix4x4 scale;
 
-	LegacyD3DMatrixScaling(&scale, STRETCH_FACTOR, STRETCH_FACTOR,1);
-	LegacyD3DMatrixMultiply(destMatrix, curViewInverse, &scale);
+	RenderMatrixScaling(&scale, STRETCH_FACTOR, STRETCH_FACTOR,1);
+	RenderMatrixMultiply(destMatrix, curViewInverse, &scale);
 
-	D3DMATRIX offset;
-	LegacyD3DMatrixTranslation(&offset, m_xOffset, m_yOffset,0);
-	LegacyD3DMatrixMultiply(destMatrix, destMatrix, &offset);
+	RenderMatrix4x4 offset;
+	RenderMatrixTranslation(&offset, m_xOffset, m_yOffset,0);
+	RenderMatrixMultiply(destMatrix, destMatrix, &offset);
 }
 
-void TerrainShader2Stage::updateNoise2(D3DMATRIX *destMatrix,D3DMATRIX *curViewInverse, Bool doUpdate)
+void TerrainShader2Stage::updateNoise2(RenderMatrix4x4 *destMatrix,RenderMatrix4x4 *curViewInverse, Bool doUpdate)
 {
 
-	D3DMATRIX scale;
+	RenderMatrix4x4 scale;
 
-	LegacyD3DMatrixScaling(&scale, STRETCH_FACTOR, STRETCH_FACTOR,1);
-	LegacyD3DMatrixMultiply(destMatrix, curViewInverse, &scale);
+	RenderMatrixScaling(&scale, STRETCH_FACTOR, STRETCH_FACTOR,1);
+	RenderMatrixMultiply(destMatrix, curViewInverse, &scale);
 }
 
 Int TerrainShader2Stage::set(Int pass)
 {
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 	if (TheGlobalData && (TheGlobalData->m_bilinearTerrainTex || TheGlobalData->m_trilinearTerrainTex)) {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	} else {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_POINT);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
 	}
 	if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex) {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	} else {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	}
 
 	switch (pass)
 	{
 		case 0:
-			DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(0)->Peek_D3D_Texture());
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+			rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(0));
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
 
 			// Modulate the diffuse color with the texture as lighting comes from diffuse.
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0 );
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,false);
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0 );
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE,false);
 			break;
 		case 1:
-			DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(1)->Peek_D3D_Texture());
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+			rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(1));
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
 
 			// Modulate the diffuse color with the texture as lighting comes from diffuse.
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_MODULATE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 1 );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 1 );
 			// Blend the result using the alpha. (came from diffuse mod texture)
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,true);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE,true);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_SOURCE_BLEND,RENDER_BLEND_SOURCE_ALPHA);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_DESTINATION_BLEND,RENDER_BLEND_INVERSE_SOURCE_ALPHA);
 			// Disable stage 2.
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
 			break;
 		case 2:
 			// Noise/cloud pass
-D3DMATRIX curView;
-			DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+			rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
 			//these states apply to all noise/cloud combination passes
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_SELECTARG1 );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_SELECT_ARGUMENT_1 );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+			rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 			// Two output coordinates are used.
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+			rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
+			rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+			rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
 
 			//blend into frame buffer
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,true);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_DESTCOLOR);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_ZERO);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE,true);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_SOURCE_BLEND,RENDER_BLEND_DESTINATION_COLOR);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_DESTINATION_BLEND,RENDER_BLEND_ZERO);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 			float det;
-			LegacyD3DMatrixInverse(&inv, &det, &curView);
+			RenderMatrixInverse(&inv, &det, &curView);
 
 			if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_TERRAIN_BASE_NOISE12)
 			{
 				//setup cloud pass
-				DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+				rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(2));
 
 				updateNoise1(&curView,&inv);	//update curView with texture matrix
-				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE0, curView);
+				rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE0, &curView);
 				//clouds always need bilinear filtering
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+				rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+				rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
 				//setup noise pass
-				DX8Wrapper::Set_DX8_Texture(1, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+				rts::render::SetGameTexture(1, W3DShaderManager::getShaderTexture(3));
 
 				updateNoise2(&curView,&inv);
-				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE1, curView);
+				rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE1, &curView);
 				//noise always needs point/linear filtering.  Why point!?
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+				rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+				rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_CURRENT );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 				// Two output coordinates are used.
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
 			}
 			else
 			{	//only 1 noise or cloud texture
 				// Now setup the texture pipeline.
 				if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_TERRAIN_BASE_NOISE1)
 				{	//setup cloud pass
-					DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+					rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(2));
 					updateNoise1(&curView,&inv);	//update curView with texture matrix
-					DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-					DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+					rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+					rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 				}
 				else
 				{
 					//setup noise pass
-					DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+					rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(3));
 					updateNoise2(&curView,&inv);	//update curView with texture matrix
-					DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-					DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+					rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+					rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 				}
 
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE0, curView);
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+				rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE0, &curView);
 			}
 			break;
 	}
@@ -1836,112 +1999,112 @@ Int TerrainShader8Stage::set(Int pass)
 	if (pass == 0)
 	{
 		//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
-		DX8Wrapper::Apply_Render_State_Changes();
+		rts::render::ApplyGameRenderStateChanges();
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
 
 		if (TheGlobalData && (TheGlobalData->m_bilinearTerrainTex || TheGlobalData->m_trilinearTerrainTex)) {
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+			rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+			rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+			rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+			rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 		} else {
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_POINT);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_POINT);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_POINT);
+			rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+			rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+			rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+			rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
 		}
 		if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex) {
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+			rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+			rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 		} else {
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_POINT);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+			rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
+			rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 		}
 
-		DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(0)->Peek_D3D_Texture());
-		DX8Wrapper::Set_DX8_Texture(1, W3DShaderManager::getShaderTexture(1)->Peek_D3D_Texture());
+		rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(0));
+		rts::render::SetGameTexture(1, W3DShaderManager::getShaderTexture(1));
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP, D3DTOP_MODULATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_MODULATE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE);
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP, D3DTOP_ADD);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, 1);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_DIFFUSE | D3DTA_COMPLEMENT | D3DTA_ALPHAREPLICATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_ADD);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAARG1, D3DTA_TFACTOR | D3DTA_COMPLEMENT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_ADD);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 1);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_DIFFUSE | GAME_TEXTURE_ARGUMENT_COMPLEMENT | GAME_TEXTURE_ARGUMENT_ALPHA_REPLICATE);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_ADD);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_FACTOR | GAME_TEXTURE_ARGUMENT_COMPLEMENT);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
 
-		DX8Wrapper::Set_DX8_Texture(2, nullptr);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_COLOROP, D3DTOP_MODULATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_TEXCOORDINDEX, 2);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_COLORARG1, D3DTA_TEXTURE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_COLORARG2, D3DTA_TEXTURE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+		rts::render::SetGameTexture(2, nullptr);
+		rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_MODULATE);
+		rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 2);
+		rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE);
+		rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_TEXTURE);
+		rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE);
+		rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
 
-		DX8Wrapper::Set_DX8_Texture(3, nullptr);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_TEXCOORDINDEX, 3);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_COLORARG1, D3DTA_DIFFUSE | 0 | D3DTA_ALPHAREPLICATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+		rts::render::SetGameTexture(3, nullptr);
+		rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_SELECT_ARGUMENT_1);
+		rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 3);
+		rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_DIFFUSE | 0 | GAME_TEXTURE_ARGUMENT_ALPHA_REPLICATE);
+		rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE);
+		rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_SELECT_ARGUMENT_1);
+		rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
 
-		DX8Wrapper::Set_DX8_Texture(4, nullptr);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_COLOROP, D3DTOP_MODULATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_TEXCOORDINDEX, 4);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_COLORARG1, D3DTA_CURRENT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_ALPHAARG1, D3DTA_CURRENT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+		rts::render::SetGameTexture(4, nullptr);
+		rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_MODULATE);
+		rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 4);
+		rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_CURRENT);
+		rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE);
+		rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE);
+		rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_CURRENT);
+		rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE);
 
-		DX8Wrapper::Set_DX8_Texture(5, nullptr);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 5, D3DTSS_COLOROP, D3DTOP_ADD);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 5, D3DTSS_TEXCOORDINDEX, 5);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 5, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 5, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 5, D3DTSS_ALPHAOP,   D3DTOP_ADD);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 5, D3DTSS_ALPHAARG1, D3DTA_TFACTOR | D3DTA_COMPLEMENT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 5, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+		rts::render::SetGameTexture(5, nullptr);
+		rts::render::SetGameTextureStageState( 5, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_ADD);
+		rts::render::SetGameTextureStageState( 5, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 5);
+		rts::render::SetGameTextureStageState( 5, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_DIFFUSE);
+		rts::render::SetGameTextureStageState( 5, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE);
+		rts::render::SetGameTextureStageState( 5, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_ADD);
+		rts::render::SetGameTextureStageState( 5, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_FACTOR | GAME_TEXTURE_ARGUMENT_COMPLEMENT);
+		rts::render::SetGameTextureStageState( 5, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
 
-		DX8Wrapper::Set_DX8_Texture(6, nullptr);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 6, D3DTSS_COLOROP, D3DTOP_MODULATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 6, D3DTSS_TEXCOORDINDEX, 6);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 6, D3DTSS_COLORARG1, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 6, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 6, D3DTSS_ALPHAOP,   D3DTOP_MODULATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 6, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 6, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+		rts::render::SetGameTexture(6, nullptr);
+		rts::render::SetGameTextureStageState( 6, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_MODULATE);
+		rts::render::SetGameTextureStageState( 6, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 6);
+		rts::render::SetGameTextureStageState( 6, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 6, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 6, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE);
+		rts::render::SetGameTextureStageState( 6, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 6, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
 
-		DX8Wrapper::Set_DX8_Texture(7, nullptr);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 7, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 7, D3DTSS_TEXCOORDINDEX, 7);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 7, D3DTSS_COLORARG1, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 7, D3DTSS_COLORARG2, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 7, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 7, D3DTSS_ALPHAARG1, D3DTA_TFACTOR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 7, D3DTSS_ALPHAARG2, D3DTA_TFACTOR);
+		rts::render::SetGameTexture(7, nullptr);
+		rts::render::SetGameTextureStageState( 7, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_SELECT_ARGUMENT_1);
+		rts::render::SetGameTextureStageState( 7, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 7);
+		rts::render::SetGameTextureStageState( 7, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 7, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 7, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_SELECT_ARGUMENT_1);
+		rts::render::SetGameTextureStageState( 7, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_FACTOR);
+		rts::render::SetGameTextureStageState( 7, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_FACTOR);
 	}
 	else
 	{	//setup cloud noise/pass
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_COLOROP, D3DTOP_DISABLE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_COLOROP, D3DTOP_DISABLE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-		DX8Wrapper::Invalidate_Cached_Render_States();
+		rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_DISABLE);
+		rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_ALPHA_OPERATION, RENDER_TEXTURE_OP_DISABLE);
+		rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_DISABLE);
+		rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_ALPHA_OPERATION, RENDER_TEXTURE_OP_DISABLE);
+		rts::render::InvalidateGameRenderStateCache();
 
 		terrainShader2Stage.set(2);
 	}
@@ -1950,28 +2113,28 @@ Int TerrainShader8Stage::set(Int pass)
 
 void TerrainShader8Stage::reset()
 {
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_COLOROP, D3DTOP_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_COLOROP, D3DTOP_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_COLOROP, D3DTOP_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+	rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_DISABLE);
+	rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_ALPHA_OPERATION, RENDER_TEXTURE_OP_DISABLE);
+	rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_DISABLE);
+	rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_ALPHA_OPERATION, RENDER_TEXTURE_OP_DISABLE);
+	rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_COLOR_OPERATION, RENDER_TEXTURE_OP_DISABLE);
+	rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_ALPHA_OPERATION, RENDER_TEXTURE_OP_DISABLE);
 
-	DX8Wrapper::Set_DX8_Texture(0, nullptr);
-	DX8Wrapper::Set_DX8_Texture(1, nullptr);
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::SetGameTexture(0, nullptr);
+	rts::render::SetGameTexture(1, nullptr);
+	rts::render::InvalidateGameRenderStateCache();
 }
 
 Int TerrainShaderPixelShader::shutdown()
 {
 	if (m_dwBasePixelShader)
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_dwBasePixelShader);
+		(void)rts::render::DeleteGameShader(false, m_dwBasePixelShader);
 
 	if (m_dwBaseNoise1PixelShader)
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_dwBaseNoise1PixelShader);
+		(void)rts::render::DeleteGameShader(false, m_dwBaseNoise1PixelShader);
 
 	if (m_dwBaseNoise2PixelShader)
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_dwBaseNoise2PixelShader);
+		(void)rts::render::DeleteGameShader(false, m_dwBaseNoise2PixelShader);
 
 	m_dwBasePixelShader=0;
 	m_dwBaseNoise1PixelShader=0;
@@ -1991,32 +2154,32 @@ Int TerrainShaderPixelShader::init()
 	{
 		if (res >= DC_GENERIC_PIXEL_SHADER_1_1)
 		{
-			//this shader needs some assets that need to be loaded
-			//shader decleration
-			DWORD Declaration[]=
-			{
-				(D3DVSD_STREAM(0)),
-				(D3DVSD_REG(0, D3DVSDT_FLOAT3)), // Position
-				(D3DVSD_REG(1, D3DVSDT_D3DCOLOR)), // Diffuse
-				(D3DVSD_REG(2, D3DVSDT_FLOAT2)), //  Texture Coordinates
-				(D3DVSD_REG(3, D3DVSDT_FLOAT2)), //  Texture Coordinates
-				(D3DVSD_END())
-			};
-
 			//base version which doesn't apply any noise textures.
-			HRESULT hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\terrain.pso", &Declaration[0], 0, false, &m_dwBasePixelShader);
-			if (FAILED(hr))
+			if (rts::render::CreateGameShaderFromAsset(
+				"shaders\\terrain.pso", false, nullptr, 0, 0,
+				&m_dwBasePixelShader) != rts::render::RENDER_RESULT_OK)
+			{
+				shutdown();
 				return FALSE;
+			}
 
 			//version which blends 1 noise texture.
-			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\terrainnoise.pso", &Declaration[0], 0, false, &m_dwBaseNoise1PixelShader);
-			if (FAILED(hr))
+			if (rts::render::CreateGameShaderFromAsset(
+				"shaders\\terrainnoise.pso", false, nullptr, 0, 0,
+				&m_dwBaseNoise1PixelShader) != rts::render::RENDER_RESULT_OK)
+			{
+				shutdown();
 				return FALSE;
+			}
 
 			//version which blends 2 noise textures.
-			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\terrainnoise2.pso", &Declaration[0], 0, false, &m_dwBaseNoise2PixelShader);
-			if (FAILED(hr))
+			if (rts::render::CreateGameShaderFromAsset(
+				"shaders\\terrainnoise2.pso", false, nullptr, 0, 0,
+				&m_dwBaseNoise2PixelShader) != rts::render::RENDER_RESULT_OK)
+			{
+				shutdown();
 				return FALSE;
+			}
 
 			W3DShaders[W3DShaderManager::ST_TERRAIN_BASE]=&terrainShaderPixelShader;
 			W3DShaders[W3DShaderManager::ST_TERRAIN_BASE_NOISE1]=&terrainShaderPixelShader;
@@ -2035,109 +2198,109 @@ Int TerrainShaderPixelShader::init()
 Int TerrainShaderPixelShader::set(Int pass)
 {
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 	//setup base pass
-	DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(0)->Peek_D3D_Texture());
-	DX8Wrapper::Set_DX8_Texture(1, W3DShaderManager::getShaderTexture(1)->Peek_D3D_Texture());
+	rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(0));
+	rts::render::SetGameTexture(1, W3DShaderManager::getShaderTexture(1));
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
 
 	//tell pixel shader which UV set to use for each stage
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0 );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, 1 );
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0 );
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 1 );
 
 	if (TheGlobalData && (TheGlobalData->m_bilinearTerrainTex || TheGlobalData->m_trilinearTerrainTex)) {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	} else {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_POINT);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
 	}
 	if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex) {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	} else {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	}
 
 	if (W3DShaderManager::getCurrentShader() >= W3DShaderManager::ST_TERRAIN_BASE_NOISE1)
 	{
-D3DMATRIX curView;
-		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+		rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 		float det;
-		LegacyD3DMatrixInverse(&inv, &det, &curView);
+		RenderMatrixInverse(&inv, &det, &curView);
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+		rts::render::SetGameTextureStageState(2,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 		// Two output coordinates are used.
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+		rts::render::SetGameTextureStageState(2,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+		rts::render::SetGameTextureStageState(2,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+		rts::render::SetGameTextureStageState(2,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
 
 		if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_TERRAIN_BASE_NOISE12)
 		{	//full shader
-			DX8Wrapper::Set_DX8_Texture_Stage_State(3,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(3,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
-			DX8Wrapper::Set_DX8_Texture(2, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
-			DX8Wrapper::Set_DX8_Texture(3, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
-			DX8Wrapper::Set_Pixel_Shader(m_dwBaseNoise2PixelShader);
-			DX8Wrapper::Set_Legacy_Pixel_Program(
+			rts::render::SetGameTextureStageState(3,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+			rts::render::SetGameTextureStageState(3,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
+			rts::render::SetGameTexture(2, W3DShaderManager::getShaderTexture(2));
+			rts::render::SetGameTexture(3, W3DShaderManager::getShaderTexture(3));
+			rts::render::SetGamePixelShader(m_dwBaseNoise2PixelShader);
+			rts::render::SetGameLegacyPixelProgram(
 				rts::render::RENDER_LEGACY_PIXEL_TERRAIN_NOISE2);
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(2, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+			rts::render::SetGameTextureStageState(2, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+			rts::render::SetGameTextureStageState(2, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State(3, D3DTSS_MINFILTER, D3DTEXF_POINT);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(3, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+			rts::render::SetGameTextureStageState(3, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+			rts::render::SetGameTextureStageState(3, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
 			terrainShader2Stage.updateNoise1(&curView,&inv);	//update curView with texture matrix
-			DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE2, curView);
+		rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE2, &curView);
 
 			terrainShader2Stage.updateNoise2(&curView,&inv);	//update curView with texture matrix
-			DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE3, curView);
+		rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE3, &curView);
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State(3,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+			rts::render::SetGameTextureStageState(3,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 			// Two output coordinates are used.
-			DX8Wrapper::Set_DX8_Texture_Stage_State(3,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+			rts::render::SetGameTextureStageState(3,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 		}
 		else
 		{	//single noise texture shader
-			DX8Wrapper::Set_Pixel_Shader(m_dwBaseNoise1PixelShader);
-			DX8Wrapper::Set_Legacy_Pixel_Program(
+			rts::render::SetGamePixelShader(m_dwBaseNoise1PixelShader);
+			rts::render::SetGameLegacyPixelProgram(
 				rts::render::RENDER_LEGACY_PIXEL_TERRAIN_NOISE);
 
 			if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_TERRAIN_BASE_NOISE1)
 			{	//cloud map
-				DX8Wrapper::Set_DX8_Texture(2, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+				rts::render::SetGameTexture(2, W3DShaderManager::getShaderTexture(2));
 				terrainShader2Stage.updateNoise1(&curView,&inv);	//update curView with texture matrix
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+				rts::render::SetGameTextureStageState(2, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+				rts::render::SetGameTextureStageState(2, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 			}
 			else
 			{	//light map
-				DX8Wrapper::Set_DX8_Texture(2, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+				rts::render::SetGameTexture(2, W3DShaderManager::getShaderTexture(3));
 				terrainShader2Stage.updateNoise2(&curView,&inv);	//update curView with texture matrix
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2, D3DTSS_MINFILTER, D3DTEXF_POINT);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(2, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+				rts::render::SetGameTextureStageState(2, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+				rts::render::SetGameTextureStageState(2, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 			}
-			DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE2, curView);
+		rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE2, &curView);
 		}
 	}
 	else
 	{	//just base texturing
-		DX8Wrapper::Set_Pixel_Shader(m_dwBasePixelShader);
-		DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::SetGamePixelShader(m_dwBasePixelShader);
+		rts::render::SetGameLegacyPixelProgram(
 			rts::render::RENDER_LEGACY_PIXEL_TERRAIN_BASE);
 	}
 
@@ -2146,30 +2309,30 @@ D3DMATRIX inv;
 
 void TerrainShaderPixelShader::reset()
 {
-	DX8Wrapper::Set_DX8_Texture(2,nullptr);	//release reference to any texture
-	DX8Wrapper::Set_DX8_Texture(3,nullptr);	//release reference to any texture
+	rts::render::SetGameTexture(2,nullptr);	//release reference to any texture
+	rts::render::SetGameTexture(3,nullptr);	//release reference to any texture
 
-	DX8Wrapper::Set_Pixel_Shader(0);	//turn off pixel shader
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGamePixelShader(0);	//turn off pixel shader
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
 
-	DX8Wrapper::Set_DX8_Texture(0, nullptr);
-	DX8Wrapper::Set_DX8_Texture(1, nullptr);
+	rts::render::SetGameTexture(0, nullptr);
+	rts::render::SetGameTexture(1, nullptr);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|0);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|1);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|1);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|2);
+	rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|2);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|3);
+	rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|3);
 
 
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::InvalidateGameRenderStateCache();
 }
 
 ///Cloud layer rendering shader - used for objects similar to terrain which only need the cloud layer.
@@ -2199,33 +2362,33 @@ Int CloudTextureShader::init()
 /**Setup a certain texture stage to project our cloud texture*/
 Int CloudTextureShader::set(Int stage)
 {
-D3DMATRIX curView;
-	DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+	rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 	float det;
 
-	LegacyD3DMatrixInverse(&inv, &det, &curView);
+	RenderMatrixInverse(&inv, &det, &curView);
 
 	//Get a texture matrix that applies the current cloud position
 	terrainShader2Stage.updateNoise1(&curView,&inv,false);	//update curView with texture matrix
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
-	DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0+stage), curView);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage, D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(stage, D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+	rts::render::SetGameTextureStageState(stage,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
+	rts::render::SetGameTextureStageState(stage,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
+	rts::render::SetGameTransform(static_cast<rts::render::GameRenderTransformSlot>(GAME_TRANSFORM_TEXTURE0+stage), &curView);
+	rts::render::SetGameTextureStageState(stage, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+	rts::render::SetGameTextureStageState(stage, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+	rts::render::SetGameTextureStageState(stage, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+	rts::render::SetGameTextureStageState(stage, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_COLORARG2, D3DTA_CURRENT );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ALPHAARG1, D3DTA_TEXTURE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ALPHAARG2, D3DTA_CURRENT );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ALPHAOP,   D3DTOP_MODULATE );
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+	rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
 
-	DX8Wrapper::Set_DX8_Texture(stage, W3DShaderManager::getShaderTexture(stage)->Peek_D3D_Texture());
+	rts::render::SetGameTexture(stage, W3DShaderManager::getShaderTexture(stage));
 
 	m_stageOfSet=stage;
 	return TRUE;
@@ -2234,13 +2397,13 @@ D3DMATRIX inv;
 void CloudTextureShader::reset()
 {
 	//Free reference to texture
-	DX8Wrapper::Set_DX8_Texture(m_stageOfSet, nullptr);
+	rts::render::SetGameTexture(m_stageOfSet, nullptr);
 	//Turn off texture projection
-	DX8Wrapper::Set_DX8_Texture_Stage_State( m_stageOfSet, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( m_stageOfSet, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|m_stageOfSet);
+	rts::render::SetGameTextureStageState( m_stageOfSet, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( m_stageOfSet, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|m_stageOfSet);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( m_stageOfSet, D3DTSS_COLOROP,   D3DTOP_DISABLE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( m_stageOfSet, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
+	rts::render::SetGameTextureStageState( m_stageOfSet, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+	rts::render::SetGameTextureStageState( m_stageOfSet, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
 }
 
 /*===========================================================================================*/
@@ -2248,7 +2411,7 @@ void CloudTextureShader::reset()
 /*===========================================================================================*/
 class RoadShaderPixelShader : public W3DShaderInterface
 {
-	DWORD					m_dwBaseNoise2PixelShader;	///<handle to road/double noise D3D pixel shader
+	unsigned int				m_dwBaseNoise2PixelShader;	///<opaque handle to road/double noise program
 
 	virtual Int set(Int pass) override;		///<setup shader for the specified rendering pass.
 	virtual void reset() override;		///<do any custom resetting necessary to bring W3D in sync.
@@ -2275,7 +2438,7 @@ W3DShaderInterface *RoadShaderList[]=
 Int RoadShaderPixelShader::shutdown()
 {
 	if (m_dwBaseNoise2PixelShader)
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_dwBaseNoise2PixelShader);
+		(void)rts::render::DeleteGameShader(false, m_dwBaseNoise2PixelShader);
 
 	m_dwBaseNoise2PixelShader=0;
 
@@ -2291,20 +2454,10 @@ Int RoadShaderPixelShader::init()
 	{
 		if (res >= DC_GENERIC_PIXEL_SHADER_1_1)
 		{
-			//this shader needs some assets that need to be loaded
-			//shader declaration
-			DWORD Declaration[]=
-			{
-				(D3DVSD_STREAM(0)),
-				(D3DVSD_REG(0, D3DVSDT_FLOAT3)), // Position
-				(D3DVSD_REG(1, D3DVSDT_D3DCOLOR)), // Diffuse
-				(D3DVSD_REG(2, D3DVSDT_FLOAT2)), //  Texture Coordinates
-				(D3DVSD_END())
-			};
-
 			//version which blends 2 noise textures.
-			HRESULT hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\roadnoise2.pso", &Declaration[0], 0, false, &m_dwBaseNoise2PixelShader);
-			if (FAILED(hr))
+			if (rts::render::CreateGameShaderFromAsset(
+				"shaders\\roadnoise2.pso", false, nullptr, 0, 0,
+				&m_dwBaseNoise2PixelShader) != rts::render::RENDER_RESULT_OK)
 				return FALSE;
 
 			//Only set this shader for use in dual noise mode.  The 2Stage shader will take care of
@@ -2319,96 +2472,96 @@ Int RoadShaderPixelShader::init()
 
 Int RoadShaderPixelShader::set(Int pass)
 {
-	DX8Wrapper::Set_Texture(0,W3DShaderManager::getShaderTexture(0));
+	rts::render::SetGameTexture(0,W3DShaderManager::getShaderTexture(0));
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 	//tell pixel shader which UV set to use for each stage
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0 );
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0 );
 
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,FALSE);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_LESS_EQUAL);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_WRITE,FALSE);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_LIGHTING, FALSE);
 
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,true);	//blend roads into terrain
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE,true);	//blend roads into terrain
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_SOURCE_BLEND,RENDER_BLEND_SOURCE_ALPHA);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DESTINATION_BLEND,RENDER_BLEND_INVERSE_SOURCE_ALPHA);
 
-D3DMATRIX curView;
-	DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+	rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 	float det;
-	LegacyD3DMatrixInverse(&inv, &det, &curView);
+	RenderMatrixInverse(&inv, &det, &curView);
 
 	if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex)
-	{	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+	{	rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	}
 	else
-	{	DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_POINT);
+	{	rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
 	}
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+	rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 	// Two output coordinates are used.
-	DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+	rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+	rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+	rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+	rts::render::SetGameTextureStageState(2,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+	rts::render::SetGameTextureStageState(2,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
 
-	DX8Wrapper::Set_Texture(1,W3DShaderManager::getShaderTexture(1));
-	DX8Wrapper::Set_Texture(2,W3DShaderManager::getShaderTexture(2));
+	rts::render::SetGameTexture(1,W3DShaderManager::getShaderTexture(1));
+	rts::render::SetGameTexture(2,W3DShaderManager::getShaderTexture(2));
 
-	DX8Wrapper::Set_Pixel_Shader(m_dwBaseNoise2PixelShader);
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGamePixelShader(m_dwBaseNoise2PixelShader);
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_ROAD_NOISE2);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+	rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+	rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(2, D3DTSS_MINFILTER, D3DTEXF_POINT);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(2, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+	rts::render::SetGameTextureStageState(2, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+	rts::render::SetGameTextureStageState(2, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
 	terrainShader2Stage.updateNoise1(&curView,&inv, false);	//get texture projection matrix
-	DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE1, curView);
+	rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE1, &curView);
 
 	terrainShader2Stage.updateNoise2(&curView,&inv, false);	//get texture projection matrix
-	DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE2, curView);
+	rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE2, &curView);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+	rts::render::SetGameTextureStageState(2,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 	// Two output coordinates are used.
-	DX8Wrapper::Set_DX8_Texture_Stage_State(2,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+	rts::render::SetGameTextureStageState(2,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
 	return TRUE;
 }
 
 void RoadShaderPixelShader::reset()
 {
-	DX8Wrapper::Set_DX8_Texture(0, nullptr);
-	DX8Wrapper::Set_DX8_Texture(1, nullptr);
-	DX8Wrapper::Set_DX8_Texture(2, nullptr);
-	DX8Wrapper::Set_Pixel_Shader(0);	//turn off pixel shader
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGameTexture(0, nullptr);
+	rts::render::SetGameTexture(1, nullptr);
+	rts::render::SetGameTexture(2, nullptr);
+	rts::render::SetGamePixelShader(0);	//turn off pixel shader
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|0);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|1);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|1);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|2);
+	rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|2);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|3);
+	rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|3);
 
 
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::InvalidateGameRenderStateCache();
 }
 
 Int RoadShader2Stage::init()
@@ -2429,141 +2582,141 @@ Int RoadShader2Stage::init()
 Int RoadShader2Stage::set(Int pass)
 {
 	//First stage always contains base texture.
-	DX8Wrapper::Set_Texture(0,W3DShaderManager::getShaderTexture(0));
+	rts::render::SetGameTexture(0,W3DShaderManager::getShaderTexture(0));
 	//Force system to apply world/view transforms.
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZFUNC,D3DCMP_LESSEQUAL);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ZWRITEENABLE,FALSE);
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_LIGHTING, FALSE);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_FUNCTION,RENDER_COMPARE_LESS_EQUAL);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_DEPTH_WRITE,FALSE);
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_LIGHTING, FALSE);
 
 	// Modulate the diffuse color with the texture as lighting comes from diffuse.
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE );
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_MODULATE );
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE );
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE );
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0 );
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,true);	//blend roads into terrain
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0 );
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE,true);	//blend roads into terrain
 
 	if (pass == 0)
 	{
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_SRCALPHA);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_INVSRCALPHA);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_SOURCE_BLEND,RENDER_BLEND_SOURCE_ALPHA);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DESTINATION_BLEND,RENDER_BLEND_INVERSE_SOURCE_ALPHA);
 
 		if (W3DShaderManager::getCurrentShader() >= W3DShaderManager::ST_ROAD_BASE_NOISE1)
 		{	//second texture unit will contain a noise pass
-D3DMATRIX curView;
-			DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+			rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 			float det;
-			LegacyD3DMatrixInverse(&inv, &det, &curView);
+			RenderMatrixInverse(&inv, &det, &curView);
 
 			if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex)
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+				rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 			else
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_POINT);
+				rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+			rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 			// Two output coordinates are used.
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+			rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+			rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+			rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_CURRENT );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAARG2, D3DTA_CURRENT );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_MODULATE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
 
 			if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_ROAD_BASE_NOISE12)
 			{	//full shader, apply noise 1 in pass 0.
-				DX8Wrapper::Set_Texture(1,W3DShaderManager::getShaderTexture(1));
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+				rts::render::SetGameTexture(1,W3DShaderManager::getShaderTexture(1));
+				rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+				rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
 				terrainShader2Stage.updateNoise1(&curView, &inv, false);	//get texture projection matrix
-				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE1, curView);
+				rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE1, &curView);
 			}
 			else
 			{	//single noise texture shader
 				if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_ROAD_BASE_NOISE1)
 				{	//cloud map
-					DX8Wrapper::Set_Texture(1,W3DShaderManager::getShaderTexture(1));
+					rts::render::SetGameTexture(1,W3DShaderManager::getShaderTexture(1));
 					terrainShader2Stage.updateNoise1(&curView, &inv, false);	//update curView with texture matrix
-					DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-					DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+					rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+					rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 				}
 				else
 				{	//light map
-					DX8Wrapper::Set_Texture(1,W3DShaderManager::getShaderTexture(2));
+					rts::render::SetGameTexture(1,W3DShaderManager::getShaderTexture(2));
 					terrainShader2Stage.updateNoise2(&curView,&inv, false);	//update curView with texture matrix
-					DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-					DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+					rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+					rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 				}
-				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE1, curView);
+				rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE1, &curView);
 			}
 		}
 		else
 		{	//just base texturing
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
 		}
 	}
 	else
 	{	//pass 1, apply additional noise pass
-D3DMATRIX curView;
-		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+		rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 		float det;
-		LegacyD3DMatrixInverse(&inv, &det, &curView);
+		RenderMatrixInverse(&inv, &det, &curView);
 
 		if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex)
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+			rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 		else
-			DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_POINT);
+			rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
 
-		DX8Wrapper::Set_Texture(1,W3DShaderManager::getShaderTexture(2));
+		rts::render::SetGameTexture(1,W3DShaderManager::getShaderTexture(2));
 
 		terrainShader2Stage.updateNoise2(&curView, &inv, false);	//update curView with texture matrix
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+		rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 		// Two output coordinates are used.
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+		rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+		rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+		rts::render::SetGameTextureStageState(1,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
 
 		//Copy alpha channel into stage 1 but mask out color channel by replacing with white.
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
 		//Force color channel to white by copying the alpha into RGB
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE|D3DTA_ALPHAREPLICATE);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_SELECTARG2);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG1 );
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE|GAME_TEXTURE_ARGUMENT_ALPHA_REPLICATE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_SELECT_ARGUMENT_2);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE );
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_SELECT_ARGUMENT_1 );
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_CURRENT );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_BLENDCURRENTALPHA);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAARG1, D3DTA_TEXTURE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAARG2, D3DTA_CURRENT );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_BLEND_CURRENT_ALPHA);
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+		rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
 
 		//Modulate into existing roads with clouds applied. - only apply where roads are transparent by
 		//using road texture as a mask.
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_ZERO);
-		DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_SRCCOLOR);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_SOURCE_BLEND,RENDER_BLEND_ZERO);
+		rts::render::SetGameRenderState(GAME_RENDER_STATE_DESTINATION_BLEND,RENDER_BLEND_SOURCE_COLOR);
 
-		DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE0, curView);
+		rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE0, &curView);
 	}
 
 	return TRUE;
@@ -2573,11 +2726,11 @@ void RoadShader2Stage::reset()
 {
 	ShaderClass::Invalidate();
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|0);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|1);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|1);
 }
 
 /** List of all custom shader lists - each list in this list contains variations of the same
@@ -2614,10 +2767,8 @@ W3DShaderManager::W3DShaderManager()
 {
 	m_currentShader = ST_INVALID;
 	m_currentFilter = FT_NULL_FILTER;
-	m_oldRenderSurface = nullptr;
+	m_renderTargetAvailable = false;
 	m_renderTexture = nullptr;
-	m_newRenderSurface = nullptr;
-	m_oldDepthSurface = nullptr;
 	m_renderingToTexture = false;
 	Int i;
 	for (i=0; i<W3DShaderManager::ST_MAX; i++)
@@ -2640,54 +2791,26 @@ W3DShaderManager::W3DShaderManager()
 void W3DShaderManager::init()
 {
 	int i,j;
+	ChipsetType res=W3DShaderManager::getChipset();
+	m_currentChipset = res;
+	m_renderTargetAvailable = false;
+	m_renderingToTexture = false;
+	REF_PTR_RELEASE(m_renderTexture);
 
-	D3DSURFACE_DESC desc;
-	// For now, check & see if we are gf3 or higher on the food chain.
-
-	ChipsetType res=DC_UNKNOWN;
-	if ((res=W3DShaderManager::getChipset()) != 0)
+	// Effects that need a copy of the frame use the renderer-owned target
+	// contract.  The owner rejects multisampled or otherwise incompatible
+	// targets; no backend surface is inspected here.
+	if (res != DC_UNKNOWN)
 	{
-		m_currentChipset = res;	//cache the current chipset.
-
-		//Some of our effects require an offscreen render target, so try creating it here.
-		HRESULT hr=DX8Wrapper::_Get_D3D_Device8()->GetRenderTarget(&m_oldRenderSurface);
-
-		if (hr != S_OK || !m_oldRenderSurface)
-			return;
-
-		m_oldRenderSurface->GetDesc(&desc);
-		
-		// TheSuperHackers @bugfix Redirecting rendering to a non-multisampled texture
-		// while using a multisampled depth buffer is an API violation in DX8.
-		if (desc.MultiSampleType == D3DMULTISAMPLE_NONE)
+		rts::render::RenderBackBufferInfo info;
+		if (rts::render::GetGameBackBufferInfo(&info) ==
+			rts::render::RENDER_RESULT_OK && info.width > 0 && info.height > 0 &&
+			(info.format == rts::render::RENDER_FORMAT_R8G8B8A8_UNORM ||
+			 info.format == rts::render::RENDER_FORMAT_B8G8R8A8_UNORM))
 		{
-			hr=DX8Wrapper::_Get_D3D_Device8()->CreateTexture(desc.Width,desc.Height,1,D3DUSAGE_RENDERTARGET,desc.Format,D3DPOOL_DEFAULT,&m_renderTexture);
-		}
-		else
-		{
-			// Force failure path to avoid MSAA mismatch
-			hr = E_FAIL;
-		}
-
-		if (hr != S_OK)
-		{
-			SAFE_RELEASE(m_oldRenderSurface);
-			m_renderTexture = nullptr;
-		} else {
-			hr = m_renderTexture->GetSurfaceLevel(0, &m_newRenderSurface);
-			if (hr != S_OK)
-			{
-				SAFE_RELEASE(m_renderTexture);
-				m_newRenderSurface = nullptr;
-			}	else {
-				hr = DX8Wrapper::_Get_D3D_Device8()->GetDepthStencilSurface(&m_oldDepthSurface);
-				if (hr != S_OK)
-				{
-					SAFE_RELEASE(m_newRenderSurface);
-					SAFE_RELEASE(m_renderTexture);
-					m_oldDepthSurface = nullptr;
-				}
-			}
+			m_renderTexture = rts::render::CreateGameRenderTarget(
+				info.width, info.height, WW3D_FORMAT_A8R8G8B8);
+			m_renderTargetAvailable = m_renderTexture != nullptr;
 		}
 	}
 
@@ -2713,7 +2836,6 @@ void W3DShaderManager::init()
 				break;	//found a working shader
 		}
 	}
-
 	DEBUG_LOG(("ShaderManager ChipsetID %d", res));
 }
 
@@ -2722,10 +2844,9 @@ void W3DShaderManager::init()
 //=============================================================================
 void W3DShaderManager::shutdown()
 {
-	SAFE_RELEASE(m_newRenderSurface);
-	SAFE_RELEASE(m_renderTexture);
-	SAFE_RELEASE(m_oldRenderSurface);
-	SAFE_RELEASE(m_oldDepthSurface);
+	m_renderingToTexture = false;
+	m_renderTargetAvailable = false;
+	REF_PTR_RELEASE(m_renderTexture);
 	m_currentShader = ST_INVALID;
 	m_currentFilter = FT_NULL_FILTER;
 	//release any assets associated with a shader (vertex/pixel shaders, textures, etc.)
@@ -2763,7 +2884,7 @@ Int W3DShaderManager::getShaderPasses(ShaderTypes shader)
 }
 
 // W3DShaderManager::setShader =======================================================
-/** Must call this method before each rendering pass in order to perform proper D3D
+/** Must call this method before each rendering pass in order to perform proper renderer
 	setup for each shader.
  */
 //=============================================================================
@@ -2780,7 +2901,7 @@ Int W3DShaderManager::setShader(ShaderTypes shader, Int pass)
 
 // W3DShaderManager::resetShader =======================================================
 /** Must call this method after all polygons and rendering passes have been submitted.
-	This method allows D3D to reset itself to a default state that doesn't conflict
+	This method allows the renderer to reset itself to a default state that doesn't conflict
 	with the WW3D2 Shader system.
  */
 //=============================================================================
@@ -2802,8 +2923,11 @@ Bool W3DShaderManager::filterPreRender(FilterTypes filter, Bool &skipRender, Cus
 	{	Bool result=W3DFilters[filter]->preRender(skipRender,scenePassMode);
 		if (result)
 			m_currentFilter = filter;
+		else
+			m_currentFilter = FT_NULL_FILTER;
 		return result;
 	}
+	m_currentFilter = FT_NULL_FILTER;
 	return FALSE;
 }
 
@@ -2814,7 +2938,15 @@ Bool W3DShaderManager::filterPreRender(FilterTypes filter, Bool &skipRender, Cus
 Bool W3DShaderManager::filterPostRender(FilterTypes filter, FilterModes mode, Coord2D &scrollDelta, Bool &doExtraRender)
 {
 	if (W3DFilters[filter])
-		return W3DFilters[filter]->postRender(mode, scrollDelta,doExtraRender);
+	{
+		const Bool result = W3DFilters[filter]->postRender(
+			mode, scrollDelta, doExtraRender);
+		// A filter owns the temporary target only for its post pass.  Clear the
+		// active-filter latch even when the pass rejects the target or draw so a
+		// later RTT setup cannot inherit motion-blur/crossfade clear semantics.
+		m_currentFilter = FT_NULL_FILTER;
+		return result;
+	}
 
 	m_currentFilter = FT_NULL_FILTER;
 	return FALSE;
@@ -2867,13 +2999,14 @@ void W3DShaderManager::drawViewport(Int color)
 
 	//draw polygons like this is very inefficient but for only 2 triangles, it's
 	//not worth bothering with index/vertex buffers.
-	DX8Wrapper::Set_Legacy_Vertex_Program(
+	rts::render::SetGameLegacyVertexProgram(
 		rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION);
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
-	DX8Wrapper::Set_Vertex_Shader(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+	rts::render::SetGameVertexShader(GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1);
 
-	DX8Wrapper::Draw_Primitive_UP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(_TRANS_LIT_TEX_VERTEX));
+	(void)DrawGameTriangleStrip(v, sizeof(_TRANS_LIT_TEX_VERTEX),
+		GAME_VERTEX_XYZRHW | GAME_VERTEX_DIFFUSE | GAME_VERTEX_TEX1);
 }
 
 // W3DShaderManager::startRenderToTexture =======================================================
@@ -2884,26 +3017,18 @@ void W3DShaderManager::startRenderToTexture()
 {
 	DEBUG_ASSERTCRASH(!m_renderingToTexture, ("Already rendering to texture - cannot nest calls."));
 
-	if (m_renderingToTexture || m_newRenderSurface==nullptr || m_oldDepthSurface==nullptr) return;
-	HRESULT hr = DX8Wrapper::Set_Render_Target(m_newRenderSurface,m_oldDepthSurface);
+	if (m_renderingToTexture || !canRenderToTexture()) return;
+	rts::render::SetGameRenderTarget(m_renderTexture, nullptr, true);
 
-	// TheSuperHackers @bugfix If SetRenderTarget fails (e.g. due to MSAA forced by driver
-	// profile causing a depth buffer mismatch that D3DSURFACE_DESC doesn't report), permanently
-	// disable RTT to prevent repeated failures and accidental backbuffer clears.
-	if (hr != S_OK)
+	// A rejected target is latched off for this device lifetime.  Restore the
+	// default target before releasing the publication so an optional filter can
+	// never leave the frame pointed at an invalid resource.
+	if (!rts::render::IsGameRenderingToTexture())
 	{
-		// The legacy device may accept the target while the D3D11 bridge rejects
-		// it (for example when a default swap-chain depth surface is mistaken for
-		// a texture-backed depth target).  Restore the visible default target
-		// immediately so the failed optional filter cannot leave the D3D11 frame
-		// pointed at an unavailable off-screen target.
-		DX8Wrapper::Set_Render_Target(nullptr, false);
-
-		// Permanently disable RTT
-		SAFE_RELEASE(m_newRenderSurface);
-		SAFE_RELEASE(m_renderTexture);
-		SAFE_RELEASE(m_oldRenderSurface);
-		SAFE_RELEASE(m_oldDepthSurface);
+		rts::render::SetGameRenderTarget(nullptr, nullptr, true);
+		m_renderingToTexture = false;
+		m_renderTargetAvailable = false;
+		REF_PTR_RELEASE(m_renderTexture);
 		return;
 	}
 
@@ -2913,21 +3038,36 @@ void W3DShaderManager::startRenderToTexture()
 		if (m_currentFilter == FT_VIEW_MOTION_BLUR_FILTER || m_currentFilter == FT_VIEW_CROSSFADE)
 		{	//these filters rely on the previous frame being visible so we must be careful about clearing
 			//frame buffer.  Only clear the alpha channel
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_ALPHA);	//only clear alpha
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_COLOR_WRITE_MASK,GAME_COLOR_WRITE_ALPHA);	//only clear alpha
 			ShaderClass shader=ShaderClass::_PresetOpaqueSolidShader;
 			shader.Set_Depth_Compare(ShaderClass::PASS_ALWAYS);
 			shader.Set_Depth_Mask(ShaderClass::DEPTH_WRITE_DISABLE);
-			DX8Wrapper::Set_Shader(shader);
+			rts::render::SetGameShader(shader);
 
 			VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-			DX8Wrapper::Set_Material(vmat);
+			rts::render::SetGameMaterial(vmat);
 			REF_PTR_RELEASE(vmat);	//no need to keep a reference since it's a preset.
 
 			drawViewport(0x00ffffff | (((Int)(TheWaterTransparency->m_minWaterOpacity*255.0f)) <<24));
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_COLORWRITEENABLE,D3DCOLORWRITEENABLE_RED|D3DCOLORWRITEENABLE_GREEN|D3DCOLORWRITEENABLE_BLUE);	//disable writes to alpha
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_COLOR_WRITE_MASK,GAME_COLOR_WRITE_RED|GAME_COLOR_WRITE_GREEN|GAME_COLOR_WRITE_BLUE);	//disable writes to alpha
 		}
 		else	//normal clear that overwrites everything.
-			DX8Wrapper::Clear(true, false, Vector3( 0.0f, 0.0f, 0.0f ), TheWaterTransparency->m_minWaterOpacity);
+		{
+			rts::render::GameRenderColor clearColor;
+			clearColor.red = 0.0f;
+			clearColor.green = 0.0f;
+			clearColor.blue = 0.0f;
+			clearColor.alpha = TheWaterTransparency->m_minWaterOpacity;
+			if (rts::render::ClearGameRenderTargets(
+				true, false, clearColor, clearColor.alpha) !=
+				rts::render::RENDER_RESULT_OK)
+			{
+				rts::render::SetGameRenderTarget(nullptr, nullptr, true);
+				m_renderingToTexture = false;
+				m_renderTargetAvailable = false;
+				REF_PTR_RELEASE(m_renderTexture);
+			}
+		}
 	}
 }
 
@@ -2935,32 +3075,40 @@ void W3DShaderManager::startRenderToTexture()
 /** Ends rendering to a texture.
  */
 //=============================================================================
-IDirect3DTexture8 *W3DShaderManager::endRenderToTexture()
+TextureClass *W3DShaderManager::endRenderToTexture()
 {
 	DEBUG_ASSERTCRASH(m_renderingToTexture, ("Not rendering to texture."));
 	if (!m_renderingToTexture) return nullptr;
-	HRESULT hr = DX8Wrapper::Set_Render_Target(m_oldRenderSurface,m_oldDepthSurface);	//restore original render target
-	DEBUG_ASSERTCRASH(hr==S_OK, ("Set target failed unexpectedly."));
-	if (hr == S_OK)
+	TextureClass *texture = m_renderTexture;
+	rts::render::SetGameRenderTarget(nullptr, nullptr, true);	//restore original render target
+	if (!rts::render::IsGameRenderingToTexture())
 	{
 		//assume render target texture will be in stage 0.  Most hardware has "conditional" support for
 		//non-power-of-2 textures so we must force some required states:
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSW, D3DTADDRESS_CLAMP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_MIPFILTER, D3DTEXF_NONE);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_W, RENDER_TEXTURE_ADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_NONE);
 
 		m_renderingToTexture = false;
+		return texture;
 	}
-	return m_renderTexture;
+
+	// Restoring the default target failed.  Do not return a texture that may
+	// still be bound as an active target; disable this optional path until the
+	// next renderer initialization.
+	m_renderingToTexture = false;
+	m_renderTargetAvailable = false;
+	REF_PTR_RELEASE(m_renderTexture);
+	return nullptr;
 }
 
 /**Returns texture containing the image that was last rendered using any of the effects requiring render target
 textures.  Used mostly for cross-fading effects that need an unmodified version of the view before the effect
 was applied.  NOTE: This texture does not survive device reset.. so quit effect on reset!*/
-IDirect3DTexture8 *W3DShaderManager::getRenderTexture()
+TextureClass *W3DShaderManager::getRenderTexture()
 {
 	return m_renderTexture;
 }
@@ -2983,150 +3131,22 @@ ChipsetType W3DShaderManager::getChipset()
 	if (TheGlobalData && TheGlobalData->m_chipSetType != DC_UNKNOWN)
 		return (ChipsetType)TheGlobalData->m_chipSetType;
 
-	ChipsetType chip=DC_UNKNOWN;
-	IDirect3D8* d3d8Interface=DX8Wrapper::_Get_D3D8();
+	if (!rts::render::IsGameRendererInitialized() ||
+		!rts::render::IsGameRenderTargetOperational())
+		return DC_UNKNOWN;
 
-	if (d3d8Interface && DX8Wrapper::_Get_D3D_Device8())
-	{
-
-		D3DADAPTER_IDENTIFIER8 did;
-		::ZeroMemory(&did, sizeof(D3DADAPTER_IDENTIFIER8));
-	/*	HRESULT res = */ d3d8Interface->GetAdapterIdentifier(0,D3DENUM_NO_WHQL_LEVEL,&did);
-		*((LARGE_INTEGER*)&m_driverVersion) = did.DriverVersion;
-
-		if(did.VendorId == DC_NVIDIA_VENDOR_ID)
-		{
-			m_currentVendor = DC_NVIDIA_VENDOR_ID;
-
-			if (did.DeviceId == 0x20)
-				return DC_TNT;
-
-			if (did.DeviceId >= 0x28 && did.DeviceId < 0x100)
-				return DC_TNT2;
-
-			if ( (did.DeviceId >= 0x100 && did.DeviceId <= 0x103) ||	//GeForce
-				 (did.DeviceId >= 0x110 && did.DeviceId <= 0x113) ||	//GeForce2 MX
-						 (did.DeviceId >= 0x150 && did.DeviceId <= 0x153) )	//GeForce2
-           		return DC_GEFORCE2;
-
-			if (did.DeviceId >= 0x200 && did.DeviceId < 0x250)
-				return DC_GEFORCE3;
-
-			if (did.DeviceId >= 0x250)
-				return DC_GEFORCE4;
-		}
-		else
-		if(did.VendorId == DC_3DFX_VENDOR_ID)
-		{
-			m_currentVendor = DC_3DFX_VENDOR_ID;
-
-			if (did.DeviceId == 0x0002)
-				return DC_VOODOO2;
-			if (did.DeviceId == 0x0005)
-				return DC_VOODOO3;
-			if (did.DeviceId == 0x0008)	///@todo: Just guessing on this one - find actual Voodoo4 deviceID.
-				return DC_VOODOO4;
-			if (did.DeviceId == 0x0009)
-				return DC_VOODOO5;
-		}
-		else
-		if(did.VendorId == DC_ATI_VENDOR_ID)
-		{
-			m_currentVendor = DC_ATI_VENDOR_ID;
-
-			if (did.DeviceId == 0x5144)
-				return DC_RADEON;
-			if (did.DeviceId == 0x514C)
-				return DC_RADEON_8500;
-			if (did.DeviceId == 0x4e44)
-				return DC_RADEON_9700;
-		}
-
-		//None of the vendor specific ID's matched so use generic means to classify the card
-		Int maxTextures=DX8Wrapper::Get_Current_Caps()->Get_Max_Simultaneous_Textures();
-		Real pixelShaderVersion;
-
-		char buf[256];
-
-		//Convert version to Real
-		sprintf(buf,"%d.%d",DX8Wrapper::Get_Current_Caps()->Get_Pixel_Shader_Major_Version(),DX8Wrapper::Get_Current_Caps()->Get_Pixel_Shader_Minor_Version());
-		sscanf(buf,"%f",&pixelShaderVersion);
-
-		if (maxTextures >= 4)
-		{	if (pixelShaderVersion >= 1.1f)
-				chip=DC_GENERIC_PIXEL_SHADER_1_1;
-			if (pixelShaderVersion >= 1.4f)
-				chip=DC_GENERIC_PIXEL_SHADER_1_4;
-			if (maxTextures >= 8 && pixelShaderVersion >= 2.0f)
-				chip=DC_GENERIC_PIXEL_SHADER_2_0;
-		}
-	}
-
-	return chip;
-}
-
-//=============================================================================
-// WaterRenderObjClass::LoadAndCreateShader
-//=============================================================================
-/** Loads and creates a D3D pixel or vertex shader.*/
-//=============================================================================
-HRESULT W3DShaderManager::LoadAndCreateD3DShader(const char* strFilePath, const DWORD* pDeclaration, DWORD Usage, Bool ShaderType, DWORD* pHandle)
-{
-	if (getChipset() < DC_GENERIC_PIXEL_SHADER_1_1)
-		return E_FAIL;	//don't allow loading any shaders if hardware can't handle it.
-
-	try
-	{
-		File *file = nullptr;
-		HRESULT hr;
-
-		file = TheFileSystem->openFile(strFilePath, File::READ | File::BINARY);
-		if (file == nullptr)
-		{
-			OutputDebugString("Could not find file \n" );
-			return E_FAIL;
-		}
-
-		FileInfo fileInfo;
-		TheFileSystem->getFileInfo(AsciiString(strFilePath), &fileInfo);
-		DWORD dwFileSize = fileInfo.sizeLow;
-
-		const DWORD* pShader = (DWORD*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, dwFileSize);
-		if (!pShader)
-		{
-			OutputDebugString( "Failed to allocate memory to load shader\n " );
-			return E_FAIL;
-		}
-
-		file->read((void *)pShader, dwFileSize);
-
-		file->close();
-		file = nullptr;
-
-		if (ShaderType) // SHADERTYPE_VERTEX
-		{
-			hr = DX8Wrapper::_Get_D3D_Device8()->CreateVertexShader(pDeclaration, pShader, pHandle, Usage);
-		}
-		else // SHADERTYPE_PIXEL
-		{
-			hr = DX8Wrapper::_Get_D3D_Device8()->CreatePixelShader(pShader, pHandle);
-		}
-
-		HeapFree(GetProcessHeap(), 0, (void*)pShader);
-
-		if (FAILED(hr))
-		{
-			OutputDebugString( "Failed to create shader\n ");
-			return E_FAIL;
-		}
-	}
-	catch(...)
-	{
-		OutputDebugString( "Error opening file \n" );
-		return E_FAIL;
-	}
-
-	return S_OK;
+	// The native owner exposes capability level rather than adapter-specific
+	// identifiers.  The shader manager only needs the historical tier to
+	// select a visual path, so classify from the shared texture/stage and Dot3
+	// capabilities without importing backend objects.
+	const unsigned int maxTextures = rts::render::GetGameMaxTexturesPerPass();
+	if (maxTextures >= 8)
+		return DC_GENERIC_PIXEL_SHADER_2_0;
+	if (maxTextures >= 4 && rts::render::GameRendererSupportsDot3())
+		return DC_GENERIC_PIXEL_SHADER_1_4;
+	if (maxTextures >= 4)
+		return DC_GENERIC_PIXEL_SHADER_1_1;
+	return DC_UNKNOWN;
 }
 
 //For the MP test, we're enforcing high min-spec requirements that need to be verified.
@@ -3261,25 +3281,25 @@ Int W3DShaderManager::setShroudTex(Int stage)
 	W3DShroud *shroud;
 	if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr)
 	{
-		DX8Wrapper::Set_Texture(stage, shroud->getShroudTexture());
+		rts::render::SetGameTexture(stage, shroud->getShroudTexture());
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(stage,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(stage,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_COLORARG2, D3DTA_CURRENT );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ALPHAARG1, D3DTA_TEXTURE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ALPHAARG2, D3DTA_CURRENT );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-		DX8Wrapper::Set_DX8_Texture_Stage_State( stage, D3DTSS_ALPHAOP,   D3DTOP_SELECTARG2 );
+		rts::render::SetGameTextureStageState(stage,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
+		rts::render::SetGameTextureStageState(stage,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
+		rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+		rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+		rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+		rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_ALPHA_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+		rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+		rts::render::SetGameTextureStageState( stage, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_SELECT_ARGUMENT_2 );
 
-D3DMATRIX curView;
-		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+		rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 		float det;
-		LegacyD3DMatrixInverse(&inv, &det, &curView);
+		RenderMatrixInverse(&inv, &det, &curView);
 
-		D3DMATRIX scale,offset;
+		RenderMatrix4x4 scale,offset;
 
 		//We need to make all world coordinates be relative to the heightmap data origin since that
 		//is where the shroud begins.
@@ -3295,14 +3315,14 @@ D3DMATRIX inv;
 			yoffset = -(float)shroud->getDrawOriginY() + height;
 		}
 
-		LegacyD3DMatrixTranslation(&offset, xoffset, yoffset,0);
+		RenderMatrixTranslation(&offset, xoffset, yoffset,0);
 
 		width = 1.0f/(width*shroud->getTextureWidth());
 		height = 1.0f/(height*shroud->getTextureHeight());
-		LegacyD3DMatrixScaling(&scale, width, height, 1);
-		LegacyD3DMatrixMultiply(&curView, &inv, &offset);
-		LegacyD3DMatrixMultiply(&curView, &curView, &scale);
-		DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0+stage), curView);
+		RenderMatrixScaling(&scale, width, height, 1);
+		RenderMatrixMultiply(&curView, &inv, &offset);
+		RenderMatrixMultiply(&curView, &curView, &scale);
+		rts::render::SetGameTransform(static_cast<rts::render::GameRenderTransformSlot>(GAME_TRANSFORM_TEXTURE0+stage), &curView);
 		return TRUE;
 	}
 	return FALSE;
@@ -3331,74 +3351,74 @@ void FlatTerrainShader2Stage::reset()
 	ShaderClass::Invalidate();
 
 	//Free references to textures
-	DX8Wrapper::Set_DX8_Texture(0, nullptr);
-	DX8Wrapper::Set_DX8_Texture(1, nullptr);
+	rts::render::SetGameTexture(0, nullptr);
+	rts::render::SetGameTexture(1, nullptr);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|0);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|1);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|1);
 }
 
 
 Int FlatTerrainShader2Stage::set(Int pass)
 {
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 	if (TheGlobalData && (TheGlobalData->m_bilinearTerrainTex || TheGlobalData->m_trilinearTerrainTex)) {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	} else {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_POINT);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
 	}
 	if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex) {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	} else {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MIPFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MIPFILTER, D3DTEXF_POINT);
+		rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
 	}
 
 	switch (pass)
 	{
 		case 0:
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
 
 			// Modulate the diffuse color with the texture as lighting comes from diffuse.
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE );
 			if (W3DShaderManager::getShaderTexture(0)) {
-				DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(0)->Peek_D3D_Texture());
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_CURRENT );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
+				rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(0));
+				rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+				rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+				rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+				rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
 
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+				rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
+				rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
 				//We need to scale so shroud texel stretches over one full terrain cell.  Each texel
 				//is 1/128 the size of full texture. (assuming 128x128 vid-mem texture).
 				W3DShroud *shroud;
 				if ((shroud=TheTerrainRenderObject->getShroud()) != nullptr)
 				{
-D3DMATRIX curView;
-					DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+	rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 					float det;
-					LegacyD3DMatrixInverse(&inv, &det, &curView);
+					RenderMatrixInverse(&inv, &det, &curView);
 
-					D3DMATRIX scale,offset;
+					RenderMatrix4x4 scale,offset;
 
 					//We need to make all world coordinates be relative to the heightmap data origin since that
 					//is where the shroud begins.
@@ -3414,113 +3434,113 @@ D3DMATRIX inv;
 						yoffset = -(float)shroud->getDrawOriginY() + height;
 					}
 
-					LegacyD3DMatrixTranslation(&offset, xoffset, yoffset,0);
+					RenderMatrixTranslation(&offset, xoffset, yoffset,0);
 
 					width = 1.0f/(width*shroud->getTextureWidth());
 					height = 1.0f/(height*shroud->getTextureHeight());
-					LegacyD3DMatrixScaling(&scale, width, height, 1);
-					LegacyD3DMatrixMultiply(&curView, &inv, &offset);
-					LegacyD3DMatrixMultiply(&curView, &curView, &scale);
-					DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0), curView);
+					RenderMatrixScaling(&scale, width, height, 1);
+					RenderMatrixMultiply(&curView, &inv, &offset);
+					RenderMatrixMultiply(&curView, &curView, &scale);
+					rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE0, &curView);
 				}
 			}	else {
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_SELECTARG2 );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, 0 );
+				rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_SELECT_ARGUMENT_2 );
+				rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0 );
 			}
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
 
 			// Modulate the diffuse color with the texture as lighting comes from diffuse.
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_CURRENT );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, 0 );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,false);
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0 );
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+			rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|0);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE,false);
 			break;
 		case 1:
 			// Noise/cloud pass
-D3DMATRIX curView;
-			DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+			rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
 			//these states apply to all noise/cloud combination passes
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLORARG2, D3DTA_DIFFUSE );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_COLOROP,   D3DTOP_SELECTARG1 );
-			DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_DIFFUSE );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_SELECT_ARGUMENT_1 );
+			rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
 
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+			rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 			// Two output coordinates are used.
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-			DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
+			rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
+			rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+			rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
 
 			//blend into frame buffer
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE,true);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_SRCBLEND,D3DBLEND_DESTCOLOR);
-			DX8Wrapper::Set_DX8_Render_State(D3DRS_DESTBLEND,D3DBLEND_ZERO);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE,true);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_SOURCE_BLEND,RENDER_BLEND_DESTINATION_COLOR);
+			rts::render::SetGameRenderState(GAME_RENDER_STATE_DESTINATION_BLEND,RENDER_BLEND_ZERO);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 			float det;
-			LegacyD3DMatrixInverse(&inv, &det, &curView);
+			RenderMatrixInverse(&inv, &det, &curView);
 
 			if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_FLAT_TERRAIN_BASE_NOISE12)
 			{
 				//setup cloud pass
 
 				terrainShader2Stage.updateNoise1(&curView,&inv);	//update curView with texture matrix
-				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE0, curView);
+				rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE0, &curView);
 				//clouds always need bilinear filtering
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-				DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+				rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+				rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+				rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(2));
 
 				//setup noise pass
 
 				terrainShader2Stage.updateNoise2(&curView,&inv);
-				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE1, curView);
+				rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE1, &curView);
 				//noise always needs point/linear filtering.  Why point!?
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-				DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+				rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+				rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG1, D3DTA_TEXTURE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLORARG2, D3DTA_CURRENT );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_MODULATE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT1, GAME_TEXTURE_ARGUMENT_TEXTURE );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_ARGUMENT2, GAME_TEXTURE_ARGUMENT_CURRENT );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_MODULATE );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 				// Two output coordinates are used.
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
-				DX8Wrapper::Set_DX8_Texture(1, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
+				rts::render::SetGameTexture(1, W3DShaderManager::getShaderTexture(3));
 			}
 			else
 			{	//only 1 noise or cloud texture
 				// Now setup the texture pipeline.
 				if (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_FLAT_TERRAIN_BASE_NOISE1)
 				{	//setup cloud pass
-					DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+					rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(2));
 					terrainShader2Stage.updateNoise1(&curView,&inv);	//update curView with texture matrix
-					DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-					DX8Wrapper::Set_DX8_Texture_Stage_State(0, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+					rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+					rts::render::SetGameTextureStageState(0, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 				}
 				else
 				{
 					//setup noise pass
-					DX8Wrapper::Set_DX8_Texture(0, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+					rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(3));
 					terrainShader2Stage.updateNoise2(&curView,&inv);	//update curView with texture matrix
-					DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MINFILTER, D3DTEXF_POINT);
-					DX8Wrapper::Set_DX8_Texture_Stage_State(1, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+					rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+					rts::render::SetGameTextureStageState(1, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 				}
 
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_COLOROP,   D3DTOP_DISABLE );
-				DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_ALPHAOP,   D3DTOP_DISABLE );
-				DX8Wrapper::_Set_DX8_Transform(D3DTS_TEXTURE0, curView);
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COLOR_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+				rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_ALPHA_OPERATION,   RENDER_TEXTURE_OP_DISABLE );
+				rts::render::SetGameTransform(GAME_TRANSFORM_TEXTURE0, &curView);
 			}
 			break;
 	}
@@ -3536,16 +3556,16 @@ D3DMATRIX inv;
 Int FlatTerrainShaderPixelShader::shutdown()
 {
 	if (m_dwBasePixelShader)
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_dwBasePixelShader);
+		(void)rts::render::DeleteGameShader(false, m_dwBasePixelShader);
 
 	if (m_dwBase0PixelShader)
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_dwBase0PixelShader);
+		(void)rts::render::DeleteGameShader(false, m_dwBase0PixelShader);
 
 	if (m_dwBaseNoise1PixelShader)
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_dwBaseNoise1PixelShader);
+		(void)rts::render::DeleteGameShader(false, m_dwBaseNoise1PixelShader);
 
 	if (m_dwBaseNoise2PixelShader)
-		DX8Wrapper::_Get_D3D_Device8()->DeletePixelShader(m_dwBaseNoise2PixelShader);
+		(void)rts::render::DeleteGameShader(false, m_dwBaseNoise2PixelShader);
 
 	m_dwBasePixelShader=0;
 	m_dwBase0PixelShader=0;
@@ -3568,37 +3588,41 @@ Int FlatTerrainShaderPixelShader::init()
 	{
 		if (res >= DC_GENERIC_PIXEL_SHADER_1_1)
 		{
-			//this shader needs some assets that need to be loaded
-			//shader decleration
-			DWORD Declaration[]=
-			{
-				(D3DVSD_STREAM(0)),
-				(D3DVSD_REG(0, D3DVSDT_FLOAT3)), // Position
-				(D3DVSD_REG(1, D3DVSDT_D3DCOLOR)), // Diffuse
-				(D3DVSD_REG(2, D3DVSDT_FLOAT2)), //  Texture Coordinates
-				(D3DVSD_REG(3, D3DVSDT_FLOAT2)), //  Texture Coordinates
-				(D3DVSD_END())
-			};
-
 			//base version which doesn't apply any noise textures.
-			HRESULT hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\fterrain.pso", &Declaration[0], 0, false, &m_dwBasePixelShader);
-			if (FAILED(hr))
+			if (rts::render::CreateGameShaderFromAsset(
+				"shaders\\fterrain.pso", false, nullptr, 0, 0,
+				&m_dwBasePixelShader) != rts::render::RENDER_RESULT_OK)
+			{
+				shutdown();
 				return FALSE;
+			}
 
 			//base version which doesn't apply any shroud textures.
-			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\fterrain0.pso", &Declaration[0], 0, false, &m_dwBase0PixelShader);
-			if (FAILED(hr))
+			if (rts::render::CreateGameShaderFromAsset(
+				"shaders\\fterrain0.pso", false, nullptr, 0, 0,
+				&m_dwBase0PixelShader) != rts::render::RENDER_RESULT_OK)
+			{
+				shutdown();
 				return FALSE;
+			}
 
 			//version which blends 1 noise texture.
-			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\fterrainnoise.pso", &Declaration[0], 0, false, &m_dwBaseNoise1PixelShader);
-			if (FAILED(hr))
+			if (rts::render::CreateGameShaderFromAsset(
+				"shaders\\fterrainnoise.pso", false, nullptr, 0, 0,
+				&m_dwBaseNoise1PixelShader) != rts::render::RENDER_RESULT_OK)
+			{
+				shutdown();
 				return FALSE;
+			}
 
 			//version which blends 2 noise textures.
-			hr = W3DShaderManager::LoadAndCreateD3DShader("shaders\\fterrainnoise2.pso", &Declaration[0], 0, false, &m_dwBaseNoise2PixelShader);
-			if (FAILED(hr))
+			if (rts::render::CreateGameShaderFromAsset(
+				"shaders\\fterrainnoise2.pso", false, nullptr, 0, 0,
+				&m_dwBaseNoise2PixelShader) != rts::render::RENDER_RESULT_OK)
+			{
+				shutdown();
 				return FALSE;
+			}
 
 			W3DShaders[W3DShaderManager::ST_FLAT_TERRAIN_BASE]=&flatTerrainShaderPixelShader;
 			W3DShaders[W3DShaderManager::ST_FLAT_TERRAIN_BASE_NOISE1]=&flatTerrainShaderPixelShader;
@@ -3620,33 +3644,33 @@ Int FlatTerrainShaderPixelShader::set(Int pass)
 	Int curStage = 1;
 	// setup terrain [3/31/2003]
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State(0,  D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_Texture(0, W3DShaderManager::getShaderTexture(2));
-	DX8Wrapper::Set_Texture(1, W3DShaderManager::getShaderTexture(2));
+	rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState(0,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
+	rts::render::SetGameTexture(0, W3DShaderManager::getShaderTexture(2));
+	rts::render::SetGameTexture(1, W3DShaderManager::getShaderTexture(2));
 	//force WW3D2 system to set it's states so it won't later overwrite our custom settings.
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 
 
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( curStage, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( curStage, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState( curStage, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+	rts::render::SetGameTextureStageState( curStage, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
 	//tell pixel shader which UV set to use for each stage
-	DX8Wrapper::Set_DX8_Texture_Stage_State( curStage, D3DTSS_TEXCOORDINDEX, 0 );
-	DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
+	rts::render::SetGameTextureStageState( curStage, GAME_TEXTURE_STAGE_COORDINATE_INDEX, 0 );
+	rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
 
 	if (TheGlobalData && (TheGlobalData->m_bilinearTerrainTex || TheGlobalData->m_trilinearTerrainTex)) {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	} else {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MINFILTER, D3DTEXF_POINT);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MAGFILTER, D3DTEXF_POINT);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_POINT);
 	}
 	if (TheGlobalData && TheGlobalData->m_trilinearTerrainTex) {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MIPFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 	} else {
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MIPFILTER, D3DTEXF_POINT);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MIP_FILTER, RENDER_TEXTURE_FILTER_POINT);
 	}
 
 	curStage = 0;
@@ -3654,20 +3678,20 @@ Int FlatTerrainShaderPixelShader::set(Int pass)
 	W3DShroud *shroud = TheTerrainRenderObject->getShroud();
 	if (shroud) {
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
 		//We need to scale so shroud texel stretches over one full terrain cell.  Each texel
 		//is 1/128 the size of full texture. (assuming 128x128 vid-mem texture).
 		{
-D3DMATRIX curView;
-			DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+			rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 			float det;
-			LegacyD3DMatrixInverse(&inv, &det, &curView);
+			RenderMatrixInverse(&inv, &det, &curView);
 
-			D3DMATRIX scale,offset;
+			RenderMatrix4x4 scale,offset;
 
 			//We need to make all world coordinates be relative to the heightmap data origin since that
 			//is where the shroud begins.
@@ -3683,20 +3707,20 @@ D3DMATRIX inv;
 				yoffset = -(float)shroud->getDrawOriginY() + height;
 			}
 
-			LegacyD3DMatrixTranslation(&offset, xoffset, yoffset,0);
+			RenderMatrixTranslation(&offset, xoffset, yoffset,0);
 
 			width = 1.0f/(width*shroud->getTextureWidth());
 			height = 1.0f/(height*shroud->getTextureHeight());
-			LegacyD3DMatrixScaling(&scale, width, height, 1);
-			LegacyD3DMatrixMultiply(&curView, &inv, &offset);
-			LegacyD3DMatrixMultiply(&curView, &curView, &scale);
-			DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0+curStage), curView);
+			RenderMatrixScaling(&scale, width, height, 1);
+			RenderMatrixMultiply(&curView, &inv, &offset);
+			RenderMatrixMultiply(&curView, &curView, &scale);
+		rts::render::SetGameTransform(static_cast<rts::render::GameRenderTransformSlot>(GAME_TRANSFORM_TEXTURE0+curStage), &curView);
 		}
-		DX8Wrapper::Set_DX8_Texture_Stage_State( curStage, D3DTSS_ADDRESSU, D3DTADDRESS_CLAMP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( curStage, D3DTSS_ADDRESSV, D3DTADDRESS_CLAMP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( curStage, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State( curStage, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture(curStage, shroud->getShroudTexture()->Peek_D3D_Texture());
+		rts::render::SetGameTextureStageState( curStage, GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( curStage, GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_CLAMP);
+		rts::render::SetGameTextureStageState( curStage, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState( curStage, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTexture(curStage, shroud->getShroudTexture());
 		curStage++;
 		if (curStage==1) curStage++;
 	}
@@ -3704,24 +3728,24 @@ D3DMATRIX inv;
 	Bool doNoise1 = (W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_FLAT_TERRAIN_BASE_NOISE1 ||
 						W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_FLAT_TERRAIN_BASE_NOISE12);
 	if (doNoise1) {	 // Cloud pass.
-D3DMATRIX curView;
-		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+		rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-D3DMATRIX inv;
+RenderMatrix4x4 inv;
 		float det;
-		LegacyD3DMatrixInverse(&inv, &det, &curView);
+		RenderMatrixInverse(&inv, &det, &curView);
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 		// Two output coordinates are used.
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture(curStage, W3DShaderManager::getShaderTexture(2)->Peek_D3D_Texture());
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
+		rts::render::SetGameTexture(curStage, W3DShaderManager::getShaderTexture(2));
 		terrainShader2Stage.updateNoise1(&curView,&inv);	//update curView with texture matrix
-		DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0+curStage), curView);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTransform(static_cast<rts::render::GameRenderTransformSlot>(GAME_TRANSFORM_TEXTURE0+curStage), &curView);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
 		curStage++;
 		if (curStage==1) curStage++;
@@ -3731,80 +3755,80 @@ D3DMATRIX inv;
 						W3DShaderManager::getCurrentShader() == W3DShaderManager::ST_FLAT_TERRAIN_BASE_NOISE12);
 	if (doNoise2)
 	{
-D3DMATRIX curView;
-		DX8Wrapper::_Get_DX8_Transform(D3DTS_VIEW, curView);
+RenderMatrix4x4 curView;
+		rts::render::GetGameTransform(GAME_TRANSFORM_VIEW, &curView);
 
-		D3DMATRIX inv;
+		RenderMatrix4x4 inv;
 		float det;
-		LegacyD3DMatrixInverse(&inv, &det, &curView);
+		RenderMatrixInverse(&inv, &det, &curView);
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_CAMERASPACEPOSITION);
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
 		// Two output coordinates are used.
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT2);
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_COUNT2);
 
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_ADDRESSU, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage,  D3DTSS_ADDRESSV, D3DTADDRESS_WRAP);
-		DX8Wrapper::Set_DX8_Texture(curStage, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_ADDRESS_U, RENDER_TEXTURE_ADDRESS_WRAP);
+		rts::render::SetGameTextureStageState(curStage,  GAME_TEXTURE_STAGE_ADDRESS_V, RENDER_TEXTURE_ADDRESS_WRAP);
+		rts::render::SetGameTexture(curStage, W3DShaderManager::getShaderTexture(3));
 		terrainShader2Stage.updateNoise2(&curView,&inv);	//update curView with texture matrix
-		DX8Wrapper::_Set_DX8_Transform((D3DTRANSFORMSTATETYPE )(D3DTS_TEXTURE0+curStage), curView);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MINFILTER, D3DTEXF_LINEAR);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(curStage, D3DTSS_MAGFILTER, D3DTEXF_LINEAR);
+		rts::render::SetGameTransform(static_cast<rts::render::GameRenderTransformSlot>(GAME_TRANSFORM_TEXTURE0+curStage), &curView);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MINIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
+		rts::render::SetGameTextureStageState(curStage, GAME_TEXTURE_STAGE_MAGNIFICATION_FILTER, RENDER_TEXTURE_FILTER_LINEAR);
 
 		curStage++;
 		if (curStage==1) curStage++;
 	}
 	if (curStage<2) {
-		DX8Wrapper::Set_Pixel_Shader(m_dwBase0PixelShader);
-		DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::SetGamePixelShader(m_dwBase0PixelShader);
+		rts::render::SetGameLegacyPixelProgram(
 			rts::render::RENDER_LEGACY_PIXEL_FLAT_TERRAIN_BASE0);
 	}	else if (curStage==2) {
-		DX8Wrapper::Set_Pixel_Shader(m_dwBasePixelShader);
-		DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::SetGamePixelShader(m_dwBasePixelShader);
+		rts::render::SetGameLegacyPixelProgram(
 			rts::render::RENDER_LEGACY_PIXEL_FLAT_TERRAIN_BASE);
 	}	else if (curStage==3) {
-		DX8Wrapper::Set_Pixel_Shader(m_dwBaseNoise1PixelShader);
-		DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::SetGamePixelShader(m_dwBaseNoise1PixelShader);
+		rts::render::SetGameLegacyPixelProgram(
 			rts::render::RENDER_LEGACY_PIXEL_FLAT_TERRAIN_NOISE);
 	}else if (curStage==4) {
-		DX8Wrapper::Set_Pixel_Shader(m_dwBaseNoise2PixelShader);
-		DX8Wrapper::Set_Legacy_Pixel_Program(
+		rts::render::SetGamePixelShader(m_dwBaseNoise2PixelShader);
+		rts::render::SetGameLegacyPixelProgram(
 			rts::render::RENDER_LEGACY_PIXEL_FLAT_TERRAIN_NOISE2);
 	}
-	DX8Wrapper::Set_DX8_Render_State(D3DRS_ALPHABLENDENABLE, false);
-	DX8Wrapper::Apply_Render_State_Changes();
-	DX8Wrapper::Set_DX8_Texture(curStage, W3DShaderManager::getShaderTexture(3)->Peek_D3D_Texture());
+	rts::render::SetGameRenderState(GAME_RENDER_STATE_ALPHA_BLEND_ENABLE, false);
+	rts::render::ApplyGameRenderStateChanges();
+	rts::render::SetGameTexture(curStage, W3DShaderManager::getShaderTexture(3));
 	return TRUE;
 }
 
 void FlatTerrainShaderPixelShader::reset()
 {
-	DX8Wrapper::Set_DX8_Texture(2,nullptr);	//release reference to any texture
-	DX8Wrapper::Set_DX8_Texture(3,nullptr);	//release reference to any texture
-	DX8Wrapper::Set_DX8_Texture(4,nullptr);	//curStage can advance past the four shader inputs
+	rts::render::SetGameTexture(2,nullptr);	//release reference to any texture
+	rts::render::SetGameTexture(3,nullptr);	//release reference to any texture
+	rts::render::SetGameTexture(4,nullptr);	//curStage can advance past the four shader inputs
 
-	DX8Wrapper::Set_Pixel_Shader(0);	//turn off pixel shader
-	DX8Wrapper::Set_Legacy_Pixel_Program(
+	rts::render::SetGamePixelShader(0);	//turn off pixel shader
+	rts::render::SetGameLegacyPixelProgram(
 		rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION);
 
-	DX8Wrapper::Set_DX8_Texture(0, nullptr);
-	DX8Wrapper::Set_DX8_Texture(1, nullptr);
+	rts::render::SetGameTexture(0, nullptr);
+	rts::render::SetGameTexture(1, nullptr);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 0, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|0);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 0, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|0);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 1, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|1);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 1, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|1);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 2, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|2);
+	rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 2, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|2);
 
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 3, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|3);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_DISABLE);
-	DX8Wrapper::Set_DX8_Texture_Stage_State( 4, D3DTSS_TEXCOORDINDEX, D3DTSS_TCI_PASSTHRU|4);
+	rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 3, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|3);
+	rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_TRANSFORM_FLAGS, GAME_TEXTURE_TRANSFORM_DISABLED);
+	rts::render::SetGameTextureStageState( 4, GAME_TEXTURE_STAGE_COORDINATE_INDEX, GAME_TEXTURE_COORDINATE_PASSTHROUGH|4);
 
 
-	DX8Wrapper::Invalidate_Cached_Render_States();
+	rts::render::InvalidateGameRenderStateCache();
 }
 
 

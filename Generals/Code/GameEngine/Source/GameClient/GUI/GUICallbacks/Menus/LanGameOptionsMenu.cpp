@@ -787,8 +787,9 @@ void LanGameOptionsMenuInit( WindowLayout *layout, void *userData )
 		if (it != TheMapCache->end())
 		{
 			TheLAN->GetMyGame()->getSlot(0)->setMapAvailability(true);
-			TheLAN->GetMyGame()->setMapCRC( it->second.m_CRC );
+			TheLAN->GetMyGame()->setMapCRC( GetMapFileCRC(game->getMap()) );
 			TheLAN->GetMyGame()->setMapSize( it->second.m_filesize );
+			TheLAN->GetMyGame()->getSlot(0)->setMapAvailability(game->getMapCRC() != 0U);
 
 			TheLAN->GetMyGame()->adjustSlotsForMap(); // BGC- adjust the slots for the selected map.
 		}

@@ -1,21 +1,39 @@
 add_executable(core_fvf_stride_tests
     FVFStrideTest.cpp
-    ../../Libraries/Source/WWVegas/WW3D2/dx8fvf.cpp
 )
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    target_sources(core_fvf_stride_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas/WW3D2/dx8fvf.cpp
+    )
+else()
+    target_sources(core_fvf_stride_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2/nativew3dfvf.cpp
+    )
+endif()
 
 target_include_directories(core_fvf_stride_tests PRIVATE
     ../../Libraries/Include
     ../../Libraries/Source/WWVegas
 )
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    target_include_directories(core_fvf_stride_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas
+    )
+endif()
+
 target_link_libraries(core_fvf_stride_tests PRIVATE
     core_wwlib
     core_wwdebug
     core_wwstub
     corei_always
-    d3d8lib
     winmm
 )
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    target_link_libraries(core_fvf_stride_tests PRIVATE d3d8lib)
+endif()
 
 if(IS_VS6_BUILD)
     set_target_properties(core_fvf_stride_tests PROPERTIES

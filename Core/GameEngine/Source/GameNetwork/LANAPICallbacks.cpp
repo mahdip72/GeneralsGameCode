@@ -240,7 +240,13 @@ void LANAPI::OnGameStart()
 
 		// see if we really have the map.  if not, back out.
 		TheMapCache->updateCache();
-		if (!filesOk || TheMapCache->findMap(m_currentGame->getMap()) == nullptr)
+		// Every current host path supplies a map-file CRC. An unknown value
+		// cannot bind the selected map, even when the cache has its name.
+		if (!filesOk || TheMapCache->findMap(m_currentGame->getMap()) == nullptr ||
+			!IsNetworkMapFileCRCValid(
+				m_currentGame->getMapCRC(), GetMapFileCRC(m_currentGame->getMap())) ||
+			((m_currentGame->getMapContentsMask() & (4 | 16 | 32)) == 0 &&
+			 GetMapSimulationSidecarMask(m_currentGame->getMap()) != 0))
 		{
 			DEBUG_LOG(("After transfer, we didn't really have the map.  Bailing..."));
 			OnPlayerLeave(m_name);

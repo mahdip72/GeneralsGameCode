@@ -1,3 +1,7 @@
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    return()
+endif()
+
 add_executable(core_legacy_d3d_math_tests
     LegacyD3DMathTest.cpp
 )

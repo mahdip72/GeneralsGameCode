@@ -176,6 +176,24 @@ void GlobalLanguage::init()
 	m_userResolutionFontSizeAdjustment = optionPref.getResolutionFontAdjustment();
 }
 
+void GlobalLanguage::onResolutionChanged()
+{
+	// A resolution-specific archive may now supply different localized font
+	// definitions. Release the previous font-file registrations before init()
+	// parses and registers the newly selected language file.
+	StringList::iterator it = m_localFonts.begin();
+	while (it != m_localFonts.end())
+	{
+		RemoveFontResource(it->str());
+		++it;
+	}
+	m_localFonts.clear();
+	m_resolutionFontSizeAdjustment = 0.7f;
+	m_resolutionFontSizeMethod = ResolutionFontSizeMethod_Default;
+	init();
+	parseCustomDefinition();
+}
+
 void GlobalLanguage::reset()
 {
 }

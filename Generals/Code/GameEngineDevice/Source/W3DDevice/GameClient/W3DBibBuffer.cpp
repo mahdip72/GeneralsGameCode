@@ -56,10 +56,11 @@
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "W3DDevice/GameClient/W3DDynamicLight.h"
 #include "WW3D2/camera.h"
-#include "WW3D2/dx8wrapper.h"
-#include "WW3D2/dx8renderer.h"
+#include "WW3D2/nativew3dbuffercompat.h"
+#include "WW3D2/shader.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
+#include "Renderer/RenderGameClient.h"
 
 //-----------------------------------------------------------------------------
 //         Private Data
@@ -259,7 +260,7 @@ void W3DBibBuffer::freeBibBuffers()
 //=============================================================================
 void W3DBibBuffer::allocateBibBuffers()
 {
-	m_vertexBib=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZDUV1,m_vertexBibSize+4,DX8VertexBufferClass::USAGE_DYNAMIC));
+	m_vertexBib=NEW_REF(DX8VertexBufferClass,(rts::render::GAME_VERTEX_XYZDUV1,m_vertexBibSize+4,DX8VertexBufferClass::USAGE_DYNAMIC));
 	m_indexBib=NEW_REF(DX8IndexBufferClass,(m_indexBibSize+4, DX8IndexBufferClass::USAGE_DYNAMIC));
 	m_curNumBibVertices=0;
 	m_curNumBibIndices=0;
@@ -424,16 +425,16 @@ void W3DBibBuffer::renderBibs()
 		return;
 	}
 	// Setup the vertex buffer, shader & texture.
-	DX8Wrapper::Set_Index_Buffer(m_indexBib,0);
-	DX8Wrapper::Set_Vertex_Buffer(m_vertexBib);
-	DX8Wrapper::Set_Shader(detailAlphaShader);
+	rts::render::SetGameIndexBuffer(m_indexBib,0);
+	rts::render::SetGameVertexBuffer(m_vertexBib);
+	rts::render::SetGameShader(detailAlphaShader);
 	if (m_curNumNormalBibIndices) {
-		DX8Wrapper::Set_Texture(0,m_bibTexture);
-		DX8Wrapper::Draw_Triangles(	0, m_curNumNormalBibIndices/3, 0,	m_curNumNormalBibVertex);
+		rts::render::SetGameTexture(0,m_bibTexture);
+		rts::render::DrawGameTriangles(	0, m_curNumNormalBibIndices/3, 0,	m_curNumNormalBibVertex);
 	}
 	if (m_curNumBibIndices>m_curNumNormalBibIndices) {
-		DX8Wrapper::Set_Texture(0,m_highlightBibTexture);
-		DX8Wrapper::Draw_Triangles(	m_curNumNormalBibIndices, (m_curNumBibIndices-m_curNumNormalBibIndices)/3,
+		rts::render::SetGameTexture(0,m_highlightBibTexture);
+		rts::render::DrawGameTriangles(	m_curNumNormalBibIndices, (m_curNumBibIndices-m_curNumNormalBibIndices)/3,
 						m_curNumNormalBibVertex,	m_curNumBibVertices-m_curNumNormalBibVertex);
 	}
 }

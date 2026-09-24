@@ -157,42 +157,73 @@ int testWindowPresentationPolicy()
 	return 0;
 }
 
+int testWindowedClientSizeAtCurrentDpi()
+{
+	typedef HANDLE (WINAPI *SetThreadDpiAwarenessContextProc)(HANDLE);
+	SetThreadDpiAwarenessContextProc setDpiContext =
+		reinterpret_cast<SetThreadDpiAwarenessContextProc>(GetProcAddress(
+			GetModuleHandleA("user32.dll"), "SetThreadDpiAwarenessContext"));
+	HANDLE previousContext = setDpiContext != 0 ?
+		setDpiContext(reinterpret_cast<HANDLE>(-4)) : 0;
+	const DWORD style = WS_OVERLAPPEDWINDOW;
+	const DWORD exStyle = WS_EX_CLIENTEDGE;
+	HWND window = CreateWindowExA(exStyle, "STATIC", "", style,
+		0, 0, 100, 100, 0, 0, GetModuleHandleA(0), 0);
+	RECT outer = { 0, 0, 640, 480 };
+	RECT client = { 0 };
+	const bool exactClient = window != 0 &&
+		rts::render::AdjustWindowRectForWindowDpi(window, &outer,
+			style, exStyle) &&
+		SetWindowPos(window, 0, 0, 0, outer.right - outer.left,
+			outer.bottom - outer.top, SWP_NOZORDER | SWP_NOMOVE |
+			SWP_NOACTIVATE) &&
+		GetClientRect(window, &client) && client.right == 640 &&
+		client.bottom == 480;
+	if (window != 0)
+		DestroyWindow(window);
+	if (previousContext != 0)
+		setDpiContext(previousContext);
+	CHECK("D3D11 window frame preserves client pixels at current DPI",
+		exactClient);
+	return 0;
+}
+
 int testCheckedIndexedSubmissionBounds()
 {
 	unsigned int index_count = 0;
 	CHECK("checked triangle-list arithmetic",
-		rts::render::Checked_D3D8_Primitive_Index_Count(
+		rts::render::Checked_Legacy_Primitive_Index_Count(
 			rts::render::LEGACY_D3DPT_TRIANGLELIST, 2, &index_count) &&
 			index_count == 6);
 	CHECK("triangle-list multiplication overflow is rejected",
-		!rts::render::Checked_D3D8_Primitive_Index_Count(
+		!rts::render::Checked_Legacy_Primitive_Index_Count(
 			rts::render::LEGACY_D3DPT_TRIANGLELIST,
 			static_cast<unsigned int>(-1) / 3 + 1,
 			&index_count));
 	CHECK("triangle-strip addition overflow is rejected",
-		!rts::render::Checked_D3D8_Primitive_Index_Count(
+		!rts::render::Checked_Legacy_Primitive_Index_Count(
 			rts::render::LEGACY_D3DPT_TRIANGLESTRIP,
 			static_cast<unsigned int>(-1), &index_count));
 	CHECK("indexed range at buffer end is valid",
-		rts::render::Is_D3D8_Indexed_Range_Valid(8, 7, 1));
+		rts::render::Is_Legacy_Indexed_Range_Valid(8, 7, 1));
 	CHECK("indexed range crossing buffer end is rejected",
-		!rts::render::Is_D3D8_Indexed_Range_Valid(8, 7, 2));
+		!rts::render::Is_Legacy_Indexed_Range_Valid(8, 7, 2));
 	CHECK("indexed range with start past buffer is rejected",
-		!rts::render::Is_D3D8_Indexed_Range_Valid(8, 9, 0));
+		!rts::render::Is_Legacy_Indexed_Range_Valid(8, 9, 0));
 	CHECK("exact vertex window is valid",
-		rts::render::Is_D3D8_Vertex_Range_Valid(12, 2, 4, 6));
+		rts::render::Is_Legacy_Vertex_Range_Valid(12, 2, 4, 6));
 	CHECK("sorting vertex window accepts rebased indices at a dynamic offset",
-		rts::render::Is_D3D8_Vertex_Range_Valid(12, 4, 0, 8));
+		rts::render::Is_Legacy_Vertex_Range_Valid(12, 4, 0, 8));
 	CHECK("empty vertex window at the end is valid",
-		rts::render::Is_D3D8_Vertex_Range_Valid(12, 12, 0, 0));
+		rts::render::Is_Legacy_Vertex_Range_Valid(12, 12, 0, 0));
 	CHECK("vertex base beyond capacity is rejected",
-		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 13, 0, 0));
+		!rts::render::Is_Legacy_Vertex_Range_Valid(12, 13, 0, 0));
 	CHECK("minimum vertex overflow is rejected",
-		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 2, 11, 0));
+		!rts::render::Is_Legacy_Vertex_Range_Valid(12, 2, 11, 0));
 	CHECK("vertex count overflow is rejected",
-		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 2, 4, 7));
+		!rts::render::Is_Legacy_Vertex_Range_Valid(12, 2, 4, 7));
 	CHECK("unsigned vertex addition cannot wrap into the buffer",
-		!rts::render::Is_D3D8_Vertex_Range_Valid(12, 2,
+		!rts::render::Is_Legacy_Vertex_Range_Valid(12, 2,
 			static_cast<unsigned int>(-1), 1));
 	CHECK("largest signed D3D11 base vertex is valid",
 		rts::render::Is_D3D11_Base_Vertex_Valid(0x7fffffffU));
@@ -366,6 +397,8 @@ int main()
 	if (testCaptureFrameGate() != 0)
 		return 1;
 	if (testWindowPresentationPolicy() != 0)
+		return 1;
+	if (testWindowedClientSizeAtCurrentDpi() != 0)
 		return 1;
 	if (testCheckedIndexedSubmissionBounds() != 0)
 		return 1;

@@ -37,6 +37,36 @@ function Get-FunctionBody {
     return $null
 }
 
+function Get-JobSystemShutdownPositions {
+    param(
+        [Parameter(Mandatory = $true)][string]$Destructor
+    )
+
+    $positions = @()
+    $directPattern = 'rts::JobSystem\s*::\s*instance\s*\(\s*\)\s*\.\s*shutdown\s*\(\s*\)\s*;'
+    foreach ($match in [regex]::Matches($Destructor, $directPattern)) {
+        $positions += $match.Index
+    }
+
+    # The title teardown keeps one singleton reference so it can snapshot
+    # metrics and release the game owner on the same object.  Only accept
+    # shorthand shutdown calls after a declaration that binds that reference
+    # to JobSystem::instance(); this avoids treating an unrelated variable as
+    # the process-wide scheduler.
+    $aliasPattern = 'rts::JobSystem\s*&\s*jobSystem\s*=\s*rts::JobSystem\s*::\s*instance\s*\(\s*\)\s*;'
+    $alias = [regex]::Match($Destructor, $aliasPattern)
+    if ($alias.Success) {
+        foreach ($match in [regex]::Matches($Destructor,
+            '\bjobSystem\s*\.\s*shutdown\s*\(\s*\)\s*;')) {
+            if ($match.Index -gt $alias.Index) {
+                $positions += $match.Index
+            }
+        }
+    }
+
+    return @($positions | Sort-Object -Unique)
+}
+
 function Test-NATOwnershipContract {
     param(
         [Parameter(Mandatory = $true)][string]$HeaderText,
@@ -111,8 +141,7 @@ function Test-GameEngineTeardownContract {
         'delete TheNAT;',
         'TheNAT = nullptr;',
         'delete TheMapCache;',
-        'TheGameResultsQueue->endThreads();',
-        'rts::JobSystem::instance().shutdown();'
+        'TheGameResultsQueue->endThreads();'
     )
     $previous = -1
     foreach ($required in $requiredOrder) {
@@ -124,6 +153,17 @@ function Test-GameEngineTeardownContract {
         } else {
             $previous = $position
         }
+    }
+
+    $queuePosition = $destructor.IndexOf(
+        'TheGameResultsQueue->endThreads();', [StringComparison]::Ordinal)
+    $shutdownPositions = @(Get-JobSystemShutdownPositions $destructor)
+    $shutdownAfterQueue = @($shutdownPositions | Where-Object {
+        $_ -gt $queuePosition
+    })
+    if ($shutdownAfterQueue.Count -eq 0) {
+        $violations.Add(
+            "$Title teardown must shut down JobSystem after result-thread teardown")
     }
 
     return $violations.ToArray()
@@ -170,12 +210,18 @@ Transport * NAT::takeTransport()
         GeneralsMD = 'TheNetwork->attachTransport(TheNAT->takeTransport());'
     }
     $gameEngines = @{
-        Generals = 'GameEngine::~GameEngine() { delete TheLAN; TheLAN = nullptr; delete TheNAT; TheNAT = nullptr; delete TheMapCache; TheGameResultsQueue->endThreads(); rts::JobSystem::instance().shutdown(); }'
-        GeneralsMD = 'GameEngine::~GameEngine() { delete TheLAN; TheLAN = nullptr; delete TheNAT; TheNAT = nullptr; delete TheMapCache; TheGameResultsQueue->endThreads(); rts::JobSystem::instance().shutdown(); }'
+        Generals = 'GameEngine::~GameEngine() { rts::JobSystem &jobSystem = rts::JobSystem::instance(); if (TheGlobalData->m_headless && s_headlessSimulationJobSystemStarted) jobSystem.shutdown(); delete TheLAN; TheLAN = nullptr; delete TheNAT; TheNAT = nullptr; delete TheMapCache; TheGameResultsQueue->endThreads(); if (!TheGlobalData->m_headless) jobSystem.shutdown(); }'
+        GeneralsMD = 'GameEngine::~GameEngine() { rts::JobSystem &jobSystem = rts::JobSystem::instance(); if (TheGlobalData->m_headless && s_headlessSimulationJobSystemStarted) jobSystem.shutdown(); delete TheLAN; TheLAN = nullptr; delete TheNAT; TheNAT = nullptr; delete TheMapCache; TheGameResultsQueue->endThreads(); if (!TheGlobalData->m_headless) jobSystem.shutdown(); }'
     }
 
     if (@(Get-OwnershipLifecycleViolations $natHeader $natImplementation $callers $gameEngines).Count -ne 0) {
         throw 'Known-good network ownership fixture failed.'
+    }
+    $missingShutdown = $gameEngines.Clone()
+    $missingShutdown['Generals'] = $missingShutdown['Generals'].Replace(
+        ' if (!TheGlobalData->m_headless) jobSystem.shutdown();', '')
+    if (@(Get-OwnershipLifecycleViolations $natHeader $natImplementation $callers $missingShutdown).Count -eq 0) {
+        throw 'Missing JobSystem teardown fixture was accepted.'
     }
     $missingClear = $natImplementation.Replace('m_transport = nullptr;', '')
     if (@(Get-OwnershipLifecycleViolations $natHeader $missingClear $callers $gameEngines).Count -eq 0) {
@@ -187,7 +233,7 @@ Transport * NAT::takeTransport()
         throw 'Borrowing NAT transport fixture was accepted.'
     }
     $lateTeardown = $gameEngines.Clone()
-    $lateTeardown['GeneralsMD'] = 'GameEngine::~GameEngine() { delete TheMapCache; delete TheLAN; TheLAN = nullptr; delete TheNAT; TheNAT = nullptr; TheGameResultsQueue->endThreads(); rts::JobSystem::instance().shutdown(); }'
+    $lateTeardown['GeneralsMD'] = 'GameEngine::~GameEngine() { rts::JobSystem &jobSystem = rts::JobSystem::instance(); delete TheMapCache; delete TheLAN; TheLAN = nullptr; delete TheNAT; TheNAT = nullptr; TheGameResultsQueue->endThreads(); if (!TheGlobalData->m_headless) jobSystem.shutdown(); }'
     if (@(Get-OwnershipLifecycleViolations $natHeader $natImplementation $callers $lateTeardown).Count -eq 0) {
         throw 'Late network teardown fixture was accepted.'
     }

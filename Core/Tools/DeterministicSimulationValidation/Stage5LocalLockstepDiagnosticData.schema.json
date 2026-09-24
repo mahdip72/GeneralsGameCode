@@ -1,0 +1,228 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-local-lockstep-diagnostic-data.json",
+  "title": "GeneralsGameCode local lockstep-v2 diagnostic data",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "evidenceKind",
+    "producer",
+    "status",
+    "finalAcceptanceClaim",
+    "canonicalQualification",
+    "promotionGrant",
+    "externalQualificationSkipped",
+    "manualTestingDeferred",
+    "sourceCommit",
+    "artifactSetSha256",
+    "runtimeClosure",
+    "cohortNonce",
+    "cohortCreatedUtc",
+    "mapName",
+    "mapCrcs",
+    "mapEntries",
+    "files",
+    "closureSha256"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "evidenceKind": { "type": "string", "const": "stage5-local-lockstep-diagnostic-data" },
+    "producer": { "type": "string", "const": "stage5-local-lockstep-diagnostic-data-v1" },
+    "status": { "type": "string", "const": "ready" },
+    "finalAcceptanceClaim": { "type": "boolean", "const": false },
+    "canonicalQualification": { "type": "boolean", "const": false },
+    "promotionGrant": { "type": "boolean", "const": false },
+    "externalQualificationSkipped": { "type": "boolean", "const": true },
+    "manualTestingDeferred": { "type": "boolean", "const": true },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "runtimeClosure": { "$ref": "#/$defs/runtimeClosure" },
+    "cohortNonce": { "$ref": "#/$defs/uuidV4" },
+    "cohortCreatedUtc": { "$ref": "#/$defs/canonicalUtc" },
+    "mapName": { "type": "string", "const": "Maps\\Twilight Flame\\Twilight Flame.map" },
+    "mapCrcs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Generals", "ZeroHour"],
+      "properties": {
+        "Generals": { "type": "integer", "const": 739101722 },
+        "ZeroHour": { "type": "integer", "const": 4042777579 }
+      }
+    },
+    "mapEntries": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 2,
+      "prefixItems": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/mapEntry" },
+            { "properties": {
+              "title": { "type": "string", "const": "Generals" },
+              "archivePath": { "type": "string", "const": "GeneralsRuntime/maps.big" },
+              "sha256": { "type": "string", "const": "A6811E2F16BAA0ED1E47839C71347CCB51F1F088BDE8EA696E1750687F65E115" },
+              "byteLength": { "type": "integer", "const": 402471 },
+              "mapCrc": { "type": "integer", "const": 739101722 }
+            }}
+          ]
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/mapEntry" },
+            { "properties": {
+              "title": { "type": "string", "const": "ZeroHour" },
+              "archivePath": { "type": "string", "const": "ZeroHourRuntime/MapsZH.big" },
+              "sha256": { "type": "string", "const": "3B8B47E1AF6E5D8D479F282EF6B6E542B5C2DBBD700A91FCF55AA7DA209B1100" },
+              "byteLength": { "type": "integer", "const": 400412 },
+              "mapCrc": { "type": "integer", "const": 4042777579 }
+            }}
+          ]
+        }
+      ],
+      "items": false
+    },
+    "files": {
+      "type": "array",
+      "minItems": 12,
+      "maxItems": 12,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/fileBinding" },
+      "allOf": [
+        { "$ref": "#/$defs/requiredFileGeneralsEnglish" },
+        { "$ref": "#/$defs/requiredFileGeneralsIni" },
+        { "$ref": "#/$defs/requiredFileGeneralsMaps" },
+        { "$ref": "#/$defs/requiredFileGeneralsW3D" },
+        { "$ref": "#/$defs/requiredFileGeneralsMultiplayer" },
+        { "$ref": "#/$defs/requiredFileGeneralsSkirmish" },
+        { "$ref": "#/$defs/requiredFileZeroHourIni" },
+        { "$ref": "#/$defs/requiredFileZeroHourMaps" },
+        { "$ref": "#/$defs/requiredFileZeroHourW3D" },
+        { "$ref": "#/$defs/requiredFileZeroHourMultiplayer" },
+        { "$ref": "#/$defs/requiredFileZeroHourScriptsIni" },
+        { "$ref": "#/$defs/requiredFileZeroHourSkirmish" }
+      ]
+    },
+    "closureSha256": { "$ref": "#/$defs/sha256" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9A-F]{64}$"
+    },
+    "uuidV4": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "canonicalUtc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{7}Z$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1023,
+      "pattern": "^[^\\\\/:]+(?:/[^\\\\/:]+)*$",
+      "not": { "pattern": "(^|/)\\.\\.?(/|$)|[\\x00-\\x1F\\x7F]|[.]$|[ ]$" }
+    },
+    "fileBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "path", "sha256", "byteLength"],
+      "properties": {
+        "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+        "path": {
+          "type": "string",
+          "pattern": "^(?:GeneralsRuntime|ZeroHourRuntime)/[^\\\\/:]+(?:/[^\\\\/:]+)*$",
+          "not": { "pattern": "(^|/)\\.\\.?(/|$)|[\\x00-\\x1F\\x7F]|[.]$|[ ]$" }
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "byteLength": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 }
+      }
+    },
+    "mapEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "archivePath", "entryPath", "sha256", "byteLength", "mapCrc", "crcAlgorithm", "encoding"],
+      "properties": {
+        "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+        "archivePath": { "$ref": "#/$defs/relativePath" },
+        "entryPath": { "$ref": "#/$defs/relativePath" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "byteLength": { "type": "integer", "minimum": 4, "maximum": 16777216 },
+        "mapCrc": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "crcAlgorithm": { "type": "string", "const": "Common/crc.h rotate-left-one then byte-add modulo 2^32" },
+        "encoding": { "type": "string", "const": "EAR-refpack-raw" }
+      }
+    },
+    "requiredFileGeneralsEnglish": {
+      "contains": { "properties": { "title": { "type": "string", "const": "Generals" }, "path": { "type": "string", "const": "GeneralsRuntime/English.big" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileGeneralsIni": {
+      "contains": { "properties": { "title": { "type": "string", "const": "Generals" }, "path": { "type": "string", "const": "GeneralsRuntime/INI.big" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileGeneralsMaps": {
+      "contains": { "properties": { "title": { "type": "string", "const": "Generals" }, "path": { "type": "string", "const": "GeneralsRuntime/maps.big" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileGeneralsW3D": {
+      "contains": { "properties": { "title": { "type": "string", "const": "Generals" }, "path": { "type": "string", "const": "GeneralsRuntime/W3D.big" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileGeneralsMultiplayer": {
+      "contains": { "properties": { "title": { "type": "string", "const": "Generals" }, "path": { "type": "string", "const": "GeneralsRuntime/Data/Scripts/MultiplayerScripts.scb" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileGeneralsSkirmish": {
+      "contains": { "properties": { "title": { "type": "string", "const": "Generals" }, "path": { "type": "string", "const": "GeneralsRuntime/Data/Scripts/SkirmishScripts.scb" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileZeroHourIni": {
+      "contains": { "properties": { "title": { "type": "string", "const": "ZeroHour" }, "path": { "type": "string", "const": "ZeroHourRuntime/INIZH.big" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileZeroHourMaps": {
+      "contains": { "properties": { "title": { "type": "string", "const": "ZeroHour" }, "path": { "type": "string", "const": "ZeroHourRuntime/MapsZH.big" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileZeroHourW3D": {
+      "contains": { "properties": { "title": { "type": "string", "const": "ZeroHour" }, "path": { "type": "string", "const": "ZeroHourRuntime/W3DZH.big" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileZeroHourMultiplayer": {
+      "contains": { "properties": { "title": { "type": "string", "const": "ZeroHour" }, "path": { "type": "string", "const": "ZeroHourRuntime/Data/Scripts/MultiplayerScripts.scb" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileZeroHourScriptsIni": {
+      "contains": { "properties": { "title": { "type": "string", "const": "ZeroHour" }, "path": { "type": "string", "const": "ZeroHourRuntime/Data/Scripts/Scripts.ini" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "requiredFileZeroHourSkirmish": {
+      "contains": { "properties": { "title": { "type": "string", "const": "ZeroHour" }, "path": { "type": "string", "const": "ZeroHourRuntime/Data/Scripts/SkirmishScripts.scb" } }, "required": ["title", "path"] },
+      "minContains": 1,
+      "maxContains": 1
+    },
+    "runtimeClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependencyManifestSha256", "closureSha256"],
+      "properties": {
+        "dependencyManifestSha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

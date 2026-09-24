@@ -52,7 +52,7 @@
 #include "mesh.h"
 #include "decalmsh.h"
 #include "matrixmapper.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 
 
 uint32 DecalSystemClass::DecalIDGenerator = 0;

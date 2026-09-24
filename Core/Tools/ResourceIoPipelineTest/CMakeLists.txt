@@ -11,7 +11,8 @@ set_target_properties(core_resource_io_pipeline_tests PROPERTIES
 if(MINGW)
     target_link_options(core_resource_io_pipeline_tests PRIVATE -mconsole)
 endif()
-add_test(NAME core_resource_io_pipeline_tests COMMAND core_resource_io_pipeline_tests)
+add_test(NAME core_resource_io_pipeline_tests COMMAND core_resource_io_pipeline_tests
+    --local-capacity)
 set_tests_properties(core_resource_io_pipeline_tests PROPERTIES TIMEOUT 30)
 
 if(WIN32)
@@ -23,9 +24,7 @@ if(WIN32)
         add_executable(${target}
             ResourceTextureDecodeTest.cpp
             "${_title_wwvegas}/WW3D2/ddsfile.cpp"
-            "${_core_wwvegas}/WW3D2/bitmaphandler.cpp"
             "${_core_wwvegas}/WW3D2/texturemipbuffer.cpp"
-            "${_core_wwvegas}/WW3D2/formconv.cpp"
         )
         target_include_directories(${target} PRIVATE
             "${_title_wwvegas}"
@@ -45,7 +44,6 @@ if(WIN32)
             core_wwdebug
             core_wwstub
             core_utility
-            d3d8lib
             winmm
         )
         set_target_properties(${target} PROPERTIES

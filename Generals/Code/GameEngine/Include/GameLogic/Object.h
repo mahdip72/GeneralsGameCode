@@ -192,6 +192,12 @@ public:
 
 	void maskObject( Bool mask );				///< mask/unmask object
 
+	void setPosition( const Coord3D *pos );
+	void setPositionZ( Real z );
+	void setOrientation( Real angle );
+	void setTransformMatrix( const Matrix3D *mx );
+	UnsignedInt getMotionGeneration() const { return m_motionGeneration; }
+
 	// cannot set velocity, since this is calculated from position every frame
 	Bool isDestroyed() const { return m_status.test( OBJECT_STATUS_DESTROYED ); }		///< Returns TRUE if object has been destroyed
 	Bool isAirborneTarget() const { return m_status.test( OBJECT_STATUS_AIRBORNE_TARGET ); }	///< Our locomotor will control marking us as a valid target for anti air weapons or not
@@ -559,6 +565,7 @@ public:
 	void setDisabled( DisabledType type );
 	void setDisabledUntil( DisabledType type, UnsignedInt frame );
 	Bool isDisabledByType( DisabledType type ) const { return TEST_DISABLEDMASK( m_disabledMask, type ); }
+	UnsignedInt getDisabledUntil( DisabledType type = DISABLED_ANY ) const;
 
 	void pauseAllSpecialPowers( const Bool disabling ) const;
 
@@ -713,6 +720,7 @@ private:
 
 	AIUpdateInterface*						m_ai;	///< ai interface (if any), cached for handy access. (duplicate of entry in the module array!)
 	PhysicsBehavior*							m_physics;	///< physics interface (if any), cached for handy access. (duplicate of entry in the module array!)
+	UnsignedInt m_motionGeneration;
 
 	PartitionData*								m_partitionData;	///< our PartitionData
 	RadarObject*									m_radarData;				///< radar data

@@ -1,4 +1,5 @@
 #include "Lib/ProjectedTerrainGridKernel.h"
+#include "Lib/JobSystem.h"
 
 #include <float.h>
 #include <limits.h>
@@ -272,6 +273,29 @@ void projectedTerrainWriteIndices(const ProjectedTerrainGridSnapshot &snapshot,
 	}
 }
 
+void projectedTerrainPrepareRows(
+	const ProjectedTerrainGridSnapshot &snapshot,
+	ProjectedTerrainGridVertex *vertices, UnsignedShort *indices,
+	unsigned rowBegin, unsigned rowEnd)
+{
+	unsigned row;
+	unsigned column;
+	for (row = rowBegin; row < rowEnd; ++row)
+	{
+		for (column = 0; column < snapshot.width; ++column)
+		{
+			projectedTerrainWriteVertex(snapshot,
+				&snapshot.heights[row * snapshot.width + column],
+				column, row, &vertices[row * snapshot.width + column]);
+		}
+		if (row < snapshot.cellHeight)
+		{
+			for (column = 0; column < snapshot.cellWidth; ++column)
+				projectedTerrainWriteIndices(snapshot, row, column, indices);
+		}
+	}
+}
+
 } // namespace
 
 ProjectedTerrainGridScratch::ProjectedTerrainGridScratch()
@@ -283,6 +307,48 @@ ProjectedTerrainGridScratch::ProjectedTerrainGridScratch()
 ProjectedTerrainGridScratch::~ProjectedTerrainGridScratch()
 {
 	reset();
+}
+
+bool ProjectedTerrainGridMayReachParallelThreshold(
+	Real sizeX, Real sizeY, Real mapXYFactor)
+{
+	Real maxAxisCellCount;
+	Real maxCellCount;
+	if (!projectedTerrainFinite(sizeX) || !projectedTerrainFinite(sizeY) ||
+		!projectedTerrainFinite(mapXYFactor) || sizeX < 0.0f ||
+		sizeY < 0.0f || mapXYFactor <= 0.0f)
+		return true;
+
+	/* With orthogonal yaw axes, either world-axis extent is no larger than
+	 * sizeX + sizeY. A span of d cells can touch at most d + 2 cell intervals
+	 * after floor/ceil rounding, independent of its terrain-grid alignment.
+	 * If even this square upper bound is below the worker threshold, the
+	 * detailed parallel preflight would necessarily reject the decal. */
+	maxAxisCellCount = (sizeX + sizeY) / mapXYFactor + 2.0f;
+	if (!projectedTerrainFinite(maxAxisCellCount))
+		return true;
+	maxCellCount = maxAxisCellCount * maxAxisCellCount;
+	if (!projectedTerrainFinite(maxCellCount))
+		return true;
+	return maxCellCount >=
+		static_cast<Real>(PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS);
+}
+
+unsigned ProjectedTerrainGridMinimumRowsPerTask(unsigned cellWidth)
+{
+	if (cellWidth == 0)
+		return 1;
+	return PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS / cellWidth +
+		(PROJECTED_TERRAIN_GRID_MIN_PARALLEL_CELLS % cellWidth != 0 ? 1 : 0);
+}
+
+bool ProjectedTerrainGridHasMultipleRowRanges(unsigned rowCount,
+	unsigned cellWidth, unsigned workerCount)
+{
+	if (rowCount == 0 || cellWidth == 0)
+		return false;
+	return rts::JobSystem::chooseRangeCount(rowCount,
+		ProjectedTerrainGridMinimumRowsPerTask(cellWidth), workerCount) > 1;
 }
 
 bool ProjectedTerrainGridScratch::ensure(unsigned width, unsigned height)
@@ -380,26 +446,26 @@ bool PrepareProjectedTerrainGridRows(
 	ProjectedTerrainGridVertex *vertices,
 	UnsignedShort *indices, unsigned rowBegin, unsigned rowEnd)
 {
-	unsigned row;
-	unsigned column;
 	if (!projectedTerrainValidate(snapshot, vertices, indices, false) ||
 		!projectedTerrainValidateRows(snapshot, rowBegin, rowEnd))
 		return false;
 
-	for (row = rowBegin; row < rowEnd; ++row)
-	{
-		for (column = 0; column < snapshot.width; ++column)
-		{
-			projectedTerrainWriteVertex(snapshot,
-				&snapshot.heights[row * snapshot.width + column],
-				column, row, &vertices[row * snapshot.width + column]);
-		}
-		if (row < snapshot.cellHeight)
-		{
-			for (column = 0; column < snapshot.cellWidth; ++column)
-				projectedTerrainWriteIndices(snapshot, row, column, indices);
-		}
-	}
+	projectedTerrainPrepareRows(snapshot, vertices, indices,
+		rowBegin, rowEnd);
+	return true;
+}
+
+bool PrepareProjectedTerrainGridRowsFromValidatedInput(
+	const ProjectedTerrainGridSnapshot &snapshot,
+	ProjectedTerrainGridVertex *vertices,
+	UnsignedShort *indices, unsigned rowBegin, unsigned rowEnd)
+{
+	if (!projectedTerrainValidate(snapshot, vertices, indices, false) ||
+		rowBegin >= rowEnd || rowEnd > snapshot.height)
+		return false;
+
+	projectedTerrainPrepareRows(snapshot, vertices, indices,
+		rowBegin, rowEnd);
 	return true;
 }
 

@@ -40,7 +40,7 @@
 
 #include "WWLib/always.h"
 #include "WW3D2/shader.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "WWMath/matrix3d.h"
 #include "WWMath/vector2.h"
 

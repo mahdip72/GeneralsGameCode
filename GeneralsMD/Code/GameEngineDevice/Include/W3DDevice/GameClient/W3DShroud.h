@@ -25,7 +25,7 @@
 #pragma once
 
 #include "WW3D2/matpass.h"
-#include "WW3D2/dx8wrapper.h"
+#include "WW3D2/texturefilter.h"
 
 class AABoxClass;
 class WorldHeightMap;
@@ -106,7 +106,7 @@ protected:
 	Real m_cellWidth;						///<spacing between adjacent cells
 	Real m_cellHeight;						///<spacing between adjacent cells
 	Byte *m_shroudData;						///<holds amount of shroud per cell.
-	IDirect3DSurface8 *m_pSrcTexture;		///<stores sysmem copy of visible shroud.
+	SurfaceClass *m_pSrcTexture;			///<typed system-memory copy of visible shroud.
 	void *m_srcTextureData;					///<CPU-owned shroud data backing store
 	UnsignedInt m_srcTexturePitch;			///<width (in bytes) of shroud data buffer.
 	Bool m_srcTextureDirty;							///<CPU backing store needs to be uploaded to m_pSrcTexture
@@ -123,5 +123,5 @@ protected:
 	W3DShroudLevel *m_currentFogData;		///<copy of intermediate logical shroud while it's interpolated.
 	Bool syncSourceTexture();							///<upload the CPU backing store while the source surface is locked
 	void interpolateFogLevels(RECT *rect);		///<fade current fog levels to actual logic side levels.
-	void fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface);	///<fill the destination texture with a known value
+	Bool fillBorderShroudData(W3DShroudLevel level, SurfaceClass* pDestSurface);	///<fill the destination texture with a known value
 };

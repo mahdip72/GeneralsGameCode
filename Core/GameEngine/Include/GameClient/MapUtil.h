@@ -134,6 +134,28 @@ private:
 extern MapCache *TheMapCache;
 extern TechAndSupplyImages TheSupplyAndTechImageLocations;
 
+// Read the current map file, rather than trusting the size-based map cache.
+UnsignedInt GetMapFileCRC(const AsciiString &mapName);
+Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc);
+Int GetMapSimulationSidecarMask(const AsciiString &mapName);
+#if defined(_WIN64)
+#include "Lib/NetworkMapPackageTransaction.h"
+typedef rts::network_epoch::NetworkMapPackageTransaction::ReadGuard NetworkMapReadGuard;
+void noteRecoveredMapFile(const char *path, void *context);
+Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName);
+Bool GetCurrentMapTransferContentsMask(const AsciiString &mapName,
+	UnsignedInt *maskOut);
+Bool GetNetworkMapPackageCompanionCRC(const AsciiString &mapName,
+	UnsignedInt *maskOut, UnsignedInt *crcOut);
+// An override supplies received, validated bytes before a NET3 package is
+// installed. Returning FALSE reads the existing file instead.
+typedef Bool (*NetworkMapPackageCompanionOverride)(const AsciiString &path,
+	const UnsignedByte **bytes, UnsignedInt *length, void *context);
+Bool GetProjectedNetworkMapPackageCompanionCRC(const AsciiString &mapName,
+	NetworkMapPackageCompanionOverride overrideFile, void *context,
+	UnsignedInt *maskOut, UnsignedInt *crcOut);
+#endif
+
 // TheSuperHackers @refactor xezon 28/11/2025 Refactors the map list population implementation
 // by breaking it into smaller pieces to make it more maintainable.
 

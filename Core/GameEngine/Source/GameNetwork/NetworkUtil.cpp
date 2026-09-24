@@ -105,7 +105,13 @@ UnsignedInt ResolveIP(AsciiString host)
 static UnsignedShort s_commandID = 0;
 UnsignedShort GenerateNextCommandID()
 {
+#if defined(_WIN64)
+	return rts::network_epoch::ConsumeNetworkCommandID(s_commandID);
+#else
+	// The network epoch helper is part of the native x64 handshake. Keep the
+	// legacy 16-bit command-ID sequence for Win32 and the VC6-compatible lane.
 	return s_commandID++;
+#endif
 }
 
 /**

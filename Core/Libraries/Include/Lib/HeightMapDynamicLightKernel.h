@@ -47,6 +47,16 @@ struct HeightMapDynamicLightSceneLight
 	Real ambientBlue;
 };
 
+struct HeightMapDynamicLightVertexBounds
+{
+	Real minX;
+	Real minY;
+	Real minZ;
+	Real maxX;
+	Real maxY;
+	Real maxZ;
+};
+
 struct HeightMapDynamicLightSnapshot
 {
 	unsigned width;
@@ -77,6 +87,16 @@ bool PrepareHeightMapDynamicLightRows(
 bool ValidatePreparedHeightMapDynamicLightOutput(
 	const HeightMapDynamicLightSnapshot &snapshot,
 	const HeightMapDynamicLightVertex *output);
+
+/* Validate a full owner-side light list before making a tile-local subset. */
+bool ValidateHeightMapDynamicLightSceneLights(
+	const HeightMapDynamicLightSceneLight *lights, unsigned lightCount);
+
+/* Conservative tile-local point/spot cull using the kernel's exact float
+ * distance path and the bounds of the captured terrain vertices. */
+bool HeightMapDynamicLightMayContributeToVertexBounds(
+	const HeightMapDynamicLightSceneLight &light,
+	const HeightMapDynamicLightVertexBounds &vertexBounds);
 
 /* Validate the staged object without replaying the lighting arithmetic. */
 bool ValidatePreparedHeightMapDynamicLightStructure(

@@ -65,11 +65,12 @@
 #include "W3DDevice/GameClient/W3DShaderManager.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "WW3D2/camera.h"
-#include "WW3D2/dx8wrapper.h"
-#include "WW3D2/dx8renderer.h"
+#include "WW3D2/nativew3dbuffercompat.h"
+#include "WW3D2/shader.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
 #include "WW3D2/scene.h"
+#include "Renderer/RenderGameClient.h"
 
 
 //-----------------------------------------------------------------------------
@@ -131,9 +132,9 @@ are already set.  */
 void W3DBridge::renderBridge(Bool wireframe)
 {
 	if (m_visible && m_numPolygons && m_numVertex) {
-		if (!wireframe) DX8Wrapper::Set_Texture(0,m_bridgeTexture);
+		if (!wireframe) rts::render::SetGameTexture(0,m_bridgeTexture);
 		// Draw all the bridges.
-		DX8Wrapper::Draw_Triangles(	m_firstIndex, m_numPolygons, m_firstVertex,	m_numVertex);
+		rts::render::DrawGameTriangles(	m_firstIndex, m_numPolygons, m_firstVertex,	m_numVertex);
 	}
 }
 
@@ -763,7 +764,7 @@ void W3DBridgeBuffer::allocateBridgeBuffers()
 {
 	if (TheGlobalData->m_headless)
 		return;
-	m_vertexBridge=NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZNDUV1,MAX_BRIDGE_VERTEX+4,DX8VertexBufferClass::USAGE_DYNAMIC));
+	m_vertexBridge=NEW_REF(DX8VertexBufferClass,(rts::render::GAME_VERTEX_XYZNDUV1,MAX_BRIDGE_VERTEX+4,DX8VertexBufferClass::USAGE_DYNAMIC));
 	m_indexBridge=NEW_REF(DX8IndexBufferClass,(MAX_BRIDGE_INDEX+4, DX8IndexBufferClass::USAGE_DYNAMIC));
 	m_vertexMaterial=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
 #ifdef USE_BRIDGE_NORMALS
@@ -1149,16 +1150,16 @@ void W3DBridgeBuffer::drawBridges(CameraClass * camera, Bool wireframe, TextureC
 		return;
 	}
 
-	DX8Wrapper::Set_Material(m_vertexMaterial);
+	rts::render::SetGameMaterial(m_vertexMaterial);
 	// Setup the vertex buffer, shader & texture.
-	DX8Wrapper::Set_Index_Buffer(m_indexBridge,0);
-	DX8Wrapper::Set_Vertex_Buffer(m_vertexBridge);
-	DX8Wrapper::Set_Shader(detailAlphaShader);
+	rts::render::SetGameIndexBuffer(m_indexBridge,0);
+	rts::render::SetGameVertexBuffer(m_vertexBridge);
+	rts::render::SetGameShader(detailAlphaShader);
 #ifdef RTS_DEBUG
-	//DX8Wrapper::Set_Shader(detailShader); // shows alpha clipping.
+	// The native facade owns the shader state; the detail variant remains a debug-only option.
 #endif
 
-	DX8Wrapper::Apply_Render_State_Changes();
+	rts::render::ApplyGameRenderStateChanges();
 
 	if (!wireframe && cloudTexture)
 	{	//Force a cloud texture projection into stage 1
@@ -1180,12 +1181,12 @@ void W3DBridgeBuffer::drawBridges(CameraClass * camera, Bool wireframe, TextureC
 	if (!wireframe && TheTerrainRenderObject->getShroud())
 	{
 		//Reset to a known shader.
-		DX8Wrapper::Invalidate_Cached_Render_States();
-		DX8Wrapper::Set_Shader(ShaderClass::_PresetOpaqueShader);
-		DX8Wrapper::Set_Material(m_vertexMaterial);
-		DX8Wrapper::Set_Index_Buffer(m_indexBridge,0);
-		DX8Wrapper::Set_Vertex_Buffer(m_vertexBridge);
-		DX8Wrapper::Apply_Render_State_Changes();
+		rts::render::InvalidateGameRenderStateCache();
+		rts::render::SetGameShader(ShaderClass::_PresetOpaqueShader);
+		rts::render::SetGameMaterial(m_vertexMaterial);
+		rts::render::SetGameIndexBuffer(m_indexBridge,0);
+		rts::render::SetGameVertexBuffer(m_vertexBridge);
+		rts::render::ApplyGameRenderStateChanges();
 		//Apply custom shroud projection shader.
 		W3DShaderManager::setTexture(0,TheTerrainRenderObject->getShroud()->getShroudTexture());
 		W3DShaderManager::setShader(W3DShaderManager::ST_SHROUD_TEXTURE, 0);

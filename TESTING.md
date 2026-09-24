@@ -2,6 +2,274 @@
 
 The GeneralsReplays folder contains replays and the required maps that are tested in CI to ensure that the game is retail compatible.
 
+Stage 5 product qualification is native Windows x64-only. The final VC6/Win32
+differential oracle has already been captured and its D3D8/Miles/Bink product
+lane is retired. Every current product command below therefore uses an `x64*`
+preset. Win32 and VC6 appear only in explicitly non-product historical tooling
+checks and must use `RTS_BUILD_PRODUCT=OFF`; they never build or qualify either
+game executable.
+
+## Modernization Stage 5 deterministic simulation
+
+The deterministic-runtime gate is documented separately in
+`docs/modernization-stage5-deterministic-simulation.md`. It covers the exact
+installed native runtime across serial-1, parallel-1/2/4/8/16, and automatic
+workers; two full replay passes with repeated 2-vs-6 stress; the exact repeated
+4-vs-3 and 4-vs-2 live-AI cross-product across at least three distinct seeds;
+one additional installed 16-worker 4-vs-2 `simulationMode=shadow` comparison
+with positive collision jobs, `collision_shadow_compared_candidates > 0` for
+successful legacy insertions covered by the exact collision order/orientation
+oracle, and positive matching physics
+shadow prefix/range/jobs; reset-aware per-replay collision/physics manifests;
+zero mismatch/unexpected-fallback telemetry; scheduler and consumer faults; and
+aggregate Stage 5 large-match throughput. It deliberately does not claim final
+Stage 5 acceptance. Qualifying live stress separately requires physical-worker
+path authority and physics-specific authoritative batches/prefixes/jobs; AI,
+collision, and global scheduler traffic cannot proxy either family. Synchronous
+direct-path watchdog timeouts and validation failures fail the
+deterministic-runtime gate; late worker drains remain diagnostic because they
+may occur after the completion manifest. The 2x
+replay threshold is aggregate Stage 5 throughput,
+not a collision-lane speedup claim; collision phases and qualifying live
+collision authority are reported and gated separately.
+Serial evidence must report every collision-lane work counter as zero. The
+forced parallel-1 lane may report its expected owner fallback, but cannot report
+collision preparation, jobs, authority, shadow comparison, stale publication,
+or unexpected fallback.
+
+Development readiness is a separate fail-closed, pre-manual aggregation. It
+requires exactly six independently hashed local evidence kinds for the same
+commit, fresh execution cohort, runtime closure, and artifact-set manifest:
+deterministic-runtime, replay determinism, fresh AI, performance scaling,
+mixed-worker multiplayer, and the combined Stage 4 plus Stage 5
+installed-runtime lane. The combined lane must use `pipelineMode=parallel`,
+`simulationMode=parallel`, automatic workers, D3D11, and the dedicated render
+thread for both titles; it does not replace the serial-pipeline isolation
+matrix. Run the aggregator after those local artifacts have been assembled and
+before asking the user to manually test the candidate. The output parent
+directory must already exist and must not be a reparse point; the script fails
+closed instead of creating missing directories:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Invoke-Stage5FinalAcceptance.ps1 `
+  -AcceptanceManifestPath <final-acceptance-request.json> `
+  -OutputPath <fresh-development-readiness-report.json> `
+  -DevelopmentReadiness
+```
+
+`FinalAcceptanceManifest.schema.json`, `FinalAcceptanceArtifactSet.schema.json`,
+and `FinalAcceptanceEvidence.schema.json` define the envelopes. The PowerShell
+aggregator additionally enforces exact kind-specific metrics, attachment roles,
+cross-manifest hashes, and combined-policy semantics. Missing manual evidence
+is not a local aggregation failure: the report deliberately sets
+`gateName=stage5-development-readiness`, `status=ready-for-manual-approval`, and
+`finalAcceptanceClaim=false`. A complete-diff premium review with zero open P0,
+P1, or P2 findings and the user's installed-runtime manual approval remain
+required out-of-band after this gate; writable local JSON cannot mint either
+authority.
+
+When external dense or large-physical-core qualification is unavailable for a
+pre-manual development-readiness run, pass `-ExternalQualificationExempt` to
+the readiness bundle assembler, final-acceptance aggregator, and seal step.
+The resulting installed-kernel disposition must remain `status=skipped` and
+`claim=false`; the readiness report must still retain
+`finalAcceptanceClaim=false`. This is an explicit exemption, not a
+qualification pass or release authority.
+
+The reusable hosted replay workflow runs the full functional replay/AI matrix
+and native correctness checks on `windows-2022` without
+`-EnforcePerformance`. It cannot satisfy or report the physical-core
+performance gate. That authority belongs only to the explicitly dispatched
+`Stage 5 External 16-Core Performance Qualification` job on the dedicated
+`stage5-16-physical-core` self-hosted runner; an unrun external lane remains
+deferred.
+
+The multiplayer attachment is not a free-form soak summary. It must match
+`Net3LoopbackEvidence.schema.json`: exactly 16 canonically ordered installed
+NET3 matches (both titles, four supported topologies, seeds 23063 and 49374)
+and exactly 40 nested peers (20 per title). Every multicore peer must prove all
+six diagnostic kernel bits with balanced physical-plus-owner execution,
+consistent physical-worker masks, and peak concurrent execution above one;
+forced-one peers must report zero scheduler work. These v1 bits are diagnostic
+only and do not authorize live multiplayer workers. Collision evidence is emitted
+by the actual parallel collision-candidate kernel over a qualifying batch and
+binds that kernel's own submitted, physical, owner-help, mask, and peak fields.
+The strict parser independently binds source commit,
+artifact-set hash, both executable hashes, NET3 readiness, exact roster and
+policy mask, equal peer CRC/frame, exit zero, and clean shutdown. Each peer
+also names a runner-produced raw output file whose SHA-256 and independently
+observed process executable/artifact hashes are verified. That evidence creates
+an external `MultiplayerSimulationRuntimeProof.txt` for diagnostics, but a
+mutable sibling file cannot grant authority to an ordinary build. The v1
+trusted cap remains zero in every configuration, including a promoted product,
+and its resolver still rejects the diagnostic producer before considering
+caller-supplied mask or source fields. The executable hashes itself and rechecks
+title, source revision, build/content CRCs, epochs, schema, and mask only to
+validate that diagnostic record.
+
+Ordinary native x64 Release products use a separate lockstep-v2 build trust
+root. The `x64`, `x64-vcpkg`, and title-specific x64 Release product presets
+enable `RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY` and embed exactly the
+six qualified kernel bits (`0x3f`). Debug, Profile, ASan, Win32/VC6,
+non-product, and explicitly unpromoted builds embed zero. The v2 resolver binds
+the promotion schema to the current lockstep-v2 schema and protocol epoch and
+requires the promoted mask to equal the complete live-integrated mask. Adding
+a future kernel therefore remains serial until a new reviewed promotion updates
+the build trust root. No sibling receipt, command-line value, or v1 artifact can
+alter this embedded authority.
+
+Create that evidence only from a fresh installed-runtime directory and the
+already-generated six-artifact manifest. The runner starts the exact two x64
+product executables in the explicit, hidden, local-only
+`-installedNet3Validation` process mode; ordinary game and matchmaking startup
+cannot enter this mode. It independently binds every live process ID to its
+on-disk executable and re-hashes the complete artifact set for every peer before
+allowing the peer to exchange fixed-width NET3 records. It then enforces the
+canonical 16-match/40-peer matrix. Every peer completes both directions of the
+NET3 Hello/Ack challenge using its own session token before it may publish a
+ready record. The first runner pass creates title-specific external proof
+bundles for the default-zero candidate without rebuilding either executable:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Invoke-InstalledNet3LoopbackValidation.ps1 `
+  -GeneralsExecutable <installed-generals.exe> `
+  -ZeroHourExecutable <installed-generalszh.exe> `
+  -ArtifactSetManifestPath <Stage5ArtifactSet.json> `
+  -SourceCommit <exact-lowercase-40-hex-commit> `
+  -OutputDirectory <fresh-task-owned-evidence-directory>
+```
+
+Generate v1 proof bundles only as diagnostic artifacts; copy
+`ProofBundles/Generals` beside the exact Generals executable and
+`ProofBundles/ZeroHour` beside the exact Zero Hour executable only when
+diagnostic inspection requires it. Keep the bundle files and `Net3Raw` tree
+together. Any changed executable, source revision, artifact manifest, evidence
+manifest, raw index, or raw peer output remains non-authorizing. The scoped v1
+runner mode is bounded and never joins a lobby or opens an ordinary gameplay
+network session.
+
+The separate installed lockstep-v2 qualification is a two-network-peer,
+four-local-AI (`2v4`) production simulation to the common frame 4096. It uses
+the real NET3 transport, records command-origin and frame/CRC checkpoints, and
+requires executable-origin physical-worker telemetry for physics, status,
+collision, AI planning, immutable spatial, and path kernels. Its receipts are
+review evidence for the Release configuration; ordinary gameplay never loads
+them and cannot enter the qualifier process mode. Run it only against the exact
+task-owned installed candidate and artifact manifest:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Invoke-InstalledLockstepV2Validation.ps1 `
+  -GeneralsExecutable <installed-generals.exe> `
+  -ZeroHourExecutable <installed-generalszh.exe> `
+  -ArtifactSetManifestPath <Stage5ArtifactSet.json> `
+  -SourceCommit <exact-lowercase-40-hex-commit> `
+  -OutputDirectory <fresh-task-owned-evidence-directory> `
+  -MapName 'Maps\Twilight Flame\Twilight Flame.map' `
+  -GeneralsMapCrc <reviewed-generals-map-crc> `
+  -ZeroHourMapCrc <reviewed-zerohour-map-crc> `
+  -QualificationDataManifestPath <Stage5QualificationData.json> `
+  -QualificationDataManifestSha256 <independently-recorded-manifest-sha256> `
+  -QualificationDataClosureSha256 <independently-recorded-data-closure-sha256> `
+  -AllowHeadlessDirectExecution
+```
+
+Promoted weekly binaries are published only from a successful manual `GenCI`
+run for the exact release commit. Set
+`stage5_lockstep_v2_qualification: true` and supply the reviewed
+`stage5_lockstep_v2_map_name` plus nonzero decimal
+`stage5_lockstep_v2_generals_map_crc` and
+`stage5_lockstep_v2_zerohour_map_crc`; push and pull-request runs leave this external
+qualification job skipped. The manual producer downloads the exact same-run
+Generals and Zero Hour x64 product artifacts, stages them beneath the canonical
+`<stage5-qualification-root>\GeneralsRuntime` and
+`ZeroHourRuntime` directories, hashes their complete file trees into
+`Stage5ArtifactSet.json` plus `Stage5RuntimeDependencies.json`, then downloads
+the repository's two fixed-SHA-256 R2 trimmed-data archives into the separate
+`QualificationData` staging directory. It copies only root `.big` files and
+the `Data` subtree into the disposable runtime copies, verifies every copied
+file, and writes the common map name plus both title-specific map CRCs into the metadata closure
+`Stage5QualificationData.json` before running the qualifier with `-OutputDirectory
+<stage5-qualification-root>\Evidence`. The source run exposes the two
+installed x64 product artifacts plus a `Stage5-LockstepV2-Qualification`
+artifact containing the three manifests and the complete `Evidence` subtree,
+but not either runtime subtree, the downloaded archives, or any proprietary
+data. The weekly gate stages that exact layout at the same
+canonical task-owned path so the full reader can revalidate every embedded absolute
+launcher/title-session path and every raw receipt/log/negative proof. After the
+native and outer evidence are complete, the qualifier writes the deterministic
+`Evidence\Stage5LockstepV2EvidenceClosure.json` sidecar. It ordinally declares
+the path and SHA-256 of every evidence file, binds the canonical evidence root,
+source commit, artifact set, and cohort, includes an exact
+`Evidence\QualificationData.json` copy of the reviewed data metadata closure,
+and excludes itself from the closure.
+The weekly gate treats the independently supplied sidecar hash as the promotion
+trust root, reconciles its exact file set with the aggregate, and rejects missing
+files, undeclared extras, hash changes, aliases, and reparse paths. Dispatch
+`Weekly Release` with
+`stage5_qualified_run_id` and the independently reviewed SHA-256 of
+`Stage5LockstepV2EvidenceClosure.json`. Scheduled publication uses the corresponding
+`STAGE5_LOCKSTEP_V2_QUALIFIED_RUN_ID` and
+`STAGE5_LOCKSTEP_V2_ATTESTATION_SHA256` repository variables. Missing, stale,
+cross-commit, non-manual, or hash-mismatched evidence skips publication; the
+weekly workflow never substitutes a newly rebuilt but unqualified binary.
+
+On ordinary startup, each NET3 Hello advertises the embedded v2 mask. Matching
+peers intersect the exact advertised masks only after build, content, map,
+roster, endpoint, and challenge validation; any absent, unknown, or mismatched
+authority stays serial. `core_network_wire_contract_tests` covers the positive
+ordinary promoted Hello and session-policy path, while the mixed-worker source
+audit verifies that v2 is selected before the unchanged diagnostic-v1 fallback.
+
+The performance attachment must match
+`PerformanceScalingEvidence.schema.json`. Final acceptance recomputes exact
+physical-core-mask populations for forced-one, 8-core, and 16-core lanes;
+one-worker phase totals and Amdahl limits; per-kernel capture/schedule/wait/
+validate/commit totals versus the exact serial operation; and the measured
+Stage 3 regression, 8-core throughput, and 8-to-16 scaling ratios for canonical
+1k, 4k, 8k, and dense eight-player fixtures. Logical worker counts without
+distinct physical-core evidence fail closed.
+
+The report must hash an adjacent `PerformanceScalingRawSamples.schema.json`
+manifest containing canonical per-process repeat rows bound to the source,
+artifact set, Stage 3 baseline, exact installed executable SHA-256, and exact
+supported `-headless -noFPSLimit -pipelineMode serial -simulationMode parallel
+-workerPolicy auto -validationExecutableSha256 ... -workerCount ... -replay ...`
+installed-runtime command line. That manifest must hash a parsed
+`PerformanceScalingTopologyReceipt.schema.json` CPU-set receipt. The validator
+derives the physical-core lanes and recomputes every reported median and ratio;
+the topology receipt must correlate to the first current one-worker run, and
+summary-only or internally consistent forged reports fail.
+
+Run the validation-tool self-tests and the real replay child-mode source audit
+without building or launching the game:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/DeterministicSimulationValidation.Tests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Audit-ReplayModePropagation.ps1 -SelfTest
+powershell -NoProfile -ExecutionPolicy Bypass -File Core/Tools/DeterministicSimulationValidation/Audit-ReplayModePropagation.ps1 -SourceRoot .
+```
+
+The matrix runner requires a fresh evidence directory, an installed Generals or
+Zero Hour runtime, and a reviewed explicit title-matching fixture manifest matching
+`ReplayFixtureManifest.schema.json`. Use `-PlanOnly` first. Automatic workers
+mean `-workerPolicy auto` with no `-workerCount`; replay `-jobs` is process-level
+parallelism and is not used by this matrix. A CI-built candidate may supply its
+controller-computed hash with `-ExpectedExecutableSha256`; fixture and map
+hashes still come only from the manifest. There is no continuing VC6 product
+or replay job after the final Stage 5 cutover.
+
+Installed execution additionally requires an existing task-owned directory below
+`<task-volume-root>` through `-TaskRoot`, an evidence `-OutputRoot` below that directory, and
+the reviewed `-AllowHeadlessDirectExecution` switch. The runner does not invoke
+`launcher.exe`, because its legacy process wrapper does not propagate the child
+exit code; it parses `launcher.lcf` and records an equivalence contract for the
+target executable, arguments, runtime working directory, child environment, and
+title-specific profile path before using the explicit headless exception. Both
+title variants redirect the Windows Documents known-folder values temporarily to
+a per-run task-owned tree and restore them in `finally`; TEMP, TMP, cache, logs, and
+profiles are task-owned and removed after the run. Keep the evidence directory
+for review and cleanup only the generated task scratch directory.
+
 You can also test with these replays locally:
 - Copy the replays into a subfolder in your `%USERPROFILE%/Documents/Command and Conquer Generals Zero Hour Data/Replays` folder.
 - Copy the maps into `%USERPROFILE%/Documents/Command and Conquer Generals Zero Hour Data/Maps`
@@ -11,28 +279,24 @@ START /B /W generalszh.exe -jobs 4 -headless -replay subfolder/*.rep > replay_ch
 echo %errorlevel%
 PAUSE
 ```
-It will run the game in the background and check that each replay is compatible. You need to use a VC6 build with optimizations and RTS_BUILD_OPTION_DEBUG = OFF, otherwise the game won't be compatible.
+It runs the supported installed x64 candidate in the background and checks that
+each replay is compatible. Use an optimized Release product with
+`RTS_BUILD_OPTION_DEBUG=OFF`; a 32-bit build is not a supported product.
 
 Zero Hour records the skirmish-AI behavior epoch as a suffix in the replay header's existing variable-length build-time field. Unmarked retail replays use the legacy AI behavior. Replays marked `[SkirmishAILiveness=1]` use only the PR6 liveness fixes, and new recordings marked `[SkirmishAIEpoch=2]` use the current PR7-PR9 AI behavior as well. Unknown, malformed, mixed, or duplicate markers fall back to legacy behavior. Replays produced by transitional PR7-PR9 builds carried only the older liveness marker despite using later AI behavior; those recordings cannot be identified reliably and are unsupported.
 
 # Stage 0 ownership and profiling checks
 
-Use an optimized VC6 release-log build for the replay and CRC diagnostic:
-
-```
-cmake --preset vc6-releaselog -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_GENERALS=OFF
-cmake --build --preset vc6-releaselog
-START /B /W generalszh.exe -jobs 4 -headless -replay subfolder/*.rep > replay_check.log
-echo %errorlevel%
-```
-
-Run the last two commands from the directory containing the `vc6-releaselog` Zero Hour executable after copying the replay corpus and maps as described above. A zero exit code and no CRC or ownership crash in `replay_check.log` are required. `-jobs` starts independent replay processes only; it does not create or control in-process game workers.
+The historical VC6 release-log replay oracle is frozen evidence from before the
+native cutover. It is not a buildable product lane and must not be substituted
+for an installed native x64 replay result. Current replay qualification uses the
+Stage 5 installed-runtime matrix documented above.
 
 For Tracy frame-phase capture, build the profile configuration, start Tracy v0.13.1, then launch a game and capture several shell and in-game frames:
 
 ```
-cmake --preset win32-profile -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_GENERALS=OFF
-cmake --build --preset win32-profile
+cmake --preset x64-profile
+cmake --build --preset x64-profile --target g_generals z_generals --parallel 2
 ```
 
 The capture must show `Engine.Update` and its `Radar`, `Audio`, `Client`, `MessageStream`, `Network`, `GameLogic`, and `ClientStep` child zones, plus `Platform.Win32Messages` and `Engine.FramePacer`. If Tracy cannot connect, remove `dbghelp.dll` from the game binary directory and retry.
@@ -41,12 +305,13 @@ Manually smoke-test Zero Hour first, then Generals: launch a skirmish, play thro
 
 # Stage 2 managed screenshot checks
 
-Configure a modern x86 Debug build with both games and the Core test executables, then build the two games and focused tests:
+Configure the native x64 Debug product with both games and the Core test
+executables, then build the two games and focused tests:
 
 ```
-cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
-cmake --build build/win32-debug --config Debug --target g_generals z_generals core_task_runtime_tests core_screenshot_codec_tests
-ctest --test-dir build/win32-debug -C Debug -R "^core_(task_runtime|screenshot_codec)_tests$" --output-on-failure
+cmake --preset x64-debug
+cmake --build --preset x64-debug --target g_generals z_generals core_task_runtime_tests core_screenshot_codec_tests --parallel 2
+ctest --test-dir build/x64-debug -C Debug -R "^core_(task_runtime|screenshot_codec)_tests$" --output-on-failure
 ```
 
 The two CTest targets must pass. Confirm the screenshot implementation has no unmanaged thread creation and that the worker task contains no live engine, render, or UI references:
@@ -68,22 +333,49 @@ Repeat the rapid-capture and immediate-quit manual checks for both games. Compar
 
 # Stage 4 background texture preparation checks
 
-Configure a modern x86 Debug build with both games and Core extras, then build the games and all multicore-focused tests:
+Configure the native x64 Debug product with both games and Core extras, then
+build the games and the architecture-neutral multicore-focused tests:
 
 ```
-cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
-cmake --build build/win32-debug --config Debug --target g_generals z_generals core_task_runtime_tests core_screenshot_codec_tests core_texture_mip_buffer_tests
-ctest --test-dir build/win32-debug -C Debug -R "^core_(task_runtime|screenshot_codec|texture_mip_buffer)_tests$" --output-on-failure
+cmake --preset x64-debug
+cmake --build --preset x64-debug --target g_generals z_generals core_task_runtime_tests core_screenshot_codec_tests --parallel 2
+ctest --test-dir build/x64-debug -C Debug -R "^core_(task_runtime|screenshot_codec)_tests$" --output-on-failure
 ```
 
-The three CTest targets must pass. The texture mip-buffer suite covers uncompressed and DXT layouts, odd and sub-block dimensions, rectangular mip counts, padded source/destination pitches, overflow rejection, guarded copies, and exact-limit/rejected retained-memory reservations. Two accepted preparation copies are gated concurrently on distinct worker thread IDs and compared byte-for-byte with serial preparation. A saturated runtime also proves that rejected preparation remains caller-owned, executes synchronously on the caller, and is destroyed exactly once. The production loader additionally caps accumulated asynchronous DDS/TGA source, prepared mip, and TGA conversion memory at 64 MiB; byte-admission rejection uses synchronous owner preparation. The TaskRuntime suite separately covers queued-task ownership recovery, rejection, draining, and joins. Confirm that the legacy detached texture loader and its background queue are gone, and that the bounded worker body only prepares CPU data and publishes completion:
+Those two CTest targets must pass. The historical 32-bit-only texture
+mip-buffer suite may still be run as a non-product tooling check; it cannot
+build either title:
+
+```powershell
+cmake --preset win32-debug -DRTS_BUILD_PRODUCT=OFF -DRTS_BUILD_GENERALS=OFF -DRTS_BUILD_ZEROHOUR=OFF -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build --preset win32-debug --target core_texture_mip_buffer_tests --parallel 2
+ctest --test-dir build/win32-debug -C Debug -R "^core_texture_mip_buffer_tests$" --output-on-failure
+```
+
+The texture mip-buffer suite covers uncompressed and DXT layouts, odd and
+sub-block dimensions, rectangular mip counts, padded source/destination pitches,
+overflow rejection, guarded copies, and exact-limit/rejected retained-memory
+reservations. Two accepted preparation copies are gated concurrently on distinct
+worker thread IDs and compared byte-for-byte with serial preparation. A saturated
+runtime also proves that rejected preparation remains caller-owned, executes
+synchronously on the caller, and is destroyed exactly once. The production
+loader additionally caps accumulated asynchronous DDS/TGA source, prepared mip,
+and TGA conversion memory at 64 MiB; byte-admission rejection uses synchronous
+owner preparation. The TaskRuntime suite separately covers queued-task ownership
+recovery, rejection, draining, and joins. Confirm that the legacy detached
+texture loader and its background queue are gone, and that the bounded worker
+body only prepares CPU data and publishes completion:
 
 ```
 rg -n "LoaderThreadClass|_TextureLoadThread|_BackgroundQueue|_BackgroundCriticalSection" Core/Libraries/Source/WWVegas/WW3D2/textureloader.cpp
 rg -U -P "(?ms)^class TexturePrepareRuntimeTask.*?^};" Core/Libraries/Source/WWVegas/WW3D2/textureloader.cpp | rg -n "DX8|D3D|Texture->|Apply|Lock_Surfaces|Unlock_Surfaces|Create_D3D"
 ```
 
-Both source-audit commands must produce no matches. Build both games with VC6 as well as modern Win32. Run the optimized `vc6-releaselog` replay command documented in Stage 0 and require a zero exit code with no CRC or ownership failure; the Stage 4 texture-preparation changes must not modify gameplay, replay, network, save, RNG, or serialization state.
+Both source-audit commands must produce no matches. Product and replay evidence
+comes only from the installed native x64 candidates; the optional Win32 command
+above is a non-product historical tooling check. The Stage 4 texture-preparation
+changes must not modify gameplay, replay, network, save, RNG, or serialization
+state.
 
 For Tracy validation, use a profile build on a machine with at least two logical processors and load texture-heavy maps in both games. The capture should show up to two concurrent `Texture.Prepare` worker zones, with their corresponding `Texture.Upload` zones on the render owner thread. No worker may call Direct3D, dereference a live texture, wait for another worker, or access engine globals.
 
@@ -120,10 +412,10 @@ not claim that the commands below have run successfully:
   prerequisites and shut it down before render teardown, with game-thread
   assertions.  `W3DRadar` keeps acquisition, join/fallback, surface lock,
   upload, unlock, and release on the owner thread.
-- [ ] Focused tests, the modern x86 title builds, and the VC6 compatibility
-  build have not yet been executed for the current Stage 5 source.
+- [ ] Focused tests and both native x64 title builds have not yet been executed
+  for the current Stage 5 source.
 - [ ] The ten-review-lens code review has not yet been completed.
-- [ ] The optimized VC6 replay gate has not yet been executed.
+- [ ] The installed native x64 replay gate has not yet been executed.
 - [ ] Interactive manual acceptance is intentionally deferred until the
   complete Stage 5--8 stack is ready; do not launch this intermediate stage.
 
@@ -137,9 +429,9 @@ First run the source hygiene check and focused modern build/test targets:
 
 ```powershell
 git diff --check
-cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
-cmake --build build/win32-debug --config Debug --target radar_terrain_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests g_generals z_generals --parallel 2
-ctest --test-dir build/win32-debug -C Debug -R "^(radar_terrain_prepare|core_task_runtime|core_texture_mip_buffer)_tests$" --output-on-failure
+cmake --preset x64-debug
+cmake --build --preset x64-debug --target radar_terrain_prepare_tests core_task_runtime_tests g_generals z_generals --parallel 2
+ctest --test-dir build/x64-debug -C Debug -R "^(radar_terrain_prepare|core_task_runtime)_tests$" --output-on-failure
 ```
 
 The radar target is expected to exercise serial-versus-two-range byte parity,
@@ -150,16 +442,17 @@ retry, queue/backpressure and rollback fallback, shutdown/restart, and the
 worker/owner source audits.  A test/build result must be captured before any
 checkmark is added to the execution items above.
 
-Then run the legacy compatibility lane using an actual optimized VC6 build;
-do not substitute a modern Win32 executable for replay evidence:
+The historical 32-bit format helper can be checked in the non-product Win32
+tool graph. It produces no game executable and is not replay evidence:
 
 ```powershell
-cmake --preset vc6 -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
-cmake --build build/vc6 --target radar_terrain_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests g_generals z_generals --parallel 2
+cmake --preset win32-debug -DRTS_BUILD_PRODUCT=OFF -DRTS_BUILD_GENERALS=OFF -DRTS_BUILD_ZEROHOUR=OFF -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build --preset win32-debug --target core_texture_mip_buffer_tests --parallel 2
+ctest --test-dir build/win32-debug -C Debug -R "^core_texture_mip_buffer_tests$" --output-on-failure
 ```
 
-If the VC6 toolchain or required game data is unavailable, report that exact
-external prerequisite and leave the replay gate pending.
+If required game data is unavailable, report that exact external prerequisite
+and leave the installed native x64 replay gate pending.
 
 ## Stage 5 replay gate
 
@@ -191,9 +484,9 @@ the default non-optimized layout has no shared hardware vertices.
 Run the repository-relative focused build and CTest target:
 
 ```powershell
-cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
-cmake --build build/win32-debug --config Debug --target height_map_dynamic_light_prepare_tests --parallel 2
-ctest --test-dir build/win32-debug -C Debug -R "^height_map_dynamic_light_prepare_tests$" --output-on-failure
+cmake --preset x64-debug
+cmake --build --preset x64-debug --target height_map_dynamic_light_prepare_tests g_generals z_generals --parallel 2
+ctest --test-dir build/x64-debug -C Debug -R "^height_map_dynamic_light_prepare_tests$" --output-on-failure
 ```
 
 The focused core-extra test covers directional, point, spot, disabled,
@@ -218,7 +511,7 @@ owned buffers are released.
 
 The automated Stage 8 gates require both title builds, the complete ten-replay
 / twelve-execution deterministic gate, and all ten review lenses.  These
-automated gates are complete for the current exact head.  A live
+automated gates were completed for the last reviewed Stage 8 head.  A live
 dynamic-light stress map remains intentionally deferred to manual approval on
 the owner-preserving candidate.  Do not promote the candidate or launch the
 canonical install before that manual approval.
@@ -226,10 +519,11 @@ canonical install before that manual approval.
 The ten review lenses for the Stage 8 head are: owner boundary,
 complete immutable snapshot, legacy byte parity, disjoint row ownership,
 private-runtime wait isolation, deterministic fallback behavior, bounded
-memory and lifetime, both-display lifecycle, C++98/VC6 plus replay evidence,
+memory and lifetime, both-display lifecycle, native x64 plus replay evidence,
 and scoped delivery/privacy hygiene.  All ten review passes and the resulting
-fix/retest cycle are complete for the current head.  Repeat them after any
-subsequent source change before accepting a new stacked-stage handoff.
+fix/retest cycle were completed for that reviewed Stage 8 head.  Repeat them
+after any subsequent source change before accepting a new stacked-stage
+handoff.
 
 # Stage 6 radar overlay preparation checks
 
@@ -245,17 +539,16 @@ Run the repository-relative hygiene, focused, and both-title checks:
 
 ```powershell
 git diff --check
-cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
-cmake --build build/win32-debug --config Debug --target radar_overlay_prepare_tests radar_terrain_prepare_tests core_task_runtime_tests g_generals z_generals --parallel 2
-ctest --test-dir build/win32-debug -C Debug -R "^(radar_overlay_prepare|radar_terrain_prepare|core_task_runtime)_tests$" --output-on-failure
+cmake --preset x64-debug
+cmake --build --preset x64-debug --target radar_overlay_prepare_tests radar_terrain_prepare_tests core_task_runtime_tests g_generals z_generals --parallel 2
+ctest --test-dir build/x64-debug -C Debug -R "^(radar_overlay_prepare|radar_terrain_prepare|core_task_runtime)_tests$" --output-on-failure
 ```
 
 The overlay test must cover both supported formats, clipping, inclusive shroud
 rectangles, exact object/shroud command order, last-writer-wins, row guards,
 serial-versus-split bytes, checked storage limits, lease denial, queue/task
-failure fallback, and worker/owner source audits.  Build the same targets with
-the optimized VC6 preset before replay validation; a modern executable is not
-a substitute for the compatibility lane.
+failure fallback, and worker/owner source audits. Product replay validation uses
+the exact installed native x64 executable built from the reviewed source.
 
 For the Stage 6 replay gate, use the same ten distinct fixtures defined above:
 run the nine non-stress replays once and the 2v6 Hard-AI replay three times.
@@ -284,15 +577,15 @@ isolated build trees:
 
 ```powershell
 git diff --check
-cmake --preset win32-debug -DRTS_BUILD_GENERALS=ON -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON
-cmake --build build/win32-debug --config Debug --target height_map_terrain_prepare_tests radar_terrain_prepare_tests radar_overlay_prepare_tests height_map_dynamic_light_prepare_tests core_task_runtime_tests core_texture_mip_buffer_tests core_screenshot_codec_tests core_miles_audio_completion_tests core_camera_audio_policy_tests g_generals z_generals --parallel 2
-ctest --test-dir build/win32-debug -C Debug -R "^(height_map_terrain_prepare|radar_terrain_prepare|radar_overlay_prepare|height_map_dynamic_light_prepare|core_task_runtime|core_texture_mip_buffer|core_screenshot_codec|core_miles_audio_completion|core_camera_audio_policy)_tests$" --output-on-failure
+cmake --preset x64-debug
+cmake --build --preset x64-debug --target height_map_terrain_prepare_tests radar_terrain_prepare_tests radar_overlay_prepare_tests height_map_dynamic_light_prepare_tests core_task_runtime_tests core_screenshot_codec_tests core_camera_audio_policy_tests g_generals z_generals --parallel 2
+ctest --test-dir build/x64-debug -C Debug -R "^(height_map_terrain_prepare|radar_terrain_prepare|radar_overlay_prepare|height_map_dynamic_light_prepare|core_task_runtime|core_screenshot_codec|core_camera_audio_policy)_tests$" --output-on-failure
 ```
 
-Repeat the focused targets and both game targets with `win32-profile` using the
-Release configuration.  Build and run the same targets with the VC6 preset;
-disable precompiled headers if required by the legacy compiler.  A modern
-executable is not a substitute for the VC6 compatibility lane.
+Repeat the focused targets and both game targets with `x64-profile` using the
+Release configuration. The historical 32-bit-only texture-mip and Miles tests
+may be run separately with `RTS_BUILD_PRODUCT=OFF`; they are not title-build or
+replay qualification evidence.
 
 The terrain suite must cover exact serial-versus-partitioned byte parity,
 normals, flip/UV/alpha, origin and border capture, static-light branches, depth
@@ -311,12 +604,12 @@ failure, missing map, CRC mismatch, or desync.  The three stress runs must
 produce byte-identical CRC file sets.  Run three fresh AI-vs-AI headless smoke
 games when the established runner is available.
 
-Use a VC6-compatible artifact from the exact final commit and an isolated
-disposable runtime and profile.  Do not use the live profile or playable
-installation.  Record only repository-relative commands and aggregate results;
+Use the exact installed native x64 artifact from the final commit and an isolated
+disposable runtime and profile. Do not use the live profile or playable
+installation. Record only repository-relative commands and aggregate results;
 never commit machine paths, personal profile paths, or local build/log paths.
-Do not mark Stage 7 ready until all focused tests, both-title modern and VC6
-builds, ten review rounds, and the full replay gate have passed.
+Do not mark Stage 7 ready until all focused tests, both native x64 title builds,
+ten review rounds, and the full replay gate have passed.
 
 # Pathfinding capacity checks
 
@@ -330,12 +623,13 @@ simulation serialization, or network commands. The pool is selected again at
 map activation after replay metadata has been read, because the AI subsystem is
 constructed before the recorder during engine startup.
 
-Run the focused policy and title checks from isolated modern x86 build trees:
+Run the focused policy and title checks from the isolated native x64 Profile
+product tree:
 
 ```powershell
-cmake --preset win32-profile -DRTS_BUILD_GENERALS=OFF -DRTS_BUILD_ZEROHOUR=ON -DRTS_BUILD_CORE_EXTRAS=ON -DRTS_BUILD_ZEROHOUR_EXTRAS=ON
-cmake --build build/win32-profile --config Release --target z_runtime_regression_tests z_generals
-ctest --test-dir build/win32-profile -C Release -R "^z_skirmish_ai_replay_epoch_tests$" --output-on-failure
+cmake --preset x64-profile
+cmake --build --preset x64-profile --target z_runtime_regression_tests z_generals --parallel 2
+ctest --test-dir build/x64-profile -C Release -R "^z_skirmish_ai_replay_epoch_tests$" --output-on-failure
 ```
 
 Build the Generals title separately with `RTS_BUILD_GENERALS=ON` and
@@ -356,21 +650,24 @@ replay artifact. The target stress run should show pool failures at the legacy
 limit but no failures with the 150,000-record live pool; queue saturation is a
 separate signal and must not be inferred from pool pressure.
 
-After the final VC6 optimized build, run the complete replay gate described
-above: ten distinct fixtures and twelve executions, with the 2v6 Hard-AI
-fixture executed three times and its CRC traces byte-identical. Require zero
-exit status and no CRC mismatch, assertion, crash, missing map, or ownership
-failure. Keep replay state isolated and do not record machine-specific paths in
-commits, documentation, or pull-request text.
+After the final native x64 Release build, run the complete installed-runtime
+replay gate described above: ten distinct fixtures and twelve executions, with
+the 2v6 Hard-AI fixture executed three times and its CRC traces byte-identical.
+Require zero exit status and no CRC mismatch, assertion, crash, missing map, or
+ownership failure. Keep replay state isolated and do not record machine-specific
+paths in commits, documentation, or pull-request text.
 
-# Miles completion callback checks
+# Historical non-product Miles completion callback checks
 
 The Miles EOS callbacks must only publish a fixed-size `{handle, type, generation}` record. They must not enter `TheAudio`, call Miles APIs, allocate, or take the audio-cache mutex. The owner-thread `MilesAudioManager::update()` drains one queue snapshot per frame; reset and shutdown close admission before unregistering callbacks and releasing handles, then clear queued generations. On overflow, the owner drains status-visible stopped handles and uses the compatibility fallback rather than waiting in a callback.
 
-Build and run the bounded queue test with Core extras enabled:
+Miles is retired from the product runtime. This retained test checks only the
+historical Win32 tooling boundary and must explicitly disable both product
+titles:
 
 ```
-cmake --build build/win32-debug --config Debug --target core_miles_audio_completion_tests
+cmake --preset win32-debug -DRTS_BUILD_PRODUCT=OFF -DRTS_BUILD_GENERALS=OFF -DRTS_BUILD_ZEROHOUR=OFF -DRTS_BUILD_CORE_EXTRAS=ON
+cmake --build --preset win32-debug --target core_miles_audio_completion_tests --parallel 2
 ctest --test-dir build/win32-debug -C Debug -R "^core_miles_audio_completion_tests$" --output-on-failure
 ```
 
@@ -380,4 +677,8 @@ The test covers FIFO delivery, concurrent producers, bounded overflow/recovery, 
 rg -n "set(Sample|3DSample|Stream)Completed|TheAudio->notifyOfAudioCompletion" Core/GameEngineDevice/Source/MilesAudioDevice/MilesAudioManager.cpp
 ```
 
-The callback declarations/definitions may match, but the callback bodies must contain only `tryPublish`; all `notifyOfAudioCompletion` calls must be on the owner-thread drain/recovery path. During manual gameplay, stress dense combat and rapid sound effects, reset/return to shell, alt-tab, and exit while sounds are active. The game must remain responsive and must not show the previous audio hang; no callback-thread stack may contain `ScopedMutex::Lock` or `AudioFileCache` operations.
+The callback declarations/definitions may match, but the callback bodies must
+contain only `tryPublish`; all `notifyOfAudioCompletion` calls must be on the
+owner-thread drain/recovery path. This historical check provides no product
+audio evidence. Current manual gameplay audio validation exercises the native
+XAudio2 runtime, not Miles.

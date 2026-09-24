@@ -33,6 +33,9 @@
 #include "Common/GameMemory.h"
 #include "GameLogic/AIPlayer.h"
 #include "GameLogic/SkirmishAIDecision.h"
+#if defined(_WIN64)
+#include "Lib/DeterministicAIPlanning.h"
+#endif
 #include "GameLogic/SkirmishAIStrategy.h"
 
 class BuildListInfo;
@@ -88,6 +91,30 @@ public:	// AIPlayer interface methods.
 
 	virtual Player *getAiEnemy() override;	///< Solo AI attacks based on scripting.  Only skirmish auto-acquires an enemy at this point.  jba.
 	virtual Player *getCachedAiEnemy() const override { return m_currentEnemy; }
+
+#if defined(_WIN64)
+	// Owner-thread Stage 5 target capture/validation/commit. AI::update batches
+	// these immutable snapshots before any Player::update mutates live state.
+	Bool isEnemyPlanningDue() const;
+	Bool captureEnemyPlanningSnapshot(
+		rts::AIEnemyPlanningSnapshot *snapshot ) const;
+	Bool validateEnemyPlanningCommit(
+		const rts::AIEnemyPlanningSnapshot &snapshot,
+		const rts::AIEnemyPlanningResult &result ) const;
+	Bool resolveEnemyPlanningCommit(
+		const rts::AIEnemyPlanningSnapshot &snapshot,
+		const rts::AIEnemyPlanningResult &result,
+		Player **resolvedEnemy ) const;
+	void applyEnemyPlanningCommit(Player *resolvedEnemy);
+	Bool prepareAdaptiveProductionPlanningSnapshot(
+		rts::AIProductionPlanningSnapshot *snapshot,
+		const rts::AICounterRngKey &baseRandomKey,
+		Bool *handled,
+		Bool *overflowed);
+	Bool validateProductionPlanningBatchCommit(
+		const rts::AIProductionPlanningSnapshot &snapshot,
+		const rts::AIProductionPlanningResult &result) const;
+#endif
 
 protected:
 
@@ -158,6 +185,9 @@ protected:
 		Int *productionCost, Int *completionFrames );
 	void getVisibleEnemyComposition( Int *aircraftValue, Int *vehicleValue, Int *infantryValue,
 		Coord3D *routeTarget, Bool *hasRouteTarget );
+	void getVisibleEnemyCompositionFor( Player *enemy, Int *aircraftValue,
+		Int *vehicleValue, Int *infantryValue, Coord3D *routeTarget,
+		Bool *hasRouteTarget ) const;
 	Int getCandidateCounterFit( TeamPrototype *proto, Int aircraftValue, Int vehicleValue, Int infantryValue );
 	SkirmishAIRouteClass classifyTeamRoute( TeamPrototype *proto, const Coord3D *routeTarget, Bool hasRouteTarget );
 	Bool getKnownEnemyPosition( Player *enemy, Coord3D *position ) const;
@@ -168,6 +198,26 @@ protected:
 		Object *representative, const Coord3D *enemyPosition, Bool hasEnemyPosition ) const;
 	Int countAlliedSkirmishAIsTargeting( Player *enemy ) const;
 	SkirmishAIDecisionDifficulty getDecisionDifficulty() const;
+#if defined(_WIN64)
+	// All live reads stay in these owner-thread capture adapters. Workers see
+	// only the resulting POD snapshots and emit stable IDs/order keys.
+	Bool captureAdaptiveProductionCandidateFacts(
+		rts::AIProductionPlanningSnapshot *snapshot,
+		const rts::AICounterRngKey &baseRandomKey,
+		Int *highestPriority,
+		Bool *overflowed );
+	Bool finishAdaptiveProductionPlanningSnapshot(
+		rts::AIProductionPlanningSnapshot *snapshot );
+	Bool selectTeamToBuildCounterSerialFallback(
+		const rts::AICounterRngKey &randomKey );
+	Bool validateProductionPlanningCommit(
+		const rts::AIProductionPlanningSnapshot &snapshot,
+		const rts::AIProductionPlanningResult &result ) const;
+	Bool commitProductionPlanningResult(
+		const rts::AIProductionPlanningSnapshot &snapshot,
+		const rts::AIProductionPlanningResult &result );
+	Bool selectTeamToBuildWithPlanning();
+#endif
 	Bool usesStrategyBehavior() const;
 	Bool usesProductionBehavior() const;
 	void clearStrategySourceCommandLock();
