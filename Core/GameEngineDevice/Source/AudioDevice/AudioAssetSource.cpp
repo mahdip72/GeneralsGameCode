@@ -28,7 +28,9 @@ constexpr UnsignedInt OUTPUT_SAMPLE_RATE = 48000U;
 constexpr UnsignedShort OUTPUT_CHANNELS = 2U;
 constexpr std::size_t OUTPUT_BYTES_PER_FRAME = OUTPUT_CHANNELS * sizeof(std::int16_t);
 constexpr UnsignedInt MAX_OUTPUT_FRAMES = OUTPUT_SAMPLE_RATE;
-constexpr UnsignedInt MAX_CACHED_SAMPLE_FRAMES = 3U * OUTPUT_SAMPLE_RATE;
+// Shell-map ambience commonly lasts four to seven seconds and may be played
+// by many emitters. Keep complete PCM within the existing byte budget.
+constexpr UnsignedInt MAX_CACHED_SAMPLE_FRAMES = 8U * OUTPUT_SAMPLE_RATE;
 
 struct WaveInfo
 {
@@ -1525,7 +1527,7 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 		}
 		if (!openPcmStream(fileName, stream) || stream == nullptr) return FALSE;
 		const Real duration = stream->durationMS();
-		if (!std::isfinite(duration) || duration <= 0.0f || duration > 3000.0f) return TRUE;
+		if (!std::isfinite(duration) || duration <= 0.0f || duration > 8000.0f) return TRUE;
 		const UnsignedInt frameLimit = static_cast<UnsignedInt>(std::min<std::size_t>(
 			MAX_CACHED_SAMPLE_FRAMES, cache.budget->limit / OUTPUT_BYTES_PER_FRAME));
 		const double expectedFrames = std::ceil(static_cast<double>(duration)

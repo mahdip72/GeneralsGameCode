@@ -728,13 +728,35 @@ int runCatalogTest(int argc, char *argv[])
 	const std::filesystem::path longPath = root / "long.wav";
 	const std::filesystem::path longAdpcmPath = root / "long_adpcm.wav";
 	writeWaveFile(longPath, 5000U);
-	MemoryVirtualAudioSource uncachedLongArchive("archive\\long-cache-bypass.wav", readBinaryFile(longPath));
-	FileAudioAssetSource uncachedLongSource(AsciiString(root.string().c_str()), &uncachedLongArchive);
-	uncachedLongSource.setSamplePcmCacheBudget(1920000U);
-	check(uncachedLongSource.openPcmSampleStream(AsciiString("archive\\long-cache-bypass.wav"), cachedFirst)
-		&& uncachedLongSource.openPcmSampleStream(AsciiString("archive\\long-cache-bypass.wav"), cachedSecond)
-		&& uncachedLongArchive.getReadCalls() == 2U,
-		"long sound effects remain sequential streams even when the cache budget could hold them");
+	MemoryVirtualAudioSource ambientArchive("archive\\ambient.wav", readBinaryFile(longPath));
+	FileAudioAssetSource ambientSource(AsciiString(root.string().c_str()), &ambientArchive);
+	ambientSource.setSamplePcmCacheBudget(1920000U);
+	check(ambientSource.openPcmSampleStream(AsciiString("archive\\ambient.wav"), cachedFirst)
+		&& ambientSource.openPcmSampleStream(AsciiString("archive\\ambient.wav"), cachedSecond)
+		&& ambientArchive.getReadCalls() == 1U,
+		"five-second ambience reuses complete decoded PCM across concurrent voices");
+	AudioPcmChunk ambientFirst, ambientSecond;
+	for (UnsignedInt second = 0; second < 5U; ++second) {
+		check(cachedFirst->readPcm(ambientFirst, 48000U)
+			&& cachedSecond->readPcm(ambientSecond, 48000U)
+			&& ambientFirst.startSample == second * 48000U
+			&& ambientFirst.data == ambientSecond.data,
+			"cached ambience keeps independent cursors and identical PCM");
+	}
+	check(cachedFirst->isEnded() && cachedSecond->isEnded(),
+		"cached ambience ends after its full five-second duration");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	const std::filesystem::path overLimitPath = root / "over-limit.wav";
+	writeWaveFile(overLimitPath, 9000U);
+	MemoryVirtualAudioSource overLimitArchive("archive\\over-limit.wav",
+		readBinaryFile(overLimitPath));
+	FileAudioAssetSource overLimitSource(AsciiString(root.string().c_str()), &overLimitArchive);
+	overLimitSource.setSamplePcmCacheBudget(8U * 1024U * 1024U);
+	check(overLimitSource.openPcmSampleStream(AsciiString("archive\\over-limit.wav"), cachedFirst)
+		&& overLimitSource.openPcmSampleStream(AsciiString("archive\\over-limit.wav"), cachedSecond)
+		&& overLimitArchive.getReadCalls() == 2U,
+		"sound effects above the eight-second cap remain sequential streams");
 	cachedFirst.reset();
 	cachedSecond.reset();
 	check(runFFmpeg(ffmpegExecutable, longPath, "adpcm_ima_wav", longAdpcmPath) == 0,
