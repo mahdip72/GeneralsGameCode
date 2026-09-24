@@ -1159,6 +1159,54 @@ int TestResizeRollback(HWND window)
 			"resize rollback fixture initializes native owner");
 		if (!owner.IsOperational()) continue;
 		owner.SetGameCleanupHook(&hook);
+		GpuHandle retainedDynamicBuffer;
+		GpuHandle retainedGpuTexture;
+		NativeW3DGpuContentLease retainedGpuLease;
+		if (scenario == 2 || scenario == 5)
+		{
+			const unsigned int vertices[3] = { 1U, 2U, 3U };
+			BufferDescriptor bufferDescriptor;
+			bufferDescriptor.byteCount = sizeof(vertices);
+			bufferDescriptor.stride = sizeof(vertices[0]);
+			bufferDescriptor.binding = RENDER_BUFFER_VERTEX;
+			bufferDescriptor.usage = RENDER_USAGE_DYNAMIC;
+			GpuHandle validated;
+			result |= Check(owner.Resources().CreateBuffer(bufferDescriptor,
+				vertices, sizeof(vertices), &retainedDynamicBuffer) ==
+				RENDER_RESULT_OK &&
+				owner.Resources().AcquireVertexBufferRange(retainedDynamicBuffer,
+					sizeof(vertices[0]), 0, 0, 3, &validated) ==
+					RENDER_RESULT_OK,
+				"resize fixture retains an initialized dynamic buffer");
+			TextureDescriptor textureDescriptor;
+			textureDescriptor.width = 64;
+			textureDescriptor.height = 64;
+			textureDescriptor.mipCount = 1;
+			textureDescriptor.arrayCount = 1;
+			textureDescriptor.dimension = RENDER_TEXTURE_2D;
+			textureDescriptor.format = RENDER_FORMAT_B8G8R8A8_UNORM;
+			textureDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+			textureDescriptor.usage = RENDER_USAGE_DEFAULT;
+			result |= Check(owner.Resources().CreateTexture(textureDescriptor,
+				0, 0, &retainedGpuTexture) == RENDER_RESULT_OK,
+				"resize fixture creates a GPU-copy texture");
+			const RenderResult beginResult = owner.Renderer().BeginFrame();
+			const RenderResult copyResult = beginResult == RENDER_RESULT_OK ?
+				owner.Resources().CopyActiveColorTargetToTexture(
+					retainedGpuTexture, &retainedGpuLease) :
+				RENDER_RESULT_INVALID_ARGUMENT;
+			const RenderResult endResult = beginResult == RENDER_RESULT_OK ?
+				owner.Renderer().EndFrame(false) :
+				RENDER_RESULT_INVALID_ARGUMENT;
+			const RenderResult fenceResult = endResult == RENDER_RESULT_OK ?
+				owner.Renderer().FinalizeEndedFrame(false) :
+				RENDER_RESULT_INVALID_ARGUMENT;
+			result |= Check(copyResult == RENDER_RESULT_OK &&
+				retainedGpuLease.isValid() && endResult == RENDER_RESULT_OK &&
+				fenceResult == RENDER_RESULT_OK &&
+				owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
+				"resize fixture publishes GPU-authored texture content");
+		}
 		if (scenario == 3 || scenario == 4)
 			result |= Check(NativeW3DRecoveryTestAccess::PopulateGpuOnlyTexture(
 				&owner.Renderer()),
@@ -1223,6 +1271,35 @@ int TestResizeRollback(HWND window)
 				RENDER_RESULT_OK && owner.Renderer().DrainThreaded() ==
 				RENDER_RESULT_OK,
 				"new-size rendering and presentation use valid recovered targets");
+			NativeW3DBufferDescription bufferDescription;
+			NativeW3DTextureDescription textureDescription;
+			GpuHandle validated;
+			NativeW3DGpuContentLease acquiredLease = retainedGpuLease;
+			const RenderResult rangeResult =
+				owner.Resources().AcquireVertexBufferRange(
+					retainedDynamicBuffer, sizeof(unsigned int), 0, 0, 3,
+					&validated);
+			const RenderResult leaseResult =
+				owner.Resources().AcquireGpuContentLease(retainedGpuTexture,
+					&acquiredLease);
+			result |= Check(owner.Resources().DescribeBuffer(retainedDynamicBuffer,
+				&bufferDescription) == RENDER_RESULT_OK &&
+				owner.Resources().DescribeTexture(retainedGpuTexture,
+					&textureDescription) == RENDER_RESULT_OK &&
+				(scenario == 2 ?
+					(bufferDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
+						textureDescription.authority ==
+						NATIVE_W3D_CONTENT_INVALID &&
+						rangeResult == RENDER_RESULT_INVALID_ARGUMENT &&
+						leaseResult == RENDER_RESULT_INVALID_ARGUMENT &&
+						!acquiredLease.isValid()) :
+					(bufferDescription.authority == NATIVE_W3D_CONTENT_CPU &&
+						textureDescription.authority ==
+						NATIVE_W3D_CONTENT_GPU_RENDER_TARGET &&
+						rangeResult == RENDER_RESULT_OK &&
+						leaseResult == RENDER_RESULT_OK &&
+						acquiredLease.isValid())),
+				"recovered resize invalidates old content; ordinary resize retains it");
 		}
 		else
 		{
@@ -1231,6 +1308,12 @@ int TestResizeRollback(HWND window)
 				!owner.IsOperational() && !owner.Renderer().IsInitialized(),
 				"failed rollback or recovery retry terminates the native facade");
 		}
+		if (retainedDynamicBuffer.isValid() && owner.IsOperational())
+			result |= Check(owner.Resources().Destroy(retainedDynamicBuffer),
+				"resize fixture releases retained dynamic buffer");
+		if (retainedGpuTexture.isValid() && owner.IsOperational())
+			result |= Check(owner.Resources().Destroy(retainedGpuTexture),
+				"resize fixture releases retained GPU texture");
 		result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
 			"resize rollback fixture shuts down");
 	}

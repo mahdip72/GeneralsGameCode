@@ -1604,7 +1604,7 @@ public:
 	}
 
 	RenderResult resizeInternal(unsigned int width, unsigned int height,
-		bool recoverOnDeviceRemoval)
+		bool recoverOnDeviceRemoval, bool *recovered)
 	{
 		if (!isOwner() || m_frameOpen)
 		{
@@ -1657,7 +1657,7 @@ public:
 				if (translatedResult == RENDER_RESULT_DEVICE_REMOVED &&
 					recoverOnDeviceRemoval)
 				{
-					return recoverAndRetryResize(width, height);
+					return recoverAndRetryResize(width, height, recovered);
 				}
 				if (SUCCEEDED(createBackBufferTargets(previousWidth,
 					previousHeight)))
@@ -1704,7 +1704,7 @@ public:
 				if (TranslateResult(result) == RENDER_RESULT_DEVICE_REMOVED &&
 					recoverOnDeviceRemoval)
 				{
-					return recoverAndRetryResize(width, height);
+					return recoverAndRetryResize(width, height, recovered);
 				}
 				if (SUCCEEDED(m_swapChain->ResizeBuffers(0, previousWidth,
 					previousHeight, DXGI_FORMAT_UNKNOWN, 0)) &&
@@ -1740,14 +1740,18 @@ public:
 		return RENDER_RESULT_OK;
 	}
 
-	RenderResult recoverAndRetryResize(unsigned int width, unsigned int height)
+	RenderResult recoverAndRetryResize(unsigned int width, unsigned int height,
+		bool *recovered)
 	{
 		const RenderResult recoveryResult = recoverDevice();
 		if (recoveryResult != RENDER_RESULT_OK)
 		{
 			return recoveryResult;
 		}
-		const RenderResult retryResult = resizeInternal(width, height, false);
+		if (recovered != 0)
+			*recovered = true;
+		const RenderResult retryResult = resizeInternal(width, height, false,
+			recovered);
 		if (retryResult != RENDER_RESULT_OK)
 		{
 			// Recovery replaced every native texture. The threaded wrapper
@@ -1760,7 +1764,17 @@ public:
 
 	virtual RenderResult resize(unsigned int width, unsigned int height)
 	{
-		return resizeInternal(width, height, true);
+		bool recovered = false;
+		return resizeWithRecovery(width, height, &recovered);
+	}
+
+	virtual RenderResult resizeWithRecovery(unsigned int width,
+		unsigned int height, bool *recovered)
+	{
+		if (recovered == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		*recovered = false;
+		return resizeInternal(width, height, true, recovered);
 	}
 
 	virtual RenderResult present()

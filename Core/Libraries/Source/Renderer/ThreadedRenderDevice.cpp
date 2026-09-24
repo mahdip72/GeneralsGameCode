@@ -222,7 +222,7 @@ struct Reply
 	Reply() : done(false), result(RENDER_RESULT_OK), format(RENDER_FORMAT_UNKNOWN),
 		rowPitch(0), count(0), width(0), height(0), interval(0),
 		gamma(1.0f), brightness(0.0f), contrast(1.0f), calibrate(false),
-		useLimit(true), faultPoint(RENDER_RESOURCE_FAULT_NONE),
+		useLimit(true), recovered(false), faultPoint(RENDER_RESOURCE_FAULT_NONE),
 		faultFailOnInvocation(0), faultResult(RENDER_RESULT_FAILED),
 		statistics(), handle() {}
 	bool done;
@@ -231,7 +231,7 @@ struct Reply
 	size_t rowPitch;
 	unsigned int count, width, height, interval;
 	float gamma, brightness, contrast;
-	bool calibrate, useLimit;
+	bool calibrate, useLimit, recovered;
 	RenderResourceFaultPoint faultPoint;
 	unsigned int faultFailOnInvocation;
 	RenderResult faultResult;
@@ -341,7 +341,13 @@ public:
 	RenderResult copyActiveColorTargetToTexture(GpuHandle) override;
 	bool destroyResource(GpuHandle) override;
 	RenderResult recoverDevice() override { return lifecycle(CONTROL_RECOVER, 0, 0); }
-	RenderResult resize(unsigned int w, unsigned int h) override { return lifecycle(CONTROL_RESIZE, w, h); }
+	RenderResult resize(unsigned int w, unsigned int h) override
+	{
+		bool recovered = false;
+		return resizeWithRecovery(w, h, &recovered);
+	}
+	RenderResult resizeWithRecovery(unsigned int w, unsigned int h,
+		bool *recovered) override;
 	RenderResult present() override { return submitFrame(true); }
 	RenderResult setSwapInterval(unsigned int interval) override;
 	RenderResult getSwapInterval(unsigned int *interval) const override;
@@ -803,6 +809,28 @@ RenderResult ThreadedRenderDevice::lifecycle(Control control, unsigned int width
 	}
 	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__,
 		__LINE__, static_cast<uint64_t>(control), width, height); }
+}
+
+RenderResult ThreadedRenderDevice::resizeWithRecovery(unsigned int width,
+	unsigned int height, bool *recovered)
+{
+	if (recovered == 0 || !usable() || m_recording)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	*recovered = false;
+	try
+	{
+		std::shared_ptr<Reply> reply = std::make_shared<Reply>();
+		reply->width = width;
+		reply->height = height;
+		const RenderResult result = sync(CONTROL_RESIZE, reply);
+		*recovered = reply->recovered;
+		return result;
+	}
+	catch (...)
+	{
+		return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__,
+			width, height);
+	}
 }
 
 RenderResult ThreadedRenderDevice::setSwapInterval(unsigned int interval)
@@ -1741,14 +1769,28 @@ void ThreadedRenderDevice::execute(Packet &packet)
 			}
 			break;
 		case CONTROL_RESIZE:
-			result = BackendCall([&] { return m_backend->resize(packet.reply->width, packet.reply->height); });
+			result = BackendCall([&] { return m_backend->resizeWithRecovery(
+				packet.reply->width, packet.reply->height,
+				&packet.reply->recovered); });
 			if (result == RENDER_RESULT_OK && packet.reply->width && packet.reply->height)
 			{
 				m_ownerDeviceRemoved = false;
-				// resize may have recovered the native device internally. GPU-only
-				// output pixels are not a CPU recovery source and must be redrawn.
-				for (OwnerResource &slot : m_ownerResources)
-					if (slot.gpuAuthoritative) slot.contentValid = false;
+				if (packet.reply->recovered)
+				{
+					for (OwnerResource &slot : m_ownerResources)
+					{
+						if (!slot.texture)
+						{
+							slot.contentValid = slot.recoverySourceValid &&
+								IsInitializedRange(slot.initializedBytes, 0,
+									slot.byteCount);
+							if (!slot.contentValid)
+								slot.initializedBytes.clear();
+						}
+						else if (slot.gpuAuthoritative)
+							slot.contentValid = false;
+					}
+				}
 			}
 			m_context = m_backend->immediateContext();
 			break;

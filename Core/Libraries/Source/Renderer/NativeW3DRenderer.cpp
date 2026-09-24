@@ -674,7 +674,15 @@ RenderResult NativeW3DRenderer::Resize(unsigned int width, unsigned int height)
 	RenderBackBufferInfo previousInfo;
 	const bool havePreviousInfo =
 		device->getBackBufferInfo(&previousInfo) == RENDER_RESULT_OK;
-	RenderResult result = device->resize(width, height);
+	bool recovered = false;
+	RenderResult result = device->resizeWithRecovery(width, height,
+		&recovered);
+	if (result == RENDER_RESULT_OK && recovered)
+	{
+		// A successful resize may have replaced every native resource. Publish
+		// the new backend epoch before any surviving GPU-only lease is queried.
+		result = m_state->ReplaceContext(device->immediateContext());
+	}
 	bool restoredPreviousTargets = false;
 	if (result != RENDER_RESULT_OK && result != RENDER_RESULT_DEVICE_REMOVED &&
 		havePreviousInfo && m_state->IsOperational() &&
@@ -691,7 +699,8 @@ RenderResult NativeW3DRenderer::Resize(unsigned int width, unsigned int height)
 		width != 0 && height != 0 &&
 		m_recoveryResources != 0)
 	{
-		const RenderResult publicationResult =
+		const RenderResult publicationResult = recovered ?
+			m_recoveryResources->RestoreStaticBuffersAfterRecovery() :
 			m_recoveryResources->RepublishStaticBuffersAfterResize();
 		resourcesPublished = publicationResult == RENDER_RESULT_OK;
 		if (!resourcesPublished)

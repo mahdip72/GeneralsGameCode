@@ -658,6 +658,17 @@ public:
 	// swap-chain targets and treat this notification as a successful no-op;
 	// callers can submit the next non-zero size when the window is restored.
 	virtual RenderResult resize(unsigned int width, unsigned int height) = 0;
+	// A resize can recover a removed native device while still returning OK.
+	// Callers that retain content authority must distinguish that transition
+	// from an ordinary swap-chain resize.
+	virtual RenderResult resizeWithRecovery(unsigned int width,
+		unsigned int height, bool *recovered)
+	{
+		if (recovered == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		*recovered = false;
+		return resize(width, height);
+	}
 	virtual RenderResult present() = 0;
 	// Optional presentation controls are deliberately non-pure so legacy and
 	// test-only devices remain source-compatible.  Native D3D11 overrides these
