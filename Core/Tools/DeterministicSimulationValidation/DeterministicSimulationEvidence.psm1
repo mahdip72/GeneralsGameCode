@@ -15687,7 +15687,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
 
     $attachmentBindings = @{
         'deterministic-runtime' = @('validation-plan|ZeroHour',
-            'validation-results|ZeroHour', 'performance-report|ZeroHour')
+            'validation-results|ZeroHour')
         'replay-determinism' = @('replay-results|ZeroHour',
             'replay-fixture-manifest|Generals',
             'replay-fixture-manifest|ZeroHour')
@@ -15810,8 +15810,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                 "Evidence '$kind' attachment '$role'"
             $attachmentHash = Assert-Stage5FinalAcceptanceSnapshotSha256 `
                 $attachmentSnapshot $expectedHash "Evidence '$kind' attachment '$role'"
-            $readGenericReceipt = $immutableReceiptRoles -ccontains $role -or
-                ($kind -ceq 'deterministic-runtime' -and $role -ceq 'performance-report')
+            $readGenericReceipt = $immutableReceiptRoles -ccontains $role
             if ($readGenericReceipt) {
                 try {
                     $receiptArguments = [ordered]@{
@@ -15838,7 +15837,7 @@ function Invoke-Stage5FinalAcceptanceAggregation {
                         $receiptArguments['ExpectedCohortCreatedUtc'] = $cohortCreatedUtc
                     }
                     if ($role -in @('validation-results', 'replay-results',
-                            'ai-results', 'performance-report')) {
+                            'ai-results')) {
                         $attachmentReceipt = ConvertFrom-Stage5FinalAcceptanceJsonSnapshot `
                             $attachmentSnapshot "Evidence '$kind' attachment '$role'"
                         if ((Get-Stage5JsonValue $attachmentReceipt 'trustDomain' `

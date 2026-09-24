@@ -9824,7 +9824,7 @@ try {
         'combined-stage4-stage5-installed-runtime' = @('combined-results')
         'premium-review' = @('premium-review-results')
         'manual-acceptance' = @('manual-checklist')
-        'deterministic-runtime' = @('validation-plan', 'validation-results', 'performance-report')
+        'deterministic-runtime' = @('validation-plan', 'validation-results')
     }
     $detailsByKind = [ordered]@{
         'replay-determinism' = [ordered]@{
@@ -10470,7 +10470,7 @@ try {
     })[0]
     $reusedValidationDocument = Read-TestJson `
         ([string]$syntheticZeroHourReceipts['validation-results'])
-    Assert-True ($deterministicAttachments.Count -eq 3 -and
+    Assert-True ($deterministicAttachments.Count -eq 2 -and
         [string]$reusedValidationAttachment.sha256 -ceq
             [string]$syntheticZeroHour.validationReceiptSha256 -and
         @($reusedValidationDocument.provenance.children).Count -eq 253 -and

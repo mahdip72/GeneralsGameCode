@@ -177,7 +177,8 @@ if(WIN32)
     add_test(NAME core_stage5_development_readiness_bundle_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5DevelopmentReadinessBundle.Tests.ps1"
-            -SourceRoot "${CMAKE_SOURCE_DIR}")
+            -SourceRoot "${CMAKE_SOURCE_DIR}"
+            -ScratchRoot "${_stage5_validation_test_scratch_root}/development-readiness-bundle")
     set_tests_properties(core_stage5_development_readiness_bundle_tests
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 120)
     # These fixtures exercise JSON Schema validation through Test-Json.  Keep

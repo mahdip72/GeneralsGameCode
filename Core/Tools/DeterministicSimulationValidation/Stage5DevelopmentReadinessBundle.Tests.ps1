@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$SourceRoot
+    [Parameter(Mandatory = $true)][string]$SourceRoot,
+    [Parameter(Mandatory = $true)][string]$ScratchRoot
 )
 
 Set-StrictMode -Version 2.0
@@ -266,7 +267,6 @@ $expectedReceiptSpecs = @(
     'Generals|validation-plan|validation-plan-receipt.json',
     'Generals|validation-results|validation-results-receipt.json',
     'ZeroHour|ai-results|ai-results-receipt.json',
-    'ZeroHour|performance-report|performance-report-receipt.json',
     'ZeroHour|replay-results|replay-results-receipt.json',
     'ZeroHour|validation-plan|validation-plan-receipt.json',
     'ZeroHour|validation-results|validation-results-receipt.json'
@@ -381,5 +381,216 @@ $expectedEvidenceKinds = @('deterministic-runtime', 'replay-determinism',
     'combined-stage4-stage5-installed-runtime')
 Assert-Test (($evidenceKinds -join '|') -ceq ($expectedEvidenceKinds -join '|')) `
     "Assembler must preserve exactly six top-level evidence kinds: $($evidenceKinds -join ', ')"
+$evidenceModulePath = Join-Path $root `
+    'Core\Tools\DeterministicSimulationValidation\DeterministicSimulationEvidence.psm1'
+$evidenceModuleTokens = $null
+$evidenceModuleErrors = $null
+$evidenceModuleAst = [Management.Automation.Language.Parser]::ParseFile(
+    $evidenceModulePath, [ref]$evidenceModuleTokens, [ref]$evidenceModuleErrors)
+Assert-Test ($evidenceModuleErrors.Count -eq 0) `
+    "Final-acceptance evidence module must parse: $($evidenceModuleErrors -join '; ')"
+$aggregationFunction = Get-FunctionDefinition $evidenceModuleAst `
+    'Invoke-Stage5FinalAcceptanceAggregation'
+$attachmentBindingAssignments = @($aggregationFunction.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+        $node.Left.VariablePath.UserPath -ceq 'attachmentBindings'
+}, $true))
+Assert-Test ($attachmentBindingAssignments.Count -eq 1 -and
+    [string]$attachmentBindingAssignments[0].Right.Extent.Text -match
+        "'deterministic-runtime'\s*=\s*@\('validation-plan\|ZeroHour',\s*'validation-results\|ZeroHour'\)") `
+    'Final-acceptance reader must require exactly the plan and results attachments for deterministic-runtime.'
+
+$runtimeEnvelopeFunction = Get-FunctionDefinition $ast `
+    'New-Stage5DeterministicRuntimeEnvelope'
+$runtimeEnvelopeText = [string]$runtimeEnvelopeFunction.Extent.Text
+Assert-Test ($runtimeEnvelopeText -notmatch 'performance-report' -and
+    $runtimeEnvelopeText -match 'PerformanceScalingEvidenceSha256') `
+    'Deterministic-runtime envelope must not require a host-runner performance report and must only reference the separately validated scaling envelope.'
+Assert-Test ($runtimeEnvelopeText -match "Write-EvidenceEnvelope 'deterministic-runtime'") `
+    'Deterministic-runtime envelope helper no longer writes the runtime evidence envelope.'
+$performanceScalingEnvelopeCalls = @($commands | Where-Object {
+    $_.GetCommandName() -ceq 'Write-EvidenceEnvelope' -and
+        $_.CommandElements.Count -gt 1 -and
+        $_.CommandElements[1] -is [Management.Automation.Language.StringConstantExpressionAst] -and
+        $_.CommandElements[1].Value -ceq 'performance-scaling'
+})
+Assert-Test ($performanceScalingEnvelopeCalls.Count -eq 1 -and
+    [string]$performanceScalingEnvelopeCalls[0].Extent.Text -match
+        '\$performancePath' -and
+    [string]$performanceScalingEnvelopeCalls[0].Extent.Text -match
+        "-Role 'performance-report'" -and
+    [string]$performanceScalingEnvelopeCalls[0].Extent.Text -match
+        "-Role 'stage3-baseline'" -and
+    [string]$performanceScalingEnvelopeCalls[0].Extent.Text -match
+        "-Role 'phase-baseline-profile'") `
+    'Separate performance-scaling envelope must remain bound to the external scaling report.'
+
+# Exercise the production attachment and deterministic-runtime envelope writers
+# with current-cohort receipt fixtures. This is intentionally a bounded bundle
+# component test rather than a synthetic claim that the complete 253-run
+# readiness corpus has been assembled.
+$scratchFull = [IO.Path]::GetFullPath($ScratchRoot)
+$fixtureRoot = Join-Path $scratchFull `
+    ('readiness-runtime-no-performance-' + [Guid]::NewGuid().ToString('N'))
+$readinessRoot = Join-Path $fixtureRoot 'readiness'
+$sourceRootFixture = Join-Path $readinessRoot 'Sources\ZeroHour'
+try {
+    [IO.Directory]::CreateDirectory($sourceRootFixture) | Out-Null
+    foreach ($functionName in @('Get-ContainedRelativePath', 'New-Attachment',
+            'Write-EvidenceEnvelope', 'New-Stage5DeterministicRuntimeEnvelope')) {
+        $functionAst = Get-FunctionDefinition $ast $functionName
+        Invoke-Expression ([string]$functionAst.Extent.Text)
+    }
+
+    $script:ReadinessRoot = $readinessRoot
+    $script:ArtifactSetSha256 = 'B' * 64
+    $script:AssemblyRecordedUtc = [DateTime]::UtcNow.ToString('o',
+        [Globalization.CultureInfo]::InvariantCulture)
+    $script:RuntimeClosure = [ordered]@{
+        dependencyManifestSha256 = 'C' * 64
+        closureSha256 = 'D' * 64
+    }
+    $script:InstalledKernelExecutionStatus = [ordered]@{
+        status = 'skipped'
+        claim = $false
+        reason = 'external-qualification-exempt-and-reviewed-native-fixture-unavailable'
+        sha256 = $null
+    }
+    $ExpectedSourceCommit = '1' * 40
+    $ExpectedCohortNonce = '11111111-1111-4111-8111-111111111111'
+
+    $utf8NoBom = New-Object Text.UTF8Encoding($false)
+    $runtimeClosure = [ordered]@{
+        dependencyManifestSha256 = $script:RuntimeClosure.dependencyManifestSha256
+        closureSha256 = $script:RuntimeClosure.closureSha256
+    }
+    $fixtureReceiptCommon = [ordered]@{
+        schemaVersion = 1
+        evidenceKind = 'stage5-host-runner-receipt'
+        status = 'passed'
+        trustDomain = 'host-runner'
+        producerVersion = '2'
+        runNonce = '22222222-2222-4222-8222-222222222222'
+        sourceCommit = $ExpectedSourceCommit
+        title = 'ZeroHour'
+        architecture = 'x64'
+        artifactSetSha256 = $script:ArtifactSetSha256
+        cohortNonce = $ExpectedCohortNonce
+        runtimeClosure = $runtimeClosure
+        executableSha256 = 'A' * 64
+        recordedUtc = $script:AssemblyRecordedUtc
+        rawLogs = @()
+        provenance = [ordered]@{}
+        details = [ordered]@{}
+    }
+    $planPath = Join-Path $sourceRootFixture 'validation-plan-receipt.json'
+    $planDocument = [ordered]@{}
+    foreach ($field in $fixtureReceiptCommon.Keys) {
+        $planDocument[$field] = $fixtureReceiptCommon[$field]
+    }
+    $planDocument.role = 'validation-plan'
+    $planDocument.producer = 'installed-runtime-validation-plan-v2'
+    $planDocument.runNonce = '33333333-3333-4333-8333-333333333333'
+    [IO.File]::WriteAllText($planPath, ($planDocument | ConvertTo-Json -Depth 16),
+        $utf8NoBom)
+    $resultsPath = Join-Path $sourceRootFixture 'validation-results-receipt.json'
+    $resultsDocument = [ordered]@{}
+    foreach ($field in $fixtureReceiptCommon.Keys) {
+        $resultsDocument[$field] = $fixtureReceiptCommon[$field]
+    }
+    $resultsDocument.role = 'validation-results'
+    $resultsDocument.producer = 'installed-runtime-validation-results-v2'
+    $resultsDocument.runNonce = '44444444-4444-4444-8444-444444444444'
+    [IO.File]::WriteAllText($resultsPath,
+        ($resultsDocument | ConvertTo-Json -Depth 16), $utf8NoBom)
+
+    $missingPerformanceReceipt = Join-Path $sourceRootFixture `
+        'performance-report-receipt.json'
+    Assert-Test (-not (Test-Path -LiteralPath $missingPerformanceReceipt)) `
+        'No-performance fixture unexpectedly contains a host-runner performance receipt.'
+    foreach ($boundReceipt in @(
+            [pscustomobject]@{ path = $planPath; role = 'validation-plan' },
+            [pscustomobject]@{ path = $resultsPath; role = 'validation-results' })) {
+        $document = ConvertFrom-Stage5JsonDictionary $boundReceipt.path
+        Assert-Test ($document.role -ceq $boundReceipt.role -and
+            $document.sourceCommit -ceq $ExpectedSourceCommit -and
+            $document.title -ceq 'ZeroHour' -and $document.architecture -ceq 'x64' -and
+            $document.artifactSetSha256 -ceq $script:ArtifactSetSha256 -and
+            $document.cohortNonce -ceq $ExpectedCohortNonce -and
+            $document.runtimeClosure.closureSha256 -ceq
+                $script:RuntimeClosure.closureSha256) `
+            "No-performance '$($boundReceipt.role)' fixture is not source/artifact/cohort/runtime bound."
+    }
+    $runtimeEnvelope = New-Stage5DeterministicRuntimeEnvelope `
+        -ValidationPlanReceiptPath $planPath `
+        -ValidationResultsReceiptPath $resultsPath `
+        -InstalledKernelAttachmentPath '' `
+        -RequiredWorkers @('serial-1', 'parallel-1', 'parallel-2', 'parallel-4',
+            'parallel-8', 'parallel-16', 'parallel-auto') `
+        -ReplayEvidenceSha256 ('E' * 64) `
+        -FreshAiEvidenceSha256 ('F' * 64) `
+        -PerformanceScalingEvidenceSha256 ('9' * 64)
+    $runtimeDocument = ConvertFrom-Stage5JsonDictionary $runtimeEnvelope.path
+    Assert-Test ($runtimeDocument.evidenceKind -ceq 'deterministic-runtime' -and
+        $runtimeDocument.sourceCommit -ceq $ExpectedSourceCommit -and
+        $runtimeDocument.artifactSetSha256 -ceq $script:ArtifactSetSha256 -and
+        $runtimeDocument.cohortNonce -ceq $ExpectedCohortNonce -and
+        $runtimeDocument.runtimeClosure.closureSha256 -ceq
+            $script:RuntimeClosure.closureSha256) `
+        'Runtime envelope lost source, artifact, cohort, or closure binding.'
+    Assert-Test (@($runtimeDocument.attachments).Count -eq 2 -and
+        (@($runtimeDocument.attachments | ForEach-Object { $_.role }) -join '|') -ceq
+            'validation-plan|validation-results') `
+        'No-performance runtime envelope must bind exactly the plan and result receipts.'
+    foreach ($expectedFixture in @(
+            [pscustomobject]@{ role = 'validation-plan'; path = $planPath },
+            [pscustomobject]@{ role = 'validation-results'; path = $resultsPath })) {
+        $attachment = @($runtimeDocument.attachments | Where-Object {
+            $_.role -ceq $expectedFixture.role -and $_.title -ceq 'ZeroHour'
+        })
+        $relative = Get-ContainedRelativePath $readinessRoot $expectedFixture.path `
+            "No-performance fixture '$($expectedFixture.role)'"
+        Assert-Test ($attachment.Count -eq 1 -and
+            $attachment[0].path -ceq $relative -and
+            $attachment[0].sha256 -ceq
+                (Get-Stage5FileSha256 $expectedFixture.path) -and
+            $attachment[0].trustDomain -ceq 'host-runner') `
+            "Runtime envelope '$($expectedFixture.role)' binding is detached from its fixture bytes."
+    }
+    Assert-Test (-not [bool]$runtimeDocument.details.finalAcceptanceClaim -and
+        $runtimeDocument.details.replayEvidenceSha256 -ceq ('E' * 64) -and
+        $runtimeDocument.details.freshAiEvidenceSha256 -ceq ('F' * 64) -and
+        $runtimeDocument.details.performanceEvidenceSha256 -ceq ('9' * 64)) `
+        'Runtime envelope overclaims final acceptance or lost its replay, AI, or separate scaling-envelope binding.'
+    $evidenceModule = @(Get-Module | Where-Object {
+        $_.Name -ceq 'DeterministicSimulationEvidence'
+    })[0]
+    & $evidenceModule {
+        param($details, $evidenceHashes)
+        Assert-Stage5FinalAcceptanceDetails 'deterministic-runtime' $details `
+            ('1' * 40) $evidenceHashes
+    } $runtimeDocument.details @{
+        'replay-determinism' = 'E' * 64
+        'fresh-ai' = 'F' * 64
+        'performance-scaling' = '9' * 64
+    }
+    Assert-Test (-not (Test-Path -LiteralPath $missingPerformanceReceipt)) `
+        'Runtime envelope assembly created an unsupported performance receipt.'
+}
+finally {
+    if (Test-Path -LiteralPath $fixtureRoot -PathType Container) {
+        $fixtureFull = [IO.Path]::GetFullPath($fixtureRoot).TrimEnd([char[]]@(
+            [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar))
+        $scratchPrefix = $scratchFull.TrimEnd([char[]]@(
+            [IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)) +
+            [IO.Path]::DirectorySeparatorChar
+        Assert-Test ($fixtureFull.StartsWith($scratchPrefix,
+            [StringComparison]::OrdinalIgnoreCase)) `
+            'No-performance fixture cleanup target escaped its designated scratch root.'
+        Remove-Item -LiteralPath $fixtureFull -Recurse -Force
+    }
+}
 
 Write-Output 'Stage 5 development-readiness bundle assembler tests passed.'

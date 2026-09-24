@@ -381,6 +381,45 @@ function Write-EvidenceEnvelope {
     return [pscustomobject]@{ path = $path; sha256 = [string]$snapshot.sha256 }
 }
 
+function New-Stage5DeterministicRuntimeEnvelope {
+    param(
+        [string]$ValidationPlanReceiptPath,
+        [string]$ValidationResultsReceiptPath,
+        [string]$InstalledKernelAttachmentPath,
+        [string[]]$RequiredWorkers,
+        [string]$ReplayEvidenceSha256,
+        [string]$FreshAiEvidenceSha256,
+        [string]$PerformanceScalingEvidenceSha256
+    )
+    $runtimeAttachments = New-Object 'Collections.Generic.List[object]'
+    $runtimeAttachments.Add((New-Attachment -Role 'validation-plan' `
+            -Title 'ZeroHour' -Path $ValidationPlanReceiptPath `
+            -TrustDomain 'host-runner')) | Out-Null
+    $runtimeAttachments.Add((New-Attachment -Role 'validation-results' `
+            -Title 'ZeroHour' -Path $ValidationResultsReceiptPath `
+            -TrustDomain 'host-runner')) | Out-Null
+    if (-not [string]::IsNullOrWhiteSpace($InstalledKernelAttachmentPath)) {
+        $runtimeAttachments.Add((New-Attachment `
+                -Role 'installed-kernel-execution' -Title 'Both' `
+                -Path $InstalledKernelAttachmentPath `
+                -TrustDomain 'installed-runtime')) | Out-Null
+    }
+
+    return Write-EvidenceEnvelope 'deterministic-runtime' 'ZeroHour' `
+        $runtimeAttachments.ToArray() ([ordered]@{
+        gateName = 'deterministic-runtime'
+        isolatedPipelineMode = 'serial'
+        simulationModes = @('serial', 'parallel', 'shadow')
+        workerConfigurations = $RequiredWorkers
+        isolatedMatrixPassed = $true
+        finalAcceptanceClaim = $false
+        replayEvidenceSha256 = $ReplayEvidenceSha256
+        freshAiEvidenceSha256 = $FreshAiEvidenceSha256
+        performanceEvidenceSha256 = $PerformanceScalingEvidenceSha256
+        installedKernelExecution = $script:InstalledKernelExecutionStatus
+    })
+}
+
 function Get-TemplateAttachment {
     param([string]$Kind, [string]$Role, [string]$Title,
         [string]$ExpectedTrustDomain)
@@ -751,8 +790,6 @@ $receiptSpecs = @(
         leaf = 'replay-results-receipt.json'; role = 'replay-results'; title = 'ZeroHour' },
     [pscustomobject]@{ key = 'ai'; root = $zeroHourStage
         leaf = 'ai-results-receipt.json'; role = 'ai-results'; title = 'ZeroHour' },
-    [pscustomobject]@{ key = 'titlePerformance'; root = $zeroHourStage
-        leaf = 'performance-report-receipt.json'; role = 'performance-report'; title = 'ZeroHour' },
     [pscustomobject]@{ key = 'combined'; root = $combinedStage
         leaf = 'combined-results-receipt.json'; role = 'combined-results'; title = 'Both' }
 )
@@ -826,8 +863,7 @@ foreach ($spec in $receiptSpecs) {
         $arguments['ExpectedQualificationData'] =
             $qualificationDataByTitle[$spec.title]
     }
-    if ($spec.role -in @('validation-results', 'replay-results', 'ai-results',
-            'performance-report')) {
+    if ($spec.role -in @('validation-results', 'replay-results', 'ai-results')) {
         $relocation = Get-Stage5FinalAcceptanceNativeRelocationBinding `
             -Path $record.path -EvidenceDirectory $spec.root
         if ($spec.role -ceq 'validation-results') {
@@ -1462,35 +1498,14 @@ $combinedEnvelope = Write-EvidenceEnvelope `
         sourceChildCount = [int]$receipts.combined.details.sourceChildCount
         bothTitlesPassed = [bool]$receipts.combined.details.bothTitlesPassed
     })
-$runtimeAttachments = New-Object 'Collections.Generic.List[object]'
-$runtimeAttachments.Add((New-Attachment -Role 'validation-plan' `
-        -Title 'ZeroHour' -Path $receipts.plan.path `
-        -TrustDomain 'host-runner')) | Out-Null
-$runtimeAttachments.Add((New-Attachment -Role 'validation-results' `
-        -Title 'ZeroHour' -Path $receipts.validation.path `
-        -TrustDomain 'host-runner')) | Out-Null
-$runtimeAttachments.Add((New-Attachment -Role 'performance-report' `
-        -Title 'ZeroHour' -Path $receipts.titlePerformance.path `
-        -TrustDomain 'host-runner')) | Out-Null
-if ($null -ne $installedKernelAttachmentPath) {
-    $runtimeAttachments.Add((New-Attachment `
-            -Role 'installed-kernel-execution' -Title 'Both' `
-            -Path $installedKernelAttachmentPath `
-            -TrustDomain 'installed-runtime')) | Out-Null
-}
-$runtimeEnvelope = Write-EvidenceEnvelope 'deterministic-runtime' 'ZeroHour' `
-    $runtimeAttachments.ToArray() ([ordered]@{
-    gateName = 'deterministic-runtime'
-    isolatedPipelineMode = 'serial'
-    simulationModes = @('serial', 'parallel', 'shadow')
-    workerConfigurations = $requiredWorkers
-    isolatedMatrixPassed = $true
-    finalAcceptanceClaim = $false
-    replayEvidenceSha256 = $replayEnvelope.sha256
-    freshAiEvidenceSha256 = $aiEnvelope.sha256
-    performanceEvidenceSha256 = $performanceEnvelope.sha256
-    installedKernelExecution = $script:InstalledKernelExecutionStatus
-})
+$runtimeEnvelope = New-Stage5DeterministicRuntimeEnvelope `
+    -ValidationPlanReceiptPath $receipts.plan.path `
+    -ValidationResultsReceiptPath $receipts.validation.path `
+    -InstalledKernelAttachmentPath $installedKernelAttachmentPath `
+    -RequiredWorkers $requiredWorkers `
+    -ReplayEvidenceSha256 $replayEnvelope.sha256 `
+    -FreshAiEvidenceSha256 $aiEnvelope.sha256 `
+    -PerformanceScalingEvidenceSha256 $performanceEnvelope.sha256
 
 $evidenceRecords = [ordered]@{
     'deterministic-runtime' = $runtimeEnvelope
