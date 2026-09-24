@@ -5359,6 +5359,46 @@ int testD3D11HiddenSwapChain()
 				typeProbeCenter[0] < 16 && typeProbeCenter[2] < 16,
 				"D3D11 texture-before-state ordering publishes the 2D type mask");
 
+			// A different 2D SRV changes the sampled color, but not either type bit
+			// in the already-published constant buffer. It must render correctly
+			// without asking the draw boundary to repack those same constants.
+			typeProbeFrameStarted = context->beginFrame() ==
+				rts::render::RENDER_RESULT_OK;
+			typeProbeFrameSucceeded = false;
+			if (typeProbeFrameStarted)
+			{
+				typeProbeFrameSucceeded =
+					context->clear(clearColor, 1.0f, 0) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, texture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->setLegacyStateForLayout(typeProbeState, texturedLayout,
+						1) == rts::render::RENDER_RESULT_OK &&
+					context->setVertexBuffer(texturedVertexBuffer,
+						sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+					context->setPrimitiveTopology(
+						rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+					context->setTexture(0, typeProbeUnsignedTexture) ==
+						rts::render::RENDER_RESULT_OK &&
+					context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+				const rts::render::RenderResult typeProbeEndResult =
+					context->endFrame();
+				typeProbeFrameSucceeded = typeProbeFrameSucceeded &&
+					typeProbeEndResult == rts::render::RENDER_RESULT_OK;
+			}
+			const bool typeProbeSameTypeCaptured = typeProbeFrameSucceeded &&
+				device->captureBackBuffer(&typeProbeCapture[0],
+					typeProbeCapture.size(), 64 * 4, &typeProbeCaptureFormat) ==
+					rts::render::RENDER_RESULT_OK;
+			typeProbeCenter = &typeProbeCapture[4 * (32 * 64 + 32)];
+			result |= check(typeProbeSameTypeCaptured && typeProbeCenter[2] > 48 &&
+				typeProbeCenter[0] < 16 && typeProbeCenter[1] < 16,
+				"D3D11 same-type 2D SRV replacement samples the new texture");
+
 			// Once a cube state has been bound, replacing its SRV with a 2D SRV
 			// without rebinding the logical state must refresh constants at draw time.
 			typeProbeFrameStarted = context->beginFrame() ==

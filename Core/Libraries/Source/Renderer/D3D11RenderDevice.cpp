@@ -2893,9 +2893,11 @@ public:
 			m_context->PSSetShaderResources(stage, 1, &emptyView);
 			m_context->PSSetShaderResources(8 + stage, 1, &emptyView);
 			m_boundTextures[stage] = GpuHandle();
+			const bool typeChanged = ((m_boundCubeTextureMask |
+				m_boundSignedTextureMask) & (1U << stage)) != 0U;
 			m_boundCubeTextureMask &= ~(1U << stage);
 			m_boundSignedTextureMask &= ~(1U << stage);
-			m_transformConstantsChanged = true;
+			if (typeChanged) m_transformConstantsChanged = true;
 			m_textureBindingsValid = true;
 			return RENDER_RESULT_OK;
 		}
@@ -2950,7 +2952,12 @@ public:
 		}
 		m_boundTextures[stage] = texture;
 		m_textureBindingsValid = true;
-		m_transformConstantsChanged = true;
+		// The SRV was rebound above. Only its cube/signed type bits enter the
+		// transform payload; a same-type replacement leaves those bytes intact.
+		if (wasCube != isCube || wasSigned != isSigned)
+		{
+			m_transformConstantsChanged = true;
+		}
 		return RENDER_RESULT_OK;
 	}
 
