@@ -2,6 +2,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 #include <windows.h>
 
@@ -189,7 +190,7 @@ static int edgeParity()
     std::vector<HeightMapDynamicLightVertex> baseline(4), candidate(4);
     std::vector<HeightMapDynamicLightSceneLight> lights(1);
     HeightMapDynamicLightSnapshot snapshot;
-    const double ranges[] = {0.0, 1.0e-40, 0.9999999, 1.0,
+    const double ranges[] = {-0.0, 0.0, 1.0e-40, 0.9999999, 1.0,
         1.0000001, 20.0, 1.0e8};
     unsigned boundaryCases = 0;
     for (unsigned r = 0; r < sizeof(ranges) / sizeof(ranges[0]); ++r)
@@ -235,6 +236,27 @@ static int edgeParity()
     if (!compare(snapshot, baseline, candidate, false))
         return 6;
     lights.resize(1);
+    const double invalidRanges[] = {-1.0,
+        std::numeric_limits<double>::infinity(),
+        -std::numeric_limits<double>::infinity(),
+        std::numeric_limits<double>::quiet_NaN()};
+    for (unsigned r = 0; r < sizeof(invalidRanges) /
+            sizeof(invalidRanges[0]); ++r)
+    {
+        lights[0] = pointLight(0.0f, 0.0f, 0.0f,
+            invalidRanges[r], 5.0);
+        setupSnapshot(&snapshot, input, lights, 1, 1);
+        memset(baseline.data(), 0xA5, baseline.size() * sizeof(baseline[0]));
+        memset(candidate.data(), 0xA5, candidate.size() * sizeof(candidate[0]));
+        if (BaselinePrepareHeightMapDynamicLightRows(snapshot,
+                baseline.data(), 0, 1) ||
+            PrepareHeightMapDynamicLightRows(snapshot,
+                candidate.data(), 0, 1) ||
+            memcmp(baseline.data(), candidate.data(),
+                snapshot.outputCapacityBytes) != 0 ||
+            reinterpret_cast<unsigned char *>(candidate.data())[0] != 0xA5)
+            return 8;
+    }
     for (unsigned iteration = 0; iteration < 100000; ++iteration)
     {
         const unsigned code = nextRandom();
@@ -285,7 +307,8 @@ static int edgeParity()
             snapshot.outputCapacityBytes) != 0 ||
         reinterpret_cast<unsigned char *>(candidate.data())[0] != 0xA5)
         return 7;
-    printf("edge_cases=%u byte_mismatches=0\n", 100002u + boundaryCases);
+    printf("edge_cases=%u byte_mismatches=0\n", 100002u + boundaryCases +
+        static_cast<unsigned>(sizeof(invalidRanges) / sizeof(invalidRanges[0])));
     return 0;
 }
 
