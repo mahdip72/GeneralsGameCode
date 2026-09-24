@@ -19,6 +19,8 @@ public:
 	~HeightMapDynamicLightBatch();
 
 	bool initialize(unsigned width, unsigned height, unsigned lightCount);
+	bool initialize(unsigned width, unsigned height, unsigned lightCount,
+		unsigned lightCapacity);
 	void reset();
 	bool isAllocated() const;
 	HeightMapDynamicLightSnapshot &snapshot() { return m_snapshot; }
@@ -26,6 +28,7 @@ public:
 	HeightMapDynamicLightVertex *inputVertices() { return m_inputVertices; }
 	HeightMapDynamicLightVertex *outputVertices() { return m_outputVertices; }
 	HeightMapDynamicLightSceneLight *lights() { return m_lights; }
+	unsigned lightCapacity() const { return m_lightCapacity; }
 
 	/* The caller must hold the service's consumer lease. */
 	bool run(RadarTerrainPrepareService &service);
@@ -40,4 +43,5 @@ private:
 	HeightMapDynamicLightVertex *m_inputVertices;
 	HeightMapDynamicLightVertex *m_outputVertices;
 	HeightMapDynamicLightSceneLight *m_lights;
+	unsigned m_lightCapacity;
 };

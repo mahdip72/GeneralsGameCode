@@ -37,6 +37,10 @@ set_tests_properties(height_map_dynamic_light_prepare_tests PROPERTIES TIMEOUT 3
 
 add_executable(height_map_dynamic_light_envelope_tests
     HeightMapDynamicLightEnvelopeTest.cpp)
+target_include_directories(height_map_dynamic_light_envelope_tests PRIVATE
+    ../../Libraries/Include)
+target_include_directories(height_map_dynamic_light_envelope_tests PRIVATE
+    ../../../Dependencies/Utility)
 set_target_properties(height_map_dynamic_light_envelope_tests PROPERTIES
     CXX_STANDARD 98 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
 add_test(NAME height_map_dynamic_light_envelope_tests

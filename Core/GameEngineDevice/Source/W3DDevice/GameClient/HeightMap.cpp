@@ -1263,13 +1263,19 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 	unsigned lightIndex;
 	unsigned cellIndex = 0;
 	HeightMapDynamicLightBounds lightBounds[MAX_ENABLED_DYNAMIC_LIGHTS];
+	HeightMapDynamicLightSceneLight fullLightSnapshots[
+		MAX_ENABLED_DYNAMIC_LIGHTS];
+	HeightMapDynamicLightSceneLight contributingLightSnapshots[
+		MAX_ENABLED_DYNAMIC_LIGHTS];
+	unsigned contributingLightCount = 0;
+	Int xCoords[VERTEX_BUFFER_TILE_LENGTH];
+	Int yCoords[VERTEX_BUFFER_TILE_LENGTH];
 
 	if (!data || !m_map || !pLights || width == 0 || height == 0 ||
 		x0 < originX || y0 < originY ||
 		x1 > originX + VERTEX_BUFFER_TILE_LENGTH ||
 		y1 > originY + VERTEX_BUFFER_TILE_LENGTH || numLights < 0 ||
-		numLights > MAX_ENABLED_DYNAMIC_LIGHTS ||
-		!batch.initialize(width, height, static_cast<unsigned>(numLights)))
+		numLights > MAX_ENABLED_DYNAMIC_LIGHTS)
 		return false;
 
 	for (lightIndex = 0; lightIndex < static_cast<unsigned>(numLights);
@@ -1277,7 +1283,7 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 	{
 		W3DDynamicLight *light = pLights[lightIndex];
 		HeightMapDynamicLightSceneLight &captured =
-			batch.lights()[lightIndex];
+			fullLightSnapshots[lightIndex];
 		Vector3 position;
 		Vector3 direction;
 		Vector3 diffuse;
@@ -1327,6 +1333,24 @@ Bool HeightMapRenderObjClass::captureDynamicLightBatch(
 		captured.ambientGreen = ambient.Y;
 		captured.ambientBlue = ambient.Z;
 	}
+	if (!ValidateHeightMapDynamicLightSceneLights(fullLightSnapshots,
+		static_cast<unsigned>(numLights)))
+		return false;
+	for (Int column = 0; column < static_cast<Int>(width); ++column)
+		xCoords[column] = getXWithOrigin(x0 + column) +
+			m_map->getDrawOrgX() - m_map->getBorderSizeInline();
+	for (Int row = 0; row < static_cast<Int>(height); ++row)
+		yCoords[row] = getYWithOrigin(y0 + row) +
+			m_map->getDrawOrgY() - m_map->getBorderSizeInline();
+	if (!HeightMapSelectDynamicLightContributors(fullLightSnapshots,
+		lightBounds, static_cast<unsigned>(numLights), xCoords, width, yCoords,
+		height, contributingLightSnapshots, &contributingLightCount) ||
+		!batch.initialize(width, height, contributingLightCount,
+			static_cast<unsigned>(numLights)))
+		return false;
+	if (contributingLightCount != 0)
+		memcpy(batch.lights(), contributingLightSnapshots,
+			contributingLightCount * sizeof(contributingLightSnapshots[0]));
 
 	for (Int row = y0; row < y1; ++row)
 	{

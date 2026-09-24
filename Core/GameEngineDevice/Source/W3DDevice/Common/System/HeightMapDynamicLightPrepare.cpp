@@ -97,7 +97,8 @@ extern "C" void rts_height_map_dynamic_light_prepare_set_test_observer(
 #endif
 
 HeightMapDynamicLightBatch::HeightMapDynamicLightBatch()
-	: m_inputVertices(0), m_outputVertices(0), m_lights(0)
+	: m_inputVertices(0), m_outputVertices(0), m_lights(0),
+	  m_lightCapacity(0)
 {
 	memset(&m_snapshot, 0, sizeof(m_snapshot));
 }
@@ -110,6 +111,12 @@ HeightMapDynamicLightBatch::~HeightMapDynamicLightBatch()
 bool HeightMapDynamicLightBatch::initialize(unsigned width, unsigned height,
 	unsigned lightCount)
 {
+	return initialize(width, height, lightCount, lightCount);
+}
+
+bool HeightMapDynamicLightBatch::initialize(unsigned width, unsigned height,
+	unsigned lightCount, unsigned lightCapacity)
+{
 	unsigned cellCount;
 	unsigned vertexCount;
 	unsigned rowBytes;
@@ -117,8 +124,8 @@ bool HeightMapDynamicLightBatch::initialize(unsigned width, unsigned height,
 	unsigned lightBytes;
 	unsigned batchBytes;
 
-	if (width == 0 || height == 0 || lightCount >
-		HEIGHTMAP_DYNAMIC_LIGHT_MAX_LIGHTS ||
+	if (width == 0 || height == 0 || lightCount > lightCapacity ||
+		lightCapacity > HEIGHTMAP_DYNAMIC_LIGHT_MAX_LIGHTS ||
 		!checkedMultiply(width, height, &cellCount) ||
 		!checkedMultiply(cellCount, HEIGHTMAP_DYNAMIC_LIGHT_VERTEX_COUNT,
 			&vertexCount) || !checkedMultiply(vertexCount,
@@ -126,7 +133,7 @@ bool HeightMapDynamicLightBatch::initialize(unsigned width, unsigned height,
 			&vertexBytes) || !checkedMultiply(width,
 			HEIGHTMAP_DYNAMIC_LIGHT_VERTEX_COUNT *
 				static_cast<unsigned>(sizeof(HeightMapDynamicLightVertex)),
-			&rowBytes) || !checkedMultiply(lightCount,
+			&rowBytes) || !checkedMultiply(lightCapacity,
 			static_cast<unsigned>(sizeof(HeightMapDynamicLightSceneLight)),
 			&lightBytes) || !checkedAdd(vertexBytes, vertexBytes, &batchBytes) ||
 		!checkedAdd(batchBytes, lightBytes, &batchBytes) ||
@@ -136,7 +143,7 @@ bool HeightMapDynamicLightBatch::initialize(unsigned width, unsigned height,
 	if (isAllocated())
 	{
 		if (m_snapshot.width != width || m_snapshot.height != height ||
-			m_snapshot.lightCount != lightCount)
+			m_lightCapacity != lightCapacity)
 		{
 			reset();
 		}
@@ -168,15 +175,16 @@ bool HeightMapDynamicLightBatch::initialize(unsigned width, unsigned height,
 		reset();
 		return false;
 	}
-	if (lightCount != 0)
+	if (lightCapacity != 0)
 	{
-		m_lights = allocateLights(lightCount);
+		m_lights = allocateLights(lightCapacity);
 		if (m_lights == 0)
 		{
 			reset();
 			return false;
 		}
 	}
+	m_lightCapacity = lightCapacity;
 
 	memset(m_outputVertices, 0xFF, vertexBytes);
 	memset(&m_snapshot, 0, sizeof(m_snapshot));
@@ -201,13 +209,14 @@ void HeightMapDynamicLightBatch::reset()
 	m_lights = 0;
 	m_outputVertices = 0;
 	m_inputVertices = 0;
+	m_lightCapacity = 0;
 	memset(&m_snapshot, 0, sizeof(m_snapshot));
 }
 
 bool HeightMapDynamicLightBatch::isAllocated() const
 {
 	return m_inputVertices != 0 && m_outputVertices != 0 &&
-		(m_snapshot.lightCount == 0 || m_lights != 0);
+		(m_lightCapacity == 0 || m_lights != 0);
 }
 
 bool HeightMapDynamicLightBatch::run(RadarTerrainPrepareService &service)

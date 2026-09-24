@@ -309,6 +309,18 @@ static unsigned computeDiffuse(const HeightMapDynamicLightVertex &vertex,
 
 } // namespace
 
+bool ValidateHeightMapDynamicLightSceneLights(
+	const HeightMapDynamicLightSceneLight *lights, unsigned lightCount)
+{
+	if (lightCount > HEIGHTMAP_DYNAMIC_LIGHT_MAX_LIGHTS ||
+		(lightCount != 0 && lights == 0))
+		return false;
+	for (unsigned index = 0; index < lightCount; ++index)
+		if (!validLight(lights[index]))
+			return false;
+	return true;
+}
+
 bool PrepareHeightMapDynamicLightRows(
 	const HeightMapDynamicLightSnapshot &snapshot,
 	HeightMapDynamicLightVertex *output, unsigned yBegin, unsigned yEnd)

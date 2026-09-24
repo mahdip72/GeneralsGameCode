@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Lib/HeightMapDynamicLightKernel.h"
+
 // Coordinates and bounds are map cells, with inclusive light/cell overlap.
 struct HeightMapDynamicLightBounds
 {
@@ -24,6 +26,64 @@ inline bool HeightMapDynamicLightCellHit(
 		HeightMapDynamicLightAxisHit(light.minY, light.maxY, y)) ||
 		(HeightMapDynamicLightAxisHit(light.prevMinX, light.prevMaxX, x) &&
 		HeightMapDynamicLightAxisHit(light.prevMinY, light.prevMaxY, y));
+}
+
+// Only current bounds determine whether a point/spot light can contribute to
+// this tile. Previous bounds remain in HeightMapDynamicLightCellHit above so
+// cells from a moved or disabled light are still rewritten.
+inline bool HeightMapDynamicLightCurrentBoundsHitTile(
+	const HeightMapDynamicLightBounds &light, const int *xCoords,
+	unsigned width, const int *yCoords, unsigned height)
+{
+	bool hitX = false;
+	bool hitY = false;
+	if (xCoords == 0 || yCoords == 0 || width == 0 || height == 0)
+		return false;
+	for (unsigned x = 0; x < width; ++x)
+		if (HeightMapDynamicLightAxisHit(light.minX, light.maxX, xCoords[x]))
+		{
+			hitX = true;
+			break;
+		}
+	if (!hitX)
+		return false;
+	for (unsigned y = 0; y < height; ++y)
+		if (HeightMapDynamicLightAxisHit(light.minY, light.maxY, yCoords[y]))
+		{
+			hitY = true;
+			break;
+		}
+	return hitY;
+}
+
+// Return an order-preserving contributor subsequence. Directional lights
+// affect every rewritten cell regardless of their own bounds. Unknown types
+// are retained so the normal capture validator can select the legacy
+// fallback instead of silently changing that contract.
+inline bool HeightMapSelectDynamicLightContributors(
+	const HeightMapDynamicLightSceneLight *lights,
+	const HeightMapDynamicLightBounds *bounds, unsigned lightCount,
+	const int *xCoords, unsigned width, const int *yCoords, unsigned height,
+	HeightMapDynamicLightSceneLight *selected, unsigned *selectedCount)
+{
+	if (selectedCount == 0 || (lightCount != 0 &&
+		(lights == 0 || bounds == 0 || selected == 0)) ||
+		lightCount > HEIGHTMAP_DYNAMIC_LIGHT_MAX_LIGHTS ||
+		xCoords == 0 || yCoords == 0 || width == 0 || height == 0)
+		return false;
+	*selectedCount = 0;
+	for (unsigned index = 0; index < lightCount; ++index)
+	{
+		const HeightMapDynamicLightSceneLight &light = lights[index];
+		const bool keep = light.type == HEIGHTMAP_DYNAMIC_LIGHT_DIRECTIONAL ||
+			(light.type != HEIGHTMAP_DYNAMIC_LIGHT_POINT &&
+			 light.type != HEIGHTMAP_DYNAMIC_LIGHT_SPOT) ||
+			(light.enabled && HeightMapDynamicLightCurrentBoundsHitTile(
+				bounds[index], xCoords, width, yCoords, height));
+		if (keep)
+			selected[(*selectedCount)++] = light;
+	}
+	return true;
 }
 
 // xCoords/yCoords are the exact wrapped cell coordinates for this VB tile.

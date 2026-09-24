@@ -78,6 +78,10 @@ bool ValidatePreparedHeightMapDynamicLightOutput(
 	const HeightMapDynamicLightSnapshot &snapshot,
 	const HeightMapDynamicLightVertex *output);
 
+/* Validate a full owner-side light list before making a tile-local subset. */
+bool ValidateHeightMapDynamicLightSceneLights(
+	const HeightMapDynamicLightSceneLight *lights, unsigned lightCount);
+
 /* Validate the staged object without replaying the lighting arithmetic. */
 bool ValidatePreparedHeightMapDynamicLightStructure(
 	const HeightMapDynamicLightSnapshot &snapshot,

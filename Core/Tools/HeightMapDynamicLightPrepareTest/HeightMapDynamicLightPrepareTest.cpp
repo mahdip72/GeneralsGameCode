@@ -547,6 +547,25 @@ static int testServiceAdapterAndEmptyStripe()
 		CHECK("adapter-reuse", batch.outputVertices() == outputStorage);
 		CHECK("adapter-reuse", batch.outputVertices()[0].applyLighting == 255);
 	}
+	{
+		CHECK("adapter-capacity", batch.initialize(2, 1, 1, 3));
+		HeightMapDynamicLightVertex *inputStorage = batch.inputVertices();
+		HeightMapDynamicLightVertex *outputStorage = batch.outputVertices();
+		HeightMapDynamicLightSceneLight *lightStorage = batch.lights();
+		CHECK("adapter-capacity", batch.initialize(2, 1, 0, 3));
+		CHECK("adapter-capacity", batch.snapshot().lightCount == 0);
+		CHECK("adapter-capacity", batch.lightCapacity() == 3);
+		CHECK("adapter-capacity", batch.inputVertices() == inputStorage);
+		CHECK("adapter-capacity", batch.outputVertices() == outputStorage);
+		CHECK("adapter-capacity", batch.lights() == lightStorage);
+		CHECK("adapter-capacity", batch.isAllocated());
+		CHECK("adapter-capacity", batch.initialize(2, 1, 2, 3));
+		CHECK("adapter-capacity", batch.snapshot().lightCount == 2);
+		CHECK("adapter-capacity", batch.lightCapacity() == 3);
+		CHECK("adapter-capacity", batch.inputVertices() == inputStorage);
+		CHECK("adapter-capacity", batch.outputVertices() == outputStorage);
+		CHECK("adapter-capacity", batch.lights() == lightStorage);
+	}
 	service.shutdown();
 	return 0;
 }
