@@ -50,12 +50,14 @@ public:
 	bool HasFailedMutation() const;
 
 private:
+	friend struct NativeW3DBufferOwnerTestAccess;
 	NativeW3DBufferOwner(const NativeW3DBufferOwner &);
 	NativeW3DBufferOwner &operator=(const NativeW3DBufferOwner &);
 
 	RenderResult RecreateForDiscard();
 	NativeW3DResources *ActiveResources() const;
 	void ObserveAuthorityFailure(NativeW3DResources *resources) const;
+	void FinishLock();
 	void ReleaseStaging();
 
 	NativeW3DResources *m_resources;
@@ -73,6 +75,7 @@ private:
 	unsigned char *m_authoritative;
 	size_t m_authoritativeBytes;
 	unsigned char *m_staging;
+	size_t m_stagingCapacity;
 	size_t m_lockOffset;
 	size_t m_lockBytes;
 	RenderBufferUpdateMode m_lockMode;

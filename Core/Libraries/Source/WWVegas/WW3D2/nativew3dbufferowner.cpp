@@ -86,7 +86,7 @@ NativeW3DBufferOwner::NativeW3DBufferOwner() :
 	m_resources(0), m_bindingGeneration(0), m_descriptor(), m_handle(),
 	m_cleanupTicket(0), m_deferredHandle(), m_deferredCleanupTicket(0),
 	m_authoritative(0), m_authoritativeBytes(0), m_staging(0),
-	m_lockOffset(0), m_lockBytes(0),
+	m_stagingCapacity(0), m_lockOffset(0), m_lockBytes(0),
 	m_lockMode(RENDER_BUFFER_UPDATE_PRESERVE), m_locked(false),
 	m_failedMutation(false)
 {
@@ -346,10 +346,20 @@ RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 			return recreateResult;
 		}
 	}
-	unsigned char *staging = new(std::nothrow) unsigned char[byteCount];
-	if (staging == 0)
+	if (byteCount > m_stagingCapacity)
 	{
-		return RENDER_RESULT_OUT_OF_MEMORY;
+		// Streaming DX8 buffers take this path once per lock. Retain the largest
+		// requested range so steady-state updates do not allocate/free a staging
+		// array for every upload. byteCount has already been bounded by the
+		// descriptor, and Reset/destruction release this owner-local capacity.
+		unsigned char *staging = new(std::nothrow) unsigned char[byteCount];
+		if (staging == 0)
+		{
+			return RENDER_RESULT_OUT_OF_MEMORY;
+		}
+		delete[] m_staging;
+		m_staging = staging;
+		m_stagingCapacity = byteCount;
 	}
 	if (mode == RENDER_BUFFER_UPDATE_DISCARD &&
 		m_authoritative != 0 && m_authoritativeBytes != 0)
@@ -360,13 +370,12 @@ RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 		// authoritative shadow before a write has been accepted.
 		memset(m_authoritative, 0, m_authoritativeBytes);
 	}
-	memset(staging, 0, byteCount);
+	memset(m_staging, 0, byteCount);
 	if (mode != RENDER_BUFFER_UPDATE_DISCARD && m_authoritative != 0 &&
 		m_authoritativeBytes == m_descriptor.byteCount)
 	{
-		memcpy(staging, m_authoritative + destinationOffset, byteCount);
+		memcpy(m_staging, m_authoritative + destinationOffset, byteCount);
 	}
-	m_staging = staging;
 	m_lockOffset = destinationOffset;
 	m_lockBytes = byteCount;
 	m_lockMode = mode;
@@ -387,7 +396,7 @@ RenderResult NativeW3DBufferOwner::Unlock()
 	if (resources == 0 || m_staging == 0 ||
 		!m_handle.isValid() || !resources->IsValid(m_handle))
 	{
-		ReleaseStaging();
+		FinishLock();
 		m_failedMutation = true;
 		return RENDER_RESULT_FAILED;
 	}
@@ -398,7 +407,7 @@ RenderResult NativeW3DBufferOwner::Unlock()
 	{
 		memcpy(m_authoritative + m_lockOffset, m_staging, m_lockBytes);
 	}
-	ReleaseStaging();
+	FinishLock();
 	m_failedMutation = result != RENDER_RESULT_OK;
 	return result;
 }
@@ -536,14 +545,20 @@ NativeW3DResources *NativeW3DBufferOwner::ActiveResources() const
 		m_resources : 0;
 }
 
-void NativeW3DBufferOwner::ReleaseStaging()
+void NativeW3DBufferOwner::FinishLock()
 {
-	delete[] m_staging;
-	m_staging = 0;
 	m_lockOffset = 0;
 	m_lockBytes = 0;
 	m_lockMode = RENDER_BUFFER_UPDATE_PRESERVE;
 	m_locked = false;
+}
+
+void NativeW3DBufferOwner::ReleaseStaging()
+{
+	FinishLock();
+	delete[] m_staging;
+	m_staging = 0;
+	m_stagingCapacity = 0;
 }
 
 }

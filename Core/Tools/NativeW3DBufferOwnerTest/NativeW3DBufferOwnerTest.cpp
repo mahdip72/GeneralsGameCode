@@ -10,6 +10,20 @@
 #include <new>
 #include <vector>
 
+namespace rts
+{
+namespace render
+{
+struct NativeW3DBufferOwnerTestAccess
+{
+	static size_t StagingCapacity(const NativeW3DBufferOwner &owner)
+	{
+		return owner.m_stagingCapacity;
+	}
+};
+}
+}
+
 namespace
 {
 using namespace rts::render;
@@ -689,8 +703,10 @@ int main()
 	result |= Check(dynamicBuffer.Create(dynamicDescriptor) == RENDER_RESULT_OK,
 		"dynamic index buffer creation publishes a neutral handle");
 	result |= Check(dynamicBuffer.Lock(0, 8, RENDER_BUFFER_UPDATE_DISCARD,
-		&bytes) == RENDER_RESULT_OK && bytes != nullptr,
+		&bytes) == RENDER_RESULT_OK && bytes != nullptr &&
+		NativeW3DBufferOwnerTestAccess::StagingCapacity(dynamicBuffer) == 8,
 		"dynamic buffer accepts a discard-at-zero range");
+	void *dynamicStaging = bytes;
 	GpuHandle lockedDynamicBinding;
 	result |= Check(dynamicBuffer.AcquireIndexBinding(&lockedDynamicBinding) ==
 		RENDER_RESULT_FAILED && !lockedDynamicBinding.isValid(),
@@ -700,6 +716,9 @@ int main()
 		device.LastOffset() == 0 && device.LastBytes() == 8 &&
 		device.LastMode() == RENDER_BUFFER_UPDATE_DISCARD,
 		"discard publishes its exact initialized prefix");
+	result |= Check(NativeW3DBufferOwnerTestAccess::StagingCapacity(
+		dynamicBuffer) == 8,
+		"dynamic staging capacity remains available after unlock");
 	GpuHandle dynamicHandle;
 	unsigned char dynamicBytes[16];
 	std::memset(dynamicBytes, 0, sizeof(dynamicBytes));
@@ -721,8 +740,10 @@ int main()
 		!rejectedHandle.isValid(),
 		"index acquisition clears adjacent unwritten and wrong-format ranges");
 	result |= Check(dynamicBuffer.Lock(8, 8,
-		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &bytes) == RENDER_RESULT_OK,
-		"dynamic buffer accepts a disjoint no-overwrite tail");
+		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &bytes) == RENDER_RESULT_OK &&
+		bytes == dynamicStaging &&
+		NativeW3DBufferOwnerTestAccess::StagingCapacity(dynamicBuffer) == 8,
+		"dynamic buffer reuses staging for a same-sized no-overwrite upload");
 	Fill(bytes, 8, 0x33);
 	std::memset(dynamicBytes + 8, 0x33, 8);
 	result |= Check(dynamicBuffer.Unlock() == RENDER_RESULT_OK &&
@@ -778,6 +799,7 @@ int main()
 	rejectedHandle = GpuHandle(1, 1);
 	result |= Check(dynamicBuffer.Unlock() == RENDER_RESULT_FAILED &&
 		dynamicBuffer.HasFailedMutation() &&
+		NativeW3DBufferOwnerTestAccess::StagingCapacity(dynamicBuffer) == 8 &&
 		dynamicBuffer.AcquireIndexBinding(&rejectedHandle) ==
 			RENDER_RESULT_FAILED && !rejectedHandle.isValid() &&
 		dynamicBuffer.AcquireIndexRange(RENDER_FORMAT_R16_UINT, 0, 0, 1,
@@ -798,12 +820,14 @@ int main()
 	device.FailCreate(true);
 	result |= Check(dynamicBuffer.Lock(0, 16, RENDER_BUFFER_UPDATE_DISCARD,
 		&bytes) == RENDER_RESULT_FAILED && bytes == nullptr &&
+		NativeW3DBufferOwnerTestAccess::StagingCapacity(dynamicBuffer) == 8 &&
 		device.DestroyCount() == destroysBeforeRecovery &&
 		resources.IsValid(dynamicHandle),
 		"failed discard recreation retains the retryable previous generation");
 	device.FailCreate(false);
 	result |= Check(dynamicBuffer.Lock(0, 16, RENDER_BUFFER_UPDATE_DISCARD,
-		&bytes) == RENDER_RESULT_OK,
+		&bytes) == RENDER_RESULT_OK &&
+		NativeW3DBufferOwnerTestAccess::StagingCapacity(dynamicBuffer) == 16,
 		"discard recreation retries after a transient allocation failure");
 	Fill(bytes, 16, 0x55);
 	GpuHandle recoveredHandle;
@@ -912,6 +936,7 @@ int main()
 
 	result |= Check(staticBuffer.Reset() == RENDER_RESULT_OK &&
 		dynamicBuffer.Reset() == RENDER_RESULT_OK &&
+		NativeW3DBufferOwnerTestAccess::StagingCapacity(dynamicBuffer) == 0 &&
 		partialVertex.Reset() == RENDER_RESULT_OK &&
 		failedCreate.Reset() == RENDER_RESULT_OK &&
 		!resources.IsValid(staticHandle) &&
