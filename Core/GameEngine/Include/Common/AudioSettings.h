@@ -50,10 +50,10 @@ struct AudioSettings
 	UnsignedInt nativeSamplePcmCacheBudgetInBytes() const
 	{
 		if (m_hasNativeSamplePcmCacheBudget) return m_nativeSamplePcmCacheBudgetInBytes;
-		// The shipped AudioFootprintInBytes is 4 MiB; x64 native SFX uses an
-		// 8 MiB working set unless a distinct native override is supplied.
+		// The shipped AudioFootprintInBytes is 4 MiB; x64 native SFX uses a
+		// 64 MiB working set unless a distinct native override is supplied.
 #if defined(_WIN64)
-		return m_maxCacheSize == 4194304U ? 8388608U : m_maxCacheSize;
+		return m_maxCacheSize == 4194304U ? 67108864U : m_maxCacheSize;
 #else
 		return m_maxCacheSize;
 #endif

@@ -125,7 +125,7 @@ static const FieldParse audioSettingsFieldParseTable[] =
 	{ "TimeToFadeAudio",			INI::parseDurationUnsignedInt,			nullptr,							offsetof( AudioSettings, m_fadeAudioFrames) },
 	{ "AudioFootprintInBytes",INI::parseUnsignedInt,							nullptr,							offsetof( AudioSettings, m_maxCacheSize) },
 	// Optional native SFX PCM cache override. Unlike AudioFootprintInBytes,
-	// this can explicitly request 4 MiB (or zero) without the shipped 8 MiB default.
+	// this can explicitly request 4 MiB (or zero) without the x64 64 MiB default.
 	{ "NativeSamplePcmCacheBudgetInBytes", parseNativeSamplePcmCacheBudget, nullptr,
 		offsetof( AudioSettings, m_nativeSamplePcmCacheBudgetInBytes) },
 	{ "Relative2DVolume",			INI::parsePercentToReal,						nullptr,							offsetof( AudioSettings, m_relative2DVolume ) },

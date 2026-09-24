@@ -558,8 +558,13 @@ int main()
 #endif
 	AudioSettings cacheBudgetSettings;
 	cacheBudgetSettings.m_maxCacheSize = 4194304U;
-	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 8388608U,
-		"shipped legacy 4 MiB value defaults to an 8 MiB native SFX cache");
+#if defined(_WIN64)
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 67108864U,
+		"shipped legacy 4 MiB value defaults to a 64 MiB x64 native SFX cache");
+#else
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 4194304U,
+		"shipped legacy 4 MiB value remains exact on non-x64 builds");
+#endif
 	cacheBudgetSettings.m_hasNativeSamplePcmCacheBudget = TRUE;
 	cacheBudgetSettings.m_nativeSamplePcmCacheBudgetInBytes = 4194304U;
 	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 4194304U,
