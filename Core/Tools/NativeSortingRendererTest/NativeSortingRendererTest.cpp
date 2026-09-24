@@ -14,6 +14,8 @@
 
 bool NativeSortingRendererTestRetireAllComplete();
 bool NativeSortingRendererTestRetireMixedPending();
+unsigned int NativeSortingRendererTestLastFlushScratchAllocationCount();
+unsigned int NativeSortingRendererTestLastFlushPreparedGrowthCount();
 
 namespace
 {
@@ -267,6 +269,83 @@ void QueueOne(NativeSortingRenderer &renderer, unsigned int shaderBits,
 	CHECK(renderer.Queue(state, packet, vertices.data(),
 		vertices.size() * sizeof(TestVertex), indices.data(),
 		indices.size() * sizeof(unsigned short), sphere) == RENDER_RESULT_OK);
+}
+
+void QueueMixedSizeScratchReuseFixture(NativeSortingRenderer &renderer)
+{
+	const float depths[][5] = {
+		{7.0f, 1.0f, 11.0f, 4.0f, 2.0f},
+		{3.0f, 8.0f, 0.0f, 0.0f, 0.0f},
+		{-1.0f, 0.0f, 0.0f, 0.0f, 0.0f}
+	};
+	const unsigned int triangleCounts[] = {5, 2, 1};
+	const unsigned int shaderBits[] = {101, 202, 303};
+	const unsigned int colorBases[] = {
+		0x10000000U, 0x20000000U, 0x30000000U
+	};
+	for (unsigned int node = 0; node < 3; ++node)
+	{
+		std::vector<TestVertex> vertices(triangleCounts[node] * 3);
+		std::vector<unsigned short> indices(triangleCounts[node] * 3);
+		for (unsigned int triangle = 0;
+			triangle < triangleCounts[node]; ++triangle)
+		{
+			for (unsigned int corner = 0; corner < 3; ++corner)
+			{
+				TestVertex &vertex = vertices[triangle * 3 + corner];
+				vertex.x = static_cast<float>(corner);
+				vertex.y = static_cast<float>(node);
+				vertex.z = depths[node][triangle];
+				vertex.color = colorBases[node] + triangle;
+				indices[triangle * 3 + corner] = static_cast<unsigned short>(
+					triangle * 3 + corner);
+			}
+		}
+		QueueOne(renderer, shaderBits[node], vertices, indices, 0);
+	}
+}
+
+void CheckMixedSizeScratchReuseStream(
+	const std::vector<CapturedDraw> &draws)
+{
+	const unsigned int expectedStates[] = {303, 101, 202, 101, 202, 101};
+	const unsigned int expectedTrianglesPerDraw[] = {1, 2, 1, 2, 1, 1};
+	const unsigned int expectedColors[] = {
+		0x30000000U, 0x10000001U, 0x10000004U, 0x20000000U,
+		0x10000003U, 0x10000000U, 0x20000001U, 0x10000002U
+	};
+	const float expectedDepths[] = {-1.0f, 1.0f, 2.0f, 3.0f,
+		4.0f, 7.0f, 8.0f, 11.0f};
+	const size_t expectedDrawCount =
+		sizeof(expectedStates) / sizeof(expectedStates[0]);
+	CHECK(draws.size() == expectedDrawCount);
+	if (draws.size() != expectedDrawCount)
+		return;
+	size_t triangleOffset = 0;
+	for (size_t index = 0; index < draws.size(); ++index)
+	{
+		CHECK(draws[index].state == expectedStates[index]);
+		const size_t triangleCount = expectedTrianglesPerDraw[index];
+		CHECK(draws[index].indices.size() == triangleCount * 3);
+		CHECK(draws[index].referencedVertices.size() ==
+			triangleCount * 3 * sizeof(TestVertex));
+		if (draws[index].referencedVertices.size() ==
+			triangleCount * 3 * sizeof(TestVertex))
+		{
+			for (size_t triangle = 0; triangle < triangleCount; ++triangle)
+			{
+				TestVertex firstVertex;
+				const size_t vertexOffset = triangle * 3 * sizeof(TestVertex);
+				memcpy(&firstVertex,
+					draws[index].referencedVertices.data() + vertexOffset,
+					sizeof(firstVertex));
+				CHECK(firstVertex.color == expectedColors[triangleOffset]);
+				CHECK(firstVertex.z == expectedDepths[triangleOffset]);
+				++triangleOffset;
+			}
+		}
+	}
+	CHECK(triangleOffset == sizeof(expectedColors) / sizeof(expectedColors[0]));
 }
 
 void QueueStableNodeOrderFixture(NativeSortingRenderer &renderer)
@@ -652,6 +731,40 @@ void TestPartialDrawFailureRetryMatchesOneShotOutput()
 	CHECK(SameAcceptedDrawStream(baselineDraws, retriedDraws));
 }
 
+void TestFlushLocalScratchReuseMixedSizesAndRetry()
+{
+	NativeSortingRenderer baselineRenderer;
+	RecordingSink baselineSink;
+	QueueMixedSizeScratchReuseFixture(baselineRenderer);
+	CHECK(baselineRenderer.Flush(baselineSink) == RENDER_RESULT_OK);
+	CHECK(baselineRenderer.Empty());
+	CHECK(NativeSortingRendererTestLastFlushScratchAllocationCount() == 1);
+	CHECK(NativeSortingRendererTestLastFlushPreparedGrowthCount() == 1);
+	std::vector<CapturedDraw> baselineDraws;
+	CHECK(CaptureAcceptedDrawStream(baselineSink, baselineDraws));
+	CheckMixedSizeScratchReuseStream(baselineDraws);
+
+	NativeSortingRenderer retryRenderer;
+	RecordingSink retrySink;
+	retrySink.failCall = 1;
+	retrySink.acceptedOnFailure = 3;
+	QueueMixedSizeScratchReuseFixture(retryRenderer);
+	CHECK(retryRenderer.Flush(retrySink) == RENDER_RESULT_FAILED);
+	CHECK(!retryRenderer.Empty());
+	CHECK(NativeSortingRendererTestLastFlushScratchAllocationCount() == 1);
+	CHECK(NativeSortingRendererTestLastFlushPreparedGrowthCount() == 1);
+
+	retrySink.failCall = 0;
+	CHECK(retryRenderer.Flush(retrySink) == RENDER_RESULT_OK);
+	CHECK(retryRenderer.Empty());
+	CHECK(NativeSortingRendererTestLastFlushScratchAllocationCount() == 1);
+	CHECK(NativeSortingRendererTestLastFlushPreparedGrowthCount() == 1);
+	std::vector<CapturedDraw> retriedDraws;
+	CHECK(CaptureAcceptedDrawStream(retrySink, retriedDraws));
+	CheckMixedSizeScratchReuseStream(retriedDraws);
+	CHECK(SameAcceptedDrawStream(baselineDraws, retriedDraws));
+}
+
 void TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput()
 {
 	NativeSortingRenderer baselineRenderer;
@@ -700,6 +813,7 @@ int main()
 	TestSameSubmissionTrianglesBeforeIncompatibleSubmission();
 	TestFailureAfterFirstChunkRetainsOnlyPendingGeometry();
 	TestPartialDrawFailureRetryMatchesOneShotOutput();
+	TestFlushLocalScratchReuseMixedSizesAndRetry();
 	TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput();
 	CHECK(NativeSortingRendererTestRetireAllComplete());
 	CHECK(NativeSortingRendererTestRetireMixedPending());

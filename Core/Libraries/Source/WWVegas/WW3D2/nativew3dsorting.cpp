@@ -95,6 +95,11 @@ struct FlushScope
 	bool &active;
 };
 
+#if defined(RTS_NATIVE_SORTING_TESTS)
+unsigned int g_nativeSortingLastFlushScratchAllocationCount = 0;
+unsigned int g_nativeSortingLastFlushPreparedGrowthCount = 0;
+#endif
+
 bool IsFiniteFloat(float value)
 {
 	return _finite(value) != 0;
@@ -241,6 +246,8 @@ bool ValidateSourceIndices(const SortedSubmission &submission)
 
 RenderResult AppendPreparedTriangles(const SortedSubmission &submission,
 	size_t submissionIndex, const float *matrix,
+	rts::SortingTriangleScratchLease &scratch,
+	std::vector<rts::SortingTriangleOutput> &prepared,
 	std::vector<SortedTriangle> &triangles)
 {
 	if (!ValidateSourceIndices(submission))
@@ -254,7 +261,6 @@ RenderResult AppendPreparedTriangles(const SortedSubmission &submission,
 		matrix[1 * 4 + 2] == 0.0f && matrix[3 * 4 + 2] == 0.0f &&
 		matrix[2 * 4 + 2] == 1.0f;
 
-	rts::SortingTriangleScratchLease scratch;
 	rts::SortingTriangleOptions options;
 	options.parallel = true;
 	for (unsigned int batchStart = 0; batchStart < triangleCount; )
@@ -284,7 +290,15 @@ RenderResult AppendPreparedTriangles(const SortedSubmission &submission,
 		descriptor.zTranslation = matrix[3 * 4 + 2];
 		descriptor.commonZ = commonZ ? 1U : 0U;
 
-		std::vector<rts::SortingTriangleOutput> prepared(batchCount);
+		if (prepared.size() < batchCount)
+		{
+			const bool growsCapacity = prepared.capacity() < batchCount;
+			prepared.resize(batchCount);
+#if defined(RTS_NATIVE_SORTING_TESTS)
+			if (growsCapacity)
+				++g_nativeSortingLastFlushPreparedGrowthCount;
+#endif
+		}
 		rts::SortingTriangleMetrics metrics;
 		rts::SortingTriangleResult result = rts::PrepareSortingTriangles(
 			&descriptor, 1, batchCount, prepared.data(), scratch.outputs(),
@@ -570,6 +584,10 @@ RenderResult NativeSortingRenderer::Queue(const LegacyLogicalState &state,
 
 RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 {
+#if defined(RTS_NATIVE_SORTING_TESTS)
+	g_nativeSortingLastFlushScratchAllocationCount = 0;
+	g_nativeSortingLastFlushPreparedGrowthCount = 0;
+#endif
 	if (m_impl == 0 || m_impl->submissions.empty())
 		return RENDER_RESULT_OK;
 	if (m_impl->flushing)
@@ -578,6 +596,10 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 
 	try
 	{
+		// SortingTriangleScratchLease is synchronously fenced by each kernel
+		// call, so one Flush-local workspace safely serves every sorted node.
+		rts::SortingTriangleScratchLease scratch;
+		std::vector<rts::SortingTriangleOutput> prepared;
 		std::vector<SortedNode> nodes;
 		std::vector<size_t> positiveNodes;
 		std::vector<size_t> unsortedNodes;
@@ -641,7 +663,11 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			const SortedSubmission &submission = m_impl->submissions[
 				submissionIndex];
 			const RenderResult prepareResult = AppendPreparedTriangles(submission,
-				submissionIndex, node.worldView, triangles);
+				submissionIndex, node.worldView, scratch, prepared, triangles);
+#if defined(RTS_NATIVE_SORTING_TESTS)
+			g_nativeSortingLastFlushScratchAllocationCount =
+				scratch.allocationCount();
+#endif
 			if (prepareResult != RENDER_RESULT_OK)
 				return prepareResult;
 		}
@@ -762,6 +788,16 @@ bool NativeSortingRenderer::Empty() const
 }
 
 #if defined(RTS_NATIVE_SORTING_TESTS)
+unsigned int NativeSortingRendererTestLastFlushScratchAllocationCount()
+{
+	return g_nativeSortingLastFlushScratchAllocationCount;
+}
+
+unsigned int NativeSortingRendererTestLastFlushPreparedGrowthCount()
+{
+	return g_nativeSortingLastFlushPreparedGrowthCount;
+}
+
 bool NativeSortingRendererTestRetireAllComplete()
 {
 	std::vector<SortedSubmission> submissions(3);
