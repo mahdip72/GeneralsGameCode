@@ -6614,7 +6614,7 @@ int checkW3DDisplayVideoBufferFormatSelection(
 		for (unsigned int i = 0; i != sizeof(formats) / sizeof(formats[0]); ++i)
 		{
 			const std::string::size_type support = legacyFallback.find(
-				"Support_Texture_Format", cursor);
+				"rts::render::IsLegacyTextureFormatSupported(", cursor);
 			const std::string::size_type format = legacyFallback.find(
 				formats[i], cursor);
 			const std::string::size_type assignment = format ==
