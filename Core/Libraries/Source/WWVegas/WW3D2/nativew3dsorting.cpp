@@ -57,6 +57,7 @@ struct SortedNode
 	float centerDepth;
 	bool hasSphere;
 	size_t insertionOrder;
+	float worldView[16];
 };
 
 struct SortedTriangle
@@ -590,12 +591,12 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			node.submissionIndex = index;
 			node.hasSphere = submission.hasSphere;
 			node.insertionOrder = submission.insertionOrder;
-			float matrix[16];
 			MultiplySortingMatrices(submission.state.constants.world,
-				submission.state.constants.view, matrix);
-			if (!IsFiniteMatrix(matrix))
+				submission.state.constants.view, node.worldView);
+			if (!IsFiniteMatrix(node.worldView))
 				return RENDER_RESULT_INVALID_ARGUMENT;
-			node.centerDepth = submission.hasSphere ? TransformDepth(matrix,
+			node.centerDepth = submission.hasSphere ? TransformDepth(
+				node.worldView,
 				submission.sphere.centerX, submission.sphere.centerY,
 				submission.sphere.centerZ) : 0.0f;
 			if (!IsFiniteFloat(node.centerDepth))
@@ -635,14 +636,12 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 		std::vector<SortedTriangle> triangles;
 		for (size_t order = 0; order < nodeOrder.size(); ++order)
 		{
-			const size_t submissionIndex = nodes[nodeOrder[order]].submissionIndex;
+			const SortedNode &node = nodes[nodeOrder[order]];
+			const size_t submissionIndex = node.submissionIndex;
 			const SortedSubmission &submission = m_impl->submissions[
 				submissionIndex];
-			float matrix[16];
-			MultiplySortingMatrices(submission.state.constants.world,
-				submission.state.constants.view, matrix);
 			const RenderResult prepareResult = AppendPreparedTriangles(submission,
-				submissionIndex, matrix, triangles);
+				submissionIndex, node.worldView, triangles);
 			if (prepareResult != RENDER_RESULT_OK)
 				return prepareResult;
 		}
