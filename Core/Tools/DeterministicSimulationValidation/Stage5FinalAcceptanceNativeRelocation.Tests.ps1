@@ -51,6 +51,15 @@ function Get-RelocationSha256 {
     }
 }
 
+function Set-Stage5ReplayEvidenceHashBinding {
+    param(
+        [Parameter(Mandatory = $true)][string]$ReplayEvidencePath,
+        [Parameter(Mandatory = $true)][object]$RuntimeEvidenceDocument
+    )
+    $RuntimeEvidenceDocument.details.replayEvidenceSha256 =
+        (Get-FileHash -LiteralPath $ReplayEvidencePath -Algorithm SHA256).Hash.ToUpperInvariant()
+}
+
 function Write-RelocationJson {
     param([string]$Path, [object]$Value)
     Write-RelocationText $Path ($Value | ConvertTo-Json -Depth 20)
@@ -234,6 +243,159 @@ $expectedReplayBindings = @(
     'replay-fixture-manifest|ZeroHour'
 )
 $seenReplayBindings = New-Object 'Collections.Generic.List[string]'
+
+# Keep replay-envelope rebinding probes here with the other bounded production
+# guard cases. Re-running final acceptance for each mutation would traverse the
+# full 253-child corpus repeatedly without exercising a different reader guard.
+function Assert-CurrentReplayRuntimeBinding {
+    param([string]$ReplayEvidencePath, [object]$RuntimeEvidenceDocument,
+        [object]$EvidenceModule)
+    $evidenceHashes = @{
+        'replay-determinism' = Get-RelocationSha256 $ReplayEvidencePath
+        'fresh-ai' = 'B' * 64
+        'performance-scaling' = 'C' * 64
+    }
+    & $EvidenceModule {
+        param($details, $hashes)
+        Assert-Stage5FinalAcceptanceDetails 'deterministic-runtime' `
+            $details ('a' * 40) $hashes | Out-Null
+    } $RuntimeEvidenceDocument.details $evidenceHashes
+}
+function Assert-StaleReplayRuntimeBindingRejected {
+    param([string]$ReplayEvidencePath, [object]$RuntimeEvidenceDocument,
+        [object]$EvidenceModule, [string]$CaseName)
+    $evidenceHashes = @{
+        'replay-determinism' = Get-RelocationSha256 $ReplayEvidencePath
+        'fresh-ai' = 'B' * 64
+        'performance-scaling' = 'C' * 64
+    }
+    Assert-RelocationThrows {
+        & $EvidenceModule {
+            param($details, $hashes)
+            Assert-Stage5FinalAcceptanceDetails 'deterministic-runtime' `
+                $details ('a' * 40) $hashes | Out-Null
+        } $RuntimeEvidenceDocument.details $evidenceHashes
+    } 'replayEvidenceSha256 does not bind the independently hashed replay-determinism evidence' `
+        "$CaseName must reject a stale cross-evidence hash before its title guard."
+}
+
+$replayHashFixtureRoot = Join-Path $RunRoot 'replay-hash-binding'
+$generalsReplayManifestPath = Join-Path $replayHashFixtureRoot 'Generals.json'
+$zeroHourReplayManifestPath = Join-Path $replayHashFixtureRoot 'ZeroHour.json'
+Write-RelocationJson $generalsReplayManifestPath ([ordered]@{ title = 'Generals' })
+Write-RelocationJson $zeroHourReplayManifestPath ([ordered]@{ title = 'ZeroHour' })
+$replayHashFixturePath = Join-Path $replayHashFixtureRoot 'replay-determinism.json'
+$replayHashFixtureDocument = [ordered]@{
+    attachments = @(
+        [ordered]@{
+            role = 'replay-fixture-manifest'; title = 'Generals'
+            path = $generalsReplayManifestPath
+            sha256 = Get-RelocationSha256 $generalsReplayManifestPath
+            trustDomain = 'reviewed-fixture'
+        }
+        [ordered]@{
+            role = 'replay-fixture-manifest'; title = 'ZeroHour'
+            path = $zeroHourReplayManifestPath
+            sha256 = Get-RelocationSha256 $zeroHourReplayManifestPath
+            trustDomain = 'reviewed-fixture'
+        }
+    )
+}
+Write-RelocationJson $replayHashFixturePath $replayHashFixtureDocument
+$originalReplayHashFixtureBytes = [IO.File]::ReadAllBytes($replayHashFixturePath)
+$runtimeEvidenceDocument = [ordered]@{
+    details = [ordered]@{
+        gateName = 'deterministic-runtime'; isolatedPipelineMode = 'serial'
+        simulationModes = @('serial', 'parallel', 'shadow')
+        workerConfigurations = @('serial-1', 'parallel-1', 'parallel-2',
+            'parallel-4', 'parallel-8', 'parallel-16', 'parallel-auto')
+        isolatedMatrixPassed = $true; finalAcceptanceClaim = $false
+        replayEvidenceSha256 = Get-RelocationSha256 $replayHashFixturePath
+        freshAiEvidenceSha256 = 'B' * 64
+        performanceEvidenceSha256 = 'C' * 64
+        installedKernelExecution = [ordered]@{
+            status = 'skipped'; claim = $false
+            reason = 'external-qualification-exempt-and-reviewed-native-fixture-unavailable'
+            sha256 = $null
+        }
+    }
+}
+
+$duplicateReplayDocument = Get-Content -LiteralPath $replayHashFixturePath -Raw |
+    ConvertFrom-Json
+$duplicateReplayDocument.attachments[1].title = 'Generals'
+Write-RelocationJson $replayHashFixturePath $duplicateReplayDocument
+Assert-RelocationTest (@($duplicateReplayDocument.attachments | Where-Object {
+    $_.sha256 -cne (Get-RelocationSha256 $_.path)
+}).Count -eq 0) `
+    'duplicate-title probe must keep both replay fixture files byte-valid'
+Assert-StaleReplayRuntimeBindingRejected $replayHashFixturePath `
+    $runtimeEvidenceDocument $EvidenceModule 'duplicate-title probe'
+$duplicateTitleReplayPath = $replayHashFixturePath
+Set-Stage5ReplayEvidenceHashBinding $duplicateTitleReplayPath $runtimeEvidenceDocument
+Assert-CurrentReplayRuntimeBinding $replayHashFixturePath `
+    $runtimeEvidenceDocument $EvidenceModule
+$duplicateSeenBindings = New-Object 'Collections.Generic.List[string]'
+Assert-RelocationThrows {
+    & $EvidenceModule {
+        param($attachments, $trustDomains, $expectedBindings, $seenBindings)
+        foreach ($attachment in @($attachments)) {
+            $binding = Assert-Stage5FinalAcceptanceAttachmentBinding `
+                -Role $attachment.role -Title $attachment.title `
+                -TrustDomain $attachment.trustDomain `
+                -AttachmentTrustDomains $trustDomains `
+                -ExpectedBindings $expectedBindings -SeenBindings $seenBindings `
+                -Context 'bounded duplicate-title replay binding test'
+            $seenBindings.Add($binding) | Out-Null
+        }
+    } $duplicateReplayDocument.attachments $attachmentTrustDomains `
+        $expectedReplayBindings $duplicateSeenBindings
+} 'repeats or does not authorize attachment' `
+    'duplicate-title probe must reach the production duplicate-binding guard after rebinding'
+
+[IO.File]::WriteAllBytes($replayHashFixturePath,
+    [byte[]]$originalReplayHashFixtureBytes)
+Assert-RelocationTest ([Convert]::ToBase64String(
+    [IO.File]::ReadAllBytes($replayHashFixturePath)) -ceq
+        [Convert]::ToBase64String($originalReplayHashFixtureBytes)) `
+    'restored-source probe must restore the original replay evidence bytes exactly'
+$restoredSourceReplayPath = $replayHashFixturePath
+Assert-StaleReplayRuntimeBindingRejected $replayHashFixturePath `
+    $runtimeEvidenceDocument $EvidenceModule 'restored-source probe'
+Set-Stage5ReplayEvidenceHashBinding $restoredSourceReplayPath $runtimeEvidenceDocument
+Assert-RelocationTest ($runtimeEvidenceDocument.details.replayEvidenceSha256 -ceq
+    (Get-RelocationSha256 $replayHashFixturePath)) `
+    'restored-source probe must rebind to the byte-identical original replay evidence'
+Assert-CurrentReplayRuntimeBinding $replayHashFixturePath `
+    $runtimeEvidenceDocument $EvidenceModule
+
+$swappedReplayDocument = Get-Content -LiteralPath $replayHashFixturePath -Raw |
+    ConvertFrom-Json
+$swappedReplayDocument.attachments[1].path =
+    $swappedReplayDocument.attachments[0].path
+$swappedReplayDocument.attachments[1].sha256 =
+    $swappedReplayDocument.attachments[0].sha256
+Write-RelocationJson $replayHashFixturePath $swappedReplayDocument
+Assert-StaleReplayRuntimeBindingRejected $replayHashFixturePath `
+    $runtimeEvidenceDocument $EvidenceModule 'swapped-title probe'
+$swappedTitleReplayPath = $replayHashFixturePath
+Set-Stage5ReplayEvidenceHashBinding $swappedTitleReplayPath $runtimeEvidenceDocument
+Assert-CurrentReplayRuntimeBinding $replayHashFixturePath `
+    $runtimeEvidenceDocument $EvidenceModule
+$swappedReceipt = Get-Content -LiteralPath `
+    $swappedReplayDocument.attachments[1].path -Raw | ConvertFrom-Json
+Assert-RelocationTest ($swappedReplayDocument.attachments[1].sha256 -ceq
+    (Get-RelocationSha256 $swappedReplayDocument.attachments[1].path)) `
+    'swapped-title probe must keep the substituted receipt byte-valid'
+Assert-RelocationThrows {
+    & $EvidenceModule {
+        param($expectedTitle, $receiptTitle)
+        Assert-Stage5FinalAcceptanceReceiptTitleScope `
+            $expectedTitle $receiptTitle 'bounded swapped replay manifest test'
+    } $swappedReplayDocument.attachments[1].title $swappedReceipt.title
+} 'title scope is substituted' `
+    'swapped-title probe must reach the production receipt-title guard after rebinding'
+
 $bindingResults = & $evidenceModule {
     param($trustDomains, $expectedBindings, $seenBindings)
     $first = Assert-Stage5FinalAcceptanceAttachmentBinding `

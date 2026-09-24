@@ -47,6 +47,16 @@ try {
     if (@($parseErrors).Count -ne 0) {
         throw "The Acceptance entrypoint does not parse: $($parseErrors[0].Message)"
     }
+    $replayBindingSourcePath = Join-Path $PSScriptRoot `
+        'Stage5FinalAcceptanceNativeRelocation.Tests.ps1'
+    $replayBindingSourceText = [IO.File]::ReadAllText($replayBindingSourcePath)
+    $replayBindingTokens = $null
+    $replayBindingParseErrors = $null
+    $replayBindingAst = [Management.Automation.Language.Parser]::ParseInput(
+        $replayBindingSourceText, [ref]$replayBindingTokens,
+        [ref]$replayBindingParseErrors)
+    Assert-CorpusReuseTest (@($replayBindingParseErrors).Count -eq 0) `
+        'The bounded native-relocation replay-binding tests do not parse.'
 
     $reparseCleanupDefinitions = @($sourceAst.FindAll({
         param($node)
@@ -260,21 +270,35 @@ try {
         throw "The installed-runtime Acceptance fixture violates the production details contract: $($_.Exception.Message)"
     }
 
-    $replayBindingDefinitions = @($sourceAst.FindAll({
+    $replayBindingDefinitions = @($replayBindingAst.FindAll({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
             $node.Name -ceq 'Set-Stage5ReplayEvidenceHashBinding'
     }, $true))
     Assert-CorpusReuseTest ($replayBindingDefinitions.Count -eq 1) `
-        'The Acceptance entrypoint must define one replay-evidence hash rebinding helper.'
+        'The bounded native-relocation suite must define one replay-evidence hash rebinding helper.'
     Invoke-Expression $replayBindingDefinitions[0].Extent.Text
-    $replayBindingCalls = @($sourceAst.FindAll({
+    $replayBindingCalls = @($replayBindingAst.FindAll({
         param($node)
         $node -is [Management.Automation.Language.CommandAst] -and
             $node.GetCommandName() -ceq 'Set-Stage5ReplayEvidenceHashBinding'
     }, $true))
-    Assert-CorpusReuseTest ($replayBindingCalls.Count -eq 3) `
-        'Duplicate-title, restored-source, and swapped-title acceptance probes must each refresh the cross-evidence hash.'
+    $replayBindingOwner = @($replayBindingAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Invoke-Stage5FinalAcceptanceBoundedGuardTests'
+    }, $true))
+    $replayBindingCallsOwned = @($replayBindingCalls | Where-Object {
+        $_.Extent.StartOffset -gt $replayBindingOwner[0].Body.Extent.StartOffset -and
+            $_.Extent.EndOffset -lt $replayBindingOwner[0].Body.Extent.EndOffset
+    })
+    Assert-CorpusReuseTest ($replayBindingOwner.Count -eq 1 -and
+        $replayBindingCalls.Count -eq 3 -and
+        $replayBindingCallsOwned.Count -eq 3 -and
+        $replayBindingCalls[0].Extent.Text -match '\$duplicateTitleReplayPath' -and
+        $replayBindingCalls[1].Extent.Text -match '\$restoredSourceReplayPath' -and
+        $replayBindingCalls[2].Extent.Text -match '\$swappedTitleReplayPath') `
+        'The bounded duplicate-title, restored-source, and swapped-title probes must each refresh the cross-evidence hash in order.'
 
     $replayBindingProbePath = Join-Path $runRoot 'replay-binding-probe.json'
     [IO.File]::WriteAllText($replayBindingProbePath, '{"marker":"mutated replay"}')
