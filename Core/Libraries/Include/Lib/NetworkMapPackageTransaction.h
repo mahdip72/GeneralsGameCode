@@ -16,28 +16,53 @@ namespace rts { namespace network_epoch {
 class NetworkMapPackageTransaction
 {
 private:
-	// An exclusive delete-on-close file separates live preparation from
-	// restart recovery, including across processes and after a hard exit.
-	class MapLock
+	// Serialize the journal check and every transaction phase across processes.
+	// A kernel mutex needs no write access to the map directory.
+	class MapMutex
 	{
 	public:
-		explicit MapLock(const std::string &map) : m_handle(INVALID_HANDLE_VALUE)
+		explicit MapMutex(const std::string &map) : m_handle(nullptr), m_owned(false)
 		{
-			const std::string path = map + ".ggclock";
-			m_handle = CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE | DELETE,
-				0, nullptr, OPEN_ALWAYS,
-				FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+			char absolute[MAX_PATH];
+			const DWORD length = GetFullPathNameA(map.c_str(), MAX_PATH,
+				absolute, nullptr);
+			if (length == 0 || length >= MAX_PATH)
+				return;
+			unsigned long long hash = 14695981039346656037ULL;
+			for (DWORD i = 0; i < length; ++i)
+			{
+				unsigned char ch = static_cast<unsigned char>(absolute[i]);
+				if (ch >= 'a' && ch <= 'z')
+					ch -= 'a' - 'A';
+				hash ^= ch;
+				hash *= 1099511628211ULL;
+			}
+			std::string name = "Global\\GGCNET3-";
+			const char digits[] = "0123456789ABCDEF";
+			for (int shift = 60; shift >= 0; shift -= 4)
+				name += digits[(hash >> shift) & 15];
+			m_handle = CreateMutexA(nullptr, FALSE, name.c_str());
+			if (m_handle != nullptr)
+			{
+				const DWORD result = WaitForSingleObject(m_handle, 0);
+				m_owned = result == WAIT_OBJECT_0 || result == WAIT_ABANDONED;
+			}
 		}
-		~MapLock()
+		~MapMutex()
 		{
-			if (m_handle != INVALID_HANDLE_VALUE)
+			if (m_handle != nullptr)
+			{
+				if (m_owned)
+					ReleaseMutex(m_handle);
 				CloseHandle(m_handle);
+			}
 		}
-		bool valid() const { return m_handle != INVALID_HANDLE_VALUE; }
+		bool valid() const { return m_owned; }
 	private:
-		MapLock(const MapLock &);
-		MapLock &operator=(const MapLock &);
+		MapMutex(const MapMutex &);
+		MapMutex &operator=(const MapMutex &);
 		HANDLE m_handle;
+		bool m_owned;
 	};
 
 public:
@@ -105,10 +130,9 @@ public:
 		const std::string journal = journalPath(map);
 		if (journal.empty())
 			return false;
-		MapLock lock(map);
+		MapMutex lock(map);
 		if (!lock.valid())
-			return GetLastError() == ERROR_FILE_NOT_FOUND ||
-				GetLastError() == ERROR_PATH_NOT_FOUND;
+			return false;
 		return recoverLocked(map, journal, notify, context);
 	}
 
@@ -240,7 +264,7 @@ public:
 		std::string mapDirectory;
 		if (!createDirectoryTree(map.c_str(), mapDirectory))
 			return false;
-		MapLock lock(map);
+		MapMutex lock(map);
 		if (!lock.valid())
 			return false;
 		std::vector<DiskFile> disk(m_files.size());

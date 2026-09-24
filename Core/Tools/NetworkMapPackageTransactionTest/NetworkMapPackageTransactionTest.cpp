@@ -215,6 +215,10 @@ int main(int argc, char **argv)
 	const std::string oldIni = Read(ini);
 	const std::string oldMap = Read(map);
 	const std::string oldPreview = Read(preview);
+	ok = Check(NetworkMapPackageTransaction::recover(map.c_str()) &&
+		GetFileAttributesA((map + ".ggclock").c_str()) == INVALID_FILE_ATTRIBUTES &&
+		Read(map) == oldMap,
+		"map without a journal remains readable without directory writes") && ok;
 	const std::string newIni = "new=2\r\n";
 	const std::string newMap("new-map\0bytes", 13);
 	const std::string rogue = folder + "\\rogue.dat";
@@ -516,6 +520,12 @@ int main(int argc, char **argv)
 		NoTemps(folder),
 		"rolled-back package survives crash before backup cleanup") && ok;
 	const std::string holdMap = folder + "\\hold.map";
+	std::string holdMapForward = holdMap;
+	for (std::size_t i = 0; i < holdMapForward.size(); ++i)
+	{
+		if (holdMapForward[i] == '\\')
+			holdMapForward[i] = '/';
+	}
 	const std::string ready = ini + ".ready";
 	const std::string release = ini + ".release";
 	std::string holdCommand = "\"" + std::string(executable) +
@@ -541,7 +551,7 @@ int main(int argc, char **argv)
 	}
 	ok = Check(readySeen &&
 		Read(holdMap + ".ggctxn").compare(0, 9, "GGCNET30\n") == 0 &&
-		!NetworkMapPackageTransaction::recover(holdMap.c_str()) &&
+		!NetworkMapPackageTransaction::recover(holdMapForward.c_str()) &&
 		Read(ini) == cleanupBytes,
 		"another process cannot recover a live preparation") && ok;
 	Write(release, "go");
