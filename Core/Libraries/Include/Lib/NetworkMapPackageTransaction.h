@@ -135,16 +135,18 @@ public:
 		{
 			if (disk[i].hadOriginal)
 			{
-				if (!CopyFileA(disk[i].backup.c_str(), targets[i].c_str(), FALSE))
+				if (!restoreBackup(disk[i].backup, targets[i]))
 					return false;
 			}
-			else if (!DeleteFileA(targets[i].c_str()) &&
-				GetLastError() != ERROR_FILE_NOT_FOUND)
+			else if (!removeInstalledFile(targets[i]))
 				return false;
 			if (notify != nullptr)
 				notify(targets[i].c_str(), context);
 		}
-		if (!DeleteFileA(journal.c_str()))
+		// Keep the rollback record (and its backups) until every restored file is
+		// on disk. Retiring by a write-through rename also prevents a power loss
+		// from resurrecting a deleted journal after its backups are removed.
+		if (!retireJournal(journal))
 			return false;
 		cleanup(disk, false);
 		return true;
@@ -197,7 +199,7 @@ public:
 
 		if (allowed && committed == disk.size() && validate(context))
 		{
-			if (!DeleteFileA(journal.c_str()))
+			if (!retireJournal(journal))
 			{
 				m_rollbackComplete = recover(map.c_str(), notify, context);
 				--commitDepth();
@@ -400,6 +402,72 @@ private:
 		if (GetTempFileNameA(directory.c_str(), "ggc", 0, name) == 0)
 			return false;
 		path = name;
+		return true;
+	}
+
+	static bool flushFile(const std::string &path)
+	{
+		HANDLE handle = CreateFileA(path.c_str(), GENERIC_WRITE,
+			FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+		if (handle == INVALID_HANDLE_VALUE)
+			return false;
+		const bool flushed = FlushFileBuffers(handle) != 0;
+		CloseHandle(handle);
+		return flushed;
+	}
+
+	static bool restoreBackup(const std::string &backup, const std::string &target)
+	{
+		const std::size_t separator = target.find_last_of('\\');
+		if (separator == std::string::npos)
+			return false;
+		std::string temporary;
+		if (!tempName(target.substr(0, separator + 1), temporary))
+			return false;
+		const bool copied = CopyFileA(backup.c_str(), temporary.c_str(), FALSE) != 0;
+		const bool flushed = copied && flushFile(temporary);
+		const bool restored = flushed &&
+			MoveFileExA(temporary.c_str(), target.c_str(),
+				MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+		if (!restored)
+			DeleteFileA(temporary.c_str());
+		return restored;
+	}
+
+	static bool removeInstalledFile(const std::string &target)
+	{
+		const std::size_t separator = target.find_last_of('\\');
+		if (separator == std::string::npos)
+			return false;
+		std::string temporary;
+		if (!tempName(target.substr(0, separator + 1), temporary))
+			return false;
+		const bool removed = MoveFileExA(target.c_str(), temporary.c_str(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+		const DWORD error = removed ? ERROR_SUCCESS : GetLastError();
+		DeleteFileA(temporary.c_str());
+		return removed || error == ERROR_FILE_NOT_FOUND ||
+			error == ERROR_PATH_NOT_FOUND;
+	}
+
+	static bool retireJournal(const std::string &journal)
+	{
+		const std::size_t separator = journal.find_last_of('\\');
+		if (separator == std::string::npos)
+			return false;
+		std::string retired;
+		if (!tempName(journal.substr(0, separator + 1), retired))
+			return false;
+		if (!MoveFileExA(journal.c_str(), retired.c_str(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		{
+			DeleteFileA(retired.c_str());
+			return false;
+		}
+		// The active journal is durably retired now; this small tombstone is
+		// harmless if cleanup is interrupted.
+		DeleteFileA(retired.c_str());
 		return true;
 	}
 

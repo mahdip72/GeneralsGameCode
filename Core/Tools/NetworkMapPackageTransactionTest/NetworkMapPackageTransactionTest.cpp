@@ -47,6 +47,10 @@ static bool CrashAfterThird(std::size_t committed, void *)
 		ExitProcess(89);
 	return true;
 }
+static void CrashAfterFirstRecovery(const char *, void *)
+{
+	ExitProcess(90);
+}
 
 int main(int argc, char **argv)
 {
@@ -86,6 +90,20 @@ int main(int argc, char **argv)
 			return 2;
 		child.commit(Valid, nullptr, nullptr, CrashAfterThird);
 		return 3;
+	}
+	if (argc == 3 && std::string(argv[1]) == "--recover-crash")
+	{
+		const std::string map = std::string(argv[2]) + "\\arena.map";
+		NetworkMapPackageTransaction::recover(map.c_str(),
+			CrashAfterFirstRecovery);
+		return 4;
+	}
+	if (argc == 3 && std::string(argv[1]) == "--recover-crash-new")
+	{
+		const std::string map = std::string(argv[2]) + "\\fresh.map";
+		NetworkMapPackageTransaction::recover(map.c_str(),
+			CrashAfterFirstRecovery);
+		return 4;
 	}
 	char current[MAX_PATH];
 	if (GetCurrentDirectoryA(MAX_PATH, current) == 0)
@@ -196,6 +214,27 @@ int main(int argc, char **argv)
 	ok = Check(launched && crashCode == 88 &&
 		Read(ini) == newIni && Read(map) == oldMap,
 		"hard exit exposes only a journaled partial package") && ok;
+	std::string recoverCommand = "\"" + std::string(executable) +
+		"\" --recover-crash \"" + folder + "\"";
+	std::vector<char> recoverCommandLine(recoverCommand.begin(),
+		recoverCommand.end());
+	recoverCommandLine.push_back(0);
+	PROCESS_INFORMATION recoveryProcess = {};
+	const bool recoveryLaunched = CreateProcessA(nullptr,
+		recoverCommandLine.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+		nullptr, nullptr, &startup, &recoveryProcess) != 0;
+	DWORD recoveryCrashCode = 0;
+	if (recoveryLaunched)
+	{
+		WaitForSingleObject(recoveryProcess.hProcess, 30000);
+		GetExitCodeProcess(recoveryProcess.hProcess, &recoveryCrashCode);
+		CloseHandle(recoveryProcess.hThread);
+		CloseHandle(recoveryProcess.hProcess);
+	}
+	ok = Check(recoveryLaunched && recoveryCrashCode == 90 &&
+		GetFileAttributesA(incompleteJournal.c_str()) != INVALID_FILE_ATTRIBUTES &&
+		Read(ini) == oldIni,
+		"interrupted rollback keeps its journal after a durable file restore") && ok;
 	ok = Check(NetworkMapPackageTransaction::recover(map.c_str()) &&
 		Read(ini) == oldIni && Read(map) == oldMap &&
 		Read(preview) == oldPreview,
@@ -232,6 +271,29 @@ int main(int argc, char **argv)
 		GetFileAttributesA(freshReadme.c_str()) != INVALID_FILE_ATTRIBUTES &&
 		GetFileAttributesA(freshMap.c_str()) == INVALID_FILE_ATTRIBUTES,
 		"hard exit after new companions leaves a recoverable journal") && ok;
+	std::string recoverNewCommand = "\"" + std::string(executable) +
+		"\" --recover-crash-new \"" + folder + "\"";
+	const std::string freshJournal = freshMap + ".ggctxn";
+	std::vector<char> recoverNewCommandLine(recoverNewCommand.begin(),
+		recoverNewCommand.end());
+	recoverNewCommandLine.push_back(0);
+	PROCESS_INFORMATION recoveryNewProcess = {};
+	const bool recoveryNewLaunched = CreateProcessA(nullptr,
+		recoverNewCommandLine.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+		nullptr, nullptr, &startup, &recoveryNewProcess) != 0;
+	DWORD recoveryNewCrashCode = 0;
+	if (recoveryNewLaunched)
+	{
+		WaitForSingleObject(recoveryNewProcess.hProcess, 30000);
+		GetExitCodeProcess(recoveryNewProcess.hProcess, &recoveryNewCrashCode);
+		CloseHandle(recoveryNewProcess.hThread);
+		CloseHandle(recoveryNewProcess.hProcess);
+	}
+	ok = Check(recoveryNewLaunched && recoveryNewCrashCode == 90 &&
+		GetFileAttributesA(freshJournal.c_str()) != INVALID_FILE_ATTRIBUTES &&
+		GetFileAttributesA(freshPreview.c_str()) == INVALID_FILE_ATTRIBUTES &&
+		GetFileAttributesA(freshStr.c_str()) != INVALID_FILE_ATTRIBUTES,
+		"interrupted removal keeps its journal for idempotent recovery") && ok;
 	ok = Check(NetworkMapPackageTransaction::recover(freshMapForward.c_str()) &&
 		GetFileAttributesA(freshPreview.c_str()) == INVALID_FILE_ATTRIBUTES &&
 		GetFileAttributesA(freshStr.c_str()) == INVALID_FILE_ATTRIBUTES &&
