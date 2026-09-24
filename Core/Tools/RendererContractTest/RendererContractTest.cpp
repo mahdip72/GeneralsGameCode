@@ -4390,6 +4390,64 @@ int testD3D11HiddenSwapChain()
 		result |= check(center[0] > 240 && center[1] > 240 && center[2] > 240,
 			"untextured flexible layouts preserve vertex diffuse color");
 
+		// Exercise last-hit and alternating input-layout lookups before forcing
+		// eviction. The varying strides are valid, distinct cache descriptors;
+		// only the original stride is used for the final draw.
+		rts::render::LegacyLogicalState layoutCacheState;
+		layoutCacheState.pipeline.rasterizer.cullMode =
+			rts::render::RENDER_CULL_NONE;
+		rts::render::LegacyVertexLayout alternateLayout = texturedLayout;
+		alternateLayout.stride += 4;
+		alternateLayout.elements[3].byteOffset += 4;
+		bool layoutCacheFrameStarted = context->beginFrame() ==
+			rts::render::RENDER_RESULT_OK;
+		bool layoutCacheSucceeded = false;
+		if (layoutCacheFrameStarted)
+		{
+			layoutCacheSucceeded =
+				context->clear(clearColor, 1.0f, 0) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(layoutCacheState,
+					texturedLayout, 0) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(layoutCacheState,
+					texturedLayout, 0) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(layoutCacheState,
+					alternateLayout, 0) == rts::render::RENDER_RESULT_OK &&
+				context->setLegacyStateForLayout(layoutCacheState,
+					alternateLayout, 0) == rts::render::RENDER_RESULT_OK;
+			for (unsigned int index = 0; layoutCacheSucceeded && index < 260;
+				++index)
+			{
+				rts::render::LegacyVertexLayout distinctLayout = texturedLayout;
+				distinctLayout.stride += 8 + index * 4;
+				distinctLayout.elements[3].byteOffset += 8 + index * 4;
+				layoutCacheSucceeded = context->setLegacyStateForLayout(
+					layoutCacheState, distinctLayout, 0) ==
+						rts::render::RENDER_RESULT_OK;
+			}
+			layoutCacheSucceeded = layoutCacheSucceeded &&
+				context->setLegacyStateForLayout(layoutCacheState,
+					texturedLayout, 0) == rts::render::RENDER_RESULT_OK &&
+				context->setVertexBuffer(texturedVertexBuffer,
+					sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+				context->setPrimitiveTopology(
+					rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+					rts::render::RENDER_RESULT_OK &&
+				context->draw(3, 0) == rts::render::RENDER_RESULT_OK;
+			layoutCacheSucceeded = context->endFrame() ==
+				rts::render::RENDER_RESULT_OK && layoutCacheSucceeded;
+		}
+		result |= check(layoutCacheSucceeded &&
+			device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+				&captureFormat) == rts::render::RENDER_RESULT_OK,
+			"D3D11 input-layout cache handles repeat, alternation, and eviction");
+		center = &pixels[4 * (32 * 64 + 32)];
+		result |= check(layoutCacheSucceeded && center[0] > 240 &&
+			center[1] > 240 && center[2] > 240,
+			"D3D11 input-layout eviction preserves the original draw layout");
+
 		struct PreTransformedVertex
 		{
 			float position[4];
@@ -5977,6 +6035,35 @@ int testD3D11HiddenSwapChain()
 				96 * 4, &captureFormat) == rts::render::RENDER_RESULT_OK &&
 			resizedPixels[1] > 240 && resizedPixels[0] < 16,
 			"D3D11 recovery preserves resized back-buffer dimensions and pixels");
+		rts::render::GpuHandle recoveredLayoutVertexBuffer;
+		result |= check(device->createBuffer(texturedVertexDescriptor,
+			texturedVertices, sizeof(texturedVertices),
+			&recoveredLayoutVertexBuffer) == rts::render::RENDER_RESULT_OK,
+			"D3D11 creates a vertex buffer for post-recovery layout reuse");
+		result |= check(context->beginFrame() == rts::render::RENDER_RESULT_OK &&
+			context->clear(rts::render::RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f),
+				1.0f, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, 96.0f, 80.0f, 0.0f, 1.0f) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(layoutCacheState,
+				texturedLayout, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setLegacyStateForLayout(layoutCacheState,
+				texturedLayout, 0) == rts::render::RENDER_RESULT_OK &&
+			context->setVertexBuffer(recoveredLayoutVertexBuffer,
+				sizeof(TexturedVertex), 0) == rts::render::RENDER_RESULT_OK &&
+			context->setPrimitiveTopology(
+				rts::render::RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+				rts::render::RENDER_RESULT_OK &&
+			context->draw(3, 0) == rts::render::RENDER_RESULT_OK &&
+			context->endFrame() == rts::render::RENDER_RESULT_OK &&
+			device->captureBackBuffer(&resizedPixels[0], resizedPixels.size(),
+				96 * 4, &captureFormat) == rts::render::RENDER_RESULT_OK &&
+			resizedPixels[4 * (40 * 96 + 48)] > 240 &&
+			resizedPixels[4 * (40 * 96 + 48) + 1] > 240 &&
+			resizedPixels[4 * (40 * 96 + 48) + 2] > 240,
+			"D3D11 input-layout last hit rebuilds after device recovery");
+		result |= check(device->destroyResource(recoveredLayoutVertexBuffer),
+			"D3D11 releases the post-recovery layout vertex buffer");
 		const rts::render::RenderResult liveObjectReportResult =
 			device->reportDebugLiveObjects();
 		result |= check(liveObjectReportResult ==

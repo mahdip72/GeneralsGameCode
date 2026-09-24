@@ -672,7 +672,8 @@ public:
 		m_presentationSampler(0),
 		m_handles(0), m_faultPoint(RENDER_RESOURCE_FAULT_NONE),
 		m_faultCountdown(0), m_faultResult(RENDER_RESULT_FAILED),
-		m_stateUseSerial(0), m_ownerThread(0), m_initialized(false),
+		m_lastInputLayoutIndex(UINT_MAX), m_stateUseSerial(0),
+		m_ownerThread(0), m_initialized(false),
 		m_frameOpen(false), m_pipelineBound(false), m_vertexBufferBound(false),
 		m_indexBufferBound(false), m_topologyBound(false),
 		m_swapInterval(1), m_gamma(1.0f), m_brightness(0.0f),
@@ -5160,6 +5161,7 @@ private:
 		}
 		m_inputLayouts[oldest].layout->Release();
 		m_inputLayouts.erase(m_inputLayouts.begin() + oldest);
+		m_lastInputLayoutIndex = UINT_MAX;
 		return true;
 	}
 
@@ -5328,11 +5330,24 @@ private:
 		{
 			return E_INVALIDARG;
 		}
+		// The cache is ordered by insertion, not recent use. The last matching
+		// index avoids a linear scan for repeated layouts, but always rechecks
+		// the complete descriptor before using the current native entry.
+		if (m_lastInputLayoutIndex < m_inputLayouts.size() &&
+			EqualVertexLayouts(m_inputLayouts[m_lastInputLayoutIndex].descriptor,
+				descriptor))
+		{
+			InputLayoutEntry &entry = m_inputLayouts[m_lastInputLayoutIndex];
+			entry.lastUsedSerial = nextStateUseSerial();
+			*layout = entry.layout;
+			return S_OK;
+		}
 		for (unsigned int cached = 0; cached < m_inputLayouts.size(); ++cached)
 		{
 			if (EqualVertexLayouts(m_inputLayouts[cached].descriptor, descriptor))
 			{
 				m_inputLayouts[cached].lastUsedSerial = nextStateUseSerial();
+				m_lastInputLayoutIndex = cached;
 				*layout = m_inputLayouts[cached].layout;
 				return S_OK;
 			}
@@ -5611,6 +5626,8 @@ private:
 			entry.layout->Release();
 			return E_OUTOFMEMORY;
 		}
+		m_lastInputLayoutIndex =
+			static_cast<unsigned int>(m_inputLayouts.size() - 1);
 		*layout = entry.layout;
 		return S_OK;
 	}
@@ -5895,6 +5912,7 @@ private:
 			m_inputLayouts[index].layout->Release();
 		}
 		m_inputLayouts.clear();
+		m_lastInputLayoutIndex = UINT_MAX;
 		for (unsigned int index = 0; index < m_blendStates.size(); ++index)
 		{
 			m_blendStates[index].state->Release();
@@ -6086,6 +6104,7 @@ private:
 	std::vector<RasterizerStateEntry> m_rasterizerStates;
 	std::vector<SamplerStateEntry> m_samplerStates;
 	std::vector<InputLayoutEntry> m_inputLayouts;
+	unsigned int m_lastInputLayoutIndex;
 	unsigned int m_stateUseSerial;
 	DWORD m_ownerThread;
 	bool m_initialized;
