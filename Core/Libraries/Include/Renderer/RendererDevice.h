@@ -227,7 +227,9 @@ enum RenderResourceFaultPoint
 	// Surface removal at ResizeBuffers, then fail the fresh device's retry.
 	RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS,
 	// Fail after a texture refresh has temporarily cleared its sampler stages.
-	RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND
+	RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND,
+	// Surface removal while rebuilding resized targets, then fail recovery.
+	RENDER_RESOURCE_FAULT_RESIZE_TARGETS_RECOVERY_FAILURE
 };
 
 struct RenderResourceStatistics

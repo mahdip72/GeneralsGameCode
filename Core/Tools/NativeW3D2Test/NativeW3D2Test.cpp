@@ -151,6 +151,12 @@ struct ShutdownRequest
 	rts::render::RenderResult result;
 };
 
+struct ResizeRequest
+{
+	rts::render::IRenderDevice *device;
+	rts::render::RenderResult result;
+};
+
 struct CaptureProbe
 {
 	NativeW3D2 *owner;
@@ -572,6 +578,13 @@ DWORD WINAPI ShutdownFromWorker(void *parameter)
 {
 	ShutdownRequest *request = static_cast<ShutdownRequest *>(parameter);
 	request->result = request->owner->Shutdown();
+	return 0;
+}
+
+DWORD WINAPI ResizeFromWorker(void *parameter)
+{
+	ResizeRequest *request = static_cast<ResizeRequest *>(parameter);
+	request->result = request->device->resize(80, 72);
 	return 0;
 }
 
@@ -1126,15 +1139,19 @@ int TestResizeRollback(HWND window)
 		RENDER_RESOURCE_FAULT_RESIZE_TARGETS,
 		RENDER_RESOURCE_FAULT_RESIZE_TARGETS_AND_ROLLBACK,
 		RENDER_RESOURCE_FAULT_RESIZE_TARGETS,
-		RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS
+		RENDER_RESOURCE_FAULT_RESIZE_RECOVERY_RETRY_TARGETS,
+		RENDER_RESOURCE_FAULT_RESIZE_TARGETS_RECOVERY_FAILURE,
+		RENDER_RESOURCE_FAULT_NONE
 	};
 	const RenderResult injectedResults[] = {
 		RENDER_RESULT_OUT_OF_MEMORY,
 		RENDER_RESULT_OUT_OF_MEMORY,
 		RENDER_RESULT_DEVICE_REMOVED,
-		RENDER_RESULT_OUT_OF_MEMORY
+		RENDER_RESULT_OUT_OF_MEMORY,
+		RENDER_RESULT_OUT_OF_MEMORY,
+		RENDER_RESULT_OK
 	};
-	for (unsigned int scenario = 0; scenario < 4; ++scenario)
+	for (unsigned int scenario = 0; scenario < 6; ++scenario)
 	{
 		NativeW3D2 owner;
 		CountingResizeHook hook;
@@ -1142,14 +1159,15 @@ int TestResizeRollback(HWND window)
 			"resize rollback fixture initializes native owner");
 		if (!owner.IsOperational()) continue;
 		owner.SetGameCleanupHook(&hook);
-		if (scenario == 3)
+		if (scenario == 3 || scenario == 4)
 			result |= Check(NativeW3DRecoveryTestAccess::PopulateGpuOnlyTexture(
 				&owner.Renderer()),
-				"recovery retry fixture populates a shader-only texture on the GPU");
-		result |= Check(NativeW3DRecoveryTestAccess::ConfigureResourceFault(
-			&owner.Renderer(), faults[scenario], 1,
-			injectedResults[scenario]) == RENDER_RESULT_OK,
-			"resize rollback fixture arms target failure");
+				"resize recovery fixture populates a shader-only texture on the GPU");
+		if (scenario != 5)
+			result |= Check(NativeW3DRecoveryTestAccess::ConfigureResourceFault(
+				&owner.Renderer(), faults[scenario], 1,
+				injectedResults[scenario]) == RENDER_RESULT_OK,
+				"resize rollback fixture arms target failure");
 		const RenderResult resizeResult =
 			owner.ExecuteGameRenderCommand(resizeCommand);
 		RenderBackBufferInfo info;
@@ -1185,6 +1203,27 @@ int TestResizeRollback(HWND window)
 				endResult == RENDER_RESULT_OK && drainResult == RENDER_RESULT_OK,
 				"old-size rendering and presentation continue after resize rollback");
 		}
+		else if (scenario == 2 || scenario == 5)
+		{
+			result |= Check(resizeResult == RENDER_RESULT_OK &&
+				hook.releaseCalls == 1 && hook.reacquireCalls == 1 &&
+				owner.IsOperational() && owner.Renderer().GetBackBufferInfo(&info) ==
+					RENDER_RESULT_OK && info.width == 80 && info.height == 72,
+				"removed-target recovery and ordinary resize publish new targets");
+			GameRenderCommand begin = {};
+			begin.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+			begin.value0 = RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH;
+			begin.float3 = 1.0f;
+			begin.float4 = 1.0f;
+			GameRenderCommand end = {};
+			end.type = GAME_RENDER_COMMAND_END_RENDER;
+			end.value0 = 1;
+			result |= Check(owner.ExecuteGameRenderCommand(begin) ==
+				RENDER_RESULT_OK && owner.ExecuteGameRenderCommand(end) ==
+				RENDER_RESULT_OK && owner.Renderer().DrainThreaded() ==
+				RENDER_RESULT_OK,
+				"new-size rendering and presentation use valid recovered targets");
+		}
 		else
 		{
 			result |= Check(resizeResult == injectedResults[scenario] &&
@@ -1195,6 +1234,46 @@ int TestResizeRollback(HWND window)
 		result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
 			"resize rollback fixture shuts down");
 	}
+	return result;
+}
+
+int TestResizeOwnerThread(HWND window)
+{
+	using namespace rts::render;
+	int result = 0;
+	IRenderDevice *device = CreateD3D11RenderDevice();
+	result |= Check(device != 0, "resize owner fixture allocates D3D11 device");
+	if (device == 0) return result;
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = window;
+	parameters.width = 64;
+	parameters.height = 64;
+	parameters.enableVsync = false;
+	parameters.allowSoftwareFallback = true;
+	const RenderResult initialized = device->initialize(parameters);
+	result |= Check(initialized == RENDER_RESULT_OK,
+		"resize owner fixture initializes D3D11");
+	if (initialized == RENDER_RESULT_OK)
+	{
+		ResizeRequest request = { device, RENDER_RESULT_OK };
+		HANDLE worker = CreateThread(0, 0, ResizeFromWorker, &request, 0, 0);
+		result |= Check(worker != 0, "resize owner fixture starts worker");
+		if (worker != 0)
+		{
+			WaitForSingleObject(worker, INFINITE);
+			CloseHandle(worker);
+			RenderBackBufferInfo info;
+			result |= Check(request.result == RENDER_RESULT_INVALID_ARGUMENT &&
+				device->isOperational() &&
+				device->getBackBufferInfo(&info) == RENDER_RESULT_OK &&
+				info.width == 64 && info.height == 64 &&
+				device->resize(80, 72) == RENDER_RESULT_OK,
+				"off-owner resize is refused and owner resize remains usable");
+		}
+	}
+	device->shutdown();
+	delete device;
 	return result;
 }
 
@@ -1916,6 +1995,7 @@ int main()
 	result |= threadedResult;
 	result |= TestPublicFrameResetRecoversRemovedDevice(window);
 	result |= TestResizeRollback(window);
+	result |= TestResizeOwnerThread(window);
 	result |= TestReacquireFailureFailClosed(window);
 	const rts::render::RenderResult initializeResult = w3d.Initialize(window, descriptor);
 	if (initializeResult == rts::render::RENDER_RESULT_UNSUPPORTED)
