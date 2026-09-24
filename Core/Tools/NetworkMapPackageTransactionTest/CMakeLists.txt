@@ -16,3 +16,9 @@ add_test(NAME core_network_map_package_transaction_tests
     COMMAND core_network_map_package_transaction_tests
 )
 set_tests_properties(core_network_map_package_transaction_tests PROPERTIES TIMEOUT 90)
+
+add_test(NAME core_network_map_transfer_guard_contract_tests
+    COMMAND powershell.exe -NoProfile -ExecutionPolicy Bypass -File
+        ${CMAKE_CURRENT_SOURCE_DIR}/FileTransferGuard.Tests.ps1
+        -SourceRoot ${CMAKE_SOURCE_DIR}
+)

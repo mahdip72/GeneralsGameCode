@@ -38,6 +38,7 @@
 #include "Common/LocalFileSystem.h"
 #include "Common/file.h"
 #include "Lib/NetworkMapPackageTransaction.h"
+#include <memory>
 #endif
 #include "GameNetwork/FileTransfer.h"
 #include "GameNetwork/networkutil.h"
@@ -323,12 +324,18 @@ Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 		TheNetwork->liteupdate();
 		Sleep(1);
 	}
-	// The network hello may take eleven seconds. Only hold the package read
-	// lock while selecting and streaming actual installed map bytes.
-	rts::network_epoch::NetworkMapPackageTransaction::ReadGuard mapRead(
-		game->getMap().str(), noteRecoveredTransferMapFile);
-	if (!mapRead.ready())
-		return FALSE;
+	// Only the host reads a package for transfer. The receiver must not hold
+	// a read lock while liteupdate processes its final-map commit; that commit
+	// needs the exclusive lock before it can acknowledge the transfer.
+	std::unique_ptr<rts::network_epoch::NetworkMapPackageTransaction::ReadGuard>
+		hostRead;
+	if (game->amIHost())
+	{
+		hostRead.reset(new rts::network_epoch::NetworkMapPackageTransaction::ReadGuard(
+			game->getMap().str(), noteRecoveredTransferMapFile));
+		if (!hostRead->ready())
+			return FALSE;
+	}
 	UnsignedInt hostContentsMask = 0U;
 	UnsignedInt hostSidecarCRC = 0U;
 	if (!TheNetwork->getNetworkMapSidecarIdentity(0, &hostContentsMask,
@@ -376,6 +383,10 @@ Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 	if (!mask)
 	{
 #if defined(_WIN64)
+		rts::network_epoch::NetworkMapPackageTransaction::ReadGuard localRead(
+			game->getMap().str(), noteRecoveredTransferMapFile);
+		if (!localRead.ready())
+			return FALSE;
 		UnsignedInt localCompanionMask = 0U;
 		UnsignedInt localCompanionCRC = 0U;
 		if (!GetNetworkMapPackageCompanionCRC(game->getMap(),
@@ -417,14 +428,21 @@ Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 #if defined(_WIN64)
 	if (ok)
 	{
-		UnsignedInt localCompanionMask = 0U;
-		UnsignedInt localCompanionCRC = 0U;
-		ok = GetNetworkMapPackageCompanionCRC(game->getMap(),
-			&localCompanionMask, &localCompanionCRC) &&
-			rts::network_epoch::IsNetworkMapPackageReady(TRUE,
-				game->getMapCRC(), GetMapFileCRC(game->getMap()),
-				hostContentsMask, hostSidecarCRC,
-				localCompanionMask, localCompanionCRC);
+		rts::network_epoch::NetworkMapPackageTransaction::ReadGuard localRead(
+			game->getMap().str(), noteRecoveredTransferMapFile);
+		if (!localRead.ready())
+			ok = FALSE;
+		else
+		{
+			UnsignedInt localCompanionMask = 0U;
+			UnsignedInt localCompanionCRC = 0U;
+			ok = GetNetworkMapPackageCompanionCRC(game->getMap(),
+				&localCompanionMask, &localCompanionCRC) &&
+				rts::network_epoch::IsNetworkMapPackageReady(TRUE,
+					game->getMapCRC(), GetMapFileCRC(game->getMap()),
+					hostContentsMask, hostSidecarCRC,
+					localCompanionMask, localCompanionCRC);
+		}
 	}
 #endif
 	if (!ok)
