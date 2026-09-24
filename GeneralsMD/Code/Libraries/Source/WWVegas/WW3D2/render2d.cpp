@@ -197,7 +197,7 @@ void	  Render2DClass::Update_Bias()
 
 	BiasedCoordinateOffset = CoordinateOffset;
 
-	// D3D11 samples at half-integer pixel centers. The D3D8 half-pixel
+	// D3D11 samples at half-integer pixel centers. The historical half-pixel
 	// correction would sample the neighboring atlas texel at every repeated
 	// UI tile edge (including button centers and loading bars).
 	if ( WW3D::Is_Screen_UV_Biased() &&

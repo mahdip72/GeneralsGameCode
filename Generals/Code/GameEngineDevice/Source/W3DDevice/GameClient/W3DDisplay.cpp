@@ -90,8 +90,7 @@ static void drawFramerateBar();
 #include "WWLib/registry.h"
 #include "WW3D2/ww3d.h"
 #if !defined(_WIN64)
-#include "WW3D2/dx8wrapper.h"
-#include "WW3D2/dx8caps.h"
+#include "W3DDevice/GameClient/LegacyTextureFormatSupport.h"
 #endif
 #include "WW3D2/predlod.h"
 #include "WW3D2/part_emt.h"
@@ -3004,7 +3003,7 @@ VideoBuffer*	W3DDisplay::createVideoBuffer()
 		// If not, let the caps-ordered compatibility fallback select a format.
 		if (format != VideoBuffer::TYPE_UNKNOWN &&
 			!rts::render::IsNativeGameRendererActive() &&
-			!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( displayFormat ))
+			!rts::render::IsLegacyTextureFormatSupported( displayFormat ))
 		{
 			format = VideoBuffer::TYPE_UNKNOWN;
 		}
@@ -3015,25 +3014,25 @@ VideoBuffer*	W3DDisplay::createVideoBuffer()
 		rts::render::IsNativeGameRendererActive())
 		format = VideoBuffer::TYPE_X8R8G8B8;
 
-	// D3D8 compatibility builds retain the historical caps-based fallback.
+	// Compatibility builds retain the historical caps-based fallback.
 	// Keep these formats out of the native x64 D3D11 selection path.
 #if !defined(_WIN64)
 	if (format == VideoBuffer::TYPE_UNKNOWN &&
 		!rts::render::IsNativeGameRendererActive())
 	{
-		if (DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( WW3D_FORMAT_X8R8G8B8 ))
+		if (rts::render::IsLegacyTextureFormatSupported( WW3D_FORMAT_X8R8G8B8 ))
 		{
 			format = VideoBuffer::TYPE_X8R8G8B8;
 		}
-		else if (DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( WW3D_FORMAT_R8G8B8 ))
+		else if (rts::render::IsLegacyTextureFormatSupported( WW3D_FORMAT_R8G8B8 ))
 		{
 			format = VideoBuffer::TYPE_R8G8B8;
 		}
-		else if (DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( WW3D_FORMAT_R5G6B5 ))
+		else if (rts::render::IsLegacyTextureFormatSupported( WW3D_FORMAT_R5G6B5 ))
 		{
 			format = VideoBuffer::TYPE_R5G6B5;
 		}
-		else if (DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( WW3D_FORMAT_X1R5G5B5 ))
+		else if (rts::render::IsLegacyTextureFormatSupported( WW3D_FORMAT_X1R5G5B5 ))
 		{
 			format = VideoBuffer::TYPE_X1R5G5B5;
 		}

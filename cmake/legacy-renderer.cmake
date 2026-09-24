@@ -49,6 +49,7 @@ function(rts_add_legacy_renderer_targets)
         "${_legacy_ww3d2}/surfaceclass_legacy.cpp"
         "${_legacy_ww3d2}/texture_legacy.cpp"
         "${_legacy_ww3d2}/ww3dformat_legacy.cpp"
+        "${_legacy_gameengine_device}/Source/W3DDevice/GameClient/LegacyTextureFormatSupport.cpp"
         "${_legacy_gameengine_device}/Source/W3DDevice/GameClient/W3DProfilerFrameCaptureLegacy.cpp")
 
     add_library(rts_legacy_renderer STATIC ${_legacy_renderer_sources})
