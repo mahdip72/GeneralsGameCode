@@ -1714,6 +1714,11 @@ function Write-Stage5HostReceiptTestDocument {
                 [string]$ArtifactHashes['generals-executable']
             }
             else { [string]$ArtifactHashes['zerohour-executable'] }
+            $executableLeaf = if ($childTitle -ceq 'Generals') {
+                'generalsv.exe'
+            }
+            else { 'generalszh.exe' }
+            $recordedExecutablePath = "installed\$executableLeaf"
             $childLeaf = if ($Role -ceq 'validation-results') {
                 '{0}.{1:D4}' -f $childTitle.ToLowerInvariant(), $sequence
             }
@@ -1731,7 +1736,7 @@ function Write-Stage5HostReceiptTestDocument {
             $childArguments = @('-headless', '-noFPSLimit', '-pipelineMode', 'serial',
                 '-simulationMode', 'serial', '-workerPolicy', 'auto',
                 '-workerCount', '1', '-validationExecutableSha256', $executableHash)
-            $childCommandLine = "installed\$childTitle.exe " + ($childArguments -join ' ')
+            $childCommandLine = $recordedExecutablePath + ' ' + ($childArguments -join ' ')
             $nativeDocument = [ordered]@{
                 schemaVersion = 1
                 evidenceKind = 'stage5-executable-originated-receipt'
@@ -1758,7 +1763,7 @@ function Write-Stage5HostReceiptTestDocument {
                     receiptPath = $nativeLeaf
                     processId = $processId
                     processCreationUtc = '2026-09-01T00:00:00.0000000Z'
-                    executablePath = "installed\$childTitle.exe"
+                    executablePath = $recordedExecutablePath
                     executableSha256 = $executableHash
                     commandLine = $childCommandLine
                     exitCode = 0
@@ -1769,7 +1774,7 @@ function Write-Stage5HostReceiptTestDocument {
             $child = [ordered]@{
                 role = $Role; title = $childTitle; runNonce = $childRunNonce
                 processId = $processId; processCreationUtc = '2026-09-01T00:00:00.0000000Z'
-                executablePath = "installed\$childTitle.exe"
+                executablePath = $recordedExecutablePath
                 executableSha256 = $executableHash
                 commandLine = $childCommandLine
                 exitCode = 0
