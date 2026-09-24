@@ -87,6 +87,20 @@ if(WIN32)
                 ENVIRONMENT
                     "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=${_stage5_validation_test_scratch_root}")
     endforeach()
+    # The complete mixed native-path producer uses a fresh two-title,
+    # 253-child corpus. Run it as a separate bounded acceptance gate so its
+    # independent immutable-read/staging pass has its own CTest budget.
+    add_test(NAME core_deterministic_simulation_validation_combined_native_path_modes_tests
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+            -File "${CMAKE_CURRENT_SOURCE_DIR}/DeterministicSimulationValidation.Tests.ps1"
+            -ValidationPartition Acceptance
+            -FocusedAcceptanceCase CombinedNativePathModes
+            -Verbose)
+    set_tests_properties(
+        core_deterministic_simulation_validation_combined_native_path_modes_tests
+        PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 7200
+            ENVIRONMENT
+                "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=${_stage5_validation_test_scratch_root}")
     add_test(NAME core_stage5_replay_corpus_exporter_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass
             -File "${CMAKE_CURRENT_SOURCE_DIR}/Stage5ReplayCorpusExporter.Tests.ps1"
@@ -346,6 +360,7 @@ if(WIN32)
         core_deterministic_simulation_validation_plan_tests
         core_deterministic_simulation_validation_runtime_tests
         core_deterministic_simulation_validation_acceptance_tests
+        core_deterministic_simulation_validation_combined_native_path_modes_tests
         core_stage5_replay_corpus_exporter_tests
         core_stage5_validation_runner_safety_tests
         core_stage5_validation_results_provenance_tests

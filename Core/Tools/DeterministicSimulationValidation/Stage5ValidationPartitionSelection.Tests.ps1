@@ -123,7 +123,7 @@ foreach ($partition in @('All', 'Plan', 'Runtime', 'Acceptance')) {
 foreach ($focusedCase in @('QualificationDataReceipt',
         'DevelopmentReadinessExecutionEvidence', 'AiDeterminismGrouping',
         'LivePlanEntryIdentity', 'ResultTreeDictionary',
-        'FinalAcceptanceOutputPublication')) {
+        'FinalAcceptanceOutputPublication', 'CombinedNativePathModes')) {
     foreach ($partition in @('All', 'Acceptance')) {
         $output = @(& $entrypoint -ValidationPartition $partition `
             -FocusedAcceptanceCase $focusedCase -PartitionSelectionPreflightOnly)

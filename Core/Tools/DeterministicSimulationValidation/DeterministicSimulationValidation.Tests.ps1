@@ -21,6 +21,8 @@ $focusedPerformanceScalingExport =
     $FocusedAcceptanceCase -ceq 'PerformanceScalingExport'
 $focusedFinalAcceptanceOutputPublication =
     $FocusedAcceptanceCase -ceq 'FinalAcceptanceOutputPublication'
+$focusedCombinedNativePathModes =
+    $FocusedAcceptanceCase -ceq 'CombinedNativePathModes'
 if (-not [string]::IsNullOrWhiteSpace($FocusedAcceptanceCase) -and
     -not ($focusedQualificationData -or
         $focusedDevelopmentReadinessExecutionEvidence -or
@@ -28,7 +30,8 @@ if (-not [string]::IsNullOrWhiteSpace($FocusedAcceptanceCase) -and
         $focusedLivePlanEntryIdentity -or
         $focusedResultTreeDictionary -or
         $focusedPerformanceScalingExport -or
-        $focusedFinalAcceptanceOutputPublication)) {
+        $focusedFinalAcceptanceOutputPublication -or
+        $focusedCombinedNativePathModes)) {
     throw "Unknown focused acceptance case '$FocusedAcceptanceCase'."
 }
 if (($focusedQualificationData -or
@@ -37,7 +40,8 @@ if (($focusedQualificationData -or
         $focusedLivePlanEntryIdentity -or
         $focusedResultTreeDictionary -or
         $focusedPerformanceScalingExport -or
-        $focusedFinalAcceptanceOutputPublication) -and
+        $focusedFinalAcceptanceOutputPublication -or
+        $focusedCombinedNativePathModes) -and
     $ValidationPartition -notin @('All', 'Acceptance')) {
     throw 'Focused acceptance cases require ValidationPartition Acceptance or All.'
 }
@@ -47,7 +51,7 @@ $hasFocusedAcceptanceCase = $focusedQualificationData -or
     $focusedLivePlanEntryIdentity -or
     $focusedResultTreeDictionary -or
     $focusedPerformanceScalingExport -or
-    $focusedFinalAcceptanceOutputPublication
+    $focusedFinalAcceptanceOutputPublication -or $focusedCombinedNativePathModes
 $runPlan = -not $hasFocusedAcceptanceCase -and
     ($ValidationPartition -eq 'All' -or $ValidationPartition -eq 'Plan')
 $runRuntime = -not $hasFocusedAcceptanceCase -and
@@ -61,7 +65,8 @@ $runAcceptance = $hasFocusedAcceptanceCase -or
 $expectedFocusedSelection = $focusedQualificationData -or
     $focusedDevelopmentReadinessExecutionEvidence -or $focusedAiDeterminismGrouping -or
     $focusedLivePlanEntryIdentity -or $focusedResultTreeDictionary -or
-    $focusedPerformanceScalingExport -or $focusedFinalAcceptanceOutputPublication
+    $focusedPerformanceScalingExport -or $focusedFinalAcceptanceOutputPublication -or
+    $focusedCombinedNativePathModes
 if ($runPlan -ne (($ValidationPartition -in @('All', 'Plan')) -and
         -not $expectedFocusedSelection) -or
     $runRuntime -ne (($ValidationPartition -in @('All', 'Runtime')) -and
@@ -9745,6 +9750,10 @@ try {
         'replay-results' = [string]$syntheticZeroHour.replayReceiptPath
         'ai-results' = [string]$syntheticZeroHour.aiReceiptPath
     }
+    # The mixed native-path producer runs as its own bounded CTest. Its input
+    # corpus is still freshly generated and complete, but it does not need the
+    # unrelated final-acceptance attachments or primary producer output.
+    if (-not $focusedCombinedNativePathModes) {
     $requiredAttachmentRoles = [ordered]@{
         # Attachment identity is the composite role/title key.  Replay
         # qualification has one reviewed fixture receipt per title; retaining
@@ -9995,6 +10004,7 @@ try {
         $evidencePaths[$kind] = $path
         $evidenceHashes[$kind] = Get-Sha256 $path
     }
+    }
 
     # The combined-results producer is an independent host-runner boundary. It
     # must consume two already-produced title receipts, not synthesize a Both
@@ -10117,6 +10127,7 @@ try {
     # Each case snapshots and restores only the small JSON documents it mutates,
     # preserving the complete producer path while avoiding repeated tree copies.
     $combinedProducerRoot = New-CombinedHostProducerTestCase 'shared'
+    if (-not $focusedCombinedNativePathModes) {
     $combinedForgedSource = Join-Path $combinedProducerRoot `
         'combined-source-receipts\Generals\validation-results-receipt.json'
     Invoke-Stage5AcceptanceMutationCase {
@@ -10200,6 +10211,7 @@ try {
             Invoke-CombinedHostProducerTestCase $combinedProducerRoot 'duplicate-nonce'
         } 'replayed.*runNonce|distinct run nonces|wrapper nonce distinct' `
             'combined host producer rejects reused source run nonces'
+    }
     }
 
     function Set-CombinedNativeRawPathFixture {
@@ -10313,6 +10325,7 @@ try {
     # Repeating the 253-child producer once per mode duplicates the expensive
     # immutable-read and staging matrix without covering a distinct code path;
     # the focused relocation suite retains exhaustive per-mode negatives.
+    if ($focusedCombinedNativePathModes) {
     Invoke-Stage5AcceptanceMutationCase {
         param($snapshot)
         Set-CombinedNativeRawPathFixture $combinedProducerRoot $snapshot `
@@ -10352,6 +10365,12 @@ try {
         catch {
             Assert-True $false "combined host producer accepts mixed absolute and uploaded native paths: $($_.Exception.Message)"
         }
+    }
+    if ($script:Failures -ne 0) {
+        throw "$script:Failures focused combined native-path test(s) failed."
+    }
+    Write-Output 'Focused combined native-path acceptance proof passed.'
+    return
     }
     foreach ($pathMode in @(
         @{ mode = 'traversal'; pattern = 'parent traversal' },
