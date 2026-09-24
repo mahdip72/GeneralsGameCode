@@ -152,6 +152,27 @@ int main(int argc, char **argv)
 	DeleteFileA(incompleteJournal.c_str());
 	RemoveDirectoryA(nested.c_str());
 	DeleteFileA(sentinel.c_str());
+	const std::string shortMap = folder + "\\short.map";
+	const std::string shortJournal = shortMap + ".ggctxn";
+	const std::string shortBackup = folder + "\\ggcA.tmp";
+	const std::string longBackup = folder + "\\ggc12345.tmp";
+	const std::string shortRecord = "GGCNET31\n1\n1\t" + shortMap +
+		"\t" + shortBackup + "\n";
+	ok = Check(Write(shortMap, "partial") && Write(shortBackup, "original") &&
+		Write(shortJournal, shortRecord) &&
+		NetworkMapPackageTransaction::recover(shortMap.c_str()) &&
+		Read(shortMap) == "original" &&
+		GetFileAttributesA(shortBackup.c_str()) == INVALID_FILE_ATTRIBUTES,
+		"short GetTempFileName backup suffix restores original bytes") && ok;
+	const std::string longRecord = "GGCNET31\n1\n1\t" + shortMap +
+		"\t" + longBackup + "\n";
+	ok = Check(Write(longBackup, "invalid") && Write(shortJournal, longRecord) &&
+		!NetworkMapPackageTransaction::recover(shortMap.c_str()) &&
+		Read(shortMap) == "original" && Read(longBackup) == "invalid",
+		"oversized backup suffix is rejected before file access") && ok;
+	DeleteFileA(shortJournal.c_str());
+	DeleteFileA(shortMap.c_str());
+	DeleteFileA(longBackup.c_str());
 	char executable[MAX_PATH];
 	STARTUPINFOA startup = {};
 	startup.cb = sizeof(startup);

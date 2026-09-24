@@ -284,16 +284,19 @@ private:
 			return false;
 		const std::string directory(map, separator - map + 1);
 		const std::string normalized = normalizePath(backup);
-		if (normalized.size() != directory.size() + 11U ||
+		if (normalized.size() < directory.size() + 8U ||
+			normalized.size() > directory.size() + 11U ||
 			_strnicmp(normalized.c_str(), directory.c_str(), directory.size()) != 0)
 			return false;
-		// GetTempFileNameA("ggc") creates exactly ggcXXXX.tmp in this folder.
+		// GetTempFileNameA("ggc") uses one to four hex digits in this folder.
 		// An arbitrary or traversing journal path must not become a CopyFileA
 		// source or a cleanup deletion target during restart recovery.
 		const char *name = normalized.c_str() + directory.size();
-		if (_strnicmp(name, "ggc", 3) != 0 || _stricmp(name + 7, ".tmp") != 0)
+		const std::size_t nameLength = normalized.size() - directory.size();
+		if (_strnicmp(name, "ggc", 3) != 0 ||
+			_stricmp(name + nameLength - 4, ".tmp") != 0)
 			return false;
-		for (std::size_t i = 3; i < 7; ++i)
+		for (std::size_t i = 3; i < nameLength - 4; ++i)
 		{
 			const char ch = name[i];
 			if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F') ||
