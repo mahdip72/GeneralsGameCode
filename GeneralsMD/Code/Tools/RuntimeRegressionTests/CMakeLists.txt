@@ -62,6 +62,28 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD)
 	add_test(NAME z_resolution_archive_policy_tests
 		COMMAND z_runtime_regression_tests --resolution-archive-policy)
 	set_tests_properties(z_resolution_archive_policy_tests PROPERTIES TIMEOUT 30)
+	add_executable(z_point_group_startup_tests
+		"${CMAKE_SOURCE_DIR}/Generals/Code/Tools/RuntimeRegressionTests/PointGroupStartupTest.cpp"
+	)
+	target_include_directories(z_point_group_startup_tests PRIVATE
+		"${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2"
+	)
+	target_link_libraries(z_point_group_startup_tests PRIVATE
+		comctl32
+		core_debug
+		core_profile_legacy
+		core_ww3d2_native
+		imm32
+		rts_product_runtime
+		vfw32
+		winmm
+		z_gameengine
+		z_gameenginedevice
+		zi_always
+	)
+	add_test(NAME z_point_group_startup_tests
+		COMMAND z_point_group_startup_tests)
+	set_tests_properties(z_point_group_startup_tests PROPERTIES TIMEOUT 30)
 	include("${CMAKE_SOURCE_DIR}/Core/Tools/Stage5PerformanceFixtureTest/HeadlessMetricStartupTitleTest.cmake")
 	rts_add_headless_metric_startup_test(z_runtime_regression_tests
 		GeneralsMD z_headless_metric_startup_tests)

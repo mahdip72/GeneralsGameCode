@@ -2,13 +2,11 @@
 #include "nativew3dbufferowner.h"
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/LegacyColorPacking.h"
+#include "Renderer/PointGroupColorPacking.h"
 
 #include <cstdio>
 #include <cstring>
 #include <vector>
-
-unsigned int PackPointGroupVertexColor(const Vector4 *colors, int vertex,
-	bool quads, unsigned int &packed);
 
 namespace
 {
@@ -27,35 +25,38 @@ int Check(bool condition, const char *message)
 int CheckPackedQuadColors()
 {
 	const int verticesPerChunk = 2048;
-	std::vector<Vector4> colors(verticesPerChunk + 8);
-	for (int i = 0; i < static_cast<int>(colors.size()); ++i)
-	{
-		const int particle = i / 4;
-		colors[i] = Vector4((particle % 7) / 6.0f,
-			(particle % 11) / 10.0f, (particle % 13) / 12.0f,
-			(particle % 17) / 16.0f);
-	}
+	const int vertexCount = verticesPerChunk + 8;
 	for (int mode = 0; mode != 2; ++mode)
 	{
-		if (mode != 0)
+		const int verticesPerPoint = mode == 0 ? 4 : 3;
+		const int pointCount =
+			(vertexCount + verticesPerPoint - 1) / verticesPerPoint;
+		std::vector<Vector4> colors(pointCount);
+		for (int i = 0; i < pointCount; ++i)
 		{
-			for (int i = 0; i < static_cast<int>(colors.size()); ++i)
-				colors[i] = Vector4((i % 7) / 6.0f, (i % 11) / 10.0f,
-					(i % 13) / 12.0f, (i % 17) / 16.0f);
+			colors[i] = Vector4((i % 7) / 6.0f, (i % 11) / 10.0f,
+				(i % 13) / 12.0f, (i % 17) / 16.0f);
 		}
+		int cachedPointIndex = -1;
 		unsigned int packed = 0;
-		for (int i = 0; i < static_cast<int>(colors.size()); ++i)
+		for (int i = 0; i < vertexCount; ++i)
 		{
-			if (i == verticesPerChunk) packed = 0;
-			const Vector4 &color = colors[i];
+			if (i == verticesPerChunk)
+			{
+				cachedPointIndex = -1;
+				packed = 0;
+			}
+			const Vector4 &color = colors[i / verticesPerPoint];
 			const unsigned int expected = PackLegacyARGB(color.X, color.Y,
 				color.Z, color.W);
-			const unsigned int actual = PackPointGroupVertexColor(
-				&colors[0], i, mode == 0, packed);
-			if (actual != expected)
+			const bool repacked = rts::render::PackPointGroupColorForVertex(
+				&colors[0], i, verticesPerPoint, cachedPointIndex, packed);
+			const bool expectedRepack = i == 0 || i == verticesPerChunk ||
+				i % verticesPerPoint == 0;
+			if (packed != expected || repacked != expectedRepack)
 				return Check(false, mode == 0 ?
 					"quad RGBA packing preserves colors across vertex chunks" :
-					"non-quad RGBA packing preserves each vertex color");
+					"triangle RGBA packing preserves colors across vertex chunks");
 		}
 	}
 	return 0;
