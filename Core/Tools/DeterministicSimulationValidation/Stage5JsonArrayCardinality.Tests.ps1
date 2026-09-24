@@ -425,8 +425,14 @@ try {
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
             $node.Name -ceq 'Invoke-Stage5FinalAcceptanceAggregation'
     }, $true))[0]
+    $evidenceIdentityAst = @($moduleAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq 'Assert-Stage5FinalAcceptanceEvidenceIdentity'
+    }, $true))[0]
     $nativeChildText = $nativeChildAst.Extent.Text
     $aggregationText = $aggregationAst.Extent.Text
+    $evidenceIdentityText = $evidenceIdentityAst.Extent.Text
     foreach ($guard in @(
             '\$nativeEvidenceKind\s+-is\s+\[string\]',
             '\$nativeStatus\s+-is\s+\[string\]',
@@ -437,12 +443,50 @@ try {
     }
     foreach ($guard in @(
             '\$artifactSetSourceCommit\s+-is\s+\[string\]',
-            '\$artifactSetArchitecture\s+-is\s+\[string\]',
-            '\$evidenceKind\s+-is\s+\[string\]',
-            '\$evidenceSourceCommit\s+-is\s+\[string\]',
-            '\$evidenceArtifactSetSha256\s+-is\s+\[string\]')) {
+            '\$artifactSetArchitecture\s+-is\s+\[string\]')) {
         Assert-Cardinality ($aggregationText -match $guard) `
             "Final aggregation scalar guard is missing: $guard"
+    }
+    foreach ($guard in @(
+            '\$EvidenceKind\s+-is\s+\[string\]',
+            '\$Status\s+-is\s+\[string\]',
+            '\$SourceCommit\s+-is\s+\[string\]',
+            '\$Architecture\s+-is\s+\[string\]',
+            '\$ArtifactSetSha256\s+-is\s+\[string\]')) {
+        Assert-Cardinality ($evidenceIdentityText -match $guard) `
+            "Final evidence identity scalar guard is missing: $guard"
+    }
+    $evidenceIdentityCalls = @($aggregationAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -ceq 'Assert-Stage5FinalAcceptanceEvidenceIdentity'
+    }, $true))
+    Assert-Cardinality ($evidenceIdentityCalls.Count -eq 1) `
+        'Final aggregation must use one shared evidence identity guard.'
+    $evidenceIdentityCommandElements = @(
+        $evidenceIdentityCalls[0].CommandElements | ForEach-Object {
+            $_.Extent.Text
+        })
+    $evidenceIdentityBindings = @(
+        '-SchemaVersion', '$evidenceSchemaVersion',
+        '-EvidenceKind', '$evidenceKind',
+        '-Status', '$evidenceStatus',
+        '-SourceCommit', '$evidenceSourceCommit',
+        '-Architecture', '$evidenceArchitecture',
+        '-ArtifactSetSha256', '$evidenceArtifactSetSha256',
+        '-ExpectedKind', '$kind',
+        '-ExpectedSourceCommit', '$sourceCommit',
+        '-ExpectedArtifactSetSha256', '$artifactSetHash')
+    for ($bindingIndex = 0; $bindingIndex -lt $evidenceIdentityBindings.Count;
+            $bindingIndex += 2) {
+        $parameterName = $evidenceIdentityBindings[$bindingIndex]
+        $expectedValue = $evidenceIdentityBindings[$bindingIndex + 1]
+        $parameterIndex = [Array]::IndexOf($evidenceIdentityCommandElements, $parameterName)
+        Assert-Cardinality ($parameterIndex -ge 0 -and
+            [Array]::LastIndexOf($evidenceIdentityCommandElements, $parameterName) -eq $parameterIndex -and
+            $parameterIndex + 1 -lt $evidenceIdentityCommandElements.Count -and
+            $evidenceIdentityCommandElements[$parameterIndex + 1] -ceq $expectedValue) `
+            "Final aggregation must bind $parameterName to $expectedValue through the evidence identity guard."
     }
     $runtimeClosureAst = @($moduleAst.FindAll({
         param($node)
