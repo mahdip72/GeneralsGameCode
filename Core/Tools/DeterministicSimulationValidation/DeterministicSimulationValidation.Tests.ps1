@@ -19,6 +19,8 @@ $focusedResultTreeDictionary =
     $FocusedAcceptanceCase -ceq 'ResultTreeDictionary'
 $focusedPerformanceScalingExport =
     $FocusedAcceptanceCase -ceq 'PerformanceScalingExport'
+$focusedNativeReceiptDiagnostics =
+    $FocusedAcceptanceCase -ceq 'NativeReceiptDiagnostics'
 $focusedFinalAcceptanceOutputPublication =
     $FocusedAcceptanceCase -ceq 'FinalAcceptanceOutputPublication'
 $focusedCombinedNativePathModes =
@@ -30,6 +32,7 @@ if (-not [string]::IsNullOrWhiteSpace($FocusedAcceptanceCase) -and
         $focusedLivePlanEntryIdentity -or
         $focusedResultTreeDictionary -or
         $focusedPerformanceScalingExport -or
+        $focusedNativeReceiptDiagnostics -or
         $focusedFinalAcceptanceOutputPublication -or
         $focusedCombinedNativePathModes)) {
     throw "Unknown focused acceptance case '$FocusedAcceptanceCase'."
@@ -40,6 +43,7 @@ if (($focusedQualificationData -or
         $focusedLivePlanEntryIdentity -or
         $focusedResultTreeDictionary -or
         $focusedPerformanceScalingExport -or
+        $focusedNativeReceiptDiagnostics -or
         $focusedFinalAcceptanceOutputPublication -or
         $focusedCombinedNativePathModes) -and
     $ValidationPartition -notin @('All', 'Acceptance')) {
@@ -51,6 +55,7 @@ $hasFocusedAcceptanceCase = $focusedQualificationData -or
     $focusedLivePlanEntryIdentity -or
     $focusedResultTreeDictionary -or
     $focusedPerformanceScalingExport -or
+    $focusedNativeReceiptDiagnostics -or
     $focusedFinalAcceptanceOutputPublication -or $focusedCombinedNativePathModes
 $runPlan = -not $hasFocusedAcceptanceCase -and
     ($ValidationPartition -eq 'All' -or $ValidationPartition -eq 'Plan')
@@ -65,7 +70,8 @@ $runAcceptance = $hasFocusedAcceptanceCase -or
 $expectedFocusedSelection = $focusedQualificationData -or
     $focusedDevelopmentReadinessExecutionEvidence -or $focusedAiDeterminismGrouping -or
     $focusedLivePlanEntryIdentity -or $focusedResultTreeDictionary -or
-    $focusedPerformanceScalingExport -or $focusedFinalAcceptanceOutputPublication -or
+    $focusedPerformanceScalingExport -or $focusedNativeReceiptDiagnostics -or
+    $focusedFinalAcceptanceOutputPublication -or
     $focusedCombinedNativePathModes
 if ($runPlan -ne (($ValidationPartition -in @('All', 'Plan')) -and
         -not $expectedFocusedSelection) -or
@@ -1917,6 +1923,7 @@ function Write-Stage5ExecutableReceiptTestDocument {
         [string]$ArtifactHashes['generals-executable']
     }
     else { [string]$ArtifactHashes['zerohour-executable'] }
+    $recordedExecutablePath = "installed\$Title.exe"
     $nativeLeaf = "$leaf.native.json"
     $nativePath = Join-Path $directory $nativeLeaf
     $nativeRawLeaf = "$leaf.native.raw.log"
@@ -1951,9 +1958,9 @@ function Write-Stage5ExecutableReceiptTestDocument {
             receiptPath = $nativeLeaf
             processId = 33000
             processCreationUtc = '2026-09-01T00:00:00.0000000Z'
-            executablePath = "installed\$Title.exe"
+            executablePath = $recordedExecutablePath
             executableSha256 = $executableHash
-            commandLine = "$Title.exe -headless -stage5-validation"
+            commandLine = "$recordedExecutablePath -headless -stage5-validation"
             exitCode = 0
         }
     }
@@ -1989,9 +1996,9 @@ function Write-Stage5ExecutableReceiptTestDocument {
             kind = 'native-executable-observation'
             receiptPath = $nativeLeaf; receiptSha256 = $nativeHash
             processId = 33000; processCreationUtc = '2026-09-01T00:00:00.0000000Z'
-            executablePath = "installed\$Title.exe"
+            executablePath = $recordedExecutablePath
             executableSha256 = $executableHash
-            commandLine = "$Title.exe -headless -stage5-validation"
+            commandLine = "$recordedExecutablePath -headless -stage5-validation"
             exitCode = 0
         }
         details = $wrapperDetails
@@ -2887,7 +2894,7 @@ function Assert-CurrentNativeReceiptCatalog {
     }
     $definition = $runnerTree.Find({param($node)
         $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
-        @('Get-NativeV2ReceiptReference','Get-NativePerformanceReceiptReference') -ccontains $node.Name
+        $node.Name -ceq 'Get-NativePerformanceReceiptReference'
     }, $true)
     Invoke-Expression $definition.Extent.Text
     $parserCommand = $definition.Name
@@ -2924,7 +2931,15 @@ function Assert-CurrentNativeReceiptCatalog {
             ExpectedCohortNonce=$script:TestCohortNonce
             ExpectedCohortCreatedUtc=$script:TestCohortCreatedUtc
             ExpectedRuntimeClosure=$script:TestRuntimeClosure}
-        Assert-Throws { Read-Stage5FinalAcceptanceImmutableReceipt @readArguments } 'producer|version|V5|obsolete' `
+        if ($domain -ceq 'host-runner') {
+            $relocation = Get-Stage5FinalAcceptanceNativeRelocationBinding `
+                -Path $path -EvidenceDirectory $Directory
+            $readArguments.NativeRelocationBindings = @($relocation.children)
+        }
+        $readImmutableReceipt = {
+            Read-Stage5FinalAcceptanceImmutableReceipt @readArguments
+        }
+        Assert-Throws { & $readImmutableReceipt | Out-Null } 'producer|version|V5|obsolete' `
             "$domain cannot promote an obsolete hash-bound native receipt"
         [string[]]$expectedArguments = if ($domain -ceq 'host-runner') {
             @('-headless', '-noFPSLimit', '-pipelineMode', 'serial',
@@ -2947,7 +2962,7 @@ function Assert-CurrentNativeReceiptCatalog {
         Add-Stage5NativeReceiptTestObservations $native
         & $publish
         try {
-            $proof = Read-Stage5FinalAcceptanceImmutableReceipt @readArguments
+            $proof = & $readImmutableReceipt
             Assert-True ($proof.trustDomain -ceq $domain) `
                 'current V5 throughput provenance with no admitted streams remains valid non-scaling evidence'
         } catch { Assert-True $false "current V5 throughput provenance was rejected: $($_.Exception.Message)" }
@@ -2955,14 +2970,14 @@ function Assert-CurrentNativeReceiptCatalog {
         $native.provenance.processId = [double]$nativeProcessId + 0.5
         & $publish
         Assert-Throws {
-            Read-Stage5FinalAcceptanceImmutableReceipt @readArguments | Out-Null
+            & $readImmutableReceipt | Out-Null
         } 'processId must be an integer' `
             "$domain native provenance rejects a fractional processId"
         $native.provenance.processId = $nativeProcessId
         $native.provenance.exitCode = 0.5
         & $publish
         Assert-Throws {
-            Read-Stage5FinalAcceptanceImmutableReceipt @readArguments | Out-Null
+            & $readImmutableReceipt | Out-Null
         } 'exitCode must be an integer' `
             "$domain native provenance rejects a fractional exitCode"
         $native.provenance.exitCode = 0
@@ -3032,7 +3047,7 @@ function Assert-CurrentNativeReceiptCatalog {
             }
             & $publish
             try {
-                $proof = Read-Stage5FinalAcceptanceImmutableReceipt @readArguments
+                $proof = & $readImmutableReceipt
                 Assert-True ($proof.trustDomain -ceq $domain) "$domain accepts explicit observed-only $mode without fabricated workload or workers"
             } catch { Assert-True $false "$domain observed-only $mode rejected: $($_.Exception.Message)" }
             $parsedReferences=@(& $parserCommand @parserArguments)
@@ -3049,7 +3064,7 @@ function Assert-CurrentNativeReceiptCatalog {
                 'serial-workers' { $native.simulationMode='serial';$native.schedulerStarted=$false }
             }
             & $publish
-            Assert-Throws { Read-Stage5FinalAcceptanceImmutableReceipt @readArguments } 'fixture|seed|qualif|scheduler|worker|replay' `
+            Assert-Throws { & $readImmutableReceipt | Out-Null } 'fixture|seed|qualif|scheduler|worker|replay' `
                 "$domain rejects $mutation without inventing observed metadata"
             Assert-True ($null -eq (& $parserCommand @parserArguments)) "runner child reader rejects $mutation"
             $crlfArguments = $parserArguments.Clone()
@@ -3066,7 +3081,7 @@ function Assert-CurrentNativeReceiptCatalog {
                 'unclosed' { $native.rawEvidence.timingClosed=$false }
             }
             & $publish
-            Assert-Throws { Read-Stage5FinalAcceptanceImmutableReceipt @readArguments } 'role|oracle|reference|timing|finalized|producer|version' `
+            Assert-Throws { & $readImmutableReceipt | Out-Null } 'role|oracle|reference|timing|finalized|producer|version' `
                 "$domain rejects $mutation native evidence without inventing coverage"
             Assert-True ($null -eq (& $parserCommand @parserArguments)) `
                 "runner child reader rejects $mutation native evidence"
@@ -3076,6 +3091,43 @@ function Assert-CurrentNativeReceiptCatalog {
                 "CRLF runner child reader rejects $mutation native evidence"
         }
     }
+}
+
+function Assert-HostNativeOracleMutationRejects {
+    param([string]$Directory, [string]$SourceCommit, [string]$ArtifactSetSha256,
+        [Collections.IDictionary]$ArtifactHashes)
+    $caseDirectory = Join-Path $Directory 'focused-host-native-oracle'
+    New-Item -ItemType Directory -Path $caseDirectory -Force | Out-Null
+    $path = Join-Path $caseDirectory 'validation-results.json'
+    Write-Stage5HostReceiptTestDocument $path 'validation-results' 'ZeroHour' $SourceCommit $ArtifactSetSha256 $ArtifactHashes
+    $wrapper = ConvertFrom-Stage5JsonDictionary $path
+    $child = $wrapper.provenance.children[0]
+    $nativePath = Join-Path $caseDirectory ([string]$child.nativeReceipt.path)
+    $native = ConvertFrom-Stage5JsonDictionary $nativePath
+    Add-Stage5NativeReceiptTestObservations $native
+    $native.measurementRole = 'serial-oracle'
+    $native.kernelReference.mode = 'serial-oracle'
+    Write-JsonDocument $nativePath $native
+    $child.nativeReceipt.sha256 = Get-Sha256 $nativePath
+    Write-JsonDocument $path $wrapper
+    $relocation = Get-Stage5FinalAcceptanceNativeRelocationBinding -Path $path -EvidenceDirectory $caseDirectory
+    $arguments = @{
+        Path = $path
+        Kind = 'deterministic-runtime'
+        Role = 'validation-results'
+        EvidenceTitle = 'ZeroHour'
+        ExpectedSourceCommit = $SourceCommit
+        ExpectedArtifactSetSha256 = $ArtifactSetSha256
+        ArtifactHashes = $ArtifactHashes
+        ExpectedCohortNonce = $script:TestCohortNonce
+        ExpectedCohortCreatedUtc = $script:TestCohortCreatedUtc
+        ExpectedRuntimeClosure = $script:TestRuntimeClosure
+        NativeRelocationBindings = @($relocation.children)
+    }
+    Assert-Throws {
+        Read-Stage5FinalAcceptanceImmutableReceipt @arguments | Out-Null
+    } 'role|oracle|reference|timing|finalized|producer|version' `
+        'host-runner rejects oracle native evidence after valid relocation binding'
 }
 
 function Write-Stage5ProtectedAttestationTestDocument {
@@ -4240,6 +4292,9 @@ function Assert-PerformanceDiagnosticsConversion {
         Write-JsonDocument $rawPath @{ run = $index }
         Write-JsonDocument $timingPath @{ frame = $index }
         $receiptPath = Join-Path $directory "diagnostics-$index.receipt.json"
+        $expectedArgumentString = '-headless -noFPSLimit -pipelineMode serial ' +
+            '-simulationMode parallel -workerPolicy auto -workerCount 1 ' +
+            "-validationExecutableSha256 $ExecutableSha256 -replay `"$replayPath`""
         $phases = @()
         foreach ($name in @('owner-intake', 'legacy-mutable-island', 'spatial-work',
             'owner-tail', 'verification-publication')) {
@@ -4258,7 +4313,8 @@ function Assert-PerformanceDiagnosticsConversion {
             architecture = 'x64'; cohortCreatedUtc = '2026-01-01T00:00:00Z'
             runtimeClosure = @{ dependencyManifestSha256 = $dependencyHash; closureSha256 = $closureHash }
             runNonce = "11111111-1111-4111-8111-11111111111$index"
-            cohortNonce = '22222222-2222-4222-8222-222222222222'; commandLine = "test-run-$index"
+            cohortNonce = '22222222-2222-4222-8222-222222222222'
+            commandLine = "$executablePath $expectedArgumentString"
             process = @{ id = 20000 + $index; creationTimeUtc100ns = 100 + $index
                 identityAvailable = $true; exitCodeKnown = $true; exitCode = 0 }
             fixture = @{ id = 'one-thousand-units'; requestedPlayerCount = 8
@@ -4322,6 +4378,7 @@ function Assert-PerformanceDiagnosticsConversion {
         $runs += [ordered]@{
             fixtureId = 'one-thousand-units'; lane = 'forced-one'; ordinal = $index
             warmup = $index -eq 0; elapsedMilliseconds = $times[$index]
+            expectedArgumentString = $expectedArgumentString
             runId = $receipt.runId; processId = $receipt.process.id
             processCreationTimeUtc100ns = $receipt.process.creationTimeUtc100ns
             receiptPath = $receiptPath; receiptSha256 = $binding.sha256; receiptBinding = $binding
@@ -4348,6 +4405,7 @@ function Assert-PerformanceDiagnosticsConversion {
         $SourceCommit $ArtifactSetSha256 $ExecutableSha256 'ZeroHour'
     Assert-True (@($proof).Count -eq 1 -and -not $proof.finalAcceptanceClaim -and $proof.status -ceq 'diagnostic' -and
         $proof.schemaVersion -eq 3 -and $proof.runs[1].measurementRole -ceq 'throughput' -and
+        $proof.runs[1].argumentString -ceq $runs[1].expectedArgumentString -and
         $proof.runs[1].kernelReference.streams[0].committedOperationCount -eq 2 -and
         $proof.lanes[0].medianElapsedMilliseconds -eq 20.0 -and $proof.lanes[0].measuredRuns -eq 3) `
         'local converter retains canonical batch/operation identity and excludes warmups from throughput medians'
@@ -9656,6 +9714,19 @@ try {
         'Runtime role semantic positive'
     Assert-True ($runtimeRoleBinding.fileCount -eq 10) `
         'runtime closure binds all six core artifact roles to the complete installed closure'
+
+    if ($focusedNativeReceiptDiagnostics) {
+        Assert-HostNativeOracleMutationRejects $attachmentRoot $sourceCommit $artifactSetHash $artifactTestHashes
+        Assert-PerformanceDiagnosticsConversion `
+            (Join-Path $attachmentRoot 'scaling-diagnostics-input.json') `
+            $sourceCommit $artifactSetHash `
+            $artifactTestHashes['zerohour-executable']
+        if ($script:Failures -ne 0) {
+            throw "$script:Failures focused native-receipt/diagnostics test(s) failed."
+        }
+        Write-Output 'Stage 5 focused native-receipt and performance-diagnostics tests passed.'
+        return
+    }
 
     if ($focusedPerformanceScalingExport) {
         $focusedPerformancePath = Join-Path $attachmentRoot `
