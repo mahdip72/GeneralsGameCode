@@ -1642,6 +1642,104 @@ int main()
 	manager.update();
 	check(!manager.isCurrentlyPlaying(inaudibleHandle) && engine->activeVoiceCount == 0,
 		"ordinary 3D loops retire below the minimum volume before reaching maximum range");
+	{
+		std::unique_ptr<FakeEngine> churnOwnedEngine = std::make_unique<FakeEngine>();
+		FakeEngine *churnEngine = churnOwnedEngine.get();
+		XAudio2AudioService churnService(std::move(churnOwnedEngine));
+		StreamingAudioAssetSource churnSource(48000U);
+		XAudio2AudioManager churnManager(&churnService, &churnSource);
+		AudioSettings churnSettings;
+		churnSettings.m_use3DSoundRangeVolumeFade = TRUE;
+		churnSettings.m_3DSoundRangeVolumeFadeExponent = 1.0f;
+		churnSettings.m_minVolume = 0.01f;
+		churnManager.setAudioSettingsForTest(&churnSettings);
+		churnManager.openDevice();
+		AudioEventInfo *churnInfo = newInstance(AudioEventInfo);
+		*churnInfo = *lifecycleInfo;
+		churnInfo->m_audioName = AsciiString("permanent-ambient-retry");
+		churnInfo->m_loopCount = 0;
+		g_nativeAudioObjectPositionForTest.set(99.5f, 0.0f, 0.0f);
+		for (int retry = 0; retry < 12; ++retry) {
+			FixtureEvent ambient(AsciiString("permanent-ambient-retry"));
+			ambient.setAudioEventInfo(churnInfo);
+			ambient.setObjectID(static_cast<ObjectID>(77U));
+			const AudioHandle handle = churnManager.addAudioEvent(&ambient);
+			churnManager.update();
+			check(handle != AHSV_Error && handle != AHSV_NotForLocal
+				&& !churnManager.isCurrentlyPlaying(handle)
+				&& churnManager.getPendingAudioRequestCount() == 0U
+				&& churnManager.getActiveAudioCount() == 0U
+				&& churnEngine->activeVoiceCount == 0
+				&& churnEngine->voices.empty() && churnSource.openStreamCalls == 0,
+				"inaudible permanent 3D ambient retries retain no record and open no PCM or voice");
+		}
+		g_nativeAudioObjectPositionForTest.set(10.0f, 0.0f, 0.0f);
+		FixtureEvent audibleAmbient(AsciiString("permanent-ambient-retry"));
+		audibleAmbient.setAudioEventInfo(churnInfo);
+		audibleAmbient.setObjectID(static_cast<ObjectID>(77U));
+		const AudioHandle audibleHandle = churnManager.addAudioEvent(&audibleAmbient);
+		churnManager.update();
+		check(churnManager.isCurrentlyPlaying(audibleHandle)
+			&& churnManager.getActiveAudioCount() == 1U
+			&& churnEngine->activeVoiceCount == 1
+			&& churnEngine->voices.size() == 1U
+			&& churnSource.openStreamCalls == 1
+			&& churnEngine->lastVoice != nullptr && churnEngine->lastVoice->startCalls == 1,
+			"the same permanent ambient is admitted and started once when it becomes audible");
+		g_nativeAudioObjectPositionForTest.set(99.5f, 0.0f, 0.0f);
+		churnManager.update();
+		check(!churnManager.isCurrentlyPlaying(audibleHandle)
+			&& churnEngine->activeVoiceCount == 0,
+			"the audible ambient still retires when its owner moves below the volume threshold");
+		churnManager.setChannelLimitsForTest(1U, 1U, 1U);
+		AudioEventInfo *orderedLowInfo = newInstance(AudioEventInfo);
+		*orderedLowInfo = *lowInfo;
+		AudioEventInfo *orderedHighInfo = newInstance(AudioEventInfo);
+		*orderedHighInfo = *orderedLowInfo;
+		orderedHighInfo->m_priority = AP_HIGH;
+		AudioEventInfo *orderedMediumInfo = newInstance(AudioEventInfo);
+		*orderedMediumInfo = *orderedLowInfo;
+		orderedMediumInfo->m_priority = AP_NORMAL;
+		Coord3D nearPosition;
+		nearPosition.set(10.0f, 0.0f, 0.0f);
+		Coord3D quietPosition;
+		quietPosition.set(99.5f, 0.0f, 0.0f);
+		FixtureEvent orderedLow(AsciiString("ordered-low"));
+		orderedLow.setAudioEventInfo(orderedLowInfo);
+		orderedLow.setPosition(&nearPosition);
+		const AudioHandle orderedLowHandle = churnManager.addAudioEvent(&orderedLow);
+		churnManager.update();
+		check(churnManager.isCurrentlyPlaying(orderedLowHandle)
+			&& churnManager.getNumAvailable3DSamples() == 0U,
+			"one-voice ordered fixture begins with an audible low-priority owner");
+		const int opensBeforeOrderedRequests = churnSource.openStreamCalls;
+		const std::size_t voicesBeforeOrderedRequests = churnEngine->voices.size();
+		FixtureEvent orderedHigh(AsciiString("ordered-high-inaudible"));
+		orderedHigh.setAudioEventInfo(orderedHighInfo);
+		orderedHigh.setPosition(&quietPosition);
+		const AudioHandle orderedHighHandle = churnManager.addAudioEvent(&orderedHigh);
+		FixtureEvent orderedMedium(AsciiString("ordered-medium-audible"));
+		orderedMedium.setAudioEventInfo(orderedMediumInfo);
+		orderedMedium.setPosition(&nearPosition);
+		const AudioHandle orderedMediumHandle = churnManager.addAudioEvent(&orderedMedium);
+		check(orderedHighHandle != AHSV_NoSound && orderedMediumHandle != AHSV_NoSound
+			&& churnManager.getPendingAudioRequestCount() == 2U,
+			"both replacement candidates retain their FIFO request reservations");
+		churnManager.update();
+		check(!churnManager.isCurrentlyPlaying(orderedLowHandle)
+			&& !churnManager.isCurrentlyPlaying(orderedHighHandle)
+			&& !churnManager.isCurrentlyPlaying(orderedMediumHandle)
+			&& churnManager.getActiveAudioCount() == 0U
+			&& churnEngine->activeVoiceCount == 0
+			&& churnSource.openStreamCalls == opensBeforeOrderedRequests
+			&& churnEngine->voices.size() == voicesBeforeOrderedRequests,
+			"inaudible high priority reserves the channel until retirement and blocks later medium audio");
+		churnManager.closeDevice();
+		deleteInstance(orderedLowInfo);
+		deleteInstance(orderedHighInfo);
+		deleteInstance(orderedMediumInfo);
+		deleteInstance(churnInfo);
+	}
 
 	g_nativeAudioObjectPositionForTest.set(10.0f, 0.0f, 0.0f);
 	FixtureEvent nullPositionLoop(AsciiString("lifecycle-null-position"));

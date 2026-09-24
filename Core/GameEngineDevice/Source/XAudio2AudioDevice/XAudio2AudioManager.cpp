@@ -800,12 +800,29 @@ void XAudio2AudioManager::processPlayRequest(AudioRequest *request)
 			}
 		}
 	}
+	// Keep this record visible to the rest of the ordered request pass, but avoid
+	// opening a voice that active-audio retirement will discard before service.
+	const AudioEventInfo *info = event->getAudioEventInfo();
+	if (playing.channel == Channel::SAMPLE_3D && m_audioSettings != nullptr
+		&& !BitIsSet(info->m_type, ST_GLOBAL) && info->m_priority != AP_CRITICAL) {
+		const Coord3D *position = event->getCurrentPosition();
+		if (position != nullptr && !event->isDead()) {
+			Coord3D distance = *position;
+			distance.sub(m_listenerPosition);
+			if (distance.length() < info->m_maxDistance
+				&& isBelow3DVolumeThreshold(playing)) {
+				playing.deferPhaseStart = TRUE;
+			}
+		}
+	}
 
 	m_playing.push_back(std::move(playing));
 	if (isMusic(*event)) {
 		m_activeMusicTrack = event->getEventName();
 	}
-	startNextPhase(m_playing.back());
+	if (!m_playing.back().deferPhaseStart) {
+		startNextPhase(m_playing.back());
+	}
 	updateDisallowSpeechGuard();
 }
 
@@ -1188,8 +1205,7 @@ void XAudio2AudioManager::processActiveAudio()
 				if (!retire && m_audioSettings != nullptr) {
 					// Match Miles' range-volume culling, expressed without dividing
 					// by a possibly muted category. Drawable owns ambient restarts.
-					const Real category = m_sound3DVolume > 0.0f ? m_soundVolume : 1.0f;
-					retire = effectiveVolume(playing) < m_audioSettings->m_minVolume * category;
+					retire = isBelow3DVolumeThreshold(playing);
 				}
 			}
 			if (retire) playing.stopping = TRUE;
@@ -1198,6 +1214,20 @@ void XAudio2AudioManager::processActiveAudio()
 			finishPlaying(playing);
 			m_playing.erase(m_playing.begin() + index);
 			continue;
+		}
+		if (playing.deferPhaseStart) {
+			// If the emitter changed during this update, start the still-audible
+			// record on the original tick instead of losing its first phase.
+			playing.deferPhaseStart = FALSE;
+			startNextPhase(playing);
+			if (playing.stopping) {
+				finishPlaying(playing);
+				m_playing.erase(m_playing.begin() + index);
+				continue;
+			}
+			if (playing.paused && playing.voiceOpen) {
+				m_service->pauseVoice(playing.voice);
+			}
 		}
 		if (playing.paused && !playing.stopping) {
 			++index;
@@ -2091,6 +2121,13 @@ Real XAudio2AudioManager::effectiveVolume(const PlayingAudio &playing) const
 	if (volume < 0.0f) return 0.0f;
 	if (volume > 1.0f) return 1.0f;
 	return volume;
+}
+
+Bool XAudio2AudioManager::isBelow3DVolumeThreshold(const PlayingAudio &playing) const
+{
+	// Preserve the same muted-category comparison used by active-audio retirement.
+	const Real category = m_sound3DVolume > 0.0f ? m_soundVolume : 1.0f;
+	return effectiveVolume(playing) < m_audioSettings->m_minVolume * category;
 }
 
 Real XAudio2AudioManager::outputVolume(const PlayingAudio &playing) const
