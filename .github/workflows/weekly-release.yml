@@ -334,18 +334,28 @@ jobs:
 
       - name: Generate release notes
         id: release_body
+        env:
+          BUILD_NOTES: ${{ github.event.inputs.build_notes }}
+          KNOWN_ISSUES: ${{ github.event.inputs.known_issues }}
+          CHANGELOG: ${{ steps.changelog.outputs.commits }}
         run: |
-          BODY=""
-          if [ "${{ github.event.inputs.build_notes }}" != "" ]; then
-            BODY="${BODY}### Build notes\n${{ github.event.inputs.build_notes }}\n"
+          body=""
+          if [ -n "$BUILD_NOTES" ]; then
+            printf -v body '%s### Build notes\n%s\n\n' "$body" "$BUILD_NOTES"
           fi
-          if [ "${{ github.event.inputs.known_issues }}" != "" ]; then
-            BODY="${BODY}### Known issues\n${{ github.event.inputs.known_issues }}\n"
+          if [ -n "$KNOWN_ISSUES" ]; then
+            printf -v body '%s### Known issues\n%s\n\n' "$body" "$KNOWN_ISSUES"
           fi
-          BODY="${BODY}### Changelog\n${{ steps.changelog.outputs.commits }}"
-          echo "body<<EOF" >> $GITHUB_OUTPUT
-          echo -e "$BODY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          printf -v body '%s### Changelog\n%s\n' "$body" "$CHANGELOG"
+          delimiter="GGC_RELEASE_BODY_$(openssl rand -hex 16)"
+          while grep -Fqx "$delimiter" <<< "$body"; do
+            delimiter="GGC_RELEASE_BODY_$(openssl rand -hex 16)"
+          done
+          {
+            printf 'body<<%s\n' "$delimiter"
+            printf '%s' "$body"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
