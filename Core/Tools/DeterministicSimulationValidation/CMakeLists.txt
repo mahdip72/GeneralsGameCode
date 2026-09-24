@@ -99,6 +99,7 @@ if(WIN32)
     set_tests_properties(
         core_deterministic_simulation_validation_combined_native_path_modes_tests
         PROPERTIES RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 7200
+            LABELS stage5-extended
             ENVIRONMENT
                 "RTS_STAGE5_VALIDATION_SCRATCH_ROOT=${_stage5_validation_test_scratch_root}")
     add_test(NAME core_stage5_replay_corpus_exporter_tests

@@ -18,13 +18,14 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
+$combinedPhaseStopwatch = [Diagnostics.Stopwatch]::StartNew()
+Write-Verbose 'STAGE5_COMBINED_PHASE phase=module-import state=start context= index=0 total=0 elapsedMs=0'
 Import-Module (Join-Path $PSScriptRoot 'DeterministicSimulationEvidence.psm1') -Force
 if ($PSBoundParameters.ContainsKey('Verbose')) {
     $stage5EvidenceModule = Get-Module DeterministicSimulationEvidence
     & $stage5EvidenceModule { $VerbosePreference = 'Continue' }
 }
 
-$combinedPhaseStopwatch = [Diagnostics.Stopwatch]::StartNew()
 function Write-CombinedPhaseTiming {
     param(
         [string]$Phase,
@@ -37,6 +38,7 @@ function Write-CombinedPhaseTiming {
         'index={3} total={4} elapsedMs={5}') -f $Phase, $State, $Context,
         $Index, $Total, $combinedPhaseStopwatch.ElapsedMilliseconds)
 }
+Write-CombinedPhaseTiming 'module-import' 'complete'
 
 function Assert-CombinedCondition {
     param([bool]$Condition, [string]$Message)
@@ -822,6 +824,7 @@ $artifactHashes = @{
     'zerohour-executable' = $ExpectedZeroHourExecutableSha256.ToUpperInvariant()
 }
 $sourceSeenRunNonces = @{}
+Write-CombinedPhaseTiming 'source-envelope-preflight' 'start'
 $generalsSnapshot = Get-CombinedFileSnapshot $generalsFull 'Generals source receipt'
 $zeroHourSnapshot = Get-CombinedFileSnapshot $zeroHourFull 'Zero Hour source receipt'
 $generalsHash = [string]$generalsSnapshot.sha256
@@ -845,6 +848,7 @@ Assert-CombinedCondition ([string]$generalsPreflight.runNonce -cne
     'Generals and Zero Hour source receipts must have distinct run nonces.'
 $generalsSourceBase = Split-Path -Parent $generalsFull
 $zeroHourSourceBase = Split-Path -Parent $zeroHourFull
+Write-CombinedPhaseTiming 'source-envelope-preflight' 'complete'
 Write-CombinedPhaseTiming 'generals-native-closure' 'start'
 $generalsNativeClosureInfo = Get-CombinedNativeClosureInfo $generalsFull `
     $generalsSourceBase 'Generals' 'Generals source receipt'

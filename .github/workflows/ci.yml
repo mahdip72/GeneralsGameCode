@@ -193,6 +193,64 @@ jobs:
       extras: true
     secrets: inherit
 
+  stage5-combined-native-path-modes:
+    name: Stage 5 Combined Native Path Modes
+    needs: detect-changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' || needs.detect-changes.outputs.stage5 == 'true' }}
+    runs-on: windows-2022
+    timeout-minutes: 150
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Provision Stage 5 native-path scratch
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Provision `
+            -Token "${{ github.run_id }}-${{ github.run_attempt }}-combined-native-paths"
+          if (-not $?) { throw 'Stage 5 native-path scratch provisioning failed.' }
+
+      - name: Validate complete mixed native-path corpus
+        shell: pwsh
+        timeout-minutes: 120
+        run: |
+          $scratchRoot = $env:RTS_STAGE5_VALIDATION_SCRATCH_ROOT
+          if ([string]::IsNullOrWhiteSpace($scratchRoot) -or
+              -not $scratchRoot.StartsWith('H:\', [StringComparison]::OrdinalIgnoreCase) -or
+              -not (Test-Path -LiteralPath $scratchRoot -PathType Container)) {
+            throw "Stage 5 native-path scratch root is not an existing H: directory: $scratchRoot"
+          }
+          $originalPsModulePath = $env:PSModulePath
+          $testExitCode = 1
+          try {
+            Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+              -File "$env:GITHUB_WORKSPACE/Core/Tools/DeterministicSimulationValidation/DeterministicSimulationValidation.Tests.ps1" `
+              -ValidationPartition Acceptance `
+              -FocusedAcceptanceCase CombinedNativePathModes -Verbose
+            $testExitCode = $LASTEXITCODE
+          }
+          finally {
+            if ($null -eq $originalPsModulePath) {
+              Remove-Item Env:PSModulePath -ErrorAction SilentlyContinue
+            } else {
+              $env:PSModulePath = $originalPsModulePath
+            }
+          }
+          exit $testExitCode
+
+      - name: Clean Stage 5 native-path scratch
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
+            -Mode Cleanup `
+            -Token "${{ github.run_id }}-${{ github.run_attempt }}-combined-native-paths"
+          if (-not $?) { throw 'Stage 5 native-path scratch cleanup failed.' }
+
   build-generalsmd-win32:
     name: Build GeneralsMD${{ matrix.preset && '' }}
     needs: detect-changes

@@ -4016,6 +4016,26 @@ Assert-Stage5ExactJobSchema $exactReadinessJob ([ordered]@{
         env = ''
         steps = ''
     }) 'CI exact Stage 5 development-readiness job schema'
+$nativePathJob = Get-Stage5IndentedBlock $ci 'stage5-combined-native-path-modes:' 2
+Assert-Stage5ExactJobSchema $nativePathJob ([ordered]@{
+        name = 'Stage 5 Combined Native Path Modes'
+        needs = 'detect-changes'
+        'if' = '${{ github.event_name == ''workflow_dispatch'' || needs.detect-changes.outputs.generals == ''true'' || needs.detect-changes.outputs.generalsmd == ''true'' || needs.detect-changes.outputs.shared == ''true'' || needs.detect-changes.outputs.stage5 == ''true'' }}'
+        'runs-on' = 'windows-2022'
+        'timeout-minutes' = '150'
+        steps = ''
+    }) 'CI exact Stage 5 mixed native-path job schema'
+Assert-Stage5WorkflowContains $nativePathJob `
+    '(?s)Validate complete mixed native-path corpus.*?timeout-minutes:\s*120.*?-FocusedAcceptanceCase CombinedNativePathModes' `
+    'CI complete mixed native-path execution and bound'
+Assert-Stage5ValidationVolumeBinding $nativePathJob `
+    'Provision Stage 5 native-path scratch' `
+    'Clean Stage 5 native-path scratch' '' '${{ always() }}' `
+    '__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-combined-native-paths' `
+    @() $null 'CI mixed native-path task-owned validation volume'
+Assert-Stage5WorkflowContains $buildToolchain `
+    "(?s)focused_test_regex.*?'-LE', '\^stage5-extended\$'" `
+    'Reusable full extras must defer the extended native-path gate'
 Assert-Stage5ExecutionCohortProducer $ci `
     'CI shared Stage 5 execution cohort producer'
 Assert-Stage5CombinedHostRunnerProducer $ci `

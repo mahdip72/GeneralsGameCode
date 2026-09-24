@@ -272,6 +272,10 @@ jobs:
           $arguments = @('--test-dir', "build\${{ inputs.preset }}", '--output-on-failure', '--no-tests=error')
           if (-not [string]::IsNullOrWhiteSpace('${{ inputs.focused_test_regex }}')) {
             $arguments += @('-R', '${{ inputs.focused_test_regex }}')
+          } else {
+            # A separate required job owns the complete mixed native-path gate.
+            # Keep the product job inside its 240-minute bound.
+            $arguments += @('-LE', '^stage5-extended$')
           }
           if ('${{ inputs.preset }}' -like 'win32*' -or '${{ inputs.preset }}' -like 'x64*') {
             $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
