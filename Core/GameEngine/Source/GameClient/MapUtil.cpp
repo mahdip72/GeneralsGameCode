@@ -63,7 +63,9 @@
 #include "GameNetwork/NetworkDefs.h"
 #if defined(_WIN64)
 #include "Lib/NetworkEpochHandshake.h"
+#include "Lib/NetworkMapPackageIdentity.h"
 #include "Lib/NetworkMapPackageTransaction.h"
+#include <cstring>
 #endif
 
 
@@ -196,6 +198,102 @@ Int GetMapSimulationSidecarMask(const AsciiString &mapName)
 }
 
 #if defined(_WIN64)
+namespace
+{
+
+class NetworkMapPackageCompanionReader
+{
+public:
+	NetworkMapPackageCompanionReader(const AsciiString *paths,
+		NetworkMapPackageCompanionOverride overrideFile, void *context)
+		: m_paths(paths), m_overrideFile(overrideFile), m_context(context),
+		  m_file(nullptr), m_stagedBytes(nullptr), m_stagedLength(0U),
+		  m_stagedOffset(0U), m_staged(false)
+	{}
+
+	int open(std::size_t index, std::uint32_t *lengthOut)
+	{
+		close();
+		if (m_paths == nullptr || lengthOut == nullptr ||
+			index >= rts::network_epoch::kNetworkMapPackageCompanionCount)
+			return -1;
+
+		const UnsignedByte *stagedBytes = nullptr;
+		UnsignedInt stagedLength = 0U;
+		if (m_overrideFile != nullptr &&
+			m_overrideFile(m_paths[index], &stagedBytes, &stagedLength, m_context))
+		{
+			if (stagedLength > 0x7fffffffU ||
+				(stagedLength != 0U && stagedBytes == nullptr))
+				return -1;
+			m_staged = true;
+			m_stagedBytes = stagedBytes;
+			m_stagedLength = stagedLength;
+			*lengthOut = stagedLength;
+			return 1;
+		}
+
+		if (TheFileSystem == nullptr)
+			return -1;
+		m_file = TheFileSystem->openFile(m_paths[index].str(), File::READ);
+		if (m_file == nullptr)
+			return 0;
+		const Int fileLength = m_file->size();
+		if (fileLength < 0)
+		{
+			close();
+			return -1;
+		}
+		*lengthOut = static_cast<std::uint32_t>(fileLength);
+		return 1;
+	}
+
+	int read(unsigned char *buffer, int requested)
+	{
+		if (buffer == nullptr || requested <= 0)
+			return -1;
+		if (m_staged)
+		{
+			if (m_stagedOffset > m_stagedLength)
+				return -1;
+			const UnsignedInt remaining = m_stagedLength - m_stagedOffset;
+			const UnsignedInt count = remaining < static_cast<UnsignedInt>(requested) ?
+				remaining : static_cast<UnsignedInt>(requested);
+			if (count == 0U)
+				return 0;
+			std::memcpy(buffer, m_stagedBytes + m_stagedOffset, count);
+			m_stagedOffset += count;
+			return static_cast<int>(count);
+		}
+		return m_file != nullptr ? m_file->read(buffer, requested) : -1;
+	}
+
+	void close()
+	{
+		if (m_file != nullptr)
+		{
+			m_file->close();
+			m_file = nullptr;
+		}
+		m_stagedBytes = nullptr;
+		m_stagedLength = 0U;
+		m_stagedOffset = 0U;
+		m_staged = false;
+	}
+
+private:
+	const AsciiString *m_paths;
+	NetworkMapPackageCompanionOverride m_overrideFile;
+	void *m_context;
+	File *m_file;
+	const UnsignedByte *m_stagedBytes;
+	UnsignedInt m_stagedLength;
+	UnsignedInt m_stagedOffset;
+	Bool m_staged;
+};
+
+} // namespace
+
 Bool GetNetworkMapPackageCompanionCRC(const AsciiString &mapName,
 	UnsignedInt *maskOut, UnsignedInt *crcOut)
 {
@@ -217,70 +315,16 @@ Bool GetProjectedNetworkMapPackageCompanionCRC(const AsciiString &mapName,
 		GetStrFileFromMap(mapName), GetSoloINIFromMap(mapName),
 		GetAssetUsageFromMap(mapName), GetReadmeFromMap(mapName)
 	};
-	const UnsignedInt maskBits[] = { 2U, 4U, 8U, 16U, 32U, 64U };
+	NetworkMapPackageCompanionReader reader(paths, overrideFile, context);
 	CRC crc;
-	crc.clear();
-	const UnsignedByte domain[] = { 'M', 'A', 'P', 'C', 'O', 'M', 1 };
-	crc.computeCRC(domain, sizeof(domain));
-	for (Int i = 0; i < ARRAY_SIZE(paths); ++i)
-	{
-		const UnsignedByte kind = static_cast<UnsignedByte>(i + 1);
-		crc.computeCRC(&kind, 1);
-		const UnsignedByte *stagedBytes = nullptr;
-		UnsignedInt stagedLength = 0U;
-		const Bool staged = overrideFile != nullptr &&
-			overrideFile(paths[i], &stagedBytes, &stagedLength, context);
-		File *file = staged ? nullptr :
-			TheFileSystem->openFile(paths[i].str(), File::READ);
-		const UnsignedByte present = staged || file ? 1 : 0;
-		crc.computeCRC(&present, 1);
-		if (present)
-		{
-			const Int fileLength = staged ? static_cast<Int>(stagedLength) : file->size();
-			if (fileLength < 0 ||
-				(staged && stagedLength != 0U && stagedBytes == nullptr))
-			{
-				if (file)
-					file->close();
-				return FALSE;
-			}
-			if (maskOut != nullptr)
-				*maskOut |= maskBits[i];
-			const UnsignedInt length = static_cast<UnsignedInt>(fileLength);
-			const UnsignedByte lengthBytes[] = {
-				static_cast<UnsignedByte>(length),
-				static_cast<UnsignedByte>(length >> 8),
-				static_cast<UnsignedByte>(length >> 16),
-				static_cast<UnsignedByte>(length >> 24)
-			};
-			crc.computeCRC(lengthBytes, sizeof(lengthBytes));
-			if (staged)
-			{
-				if (length != 0U)
-					crc.computeCRC(stagedBytes, length);
-			}
-			else
-			{
-				UnsignedByte buffer[4096];
-				UnsignedInt remaining = length;
-				while (remaining > 0)
-				{
-					const Int wanted = remaining < sizeof(buffer) ?
-						static_cast<Int>(remaining) : static_cast<Int>(sizeof(buffer));
-					const Int count = file->read(buffer, wanted);
-					if (count <= 0 || count > wanted)
-					{
-						file->close();
-						return FALSE; // Incomplete content must never become a valid identity.
-					}
-					crc.computeCRC(buffer, count);
-					remaining -= static_cast<UnsignedInt>(count);
-				}
-				file->close();
-			}
-		}
-	}
-	*crcOut = crc.get();
+	std::uint32_t companionMask = 0U;
+	std::uint32_t companionCrc = 0U;
+	if (!rts::network_epoch::ComputeNetworkMapPackageIdentity(reader, crc,
+		&companionMask, &companionCrc))
+		return FALSE;
+	if (maskOut != nullptr)
+		*maskOut = static_cast<UnsignedInt>(companionMask);
+	*crcOut = static_cast<UnsignedInt>(companionCrc);
 	return TRUE;
 }
 #endif

@@ -1,12 +1,15 @@
 #include "Lib/NetworkWireContract.h"
 #include "Lib/NetworkCommandOriginPolicy.h"
 #include "Lib/NetworkEpochHandshake.h"
+#include "Lib/NetworkMapPackageIdentity.h"
 #include "Lib/LockstepV2Promotion.h"
 #include "Lib/MultiplayerSimulationRuntimeProof.h"
 #include "Lib/NetworkNatPolicy.h"
 
 #include <array>
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -27,6 +30,167 @@ int Check(bool condition, const char *message)
 		return 1;
 	}
 	return 0;
+}
+
+struct MapPackageFixtureReader
+{
+	std::array<std::vector<unsigned char>,
+		rts::network_epoch::kNetworkMapPackageCompanionCount> installed;
+	std::array<bool, rts::network_epoch::kNetworkMapPackageCompanionCount> present =
+		{{ true, true, true, true, true, true }};
+	std::array<std::vector<unsigned char>,
+		rts::network_epoch::kNetworkMapPackageCompanionCount> staged;
+	std::array<bool, rts::network_epoch::kNetworkMapPackageCompanionCount> useStaged =
+		{{ false, false, false, false, false, false }};
+	const std::vector<unsigned char> *current = nullptr;
+	std::size_t offset = 0U;
+	std::size_t openCount = 0U;
+	std::size_t closeCount = 0U;
+	std::size_t readCallCount = 0U;
+	bool failRead = false;
+
+	int open(std::size_t index, std::uint32_t *lengthOut)
+	{
+		if (index >= installed.size() || lengthOut == nullptr || current != nullptr)
+			return -1;
+		if (useStaged[index])
+			current = &staged[index];
+		else if (present[index])
+			current = &installed[index];
+		else
+			return 0;
+
+		++openCount;
+		offset = 0U;
+		*lengthOut = static_cast<std::uint32_t>(current->size());
+		return 1;
+	}
+
+	int read(unsigned char *buffer, int requested)
+	{
+		if (failRead || current == nullptr || buffer == nullptr || requested <= 0)
+			return 0;
+		++readCallCount;
+		const std::size_t remaining = current->size() - offset;
+		const std::size_t count = std::min(remaining,
+			static_cast<std::size_t>(requested));
+		if (count == 0U)
+			return 0;
+		std::memcpy(buffer, current->data() + offset, count);
+		offset += count;
+		return static_cast<int>(count);
+	}
+
+	void close()
+	{
+		if (current != nullptr)
+			++closeCount;
+		current = nullptr;
+		offset = 0U;
+	}
+};
+
+class FixtureCrc
+{
+public:
+	void clear() { m_value = 2166136261U; }
+	void computeCRC(const void *data, int length)
+	{
+		const unsigned char *bytes = static_cast<const unsigned char *>(data);
+		for (int i = 0; i < length; ++i)
+			m_value = (m_value ^ bytes[i]) * 16777619U;
+	}
+	std::uint32_t get() const { return m_value; }
+
+private:
+	std::uint32_t m_value = 2166136261U;
+};
+
+bool ComputeFixtureMapPackageIdentity(MapPackageFixtureReader &reader,
+	std::uint32_t *maskOut, std::uint32_t *crcOut)
+{
+	FixtureCrc crc;
+	return rts::network_epoch::ComputeNetworkMapPackageIdentity(reader, crc,
+		maskOut, crcOut);
+}
+
+int TestMapPackageIdentityProducer()
+{
+	int result = 0;
+	MapPackageFixtureReader installed;
+	for (std::size_t i = 0; i < installed.installed.size(); ++i)
+	{
+		installed.installed[i] = { static_cast<unsigned char>(0x10U + i),
+			static_cast<unsigned char>(0x80U + i), static_cast<unsigned char>(i) };
+	}
+	installed.installed[4].resize(5000U);
+	for (std::size_t i = 0; i < installed.installed[4].size(); ++i)
+		installed.installed[4][i] = static_cast<unsigned char>(i * 13U);
+	std::uint32_t installedMask = 0U;
+	std::uint32_t installedCrc = 0U;
+	result |= Check(ComputeFixtureMapPackageIdentity(installed,
+		&installedMask, &installedCrc),
+		"six-file package identity streams fixture companions");
+	result |= Check(installedMask == rts::network_epoch::kNetworkMapPackageCompanionMask &&
+		installed.openCount == rts::network_epoch::kNetworkMapPackageCompanionCount &&
+		installed.closeCount == installed.openCount && installed.readCallCount >= 7U,
+		"all six companions stream through multiple chunks and close after identity reads");
+
+	for (std::size_t i = 0; i < installed.installed.size(); ++i)
+	{
+		MapPackageFixtureReader changed = installed;
+		changed.openCount = changed.closeCount = 0U;
+		changed.installed[i][1] ^= 0x01U;
+		std::uint32_t changedCrc = 0U;
+		result |= Check(ComputeFixtureMapPackageIdentity(changed, nullptr,
+			&changedCrc) && changedCrc != installedCrc,
+			"changing any of the six companion contents changes package identity");
+	}
+
+	MapPackageFixtureReader absent = installed;
+	absent.present[5] = false;
+	absent.openCount = absent.closeCount = 0U;
+	std::uint32_t absentMask = 0U;
+	std::uint32_t absentCrc = 0U;
+	result |= Check(ComputeFixtureMapPackageIdentity(absent, &absentMask,
+		&absentCrc) && (absentMask & 64U) == 0U && absentCrc != installedCrc,
+		"absent companion changes presence mask and package identity");
+
+	MapPackageFixtureReader presentEmpty = absent;
+	presentEmpty.present[5] = true;
+	presentEmpty.installed[5].clear();
+	presentEmpty.openCount = presentEmpty.closeCount = 0U;
+	std::uint32_t emptyMask = 0U;
+	std::uint32_t emptyCrc = 0U;
+	result |= Check(ComputeFixtureMapPackageIdentity(presentEmpty, &emptyMask,
+		&emptyCrc) && (emptyMask & 64U) != 0U && emptyCrc != absentCrc,
+		"present-empty companion remains distinct from an absent companion");
+
+	MapPackageFixtureReader projected = installed;
+	projected.useStaged[2] = true; // The staged map STR shadows the installed STR.
+	projected.staged[2] = { 0xE1U, 0xE2U, 0xE3U, 0xE4U };
+	projected.openCount = projected.closeCount = 0U;
+	std::uint32_t projectedCrc = 0U;
+	result |= Check(ComputeFixtureMapPackageIdentity(projected, nullptr,
+		&projectedCrc) && projectedCrc != installedCrc,
+		"projected identity reads staged companion bytes instead of installed bytes");
+
+	MapPackageFixtureReader projectedExpected = installed;
+	projectedExpected.installed[2] = projected.staged[2];
+	projectedExpected.openCount = projectedExpected.closeCount = 0U;
+	std::uint32_t expectedCrc = 0U;
+	result |= Check(ComputeFixtureMapPackageIdentity(projectedExpected, nullptr,
+		&expectedCrc) && projectedCrc == expectedCrc,
+		"staged projected package identity equals its effective installed contents");
+
+	MapPackageFixtureReader truncated = installed;
+	truncated.failRead = true;
+	truncated.openCount = truncated.closeCount = 0U;
+	std::uint32_t failedCrc = 99U;
+	result |= Check(!ComputeFixtureMapPackageIdentity(truncated, nullptr,
+		&failedCrc) && failedCrc == 0U && truncated.closeCount == 1U,
+		"incomplete companion reads fail closed and release the opened fixture");
+	return result;
 }
 
 int TestFixedSizes()
@@ -1336,7 +1500,8 @@ int main()
 	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
 	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
 #endif
-	return TestFixedSizes() | TestSizeConversion() | TestWrapperCapacity() |
+	return TestFixedSizes() | TestMapPackageIdentityProducer() |
+		TestSizeConversion() | TestWrapperCapacity() |
 		TestWrappedCommandOriginPolicy() | TestExternalRuntimeReleaseProof() |
 		TestLockstepV2ProductPromotion() |
 		TestLockstepV2ReceiptContract() |
