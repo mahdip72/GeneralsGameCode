@@ -125,6 +125,21 @@ int	nShadowDecalVertsInBatch=0;
 int SHADOW_DECAL_VERTEX_SIZE=32768;
 int SHADOW_DECAL_INDEX_SIZE=65536;
 
+static void ResetProjectedTerrainStreamAfterUploadFailure()
+{
+	rts::render::Invalidate_Native_W3D_Stream_Cursors(nShadowVertsInBuf,
+		nShadowIndicesInBuf, nShadowStartBatchVertex, nShadowStartBatchIndex);
+}
+
+static void ResetProjectedDecalStreamAfterUploadFailure()
+{
+	rts::render::Invalidate_Native_W3D_Stream_Cursors(nShadowDecalVertsInBuf,
+		nShadowDecalIndicesInBuf, nShadowDecalStartBatchVertex,
+		nShadowDecalStartBatchIndex);
+	nShadowDecalPolysInBatch = 0;
+	nShadowDecalVertsInBatch = 0;
+}
+
 class W3DShadowTexture;	//forward reference
 class W3DShadowTextureManager;	//forward reference
 
@@ -615,13 +630,17 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 		UnsignedShort *pvIndices = 0;
 		UnsignedShort *indexStart;
 		static Matrix4x4 mWorld(true);
-		if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE - numVerts))
+		if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowVertsInBuf,
+			SHADOW_VERTEX_SIZE, numVerts))
 		{
 			if (!shadowVertexBufferOwner->Lock_Buffer(0,
 				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
 				NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvVertices)))
+			{
+				ResetProjectedTerrainStreamAfterUploadFailure();
 				return result;
+			}
 			nShadowVertsInBuf = 0;
 			nShadowStartBatchVertex = 0;
 		}
@@ -632,11 +651,15 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
 				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvVertices)))
+			{
+				ResetProjectedTerrainStreamAfterUploadFailure();
 				return result;
+			}
 		}
 		if (pvVertices == 0)
 		{
 			shadowVertexBufferOwner->Unlock_Buffer();
+			ResetProjectedTerrainStreamAfterUploadFailure();
 			return result;
 		}
 		for (row = 0; row < static_cast<unsigned>(vertsPerColumn); ++row)
@@ -654,15 +677,22 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 			}
 		}
 		if (!shadowVertexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedTerrainStreamAfterUploadFailure();
 			return result;
+		}
 
-		if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE - numIndex))
+		if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowIndicesInBuf,
+			SHADOW_INDEX_SIZE, numIndex))
 		{
 			if (!shadowIndexBufferOwner->Lock_Buffer(0,
 				numIndex * sizeof(UnsignedShort),
 				NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvIndices)))
+			{
+				ResetProjectedTerrainStreamAfterUploadFailure();
 				return result;
+			}
 			nShadowIndicesInBuf = 0;
 			nShadowStartBatchIndex = 0;
 		}
@@ -673,18 +703,25 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 				numIndex * sizeof(UnsignedShort),
 				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvIndices)))
+			{
+				ResetProjectedTerrainStreamAfterUploadFailure();
 				return result;
+			}
 		}
 		if (pvIndices == 0)
 		{
 			shadowIndexBufferOwner->Unlock_Buffer();
+			ResetProjectedTerrainStreamAfterUploadFailure();
 			return result;
 		}
 		indexStart = pvIndices;
 		memcpy(indexStart, s_projectedTerrainGridScratch.indices(),
 			static_cast<size_t>(numIndex) * sizeof(UnsignedShort));
 		if (!shadowIndexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedTerrainStreamAfterUploadFailure();
 			return result;
+		}
 
 		rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
 			static_cast<unsigned short>(nShadowStartBatchVertex));
@@ -785,9 +822,11 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		if (!rts::render::IsGameRendererInitialized() ||
 			!rts::render::IsGameRenderTargetOperational() ||
 			shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr ||
-			!shadowVertexBufferOwner->Is_Valid() ||
-			!shadowIndexBufferOwner->Is_Valid())
+			SHADOW_VERTEX_SIZE <= 0 || SHADOW_INDEX_SIZE <= 0)
 			return 0;
+		if (!shadowVertexBufferOwner->Is_Valid() ||
+			!shadowIndexBufferOwner->Is_Valid())
+			ResetProjectedTerrainStreamAfterUploadFailure();
 
 		//Get terrain cell index for area with shadow
 		Int startX=REAL_TO_INT_FLOOR(((cx - dx)*mapScaleInv));
@@ -809,13 +848,17 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 
 		Int numVerts = vertsPerRow *vertsPerColumn;	//number of terrain vertices
 
-		if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE-numVerts))	//check if room for model verts
+		if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowVertsInBuf,
+			SHADOW_VERTEX_SIZE, numVerts))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			if (!shadowVertexBufferOwner->Lock_Buffer(0,
 				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
 				NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvVertices)))
+			{
+				ResetProjectedTerrainStreamAfterUploadFailure();
 				return 0;
+			}
 			nShadowVertsInBuf=0;
 			nShadowStartBatchVertex=0;
 		}
@@ -825,7 +868,10 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 				numVerts * sizeof(SHADOW_VOLUME_VERTEX),
 				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvVertices)))
+			{
+				ResetProjectedTerrainStreamAfterUploadFailure();
 				return 0;
+			}
 		}
 
 		if(pvVertices)
@@ -846,16 +892,23 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		}
 
 		if (!shadowVertexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedTerrainStreamAfterUploadFailure();
 			return 0;
+		}
 
 		Int numIndex=(endX - startX) * (endY-startY)*6;	//6 indices per terrain cell (2 triangles).
 
-		if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE-numIndex))	//check if room for model verts
+		if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowIndicesInBuf,
+			SHADOW_INDEX_SIZE, numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			if (!shadowIndexBufferOwner->Lock_Buffer(0, numIndex*sizeof(short),
 				NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvIndices)))
+			{
+				ResetProjectedTerrainStreamAfterUploadFailure();
 				return 0;
+			}
 			nShadowIndicesInBuf=0;
 			nShadowStartBatchIndex=0;
 		}
@@ -864,7 +917,10 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 				nShadowIndicesInBuf*sizeof(short), numIndex*sizeof(short),
 				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvIndices)))
+			{
+				ResetProjectedTerrainStreamAfterUploadFailure();
 				return 0;
+			}
 		}
 
 		if(pvIndices)
@@ -912,7 +968,10 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 		}
 
 		if (!shadowIndexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedTerrainStreamAfterUploadFailure();
 			return 0;
+		}
 
 		rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
 			static_cast<unsigned short>(nShadowStartBatchVertex));
@@ -997,10 +1056,14 @@ void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowTyp
 
 	if (!rts::render::IsGameRendererInitialized() ||
 		shadowDecalVertexBufferOwner == nullptr ||
-		shadowDecalIndexBufferOwner == nullptr ||
-		!shadowDecalVertexBufferOwner->Is_Valid() ||
-		!shadowDecalIndexBufferOwner->Is_Valid())
+		shadowDecalIndexBufferOwner == nullptr)
 		return;	//no render device to render
+	if (!shadowDecalVertexBufferOwner->Is_Valid() ||
+		!shadowDecalIndexBufferOwner->Is_Valid())
+	{
+		ResetProjectedDecalStreamAfterUploadFailure();
+		return;	//failed writes must not be drawn
+	}
 
 	VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
 	rts::render::SetGameMaterial(vmat);
@@ -1267,26 +1330,37 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 			numVerts * sizeof(SHADOW_DECAL_VERTEX),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 			reinterpret_cast<void **>(&pvVertices)))
+		{
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
+		}
 		if (pvVertices == 0)
 		{
 			shadowDecalVertexBufferOwner->Unlock_Buffer();
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
 		}
 		memcpy(pvVertices, s_projectedTerrainGridScratch.vertices(),
 			static_cast<size_t>(numVerts) * sizeof(SHADOW_DECAL_VERTEX));
 		if (!shadowDecalVertexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
+		}
 
 		if (!shadowDecalIndexBufferOwner->Lock_Buffer(
 			nShadowDecalIndicesInBuf * sizeof(UnsignedShort),
 			numIndex * sizeof(UnsignedShort),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 			reinterpret_cast<void **>(&pvIndices)))
+		{
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
+		}
 		if (pvIndices == 0)
 		{
 			shadowDecalIndexBufferOwner->Unlock_Buffer();
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
 		}
 		for (index = 0; index < static_cast<unsigned>(numIndex); ++index)
@@ -1294,7 +1368,10 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
 				s_projectedTerrainGridScratch.indices()[index] +
 				nShadowDecalVertsInBatch);
 		if (!shadowDecalIndexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return PROJECTED_SHADOW_QUEUE_RETRY_SERIAL;
+		}
 
 		nShadowDecalPolysInBatch += static_cast<Int>(cellCount * 2);
 		nShadowDecalVertsInBuf += numVerts;
@@ -1334,10 +1411,11 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		if (!rts::render::IsGameRendererInitialized() ||
 			!rts::render::IsGameRenderTargetOperational() ||
 			shadowDecalVertexBufferOwner == nullptr ||
-			shadowDecalIndexBufferOwner == nullptr ||
-			!shadowDecalVertexBufferOwner->Is_Valid() ||
-			!shadowDecalIndexBufferOwner->Is_Valid())
+			shadowDecalIndexBufferOwner == nullptr)
 			return;	//no render device to render
+		if (!shadowDecalVertexBufferOwner->Is_Valid() ||
+			!shadowDecalIndexBufferOwner->Is_Valid())
+			ResetProjectedDecalStreamAfterUploadFailure();
 
 		WorldHeightMap *hmap=TheTerrainRenderObject->getMap();
 		borderSize=hmap->getBorderSizeInline();
@@ -1518,13 +1596,17 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		SHADOW_DECAL_VERTEX* pvVertices;
 		UnsignedShort *pvIndices;
 
-		if (nShadowDecalVertsInBuf > (SHADOW_DECAL_VERTEX_SIZE-numVerts))	//check if room for model verts
+		if (rts::render::Native_W3D_Stream_Needs_Discard(
+			nShadowDecalVertsInBuf, SHADOW_DECAL_VERTEX_SIZE, numVerts))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0], shadow->m_type);
 			if (!shadowDecalVertexBufferOwner->Lock_Buffer(0,
 				numVerts*sizeof(SHADOW_DECAL_VERTEX), NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvVertices)))
+			{
+				ResetProjectedDecalStreamAfterUploadFailure();
 				return;
+			}
 
 			nShadowDecalStartBatchVertex=0;
 			nShadowDecalPolysInBatch=0;	//reset number of polys in texture batch
@@ -1536,7 +1618,10 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 				nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),
 				numVerts*sizeof(SHADOW_DECAL_VERTEX), NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvVertices)))
+			{
+				ResetProjectedDecalStreamAfterUploadFailure();
 				return;
+			}
 		}
 
 		//code to deal with rotated shadows based on sun direction, fix this later.  For now shadow rotates with object rotation.
@@ -1594,16 +1679,23 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		}
 
 		if (!shadowDecalVertexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return;
+		}
 
-		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
+		if (rts::render::Native_W3D_Stream_Needs_Discard(
+			nShadowDecalIndicesInBuf, SHADOW_DECAL_INDEX_SIZE, numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0], shadow->m_type);
 
 			if (!shadowDecalIndexBufferOwner->Lock_Buffer(0,
 				numIndex*sizeof(short), NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvIndices)))
+			{
+				ResetProjectedDecalStreamAfterUploadFailure();
 				return;
+			}
 
 			nShadowDecalStartBatchIndex=0;
 			nShadowDecalPolysInBatch=0;	//reset number of polys in texture batch
@@ -1615,7 +1707,10 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 				nShadowDecalIndicesInBuf*sizeof(short), numIndex*sizeof(short),
 				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvIndices)))
+			{
+				ResetProjectedDecalStreamAfterUploadFailure();
 				return;
+			}
 		}
 
 		if(pvIndices)
@@ -1648,7 +1743,10 @@ void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 		}
 
 		if (!shadowDecalIndexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return;
+		}
 
 		Int numPolys = (endX - startX)*(endY - startY)*2;	//2 triangles per cell
 		nShadowDecalPolysInBatch += numPolys;
@@ -1681,10 +1779,11 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 		if (!rts::render::IsGameRendererInitialized() ||
 			!rts::render::IsGameRenderTargetOperational() ||
 			shadowDecalVertexBufferOwner == nullptr ||
-			shadowDecalIndexBufferOwner == nullptr ||
-			!shadowDecalVertexBufferOwner->Is_Valid() ||
-			!shadowDecalIndexBufferOwner->Is_Valid())
+			shadowDecalIndexBufferOwner == nullptr)
 			return;	//no render device to render
+		if (!shadowDecalVertexBufferOwner->Is_Valid() ||
+			!shadowDecalIndexBufferOwner->Is_Valid())
+			ResetProjectedDecalStreamAfterUploadFailure();
 
 		objPos=shadow->m_robj->Get_Position();
 		objXform=shadow->m_robj->Get_Transform();
@@ -1706,13 +1805,17 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 		SHADOW_DECAL_VERTEX* pvVertices;
 		UnsignedShort *pvIndices;
 
-		if (nShadowDecalVertsInBuf > (SHADOW_DECAL_VERTEX_SIZE-numVerts))	//check if room for model verts
+		if (rts::render::Native_W3D_Stream_Needs_Discard(
+			nShadowDecalVertsInBuf, SHADOW_DECAL_VERTEX_SIZE, numVerts))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0], shadow->m_type);
 			if (!shadowDecalVertexBufferOwner->Lock_Buffer(0,
 				numVerts*sizeof(SHADOW_DECAL_VERTEX), NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvVertices)))
+			{
+				ResetProjectedDecalStreamAfterUploadFailure();
 				return;
+			}
 
 			nShadowDecalStartBatchVertex=0;
 			nShadowDecalPolysInBatch=0;	//reset number of polys in texture batch
@@ -1724,7 +1827,10 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 				nShadowDecalVertsInBuf*sizeof(SHADOW_DECAL_VERTEX),
 				numVerts*sizeof(SHADOW_DECAL_VERTEX), NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvVertices)))
+			{
+				ResetProjectedDecalStreamAfterUploadFailure();
 				return;
+			}
 		}
 
 		objPos.Z=groundHeight;	//force decal to ground level
@@ -1771,16 +1877,23 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 		}
 
 		if (!shadowDecalVertexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return;
+		}
 
-		if (nShadowDecalIndicesInBuf > (SHADOW_DECAL_INDEX_SIZE-numIndex))	//check if room for model verts
+		if (rts::render::Native_W3D_Stream_Needs_Discard(
+			nShadowDecalIndicesInBuf, SHADOW_DECAL_INDEX_SIZE, numIndex))	//check if room for model verts
 		{	//flush the buffer by drawing the contents and re-locking again
 			flushDecals(shadow->m_shadowTexture[0],shadow->m_type);
 
 			if (!shadowDecalIndexBufferOwner->Lock_Buffer(0,
 				numIndex*sizeof(short), NATIVE_BUFFER_LOCK_DISCARD,
 				reinterpret_cast<void **>(&pvIndices)))
+			{
+				ResetProjectedDecalStreamAfterUploadFailure();
 				return;
+			}
 
 			nShadowDecalStartBatchIndex=0;
 			nShadowDecalPolysInBatch=0;	//reset number of polys in texture batch
@@ -1792,7 +1905,10 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 				nShadowDecalIndicesInBuf*sizeof(short), numIndex*sizeof(short),
 				NATIVE_BUFFER_LOCK_NO_OVERWRITE,
 				reinterpret_cast<void **>(&pvIndices)))
+			{
+				ResetProjectedDecalStreamAfterUploadFailure();
 				return;
+			}
 		}
 
 		if(pvIndices)
@@ -1806,7 +1922,10 @@ void W3DProjectedShadowManager::queueSimpleDecal(W3DProjectedShadow *shadow)
 		}
 
 		if (!shadowDecalIndexBufferOwner->Unlock_Buffer())
+		{
+			ResetProjectedDecalStreamAfterUploadFailure();
 			return;
+		}
 
 		Int numPolys = 2;	//2 triangles per decal
 		nShadowDecalPolysInBatch += numPolys;

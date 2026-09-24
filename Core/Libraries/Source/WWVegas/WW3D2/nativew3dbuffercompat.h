@@ -10,6 +10,28 @@ namespace rts
 namespace render
 {
 
+// Streaming shadow buffers force a discard by making the next append cursor
+// exceed the available range.  Keep the cursor policy shared between the
+// projected and volumetric shadow callers so a failed mutation always retries
+// from offset zero instead of reusing a poisoned append range.
+static const int NATIVE_W3D_STREAM_DISCARD_CURSOR = 0xffff;
+
+inline bool Native_W3D_Stream_Needs_Discard(int cursor, int capacity,
+	int append_count)
+{
+	return cursor < 0 || capacity < 0 || append_count < 0 ||
+		append_count > capacity || cursor > capacity - append_count;
+}
+
+inline void Invalidate_Native_W3D_Stream_Cursors(int &vertex_cursor,
+	int &index_cursor, int &vertex_start, int &index_start)
+{
+	vertex_cursor = NATIVE_W3D_STREAM_DISCARD_CURSOR;
+	index_cursor = NATIVE_W3D_STREAM_DISCARD_CURSOR;
+	vertex_start = 0;
+	index_start = 0;
+}
+
 // Water-track writes are already uploaded by DX8VertexBufferClass::Unlock_Buffer
 // on the native lane. The x86 compatibility adapter supplies the historical
 // bridge publication below, keeping product callers independent of the

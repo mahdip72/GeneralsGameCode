@@ -117,6 +117,12 @@ int nShadowStartBatchIndex=0;
 int SHADOW_VERTEX_SIZE=4096;
 int SHADOW_INDEX_SIZE=8192;
 
+static void ResetVolumetricStreamAfterUploadFailure()
+{
+	rts::render::Invalidate_Native_W3D_Stream_Cursors(nShadowVertsInBuf,
+		nShadowIndicesInBuf, nShadowStartBatchVertex, nShadowStartBatchIndex);
+}
+
 //Rough bounding box around visible portion of the terrain
 //useful for quick culling
 static Real bcX;
@@ -1331,9 +1337,7 @@ void W3DVolumetricShadow::RenderMeshVolume(Int meshIndex, Int lightIndex, const 
 
 	if (!rts::render::IsGameRendererInitialized() ||
 		!rts::render::IsGameRenderTargetOperational() ||
-		shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr ||
-		!shadowVertexBufferOwner->Is_Valid() ||
-		!shadowIndexBufferOwner->Is_Valid())
+		shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr)
 		return;
 
 	geometry = m_shadowVolume[lightIndex][ meshIndex ];
@@ -1393,9 +1397,7 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 
 	if (!rts::render::IsGameRendererInitialized() ||
 		!rts::render::IsGameRenderTargetOperational() ||
-		shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr ||
-		!shadowVertexBufferOwner->Is_Valid() ||
-		!shadowIndexBufferOwner->Is_Valid())
+		shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr)
 		return;
 
 
@@ -1417,12 +1419,16 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 		return;
 
 
-	if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE-numVerts))	//check if room for model verts
+	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowVertsInBuf,
+		SHADOW_VERTEX_SIZE, numVerts))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
 		if (!shadowVertexBufferOwner->Lock_Buffer(0,
 			numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvVertices)))
+		{
+			ResetVolumetricStreamAfterUploadFailure();
 			return;
+		}
 		nShadowVertsInBuf=0;
 		nShadowStartBatchVertex=0;
 	}
@@ -1431,7 +1437,16 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 			static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvVertices)))
+		{
+			ResetVolumetricStreamAfterUploadFailure();
 			return;
+		}
+	}
+	if (pvVertices == nullptr)
+	{
+		shadowVertexBufferOwner->Unlock_Buffer();
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
 	}
 #ifdef SV_DEBUG
 	srand(0x1345465);
@@ -1450,14 +1465,22 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 #endif
 	}
 
-	shadowVertexBufferOwner->Unlock_Buffer();
+	if (!shadowVertexBufferOwner->Unlock_Buffer())
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
 
-	if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE-numIndex))	//check if room for model verts
+	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowIndicesInBuf,
+		SHADOW_INDEX_SIZE, numIndex))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
 		if (!shadowIndexBufferOwner->Lock_Buffer(0,
 			static_cast<size_t>(numIndex) * sizeof(short),
 			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvIndices)))
+		{
+			ResetVolumetricStreamAfterUploadFailure();
 			return;
+		}
 		nShadowIndicesInBuf=0;
 		nShadowStartBatchIndex=0;
 	}
@@ -1466,14 +1489,27 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 			static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
 			static_cast<size_t>(numIndex) * sizeof(short),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvIndices)))
+		{
+			ResetVolumetricStreamAfterUploadFailure();
 			return;
+		}
+	}
+	if (pvIndices == nullptr)
+	{
+		shadowIndexBufferOwner->Unlock_Buffer();
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
 	}
 	if(pvIndices)
 	{
 		memcpy(pvIndices,geometry->GetPolygonIndex(0,(short *)pvIndices),numPolys*3*sizeof(short));
 	}
 
-	shadowIndexBufferOwner->Unlock_Buffer();
+	if (!shadowIndexBufferOwner->Unlock_Buffer())
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
 
 	rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
 		static_cast<unsigned short>(nShadowStartBatchVertex));
@@ -1572,12 +1608,16 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 		return;
 
 
-	if (nShadowVertsInBuf > (SHADOW_VERTEX_SIZE-numVerts))	//check if room for model verts
+	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowVertsInBuf,
+		SHADOW_VERTEX_SIZE, numVerts))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
 		if (!shadowVertexBufferOwner->Lock_Buffer(0,
 			static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvVertices)))
+		{
+			ResetVolumetricStreamAfterUploadFailure();
 			return;
+		}
 		nShadowVertsInBuf=0;
 		nShadowStartBatchVertex=0;
 	}
@@ -1586,7 +1626,16 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 			static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvVertices)))
+		{
+			ResetVolumetricStreamAfterUploadFailure();
 			return;
+		}
+	}
+	if (pvVertices == nullptr)
+	{
+		shadowVertexBufferOwner->Unlock_Buffer();
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
 	}
 	srand(0x1345465);
 	if(pvVertices)
@@ -1602,14 +1651,22 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 		}
 	}
 
-	shadowVertexBufferOwner->Unlock_Buffer();
+	if (!shadowVertexBufferOwner->Unlock_Buffer())
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
 
-	if (nShadowIndicesInBuf > (SHADOW_INDEX_SIZE-numIndex))	//check if room for model verts
+	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowIndicesInBuf,
+		SHADOW_INDEX_SIZE, numIndex))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
 		if (!shadowIndexBufferOwner->Lock_Buffer(0,
 			static_cast<size_t>(numIndex) * sizeof(short),
 			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvIndices)))
+		{
+			ResetVolumetricStreamAfterUploadFailure();
 			return;
+		}
 		nShadowIndicesInBuf=0;
 		nShadowStartBatchIndex=0;
 	}
@@ -1618,7 +1675,16 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 			static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
 			static_cast<size_t>(numIndex) * sizeof(short),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvIndices)))
+		{
+			ResetVolumetricStreamAfterUploadFailure();
 			return;
+		}
+	}
+	if (pvIndices == nullptr)
+	{
+		shadowIndexBufferOwner->Unlock_Buffer();
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
 	}
 
 
@@ -1632,7 +1698,11 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 		}
 	}
 
-	shadowIndexBufferOwner->Unlock_Buffer();
+	if (!shadowIndexBufferOwner->Unlock_Buffer())
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
 
 	rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
 		static_cast<unsigned short>(nShadowStartBatchVertex));
@@ -3465,9 +3535,7 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 		if (!rts::render::IsGameRendererInitialized() ||
 			!rts::render::IsGameRenderTargetOperational() ||
 			!rts::render::GameRendererSupportsStencil() ||
-			shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr ||
-			!shadowVertexBufferOwner->Is_Valid() ||
-			!shadowIndexBufferOwner->Is_Valid())
+			shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr)
 			return;	//need a live renderer with a stencil attachment.
 
 		//Some drivers require a fresh dynamic VB each frame, so force a

@@ -843,6 +843,107 @@ int main()
 		!resources.IsValid(dynamicHandle),
 		"successful recovery publishes a replacement before retiring the stale generation");
 
+	// Mirror the shadow append-cursor contract around a real failed Unlock:
+	// discard both streams after either upload fails, suppress the failed draw,
+	// and let the next frame rebuild from offset zero.
+	NativeW3DBufferOwner frameRecoveryBuffer;
+	BufferDescriptor frameRecoveryDescriptor = dynamicVertexDescriptor;
+	frameRecoveryDescriptor.byteCount = 16;
+	result |= Check(frameRecoveryBuffer.Create(frameRecoveryDescriptor) ==
+		RENDER_RESULT_OK, "shadow recovery fixture creates a dynamic vertex stream");
+	NativeW3DBufferOwner frameRecoveryIndexBuffer;
+	BufferDescriptor frameRecoveryIndexDescriptor = dynamicDescriptor;
+	frameRecoveryIndexDescriptor.byteCount = 24;
+	result |= Check(frameRecoveryIndexBuffer.Create(
+		frameRecoveryIndexDescriptor) == RENDER_RESULT_OK,
+		"shadow recovery fixture creates a dynamic index stream");
+	int shadowVertexCursor = 1;
+	int shadowIndexCursor = 6;
+	int shadowVertexStart = 1;
+	int shadowIndexStart = 6;
+	void *frameRecoveryBytes = nullptr;
+	device.FailUpdate(true);
+	const unsigned int drawsBeforeFailedShadowUpload = device.DrawCount();
+	result |= Check(frameRecoveryBuffer.Lock(shadowVertexCursor * 4, 4,
+		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &frameRecoveryBytes) ==
+		RENDER_RESULT_OK && frameRecoveryBytes != nullptr,
+		"shadow recovery fixture appends one no-overwrite range");
+	if (frameRecoveryBytes != nullptr)
+	{
+		Fill(frameRecoveryBytes, 4, 0x4d);
+	}
+	const bool failedShadowUnlock =
+		frameRecoveryBuffer.Unlock() == RENDER_RESULT_FAILED;
+	Invalidate_Native_W3D_Stream_Cursors(shadowVertexCursor,
+		shadowIndexCursor, shadowVertexStart, shadowIndexStart);
+	GpuHandle failedShadowHandle;
+	result |= Check(failedShadowUnlock &&
+		frameRecoveryBuffer.HasFailedMutation() &&
+		frameRecoveryBuffer.AcquireVertexRange(4, 0, 0, 1,
+			&failedShadowHandle) == RENDER_RESULT_FAILED &&
+		!failedShadowHandle.isValid() &&
+		device.DrawCount() == drawsBeforeFailedShadowUpload &&
+		shadowVertexCursor == NATIVE_W3D_STREAM_DISCARD_CURSOR &&
+		shadowIndexCursor == NATIVE_W3D_STREAM_DISCARD_CURSOR &&
+		shadowVertexStart == 0 && shadowIndexStart == 0 &&
+		Native_W3D_Stream_Needs_Discard(shadowVertexCursor, 4, 2) &&
+		Native_W3D_Stream_Needs_Discard(shadowIndexCursor, 12, 3),
+		"failed UpdateBuffer at Unlock suppresses drawing and invalidates both cursors");
+	device.FailUpdate(false);
+	if (Native_W3D_Stream_Needs_Discard(shadowVertexCursor, 4, 2))
+	{
+		result |= Check(frameRecoveryBuffer.Lock(0, 16,
+			RENDER_BUFFER_UPDATE_DISCARD, &frameRecoveryBytes) ==
+			RENDER_RESULT_OK && frameRecoveryBytes != nullptr,
+			"next shadow frame retries the poisoned owner with an offset-zero discard");
+		if (frameRecoveryBytes != nullptr)
+		{
+			Fill(frameRecoveryBytes, 16, 0x62);
+		}
+		const RenderResult recoveredShadowUnlock = frameRecoveryBuffer.Unlock();
+		void *frameRecoveryIndices = nullptr;
+		const bool indexNeedsDiscard = Native_W3D_Stream_Needs_Discard(
+			shadowIndexCursor, 12, 3);
+		bool recoveredIndexLock = false;
+		RenderResult recoveredIndexUnlock = RENDER_RESULT_FAILED;
+		if (indexNeedsDiscard)
+		{
+			recoveredIndexLock = frameRecoveryIndexBuffer.Lock(0, 6,
+				RENDER_BUFFER_UPDATE_DISCARD, &frameRecoveryIndices) ==
+				RENDER_RESULT_OK && frameRecoveryIndices != nullptr;
+			if (recoveredIndexLock)
+			{
+				Fill(frameRecoveryIndices, 6, 0x73);
+				recoveredIndexUnlock = frameRecoveryIndexBuffer.Unlock();
+			}
+		}
+		shadowVertexCursor = 2;
+		shadowIndexCursor = 3;
+		shadowVertexStart = shadowVertexCursor;
+		shadowIndexStart = shadowIndexCursor;
+		GpuHandle frameRecoveryHandle;
+		GpuHandle frameRecoveryIndexHandle;
+		unsigned char recoveredShadowImage[16];
+		std::memset(recoveredShadowImage, 0, sizeof(recoveredShadowImage));
+		std::memset(recoveredShadowImage, 0x62, sizeof(recoveredShadowImage));
+		result |= Check(recoveredShadowUnlock == RENDER_RESULT_OK &&
+			!frameRecoveryBuffer.HasFailedMutation() &&
+			device.LastOffset() == 0 && device.LastMode() ==
+				RENDER_BUFFER_UPDATE_DISCARD &&
+			frameRecoveryBuffer.AcquireVertexRange(4, 0, 0, 4,
+				&frameRecoveryHandle) == RENDER_RESULT_OK &&
+			frameRecoveryIndexBuffer.AcquireIndexRange(RENDER_FORMAT_R16_UINT,
+				0, 0, 3, &frameRecoveryIndexHandle) == RENDER_RESULT_OK &&
+			device.BufferEquals(frameRecoveryHandle,
+				recoveredShadowImage, sizeof(recoveredShadowImage)) &&
+			indexNeedsDiscard && recoveredIndexLock &&
+			recoveredIndexUnlock == RENDER_RESULT_OK &&
+			!frameRecoveryIndexBuffer.HasFailedMutation() &&
+			!Native_W3D_Stream_Needs_Discard(shadowVertexCursor, 4, 2) &&
+			!Native_W3D_Stream_Needs_Discard(shadowIndexCursor, 12, 3),
+			"discard recovery republishes a complete first range for the next draw");
+	}
+
 	// A replacement allocation is already live when destruction of the old
 	// handle refuses the transaction.  Retire only the exact old registry slot;
 	// keep its native allocation for Shutdown while publishing the replacement.
@@ -1013,7 +1114,9 @@ int main()
 		staleBindingBuffer.AcquireVertexRange(4, 0, 0, 4,
 			&staleBindingHandle) == RENDER_RESULT_OK,
 		"the lifecycle fixture exposes its current binding generation");
-	result |= Check(UnbindNativeW3DBufferResources(&differentResources) ==
+	result |= Check(frameRecoveryIndexBuffer.Reset() == RENDER_RESULT_OK &&
+		frameRecoveryBuffer.Reset() == RENDER_RESULT_OK &&
+		UnbindNativeW3DBufferResources(&differentResources) ==
 		RENDER_RESULT_INVALID_ARGUMENT &&
 		UnbindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK &&
 		BindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK &&
