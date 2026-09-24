@@ -34,14 +34,24 @@
 #include "GameClient/MapUtil.h"
 #include "GameClient/Shell.h"
 #if defined(_WIN64)
+#include "Common/FileSystem.h"
 #include "Common/LocalFileSystem.h"
 #include "Common/file.h"
+#include "Lib/NetworkMapPackageTransaction.h"
 #endif
 #include "GameNetwork/FileTransfer.h"
 #include "GameNetwork/networkutil.h"
 #include "Lib/FileTransferTimeout.h"
 #if defined(_WIN64)
 #include "Lib/NetworkEpochHandshake.h"
+#endif
+
+#if defined(_WIN64)
+static void noteRecoveredTransferMapFile(const char *path, void *)
+{
+	if (TheFileSystem != nullptr)
+		TheFileSystem->noteExternalFileReplacement(path);
+}
 #endif
 
 //-------------------------------------------------------------------------------------
@@ -296,7 +306,11 @@ Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 {
 	TheGameInfo = game;
 #if defined(_WIN64)
-	if (game == nullptr || !RecoverInterruptedNetworkMapPackage(game->getMap()))
+	if (game == nullptr)
+		return FALSE;
+	rts::network_epoch::NetworkMapPackageTransaction::ReadGuard mapRead(
+		game->getMap().str(), noteRecoveredTransferMapFile);
+	if (!mapRead.ready())
 		return FALSE;
 #endif
 	Int mask = 0;

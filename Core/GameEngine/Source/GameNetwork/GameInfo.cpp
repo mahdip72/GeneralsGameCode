@@ -44,10 +44,21 @@
 #include "GameNetwork/LANAPI.h"						// for testing packet size
 #include "GameNetwork/LANAPICallbacks.h"	// for testing packet size
 #include "WWLib/strtok_r.h"
+#if defined(_WIN64)
+#include "Lib/NetworkMapPackageTransaction.h"
+#endif
 
 
 
 GameInfo *TheGameInfo = nullptr;
+
+#if defined(_WIN64)
+static void noteRecoveredGameInfoMapFile(const char *path, void *)
+{
+	if (TheFileSystem != nullptr)
+		TheFileSystem->noteExternalFileReplacement(path);
+}
+#endif
 
 // GameSlot ----------------------------------------
 
@@ -510,7 +521,9 @@ void GameInfo::setMap( AsciiString mapName )
 {
 	m_mapName = mapName;
 #if defined(_WIN64)
-	if (!RecoverInterruptedNetworkMapPackage(m_mapName))
+	rts::network_epoch::NetworkMapPackageTransaction::ReadGuard mapRead(
+		m_mapName.str(), noteRecoveredGameInfoMapFile);
+	if (!mapRead.ready())
 	{
 		m_mapMask = 0;
 		return;

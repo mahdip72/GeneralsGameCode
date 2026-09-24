@@ -23,6 +23,8 @@ private:
 	public:
 		explicit MapMutex(const std::string &map) : m_handle(nullptr), m_owned(false)
 		{
+			if (map.empty())
+				return;
 			char absolute[MAX_PATH];
 			const DWORD length = GetFullPathNameA(map.c_str(), MAX_PATH,
 				absolute, nullptr);
@@ -71,6 +73,30 @@ public:
 	typedef bool (*ContinueCommit)(std::size_t committed, void *context);
 
 	NetworkMapPackageTransaction() : m_rollbackComplete(true) {}
+
+	class ReadGuard
+	{
+	public:
+		ReadGuard(const char *map, NotifyReplacement notify = nullptr,
+			void *context = nullptr) :
+			m_map(map != nullptr ? normalizePath(map) : std::string()),
+			m_mutex(m_map), m_ready(false)
+		{
+			if (!safePath(map) || !m_mutex.valid())
+				return;
+			const std::string journal = journalPath(m_map.c_str());
+			if (!journal.empty())
+				m_ready = isCommitting() ||
+					recoverLocked(m_map.c_str(), journal, notify, context);
+		}
+		bool ready() const { return m_ready; }
+	private:
+		ReadGuard(const ReadGuard &);
+		ReadGuard &operator=(const ReadGuard &);
+		std::string m_map;
+		MapMutex m_mutex;
+		bool m_ready;
+	};
 
 	bool stage(const char *path, const unsigned char *bytes, std::size_t length)
 	{
@@ -479,7 +505,7 @@ private:
 
 	static int &commitDepth()
 	{
-		static int depth = 0;
+		static thread_local int depth = 0;
 		return depth;
 	}
 

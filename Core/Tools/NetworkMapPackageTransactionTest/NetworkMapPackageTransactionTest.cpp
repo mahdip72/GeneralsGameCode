@@ -196,6 +196,23 @@ int main(int argc, char **argv)
 		SetEnvironmentVariableA("GGC_NET3_TEST_HOLD_PREPARE", "1");
 		return child.commit(Valid, nullptr) ? 0 : 3;
 	}
+	if (argc == 3 && std::string(argv[1]) == "--hold-read")
+	{
+		const std::string folder = argv[2];
+		const std::string ini = folder + "\\map.ini";
+		const std::string map = folder + "\\read.map";
+		NetworkMapPackageTransaction::ReadGuard outer(map.c_str());
+		NetworkMapPackageTransaction::ReadGuard inner(map.c_str());
+		if (!outer.ready() || !inner.ready() || Read(ini) != "read-old")
+			return 2;
+		if (!Write(map + ".ready", "ready"))
+			return 3;
+		for (int attempt = 0; attempt < 3000 &&
+			GetFileAttributesA((map + ".release").c_str()) == INVALID_FILE_ATTRIBUTES;
+			++attempt)
+			Sleep(10);
+		return Read(map) == "read-old" && Read(ini) == "read-old" ? 0 : 4;
+	}
 	char current[MAX_PATH];
 	if (GetCurrentDirectoryA(MAX_PATH, current) == 0)
 		return 1;
@@ -570,7 +587,57 @@ int main(int argc, char **argv)
 		"live preparation completes after competing recovery is rejected") && ok;
 	DeleteFileA(ready.c_str());
 	DeleteFileA(release.c_str());
+	const std::string readMap = folder + "\\read.map";
+	const std::string readBytes = "read-new";
+	ok = Check(Write(ini, "read-old") && Write(readMap, "read-old"),
+		"set up a coherent package for the concurrent read") && ok;
+	std::string readCommand = "\"" + std::string(executable) +
+		"\" --hold-read \"" + folder + "\"";
+	std::vector<char> readCommandLine(readCommand.begin(), readCommand.end());
+	readCommandLine.push_back(0);
+	PROCESS_INFORMATION readProcess = {};
+	const bool readLaunched = CreateProcessA(nullptr, readCommandLine.data(),
+		nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+		&startup, &readProcess) != 0;
+	bool readReady = false;
+	if (readLaunched)
+	{
+		for (int attempt = 0; attempt < 1000; ++attempt)
+		{
+			if (GetFileAttributesA((readMap + ".ready").c_str()) !=
+					INVALID_FILE_ATTRIBUTES)
+			{
+				readReady = true;
+				break;
+			}
+			Sleep(10);
+		}
+	}
+	NetworkMapPackageTransaction pendingReadCommit;
+	ok = Check(readReady && pendingReadCommit.stage(ini.c_str(),
+		reinterpret_cast<const unsigned char *>(readBytes.data()), readBytes.size()) &&
+		pendingReadCommit.stage(readMap.c_str(),
+			reinterpret_cast<const unsigned char *>(readBytes.data()), readBytes.size()) &&
+		!pendingReadCommit.commit(Valid, nullptr) &&
+		Read(ini) == "read-old" && Read(readMap) == "read-old",
+		"live package read rejects a concurrent commit before replacement") && ok;
+	Write(readMap + ".release", "go");
+	DWORD readCode = 0;
+	if (readLaunched)
+	{
+		WaitForSingleObject(readProcess.hProcess, 30000);
+		GetExitCodeProcess(readProcess.hProcess, &readCode);
+		CloseHandle(readProcess.hThread);
+		CloseHandle(readProcess.hProcess);
+	}
+	ok = Check(readLaunched && readCode == 0 &&
+		pendingReadCommit.commit(Valid, nullptr) &&
+		Read(ini) == readBytes && Read(readMap) == readBytes && NoTemps(folder),
+		"read guard keeps old package coherent before later commit") && ok;
+	DeleteFileA((readMap + ".ready").c_str());
+	DeleteFileA((readMap + ".release").c_str());
 
+	DeleteFileA(readMap.c_str());
 	DeleteFileA(holdMap.c_str());
 	DeleteFileA(cleanupMap.c_str());
 	DeleteFileA(ini.c_str());

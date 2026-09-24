@@ -120,6 +120,9 @@ static void noteRecoveredMapFile(const char *path, void *)
 		TheFileSystem->noteExternalFileReplacement(path);
 }
 
+typedef rts::network_epoch::NetworkMapPackageTransaction::ReadGuard
+	NetworkMapReadGuard;
+
 Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName)
 {
 	return rts::network_epoch::NetworkMapPackageTransaction::isCommitting() ||
@@ -130,7 +133,10 @@ Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName)
 Bool GetCurrentMapTransferContentsMask(const AsciiString &mapName,
 	UnsignedInt *maskOut)
 {
-	if (maskOut == nullptr || !RecoverInterruptedNetworkMapPackage(mapName))
+	if (maskOut == nullptr)
+		return FALSE;
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
 		return FALSE;
 	*maskOut = 0U;
 	const AsciiString paths[] = {
@@ -154,7 +160,8 @@ Bool GetCurrentMapTransferContentsMask(const AsciiString &mapName,
 UnsignedInt GetMapFileCRC(const AsciiString &mapName)
 {
 #if defined(_WIN64)
-	if (!RecoverInterruptedNetworkMapPackage(mapName))
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
 		return 0U;
 #endif
 	File *file = TheFileSystem->openFile(mapName.str(), File::READ);
@@ -176,7 +183,8 @@ Bool IsNetworkMapFileCRCValid(UnsignedInt expectedCrc, UnsignedInt localCrc)
 Int GetMapSimulationSidecarMask(const AsciiString &mapName)
 {
 #if defined(_WIN64)
-	if (!RecoverInterruptedNetworkMapPackage(mapName))
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
 		return 0;
 #endif
 	const AsciiString paths[] = {
@@ -305,7 +313,10 @@ Bool GetProjectedNetworkMapPackageCompanionCRC(const AsciiString &mapName,
 	NetworkMapPackageCompanionOverride overrideFile, void *context,
 	UnsignedInt *maskOut, UnsignedInt *crcOut)
 {
-	if (crcOut == nullptr || !RecoverInterruptedNetworkMapPackage(mapName))
+	if (crcOut == nullptr)
+		return FALSE;
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
 		return FALSE;
 	*crcOut = 0U;
 	if (maskOut != nullptr)
@@ -441,7 +452,8 @@ static Bool ParseSizeOnlyInChunk(DataChunkInput &file, DataChunkInfo *info, void
 static Bool loadMap( AsciiString filename )
 {
 #if defined(_WIN64)
-	if (!RecoverInterruptedNetworkMapPackage(filename))
+	NetworkMapReadGuard mapRead(filename.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
 		return FALSE;
 #endif
 	CachedFileInputStream fileStrm;
@@ -785,7 +797,8 @@ Bool MapCache::loadMapsFromDisk( const AsciiString &mapDir, Bool isOfficial, Boo
 #if defined(_WIN64)
 		// A crash may have replaced the .map itself before the journal was
 		// removed. Restore it before the cache records size or timestamp.
-		if (!RecoverInterruptedNetworkMapPackage(*filepathIt))
+		NetworkMapReadGuard mapRead(filepathIt->str(), noteRecoveredMapFile);
+		if (!mapRead.ready())
 			continue;
 #endif
 		if (!TheFileSystem->getFileInfo(*filepathIt, &fileInfo))
@@ -812,6 +825,11 @@ Bool MapCache::addMap(
 	FileInfo &fileInfo,
 	Bool isOfficial)
 {
+#if defined(_WIN64)
+	NetworkMapReadGuard mapRead(fname.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
+		return FALSE;
+#endif
 	MapCache::iterator it = find(lowerFname);
 	if (it != end())
 	{
@@ -1377,7 +1395,8 @@ Image *getMapPreviewImage( AsciiString mapName )
 	if(!TheGlobalData)
 		return nullptr;
 #if defined(_WIN64)
-	if (!RecoverInterruptedNetworkMapPackage(mapName))
+	NetworkMapReadGuard mapRead(mapName.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
 		return nullptr;
 #endif
 	DEBUG_LOG(("%s Map Name", mapName.str()));
