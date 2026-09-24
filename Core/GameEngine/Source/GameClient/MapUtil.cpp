@@ -196,14 +196,15 @@ Int GetMapSimulationSidecarMask(const AsciiString &mapName)
 }
 
 #if defined(_WIN64)
-Bool GetMapSimulationSidecarCRC(const AsciiString &mapName, UnsignedInt *crcOut)
+Bool GetNetworkMapPackageCompanionCRC(const AsciiString &mapName,
+	UnsignedInt *maskOut, UnsignedInt *crcOut)
 {
-	return GetProjectedMapSimulationSidecarCRC(mapName, nullptr, nullptr,
-		nullptr, crcOut);
+	return GetProjectedNetworkMapPackageCompanionCRC(mapName, nullptr, nullptr,
+		maskOut, crcOut);
 }
 
-Bool GetProjectedMapSimulationSidecarCRC(const AsciiString &mapName,
-	MapSimulationSidecarOverride overrideFile, void *context,
+Bool GetProjectedNetworkMapPackageCompanionCRC(const AsciiString &mapName,
+	NetworkMapPackageCompanionOverride overrideFile, void *context,
 	UnsignedInt *maskOut, UnsignedInt *crcOut)
 {
 	if (crcOut == nullptr || !RecoverInterruptedNetworkMapPackage(mapName))
@@ -212,13 +213,14 @@ Bool GetProjectedMapSimulationSidecarCRC(const AsciiString &mapName,
 	if (maskOut != nullptr)
 		*maskOut = 0U;
 	const AsciiString paths[] = {
-		GetINIFromMap(mapName), GetSoloINIFromMap(mapName),
-		GetAssetUsageFromMap(mapName)
+		GetPreviewFromMap(mapName), GetINIFromMap(mapName),
+		GetStrFileFromMap(mapName), GetSoloINIFromMap(mapName),
+		GetAssetUsageFromMap(mapName), GetReadmeFromMap(mapName)
 	};
-	const UnsignedInt maskBits[] = { 4U, 16U, 32U };
+	const UnsignedInt maskBits[] = { 2U, 4U, 8U, 16U, 32U, 64U };
 	CRC crc;
 	crc.clear();
-	const UnsignedByte domain[] = { 'M', 'A', 'P', 'S', 'I', 'M', 1 };
+	const UnsignedByte domain[] = { 'M', 'A', 'P', 'C', 'O', 'M', 1 };
 	crc.computeCRC(domain, sizeof(domain));
 	for (Int i = 0; i < ARRAY_SIZE(paths); ++i)
 	{

@@ -142,13 +142,14 @@ Int GetMapSimulationSidecarMask(const AsciiString &mapName);
 Bool RecoverInterruptedNetworkMapPackage(const AsciiString &mapName);
 Bool GetCurrentMapTransferContentsMask(const AsciiString &mapName,
 	UnsignedInt *maskOut);
-Bool GetMapSimulationSidecarCRC(const AsciiString &mapName, UnsignedInt *crcOut);
+Bool GetNetworkMapPackageCompanionCRC(const AsciiString &mapName,
+	UnsignedInt *maskOut, UnsignedInt *crcOut);
 // An override supplies received, validated bytes before a NET3 package is
 // installed. Returning FALSE reads the existing file instead.
-typedef Bool (*MapSimulationSidecarOverride)(const AsciiString &path,
+typedef Bool (*NetworkMapPackageCompanionOverride)(const AsciiString &path,
 	const UnsignedByte **bytes, UnsignedInt *length, void *context);
-Bool GetProjectedMapSimulationSidecarCRC(const AsciiString &mapName,
-	MapSimulationSidecarOverride overrideFile, void *context,
+Bool GetProjectedNetworkMapPackageCompanionCRC(const AsciiString &mapName,
+	NetworkMapPackageCompanionOverride overrideFile, void *context,
 	UnsignedInt *maskOut, UnsignedInt *crcOut);
 #endif
 

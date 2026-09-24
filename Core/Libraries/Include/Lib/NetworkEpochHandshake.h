@@ -102,6 +102,9 @@ struct NetworkSimulationPolicyIdentity
 	std::uint32_t mapCrc = 0U;
 	std::uint32_t rosterMask = 0U;
 	std::uint32_t provenKernelMask = 0U;
+	// The wire-compatible sidecar fields bind all transferable map companions
+	// (preview, INI, STR, solo INI, asset usage, and readme). Only the narrower
+	// kNetworkSimulationSidecarMask participates in simulation eligibility.
 	std::uint32_t sidecarMask = 0U;
 	std::uint32_t sidecarCrc = 0U;
 };
@@ -153,6 +156,13 @@ inline bool IsNetworkMapFileCRCValid(std::uint32_t expectedCrc,
 	return expectedCrc != 0U && localCrc != 0U && expectedCrc == localCrc;
 }
 
+// The complete set of transferable map companions. Map bytes are separately
+// identified by the map CRC; these companions are all bound to the NET3
+// package identity, including visual and documentation files.
+constexpr std::uint32_t kNetworkMapPackageCompanionMask =
+	2U | 4U | 8U | 16U | 32U | 64U;
+// Only these companions affect deterministic simulation and parallel-kernel
+// eligibility. Keep this narrower than the transfer/identity mask above.
 constexpr std::uint32_t kNetworkSimulationSidecarMask = 4U | 16U | 32U;
 
 inline bool IsSameCanonicalNetworkMapPath(const char *left, const char *right)
@@ -181,17 +191,19 @@ inline std::uint16_t ConsumeNetworkCommandID(std::uint16_t &next)
 	return current;
 }
 
+// Sidecar identity/transfer decisions cover all companions above. The
+// narrower simulation-sidecar mask remains dedicated to worker eligibility.
 inline bool HasUntransferrableNetworkSidecars(std::uint32_t hostMask,
 	std::uint32_t peerMask)
 {
-	return (peerMask & kNetworkSimulationSidecarMask & ~hostMask) != 0U;
+	return (peerMask & kNetworkMapPackageCompanionMask & ~hostMask) != 0U;
 }
 
 inline bool IsMatchingNetworkSidecarIdentity(std::uint32_t hostMask,
 	std::uint32_t hostCrc, std::uint32_t peerMask, std::uint32_t peerCrc)
 {
-	return (hostMask & kNetworkSimulationSidecarMask) ==
-		(peerMask & kNetworkSimulationSidecarMask) && hostCrc == peerCrc;
+	return (hostMask & kNetworkMapPackageCompanionMask) ==
+		(peerMask & kNetworkMapPackageCompanionMask) && hostCrc == peerCrc;
 }
 
 enum class NetworkSidecarTransferDecision
@@ -215,9 +227,11 @@ inline NetworkSidecarTransferDecision DecideNetworkSidecarTransfer(
 {
 	if (HasUntransferrableNetworkSidecars(hostMask, peerMask))
 		return NetworkSidecarTransferDecision::Reject;
-	if (IsMatchingNetworkSidecarIdentity(hostMask, hostCrc, peerMask, peerCrc))
+	if (IsMatchingNetworkSidecarIdentity(hostMask, hostCrc,
+		peerMask, peerCrc))
 		return NetworkSidecarTransferDecision::Ready;
-	return hasTransferSender ? NetworkSidecarTransferDecision::Transfer :
+	return hasTransferSender ?
+		NetworkSidecarTransferDecision::Transfer :
 		NetworkSidecarTransferDecision::Reject;
 }
 

@@ -360,14 +360,15 @@ Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 	if (!mask)
 	{
 #if defined(_WIN64)
-		UnsignedInt localSidecarCRC = 0U;
-		if (!GetMapSimulationSidecarCRC(game->getMap(), &localSidecarCRC))
+		UnsignedInt localCompanionMask = 0U;
+		UnsignedInt localCompanionCRC = 0U;
+		if (!GetNetworkMapPackageCompanionCRC(game->getMap(),
+			&localCompanionMask, &localCompanionCRC))
 			return FALSE;
 		return rts::network_epoch::IsNetworkMapPackageReady(TRUE,
 			game->getMapCRC(), GetMapFileCRC(game->getMap()),
 			hostContentsMask, hostSidecarCRC,
-			GetMapSimulationSidecarMask(game->getMap()),
-			localSidecarCRC);
+			localCompanionMask, localCompanionCRC);
 #else
 		return TRUE;
 #endif
@@ -400,13 +401,14 @@ Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer)
 #if defined(_WIN64)
 	if (ok)
 	{
-		UnsignedInt localSidecarCRC = 0U;
-		ok = GetMapSimulationSidecarCRC(game->getMap(), &localSidecarCRC) &&
+		UnsignedInt localCompanionMask = 0U;
+		UnsignedInt localCompanionCRC = 0U;
+		ok = GetNetworkMapPackageCompanionCRC(game->getMap(),
+			&localCompanionMask, &localCompanionCRC) &&
 			rts::network_epoch::IsNetworkMapPackageReady(TRUE,
 				game->getMapCRC(), GetMapFileCRC(game->getMap()),
 				hostContentsMask, hostSidecarCRC,
-				GetMapSimulationSidecarMask(game->getMap()),
-				localSidecarCRC);
+				localCompanionMask, localCompanionCRC);
 	}
 #endif
 	if (!ok)

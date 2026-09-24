@@ -1105,8 +1105,8 @@ void ConnectionManager::clearNetworkSimulationPolicy()
 {
 	m_networkSimulationMapCrc = 0U;
 	m_networkSimulationMapContentsMask = 0;
-	m_networkSimulationSidecarMask = 0U;
-	m_networkSimulationSidecarCrc = 0U;
+	m_networkMapPackageCompanionMask = 0U;
+	m_networkMapPackageCompanionCrc = 0U;
 	m_networkSimulationRosterMask = 0U;
 	m_networkSimulationPolicyResolved = FALSE;
 	m_networkSimulationLocalIdentity =
@@ -1288,8 +1288,10 @@ void ConnectionManager::beginNetworkHello()
 			TheGlobalData->m_exeCRC, TheGlobalData->m_iniCRC,
 			m_networkSimulationMapCrc, m_networkSimulationRosterMask,
 			candidateKernelMask);
-	m_networkSimulationLocalIdentity.sidecarMask = m_networkSimulationSidecarMask;
-	m_networkSimulationLocalIdentity.sidecarCrc = m_networkSimulationSidecarCrc;
+	m_networkSimulationLocalIdentity.sidecarMask =
+		m_networkMapPackageCompanionMask;
+	m_networkSimulationLocalIdentity.sidecarCrc =
+		m_networkMapPackageCompanionCrc;
 
 	if (!hasRemotePeer)
 		return;
@@ -2545,7 +2547,7 @@ static Int selectedMapPackageFileIndex(const AsciiString &path,
 	return -1;
 }
 
-static Bool projectedNetworkMapSidecar(const AsciiString &path,
+static Bool projectedNetworkMapPackageCompanion(const AsciiString &path,
 	const UnsignedByte **bytes, UnsignedInt *length, void *context)
 {
 	rts::network_epoch::NetworkMapPackageTransaction *package =
@@ -2561,20 +2563,22 @@ struct NetworkMapCommitContext
 {
 	AsciiString map;
 	UnsignedInt mapCrc;
-	UnsignedInt hostMask;
-	UnsignedInt hostSidecarCrc;
+	UnsignedInt hostCompanionMask;
+	UnsignedInt hostCompanionCrc;
 };
 
 static bool validateCommittedNetworkMap(void *context)
 {
 	NetworkMapCommitContext *identity =
 		static_cast<NetworkMapCommitContext *>(context);
-	UnsignedInt localSidecarCrc = 0U;
-	return GetMapSimulationSidecarCRC(identity->map, &localSidecarCrc) &&
+	UnsignedInt localCompanionMask = 0U;
+	UnsignedInt localCompanionCrc = 0U;
+	return GetNetworkMapPackageCompanionCRC(identity->map,
+		&localCompanionMask, &localCompanionCrc) &&
 		rts::network_epoch::IsNetworkMapPackageReady(true,
 			identity->mapCrc, GetMapFileCRC(identity->map),
-			identity->hostMask, identity->hostSidecarCrc,
-			GetMapSimulationSidecarMask(identity->map), localSidecarCrc);
+			identity->hostCompanionMask, identity->hostCompanionCrc,
+			localCompanionMask, localCompanionCrc);
 }
 
 static void noteCommittedNetworkMapFile(const char *path, void *)
@@ -2696,18 +2700,19 @@ void ConnectionManager::processFile(NetFileCommandMsg *msg)
 		transferredMapCrc.clear();
 		transferredMapCrc.computeCRC(buf, len);
 		UnsignedInt hostContentsMask = 0U;
-		UnsignedInt hostSidecarCrc = 0U;
-		UnsignedInt projectedSidecarMask = 0U;
-		UnsignedInt projectedSidecarCrc = 0U;
+		UnsignedInt hostCompanionCrc = 0U;
+		UnsignedInt projectedCompanionMask = 0U;
+		UnsignedInt projectedCompanionCrc = 0U;
 		if (!getNetworkMapSidecarIdentity(0, &hostContentsMask,
-			&hostSidecarCrc) ||
-			!GetProjectedMapSimulationSidecarCRC(TheGameInfo->getMap(),
-				projectedNetworkMapSidecar, &m_pendingMapPackage,
-				&projectedSidecarMask, &projectedSidecarCrc) ||
+			&hostCompanionCrc) ||
+			!GetProjectedNetworkMapPackageCompanionCRC(
+				TheGameInfo->getMap(), projectedNetworkMapPackageCompanion,
+				&m_pendingMapPackage, &projectedCompanionMask,
+				&projectedCompanionCrc) ||
 			!rts::network_epoch::IsNetworkMapPackageReady(TRUE,
 				TheGameInfo->getMapCRC(), transferredMapCrc.get(),
-				hostContentsMask, hostSidecarCrc,
-				projectedSidecarMask, projectedSidecarCrc))
+				hostContentsMask, hostCompanionCrc,
+				projectedCompanionMask, projectedCompanionCrc))
 		{
 			m_pendingMapPackage.clear();
 			DEBUG_LOG(("Staged map bytes or sidecars fail NET3 host identity"));
@@ -2723,8 +2728,8 @@ void ConnectionManager::processFile(NetFileCommandMsg *msg)
 		NetworkMapCommitContext identity;
 		identity.map = TheGameInfo->getMap();
 		identity.mapCrc = TheGameInfo->getMapCRC();
-		wroteFile = getNetworkMapSidecarIdentity(0, &identity.hostMask,
-			&identity.hostSidecarCrc) &&
+		wroteFile = getNetworkMapSidecarIdentity(0,
+			&identity.hostCompanionMask, &identity.hostCompanionCrc) &&
 			m_pendingMapPackage.commit(validateCommittedNetworkMap, &identity,
 				noteCommittedNetworkMapFile);
 		if (!wroteFile && !m_pendingMapPackage.rollbackComplete())
@@ -4081,9 +4086,9 @@ void ConnectionManager::parseUserList(const GameInfo *game)
 	m_networkSimulationMapContentsMask = game->getMapContentsMask() |
 		static_cast<Int>(currentContentsMask &
 			rts::network_epoch::kNetworkSimulationSidecarMask);
-	m_networkSimulationSidecarMask = currentContentsMask;
-	const Bool sidecarIdentityReadable =
-		GetMapSimulationSidecarCRC(game->getMap(), &m_networkSimulationSidecarCrc);
+	const Bool sidecarIdentityReadable = GetNetworkMapPackageCompanionCRC(
+		game->getMap(), &m_networkMapPackageCompanionMask,
+		&m_networkMapPackageCompanionCrc);
 	beginNetworkHello();
 	if (!contentsReadable || !sidecarIdentityReadable)
 		rejectNetworkHello(-1, "NET3 map package read failed");

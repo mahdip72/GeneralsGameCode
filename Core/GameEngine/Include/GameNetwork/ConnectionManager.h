@@ -305,8 +305,8 @@ private:
 	UnsignedInt m_networkHelloAttempts;
 	UnsignedInt m_networkSimulationMapCrc;
 	Int m_networkSimulationMapContentsMask;
-	UnsignedInt m_networkSimulationSidecarMask;
-	UnsignedInt m_networkSimulationSidecarCrc;
+	UnsignedInt m_networkMapPackageCompanionMask;
+	UnsignedInt m_networkMapPackageCompanionCrc;
 	UnsignedInt m_networkSimulationRosterMask;
 	Bool m_networkSimulationPolicyResolved;
 	rts::network_epoch::NetworkSimulationPolicyIdentity

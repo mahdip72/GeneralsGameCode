@@ -281,7 +281,7 @@ int TestNetworkHelloContract()
 	NetworkSimulationPolicyIdentity simulationPolicy =
 		MakeNetworkSimulationPolicyIdentity(executableCrc, iniCrc,
 			0x10203040U, 0xa5U, nonProductTestMask);
-	simulationPolicy.sidecarMask = 1U | 4U | 16U;
+	simulationPolicy.sidecarMask = kNetworkMapPackageCompanionMask;
 	simulationPolicy.sidecarCrc = 0x76543210U;
 	const std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> encoded =
 		EncodeNetworkHello(executableCrc, iniCrc, 2U, 5U, sessionToken,
@@ -304,7 +304,11 @@ int TestNetworkHelloContract()
 		!IsNetworkMapFileCRCValid(0x10203040U, 0U) &&
 		!IsNetworkMapFileCRCValid(0x10203040U, 0x10203041U),
 		"network start requires matching nonzero map file CRCs");
-	const std::uint32_t sidecarBits[] = {4U, 16U, 32U};
+	const std::uint32_t sidecarBits[] = {2U, 4U, 8U, 16U, 32U, 64U};
+	result |= Check(kNetworkMapPackageCompanionMask ==
+		(2U | 4U | 8U | 16U | 32U | 64U) &&
+		kNetworkSimulationSidecarMask == (4U | 16U | 32U),
+		"transfer identity covers all companions but simulation policy stays narrow");
 	result |= Check(IsSameCanonicalNetworkMapPath("UserData\\Maps\\Map\\Map.map",
 		"userdata/maps/map/map.MAP") &&
 		!IsSameCanonicalNetworkMapPath("UserData\\Maps\\Other\\Other.map",
@@ -319,7 +323,8 @@ int TestNetworkHelloContract()
 		AddNetworkMapTransferRecipient(transferRecipients, 3U, false, false) ==
 			transferRecipients &&
 		IsNetworkMapPackageReady(true, 0x10203040U, 0x10203040U,
-			1U | 4U, 0x12345678U, 1U | 4U, 0x12345678U),
+			kNetworkMapPackageCompanionMask, 0x12345678U,
+			kNetworkMapPackageCompanionMask, 0x12345678U),
 		"missing-map and sidecar-only peers share the final map ACK mask");
 	std::uint16_t nextCommandId = 0U;
 	result |= Check(ConsumeNetworkCommandID(nextCommandId) == 0U &&
@@ -338,7 +343,7 @@ int TestNetworkHelloContract()
 				0x12345678U, 1U, 0x12345678U) &&
 			!HasUntransferrableNetworkSidecars(1U | bit, 1U) &&
 			HasUntransferrableNetworkSidecars(1U, 1U | bit),
-			"simulation sidecar presence and bytes must match host or transfer");
+			"every package companion presence and bytes must match or transfer");
 		result |= Check(DecideNetworkSidecarTransfer(1U | bit,
 			0x12345678U, 1U | bit, 0x12345678U, true) ==
 				NetworkSidecarTransferDecision::Ready &&
@@ -382,10 +387,10 @@ int TestNetworkHelloContract()
 		"reviewed lockstep-v2 promotion grants ordinary product authority");
 	result |= Check(kNetworkHelloWireSize == 88U, "NET3 policy hello binds sidecar identity");
 	result |= Check(ReadLittleEndian32(encoded.data() + kNetworkHelloSidecarMaskOffset) ==
-		(1U | 4U | 16U) &&
+		kNetworkMapPackageCompanionMask &&
 		ReadLittleEndian32(encoded.data() + kNetworkHelloSidecarCrcOffset) ==
 		0x76543210U,
-		"NET3 hello carries sidecar presence and content CRC");
+		"NET3 hello carries all map companion presence and content CRC");
 	result |= Check(HasNetworkHelloMagic(encoded.data(), encoded.size()),
 		"NET3 hello carries its independent wire magic");
 	result |= Check(!HasNetworkHelloMagic(encoded.data(), encoded.size() - 1U),
@@ -627,7 +632,13 @@ int TestNetworkHelloContract()
 	wrongBuild[12] ^= 0x01U;
 	result |= Check(DecodeAndValidateNetworkHello(wrongBuild.data(), wrongBuild.size(),
 		executableCrc, iniCrc, 2U, 5U, sessionToken, &decoded).error == rts::runtime_epoch::ValidationError::BuildCompatibilityMismatch,
-		"NET3 incompatible build identity is rejected");
+		"mixed NET3 executable builds reject incompatible companion digest semantics");
+	result |= Check(DecodeAndValidateNetworkHelloRecord(encoded.data(),
+		encoded.size(), executableCrc ^ 1U, iniCrc, &decoded, &decodedKind,
+		&decodedRecordIdentity, &decodedSessionToken,
+		&decodedSimulationPolicy).error ==
+		rts::runtime_epoch::ValidationError::BuildCompatibilityMismatch,
+		"old NET3 peers reject the expanded companion identity by build CRC");
 
 	std::array<rts::runtime_epoch::Byte, kNetworkHelloWireSize> wrongContent = encoded;
 	wrongContent[20] ^= 0x01U;
