@@ -361,11 +361,33 @@ private:
 			static_cast<DWORD>(contents.size()), &written, nullptr) != 0 &&
 			written == contents.size() && FlushFileBuffers(handle) != 0;
 		CloseHandle(handle);
-		const bool published = complete &&
-			MoveFileExA(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+		const bool published = complete && publishJournal(temporary, path);
 		if (!published)
 			DeleteFileA(temporary.c_str());
 		return published;
+	}
+
+	static bool publishJournal(const std::string &temporary,
+		const std::string &journal)
+	{
+		// Antivirus/indexing software can briefly hold a just-flushed temporary
+		// file without FILE_SHARE_DELETE. Retry only that transient condition;
+		// all other errors and exhausted retries remain fail-closed.
+		const DWORD delays[] = { 10U, 20U, 40U, 80U, 160U };
+		for (std::size_t attempt = 0; ; ++attempt)
+		{
+			if (MoveFileExA(temporary.c_str(), journal.c_str(),
+				MOVEFILE_WRITE_THROUGH))
+				return true;
+			const DWORD error = GetLastError();
+			if (error != ERROR_SHARING_VIOLATION ||
+				attempt >= sizeof(delays) / sizeof(delays[0]))
+			{
+				SetLastError(error);
+				return false;
+			}
+			Sleep(delays[attempt]);
+		}
 	}
 
 	static bool createDirectoryTree(const char *path, std::string &directory)
