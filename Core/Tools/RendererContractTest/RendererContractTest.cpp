@@ -6517,17 +6517,25 @@ int checkW3DDisplayVideoBufferFormatSelection(
 	}
 
 	const std::string body = source.substr(method, methodEnd - method);
+	std::string legacyTextureFormatSupportSource;
+	result |= check(ReadSourceText(
+		"Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/GameClient/LegacyTextureFormatSupport.cpp",
+		&legacyTextureFormatSupportSource),
+		"legacy texture-format support helper source is available");
+	const std::string::size_type legacyTextureFormatCapsQuery =
+		legacyTextureFormatSupportSource.find(
+			"DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(format)");
 	const std::string::size_type displayFormatMap = body.find(
 		"format = W3DVideoBuffer::W3DFormatToType(displayFormat);");
 	const std::string::size_type displayFormatTextureQuery = body.find(
-		"Support_Texture_Format( displayFormat )", displayFormatMap);
+		"IsLegacyTextureFormatSupported( displayFormat )", displayFormatMap);
 	const std::string::size_type displayFormatUnsupportedReset = body.find(
 		"format = VideoBuffer::TYPE_UNKNOWN;", displayFormatTextureQuery);
 	const std::string::size_type knownDisplayFormatGuard = body.rfind(
 		"if (format != VideoBuffer::TYPE_UNKNOWN &&",
 		displayFormatTextureQuery);
 	const std::string::size_type unsupportedDisplayFormatCondition =
-		body.find("!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format( displayFormat )",
+		body.find("!rts::render::IsLegacyTextureFormatSupported( displayFormat )",
 			knownDisplayFormatGuard);
 	const std::string::size_type displayFormatRuntimeGuard = body.find(
 		"!rts::render::IsNativeGameRendererActive()", displayFormatMap);
@@ -6548,9 +6556,9 @@ int checkW3DDisplayVideoBufferFormatSelection(
 		"if (format == VideoBuffer::TYPE_UNKNOWN)", legacyGuard);
 	const std::string::size_type unknownReturn = body.find(
 		"return nullptr;", unknownCheck);
-	const std::string::size_type firstFallbackCapsQuery = legacyBranch ==
+	const std::string::size_type firstLegacyTextureFormatQuery = legacyBranch ==
 		std::string::npos ? std::string::npos : body.find(
-		"DX8Wrapper::Get_Current_Caps()", legacyBranch);
+		"IsLegacyTextureFormatSupported( WW3D_FORMAT_X8R8G8B8 )", legacyBranch);
 
 	const std::string knownFormatFallbackMessage = std::string(titleName) +
 		" falls back when a mapped back-buffer format is not texture-supported";
@@ -6567,6 +6575,8 @@ int checkW3DDisplayVideoBufferFormatSelection(
 		displayFormatCompileGuard < displayFormatTextureQuery &&
 		displayFormatCompileGuardEnd > displayFormatTextureQuery,
 		knownFormatFallbackMessage.c_str());
+	result |= check(legacyTextureFormatCapsQuery != std::string::npos,
+		"legacy texture-format support helper queries D3D8 texture caps");
 
 	const std::string nativeSelectionMessage = std::string(titleName) +
 		" keeps the canonical native X8R8G8B8 selection";
@@ -6580,8 +6590,8 @@ int checkW3DDisplayVideoBufferFormatSelection(
 		" gates compatibility fallback away from native D3D11";
 	result |= check(legacyBranch != std::string::npos &&
 		unknownCheck > legacyGuard && unknownReturn > unknownCheck &&
-		firstFallbackCapsQuery >= legacyBranch &&
-		firstFallbackCapsQuery < unknownCheck,
+		firstLegacyTextureFormatQuery >= legacyBranch &&
+		firstLegacyTextureFormatQuery < unknownCheck,
 		legacyGuardMessage.c_str());
 
 	if (legacyBranch != std::string::npos && unknownCheck > legacyBranch)
