@@ -1,4 +1,5 @@
 #include "Renderer/LegacyColorPacking.h"
+#include "Renderer/PointGroupColorPacking.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -9,6 +10,16 @@
 
 namespace
 {
+	struct PointColor
+	{
+		float channels[4];
+
+		float operator[](int index) const
+		{
+			return channels[index];
+		}
+	};
+
 	bool Near(float first, float second)
 	{
 		return fabs(first - second) <= 1.0e-6f;
@@ -36,11 +47,85 @@ namespace
 		raw.bits = bits;
 		return raw.value;
 	}
+
+	bool TestPointGroupColorPacking()
+	{
+		enum { POINT_COUNT = 700, MAX_VERTICES = POINT_COUNT * 4,
+			MAX_VB_SIZE = 2048 };
+		PointColor pointColors[POINT_COUNT];
+		PointColor expandedColors[MAX_VERTICES];
+		unsigned int reference[MAX_VERTICES];
+		int point;
+		for (point = 0; point < POINT_COUNT; ++point)
+		{
+			pointColors[point].channels[0] =
+				static_cast<float>(point % 17) / 16.0f;
+			pointColors[point].channels[1] =
+				static_cast<float>((point + 3) % 13) / 12.0f;
+			pointColors[point].channels[2] =
+				static_cast<float>((point + 5) % 11) / 10.0f;
+			pointColors[point].channels[3] =
+				static_cast<float>((point + 7) % 9) / 8.0f;
+		}
+
+		bool passed = true;
+		const int verticesPerPointValues[] = {3, 4};
+		int mode;
+		for (mode = 0; mode < 2; ++mode)
+		{
+			const int verticesPerPoint = verticesPerPointValues[mode];
+			const int vertexCount = POINT_COUNT * verticesPerPoint;
+			for (int vertex = 0; vertex < vertexCount; ++vertex)
+			{
+				expandedColors[vertex] = pointColors[vertex / verticesPerPoint];
+				const PointColor &color = expandedColors[vertex];
+				reference[vertex] = rts::render::PackLegacyARGB(
+					color[0], color[1], color[2], color[3]);
+			}
+
+			int packedPointCount = 0;
+			int expectedPackedPointCount = 0;
+			bool pointMappingMatches = true;
+			for (int chunkStart = 0; chunkStart < vertexCount;
+				chunkStart += MAX_VB_SIZE)
+			{
+				const int chunkEnd =
+					(chunkStart + MAX_VB_SIZE < vertexCount) ?
+					chunkStart + MAX_VB_SIZE : vertexCount;
+				int cachedPointIndex = -1;
+				int previousPointIndex = -1;
+				unsigned int packedColor = 0U;
+				for (int vertex = chunkStart; vertex < chunkEnd; ++vertex)
+				{
+					const int pointIndex = vertex / verticesPerPoint;
+					const bool repacked =
+						rts::render::PackPointGroupColorForVertex(pointColors,
+							vertex, verticesPerPoint, cachedPointIndex, packedColor);
+					if (pointIndex != previousPointIndex)
+						++expectedPackedPointCount;
+					if (repacked)
+						++packedPointCount;
+					if (repacked != (pointIndex != previousPointIndex) ||
+						packedColor != reference[vertex])
+						pointMappingMatches = false;
+					previousPointIndex = pointIndex;
+				}
+			}
+			passed = Check(pointMappingMatches,
+				"cached point colors match reference bytes across split VB chunks") && passed;
+			passed = Check(packedPointCount == expectedPackedPointCount &&
+				packedPointCount < vertexCount,
+				"point color packs once per touched primitive per VB chunk") && passed;
+		}
+		return passed;
+	}
 }
 
 int main()
 {
 	bool passed = true;
+
+	passed = TestPointGroupColorPacking() && passed;
 
 	passed = Check(rts::render::ClampLegacyColorUnit(0.0f) == 0.0f,
 		"zero remains zero") && passed;

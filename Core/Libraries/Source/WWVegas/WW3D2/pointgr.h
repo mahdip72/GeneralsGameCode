@@ -123,7 +123,6 @@ public:
 protected:
 	// Update arrays.
 	void						Update_Arrays(Vector3 *point_loc,
-									Vector4 *point_diffuse,
 									float *point_size,
 									unsigned char *point_orientation,
 									unsigned char *point_frame,

@@ -84,6 +84,7 @@
 #include "WW3D2/dx8indexbuffer.h"
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/LegacyColorPacking.h"
+#include "Renderer/PointGroupColorPacking.h"
 #include "rinfo.h"
 #include "camera.h"
 
@@ -121,19 +122,7 @@ static Vector3 GroundMultiplierY(0.0f, 1.0f, 0.0f);
 
 // Some internal variables
 VectorClass<Vector3>			VertexLoc;		// camera-space vertex locations
-VectorClass<Vector4>			VertexDiffuse;	// vertex diffuse/alpha colors
 VectorClass<Vector2>			VertexUV;		// vertex texture coords
-
-unsigned int PackPointGroupVertexColor(const Vector4 *colors, int vertex,
-	bool quads, unsigned int &packed)
-{
-	if (!quads || (vertex & 3) == 0)
-	{
-		const Vector4 &color = colors[vertex];
-		packed = rts::render::PackLegacyARGB(color.X, color.Y, color.Z, color.W);
-	}
-	return packed;
-}
 
 // Some DX 8 variables
 #define MAX_VB_SIZE			2048
@@ -921,7 +910,7 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	// Update the arrays with the offsets.
 	int vnum, pnum;
 
-	Update_Arrays(current_loc, current_diffuse, current_size, current_orient, current_frame,
+	Update_Arrays(current_loc, current_size, current_orient, current_frame,
 		PointCount, PointLoc->Get_Count(), vnum, pnum);
 
 	// the locations are now in view space
@@ -946,6 +935,7 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	                  WW3D::Is_Sorting_Enabled();
 
 	IndexBufferClass *indexbuffer;
+	const int verticesperpoint = PointMode == QUADS ? 4 : 3;
 	int	verticesperprimitive;/// lorenzen fixed
 	int current;
 	int delta;
@@ -981,6 +971,7 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 			}
 			const FVFInfoClass& fvfinfo=PointVerts.FVF_Info();
 			unsigned int packedColor = 0;
+			int packedPointIndex = -1;
 			const unsigned int defaultColor = current_diffuse ? 0 :
 				rts::render::PackLegacyARGB(DefaultPointColor[0],
 					DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
@@ -993,9 +984,14 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 				// Copy Locations
 				*(Vector3*)(vb+fvfinfo.Get_Location_Offset())=VertexLoc[i];
 				*(Vector3*)(vb+fvfinfo.Get_Normal_Offset())=Vector3(0.0f,0.0f,1.0f);
-				*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset()) = current_diffuse ?
-					PackPointGroupVertexColor(&VertexDiffuse[0], i,
-						PointMode == QUADS, packedColor) : defaultColor;
+				unsigned int diffuseColor = defaultColor;
+				if (current_diffuse)
+				{
+					rts::render::PackPointGroupColorForVertex(current_diffuse,
+						i, verticesperpoint, packedPointIndex, packedColor);
+					diffuseColor = packedColor;
+				}
+				*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset()) = diffuseColor;
 				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(0))=VertexUV[i];
 				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 				vb+=fvfinfo.Get_FVF_Size();
@@ -1048,7 +1044,6 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
  *========================================================================*/
 void PointGroupClass::Update_Arrays(
 	Vector3 *point_loc,
-	Vector4 *point_diffuse,
 	float *point_size,
 	unsigned char *point_orientation,
 	unsigned char *point_frame,
@@ -1077,10 +1072,9 @@ void PointGroupClass::Update_Arrays(
 		// Resize arrays (2x guardband to prevent frequent reallocations).
 		VertexLoc.Resize(total_vnum * 2, nullptr);
 		VertexUV.Resize(total_vnum * 2, nullptr);
-		VertexDiffuse.Resize(total_vnum * 2, nullptr);
 	}
 
-	int vert, i, j;
+	int vert, i;
 
 	/*
 	** Generate the vertex locations from the point locations (note that both are in camera space).
@@ -1446,21 +1440,6 @@ void PointGroupClass::Update_Arrays(
 
 	}
 
-	/*
-	** If we have a point color array, fill the vertex diffuse array from it.
-	*/
-	/// @todo lorenzen sez: use a quicker, unwrapped loop, and pointer arithmetic
-	/// @todo lorenzen sez: this is a leaf function, dang it
-	vert = 0;
-	if (point_diffuse) {
-		Vector4* vertex_color = &VertexDiffuse[0];
-		for (i = 0; i < active_points; i++) {
-			for (j = 0; j < verts_per_point; j++) {
-				vertex_color[vert + j] = point_diffuse[i];
-			}
-			vert += verts_per_point;
-		}
-	}
 }
 
 
@@ -1701,7 +1680,6 @@ void PointGroupClass::_Shutdown()
 	REF_PTR_RELEASE(Tris);
 	transformed_loc.Clear();
 	VertexLoc.Clear();
-	VertexDiffuse.Clear();
 	VertexUV.Clear();
 }
 
@@ -1911,7 +1889,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		//current_diffuse->Z *= attenuator;
 		//current_diffuse->W *= attenuator;
 
-		Update_Arrays(current_loc, current_diffuse, current_size, current_orient, current_frame,
+		Update_Arrays(current_loc, current_size, current_orient, current_frame,
 			PointCount, PointLoc->Get_Count(), vnum, pnum);
 
 		// the locations are now in view space
@@ -1933,6 +1911,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		const bool sort = (Shader.Get_Dst_Blend_Func() != ShaderClass::DSTBLEND_ZERO) && (Shader.Get_Alpha_Test() == ShaderClass::ALPHATEST_DISABLE) && (WW3D::Is_Sorting_Enabled());
 
 		IndexBufferClass *indexbuffer;
+		const int verticesperpoint = PointMode == QUADS ? 4 : 3;
 		int	verticesperprimitive;/// lorenzen fixed
 		int current;
 		int delta;
@@ -1971,6 +1950,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 				}
 				const FVFInfoClass& fvfinfo = PointVerts.FVF_Info();
 				unsigned int packedColor = 0;
+				int packedPointIndex = -1;
 				const unsigned int defaultColor = current_diffuse ? 0 :
 					rts::render::PackLegacyARGB(DefaultPointColor[0],
 						DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
@@ -1985,9 +1965,14 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 					*(Vector3*)(vb+fvfinfo.Get_Location_Offset()) = VertexLoc[i];
 					*(Vector3*)(vb+fvfinfo.Get_Normal_Offset()) = Vector3(0.0f,0.0f,1.0f);
 
-					*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset()) = current_diffuse ?
-						PackPointGroupVertexColor(&VertexDiffuse[0], i,
-							PointMode == QUADS, packedColor) : defaultColor;
+					unsigned int diffuseColor = defaultColor;
+					if (current_diffuse)
+					{
+						rts::render::PackPointGroupColorForVertex(current_diffuse,
+							i, verticesperpoint, packedPointIndex, packedColor);
+						diffuseColor = packedColor;
+					}
+					*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset()) = diffuseColor;
 					*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(0))=VertexUV[i];
 					*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 					vb+=fvfinfo.Get_FVF_Size();
