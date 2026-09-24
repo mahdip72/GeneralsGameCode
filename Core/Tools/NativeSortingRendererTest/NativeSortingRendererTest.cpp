@@ -269,6 +269,42 @@ void QueueOne(NativeSortingRenderer &renderer, unsigned int shaderBits,
 		indices.size() * sizeof(unsigned short), sphere) == RENDER_RESULT_OK);
 }
 
+void QueueStableNodeOrderFixture(NativeSortingRenderer &renderer)
+{
+	std::vector<TestVertex> vertices;
+	// Equal triangle depths keep the later small-range triangle sort stable, so
+	// the recorded sequence exposes the node-ordering result directly.
+	MakeVertices(vertices, std::vector<float>(3, 0.0f));
+	const unsigned short sourceIndices[] = {0, 1, 2};
+	const std::vector<unsigned short> indices(sourceIndices,
+		sourceIndices + 3);
+	GameBoundingSphere depthOne(0.0f, 0.0f, 1.0f, 1.0f);
+	GameBoundingSphere depthThreeFirst(0.0f, 0.0f, 3.0f, 1.0f);
+	GameBoundingSphere depthThreeSecond(0.0f, 0.0f, 3.0f, 1.0f);
+	GameBoundingSphere positiveZero(0.0f, 0.0f, 0.0f, 1.0f);
+	GameBoundingSphere negativeZero(0.0f, 0.0f, -0.0f, 1.0f);
+	GameBoundingSphere negativeDepth(0.0f, 0.0f, -2.0f, 1.0f);
+
+	QueueOne(renderer, 101, vertices, indices, &depthOne);
+	QueueOne(renderer, 202, vertices, indices, &depthThreeFirst);
+	QueueOne(renderer, 303, vertices, indices, &depthThreeSecond);
+	QueueOne(renderer, 404, vertices, indices, 0);
+	QueueOne(renderer, 505, vertices, indices, &positiveZero);
+	QueueOne(renderer, 606, vertices, indices, &negativeZero);
+	QueueOne(renderer, 707, vertices, indices, &negativeDepth);
+}
+
+void CheckStableNodeOrder(const std::vector<CapturedDraw> &draws)
+{
+	const unsigned int expected[] = {202, 303, 101, 404, 505, 606, 707};
+	CHECK(draws.size() == sizeof(expected) / sizeof(expected[0]));
+	if (draws.size() == sizeof(expected) / sizeof(expected[0]))
+	{
+		for (size_t index = 0; index < draws.size(); ++index)
+			CHECK(draws[index].state == expected[index]);
+	}
+}
+
 void TestNodeOrderingAndFlushBoundary()
 {
 	NativeSortingRenderer renderer;
@@ -317,6 +353,19 @@ void TestNodeOrderingAndFlushBoundary()
 	CHECK(renderer.Empty());
 	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
 	CHECK(sink.calls == 1);
+}
+
+void TestStableNodeOrderingPreservesEqualDepthAndSplice()
+{
+	NativeSortingRenderer renderer;
+	RecordingSink sink;
+	QueueStableNodeOrderFixture(renderer);
+	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
+	CHECK(sink.calls == 1);
+	std::vector<CapturedDraw> draws;
+	CHECK(CaptureAcceptedDrawStream(sink, draws));
+	CheckStableNodeOrder(draws);
+	CHECK(renderer.Empty());
 }
 
 void TestPerTriangleDepthOrder()
@@ -603,6 +652,40 @@ void TestPartialDrawFailureRetryMatchesOneShotOutput()
 	CHECK(SameAcceptedDrawStream(baselineDraws, retriedDraws));
 }
 
+void TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput()
+{
+	NativeSortingRenderer baselineRenderer;
+	RecordingSink baselineSink;
+	QueueStableNodeOrderFixture(baselineRenderer);
+	CHECK(baselineRenderer.Flush(baselineSink) == RENDER_RESULT_OK);
+	CHECK(baselineRenderer.Empty());
+	CHECK(baselineSink.calls == 1);
+	std::vector<CapturedDraw> baselineDraws;
+	CHECK(CaptureAcceptedDrawStream(baselineSink, baselineDraws));
+	CheckStableNodeOrder(baselineDraws);
+
+	NativeSortingRenderer retryRenderer;
+	RecordingSink retrySink;
+	retrySink.failCall = 1;
+	retrySink.acceptedOnFailure = 3;
+	QueueStableNodeOrderFixture(retryRenderer);
+	CHECK(retryRenderer.Flush(retrySink) == RENDER_RESULT_FAILED);
+	CHECK(!retryRenderer.Empty());
+	CHECK(retrySink.calls == 1);
+	CHECK(retrySink.batches.size() == 1);
+	if (retrySink.batches.size() == 1)
+		CHECK(retrySink.batches[0].acceptedDrawCount == 3);
+
+	retrySink.failCall = 0;
+	CHECK(retryRenderer.Flush(retrySink) == RENDER_RESULT_OK);
+	CHECK(retryRenderer.Empty());
+	CHECK(retrySink.calls == 2);
+	std::vector<CapturedDraw> retriedDraws;
+	CHECK(CaptureAcceptedDrawStream(retrySink, retriedDraws));
+	CheckStableNodeOrder(retriedDraws);
+	CHECK(SameAcceptedDrawStream(baselineDraws, retriedDraws));
+}
+
 }
 
 int main()
@@ -611,11 +694,13 @@ int main()
 	// host exposes more logical processors.
 	rts::JobSystem::setStartupWorkerCount(6);
 	TestNodeOrderingAndFlushBoundary();
+	TestStableNodeOrderingPreservesEqualDepthAndSplice();
 	TestPerTriangleDepthOrder();
 	TestMixedGeometryPreservesSortedOrder();
 	TestSameSubmissionTrianglesBeforeIncompatibleSubmission();
 	TestFailureAfterFirstChunkRetainsOnlyPendingGeometry();
 	TestPartialDrawFailureRetryMatchesOneShotOutput();
+	TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput();
 	CHECK(NativeSortingRendererTestRetireAllComplete());
 	CHECK(NativeSortingRendererTestRetireMixedPending());
 	return failures == 0 ? 0 : 1;

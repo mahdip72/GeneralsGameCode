@@ -211,20 +211,19 @@ void RetireCompletedSubmissions(std::vector<SortedSubmission> &submissions)
 	submissions.erase(pendingEnd, submissions.end());
 }
 
-void InsertSortedNode(std::vector<size_t> &order,
-	const std::vector<SortedNode> &nodes, size_t nodeIndex)
+struct SortedNodeDepthDescending
 {
-	for (std::vector<size_t>::iterator iter = order.begin(); iter != order.end();
-		++iter)
+	explicit SortedNodeDepthDescending(
+		const std::vector<SortedNode> &sourceNodes) : nodes(&sourceNodes) {}
+
+	bool operator()(size_t leftIndex, size_t rightIndex) const
 	{
-		if (nodes[nodeIndex].centerDepth > nodes[*iter].centerDepth)
-		{
-			order.insert(iter, nodeIndex);
-			return;
-		}
+		return (*nodes)[leftIndex].centerDepth >
+			(*nodes)[rightIndex].centerDepth;
 	}
-	order.push_back(nodeIndex);
-}
+
+	const std::vector<SortedNode> *nodes;
+};
 
 bool ValidateSourceIndices(const SortedSubmission &submission)
 {
@@ -603,10 +602,15 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 				return RENDER_RESULT_INVALID_ARGUMENT;
 			nodes.push_back(node);
 			if (node.hasSphere)
-				InsertSortedNode(positiveNodes, nodes, nodes.size() - 1);
+				positiveNodes.push_back(nodes.size() - 1);
 			else
 				unsortedNodes.push_back(nodes.size() - 1);
 		}
+
+		// Preserve submission order for equal depths, matching the old insertion
+		// rule while avoiding repeated vector shifts for every sphere node.
+		std::stable_sort(positiveNodes.begin(), positiveNodes.end(),
+			SortedNodeDepthDescending(nodes));
 
 		// Match the legacy splice: all unsorted nodes are inserted before the
 		// first sorted node whose transformed center is at or behind zero.
