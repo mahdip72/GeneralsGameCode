@@ -97,8 +97,13 @@ public:
 		const bool readOk = size == 0 || ReadFile(handle, &text[0], size,
 			&read, nullptr) != 0;
 		CloseHandle(handle);
-		if (!readOk || read != size || text.compare(0, 9, "GGCNET31\n") != 0)
+		if (!readOk || read != size ||
+			(text.compare(0, 9, "GGCNET32\n") != 0 &&
+			text.compare(0, 9, "GGCNET31\n") != 0 &&
+			text.compare(0, 9, "GGCNET30\n") != 0))
 			return false;
+		const bool preparing = text[7] == '0';
+		const bool recordedTemporaries = text[7] != '1';
 		std::size_t at = 9;
 		const std::size_t countEnd = text.find('\n', at);
 		if (countEnd == std::string::npos || countEnd != at + 1 ||
@@ -119,18 +124,39 @@ public:
 				return false;
 			disk[i].hadOriginal = text[at] == '1';
 			targets[i] = text.substr(at + 2, separator - at - 2);
-			const std::string recordedBackup =
-				text.substr(separator + 1, end - separator - 1);
+			const std::size_t temporaryEnd = recordedTemporaries ?
+				text.find('\t', separator + 1) : std::string::npos;
+			if (recordedTemporaries && (temporaryEnd == std::string::npos ||
+				temporaryEnd >= end))
+				return false;
+			if (recordedTemporaries)
+				disk[i].temporary = normalizePath(text.substr(separator + 1,
+					temporaryEnd - separator - 1).c_str());
+			const std::string recordedBackup = text.substr(
+				recordedTemporaries ? temporaryEnd + 1 : separator + 1,
+				end - (recordedTemporaries ? temporaryEnd + 1 : separator + 1));
 			disk[i].backup = normalizePath(recordedBackup.c_str());
 			if (!allowedTarget(map, targets[i].c_str()) ||
-				(disk[i].hadOriginal ?
+				(recordedTemporaries &&
+					!allowedBackup(map, disk[i].temporary.c_str())) ||
+				(recordedTemporaries ?
 					!allowedBackup(map, disk[i].backup.c_str()) :
-					!disk[i].backup.empty()))
+					(disk[i].hadOriginal ?
+						!allowedBackup(map, disk[i].backup.c_str()) :
+						!disk[i].backup.empty())))
 				return false;
 			at = end + 1;
 		}
 		if (at != text.size())
 			return false;
+		if (preparing)
+		{
+			// No installed file can change before the active journal is published.
+			// Keep the record until all prepared bytes have been removed.
+			if (!cleanup(disk, false) || !retireJournal(journal))
+				return false;
+			return true;
+		}
 		for (std::size_t i = 0; i < count; ++i)
 		{
 			if (disk[i].hadOriginal)
@@ -159,20 +185,49 @@ public:
 		m_rollbackComplete = true;
 		if (m_files.empty() || validate == nullptr)
 			return false;
+		const std::string map = m_files.back().path;
+		const std::string journal = journalPath(map.c_str());
+		if (journal.empty())
+			return false;
+		for (std::size_t i = 0; i < m_files.size(); ++i)
+		{
+			if (!allowedTarget(map.c_str(), m_files[i].path.c_str()))
+				return false;
+		}
 		std::vector<DiskFile> disk(m_files.size());
 		for (std::size_t i = 0; i < m_files.size(); ++i)
 		{
-			if (!prepare(m_files[i], disk[i]))
+			std::string directory;
+			if (!createDirectoryTree(m_files[i].path.c_str(), directory) ||
+				!tempName(directory, disk[i].temporary) ||
+				!tempName(directory, disk[i].backup))
 			{
 				cleanup(disk, false);
 				return false;
 			}
 		}
-		const std::string map = m_files.back().path;
-		const std::string journal = journalPath(map.c_str());
-		if (journal.empty() || !writeJournal(journal, disk))
+		if (!writeJournal(journal, disk, true))
 		{
 			cleanup(disk, false);
+			return false;
+		}
+		for (std::size_t i = 0; i < m_files.size(); ++i)
+		{
+			if (!prepare(m_files[i], disk[i]))
+			{
+				if (cleanup(disk, false))
+					retireJournal(journal);
+				return false;
+			}
+#if defined(GGC_NET3_TEST_CRASH_PREPARE)
+			if (GetEnvironmentVariableA("GGC_NET3_TEST_CRASH_PREPARE", nullptr, 0) != 0)
+				ExitProcess(91);
+#endif
+		}
+		if (!writeJournal(journal, disk, false))
+		{
+			if (cleanup(disk, false))
+				retireJournal(journal);
 			return false;
 		}
 		++commitDepth();
@@ -328,9 +383,9 @@ private:
 	}
 
 	bool writeJournal(const std::string &path,
-		const std::vector<DiskFile> &disk) const
+		const std::vector<DiskFile> &disk, bool preparing) const
 	{
-		std::string contents = "GGCNET31\n";
+		std::string contents = preparing ? "GGCNET30\n" : "GGCNET32\n";
 		contents += static_cast<char>('0' + disk.size());
 		contents += '\n';
 		for (std::size_t i = 0; i < disk.size(); ++i)
@@ -338,6 +393,8 @@ private:
 			contents += disk[i].hadOriginal ? '1' : '0';
 			contents += '\t';
 			contents += m_files[i].path;
+			contents += '\t';
+			contents += disk[i].temporary;
 			contents += '\t';
 			contents += disk[i].backup;
 			contents += '\n';
@@ -361,14 +418,15 @@ private:
 			static_cast<DWORD>(contents.size()), &written, nullptr) != 0 &&
 			written == contents.size() && FlushFileBuffers(handle) != 0;
 		CloseHandle(handle);
-		const bool published = complete && publishJournal(temporary, path);
+		const bool published = complete && publishJournal(temporary, path,
+			!preparing);
 		if (!published)
 			DeleteFileA(temporary.c_str());
 		return published;
 	}
 
 	static bool publishJournal(const std::string &temporary,
-		const std::string &journal)
+		const std::string &journal, bool replace)
 	{
 		// Antivirus/indexing software can briefly hold a just-flushed temporary
 		// file without FILE_SHARE_DELETE. Retry only that transient condition;
@@ -377,7 +435,8 @@ private:
 		for (std::size_t attempt = 0; ; ++attempt)
 		{
 			if (MoveFileExA(temporary.c_str(), journal.c_str(),
-				MOVEFILE_WRITE_THROUGH))
+				MOVEFILE_WRITE_THROUGH |
+				(replace ? MOVEFILE_REPLACE_EXISTING : 0)))
 				return true;
 			const DWORD error = GetLastError();
 			if (error != ERROR_SHARING_VIOLATION ||
@@ -495,10 +554,6 @@ private:
 
 	static bool prepare(const File &source, DiskFile &disk)
 	{
-		std::string directory;
-		if (!createDirectoryTree(source.path.c_str(), directory) ||
-			!tempName(directory, disk.temporary))
-			return false;
 		HANDLE handle = CreateFileA(disk.temporary.c_str(), GENERIC_WRITE, 0,
 			nullptr, TRUNCATE_EXISTING,
 			FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
@@ -517,8 +572,7 @@ private:
 		const DWORD attributes = GetFileAttributesA(source.path.c_str());
 		if (attributes == INVALID_FILE_ATTRIBUTES)
 			return GetLastError() == ERROR_FILE_NOT_FOUND;
-		if ((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY)) != 0 ||
-			!tempName(directory, disk.backup))
+		if ((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY)) != 0)
 			return false;
 		DeleteFileA(disk.backup.c_str());
 		if (!CopyFileA(source.path.c_str(), disk.backup.c_str(), TRUE))
@@ -536,15 +590,21 @@ private:
 		return true;
 	}
 
-	static void cleanup(const std::vector<DiskFile> &disk, bool retainBackups)
+	static bool cleanup(const std::vector<DiskFile> &disk, bool retainBackups)
 	{
+		bool complete = true;
 		for (std::size_t i = 0; i < disk.size(); ++i)
 		{
-			if (!disk[i].temporary.empty())
-				DeleteFileA(disk[i].temporary.c_str());
-			if (!retainBackups && !disk[i].backup.empty())
-				DeleteFileA(disk[i].backup.c_str());
+			if (!disk[i].temporary.empty() &&
+				!DeleteFileA(disk[i].temporary.c_str()) &&
+				GetLastError() != ERROR_FILE_NOT_FOUND)
+				complete = false;
+			if (!retainBackups && !disk[i].backup.empty() &&
+				!DeleteFileA(disk[i].backup.c_str()) &&
+				GetLastError() != ERROR_FILE_NOT_FOUND)
+				complete = false;
 		}
+		return complete;
 	}
 
 	std::vector<File> m_files;
