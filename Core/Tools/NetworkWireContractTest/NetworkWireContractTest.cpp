@@ -492,7 +492,8 @@ int TestNetworkHelloContract()
 		decodedSimulationPolicy.rosterMask == 0xa5U &&
 		decodedSimulationPolicy.provenKernelMask ==
 			nonProductTestMask &&
-		decodedSimulationPolicy.sidecarMask == (1U | 4U | 16U) &&
+		decodedSimulationPolicy.sidecarMask ==
+			kNetworkMapPackageCompanionMask &&
 		decodedSimulationPolicy.sidecarCrc == 0x76543210U &&
 		IsMatchingNetworkSimulationPolicyIdentity(
 			decodedSimulationPolicy, simulationPolicy),
