@@ -553,16 +553,8 @@ static int testServiceAdapterAndEmptyStripe()
 
 static int testServiceAdapterWorkerPath()
 {
-	const unsigned expectedDiffuse[32] = {
-		0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu,
-		0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu,
-		0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu,
-		0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu,
-		0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu,
-		0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu,
-		0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu,
-		0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu, 0x807F9FFFu
-	};
+	HeightMapDynamicLightSnapshot expectedSnapshot;
+	HeightMapDynamicLightVertex expected[128];
 	HeightMapDynamicLightBatch batch;
 	RadarTerrainPrepareService service;
 	unsigned index;
@@ -570,14 +562,13 @@ static int testServiceAdapterWorkerPath()
 	#if defined(RTS_BUILD_CORE_EXTRAS)
 	HeightMapDynamicLightTestThreadId threadIds[2];
 	unsigned char arrivals[2] = { 0, 0 };
-	HeightMapDynamicLightWorkerProbe probe(4, threadIds, arrivals);
+	HeightMapDynamicLightWorkerProbe probe(16, threadIds, arrivals);
 	HeightMapDynamicLightObserverGuard observerGuard;
 	#endif
 
-	/* The adapter's serial cutoff is eight cells; 2x4 is the smallest
-	 * two-row fixture that can reach the two-worker path. */
-	CHECK("adapter-worker", batch.initialize(2, 4, 1));
-	for (index = 0; index < 32; ++index)
+	/* The eight-row grain creates two disjoint ranges for this fixture. */
+	CHECK("adapter-worker", batch.initialize(2, 16, 1));
+	for (index = 0; index < 128; ++index)
 		initializeVertex(&batch.inputVertices()[index],
 			static_cast<Real>(index), 0.0f, 0.0f, 0x80402010u);
 	memset(batch.lights(), 0, sizeof(*batch.lights()));
@@ -587,6 +578,10 @@ static int testServiceAdapterWorkerPath()
 	batch.lights()[0].diffuseRed = 0.25f;
 	batch.lights()[0].diffuseGreen = 0.5f;
 	batch.lights()[0].diffuseBlue = 1.0f;
+	memcpy(&expectedSnapshot, &batch.snapshot(), sizeof(expectedSnapshot));
+	memset(expected, 0xFF, sizeof(expected));
+	CHECK("adapter-worker", PrepareHeightMapDynamicLightRows(expectedSnapshot,
+		expected, 0, 16));
 	CHECK("adapter-worker", service.initialize(2, 8));
 	CHECK("adapter-worker", service.tryAcquire(5));
 	#if defined(RTS_BUILD_CORE_EXTRAS)
@@ -605,9 +600,8 @@ static int testServiceAdapterWorkerPath()
 	 * scheduler stress tests separately prove execution beyond two workers. */
 	#endif
 	service.release(5);
-	for (index = 0; index < 32; ++index)
-		CHECK("adapter-worker", batch.outputVertices()[index].diffuse ==
-			expectedDiffuse[index]);
+	CHECK("adapter-worker", memcmp(batch.outputVertices(), expected,
+		sizeof(expected)) == 0);
 	service.shutdown();
 	return 0;
 }

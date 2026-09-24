@@ -64,6 +64,10 @@ public:
 	{
 	}
 
+	/* Keep enough parallelism for a dense tile without dispatching a heap
+	 * job per row for sparse interactive lighting updates. */
+	virtual unsigned minimumRowsPerTask() const { return 8; }
+
 	virtual bool executeRows(unsigned rowBegin, unsigned rowEnd)
 	{
 		if (m_snapshot == 0 || m_output == 0)
