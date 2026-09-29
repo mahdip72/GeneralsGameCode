@@ -34,6 +34,7 @@
 #include "GameLogic/TerrainLogic.h"
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/Module/DozerAIUpdate.h"
+#include "GameLogic/Module/HackInternetAIUpdate.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
 #include "GameLogic/PartitionManager.h"
@@ -83,6 +84,8 @@ enum SkirmishAIRecoveryFixturePhase
 	SKIRMISH_AI_RECOVERY_PHASE_WAIT_LOW_CASH,
 	SKIRMISH_AI_RECOVERY_PHASE_VERIFY_NO_PATH,
 	SKIRMISH_AI_RECOVERY_PHASE_WAIT_SECOND_RECOVERY,
+	SKIRMISH_AI_RECOVERY_PHASE_WAIT_INFRASTRUCTURE,
+	SKIRMISH_AI_RECOVERY_PHASE_WAIT_POWER_REBUILD,
 	SKIRMISH_AI_RECOVERY_PHASE_VERIFY_GLA_HOLE,
 	SKIRMISH_AI_RECOVERY_PHASE_SAVE_LOAD_PENDING,
 	SKIRMISH_AI_RECOVERY_PHASE_SAVE_LOAD_REBOUND,
@@ -103,6 +106,9 @@ enum
 	SKIRMISH_AI_RECOVERY_NO_PATH_VERIFY_FRAMES = 600,
 	SKIRMISH_AI_RECOVERY_REPEAT_SETTLE_FRAMES = 30,
 	SKIRMISH_AI_RECOVERY_MAX_CONSTRUCTION_ATTEMPTS = 24,
+	// A one-worker rebuild must allow the full advanced-tech and sixth-market
+	// construction cycle after the replacement command center completes.
+	SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_TIMEOUT_FRAMES = 24000,
 	SKIRMISH_AI_RECOVERY_DIAGNOSTIC_MAX_IDS = 32
 };
 
@@ -129,6 +135,8 @@ struct SkirmishAIRecoveryFixtureState
 	Bool sawConstructionProgress;
 	Bool sawConstructionOwnership;
 	Bool sawCompletedRecovery;
+	Bool infrastructureFaulted;
+	Int depletedSupplySources;
 	Bool sawLastStand;
 	Bool secondFaultIssued;
 	Bool secondBuilderLossIssued;
@@ -190,6 +198,12 @@ struct SkirmishAIRecoveryFixtureState
 	Int builderCost;
 	Int destructionCount;
 	Int recoveryCompletionCount;
+	Int infrastructureBaselineBuildings;
+	Int infrastructureBaselinePower;
+	Int infrastructureBaselineProduction;
+	const ThingTemplate *infrastructureBaselineTemplates[
+		SKIRMISH_AI_RECOVERY_DIAGNOSTIC_MAX_IDS];
+	Int infrastructureBaselineTemplateCount;
 	// Counts visible under-construction center scaffolds; failed pre-scaffold
 	// placement calls are intentionally outside this fixture's observation API.
 	Int constructionScaffoldCount;
@@ -246,6 +260,8 @@ struct SkirmishAIRecoveryFixtureState
 		sawConstructionProgress = FALSE;
 		sawConstructionOwnership = FALSE;
 		sawCompletedRecovery = FALSE;
+		infrastructureFaulted = FALSE;
+		depletedSupplySources = 0;
 		sawLastStand = FALSE;
 		secondFaultIssued = FALSE;
 		secondBuilderLossIssued = FALSE;
@@ -312,6 +328,14 @@ struct SkirmishAIRecoveryFixtureState
 		builderCost = 0;
 		destructionCount = 0;
 		recoveryCompletionCount = 0;
+		infrastructureBaselineBuildings = 0;
+		infrastructureBaselinePower = 0;
+		infrastructureBaselineProduction = 0;
+		infrastructureBaselineTemplateCount = 0;
+		for (Int templateIndex = 0;
+			templateIndex < SKIRMISH_AI_RECOVERY_DIAGNOSTIC_MAX_IDS;
+			++templateIndex)
+			infrastructureBaselineTemplates[templateIndex] = nullptr;
 		constructionScaffoldCount = 0;
 		disabledFactoryBuilderCount = 0;
 		lastConstructionAttemptFrame = 0;
@@ -351,7 +375,8 @@ static const char *const g_skirmishAIRecoveryFixtureCaseNames[] =
 	"low_cash",
 	"gla_hole",
 	"save_load",
-	"disabled_factory"
+	"disabled_factory",
+	"infrastructure_collapse"
 };
 
 static const char *const g_skirmishAIRecoveryFactionNames[] =
@@ -2349,6 +2374,7 @@ Bool ObserveSkirmishAIRecoveryFixture(Player *player)
 	}
 	if (s_recovery.baselineCaptured &&
 		!IsSkirmishAIRecoveryFactoryFixture() &&
+		s_recovery.fixtureCase != SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_COLLAPSE &&
 		builderCount > s_recovery.initialBuilderCount + 2)
 	{
 		FailSkirmishAITest("fixture_duplicate_builder");
@@ -3176,6 +3202,103 @@ Bool FinishSkirmishAIRecoveryFixture()
 	return TRUE;
 }
 
+void CountSkirmishAIInfrastructure(Player *player, Int *buildings,
+	Int *power, Int *production, Int *renewableIncome)
+{
+	*buildings = *power = *production = *renewableIncome = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject())
+	{
+		if (object->getControllingPlayer() != player ||
+			!IsLiveSkirmishAIRecoveryObject(object) ||
+			object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION))
+			continue;
+		if (object->isKindOf(KINDOF_STRUCTURE) &&
+			!object->isKindOf(KINDOF_COMMANDCENTER) &&
+			!object->isKindOf(KINDOF_SUPPLY_SOURCE))
+			++*buildings;
+		if (object->isKindOf(KINDOF_FS_POWER) &&
+			!object->isKindOf(KINDOF_CASH_GENERATOR))
+			++*power;
+		if (object->isKindOf(KINDOF_FS_BARRACKS) ||
+			object->isKindOf(KINDOF_FS_WARFACTORY) ||
+			object->isKindOf(KINDOF_FS_AIRFIELD) ||
+			object->isKindOf(KINDOF_FS_FACTORY))
+			++*production;
+		if (object->isKindOf(KINDOF_FS_SUPPLY_DROPZONE) ||
+			object->isKindOf(KINDOF_FS_BLACK_MARKET) ||
+			(object->isKindOf(KINDOF_INFANTRY) &&
+			 object->isKindOf(KINDOF_MONEY_HACKER) &&
+			 object->getAIUpdateInterface() &&
+			 object->getAIUpdateInterface()->getHackInternetAIInterface() &&
+			 object->getAIUpdateInterface()->getHackInternetAIInterface()
+				->isHacking()))
+			++*renewableIncome;
+	}
+}
+
+Bool HasRestoredSkirmishAIInfrastructureBaseline(Player *player)
+{
+	for (Int i = 0; i < s_recovery.infrastructureBaselineTemplateCount; ++i)
+	{
+		const ThingTemplate *plan = s_recovery.infrastructureBaselineTemplates[i];
+		Int needed = 0;
+		for (Int prior = 0; prior <= i; ++prior)
+			if (s_recovery.infrastructureBaselineTemplates[prior] == plan)
+				++needed;
+		Int restored = 0;
+		for (Object *object = TheGameLogic->getFirstObject(); object;
+			object = object->getNextObject())
+		{
+			if (object->getControllingPlayer() == player &&
+				IsLiveSkirmishAIRecoveryObject(object) &&
+				!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+				object->getTemplate() == plan)
+				++restored;
+		}
+		if (restored < needed)
+			return FALSE;
+	}
+	return TRUE;
+}
+
+void PrintSkirmishAIInfrastructureIncomePlans(Player *player)
+{
+	Object *builder = nullptr;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject())
+		if (object->getControllingPlayer() == player &&
+			object->isKindOf(KINDOF_DOZER) &&
+			IsLiveSkirmishAIRecoveryObject(object) && !object->isContained())
+		{
+			builder = object;
+			break;
+		}
+	Int printed = 0;
+	for (BuildListInfo *info = player->getBuildList(); info && printed < 12;
+		info = info->getNext())
+	{
+		const ThingTemplate *plan = TheThingFactory->findTemplate(
+			info->getTemplateName());
+		if (!plan || (!plan->isKindOf(KINDOF_FS_SUPPLY_DROPZONE) &&
+			!plan->isKindOf(KINDOF_FS_BLACK_MARKET)))
+			continue;
+		Object *built = TheGameLogic->findObjectByID(info->getObjectID());
+		printf("SKIRMISH_AI_INCOME_PLAN template=%s priority=%d automatic=%d "
+			"rebuilds=%d object=%u built=%d constructing=%d timestamp=%u "
+			"can_make=%d site=(%g,%g)\n",
+			plan->getName().str(), info->isPriorityBuild(),
+			info->isAutomaticBuild(), info->getNumRebuilds(),
+			info->getObjectID(), built != nullptr,
+			built && built->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+			info->getObjectTimestamp(), builder
+				? TheBuildAssistant->canMakeUnit(builder, plan) : -1,
+			info->getLocation()->x, info->getLocation()->y);
+		++printed;
+	}
+	fflush(stdout);
+}
+
 void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 {
 	if (!player || !s_recovery.primaryTemplate || !s_recovery.builderTemplate)
@@ -3230,7 +3353,8 @@ void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 			s_recovery.obstructionID = obstruction->getID();
 			s_recovery.obstructionOriginalPosition = *obstruction->getPosition();
 		}
-		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_SURVIVING_BUILDER)
+		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_SURVIVING_BUILDER ||
+			s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_COLLAPSE)
 		{
 			// Isolate surviving_builder's baseline-builder reuse assertion without
 			// adding a free faction building that changes power, production, or
@@ -3254,6 +3378,109 @@ void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 			printf("SKIRMISH_AI_RECOVERY_PHASE phase=victory_conditions_overridden "
 				"frame=%u prior_conditions=%d conditions=%d\n", frame,
 				priorVictoryConditions, fixtureVictoryConditions);
+			fflush(stdout);
+		}
+		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_COLLAPSE)
+		{
+			ObjectID survivingBuilderID = INVALID_ID;
+			for (Object *object = TheGameLogic->getFirstObject(); object;
+				object = object->getNextObject())
+			{
+				if (object->getControllingPlayer() == player &&
+					object->isKindOf(KINDOF_DOZER) &&
+					IsLiveSkirmishAIRecoveryObject(object) &&
+					!object->isContained() &&
+					(survivingBuilderID == INVALID_ID ||
+					 object->getID() < survivingBuilderID))
+					survivingBuilderID = object->getID();
+			}
+			if (survivingBuilderID == INVALID_ID)
+			{
+				FailSkirmishAITest("fixture_single_builder_unavailable");
+				RequestSkirmishAITestStop();
+				return;
+			}
+			for (Object *object = TheGameLogic->getFirstObject(); object; )
+			{
+				Object *next = object->getNextObject();
+				if (object->getControllingPlayer() == player &&
+					object->isKindOf(KINDOF_DOZER) &&
+					object->getID() != survivingBuilderID &&
+					IsLiveSkirmishAIRecoveryObject(object))
+					DestroySkirmishAIRecoveryObject(object);
+				object = next;
+			}
+			// Exhaust the starting supply field too, so restored income must
+			// come from hackers, drop zones, or markets rather than collectors.
+			for (Object *object = TheGameLogic->getFirstObject(); object; )
+			{
+				Object *next = object->getNextObject();
+				if (object->isKindOf(KINDOF_SUPPLY_SOURCE) &&
+					IsLiveSkirmishAIRecoveryObject(object) &&
+					object->getPosition())
+				{
+					const Real dx = object->getPosition()->x -
+						s_recovery.originalCenterPosition.x;
+					const Real dy = object->getPosition()->y -
+						s_recovery.originalCenterPosition.y;
+					if (dx * dx + dy * dy < 700.0f * 700.0f)
+					{
+						DestroySkirmishAIRecoveryObject(object);
+						++s_recovery.depletedSupplySources;
+					}
+				}
+				object = next;
+			}
+			if (s_recovery.depletedSupplySources == 0)
+			{
+				FailSkirmishAITest("fixture_supply_field_unavailable");
+				RequestSkirmishAITestStop();
+				return;
+			}
+			// Remove every completed base building while keeping the surviving
+			// builders. Exhaust their ordinary build-list allowances as well.
+			for (Object *object = TheGameLogic->getFirstObject(); object; )
+			{
+				Object *next = object->getNextObject();
+				if (object != commandCenter &&
+					object->getControllingPlayer() == player &&
+					object->isKindOf(KINDOF_STRUCTURE) &&
+					!object->isKindOf(KINDOF_SUPPLY_SOURCE) &&
+					IsLiveSkirmishAIRecoveryObject(object))
+				{
+					if (!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+						!object->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+						object->getTemplate() &&
+						s_recovery.infrastructureBaselineTemplateCount <
+							SKIRMISH_AI_RECOVERY_DIAGNOSTIC_MAX_IDS)
+						s_recovery.infrastructureBaselineTemplates[
+							s_recovery.infrastructureBaselineTemplateCount++] =
+							object->getTemplate();
+					DestroySkirmishAIRecoveryObject(object);
+					++s_recovery.destructionCount;
+				}
+				object = next;
+			}
+			for (BuildListInfo *buildInfo = player->getBuildList();
+				buildInfo; buildInfo = buildInfo->getNext())
+			{
+				const ThingTemplate *plan = TheThingFactory->findTemplate(
+					buildInfo->getTemplateName());
+				if (plan && !plan->isKindOf(KINDOF_COMMANDCENTER) &&
+					(plan->isKindOf(KINDOF_FS_POWER) ||
+					 plan->isKindOf(KINDOF_FS_BARRACKS) ||
+					 plan->isKindOf(KINDOF_FS_WARFACTORY) ||
+					 plan->isKindOf(KINDOF_FS_FACTORY) ||
+					 plan->isKindOf(KINDOF_FS_SUPPLY_DROPZONE) ||
+					 plan->isKindOf(KINDOF_FS_BLACK_MARKET)))
+					buildInfo->setNumRebuilds(0);
+			}
+			SetSkirmishAIRecoveryCash(player, 30000);
+			s_recovery.infrastructureFaulted = TRUE;
+			printf("SKIRMISH_AI_INFRASTRUCTURE_FAULT frame=%u "
+				"single_builder=%u depleted_supply_sources=%d\n",
+				frame, survivingBuilderID,
+				s_recovery.depletedSupplySources);
 			fflush(stdout);
 		}
 
@@ -3436,7 +3663,8 @@ void UpdateSkirmishAIRecoveryFixture()
 		const UnsignedInt baselineTimeout =
 			s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_NO_PATH_LASTSTAND
 				? SKIRMISH_AI_RECOVERY_NO_PATH_BASELINE_TIMEOUT_FRAMES
-				: SKIRMISH_AI_RECOVERY_BASELINE_TIMEOUT_FRAMES;
+				: (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_COLLAPSE
+					? 3600 : SKIRMISH_AI_RECOVERY_BASELINE_TIMEOUT_FRAMES);
 		if (frame > baselineTimeout)
 		{
 			printf("SKIRMISH_AI_RECOVERY_DIAGNOSTIC reason=baseline_timeout frame=%u "
@@ -3483,6 +3711,19 @@ void UpdateSkirmishAIRecoveryFixture()
 		if (IsSkirmishAIRecoveryFactoryFixture() &&
 			(builderFactoryCount == 0 || !builderFactory))
 			return;
+		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_COLLAPSE)
+		{
+			Int baselineIncome = 0;
+			CountSkirmishAIInfrastructure(player,
+				&s_recovery.infrastructureBaselineBuildings,
+				&s_recovery.infrastructureBaselinePower,
+				&s_recovery.infrastructureBaselineProduction, &baselineIncome);
+			const Bool gla = strncmp(player->getSide().str(), "GLA", 3) == 0;
+			if (s_recovery.infrastructureBaselineBuildings < 2 ||
+				s_recovery.infrastructureBaselineProduction < 1 ||
+				(!gla && s_recovery.infrastructureBaselinePower < 1))
+				return;
+		}
 	if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_OBSTRUCTED &&
 		!FindSkirmishAIRecoveryObstruction(player, commandCenter))
 		return;
@@ -3859,6 +4100,12 @@ void UpdateSkirmishAIRecoveryFixture()
 		}
 		if (s_recovery.sawCompletedRecovery)
 		{
+			if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_COLLAPSE)
+			{
+				s_recovery.phase = SKIRMISH_AI_RECOVERY_PHASE_WAIT_INFRASTRUCTURE;
+				s_recovery.phaseStartFrame = frame;
+				return;
+			}
 			if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_REPEATED_COMMAND_CENTER &&
 				!s_recovery.secondFaultIssued)
 			{
@@ -3903,6 +4150,132 @@ void UpdateSkirmishAIRecoveryFixture()
 				RequestSkirmishAITestStop();
 				return;
 			}
+		}
+		return;
+	}
+	if (s_recovery.phase == SKIRMISH_AI_RECOVERY_PHASE_WAIT_INFRASTRUCTURE)
+	{
+		if (frame % LOGICFRAMES_PER_SECOND != 0)
+			return;
+		Int buildings = 0;
+		Int power = 0;
+		Int production = 0;
+		Int income = 0;
+		CountSkirmishAIInfrastructure(player, &buildings, &power,
+			&production, &income);
+		const UnsignedInt infrastructureElapsed =
+			frame - s_recovery.phaseStartFrame;
+		if ((infrastructureElapsed >= 9000 && infrastructureElapsed <
+				9000 + LOGICFRAMES_PER_SECOND) ||
+			(infrastructureElapsed >= 15000 && infrastructureElapsed <
+				15000 + LOGICFRAMES_PER_SECOND))
+		{
+			printf("SKIRMISH_AI_INFRASTRUCTURE_PROGRESS frame=%u "
+				"buildings=%d power=%d production=%d renewable_income=%d "
+				"cash=%u\n", frame, buildings, power, production,
+				income, player->getMoney()->countMoney());
+			PrintSkirmishAIInfrastructureIncomePlans(player);
+		}
+		const Bool gla = strncmp(player->getSide().str(), "GLA", 3) == 0;
+		if (power >= (gla ? 0 : max(2,
+			s_recovery.infrastructureBaselinePower)) &&
+			production >= s_recovery.infrastructureBaselineProduction &&
+			income >= 6 &&
+			buildings >= s_recovery.infrastructureBaselineBuildings &&
+			HasRestoredSkirmishAIInfrastructureBaseline(player) &&
+			s_recovery.infrastructureFaulted)
+		{
+			printf("SKIRMISH_AI_INFRASTRUCTURE_RESTORED frame=%u buildings=%d "
+				"power=%d production=%d renewable_income=%d cash=%u "
+				"depleted_supply_sources=%d\n",
+				frame, buildings, power, production, income,
+				player->getMoney()->countMoney(),
+				s_recovery.depletedSupplySources);
+			fflush(stdout);
+			if (!gla)
+			{
+				Int destroyedPower = 0;
+				for (Object *object = TheGameLogic->getFirstObject(); object; )
+				{
+					Object *next = object->getNextObject();
+					if (object->getControllingPlayer() == player &&
+						object->isKindOf(KINDOF_FS_POWER) &&
+						!object->isKindOf(KINDOF_CASH_GENERATOR) &&
+						IsLiveSkirmishAIRecoveryObject(object))
+					{
+						DestroySkirmishAIRecoveryObject(object);
+						++destroyedPower;
+					}
+					object = next;
+				}
+				for (BuildListInfo *info = player->getBuildList(); info;
+					info = info->getNext())
+				{
+					const ThingTemplate *plan = TheThingFactory->findTemplate(
+						info->getTemplateName());
+					if (plan && plan->isKindOf(KINDOF_FS_POWER) &&
+						!plan->isKindOf(KINDOF_CASH_GENERATOR))
+						info->setNumRebuilds(0);
+				}
+				s_recovery.phase = SKIRMISH_AI_RECOVERY_PHASE_WAIT_POWER_REBUILD;
+				s_recovery.phaseStartFrame = frame;
+				printf("SKIRMISH_AI_POWER_FAULT frame=%u destroyed=%d\n",
+					frame, destroyedPower);
+				fflush(stdout);
+				return;
+			}
+			if (!FinishSkirmishAIRecoveryFixture())
+				RequestSkirmishAITestStop();
+			return;
+		}
+		if (frame - s_recovery.phaseStartFrame >
+			SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_TIMEOUT_FRAMES)
+		{
+			printf("SKIRMISH_AI_INFRASTRUCTURE_TIMEOUT frame=%u buildings=%d "
+				"power=%d production=%d renewable_income=%d cash=%u "
+				"baseline_templates_restored=%d\n",
+				frame, buildings, power, production, income,
+				player->getMoney()->countMoney(),
+				HasRestoredSkirmishAIInfrastructureBaseline(player));
+			fflush(stdout);
+			PrintSkirmishAIInfrastructureIncomePlans(player);
+			FailSkirmishAITest("fixture_infrastructure_not_restored");
+			RequestSkirmishAITestStop();
+		}
+		return;
+	}
+	if (s_recovery.phase == SKIRMISH_AI_RECOVERY_PHASE_WAIT_POWER_REBUILD)
+	{
+		if (frame % LOGICFRAMES_PER_SECOND != 0)
+			return;
+		Int buildings = 0;
+		Int power = 0;
+		Int production = 0;
+		Int income = 0;
+		CountSkirmishAIInfrastructure(player, &buildings, &power,
+			&production, &income);
+		if (power >= 2 && player->getEnergy()->hasSufficientPower() &&
+			production >= 1 && income >= 3)
+		{
+			printf("SKIRMISH_AI_POWER_RESTORED frame=%u power=%d "
+				"production=%d renewable_income=%d cash=%u\n",
+				frame, power, production, income,
+				player->getMoney()->countMoney());
+			fflush(stdout);
+			if (!FinishSkirmishAIRecoveryFixture())
+				RequestSkirmishAITestStop();
+			return;
+		}
+		if (frame - s_recovery.phaseStartFrame >
+			SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_TIMEOUT_FRAMES)
+		{
+			printf("SKIRMISH_AI_POWER_TIMEOUT frame=%u power=%d "
+				"production=%d renewable_income=%d cash=%u\n",
+				frame, power, production, income,
+				player->getMoney()->countMoney());
+			fflush(stdout);
+			FailSkirmishAITest("fixture_power_not_restored");
+			RequestSkirmishAITestStop();
 		}
 		return;
 	}

@@ -57,6 +57,7 @@
 #include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/Module/ContainModule.h"
 #include "GameLogic/Module/DozerAIUpdate.h"
+#include "GameLogic/Module/HackInternetAIUpdate.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
 #include "GameLogic/Module/SpecialPowerModule.h"
 #include "GameLogic/Module/SupplyTruckAIUpdate.h"
@@ -117,6 +118,14 @@ static Bool ShouldUseCurrentSkirmishAIProductionBehavior()
 static Bool ShouldUseCurrentSkirmishAITacticalBehavior()
 {
 	return TheGameLogic && ShouldUseSkirmishAITacticalBehavior(
+		TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+static Bool ShouldUseCurrentSkirmishAIInfrastructureBehavior()
+{
+	return TheGameLogic && ShouldUseSkirmishAIInfrastructureBehavior(
 		TheGameLogic->isInReplayGame(),
 		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
 			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -481,6 +490,47 @@ static Bool IsSkirmishStrategyPotentialOffensiveRecipient(
 		!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
 		!object->isContained() &&
 		IsSkirmishStrategyCombatObject(object) && object->getAIUpdateInterface();
+}
+
+static Int CountSkirmishAIPendingMoneyHackers(Player *owner)
+{
+	Int count = 0;
+	for (Object *factory = TheGameLogic->getFirstObject(); factory;
+		factory = factory->getNextObject()) {
+		if (factory->getControllingPlayer() != owner ||
+			factory->isEffectivelyDead() || factory->isDestroyed())
+			continue;
+		ProductionUpdateInterface *production =
+			factory->getProductionUpdateInterface();
+		if (!production)
+			continue;
+		for (const ProductionEntry *entry = production->firstProduction();
+			entry; entry = production->nextProduction(entry)) {
+			if (entry->getProductionType() == PRODUCTION_UNIT &&
+				entry->getProductionObject() &&
+				entry->getProductionObject()->isKindOf(KINDOF_MONEY_HACKER))
+				count += entry->getProductionQuantityRemaining();
+		}
+	}
+	return count;
+}
+
+static Bool IsSkirmishAIRenewableIncomeStructure(const ThingTemplate *thing)
+{
+	return thing && thing->isKindOf(KINDOF_STRUCTURE) &&
+		(thing->isKindOf(KINDOF_FS_SUPPLY_DROPZONE) ||
+		 thing->isKindOf(KINDOF_FS_BLACK_MARKET));
+}
+
+static Bool IsSkirmishAICoreInfrastructure(const ThingTemplate *thing)
+{
+	return thing && !thing->isKindOf(KINDOF_COMMANDCENTER) &&
+		(thing->isKindOf(KINDOF_FS_POWER) ||
+		 IsSkirmishAIRenewableIncomeStructure(thing) ||
+		 thing->isKindOf(KINDOF_FS_BARRACKS) ||
+		 thing->isKindOf(KINDOF_FS_WARFACTORY) ||
+		 thing->isKindOf(KINDOF_FS_AIRFIELD) ||
+		 thing->isKindOf(KINDOF_FS_FACTORY));
 }
 
 static Bool HasSkirmishStrategyPotentialOffensiveRecipient(
@@ -4912,7 +4962,11 @@ void AISkirmishPlayer::processBaseBuilding()
 			} else if (info->getObjectID()==INVALID_ID && info->getObjectTimestamp()>0) {
 				// this object was built at some time, and got destroyed at or near objectTimestamp.
 				// Wait a few seconds before initiating a rebuild.
-				if (info->getObjectTimestamp()+TheAI->getAiData()->m_rebuildDelaySeconds*LOGICFRAMES_PER_SECOND > TheGameLogic->getFrame()) {
+				Int delaySeconds = TheAI->getAiData()->m_rebuildDelaySeconds;
+				if (ShouldUseCurrentSkirmishAIInfrastructureBehavior())
+					delaySeconds = GetSkirmishAICoreRebuildDelaySeconds(
+						delaySeconds, IsSkirmishAICoreInfrastructure(curPlan));
+				if (info->getObjectTimestamp()+delaySeconds*LOGICFRAMES_PER_SECOND > TheGameLogic->getFrame()) {
 					continue;
 				}	else {
 					DEBUG_LOG(("Enabling rebuild for %s", info->getTemplateName().str()));
@@ -5101,7 +5155,7 @@ void AISkirmishPlayer::processBaseBuilding()
 						 curPlan->isKindOf(KINDOF_FS_BARRACKS) ||
 						 curPlan->isKindOf(KINDOF_FS_WARFACTORY) ||
 						 curPlan->isKindOf(KINDOF_FS_AIRFIELD));
-					const Int priority = GetSkirmishAIStructurePriority(
+					Int priority = GetSkirmishAIStructurePriority(
 						info->isPriorityBuild(),
 						curPlan->isKindOf(KINDOF_COMMANDCENTER),
 						curPlan->isKindOf(KINDOF_FS_POWER) &&
@@ -5114,6 +5168,14 @@ void AISkirmishPlayer::processBaseBuilding()
 						curPlan->isKindOf(KINDOF_FS_BASE_DEFENSE),
 						m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY,
 						admittedSuperweapon);
+					if (ShouldUseCurrentSkirmishAIInfrastructureBehavior())
+						priority = GetSkirmishAIInfrastructurePriority(
+							priority, curPlan->isKindOf(KINDOF_COMMANDCENTER),
+							curPlan->isKindOf(KINDOF_FS_POWER) &&
+							!curPlan->isKindOf(KINDOF_CASH_GENERATOR) &&
+							isUnderPowered,
+							curPlan->isKindOf(KINDOF_FS_ADVANCED_TECH),
+							IsSkirmishAIRenewableIncomeStructure(curPlan));
 					if (!bldgPlan || priority > selectedStructurePriority) {
 						bldgPlan = curPlan;
 						bldgInfo = info;
@@ -5338,6 +5400,10 @@ void AISkirmishPlayer::processBaseBuilding()
 				}	else if (m_player->getMoney()->countMoney() > TheAI->getAiData()->m_resourcesWealthy) {
 					m_structureTimer = m_structureTimer/TheAI->getAiData()->m_structuresWealthyMod;
 				}
+				if (ShouldUseCurrentSkirmishAIInfrastructureBehavior() &&
+					IsSkirmishAICoreInfrastructure(bldgPlan) &&
+					m_structureTimer > 2 * LOGICFRAMES_PER_SECOND)
+					m_structureTimer = 2 * LOGICFRAMES_PER_SECOND;
 				m_frameLastBuildingBuilt = TheGameLogic->getFrame();
 				// only build one building per delay loop
 			}
@@ -6100,9 +6166,13 @@ Int AISkirmishPlayer::getCriticalRebuildReserve(Bool *canStartNow)
 Bool AISkirmishPlayer::canStartCriticalRebuildNow(
 	BuildListInfo *info, const ThingTemplate *plan)
 {
+	Int delaySeconds = TheAI->getAiData()->m_rebuildDelaySeconds;
+	if (ShouldUseCurrentSkirmishAIInfrastructureBehavior())
+		delaySeconds = GetSkirmishAICoreRebuildDelaySeconds(
+			delaySeconds, IsSkirmishAICoreInfrastructure(plan));
 	Bool rebuildReady = info->getObjectTimestamp() == 0 ||
 		info->getObjectTimestamp() +
-			TheAI->getAiData()->m_rebuildDelaySeconds * LOGICFRAMES_PER_SECOND <=
+			delaySeconds * LOGICFRAMES_PER_SECOND <=
 			TheGameLogic->getFrame();
 	if (rebuildReady)
 		rebuildReady = isLocationSafe(info->getLocation(), plan);
@@ -6562,6 +6632,7 @@ void AISkirmishPlayer::collectStrategyMetrics(
 		GetSkirmishStrategyExpectedAssets(m_player);
 	Int commandHealth = 0;
 	Int economyHealth = 0;
+	Int liveIncomeSources = 0;
 	Int powerHealth = 0;
 	Int productionHealth = 0;
 	Int ownCombatValue = 0;
@@ -6637,6 +6708,24 @@ void AISkirmishPlayer::collectStrategyMetrics(
 		Player *owner = object->getControllingPlayer();
 		if (owner == m_player) {
 			const Int health = GetSkirmishStrategyHealthPercent(object);
+			if (ShouldUseCurrentSkirmishAIInfrastructureBehavior() &&
+				!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION)) {
+				if (object->isKindOf(KINDOF_FS_SUPPLY_CENTER)) {
+					if (hasUsableSupplySource(object->getPosition(),
+						object->getTemplate()->getTemplateGeometryInfo()
+							.getBoundingCircleRadius()))
+						++liveIncomeSources;
+				} else if (IsSkirmishAIRenewableIncomeStructure(
+						object->getTemplate()) ||
+					(object->isKindOf(KINDOF_INFANTRY) &&
+					 object->isKindOf(KINDOF_MONEY_HACKER) &&
+					 object->getAIUpdateInterface() &&
+					 object->getAIUpdateInterface()->getHackInternetAIInterface() &&
+					 object->getAIUpdateInterface()->getHackInternetAIInterface()
+						->isHacking())) {
+					++liveIncomeSources;
+				}
+			}
 			if (object->isKindOf(KINDOF_COMMANDCENTER))
 				commandHealth = AddSkirmishStrategyValue(commandHealth, health);
 			else if (object->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
@@ -6801,10 +6890,19 @@ void AISkirmishPlayer::collectStrategyMetrics(
 	else
 		cashScore = 50 +
 			(Int)((__int64)(money - poor) * 50 / (wealthy - poor));
-	const Int economyStructureScore = GetSkirmishStrategyCategoryPercent(
+	Int economyStructureScore = GetSkirmishStrategyCategoryPercent(
 		economyHealth, expected.economyStructures);
-	metrics->economyHealth = ClampSkirmishStrategyPercent(
-		(60 * cashScore + 40 * economyStructureScore) / 100);
+	if (ShouldUseCurrentSkirmishAIInfrastructureBehavior()) {
+		const Int incomeTarget = GetSkirmishAIRenewableIncomeTarget(
+			getDecisionDifficulty());
+		economyStructureScore = ClampSkirmishStrategyPercent(
+			liveIncomeSources * 100 / incomeTarget);
+		metrics->economyHealth = GetSkirmishAIRenewableEconomyHealth(
+			cashScore, liveIncomeSources, incomeTarget);
+	} else {
+		metrics->economyHealth = ClampSkirmishStrategyPercent(
+			(60 * cashScore + 40 * economyStructureScore) / 100);
+	}
 
 	Int baseWeighted = 35 * GetSkirmishStrategyCategoryPercent(
 		commandHealth, expected.commandCenters);
@@ -6814,8 +6912,10 @@ void AISkirmishPlayer::collectStrategyMetrics(
 		baseWeight += 20;
 	}
 	if (expected.powerStructures > 0) {
-		baseWeighted += 15 * GetSkirmishStrategyCategoryPercent(
-			powerHealth, expected.powerStructures);
+		baseWeighted += 15 * (ShouldUseCurrentSkirmishAIInfrastructureBehavior() &&
+			!m_player->getEnergy()->hasSufficientPower() ? 0 :
+			GetSkirmishStrategyCategoryPercent(
+				powerHealth, expected.powerStructures));
 		baseWeight += 15;
 	}
 	if (expected.productionStructures > 0) {
@@ -10563,10 +10663,329 @@ void AISkirmishPlayer::processTeamBuilding()
 /**
  * See if it's time to build another base building.
  */
+void AISkirmishPlayer::updateInfrastructureExpansion()
+{
+	if (!ShouldUseCurrentSkirmishAIInfrastructureBehavior() ||
+		!usesProductionBehavior() || !m_player->getCanBuildBase() ||
+		!m_baseCenterSet)
+		return;
+	const UnsignedInt now = TheGameLogic->getFrame();
+	const UnsignedInt interval = 10 * LOGICFRAMES_PER_SECOND;
+	if ((now + m_player->getPlayerIndex() * LOGICFRAMES_PER_SECOND) %
+		interval != 0)
+		return;
+
+	Object *center = nullptr;
+	Int otherBuildings = 0;
+	Int livePower = 0;
+	Int liveIncome = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (object->getControllingPlayer() != m_player ||
+			object->isEffectivelyDead() || object->isDestroyed() ||
+			object->testStatus(OBJECT_STATUS_SOLD))
+			continue;
+		const Bool constructing =
+			object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION);
+		if (object->isKindOf(KINDOF_COMMANDCENTER)) {
+			if (!constructing && (!center || object->getID() < center->getID()))
+				center = object;
+			continue;
+		}
+		if (object->isKindOf(KINDOF_STRUCTURE) &&
+			!object->isKindOf(KINDOF_SUPPLY_SOURCE) &&
+			!object->isKindOf(KINDOF_REBUILD_HOLE))
+			++otherBuildings;
+		if (constructing)
+			continue;
+		if (object->isKindOf(KINDOF_FS_POWER) &&
+			!object->isKindOf(KINDOF_CASH_GENERATOR))
+			++livePower;
+		if (object->isKindOf(KINDOF_FS_SUPPLY_CENTER)) {
+			if (hasUsableSupplySource(object->getPosition(),
+					object->getTemplate()->getTemplateGeometryInfo()
+						.getBoundingCircleRadius()))
+				++liveIncome;
+		} else if (IsSkirmishAIRenewableIncomeStructure(
+				object->getTemplate())) {
+			++liveIncome;
+		} else if (object->isKindOf(KINDOF_INFANTRY) &&
+			object->isKindOf(KINDOF_MONEY_HACKER) &&
+			object->getAIUpdateInterface()) {
+			HackInternetAIInterface *hacker = object->getAIUpdateInterface()
+				->getHackInternetAIInterface();
+			if (hacker) {
+				if (!hacker->isHackingPackingOrUnpacking() &&
+					!object->isContained() && object->getAI())
+					object->getAI()->aiHackInternet(CMD_FROM_AI);
+				if (hacker->isHackingPackingOrUnpacking())
+					++liveIncome;
+			}
+		}
+	}
+	// Revive the exhausted build plan even while the command center is being
+	// reconstructed. Waiting for its completion can miss the all-buildings-lost
+	// moment if a new power or production scaffold appears first.
+	Coord3D anchor = center ? *center->getPosition() : m_baseCenter;
+	anchor.z = 0.0f;
+	const Real centerDx = anchor.x - m_baseCenter.x;
+	const Real centerDy = anchor.y - m_baseCenter.y;
+	if (center && otherBuildings == 0 &&
+		centerDx * centerDx + centerDy * centerDy > 350.0f * 350.0f) {
+		// A relocated recovery center becomes the new base, including the
+		// reference point for defense-line planning.
+		m_baseCenter = anchor;
+		if (m_baseRadius > 350.0f)
+			m_baseRadius = 350.0f;
+	}
+	const Bool fullBaseRecovery = otherBuildings == 0;
+
+	const ThingTemplate *powerPlan = nullptr;
+	const ThingTemplate *incomePlan = nullptr;
+	BuildListInfo *powerInfo = nullptr;
+	BuildListInfo *incomeInfo = nullptr;
+	Object *builder = center ? findDozer(&anchor) : nullptr;
+	Int pendingPower = 0;
+	Int pendingIncome = 0;
+	Bool revivedCore = false;
+	Bool relocatedCore = false;
+	Bool prerequisiteSupplyRevived = false;
+	for (BuildListInfo *info = m_player->getBuildList(); info;
+		info = info->getNext()) {
+		const ThingTemplate *plan =
+			TheThingFactory->findTemplate(info->getTemplateName());
+		if (!plan)
+			continue;
+		const Bool power = plan->isKindOf(KINDOF_FS_POWER) &&
+			!plan->isKindOf(KINDOF_CASH_GENERATOR);
+		const Bool income = IsSkirmishAIRenewableIncomeStructure(plan);
+		if (power && !powerPlan)
+			powerPlan = plan;
+		if (income && !incomePlan)
+			incomePlan = plan;
+		Object *built = TheGameLogic->findObjectByID(info->getObjectID());
+		if (built && built->getControllingPlayer() == m_player &&
+			!built->isEffectivelyDead() && !built->isDestroyed()) {
+			if (built->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION)) {
+				if (power) ++pendingPower;
+				if (income) ++pendingIncome;
+			}
+			continue;
+		}
+		const Bool supplyCenter = plan->isKindOf(KINDOF_FS_SUPPLY_CENTER);
+		Bool restoreSupplyCenter = false;
+		if (center && supplyCenter) {
+			const Bool usableSupply = hasUsableSupplySource(
+				info->getLocation(),
+				plan->getTemplateGeometryInfo().getBoundingCircleRadius());
+			const Bool prerequisiteSupply = !usableSupply &&
+				!prerequisiteSupplyRevived &&
+				!hasOwnedSupplyCenter(plan) &&
+				!hasQueuedSupplyCenter(plan) &&
+				isSupplyCenterPrerequisiteNeeded(plan);
+			restoreSupplyCenter = usableSupply;
+			if (prerequisiteSupply) {
+				const Real supplyDx = info->getLocation()->x - anchor.x;
+				const Real supplyDy = info->getLocation()->y - anchor.y;
+				if (info->isBuildable() &&
+					supplyDx * supplyDx + supplyDy * supplyDy <=
+						350.0f * 350.0f &&
+					isLocationSafe(info->getLocation(), plan)) {
+					restoreSupplyCenter = true;
+					prerequisiteSupplyRevived = true;
+				} else {
+					Coord3D nearBase = anchor;
+					if (calcClosestConstructionZoneLocation(plan, &nearBase) &&
+						isLocationSafe(&nearBase, plan)) {
+						info->setLocation(nearBase);
+						restoreSupplyCenter = true;
+						prerequisiteSupplyRevived = true;
+					}
+				}
+			}
+		}
+		const Bool restoreWholeBase = fullBaseRecovery &&
+			plan->isKindOf(KINDOF_STRUCTURE) &&
+			!plan->isKindOf(KINDOF_COMMANDCENTER) &&
+			!plan->isKindOf(KINDOF_SUPPLY_SOURCE) &&
+			(!supplyCenter || restoreSupplyCenter) &&
+			(info->isAutomaticBuild() || info->isInitiallyBuilt() ||
+			 info->getObjectTimestamp() > 0);
+		if (ShouldReviveSkirmishAICoreBuild(
+				false, info->isBuildable(),
+				IsSkirmishAICoreInfrastructure(plan) || restoreWholeBase ||
+				(supplyCenter && restoreSupplyCenter))) {
+			info->setNumRebuilds(1);
+			if (IsSkirmishAICoreInfrastructure(plan) ||
+				!info->isAutomaticBuild())
+				info->markPriorityBuild();
+			revivedCore = true;
+		}
+		if (!info->isBuildable())
+			continue;
+		if (power) {
+			if (info->isPriorityBuild() && pendingPower < 2 && builder &&
+				TheBuildAssistant->canMakeUnit(builder, plan) == CANMAKE_OK &&
+				isLocationSafe(info->getLocation(), plan))
+				++pendingPower;
+			else if (!powerInfo) powerInfo = info;
+		}
+		if (income) {
+			if (info->isPriorityBuild() && pendingIncome < 2 && builder &&
+				TheBuildAssistant->canMakeUnit(builder, plan) == CANMAKE_OK &&
+				isLocationSafe(info->getLocation(), plan))
+				++pendingIncome;
+			else if (!incomeInfo) incomeInfo = info;
+		}
+		if (!center ||
+			!(IsSkirmishAICoreInfrastructure(plan) || restoreWholeBase) ||
+			relocatedCore)
+			continue;
+		const Real dx = info->getLocation()->x - anchor.x;
+		const Real dy = info->getLocation()->y - anchor.y;
+		if (dx * dx + dy * dy <= 350.0f * 350.0f &&
+			isLocationSafe(info->getLocation(), plan))
+			continue;
+		Coord3D newLocation = anchor;
+		if (calcClosestConstructionZoneLocation(plan, &newLocation) &&
+			isLocationSafe(&newLocation, plan)) {
+			newLocation.z = 0.0f;
+			info->setLocation(newLocation);
+		}
+		relocatedCore = true;
+	}
+	if (revivedCore) {
+		m_structureTimer = 0;
+		m_buildDelay = 0;
+	}
+	// The recovery controller retains sole construction authority until the
+	// replacement command center is complete.
+	if (!center)
+		return;
+
+	const Bool sufficientPower = m_player->getEnergy()->hasSufficientPower();
+	const Bool emergencyPower = powerPlan &&
+		(!sufficientPower || livePower < 2);
+	const Bool reservePower = powerPlan && livePower + pendingPower < 8 &&
+		NeedsSkirmishAIPowerReserve(sufficientPower,
+			m_player->getEnergy()->getProduction(),
+			m_player->getEnergy()->getConsumption(), livePower);
+	const Bool china = strncmp(m_player->getSide().str(), "China", 5) == 0;
+	const Int pendingHackers = china
+		? CountSkirmishAIPendingMoneyHackers(m_player) : 0;
+	const Bool needsIncome = liveIncome + pendingIncome + pendingHackers <
+		GetSkirmishAIRenewableIncomeTarget(getDecisionDifficulty());
+	if (emergencyPower && pendingPower > 0)
+		return;
+	if (needsIncome && pendingIncome >= 2 && !emergencyPower)
+		return;
+	// Restore an outage and two dispersed plants first. After that, establish
+	// recurring income before buying further power headroom.
+	const Bool needPower = emergencyPower ||
+		(!needsIncome && reservePower && pendingPower == 0);
+	if (!needPower && !needsIncome)
+		return;
+
+	if (!needPower && china) {
+		// China converts spare production time into hackers rather than
+		// repeatedly placing Internet Centers or empty supply depots.
+		if (pendingHackers >= 2)
+			return;
+		for (const ThingTemplate *thing = TheThingFactory->firstTemplate();
+			thing; thing = thing->friend_getNextTemplate()) {
+			if (!thing->isKindOf(KINDOF_INFANTRY) ||
+				!thing->isKindOf(KINDOF_MONEY_HACKER))
+				continue;
+			std::vector<Object *> factories;
+			FindSkirmishAICompatibleProducers(
+				m_player, thing, &factories);
+			if (factories.empty() ||
+				m_player->getMoney()->countMoney() <
+					thing->calcCostToBuild(m_player))
+				continue;
+			if (QueueSkirmishAIUnitAtCompatibleProducer(
+					factories, thing, TRUE, nullptr))
+				return;
+		}
+		return;
+	}
+	if (!builder) {
+		queueDozer();
+		return;
+	}
+	BuildListInfo *existingInfo = needPower ? powerInfo : incomeInfo;
+	const ThingTemplate *existingPlan = needPower ? powerPlan : incomePlan;
+	if (existingInfo && existingPlan &&
+		TheBuildAssistant->canMakeUnit(builder, existingPlan) == CANMAKE_OK &&
+		isLocationSafe(existingInfo->getLocation(), existingPlan)) {
+		existingInfo->markPriorityBuild();
+		m_structureTimer = 0;
+		m_buildDelay = 0;
+		return;
+	}
+	if (!needPower && (!incomePlan ||
+		TheBuildAssistant->canMakeUnit(builder, incomePlan) != CANMAKE_OK)) {
+		// Script build lists differ by general. A buildable faction-specific
+		// drop zone or market may exist even if that script omitted its entry.
+		for (const ThingTemplate *thing = TheThingFactory->firstTemplate();
+			thing; thing = thing->friend_getNextTemplate()) {
+			if (IsSkirmishAIRenewableIncomeStructure(thing) &&
+				TheBuildAssistant->canMakeUnit(builder, thing) == CANMAKE_OK) {
+				incomePlan = thing;
+				break;
+			}
+		}
+	}
+	const ThingTemplate *plan = needPower ? powerPlan : incomePlan;
+	if (!plan || TheBuildAssistant->canMakeUnit(builder, plan) != CANMAKE_OK)
+		return;
+	static const Real radii[] = { 180.0f, 280.0f, 380.0f,
+		480.0f, 580.0f, 680.0f };
+	static const Real directions[][2] = {
+		{ 1.0f, 0.0f }, { 0.7071f, 0.7071f },
+		{ 0.0f, 1.0f }, { -0.7071f, 0.7071f },
+		{ -1.0f, 0.0f }, { -0.7071f, -0.7071f },
+		{ 0.0f, -1.0f }, { 0.7071f, -0.7071f }
+	};
+	Coord3D position;
+	Bool foundSite = false;
+	for (Int ring = 0; ring < 6 && !foundSite; ++ring) {
+		for (Int direction = 0; direction < 8; ++direction) {
+			Coord3D candidate = anchor;
+			candidate.x += radii[ring] * directions[direction][0];
+			candidate.y += radii[ring] * directions[direction][1];
+			candidate.z = TheTerrainLogic->getGroundHeight(
+				candidate.x, candidate.y);
+			if (!isLocationSafe(&candidate, plan))
+				continue;
+			if (TheBuildAssistant->isLocationLegalToBuild(&candidate, plan,
+					plan->getPlacementViewAngle(),
+					BuildAssistant::CLEAR_PATH |
+					BuildAssistant::TERRAIN_RESTRICTIONS |
+					BuildAssistant::NO_OBJECT_OVERLAP,
+					builder, m_player) != LBC_OK)
+				continue;
+			position = candidate;
+			foundSite = true;
+			break;
+		}
+	}
+	TheTerrainVisual->removeAllBibs();
+	if (!foundSite)
+		return;
+	position.z = 0.0f;
+	m_player->addToPriorityBuildList(plan->getName(), &position,
+		plan->getPlacementViewAngle());
+	m_structureTimer = 0;
+	m_buildDelay = 0;
+}
+
 void AISkirmishPlayer::doBaseBuilding()
 {
 	if (usesCriticalRecoveryBehavior())
 		updateCriticalRecovery();
+	if (TheGameLogic)
+		updateInfrastructureExpansion();
 	// The recovery controller owns all base-spend decisions until the missing
 	// completed center has a real construction object or enters last stand.
 	if (usesCriticalRecoveryBehavior() && m_recoveryEverCompleted &&

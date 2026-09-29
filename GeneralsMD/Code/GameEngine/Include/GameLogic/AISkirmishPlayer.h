@@ -178,6 +178,7 @@ protected:
 	Bool hasOwnedSupplyCenter(const ThingTemplate *supplyPlan) const;
 	Bool hasQueuedSupplyCenter(const ThingTemplate *supplyPlan) const;
 	Bool hasUsableSupplyCenterForCollectors() const;
+	void updateInfrastructureExpansion();
 	void cancelDepletedCollectorProduction();
 	Bool isSupplyCenterPrerequisiteNeeded(const ThingTemplate *supplyPlan) const;
 	void refreshStrategyProductionReserve();

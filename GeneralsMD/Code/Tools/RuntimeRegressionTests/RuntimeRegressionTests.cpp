@@ -2647,28 +2647,28 @@ static void TestSkirmishAIReplayEpoch()
 
 	// Live games always use the current and recovery paths. Replays retain the
 	// behavior selected by their recording epoch; an unknown epoch is legacy.
-	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };
 	const Bool expectedReplayCurrentBehavior[] =
-		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedReplayRecoveryBehavior[] =
-		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedRecoveryCRCFields[] =
-		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedCancellationOwnership[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedUnownedQueueFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedBoundedFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedResourceWorkerPreservation[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedStrategyBehavior[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedProductionBehavior[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, FALSE };
 	const Bool expectedTacticalBehavior[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, FALSE };
-	for (Int i = 0; i < 13; ++i)
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, FALSE };
+	for (Int i = 0; i < 14; ++i)
 	{
 		CHECK(ShouldUseSkirmishAICurrentBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(FALSE, replayEpochs[i]));
@@ -2692,6 +2692,7 @@ static void TestSkirmishAIReplayEpoch()
 		CHECK(ShouldIncludeSkirmishAIProductionCRCFields(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAITacticalBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldIncludeSkirmishAITacticalCRCFields(FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAIInfrastructureBehavior(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, replayEpochs[i])
 			== expectedReplayCurrentBehavior[i]);
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, replayEpochs[i])
@@ -2724,6 +2725,8 @@ static void TestSkirmishAIReplayEpoch()
 			== expectedTacticalBehavior[i]);
 		CHECK(ShouldIncludeSkirmishAITacticalCRCFields(TRUE, replayEpochs[i])
 			== expectedTacticalBehavior[i]);
+		CHECK(ShouldUseSkirmishAIInfrastructureBehavior(TRUE, replayEpochs[i])
+			== (replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE));
 	}
 
 	UnicodeString livenessOnly = unmarked;
@@ -2943,9 +2946,23 @@ static void TestSkirmishAIReplayEpoch()
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=10]") == 0);
 
 	UnicodeString tacticalAdaptationEpoch = unmarked;
-	MarkReplayVersionForSkirmishAICurrentEpoch(tacticalAdaptationEpoch);
+	MarkReplayVersionForSkirmishAITacticalAdaptationEpoch(tacticalAdaptationEpoch);
 	CHECK(tacticalAdaptationEpoch.compare(
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=11]") == 0);
+	CHECK(!ShouldUseSkirmishAIInfrastructureBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION));
+	UnicodeString infrastructureEpoch = unmarked;
+	MarkReplayVersionForSkirmishAICurrentEpoch(infrastructureEpoch);
+	CHECK(infrastructureEpoch.compare(
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=12]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(infrastructureEpoch) ==
+		SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE);
+	CHECK(ShouldUseSkirmishAIInfrastructureBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE));
+	CHECK(ShouldUseSkirmishAITacticalBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE));
+	CHECK(ShouldUseSkirmishAIProductionBehavior(
+		TRUE, SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE));
 	CHECK(GetSkirmishAIReplayEpoch(tacticalAdaptationEpoch) ==
 		SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION);
 	CHECK(ShouldUseSkirmishAICurrentBehavior(
@@ -2977,7 +2994,7 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=12]";
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=13]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -3082,15 +3099,15 @@ static void TestPathfindQueueReplayEpoch()
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=11]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=12]") == 0);
 	CHECK(GetSkirmishAIReplayEpoch(combined) ==
-		SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION);
+		SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE);
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAITacticalBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=11]") == 0);
+	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=12]") == 0);
 
 	UnicodeString pathLiveness = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLiveness);
@@ -3458,6 +3475,31 @@ static void TestSkirmishAIStage3Policies()
 	CHECK(IsSkirmishAIAlternateIncomeStructure(false, false, true, false));
 	CHECK(IsSkirmishAIAlternateIncomeStructure(false, false, false, true));
 	CHECK(!IsSkirmishAIAlternateIncomeStructure(false, false, false, false));
+	// Model an exhausted supply map with a large cash balance. Stored money
+	// cannot hide the missing recurring income; each restored source raises
+	// health until a sustainable diversified economy is reached.
+	CHECK(GetSkirmishAIRenewableIncomeTarget(SKIRMISH_AI_DIFFICULTY_HARD) == 8);
+	CHECK(GetSkirmishAIRenewableIncomeTarget(SKIRMISH_AI_DIFFICULTY_NORMAL) == 6);
+	CHECK(GetSkirmishAIRenewableEconomyHealth(100, 0, 8) == 25);
+	CHECK(GetSkirmishAIRenewableEconomyHealth(100, 1, 8) == 34);
+	CHECK(GetSkirmishAIRenewableEconomyHealth(100, 4, 8) == 62);
+	CHECK(GetSkirmishAIRenewableEconomyHealth(100, 8, 8) == 100);
+	// Destroyed power and a near-empty base trigger a replacement before
+	// optional script builds; completed redundant power ends the emergency.
+	CHECK(NeedsSkirmishAIPowerReserve(false, 0, 30, 0));
+	CHECK(NeedsSkirmishAIPowerReserve(true, 0, 0, 0));
+	CHECK(NeedsSkirmishAIPowerReserve(true, 120, 100, 1));
+	CHECK(!NeedsSkirmishAIPowerReserve(true, 150, 100, 2));
+	CHECK(GetSkirmishAIInfrastructurePriority(1000, true, false, false, false) == 1200);
+	CHECK(GetSkirmishAIInfrastructurePriority(1000, false, true, true, true) == 1100);
+	CHECK(GetSkirmishAIInfrastructurePriority(800, false, false, true, false) == 1080);
+	CHECK(GetSkirmishAIInfrastructurePriority(800, false, false, false, true) == 1050);
+	CHECK(GetSkirmishAIInfrastructurePriority(800, false, false, false, false) == 800);
+	CHECK(ShouldReviveSkirmishAICoreBuild(false, false, true));
+	CHECK(!ShouldReviveSkirmishAICoreBuild(true, false, true));
+	CHECK(!ShouldReviveSkirmishAICoreBuild(false, false, false));
+	CHECK(GetSkirmishAICoreRebuildDelaySeconds(30, true) == 3);
+	CHECK(GetSkirmishAICoreRebuildDelaySeconds(30, false) == 30);
 	CHECK(IsSkirmishAISupplyRevenueAvailable(
 		true, true, false, true, false, 1));
 	CHECK(!IsSkirmishAISupplyRevenueAvailable(
@@ -4645,7 +4687,8 @@ static void TestSkirmishAITestRunnerContract()
 		"low_cash",
 		"gla_hole",
 		"save_load",
-		"disabled_factory"
+		"disabled_factory",
+		"infrastructure_collapse"
 	};
 	const Int expectedRecoveryCases[] = {
 		SKIRMISH_AI_RECOVERY_SURVIVING_BUILDER,
@@ -4656,9 +4699,10 @@ static void TestSkirmishAITestRunnerContract()
 		SKIRMISH_AI_RECOVERY_LOW_CASH,
 		SKIRMISH_AI_RECOVERY_GLA_HOLE,
 		SKIRMISH_AI_RECOVERY_SAVE_LOAD,
-		SKIRMISH_AI_RECOVERY_DISABLED_FACTORY
+		SKIRMISH_AI_RECOVERY_DISABLED_FACTORY,
+		SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_COLLAPSE
 	};
-	for (i = 0; i < 9; ++i)
+	for (i = 0; i < SKIRMISH_AI_RECOVERY_FIXTURE_CASE_COUNT; ++i)
 	{
 		Int fixtureCase = -1;
 		CHECK(TryParseSkirmishAIRecoveryFixtureCase(recoveryCaseNames[i], &fixtureCase));

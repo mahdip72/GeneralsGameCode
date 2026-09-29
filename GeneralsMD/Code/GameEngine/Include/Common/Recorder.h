@@ -161,7 +161,8 @@ public:
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
-		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION; }
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE; }
 	Int getPathfindQueueReplayEpoch() const { return m_pathfindQueueReplayEpoch; }
 	Bool replayUsesPathfindQueueCapacity() const { return m_pathfindQueueReplayEpoch == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT; }
 	void initControls();															///< Show or Hide the Replay controls
