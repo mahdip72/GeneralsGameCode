@@ -3383,16 +3383,16 @@ void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 		if (s_recovery.fixtureCase == SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_COLLAPSE)
 		{
 			ObjectID survivingBuilderID = INVALID_ID;
-			for (Object *object = TheGameLogic->getFirstObject(); object;
-				object = object->getNextObject())
+			for (Object *baselineBuilder = TheGameLogic->getFirstObject(); baselineBuilder;
+				baselineBuilder = baselineBuilder->getNextObject())
 			{
-				if (object->getControllingPlayer() == player &&
-					object->isKindOf(KINDOF_DOZER) &&
-					IsLiveSkirmishAIRecoveryObject(object) &&
-					!object->isContained() &&
+				if (baselineBuilder->getControllingPlayer() == player &&
+					baselineBuilder->isKindOf(KINDOF_DOZER) &&
+					IsLiveSkirmishAIRecoveryObject(baselineBuilder) &&
+					!baselineBuilder->isContained() &&
 					(survivingBuilderID == INVALID_ID ||
-					 object->getID() < survivingBuilderID))
-					survivingBuilderID = object->getID();
+					 baselineBuilder->getID() < survivingBuilderID))
+					survivingBuilderID = baselineBuilder->getID();
 			}
 			if (survivingBuilderID == INVALID_ID)
 			{
@@ -3400,36 +3400,36 @@ void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 				RequestSkirmishAITestStop();
 				return;
 			}
-			for (Object *object = TheGameLogic->getFirstObject(); object; )
+			for (Object *extraBuilder = TheGameLogic->getFirstObject(); extraBuilder; )
 			{
-				Object *next = object->getNextObject();
-				if (object->getControllingPlayer() == player &&
-					object->isKindOf(KINDOF_DOZER) &&
-					object->getID() != survivingBuilderID &&
-					IsLiveSkirmishAIRecoveryObject(object))
-					DestroySkirmishAIRecoveryObject(object);
-				object = next;
+				Object *next = extraBuilder->getNextObject();
+				if (extraBuilder->getControllingPlayer() == player &&
+					extraBuilder->isKindOf(KINDOF_DOZER) &&
+					extraBuilder->getID() != survivingBuilderID &&
+					IsLiveSkirmishAIRecoveryObject(extraBuilder))
+					DestroySkirmishAIRecoveryObject(extraBuilder);
+				extraBuilder = next;
 			}
 			// Exhaust the starting supply field too, so restored income must
 			// come from hackers, drop zones, or markets rather than collectors.
-			for (Object *object = TheGameLogic->getFirstObject(); object; )
+			for (Object *supplyObject = TheGameLogic->getFirstObject(); supplyObject; )
 			{
-				Object *next = object->getNextObject();
-				if (object->isKindOf(KINDOF_SUPPLY_SOURCE) &&
-					IsLiveSkirmishAIRecoveryObject(object) &&
-					object->getPosition())
+				Object *next = supplyObject->getNextObject();
+				if (supplyObject->isKindOf(KINDOF_SUPPLY_SOURCE) &&
+					IsLiveSkirmishAIRecoveryObject(supplyObject) &&
+					supplyObject->getPosition())
 				{
-					const Real dx = object->getPosition()->x -
+					const Real dx = supplyObject->getPosition()->x -
 						s_recovery.originalCenterPosition.x;
-					const Real dy = object->getPosition()->y -
+					const Real dy = supplyObject->getPosition()->y -
 						s_recovery.originalCenterPosition.y;
 					if (dx * dx + dy * dy < 700.0f * 700.0f)
 					{
-						DestroySkirmishAIRecoveryObject(object);
+						DestroySkirmishAIRecoveryObject(supplyObject);
 						++s_recovery.depletedSupplySources;
 					}
 				}
-				object = next;
+				supplyObject = next;
 			}
 			if (s_recovery.depletedSupplySources == 0)
 			{
@@ -3439,27 +3439,27 @@ void ApplySkirmishAIRecoveryFixtureFault(Player *player)
 			}
 			// Remove every completed base building while keeping the surviving
 			// builders. Exhaust their ordinary build-list allowances as well.
-			for (Object *object = TheGameLogic->getFirstObject(); object; )
+			for (Object *baseStructure = TheGameLogic->getFirstObject(); baseStructure; )
 			{
-				Object *next = object->getNextObject();
-				if (object != commandCenter &&
-					object->getControllingPlayer() == player &&
-					object->isKindOf(KINDOF_STRUCTURE) &&
-					!object->isKindOf(KINDOF_SUPPLY_SOURCE) &&
-					IsLiveSkirmishAIRecoveryObject(object))
+				Object *next = baseStructure->getNextObject();
+				if (baseStructure != commandCenter &&
+					baseStructure->getControllingPlayer() == player &&
+					baseStructure->isKindOf(KINDOF_STRUCTURE) &&
+					!baseStructure->isKindOf(KINDOF_SUPPLY_SOURCE) &&
+					IsLiveSkirmishAIRecoveryObject(baseStructure))
 				{
-					if (!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
-						!object->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
-						object->getTemplate() &&
+					if (!baseStructure->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+						!baseStructure->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+						baseStructure->getTemplate() &&
 						s_recovery.infrastructureBaselineTemplateCount <
 							SKIRMISH_AI_RECOVERY_DIAGNOSTIC_MAX_IDS)
 						s_recovery.infrastructureBaselineTemplates[
 							s_recovery.infrastructureBaselineTemplateCount++] =
-							object->getTemplate();
-					DestroySkirmishAIRecoveryObject(object);
+							baseStructure->getTemplate();
+					DestroySkirmishAIRecoveryObject(baseStructure);
 					++s_recovery.destructionCount;
 				}
-				object = next;
+				baseStructure = next;
 			}
 			for (BuildListInfo *buildInfo = player->getBuildList();
 				buildInfo; buildInfo = buildInfo->getNext())
