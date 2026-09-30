@@ -468,6 +468,7 @@ Render2DSentenceClass::Draw_Sentence (uint32 color)
 				//	Allocate a new renderer
 				//
 				curr_renderer = W3DNEW Render2DClass;
+				curr_renderer->Enable_Native_Pixel_Centers (true);
 				curr_renderer->Set_Coordinate_Range (Render2DClass::Get_Screen_Resolution ());
 				ShaderClass *curr_shader = curr_renderer->Get_Shader ();
 				(*curr_shader) = Shader;
