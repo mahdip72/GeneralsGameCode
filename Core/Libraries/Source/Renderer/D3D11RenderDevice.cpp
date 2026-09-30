@@ -2674,7 +2674,7 @@ public:
 					samplerDescriptor.MaxLOD = FLT_MAX;
 				}
 				result = findOrCreateSamplerState(samplerDescriptor,
-					&samplerStates[stage]);
+					&samplerStates[stage], samplerStates, stage);
 				if (FAILED(result))
 				{
 					return TranslateResult(result);
@@ -5167,7 +5167,8 @@ private:
 		return true;
 	}
 
-	bool evictSamplerState()
+	bool evictSamplerState(ID3D11SamplerState *const *gatheredStates,
+		unsigned int gatheredCount)
 	{
 		if (m_samplerStates.size() < STATE_CACHE_CAPACITY)
 		{
@@ -5185,6 +5186,14 @@ private:
 					bound = true;
 					break;
 				}
+			}
+			// Rollover can make a state gathered earlier in this pipeline look
+			// oldest. Its cache reference must survive until PSSetSamplers takes
+			// the native context reference, even though it is not yet bound.
+			for (unsigned int stage = 0; !bound && stage < gatheredCount; ++stage)
+			{
+				if (gatheredStates[stage] == m_samplerStates[index].state)
+					bound = true;
 			}
 			if (bound)
 			{
@@ -5354,7 +5363,8 @@ private:
 	}
 
 	HRESULT findOrCreateSamplerState(const D3D11_SAMPLER_DESC &descriptor,
-		ID3D11SamplerState **state)
+		ID3D11SamplerState **state, ID3D11SamplerState *const *gatheredStates,
+		unsigned int gatheredCount)
 	{
 		for (unsigned int index = 0; index < m_samplerStates.size(); ++index)
 		{
@@ -5366,7 +5376,7 @@ private:
 				return S_OK;
 			}
 		}
-		if (!evictSamplerState())
+		if (!evictSamplerState(gatheredStates, gatheredCount))
 		{
 			return E_OUTOFMEMORY;
 		}

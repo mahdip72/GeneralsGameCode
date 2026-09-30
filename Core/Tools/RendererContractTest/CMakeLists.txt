@@ -151,6 +151,71 @@ add_test(NAME core_renderer_contract_tests
 set_tests_properties(core_renderer_contract_tests PROPERTIES TIMEOUT 30)
 
 if(WIN32 AND NOT IS_VS6_BUILD)
+
+    # Execute the production sampler lifetime methods and their real gather/
+    # bind callsites against a recording device. Missing or duplicate markers
+    # fail configuration; the generated proof records exact normalized bodies.
+    set(d3d11_sampler_source
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/Renderer/D3D11RenderDevice.cpp")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${d3d11_sampler_source}")
+    file(READ "${d3d11_sampler_source}" d3d11_sampler_contents)
+    string(REPLACE "\r\n" "\n" d3d11_sampler_contents "${d3d11_sampler_contents}")
+    file(SHA256 "${d3d11_sampler_source}" d3d11_sampler_source_hash)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/D3D11SamplerSourceProof.txt"
+        "source=${d3d11_sampler_source}\nsource_sha256=${d3d11_sampler_source_hash}\n")
+    function(d3d11_sampler_fragment name start_marker end_marker)
+        string(FIND "${d3d11_sampler_contents}" "${start_marker}" start)
+        if(start LESS 0)
+            message(FATAL_ERROR "D3D11 sampler fixture start marker missing: ${name}")
+        endif()
+        string(SUBSTRING "${d3d11_sampler_contents}" ${start} -1 fragment)
+        string(LENGTH "${start_marker}" marker_length)
+        string(SUBSTRING "${fragment}" ${marker_length} -1 remainder)
+        string(FIND "${remainder}" "${start_marker}" duplicate)
+        if(NOT duplicate LESS 0)
+            message(FATAL_ERROR "D3D11 sampler fixture marker duplicated: ${name}")
+        endif()
+        string(FIND "${fragment}" "${end_marker}" end)
+        if(end LESS 0)
+            message(FATAL_ERROR "D3D11 sampler fixture end marker missing: ${name}")
+        endif()
+        string(SUBSTRING "${fragment}" 0 ${end} fragment)
+        string(SHA256 fragment_hash "${fragment}")
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${name}.inc"
+            "// Production source body SHA256: ${fragment_hash}\n${fragment}\n")
+        file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/D3D11SamplerSourceProof.txt"
+            "${name}_sha256=${fragment_hash}\n")
+    endfunction()
+    d3d11_sampler_fragment(D3D11SamplerConstants
+        "const unsigned int STATE_CACHE_CAPACITY ="
+        "\nconst unsigned int TRANSFORM_CONSTANT_BUFFER_COUNT")
+    d3d11_sampler_fragment(D3D11SamplerEntry
+        "struct SamplerStateEntry" "\nstruct InputLayoutEntry")
+    d3d11_sampler_fragment(D3D11SamplerSerial
+        "\tunsigned int nextStateUseSerial()" "\n\tbool evictBlendState()")
+    d3d11_sampler_fragment(D3D11SamplerEviction
+        "\tbool evictSamplerState(" "\n\tbool evictInputLayout()")
+    d3d11_sampler_fragment(D3D11SamplerLookup
+        "\tHRESULT findOrCreateSamplerState(" "\n\tHRESULT findOrCreateInputLayout(")
+    d3d11_sampler_fragment(D3D11SamplerGatherCall
+        "\t\t\t\tresult = findOrCreateSamplerState(samplerDescriptor,"
+        "\n\t\t\t}\n\t\t}")
+    d3d11_sampler_fragment(D3D11SamplerBindCall
+        "\t\tif (hasTextures && (forcePipeline || !m_pipelineHasTextures ||"
+        "\n\t\tm_boundBlendDescriptor =")
+
+    add_executable(core_d3d11_sampler_rollover_tests
+        D3D11SamplerRolloverTest.cpp)
+    target_include_directories(core_d3d11_sampler_rollover_tests PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(core_d3d11_sampler_rollover_tests PRIVATE core_renderer)
+    set_target_properties(core_d3d11_sampler_rollover_tests PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME core_d3d11_sampler_rollover_tests
+        COMMAND core_d3d11_sampler_rollover_tests)
+    set_tests_properties(core_d3d11_sampler_rollover_tests PROPERTIES TIMEOUT 30)
+
     # Exercise the actual backend without pulling the WW3D library into this
     # focused validation/performance fixture.
     add_executable(core_d3d11_index_validation_tests
