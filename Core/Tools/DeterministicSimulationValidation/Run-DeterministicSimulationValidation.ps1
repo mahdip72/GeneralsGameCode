@@ -426,7 +426,7 @@ function Get-NativePerformanceReceiptReference {
                 $native['cohortNonce'] -cne $CohortNonce) { continue }
             Assert-Stage5NativePerformanceReceiptProvenance $native 'Native receipt reference' `
                 $ExpectedTitle $ExpectedExecutablePath $ExecutableSha256 $ProcessId `
-                $ProcessCreationUtc $ExpectedCohortCreatedUtc $candidate $OutputRoot
+                $ProcessCreationUtc $ExpectedCohortCreatedUtc $candidate $OutputRoot | Out-Null
             Assert-Stage5NativeCommandLineMatchesPlan `
                 $nativeProvenance['commandLine'] $ExpectedExecutablePath `
                 $ExpectedArguments 'Native receipt reference' | Out-Null

@@ -604,10 +604,17 @@ void DebugResourceOwnerTransport()
 		f.lastFaultInvocation == 1 &&
 		f.lastFaultResult == RENDER_RESULT_FAILED);
 	CHECK(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_RESIZE_TARGETS_RECOVERY_FAILURE, 1,
+		RENDER_RESULT_FAILED) == RENDER_RESULT_OK &&
+		f.faultConfigCalls == 5 &&
+		f.lastFaultPoint == RENDER_RESOURCE_FAULT_RESIZE_TARGETS_RECOVERY_FAILURE &&
+		f.lastFaultInvocation == 1 &&
+		f.lastFaultResult == RENDER_RESULT_FAILED);
+	CHECK(device->configureResourceFaultInjection(
 		static_cast<RenderResourceFaultPoint>(
-			RENDER_RESOURCE_FAULT_TEXTURE_REFRESH_AFTER_UNBIND + 1), 1,
+			RENDER_RESOURCE_FAULT_RESIZE_TARGETS_RECOVERY_FAILURE + 1), 1,
 		RENDER_RESULT_FAILED) == RENDER_RESULT_INVALID_ARGUMENT &&
-		f.faultConfigCalls == 4);
+		f.faultConfigCalls == 5);
 }
 
 void OwnershipAndDeepCopy()
