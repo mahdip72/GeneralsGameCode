@@ -59,7 +59,7 @@ jobs:
   build:
     name: ${{ inputs.preset }}
     runs-on: windows-2022
-    timeout-minutes: 240
+    timeout-minutes: ${{ inputs.stage5 && 240 || (inputs.preset == 'vc6-releaselog+t+e' && 75 || 15) }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

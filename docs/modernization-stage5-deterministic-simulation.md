@@ -33,6 +33,32 @@ Replay worker children must preserve explicit worker count, worker policy,
 pipeline mode, and simulation mode. `Audit-ReplayModePropagation.ps1`
 enforces that contract while rejecting recursive process-level `-jobs`.
 
+## Zero Hour AI replay compatibility
+
+The integrated source preserves the released Zero Hour AI epochs through 12.
+Epoch 11 selects tactical adaptation; epoch 12 also selects infrastructure
+recovery. Neither selects Stage 5 adaptive planning or counter RNG. New epoch
+13 combines those released behaviors with adaptive global RNG planning, and
+epoch 14 adds native counter RNG planning. Win32 writes epoch 13; native x64
+writes epoch 14. Playback restamps each known epoch exactly, and unknown,
+duplicate, malformed, or mixed AI markers keep the legacy rejection behavior.
+
+The unpublished Stage 5 draft also used bare epoch 11/12 markers for its RNG
+modes. Those draft Win32 recordings are ambiguous and unsupported; the merged
+source gives the markers their released main meanings. They must not be
+restamped into epochs 13/14 or used as compatibility evidence. Native RPL3
+recordings remain bound to the exact executable CRC, content CRC, schema,
+payload length, and payload checksum before the AI marker is read. Prior
+native draft recordings therefore cannot qualify the integrated executable.
+Generate fresh fixtures for its new combined behavior boundaries.
+
+The paired native Stage 5 CI lane retains its 240-minute qualification budget.
+The replay workflow also preserves main's 75-minute VC6 and 15-minute ordinary
+budgets in its timeout expression; its existing entry guard continues to
+require the native Stage 5 lane. The main VC6 oracle script remains available,
+while retail build-tree/profile steps do not run inside this installed-runtime
+qualification workflow.
+
 ## Pathfinding worker boundary
 
 Stage 5 has two request-local pathfinding worker lanes. The compact direct lane

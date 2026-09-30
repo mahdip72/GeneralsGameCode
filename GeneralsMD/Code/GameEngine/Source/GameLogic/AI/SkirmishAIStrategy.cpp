@@ -246,7 +246,7 @@ void ArmOldSaveSkirmishFortifyDeadline( SkirmishStrategyState *state,
 
 SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &state,
 	const SkirmishStrategyMetrics &metrics, GameDifficulty difficulty, UnsignedInt currentFrame,
-	Bool useProductionBehavior )
+	Bool useProductionBehavior, Bool tacticalRouteExhausted, Bool viableSuperweaponPlan )
 {
 	SkirmishStrategyDecision decision;
 	SkirmishStrategyMode candidateMode = SKIRMISH_STRATEGY_NONE;
@@ -282,7 +282,7 @@ SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &
 		IsSkirmishStrategyFrameReached( currentFrame,
 			decision.nextState.assaultAssemblyDeadlineFrame ) )
 	{
-		if( metrics.hasStrategicTarget &&
+		if( !tacticalRouteExhausted && metrics.hasStrategicTarget &&
 			(metrics.viableAssaultForceAssembled ||
 			 ClampStrategyMetric( metrics.armyReadiness ) >= 35) )
 		{
@@ -333,6 +333,20 @@ SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &
 		return decision;
 	}
 
+	// Route exhaustion is supplied only by the new tactical caller.  CommitMode
+	// keeps Fortify attempt ownership and its assembly deadline consistent.
+	if( tacticalRouteExhausted && state.currentMode == SKIRMISH_STRATEGY_ASSAULT )
+	{
+		const SkirmishStrategyMode fallbackMode = viableSuperweaponPlan ?
+			SKIRMISH_STRATEGY_FORTIFY : SKIRMISH_STRATEGY_BALANCED;
+		const SkirmishStrategyReason fallbackReason = viableSuperweaponPlan ?
+			SKIRMISH_STRATEGY_REASON_FORTIFY_TACTICAL_ROUTE_EXHAUSTED :
+			SKIRMISH_STRATEGY_REASON_BALANCED_TACTICAL_ROUTE_EXHAUSTED;
+		CommitMode( &decision, fallbackMode, fallbackReason, difficulty,
+			currentFrame, false, useProductionBehavior );
+		return decision;
+	}
+
 	if( state.currentMode == SKIRMISH_STRATEGY_BALANCED )
 	{
 		if( decision.fortifyPressureHundredths >= SKIRMISH_FORTIFY_ENTRY_THRESHOLD )
@@ -340,7 +354,7 @@ SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &
 			candidateMode = SKIRMISH_STRATEGY_FORTIFY;
 			candidateReason = SKIRMISH_STRATEGY_REASON_FORTIFY_PRESSURE;
 		}
-		else if( MeetsNormalAssaultRequirements( metrics,
+		else if( !tacticalRouteExhausted && MeetsNormalAssaultRequirements( metrics,
 			decision.assaultReadinessHundredths ) )
 		{
 			candidateMode = SKIRMISH_STRATEGY_ASSAULT;
@@ -349,19 +363,19 @@ SkirmishStrategyDecision EvaluateSkirmishStrategy( const SkirmishStrategyState &
 	}
 	else if( state.currentMode == SKIRMISH_STRATEGY_FORTIFY )
 	{
-		if( metrics.hasStrategicTarget &&
+		if( !tacticalRouteExhausted && metrics.hasStrategicTarget &&
 			state.superweaponAttemptStatus == SKIRMISH_STRATEGY_ATTEMPT_SUCCEEDED )
 		{
 			candidateMode = SKIRMISH_STRATEGY_ASSAULT;
 			candidateReason = SKIRMISH_STRATEGY_REASON_ASSAULT_SUPERWEAPON_FIRED;
 		}
-		else if( metrics.hasStrategicTarget &&
+		else if( !tacticalRouteExhausted && metrics.hasStrategicTarget &&
 			metrics.viableAssaultForceAssembled )
 		{
 			candidateMode = SKIRMISH_STRATEGY_ASSAULT;
 			candidateReason = SKIRMISH_STRATEGY_REASON_ASSAULT_FORCE_ASSEMBLED;
 		}
-		else if( MeetsFortifyOpportunityRequirements( metrics ) )
+		else if( !tacticalRouteExhausted && MeetsFortifyOpportunityRequirements( metrics ) )
 		{
 			candidateMode = SKIRMISH_STRATEGY_ASSAULT;
 			candidateReason = SKIRMISH_STRATEGY_REASON_ASSAULT_EXPOSED_OPPORTUNITY;

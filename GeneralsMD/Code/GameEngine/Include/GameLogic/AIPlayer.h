@@ -281,7 +281,7 @@ protected:
 		const rts::AIProductionPlanningResult &result );
 #endif
 	Object *buildStructureNow(const ThingTemplate *bldgPlan, BuildListInfo *info );		///< Build a base buiding.
-	Object *buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildListInfo *info );		///< Build a base buiding.
+	Object *buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildListInfo *info, Bool allowTeleport = TRUE, Bool allowLocationAdjustment = TRUE );		///< Build a base buiding.
 	void clearTeamsInQueue();			///< Delete all teams in the build queue.
 	void computeCenterAndRadiusOfBase(Coord3D *center, Real *radius);
 	Object *findFactory(const ThingTemplate *thing, Bool busyOK); ///< Find a factory to build a unit.  If force is true, may return a busy factory.

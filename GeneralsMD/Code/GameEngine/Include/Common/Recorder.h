@@ -161,6 +161,8 @@ public:
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_RESOURCE_WORKER_PRESERVATION ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_STRATEGY_CONTROLLER ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_PRODUCTION ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
 	Bool replayUsesSkirmishAICounterRng() const {
