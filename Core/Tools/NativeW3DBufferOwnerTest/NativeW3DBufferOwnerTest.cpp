@@ -515,9 +515,12 @@ int RunDynamicBufferPoolWrapContract(FakeRenderDevice &device)
 	{
 		DynamicVBAccessClass afterRejected(BUFFER_TYPE_DYNAMIC_DX8,
 			dynamic_fvf_type, 1);
-		result |= Check(afterRejected.Is_Valid() &&
-			afterRejected.Get_Vertex_Buffer_Offset() == 1,
-			"rejected vertex count leaves the nonzero pool offset unchanged");
+		const bool afterRejectedValid = afterRejected.Is_Valid();
+		const unsigned int stride = afterRejectedValid ?
+			afterRejected.FVF_Info().Get_FVF_Size() : 0U;
+		result |= Check(afterRejectedValid && stride != 0 &&
+			afterRejected.Get_Vertex_Buffer_Offset() == stride,
+			"rejected vertex count leaves the pool cursor at one FVF stride");
 	}
 	DynamicVBAccessClass::_Deinit();
 
