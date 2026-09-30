@@ -1900,7 +1900,7 @@ Bool RecorderClass::playbackFile(AsciiString filename)
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathLivenessMarkedVersionTimeString);
 	MarkReplayVersionForSkirmishAILivenessRecovery(pathLivenessMarkedVersionTimeString);
 	// The member helper restamps the exact parsed epoch, including released
-	// epochs 2-10 and the Stage 5 epochs 11-12. This avoids reinterpreting an
+	// epochs 2-12 and the combined Stage 5 epochs 13-14. This avoids reinterpreting an
 	// older replay as the latest AI contract during the compatibility check.
 	UnicodeString compatibilityMarkedVersionTimeString = TheVersion->getUnicodeBuildTime();
 	MarkReplayVersionForSkirmishAICurrentEpoch(compatibilityMarkedVersionTimeString);

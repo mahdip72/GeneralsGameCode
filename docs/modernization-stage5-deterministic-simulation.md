@@ -41,7 +41,7 @@ recovery. Neither selects Stage 5 adaptive planning or counter RNG. New epoch
 13 combines those released behaviors with adaptive global RNG planning, and
 epoch 14 adds native counter RNG planning. Win32 writes epoch 13; native x64
 writes epoch 14. Playback restamps each known epoch exactly, and unknown,
-duplicate, malformed, or mixed AI markers keep the legacy rejection behavior.
+duplicate, malformed, or mixed AI markers fall back to legacy AI selection.
 
 The unpublished Stage 5 draft also used bare epoch 11/12 markers for its RNG
 modes. Those draft Win32 recordings are ambiguous and unsupported; the merged
