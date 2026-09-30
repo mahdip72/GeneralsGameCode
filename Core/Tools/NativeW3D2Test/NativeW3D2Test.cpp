@@ -1696,6 +1696,35 @@ int TestNativeCommandsPreservePipelineState(NativeW3D2 *owner)
 				"preserving pipeline state still publishes the requested shader constants");
 		}
 	}
+	{
+		using namespace rts::render;
+		static_assert(GAME_TEXTURE_STAGE_MAX_ANISOTROPY == 16,
+			"existing texture-stage command ordinals remain stable");
+		static_assert(GAME_TEXTURE_STAGE_MAX_MIP_LEVEL == 17,
+			"native mip-LOD command is appended");
+		ResetTrackedLegacyState();
+		SeedTrackedLegacyPipelineState();
+		GameRenderCommand command = {};
+		command.type = GAME_RENDER_COMMAND_SET_TEXTURE_STAGE_STATE;
+		command.value0 = 2;
+		command.value1 = GAME_TEXTURE_STAGE_MAX_MIP_LEVEL;
+		command.value2 = GAME_TEXTURE_MAX_MIP_LEVEL_INDEX;
+		LegacyLogicalState state;
+		result |= Check(owner->ExecuteGameRenderCommand(command) ==
+			RENDER_RESULT_OK && GetTrackedLegacyLogicalState(&state) &&
+			state.pipeline.textureStages[2].sampler.maximumMipLevel ==
+			GAME_TEXTURE_MAX_MIP_LEVEL_INDEX,
+			"native stage conversion accepts the maximum supported mip index");
+		command.value2 = GAME_TEXTURE_MAX_MIP_LEVEL_INDEX + 1U;
+		result |= Check(owner->ExecuteGameRenderCommand(command) ==
+			RENDER_RESULT_INVALID_ARGUMENT &&
+			GetTrackedLegacyLogicalState(&state) &&
+			state.pipeline.textureStages[2].sampler.maximumMipLevel ==
+			GAME_TEXTURE_MAX_MIP_LEVEL_INDEX,
+			"native stage conversion rejects an invalid mip payload without mutation");
+		result |= Check(owner->BeginGameDisplayIteration() == RENDER_RESULT_OK,
+			"the rejected sampler payload does not poison the next native iteration");
+	}
 	return result;
 }
 

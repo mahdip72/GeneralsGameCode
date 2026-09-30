@@ -1,12 +1,15 @@
 function(add_native_title_camera_adapter_test target_name title_root title_prefix)
     add_executable(${target_name}
         NativeTitleCameraAdapterTest.cpp
+        "${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Source/W3DDevice/GameClient/RenderTextureOperationsNative.cpp"
         "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WWStub/wwallocstub.cpp")
     target_precompile_headers(${target_name} PRIVATE [["Utility/CppMacros.h"]])
     target_include_directories(${target_name} PRIVATE
         "${CMAKE_SOURCE_DIR}/${title_root}/Code/Libraries/Source/WWVegas/WW3D2"
         "${CMAKE_SOURCE_DIR}/${title_root}/Code/Libraries/Source/WWVegas"
-        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2")
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas"
+        "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas/WW3D2"
+        "${CMAKE_SOURCE_DIR}/Core/GameEngineDevice/Include")
     target_link_libraries(${target_name} PRIVATE
         core_wwstub
         core_ww3d2_native

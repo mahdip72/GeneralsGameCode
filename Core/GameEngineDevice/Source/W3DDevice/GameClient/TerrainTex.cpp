@@ -101,6 +101,7 @@ using rts::render::RENDER_TEXTURE_OP_SELECT_ARGUMENT_2;
 
 #include "Renderer/RenderMatrixMath.h"
 #include "WW3D2/surfaceclass.h"
+#include "WW3D2/ww3d.h"
 
 namespace
 {
@@ -297,6 +298,9 @@ int TerrainTextureClass::update(WorldHeightMap *htMap)
 	}
 	if (!surface.Finish(this)) return 0;
 	rts::render::NotifyTextureChanged(this);
+#if defined(_WIN64)
+	Set_Render_Texture_Default_LOD(this, WW3D::Get_Texture_Reduction());
+#endif
 	return(surface.Height);
 }
 

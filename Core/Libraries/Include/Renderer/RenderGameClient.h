@@ -217,8 +217,13 @@ enum GameTextureStageState
 	GAME_TEXTURE_STAGE_COORDINATE_INDEX,
 	GAME_TEXTURE_STAGE_TRANSFORM_FLAGS,
 	// Appended to preserve all existing stage-state ordinals for VC6 callers.
-	GAME_TEXTURE_STAGE_MAX_ANISOTROPY
+	GAME_TEXTURE_STAGE_MAX_ANISOTROPY,
+	GAME_TEXTURE_STAGE_MAX_MIP_LEVEL
 };
+
+// MIP_LEVELS_MAX reserves index 13 as a sentinel, so 12 is the largest
+// concrete mip index that can be represented by the WW3D texture contract.
+enum { GAME_TEXTURE_MAX_MIP_LEVEL_INDEX = 12 };
 
 // Texture arguments use the low byte for the semantic argument.  Modifiers
 // deliberately live in a separate high-byte range so callers can combine

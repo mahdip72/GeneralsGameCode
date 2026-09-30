@@ -4,12 +4,14 @@
 #include "Renderer/RenderGameClientNative.h"
 #include "Renderer/RenderTexturePublication.h"
 #include "Renderer/RenderMatrixMath.h"
+#include "W3DDevice/GameClient/RenderTextureOperations.h"
 #include "camera.h"
 #include "dx8renderer.h"
 #include "vertmaterial.h"
 #include "shader.h"
 #include "texture.h"
 #include "texturefilter.h"
+#include "nativew3dsampledtexture.h"
 #include "nativew3d2.h"
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
@@ -402,6 +404,34 @@ public:
 	unsigned int m_applyCalls;
 };
 
+static_assert(rts::render::GAME_TEXTURE_STAGE_MAX_ANISOTROPY == 16,
+	"existing texture-stage command ordinals remain stable");
+static_assert(rts::render::GAME_TEXTURE_STAGE_MAX_MIP_LEVEL == 17,
+	"native mip-LOD state is appended after existing texture-stage commands");
+
+bool PublishLODTestMipChain(TextureClass *texture, unsigned int mipCount)
+{
+	if (texture == 0 || mipCount < 2 || mipCount > 3) return false;
+	static const unsigned char mip0[4 * 4 * 4] = {};
+	static const unsigned char mip1[2 * 2 * 4] = {};
+	static const unsigned char mip2[1 * 1 * 4] = {};
+	rts::render::NativeW3DSampledTextureMipView mips[3];
+	mips[0].data = mip0;
+	mips[0].dataSize = sizeof(mip0);
+	mips[0].rowPitch = 4 * 4;
+	mips[1].data = mip1;
+	mips[1].dataSize = sizeof(mip1);
+	mips[1].rowPitch = 2 * 4;
+	mips[2].data = mip2;
+	mips[2].dataSize = sizeof(mip2);
+	mips[2].rowPitch = 1 * 4;
+	rts::render::NativeW3DSampledTextureUpload upload;
+	return upload.Prepare(WW3D_FORMAT_A8R8G8B8, 4, 4, mipCount, 1,
+		mips, mipCount) && texture->Apply_Native_Texture(upload.Descriptor(),
+		upload.Subresources(), upload.SubresourceCount(),
+		WW3D_FORMAT_A8R8G8B8, true);
+}
+
 int TestNativeTextureApplyBoundary(CameraOutputSink *sink)
 {
 	int result = 0;
@@ -430,6 +460,137 @@ int TestNativeTextureApplyBoundary(CameraOutputSink *sink)
 		sink->lastFailure == rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
 		sink->commandCount == 0,
 		"native texture binding preserves legitimate acquisition failures after Apply");
+	return result;
+}
+
+int TestNativeTextureLOD(NativeW3D2 *owner)
+{
+	using namespace rts::render;
+	int result = 0;
+	if (owner == 0 || !owner->IsOperational())
+		return Check(false, "native texture LOD fixture has an operational owner");
+
+	LegacyLogicalState saved;
+	LegacyLogicalState applied;
+	const bool haveSavedState = GetTrackedLegacyLogicalState(&saved);
+	TextureClass fullMipTexture(32, 32, WW3D_FORMAT_A8R8G8B8,
+		MIP_LEVELS_ALL);
+	TextureClass shortMipTexture(32, 32, WW3D_FORMAT_A8R8G8B8,
+		MIP_LEVELS_3);
+	result |= Check(fullMipTexture.Is_Initialized() &&
+		shortMipTexture.Is_Initialized() &&
+		fullMipTexture.Get_Mip_Level_Count() >
+		shortMipTexture.Get_Mip_Level_Count(),
+		"native test textures publish distinct mip-chain lengths");
+	result |= Check(fullMipTexture.Get_Effective_Native_Texture_LOD() == 0,
+		"a texture with no LOD selection starts at full-fidelity mip zero");
+	TextureClass noReductionDefault(32, 32, WW3D_FORMAT_A8R8G8B8,
+		MIP_LEVELS_ALL);
+	Apply_Render_Texture_LOD_Policy(&noReductionDefault, 0, false, 0);
+	noReductionDefault.Apply(7);
+	result |= Check(GetTrackedLegacyLogicalState(&applied) &&
+		applied.pipeline.textureStages[7].sampler.maximumMipLevel == 0,
+		"texture reduction zero keeps the native sampler on base mip zero");
+
+	Set_Render_Texture_LOD(&fullMipTexture, 1);
+	Set_Render_Texture_LOD(&shortMipTexture, 3);
+	result |= Check(fullMipTexture.Get_Effective_Native_Texture_LOD() == 1 &&
+		shortMipTexture.Get_Effective_Native_Texture_LOD() == 2,
+		"requested LOD is independent per texture and clamps to its published chain");
+	fullMipTexture.Apply(2);
+	shortMipTexture.Apply(5);
+	result |= Check(GetTrackedLegacyLogicalState(&applied) &&
+		applied.pipeline.textureStages[2].sampler.maximumMipLevel == 1 &&
+		applied.pipeline.textureStages[5].sampler.maximumMipLevel == 2,
+		"distinct texture LODs reach their exact native texture stages");
+
+	const LegacySamplerState originalSampler =
+		applied.pipeline.textureStages[2].sampler;
+	Set_Render_Texture_LOD(&fullMipTexture, 0);
+	fullMipTexture.Apply(2);
+	result |= Check(GetTrackedLegacyLogicalState(&applied) &&
+		applied.pipeline.textureStages[2].sampler.maximumMipLevel == 0 &&
+		applied.pipeline.textureStages[2].sampler.addressU ==
+			originalSampler.addressU &&
+		applied.pipeline.textureStages[2].sampler.addressV ==
+			originalSampler.addressV &&
+		applied.pipeline.textureStages[2].sampler.addressW ==
+			originalSampler.addressW &&
+		applied.pipeline.textureStages[2].sampler.minification ==
+			originalSampler.minification &&
+		applied.pipeline.textureStages[2].sampler.magnification ==
+			originalSampler.magnification &&
+		applied.pipeline.textureStages[2].sampler.mipmapping ==
+			originalSampler.mipmapping &&
+		applied.pipeline.textureStages[2].sampler.maximumAnisotropy ==
+			originalSampler.maximumAnisotropy &&
+		applied.pipeline.textureStages[2].sampler.mipLodBias ==
+			originalSampler.mipLodBias,
+		"LOD0 preserves full fidelity and leaves per-stage filter settings intact");
+	Set_Render_Texture_LOD(&fullMipTexture, 1);
+	fullMipTexture.Apply(2);
+	result |= Check(GetTrackedLegacyLogicalState(&applied) &&
+		applied.pipeline.textureStages[2].sampler.maximumMipLevel == 1,
+		"explicit LOD1 is applied through the production texture Apply path");
+
+	Set_Render_Texture_LOD(&fullMipTexture, 99);
+	const unsigned int lastMip = fullMipTexture.Get_Mip_Level_Count() - 1;
+	result |= Check(fullMipTexture.Get_Effective_Native_Texture_LOD() == lastMip,
+		"oversized caller LOD is safely clamped to the available native mip chain");
+	Set_Render_Texture_LOD(&fullMipTexture, -1);
+	result |= Check(fullMipTexture.Get_Effective_Native_Texture_LOD() == 0,
+		"negative caller LOD clamps to the full-fidelity base mip");
+
+	TextureClass changingMipChain(4, 4, WW3D_FORMAT_A8R8G8B8,
+		MIP_LEVELS_1, TextureBaseClass::POOL_MANAGED, false, true, false);
+	Set_Render_Texture_LOD(&changingMipChain, 2);
+	result |= Check(changingMipChain.Get_Effective_Native_Texture_LOD() == 2 &&
+		PublishLODTestMipChain(&changingMipChain, 2) &&
+		changingMipChain.Get_Effective_Native_Texture_LOD() == 1 &&
+		PublishLODTestMipChain(&changingMipChain, 3) &&
+		changingMipChain.Get_Effective_Native_Texture_LOD() == 2,
+		"requested LOD survives a short initial chain and reclamps after publication");
+	changingMipChain.Apply(6);
+	result |= Check(GetTrackedLegacyLogicalState(&applied) &&
+		applied.pipeline.textureStages[6].sampler.maximumMipLevel == 2,
+		"the expanded replacement chain restores the retained request when applied");
+
+	TextureClass globalDefaultBeforeRebuild(32, 32,
+		WW3D_FORMAT_A8R8G8B8, MIP_LEVELS_ALL);
+	Apply_Render_Texture_LOD_Policy(&globalDefaultBeforeRebuild, 0, false, 1);
+	result |= Check(globalDefaultBeforeRebuild.Get_Effective_Native_Texture_LOD() == 1 &&
+		Generate_Render_Texture_Mip_Levels(&globalDefaultBeforeRebuild) &&
+		globalDefaultBeforeRebuild.Get_Effective_Native_Texture_LOD() == 1,
+		"procedural mip regeneration retains the non-explicit default selection");
+	globalDefaultBeforeRebuild.Apply(3);
+	result |= Check(GetTrackedLegacyLogicalState(&applied) &&
+		applied.pipeline.textureStages[3].sampler.maximumMipLevel == 1,
+		"regenerated procedural content reapplies its current default LOD on draw");
+
+	TextureClass globalDefaultAfterRebuild(32, 32,
+		WW3D_FORMAT_A8R8G8B8, MIP_LEVELS_ALL);
+	Apply_Render_Texture_LOD_Policy(&globalDefaultAfterRebuild, 0, false, 3);
+	result |= Check(globalDefaultAfterRebuild.Get_Effective_Native_Texture_LOD() == 3,
+		"a recreated atlas takes the latest global default when no explicit LOD exists");
+	globalDefaultAfterRebuild.Apply(4);
+	result |= Check(GetTrackedLegacyLogicalState(&applied) &&
+		applied.pipeline.textureStages[4].sampler.maximumMipLevel == 3,
+		"the recreated atlas sends its latest default through TextureClass::Apply");
+
+	TextureClass explicitZero(32, 32, WW3D_FORMAT_A8R8G8B8, MIP_LEVELS_ALL);
+	Apply_Render_Texture_LOD_Policy(&explicitZero, 0, true, 3);
+	Set_Render_Texture_Default_LOD(&explicitZero, 4);
+	result |= Check(explicitZero.Get_Effective_Native_Texture_LOD() == 0 &&
+		Generate_Render_Texture_Mip_Levels(&explicitZero) &&
+		explicitZero.Get_Effective_Native_Texture_LOD() == 0,
+		"an explicit LOD0 survives a nonzero default and resource republish");
+	explicitZero.Apply(6);
+	result |= Check(GetTrackedLegacyLogicalState(&applied) &&
+		applied.pipeline.textureStages[6].sampler.maximumMipLevel == 0,
+		"full-fidelity procedural content applies explicit LOD0 after republish");
+
+	if (haveSavedState) TrackLegacyPipelineState(saved);
+	else ResetTrackedLegacyState();
 	return result;
 }
 
@@ -1492,6 +1653,7 @@ int main()
 			if (lifecycle.IsAcquired())
 				lifecycle.Publish(actualOwner);
 		}
+		result |= TestNativeTextureLOD(static_cast<NativeW3D2 *>(actualOwner));
 		result |= TestNativeOffscreenFacade(window, actualOwner, &recoveryHook);
 	}
 	else

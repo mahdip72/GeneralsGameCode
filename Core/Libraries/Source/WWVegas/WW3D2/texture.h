@@ -206,6 +206,9 @@ public:
 	// Product-facing x64 texture publication. These methods expose only typed
 	// generation-safe handles; the retained CPU view supports SurfaceClass
 	// read/modify paths without retaining a native COM resource.
+	void Set_Native_Texture_LOD(int lod);
+	void Set_Default_Native_Texture_LOD(int lod);
+	unsigned int Get_Effective_Native_Texture_LOD() const;
 	bool Apply_Native_Texture(const rts::render::TextureDescriptor &descriptor,
 		const rts::render::TextureSubresourceData *subresources,
 		unsigned int subresource_count, WW3DFormat source_format,
@@ -252,6 +255,10 @@ protected:
 	bool IsCompressionAllowed;
 	bool IsProcedural;
 	bool IsReducible;
+#if defined(_WIN64)
+	unsigned int RequestedNativeTextureLOD;
+	bool HasExplicitNativeTextureLOD;
+#endif
 
 
 	unsigned InactivationTime;	// In milliseconds

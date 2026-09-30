@@ -41,6 +41,7 @@
 
 #include "texture.h"
 
+#include "Renderer/RenderGameClient.h"
 #include "Renderer/RenderTexturePublication.h"
 #include "WWLib/TARGA.h"
 #include <WWLib/nstrdup.h>
@@ -161,29 +162,66 @@ TextureBaseClass::TextureBaseClass
 	bool reducible
 )
 :	MipLevelCount(mip_level_count),
-	TextureHandle(nullptr),
-	NativeTexture(nullptr),
 	Initialized(false),
-   Name(""),
-	FullPath(""),
-	texture_id(unused_texture_id++),
 	IsLightmap(false),
+	IsCompressionAllowed(false),
 	IsProcedural(false),
 	IsReducible(reducible),
-	IsCompressionAllowed(false),
+#if defined(_WIN64)
+	RequestedNativeTextureLOD(0),
+	HasExplicitNativeTextureLOD(false),
+#endif
 	InactivationTime(0),
 	ExtendedInactivationTime(0),
 	LastInactivationSyncTime(0),
 	LastAccessed(0),
+	HSVShift(0.0f,0.0f,0.0f),
 	Width(width),
 	Height(height),
+	TextureHandle(nullptr),
+	NativeTexture(nullptr),
+	Name(""),
+	FullPath(""),
+	texture_id(unused_texture_id++),
 	Pool(pool),
 	Dirty(false),
 	TextureLoadTask(nullptr),
-	ThumbnailLoadTask(nullptr),
-	HSVShift(0.0f,0.0f,0.0f)
+	ThumbnailLoadTask(nullptr)
 {
 }
+
+#if defined(_WIN64)
+static unsigned int Clamp_Native_Texture_LOD(int lod)
+{
+	if (lod <= 0) return 0;
+	const unsigned int requested = static_cast<unsigned int>(lod);
+	return requested < static_cast<unsigned int>(
+		rts::render::GAME_TEXTURE_MAX_MIP_LEVEL_INDEX) ?
+		requested : static_cast<unsigned int>(
+			rts::render::GAME_TEXTURE_MAX_MIP_LEVEL_INDEX);
+}
+
+void TextureBaseClass::Set_Native_Texture_LOD(int lod)
+{
+	RequestedNativeTextureLOD = Clamp_Native_Texture_LOD(lod);
+	HasExplicitNativeTextureLOD = true;
+}
+
+void TextureBaseClass::Set_Default_Native_Texture_LOD(int lod)
+{
+	if (!HasExplicitNativeTextureLOD)
+		RequestedNativeTextureLOD = Clamp_Native_Texture_LOD(lod);
+}
+
+unsigned int TextureBaseClass::Get_Effective_Native_Texture_LOD() const
+{
+	if (NativeTexture == nullptr || NativeTexture->descriptor.mipCount == 0)
+		return RequestedNativeTextureLOD;
+	const unsigned int lastMip = NativeTexture->descriptor.mipCount - 1;
+	return RequestedNativeTextureLOD < lastMip ? RequestedNativeTextureLOD :
+		lastMip;
+}
+#endif
 
 
 //**********************************************************************************************
@@ -1389,6 +1427,14 @@ void TextureClass::Apply(unsigned int stage)
 	}
 
 	Filter.Apply(stage);
+#if defined(_WIN64)
+	if (stage < rts::render::LEGACY_TEXTURE_STAGE_COUNT)
+	{
+		rts::render::SetGameTextureStageState(stage,
+			rts::render::GAME_TEXTURE_STAGE_MAX_MIP_LEVEL,
+			Get_Effective_Native_Texture_LOD());
+	}
+#endif
 }
 
 //**********************************************************************************************

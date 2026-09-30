@@ -84,6 +84,7 @@ enum
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
 #include "WW3D2/camera.h"
+#include "WW3D2/ww3d.h"
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/RenderTexturePublication.h"
 
@@ -667,6 +668,10 @@ void W3DTreeBuffer::updateTexture()
 		return;
 	}
 	m_textureHeight = updatedHeight;
+#if defined(_WIN64)
+	Apply_Render_Texture_LOD_Policy(tex, m_textureLOD,
+		m_hasExplicitTextureLOD, WW3D::Get_Texture_Reduction());
+#endif
 
 	m_treeTexture = tex;
 
@@ -683,6 +688,12 @@ some point since it wastes a lot of system memory on low-end systems. -MW
 */
 void W3DTreeBuffer::setTextureLOD(Int lod)
 {
+#if defined(_WIN64)
+	m_textureLOD = lod < 0 ? 0 :
+		(lod > rts::render::GAME_TEXTURE_MAX_MIP_LEVEL_INDEX ?
+		rts::render::GAME_TEXTURE_MAX_MIP_LEVEL_INDEX : lod);
+	m_hasExplicitTextureLOD = true;
+#endif
 	if (m_treeTexture)
 		((W3DTreeTextureClass*)m_treeTexture)->setLOD(lod);
 }
@@ -1119,6 +1130,10 @@ W3DTreeBuffer::W3DTreeBuffer()
 		m_curNumTreeIndices[i]=0;
 	}
 	m_treeTexture = nullptr;
+#if defined(_WIN64)
+	m_textureLOD = 0;
+	m_hasExplicitTextureLOD = false;
+#endif
 	m_dwTreeVertexShader = 0;
 	m_dwTreePixelShader = 0;
 	clearAllTrees();

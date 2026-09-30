@@ -229,6 +229,10 @@ private:
 	Region2D m_bounds;
 
 	TextureClass *m_treeTexture;	///<Trees texture
+#if defined(_WIN64)
+	Int			m_textureLOD;
+	Bool			m_hasExplicitTextureLOD;
+#endif
 	Int			m_textureWidth;				///<Width in pixels m_treeTexture;
 	Int			m_textureHeight;				///<Width in pixels m_treeTexture;
 	Int			m_curNumTreeVertices[MAX_BUFFERS]; ///<Number of vertices used in m_vertexTree.

@@ -1494,7 +1494,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 
 	case GAME_RENDER_COMMAND_SET_TEXTURE_STAGE_STATE:
 		if (command.value0 >= LEGACY_TEXTURE_STAGE_COUNT || command.value1 >
-			static_cast<unsigned int>(GAME_TEXTURE_STAGE_MAX_ANISOTROPY))
+			static_cast<unsigned int>(GAME_TEXTURE_STAGE_MAX_MIP_LEVEL))
 		{
 			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 			return RENDER_RESULT_INVALID_ARGUMENT;
@@ -1634,6 +1634,12 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					}
 				}
 				stage.sampler.maximumAnisotropy = command.value2;
+				break;
+			case GAME_TEXTURE_STAGE_MAX_MIP_LEVEL:
+				if (command.value2 > static_cast<unsigned int>(
+					GAME_TEXTURE_MAX_MIP_LEVEL_INDEX))
+					goto invalid_command;
+				stage.sampler.maximumMipLevel = command.value2;
 				break;
 			default:
 				goto invalid_command;
