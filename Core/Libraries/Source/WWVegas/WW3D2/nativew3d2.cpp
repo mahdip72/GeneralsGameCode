@@ -180,6 +180,75 @@ void TraceGameSubmitRejection(const char *stage,
 	fclose(trace);
 }
 
+void TraceGameDrawPrePacketRejection(const char *stage,
+	rts::render::RenderResult result, unsigned int displayIteration,
+	bool ownerThread, bool operational, bool frameOpen,
+	bool vertexBound, rts::render::GpuHandle vertexBuffer,
+	rts::render::RenderVertexFormat vertexFormat,
+	unsigned int vertexStride, unsigned int vertexOffset,
+	unsigned int vertexStream, unsigned int vertexLayoutStride,
+	unsigned int vertexLayoutElements, bool indexBound,
+	rts::render::GpuHandle indexBuffer, rts::render::RenderFormat indexFormat,
+	unsigned int indexOffset, int indexBaseVertex,
+	unsigned long long sortedVertexBytes,
+	unsigned int sortedVertexMinimum, unsigned int sortedVertexCount,
+	unsigned int sortedVertexSourceOffset,
+	unsigned long long sortedIndexBytes,
+	unsigned int sortedIndexStart, unsigned int sortedIndexCount,
+	const rts::render::GameRenderCommand &command,
+	int trackedStateAvailable)
+{
+	const char *path = getenv("RTS_RENDER_FAILURE_TRACE");
+	if (path == 0 || path[0] == '\0' || !ownerThread ||
+		!ReserveGameSubmitFailureTraceEvent())
+		return;
+	FILE *trace = fopen(path, "ab");
+	if (trace == 0)
+		return;
+	fprintf(trace,
+		"renderer_failure_detail source=game-prepacket stage=%s result=%d display_iteration=%u owner_thread=%d operational=%d frame_open=%d vertex_bound=%d vb=%u:%u vertex_format=%u vertex_stride=%u vertex_offset_bytes=%u vertex_stream=%u vertex_layout_stride=%u vertex_layout_elements=%u index_bound=%d ib=%u:%u index_format=%u index_offset_bytes=%u index_base_vertex=%d sorted_vb_bytes=%llu sorted_vb_minimum=%u sorted_vb_count=%u sorted_vb_source_offset_bytes=%u sorted_ib_bytes=%llu sorted_ib_start_index=%u sorted_ib_index_count=%u command=%u start_index=%u primitive_count=%u min_vertex=%u vertex_count=%u tracked_state_available=%d\r\n",
+		stage,
+		static_cast<int>(result),
+		displayIteration,
+		ownerThread ? 1 : 0,
+		operational ? 1 : 0,
+		frameOpen ? 1 : 0,
+		vertexBound ? 1 : 0,
+		vertexBuffer.index(), vertexBuffer.generation(),
+		static_cast<unsigned int>(vertexFormat), vertexStride, vertexOffset,
+		vertexStream, vertexLayoutStride, vertexLayoutElements,
+		indexBound ? 1 : 0,
+		indexBuffer.index(), indexBuffer.generation(),
+		static_cast<unsigned int>(indexFormat), indexOffset, indexBaseVertex,
+		sortedVertexBytes, sortedVertexMinimum, sortedVertexCount,
+		sortedVertexSourceOffset, sortedIndexBytes, sortedIndexStart,
+		sortedIndexCount,
+		static_cast<unsigned int>(command.type), command.value0, command.value1,
+		command.value2, command.value3, trackedStateAvailable);
+	fclose(trace);
+}
+
+void TraceGameDrawOffOwnerRejection(const char *stage,
+	rts::render::RenderResult result,
+	const rts::render::GameRenderCommand &command)
+{
+	const char *path = getenv("RTS_RENDER_FAILURE_TRACE");
+	if (path == 0 || path[0] == '\0' ||
+		!ReserveGameSubmitFailureTraceEvent())
+		return;
+	FILE *trace = fopen(path, "ab");
+	if (trace == 0)
+		return;
+	fprintf(trace,
+		"renderer_failure_detail source=game-prepacket stage=%s result=%d owner_thread=0 display_iteration=unavailable operational=unavailable frame_open=unavailable binding_state_sampled=0 command=%u start_index=%u primitive_count=%u min_vertex=%u vertex_count=%u resource0=%llu resource1=%llu\r\n",
+		stage, static_cast<int>(result),
+		static_cast<unsigned int>(command.type), command.value0, command.value1,
+		command.value2, command.value3,
+		static_cast<unsigned long long>(PackTraceHandle(command.resource0)),
+		static_cast<unsigned long long>(PackTraceHandle(command.resource1)));
+	fclose(trace);
+}
+
 rts::render::RenderResult BindNativeResourceOwners(
 	rts::render::NativeW3DResources *resources)
 {
@@ -1362,6 +1431,36 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	if (serviceResult != RENDER_RESULT_OK &&
 		!m_renderer.IsBackendOperational())
 	{
+		if (command.type == GAME_RENDER_COMMAND_DRAW_TRIANGLES ||
+			command.type == GAME_RENDER_COMMAND_DRAW_STRIP)
+		{
+			if (m_resources.IsOwnerThread())
+			{
+				LegacyLogicalState trackedState;
+				const int trackedStateAvailable =
+					GetTrackedLegacyLogicalState(&trackedState) ? 1 : 0;
+				TraceGameDrawPrePacketRejection(
+					"draw-threaded-completion-gate", serviceResult,
+					m_displayIterationEpoch, true, IsOperational(),
+					m_renderer.IsFrameOpen(), m_gameVertexBound,
+					m_gameVertexBuffer, m_gameVertexFormat, m_gameVertexStride,
+					m_gameVertexOffset, m_gameVertexStream,
+					m_gameVertexLayout.stride,
+					m_gameVertexLayout.elementCount, m_gameIndexBound,
+					m_gameIndexBuffer, m_gameIndexFormat, m_gameIndexOffset,
+					m_gameIndexBaseVertex,
+					static_cast<unsigned long long>(
+						m_gameSortedVertexBytes.size()),
+					m_gameSortedVertexMinimum, m_gameSortedVertexCount,
+					m_gameSortedVertexSourceOffset,
+					static_cast<unsigned long long>(m_gameSortedIndexBytes.size()),
+					m_gameSortedIndexStart, m_gameSortedIndexCount,
+					command, trackedStateAvailable);
+			}
+			else
+				TraceGameDrawOffOwnerRejection(
+					"draw-threaded-completion-gate", serviceResult, command);
+		}
 		RecordGameFailure(serviceResult);
 		return serviceResult;
 	}
@@ -1371,6 +1470,37 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		!IsWellFormedGameHandle(command.resource1) ||
 		!IsOperational() || !m_resources.IsOwnerThread())
 	{
+		if (command.type == GAME_RENDER_COMMAND_DRAW_TRIANGLES ||
+			command.type == GAME_RENDER_COMMAND_DRAW_STRIP)
+		{
+			if (m_resources.IsOwnerThread())
+			{
+				LegacyLogicalState trackedState;
+				const int trackedStateAvailable =
+					GetTrackedLegacyLogicalState(&trackedState) ? 1 : 0;
+				TraceGameDrawPrePacketRejection(
+					"draw-command-entry-gate", RENDER_RESULT_INVALID_ARGUMENT,
+					m_displayIterationEpoch, true, IsOperational(),
+					m_renderer.IsFrameOpen(), m_gameVertexBound,
+					m_gameVertexBuffer, m_gameVertexFormat, m_gameVertexStride,
+					m_gameVertexOffset, m_gameVertexStream,
+					m_gameVertexLayout.stride,
+					m_gameVertexLayout.elementCount, m_gameIndexBound,
+					m_gameIndexBuffer, m_gameIndexFormat, m_gameIndexOffset,
+					m_gameIndexBaseVertex,
+					static_cast<unsigned long long>(
+						m_gameSortedVertexBytes.size()),
+					m_gameSortedVertexMinimum, m_gameSortedVertexCount,
+					m_gameSortedVertexSourceOffset,
+					static_cast<unsigned long long>(m_gameSortedIndexBytes.size()),
+					m_gameSortedIndexStart, m_gameSortedIndexCount,
+					command, trackedStateAvailable);
+			}
+			else
+				TraceGameDrawOffOwnerRejection(
+					"draw-command-entry-gate", RENDER_RESULT_INVALID_ARGUMENT,
+					command);
+		}
 		RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -1989,7 +2119,27 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	case GAME_RENDER_COMMAND_DRAW_STRIP:
 		if (!m_gameVertexBound || !m_gameIndexBound ||
 			command.value3 == 0U)
+		{
+			LegacyLogicalState trackedState;
+			const int trackedStateAvailable =
+				GetTrackedLegacyLogicalState(&trackedState) ? 1 : 0;
+			TraceGameDrawPrePacketRejection("draw-prerequisite-gate",
+				RENDER_RESULT_INVALID_ARGUMENT, m_displayIterationEpoch,
+				m_resources.IsOwnerThread(), IsOperational(),
+				m_renderer.IsFrameOpen(), m_gameVertexBound, m_gameVertexBuffer,
+				m_gameVertexFormat, m_gameVertexStride, m_gameVertexOffset,
+				m_gameVertexStream, m_gameVertexLayout.stride,
+				m_gameVertexLayout.elementCount, m_gameIndexBound,
+				m_gameIndexBuffer, m_gameIndexFormat, m_gameIndexOffset,
+				m_gameIndexBaseVertex,
+				static_cast<unsigned long long>(m_gameSortedVertexBytes.size()),
+				m_gameSortedVertexMinimum, m_gameSortedVertexCount,
+				m_gameSortedVertexSourceOffset,
+				static_cast<unsigned long long>(m_gameSortedIndexBytes.size()),
+				m_gameSortedIndexStart, m_gameSortedIndexCount,
+				command, trackedStateAvailable);
 			goto invalid_command;
+		}
 		{
 			unsigned int indexCount = 0U;
 			if (command.type == GAME_RENDER_COMMAND_DRAW_TRIANGLES)
@@ -2012,7 +2162,26 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				goto invalid_command;
 			LegacyLogicalState state;
 			if (!GetTrackedLegacyLogicalState(&state))
+			{
+				TraceGameDrawPrePacketRejection(
+					"draw-tracked-state-unavailable",
+					RENDER_RESULT_INVALID_ARGUMENT, m_displayIterationEpoch,
+					m_resources.IsOwnerThread(), IsOperational(),
+					m_renderer.IsFrameOpen(), m_gameVertexBound,
+					m_gameVertexBuffer, m_gameVertexFormat, m_gameVertexStride,
+					m_gameVertexOffset, m_gameVertexStream,
+					m_gameVertexLayout.stride,
+					m_gameVertexLayout.elementCount, m_gameIndexBound,
+					m_gameIndexBuffer, m_gameIndexFormat, m_gameIndexOffset,
+					m_gameIndexBaseVertex,
+					static_cast<unsigned long long>(m_gameSortedVertexBytes.size()),
+					m_gameSortedVertexMinimum, m_gameSortedVertexCount,
+					m_gameSortedVertexSourceOffset,
+					static_cast<unsigned long long>(m_gameSortedIndexBytes.size()),
+					m_gameSortedIndexStart, m_gameSortedIndexCount,
+					command, 0);
 				goto invalid_command;
+			}
 			NativeDrawPacket packet;
 			packet.vertexBuffer = m_gameVertexBuffer;
 			packet.indexBuffer = m_gameIndexBuffer;
