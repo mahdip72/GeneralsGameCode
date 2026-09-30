@@ -292,6 +292,17 @@ int main()
 				uploaded[4] == 255 && uploaded[7] == 136 &&
 				uploaded[8] == 255 && uploaded[11] == 255,
 				"sentence surface upload preserves transparent, antialiased, and opaque glyph alpha");
+			SurfaceClass *fontSurface = font->Get_Surface_Level(0);
+			int fontPitch = 0;
+			unsigned char *fontPixels = fontSurface == nullptr ? nullptr :
+				static_cast<unsigned char *>(fontSurface->Lock(&fontPitch));
+			if (fontPixels != nullptr) fontPixels[0] = 0x7e;
+			result |= Check(fontPixels != nullptr && fontPitch >= 12 &&
+				fontSurface->Unlock_Native_Surface() &&
+				font->Get_Native_Subresource_Data(0, 0, &uploaded, &rowPitch,
+					&slicePitch) && uploaded[0] == 0x7e,
+				"ordinary CPU font-surface edits still publish");
+			if (fontSurface != nullptr) fontSurface->Release_Ref();
 			font->Release_Ref();
 		}
 		atlas->Release_Ref();
@@ -307,6 +318,20 @@ int main()
 		beforeRecovery.format == RENDER_FORMAT_B8G8R8A8_UNORM &&
 		device.LiveCount() == 1,
 		"a title TextureClass creates an initialized typed native color target");
+	SurfaceClass *lockedView = target->Get_Surface_Level(0);
+	SurfaceClass *retainedView = target->Get_Surface_Level(0);
+	int lockedPitch = 0;
+	unsigned char *lockedPixels = lockedView == nullptr ? nullptr :
+		static_cast<unsigned char *>(lockedView->Lock(&lockedPitch));
+	result |= Check(lockedView != nullptr && retainedView != nullptr &&
+		lockedPixels != nullptr && lockedPitch >= 64 * 4,
+		"texture-backed SurfaceClass views expose the CPU-authoritative target before output");
+	if (lockedPixels != nullptr && lockedPitch >= 64 * 4)
+	{
+		lockedPixels[0] = 0x3c;
+		lockedPixels[1] = 0x4d;
+		lockedPixels[2] = 0x5e;
+	}
 	RenderTargetBinding outputBinding;
 	outputBinding.useBackBufferColor = false;
 	outputBinding.hasColor = true;
@@ -324,7 +349,22 @@ int main()
 		renderedLease.isValid() &&
 		!target->Get_Native_Subresource_Data(0, 0, &cpuPixels, &cpuPitch, &cpuBytes),
 		"GPU-authored target samples through a lease and hides stale creation pixels");
-
+	const bool staleUnlockRejected = lockedView != nullptr &&
+		!lockedView->Unlock_Native_Surface();
+	NativeW3DTextureHandle afterRejectedUnlock;
+	NativeW3DGpuContentLease afterRejectedLease;
+	result |= Check(staleUnlockRejected &&
+		!target->Get_Native_Subresource_Data(0, 0, &cpuPixels, &cpuPitch,
+			&cpuBytes) &&
+		target->Acquire_Native_Texture(&afterRejectedUnlock,
+			&afterRejectedLease) && afterRejectedLease.isValid(),
+		"a pre-output partial CPU edit is rejected without reviving stale pixels over GPU authority");
+	int rejectedPitch = -1;
+	unsigned char *rejectedPixels = retainedView == nullptr ? nullptr :
+		static_cast<unsigned char *>(retainedView->Lock(&rejectedPitch));
+	if (rejectedPixels != nullptr) retainedView->Unlock_Read_Only();
+	result |= Check(rejectedPixels == nullptr && rejectedPitch == -1,
+		"a retained SurfaceClass view cannot lock its stale CPU shadow after GPU output");
 	device.FailCreation(true);
 	TextureClass *failedTarget = new TextureClass(32, 32,
 		WW3D_FORMAT_A8R8G8B8, MIP_LEVELS_1,
@@ -364,6 +404,58 @@ int main()
 	NativeW3DTextureHandle staleHandle = rendered;
 	result |= Check(!target->Acquire_Native_Texture(&staleHandle, &renderedLease),
 		"an explicitly requested pre-recovery GPU lease remains invalid");
+	unsigned char freshPixels[64 * 32 * 4];
+	std::memset(freshPixels, 0xa5, sizeof(freshPixels));
+	result |= Check(target->Publish_Native_BGRA8(freshPixels, 64 * 4,
+		sizeof(freshPixels)) &&
+		target->Get_Native_Subresource_Data(0, 0, &cpuPixels, &cpuPitch,
+			&cpuBytes) && cpuPitch == 64 * 4 && cpuBytes == sizeof(freshPixels) &&
+		cpuPixels[0] == 0xa5,
+		"a fresh CPU-generated render-target image can restore CPU authority");
+	int freshPitch = 0;
+	unsigned char *freshViewPixels = retainedView == nullptr ? nullptr :
+		static_cast<unsigned char *>(retainedView->Lock(&freshPitch));
+	result |= Check(freshViewPixels != nullptr && freshPitch == 64 * 4 &&
+		freshViewPixels[0] == 0xa5,
+		"a retained render-target view rebases before locking a fresh CPU upload");
+	if (retainedView != nullptr && freshViewPixels != nullptr)
+		retainedView->Unlock_Read_Only();
+	SurfaceClass *firstCpuView = target->Get_Surface_Level(0);
+	SurfaceClass *staleCpuView = target->Get_Surface_Level(0);
+	int firstCpuPitch = 0;
+	int staleCpuPitch = 0;
+	unsigned char *firstCpuPixels = firstCpuView == nullptr ? nullptr :
+		static_cast<unsigned char *>(firstCpuView->Lock(&firstCpuPitch));
+	unsigned char *staleCpuPixels = staleCpuView == nullptr ? nullptr :
+		static_cast<unsigned char *>(staleCpuView->Lock(&staleCpuPitch));
+	if (firstCpuPixels != nullptr) firstCpuPixels[0] = 0x3a;
+	if (staleCpuPixels != nullptr) staleCpuPixels[4] = 0x4b;
+	const bool firstCpuViewUnlockSucceeded = firstCpuPixels != nullptr &&
+		firstCpuView->Unlock_Native_Surface();
+	const bool firstCpuViewPublished = firstCpuPitch == 64 * 4 &&
+		firstCpuViewUnlockSucceeded;
+	const bool staleCallerBytesPreserved = staleCpuPixels != nullptr &&
+		staleCpuPixels[4] == 0x4b;
+	const bool staleCpuViewUnlockRejected = staleCpuPixels != nullptr &&
+		!staleCpuView->Unlock_Native_Surface();
+	const bool staleCpuViewRejected = staleCpuPitch == 64 * 4 &&
+		staleCpuViewUnlockRejected && staleCallerBytesPreserved;
+	const unsigned char *afterStaleCpuView = nullptr;
+	size_t afterStaleCpuPitch = 0;
+	size_t afterStaleCpuBytes = 0;
+	const bool staleCpuViewPreservedNewerPixels =
+		target->Get_Native_Subresource_Data(0, 0, &afterStaleCpuView,
+			&afterStaleCpuPitch, &afterStaleCpuBytes) &&
+		afterStaleCpuView != nullptr && afterStaleCpuPitch == 64 * 4 &&
+		afterStaleCpuBytes == sizeof(freshPixels) &&
+		afterStaleCpuView[0] == 0x3a && afterStaleCpuView[4] == 0xa5;
+	result |= Check(firstCpuViewPublished && staleCpuViewRejected &&
+		staleCpuViewPreservedNewerPixels,
+		"a stale partial CPU view is rejected without overwriting a newer view's published pixels");
+	if (firstCpuView != nullptr) firstCpuView->Release_Ref();
+	if (staleCpuView != nullptr) staleCpuView->Release_Ref();
+	if (lockedView != nullptr) lockedView->Release_Ref();
+	if (retainedView != nullptr) retainedView->Release_Ref();
 
 	target->Release_Ref();
 	result |= Check(device.LiveCount() == 0 &&
