@@ -142,6 +142,70 @@ int Performance(Fixture &fixture)
 	}
 	return result;
 }
+
+int VertexUpdatePerformance(Fixture &fixture)
+{
+	const unsigned int counts[2] = { 6144, 65535 };
+	const unsigned int repeats = 32;
+	const unsigned int usedVertices = 4096;
+	std::vector<unsigned char> vertices((usedVertices + 1) * 16, 0);
+	LARGE_INTEGER frequency;
+	QueryPerformanceFrequency(&frequency);
+	int result = 0;
+	for (unsigned int profile = 0; profile < 2; ++profile)
+	{
+		std::vector<unsigned short> indices(counts[profile]);
+		for (unsigned int index = 0; index < counts[profile]; ++index)
+			indices[index] = static_cast<unsigned short>(index % usedVertices);
+		GpuHandle vb, ib;
+		result |= Check(fixture.Buffer(RENDER_BUFFER_VERTEX, &vertices[0],
+			vertices.size(), &vb) && fixture.Buffer(RENDER_BUFFER_INDEX,
+				&indices[0], indices.size() * sizeof(indices[0]), &ib),
+			"vertex-update performance buffers create");
+		if (result) return result;
+		const char *modes[4] = { "vb-preserve", "vb-no-overwrite",
+			"vb-full-discard", "ib-preserve-control" };
+		for (unsigned int mode = 0; mode < 4; ++mode)
+		{
+			result |= Check(fixture.Begin(vb, ib, RENDER_FORMAT_R16_UINT) &&
+				fixture.context->drawIndexed(counts[profile], 0, 0) == RENDER_RESULT_OK,
+				"vertex-update performance warm draw");
+			double uploadMilliseconds = 0.0, drawMilliseconds = 0.0;
+			for (unsigned int draw = 0; draw < repeats; ++draw)
+			{
+				LARGE_INTEGER begin, uploaded, end;
+				QueryPerformanceCounter(&begin);
+				// NO_OVERWRITE touches only the extra, unreferenced vertex, so
+				// it does not overwrite any queued GPU vertex reads.
+				const bool indexUpdate = mode == 3;
+				const size_t offset = mode == 1 ? usedVertices * 16 : 0;
+				const void *bytes = indexUpdate ? static_cast<const void *>(&indices[0]) :
+					static_cast<const void *>(&vertices[offset]);
+				const size_t size = indexUpdate ? indices.size() * sizeof(indices[0]) :
+					(mode == 1 ? 16 : vertices.size());
+				const RenderBufferUpdateMode updateMode = mode == 1 ?
+					RENDER_BUFFER_UPDATE_NO_OVERWRITE : (mode == 2 ?
+						RENDER_BUFFER_UPDATE_DISCARD : RENDER_BUFFER_UPDATE_PRESERVE);
+				result |= Check(fixture.device->updateBufferResource(indexUpdate ? ib : vb,
+					bytes, size, offset, updateMode) == RENDER_RESULT_OK,
+					"vertex-update performance upload succeeds");
+				QueryPerformanceCounter(&uploaded);
+				result |= Check(fixture.context->drawIndexed(counts[profile], 0, 0) ==
+					RENDER_RESULT_OK, "vertex-update performance physical validation succeeds");
+				QueryPerformanceCounter(&end);
+				uploadMilliseconds += Milliseconds(begin, uploaded, frequency);
+				drawMilliseconds += Milliseconds(uploaded, end, frequency);
+			}
+			result |= Check(fixture.context->endFrame() == RENDER_RESULT_OK,
+				"vertex-update performance frame ends");
+			printf("INDEX_SUMMARY_PERF profile=%s mode=%s indices=%u repeats=%u "
+				"upload_total_ms=%.6f draw_total_ms=%.6f\n",
+				profile == 0 ? "terrain" : "skinning-style", modes[mode],
+				counts[profile], repeats, uploadMilliseconds, drawMilliseconds);
+		}
+	}
+	return result;
+}
 }
 #endif
 
@@ -154,6 +218,8 @@ int main(int argc, char **argv)
 	int result = Check(fixture.Initialize(), "indexed validation real backend initializes");
 	if (result) return result;
 	if (performance) return Performance(fixture);
+	if (argc == 2 && strcmp(argv[1], "--vertex-update-performance") == 0)
+		return VertexUpdatePerformance(fixture);
 	unsigned char vertices[4 * 16] = { 0 };
 	unsigned short indices[6] = { 4, 0, 1, 2, 3, 0 };
 	unsigned int wide[6] = { 4, 1, 2, 3, 4, 0xffffffffU };
