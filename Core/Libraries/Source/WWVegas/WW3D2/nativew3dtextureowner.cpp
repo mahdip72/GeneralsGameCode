@@ -108,6 +108,30 @@ NativeW3DTextureCandidate::NativeW3DTextureCandidate() :
 {
 }
 
+NativeW3DTextureContentStamp::NativeW3DTextureContentStamp() : texture(),
+	bindingGeneration(0), publicationGeneration(0), authorityEpoch(0),
+	cpuShadowRevision(0), authority(NATIVE_W3D_CONTENT_INVALID)
+{
+}
+
+bool NativeW3DTextureContentStamp::isValid() const
+{
+	return texture.isValid() && bindingGeneration != 0 &&
+		publicationGeneration != 0 && authorityEpoch != 0;
+}
+
+bool NativeW3DTextureContentStamp::operator==(
+	const NativeW3DTextureContentStamp &other) const
+{
+	return texture.resource == other.texture.resource &&
+		texture.attachmentGeneration == other.texture.attachmentGeneration &&
+		bindingGeneration == other.bindingGeneration &&
+		publicationGeneration == other.publicationGeneration &&
+		authorityEpoch == other.authorityEpoch &&
+		cpuShadowRevision == other.cpuShadowRevision &&
+		authority == other.authority;
+}
+
 NativeW3DTextureCandidate::~NativeW3DTextureCandidate()
 {
 	Abandon();
@@ -481,6 +505,41 @@ RenderResult NativeW3DTextureOwner::RefreshCpuContent(
 	}
 	return resources->RefreshTexture(m_handle, descriptor, subresources,
 		subresourceCount);
+}
+
+RenderResult NativeW3DTextureOwner::DescribeContentStamp(
+	NativeW3DTextureContentStamp *stamp) const
+{
+	NativeGameRenderOwnerScope ownerScope;
+	if (stamp == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*stamp = NativeW3DTextureContentStamp();
+	NativeW3DResources *resources = ActiveResources();
+	if (resources == 0 || !m_handle.isValid() || m_bindingGeneration == 0 ||
+		m_publicationGeneration == 0)
+	{
+		return RENDER_RESULT_FAILED;
+	}
+	if (!resources->IsOwnerThread())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	NativeW3DTextureDescription description;
+	const RenderResult validation = ValidateCandidate(resources, m_handle,
+		m_descriptor, &description);
+	if (validation != RENDER_RESULT_OK || description.authorityEpoch == 0)
+	{
+		return validation == RENDER_RESULT_OK ? RENDER_RESULT_FAILED :
+			validation;
+	}
+	stamp->texture = m_handle;
+	stamp->bindingGeneration = m_bindingGeneration;
+	stamp->publicationGeneration = m_publicationGeneration;
+	stamp->authorityEpoch = description.authorityEpoch;
+	stamp->authority = description.authority;
+	return RENDER_RESULT_OK;
 }
 
 RenderResult NativeW3DTextureOwner::Reset()

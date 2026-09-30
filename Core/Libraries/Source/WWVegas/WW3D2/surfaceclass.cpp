@@ -54,15 +54,18 @@
 #include "WWLib/bound.h"
 #include "texture.h"
 #include "texturemipbuffer.h"
+#include "Renderer/RenderGameClientNative.h"
 #include "Renderer/NativeW3DResources.h"
+#include "nativew3dtextureowner.h"
 #include <new>
 #include <vector>
 
 struct NativeSurfaceStorage
 {
 	NativeSurfaceStorage() : width(0), height(0), pitch(0), rowCount(0),
-		bytes(), texture(nullptr), mipLevel(0), arraySlice(0), surface(), lease(),
-		locked(false) {}
+		format(WW3D_FORMAT_UNKNOWN), bytes(), texture(nullptr), mipLevel(0),
+		arraySlice(0), surface(), lease(), observedStamp(), retryStamp(),
+		retryPending(false), locked(false) {}
 	~NativeSurfaceStorage()
 	{
 		if (texture != nullptr) texture->Release_Ref();
@@ -71,12 +74,16 @@ struct NativeSurfaceStorage
 	unsigned int height;
 	size_t pitch;
 	size_t rowCount;
+	WW3DFormat format;
 	std::vector<unsigned char> bytes;
 	TextureBaseClass *texture;
 	unsigned int mipLevel;
 	unsigned int arraySlice;
 	mutable rts::render::NativeW3DSurfaceHandle surface;
 	mutable rts::render::NativeW3DGpuContentLease lease;
+	rts::render::NativeW3DTextureContentStamp observedStamp;
+	rts::render::NativeW3DTextureContentStamp retryStamp;
+	bool retryPending;
 	bool locked;
 };
 
@@ -108,16 +115,97 @@ static bool Allocate_Native_Surface(NativeSurfaceStorage *storage,
 	storage->height = height;
 	storage->pitch = layout.rowPitch;
 	storage->rowCount = layout.rowCount;
+	storage->format = format;
+	return true;
+}
+
+static bool Get_Native_Surface_Content_Stamp(
+	const NativeSurfaceStorage *storage,
+	rts::render::NativeW3DTextureContentStamp *stamp)
+{
+	if (stamp == nullptr) return false;
+	*stamp = rts::render::NativeW3DTextureContentStamp();
+	return storage != nullptr && storage->texture != nullptr &&
+		storage->texture->Get_Native_Subresource_Content_Stamp(
+			storage->mipLevel, storage->arraySlice, stamp) && stamp->isValid();
+}
+
+static bool Has_Current_Native_Surface_Cpu_Data(
+	const NativeSurfaceStorage *storage, const unsigned char **cpu_data,
+	rts::render::NativeW3DTextureContentStamp *stamp)
+{
+	rts::render::NativeGameRenderOwnerScope ownerScope;
+	if (cpu_data == nullptr || stamp == nullptr) return false;
+	*cpu_data = nullptr;
+	*stamp = rts::render::NativeW3DTextureContentStamp();
+	if (storage == nullptr || storage->texture == nullptr ||
+		storage->bytes.empty() || storage->width == 0 || storage->height == 0 ||
+		storage->pitch == 0 || storage->rowCount == 0) return false;
+	rts::render::NativeW3DTextureContentStamp before;
+	if (!Get_Native_Surface_Content_Stamp(storage, &before) ||
+		before.authority != rts::render::NATIVE_W3D_CONTENT_CPU) return false;
+	const unsigned char *data = nullptr;
+	size_t row_pitch = 0;
+	size_t slice_pitch = 0;
+	if (!storage->texture->Get_Native_Subresource_Data(storage->mipLevel,
+		storage->arraySlice, &data, &row_pitch, &slice_pitch) || data == nullptr ||
+		row_pitch != storage->pitch || slice_pitch != storage->bytes.size() ||
+		row_pitch == 0 || slice_pitch % row_pitch != 0 ||
+		slice_pitch / row_pitch != storage->rowCount) return false;
+	rts::render::NativeW3DTextureContentStamp after;
+	if (!Get_Native_Surface_Content_Stamp(storage, &after) || after != before)
+		return false;
+	if (storage->format != WW3D_FORMAT_UNKNOWN)
+	{
+		TextureMipLayout layout;
+		if (!CalculateTextureMipLayout(storage->format, storage->width,
+			storage->height, 1, layout) || layout.rowPitch != row_pitch ||
+			layout.rowCount != storage->rowCount ||
+			layout.slicePitch != slice_pitch ||
+			layout.dataSize != storage->bytes.size())
+		{
+			return false;
+		}
+	}
+	*cpu_data = data;
+	*stamp = before;
 	return true;
 }
 
 static bool Publish_Native_Surface(NativeSurfaceStorage *storage)
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
+	rts::render::NativeW3DTextureContentStamp current;
 	if (storage == nullptr || storage->texture == nullptr ||
-		storage->bytes.empty() || storage->pitch == 0) return false;
-	if (storage->texture->Update_Native_Subresource_Data(storage->mipLevel,
-		storage->arraySlice, &storage->bytes[0], storage->pitch,
-		storage->bytes.size()))
+		storage->bytes.empty() || storage->pitch == 0 ||
+		!Get_Native_Surface_Content_Stamp(storage, &current))
+		return false;
+	if (storage->retryPending)
+	{
+		if (current != storage->retryStamp) return false;
+	}
+	else if (current.authority != rts::render::NATIVE_W3D_CONTENT_CPU ||
+		current != storage->observedStamp)
+	{
+		return false;
+	}
+	const bool updated = storage->texture->Update_Native_Subresource_Data(
+		storage->mipLevel, storage->arraySlice, &storage->bytes[0],
+		storage->pitch, storage->bytes.size());
+	rts::render::NativeW3DTextureContentStamp after;
+	if (Get_Native_Surface_Content_Stamp(storage, &after))
+	{
+		storage->observedStamp = after;
+		storage->retryStamp = after;
+		storage->retryPending = !updated;
+	}
+	else
+	{
+		storage->observedStamp = rts::render::NativeW3DTextureContentStamp();
+		storage->retryStamp = rts::render::NativeW3DTextureContentStamp();
+		storage->retryPending = false;
+	}
+	if (updated && storage->observedStamp.isValid())
 	{
 		// Publication replaces the logical resource generation. Force the next
 		// sampling/output operation to acquire the new exact typed surface.
@@ -306,6 +394,7 @@ SurfaceClass::SurfaceClass(TextureBaseClass *texture, unsigned int mip_level,
 	unsigned int array_slice) : SurfaceHandle(nullptr), NativeSurface(nullptr),
 	SurfaceFormat(WW3D_FORMAT_UNKNOWN)
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (texture == nullptr) return;
 	NativeSurfaceStorage *storage = new(std::nothrow) NativeSurfaceStorage;
 	if (storage == nullptr) return;
@@ -321,12 +410,16 @@ SurfaceClass::SurfaceClass(TextureBaseClass *texture, unsigned int mip_level,
 	storage->arraySlice = array_slice;
 	storage->width = storage->surface.width;
 	storage->height = storage->surface.height;
-	SurfaceFormat = Native_Surface_Format(storage->surface.format);
+	storage->format = Native_Surface_Format(storage->surface.format);
+	SurfaceFormat = storage->format;
+	rts::render::NativeW3DTextureContentStamp before;
 	const unsigned char *data = nullptr;
 	size_t row_pitch = 0;
 	size_t slice_pitch = 0;
-	if (texture->Get_Native_Subresource_Data(mip_level, array_slice, &data,
-		&row_pitch, &slice_pitch) && data != nullptr)
+	if (texture->Get_Native_Subresource_Content_Stamp(mip_level, array_slice,
+		&before) && before.authority == rts::render::NATIVE_W3D_CONTENT_CPU &&
+		texture->Get_Native_Subresource_Data(mip_level, array_slice, &data,
+			&row_pitch, &slice_pitch) && data != nullptr)
 	{
 		try
 		{
@@ -336,6 +429,19 @@ SurfaceClass::SurfaceClass(TextureBaseClass *texture, unsigned int mip_level,
 			storage->rowCount = row_pitch == 0 ? 0 : slice_pitch / row_pitch;
 		}
 		catch (...) { storage->bytes.clear(); }
+		rts::render::NativeW3DTextureContentStamp after;
+		if (!storage->bytes.empty() &&
+			texture->Get_Native_Subresource_Content_Stamp(mip_level,
+				array_slice, &after) && after == before)
+		{
+			storage->observedStamp = after;
+		}
+		else
+		{
+			storage->bytes.clear();
+			storage->pitch = 0;
+			storage->rowCount = 0;
+		}
 	}
 	NativeSurface = storage;
 }
@@ -369,9 +475,31 @@ unsigned int SurfaceClass::Get_Bytes_Per_Pixel()
 
 SurfaceClass::LockedSurfacePtr SurfaceClass::Lock(int *pitch)
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
+	const unsigned char *cpu_data = nullptr;
+	rts::render::NativeW3DTextureContentStamp current;
 	if (pitch == nullptr || NativeSurface == nullptr ||
 		NativeSurface->bytes.empty() || NativeSurface->pitch == 0 ||
-		NativeSurface->locked) return nullptr;
+		NativeSurface->locked ||
+		(NativeSurface->texture != nullptr &&
+			!Has_Current_Native_Surface_Cpu_Data(NativeSurface, &cpu_data,
+				&current))) return nullptr;
+	if (NativeSurface->texture != nullptr)
+	{
+		// A texture may have returned to CPU authority after render output, or
+		// another surface may have published newer CPU bytes. Rebase only when
+		// its exact owner/authority/shadow stamp changed; ordinary font locks
+		// avoid both a second image allocation and an unchanged-image copy.
+		if (current != NativeSurface->observedStamp)
+		{
+			memcpy(&NativeSurface->bytes[0], cpu_data,
+				NativeSurface->bytes.size());
+			NativeSurface->observedStamp = current;
+		}
+		// A CPU-authoritative retry can be resumed through a fresh lock. The
+		// lock now starts from the exact retained shadow and gets a new attempt.
+		NativeSurface->retryPending = false;
+	}
 	NativeSurface->locked = true;
 	*pitch = static_cast<int>(NativeSurface->pitch);
 	return &NativeSurface->bytes[0];

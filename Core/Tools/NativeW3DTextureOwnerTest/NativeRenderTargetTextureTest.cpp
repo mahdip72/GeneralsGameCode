@@ -71,7 +71,8 @@ public:
 	};
 
 	TextureTestDevice() : m_allocator(16), m_context(), m_operational(true),
-		m_failCreation(false), m_failRefresh(false), m_recoveryCount(0), m_textures(16) {}
+		m_failCreation(false), m_failRefresh(false), m_refreshCount(0),
+		m_recoveryCount(0), m_textures(16) {}
 
 	RenderBackend backend() const override { return RENDER_BACKEND_D3D11; }
 	bool isOperational() const override { return m_operational; }
@@ -123,6 +124,7 @@ public:
 		const TextureDescriptor &descriptor, const TextureSubresourceData *,
 		unsigned int) override
 	{
+		++m_refreshCount;
 		if (m_failRefresh) return RENDER_RESULT_FAILED;
 		TextureSlot *slot = Find(texture);
 		if (slot == nullptr)
@@ -175,6 +177,7 @@ public:
 	void FailCreation(bool fail) { m_failCreation = fail; }
 	void FailRefresh(bool fail) { m_failRefresh = fail; }
 	unsigned int LiveCount() const { return m_allocator.liveCount(); }
+	unsigned int RefreshCount() const { return m_refreshCount; }
 	unsigned int RecoveryCount() const { return m_recoveryCount; }
 
 private:
@@ -193,6 +196,7 @@ private:
 	bool m_operational;
 	bool m_failCreation;
 	bool m_failRefresh;
+	unsigned int m_refreshCount;
 	unsigned int m_recoveryCount;
 	std::vector<TextureSlot> m_textures;
 };
@@ -454,6 +458,182 @@ int main()
 		"a stale partial CPU view is rejected without overwriting a newer view's published pixels");
 	if (firstCpuView != nullptr) firstCpuView->Release_Ref();
 	if (staleCpuView != nullptr) staleCpuView->Release_Ref();
+	NativeW3DTextureContentStamp beforeFailedWriteStamp;
+	const bool hasBeforeFailedWriteStamp = target->
+		Get_Native_Subresource_Content_Stamp(0, 0,
+			&beforeFailedWriteStamp) && beforeFailedWriteStamp.isValid() &&
+		beforeFailedWriteStamp.authority == NATIVE_W3D_CONTENT_CPU;
+	SurfaceClass *failedWriteView = target->Get_Surface_Level(0);
+	int failedWritePitch = 0;
+	unsigned char *failedWritePixels = failedWriteView == nullptr ? nullptr :
+		static_cast<unsigned char *>(failedWriteView->Lock(&failedWritePitch));
+	if (failedWritePixels != nullptr && failedWritePitch == 64 * 4)
+		failedWritePixels[12] = 0x6c;
+	device.FailRefresh(true);
+	const unsigned int refreshesBeforeSurfaceFailure = device.RefreshCount();
+	const bool failedSurfacePublication = failedWritePixels != nullptr &&
+		failedWritePitch == 64 * 4 &&
+		!failedWriteView->Unlock_Native_Surface();
+	const bool failedCallerBytesPreserved = failedWritePixels != nullptr &&
+		failedWritePixels[12] == 0x6c;
+	if (failedWriteView != nullptr) failedWriteView->Release_Ref();
+	NativeW3DTextureContentStamp failedWriteStamp;
+	const bool failedWriteStampAdvanced = hasBeforeFailedWriteStamp &&
+		target->Get_Native_Subresource_Content_Stamp(0, 0, &failedWriteStamp) &&
+		failedWriteStamp.isValid() &&
+		failedWriteStamp.authority == NATIVE_W3D_CONTENT_INVALID &&
+		failedWriteStamp.cpuShadowRevision ==
+			beforeFailedWriteStamp.cpuShadowRevision + 1;
+	device.FailRefresh(false);
+	SurfaceClass *retriedWriteView = target->Get_Surface_Level(0);
+	NativeW3DTextureContentStamp retriedWriteStamp;
+	const bool retryRestoredCpuAuthority = retriedWriteView != nullptr &&
+		target->Get_Native_Subresource_Content_Stamp(0, 0,
+			&retriedWriteStamp) && retriedWriteStamp.isValid() &&
+		retriedWriteStamp.authority == NATIVE_W3D_CONTENT_CPU &&
+		retriedWriteStamp.cpuShadowRevision == failedWriteStamp.cpuShadowRevision;
+	int retriedWritePitch = 0;
+	unsigned char *retriedWritePixels = retriedWriteView == nullptr ? nullptr :
+		static_cast<unsigned char *>(retriedWriteView->Lock(&retriedWritePitch));
+	const bool retriedSurfaceBytes = retriedWritePixels != nullptr &&
+		retriedWritePitch == 64 * 4 && retriedWritePixels[12] == 0x6c;
+	if (retriedWriteView != nullptr && retriedWritePixels != nullptr)
+		retriedWriteView->Unlock_Read_Only();
+	result |= Check(failedSurfacePublication && failedCallerBytesPreserved &&
+		failedWriteStampAdvanced &&
+		retryRestoredCpuAuthority && retriedSurfaceBytes &&
+		device.RefreshCount() == refreshesBeforeSurfaceFailure + 2,
+		"a released failed SurfaceClass edit retries the exact retained image through a fresh view");
+	if (retriedWriteView != nullptr) retriedWriteView->Release_Ref();
+
+	SurfaceClass *pendingBeforeGpuView = target->Get_Surface_Level(0);
+	int pendingBeforeGpuPitch = 0;
+	unsigned char *pendingBeforeGpuPixels = pendingBeforeGpuView == nullptr ? nullptr :
+		static_cast<unsigned char *>(pendingBeforeGpuView->Lock(
+			&pendingBeforeGpuPitch));
+	if (pendingBeforeGpuPixels != nullptr && pendingBeforeGpuPitch == 64 * 4)
+		pendingBeforeGpuPixels[16] = 0x74;
+	device.FailRefresh(true);
+	const unsigned int refreshesBeforePendingGpuWrite = device.RefreshCount();
+	const bool failedPendingGpuWrite = pendingBeforeGpuPixels != nullptr &&
+		pendingBeforeGpuPitch == 64 * 4 &&
+		!pendingBeforeGpuView->Unlock_Native_Surface();
+	if (pendingBeforeGpuView != nullptr) pendingBeforeGpuView->Release_Ref();
+	device.FailRefresh(false);
+	NativeW3DTextureContentStamp pendingBeforeGpuStamp;
+	const bool pendingBeforeGpuStampValid = failedPendingGpuWrite &&
+		target->Get_Native_Subresource_Content_Stamp(0, 0,
+			&pendingBeforeGpuStamp) && pendingBeforeGpuStamp.isValid() &&
+		pendingBeforeGpuStamp.authority == NATIVE_W3D_CONTENT_INVALID;
+
+	NativeW3DSurfaceHandle retryOutput;
+	RenderTargetBinding retryOutputBinding;
+	retryOutputBinding.useBackBufferColor = false;
+	retryOutputBinding.hasColor = true;
+	const bool gpuOutputPublished =
+		target->Acquire_Native_Surface(0, 0, true, &retryOutput) &&
+		retryOutput.isValid();
+	if (gpuOutputPublished)
+	{
+		retryOutputBinding.color.resource = retryOutput.texture.resource;
+	}
+	const bool outputBecameAuthoritative = gpuOutputPublished &&
+		device.immediateContext()->beginFrame() == RENDER_RESULT_OK &&
+		device.immediateContext()->setRenderTargets(retryOutputBinding) ==
+			RENDER_RESULT_OK &&
+		target->Publish_Native_Output(retryOutput) &&
+		device.immediateContext()->endFrame() == RENDER_RESULT_OK;
+	NativeW3DTextureContentStamp gpuOutputStamp;
+	const bool outputAdvancedAuthority = outputBecameAuthoritative &&
+		target->Get_Native_Subresource_Content_Stamp(0, 0, &gpuOutputStamp) &&
+		gpuOutputStamp.isValid() &&
+		gpuOutputStamp.authority == NATIVE_W3D_CONTENT_GPU_RENDER_TARGET &&
+		pendingBeforeGpuStampValid &&
+		gpuOutputStamp != pendingBeforeGpuStamp;
+	TextureClass *unrelated = new TextureClass(4, 4, WW3D_FORMAT_A8R8G8B8,
+		MIP_LEVELS_1, TextureClass::POOL_DEFAULT);
+	unsigned char unrelatedUpload[4 * 4 * 4];
+	std::memset(unrelatedUpload, 0xb4, sizeof(unrelatedUpload));
+	device.FailRefresh(true);
+	const unsigned int refreshesBeforeGpuInvalidation = device.RefreshCount();
+	const bool unrelatedGpuInvalidationFailure = unrelated != nullptr &&
+		!unrelated->Publish_Native_BGRA8(unrelatedUpload, 4 * 4,
+			sizeof(unrelatedUpload));
+	device.FailRefresh(false);
+	NativeW3DTextureContentStamp afterGpuInvalidationStamp;
+	const bool gpuOutputWasInvalidated = unrelatedGpuInvalidationFailure &&
+		target->Get_Native_Subresource_Content_Stamp(0, 0,
+			&afterGpuInvalidationStamp) && afterGpuInvalidationStamp.isValid() &&
+		afterGpuInvalidationStamp.authority == NATIVE_W3D_CONTENT_INVALID &&
+		afterGpuInvalidationStamp.authorityEpoch != gpuOutputStamp.authorityEpoch &&
+		afterGpuInvalidationStamp != gpuOutputStamp;
+	const unsigned int refreshesAfterGpuInvalidation = device.RefreshCount();
+	NativeW3DTextureHandle gpuInvalidatedHandle;
+	NativeW3DGpuContentLease gpuInvalidatedLease;
+	SurfaceClass *gpuInvalidatedSurface = target->Get_Surface_Level(0);
+	const bool gpuAuthoredShadowDenied =
+		!target->Acquire_Native_Texture(&gpuInvalidatedHandle,
+			&gpuInvalidatedLease) && !gpuInvalidatedHandle.isValid() &&
+		!target->Get_Native_Subresource_Data(0, 0, &cpuPixels, &cpuPitch,
+			&cpuBytes) && gpuInvalidatedSurface == nullptr &&
+		device.RefreshCount() == refreshesAfterGpuInvalidation;
+	result |= Check(pendingBeforeGpuStampValid && outputAdvancedAuthority &&
+		unrelatedGpuInvalidationFailure && gpuOutputWasInvalidated &&
+		refreshesBeforeGpuInvalidation ==
+			refreshesBeforePendingGpuWrite + 1 &&
+		refreshesBeforeGpuInvalidation + 1 == refreshesAfterGpuInvalidation &&
+		gpuAuthoredShadowDenied,
+		"a newer GPU write and unrelated failed refresh cannot revive the released stale CPU edit");
+	if (gpuInvalidatedSurface != nullptr) gpuInvalidatedSurface->Release_Ref();
+
+	unsigned char cpuAfterOutput[64 * 32 * 4];
+	std::memset(cpuAfterOutput, 0x91, sizeof(cpuAfterOutput));
+	const bool freshCpuUpload = outputBecameAuthoritative &&
+		target->Publish_Native_BGRA8(cpuAfterOutput, 64 * 4,
+			sizeof(cpuAfterOutput));
+	unsigned char pendingAfterOutput[64 * 32 * 4];
+	std::memset(pendingAfterOutput, 0x2a, sizeof(pendingAfterOutput));
+	device.FailRefresh(true);
+	const unsigned int refreshesBeforeInvalidation = device.RefreshCount();
+	const bool targetCpuFailureRecorded = freshCpuUpload &&
+		!target->Publish_Native_BGRA8(pendingAfterOutput, 64 * 4,
+			sizeof(pendingAfterOutput));
+	NativeW3DTextureContentStamp pendingAfterOutputFailureStamp;
+	const bool pendingFailureStampValid = targetCpuFailureRecorded &&
+		target->Get_Native_Subresource_Content_Stamp(0, 0,
+			&pendingAfterOutputFailureStamp) &&
+		pendingAfterOutputFailureStamp.isValid() &&
+		pendingAfterOutputFailureStamp.authority == NATIVE_W3D_CONTENT_INVALID;
+	const bool unrelatedCpuFailureRecorded = unrelated != nullptr &&
+		!unrelated->Publish_Native_BGRA8(unrelatedUpload, 4 * 4,
+			sizeof(unrelatedUpload));
+	device.FailRefresh(false);
+	const unsigned int refreshesAfterInvalidation = device.RefreshCount();
+	NativeW3DTextureContentStamp invalidatedPendingStamp;
+	const bool laterInvalidationChangedStamp = pendingFailureStampValid &&
+		target->Get_Native_Subresource_Content_Stamp(0, 0,
+			&invalidatedPendingStamp) && invalidatedPendingStamp.isValid() &&
+		invalidatedPendingStamp.authority == NATIVE_W3D_CONTENT_INVALID &&
+		invalidatedPendingStamp.authorityEpoch !=
+			pendingAfterOutputFailureStamp.authorityEpoch &&
+		invalidatedPendingStamp != pendingAfterOutputFailureStamp;
+	NativeW3DTextureHandle deniedHandle;
+	NativeW3DGpuContentLease deniedLease;
+	SurfaceClass *deniedSurface = target->Get_Surface_Level(0);
+	const bool staleCpuShadowDenied =
+		!target->Acquire_Native_Texture(&deniedHandle, &deniedLease) &&
+		!deniedHandle.isValid() &&
+		!target->Get_Native_Subresource_Data(0, 0, &cpuPixels, &cpuPitch,
+			&cpuBytes) && deniedSurface == nullptr &&
+		!target->Acquire_Native_Texture(&deniedHandle, &deniedLease) &&
+		device.RefreshCount() == refreshesAfterInvalidation;
+	result |= Check(targetCpuFailureRecorded && pendingFailureStampValid &&
+		unrelatedCpuFailureRecorded && laterInvalidationChangedStamp &&
+		refreshesBeforeInvalidation + 2 == refreshesAfterInvalidation &&
+		staleCpuShadowDenied,
+		"a later global authority invalidation cannot reauthorize a failed CPU image after GPU output");
+	if (deniedSurface != nullptr) deniedSurface->Release_Ref();
+	if (unrelated != nullptr) unrelated->Release_Ref();
 	if (lockedView != nullptr) lockedView->Release_Ref();
 	if (retainedView != nullptr) retainedView->Release_Ref();
 

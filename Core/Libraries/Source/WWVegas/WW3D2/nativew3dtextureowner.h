@@ -49,6 +49,25 @@ private:
 	bool m_owned;
 };
 
+// Read-only identity and authority version for one published texture owner.
+// Invalid content authority is still describable so a caller can distinguish
+// its own failed CPU publication from any later resource/authority mutation.
+struct NativeW3DTextureContentStamp
+{
+	NativeW3DTextureContentStamp();
+	bool isValid() const;
+	bool operator==(const NativeW3DTextureContentStamp &other) const;
+	bool operator!=(const NativeW3DTextureContentStamp &other) const
+		{ return !(*this == other); }
+
+	NativeW3DTextureHandle texture;
+	unsigned int bindingGeneration;
+	unsigned int publicationGeneration;
+	unsigned int authorityEpoch;
+	unsigned int cpuShadowRevision;
+	NativeW3DContentAuthority authority;
+};
+
 class NativeW3DTextureOwner
 {
 public:
@@ -88,6 +107,11 @@ public:
 	RenderResult RefreshCpuContent(const TextureDescriptor &descriptor,
 		const TextureSubresourceData *subresources,
 		unsigned int subresourceCount) const;
+	// Describes the exact owner publication and current registry content epoch.
+	// Unlike sampling acquisition, this read-only query can report INVALID
+	// authority while that exact texture remains registered.
+	RenderResult DescribeContentStamp(
+		NativeW3DTextureContentStamp *stamp) const;
 	RenderResult Reset();
 
 	unsigned int PublicationGeneration() const;

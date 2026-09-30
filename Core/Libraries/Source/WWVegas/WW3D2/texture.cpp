@@ -54,6 +54,7 @@
 #include "WWDebug/wwprofile.h"
 #include "nativew3dsampledtexture.h"
 #include "nativew3dtextureowner.h"
+#include "Renderer/RenderGameClientNative.h"
 #include "texturemipbuffer.h"
 #include "texturemipgenerator.h"
 #include <new>
@@ -70,19 +71,82 @@ static unsigned unused_texture_id;
 struct NativeTextureStorage
 {
 	NativeTextureStorage() : owner(), descriptor(), pixels(), rowPitches(),
-		slicePitches(), gpuLease(), sourceFormat(WW3D_FORMAT_UNKNOWN),
-		missing(false), gpuAuthored(false) {}
+		slicePitches(), cpuShadowRevision(0), cpuShadowRevisionExhausted(false),
+		cpuRefreshRetryPending(false), cpuRefreshRetryStamp(), gpuLease(),
+		sourceFormat(WW3D_FORMAT_UNKNOWN), missing(false), gpuAuthored(false) {}
 
 	rts::render::NativeW3DTextureOwner owner;
 	rts::render::TextureDescriptor descriptor;
 	std::vector<std::vector<unsigned char> > pixels;
 	std::vector<size_t> rowPitches;
 	std::vector<size_t> slicePitches;
+	unsigned int cpuShadowRevision;
+	bool cpuShadowRevisionExhausted;
+	bool cpuRefreshRetryPending;
+	rts::render::NativeW3DTextureContentStamp cpuRefreshRetryStamp;
 	mutable rts::render::NativeW3DGpuContentLease gpuLease;
 	WW3DFormat sourceFormat;
 	bool missing;
 	mutable bool gpuAuthored;
 };
+
+static void Clear_Native_CPU_Refresh_Retry(NativeTextureStorage *storage)
+{
+	if (storage == nullptr) return;
+	storage->cpuRefreshRetryPending = false;
+	storage->cpuRefreshRetryStamp =
+		rts::render::NativeW3DTextureContentStamp();
+}
+
+static bool Capture_Native_CPU_Refresh_Retry(NativeTextureStorage *storage)
+{
+	if (storage == nullptr || storage->cpuShadowRevisionExhausted ||
+		storage->cpuShadowRevision == 0)
+	{
+		Clear_Native_CPU_Refresh_Retry(storage);
+		return false;
+	}
+	rts::render::NativeW3DTextureContentStamp stamp;
+	if (storage->owner.DescribeContentStamp(&stamp) !=
+		rts::render::RENDER_RESULT_OK || !stamp.isValid())
+	{
+		Clear_Native_CPU_Refresh_Retry(storage);
+		return false;
+	}
+	stamp.cpuShadowRevision = storage->cpuShadowRevision;
+	storage->cpuRefreshRetryStamp = stamp;
+	storage->cpuRefreshRetryPending = true;
+	return true;
+}
+
+static bool Has_Current_Native_CPU_Refresh_Retry(
+	NativeTextureStorage *storage)
+{
+	if (storage == nullptr || !storage->cpuRefreshRetryPending) return false;
+	if (storage->cpuShadowRevisionExhausted ||
+		storage->cpuShadowRevision == 0)
+	{
+		return false;
+	}
+	rts::render::NativeW3DTextureContentStamp current;
+	if (storage->owner.DescribeContentStamp(&current) !=
+		rts::render::RENDER_RESULT_OK || !current.isValid()) return false;
+	current.cpuShadowRevision = storage->cpuShadowRevision;
+	return current == storage->cpuRefreshRetryStamp;
+}
+
+static bool Advance_Native_CPU_Shadow_Revision(NativeTextureStorage *storage)
+{
+	if (storage == nullptr || storage->cpuShadowRevisionExhausted ||
+		storage->cpuShadowRevision == UINT_MAX)
+	{
+		if (storage != nullptr) storage->cpuShadowRevisionExhausted = true;
+		return false;
+	}
+	Clear_Native_CPU_Refresh_Retry(storage);
+	++storage->cpuShadowRevision;
+	return true;
+}
 
 static bool Apply_Native_Empty_Texture(TextureBaseClass *texture,
 	unsigned int width, unsigned int height, WW3DFormat format,
@@ -230,6 +294,7 @@ unsigned int TextureBaseClass::Get_Effective_Native_Texture_LOD() const
 */
 TextureBaseClass::~TextureBaseClass()
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	delete TextureLoadTask;
 	TextureLoadTask=nullptr;
 	delete ThumbnailLoadTask;
@@ -242,6 +307,7 @@ TextureBaseClass::~TextureBaseClass()
 
 void TextureBaseClass::Release_Native_Texture()
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (NativeTexture != nullptr)
 	{
 		NativeTexture->owner.Reset();
@@ -256,6 +322,7 @@ bool TextureBaseClass::Apply_Native_Texture(
 	unsigned int subresource_count, WW3DFormat source_format,
 	bool initialized, bool disable_auto_invalidation, bool missing_texture)
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	const unsigned int expected_count = descriptor.mipCount * descriptor.arrayCount;
 	if (descriptor.width == 0 || descriptor.height == 0 ||
 		descriptor.mipCount == 0 || descriptor.arrayCount == 0 ||
@@ -327,6 +394,9 @@ bool TextureBaseClass::Apply_Native_Texture(
 	storage->pixels.swap(pixels);
 	storage->rowPitches.swap(row_pitches);
 	storage->slicePitches.swap(slice_pitches);
+	storage->cpuShadowRevision = 1;
+	storage->cpuShadowRevisionExhausted = false;
+	Clear_Native_CPU_Refresh_Retry(storage);
 	storage->gpuLease = rts::render::NativeW3DGpuContentLease();
 	storage->gpuAuthored = false;
 	storage->sourceFormat = source_format;
@@ -368,7 +438,11 @@ bool TextureBaseClass::Acquire_Native_Texture(
 	rts::render::NativeW3DTextureHandle *handle,
 	rts::render::NativeW3DGpuContentLease *gpu_lease) const
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (handle == nullptr || NativeTexture == nullptr) return false;
+	if (NativeTexture->cpuRefreshRetryPending &&
+		(!Has_Current_Native_CPU_Refresh_Retry(NativeTexture) ||
+		 !Refresh_Native_CPU_Content())) return false;
 	rts::render::NativeW3DGpuContentLease *lease = gpu_lease == nullptr ?
 		&NativeTexture->gpuLease : gpu_lease;
 	const bool caller_requested_generation = handle->isValid() ||
@@ -406,6 +480,7 @@ bool TextureBaseClass::Acquire_Native_Surface(unsigned int mip_level,
 	rts::render::NativeW3DSurfaceHandle *surface,
 	rts::render::NativeW3DGpuContentLease *gpu_lease) const
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (surface == nullptr || NativeTexture == nullptr) return false;
 	if (for_output)
 	{
@@ -415,6 +490,11 @@ bool TextureBaseClass::Acquire_Native_Surface(unsigned int mip_level,
 		// cleared it on failure, so reacquire the same logical output once.
 		return NativeTexture->owner.AcquireOutputSurface(mip_level, array_slice,
 			surface) == rts::render::RENDER_RESULT_OK;
+	}
+	if (NativeTexture->cpuRefreshRetryPending)
+	{
+		if (!Has_Current_Native_CPU_Refresh_Retry(NativeTexture) ||
+			!Refresh_Native_CPU_Content()) return false;
 	}
 	rts::render::NativeW3DGpuContentLease *lease = gpu_lease == nullptr ?
 		&NativeTexture->gpuLease : gpu_lease;
@@ -449,27 +529,38 @@ bool TextureBaseClass::Publish_Native_Output(
 	rts::render::NativeW3DSurfaceHandle surface,
 	rts::render::NativeW3DGpuContentLease *gpu_lease) const
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (NativeTexture == nullptr) return false;
 	rts::render::NativeW3DGpuContentLease *lease = gpu_lease == nullptr ?
 		&NativeTexture->gpuLease : gpu_lease;
 	const bool published = NativeTexture->owner.PublishOutputWrite(surface, lease) ==
 		rts::render::RENDER_RESULT_OK;
-	if (published) NativeTexture->gpuAuthored = true;
+	if (published)
+	{
+		Clear_Native_CPU_Refresh_Retry(NativeTexture);
+		NativeTexture->gpuAuthored = true;
+	}
 	return published;
 }
 
 bool TextureBaseClass::Copy_Native_Active_Color_Target()
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (NativeTexture == nullptr) return false;
 	const bool copied = NativeTexture->owner.CopyActiveColorTarget(
 		&NativeTexture->gpuLease) == rts::render::RENDER_RESULT_OK;
-	if (copied) NativeTexture->gpuAuthored = true;
+	if (copied)
+	{
+		Clear_Native_CPU_Refresh_Retry(NativeTexture);
+		NativeTexture->gpuAuthored = true;
+	}
 	return copied;
 }
 
 bool TextureBaseClass::Publish_Native_BGRA8(const void *data,
 	size_t row_pitch, size_t slice_pitch)
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (NativeTexture == nullptr || data == nullptr ||
 		NativeTexture->descriptor.dimension != rts::render::RENDER_TEXTURE_2D ||
 		NativeTexture->descriptor.format !=
@@ -492,6 +583,7 @@ bool Publish_Render_Texture_BGRA8_Change(TextureClass *texture,
 
 bool TextureBaseClass::Generate_Native_Mip_Levels()
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (NativeTexture == nullptr || NativeTexture->descriptor.width == 0 ||
 		NativeTexture->descriptor.height == 0) return false;
 	rts::render::NativeW3DTextureHandle cpu_handle;
@@ -506,7 +598,9 @@ bool TextureBaseClass::Generate_Native_Mip_Levels()
 	const unsigned int count = mip_count * array_count;
 	if (count != NativeTexture->pixels.size() ||
 		count != NativeTexture->rowPitches.size() ||
-		count != NativeTexture->slicePitches.size()) return false;
+		count != NativeTexture->slicePitches.size() ||
+		NativeTexture->cpuShadowRevision == 0 ||
+		NativeTexture->cpuShadowRevisionExhausted) return false;
 	for (unsigned int slice = 0; slice < array_count; ++slice)
 	{
 		unsigned int width = NativeTexture->descriptor.width;
@@ -518,16 +612,18 @@ bool TextureBaseClass::Generate_Native_Mip_Levels()
 			if (NativeTexture->pixels[source].empty() ||
 				NativeTexture->pixels[destination].empty() ||
 				NativeTexture->rowPitches[source] > UINT_MAX ||
-				NativeTexture->rowPitches[destination] > UINT_MAX ||
-				!Generate_Texture_Mip_Level_Box(
-					&NativeTexture->pixels[source][0],
-					static_cast<unsigned int>(NativeTexture->rowPitches[source]),
-					width, height, &NativeTexture->pixels[destination][0],
-					static_cast<unsigned int>(NativeTexture->rowPitches[destination]),
-					mip_format))
+				NativeTexture->rowPitches[destination] > UINT_MAX)
 			{
 				return false;
 			}
+			if (!Advance_Native_CPU_Shadow_Revision(NativeTexture))
+				return false;
+			if (!Generate_Texture_Mip_Level_Box(
+				&NativeTexture->pixels[source][0],
+				static_cast<unsigned int>(NativeTexture->rowPitches[source]),
+				width, height, &NativeTexture->pixels[destination][0],
+				static_cast<unsigned int>(NativeTexture->rowPitches[destination]),
+				mip_format)) return false;
 			ReduceTextureMipDimensions(width, height);
 		}
 	}
@@ -547,7 +643,13 @@ bool TextureBaseClass::Generate_Native_Mip_Levels()
 
 bool TextureBaseClass::Refresh_Native_CPU_Content() const
 {
-	if (NativeTexture == nullptr || NativeTexture->gpuAuthored) return false;
+	rts::render::NativeGameRenderOwnerScope ownerScope;
+	if (NativeTexture == nullptr || NativeTexture->cpuShadowRevision == 0 ||
+		NativeTexture->cpuShadowRevisionExhausted) return false;
+	const bool qualified_retry = NativeTexture->cpuRefreshRetryPending;
+	if ((qualified_retry &&
+		 !Has_Current_Native_CPU_Refresh_Retry(NativeTexture)) ||
+		(NativeTexture->gpuAuthored && !qualified_retry)) return false;
 	const unsigned int count = NativeTexture->descriptor.mipCount *
 		NativeTexture->descriptor.arrayCount;
 	if (count == 0 || count != NativeTexture->pixels.size() ||
@@ -567,7 +669,16 @@ bool TextureBaseClass::Refresh_Native_CPU_Content() const
 		NativeTexture->descriptor, &subresources[0], count) ==
 		rts::render::RENDER_RESULT_OK;
 	if (refreshed)
+	{
+		Clear_Native_CPU_Refresh_Retry(NativeTexture);
 		NativeTexture->gpuLease = rts::render::NativeW3DGpuContentLease();
+		NativeTexture->gpuAuthored = false;
+	}
+	else
+	{
+		if (qualified_retry)
+			(void)Capture_Native_CPU_Refresh_Retry(NativeTexture);
+	}
 	return refreshed;
 }
 
@@ -575,6 +686,7 @@ bool TextureBaseClass::Get_Native_Subresource_Data(unsigned int mip_level,
 	unsigned int array_slice, const unsigned char **data, size_t *row_pitch,
 	size_t *slice_pitch) const
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (data == nullptr || row_pitch == nullptr || slice_pitch == nullptr)
 		return false;
 	*data = nullptr;
@@ -599,10 +711,37 @@ bool TextureBaseClass::Get_Native_Subresource_Data(unsigned int mip_level,
 	return true;
 }
 
+bool TextureBaseClass::Get_Native_Subresource_Content_Stamp(
+	unsigned int mip_level, unsigned int array_slice,
+	rts::render::NativeW3DTextureContentStamp *stamp) const
+{
+	rts::render::NativeGameRenderOwnerScope ownerScope;
+	if (stamp == nullptr) return false;
+	*stamp = rts::render::NativeW3DTextureContentStamp();
+	if (NativeTexture == nullptr ||
+		mip_level >= NativeTexture->descriptor.mipCount ||
+		array_slice >= NativeTexture->descriptor.arrayCount ||
+		NativeTexture->cpuShadowRevisionExhausted ||
+		NativeTexture->cpuShadowRevision == 0) return false;
+	const unsigned int count = NativeTexture->descriptor.mipCount *
+		NativeTexture->descriptor.arrayCount;
+	const size_t index = static_cast<size_t>(array_slice) *
+		NativeTexture->descriptor.mipCount + mip_level;
+	if (count == 0 || index >= count ||
+		count != NativeTexture->pixels.size()) return false;
+	rts::render::NativeW3DTextureContentStamp current;
+	if (NativeTexture->owner.DescribeContentStamp(&current) !=
+		rts::render::RENDER_RESULT_OK || !current.isValid()) return false;
+	current.cpuShadowRevision = NativeTexture->cpuShadowRevision;
+	*stamp = current;
+	return true;
+}
+
 bool TextureBaseClass::Update_Native_Subresource_Data(unsigned int mip_level,
 	unsigned int array_slice, const unsigned char *data, size_t row_pitch,
 	size_t slice_pitch)
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (NativeTexture == nullptr || data == nullptr || row_pitch == 0 ||
 		slice_pitch == 0 || mip_level >= NativeTexture->descriptor.mipCount ||
 		array_slice >= NativeTexture->descriptor.arrayCount) return false;
@@ -613,20 +752,35 @@ bool TextureBaseClass::Update_Native_Subresource_Data(unsigned int mip_level,
 	if (replaced >= count || count != NativeTexture->pixels.size() ||
 		count != NativeTexture->rowPitches.size() ||
 		count != NativeTexture->slicePitches.size() ||
+		NativeTexture->cpuShadowRevision == 0 ||
+		NativeTexture->cpuShadowRevisionExhausted ||
 		row_pitch != NativeTexture->rowPitches[replaced] ||
 		slice_pitch != NativeTexture->slicePitches[replaced] ||
 		NativeTexture->pixels[replaced].size() != slice_pitch) return false;
+	rts::render::NativeW3DTextureContentStamp admission;
+	if (NativeTexture->owner.DescribeContentStamp(&admission) !=
+		rts::render::RENDER_RESULT_OK || !admission.isValid()) return false;
 	// Keep the new image in the owner-side CPU shadow before attempting the
 	// backend mutation. A lost device, ownership rejection, or apply failure
 	// can invalidate native authority; the next lock then retries this exact
 	// image without requiring the transient SurfaceClass to stay alive.
+	if (!Advance_Native_CPU_Shadow_Revision(NativeTexture))
+		return false;
 	memcpy(&NativeTexture->pixels[replaced][0], data, slice_pitch);
 	std::vector<rts::render::TextureSubresourceData> subresources;
 	try { subresources.resize(count); }
-	catch (...) { return false; }
+	catch (...)
+	{
+		(void)Capture_Native_CPU_Refresh_Retry(NativeTexture);
+		return false;
+	}
 	for (unsigned int index = 0; index < count; ++index)
 	{
-		if (NativeTexture->pixels[index].empty()) return false;
+		if (NativeTexture->pixels[index].empty())
+		{
+			(void)Capture_Native_CPU_Refresh_Retry(NativeTexture);
+			return false;
+		}
 		subresources[index].data = &NativeTexture->pixels[index][0];
 		subresources[index].rowPitch = NativeTexture->rowPitches[index];
 		subresources[index].slicePitch = NativeTexture->slicePitches[index];
@@ -640,8 +794,10 @@ bool TextureBaseClass::Update_Native_Subresource_Data(unsigned int mip_level,
 			&subresources[0], count);
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
+		(void)Capture_Native_CPU_Refresh_Retry(NativeTexture);
 		return false;
 	}
+	Clear_Native_CPU_Refresh_Retry(NativeTexture);
 	NativeTexture->gpuLease = rts::render::NativeW3DGpuContentLease();
 	NativeTexture->gpuAuthored = false;
 	return true;
@@ -649,6 +805,7 @@ bool TextureBaseClass::Update_Native_Subresource_Data(unsigned int mip_level,
 
 size_t TextureBaseClass::Get_Native_Texture_Byte_Count() const
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	if (NativeTexture == nullptr) return 0;
 	size_t size = 0;
 	for (unsigned int index = 0; index < NativeTexture->slicePitches.size(); ++index)
@@ -1443,6 +1600,7 @@ void TextureClass::Apply(unsigned int stage)
 */
 SurfaceClass *TextureClass::Get_Surface_Level(unsigned int level)
 {
+	rts::render::NativeGameRenderOwnerScope ownerScope;
 	rts::render::NativeW3DSurfaceHandle surface_handle;
 	if (!Acquire_Native_Surface(level, 0, false, &surface_handle))
 	{

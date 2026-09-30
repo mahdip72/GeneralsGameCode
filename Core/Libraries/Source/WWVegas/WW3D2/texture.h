@@ -61,6 +61,7 @@ namespace rts { namespace render {
 	struct NativeW3DTextureHandle;
 	struct NativeW3DSurfaceHandle;
 	struct NativeW3DGpuContentLease;
+	struct NativeW3DTextureContentStamp;
 	struct TextureDescriptor;
 	struct TextureSubresourceData;
 } }
@@ -231,6 +232,9 @@ public:
 	bool Get_Native_Subresource_Data(unsigned int mip_level,
 		unsigned int array_slice, const unsigned char **data,
 		size_t *row_pitch, size_t *slice_pitch) const;
+	bool Get_Native_Subresource_Content_Stamp(unsigned int mip_level,
+		unsigned int array_slice,
+		rts::render::NativeW3DTextureContentStamp *stamp) const;
 	bool Update_Native_Subresource_Data(unsigned int mip_level,
 		unsigned int array_slice, const unsigned char *data,
 		size_t row_pitch, size_t slice_pitch);
