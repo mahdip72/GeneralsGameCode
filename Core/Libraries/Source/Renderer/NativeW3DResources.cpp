@@ -1349,7 +1349,7 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 	IRenderDevice *device = m_impl == 0 || m_impl->state == 0 ? 0 :
 		m_impl->state->Device();
 	Slot *slot = Find(handle);
-	if (device == 0 || slot == 0 || slot->kind != 1 || bytes == 0 ||
+	if (device == 0 || slot == 0 || slot->kind != 1 || slot->retired || bytes == 0 ||
 		byteCount == 0 || destinationOffset > slot->buffer.byteCount ||
 		byteCount > slot->buffer.byteCount - destinationOffset ||
 		m_impl->stateGeneration != m_impl->state->Generation())
@@ -2786,7 +2786,7 @@ void NativeW3DResources::InvalidateAllAuthorities()
 bool NativeW3DResources::IsBufferRangeInitialized(const Slot &slot,
 	size_t offset, size_t byteCount) const
 {
-	if (m_impl == 0 || m_impl->state == 0 ||
+	if (slot.retired || m_impl == 0 || m_impl->state == 0 ||
 		slot.backendEpoch != m_impl->state->BufferEpoch() ||
 		byteCount == 0 || offset > slot.buffer.byteCount ||
 		byteCount > slot.buffer.byteCount - offset)
@@ -2800,7 +2800,7 @@ bool NativeW3DResources::IsBufferRangeInitialized(const Slot &slot,
 bool NativeW3DResources::IsBufferRangeInitializedForSubmission(
 	const Slot &slot, size_t offset, size_t byteCount) const
 {
-	if (m_impl == 0 || m_impl->state == 0 ||
+	if (slot.retired || m_impl == 0 || m_impl->state == 0 ||
 		slot.submissionBackendEpoch != m_impl->state->BufferEpoch() ||
 		byteCount == 0 || offset > slot.buffer.byteCount ||
 		byteCount > slot.buffer.byteCount - offset)

@@ -1721,6 +1721,148 @@ int TestSplitPacketResourceFenceReportsOwnerFailure()
 	return result;
 }
 
+int TestRetiredBufferPublication()
+{
+	int result = 0;
+	FakeRenderControl control;
+	FakeRenderDevice device(true, &control);
+	NativeW3D2 product;
+	result |= Check(product.AttachBackend(&device, device.immediateContext()) ==
+		RENDER_RESULT_OK, "retirement fixture attaches the real product resource table");
+	NativeW3DResources &resources = product.Resources();
+	const unsigned int vertices[] = { 1, 2, 3, 4 };
+	const unsigned short indices[] = { 0, 1, 2 };
+	BufferDescriptor vertexDescriptor;
+	vertexDescriptor.byteCount = sizeof(vertices);
+	vertexDescriptor.stride = sizeof(vertices[0]);
+	vertexDescriptor.binding = RENDER_BUFFER_VERTEX;
+	vertexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	BufferDescriptor indexDescriptor;
+	indexDescriptor.byteCount = sizeof(indices);
+	indexDescriptor.stride = sizeof(indices[0]);
+	indexDescriptor.binding = RENDER_BUFFER_INDEX;
+	indexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle retiredVertex;
+	GpuHandle retiredIndex;
+	GpuHandle liveVertex;
+	GpuHandle liveIndex;
+	result |= Check(resources.CreateBuffer(vertexDescriptor, vertices,
+		sizeof(vertices), &retiredVertex) == RENDER_RESULT_OK &&
+		resources.CreateBuffer(indexDescriptor, indices, sizeof(indices),
+			&retiredIndex) == RENDER_RESULT_OK &&
+		resources.CreateBuffer(vertexDescriptor, vertices, sizeof(vertices),
+			&liveVertex) == RENDER_RESULT_OK &&
+		resources.CreateBuffer(indexDescriptor, indices, sizeof(indices),
+			&liveIndex) == RENDER_RESULT_OK,
+		"retirement fixture initializes independent vertex and index slots");
+	NativeDrawPacket vertexPacket;
+	vertexPacket.vertexBuffer = retiredVertex;
+	vertexPacket.vertexStride = vertexDescriptor.stride;
+	vertexPacket.vertexLayout.stride = vertexDescriptor.stride;
+	vertexPacket.vertexCount = 3;
+	vertexPacket.indexed = true;
+	vertexPacket.indexBuffer = liveIndex;
+	vertexPacket.indexFormat = RENDER_FORMAT_R16_UINT;
+	vertexPacket.indexCount = 3;
+	NativeDrawPacket indexPacket = vertexPacket;
+	indexPacket.vertexBuffer = liveVertex;
+	indexPacket.indexBuffer = retiredIndex;
+	LegacyLogicalState state;
+	result |= Check(product.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+		product.Renderer().Submit(resources, state, vertexPacket) ==
+			RENDER_RESULT_OK &&
+		product.Renderer().Submit(resources, state, indexPacket) ==
+			RENDER_RESULT_OK &&
+		product.Renderer().EndFrame(false) == RENDER_RESULT_OK,
+		"retirement fixture admits both exact submission ranges before retirement");
+	NativeW3DBufferDescription vertexBefore;
+	NativeW3DBufferDescription indexBefore;
+	result |= Check(resources.DescribeBuffer(retiredVertex, &vertexBefore) ==
+		RENDER_RESULT_OK &&
+		resources.DescribeBuffer(retiredIndex, &indexBefore) == RENDER_RESULT_OK,
+		"retirement fixture records the original authority epochs");
+	const unsigned int destroysBefore = device.DestroyCount();
+	device.FailDestroy(true);
+	result |= Check(resources.RetireBuffer(retiredVertex) &&
+		resources.RetireBuffer(retiredIndex) && !resources.IsValid(retiredVertex) &&
+		!resources.IsValid(retiredIndex) && resources.IsValid(liveVertex) &&
+		resources.IsValid(liveIndex) && device.LiveCount() == 4 &&
+		device.DestroyCount() == destroysBefore,
+		"backend refusal transfers only the exact retired slots to shutdown cleanup");
+	NativeW3DBufferDescription retiredVertexDescription;
+	NativeW3DBufferDescription retiredIndexDescription;
+	result |= Check(resources.DescribeBuffer(retiredVertex,
+		&retiredVertexDescription) == RENDER_RESULT_OK &&
+		resources.DescribeBuffer(retiredIndex, &retiredIndexDescription) ==
+			RENDER_RESULT_OK &&
+		retiredVertexDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
+		retiredIndexDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
+		retiredVertexDescription.authorityEpoch > vertexBefore.authorityEpoch &&
+		retiredIndexDescription.authorityEpoch > indexBefore.authorityEpoch,
+		"retirement invalidates content and advances each exact authority epoch");
+	const long updatesBefore = ReadCount(&control.updateCalls);
+	const unsigned int replacementVertices[] = { 11, 12, 13, 14 };
+	const unsigned short replacementIndices[] = { 2, 1, 0 };
+	result |= Check(resources.UpdateBuffer(retiredVertex, replacementVertices,
+		sizeof(replacementVertices), 0, RENDER_BUFFER_UPDATE_DISCARD) ==
+			RENDER_RESULT_INVALID_ARGUMENT &&
+		ReadCount(&control.updateCalls) == updatesBefore,
+		"a retired vertex slot rejects resurrection before backend upload");
+	result |= Check(resources.UpdateBuffer(retiredIndex, replacementIndices,
+		sizeof(replacementIndices), 0, RENDER_BUFFER_UPDATE_DISCARD) ==
+			RENDER_RESULT_INVALID_ARGUMENT &&
+		ReadCount(&control.updateCalls) == updatesBefore,
+		"a retired index slot rejects resurrection before backend upload");
+	NativeW3DBufferDescription vertexAfter;
+	NativeW3DBufferDescription indexAfter;
+	result |= Check(resources.DescribeBuffer(retiredVertex, &vertexAfter) ==
+		RENDER_RESULT_OK &&
+		resources.DescribeBuffer(retiredIndex, &indexAfter) == RENDER_RESULT_OK &&
+		vertexAfter.authority == NATIVE_W3D_CONTENT_INVALID &&
+		indexAfter.authority == NATIVE_W3D_CONTENT_INVALID &&
+		vertexAfter.authorityEpoch == retiredVertexDescription.authorityEpoch &&
+		indexAfter.authorityEpoch == retiredIndexDescription.authorityEpoch &&
+		device.BufferEquals(retiredVertex, vertices, sizeof(vertices)) &&
+		device.BufferEquals(retiredIndex, indices, sizeof(indices)) &&
+		device.BufferEquals(liveVertex, vertices, sizeof(vertices)) &&
+		device.BufferEquals(liveIndex, indices, sizeof(indices)),
+		"rejected retired uploads preserve epochs, backend bytes, and unrelated authority");
+	GpuHandle validated = liveVertex;
+	result |= Check(resources.AcquireVertexBufferRange(retiredVertex,
+		vertexDescriptor.stride, 0, 0, 3, &validated) ==
+			RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid(),
+		"retired vertex exact acquisition clears its output after resurrection rejection");
+	validated = liveIndex;
+	result |= Check(resources.AcquireIndexBufferRange(retiredIndex,
+		RENDER_FORMAT_R16_UINT, 0, 0, 3, &validated) ==
+			RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid(),
+		"retired index exact acquisition clears its output after resurrection rejection");
+	result |= Check(product.Renderer().BeginFrame() == RENDER_RESULT_OK,
+		"retirement fixture opens a submission-validation frame");
+	result |= Check(product.Renderer().Submit(resources, state, vertexPacket) ==
+		RENDER_RESULT_INVALID_ARGUMENT,
+		"submission range validation rejects a retired vertex with a live index");
+	result |= Check(product.Renderer().Submit(resources, state, indexPacket) ==
+		RENDER_RESULT_INVALID_ARGUMENT,
+		"submission range validation rejects a retired index with a live vertex");
+	NativeDrawPacket livePacket = vertexPacket;
+	livePacket.vertexBuffer = liveVertex;
+	result |= Check(product.Renderer().Submit(resources, state, livePacket) ==
+		RENDER_RESULT_OK &&
+		product.Renderer().EndFrame(false) == RENDER_RESULT_OK,
+		"retirement keeps unrelated initialized submission ranges usable");
+	result |= Check(product.Shutdown() == RENDER_RESULT_FAILED &&
+		device.LiveCount() == 4 && device.DestroyCount() == destroysBefore,
+		"shutdown refusal retains all native allocations for a later exact retry");
+	device.FailDestroy(false);
+	result |= Check(product.Shutdown() == RENDER_RESULT_OK &&
+		device.LiveCount() == 0 && device.DestroyCount() == destroysBefore + 4 &&
+		device.isOperational() && !resources.IsValid(retiredVertex) &&
+		!resources.IsValid(retiredIndex),
+		"later shutdown destroys retired allocations without shutting down the borrowed backend");
+	return result;
+}
+
 int TestRawHandlesAcrossFreshBackends()
 {
 	int result = 0;
@@ -1792,6 +1934,7 @@ int TestRawHandlesAcrossFreshBackends()
 int main()
 {
 	int result = 0;
+	result |= TestRetiredBufferPublication();
 	result |= TestRawHandlesAcrossFreshBackends();
 	NativeW3DResources unbound(2);
 	GpuHandle invalid;
