@@ -589,7 +589,7 @@ int TestNativeTextureLOD(NativeW3D2 *owner)
 		applied.pipeline.textureStages[6].sampler.maximumMipLevel == 0,
 		"full-fidelity procedural content applies explicit LOD0 after republish");
 
-	if (haveSavedState) TrackLegacyPipelineState(saved);
+	if (haveSavedState) TrackLegacyPipelineState(saved.pipeline);
 	else ResetTrackedLegacyState();
 	return result;
 }
