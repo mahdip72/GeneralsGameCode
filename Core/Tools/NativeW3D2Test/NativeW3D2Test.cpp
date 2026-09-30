@@ -2073,7 +2073,191 @@ int TestOffOwnerAggregatePublication(HWND window)
 	return result;
 }
 
-int main()
+int TestCpuSortingImmediateTriangles(HWND window)
+{
+	using namespace rts::render;
+	NativeW3D2 owner;
+	NativeW3DRendererDescriptor descriptor;
+	descriptor.width = descriptor.height = 64;
+	descriptor.enableVsync = false;
+	descriptor.allowSoftwareFallback = true;
+	const RenderResult initialized = owner.Initialize(window, descriptor);
+	if (initialized == RENDER_RESULT_UNSUPPORTED) return 77;
+	int result = Check(initialized == RENDER_RESULT_OK,
+		"CPU sorting immediate fixture initializes production owner");
+	if (result) return result;
+	struct Vertex
+	{
+		float x, y, z, nx, ny, nz;
+		unsigned int diffuse;
+		float u0, v0, u1, v1;
+	};
+	Vertex vertices[8] = {
+		{ -0.9f, -0.6f, 0, 0, 0, 1, 0xffff0000U },
+		{ -0.9f,  0.6f, 0, 0, 0, 1, 0xffff0000U },
+		{ -0.1f,  0.6f, 0, 0, 0, 1, 0xffff0000U },
+		{ -0.1f, -0.6f, 0, 0, 0, 1, 0xffff0000U },
+		{  0.1f, -0.6f, 0, 0, 0, 1, 0xff00ff00U },
+		{  0.1f,  0.6f, 0, 0, 0, 1, 0xff00ff00U },
+		{  0.9f,  0.6f, 0, 0, 0, 1, 0xff00ff00U },
+		{  0.9f, -0.6f, 0, 0, 0, 1, 0xff00ff00U }
+	};
+	const unsigned short indices[12] = { 0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7 };
+	result |= Check(sizeof(Vertex) == LegacyFvfVertexSize(GAME_VERTEX_XYZNDUV2),
+		"CPU sorting immediate fixture keeps production FVF stride");
+	auto begin = [&]() {
+		ResetTrackedLegacyState();
+		LegacyPipelineState pipeline;
+		pipeline.rasterizer.cullMode = RENDER_CULL_NONE;
+		pipeline.depthStencil.depthEnable = false;
+		pipeline.depthStencil.depthWrite = false;
+		TrackLegacyPipelineState(pipeline);
+		return owner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+			owner.Renderer().SetViewport(RenderViewport(0, 0, 64, 64, 0, 1)) ==
+				RENDER_RESULT_OK && owner.Renderer().ClearExternal(
+					RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH, RenderFloat4(), 1, 0) ==
+					RENDER_RESULT_OK;
+	};
+	auto bind = [&](unsigned int minimum, unsigned int indexStart,
+		int baseVertex, const unsigned short *sourceIndices, unsigned int indexCount) {
+		GameRenderCommand command = {};
+		command.type = GAME_RENDER_COMMAND_SET_VERTEX_BUFFER;
+		command.value0 = GAME_VERTEX_XYZNDUV2;
+		command.value1 = sizeof(Vertex);
+		command.value2 = minimum;
+		command.value3 = 8;
+		command.value4 = minimum * sizeof(Vertex);
+		command.input = vertices;
+		command.inputBytes = sizeof(vertices);
+		const RenderResult vb = owner.ExecuteGameRenderCommand(command);
+		command = {};
+		command.type = GAME_RENDER_COMMAND_SET_INDEX_BUFFER;
+		command.value0 = RENDER_FORMAT_R16_UINT;
+		command.value1 = indexStart;
+		command.value2 = indexCount;
+		command.signedValue0 = baseVertex;
+		command.input = sourceIndices;
+		command.inputBytes = indexCount * sizeof(unsigned short);
+		return vb == RENDER_RESULT_OK &&
+			owner.ExecuteGameRenderCommand(command) == RENDER_RESULT_OK;
+	};
+	auto draw = [&](unsigned int start, unsigned int polygons,
+		unsigned int minimum, unsigned int count) {
+		GameRenderCommand command = {};
+		command.type = GAME_RENDER_COMMAND_DRAW_TRIANGLES;
+		command.value0 = start; command.value1 = polygons;
+		command.value2 = minimum; command.value3 = count;
+		return owner.ExecuteGameRenderCommand(command);
+	};
+	auto capture = [&]() {
+		owner.RequestGameBackBufferCapture();
+		GameRenderCommand command = {};
+		command.type = GAME_RENDER_COMMAND_END_RENDER;
+		command.value0 = 1;
+		const RenderResult ended = owner.ExecuteGameRenderCommand(command);
+		return ended == RENDER_RESULT_OK && owner.ConsumeGameBackBufferCaptureSuccess();
+	};
+	std::remove("D3D11RendererCapture.tga");
+	result |= Check(begin() && bind(0, 0, 0, indices, 12),
+		"generic quad draw binds paired retained CPU sorting images");
+	result |= Check(draw(0, 4, 0, 8) == RENDER_RESULT_OK,
+		"generic 0/4/0/8 triangle draw accepts valid CPU sorting geometry");
+	if (result != 0)
+	{
+		(void)owner.Renderer().EndFrame(false);
+		(void)owner.Renderer().DrainThreaded();
+		(void)owner.Shutdown();
+		return result;
+	}
+	for (unsigned int vertex = 0; vertex < 4; ++vertex)
+		vertices[vertex].diffuse = 0xff0000ffU;
+	result |= Check(bind(0, 0, 0, indices, 12) &&
+		draw(0, 2, 0, 4) == RENDER_RESULT_OK && capture() &&
+		HasNativeCapturePixel(16, 32, 255, 0, 0) &&
+		HasNativeCapturePixel(48, 32, 0, 255, 0),
+		"generic CPU sorting draws execute immediately in order without sorter flush");
+	// The retained source begins at physical vertex 2, while indices remain
+	// relative to the mesh and the index binding has a nonzero selected start.
+	result |= Check(begin() && bind(2, 5, 2, indices, 12) &&
+		draw(5, 4, 0, 8) == RENDER_RESULT_OK && capture() &&
+		HasNativeCapturePixel(16, 32, 255, 0, 0) &&
+		HasNativeCapturePixel(48, 32, 0, 255, 0),
+		"generic CPU sorting draw honors retained origins and nonzero base vertex");
+	const unsigned short subrange[6] = { 2, 3, 4, 2, 4, 5 };
+	result |= Check(begin() && bind(2, 5, 0, subrange, 6) &&
+		draw(5, 2, 2, 4) == RENDER_RESULT_OK && capture() &&
+		HasNativeCapturePixel(16, 32, 255, 0, 0),
+		"generic CPU sorting draw rebases a nonzero minimum vertex window");
+
+	BufferDescriptor gpuDescriptor;
+	gpuDescriptor.byteCount = sizeof(vertices);
+	gpuDescriptor.stride = sizeof(Vertex);
+	gpuDescriptor.binding = RENDER_BUFFER_VERTEX;
+	gpuDescriptor.usage = RENDER_USAGE_DEFAULT;
+	GpuHandle gpuVertex, gpuIndex;
+	result |= Check(owner.Resources().CreateBuffer(gpuDescriptor, vertices,
+		sizeof(vertices), &gpuVertex) == RENDER_RESULT_OK,
+		"mixed-mode negative fixture creates an actual GPU vertex resource");
+	gpuDescriptor.byteCount = sizeof(indices);
+	gpuDescriptor.stride = sizeof(unsigned short);
+	gpuDescriptor.binding = RENDER_BUFFER_INDEX;
+	result |= Check(owner.Resources().CreateBuffer(gpuDescriptor, indices,
+		sizeof(indices), &gpuIndex) == RENDER_RESULT_OK,
+		"mixed-mode negative fixture creates an actual GPU index resource");
+	for (unsigned int invalid = 0; invalid < 8; ++invalid)
+	{
+		unsigned short badIndices[12];
+		std::memcpy(badIndices, indices, sizeof(indices));
+		if (invalid == 2) badIndices[1] = 8;
+		if (invalid == 3) badIndices[1] = 1;
+		result |= Check(begin() && bind(0, 0, 0, badIndices, 12),
+			"generic CPU sorting negative case starts with valid retained bindings");
+		if (invalid >= 4)
+		{
+			GameRenderCommand command = {};
+			command.type = invalid == 5 ? GAME_RENDER_COMMAND_SET_INDEX_BUFFER :
+				GAME_RENDER_COMMAND_SET_VERTEX_BUFFER;
+			if (invalid == 4)
+			{
+				command.resource0.index = gpuVertex.index();
+				command.resource0.generation = gpuVertex.generation();
+				command.value0 = GAME_VERTEX_XYZNDUV2;
+				command.value1 = sizeof(Vertex);
+			}
+			else if (invalid == 5)
+			{
+				command.resource0.index = gpuIndex.index();
+				command.resource0.generation = gpuIndex.generation();
+				command.value0 = RENDER_FORMAT_R16_UINT;
+			}
+			result |= Check(owner.ExecuteGameRenderCommand(command) == RENDER_RESULT_OK,
+				"generic negative fixture selects mixed or unbound vertex/index mode");
+			if (invalid == 7)
+			{
+				command = {};
+				command.type = GAME_RENDER_COMMAND_SET_INDEX_BUFFER;
+				result |= Check(owner.ExecuteGameRenderCommand(command) == RENDER_RESULT_OK,
+					"generic negative fixture explicitly unbinds both images");
+			}
+		}
+		const RenderResult rejected = draw(invalid == 0 ? 12 : 0,
+			invalid == 1 ? 5 : (invalid == 3 ? 2 : 4),
+			invalid == 3 ? 2 : 0, invalid == 3 ? 4 : 8);
+		result |= Check(rejected == RENDER_RESULT_INVALID_ARGUMENT &&
+			owner.Renderer().EndFrame(false) == RENDER_RESULT_INVALID_ARGUMENT,
+			"generic CPU sorting rejects invalid ranges/references and mixed/unbound modes");
+		(void)owner.Renderer().DrainThreaded();
+	}
+	result |= Check(owner.Resources().Destroy(gpuVertex) &&
+		owner.Resources().Destroy(gpuIndex), "mixed-mode fixture releases GPU resources");
+	std::remove("D3D11RendererCapture.tga");
+	result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
+		"CPU sorting immediate fixture shuts down its production owner");
+	if (result == 0) std::printf("CPU sorting immediate triangle tests passed.\n");
+	return result;
+}
+
+int main(int argc, char **argv)
 {
 	int result = 0;
 	NativeW3D2 w3d;
@@ -2094,6 +2278,12 @@ int main()
 		std::fprintf(stderr, "FAIL: could not create hidden native window\n");
 		return 1;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--cpu-sorting-immediate") == 0)
+	{
+		const int immediateResult = TestCpuSortingImmediateTriangles(window);
+		DestroyWindow(window);
+		return immediateResult;
+	}
 	// Keep the owned/borrowed threaded lifecycle fixture independent from the
 	// longer native contract sequence below. Earlier negative assertions in the
 	// latter must not suppress coverage for capture ordering, failed clear
@@ -2109,6 +2299,7 @@ int main()
 	result |= TestResizeRollback(window);
 	result |= TestResizeOwnerThread(window);
 	result |= TestReacquireFailureFailClosed(window);
+	result |= TestCpuSortingImmediateTriangles(window);
 	const rts::render::RenderResult initializeResult = w3d.Initialize(window, descriptor);
 	if (initializeResult == rts::render::RENDER_RESULT_UNSUPPORTED)
 	{
