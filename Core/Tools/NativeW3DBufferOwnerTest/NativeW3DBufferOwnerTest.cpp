@@ -448,6 +448,136 @@ int RunNativeLine3DDestroyFailureContract()
 	return result;
 }
 
+int RunDynamicBufferPoolWrapContract(FakeRenderDevice &device)
+{
+	using namespace rts::render;
+	int result = 0;
+	const unsigned short maxCount = static_cast<unsigned short>(65535U);
+
+	DynamicVBAccessClass::_Deinit();
+	{
+		DynamicVBAccessClass seed(BUFFER_TYPE_DYNAMIC_DX8,
+			dynamic_fvf_type, 1);
+		result |= Check(seed.Is_Valid(),
+			"dynamic vertex wrap fixture creates its initial pool allocation");
+	}
+	{
+		DynamicVBAccessClass maximum(BUFFER_TYPE_DYNAMIC_DX8,
+			dynamic_fvf_type, maxCount);
+		const size_t byteCount = static_cast<size_t>(maxCount) *
+			maximum.FVF_Info().Get_FVF_Size();
+		const std::vector<unsigned char> expectedBytes(byteCount, 0x5a);
+		result |= Check(maximum.Is_Valid() &&
+			maximum.Get_Vertex_Count() == maxCount &&
+			maximum.Get_Vertex_Buffer_Offset() == 0,
+			"maximum vertex allocation grows and wraps to offset zero");
+		DynamicVBAccessClass::WriteLockClass lock(&maximum);
+		VertexFormatXYZNDUV2 *vertices = lock.Get_Formatted_Vertex_Array();
+		result |= Check(lock.Is_Locked() && vertices != nullptr,
+			"maximum vertex allocation exposes its full write range");
+		if (vertices != nullptr)
+			std::memset(vertices, 0x5a, byteCount);
+		const bool published = lock.Commit();
+		result |= Check(published && device.LastOffset() == 0 &&
+			device.LastBytes() == byteCount &&
+			device.LastMode() == RENDER_BUFFER_UPDATE_DISCARD,
+			"maximum vertex wrap publishes the exact range with zero-offset discard");
+		GpuHandle handle;
+		const bool acquired = maximum.Acquire_Native_Vertex_Buffer(&handle);
+		result |= Check(acquired && device.BufferEquals(handle,
+			expectedBytes.data(), expectedBytes.size()),
+			"maximum vertex wrap initializes exactly the requested vertex range");
+	}
+	DynamicVBAccessClass::_Deinit();
+	{
+		DynamicVBAccessClass seed(BUFFER_TYPE_DYNAMIC_DX8,
+			dynamic_fvf_type, 1);
+		result |= Check(seed.Is_Valid(),
+			"oversized vertex rejection fixture creates a nonzero pool offset");
+	}
+	const unsigned int vertexCreateCount = device.CreateCount();
+	const unsigned int oversizedVertexCount = 65536U;
+	const unsigned short narrowedVertexCount =
+		static_cast<unsigned short>(oversizedVertexCount);
+	result |= Check(narrowedVertexCount == 0,
+		"the 16-bit vertex API cannot represent a count above 65535");
+	{
+		DynamicVBAccessClass rejected(BUFFER_TYPE_DYNAMIC_DX8,
+			dynamic_fvf_type, narrowedVertexCount);
+		result |= Check(!rejected.Is_Valid() &&
+			device.CreateCount() == vertexCreateCount,
+			"a narrowed oversized vertex count is rejected without buffer creation");
+	}
+	{
+		DynamicVBAccessClass afterRejected(BUFFER_TYPE_DYNAMIC_DX8,
+			dynamic_fvf_type, 1);
+		result |= Check(afterRejected.Is_Valid() &&
+			afterRejected.Get_Vertex_Buffer_Offset() == 1,
+			"rejected vertex count leaves the nonzero pool offset unchanged");
+	}
+	DynamicVBAccessClass::_Deinit();
+
+	DynamicIBAccessClass::_Deinit();
+	{
+		DynamicIBAccessClass seed(BUFFER_TYPE_DYNAMIC_DX8, 1);
+		result |= Check(seed.Is_Valid(),
+			"dynamic index wrap fixture creates its initial pool allocation");
+	}
+	{
+		DynamicIBAccessClass maximum(BUFFER_TYPE_DYNAMIC_DX8, maxCount);
+		const size_t byteCount = static_cast<size_t>(maxCount) *
+			sizeof(unsigned short);
+		const std::vector<unsigned char> expectedBytes(byteCount, 0x5a);
+		result |= Check(maximum.Is_Valid() &&
+			maximum.Get_Index_Count() == maxCount &&
+			maximum.Get_Index_Buffer_Offset() == 0,
+			"maximum index allocation grows and wraps to offset zero");
+		DynamicIBAccessClass::WriteLockClass lock(&maximum);
+		unsigned short *indices = lock.Get_Index_Array();
+		result |= Check(lock.Is_Locked() && indices != nullptr,
+			"maximum index allocation exposes its full write range");
+		if (indices != nullptr)
+			std::memset(indices, 0x5a, byteCount);
+		const bool published = lock.Commit();
+		result |= Check(published && device.LastOffset() == 0 &&
+			device.LastBytes() == byteCount &&
+			device.LastMode() == RENDER_BUFFER_UPDATE_DISCARD,
+			"maximum index wrap publishes the exact range with zero-offset discard");
+		GpuHandle handle;
+		const bool acquired = maximum.Acquire_Native_Index_Buffer(&handle);
+		result |= Check(acquired && device.BufferEquals(handle,
+			expectedBytes.data(), expectedBytes.size()),
+			"maximum index wrap initializes exactly the requested index range");
+	}
+	DynamicIBAccessClass::_Deinit();
+	{
+		DynamicIBAccessClass seed(BUFFER_TYPE_DYNAMIC_DX8, 1);
+		result |= Check(seed.Is_Valid(),
+			"oversized index rejection fixture creates a nonzero pool offset");
+	}
+	const unsigned int indexCreateCount = device.CreateCount();
+	const unsigned int oversizedIndexCount = 65536U;
+	const unsigned short narrowedIndexCount =
+		static_cast<unsigned short>(oversizedIndexCount);
+	result |= Check(narrowedIndexCount == 0,
+		"the 16-bit index API cannot represent a count above 65535");
+	{
+		DynamicIBAccessClass rejected(BUFFER_TYPE_DYNAMIC_DX8,
+			narrowedIndexCount);
+		result |= Check(!rejected.Is_Valid() &&
+			device.CreateCount() == indexCreateCount,
+			"a narrowed oversized index count is rejected without buffer creation");
+	}
+	{
+		DynamicIBAccessClass afterRejected(BUFFER_TYPE_DYNAMIC_DX8, 1);
+		result |= Check(afterRejected.Is_Valid() &&
+			afterRejected.Get_Index_Buffer_Offset() == sizeof(unsigned short),
+			"rejected index count leaves the nonzero pool offset unchanged");
+	}
+	DynamicIBAccessClass::_Deinit();
+	return result;
+}
+
 }
 
 int main()
@@ -586,6 +716,7 @@ int main()
 	}
 	DynamicIBAccessClass::_Deinit();
 	DynamicVBAccessClass::_Deinit();
+	result |= RunDynamicBufferPoolWrapContract(device);
 	DX8IndexBufferClass *nativeIndex = NEW_REF(DX8IndexBufferClass,(3));
 	DX8VertexBufferClass *nativeVertex = NEW_REF(DX8VertexBufferClass,(
 		DX8_FVF_XYZ, 3));

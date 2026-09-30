@@ -816,9 +816,7 @@ void DynamicVBAccessClass::_Deinit()
 void DynamicVBAccessClass::Allocate_DX8_Dynamic_Buffer()
 {
 	WWMEMLOG(MEM_RENDERER);
-	if (!rts::render::IsNativeW3DBufferOwnerThread() || VertexCount == 0 ||
-		g_dynamicVertexBufferOffset > 65535U -
-			static_cast<unsigned int>(VertexCount))
+	if (!rts::render::IsNativeW3DBufferOwnerThread() || VertexCount == 0)
 	{
 		VertexBuffer = nullptr;
 		VertexBufferOffset = 0;
@@ -1596,9 +1594,7 @@ bool DynamicIBAccessClass::WriteLockClass::Commit()
 void DynamicIBAccessClass::Allocate_DX8_Dynamic_Buffer()
 {
 	WWMEMLOG(MEM_RENDERER);
-	if (!rts::render::IsNativeW3DBufferOwnerThread() || IndexCount == 0 ||
-		g_dynamicIndexBufferOffset > 65535U -
-			static_cast<unsigned int>(IndexCount))
+	if (!rts::render::IsNativeW3DBufferOwnerThread() || IndexCount == 0)
 	{
 		IndexBuffer = nullptr;
 		IndexBufferOffset = 0;
