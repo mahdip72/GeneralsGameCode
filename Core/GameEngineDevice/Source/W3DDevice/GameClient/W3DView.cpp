@@ -38,6 +38,7 @@
 
 // USER INCLUDES //////////////////////////////////////////////////////////////////////////////////
 #include "Lib/BaseType.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 #include "Common/BuildAssistant.h"
 #include "Common/FramePacer.h"
@@ -1852,6 +1853,7 @@ void W3DView::draw()
 	Bool doExtraRender = false;
 	CustomScenePassModes customScenePassMode  = SCENE_PASS_DEFAULT;
 	Bool preRenderResult = false;
+	const bool frameTimingActive = rts::frame_timing::IsActive();
 
 	if (m_viewFilterMode &&
 			m_viewFilter > FT_NULL_FILTER &&
@@ -1876,7 +1878,11 @@ void W3DView::draw()
 		W3DDisplay::m_3DScene->setCustomPassMode(customScenePassMode);
 		if (m_isWireFrameEnabled)
 			W3DDisplay::m_3DScene->Set_Extra_Pass_Polygon_Mode(SceneClass::EXTRA_PASS_CLEAR_LINE);
-		W3DDisplay::m_3DScene->doRender( m_3DCamera );
+		{
+			rts::frame_timing::ConditionalScope sceneTiming(
+				rts::frame_timing::ViewScene3D, frameTimingActive);
+			W3DDisplay::m_3DScene->doRender( m_3DCamera );
+		}
 		W3DDisplay::m_3DScene->Set_Extra_Pass_Polygon_Mode(SceneClass::EXTRA_PASS_DISABLE);
 		m_isWireFrameEnabled = m_nextWireFrameEnabled;
 	}
@@ -1932,7 +1938,11 @@ void W3DView::draw()
 			false, true, clearColor,
 			TheWaterTransparency->m_minWaterOpacity);	// Clear z but not color
 		W3DDisplay::m_3DScene->setCustomPassMode(SCENE_PASS_DEFAULT);
-		W3DDisplay::m_3DScene->doRender( m_3DCamera );
+		{
+			rts::frame_timing::ConditionalScope sceneTiming(
+				rts::frame_timing::ViewScene3D, frameTimingActive);
+			W3DDisplay::m_3DScene->doRender( m_3DCamera );
+		}
 		Coord2D deltaScroll;
 		W3DShaderManager::filterPostRender(m_viewFilter, m_viewFilterMode, deltaScroll, doExtraRender);
 	}
@@ -2099,6 +2109,8 @@ void W3DView::draw()
 	TheGameClient->flushTextBearingDrawables();
 
 	// Render 2D scene
+	rts::frame_timing::ConditionalScope scene2DTiming(
+		rts::frame_timing::ViewScene2D, frameTimingActive);
 	W3DDisplay::m_2DScene->doRender( m_2DCamera );
 }
 

@@ -220,12 +220,15 @@ void clientDisplayPhases(const std::string& directory)
 		rts::frame_timing::DisplayPreframe, rts::frame_timing::DisplayViews,
 		rts::frame_timing::DisplayRtt, rts::frame_timing::DisplayBeginRender,
 		rts::frame_timing::DisplayMainRender, rts::frame_timing::DisplayEndRender,
-		rts::frame_timing::RenderProducerWait
+		rts::frame_timing::RenderProducerWait,
+		rts::frame_timing::ViewScene3D, rts::frame_timing::ViewScene2D,
+		rts::frame_timing::NativeSortingFlush, rts::frame_timing::NativeSkinRender
 	};
 	const char *names[] = {
 		"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
 		"display_preframe", "display_views", "display_rtt", "display_begin_render",
-		"display_main_render", "display_end_render", "render_producer_wait"
+		"display_main_render", "display_end_render", "render_producer_wait",
+		"view_scene_3d", "view_scene_2d", "native_sorting_flush", "native_skin_render"
 	};
 	for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 	{
@@ -248,14 +251,14 @@ void clientDisplayPhases(const std::string& directory)
 	check(!rts::frame_timing::IsActive(), "ending the producer frame clears the singleton gate");
 	capture.endSession();
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
-	check(final.complete, "client/display and producer wait subphases retain complete frame evidence");
+	check(final.complete, "child diagnostic phases retain complete frame evidence");
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 12, "frame plus ten client/display phases and producer wait are emitted");
-	if (data.size() == 12)
+	check(data.size() == 16, "frame plus all fifteen child diagnostic phases are emitted");
+	if (data.size() == 16)
 	{
 		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&
-				data[phase + 1].samples == 1, "client/display phase name and exactly one sample");
+				data[phase + 1].samples == 1, "child diagnostic phase name and exactly one sample");
 	}
 }
 

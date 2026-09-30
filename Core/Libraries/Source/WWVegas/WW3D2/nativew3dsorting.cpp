@@ -12,6 +12,10 @@
 #include "nativew3dsorting.h"
 
 #include "Lib/SortingTriangleKernel.h"
+#if defined(_WIN64) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
+#include "Lib/FrameTimingDiagnostics.h"
 
 #include <algorithm>
 #include <limits>
@@ -697,6 +701,8 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 		return RENDER_RESULT_OK;
 	if (m_impl->flushing)
 		return RENDER_RESULT_FAILED;
+	rts::frame_timing::ConditionalScope sortingTiming(
+		rts::frame_timing::NativeSortingFlush, rts::frame_timing::IsActive());
 	FlushScope flushScope(m_impl->flushing);
 	FlushWorkspaceScope workspaceScope(m_impl->workspace);
 
