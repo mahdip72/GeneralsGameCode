@@ -64,7 +64,7 @@ struct NativeSurfaceStorage
 {
 	NativeSurfaceStorage() : width(0), height(0), pitch(0), rowCount(0),
 		format(WW3D_FORMAT_UNKNOWN), bytes(), texture(nullptr), mipLevel(0),
-		arraySlice(0), surface(), lease(), observedStamp(), retryStamp(),
+		arraySlice(0), surface(), lease(), identityStamp(), observedStamp(), retryStamp(),
 		retryPending(false), locked(false) {}
 	~NativeSurfaceStorage()
 	{
@@ -81,6 +81,7 @@ struct NativeSurfaceStorage
 	unsigned int arraySlice;
 	mutable rts::render::NativeW3DSurfaceHandle surface;
 	mutable rts::render::NativeW3DGpuContentLease lease;
+	rts::render::NativeW3DTextureContentStamp identityStamp;
 	rts::render::NativeW3DTextureContentStamp observedStamp;
 	rts::render::NativeW3DTextureContentStamp retryStamp;
 	bool retryPending;
@@ -130,6 +131,18 @@ static bool Get_Native_Surface_Content_Stamp(
 			storage->mipLevel, storage->arraySlice, stamp) && stamp->isValid();
 }
 
+static bool Same_Native_Surface_Publication(
+	const rts::render::NativeW3DTextureContentStamp &left,
+	const rts::render::NativeW3DTextureContentStamp &right)
+{
+	return left.isValid() && right.isValid() &&
+		left.texture.resource == right.texture.resource &&
+		left.texture.attachmentGeneration ==
+			right.texture.attachmentGeneration &&
+		left.bindingGeneration == right.bindingGeneration &&
+		left.publicationGeneration == right.publicationGeneration;
+}
+
 static bool Has_Current_Native_Surface_Cpu_Data(
 	const NativeSurfaceStorage *storage, const unsigned char **cpu_data,
 	rts::render::NativeW3DTextureContentStamp *stamp)
@@ -143,7 +156,9 @@ static bool Has_Current_Native_Surface_Cpu_Data(
 		storage->pitch == 0 || storage->rowCount == 0) return false;
 	rts::render::NativeW3DTextureContentStamp before;
 	if (!Get_Native_Surface_Content_Stamp(storage, &before) ||
-		before.authority != rts::render::NATIVE_W3D_CONTENT_CPU) return false;
+		before.authority != rts::render::NATIVE_W3D_CONTENT_CPU ||
+		!Same_Native_Surface_Publication(before, storage->identityStamp))
+		return false;
 	const unsigned char *data = nullptr;
 	size_t row_pitch = 0;
 	size_t slice_pitch = 0;
@@ -434,6 +449,7 @@ SurfaceClass::SurfaceClass(TextureBaseClass *texture, unsigned int mip_level,
 			texture->Get_Native_Subresource_Content_Stamp(mip_level,
 				array_slice, &after) && after == before)
 		{
+			storage->identityStamp = after;
 			storage->observedStamp = after;
 		}
 		else
