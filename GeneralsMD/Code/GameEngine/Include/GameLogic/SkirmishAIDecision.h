@@ -705,6 +705,67 @@ inline bool IsSkirmishAIAlternateIncomeStructure(
 	return cashGenerator || supplyDropzone || blackMarket || internetCenter;
 }
 
+inline int GetSkirmishAIRenewableIncomeTarget(
+	SkirmishAIDecisionDifficulty difficulty)
+{
+	if (difficulty == SKIRMISH_AI_DIFFICULTY_EASY)
+		return 4;
+	if (difficulty == SKIRMISH_AI_DIFFICULTY_NORMAL)
+		return 6;
+	return 8;
+}
+
+inline int GetSkirmishAIRenewableEconomyHealth(
+	int cashScore, int liveIncomeSources, int targetIncomeSources)
+{
+	const int cash = ClampSkirmishAIDecisionValue(cashScore, 0, 100);
+	const int sources = ClampSkirmishAIDecisionValue(liveIncomeSources, 0,
+		targetIncomeSources > 0 ? targetIncomeSources : 1);
+	const int sourceScore = targetIncomeSources > 0
+		? sources * 100 / targetIncomeSources : 0;
+	return (25 * cash + 75 * sourceScore) / 100;
+}
+
+inline bool NeedsSkirmishAIPowerReserve(bool sufficientPower,
+	int production, int consumption, int livePlants)
+{
+	if (!sufficientPower)
+		return true;
+	if (livePlants <= 0)
+		return true;
+	if (consumption <= 0)
+		return false;
+	return livePlants < 2 ||
+		(__int64)production * 4 < (__int64)consumption * 5;
+}
+
+inline bool ShouldReviveSkirmishAICoreBuild(
+	bool builtObjectExists, bool buildable, bool coreStructure)
+{
+	return !builtObjectExists && !buildable && coreStructure;
+}
+
+inline int GetSkirmishAIInfrastructurePriority(
+	int normalPriority, bool commandCenter, bool missingPower,
+	bool advancedTechnology, bool renewableIncome)
+{
+	if (commandCenter)
+		return 1200;
+	if (missingPower)
+		return 1100;
+	if (advancedTechnology && normalPriority < 1080)
+		return 1080;
+	if (renewableIncome && normalPriority < 1050)
+		return 1050;
+	return normalPriority;
+}
+
+inline int GetSkirmishAICoreRebuildDelaySeconds(
+	int configuredSeconds, bool coreStructure)
+{
+	return coreStructure && configuredSeconds > 3 ? 3 : configuredSeconds;
+}
+
 inline bool ShouldBuildSkirmishAIPrerequisiteSupplyCenter(
 	bool hasUsableSupply, bool hasOwnedSupplyCenter, bool hasQueuedSupplyCenter)
 {

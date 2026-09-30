@@ -28,11 +28,12 @@ enum SkirmishAITestScenario
 };
 
 // CLI: -runSkirmishAIRecoveryTest <positive-seed> <case> <FactionTemplate>.
-// Opt-in, full-engine Stage 1 recovery fixtures.  These are deliberately
+// Opt-in, full-engine recovery and infrastructure fixtures. These are
 // separate from the normal replay scenarios: they stop on fixture assertions
 // and never report a fixture result as a gameplay/replay gate.
 // Cases: surviving_builder, factory_only, no_path_laststand, repeated_cc,
-// obstructed, low_cash, gla_hole, save_load, disabled_factory. Factions are the
+// obstructed, low_cash, gla_hole, save_load, disabled_factory,
+// infrastructure_collapse. Factions are the
 // 12 playable Zero Hour Faction*
 // templates returned by GetSkirmishAIRecoveryFactionTemplateName().
 enum SkirmishAIRecoveryFixtureCase
@@ -46,6 +47,7 @@ enum SkirmishAIRecoveryFixtureCase
 	SKIRMISH_AI_RECOVERY_GLA_HOLE,
 	SKIRMISH_AI_RECOVERY_SAVE_LOAD,
 	SKIRMISH_AI_RECOVERY_DISABLED_FACTORY,
+	SKIRMISH_AI_RECOVERY_INFRASTRUCTURE_COLLAPSE,
 	SKIRMISH_AI_RECOVERY_FIXTURE_CASE_COUNT
 };
 

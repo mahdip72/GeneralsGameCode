@@ -1217,7 +1217,7 @@ Object *AIPlayer::buildStructureNow(const ThingTemplate *bldgPlan, BuildListInfo
 
 // ------------------------------------------------------------------------------------------------
 // ------------------------------------------------------------------------------------------------
-Object *AIPlayer::buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildListInfo *info)
+Object *AIPlayer::buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildListInfo *info, Bool allowTeleport, Bool allowLocationAdjustment)
 {
 	if (!m_player->canSpendForSkirmishAIRecovery(
 		bldgPlan->calcCostToBuild(m_player), bldgPlan, FALSE))
@@ -1255,6 +1255,10 @@ Object *AIPlayer::buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildLi
 																								 BuildAssistant::TERRAIN_RESTRICTIONS |
 																								 BuildAssistant::NO_OBJECT_OVERLAP,
 																								 dozer, m_player ) != LBC_OK ) {
+			if (!allowLocationAdjustment) {
+				TheTerrainVisual->removeAllBibs();
+				return nullptr;
+			}
 			// Warn.
 			AsciiString bldgName = bldgPlan->getName();
 			bldgName.concat(" - Dozer unable to place.  Attempting to adjust position.");
@@ -1328,6 +1332,9 @@ Object *AIPlayer::buildStructureWithDozer(const ThingTemplate *bldgPlan, BuildLi
 	TheTerrainVisual->removeAllBibs();	// isLocationLegalToBuild adds bib feedback, turn it off.  jba.
 	if (!TheAI->pathfinder()->clientSafeQuickDoesPathExist(dozer->getAI()->getLocomotorSet(),
 		dozer->getPosition(), &pos)) {
+		if (!allowTeleport) {
+			return nullptr;
+		}
 		AsciiString bldgName = bldgPlan->getName();
 		bldgName.concat(" - Dozer unable to reach building.  Teleporting.");
 		TheScriptEngine->AppendDebugMessage(bldgName, false);
