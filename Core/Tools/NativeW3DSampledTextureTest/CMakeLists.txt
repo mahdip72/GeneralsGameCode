@@ -3,6 +3,9 @@ add_executable(core_native_w3d_sampled_texture_tests
     ../../Libraries/Source/WWVegas/WW3D2/nativew3dsampledtexture.cpp
     ../../Libraries/Source/WWVegas/WW3D2/surfaceblit.cpp
 )
+target_compile_definitions(core_native_w3d_sampled_texture_tests PRIVATE
+    RTS_SURFACE_BLIT_TEST_PIXEL_ORACLE=1
+)
 
 target_include_directories(core_native_w3d_sampled_texture_tests PRIVATE
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Source

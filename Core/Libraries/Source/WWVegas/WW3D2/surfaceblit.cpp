@@ -368,6 +368,77 @@ static bool Read_Pixel(const unsigned char *source, int source_pitch,
 	}
 }
 
+// Expand each BC block once, retaining the pixel reader's exact rounding and
+// stored (including DXT2/4 premultiplied) RGB. Edge mips write only valid pixels.
+static void Convert_Dxt_Blocks(const unsigned char *source, int source_pitch,
+	unsigned width, unsigned height, WW3DFormat format, unsigned char *pixels)
+{
+	const unsigned blockBytes = Dxt_Block_Bytes(format);
+	for (unsigned blockY = 0; blockY < (height + 3U) / 4U; ++blockY)
+	{
+		for (unsigned blockX = 0; blockX < (width + 3U) / 4U; ++blockX)
+		{
+			const unsigned char *block = source + (size_t)blockY * source_pitch +
+				(size_t)blockX * blockBytes;
+			const unsigned char *color = format == WW3D_FORMAT_DXT1 ? block : block + 8;
+			const unsigned short color0 = Read_Word(color);
+			const unsigned short color1 = Read_Word(color + 2);
+			const unsigned long colorIndexes = (unsigned long)color[4] |
+				((unsigned long)color[5] << 8) | ((unsigned long)color[6] << 16) |
+				((unsigned long)color[7] << 24);
+			unsigned char palette[4][4];
+			for (unsigned index = 0; index < 4; ++index)
+				Read_Dxt_Color(index, color0, color1, format != WW3D_FORMAT_DXT1,
+					palette[index]);
+			unsigned char alphaTable[8];
+			if (format == WW3D_FORMAT_DXT4 || format == WW3D_FORMAT_DXT5)
+			{
+				const unsigned alpha0 = block[0], alpha1 = block[1];
+				alphaTable[0] = (unsigned char)alpha0;
+				alphaTable[1] = (unsigned char)alpha1;
+				if (alpha0 > alpha1)
+				{
+					for (unsigned index = 1; index < 7; ++index)
+						alphaTable[index + 1] = (unsigned char)(
+							((7U - index) * alpha0 + index * alpha1 + 3U) / 7U);
+				}
+				else
+				{
+					for (unsigned index = 1; index < 5; ++index)
+						alphaTable[index + 1] = (unsigned char)(
+							((5U - index) * alpha0 + index * alpha1 + 2U) / 5U);
+					alphaTable[6] = 0;
+					alphaTable[7] = 255;
+				}
+			}
+			for (unsigned row = 0; row < 4 && blockY * 4U + row < height; ++row)
+			{
+				unsigned char *destination = pixels +
+					((size_t)(blockY * 4U + row) * width + blockX * 4U) * 4U;
+				for (unsigned column = 0; column < 4 && blockX * 4U + column < width; ++column)
+				{
+					const unsigned localIndex = row * 4U + column;
+					const unsigned colorIndex = (colorIndexes >> (2U * localIndex)) & 3U;
+					memcpy(destination, palette[colorIndex], 4);
+					if (format == WW3D_FORMAT_DXT2 || format == WW3D_FORMAT_DXT3)
+						destination[3] = (unsigned char)(
+							((Read_Word(block + row * 2U) >> (column * 4U)) & 0xfU) * 17U);
+					else if (format == WW3D_FORMAT_DXT4 || format == WW3D_FORMAT_DXT5)
+					{
+						const unsigned bitOffset = 3U * localIndex;
+						const unsigned byteOffset = bitOffset / 8U;
+						unsigned packed = block[2U + byteOffset];
+						if (byteOffset + 1U < 6U)
+							packed |= (unsigned)block[3U + byteOffset] << 8;
+						destination[3] = alphaTable[(packed >> (bitOffset & 7U)) & 7U];
+					}
+					destination += 4;
+				}
+			}
+		}
+	}
+}
+
 static bool Write_Pixel(unsigned char *destination, WW3DFormat format,
 	const unsigned char *pixel)
 {
@@ -577,13 +648,13 @@ SurfaceBlitFilter SurfaceBlit_Filter_For_Full_Copy(
 }
 
 
-bool SurfaceBlit_Convert_To_A8R8G8B8(
+static bool Convert_To_A8R8G8B8(
 	const unsigned char *source,
 	int source_pitch,
 	unsigned int width,
 	unsigned int height,
 	WW3DFormat source_format,
-	std::vector<unsigned char> *pixels)
+	std::vector<unsigned char> *pixels, bool use_fast_paths)
 {
 	size_t total_bytes;
 	unsigned int y;
@@ -613,6 +684,20 @@ bool SurfaceBlit_Convert_To_A8R8G8B8(
 	{
 		return false;
 	}
+	if (use_fast_paths && source_format == WW3D_FORMAT_A8R8G8B8)
+	{
+		const size_t rowBytes = (size_t)width * 4U;
+		for (y = 0; y < height; ++y)
+			memcpy(&(*pixels)[(size_t)y * rowBytes],
+				source + (size_t)y * source_pitch, rowBytes);
+		return true;
+	}
+	if (use_fast_paths && Is_Dxt(source_format))
+	{
+		Convert_Dxt_Blocks(source, source_pitch, width, height, source_format,
+			&(*pixels)[0]);
+		return true;
+	}
 	for (y = 0; y < height; ++y)
 	{
 		unsigned x;
@@ -628,6 +713,27 @@ bool SurfaceBlit_Convert_To_A8R8G8B8(
 	}
 	return true;
 }
+
+bool SurfaceBlit_Convert_To_A8R8G8B8(const unsigned char *source,
+	int source_pitch, unsigned int width, unsigned int height,
+	WW3DFormat source_format, std::vector<unsigned char> *pixels)
+{
+	return Convert_To_A8R8G8B8(source, source_pitch, width, height,
+		source_format, pixels, true);
+}
+
+#if defined(RTS_SURFACE_BLIT_TEST_PIXEL_ORACLE)
+// Only the focused test target exports the unchanged per-pixel path. Both
+// paths share validation/allocation, so differential timing includes neither
+// a weakened bound nor an artificial per-pixel external-call overhead.
+bool SurfaceBlit_Convert_Pixel_Reference(const unsigned char *source,
+	int source_pitch, unsigned int width, unsigned int height,
+	WW3DFormat source_format, std::vector<unsigned char> *pixels)
+{
+	return Convert_To_A8R8G8B8(source, source_pitch, width, height,
+		source_format, pixels, false);
+}
+#endif
 
 bool SurfaceBlit_Resample_A8R8G8B8(
 	const unsigned char *source,

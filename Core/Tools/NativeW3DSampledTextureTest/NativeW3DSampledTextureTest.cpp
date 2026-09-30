@@ -3,6 +3,12 @@
 
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
+#include <chrono>
+#include "surfaceblit.h"
+
+bool SurfaceBlit_Convert_Pixel_Reference(const unsigned char *, int,
+	unsigned int, unsigned int, WW3DFormat, std::vector<unsigned char> *);
 
 namespace
 {
@@ -206,6 +212,195 @@ int TestUnsupportedAndMalformedRejection()
 	return result;
 }
 
+unsigned NextBits(unsigned &state)
+{
+	state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+	return state;
+}
+
+unsigned SourcePitch(WW3DFormat format, unsigned width)
+{
+	if (format == WW3D_FORMAT_A8R8G8B8) return width * 4U;
+	return ((width + 3U) / 4U) * (format == WW3D_FORMAT_DXT1 ? 8U : 16U);
+}
+
+std::vector<unsigned char> SourceBytes(WW3DFormat format, unsigned width,
+	unsigned height, unsigned pitch, unsigned pattern)
+{
+	const unsigned rows = format == WW3D_FORMAT_A8R8G8B8 ? height : (height + 3U) / 4U;
+	std::vector<unsigned char> source((size_t)pitch * rows);
+	unsigned random = 0x4f37ba91U + width * 13U + height * 79U + pattern;
+	for (size_t byte = 0; byte < source.size(); ++byte)
+		source[byte] = (unsigned char)NextBits(random);
+	if (format != WW3D_FORMAT_A8R8G8B8)
+	{
+		const unsigned blockBytes = format == WW3D_FORMAT_DXT1 ? 8U : 16U;
+		for (unsigned row = 0; row < rows; ++row)
+			for (unsigned column = 0; column < (width + 3U) / 4U; ++column)
+			{
+				unsigned char *block = &source[(size_t)row * pitch + column * blockBytes];
+				unsigned char *color = block + (format == WW3D_FORMAT_DXT1 ? 0 : 8);
+				// Both endpoint orderings, equal endpoints, all color selectors.
+				if (pattern < 3)
+				{
+					color[0] = color[1] = pattern == 0 ? 0xff : 0;
+					color[2] = color[3] = pattern == 1 ? 0xff : 0;
+					for (unsigned byte = 4; byte < 8; ++byte) color[byte] = 0xe4;
+				}
+				// BC3 8-entry/6-entry tables, zero/full/equal alpha, every index.
+				if (format == WW3D_FORMAT_DXT4 || format == WW3D_FORMAT_DXT5)
+				{
+					if (pattern < 3)
+					{
+						block[0] = pattern == 0 ? 255 : 0;
+						block[1] = pattern == 1 ? 255 : 0;
+					}
+					else if (pattern == 3) block[0] = block[1] = 127;
+					for (unsigned byte = 2; byte < 8; ++byte) block[byte] = 0;
+					for (unsigned pixel = 0; pixel < 16; ++pixel)
+					{
+						const unsigned bits = 3U * pixel, value = pixel & 7U;
+						block[2U + bits / 8U] |= (unsigned char)(value << (bits & 7U));
+						if (bits / 8U + 1U < 6U)
+							block[3U + bits / 8U] |= (unsigned char)(value >> (8U - (bits & 7U)));
+					}
+				}
+				else if (format != WW3D_FORMAT_DXT1 && pattern < 4)
+				{
+					for (unsigned byte = 0; byte < 8; ++byte)
+						block[byte] = (unsigned char)((2U * byte) | ((2U * byte + 1U) << 4));
+				}
+			}
+	}
+	return source;
+}
+
+int TestConversionDifferential()
+{
+	const WW3DFormat formats[] = { WW3D_FORMAT_A8R8G8B8, WW3D_FORMAT_DXT1,
+		WW3D_FORMAT_DXT2, WW3D_FORMAT_DXT3, WW3D_FORMAT_DXT4, WW3D_FORMAT_DXT5 };
+	const unsigned dimensions[] = { 1, 2, 3, 4, 5, 7, 8, 9, 15, 17, 31, 33 };
+	unsigned cases = 0;
+	for (WW3DFormat format : formats)
+		for (unsigned width : dimensions)
+			for (unsigned height : dimensions)
+				for (unsigned padding : { 0U, 13U })
+					for (unsigned pattern = 0; pattern < 8; ++pattern)
+					{
+						const unsigned pitch = SourcePitch(format, width) + padding;
+						const auto source = SourceBytes(format, width, height, pitch, pattern);
+						std::vector<unsigned char> actual, expected;
+						if (!SurfaceBlit_Convert_Pixel_Reference(source.data(), (int)pitch,
+							width, height, format, &expected) ||
+							!SurfaceBlit_Convert_To_A8R8G8B8(source.data(), (int)pitch,
+								width, height, format, &actual) || actual != expected)
+						{
+							std::fprintf(stderr, "DIFFERENTIAL FAIL format=%u width=%u height=%u padding=%u pattern=%u\n",
+								(unsigned)format, width, height, padding, pattern);
+							return 1;
+						}
+						++cases;
+					}
+	std::printf("Byte-exact conversion differential cases: %u\n", cases);
+	int result = 0;
+	unsigned char bytes[16] = {};
+	const struct Invalid { unsigned width, height; int pitch; WW3DFormat format; } invalid[] = {
+		{ 0, 1, 4, WW3D_FORMAT_A8R8G8B8 }, { 1, 0, 4, WW3D_FORMAT_A8R8G8B8 },
+		{ 1, 1, -1, WW3D_FORMAT_A8R8G8B8 }, { 2, 1, 7, WW3D_FORMAT_A8R8G8B8 },
+		{ 5, 1, 15, WW3D_FORMAT_DXT1 }, { 5, 1, 31, WW3D_FORMAT_DXT5 },
+		{ 1, 1, 4, WW3D_FORMAT_U8V8 }, { 65536, 65536, 16, WW3D_FORMAT_DXT5 }
+	};
+	for (const auto &test : invalid)
+	{
+		std::vector<unsigned char> actual(7, 0x9c), expected(actual);
+		result |= Check(!SurfaceBlit_Convert_Pixel_Reference(bytes, test.pitch,
+			test.width, test.height, test.format, &expected) &&
+			!SurfaceBlit_Convert_To_A8R8G8B8(bytes, test.pitch, test.width,
+				test.height, test.format, &actual) && actual == expected && actual.size() == 7,
+			"invalid conversion rejects before changing output, with oracle parity");
+	}
+	std::vector<unsigned char> actual;
+	result |= Check(!SurfaceBlit_Convert_To_A8R8G8B8(nullptr, 4, 1, 1,
+		WW3D_FORMAT_A8R8G8B8, &actual) &&
+		!SurfaceBlit_Convert_To_A8R8G8B8(bytes, 4, 1, 1, WW3D_FORMAT_A8R8G8B8, nullptr),
+		"null source/output rejects");
+	// Check full mip/face upload, not just the conversion helper. Each face
+	// retains separately owned encoded data; views include padded block rows.
+	for (WW3DFormat format : formats)
+	{
+		std::vector<std::vector<unsigned char>> source(24), expected(24);
+		NativeW3DSampledTextureMipView views[24];
+		for (unsigned face = 0; face < 6; ++face)
+			for (unsigned mip = 0; mip < 4; ++mip)
+			{
+				const unsigned index = face * 4U + mip, dimension = 9U >> mip;
+				const unsigned pitch = SourcePitch(format, dimension) + 7;
+				source[index] = SourceBytes(format, dimension, dimension, pitch, face + mip);
+				views[index] = View(source[index].data(), source[index].size(), pitch);
+				result |= Check(SurfaceBlit_Convert_Pixel_Reference(source[index].data(),
+					(int)pitch, dimension, dimension, format, &expected[index]), "cube mip oracle converts");
+			}
+		NativeW3DSampledTextureUpload upload;
+		const bool prepared = upload.Prepare(format, 9, 9, 4, 6, views, 24);
+		result |= Check(prepared, "odd cube and all mip edges prepare");
+		if (prepared)
+			for (unsigned index = 0; index < 24; ++index)
+				result |= Check(EqualBytes(upload.Subresources()[index], expected[index].data(),
+					expected[index].size()), "every cube mip matches pixel oracle exactly");
+		views[0].dataSize = 1;
+		result |= Check(!upload.Prepare(format, 9, 9, 4, 6, views, 24) &&
+			upload.SubresourceCount() == 0, "truncated encoded input rejects without partial upload");
+		views[0].dataSize = source[0].size();
+		views[0].rowPitch = SourcePitch(format, 9) - 1;
+		result |= Check(!upload.Prepare(format, 9, 9, 4, 6, views, 24),
+			"malformed encoded row pitch rejects");
+	}
+	return result;
+}
+
+int BenchmarkConversion()
+{
+	using Clock = std::chrono::steady_clock;
+	const WW3DFormat formats[] = { WW3D_FORMAT_A8R8G8B8, WW3D_FORMAT_DXT1,
+		WW3D_FORMAT_DXT2, WW3D_FORMAT_DXT3, WW3D_FORMAT_DXT4, WW3D_FORMAT_DXT5 };
+	volatile unsigned checksum = 0;
+	std::printf("format,size,iterations,reference_ms,fast_ms,speedup\n");
+	for (WW3DFormat format : formats)
+		for (unsigned size : { 256U, 1024U, 2048U })
+		{
+			const unsigned iterations = size == 256 ? 16 : size == 1024 ? 4 : 1;
+			const unsigned pitch = SourcePitch(format, size) + 13;
+			const auto source = SourceBytes(format, size, size, pitch, 6);
+			std::vector<unsigned char> actual, expected;
+			SurfaceBlit_Convert_Pixel_Reference(source.data(), (int)pitch, size, size, format, &expected);
+			SurfaceBlit_Convert_To_A8R8G8B8(source.data(), (int)pitch, size, size, format, &actual);
+			if (actual != expected) return Check(false, "benchmark warmup is byte exact");
+			double timings[2][7];
+			for (unsigned sample = 0; sample < 7; ++sample)
+				for (unsigned pass = 0; pass < 2; ++pass)
+				{
+					const unsigned path = (sample + pass) & 1U;
+					const auto start = Clock::now();
+					for (unsigned iteration = 0; iteration < iterations; ++iteration)
+					{
+						const bool ok = path == 0 ? SurfaceBlit_Convert_Pixel_Reference(source.data(),
+							(int)pitch, size, size, format, &expected) :
+							SurfaceBlit_Convert_To_A8R8G8B8(source.data(), (int)pitch, size, size, format, &actual);
+						if (!ok) return Check(false, "benchmark conversion succeeds");
+						checksum = checksum ^ (path == 0 ? expected[iteration] : actual[iteration]);
+					}
+					timings[path][sample] = std::chrono::duration<double, std::milli>(Clock::now() - start).count() / iterations;
+					if (actual != expected) return Check(false, "every timed output is byte exact");
+				}
+			std::sort(timings[0], timings[0] + 7);
+			std::sort(timings[1], timings[1] + 7);
+			std::printf("%u,%u,%u,%.6f,%.6f,%.3f\n", (unsigned)format, size,
+				iterations, timings[0][3], timings[1][3], timings[0][3] / timings[1][3]);
+		}
+	std::printf("benchmark checksum=%u (single process; median 7 alternating-order samples)\n", (unsigned)checksum);
+	return 0;
+}
+
 int TestTypedPublicationFallbackAndRecovery()
 {
 	int result = 0;
@@ -339,10 +534,13 @@ int TestTypedPublicationFallbackAndRecovery()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	const int differential = TestConversionDifferential();
+	if (argc == 2 && std::strcmp(argv[1], "--benchmark-conversion") == 0)
+		return differential | BenchmarkConversion();
 	return TestDxtAndPackedPixelParity() |
 		TestSignedBumpAndCubeLayout() |
 		TestUnsupportedAndMalformedRejection() |
-		TestTypedPublicationFallbackAndRecovery();
+		TestTypedPublicationFallbackAndRecovery() | differential;
 }
