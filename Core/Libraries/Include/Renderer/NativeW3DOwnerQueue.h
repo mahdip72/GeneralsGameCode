@@ -21,6 +21,10 @@ class NativeW3DOwnerFallbackEntry
 public:
 	NativeW3DOwnerFallbackEntry();
 	~NativeW3DOwnerFallbackEntry();
+	// This is a caller-lifetime query, not a concurrent queue observer. Keep
+	// the entry alive and serialize this read with enqueue/drain. A successful
+	// cleanup transfer may let its release callback destroy the entry; the
+	// former caller must not poll or enqueue that entry again after transfer.
 	bool IsQueued() const;
 
 private:
