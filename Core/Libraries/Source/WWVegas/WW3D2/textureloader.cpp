@@ -39,6 +39,7 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "textureloader.h"
+#include "textureloadupdate.h"
 #include "nativew3dsampledtexture.h"
 #include "Renderer/NativeW3DResources.h"
 #include "Lib/JobSystem.h"
@@ -334,8 +335,7 @@ static TextureLoadTaskListClass _ResourceQueue;
 static bool _ResourcePipelineStarted = false;
 static rts::JobMetricCounter _ResourceOwnerFallbacks = 0;
 static TexturePrepareMemoryBudget _TexturePrepareMemoryBudget(64u * 1024u * 1024u);
-static const unsigned long _TextureForegroundSliceMilliseconds = 4;
-static const unsigned _TextureForegroundMaximumTasksPerUpdate = 8;
+static bool _TextureForegroundNext = false;
 
 static void Record_Texture_Reference_Fallback()
 {
@@ -384,6 +384,7 @@ static bool Is_Format_Compressed(WW3DFormat texture_format, bool allow_compressi
 void TextureLoader::Init()
 {
 	_TextureOwnerThreadID = ThreadClass::_Get_Current_Thread_ID();
+	_TextureForegroundNext = false;
 	ThumbnailManagerClass::Init();
 
 	rts::JobSystem &system = rts::JobSystem::instance();
@@ -743,15 +744,28 @@ void TextureLoader::Update(void (*network_callback)())
 	FastCriticalSectionClass::LockClass lock(_ForegroundCriticalSection);
 
 	unsigned long time = timeGetTime();
-	Pump_Resource_Loads();
-	const unsigned long budgetStart = time;
-	unsigned processedTaskCount = 0;
+	TextureLoadUpdateBudget budget(time, _TextureForegroundNext);
+	// IO/decode admission and model retirement must run even when owner
+	// publication consumes the slice. Explicit wait/drain callers retain the
+	// untimed resource-publication batches in Pump_Resource_Loads().
+	Pump_Resource_Loads(false);
 
-	// Bound low-priority file reads, staging, and uploads so first-use texture
-	// bursts do not consume an entire rendered frame. Flush and Deinit retain
-	// their explicit drain semantics by invoking Update repeatedly or bypassing
-	// this loop.
-	while (TextureLoadTaskClass *task = _ForegroundQueue.Pop_Front()) {
+	// Share one budget across the two independent queues. Alternate eligible
+	// tasks without changing either queue's existing FIFO/priority ordering.
+	for (;;) {
+		TextureLoadTaskClass *resourceTask = _ResourceQueue.Peek_Front();
+		const bool resourceReady = resourceTask != nullptr &&
+			_TextureResourcePipeline.isComplete(*static_cast<rts::ResourceIoTicket*>(resourceTask->ResourceRequest));
+		const TextureLoadUpdateBudget::Queue queue = budget.Next(resourceReady,
+			!_ForegroundQueue.Is_Empty(), timeGetTime());
+		if (queue == TextureLoadUpdateBudget::NONE) break;
+		if (queue == TextureLoadUpdateBudget::RESOURCE)
+		{
+			Process_Resource_Load(resourceTask);
+			continue;
+		}
+		TextureLoadTaskClass *task = _ForegroundQueue.Pop_Front();
+		if (task == nullptr) continue;
 		UPDATE_NETWORK;
 		// dispatch to proper task handler
 		switch (task->Get_Type()) {
@@ -762,11 +776,6 @@ void TextureLoader::Update(void (*network_callback)())
 			case TextureLoadTaskClass::TASK_LOAD:
 				Process_Foreground_Load(task);
 				break;
-		}
-		++processedTaskCount;
-		if (processedTaskCount >= _TextureForegroundMaximumTasksPerUpdate ||
-			timeGetTime() - budgetStart >= _TextureForegroundSliceMilliseconds) {
-			break;
 		}
 	}
 
@@ -1848,24 +1857,31 @@ void TextureLoadTaskClass::Cancel_Resource_Read()
 	LoadSucceeded = false;
 }
 
-void TextureLoader::Pump_Resource_Loads()
+void TextureLoader::Process_Resource_Load(TextureLoadTaskClass *task)
+{
+	_ResourceQueue.Remove(task);
+	if (task->Complete_Resource_Read())
+	{
+		// Immediate owner publication consumes the result before admitting
+		// more decoded output, keeping the retained-byte bound meaningful.
+		task->End_Load();
+		task->Destroy();
+	}
+}
+
+void TextureLoader::Pump_Resource_Loads(bool publish)
 {
 	_TextureResourcePipeline.pump();
 	_ModelResourceQueue.pump(_TextureResourcePipeline);
-	unsigned count = 0;
+	if (!publish) return;
+	bool foregroundNext = false;
+	TextureLoadUpdateBudget budget(0, foregroundNext, false);
 	while (TextureLoadTaskClass *task = _ResourceQueue.Peek_Front())
 	{
 		const rts::ResourceIoTicket ticket = *static_cast<rts::ResourceIoTicket*>(task->ResourceRequest);
 		if (!_TextureResourcePipeline.isComplete(ticket)) break;
-		_ResourceQueue.Remove(task);
-		if (task->Complete_Resource_Read())
-		{
-			// Immediate owner publication consumes the result before admitting
-			// more decoded output, keeping the retained-byte bound meaningful.
-			task->End_Load();
-			task->Destroy();
-		}
-		if (++count >= _TextureForegroundMaximumTasksPerUpdate) break;
+		if (budget.Next(true, false, 0) == TextureLoadUpdateBudget::NONE) break;
+		Process_Resource_Load(task);
 	}
 }
 

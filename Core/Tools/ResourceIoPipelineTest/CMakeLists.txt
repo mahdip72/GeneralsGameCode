@@ -14,6 +14,9 @@ endif()
 add_test(NAME core_resource_io_pipeline_tests COMMAND core_resource_io_pipeline_tests
     --local-capacity)
 set_tests_properties(core_resource_io_pipeline_tests PROPERTIES TIMEOUT 30)
+add_test(NAME core_texture_load_update_budget_tests COMMAND core_resource_io_pipeline_tests
+    --texture-load-budget)
+set_tests_properties(core_texture_load_update_budget_tests PROPERTIES TIMEOUT 30)
 
 if(WIN32)
     # Decode both actual title DDS implementations plus shared Targa/mip code.

@@ -115,7 +115,8 @@ public:
 
 private:
 	friend class TextureLoadTaskClass;
-	static void Pump_Resource_Loads();
+	static void Pump_Resource_Loads(bool publish = true);
+	static void Process_Resource_Load(TextureLoadTaskClass *task);
 	static void Process_Foreground_Load			(TextureLoadTaskClass *task);
 	static void Process_Foreground_Thumbnail	(TextureLoadTaskClass *task);
 
