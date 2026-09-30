@@ -6,6 +6,8 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$script:Stage5ReplayTimeoutExpression = `
+    '${{ inputs.stage5 && 240 || (inputs.preset == ''vc6-releaselog+t+e'' && 75 || 15) }}'
 
 function Assert-Stage5WorkflowCondition {
     param([bool]$Condition, [string]$Message)
@@ -1196,7 +1198,7 @@ function Assert-Stage5CheckReplaysContract {
     Assert-Stage5ExactJobSchema $job ([ordered]@{
             name = '${{ inputs.preset }}'
             'runs-on' = 'windows-2022'
-            'timeout-minutes' = '240'
+            'timeout-minutes' = $script:Stage5ReplayTimeoutExpression
             steps = ''
         }) "$Context exact reusable job schema"
     Assert-Stage5ExactJobStepSequence $job @(
@@ -1468,6 +1470,12 @@ function Invoke-Stage5CheckReplaysContractSelfTest {
     Assert-Stage5CheckReplaysContract $fixture `
         'self-test reusable Stage 5 replay workflow fixture'
 
+    $timeoutLine = '    timeout-minutes: ' + $script:Stage5ReplayTimeoutExpression
+    $stage5TimeoutExpression = `
+        '${{ inputs.stage5 && 15 || (inputs.preset == ''vc6-releaselog+t+e'' && 75 || 15) }}'
+    $vc6TimeoutExpression = `
+        '${{ inputs.stage5 && 240 || (inputs.preset == ''vc6-releaselog+t+e'' && 15 || 15) }}'
+
     $swap = $fixture.Replace(
         '      - name: Checkout Code',
         '      - name: __STAGE5_SWAP__').Replace(
@@ -1494,8 +1502,11 @@ function Invoke-Stage5CheckReplaysContractSelfTest {
                 '            -EnforcePerformance `'))
         swap = $swap
         duplicate = $fixture.Replace(
-            '    timeout-minutes: 240',
-            "    timeout-minutes: 240`n    timeout-minutes: 240")
+            $timeoutLine, ($timeoutLine + "`n" + $timeoutLine))
+        'stage5-timeout-branch' = $fixture.Replace(
+            $script:Stage5ReplayTimeoutExpression, $stage5TimeoutExpression)
+        'vc6-timeout-branch' = $fixture.Replace(
+            $script:Stage5ReplayTimeoutExpression, $vc6TimeoutExpression)
         'duplicate-job' = $fixture.Replace(
             '  build:', "  build:`n  build:")
         'action-input-order' = $fixture.Replace(
@@ -4164,7 +4175,9 @@ Assert-Stage5WorkflowContains $stage5Input 'required:\s*true' `
     'reusable Stage 5 required input'
 Assert-Stage5WorkflowNotContains $stage5Input 'default:' `
     'reusable Stage 5 required input'
-Assert-Stage5WorkflowContains $check '(?m)^\s*timeout-minutes:\s*240\s*$' `
+Assert-Stage5WorkflowContains $check `
+    ('(?m)^\s*timeout-minutes:\s*' +
+        [regex]::Escape($script:Stage5ReplayTimeoutExpression) + '\s*$') `
     'reusable Stage 5 timeout'
 foreach ($retiredReplayMarker in @(
     '!inputs.stage5',
