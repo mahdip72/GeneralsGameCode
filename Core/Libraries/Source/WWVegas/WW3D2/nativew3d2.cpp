@@ -2120,6 +2120,13 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		if (!m_gameVertexBound || !m_gameIndexBound ||
 			command.value3 == 0U)
 		{
+			// Paired CPU sorting buffers are retained bindings. Procedural
+			// triangle passes draw them immediately, not via the sorting queue.
+			if (command.type == GAME_RENDER_COMMAND_DRAW_TRIANGLES &&
+				command.value3 != 0U &&
+				!m_gameVertexBound && !m_gameIndexBound &&
+				!m_gameSortedVertexBytes.empty() && !m_gameSortedIndexBytes.empty())
+				goto draw_cpu_sorting_buffers;
 			LegacyLogicalState trackedState;
 			const int trackedStateAvailable =
 				GetTrackedLegacyLogicalState(&trackedState) ? 1 : 0;
@@ -2211,6 +2218,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		}
 
 	case GAME_RENDER_COMMAND_DRAW_SORTED_TRIANGLES:
+	draw_cpu_sorting_buffers:
 		if (m_gameSortedVertexBytes.empty() || m_gameSortedIndexBytes.empty() ||
 			command.value1 == 0U || command.value2 > 65535U ||
 			command.value3 == 0U || command.value3 > 65535U ||
@@ -2291,6 +2299,46 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
 				++stage)
 				packet.textures[stage] = m_gameTextures[stage];
+			if (command.type == GAME_RENDER_COMMAND_DRAW_TRIANGLES)
+			{
+				std::vector<unsigned short> rebasedIndices;
+				try
+				{
+					rebasedIndices.resize(indexCountSize);
+				}
+				catch (const std::bad_alloc &)
+				{
+					RecordGameFailure(RENDER_RESULT_OUT_OF_MEMORY);
+					return RENDER_RESULT_OUT_OF_MEMORY;
+				}
+				const unsigned char *sourceIndices = m_gameSortedIndexBytes.data() +
+					static_cast<size_t>(relativeIndexStart) * sizeof(unsigned short);
+				for (size_t index = 0; index < indexCountSize; ++index)
+				{
+					unsigned short sourceIndex = 0;
+					memcpy(&sourceIndex, sourceIndices + index * sizeof(sourceIndex),
+						sizeof(sourceIndex));
+					if (sourceIndex < command.value2 ||
+						static_cast<unsigned int>(sourceIndex) - command.value2 >= command.value3)
+						goto invalid_command;
+					rebasedIndices[index] = static_cast<unsigned short>(
+						static_cast<unsigned int>(sourceIndex) - command.value2);
+				}
+				packet.startIndex = 0;
+				packet.minimumVertexIndex = 0;
+				NativeSortedDraw draw;
+				draw.state = state;
+				draw.packet = packet;
+				unsigned int submittedDraws = 0;
+				const RenderResult result = SubmitNativeSortedBatch(&draw, 1,
+					m_gameSortedVertexBytes.data() + vertexByteOffset,
+					static_cast<size_t>(command.value3) * m_gameVertexStride,
+					rebasedIndices.data(), indexCountSize * sizeof(unsigned short),
+					&submittedDraws);
+				if (result != RENDER_RESULT_OK)
+					RecordGameFailure(result);
+				return result;
+			}
 			const RenderResult result = QueueGameSortedTriangles(state, packet,
 				m_gameSortedVertexBytes.data() + vertexByteOffset,
 				static_cast<size_t>(command.value3) * m_gameVertexStride,
