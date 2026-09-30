@@ -311,6 +311,81 @@ int main()
 		}
 		atlas->Release_Ref();
 	}
+	{
+		// A SurfaceClass keeps its original pixel geometry and format. Reusing the
+		// same TextureClass for a compatible-pitch replacement must not let that
+		// old view reinterpret the replacement's CPU bytes as its old format.
+		TextureClass *replaced = new TextureClass(64, 32, WW3D_FORMAT_U8V8,
+			MIP_LEVELS_1, TextureBaseClass::POOL_DEFAULT, false, false, false);
+		TextureDescriptor oldDescriptor;
+		oldDescriptor.width = 64;
+		oldDescriptor.height = 32;
+		oldDescriptor.mipCount = 1;
+		oldDescriptor.arrayCount = 1;
+		oldDescriptor.dimension = RENDER_TEXTURE_2D;
+		oldDescriptor.format = RENDER_FORMAT_R8G8_SNORM;
+		oldDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+		oldDescriptor.usage = RENDER_USAGE_DEFAULT;
+		unsigned char oldPixels[64 * 32 * 2];
+		std::memset(oldPixels, 0x18, sizeof(oldPixels));
+		TextureSubresourceData oldSubresource;
+		oldSubresource.data = oldPixels;
+		oldSubresource.rowPitch = 64 * 2;
+		oldSubresource.slicePitch = sizeof(oldPixels);
+		const bool oldTexturePublished = replaced != nullptr &&
+			replaced->Apply_Native_Texture(oldDescriptor, &oldSubresource, 1,
+				WW3D_FORMAT_U8V8, true);
+		SurfaceClass *oldView = oldTexturePublished ?
+			replaced->Get_Surface_Level(0) : nullptr;
+		SurfaceClass::SurfaceDescription oldDescription;
+		if (oldView != nullptr) oldView->Get_Description(oldDescription);
+		int oldPitch = -1;
+		unsigned char *oldViewPixels = oldView == nullptr ? nullptr :
+			static_cast<unsigned char *>(oldView->Lock(&oldPitch));
+		const bool oldViewWasUsable = oldViewPixels != nullptr &&
+			oldPitch == 64 * 2 && oldDescription.Width == 64 &&
+			oldDescription.Height == 32 &&
+			oldDescription.Format == WW3D_FORMAT_U8V8;
+		if (oldViewPixels != nullptr) oldView->Unlock_Read_Only();
+
+		TextureDescriptor newDescriptor = oldDescriptor;
+		newDescriptor.width = 32;
+		newDescriptor.height = 32;
+		newDescriptor.format = RENDER_FORMAT_B8G8R8A8_UNORM;
+		unsigned char newPixels[32 * 32 * 4];
+		std::memset(newPixels, 0x6d, sizeof(newPixels));
+		TextureSubresourceData newSubresource;
+		newSubresource.data = newPixels;
+		newSubresource.rowPitch = 32 * 4;
+		newSubresource.slicePitch = sizeof(newPixels);
+		const bool replacementPublished = oldViewWasUsable &&
+			replaced->Apply_Native_Texture(newDescriptor, &newSubresource, 1,
+				WW3D_FORMAT_A8R8G8B8, true);
+		int stalePitch = -1;
+		unsigned char *stalePixels = oldView == nullptr ? nullptr :
+			static_cast<unsigned char *>(oldView->Lock(&stalePitch));
+		if (stalePixels != nullptr) oldView->Unlock_Read_Only();
+		SurfaceClass *freshView = replacementPublished ?
+			replaced->Get_Surface_Level(0) : nullptr;
+		SurfaceClass::SurfaceDescription freshDescription;
+		if (freshView != nullptr) freshView->Get_Description(freshDescription);
+		int freshPitch = -1;
+		unsigned char *freshPixels = freshView == nullptr ? nullptr :
+			static_cast<unsigned char *>(freshView->Lock(&freshPitch));
+		const bool freshViewMatchesReplacement = freshPixels != nullptr &&
+			freshPitch == 32 * 4 && freshDescription.Width == 32 &&
+			freshDescription.Height == 32 &&
+			freshDescription.Format == WW3D_FORMAT_A8R8G8B8 &&
+			freshPixels[0] == 0x6d;
+		if (freshPixels != nullptr) freshView->Unlock_Read_Only();
+		result |= Check(oldTexturePublished && oldViewWasUsable &&
+			replacementPublished && stalePixels == nullptr && stalePitch == -1 &&
+			freshViewMatchesReplacement,
+			"a retained view rejects compatible-pitch texture replacement while a fresh view uses its new format and geometry");
+		if (freshView != nullptr) freshView->Release_Ref();
+		if (oldView != nullptr) oldView->Release_Ref();
+		if (replaced != nullptr) replaced->Release_Ref();
+	}
 
 	TextureClass *target = new TextureClass(64, 32, WW3D_FORMAT_A8R8G8B8,
 		MIP_LEVELS_1, TextureClass::POOL_DEFAULT, true);
