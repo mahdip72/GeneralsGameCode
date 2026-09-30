@@ -206,9 +206,11 @@ void enabled(const std::string& directory, __int64 frequency)
 void clientDisplayPhases(const std::string& directory)
 {
 	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
-	rts::frame_timing::Capture capture;
+	rts::frame_timing::Capture& capture = rts::frame_timing::Capture::instance();
+	check(!rts::frame_timing::IsActive(), "published singleton is inactive before its frame");
 	capture.beginSession("headless");
 	capture.beginFrame(0);
+	check(rts::frame_timing::IsActive(), "producer frame activates the published singleton gate");
 	const rts::frame_timing::Phase phases[] = {
 		rts::frame_timing::ClientDrawables, rts::frame_timing::ClientTerrainVisual,
 		rts::frame_timing::ClientDisplayUpdate, rts::frame_timing::ClientDisplayDraw,
@@ -231,7 +233,7 @@ void clientDisplayPhases(const std::string& directory)
 		check(diagnosticClockCalls == before,
 			"false gate makes no clock query even inside an active capture");
 		{
-			rts::frame_timing::ConditionalScope active(capture, phases[phase], true);
+			rts::frame_timing::ConditionalScope active(phases[phase], true);
 			active.finish();
 			active.finish();
 		}
@@ -239,6 +241,7 @@ void clientDisplayPhases(const std::string& directory)
 			"conditional phase begins and finishes once despite explicit finish and destructor");
 	}
 	capture.endFrame(900);
+	check(!rts::frame_timing::IsActive(), "ending the producer frame clears the singleton gate");
 	capture.endSession();
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
 	check(final.complete, "client/display subphases retain complete frame evidence");
