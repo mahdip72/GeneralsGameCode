@@ -150,6 +150,19 @@ add_test(NAME core_renderer_contract_tests
 )
 set_tests_properties(core_renderer_contract_tests PROPERTIES TIMEOUT 30)
 
+if(WIN32 AND NOT IS_VS6_BUILD)
+    # Exercise the actual backend without pulling the WW3D library into this
+    # focused validation/performance fixture.
+    add_executable(core_d3d11_index_validation_tests
+        D3D11IndexedValidationTest.cpp)
+    target_link_libraries(core_d3d11_index_validation_tests PRIVATE core_renderer)
+    set_target_properties(core_d3d11_index_validation_tests PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME core_d3d11_index_validation_tests
+        COMMAND core_d3d11_index_validation_tests)
+    set_tests_properties(core_d3d11_index_validation_tests PROPERTIES TIMEOUT 30)
+endif()
+
 add_test(NAME core_w3d_video_buffer_format_selection_tests
     COMMAND core_renderer_contract_tests --w3d-video-buffer-format-selection
 )

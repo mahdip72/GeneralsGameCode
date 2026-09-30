@@ -6,6 +6,7 @@
 #include <dxgi1_2.h>
 
 #include "D3D11ResultTranslation.h"
+#include "IndexedDrawValidationCache.h"
 #include "LegacyFixedFunctionPS.h"
 #include "LegacyFixedFunctionVS.h"
 #include "LegacyWaterFlatPS.h"
@@ -82,18 +83,17 @@ struct BufferByteRange
 bool IsBufferRangeInitialized(const std::vector<BufferByteRange> &ranges,
 	size_t begin, size_t end)
 {
-	for (size_t index = 0; index < ranges.size(); ++index)
+	// ApplyBufferRangeUpdate keeps sorted, disjoint intervals and merges
+	// touching writes. Find the last interval whose beginning is <= begin.
+	size_t first = 0;
+	size_t last = ranges.size();
+	while (first < last)
 	{
-		if (ranges[index].begin <= begin && ranges[index].end >= end)
-		{
-			return true;
-		}
-		if (ranges[index].begin > begin)
-		{
-			return false;
-		}
+		const size_t middle = first + (last - first) / 2;
+		if (ranges[middle].begin <= begin) first = middle + 1;
+		else last = middle;
 	}
-	return false;
+	return first != 0 && ranges[first - 1].end >= end;
 }
 
 bool PrepareBufferRangeUpdate(std::vector<BufferByteRange> *ranges,
@@ -512,7 +512,7 @@ struct ResourceSlot
 	ResourceSlot() : resource(0), view(0), renderTarget(0), depthStencil(0),
 		kind(RESOURCE_NONE),
 		usage(RENDER_USAGE_DEFAULT), binding(0), byteCount(0),
-		gpuAuthoritative(false), bufferContentValid(false)
+		gpuAuthoritative(false), bufferContentValid(false), bufferContentVersion(0)
 	{
 	}
 
@@ -531,6 +531,7 @@ struct ResourceSlot
 	// Buffer descriptors survive recovery, but their bytes do not. Consumers
 	// must republish before a recovered buffer can be rebound.
 	bool bufferContentValid;
+	unsigned int bufferContentVersion;
 	BufferDescriptor bufferDescriptor;
 	TextureDescriptor textureDescriptor;
 	// Immutable buffers cannot be republished through updateBufferResource.
@@ -899,6 +900,7 @@ public:
 			return RENDER_RESULT_OUT_OF_MEMORY;
 		}
 		ResourceSlot &slot = m_resources[handle.index()];
+		m_indexedDrawValidation.clear();
 		slot.resource = nativeBuffer;
 		slot.kind = RESOURCE_BUFFER;
 		slot.usage = descriptor.usage;
@@ -1515,6 +1517,7 @@ public:
 		}
 		m_parameters.width = m_width;
 		m_parameters.height = m_height;
+		m_indexedDrawValidation.clear();
 		m_activeRenderTarget = 0;
 		m_activeDepthStencil = 0;
 		m_activeColorResource = 0;
@@ -1973,6 +1976,11 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		const bool fullWrite = destinationOffset == 0 && byteCount == slot.byteCount;
+		if (slot.usage == RENDER_USAGE_DYNAMIC &&
+			mode == RENDER_BUFFER_UPDATE_PRESERVE && !fullWrite &&
+			(slot.binding & (RENDER_BUFFER_VERTEX | RENDER_BUFFER_INDEX)) == 0)
+			return RENDER_RESULT_UNSUPPORTED;
 		const size_t destinationEnd = destinationOffset + byteCount;
 		if (!PrepareBufferRangeUpdate(&slot.initializedBufferRanges,
 			destinationOffset, destinationEnd,
@@ -1984,6 +1992,9 @@ public:
 			(slot.binding & RENDER_BUFFER_INDEX) != 0 ||
 			(slot.usage == RENDER_USAGE_DYNAMIC &&
 			 (slot.binding & (RENDER_BUFFER_VERTEX | RENDER_BUFFER_INDEX)) != 0);
+		// Invalidate before image allocation or a driver call can change bytes.
+		// Even a failed accepted upload must not reuse an earlier proof.
+		advanceBufferContentVersion(slot);
 		if (maintainImage && slot.bufferImage.size() != slot.byteCount)
 		{
 			try
@@ -1998,13 +2009,6 @@ public:
 		if (slot.usage == RENDER_USAGE_DYNAMIC)
 		{
 			D3D11_MAPPED_SUBRESOURCE mapped;
-			const bool fullWrite = destinationOffset == 0 &&
-				byteCount == slot.byteCount;
-			if (mode == RENDER_BUFFER_UPDATE_PRESERVE && !fullWrite &&
-				(slot.binding & (RENDER_BUFFER_VERTEX | RENDER_BUFFER_INDEX)) == 0)
-			{
-				return RENDER_RESULT_UNSUPPORTED;
-			}
 			// NO_OVERWRITE is the only operation that promises the written range
 			// does not overlap queued GPU reads. PRESERVE must use a fresh backing
 			// allocation and republish the CPU image; it cannot assume a fence.
@@ -2019,6 +2023,8 @@ public:
 			if (mapped.pData == 0)
 			{
 				m_context->Unmap(slot.resource, 0);
+				slot.bufferContentValid = false;
+				slot.initializedBufferRanges.clear();
 				return RENDER_RESULT_FAILED;
 			}
 			if (mode == RENDER_BUFFER_UPDATE_PRESERVE && !fullWrite)
@@ -3078,11 +3084,15 @@ public:
 	{
 		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
 			!m_vertexBufferBound || !m_indexBufferBound ||
+			!m_handles->isLive(m_boundVertexBuffer) ||
 			!m_handles->isLive(m_boundIndexBuffer))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		const ResourceSlot &indexSlot = m_resources[m_boundIndexBuffer.index()];
+		const ResourceSlot &vertexSlot = m_resources[m_boundVertexBuffer.index()];
+		if (!indexSlot.bufferContentValid || !vertexSlot.bufferContentValid)
+			return RENDER_RESULT_INVALID_ARGUMENT;
 		const unsigned int indexSize = m_boundIndexFormat ==
 			RENDER_FORMAT_R16_UINT ? 2U : (m_boundIndexFormat ==
 			RENDER_FORMAT_R32_UINT ? 4U : 0U);
@@ -3100,10 +3110,18 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		const ResourceSlot &vertexSlot =
-			m_resources[m_boundVertexBuffer.index()];
-		if (!IsBufferRangeInitialized(vertexSlot.initializedBufferRanges,
-			m_boundVertexOffset, vertexSlot.byteCount))
+		detail::IndexedDrawValidationKey validationKey;
+		validationKey.vertexBuffer = m_boundVertexBuffer;
+		validationKey.indexBuffer = m_boundIndexBuffer;
+		validationKey.vertexVersion = vertexSlot.bufferContentVersion;
+		validationKey.indexVersion = indexSlot.bufferContentVersion;
+		validationKey.vertexOffset = m_boundVertexOffset;
+		validationKey.vertexStride = m_boundVertexStride;
+		validationKey.firstIndexByte = firstIndexByte;
+		validationKey.indexSize = indexSize;
+		validationKey.indexCount = indexCount;
+		validationKey.baseVertex = baseVertex;
+		if (!m_indexedDrawValidation.contains(validationKey))
 		{
 			const std::vector<unsigned char> *indexBytes =
 				indexSlot.usage == RENDER_USAGE_IMMUTABLE ?
@@ -3193,6 +3211,7 @@ public:
 					return RENDER_RESULT_INVALID_ARGUMENT;
 				}
 			}
+			m_indexedDrawValidation.store(validationKey);
 		}
 		const RenderResult transformResult = refreshTransformConstantsForDraw();
 		if (transformResult != RENDER_RESULT_OK)
@@ -3947,6 +3966,13 @@ private:
 	{
 		(void)rebindTextureResource(texture, affectedStages);
 		return failure;
+	}
+
+	void advanceBufferContentVersion(ResourceSlot &slot)
+	{
+		++slot.bufferContentVersion;
+		if (slot.bufferContentVersion == 0)
+			m_indexedDrawValidation.clear();
 	}
 
 	static bool isElementRangeWithinBuffer(size_t byteCapacity,
@@ -5825,6 +5851,7 @@ private:
 
 	bool releaseSlot(GpuHandle handle, ResourceSlot &slot)
 	{
+		if (slot.kind == RESOURCE_BUFFER) m_indexedDrawValidation.clear();
 		if (slot.depthStencil != 0)
 		{
 			slot.depthStencil->Release();
@@ -6148,6 +6175,7 @@ private:
 	unsigned int m_faultCountdown;
 	RenderResult m_faultResult;
 	std::vector<ResourceSlot> m_resources;
+	detail::IndexedDrawValidationCache m_indexedDrawValidation;
 	std::vector<BlendStateEntry> m_blendStates;
 	std::vector<DepthStencilStateEntry> m_depthStates;
 	std::vector<RasterizerStateEntry> m_rasterizerStates;
