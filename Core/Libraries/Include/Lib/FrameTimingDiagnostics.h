@@ -23,6 +23,7 @@ enum Phase
 	HeightMapRender, NativeRigidBatchRender, WaterRender,
 	SceneObjectSubmit, SceneShadowPrepare, SceneShadowRender, SceneTrees,
 	SceneParticleSubmit, SceneOcclusion, SceneTranslucent,
+	SceneFlush, SceneMeshFlush, SceneStaticSort,
 	PhaseCount
 };
 
@@ -366,7 +367,8 @@ private:
 			"height_map_render", "native_rigid_batch_render", "water_render",
 			"scene_object_submit", "scene_shadow_prepare", "scene_shadow_render",
 			"scene_trees", "scene_particle_submit", "scene_occlusion",
-			"scene_translucent"
+			"scene_translucent", "scene_flush", "scene_mesh_flush",
+			"scene_static_sort"
 		};
 		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)

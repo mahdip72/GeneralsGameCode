@@ -228,7 +228,8 @@ void clientDisplayPhases(const std::string& directory)
 		rts::frame_timing::SceneObjectSubmit, rts::frame_timing::SceneShadowPrepare,
 		rts::frame_timing::SceneShadowRender, rts::frame_timing::SceneTrees,
 		rts::frame_timing::SceneParticleSubmit, rts::frame_timing::SceneOcclusion,
-		rts::frame_timing::SceneTranslucent
+		rts::frame_timing::SceneTranslucent, rts::frame_timing::SceneFlush,
+		rts::frame_timing::SceneMeshFlush, rts::frame_timing::SceneStaticSort
 	};
 	const char *names[] = {
 		"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
@@ -238,7 +239,7 @@ void clientDisplayPhases(const std::string& directory)
 		"height_map_render", "native_rigid_batch_render", "water_render",
 		"scene_object_submit", "scene_shadow_prepare", "scene_shadow_render",
 		"scene_trees", "scene_particle_submit", "scene_occlusion",
-		"scene_translucent"
+		"scene_translucent", "scene_flush", "scene_mesh_flush", "scene_static_sort"
 	};
 	for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 	{
@@ -263,8 +264,8 @@ void clientDisplayPhases(const std::string& directory)
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
 	check(final.complete, "child diagnostic phases retain complete frame evidence");
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 26, "frame plus all twenty-five child diagnostic phases are emitted");
-	if (data.size() == 26)
+	check(data.size() == 29, "frame plus all twenty-eight child diagnostic phases are emitted");
+	if (data.size() == 29)
 	{
 		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&

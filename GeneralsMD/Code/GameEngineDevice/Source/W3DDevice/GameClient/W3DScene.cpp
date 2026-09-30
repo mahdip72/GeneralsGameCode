@@ -1005,6 +1005,8 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 void RTS3DScene::Flush(RenderInfoClass & rinfo)
 {
 	const bool frameTimingActive = rts::frame_timing::IsActive();
+	rts::frame_timing::ConditionalScope frameTimingScope(
+		rts::frame_timing::SceneFlush, frameTimingActive);
 	// TheSuperHackers @bugfix Now always prepares shadows to guarantee correct state before doing any
 	// shadow draw calls. Originally just drawing shadows for trees would not properly prepare shadows.
 	{
@@ -1021,7 +1023,11 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 		DoShadows(rinfo, false);	//draw all non-stencil shadows (decals) since they fall under other objects.
 	}
 
-	rts::render::FlushGameRenderMeshes();	//draw all non-translucent objects.
+	{
+		rts::frame_timing::ConditionalScope timing(
+			rts::frame_timing::SceneMeshFlush, frameTimingActive);
+		rts::render::FlushGameRenderMeshes();	//draw all non-translucent objects.
+	}
 
 	//draw all non-translucent objects which were separated because they are hidden and need custom rendering.
 	{
@@ -1053,7 +1059,11 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 		DoShadows(rinfo, true);	//draw all stencil shadows
 	}
 
-	WW3D::Render_And_Clear_Static_Sort_Lists(rinfo);	//draws things like water
+	{
+		rts::frame_timing::ConditionalScope timing(
+			rts::frame_timing::SceneStaticSort, frameTimingActive);
+		WW3D::Render_And_Clear_Static_Sort_Lists(rinfo);	//draws things like water
+	}
 
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 	{
