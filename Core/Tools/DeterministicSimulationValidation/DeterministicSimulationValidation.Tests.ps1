@@ -2886,7 +2886,8 @@ function Assert-CurrentNativeReceiptCatalog {
     }
     $parserCommand = ''
     foreach ($name in @('Get-Sha256Bytes','Get-Stage5FileSnapshot','ConvertTo-OutputRelativePath',
-        'Assert-ContainedPathNoReparse')) {
+        'Assert-ContainedPathNoReparse','ConvertTo-ProcessArgumentString',
+        'Assert-Stage5NativeCommandLineMatchesPlan')) {
         $definition = $runnerTree.Find({param($node)
             $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $name
         }, $true)
