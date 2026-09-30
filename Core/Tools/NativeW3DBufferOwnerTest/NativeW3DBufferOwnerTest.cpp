@@ -464,29 +464,33 @@ int RunDynamicBufferPoolWrapContract(FakeRenderDevice &device)
 	{
 		DynamicVBAccessClass maximum(BUFFER_TYPE_DYNAMIC_DX8,
 			dynamic_fvf_type, maxCount);
-		const size_t byteCount = static_cast<size_t>(maxCount) *
-			maximum.FVF_Info().Get_FVF_Size();
-		const std::vector<unsigned char> expectedBytes(byteCount, 0x5a);
-		result |= Check(maximum.Is_Valid() &&
+		const bool maximumAllocationValid = maximum.Is_Valid() &&
 			maximum.Get_Vertex_Count() == maxCount &&
-			maximum.Get_Vertex_Buffer_Offset() == 0,
+			maximum.Get_Vertex_Buffer_Offset() == 0;
+		result |= Check(maximumAllocationValid,
 			"maximum vertex allocation grows and wraps to offset zero");
-		DynamicVBAccessClass::WriteLockClass lock(&maximum);
-		VertexFormatXYZNDUV2 *vertices = lock.Get_Formatted_Vertex_Array();
-		result |= Check(lock.Is_Locked() && vertices != nullptr,
-			"maximum vertex allocation exposes its full write range");
-		if (vertices != nullptr)
-			std::memset(vertices, 0x5a, byteCount);
-		const bool published = lock.Commit();
-		result |= Check(published && device.LastOffset() == 0 &&
-			device.LastBytes() == byteCount &&
-			device.LastMode() == RENDER_BUFFER_UPDATE_DISCARD,
-			"maximum vertex wrap publishes the exact range with zero-offset discard");
-		GpuHandle handle;
-		const bool acquired = maximum.Acquire_Native_Vertex_Buffer(&handle);
-		result |= Check(acquired && device.BufferEquals(handle,
-			expectedBytes.data(), expectedBytes.size()),
-			"maximum vertex wrap initializes exactly the requested vertex range");
+		if (maximumAllocationValid)
+		{
+			const size_t byteCount = static_cast<size_t>(maxCount) *
+				maximum.FVF_Info().Get_FVF_Size();
+			const std::vector<unsigned char> expectedBytes(byteCount, 0x5a);
+			DynamicVBAccessClass::WriteLockClass lock(&maximum);
+			VertexFormatXYZNDUV2 *vertices = lock.Get_Formatted_Vertex_Array();
+			result |= Check(lock.Is_Locked() && vertices != nullptr,
+				"maximum vertex allocation exposes its full write range");
+			if (vertices != nullptr)
+				std::memset(vertices, 0x5a, byteCount);
+			const bool published = lock.Commit();
+			result |= Check(published && device.LastOffset() == 0 &&
+				device.LastBytes() == byteCount &&
+				device.LastMode() == RENDER_BUFFER_UPDATE_DISCARD,
+				"maximum vertex wrap publishes the exact range with zero-offset discard");
+			GpuHandle handle;
+			const bool acquired = maximum.Acquire_Native_Vertex_Buffer(&handle);
+			result |= Check(acquired && device.BufferEquals(handle,
+				expectedBytes.data(), expectedBytes.size()),
+				"maximum vertex wrap initializes exactly the requested vertex range");
+		}
 	}
 	DynamicVBAccessClass::_Deinit();
 	{
