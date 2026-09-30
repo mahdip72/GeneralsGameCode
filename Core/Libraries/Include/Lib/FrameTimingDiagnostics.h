@@ -21,6 +21,8 @@ enum Phase
 	RenderProducerWait,
 	ViewScene3D, ViewScene2D, NativeSortingFlush, NativeSkinRender,
 	HeightMapRender, NativeRigidBatchRender, WaterRender,
+	SceneObjectSubmit, SceneShadowPrepare, SceneShadowRender, SceneTrees,
+	SceneParticleSubmit, SceneOcclusion, SceneTranslucent,
 	PhaseCount
 };
 
@@ -361,7 +363,10 @@ private:
 			"display_main_render", "display_end_render",
 			"render_producer_wait",
 			"view_scene_3d", "view_scene_2d", "native_sorting_flush", "native_skin_render",
-			"height_map_render", "native_rigid_batch_render", "water_render"
+			"height_map_render", "native_rigid_batch_render", "water_render",
+			"scene_object_submit", "scene_shadow_prepare", "scene_shadow_render",
+			"scene_trees", "scene_particle_submit", "scene_occlusion",
+			"scene_translucent"
 		};
 		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)
