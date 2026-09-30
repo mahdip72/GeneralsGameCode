@@ -765,6 +765,95 @@ int TestThreadedResourceCompletion()
 		resources.AcquireVertexBufferRange(buffer, sizeof(unsigned int), 0,
 			0, 4, &validated) == RENDER_RESULT_OK && validated == buffer,
 		"later full buffer upload republishes CPU authority after failed B");
+	const long updateCallsBeforePartialRecovery = ReadCount(&control.updateCalls);
+	InterlockedExchange(&control.failUpdateOnCall,
+		updateCallsBeforePartialRecovery + 1);
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes) / 2, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes) / 2, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_FAILED &&
+		ReadCount(&control.updateCalls) == updateCallsBeforePartialRecovery + 2,
+		"queued partial DISCARD executes after an earlier upload failure");
+	ThreadedRenderFrameCompletion failedBeforePartialCompletion;
+	ThreadedRenderFrameCompletion partialRecoveryCompletion;
+	result |= Check(PollThreadedRenderCompletion(device,
+		&failedBeforePartialCompletion) &&
+		PollThreadedRenderCompletion(device, &partialRecoveryCompletion) &&
+		failedBeforePartialCompletion.resourceFailure &&
+		partialRecoveryCompletion.result == RENDER_RESULT_OK &&
+		!partialRecoveryCompletion.resourceFailure &&
+		failedBeforePartialCompletion.sequence < partialRecoveryCompletion.sequence &&
+		resources.PublishThreadedCompletion(
+			failedBeforePartialCompletion.sequence, true) == RENDER_RESULT_OK &&
+		resources.HasBufferAuthorityFailure(buffer) &&
+		resources.DescribeBuffer(buffer, &bufferDescription) == RENDER_RESULT_OK,
+		"failed buffer completion invalidates authority before partial recovery");
+	const unsigned int failedPartialAuthorityEpoch = bufferDescription.authorityEpoch;
+	result |= Check(resources.PublishThreadedCompletion(
+			partialRecoveryCompletion.sequence, false) == RENDER_RESULT_OK &&
+		resources.DescribeBuffer(buffer, &bufferDescription) == RENDER_RESULT_OK &&
+		bufferDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
+		bufferDescription.authorityEpoch > failedPartialAuthorityEpoch &&
+		!resources.HasBufferAuthorityFailure(buffer),
+		"successful partial recovery advances its epoch without claiming whole authority");
+	validated = GpuHandle();
+	result |= Check(resources.AcquireVertexBufferRange(buffer,
+		sizeof(unsigned int), 0, 0, 2, &validated) == RENDER_RESULT_OK &&
+		validated == buffer,
+		"later partial DISCARD republishes only its independent initialized prefix");
+	validated = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(buffer,
+		sizeof(unsigned int), 0, 2, 1, &validated) ==
+		RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid(),
+		"partial recovery rejects adjacent discarded bytes");
+	const long updateCallsBeforeDependentRecovery = ReadCount(&control.updateCalls);
+	InterlockedExchange(&control.failUpdateOnCall,
+		updateCallsBeforeDependentRecovery + 1);
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, bytes, sizeof(bytes) / 2, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, bytes + 2, sizeof(unsigned int),
+			sizeof(bytes) / 2, RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+			RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_FAILED &&
+		ReadCount(&control.updateCalls) == updateCallsBeforeDependentRecovery + 2,
+		"queued NO_OVERWRITE executes without independently restoring failed bytes");
+	ThreadedRenderFrameCompletion failedBeforeDependentCompletion;
+	ThreadedRenderFrameCompletion dependentRecoveryCompletion;
+	result |= Check(PollThreadedRenderCompletion(device,
+		&failedBeforeDependentCompletion) &&
+		PollThreadedRenderCompletion(device, &dependentRecoveryCompletion) &&
+		failedBeforeDependentCompletion.resourceFailure &&
+		dependentRecoveryCompletion.result == RENDER_RESULT_OK &&
+		!dependentRecoveryCompletion.resourceFailure &&
+		resources.PublishThreadedCompletion(
+			failedBeforeDependentCompletion.sequence, true) == RENDER_RESULT_OK &&
+		resources.PublishThreadedCompletion(dependentRecoveryCompletion.sequence,
+			false) == RENDER_RESULT_OK &&
+		resources.HasBufferAuthorityFailure(buffer),
+		"dependent NO_OVERWRITE cannot publish a snapshot inherited from failed DISCARD");
+	validated = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(buffer,
+		sizeof(unsigned int), 0, 0, 2, &validated) ==
+		RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid(),
+		"dependent recovery remains fail-closed for the failed prefix");
+	validated = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(buffer,
+		sizeof(unsigned int), 0, 2, 1, &validated) ==
+		RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid(),
+		"dependent snapshot cannot repair authority with its appended range");
 	InterlockedExchange(&control.failUpdateOnCall, 0);
 	const long updateCallsBeforePersistentFailure =
 		ReadCount(&control.updateCalls);

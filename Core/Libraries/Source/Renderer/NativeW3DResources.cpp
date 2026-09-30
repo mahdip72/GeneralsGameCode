@@ -863,8 +863,8 @@ RenderResult NativeW3DResources::PublishThreadedCompletion(
 			// Completion does not expose a per-command failure handle. Invalidate
 			// only slots that had accepted writes in the failed sequence window;
 			// unrelated buffer authority and DEFAULT recovery sources survive. A
-			// later full upload independently restores the owner resource, so keep
-			// that publication and every snapshot ordered after it.
+			// later DISCARD or full upload establishes its initialized bytes
+			// independently, so keep it and every snapshot ordered after it.
 			size_t recoveryIndex = completedCount;
 			while (recoveryIndex < slot.pendingBufferPublications.size() &&
 				!slot.pendingBufferPublications[recoveryIndex].restoresAfterFailure)
@@ -1432,7 +1432,7 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 			}
 			if (mode == RENDER_BUFFER_UPDATE_DISCARD)
 			{
-				restoresAfterFailure = fullWrite;
+				restoresAfterFailure = true;
 			}
 			else if (fullWrite)
 			{
