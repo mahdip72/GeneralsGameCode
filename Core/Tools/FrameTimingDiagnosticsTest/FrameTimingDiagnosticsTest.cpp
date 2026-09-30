@@ -1,4 +1,19 @@
+#include <windows.h>
+
+namespace
+{
+unsigned int diagnosticClockCalls = 0;
+BOOL WINAPI CountDiagnosticClockCalls(LARGE_INTEGER *value)
+{
+	++diagnosticClockCalls;
+	return QueryPerformanceCounter(value);
+}
+}
+
+// Count the real header's clock calls without changing its production clock.
+#define QueryPerformanceCounter CountDiagnosticClockCalls
 #include "Lib/FrameTimingDiagnostics.h"
+#undef QueryPerformanceCounter
 
 #include <string>
 #include <vector>
@@ -79,6 +94,17 @@ void disabled(const std::string& directory)
 		rts::frame_timing::Capture capture;
 		capture.beginSession("headless");
 		capture.beginFrame(0);
+		const unsigned int before = diagnosticClockCalls;
+		{
+			rts::frame_timing::ConditionalScope gated(capture,
+				rts::frame_timing::ClientDisplayDraw, false);
+			gated.finish();
+			rts::frame_timing::ConditionalScope inactive(capture,
+				rts::frame_timing::DisplayMainRender, true);
+			inactive.finish();
+		}
+		check(diagnosticClockCalls == before,
+			"disabled and inactive conditional scopes do not query the clock");
 		capture.add(rts::frame_timing::Logic, 100);
 		capture.endFrame(900);
 		capture.endSession();
@@ -166,6 +192,55 @@ void enabled(const std::string& directory, __int64 frequency)
 		strcmp(data.back().mode, "interactive") == 0, "destructor/session reset retains only new frame counts");
 }
 
+void clientDisplayPhases(const std::string& directory)
+{
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	rts::frame_timing::Capture capture;
+	capture.beginSession("headless");
+	capture.beginFrame(0);
+	const rts::frame_timing::Phase phases[] = {
+		rts::frame_timing::ClientDrawables, rts::frame_timing::ClientTerrainVisual,
+		rts::frame_timing::ClientDisplayUpdate, rts::frame_timing::ClientDisplayDraw,
+		rts::frame_timing::DisplayPreframe, rts::frame_timing::DisplayViews,
+		rts::frame_timing::DisplayRtt, rts::frame_timing::DisplayBeginRender,
+		rts::frame_timing::DisplayMainRender, rts::frame_timing::DisplayEndRender
+	};
+	const char *names[] = {
+		"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
+		"display_preframe", "display_views", "display_rtt", "display_begin_render",
+		"display_main_render", "display_end_render"
+	};
+	for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
+	{
+		const unsigned int before = diagnosticClockCalls;
+		{
+			rts::frame_timing::ConditionalScope gated(capture, phases[phase], false);
+			gated.finish();
+		}
+		check(diagnosticClockCalls == before,
+			"false gate makes no clock query even inside an active capture");
+		{
+			rts::frame_timing::ConditionalScope active(capture, phases[phase], true);
+			active.finish();
+			active.finish();
+		}
+		check(diagnosticClockCalls == before + 2,
+			"conditional phase begins and finishes once despite explicit finish and destructor");
+	}
+	capture.endFrame(900);
+	capture.endSession();
+	const rts::frame_timing::FinalizedCapture final = capture.finalize();
+	check(final.complete, "client/display subphases retain complete frame evidence");
+	const std::vector<Row> data = rows(directory);
+	check(data.size() == 11, "frame plus all ten client/display phases are emitted");
+	if (data.size() == 11)
+	{
+		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
+			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&
+				data[phase + 1].samples == 1, "client/display phase name and exactly one sample");
+	}
+}
+
 void bounded(const std::string& directory)
 {
 	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
@@ -247,16 +322,19 @@ int main()
 		return 1; // Never reuse or remove a directory owned by another run.
 	const std::string disabledDir = root + "\\disabled", enabledDir = root + "\\enabled", boundedDir = root + "\\bounded";
 	const std::string finalizedDir = root + "\\finalized", incompleteDir = root + "\\incomplete";
+	const std::string clientDisplayDir = root + "\\client-display";
 	check(CreateDirectoryA(disabledDir.c_str(), NULL) != FALSE, "create disabled case");
 	check(CreateDirectoryA(enabledDir.c_str(), NULL) != FALSE, "create enabled case");
 	check(CreateDirectoryA(boundedDir.c_str(), NULL) != FALSE, "create bounded case");
 	check(CreateDirectoryA(finalizedDir.c_str(), NULL) != FALSE, "create finalized case");
 	check(CreateDirectoryA(incompleteDir.c_str(), NULL) != FALSE, "create incomplete case");
+	check(CreateDirectoryA(clientDisplayDir.c_str(), NULL) != FALSE, "create client/display case");
 	LARGE_INTEGER frequency;
 	if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
 		return 1;
 	disabled(disabledDir);
 	enabled(enabledDir, frequency.QuadPart);
+	clientDisplayPhases(clientDisplayDir);
 	bounded(boundedDir);
 	finalized(finalizedDir);
 	incomplete(incompleteDir);
@@ -266,6 +344,7 @@ int main()
 	removeCase(boundedDir);
 	removeCase(finalizedDir);
 	removeCase(incompleteDir);
+	removeCase(clientDisplayDir);
 	check(RemoveDirectoryA(root.c_str()) != FALSE, "remove empty test root");
 	return failures ? 1 : 0;
 }

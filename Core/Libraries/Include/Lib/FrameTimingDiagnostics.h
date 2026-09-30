@@ -15,6 +15,9 @@ enum Phase
 	AudioVoiceCreate, AudioVoiceDestroy, AudioDecodeOpen, AudioDecodeRead,
 	RendererPresent, RendererTextureCollect, RendererTexturePrune,
 	WaterTrackTextureBind, WaterTrackModuleRender,
+	ClientDrawables, ClientTerrainVisual, ClientDisplayUpdate, ClientDisplayDraw,
+	DisplayPreframe, DisplayViews, DisplayRtt, DisplayBeginRender,
+	DisplayMainRender, DisplayEndRender,
 	PhaseCount
 };
 
@@ -329,7 +332,10 @@ private:
 			"recorder_update", "recorder_encode", "recorder_flush",
 			"audio_voice_create", "audio_voice_destroy", "audio_decode_open", "audio_decode_read",
 			"renderer_present", "renderer_texture_collect", "renderer_texture_prune",
-			"water_track_texture_bind", "water_track_module_render"
+			"water_track_texture_bind", "water_track_module_render",
+			"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
+			"display_preframe", "display_views", "display_rtt", "display_begin_render",
+			"display_main_render", "display_end_render"
 		};
 		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)
@@ -391,6 +397,35 @@ private:
 	Scope& operator=(const Scope&);
 };
 
+// Producer-only subphases share the existing opt-in capture. A false gate
+// never queries the clock or initializes a capture, and finish permits exact
+// boundaries without changing a caller's early-return/control-flow scope.
+class ConditionalScope
+{
+public:
+	ConditionalScope(Phase phase, bool enabled) :
+		m_capture(enabled ? &Capture::instance() : NULL), m_phase(phase),
+		m_start(m_capture != NULL && m_capture->isActive() ? Capture::clock() : 0) {}
+	ConditionalScope(Capture& capture, Phase phase, bool enabled) :
+		m_capture(enabled ? &capture : NULL), m_phase(phase),
+		m_start(m_capture != NULL && m_capture->isActive() ? Capture::clock() : 0) {}
+	~ConditionalScope() { finish(); }
+	void finish()
+	{
+		if (m_start)
+		{
+			m_capture->add(m_phase, Capture::clock() - m_start);
+			m_start = 0;
+		}
+	}
+private:
+	Capture* m_capture;
+	Phase m_phase;
+	__int64 m_start;
+	ConditionalScope(const ConditionalScope&);
+	ConditionalScope& operator=(const ConditionalScope&);
+};
+
 class Session
 {
 public:
@@ -403,13 +438,21 @@ private:
 
 inline void BeginFrame(unsigned int frame) { Capture::instance().beginFrame(frame); }
 inline void EndFrame(unsigned int frame) { Capture::instance().endFrame(frame); }
+inline bool IsActive() { return Capture::instance().isActive(); }
 
 } }
 #else
 namespace rts { namespace frame_timing {
 class Scope { public: explicit Scope(Phase) {} };
+class ConditionalScope
+{
+public:
+	ConditionalScope(Phase, bool) {}
+	void finish() {}
+};
 class Session { public: explicit Session(const char*) {} };
 inline void BeginFrame(unsigned int) {}
 inline void EndFrame(unsigned int) {}
+inline bool IsActive() { return false; }
 } }
 #endif
