@@ -901,6 +901,7 @@ public:
 		}
 		ResourceSlot &slot = m_resources[handle.index()];
 		m_indexedDrawValidation.clear();
+		m_indexRangeSummaries.clear();
 		slot.resource = nativeBuffer;
 		slot.kind = RESOURCE_BUFFER;
 		slot.usage = descriptor.usage;
@@ -1518,6 +1519,7 @@ public:
 		m_parameters.width = m_width;
 		m_parameters.height = m_height;
 		m_indexedDrawValidation.clear();
+		m_indexRangeSummaries.clear();
 		m_activeRenderTarget = 0;
 		m_activeDepthStencil = 0;
 		m_activeColorResource = 0;
@@ -3139,22 +3141,32 @@ public:
 			{
 				unsigned int minIndex = UINT_MAX;
 				unsigned int maxIndex = 0;
-				for (unsigned int index = 0; index < indexCount; ++index)
+				detail::IndexRangeSummaryKey summaryKey;
+				summaryKey.indexBuffer = m_boundIndexBuffer;
+				summaryKey.indexVersion = indexSlot.bufferContentVersion;
+				summaryKey.firstIndexByte = firstIndexByte;
+				summaryKey.indexSize = indexSize;
+				summaryKey.indexCount = indexCount;
+				if (!m_indexRangeSummaries.find(summaryKey, &minIndex, &maxIndex))
 				{
-					const size_t sourceOffset = firstIndexByte +
-						static_cast<size_t>(index) * indexSize;
-					unsigned int value = 0;
-					if (indexSize == 2)
+					for (unsigned int index = 0; index < indexCount; ++index)
 					{
-						unsigned short shortValue = 0;
-						memcpy(&shortValue, &(*indexBytes)[sourceOffset],
-							sizeof(shortValue));
-						value = shortValue;
+						const size_t sourceOffset = firstIndexByte +
+							static_cast<size_t>(index) * indexSize;
+						unsigned int value = 0;
+						if (indexSize == 2)
+						{
+							unsigned short shortValue = 0;
+							memcpy(&shortValue, &(*indexBytes)[sourceOffset],
+								sizeof(shortValue));
+							value = shortValue;
+						}
+						else
+							memcpy(&value, &(*indexBytes)[sourceOffset], sizeof(value));
+						minIndex = (std::min)(minIndex, value);
+						maxIndex = (std::max)(maxIndex, value);
 					}
-					else
-						memcpy(&value, &(*indexBytes)[sourceOffset], sizeof(value));
-					minIndex = (std::min)(minIndex, value);
-					maxIndex = (std::max)(maxIndex, value);
+					m_indexRangeSummaries.store(summaryKey, minIndex, maxIndex);
 				}
 				const long long minVertex =
 					static_cast<long long>(minIndex) + baseVertex;
@@ -3972,7 +3984,10 @@ private:
 	{
 		++slot.bufferContentVersion;
 		if (slot.bufferContentVersion == 0)
+		{
 			m_indexedDrawValidation.clear();
+			m_indexRangeSummaries.clear();
+		}
 	}
 
 	static bool isElementRangeWithinBuffer(size_t byteCapacity,
@@ -5861,7 +5876,11 @@ private:
 
 	bool releaseSlot(GpuHandle handle, ResourceSlot &slot)
 	{
-		if (slot.kind == RESOURCE_BUFFER) m_indexedDrawValidation.clear();
+		if (slot.kind == RESOURCE_BUFFER)
+		{
+			m_indexedDrawValidation.clear();
+			m_indexRangeSummaries.clear();
+		}
 		if (slot.depthStencil != 0)
 		{
 			slot.depthStencil->Release();
@@ -6186,6 +6205,7 @@ private:
 	RenderResult m_faultResult;
 	std::vector<ResourceSlot> m_resources;
 	detail::IndexedDrawValidationCache m_indexedDrawValidation;
+	detail::IndexRangeSummaryCache m_indexRangeSummaries;
 	std::vector<BlendStateEntry> m_blendStates;
 	std::vector<DepthStencilStateEntry> m_depthStates;
 	std::vector<RasterizerStateEntry> m_rasterizerStates;

@@ -5,6 +5,7 @@
 
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include <windows.h>
+#include "../../Libraries/Source/Renderer/IndexedDrawValidationCache.h"
 
 namespace
 {
@@ -206,6 +207,143 @@ int VertexUpdatePerformance(Fixture &fixture)
 	}
 	return result;
 }
+
+int SummaryCacheContract()
+{
+	using namespace rts::render::detail;
+	IndexRangeSummaryCache summaries;
+	IndexRangeSummaryKey key;
+	key.indexBuffer = GpuHandle(4, 7);
+	key.indexVersion = 9;
+	key.firstIndexByte = 2;
+	key.indexSize = 2;
+	key.indexCount = 3;
+	unsigned int minimum = 0, maximum = 0;
+	int result = Check(!summaries.find(key, &minimum, &maximum),
+		"raw summary starts cold");
+	summaries.store(key, 0, 6);
+	IndexedDrawValidationKey proof;
+	proof.vertexBuffer = GpuHandle(1, 2); proof.indexBuffer = key.indexBuffer;
+	proof.vertexVersion = 3; proof.indexVersion = key.indexVersion;
+	proof.vertexOffset = 0; proof.vertexStride = 16;
+	proof.firstIndexByte = key.firstIndexByte; proof.indexSize = key.indexSize;
+	proof.indexCount = key.indexCount; proof.baseVertex = 0;
+	IndexedDrawValidationCache proofs;
+	proofs.store(proof);
+	for (unsigned int upload = 0; upload < 3; ++upload)
+	{
+		++proof.vertexVersion;
+		result |= Check(!proofs.contains(proof) &&
+			summaries.find(key, &minimum, &maximum) && minimum == 0 && maximum == 6,
+			"VB content versions revoke physical proof but retain raw IB extrema");
+	}
+	for (unsigned int field = 0; field < 6; ++field)
+	{
+		IndexRangeSummaryKey changed = key;
+		if (field == 0) changed.indexBuffer = GpuHandle(5, 7);
+		if (field == 1) changed.indexBuffer = GpuHandle(4, 8);
+		if (field == 2) ++changed.indexVersion;
+		if (field == 3) changed.firstIndexByte += 2;
+		if (field == 4) changed.indexSize = 4;
+		if (field == 5) ++changed.indexCount;
+		result |= Check(!summaries.find(changed, &minimum, &maximum),
+			"every exact IB identity/version/byte-range/format field participates");
+	}
+	// An accepted failed write has already advanced the IB version. The old
+	// summary must miss even when the surviving bytes happen to be identical.
+	IndexRangeSummaryKey failedWrite = key;
+	++failedWrite.indexVersion;
+	result |= Check(!summaries.find(failedWrite, &minimum, &maximum),
+		"pre-mutation version advancement excludes an old summary after failure");
+	summaries.clear();
+	result |= Check(!summaries.find(key, &minimum, &maximum),
+		"lifecycle and version-wrap clear cannot retain raw extrema");
+	IndexRangeSummaryKey first[256];
+	bool occupied[256] = { false };
+	bool collision = false;
+	for (unsigned int count = 1; count <= 257; ++count)
+	{
+		IndexRangeSummaryKey candidate = key;
+		candidate.indexCount = count;
+		const unsigned int slot = candidate.hash() % IndexRangeSummaryCache::CAPACITY;
+		if (occupied[slot])
+		{
+			summaries.store(first[slot], 0, 6);
+			summaries.store(candidate, 2, 3);
+			result |= Check(!summaries.find(first[slot], &minimum, &maximum) &&
+				summaries.find(candidate, &minimum, &maximum) && minimum == 2 && maximum == 3,
+				"direct-map collision replaces rather than authorizes a different range");
+			collision = true;
+			break;
+		}
+		occupied[slot] = true;
+		first[slot] = candidate;
+	}
+	result |= Check(collision && IndexRangeSummaryCache::CAPACITY == 256,
+		"summary storage stays fixed at 256 entries");
+	return result;
+}
+
+int VertexUpdatesRetainOnlyRawSummary(Fixture &fixture)
+{
+	unsigned char vertices[8 * 16] = { 0 };
+	unsigned short indices[3] = { 0, 2, 6 };
+	GpuHandle vb, ib;
+	int result = Check(fixture.Buffer(RENDER_BUFFER_VERTEX, vertices, sizeof(vertices), &vb) &&
+		fixture.Buffer(RENDER_BUFFER_INDEX, indices, sizeof(indices), &ib) &&
+		fixture.Begin(vb, ib, RENDER_FORMAT_R16_UINT) &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK,
+		"VB-only mutation proof and raw extrema seed");
+	if (result) return result;
+	result |= Check(fixture.device->updateBufferResource(vb, vertices, sizeof(vertices), 0,
+		RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK &&
+		fixture.device->updateBufferResource(vb, vertices + 7 * 16, 16, 7 * 16,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK,
+		"VB PRESERVE and unreferenced NO_OVERWRITE retain initialized coverage");
+	result |= Check(fixture.device->updateBufferResource(vb, vertices, 16, 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_INVALID_ARGUMENT,
+		"cached raw extrema cannot bypass referenced holes after VB DISCARD");
+	result |= Check(fixture.device->updateBufferResource(vb, vertices + 2 * 16, 16, 2 * 16,
+		RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		fixture.device->updateBufferResource(vb, vertices + 6 * 16, 16, 6 * 16,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK,
+		"cached extrema with unused holes still require exact referenced-index validation");
+	indices[1] = 1; // Same min/max, but the middle reference is now a hole.
+	result |= Check(fixture.device->updateBufferResource(ib, indices, sizeof(indices), 0,
+		RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_INVALID_ARGUMENT,
+		"same-extrema IB mutation cannot hide a new referenced hole");
+	indices[1] = 2;
+	result |= Check(fixture.device->updateBufferResource(ib, indices, sizeof(indices), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK &&
+		fixture.context->setVertexBuffer(vb, 32, 0) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_INVALID_ARGUMENT &&
+		fixture.context->setVertexBuffer(vb, 16, 0) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 0, -1) == RENDER_RESULT_INVALID_ARGUMENT &&
+		fixture.context->drawIndexed(3, 0, 2) == RENDER_RESULT_INVALID_ARGUMENT,
+		"retained extrema always revalidate current stride and signed base bounds");
+	result |= Check(fixture.device->updateBufferResource(ib, indices, sizeof(indices[0]), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_INVALID_ARGUMENT &&
+		fixture.context->drawIndexed(1, 0, 0) == RENDER_RESULT_OK,
+		"IB initialized-byte coverage is checked before any summary hit");
+	result |= Check(fixture.context->endFrame() == RENDER_RESULT_OK &&
+		fixture.device->destroyResource(ib), "summarized index buffer releases");
+	GpuHandle replacement;
+	indices[0] = 8;
+	result |= Check(fixture.Buffer(RENDER_BUFFER_INDEX, indices, sizeof(indices), &replacement) &&
+		replacement.index() == ib.index() && replacement.generation() != ib.generation() &&
+		fixture.Begin(vb, replacement, RENDER_FORMAT_R16_UINT) &&
+		fixture.context->drawIndexed(1, 0, 0) == RENDER_RESULT_INVALID_ARGUMENT &&
+		fixture.context->endFrame() == RENDER_RESULT_OK,
+		"new IB generation cannot reuse prior raw extrema");
+	return result;
+}
 }
 #endif
 
@@ -220,6 +358,8 @@ int main(int argc, char **argv)
 	if (performance) return Performance(fixture);
 	if (argc == 2 && strcmp(argv[1], "--vertex-update-performance") == 0)
 		return VertexUpdatePerformance(fixture);
+	result |= SummaryCacheContract();
+	result |= VertexUpdatesRetainOnlyRawSummary(fixture);
 	unsigned char vertices[4 * 16] = { 0 };
 	unsigned short indices[6] = { 4, 0, 1, 2, 3, 0 };
 	unsigned int wide[6] = { 4, 1, 2, 3, 4, 0xffffffffU };
