@@ -33,6 +33,10 @@ endif()
 # Top level project, doesn't really affect anything.
 project(genzh LANGUAGES C CXX)
 
+# Resolve target-architecture metadata only after CMake has identified the
+# selected compiler and target platform.
+include(cmake/native-target-architecture.cmake)
+
 include(CTest)
 
 # This file handles extra settings wanted/needed for different compilers.
@@ -47,6 +51,13 @@ include(cmake/config.cmake)
 include(cmake/asan.cmake)
 include(cmake/native-product-packaging.cmake)
 
+if(BUILD_TESTING AND RTS_BUILD_PRODUCT)
+    add_test(
+        NAME native_target_architecture_guard
+        COMMAND "${CMAKE_COMMAND}" -P
+            "${CMAKE_SOURCE_DIR}/cmake/test-native-target-architecture.cmake")
+endif()
+
 # Stage 5 completes the product cutover: supported game executables are native
 # Windows x64 builds.  The 32-bit graph remains available only for historical
 # authoring and diagnostic tools, never as a shippable product fallback.
@@ -56,6 +67,11 @@ if(RTS_BUILD_PRODUCT AND
         "Stage 5 product builds are native x64-only. The legacy Win32/VC6 "
         "D3D8, Miles, and Bink product runtime has been retired; configure "
         "RTS_BUILD_PRODUCT=OFF for historical authoring or diagnostic tools.")
+endif()
+
+if(RTS_BUILD_PRODUCT OR RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY)
+    rts_require_native_amd64_target(
+        "Stage 5 product and multiplayer-promotion configurations")
 endif()
 
 # MinGW-w64 specific configuration

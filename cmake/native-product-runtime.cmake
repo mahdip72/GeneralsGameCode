@@ -2,11 +2,13 @@
 # consumer-facing rts_product_runtime target; this module contains no Win32
 # legacy fallback.
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/native-target-architecture.cmake")
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR
         "rts_native_product_runtime is available only to native x64 Windows builds.")
 endif()
+rts_require_native_amd64_target("rts_native_product_runtime")
 
 if(RTS_BUILD_PRODUCT AND (RTS_BUILD_ZEROHOUR OR RTS_BUILD_GENERALS) AND
         NOT RTS_BUILD_OPTION_FFMPEG)

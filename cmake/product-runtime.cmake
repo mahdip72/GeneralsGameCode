@@ -2,10 +2,12 @@
 # historical non-product graphs receive only their explicitly named tool
 # services instead of a legacy product fallback.
 include_guard(GLOBAL)
+include("${CMAKE_CURRENT_LIST_DIR}/native-target-architecture.cmake")
 
 add_library(rts_product_runtime INTERFACE)
 
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    rts_require_native_amd64_target("rts_product_runtime native branch")
     include("${CMAKE_CURRENT_LIST_DIR}/native-product-runtime.cmake")
     target_link_libraries(rts_product_runtime INTERFACE
         rts_native_product_runtime
