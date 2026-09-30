@@ -89,7 +89,15 @@ public:
 	static Capture& instance()
 	{
 		static Capture capture;
+		static const bool published = publishInstance(&capture);
+		(void)published;
 		return capture;
+	}
+
+	static bool isInstanceActive()
+	{
+		Capture *capture = instanceSlot().load(std::memory_order_acquire);
+		return capture != NULL && capture->isActive();
 	}
 
 	void beginSession(const char* mode)
@@ -240,6 +248,18 @@ public:
 	}
 
 private:
+	static std::atomic<Capture*>& instanceSlot()
+	{
+		static std::atomic<Capture*> capture(NULL);
+		return capture;
+	}
+
+	static bool publishInstance(Capture *capture)
+	{
+		instanceSlot().store(capture, std::memory_order_release);
+		return true;
+	}
+
 	void closeCapture(bool retainNativeHandle = false)
 	{
 		if (m_finalized)
@@ -438,7 +458,7 @@ private:
 
 inline void BeginFrame(unsigned int frame) { Capture::instance().beginFrame(frame); }
 inline void EndFrame(unsigned int frame) { Capture::instance().endFrame(frame); }
-inline bool IsActive() { return Capture::instance().isActive(); }
+inline bool IsActive() { return Capture::isInstanceActive(); }
 
 } }
 #else
