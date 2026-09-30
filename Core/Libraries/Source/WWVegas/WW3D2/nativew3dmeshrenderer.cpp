@@ -859,6 +859,8 @@ void DX8RigidFVFCategoryContainer::Log(bool only_visible)
 void DX8RigidFVFCategoryContainer::Render()
 {
 	if (!Anything_To_Render()) return;
+	rts::frame_timing::ConditionalScope frameTimingScope(
+		rts::frame_timing::NativeRigidBatchRender, rts::frame_timing::IsActive());
 	AnythingToRender=false;
 
 	rts::render::SetGameVertexBuffer(vertex_buffer);

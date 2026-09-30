@@ -55,6 +55,7 @@
 #include "WWLib/simplevec.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/matinfo.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 #include "Common/FramePacer.h"
 #include "Common/GameState.h"
@@ -1840,6 +1841,8 @@ void WaterRenderObjClass::Render(RenderInfoClass & rinfo)
 		WW3D::Add_To_Static_Sort_List(this, sort_level);
 		return;
 	}
+	rts::frame_timing::ConditionalScope frameTimingScope(
+		rts::frame_timing::WaterRender, rts::frame_timing::IsActive());
 
 	switch(m_waterType)
 	{

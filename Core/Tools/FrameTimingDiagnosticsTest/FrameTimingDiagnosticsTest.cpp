@@ -222,13 +222,16 @@ void clientDisplayPhases(const std::string& directory)
 		rts::frame_timing::DisplayMainRender, rts::frame_timing::DisplayEndRender,
 		rts::frame_timing::RenderProducerWait,
 		rts::frame_timing::ViewScene3D, rts::frame_timing::ViewScene2D,
-		rts::frame_timing::NativeSortingFlush, rts::frame_timing::NativeSkinRender
+		rts::frame_timing::NativeSortingFlush, rts::frame_timing::NativeSkinRender,
+		rts::frame_timing::HeightMapRender, rts::frame_timing::NativeRigidBatchRender,
+		rts::frame_timing::WaterRender
 	};
 	const char *names[] = {
 		"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
 		"display_preframe", "display_views", "display_rtt", "display_begin_render",
 		"display_main_render", "display_end_render", "render_producer_wait",
-		"view_scene_3d", "view_scene_2d", "native_sorting_flush", "native_skin_render"
+		"view_scene_3d", "view_scene_2d", "native_sorting_flush", "native_skin_render",
+		"height_map_render", "native_rigid_batch_render", "water_render"
 	};
 	for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 	{
@@ -253,8 +256,8 @@ void clientDisplayPhases(const std::string& directory)
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
 	check(final.complete, "child diagnostic phases retain complete frame evidence");
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 16, "frame plus all fifteen child diagnostic phases are emitted");
-	if (data.size() == 16)
+	check(data.size() == 19, "frame plus all eighteen child diagnostic phases are emitted");
+	if (data.size() == 19)
 	{
 		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&

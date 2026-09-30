@@ -49,6 +49,7 @@
 #include "W3DDevice/Common/HeightMapTerrainPrepare.h"
 #include "W3DDevice/Common/HeightMapDynamicLightPrepare.h"
 #include "Renderer/RenderSubmissionPolicy.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 #ifndef USE_FLAT_HEIGHT_MAP // Flat height map uses flattened textures. jba. [3/20/2003]
 
@@ -2608,6 +2609,9 @@ void HeightMapRenderObjClass::updateCenter(CameraClass *camera, const Vector3 *c
 
 void HeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 {
+	rts::frame_timing::ConditionalScope frameTimingScope(
+		rts::frame_timing::HeightMapRender, rts::frame_timing::IsActive());
+
 	//USE_PERF_TIMER(Terrain_Render)
 
 	Int i,j,devicePasses;
