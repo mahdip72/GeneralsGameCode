@@ -1222,10 +1222,18 @@ IndexBufferClass::AppendLockClass::AppendLockClass(IndexBufferClass *buffer,
 	{
 		return;
 	}
-	WWASSERT(buffer != nullptr);
-	WWASSERT(startIndex + indexRange <= buffer->Get_Index_Count());
+	if (buffer == nullptr)
+	{
+		return;
+	}
 	WWASSERT(!buffer->Engine_Refs());
 	buffer->Add_Ref();
+	const unsigned int indexCapacity = buffer->Get_Index_Count();
+	if (startIndex > indexCapacity ||
+		indexRange > indexCapacity - startIndex)
+	{
+		return;
+	}
 	switch (buffer->Type())
 	{
 	case BUFFER_TYPE_DX8:
@@ -1235,9 +1243,16 @@ IndexBufferClass::AppendLockClass::AppendLockClass(IndexBufferClass *buffer,
 			reinterpret_cast<void **>(&indices));
 		break;
 	case BUFFER_TYPE_SORTING:
-		indices = static_cast<SortingIndexBufferClass *>(buffer)->index_buffer +
-			startIndex;
-		locked = true;
+		{
+			SortingIndexBufferClass *sortingBuffer =
+				static_cast<SortingIndexBufferClass *>(buffer);
+			if (sortingBuffer->index_buffer == nullptr)
+			{
+				return;
+			}
+			indices = sortingBuffer->index_buffer + startIndex;
+			locked = true;
+		}
 		break;
 	default:
 		WWASSERT(0);
@@ -1252,7 +1267,8 @@ IndexBufferClass::AppendLockClass::~AppendLockClass()
 		return;
 	}
 	Commit();
-	index_buffer->Release_Ref();
+	if (index_buffer != nullptr)
+		index_buffer->Release_Ref();
 }
 
 bool IndexBufferClass::AppendLockClass::Commit()

@@ -45,6 +45,7 @@
 #include "dx8polygonrenderer.h"
 #include "dx8vertexbuffer.h"
 #include "dx8indexbuffer.h"
+#include "NativeW3DMeshCapacity.h"
 #include "dx8fvf.h"
 #include "dx8rendererdebugger.h"
 #include "Renderer/RenderGameClient.h"
@@ -96,6 +97,21 @@ static bool Is_Usable_Static_Index_Buffer(IndexBufferClass *buffer)
 	return buffer != nullptr &&
 		(buffer->Type() != BUFFER_TYPE_DX8 ||
 		 static_cast<DX8IndexBufferClass *>(buffer)->Is_Valid());
+}
+
+static bool Compute_Static_Mesh_Index_Count(MeshModelClass *mmc,
+	unsigned int *indexCount)
+{
+	if (mmc == nullptr || indexCount == nullptr)
+	{
+		return false;
+	}
+	const GapFillerClass *gapFiller = mmc->Get_Gap_Filler();
+	const unsigned int gapPolygonCount = gapFiller == nullptr ? 0U :
+		gapFiller->Get_Polygon_Count();
+	return rts::render::ComputeStaticMeshIndexCount(
+		mmc->Get_Polygon_Count(), gapPolygonCount, mmc->Get_Pass_Count(),
+		indexCount);
 }
 
 // helper data structure
@@ -862,15 +878,14 @@ void DX8RigidFVFCategoryContainer::Render()
 
 bool DX8RigidFVFCategoryContainer::Check_If_Mesh_Fits(MeshModelClass* mmc)
 {
+	unsigned int required_indices = 0;
+	if (!Compute_Static_Mesh_Index_Count(mmc, &required_indices))
+		return false;
 	if (!vertex_buffer) return true;	// No VB created - mesh will fit as a new vb will be created when inserting
 	unsigned required_vertices=mmc->Get_Vertex_Count();
 	unsigned available_vertices=vertex_buffer->Get_Vertex_Count()-used_vertices;
-	unsigned required_polygons=mmc->Get_Polygon_Count();
-	if (mmc->Get_Gap_Filler()) {
-		required_polygons+=mmc->Get_Gap_Filler()->Get_Polygon_Count();
-	}
-	unsigned required_indices=required_polygons*3*mmc->Get_Pass_Count();
 	if (!index_buffer) return required_vertices<=available_vertices;
+	if (used_indices > index_buffer->Get_Index_Count()) return false;
 	unsigned available_indices=index_buffer->Get_Index_Count()-used_indices;
 	if (
 		required_vertices<=available_vertices &&
@@ -1032,6 +1047,12 @@ public:
 
 void DX8RigidFVFCategoryContainer::Add_Mesh(MeshModelClass* mmc_)
 {
+	unsigned int required_indices = 0;
+	if (!Compute_Static_Mesh_Index_Count(mmc_, &required_indices))
+	{
+		WWDEBUG_SAY(("Rejecting rigid mesh with an unrepresentable static index count"));
+		return;
+	}
 	WWASSERT(Check_If_Mesh_Fits(mmc_));
 
 	Vertex_Split_Table split_table(mmc_);
@@ -1266,8 +1287,17 @@ struct Textures_Material_And_Shader_Booking_Struct
 
 bool DX8FVFCategoryContainer::Generate_Texture_Categories(Vertex_Split_Table& split_table,unsigned vertex_offset)
 {
-	int polygon_count=split_table.Get_Polygon_Count();
-	int index_count=polygon_count*3*split_table.Get_Pass_Count();
+	const unsigned int splitPolygonCount = split_table.Get_Polygon_Count();
+	const int meshPassCount =
+		split_table.Get_Mesh_Model_Class()->Get_Pass_Count();
+	unsigned int index_count = 0;
+	if (meshPassCount < 0 ||
+		!rts::render::ComputeStaticPolygonIndexCount(splitPolygonCount,
+			static_cast<unsigned int>(meshPassCount), &index_count))
+	{
+		return false;
+	}
+	const int polygon_count = static_cast<int>(splitPolygonCount);
 
 	/*
 	** If we don't have an index buffer yet, allocate one.  Make it hold at least 12000 entries,
@@ -1277,7 +1307,8 @@ bool DX8FVFCategoryContainer::Generate_Texture_Categories(Vertex_Split_Table& sp
 	if (!index_buffer) {
 		created_index_buffer=true;
 		int ib_size=12000;
-		if (ib_size<index_count) ib_size=index_count;
+		if (static_cast<unsigned int>(ib_size)<index_count)
+			ib_size=static_cast<int>(index_count);
 		if (sorting) {
 			index_buffer=NEW_REF(SortingIndexBufferClass,(ib_size));
 		}
@@ -1526,13 +1557,12 @@ void DX8SkinFVFCategoryContainer::Render()
 
 bool DX8SkinFVFCategoryContainer::Check_If_Mesh_Fits(MeshModelClass* mmc)
 {
+	unsigned int required_indices = 0;
+	if (!Compute_Static_Mesh_Index_Count(mmc, &required_indices))
+		return false;
 	if (!index_buffer) return true;	// No IB created - mesh will fit as a new ib will be created when inserting
-	int required_polygons=mmc->Get_Polygon_Count();
-	if (mmc->Get_Gap_Filler()) {
-		required_polygons+=mmc->Get_Gap_Filler()->Get_Polygon_Count();
-	}
-
-	if ((required_polygons*3*mmc->Get_Pass_Count())<=index_buffer->Get_Index_Count()-used_indices) {
+	if (used_indices <= index_buffer->Get_Index_Count() &&
+		required_indices <= index_buffer->Get_Index_Count()-used_indices) {
 		return true;
 	}
 	return false;
@@ -1586,6 +1616,11 @@ void DX8SkinFVFCategoryContainer::Reset()
 
 void DX8SkinFVFCategoryContainer::Add_Mesh(MeshModelClass* mmc)
 {
+	unsigned int required_indices = 0;
+	if (!Compute_Static_Mesh_Index_Count(mmc, &required_indices))
+	{
+		return;
+	}
 	Vertex_Split_Table split_table(mmc);
 
 	Generate_Texture_Categories(split_table,0);
@@ -2171,6 +2206,12 @@ void DX8MeshRendererClass::Unregister_Mesh_Type(MeshModelClass* mmc)
 
 void DX8MeshRendererClass::Register_Mesh_Type(MeshModelClass* mmc)
 {
+	unsigned int required_indices = 0;
+	if (!Compute_Static_Mesh_Index_Count(mmc, &required_indices))
+	{
+		WWDEBUG_SAY(("Register_Mesh_Type rejected a mesh with an unrepresentable static index count"));
+		return;
+	}
 	WWMEMLOG(MEM_GEOMETRY);
 #ifdef ENABLE_CATEGORY_LOG
 	WWDEBUG_SAY(("Registering mesh: %s (%d polys, %d verts + %d gap polygons)",mmc->Get_Name(),mmc->Get_Polygon_Count(),mmc->Get_Vertex_Count(),mmc->Get_Gap_Filler_Polygon_Count()));

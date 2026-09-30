@@ -2,11 +2,13 @@
 #include "nativew3dbuffercompat.h"
 #include "dx8indexbuffer.h"
 #include "dx8vertexbuffer.h"
+#include "WW3D2/NativeW3DMeshCapacity.h"
 #include "Renderer/NativeW3DRenderer.h"
 #include "nativew3dline.h"
 
 #include <cstdio>
 #include <cstring>
+#include <limits.h>
 #include <new>
 #include <vector>
 
@@ -36,6 +38,53 @@ int Check(bool condition, const char *message)
 		return 1;
 	}
 	return 0;
+}
+
+int RunStaticMeshIndexCountContract()
+{
+	using namespace rts::render;
+	unsigned int requiredIndexCount = 1;
+	int result = 0;
+	result |= Check(ComputeStaticMeshIndexCount(21845, 0, 1,
+		&requiredIndexCount) && requiredIndexCount == 65535U,
+		"static mesh admission accepts exactly 65,535 indices");
+	requiredIndexCount = 1;
+	result |= Check(ComputeStaticMeshIndexCount(21844, 1, 1,
+		&requiredIndexCount) && requiredIndexCount == 65535U,
+		"static mesh admission includes gap polygons in the exact capacity boundary");
+	requiredIndexCount = 1;
+	result |= Check(!ComputeStaticMeshIndexCount(21846, 0, 1,
+		&requiredIndexCount) && requiredIndexCount == 0,
+		"static mesh admission rejects 65,538 indices before narrowing");
+	requiredIndexCount = 1;
+	result |= Check(ComputeStaticMeshIndexCount(10922, 0, 2,
+		&requiredIndexCount) && requiredIndexCount == 65532U,
+		"static mesh admission accepts a representable two-pass count");
+	requiredIndexCount = 1;
+	result |= Check(!ComputeStaticMeshIndexCount(10923, 0, 2,
+		&requiredIndexCount) && requiredIndexCount == 0,
+		"static mesh admission rejects 65,538 indices across two passes");
+	requiredIndexCount = 1;
+	result |= Check(!ComputeStaticMeshIndexCount(-1, 0, 1,
+		&requiredIndexCount) && requiredIndexCount == 0,
+		"static mesh admission rejects a negative model polygon count");
+	requiredIndexCount = 1;
+	result |= Check(!ComputeStaticMeshIndexCount(1, 0, -1,
+		&requiredIndexCount) && requiredIndexCount == 0,
+		"static mesh admission rejects a negative pass count");
+	requiredIndexCount = 1;
+	result |= Check(!ComputeStaticMeshIndexCount(1, UINT_MAX, 1,
+		&requiredIndexCount) && requiredIndexCount == 0,
+		"static mesh admission rejects polygon-count addition overflow");
+	requiredIndexCount = 1;
+	result |= Check(!ComputeStaticMeshIndexCount(INT_MAX, 1, 0,
+		&requiredIndexCount) && requiredIndexCount == 0,
+		"static mesh admission rejects a polygon total that cannot fit signed category counts");
+	requiredIndexCount = 1;
+	result |= Check(!ComputeStaticMeshIndexCount(INT_MAX, 0, INT_MAX,
+		&requiredIndexCount) && requiredIndexCount == 0,
+		"static mesh admission rejects multiplicative overflow by capacity");
+	return result;
 }
 
 int RunNativeBufferPublicationContract()
@@ -587,10 +636,13 @@ int RunDynamicBufferPoolWrapContract(FakeRenderDevice &device)
 
 }
 
-int main()
+int main(int argc, char **argv)
 {
 	using namespace rts::render;
 	int result = 0;
+	const bool baselineSafeAppendMode = argc == 2 &&
+		std::strcmp(argv[1], "--baseline-safe-append") == 0;
+	result |= RunStaticMeshIndexCountContract();
 	result |= RunNativeBufferPublicationContract();
 
 	BufferDescriptor staticDescriptor;
@@ -647,6 +699,57 @@ int main()
 		BindNativeW3DBufferResources(&differentResources) ==
 			RENDER_RESULT_INVALID_ARGUMENT,
 		"the native buffer boundary borrows exactly one resource registry");
+	SortingIndexBufferClass *sortingAppendBuffer =
+		NEW_REF(SortingIndexBufferClass,(static_cast<unsigned short>(65535U)));
+	result |= Check(sortingAppendBuffer != nullptr &&
+		sortingAppendBuffer->Get_Index_Count() == 65535U,
+		"sorting append bounds fixture creates the maximum-size index buffer");
+	if (sortingAppendBuffer != nullptr)
+	{
+		bool fullRangeAccepted = false;
+		{
+			IndexBufferClass::AppendLockClass fullRange(
+				sortingAppendBuffer, 0, 65535U);
+			fullRangeAccepted = fullRange.Is_Locked() &&
+				fullRange.Get_Index_Array() != nullptr;
+		}
+		result |= Check(fullRangeAccepted &&
+			sortingAppendBuffer->Get_Initialized_Index_Count() == 65535U,
+			"sorting append accepts and commits the exact index-buffer boundary");
+		bool pastEndRejected = false;
+		{
+			IndexBufferClass::AppendLockClass pastEnd(
+				sortingAppendBuffer, 65535U, 1);
+			pastEndRejected = !pastEnd.Is_Locked() &&
+				pastEnd.Get_Index_Array() == nullptr;
+		}
+		result |= Check(pastEndRejected,
+			"sorting append rejects a range past the buffer without exposing a pointer");
+		bool crossingEndRejected = false;
+		{
+			// The pointer itself is valid, but the requested range crosses the end.
+			// Do not dereference it: this also safely exposes the old Release behavior.
+			IndexBufferClass::AppendLockClass crossingEnd(
+				sortingAppendBuffer, 65534U, 2);
+			crossingEndRejected = !crossingEnd.Is_Locked() &&
+				crossingEnd.Get_Index_Array() == nullptr;
+		}
+		result |= Check(crossingEndRejected,
+			"sorting append rejects a range ending after the buffer without exposing a pointer");
+		if (!baselineSafeAppendMode)
+		{
+			bool wrappedStartRejected = false;
+			{
+				IndexBufferClass::AppendLockClass wrappedStart(
+					sortingAppendBuffer, UINT_MAX, 1);
+				wrappedStartRejected = !wrappedStart.Is_Locked() &&
+					wrappedStart.Get_Index_Array() == nullptr;
+			}
+			result |= Check(wrappedStartRejected,
+				"sorting append rejects an overflowing start before forming a pointer");
+		}
+		sortingAppendBuffer->Release_Ref();
+	}
 	device.FailCreate(true);
 	DX8IndexBufferClass *failedIndex = NEW_REF(DX8IndexBufferClass,(3));
 	DX8VertexBufferClass *failedVertex = NEW_REF(DX8VertexBufferClass,(
