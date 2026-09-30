@@ -1,4 +1,5 @@
 #include "Utility/CppMacros.h"
+#include <Utility/interlocked_adapter.h>
 #include "nativew3d2.h"
 
 #include "Renderer/RenderGameClient.h"
@@ -22,6 +23,36 @@ namespace
 
 thread_local const rts::render::GameRenderCommand *g_failureCommand = 0;
 thread_local bool g_gameFailureStreakObserved = false;
+volatile long g_gameSubmitFailureTraceEvents = 0;
+const long kMaxGameSubmitFailureTraceEvents = 128L;
+
+bool ReserveGameSubmitFailureTraceEvent()
+{
+#ifdef _WIN32
+	long observed = InterlockedCompareExchange(
+		&g_gameSubmitFailureTraceEvents, 0, 0);
+	while (observed < kMaxGameSubmitFailureTraceEvents)
+	{
+		const long previous = InterlockedCompareExchange(
+			&g_gameSubmitFailureTraceEvents, observed + 1, observed);
+		if (previous == observed)
+			return true;
+		observed = previous;
+	}
+#else
+	long observed = __sync_add_and_fetch(
+		&g_gameSubmitFailureTraceEvents, 0);
+	while (observed < kMaxGameSubmitFailureTraceEvents)
+	{
+		const long previous = __sync_val_compare_and_swap(
+			&g_gameSubmitFailureTraceEvents, observed + 1, observed);
+		if (previous == observed)
+			return true;
+		observed = previous;
+	}
+#endif
+	return false;
+}
 
 class GameRenderCommandFailureScope
 {
@@ -90,6 +121,63 @@ void TraceGameFailure(rts::render::RenderResult result,
 				PackTraceHandle(command->resource1)));
 		fclose(trace);
 	}
+}
+
+void TraceGameSubmitRejection(const char *stage,
+	rts::render::RenderResult result, bool frameOpen,
+	const rts::render::NativeW3DResources &resources,
+	const rts::render::NativeDrawPacket &packet)
+{
+	const char *path = getenv("RTS_RENDER_FAILURE_TRACE");
+	if (path == 0 || path[0] == '\0')
+		return;
+	if (!resources.IsOwnerThread() ||
+		!ReserveGameSubmitFailureTraceEvent())
+		return;
+
+	rts::render::NativeW3DBufferDescription vertexDescription;
+	rts::render::NativeW3DBufferDescription indexDescription;
+	const rts::render::RenderResult vertexDescribeResult =
+		resources.DescribeBuffer(packet.vertexBuffer, &vertexDescription);
+	const rts::render::RenderResult indexDescribeResult =
+		resources.DescribeBuffer(packet.indexBuffer, &indexDescription);
+
+	FILE *trace = fopen(path, "ab");
+	if (trace == 0)
+		return;
+	fprintf(trace,
+		"renderer_failure_detail source=game-submit stage=%s result=%d frame_open=%d owner_thread=%d indexed=%d vertex_format=%u topology=%u texture_mask=%u layout_stride=%u layout_elements=%u layout_pretransformed=%u vb=%u:%u vb_describe=%d vb_bytes=%llu vb_desc_stride=%u vb_binding=%u vb_usage=%u vb_authority=%d vb_authority_epoch=%u vertex_offset_bytes=%u vertex_stride=%u start_vertex=%u min_vertex=%u vertex_count=%u base_vertex=%d ib=%u:%u ib_describe=%d ib_bytes=%llu ib_desc_stride=%u ib_binding=%u ib_usage=%u ib_authority=%d ib_authority_epoch=%u index_offset_bytes=%u index_format=%u start_index=%u index_count=%u\r\n",
+		stage,
+		static_cast<int>(result),
+		frameOpen ? 1 : 0,
+		resources.IsOwnerThread() ? 1 : 0,
+		packet.indexed ? 1 : 0,
+		static_cast<unsigned int>(packet.vertexFormat),
+		static_cast<unsigned int>(packet.topology), packet.texturePresenceMask,
+		packet.vertexLayout.stride, packet.vertexLayout.elementCount,
+		packet.vertexLayout.preTransformed ? 1 : 0,
+		packet.vertexBuffer.index(), packet.vertexBuffer.generation(),
+		static_cast<int>(vertexDescribeResult),
+		static_cast<unsigned long long>(
+			vertexDescription.descriptor.byteCount),
+		vertexDescription.descriptor.stride,
+		vertexDescription.descriptor.binding,
+		static_cast<unsigned int>(vertexDescription.descriptor.usage),
+		static_cast<int>(vertexDescription.authority),
+		vertexDescription.authorityEpoch,
+		packet.vertexOffset, packet.vertexStride, packet.startVertex,
+		packet.minimumVertexIndex, packet.vertexCount, packet.baseVertex,
+		packet.indexBuffer.index(), packet.indexBuffer.generation(),
+		static_cast<int>(indexDescribeResult),
+		static_cast<unsigned long long>(indexDescription.descriptor.byteCount),
+		indexDescription.descriptor.stride,
+		indexDescription.descriptor.binding,
+		static_cast<unsigned int>(indexDescription.descriptor.usage),
+		static_cast<int>(indexDescription.authority),
+		indexDescription.authorityEpoch,
+		packet.indexOffset, static_cast<unsigned int>(packet.indexFormat),
+		packet.startIndex, packet.indexCount);
+	fclose(trace);
 }
 
 rts::render::RenderResult BindNativeResourceOwners(
@@ -3104,8 +3192,20 @@ rts::render::RenderResult NativeW3D2::SubmitGamePacket(
 	// draw is only valid inside the frame that owns the backend command stream.
 	// SubmitExternal is reserved for the legacy bridge and must not let this
 	// owner write to an indeterminate target.
-	if (!IsOperational() || !m_renderer.IsFrameOpen())
+	if (!IsOperational())
+	{
+		TraceGameSubmitRejection("owner-not-operational",
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+			m_renderer.IsFrameOpen(), m_resources, packet);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (!m_renderer.IsFrameOpen())
+	{
+		TraceGameSubmitRejection("frame-closed",
+			rts::render::RENDER_RESULT_INVALID_ARGUMENT, false, m_resources,
+			packet);
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
 	if (textureBindingCache != 0 || sortedBatchBindingCache != 0)
 	{
 		return m_renderer.SubmitInternal(m_resources, state, packet, true,
