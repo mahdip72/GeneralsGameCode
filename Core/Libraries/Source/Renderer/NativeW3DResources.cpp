@@ -1356,6 +1356,26 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	// These descriptor/mode rejections precede mutation in both backends.
+	// A generic backend failure below must still revoke content authority.
+	if (slot->buffer.usage == RENDER_USAGE_IMMUTABLE)
+	{
+		return RENDER_RESULT_UNSUPPORTED;
+	}
+	if (mode != RENDER_BUFFER_UPDATE_PRESERVE &&
+		mode != RENDER_BUFFER_UPDATE_DISCARD &&
+		mode != RENDER_BUFFER_UPDATE_NO_OVERWRITE)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (mode != RENDER_BUFFER_UPDATE_PRESERVE &&
+		(slot->buffer.usage != RENDER_USAGE_DYNAMIC ||
+		 (slot->buffer.binding != RENDER_BUFFER_VERTEX &&
+		  slot->buffer.binding != RENDER_BUFFER_INDEX) ||
+		 (mode == RENDER_BUFFER_UPDATE_DISCARD && destinationOffset != 0)))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
 	const unsigned int bufferEpoch = m_impl->state->BufferEpoch();
 	NativeW3DSubmissionSequence submissionSequence = 0;
 #if defined(RTS_RENDERER_HAS_D3D11)

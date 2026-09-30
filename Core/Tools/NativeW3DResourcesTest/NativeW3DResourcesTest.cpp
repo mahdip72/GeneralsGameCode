@@ -30,6 +30,7 @@ class FakeRenderDevice;
 struct FakeRenderControl
 {
 	FakeRenderControl() : failCreate(0), failUpdate(0), failUpdateOnCall(0),
+		failUpdateResult(RENDER_RESULT_FAILED),
 		failRefresh(0),
 		failRefreshOnCall(0),
 		failCopy(0), createCalls(0), updateCalls(0), refreshCalls(0),
@@ -37,6 +38,7 @@ struct FakeRenderControl
 	volatile long failCreate;
 	volatile long failUpdate;
 	volatile long failUpdateOnCall;
+	volatile long failUpdateResult;
 	volatile long failRefresh;
 	volatile long failRefreshOnCall;
 	volatile long failCopy;
@@ -406,16 +408,31 @@ public:
 			if (IsSet(&m_control->failUpdate) ||
 				invocation == ReadCount(&m_control->failUpdateOnCall))
 			{
-				return RENDER_RESULT_FAILED;
+				return static_cast<RenderResult>(
+					ReadCount(&m_control->failUpdateResult));
 			}
 		}
 		FakeResource *resource = Find(handle);
 		if (resource == 0 || resource->texture || data == 0 || byteCount == 0 ||
 			destinationOffset > resource->buffer.byteCount ||
-			byteCount > resource->buffer.byteCount - destinationOffset ||
-			resource->buffer.usage == RENDER_USAGE_IMMUTABLE ||
-			mode < RENDER_BUFFER_UPDATE_PRESERVE ||
-			mode > RENDER_BUFFER_UPDATE_NO_OVERWRITE)
+			byteCount > resource->buffer.byteCount - destinationOffset)
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		// Match native/threaded pre-mutation admission rather than allowing the
+		// fake to hide a resource-table request that both actual backends reject.
+		if (resource->buffer.usage == RENDER_USAGE_IMMUTABLE)
+		{
+			return RENDER_RESULT_UNSUPPORTED;
+		}
+		if ((mode != RENDER_BUFFER_UPDATE_PRESERVE &&
+			 mode != RENDER_BUFFER_UPDATE_DISCARD &&
+			 mode != RENDER_BUFFER_UPDATE_NO_OVERWRITE) ||
+			(mode != RENDER_BUFFER_UPDATE_PRESERVE &&
+			 (resource->buffer.usage != RENDER_USAGE_DYNAMIC ||
+			  (resource->buffer.binding != RENDER_BUFFER_VERTEX &&
+			   resource->buffer.binding != RENDER_BUFFER_INDEX) ||
+			  (mode == RENDER_BUFFER_UPDATE_DISCARD && destinationOffset != 0))))
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
@@ -1721,6 +1738,155 @@ int TestSplitPacketResourceFenceReportsOwnerFailure()
 	return result;
 }
 
+int TestRejectedBufferUpdate(const char *caseName, RenderUsage usage,
+	unsigned int binding, RenderBufferUpdateMode mode, size_t offset,
+	RenderResult expected)
+{
+	int result = 0;
+	FakeRenderControl control;
+	FakeRenderDevice device(true, &control);
+	NativeW3DResourceHost host(2);
+	NativeW3DResources resources(2);
+	const unsigned int original[] = { 1, 2, 3, 4 };
+	const unsigned int replacement = 17;
+	BufferDescriptor descriptor;
+	descriptor.byteCount = sizeof(original);
+	descriptor.stride = sizeof(original[0]);
+	descriptor.binding = binding;
+	descriptor.usage = usage;
+	GpuHandle buffer;
+	NativeW3DBufferDescription before;
+	result |= Check(host.Attach(&device, device.immediateContext()) ==
+		RENDER_RESULT_OK && resources.BindHost(&host) == RENDER_RESULT_OK &&
+		resources.CreateBuffer(descriptor, original, sizeof(original), &buffer) ==
+			RENDER_RESULT_OK &&
+		resources.DescribeBuffer(buffer, &before) == RENDER_RESULT_OK &&
+		before.authority == NATIVE_W3D_CONTENT_CPU,
+		"preflight fixture establishes original whole-buffer authority");
+	result |= Check(resources.UpdateBuffer(buffer, &replacement,
+		sizeof(replacement), offset, mode) == expected &&
+		ReadCount(&control.updateCalls) == 0,
+		"descriptor/mode rejection occurs before any backend update call");
+	NativeW3DBufferDescription after;
+	result |= Check(resources.DescribeBuffer(buffer, &after) ==
+		RENDER_RESULT_OK && after.authority == before.authority &&
+		after.authorityEpoch == before.authorityEpoch &&
+		!resources.HasBufferAuthorityFailure(buffer) &&
+		device.BufferEquals(buffer, original, sizeof(original)),
+		"preflight rejection preserves unchanged bytes, authority, and epoch");
+	GpuHandle validated;
+	if ((binding & RENDER_BUFFER_VERTEX) != 0)
+	{
+		result |= Check(resources.AcquireVertexBufferRange(buffer,
+			descriptor.stride, 0, 0, 4, &validated) == RENDER_RESULT_OK &&
+			validated == buffer,
+			"preflight rejection preserves the exact committed vertex range");
+	}
+	if ((binding & RENDER_BUFFER_INDEX) != 0)
+	{
+		result |= Check(resources.AcquireIndexBufferRange(buffer,
+			RENDER_FORMAT_R32_UINT, 0, 0, 4, &validated) == RENDER_RESULT_OK &&
+			validated == buffer,
+			"preflight rejection preserves the exact committed index range");
+	}
+	if (usage == RENDER_USAGE_IMMUTABLE)
+	{
+		result |= Check(device.recoverDevice() == RENDER_RESULT_OK &&
+			host.ReplaceContext(device.immediateContext()) == RENDER_RESULT_OK &&
+			resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK &&
+			resources.AcquireVertexBufferRange(buffer, descriptor.stride, 0, 0, 4,
+				&validated) == RENDER_RESULT_OK && validated == buffer &&
+			device.BufferEquals(buffer, original, sizeof(original)) &&
+			ReadCount(&control.updateCalls) == 0,
+			"rejected immutable update retains original creation proof through recovery");
+	}
+	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+		host.Detach() == RENDER_RESULT_OK && device.LiveCount() == 0,
+		"preflight fixture releases its exact resource and borrowed host");
+	if (result != 0)
+	{
+		std::fprintf(stderr, "Preflight case: %s\n", caseName);
+	}
+	return result;
+}
+
+int TestBufferUpdatePreflight()
+{
+	int result = 0;
+	result |= TestRejectedBufferUpdate("immutable", RENDER_USAGE_IMMUTABLE,
+		RENDER_BUFFER_VERTEX, RENDER_BUFFER_UPDATE_PRESERVE, 0,
+		RENDER_RESULT_UNSUPPORTED);
+	result |= TestRejectedBufferUpdate("invalid-mode", RENDER_USAGE_DYNAMIC,
+		RENDER_BUFFER_VERTEX, static_cast<RenderBufferUpdateMode>(
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE + 1), 0,
+		RENDER_RESULT_INVALID_ARGUMENT);
+	result |= TestRejectedBufferUpdate("discard-offset", RENDER_USAGE_DYNAMIC,
+		RENDER_BUFFER_VERTEX, RENDER_BUFFER_UPDATE_DISCARD, sizeof(unsigned int),
+		RENDER_RESULT_INVALID_ARGUMENT);
+	result |= TestRejectedBufferUpdate("default-discard", RENDER_USAGE_DEFAULT,
+		RENDER_BUFFER_VERTEX, RENDER_BUFFER_UPDATE_DISCARD, 0,
+		RENDER_RESULT_INVALID_ARGUMENT);
+	result |= TestRejectedBufferUpdate("default-no-overwrite", RENDER_USAGE_DEFAULT,
+		RENDER_BUFFER_INDEX, RENDER_BUFFER_UPDATE_NO_OVERWRITE, 0,
+		RENDER_RESULT_INVALID_ARGUMENT);
+	result |= TestRejectedBufferUpdate("constant-discard", RENDER_USAGE_DYNAMIC,
+		RENDER_BUFFER_CONSTANT, RENDER_BUFFER_UPDATE_DISCARD, 0,
+		RENDER_RESULT_INVALID_ARGUMENT);
+	result |= TestRejectedBufferUpdate("constant-no-overwrite", RENDER_USAGE_DYNAMIC,
+		RENDER_BUFFER_CONSTANT, RENDER_BUFFER_UPDATE_NO_OVERWRITE, 0,
+		RENDER_RESULT_INVALID_ARGUMENT);
+	result |= TestRejectedBufferUpdate("combined-binding", RENDER_USAGE_DYNAMIC,
+		RENDER_BUFFER_VERTEX | RENDER_BUFFER_INDEX,
+		RENDER_BUFFER_UPDATE_NO_OVERWRITE, 0, RENDER_RESULT_INVALID_ARGUMENT);
+
+	// A valid request's generic backend rejection must remain fail closed, even
+	// for an error code also used by the preflight checks above. Error codes alone
+	// are not a guarantee that a backend operation left its content untouched.
+	const RenderResult failures[] = { RENDER_RESULT_FAILED,
+		RENDER_RESULT_INVALID_ARGUMENT, RENDER_RESULT_UNSUPPORTED };
+	for (unsigned int index = 0; index < sizeof(failures) / sizeof(failures[0]); ++index)
+	{
+		FakeRenderControl control;
+		FakeRenderDevice device(true, &control);
+		NativeW3DResourceHost host(2);
+		NativeW3DResources resources(2);
+		const unsigned int original[] = { 1, 2, 3, 4 };
+		const unsigned int replacement = 17;
+		BufferDescriptor descriptor;
+		descriptor.byteCount = sizeof(original);
+		descriptor.stride = sizeof(original[0]);
+		descriptor.binding = RENDER_BUFFER_VERTEX;
+		descriptor.usage = RENDER_USAGE_DYNAMIC;
+		GpuHandle buffer;
+		NativeW3DBufferDescription before;
+		result |= Check(host.Attach(&device, device.immediateContext()) ==
+			RENDER_RESULT_OK && resources.BindHost(&host) == RENDER_RESULT_OK &&
+			resources.CreateBuffer(descriptor, original, sizeof(original), &buffer) ==
+				RENDER_RESULT_OK &&
+			resources.DescribeBuffer(buffer, &before) == RENDER_RESULT_OK,
+			"valid backend-failure fixture initializes its buffer");
+		InterlockedExchange(&control.failUpdate, 1);
+		InterlockedExchange(&control.failUpdateResult, failures[index]);
+		NativeW3DBufferDescription after;
+		GpuHandle validated = buffer;
+		result |= Check(resources.UpdateBuffer(buffer, &replacement,
+			sizeof(replacement), 0, RENDER_BUFFER_UPDATE_PRESERVE) ==
+				failures[index] && ReadCount(&control.updateCalls) == 1 &&
+			resources.HasBufferAuthorityFailure(buffer) &&
+			resources.DescribeBuffer(buffer, &after) == RENDER_RESULT_OK &&
+			after.authority == NATIVE_W3D_CONTENT_INVALID &&
+			after.authorityEpoch > before.authorityEpoch &&
+			resources.AcquireVertexBufferRange(buffer, descriptor.stride, 0, 0, 4,
+				&validated) == RENDER_RESULT_INVALID_ARGUMENT &&
+			!validated.isValid(),
+			"a valid request's generic backend failure still revokes exact authority");
+		result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+			host.Detach() == RENDER_RESULT_OK && device.LiveCount() == 0,
+			"valid backend-failure fixture retains exact cleanup ownership");
+	}
+	return result;
+}
+
 int TestRetiredBufferPublication()
 {
 	int result = 0;
@@ -1934,6 +2100,7 @@ int TestRawHandlesAcrossFreshBackends()
 int main()
 {
 	int result = 0;
+	result |= TestBufferUpdatePreflight();
 	result |= TestRetiredBufferPublication();
 	result |= TestRawHandlesAcrossFreshBackends();
 	NativeW3DResources unbound(2);
