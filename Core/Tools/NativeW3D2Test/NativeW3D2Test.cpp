@@ -2257,9 +2257,20 @@ int TestCpuSortingImmediateTriangles(HWND window)
 	return result;
 }
 
+constexpr int NativeFixtureExitCode(int failures, bool skipped)
+{
+	return failures != 0 ? failures : (skipped ? 77 : 0);
+}
+
+static_assert(NativeFixtureExitCode(0, false) == 0, "completed tests pass");
+static_assert(NativeFixtureExitCode(0, true) == 77, "unsupported tests skip");
+static_assert(NativeFixtureExitCode(1, false) == 1, "failed tests fail");
+static_assert(NativeFixtureExitCode(1, true) == 1, "failures dominate skips");
+
 int main(int argc, char **argv)
 {
 	int result = 0;
+	bool skipped = false;
 	NativeW3D2 w3d;
 	rts::render::NativeW3DRendererDescriptor descriptor;
 	descriptor.width = 64;
@@ -2299,12 +2310,16 @@ int main(int argc, char **argv)
 	result |= TestResizeRollback(window);
 	result |= TestResizeOwnerThread(window);
 	result |= TestReacquireFailureFailClosed(window);
-	result |= TestCpuSortingImmediateTriangles(window);
+	const int cpuSortingResult = TestCpuSortingImmediateTriangles(window);
+	if (cpuSortingResult == 77)
+		skipped = true;
+	else
+		result |= cpuSortingResult;
 	const rts::render::RenderResult initializeResult = w3d.Initialize(window, descriptor);
 	if (initializeResult == rts::render::RENDER_RESULT_UNSUPPORTED)
 	{
 		DestroyWindow(window);
-		return 77;
+		return NativeFixtureExitCode(result, true);
 	}
 	result |= Check(initializeResult == rts::render::RENDER_RESULT_OK,
 		"native WW3D2 initializes a hidden D3D11 swap chain");
@@ -2976,5 +2991,5 @@ int main(int argc, char **argv)
 		std::fprintf(stderr, "FAIL: native WW3D2 shutdown was not deterministic\n");
 		return 1;
 	}
-	return 0;
+	return NativeFixtureExitCode(result, skipped);
 }
