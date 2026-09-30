@@ -7,6 +7,7 @@
 #endif
 #include <windows.h>
 #endif
+#include "Lib/FrameTimingDiagnostics.h"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -443,6 +444,8 @@ private:
 	}
 	template <typename Predicate> void wait(std::unique_lock<std::mutex> &lock, Predicate ready)
 	{
+		rts::frame_timing::ConditionalScope producerWaitTiming(
+			rts::frame_timing::RenderProducerWait, rts::frame_timing::IsActive());
 		const Clock::time_point start = Clock::now();
 		m_waiting = true;
 		while (!ready())

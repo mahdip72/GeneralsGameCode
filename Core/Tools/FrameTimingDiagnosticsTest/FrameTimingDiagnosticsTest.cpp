@@ -113,6 +113,9 @@ void disabled(const std::string& directory)
 			rts::frame_timing::ConditionalScope inactive(capture,
 				rts::frame_timing::DisplayMainRender, true);
 			inactive.finish();
+			rts::frame_timing::ConditionalScope producerWait(
+				rts::frame_timing::RenderProducerWait, rts::frame_timing::IsActive());
+			producerWait.finish();
 		}
 		check(diagnosticClockCalls == before,
 			"disabled and inactive conditional scopes do not query the clock");
@@ -216,12 +219,13 @@ void clientDisplayPhases(const std::string& directory)
 		rts::frame_timing::ClientDisplayUpdate, rts::frame_timing::ClientDisplayDraw,
 		rts::frame_timing::DisplayPreframe, rts::frame_timing::DisplayViews,
 		rts::frame_timing::DisplayRtt, rts::frame_timing::DisplayBeginRender,
-		rts::frame_timing::DisplayMainRender, rts::frame_timing::DisplayEndRender
+		rts::frame_timing::DisplayMainRender, rts::frame_timing::DisplayEndRender,
+		rts::frame_timing::RenderProducerWait
 	};
 	const char *names[] = {
 		"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
 		"display_preframe", "display_views", "display_rtt", "display_begin_render",
-		"display_main_render", "display_end_render"
+		"display_main_render", "display_end_render", "render_producer_wait"
 	};
 	for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 	{
@@ -244,10 +248,10 @@ void clientDisplayPhases(const std::string& directory)
 	check(!rts::frame_timing::IsActive(), "ending the producer frame clears the singleton gate");
 	capture.endSession();
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
-	check(final.complete, "client/display subphases retain complete frame evidence");
+	check(final.complete, "client/display and producer wait subphases retain complete frame evidence");
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 11, "frame plus all ten client/display phases are emitted");
-	if (data.size() == 11)
+	check(data.size() == 12, "frame plus ten client/display phases and producer wait are emitted");
+	if (data.size() == 12)
 	{
 		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&

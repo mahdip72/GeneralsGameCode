@@ -18,6 +18,7 @@ enum Phase
 	ClientDrawables, ClientTerrainVisual, ClientDisplayUpdate, ClientDisplayDraw,
 	DisplayPreframe, DisplayViews, DisplayRtt, DisplayBeginRender,
 	DisplayMainRender, DisplayEndRender,
+	RenderProducerWait,
 	PhaseCount
 };
 
@@ -355,7 +356,8 @@ private:
 			"water_track_texture_bind", "water_track_module_render",
 			"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
 			"display_preframe", "display_views", "display_rtt", "display_begin_render",
-			"display_main_render", "display_end_render"
+			"display_main_render", "display_end_render",
+			"render_producer_wait"
 		};
 		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)
