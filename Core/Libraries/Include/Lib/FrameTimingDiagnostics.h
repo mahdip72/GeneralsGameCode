@@ -25,6 +25,13 @@ enum Phase
 	SceneParticleSubmit, SceneOcclusion, SceneTranslucent,
 	SceneFlush, SceneMeshFlush, SceneStaticSort,
 	SceneProjectedShadows, SceneVolumeShadows, SmudgeRender, SmudgeColorCopy,
+	// TEMP particle producer partition: per-system/chunk owner scopes only.
+	ParticleVisibleBounds, ParticleOwnerCapture, ParticlePrepareJoin,
+	ParticleCompact, ParticleSerialGather, ParticleTextureLookup,
+	ParticlePointSubmit, ParticleVolumeSubmit, ParticleStreakSubmit,
+	ParticleSnowSubmit, ParticleSmudgeSubmit,
+	PointCenterTransform, PointUpdateArrays, PointPackedVertexFill,
+	NativeSortingQueue,
 	PhaseCount
 };
 
@@ -370,7 +377,13 @@ private:
 			"scene_trees", "scene_particle_submit", "scene_occlusion",
 			"scene_translucent", "scene_flush", "scene_mesh_flush",
 			"scene_static_sort", "scene_projected_shadows", "scene_volume_shadows",
-			"smudge_render", "smudge_color_copy"
+			"smudge_render", "smudge_color_copy",
+			"particle_visible_bounds", "particle_owner_capture", "particle_prepare_join",
+			"particle_compact", "particle_serial_gather", "particle_texture_lookup",
+			"particle_point_submit", "particle_volume_submit", "particle_streak_submit",
+			"particle_snow_submit", "particle_smudge_submit",
+			"point_center_transform", "point_update_arrays", "point_packed_vertex_fill",
+			"native_sorting_queue"
 		};
 		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)

@@ -85,6 +85,7 @@
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/LegacyColorPacking.h"
 #include "Renderer/PointGroupColorPacking.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "rinfo.h"
 #include "camera.h"
 
@@ -779,6 +780,7 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 
 	// If no points, do nothing:
 	if (PointCount == 0) return;
+	const bool frameTimingActive = rts::frame_timing::IsActive();
 
 	WWASSERT(PointLoc && PointLoc->Get_Array());
 
@@ -887,6 +889,9 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	// of the vertice to lay it down flat.
 
 	// (gth) changed this 'if' to use OR rather than AND... The way it was caused all emitters to break
+	rts::frame_timing::ConditionalScope centerTiming(
+		rts::frame_timing::PointCenterTransform,
+		frameTimingActive && Get_Flag(TRANSFORM) && Billboard);
 	if (Get_Flag(TRANSFORM) && Billboard) {
 		// Resize transformed location array if needed (2x guardband to prevent
 		// frequent reallocations):
@@ -906,12 +911,16 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 		}
 		current_loc = &transformed_loc[0];
 	}
+	centerTiming.finish();
 
 	// Update the arrays with the offsets.
 	int vnum, pnum;
 
+	rts::frame_timing::ConditionalScope arraysTiming(
+		rts::frame_timing::PointUpdateArrays, frameTimingActive);
 	Update_Arrays(current_loc, current_size, current_orient, current_frame,
 		PointCount, PointLoc->Get_Count(), vnum, pnum);
+	arraysTiming.finish();
 
 	// the locations are now in view space
 	// so set world and view matrices to identity and render
@@ -976,6 +985,8 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 				rts::render::PackLegacyARGB(DefaultPointColor[0],
 					DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
 
+			rts::frame_timing::ConditionalScope fillTiming(
+				rts::frame_timing::PointPackedVertexFill, frameTimingActive);
 			for (i = current; i < current + delta; i++)
 			{
 				/// @todo lorenzen sez: use pointer arithmetic throughout this block
@@ -996,6 +1007,7 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 				vb+=fvfinfo.Get_FVF_Size();
 			}
+			fillTiming.finish();
 			if (!Lock.Commit()) {
 				break;
 			}
@@ -1724,6 +1736,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 
 	if (PointCount == 0)
 		return;
+	const bool frameTimingActive = rts::frame_timing::IsActive();
 
 	WWASSERT(PointLoc && PointLoc->Get_Array());
 
@@ -1841,6 +1854,10 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 
 		// need to interrupt this processing. If we are not billboarding, then we need the actual position
 		// of the vertice to lay it down flat.
+		// TEMP: these children repeat once per volume layer; parent is inclusive.
+		rts::frame_timing::ConditionalScope centerTiming(
+			rts::frame_timing::PointCenterTransform,
+			frameTimingActive && Get_Flag(TRANSFORM) && Billboard);
 		if (Get_Flag(TRANSFORM) && Billboard) {
 			// Resize transformed location array if needed (2x guardband to prevent
 			// frequent reallocations):
@@ -1879,6 +1896,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 			}
 			current_loc = &transformed_loc[0];
 		}
+		centerTiming.finish();
 
 		// Update the arrays with the offsets.
 		int vnum, pnum;
@@ -1889,8 +1907,11 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		//current_diffuse->Z *= attenuator;
 		//current_diffuse->W *= attenuator;
 
+		rts::frame_timing::ConditionalScope arraysTiming(
+			rts::frame_timing::PointUpdateArrays, frameTimingActive);
 		Update_Arrays(current_loc, current_size, current_orient, current_frame,
 			PointCount, PointLoc->Get_Count(), vnum, pnum);
+		arraysTiming.finish();
 
 		// the locations are now in view space
 		// so set world and view matrices to identity and render
@@ -1956,6 +1977,8 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 						DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
 
 
+				rts::frame_timing::ConditionalScope fillTiming(
+					rts::frame_timing::PointPackedVertexFill, frameTimingActive);
 				for (i = current; i < current + delta; i++)
 				{
 					/// @todo lorenzen sez: use pointer arithmetic throughout this block
@@ -1977,6 +2000,7 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 					*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 					vb+=fvfinfo.Get_FVF_Size();
 				}
+				fillTiming.finish();
 				if (!Lock.Commit()) {
 					break;
 				}

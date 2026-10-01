@@ -231,7 +231,15 @@ void clientDisplayPhases(const std::string& directory)
 		rts::frame_timing::SceneTranslucent, rts::frame_timing::SceneFlush,
 		rts::frame_timing::SceneMeshFlush, rts::frame_timing::SceneStaticSort,
 		rts::frame_timing::SceneProjectedShadows, rts::frame_timing::SceneVolumeShadows,
-		rts::frame_timing::SmudgeRender, rts::frame_timing::SmudgeColorCopy
+		rts::frame_timing::SmudgeRender, rts::frame_timing::SmudgeColorCopy,
+		rts::frame_timing::ParticleVisibleBounds, rts::frame_timing::ParticleOwnerCapture,
+		rts::frame_timing::ParticlePrepareJoin, rts::frame_timing::ParticleCompact,
+		rts::frame_timing::ParticleSerialGather, rts::frame_timing::ParticleTextureLookup,
+		rts::frame_timing::ParticlePointSubmit, rts::frame_timing::ParticleVolumeSubmit,
+		rts::frame_timing::ParticleStreakSubmit, rts::frame_timing::ParticleSnowSubmit,
+		rts::frame_timing::ParticleSmudgeSubmit, rts::frame_timing::PointCenterTransform,
+		rts::frame_timing::PointUpdateArrays, rts::frame_timing::PointPackedVertexFill,
+		rts::frame_timing::NativeSortingQueue
 	};
 	const char *names[] = {
 		"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
@@ -242,7 +250,13 @@ void clientDisplayPhases(const std::string& directory)
 		"scene_object_submit", "scene_shadow_prepare", "scene_shadow_render",
 		"scene_trees", "scene_particle_submit", "scene_occlusion",
 		"scene_translucent", "scene_flush", "scene_mesh_flush", "scene_static_sort",
-		"scene_projected_shadows", "scene_volume_shadows", "smudge_render", "smudge_color_copy"
+		"scene_projected_shadows", "scene_volume_shadows", "smudge_render", "smudge_color_copy",
+		"particle_visible_bounds", "particle_owner_capture", "particle_prepare_join",
+		"particle_compact", "particle_serial_gather", "particle_texture_lookup",
+		"particle_point_submit", "particle_volume_submit", "particle_streak_submit",
+		"particle_snow_submit", "particle_smudge_submit",
+		"point_center_transform", "point_update_arrays", "point_packed_vertex_fill",
+		"native_sorting_queue"
 	};
 	for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 	{
@@ -267,8 +281,8 @@ void clientDisplayPhases(const std::string& directory)
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
 	check(final.complete, "child diagnostic phases retain complete frame evidence");
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 33, "frame plus all thirty-two child diagnostic phases are emitted");
-	if (data.size() == 33)
+	check(data.size() == 48, "frame plus all forty-seven child diagnostic phases are emitted");
+	if (data.size() == 48)
 	{
 		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&

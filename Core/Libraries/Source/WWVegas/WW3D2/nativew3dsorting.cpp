@@ -652,6 +652,10 @@ RenderResult NativeSortingRenderer::Queue(const LegacyLogicalState &state,
 	size_t vertexBytes, const void *indexData, size_t indexBytes,
 	const GameBoundingSphere *boundingSphere)
 {
+	// General sorted admission cost, not particle-exclusive. TEMP partition.
+	const bool frameTimingActive = rts::frame_timing::IsActive();
+	rts::frame_timing::ConditionalScope queueTiming(
+		rts::frame_timing::NativeSortingQueue, frameTimingActive);
 	size_t requiredVertexBytes = 0;
 	size_t requiredIndexBytes = 0;
 	if (m_impl == 0 || !ValidateSubmission(packet, vertexData, vertexBytes,

@@ -36,6 +36,7 @@
 #include "W3DDevice/GameClient/W3DSnow.h"
 #include "W3DDevice/Common/EffectPrepare.h"
 #include "Lib/PipelineExecutionPolicy.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "WW3D2/camera.h"
 
 
@@ -134,6 +135,9 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 	/// @todo lorenzen sez: this should be debug only:
 	m_onScreenParticleCount = 0;
 
+	const bool frameTimingActive = rts::frame_timing::IsActive();
+	rts::frame_timing::ConditionalScope boundsTiming(
+		rts::frame_timing::ParticleVisibleBounds, frameTimingActive);
  	const FrustumClass & frustum = rinfo.Camera.Get_Frustum();
 	AABoxClass bbox;
 
@@ -160,6 +164,7 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 	particleBounds.extentX = beX;
 	particleBounds.extentY = beY;
 	particleBounds.extentZ = beZ;
+	boundsTiming.finish();
 
 
 	m_fieldParticleCount = 0;
@@ -233,6 +238,8 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 		if (rts::UseParallelPipelines() && particleCount >= 256 &&
 			preparedParticles.initialize(particleCount))
 		{
+			rts::frame_timing::ConditionalScope captureTiming(
+				rts::frame_timing::ParticleOwnerCapture, frameTimingActive);
 			unsigned captured = 0;
 			Particle *particle = sys->getFirstParticle();
 			for (; particle != nullptr && captured < particleCount;
@@ -252,11 +259,16 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 				input.angle = particle->getAngle();
 				input.personality = particle->getPersonality();
 			}
+			captureTiming.finish();
+			rts::frame_timing::ConditionalScope prepareTiming(
+				rts::frame_timing::ParticlePrepareJoin, frameTimingActive);
 			prepared = captured == particleCount && particle == nullptr &&
 				preparedParticles.run(particleBounds);
 		}
 		if (prepared)
 		{
+			rts::frame_timing::ConditionalScope compactTiming(
+				rts::frame_timing::ParticleCompact, frameTimingActive);
 			// Stable compaction keeps the first 512 visible particles, field counts,
 			// streak personalities and draw order identical to the reference loop.
 			for (unsigned index = 0; index < particleCount && count < MAX_POINTS_PER_GROUP; ++index)
@@ -280,6 +292,8 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 		}
 
 		// Small systems and failed capture/allocation retain the legacy path.
+		rts::frame_timing::ConditionalScope serialGatherTiming(
+			rts::frame_timing::ParticleSerialGather, frameTimingActive && !prepared);
 		for (Particle *p = prepared ? nullptr : sys->getFirstParticle(); p; p = p->m_systemNext)
 		{
 			pos = p->getPosition();
@@ -318,13 +332,19 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 				break;
 		}
 
+		serialGatherTiming.finish();
 		if ( count == 0 )
 			continue;	//this system has no particles to render
 
+		rts::frame_timing::ConditionalScope textureTiming(
+			rts::frame_timing::ParticleTextureLookup, frameTimingActive);
 		TextureClass *texture = W3DDisplay::m_assetManager->Get_Texture( sys->getParticleTypeName().str() );
+		textureTiming.finish();
 
 		if ( m_streakLine && sys->isUsingStreak() && (count >= 2) )
 		{
+			rts::frame_timing::ConditionalScope streakTiming(
+				rts::frame_timing::ParticleStreakSubmit, frameTimingActive);
 			m_streakLine->Reset_Line();
 
 			m_streakLine->Set_Texture( texture );
@@ -369,6 +389,8 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 		}
 		else
 		{
+			rts::frame_timing::ConditionalScope pointTiming(
+				rts::frame_timing::ParticlePointSubmit, frameTimingActive);
 
 			WWASSERT( m_pointGroup );
 
@@ -408,6 +430,9 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 				const UnsignedInt volumeParticleDepth = sys->getVolumeParticleDepth();
 				if( sys->isUsingVolumeParticles() && volumeParticleDepth > DEFAULT_VOLUME_PARTICLE_DEPTH )
 				{
+					// Inclusive: layer transforms, expansion, packing and submission.
+					rts::frame_timing::ConditionalScope volumeTiming(
+						rts::frame_timing::ParticleVolumeSubmit, frameTimingActive);
 					m_pointGroup->RenderVolumeParticle( rinfo, volumeParticleDepth);
 				}
 				else
@@ -446,11 +471,17 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 
 	//Draw any particles belonging to weather effects
 	if (TheSnowManager)
+	{
+		rts::frame_timing::ConditionalScope snowTiming(
+			rts::frame_timing::ParticleSnowSubmit, frameTimingActive);
 		((W3DSnowManager *)TheSnowManager)->render(rinfo);
+	}
 
 	//Now process screen smudges which are particles that distort the background behind them.
 	if(TheSmudgeManager)
 	{
+		rts::frame_timing::ConditionalScope smudgeTiming(
+			rts::frame_timing::ParticleSmudgeSubmit, frameTimingActive);
 		((W3DSmudgeManager *)TheSmudgeManager)->render(rinfo);
 	}
 }
