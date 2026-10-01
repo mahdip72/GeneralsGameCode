@@ -392,9 +392,11 @@ once, and leave no outstanding completion.
 
 ## Mixed-worker multiplayer gate
 
-Replay playback is not multiplayer evidence. Before parallel simulation can be
-enabled for network games, `Net3LoopbackEvidence.schema.json` and the strict
-PowerShell parser require exact installed-runtime NET3 loopback peers covering:
+Replay playback is not multiplayer evidence. The diagnostic-v1
+`Net3LoopbackEvidence.schema.json` and strict PowerShell parser require exact
+installed-runtime NET3 loopback peers covering the matrix below. This matrix
+cannot enable live workers; live multiplayer authority and publication evidence
+use the separate installed lockstep-v2 product and attestation contract.
 
 The Stage 5 compatibility boundary retains the legacy trusted packet-router
 session model. Direct peer traffic is bound to the negotiated endpoint, and
@@ -521,6 +523,13 @@ absent external qualification run or independent
 attestation hash makes scheduled/manual publication skip; a same-source rebuild
 is not treated as the qualified artifact. The external qualification execution
 remains a release prerequisite rather than an ordinary PR check.
+
+Weekly publication, including a package not marked as a GitHub prerelease,
+attests only this exact-artifact lockstep-v2 publication contract. That channel
+label is not final Stage 5 acceptance, physical-core performance qualification,
+complete-diff review approval, or installed-runtime user manual approval. Those
+remain separate gates under the final development-readiness and acceptance
+contract; weekly publication cannot substitute for them.
 
 Run the installed peer matrix from a fresh task-owned evidence directory. This
 uses a dedicated local-only process mode and the exact already-installed

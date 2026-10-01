@@ -219,6 +219,13 @@ files, undeclared extras, hash changes, aliases, and reparse paths. Dispatch
 cross-commit, non-manual, or hash-mismatched evidence skips publication; the
 weekly workflow never substitutes a newly rebuilt but unqualified binary.
 
+This weekly publication gate has the narrow lockstep-v2 scope above. Even a
+weekly package not marked as a GitHub prerelease is not final Stage 5
+acceptance. Physical-core performance qualification, the full development-
+readiness evidence, complete-diff review, and installed-runtime user manual
+approval remain separate requirements; the publication/channel label proves
+none of them.
+
 On ordinary startup, each NET3 Hello advertises the embedded v2 mask. Matching
 peers intersect the exact advertised masks only after build, content, map,
 roster, endpoint, and challenge validation; any absent, unknown, or mismatched
