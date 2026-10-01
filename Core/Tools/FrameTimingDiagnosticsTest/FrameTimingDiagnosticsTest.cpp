@@ -239,7 +239,14 @@ void clientDisplayPhases(const std::string& directory)
 		rts::frame_timing::ParticleStreakSubmit, rts::frame_timing::ParticleSnowSubmit,
 		rts::frame_timing::ParticleSmudgeSubmit, rts::frame_timing::PointCenterTransform,
 		rts::frame_timing::PointUpdateArrays, rts::frame_timing::PointPackedVertexFill,
-		rts::frame_timing::NativeSortingQueue
+		rts::frame_timing::NativeSortingQueue,
+		rts::frame_timing::PointInputPrepare, rts::frame_timing::PointTransformSetup,
+		rts::frame_timing::PointMaterialApply, rts::frame_timing::PointShaderApply,
+		rts::frame_timing::PointTextureApply, rts::frame_timing::PointChunkLifetime,
+		rts::frame_timing::PointVBAcquire, rts::frame_timing::PointVBLock,
+		rts::frame_timing::PointVBCommit, rts::frame_timing::PointIBBind,
+		rts::frame_timing::PointVBBind, rts::frame_timing::PointDrawSubmit,
+		rts::frame_timing::PointTransformRestore
 	};
 	const char *names[] = {
 		"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
@@ -256,7 +263,11 @@ void clientDisplayPhases(const std::string& directory)
 		"particle_point_submit", "particle_volume_submit", "particle_streak_submit",
 		"particle_snow_submit", "particle_smudge_submit",
 		"point_center_transform", "point_update_arrays", "point_packed_vertex_fill",
-		"native_sorting_queue"
+		"native_sorting_queue",
+		"point_input_prepare", "point_transform_setup", "point_material_apply",
+		"point_shader_apply", "point_texture_apply", "point_chunk_lifetime",
+		"point_vb_acquire", "point_vb_lock", "point_vb_commit",
+		"point_ib_bind", "point_vb_bind", "point_draw_submit", "point_transform_restore"
 	};
 	for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 	{
@@ -281,8 +292,8 @@ void clientDisplayPhases(const std::string& directory)
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
 	check(final.complete, "child diagnostic phases retain complete frame evidence");
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 48, "frame plus all forty-seven child diagnostic phases are emitted");
-	if (data.size() == 48)
+	check(data.size() == 61, "frame plus all sixty child diagnostic phases are emitted");
+	if (data.size() == 61)
 	{
 		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&

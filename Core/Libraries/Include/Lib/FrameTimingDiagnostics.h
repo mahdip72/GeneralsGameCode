@@ -32,6 +32,10 @@ enum Phase
 	ParticleSnowSubmit, ParticleSmudgeSubmit,
 	PointCenterTransform, PointUpdateArrays, PointPackedVertexFill,
 	NativeSortingQueue,
+	// TEMP point-submit residual partition; chunk lifetime is inclusive.
+	PointInputPrepare, PointTransformSetup, PointMaterialApply, PointShaderApply,
+	PointTextureApply, PointChunkLifetime, PointVBAcquire, PointVBLock,
+	PointVBCommit, PointIBBind, PointVBBind, PointDrawSubmit, PointTransformRestore,
 	PhaseCount
 };
 
@@ -383,7 +387,11 @@ private:
 			"particle_point_submit", "particle_volume_submit", "particle_streak_submit",
 			"particle_snow_submit", "particle_smudge_submit",
 			"point_center_transform", "point_update_arrays", "point_packed_vertex_fill",
-			"native_sorting_queue"
+			"native_sorting_queue",
+			"point_input_prepare", "point_transform_setup", "point_material_apply",
+			"point_shader_apply", "point_texture_apply", "point_chunk_lifetime",
+			"point_vb_acquire", "point_vb_lock", "point_vb_commit",
+			"point_ib_bind", "point_vb_bind", "point_draw_submit", "point_transform_restore"
 		};
 		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)
