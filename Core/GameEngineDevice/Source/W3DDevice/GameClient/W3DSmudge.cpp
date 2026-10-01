@@ -30,6 +30,7 @@
 #include "Lib/BaseType.h"
 #include "WWLib/always.h"
 #include "W3DDevice/GameClient/W3DSmudge.h"
+#include "W3DDevice/GameClient/W3DSmudgeUVMapping.h"
 #include "Common/GameMemory.h"
 #include "GameClient/View.h"
 #include "GameClient/Display.h"
@@ -222,11 +223,21 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 	camera.Get_View_Matrix(&view);
 	camera.Get_Projection_Matrix(&proj);
 
-	Real texClampX = (Real)TheTacticalView->getWidth()/(Real)surface_desc.Width;
-	Real texClampY = (Real)TheTacticalView->getHeight()/(Real)surface_desc.Height;
-
-	Real texScaleX = texClampX*0.5f;
-	Real texScaleY = texClampY*0.5f;
+	rts::render::RenderBackBufferInfo targetInfo;
+	if (rts::render::GetGameRenderTargetInfo(&targetInfo) != RENDER_RESULT_OK ||
+		targetInfo.width == 0 || targetInfo.height == 0 ||
+		targetInfo.width > (UnsignedInt)surface_desc.Width ||
+		targetInfo.height > (UnsignedInt)surface_desc.Height ||
+		targetInfo.format != back_buffer_info.format)
+	{
+		return;
+	}
+	Vector2 viewportMin, viewportMax;
+	camera.Get_Viewport(viewportMin, viewportMax);
+	const W3DSmudgeUVAxis uvX(viewportMin.X, viewportMax.X,
+		targetInfo.width, surface_desc.Width);
+	const W3DSmudgeUVAxis uvY(viewportMin.Y, viewportMax.Y,
+		targetInfo.height, surface_desc.Height);
 
 	//Do a first pass over the smudges to determine how many are visible
 	//and to fill in their world-space positions and screen uv coordinates.
@@ -269,16 +280,18 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 				Real oow = 1.0f/ssVert.W;
 				ssVert *= oow;	//returned in camera space which is -1,-1 (bottom-left) to 1,1 (top-right)
 				//convert camera space to uv space: 0,0 (top-left), 1,1 (bottom-right)
-				verts[i].uv.Set((ssVert.X+1.0f)*texScaleX,(1.0f-ssVert.Y)*texScaleY);
+				verts[i].uv.Set(uvX.Project(ssVert.X),uvY.Project(-ssVert.Y));
 
 				Vector2 &thisUV=verts[i].uv;
 
 				// Zero coordinates that fall outside valid texel bounds
-				if (thisUV.X < 0 || thisUV.X > texClampX)
+				if (uvX.Outside(thisUV.X))
 					offset.X = 0;
 
-				if (thisUV.Y < 0 || thisUV.Y > texClampY)
+				if (uvY.Outside(thisUV.Y))
 					offset.Y = 0;
+				thisUV.X = uvX.Constrain(thisUV.X);
+				thisUV.Y = uvY.Constrain(thisUV.Y);
 			}
 
 			//Finish center vertex
@@ -287,6 +300,8 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 			uvSpanY=verts[1].uv.Y - verts[0].uv.Y;
 			verts[4].uv.X=verts[0].uv.X+uvSpanX*(0.5f+offset.X);
 			verts[4].uv.Y=verts[0].uv.Y+uvSpanY*(0.5f+offset.Y);
+			verts[4].uv.X=uvX.Constrain(verts[4].uv.X);
+			verts[4].uv.Y=uvY.Constrain(verts[4].uv.Y);
 
 			count++;	//increment visible smudge count.
 		}

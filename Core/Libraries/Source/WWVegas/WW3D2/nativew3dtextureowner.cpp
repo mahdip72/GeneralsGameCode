@@ -485,6 +485,24 @@ RenderResult NativeW3DTextureOwner::CopyActiveColorTarget(
 	{
 		return RENDER_RESULT_FAILED;
 	}
+	IGameRenderClientNativeOwner *gameOwner = ownerScope.Get();
+	if (gameOwner != 0)
+	{
+		RenderBackBufferInfo source;
+		const RenderResult queryResult = gameOwner->GetGameRenderTargetInfo(&source);
+		if (queryResult != RENDER_RESULT_OK)
+			return queryResult;
+		// The pinned owner describes the logical source before a copy command
+		// is admitted. Reject shape/format/sample mismatches here, where no GPU
+		// mutation or threaded owner metadata change can have occurred.
+		if (source.width == 0 || source.height == 0 || source.multisampleCount == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (source.format != m_descriptor.format ||
+			source.width > m_descriptor.width || source.height > m_descriptor.height ||
+			(source.multisampleCount > 1 &&
+			 (source.width != m_descriptor.width || source.height != m_descriptor.height)))
+			return RENDER_RESULT_UNSUPPORTED;
+	}
 	return resources->CopyActiveColorTargetToTexture(m_handle.resource,
 		gpuLease);
 }

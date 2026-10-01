@@ -436,6 +436,7 @@ void SetGameRenderTarget(TextureClass *colorTexture,
 	ZTextureClass *depthTexture, bool useDefaultDepth);
 
 RenderResult GetGameBackBufferInfo(RenderBackBufferInfo *info);
+RenderResult GetGameRenderTargetInfo(RenderBackBufferInfo *info);
 RenderResult QueueGameBackBufferCapture(
 	const RenderCaptureRequestDescriptor &descriptor,
 	RenderCaptureHandle *handle);
@@ -450,6 +451,9 @@ TextureClass *CreateGameRenderTarget(int width, int height,
 RenderResult CreateGameRenderTargetPair(int width, int height,
 	WW3DFormat colorFormat, WW3DZFormat depthFormat,
 	TextureClass **colorTarget, ZTextureClass **depthTarget);
+// Copy the complete active color image at destination origin. A larger
+// single-sample destination is supported without scaling; its caller must map
+// sampling coordinates to the copied region. MSAA resolves require equal size.
 RenderResult CopyGameActiveTargetToTexture(TextureClass *destination);
 // Publishes/obtains the permanent texture contents produced by the native
 // projection pass.  The legacy lane returns false because its surface copy is

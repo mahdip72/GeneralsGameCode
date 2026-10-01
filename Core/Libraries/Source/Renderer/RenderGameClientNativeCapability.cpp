@@ -303,6 +303,17 @@ RenderResult GetGameBackBufferInfo(RenderBackBufferInfo *info)
 	return owner->GetGameBackBufferInfo(info);
 }
 
+RenderResult GetGameRenderTargetInfo(RenderBackBufferInfo *info)
+{
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (info == 0)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	if (owner == 0 || !owner->IsInitialized() || !owner->IsOperational())
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	return owner->GetGameRenderTargetInfo(info);
+}
+
 WW3DFormat GetGameBackBufferFormat()
 {
 	RenderBackBufferInfo info;

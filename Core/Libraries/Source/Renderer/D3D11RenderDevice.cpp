@@ -1413,17 +1413,23 @@ public:
 		sourceTexture->GetDesc(&sourceDescriptor);
 		destinationTexture->GetDesc(&destinationDescriptor);
 		const bool matchingShape = sourceDescriptor.Width == destinationDescriptor.Width &&
-			sourceDescriptor.Height == destinationDescriptor.Height &&
+			sourceDescriptor.Height == destinationDescriptor.Height;
+		const bool matchingLayout =
 			sourceDescriptor.MipLevels == 1 && destinationDescriptor.MipLevels == 1 &&
 			sourceDescriptor.ArraySize == 1 && destinationDescriptor.ArraySize == 1 &&
 			sourceDescriptor.Format == destinationDescriptor.Format;
-		const bool copyCompatible = matchingShape &&
+		const bool copyCompatible = matchingLayout && matchingShape &&
 			sourceDescriptor.SampleDesc.Count == destinationDescriptor.SampleDesc.Count &&
 			sourceDescriptor.SampleDesc.Quality == destinationDescriptor.SampleDesc.Quality;
-		const bool resolveCompatible = matchingShape &&
+		const bool regionCompatible = matchingLayout && !matchingShape &&
+			sourceDescriptor.Width <= destinationDescriptor.Width &&
+			sourceDescriptor.Height <= destinationDescriptor.Height &&
+			sourceDescriptor.SampleDesc.Count == 1 &&
+			destinationDescriptor.SampleDesc.Count == 1;
+		const bool resolveCompatible = matchingLayout && matchingShape &&
 			sourceDescriptor.SampleDesc.Count > 1 &&
 			destinationDescriptor.SampleDesc.Count == 1;
-		if (!copyCompatible && !resolveCompatible)
+		if (!copyCompatible && !regionCompatible && !resolveCompatible)
 		{
 			destinationTexture->Release();
 			sourceTexture->Release();
@@ -1438,6 +1444,16 @@ public:
 		{
 			m_context->ResolveSubresource(destinationTexture, 0, sourceTexture, 0,
 				sourceDescriptor.Format);
+		}
+		else if (regionCompatible)
+		{
+			// A reflection pass occupies the origin of the display-sized smudge
+			// background. Copy its entire source without scaling or touching the
+			// remainder; the caller maps UVs to this exact copied region.
+			const D3D11_BOX sourceBox = { 0, 0, 0, sourceDescriptor.Width,
+				sourceDescriptor.Height, 1 };
+			m_context->CopySubresourceRegion(destinationTexture, 0, 0, 0, 0,
+				sourceTexture, 0, &sourceBox);
 		}
 		else
 		{

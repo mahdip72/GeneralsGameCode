@@ -34,7 +34,8 @@ struct FakeRenderControl
 		failUpdateResult(RENDER_RESULT_FAILED),
 		failRefresh(0),
 		failRefreshOnCall(0),
-		failCopy(0), createCalls(0), updateCalls(0), refreshCalls(0),
+		failCopy(0), failCopyResult(RENDER_RESULT_FAILED),
+		createCalls(0), updateCalls(0), refreshCalls(0),
 		copyCalls(0), refreshPixelSequence(0) {}
 	volatile long failCreate;
 	volatile long failUpdate;
@@ -43,6 +44,7 @@ struct FakeRenderControl
 	volatile long failRefresh;
 	volatile long failRefreshOnCall;
 	volatile long failCopy;
+	volatile long failCopyResult;
 	volatile long createCalls;
 	volatile long updateCalls;
 	volatile long refreshCalls;
@@ -296,7 +298,7 @@ public:
 			InterlockedIncrement(&m_control->copyCalls);
 			if (IsSet(&m_control->failCopy))
 			{
-				return RENDER_RESULT_FAILED;
+				return static_cast<RenderResult>(ReadCount(&m_control->failCopyResult));
 			}
 		}
 		FakeResource *resource = Find(texture);
@@ -646,6 +648,105 @@ DWORD WINAPI DestroyFromWorker(void *parameter)
 	delete request->resources;
 	request->resources = 0;
 	return 0;
+}
+
+int TestCopyExecutionFailures()
+{
+	int result = 0;
+	const RenderResult failures[] = { RENDER_RESULT_UNSUPPORTED,
+		RENDER_RESULT_INVALID_ARGUMENT, RENDER_RESULT_DEVICE_REMOVED };
+	for (unsigned int mode = 0; mode < 3; ++mode)
+		for (unsigned int fault = 0; fault < 3; ++fault)
+		{
+			FakeRenderControl control;
+			ThreadedRenderOptions options;
+			options.serial = mode == 1;
+			IRenderDevice *device = mode == 0 ? new FakeRenderDevice(false, &control) :
+				CreateThreadedRenderDevice(CreateThreadedFakeRenderDevice, &control, options);
+			if (!device) return result | Check(false, "copy failure fixture allocation");
+			RenderDeviceParameters parameters;
+			parameters.backend = RENDER_BACKEND_D3D11;
+			parameters.window = reinterpret_cast<void *>(1);
+			parameters.width = parameters.height = 1;
+			if (device->initialize(parameters) != RENDER_RESULT_OK)
+			{
+				delete device;
+				return result | Check(false, "copy failure fixture initialization");
+			}
+			NativeW3DResourceHost host(8);
+			NativeW3DResources resources(8);
+			if (host.Attach(device, device->immediateContext()) != RENDER_RESULT_OK ||
+				resources.BindHost(&host) != RENDER_RESULT_OK)
+			{
+				resources.Shutdown();
+				host.Detach();
+				device->shutdown();
+				delete device;
+				return result | Check(false, "copy failure fixture binding");
+			}
+			const unsigned int bytes[3] = { 1, 2, 3 };
+			BufferDescriptor bufferDescriptor;
+			bufferDescriptor.byteCount = sizeof(bytes);
+			bufferDescriptor.stride = sizeof(unsigned int);
+			bufferDescriptor.usage = RENDER_USAGE_DEFAULT;
+			GpuHandle buffer;
+			TextureDescriptor textureDescriptor;
+			textureDescriptor.width = textureDescriptor.height = 1;
+			textureDescriptor.format = RENDER_FORMAT_B8G8R8A8_UNORM;
+			textureDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+			textureDescriptor.usage = RENDER_USAGE_DEFAULT;
+			TextureSubresourceData textureData;
+			textureData.data = bytes;
+			textureData.rowPitch = textureData.slicePitch = 4;
+			NativeW3DTextureHandle destination, independent;
+			result |= Check(resources.CreateBuffer(bufferDescriptor, bytes, sizeof(bytes), &buffer) ==
+				RENDER_RESULT_OK && resources.CreateTexture(textureDescriptor, &textureData, 1,
+				&destination) == RENDER_RESULT_OK && resources.CreateTexture(textureDescriptor,
+				&textureData, 1, &independent) == RENDER_RESULT_OK,
+				"copy failure fixture starts with independent authorities");
+			IRenderContext *context = device->immediateContext();
+			InterlockedExchange(&control.failCopyResult, failures[fault]);
+			InterlockedExchange(&control.failCopy, 1);
+			NativeW3DGpuContentLease lease;
+			result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+				resources.CopyActiveColorTargetToTexture(destination.resource, &lease) == failures[fault] &&
+				!lease.isValid() && ReadCount(&control.copyCalls) == 1,
+				"backend-executed copy failure never publishes a GPU lease");
+			NativeW3DTextureDescription description;
+			GpuHandle validated;
+			const RenderResult describe = resources.DescribeTexture(independent.resource, &description);
+			result |= Check((describe != RENDER_RESULT_OK ||
+				description.authority == NATIVE_W3D_CONTENT_INVALID) &&
+				resources.AcquireVertexBufferRange(buffer, sizeof(unsigned int), 0, 0, 3, &validated) !=
+					RENDER_RESULT_OK,
+				"accepted/backend-executed failures remain globally fail-closed even for unsupported or invalid results");
+			const RenderResult ended = context->endFrame();
+			if (mode != 0 && ended == RENDER_RESULT_OK)
+			{
+				const RenderResult submitted = SubmitThreadedRenderFrame(device, false);
+				const RenderResult drained = DrainThreadedRenderDevice(device);
+				ThreadedRenderFrameCompletion completion;
+				const bool completed = PollThreadedRenderCompletion(device, &completion);
+				std::printf("COPY_COMPLETION mode=%u fault=%d submit=%d drain=%d completion=%d resourceFailure=%u\n",
+					mode, failures[fault], submitted, drained,
+					completed ? completion.result : -1, completed && completion.resourceFailure);
+				// Serial owner submission executes immediately; parallel submission
+				// accepts the packet and reports its execution failure at the fence.
+				result |= Check(submitted == (mode == 1 ? failures[fault] : RENDER_RESULT_OK) &&
+					drained == failures[fault] &&
+					completed && completion.result == failures[fault] && completion.resourceFailure,
+					"queued copy failure remains observable at deferred completion");
+			}
+			InterlockedExchange(&control.failCopy, 0);
+			result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
+				host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+				resources.Shutdown() == RENDER_RESULT_OK && host.Detach() == RENDER_RESULT_OK,
+				"copy execution failure fixture recovers and releases ownership");
+			device->shutdown();
+			delete device;
+			std::printf("COPY_EXECUTION_FAILURE mode=%u result=%d checked\n", mode, failures[fault]);
+		}
+	return result;
 }
 
 int TestThreadedResourceCompletion()
@@ -2400,6 +2501,7 @@ int main()
 		return BenchmarkThreadedAdjacentBufferPublication();
 	int result = 0;
 	result |= TestBufferUpdatePreflight();
+	result |= TestCopyExecutionFailures();
 	result |= TestRetiredBufferPublication();
 	result |= TestRawHandlesAcrossFreshBackends();
 	NativeW3DResources unbound(2);

@@ -2599,6 +2599,47 @@ RenderResult GetGameBackBufferInfo(RenderBackBufferInfo *info)
 	}
 	info->width = description.Width;
 	info->height = description.Height;
+	info->multisampleCount = description.MultiSampleType == D3DMULTISAMPLE_NONE ?
+		1U : static_cast<unsigned int>(description.MultiSampleType);
+	return RENDER_RESULT_OK;
+}
+
+RenderResult GetGameRenderTargetInfo(RenderBackBufferInfo *info)
+{
+	if (info == 0)
+	{
+		RecordFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*info = RenderBackBufferInfo();
+	if (!CheckDevice() || DX8Wrapper::_Get_D3D_Device8() == 0)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	IDirect3DSurface8 *surface = 0;
+	const HRESULT getResult = DX8Wrapper::_Get_D3D_Device8()->GetRenderTarget(&surface);
+	if (FAILED(getResult) || surface == 0)
+	{
+		const RenderResult result = FromHRESULT(FAILED(getResult) ? getResult : E_FAIL);
+		RecordFailure(result);
+		return result;
+	}
+	D3DSURFACE_DESC description;
+	const HRESULT descriptionResult = surface->GetDesc(&description);
+	surface->Release();
+	const RenderResult result = FromHRESULT(descriptionResult);
+	if (result != RENDER_RESULT_OK)
+	{
+		RecordFailure(result);
+		return result;
+	}
+	if (!ToRenderResultFormat(description.Format, &info->format))
+	{
+		RecordFailure(RENDER_RESULT_UNSUPPORTED);
+		return RENDER_RESULT_UNSUPPORTED;
+	}
+	info->width = description.Width;
+	info->height = description.Height;
+	info->multisampleCount = description.MultiSampleType == D3DMULTISAMPLE_NONE ?
+		1U : static_cast<unsigned int>(description.MultiSampleType);
 	return RENDER_RESULT_OK;
 }
 

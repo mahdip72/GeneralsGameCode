@@ -1875,6 +1875,17 @@ RenderResult NativeW3DResources::CopyActiveColorTargetToTexture(
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	// These descriptor exclusions are known before calling the backend or
+	// admitting a threaded command. No mutation has occurred, so rejecting an
+	// unsupported destination must not revoke unrelated content authorities.
+	// Backend/fence failures below remain fail-closed, including failures after
+	// a copy executed but rebinding its texture failed.
+	if ((slot->texture.binding & RENDER_TEXTURE_SHADER_RESOURCE) == 0 ||
+		slot->texture.mipCount != 1 || slot->texture.arrayCount != 1 ||
+		slot->texture.usage == RENDER_USAGE_IMMUTABLE)
+	{
+		return RENDER_RESULT_UNSUPPORTED;
+	}
 	const RenderResult result = CompleteMutation(device,
 		device->copyActiveColorTargetToTexture(handle));
 	if (result == RENDER_RESULT_OK)
