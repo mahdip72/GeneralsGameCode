@@ -911,6 +911,43 @@ RenderResult DrawGamePrimitiveUP(GamePrimitiveTopology topology,
 	return DispatchCommand(command);
 }
 
+RenderResult DrawGameSortedIndexedTrianglesUP(unsigned int triangleCount,
+	const void *vertices, unsigned int vertexCount, unsigned int stride,
+	unsigned int vertexFormat, const unsigned short *indices,
+	size_t vertexBytes, size_t indexBytes)
+{
+	if (vertices == 0 || indices == 0 || triangleCount == 0U ||
+		triangleCount > UINT_MAX / 3U || vertexCount == 0U ||
+		vertexCount > 65535U || stride == 0U || vertexFormat == 0U ||
+		static_cast<size_t>(vertexCount) > static_cast<size_t>(-1) / stride ||
+		vertexBytes != static_cast<size_t>(vertexCount) * stride ||
+		static_cast<size_t>(triangleCount) * 3U >
+			static_cast<size_t>(-1) / sizeof(unsigned short) ||
+		indexBytes != static_cast<size_t>(triangleCount) * 3U *
+			sizeof(unsigned short))
+	{
+		NativeGameRenderOwnerScope scope;
+		if (scope.Get() != 0)
+			scope.Get()->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	GameSortedIndexedTrianglesUPData data;
+	data.vertices = vertices;
+	data.vertexBytes = vertexBytes;
+	data.indices = indices;
+	data.indexBytes = indexBytes;
+	GameRenderCommand command;
+	InitializeCommand(&command,
+		GAME_RENDER_COMMAND_DRAW_SORTED_INDEXED_TRIANGLES_UP);
+	command.value0 = triangleCount;
+	command.value1 = vertexCount;
+	command.value2 = stride;
+	command.value3 = vertexFormat;
+	command.input = &data;
+	command.inputBytes = sizeof(data);
+	return DispatchCommand(command);
+}
+
 void SetGameRenderTarget(TextureClass *colorTexture,
 	ZTextureClass *depthTexture, bool useDefaultDepth)
 {

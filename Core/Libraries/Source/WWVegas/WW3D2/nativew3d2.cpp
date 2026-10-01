@@ -2131,6 +2131,64 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			return result;
 		}
 
+	case GAME_RENDER_COMMAND_DRAW_SORTED_INDEXED_TRIANGLES_UP:
+		if (command.input == 0 || command.inputBytes !=
+			sizeof(GameSortedIndexedTrianglesUPData) || command.value0 == 0U ||
+			command.value0 > UINT_MAX / 3U || command.value1 == 0U ||
+			command.value1 > 65535U || command.value2 == 0U ||
+			command.value3 == 0U)
+			goto invalid_command;
+		{
+			GameSortedIndexedTrianglesUPData data;
+			memcpy(&data, command.input, sizeof(data));
+			size_t vertexBytes = 0;
+			size_t indexCount = 0;
+			size_t indexBytes = 0;
+			if (data.vertices == 0 || data.indices == 0 ||
+				!CheckedGameSizeMultiply(command.value1, command.value2,
+					&vertexBytes) ||
+				!CheckedGameSizeMultiply(command.value0, 3U, &indexCount) ||
+				!CheckedGameSizeMultiply(indexCount, sizeof(unsigned short),
+					&indexBytes) || data.vertexBytes != vertexBytes ||
+				data.indexBytes != indexBytes)
+				goto invalid_command;
+			RenderVertexLayout layout;
+			if (!DecodeLegacyFvfVertexLayout(command.value3, command.value2,
+				&layout) || layout.preTransformed)
+				goto invalid_command;
+			const unsigned char *sourceIndices =
+				reinterpret_cast<const unsigned char *>(data.indices);
+			for (size_t index = 0; index < indexCount; ++index)
+			{
+				unsigned short vertexIndex = 0;
+				memcpy(&vertexIndex, sourceIndices + index * sizeof(vertexIndex),
+					sizeof(vertexIndex));
+				if (vertexIndex >= command.value1)
+					goto invalid_command;
+			}
+			LegacyLogicalState state;
+			if (!GetTrackedLegacyLogicalState(&state))
+				goto invalid_command;
+			NativeDrawPacket packet;
+			packet.vertexStride = command.value2;
+			packet.vertexFormat = RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1;
+			packet.vertexLayout = layout;
+			packet.topology = RENDER_PRIMITIVE_TRIANGLE_LIST;
+			packet.indexFormat = RENDER_FORMAT_R16_UINT;
+			packet.texturePresenceMask = state.texturePresenceMask;
+			packet.vertexCount = command.value1;
+			packet.indexCount = static_cast<unsigned int>(indexCount);
+			packet.indexed = true;
+			for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
+				++stage)
+				packet.textures[stage] = m_gameTextures[stage];
+			const RenderResult result = QueueGameSortedTriangles(state, packet,
+				data.vertices, vertexBytes, data.indices, indexBytes, 0);
+			if (result != RENDER_RESULT_OK)
+				RecordGameFailure(result);
+			return result;
+		}
+
 	case GAME_RENDER_COMMAND_DRAW_PRIMITIVE_UP:
 		if (command.input == 0 || command.inputBytes == 0U ||
 			command.value2 == 0U || !IsValidGameTopology(command.value0) ||

@@ -431,6 +431,15 @@ void DrawGameStrip(unsigned short startIndex, unsigned short indexCount,
 rts::render::RenderResult DrawGamePrimitiveUP(GamePrimitiveTopology topology,
 	unsigned int primitiveCount, const void *vertices, unsigned int stride,
 	unsigned int vertexFormat);
+#if defined(_WIN64)
+// Copies the original indexed CPU geometry and complete logical state into
+// the shared translucent queue before returning. No caller pointer is retained
+// and no immediate draw or bound vertex/index buffer mutation is performed.
+RenderResult DrawGameSortedIndexedTrianglesUP(unsigned int triangleCount,
+	const void *vertices, unsigned int vertexCount, unsigned int stride,
+	unsigned int vertexFormat, const unsigned short *indices,
+	size_t vertexBytes, size_t indexBytes);
+#endif
 
 void SetGameRenderTarget(TextureClass *colorTexture,
 	ZTextureClass *depthTexture, bool useDefaultDepth);

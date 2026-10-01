@@ -116,7 +116,19 @@ enum GameRenderCommandType
 	GAME_RENDER_COMMAND_GET_DEVICE_COUNT,
 	GAME_RENDER_COMMAND_GET_DEVICE_DESC,
 	GAME_RENDER_COMMAND_GET_RESOLUTION,
-	GAME_RENDER_COMMAND_GET_TARGET_RESOLUTION
+	GAME_RENDER_COMMAND_GET_TARGET_RESOLUTION,
+	GAME_RENDER_COMMAND_DRAW_SORTED_INDEXED_TRIANGLES_UP
+};
+
+// Exact synchronous byte views for sorted indexed UP submission. The native
+// owner validates then copies both views into its existing sorting queue; this
+// payload and its pointers are never retained after ExecuteGameRenderCommand.
+struct GameSortedIndexedTrianglesUPData
+{
+	const void *vertices;
+	size_t vertexBytes;
+	const unsigned short *indices;
+	size_t indexBytes;
 };
 
 // Command payload map (all sizes are exact and all pointer data is
@@ -164,6 +176,12 @@ enum GameRenderCommandType
 // DRAW_PRIMITIVE_UP: value0=RenderPrimitiveTopology, value1=primitive count,
 // value2=vertex stride, value3=legacy FVF, input=vertex bytes,
 // inputBytes is the exact copied byte count.
+// DRAW_SORTED_INDEXED_TRIANGLES_UP: value0=triangle count, value1=vertex
+// count, value2=vertex stride, value3=legacy FVF, input points to the exact
+// GameSortedIndexedTrianglesUPData payload, inputBytes=sizeof(payload). Both
+// byte counts must match the declared counts exactly; R16 indices are local.
+// The complete logical state/textures and geometry are copied into the shared
+// translucent queue with no sphere (per-triangle depth), not drawn immediately.
 // SET_RENDER_TARGET: input=RenderTargetBinding,
 // inputBytes=sizeof(RenderTargetBinding); the owner copies it before return.
 // COPY_ACTIVE_TARGET_TO_TEXTURE: resource0=destination texture,

@@ -874,6 +874,204 @@ void TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput()
 	CHECK(SameAcceptedDrawStream(baselineDraws, retriedDraws));
 }
 
+// Compare actual accepted triangles, independent of legal draw regrouping at
+// a retry/chunk boundary. No reference sort or acknowledgement algorithm.
+bool CaptureAcceptedTriangleStream(const RecordingSink &sink,
+	std::vector<CapturedDraw> &triangles)
+{
+	std::vector<CapturedDraw> draws;
+	if (!CaptureAcceptedDrawStream(sink, draws))
+		return false;
+	triangles.clear();
+	for (size_t drawIndex = 0; drawIndex < draws.size(); ++drawIndex)
+	{
+		const CapturedDraw &draw = draws[drawIndex];
+		if (draw.indices.empty() || draw.indices.size() % 3 != 0 ||
+			draw.referencedVertices.size() % draw.indices.size() != 0)
+			return false;
+		const size_t stride = draw.referencedVertices.size() / draw.indices.size();
+		for (size_t index = 0; index < draw.indices.size(); index += 3)
+		{
+			CapturedDraw triangle;
+			triangle.state = draw.state;
+			triangle.indices.assign(draw.indices.begin() + index,
+				draw.indices.begin() + index + 3);
+			triangle.referencedVertices.assign(
+				draw.referencedVertices.begin() + index * stride,
+				draw.referencedVertices.begin() + (index + 3) * stride);
+			triangles.push_back(triangle);
+		}
+	}
+	return true;
+}
+
+void QueueTieCohort(NativeSortingRenderer &renderer, bool mixedLayouts)
+{
+	// More than the insertion-sort threshold; each node has unique attributes,
+	// and acknowledged nodes must remain in the legacy quicksort input.
+	const unsigned short indices[] = {0, 1, 2};
+	for (unsigned int node = 0; node < 24; ++node)
+	{
+		LegacyLogicalState state;
+		state.pipeline.shaderBits = 1000 + node;
+		TestVertexWide vertices[3] = {};
+		for (unsigned int corner = 0; corner < 3; ++corner)
+		{
+			vertices[corner].x = static_cast<float>(node * 3 + corner);
+			vertices[corner].z = 7.0f;
+			vertices[corner].color = 0x10000000U + node * 3 + corner;
+			vertices[corner].u = static_cast<float>(node);
+		}
+		NativeDrawPacket packet = MakePacket(3, 3);
+		if (mixedLayouts && node % 2 != 0)
+		{
+			packet.vertexStride = sizeof(TestVertexWide);
+			packet.vertexLayout.stride = sizeof(TestVertexWide);
+			packet.vertexLayout.elementCount = 3;
+			packet.vertexLayout.elements[2].semantic = RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE;
+			packet.vertexLayout.elements[2].format = RENDER_VERTEX_DATA_FLOAT2;
+			packet.vertexLayout.elements[2].byteOffset = sizeof(TestVertex);
+			CHECK(renderer.Queue(state, packet, vertices, sizeof(vertices),
+				indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+		}
+		else
+		{
+			TestVertex narrow[3];
+			for (unsigned int corner = 0; corner < 3; ++corner)
+				memcpy(&narrow[corner], &vertices[corner], sizeof(TestVertex));
+			CHECK(renderer.Queue(state, packet, narrow, sizeof(narrow),
+				indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+		}
+	}
+}
+
+void QueueLaterTriangle(NativeSortingRenderer &renderer)
+{
+	std::vector<TestVertex> vertices;
+	MakeVertices(vertices, std::vector<float>{-99.0f, -99.0f, -99.0f});
+	QueueOne(renderer, 9000, vertices, std::vector<unsigned short>{0, 1, 2}, 0);
+}
+
+void TestCanonicalTieRetryAndQueueExtension()
+{
+	const unsigned int prefixes[] = {0, 1, 5, 24};
+	for (unsigned int scenario = 0; scenario < 4; ++scenario)
+	{
+		for (unsigned int extend = 0; extend < 2; ++extend)
+		{
+			NativeSortingRenderer reference;
+			RecordingSink expectedSink;
+			QueueTieCohort(reference, false);
+			if (extend && prefixes[scenario] == 0)
+				QueueLaterTriangle(reference); // No emitted prefix: same cohort.
+			CHECK(reference.Flush(expectedSink) == RENDER_RESULT_OK);
+			if (extend && prefixes[scenario] != 0)
+			{
+				QueueLaterTriangle(reference); // Separate post-prefix cohort.
+				CHECK(reference.Flush(expectedSink) == RENDER_RESULT_OK);
+			}
+
+			NativeSortingRenderer retry;
+			RecordingSink actualSink;
+			QueueTieCohort(retry, false);
+			actualSink.failCall = 1;
+			actualSink.acceptedOnFailure = prefixes[scenario];
+			CHECK(retry.Flush(actualSink) == RENDER_RESULT_FAILED);
+			CHECK(!retry.Empty()); // Includes all-accepted-but-error.
+			if (extend)
+				QueueLaterTriangle(retry); // CHECK inside verifies admission.
+			if (prefixes[scenario] == 1)
+			{
+				actualSink.failCall = actualSink.calls + 1;
+				actualSink.acceptedOnFailure = 2;
+				CHECK(retry.Flush(actualSink) == RENDER_RESULT_FAILED);
+				CHECK(!retry.Empty());
+			}
+			actualSink.failCall = 0;
+			const unsigned int beforeCompletion = actualSink.calls;
+			CHECK(retry.Flush(actualSink) == RENDER_RESULT_OK);
+			CHECK(retry.Empty());
+			if (prefixes[scenario] == 24)
+				CHECK(actualSink.calls == beforeCompletion + extend);
+			std::vector<CapturedDraw> expected, actual;
+			CHECK(CaptureAcceptedTriangleStream(expectedSink, expected));
+			CHECK(CaptureAcceptedTriangleStream(actualSink, actual));
+			CHECK(expected.size() == 24 + extend);
+			CHECK(SameAcceptedDrawStream(expected, actual));
+		}
+	}
+}
+
+void TestMixedLayoutCohortAndClear()
+{
+	NativeSortingRenderer reference;
+	RecordingSink expectedSink;
+	expectedSink.requireHomogeneous = true;
+	QueueTieCohort(reference, true);
+	CHECK(reference.Flush(expectedSink) == RENDER_RESULT_OK);
+	NativeSortingRenderer retry;
+	RecordingSink actualSink;
+	actualSink.requireHomogeneous = true;
+	QueueTieCohort(retry, true);
+	actualSink.failCall = 3; // Acknowledgements from earlier successful chunks.
+	actualSink.acceptedOnFailure = 0;
+	CHECK(retry.Flush(actualSink) == RENDER_RESULT_FAILED);
+	actualSink.failCall = actualSink.calls + 1;
+	CHECK(retry.Flush(actualSink) == RENDER_RESULT_FAILED); // Repeated zero ack.
+	actualSink.failCall = 0;
+	CHECK(retry.Flush(actualSink) == RENDER_RESULT_OK);
+	std::vector<CapturedDraw> expected, actual;
+	CHECK(CaptureAcceptedTriangleStream(expectedSink, expected));
+	CHECK(CaptureAcceptedTriangleStream(actualSink, actual));
+	CHECK(SameAcceptedDrawStream(expected, actual));
+	CHECK(retry.Empty());
+
+	QueueTieCohort(retry, false);
+	actualSink.failCall = actualSink.calls + 1;
+	actualSink.acceptedOnFailure = 1;
+	CHECK(retry.Flush(actualSink) == RENDER_RESULT_FAILED);
+	QueueLaterTriangle(retry);
+	retry.Clear();
+	CHECK(retry.Empty());
+	RecordingSink afterClear;
+	QueueLaterTriangle(retry);
+	CHECK(retry.Flush(afterClear) == RENDER_RESULT_OK);
+	CHECK(afterClear.calls == 1);
+	CHECK(afterClear.batches.size() == 1 && afterClear.batches[0].states.size() == 1 &&
+		afterClear.batches[0].states[0] == 9000);
+	CHECK(retry.Empty());
+}
+
+void TestIndexChunkCohortQueueExtension()
+{
+	std::vector<TestVertex> vertices;
+	MakeVertices(vertices, std::vector<float>{7.0f, 7.0f, 7.0f});
+	std::vector<unsigned short> indices(21846 * 3);
+	for (size_t index = 0; index < indices.size(); ++index)
+		indices[index] = static_cast<unsigned short>(index % 3);
+	NativeSortingRenderer reference;
+	RecordingSink expectedSink;
+	QueueOne(reference, 8000, vertices, indices, 0);
+	CHECK(reference.Flush(expectedSink) == RENDER_RESULT_OK);
+	CHECK(expectedSink.calls == 2);
+	QueueLaterTriangle(reference);
+	CHECK(reference.Flush(expectedSink) == RENDER_RESULT_OK);
+	NativeSortingRenderer retry;
+	RecordingSink actualSink;
+	QueueOne(retry, 8000, vertices, indices, 0);
+	actualSink.failCall = 2;
+	CHECK(retry.Flush(actualSink) == RENDER_RESULT_FAILED);
+	QueueLaterTriangle(retry);
+	actualSink.failCall = 0;
+	CHECK(retry.Flush(actualSink) == RENDER_RESULT_OK);
+	CHECK(retry.Empty());
+	std::vector<CapturedDraw> expected, actual;
+	CHECK(CaptureAcceptedTriangleStream(expectedSink, expected));
+	CHECK(CaptureAcceptedTriangleStream(actualSink, actual));
+	CHECK(expected.size() == 21847);
+	CHECK(SameAcceptedDrawStream(expected, actual));
+}
+
 }
 
 int main()
@@ -891,6 +1089,9 @@ int main()
 	TestFlushLocalScratchReuseMixedSizesAndRetry();
 	TestFlushWorkspaceReusePreservesRepeatedBatchBytes();
 	TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput();
+	TestCanonicalTieRetryAndQueueExtension();
+	TestMixedLayoutCohortAndClear();
+	TestIndexChunkCohortQueueExtension();
 	CHECK(NativeSortingRendererTestRetireAllComplete());
 	CHECK(NativeSortingRendererTestRetireMixedPending());
 	return failures == 0 ? 0 : 1;

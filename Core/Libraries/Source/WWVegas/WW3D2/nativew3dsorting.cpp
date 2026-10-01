@@ -305,6 +305,9 @@ bool HasPendingTriangles(const SortedSubmission &submission)
 	return false;
 }
 
+#if defined(RTS_NATIVE_SORTING_TESTS)
+// Retained for the existing retirement-helper assertions. Product retirement
+// now removes only a whole completed cohort so tie-sort input stays intact.
 struct CompletedSubmissionPredicate
 {
 	bool operator()(const SortedSubmission &submission) const
@@ -322,6 +325,7 @@ void RetireCompletedSubmissions(std::vector<SortedSubmission> &submissions)
 			CompletedSubmissionPredicate());
 	submissions.erase(pendingEnd, submissions.end());
 }
+#endif
 
 struct SortedNodeDepthDescending
 {
@@ -350,6 +354,7 @@ bool ValidateSourceIndices(const SortedSubmission &submission)
 	return true;
 }
 
+template <bool IncludeAcknowledged>
 RenderResult AppendPreparedTriangles(const SortedSubmission &submission,
 	size_t submissionIndex, const float *matrix,
 	rts::SortingTriangleScratchLease &scratch,
@@ -425,7 +430,8 @@ RenderResult AppendPreparedTriangles(const SortedSubmission &submission,
 		for (unsigned int local = 0; local < batchCount; ++local)
 		{
 			const unsigned int sourceTriangle = batchStart + local;
-			if (submission.submittedTriangles[sourceTriangle])
+			if (!IncludeAcknowledged &&
+				submission.submittedTriangles[sourceTriangle])
 				continue;
 			if (!IsFiniteFloat(prepared[local].z))
 				return RENDER_RESULT_INVALID_ARGUMENT;
@@ -594,7 +600,8 @@ RenderResult SubmitChunk(NativeSortedGeometrySink &sink,
 	const std::vector<NativeSortedDraw> &draws,
 	const std::vector<DrawRun> &runs,
 	const std::vector<SortedTriangle> &triangles, size_t chunkOffset,
-	std::vector<SortedSubmission> &submissions,
+	std::vector<SortedSubmission> &submissions, size_t cohortSize,
+	size_t &acknowledgedCohortSize,
 	const std::vector<unsigned char> &vertices,
 	const std::vector<unsigned short> &indices)
 {
@@ -610,6 +617,10 @@ RenderResult SubmitChunk(NativeSortedGeometrySink &sink,
 		return RENDER_RESULT_FAILED;
 	MarkRunsSubmitted(runs, triangles, chunkOffset, submittedDrawCount,
 		submissions);
+	// Seal on any valid acknowledgement, including a successful earlier chunk
+	// before a later failure. Queue continues appending outside this cohort.
+	if (submittedDrawCount != 0 && acknowledgedCohortSize == 0)
+		acknowledgedCohortSize = cohortSize;
 	if (result != RENDER_RESULT_OK)
 		return result;
 	return submittedDrawCount == draws.size() ? RENDER_RESULT_OK :
@@ -628,10 +639,11 @@ struct NativeSortingRenderer::Impl
 	std::vector<SortedSubmission> submissions;
 	FlushWorkspace workspace;
 	size_t nextInsertionOrder;
+	size_t acknowledgedCohortSize;
 	bool flushing;
 
 	Impl() : submissions(), workspace(), nextInsertionOrder(1),
-		flushing(false) {}
+		acknowledgedCohortSize(0), flushing(false) {}
 };
 
 NativeSortingRenderer::NativeSortingRenderer() : m_impl(new Impl())
@@ -701,6 +713,11 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 	FlushScope flushScope(m_impl->flushing);
 	FlushWorkspaceScope workspaceScope(m_impl->workspace);
 
+nextCohort:
+	const bool retryingAcknowledgedCohort =
+		m_impl->acknowledgedCohortSize != 0;
+	const size_t cohortSize = retryingAcknowledgedCohort ?
+		m_impl->acknowledgedCohortSize : m_impl->submissions.size();
 	try
 	{
 		// SortingTriangleScratchLease is synchronously fenced by each kernel
@@ -711,11 +728,11 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 		std::vector<SortedNode> &nodes = m_impl->workspace.nodes;
 		std::vector<size_t> &positiveNodes = m_impl->workspace.positiveNodes;
 		std::vector<size_t> &unsortedNodes = m_impl->workspace.unsortedNodes;
-		nodes.reserve(m_impl->submissions.size());
-		for (size_t index = 0; index < m_impl->submissions.size(); ++index)
+		nodes.reserve(cohortSize);
+		for (size_t index = 0; index < cohortSize; ++index)
 		{
 			const SortedSubmission &submission = m_impl->submissions[index];
-			if (!HasPendingTriangles(submission))
+			if (!retryingAcknowledgedCohort && !HasPendingTriangles(submission))
 				continue;
 			SortedNode node;
 			node.submissionIndex = index;
@@ -770,8 +787,11 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			const size_t submissionIndex = node.submissionIndex;
 			const SortedSubmission &submission = m_impl->submissions[
 				submissionIndex];
-			const RenderResult prepareResult = AppendPreparedTriangles(submission,
-				submissionIndex, node.worldView, scratch, prepared, triangles);
+			const RenderResult prepareResult = retryingAcknowledgedCohort ?
+				AppendPreparedTriangles<true>(submission, submissionIndex,
+					node.worldView, scratch, prepared, triangles) :
+				AppendPreparedTriangles<false>(submission, submissionIndex,
+					node.worldView, scratch, prepared, triangles);
 #if defined(RTS_NATIVE_SORTING_TESTS)
 			g_nativeSortingLastFlushScratchAllocationCount =
 				scratch.allocationCount();
@@ -779,13 +799,23 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			if (prepareResult != RENDER_RESULT_OK)
 				return prepareResult;
 		}
-		if (triangles.empty())
+		if (!triangles.empty())
+			Sort(triangles.data(), triangles.data() + triangles.size());
+		if (retryingAcknowledgedCohort)
 		{
-			RetireCompletedSubmissions(m_impl->submissions);
-			return RENDER_RESULT_OK;
+			// The legacy depth-only quicksort is not stable for ties. Recreate
+			// its exact full-cohort permutation BEFORE removing acknowledgements,
+			// including completed nodes which influenced the original permutation.
+			size_t pendingCount = 0;
+			for (size_t index = 0; index < triangles.size(); ++index)
+			{
+				const SortedTriangle &triangle = triangles[index];
+				if (!m_impl->submissions[triangle.submissionIndex].
+					submittedTriangles[triangle.sourceTriangle])
+					triangles[pendingCount++] = triangle;
+			}
+			triangles.resize(pendingCount);
 		}
-
-		Sort(triangles.data(), triangles.data() + triangles.size());
 
 		for (size_t chunkOffset = 0; chunkOffset < triangles.size(); )
 		{
@@ -799,7 +829,7 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			chunkIndices.clear();
 			draws.clear();
 			runs.clear();
-			std::vector<size_t> vertexOffsets(m_impl->submissions.size(),
+			std::vector<size_t> vertexOffsets(cohortSize,
 				std::numeric_limits<size_t>::max());
 			const NativeDrawPacket *chunkPacket = 0;
 			const size_t maximumChunkEnd = std::min(triangles.size(),
@@ -867,7 +897,8 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			if (local == 0)
 				return RENDER_RESULT_INVALID_ARGUMENT;
 			const RenderResult result = SubmitChunk(sink, draws, runs, triangles,
-				chunkOffset, m_impl->submissions, chunkVertices, chunkIndices);
+				chunkOffset, m_impl->submissions, cohortSize,
+				m_impl->acknowledgedCohortSize, chunkVertices, chunkIndices);
 			if (result != RENDER_RESULT_OK)
 				return result;
 			chunkOffset += local;
@@ -885,6 +916,16 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 	// Reaching this point means every chunk was fully acknowledged. Failures
 	// return above with their unacknowledged triangles retained for retry, so
 	// scanning every acknowledgement byte again here is unnecessary.
+	m_impl->acknowledgedCohortSize = 0;
+	if (cohortSize < m_impl->submissions.size())
+	{
+		// Rare retry-only tail: preserve admission, but never interleave new
+		// work with a prefix already emitted from the acknowledged cohort.
+		m_impl->submissions.erase(m_impl->submissions.begin(),
+			m_impl->submissions.begin() + cohortSize);
+		m_impl->workspace.Clear();
+		goto nextCohort;
+	}
 	m_impl->submissions.clear();
 	return RENDER_RESULT_OK;
 }
@@ -892,7 +933,10 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 void NativeSortingRenderer::Clear()
 {
 	if (m_impl != 0)
+	{
 		m_impl->submissions.clear();
+		m_impl->acknowledgedCohortSize = 0;
+	}
 }
 
 bool NativeSortingRenderer::Empty() const

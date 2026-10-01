@@ -59,6 +59,12 @@ public:
 	// beginning at the selected source vertex, and indexData contains
 	// indexCount R16 entries beginning at the selected source index.  The
 	// packet retains those logical source offsets for the sorting kernel.
+	// Queue remains admitted after failure. Once a Flush acknowledges any
+	// draw (including earlier successful chunks), its original submissions
+	// form a sealed retry cohort. Later queued work is owned separately and
+	// drains only after that cohort; it is not globally re-sorted ahead of an
+	// already emitted prefix. A zero-acknowledgement failure leaves admission
+	// in the same sortable cohort because no prefix has been emitted.
 	RenderResult Queue(const LegacyLogicalState &state,
 		const NativeDrawPacket &packet, const void *vertexData,
 		size_t vertexBytes, const void *indexData, size_t indexBytes,

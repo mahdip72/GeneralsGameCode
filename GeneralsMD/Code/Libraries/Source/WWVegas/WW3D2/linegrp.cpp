@@ -293,13 +293,17 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 		(WW3D::Is_Sorting_Enabled());
 
 #if defined(_WIN64)
-	// Transparent line groups used to enter the global sorting renderer.  The
-	// native facade currently exposes immediate primitive submission only; do
-	// not silently submit these triangles unsorted because that changes their
-	// ordering against every other translucent object.  A native sorted-submit
-	// operation carrying this exact vertex packet and sort key is required to
-	// resume this callsite.
-	if (sort) {
+	// The legacy dynamic buffers and sorting kernel use R16 vertex ranges.
+	// Refuse an unrepresentable group before integer multiplication/index
+	// construction; valid groups retain their original indexed geometry.
+	if (sort && (LineCount < 0 ||
+		(LineMode != TETRAHEDRON && LineMode != PRISM) ||
+		LineCount > 65535 / (LineMode == TETRAHEDRON ? 4 : 6))) {
+		rts::render::NativeGameRenderOwnerScope scope;
+		if (scope.Get() != 0) {
+			scope.Get()->RecordGameFailure(
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		}
 		return;
 	}
 #endif
@@ -536,6 +540,16 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 #endif
 
 #if defined(_WIN64)
+	if (sort) {
+		// Retain the original R16 triangles in the global translucent queue.
+		// This no-sphere submission matches the legacy Insert_Triangles call;
+		// depth is computed per triangle from the captured world/view state.
+		(void)rts::render::DrawGameSortedIndexedTrianglesUP(num_tris,
+			vertices, num_vertices, sizeof(LineGroupVertex),
+			rts::render::GAME_VERTEX_XYZNDUV2, indices,
+			static_cast<size_t>(num_vertices) * sizeof(LineGroupVertex),
+			static_cast<size_t>(num_indices) * sizeof(unsigned short));
+	} else {
 	// The neutral UP operation is the indexed-draw equivalent for native
 	// rendering. Expand the already-built index order so the triangle winding
 	// and per-face ordering remain byte-for-byte equivalent to the old path.
@@ -548,6 +562,7 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 		static_cast<unsigned int>(sizeof(LineGroupVertex)),
 		rts::render::GAME_VERTEX_XYZNDUV2);
 	delete [] expanded;
+	}
 	delete [] vertices;
 	delete [] indices;
 #else
