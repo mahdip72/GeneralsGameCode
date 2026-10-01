@@ -8,6 +8,7 @@
 
 #include "Renderer/LegacyBridgeValidation.h"
 #include "Lib/ShadowCounterDiagnostics.h"
+#include "Lib/MenuCriticalPathDiagnostics.h"
 #include "dx8indexbuffer.h"
 #include "nativew3dbufferowner.h"
 #include "nativew3dtextureowner.h"
@@ -923,6 +924,7 @@ rts::render::RenderResult NativeW3D2::FenceBufferPublications(void *owner)
 
 rts::render::RenderResult NativeW3D2::FenceThreadedRender()
 {
+	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Drain, true);
 	if (!m_renderer.IsThreaded())
 		return rts::render::RENDER_RESULT_OK;
 	const rts::render::RenderResult drainResult = m_renderer.DrainThreaded();
@@ -965,6 +967,7 @@ rts::render::RenderResult NativeW3D2::ServiceThreadedCompletions()
 			(m_recoveredFailureSequence == m_deferredFailureSequence &&
 				m_deferredFailure.recoveryResult() == RENDER_RESULT_OK)))
 	{
+		rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Lifecycle);
 		const RenderResult stalledResult = m_renderer.DrainThreaded();
 		const RenderResult publicationResult = PollThreadedCompletions();
 		result = FirstNativeThreadedFailure(result, stalledResult);
@@ -1382,6 +1385,7 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 		// Capture readback is a deliberate CPU owner fence. Drain the final
 		// packet, then poll through the aggregate so failed resource ranges and
 		// the matching presentation outcome are published before callbacks run.
+		rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Capture);
 		const RenderResult drainResult = m_renderer.DrainThreaded();
 		ThreadedRenderFrameCompletion completion;
 		const NativeW3DSubmissionSequence submission =
