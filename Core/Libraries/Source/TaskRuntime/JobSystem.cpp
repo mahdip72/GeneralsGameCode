@@ -1865,6 +1865,12 @@ unsigned JobSystem::summarizeSelectedPhysicalCores(
 				*selectedCoreMaskComplete = false;
 			continue;
 		}
+		if (cpuSets[cpuIndex].coreIndex == UINT_MAX)
+		{
+			if (selectedCoreMaskComplete != 0)
+				*selectedCoreMaskComplete = false;
+			continue;
+		}
 		bool alreadyCounted = false;
 		for (unsigned previous = 0; previous < selectedIndex; ++previous)
 		{
@@ -1905,9 +1911,11 @@ unsigned JobSystem::summarizeSelectedPhysicalCores(
 		unsigned topologyOrdinal = 0;
 		for (unsigned index = 0; index < representativeIndex; ++index)
 		{
+			if (cpuSets[index].coreIndex == UINT_MAX) continue;
 			bool earlierSameCore = false;
 			for (unsigned earlier = 0; earlier < index; ++earlier)
 			{
+				if (cpuSets[earlier].coreIndex == UINT_MAX) continue;
 				const bool sameKnownCore = cpuSets[index].coreIndex != UINT_MAX &&
 					cpuSets[earlier].coreIndex != UINT_MAX &&
 					cpuSets[index].group == cpuSets[earlier].group &&

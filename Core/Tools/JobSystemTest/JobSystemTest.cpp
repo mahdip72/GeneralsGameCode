@@ -546,6 +546,19 @@ int testFlatRangeKernelAndSaturationFallback()
 	return result;
 }
 
+void initializeSyntheticCpuSet(rts::JobCpuSetInfo &cpuSet, unsigned id,
+	unsigned group, unsigned coreIndex)
+{
+	cpuSet.id = id;
+	cpuSet.efficiencyClass = 1;
+	cpuSet.group = group;
+	cpuSet.coreIndex = coreIndex;
+	cpuSet.logicalProcessorIndex = id;
+	cpuSet.parked = false;
+	cpuSet.allocatedToOtherProcess = false;
+	cpuSet.availableToProcess = true;
+}
+
 int testAvailableCpuSetsAndOwnerReservations()
 {
 	int result = 0;
@@ -635,6 +648,72 @@ int testAvailableCpuSetsAndOwnerReservations()
 		widePhysicalMask == ~static_cast<rts::JobMetricCounter>(0) &&
 		!widePhysicalMaskComplete,
 		"128-LP topology reports an explicitly incomplete 64-bit core mask");
+	rts::JobCpuSetInfo mixedCpuSets[3];
+	initializeSyntheticCpuSet(mixedCpuSets[0], 300, 0, 0);
+	initializeSyntheticCpuSet(mixedCpuSets[1], 301, 0, UINT_MAX);
+	initializeSyntheticCpuSet(mixedCpuSets[2], 302, 0, 1);
+	unsigned knownMixedIds[2] = { 300, 302 };
+	rts::JobMetricCounter mixedPhysicalMask = 0;
+	bool mixedPhysicalMaskComplete = false;
+	const unsigned knownMixedPhysicalCount =
+		rts::JobSystem::summarizeSelectedPhysicalCores(mixedCpuSets, 3,
+			knownMixedIds, 2, &mixedPhysicalMask, &mixedPhysicalMaskComplete);
+	result |= check(knownMixedPhysicalCount == 2 && mixedPhysicalMask == 3 &&
+		mixedPhysicalMaskComplete,
+		"an unselected unknown core identity does not inflate known-core ordinals");
+	unsigned mixedIds[3] = { 300, 301, 302 };
+	mixedPhysicalMask = 0;
+	mixedPhysicalMaskComplete = true;
+	const unsigned mixedPhysicalCount =
+		rts::JobSystem::summarizeSelectedPhysicalCores(mixedCpuSets, 3,
+			mixedIds, 3, &mixedPhysicalMask, &mixedPhysicalMaskComplete);
+	result |= check(mixedPhysicalCount == 2 && mixedPhysicalMask == 3 &&
+		!mixedPhysicalMaskComplete,
+		"a selected unknown core identity is omitted and marks the physical mask incomplete");
+	rts::JobCpuSetInfo allUnknownCpuSets[2];
+	initializeSyntheticCpuSet(allUnknownCpuSets[0], 400, 0, UINT_MAX);
+	initializeSyntheticCpuSet(allUnknownCpuSets[1], 401, 1, UINT_MAX);
+	unsigned allUnknownIds[2] = { 400, 401 };
+	rts::JobMetricCounter unknownPhysicalMask = 0;
+	bool unknownPhysicalMaskComplete = true;
+	const unsigned unknownPhysicalCount =
+		rts::JobSystem::summarizeSelectedPhysicalCores(allUnknownCpuSets, 2,
+			allUnknownIds, 2, &unknownPhysicalMask, &unknownPhysicalMaskComplete);
+	result |= check(unknownPhysicalCount == 0 && unknownPhysicalMask == 0 &&
+		!unknownPhysicalMaskComplete,
+		"unknown identities never count as proven physical cores or mask bits");
+	unsigned unknownLogicalIds[2] = { 0, 0 };
+	const unsigned unknownLogicalCount = rts::JobSystem::selectWorkerCpuSets(
+		allUnknownCpuSets, 2, rts::JOB_WORKER_POLICY_ALL, 0,
+		unknownLogicalIds, 2);
+	result |= check(unknownLogicalCount == 2 && unknownLogicalIds[0] == 400 &&
+		unknownLogicalIds[1] == 401,
+		"unknown-core CPU sets remain usable as logical workers");
+	rts::JobCpuSetInfo sharedKnownCpuSets[3];
+	initializeSyntheticCpuSet(sharedKnownCpuSets[0], 500, 0, 7);
+	initializeSyntheticCpuSet(sharedKnownCpuSets[1], 501, 0, UINT_MAX);
+	initializeSyntheticCpuSet(sharedKnownCpuSets[2], 502, 0, 7);
+	unsigned sharedKnownIds[3] = { 500, 501, 502 };
+	rts::JobMetricCounter sharedKnownMask = 0;
+	bool sharedKnownMaskComplete = true;
+	const unsigned sharedKnownCount =
+		rts::JobSystem::summarizeSelectedPhysicalCores(sharedKnownCpuSets, 3,
+			sharedKnownIds, 3, &sharedKnownMask, &sharedKnownMaskComplete);
+	result |= check(sharedKnownCount == 1 && sharedKnownMask == 1 &&
+		!sharedKnownMaskComplete,
+		"known SMT siblings still deduplicate around an unknown identity");
+	rts::JobCpuSetInfo crossGroupCpuSets[2];
+	initializeSyntheticCpuSet(crossGroupCpuSets[0], 600, 0, 9);
+	initializeSyntheticCpuSet(crossGroupCpuSets[1], 601, 1, 9);
+	unsigned crossGroupIds[2] = { 600, 601 };
+	rts::JobMetricCounter crossGroupMask = 0;
+	bool crossGroupMaskComplete = false;
+	const unsigned crossGroupCount =
+		rts::JobSystem::summarizeSelectedPhysicalCores(crossGroupCpuSets, 2,
+			crossGroupIds, 2, &crossGroupMask, &crossGroupMaskComplete);
+	result |= check(crossGroupCount == 2 && crossGroupMask == 3 &&
+		crossGroupMaskComplete,
+		"matching core indexes in different processor groups remain distinct");
 	for (index = 0; index < 12; ++index) cpuSets[index].availableToProcess = index < 2;
 	result |= check(rts::JobSystem::selectOwnerCpuSets(cpuSets, 12,
 		rts::JOB_WORKER_POLICY_AUTO, 0, owners, 2) == 1 &&
