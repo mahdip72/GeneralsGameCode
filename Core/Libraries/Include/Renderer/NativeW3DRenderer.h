@@ -244,6 +244,9 @@ public:
 	bool IsBackendOperational() const;
 	bool CanRecoverDevice() const;
 	uint64_t LastThreadedSubmissionSequence() const;
+	// Nonzero while the producer still owns a frame sequence, including an
+	// ended-but-unsubmitted frame; zero is the resource-only state.
+	uint64_t CurrentThreadedFrameSequence() const;
 	bool PollThreadedCompletion(ThreadedRenderFrameCompletion *completion);
 	RenderResult DrainThreaded();
 	RenderResult CancelThreadedFrame(RenderResult reason);

@@ -486,7 +486,10 @@ RenderResult NativeW3DTextureOwner::CopyActiveColorTarget(
 		return RENDER_RESULT_FAILED;
 	}
 	IGameRenderClientNativeOwner *gameOwner = ownerScope.Get();
-	if (gameOwner != 0)
+	if (gameOwner == 0)
+		// Without a pinned game owner there is no frame/source proof; do not
+		// fall through to the resource registry's owner-side mutation path.
+		return RENDER_RESULT_INVALID_ARGUMENT;
 	{
 		RenderBackBufferInfo source;
 		GpuHandle sourceResource;

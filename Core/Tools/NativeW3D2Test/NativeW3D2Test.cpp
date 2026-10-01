@@ -31,6 +31,18 @@ public:
 		renderer->RecordFrameFailure(result);
 	}
 
+	static RenderResult GetFrameFailure(const NativeW3DRenderer *renderer)
+	{
+		return renderer == 0 ? RENDER_RESULT_INVALID_ARGUMENT :
+			renderer->m_frameFailure;
+	}
+
+	static void SetFacadeFrameOpen(NativeW3DRenderer *renderer, bool open)
+	{
+		if (renderer != 0)
+			renderer->m_frameOpen = open;
+	}
+
 	static RenderResult ConfigureResourceFault(NativeW3DRenderer *renderer,
 		RenderResourceFaultPoint point, unsigned int failOnInvocation,
 		RenderResult result)
@@ -1023,6 +1035,240 @@ int TestBorrowedThreadedCapture(HWND window)
 	return result;
 }
 
+int TestPrelatchedOpenFrameRecovery(HWND window, rts::render::RenderResult firstFailure)
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3DRendererDescriptor descriptor;
+	descriptor.width = descriptor.height = 64;
+	descriptor.enableVsync = false;
+	descriptor.allowSoftwareFallback = true;
+	NativeW3D2 owner;
+	CountingResizeHook hook;
+	const RenderResult initialize = owner.Initialize(window, descriptor);
+	if (initialize == RENDER_RESULT_UNSUPPORTED) return 77;
+	result |= Check(initialize == RENDER_RESULT_OK && owner.Renderer().IsThreaded(),
+		"prelatched-failure recovery initializes the production threaded owner");
+	if (initialize != RENDER_RESULT_OK) return result;
+	owner.SetGameCleanupHook(&hook);
+
+	TextureDescriptor texture;
+	texture.width = texture.height = 64;
+	texture.mipCount = texture.arrayCount = 1;
+	texture.dimension = RENDER_TEXTURE_2D;
+	RenderBackBufferInfo backBuffer;
+	result |= Check(owner.GetGameRenderTargetInfo(&backBuffer) == RENDER_RESULT_OK,
+		"prelatched-failure recovery reads the current backbuffer descriptor");
+	texture.format = backBuffer.format;
+	texture.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+	texture.usage = RENDER_USAGE_DEFAULT;
+	GpuHandle gpuTexture;
+	NativeW3DTextureHandle retainedTexture;
+	NativeW3DSurfaceHandle oldSurface;
+	result |= Check(owner.Resources().CreateTexture(texture, 0, 0, &gpuTexture) ==
+		RENDER_RESULT_OK && owner.Resources().AcquireTexture(gpuTexture,
+			&retainedTexture) == RENDER_RESULT_OK &&
+		owner.Resources().AcquireTextureSurface(retainedTexture, 0, 0,
+			&oldSurface) == RENDER_RESULT_OK,
+		"prelatched-failure recovery retains GPU texture identity and old-epoch surface");
+	NativeW3DGpuContentLease oldLease;
+	const RenderResult contentBegin = owner.Renderer().BeginFrame();
+	const RenderResult contentCopy = contentBegin == RENDER_RESULT_OK ?
+		owner.Resources().CopyActiveColorTargetToTexture(gpuTexture, &oldLease) :
+		RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult contentEnd = contentBegin == RENDER_RESULT_OK ?
+		owner.Renderer().EndFrame(false) : RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult contentFinalize = contentEnd == RENDER_RESULT_OK ?
+		owner.Renderer().FinalizeEndedFrame(false) : RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult contentDrain = contentFinalize == RENDER_RESULT_OK ?
+		owner.Renderer().DrainThreaded() : RENDER_RESULT_INVALID_ARGUMENT;
+	result |= Check(contentCopy == RENDER_RESULT_OK && oldLease.isValid() &&
+		contentEnd == RENDER_RESULT_OK && contentFinalize == RENDER_RESULT_OK &&
+		contentDrain == RENDER_RESULT_OK,
+		"prelatched-failure recovery starts with an exact GPU-content lease");
+
+	ThreadedRenderMetrics before;
+	result |= Check(owner.Renderer().GetThreadedMetrics(&before) &&
+		owner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+		owner.Renderer().CurrentThreadedFrameSequence() != 0,
+		"prelatched failure is recorded on a real open producer frame");
+	RenderResult injected = RENDER_RESULT_OK;
+	if (firstFailure == RENDER_RESULT_INVALID_ARGUMENT)
+	{
+		RenderTargetBinding invalid;
+		invalid.useBackBufferColor = invalid.useBackBufferDepth = false;
+		invalid.hasColor = true;
+		invalid.color.resource = GpuHandle();
+		injected = owner.Renderer().SetRenderTargetsExternal(invalid);
+		// The production NativeW3D2 caller records a rejected target operation
+		// through RecordGameFailure, which also latches the facade's first frame
+		// error before cancellation. Model that real adapter step after verifying
+		// the producer-side rejection above.
+		if (injected != RENDER_RESULT_OK)
+			owner.RecordGameFailure(injected);
+	}
+	else if (firstFailure == RENDER_RESULT_FAILED)
+	{
+		NativeW3DRecoveryTestAccess::RecordFrameFailure(&owner.Renderer(),
+			firstFailure);
+		injected = NativeW3DRecoveryTestAccess::GetFrameFailure(
+			&owner.Renderer());
+	}
+	else
+		injected = RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult latchedFailure =
+		NativeW3DRecoveryTestAccess::GetFrameFailure(&owner.Renderer());
+	result |= Check(injected == firstFailure && latchedFailure == firstFailure,
+		"fixture injects and reads the requested first producer/facade failure");
+	const NativeW3DSubmissionSequence cancelledSequence =
+		owner.Renderer().CurrentThreadedFrameSequence();
+	const NativeW3DSubmissionSequence previousSequence =
+		owner.Renderer().LastThreadedSubmissionSequence();
+	const RenderResult recover = owner.RecoverDevice();
+	ThreadedRenderMetrics after;
+	result |= Check(cancelledSequence != 0 && cancelledSequence != previousSequence &&
+		recover == RENDER_RESULT_OK && owner.IsOperational() &&
+		!owner.Renderer().IsFrameOpen() &&
+		owner.Renderer().CurrentThreadedFrameSequence() == 0 &&
+		owner.Renderer().LastThreadedSubmissionSequence() == cancelledSequence &&
+		hook.releaseCalls == 1 && hook.reacquireCalls == 1,
+		"recovery accepts only the exact sealed prelatched-failure sequence");
+	result |= Check(owner.Renderer().GetThreadedMetrics(&after) &&
+		after.submittedFrames == before.submittedFrames + 1 &&
+		after.completedFrames == before.completedFrames + 1 &&
+		after.failedFrames == before.failedFrames + 1,
+		"recovery fences one failed cancellation packet before rebuilding");
+	if (recover == RENDER_RESULT_OK)
+	{
+		NativeW3DGpuContentLease reacquiredLease = oldLease;
+		const RenderResult leaseResult = owner.Resources().AcquireGpuContentLease(
+			gpuTexture, &reacquiredLease);
+		NativeW3DTextureDescription textureDescription;
+		const RenderResult descriptionResult = owner.Resources().DescribeTexture(
+			gpuTexture, &textureDescription);
+		const unsigned int oldBackendEpoch = oldSurface.backendEpoch;
+		const RenderResult oldSurfaceResult = owner.Resources().AcquireTextureSurface(
+			retainedTexture, 0, 0, &oldSurface);
+		NativeW3DTextureHandle currentTexture;
+		const RenderResult currentTextureResult = owner.Resources().AcquireTexture(
+			gpuTexture, &currentTexture);
+		NativeW3DSurfaceHandle nextSurface;
+		const RenderResult nextSurfaceResult = currentTextureResult == RENDER_RESULT_OK ?
+			owner.Resources().AcquireTextureSurface(currentTexture, 0, 0,
+				&nextSurface) : RENDER_RESULT_INVALID_ARGUMENT;
+		result |= Check(leaseResult == RENDER_RESULT_INVALID_ARGUMENT &&
+			!reacquiredLease.isValid() && descriptionResult == RENDER_RESULT_OK &&
+			textureDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
+			oldSurfaceResult == RENDER_RESULT_INVALID_ARGUMENT &&
+			!oldSurface.isValid() && nextSurfaceResult == RENDER_RESULT_OK &&
+			nextSurface.isValid() && nextSurface.backendEpoch != oldBackendEpoch,
+			"recovery invalidates the old GPU lease/surface and reacquires the new epoch");
+		const RenderResult reset = owner.ResetGameRenderFrameResources(true);
+		const RenderResult failedBoundary = owner.BeginGameDisplayIteration();
+		const RenderResult healthyBoundary = owner.BeginGameDisplayIteration();
+		result |= Check(reset == RENDER_RESULT_OK && failedBoundary == firstFailure &&
+			healthyBoundary == RENDER_RESULT_OK && owner.IsOperational() &&
+			hook.releaseCalls == 1 && hook.reacquireCalls == 1,
+			"the exact first cancellation error is acknowledged once after recovery");
+		GameRenderCommand begin = {};
+		begin.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+		begin.value0 = RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH;
+		begin.float3 = begin.float4 = 1.0f;
+		GameRenderCommand end = {};
+		end.type = GAME_RENDER_COMMAND_END_RENDER;
+		const RenderResult healthyBegin = owner.ExecuteGameRenderCommand(begin);
+		const RenderResult healthyEnd = healthyBegin == RENDER_RESULT_OK ?
+			owner.ExecuteGameRenderCommand(end) : RENDER_RESULT_INVALID_ARGUMENT;
+		const RenderResult healthyDrain = healthyEnd == RENDER_RESULT_OK ?
+			owner.Renderer().DrainThreaded() : RENDER_RESULT_INVALID_ARGUMENT;
+		result |= Check(healthyBoundary == RENDER_RESULT_OK &&
+			healthyBegin == RENDER_RESULT_OK && healthyEnd == RENDER_RESULT_OK &&
+			healthyDrain == RENDER_RESULT_OK && owner.IsOperational(),
+			"normal game commands render after prelatched-error recovery");
+	}
+	owner.SetGameCleanupHook(0);
+	result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
+		"prelatched-error recovery releases the owner without a stranded frame");
+	return result;
+}
+
+int TestRejectedStaleFacadeCancellation(HWND window)
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3DRendererDescriptor descriptor;
+	descriptor.width = descriptor.height = 64;
+	descriptor.enableVsync = false;
+	descriptor.allowSoftwareFallback = true;
+	NativeW3D2 owner;
+	CountingResizeHook hook;
+	const RenderResult initialize = owner.Initialize(window, descriptor);
+	if (initialize == RENDER_RESULT_UNSUPPORTED) return 77;
+	result |= Check(initialize == RENDER_RESULT_OK && owner.Renderer().IsThreaded(),
+		"stale-facade cancellation initializes the production threaded owner");
+	if (initialize != RENDER_RESULT_OK) return result;
+	owner.SetGameCleanupHook(&hook);
+	ThreadedRenderMetrics before;
+	result |= Check(owner.Renderer().GetThreadedMetrics(&before),
+		"stale-facade fixture snapshots queue state before rejection");
+	const NativeW3DSubmissionSequence previousSequence =
+		owner.Renderer().LastThreadedSubmissionSequence();
+	NativeW3DRecoveryTestAccess::SetFacadeFrameOpen(&owner.Renderer(), true);
+	const RenderResult rejected = owner.RecoverDevice();
+	ThreadedRenderMetrics after;
+	result |= Check(rejected == RENDER_RESULT_INVALID_ARGUMENT &&
+		owner.Renderer().IsFrameOpen() &&
+		owner.Renderer().CurrentThreadedFrameSequence() == 0 &&
+		owner.Renderer().LastThreadedSubmissionSequence() == previousSequence &&
+		owner.Renderer().GetThreadedMetrics(&after) &&
+		after.submittedFrames == before.submittedFrames &&
+		after.completedFrames == before.completedFrames &&
+		hook.releaseCalls == 0 && hook.reacquireCalls == 0 && owner.IsOperational(),
+		"an INVALID_ARGUMENT with no accepted producer sequence cannot authorize recovery");
+	NativeW3DRecoveryTestAccess::SetFacadeFrameOpen(&owner.Renderer(), false);
+	const RenderResult begin = owner.Renderer().BeginFrame();
+	const RenderResult end = begin == RENDER_RESULT_OK ?
+		owner.Renderer().EndFrame(false) : RENDER_RESULT_INVALID_ARGUMENT;
+	const NativeW3DSubmissionSequence endedSequence =
+		owner.Renderer().CurrentThreadedFrameSequence();
+	const RenderResult recovered = owner.RecoverDevice();
+	ThreadedRenderMetrics recoveredMetrics;
+	const RenderResult failedBoundary = owner.BeginGameDisplayIteration();
+	const RenderResult healthyBoundary = owner.BeginGameDisplayIteration();
+	result |= Check(begin == RENDER_RESULT_OK && end == RENDER_RESULT_OK &&
+		endedSequence != 0 && !owner.Renderer().IsFrameOpen() &&
+		recovered == RENDER_RESULT_OK && owner.IsOperational() &&
+		owner.Renderer().CurrentThreadedFrameSequence() == 0 &&
+		owner.Renderer().LastThreadedSubmissionSequence() == endedSequence &&
+		owner.Renderer().GetThreadedMetrics(&recoveredMetrics) &&
+		recoveredMetrics.submittedFrames == before.submittedFrames + 1 &&
+		recoveredMetrics.completedFrames == before.completedFrames + 1 &&
+		recoveredMetrics.failedFrames == before.failedFrames + 1 &&
+		failedBoundary == RENDER_RESULT_DEVICE_REMOVED &&
+		healthyBoundary == RENDER_RESULT_OK && hook.releaseCalls == 1 &&
+		hook.reacquireCalls == 1,
+		"recovery cancels an ended producer sequence even when the facade flag is closed");
+	GameRenderCommand gameBegin = {};
+	gameBegin.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+	gameBegin.value0 = RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH;
+	gameBegin.float3 = gameBegin.float4 = 1.0f;
+	GameRenderCommand gameEnd = {};
+	gameEnd.type = GAME_RENDER_COMMAND_END_RENDER;
+	const RenderResult healthyBegin = owner.ExecuteGameRenderCommand(gameBegin);
+	const RenderResult healthyEnd = healthyBegin == RENDER_RESULT_OK ?
+		owner.ExecuteGameRenderCommand(gameEnd) : RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult healthyDrain = healthyEnd == RENDER_RESULT_OK ?
+		owner.Renderer().DrainThreaded() : RENDER_RESULT_INVALID_ARGUMENT;
+	result |= Check(healthyBoundary == RENDER_RESULT_OK &&
+		healthyBegin == RENDER_RESULT_OK && healthyEnd == RENDER_RESULT_OK &&
+		healthyDrain == RENDER_RESULT_OK && owner.IsOperational(),
+		"normal game rendering follows actual producer-sequence recovery");
+	owner.SetGameCleanupHook(0);
+	result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
+		"stale-facade cancellation fixture shuts down cleanly");
+	return result;
+}
+
 int TestExplicitRecoveryWithOpenFrame(HWND window)
 {
 	using namespace rts::render;
@@ -1176,6 +1422,17 @@ int TestExplicitRecoveryWithOpenFrame(HWND window)
 		result |= Check(failingOwner.Shutdown() == RENDER_RESULT_OK,
 			"failed open-frame recovery still releases owner resources");
 	}
+	const int failedRecovery = TestPrelatchedOpenFrameRecovery(window,
+		RENDER_RESULT_FAILED);
+	if (failedRecovery == 77) return result == 0 ? 77 : result;
+	result |= failedRecovery;
+	const int invalidArgumentRecovery = TestPrelatchedOpenFrameRecovery(window,
+		RENDER_RESULT_INVALID_ARGUMENT);
+	if (invalidArgumentRecovery == 77) return result == 0 ? 77 : result;
+	result |= invalidArgumentRecovery;
+	const int staleFacadeRecovery = TestRejectedStaleFacadeCancellation(window);
+	if (staleFacadeRecovery == 77) return result == 0 ? 77 : result;
+	result |= staleFacadeRecovery;
 	return result;
 }
 
@@ -2611,9 +2868,9 @@ int TestPublicCopyPreflight(HWND window, bool typedOnly = false)
 	RenderBackBufferInfo colorInfo;
 	GpuHandle colorResource(1, 1);
 	result |= Check(owner.GetGameActiveColorTargetInfo(&colorInfo, &colorResource) ==
-		RENDER_RESULT_OK && colorInfo.width == mainInfo.width &&
-		colorInfo.height == mainInfo.height && colorInfo.multisampleCount == 4 &&
-		!colorResource.isValid(), "active color query identifies actual AA4 backbuffer");
+		RENDER_RESULT_INVALID_ARGUMENT && colorInfo.width == 0 &&
+		colorInfo.height == 0 && !colorResource.isValid(),
+		"copy admission rejects the retained AA4 backbuffer outside a frame");
 	TextureDescriptor textureDescriptor;
 	textureDescriptor.width = textureDescriptor.height = 64;
 	textureDescriptor.format = mainInfo.format;
@@ -2758,6 +3015,48 @@ int TestPublicCopyPreflight(HWND window, bool typedOnly = false)
 		owner.Shutdown();
 		return result | Check(false, "typed copy fixture borrows actual current texture identities");
 	}
+	result |= Check(select(true) == RENDER_RESULT_OK,
+		"copy fixture retains the selected custom layer outside a frame");
+	RenderBackBufferInfo retainedInfo;
+	GpuHandle retainedResource = layer;
+	const RenderResult retainedQuery = owner.GetGameActiveColorTargetInfo(
+		&retainedInfo, &retainedResource);
+	NativeW3DTextureDescription destinationBeforeNoFrame;
+	const RenderResult destinationSnapshot = owner.Resources().DescribeTexture(
+		layerCopy, &destinationBeforeNoFrame);
+	lease = savedLease;
+	const RenderResult noFrameCopy = typedOnly ?
+		typedLayerCopy.CopyActiveColorTarget(&lease) :
+		copy(layerCopy, GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE);
+	NativeW3DTextureDescription destinationAfterNoFrame;
+	const RenderResult destinationAfter = owner.Resources().DescribeTexture(
+		layerCopy, &destinationAfterNoFrame);
+	result |= Check(retainedQuery == RENDER_RESULT_INVALID_ARGUMENT &&
+		retainedInfo.width == 0 && retainedInfo.height == 0 &&
+		!retainedResource.isValid(),
+		"retained custom target cannot satisfy active-copy admission outside a frame");
+	result |= Check(destinationSnapshot == RENDER_RESULT_OK &&
+		destinationAfter == RENDER_RESULT_OK &&
+		destinationAfterNoFrame.authority == destinationBeforeNoFrame.authority &&
+		destinationAfterNoFrame.authorityEpoch == destinationBeforeNoFrame.authorityEpoch &&
+		noFrameCopy == RENDER_RESULT_INVALID_ARGUMENT && !lease.isValid() && preserved(),
+		"out-of-frame public/typed copy clears its lease before mutation and preserves content authority");
+	if (typedOnly) owner.RecordGameFailure(RENDER_RESULT_FAILED);
+	const RenderResult noFrameBoundary = owner.BeginGameDisplayIteration();
+	const RenderResult followupBegin = owner.ExecuteGameRenderCommand(begin);
+	const RenderResult followupCopy = followupBegin == RENDER_RESULT_OK ?
+		(typedOnly ? typedLayerCopy.CopyActiveColorTarget(&lease) :
+		 copy(layerCopy, GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE)) :
+		RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult followupEnd = followupBegin == RENDER_RESULT_OK ?
+		owner.ExecuteGameRenderCommand(end) : RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult followupDrain = followupEnd == RENDER_RESULT_OK ?
+		owner.Renderer().DrainThreaded() : RENDER_RESULT_INVALID_ARGUMENT;
+	result |= Check(noFrameBoundary == RENDER_RESULT_OK &&
+		followupBegin == RENDER_RESULT_OK && followupCopy == RENDER_RESULT_OK &&
+		lease.isValid() && followupEnd == RENDER_RESULT_OK &&
+		followupDrain == RENDER_RESULT_OK && preserved(),
+		"a healthy in-frame copy follows out-of-frame rejection without recovery");
 	const GpuHandle rejected[] = { smallCopy, wrongFormat, largeCopy, GpuHandle(),
 		layer, mainCopy, layerCopy };
 	for (unsigned int scenario = typedOnly ? 4 : 0; scenario < 7; ++scenario)

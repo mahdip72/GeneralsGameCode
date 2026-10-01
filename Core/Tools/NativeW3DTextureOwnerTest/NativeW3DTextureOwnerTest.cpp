@@ -613,11 +613,14 @@ int TestNeutralTextureOwnership()
 		gpuLease.resource == gpuHandle.resource,
 		"GPU sampling acquires the exact current authority lease");
 	const NativeW3DGpuContentLease staleLease = gpuLease;
-	NativeW3DGpuContentLease nextLease;
+	NativeW3DGpuContentLease nextLease = staleLease;
 	result |= Check(owner.CopyActiveColorTarget(&nextLease) ==
-		RENDER_RESULT_OK && nextLease.isValid() &&
+		RENDER_RESULT_INVALID_ARGUMENT && !nextLease.isValid(),
+		"typed copy rejects a missing pinned game owner and clears its lease");
+	result |= Check(resources.CopyActiveColorTargetToTexture(
+		gpuHandle.resource, &nextLease) == RENDER_RESULT_OK && nextLease.isValid() &&
 		nextLease.authorityEpoch != staleLease.authorityEpoch,
-		"a later GPU write advances the authority epoch");
+		"a later resource-registry GPU write advances the authority epoch");
 	gpuLease = staleLease;
 	NativeW3DTextureHandle staleGpuHandle = gpuHandle;
 	result |= Check(owner.AcquireForSampling(&staleGpuHandle, &gpuLease) ==

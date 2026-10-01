@@ -859,6 +859,17 @@ uint64_t NativeW3DRenderer::LastThreadedSubmissionSequence() const
 #endif
 }
 
+uint64_t NativeW3DRenderer::CurrentThreadedFrameSequence() const
+{
+	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+#if defined(RTS_RENDERER_HAS_D3D11)
+	return device == 0 ? 0 : CurrentThreadedRenderFrameSequence(device);
+#else
+	(void)device;
+	return 0;
+#endif
+}
+
 bool NativeW3DRenderer::PollThreadedCompletion(
 	ThreadedRenderFrameCompletion *completion)
 {
@@ -895,11 +906,22 @@ RenderResult NativeW3DRenderer::CancelThreadedFrame(RenderResult reason)
 #if defined(RTS_RENDERER_HAS_D3D11)
 	if (!IsThreadedRenderDevice(device))
 		return RENDER_RESULT_UNSUPPORTED;
-	const RenderResult result = CancelThreadedRenderFrame(device, reason);
-	// The low-level cancellation closes the producer frame directly, so keep
-	// the facade's frame state in lockstep even when the owner reports the
-	// cancellation reason as a failure.
-	if (result != RENDER_RESULT_INVALID_ARGUMENT)
+	const uint64_t frameSequence = CurrentThreadedRenderFrameSequence(device);
+	const uint64_t previousSequence = LastThreadedRenderFrameSequence(device);
+	// A facade-side frame failure precedes the requested cancellation reason.
+	// Pass that first failure into the producer packet so serial completion and
+	// parallel completion publish the same non-present frame outcome.
+	const RenderResult frameReason = m_frameFailure == RENDER_RESULT_OK ?
+		reason : m_frameFailure;
+	const RenderResult result = CancelThreadedRenderFrame(device, frameReason);
+	const uint64_t currentSequence = CurrentThreadedRenderFrameSequence(device);
+	const uint64_t submittedSequence = LastThreadedRenderFrameSequence(device);
+	// INVALID_ARGUMENT can be the already-latched result of a successfully
+	// sealed frame. Clear facade state only when the exact recording sequence
+	// was accepted; an unaccepted/no-open cancellation remains fail-closed.
+	const bool sealed = frameSequence != 0 && currentSequence == 0 &&
+		submittedSequence == frameSequence && submittedSequence != previousSequence;
+	if (sealed)
 	{
 		m_frameOpen = false;
 		m_frameFailure = RENDER_RESULT_OK;

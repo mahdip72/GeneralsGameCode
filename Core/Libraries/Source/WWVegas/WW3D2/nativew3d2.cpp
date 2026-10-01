@@ -776,7 +776,9 @@ rts::render::RenderResult NativeW3D2::FenceThreadedRender()
 rts::render::RenderResult NativeW3D2::CancelOpenThreadedFrame(
 	rts::render::RenderResult reason)
 {
-	if (!m_renderer.IsFrameOpen())
+	if (!m_renderer.IsFrameOpen() &&
+		(!m_renderer.IsThreaded() ||
+		 m_renderer.CurrentThreadedFrameSequence() == 0))
 		return rts::render::RENDER_RESULT_OK;
 	if (m_renderer.IsThreaded())
 		return m_renderer.CancelThreadedFrame(reason);
@@ -881,7 +883,9 @@ rts::render::RenderResult NativeW3D2::RecoverDevice()
 	if (rts::render::IsNativeGameRenderOwnerPinnedByCurrentThread() ||
 		m_borrowedBackend || !m_resources.IsOwnerThread() ||
 		(!m_renderer.CanRecoverDevice() &&
-			!(m_renderer.IsThreaded() && m_renderer.IsFrameOpen() &&
+			!(m_renderer.IsThreaded() &&
+				(m_renderer.IsFrameOpen() ||
+				 m_renderer.CurrentThreadedFrameSequence() != 0) &&
 				m_renderer.HasRecoverableOwnedDevice())))
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	// CanRecoverDevice requires a sealed frame. An owned threaded frame must
@@ -898,22 +902,40 @@ rts::render::RenderResult NativeW3D2::RecoverDevice()
 	// removal. Seal it as a failed non-visible frame before the lifecycle fence;
 	// otherwise the threaded backend retains its reserved completion slot and a
 	// later recovery/shutdown can never quiesce the owner.
-	if (m_renderer.IsThreaded() && m_renderer.IsFrameOpen())
+	rts::render::NativeW3DSubmissionSequence cancelledSequence = 0;
+	if (m_renderer.IsThreaded() &&
+		(m_renderer.IsFrameOpen() ||
+		 m_renderer.CurrentThreadedFrameSequence() != 0))
 	{
+		const rts::render::NativeW3DSubmissionSequence frameSequence =
+			m_renderer.CurrentThreadedFrameSequence();
+		const rts::render::NativeW3DSubmissionSequence previousSequence =
+			m_renderer.LastThreadedSubmissionSequence();
 		const rts::render::RenderResult cancelResult =
 			CancelOpenThreadedFrame(rts::render::RENDER_RESULT_DEVICE_REMOVED);
-		// Serial submission returns the completed cancellation reason; parallel
-		// submission returns enqueue success. Both have sealed the same failed
-		// frame, which must still be fenced and recovered below.
-		if (cancelResult != rts::render::RENDER_RESULT_OK &&
-			cancelResult != rts::render::RENDER_RESULT_DEVICE_REMOVED)
-			return cancelResult;
+		const rts::render::NativeW3DSubmissionSequence submittedSequence =
+			m_renderer.LastThreadedSubmissionSequence();
+		// Serial submission may return the first already-latched producer error,
+		// while parallel submission returns enqueue success. Continue only when
+		// the exact open producer sequence was accepted and the facade agrees it
+		// is closed; a rejected/stale cancellation must not enter recovery.
+		if (frameSequence == 0 || m_renderer.CurrentThreadedFrameSequence() != 0 ||
+			m_renderer.IsFrameOpen() || submittedSequence != frameSequence ||
+			submittedSequence == previousSequence)
+		{
+			return cancelResult == rts::render::RENDER_RESULT_OK ?
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT : cancelResult;
+		}
+		cancelledSequence = submittedSequence;
 	}
 	if (m_renderer.IsThreaded())
 	{
 		const rts::render::RenderResult fenceResult = FenceThreadedRender();
+		const bool exactCancelledFrameFailure = cancelledSequence != 0 &&
+			m_deferredFailureSequence == cancelledSequence &&
+			m_deferredFailure.result() == fenceResult;
 		if (fenceResult != rts::render::RENDER_RESULT_OK &&
-			m_renderer.IsBackendOperational())
+			m_renderer.IsBackendOperational() && !exactCancelledFrameFailure)
 			return fenceResult;
 	}
 	// The fence may have retained a failed frame for the next display boundary.
@@ -2302,30 +2324,36 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			RenderResult result = RENDER_RESULT_OK;
 			if (command.type == GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE)
 			{
-				NativeW3DTextureDescription destination;
-				RenderBackBufferInfo source;
-				GpuHandle sourceResource;
-				result = m_resources.DescribeTexture(resource0, &destination);
-				if (result == RENDER_RESULT_OK)
-					result = GetGameActiveColorTargetInfo(&source, &sourceResource);
-				if (result == RENDER_RESULT_OK)
+				*lease = NativeW3DGpuContentLease();
+				if (!m_renderer.IsFrameOpen())
+					result = RENDER_RESULT_INVALID_ARGUMENT;
+				else
 				{
-					// Validate the selected logical layer before backend/queue entry.
-					// These rejections cannot have mutated resource content; accepted
-					// copy, fence, or texture-rebind failures remain fail-closed below.
-					if ((sourceResource.isValid() && sourceResource == resource0) ||
-						source.width == 0 || source.height == 0 || source.multisampleCount == 0)
-						result = RENDER_RESULT_INVALID_ARGUMENT;
-					else if (source.format != destination.descriptor.format ||
-						source.width > destination.descriptor.width ||
-						source.height > destination.descriptor.height ||
-						(source.multisampleCount > 1 &&
-						 (source.width != destination.descriptor.width ||
-						  source.height != destination.descriptor.height)))
-						result = RENDER_RESULT_UNSUPPORTED;
+					NativeW3DTextureDescription destination;
+					RenderBackBufferInfo source;
+					GpuHandle sourceResource;
+					result = m_resources.DescribeTexture(resource0, &destination);
+					if (result == RENDER_RESULT_OK)
+						result = GetGameActiveColorTargetInfo(&source, &sourceResource);
+					if (result == RENDER_RESULT_OK)
+					{
+						// Validate the selected logical layer before backend/queue entry.
+						// These rejections cannot have mutated resource content; accepted
+						// copy, fence, or texture-rebind failures remain fail-closed below.
+						if ((sourceResource.isValid() && sourceResource == resource0) ||
+							source.width == 0 || source.height == 0 || source.multisampleCount == 0)
+							result = RENDER_RESULT_INVALID_ARGUMENT;
+						else if (source.format != destination.descriptor.format ||
+							source.width > destination.descriptor.width ||
+							source.height > destination.descriptor.height ||
+							(source.multisampleCount > 1 &&
+							 (source.width != destination.descriptor.width ||
+							  source.height != destination.descriptor.height)))
+							result = RENDER_RESULT_UNSUPPORTED;
+					}
+					if (result == RENDER_RESULT_OK)
+						result = m_resources.CopyActiveColorTargetToTexture(resource0, lease);
 				}
-				if (result == RENDER_RESULT_OK)
-					result = m_resources.CopyActiveColorTargetToTexture(resource0, lease);
 			}
 			else
 				result = m_resources.AcquireGpuContentLease(resource0, lease);
@@ -3795,7 +3823,7 @@ rts::render::RenderResult NativeW3D2::GetGameActiveColorTargetInfo(
 		*info = RenderBackBufferInfo();
 	if (colorResource != 0)
 		*colorResource = GpuHandle();
-	if (info == 0 || colorResource == 0 ||
+	if (info == 0 || colorResource == 0 || !m_renderer.IsFrameOpen() ||
 		(!m_gameRenderTargetBinding.useBackBufferColor &&
 		 !m_gameRenderTargetBinding.hasColor))
 		return RENDER_RESULT_INVALID_ARGUMENT;
