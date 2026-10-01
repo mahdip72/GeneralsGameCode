@@ -114,12 +114,28 @@ struct Anchor
   utc100ns = (static_cast<Tick>(utc.dwHighDateTime) << 32) | utc.dwLowDateTime;
   after = QueryPerformanceCounter(&qpc) ? static_cast<Tick>(qpc.QuadPart) : 0; }
 };
+// File operations occur only after owner join. Injection permits actual-helper
+// fixtures to exercise failed publication without changing renderer callers.
+class DumpIO
+{
+public:
+ virtual ~DumpIO() {}
+ virtual HANDLE createPartial(const char *path)
+ { return CreateFileA(path, GENERIC_WRITE, 0, 0, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0); }
+ virtual bool write(HANDLE file, const char *data, DWORD length, DWORD *written)
+ { return WriteFile(file, data, length, written, 0) != 0; }
+ virtual bool flush(HANDLE file) { return FlushFileBuffers(file) != 0; }
+ virtual bool close(HANDLE file) { return CloseHandle(file) != 0; }
+ virtual bool publish(const char *partial, const char *finalPath)
+ { return MoveFileExA(partial, finalPath, MOVEFILE_WRITE_THROUGH) != 0; }
+};
 // Construct before worker startup. Producer and owner each exclusively write
 // their own lane; dump only after worker join. A session owns all its storage.
 class Session
 {
 public:
- Session() : frequency(0), delayMilliseconds(0), captureBeginQpc(0), dumped(false), dumpSucceeded(false)
+ explicit Session(DumpIO *io = 0) : frequency(0), delayMilliseconds(0), captureBeginQpc(0), dumped(false), dumpSucceeded(false),
+  m_io(io ? io : &m_defaultIO)
  {
   LARGE_INTEGER value; if (QueryPerformanceFrequency(&value)) frequency = value.QuadPart;
   start.capture(); producer.threadId = GetCurrentThreadId();
@@ -154,7 +170,9 @@ public:
   char path[MAX_PATH]; int length = snprintf(path, sizeof(path), "%s\\menu-critical-path-%lu-%llu.csv",
    directory, GetCurrentProcessId(), start.before);
   if (length <= 0 || length >= sizeof(path)) return;
-  HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, 0, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
+  char partial[MAX_PATH]; length = snprintf(partial, sizeof(partial), "%s.partial", path);
+  if (length <= 0 || length >= sizeof(partial)) return;
+  HANDLE file = m_io->createPartial(partial);
   if (file == INVALID_HANDLE_VALUE) return;
   bool ok = true; char row[1024];
   length = snprintf(row, sizeof(row), "# TEMP inclusive CPU wall ticks; nested scopes overlap; owner execution includes backend, not GPU time\n# frequency=%llu,start_qpc_before=%llu,start_utc_filetime_100ns=%llu,start_qpc_after=%llu,end_qpc_before=%llu,end_utc_filetime_100ns=%llu,end_qpc_after=%llu\n",
@@ -163,8 +181,11 @@ public:
   length = snprintf(row, sizeof(row), "# detail_delay_ms=%u,capture_begin_qpc=%llu; result_known=0 means unobserved result (blank), not success; totals cover entire session including warmup\n",
    delayMilliseconds, captureBeginQpc);
   write(file, row, length, ok);
+  const char *status = "# trace_status=partial_until_published; accept only final .csv with terminal trace_complete footer\n";
+  write(file, status, static_cast<int>(strlen(status)), ok);
   const char *header = "row,lane,kind,reason,begin_qpc,end_qpc,sequence,last_sequence,packet,control,recording,commands,bytes,depth,result_known,result,calls,ticks\n";
   write(file, header, static_cast<int>(strlen(header)), ok);
+  unsigned int totalRows[2] = {0, 0};
   for (unsigned int laneIndex = 0; laneIndex < 2; ++laneIndex)
   {
    Lane &lane = laneIndex == 0 ? producer : owner;
@@ -184,18 +205,31 @@ public:
    for (unsigned int k = 0; k < KindCount; ++k) for (unsigned int r = 0; r < ReasonCount; ++r)
    {
     const Aggregate &total = lane.totals[k][r]; if (!total.calls) continue;
+    ++totalRows[laneIndex];
     length = snprintf(row, sizeof(row), "total,%s,%s,%s,,,,,,,,,,,,,%llu,%llu\n",
      name, KindName(k), ReasonName(r), total.calls, total.ticks);
     write(file, row, length, ok);
    }
   }
-  if (!CloseHandle(file)) ok = false; dumpSucceeded = ok;
+  if (ok)
+  {
+   length = snprintf(row, sizeof(row), "# trace_complete,status=complete,format=menu-critical-path-v2,producer_events=%u,owner_events=%u,producer_totals=%u,owner_totals=%u\n",
+    producer.used, owner.used, totalRows[0], totalRows[1]);
+   write(file, row, length, ok);
+  }
+  // Complete logical rows alone are insufficient: successful flush/close and
+  // non-overwriting publication are mandatory. Retain failures as .partial.
+  if (!m_io->flush(file)) ok = false;
+  if (!m_io->close(file)) ok = false;
+  if (ok) dumpSucceeded = m_io->publish(partial, path);
  }
 private:
  char directory[MAX_PATH];
- static void write(HANDLE file, const char *row, int length, bool &ok)
- { if (length <= 0 || length >= 1024) { ok = false; return; }
-  DWORD written = 0; if (!WriteFile(file, row, length, &written, 0) || written != static_cast<DWORD>(length)) ok = false; }
+ DumpIO m_defaultIO; DumpIO *m_io;
+ void write(HANDLE file, const char *row, int length, bool &ok)
+ { if (!ok) return;
+  if (length <= 0 || length >= 1024) { ok = false; return; }
+  DWORD written = 0; if (!m_io->write(file, row, static_cast<DWORD>(length), &written) || written != static_cast<DWORD>(length)) ok = false; }
  Session(const Session &); Session &operator=(const Session &);
 };
 } }
