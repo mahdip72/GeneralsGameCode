@@ -31,12 +31,21 @@ class TargetOwner : public IGameRenderClientNativeOwner
 {
 public:
 	RenderBackBufferInfo target;
+	GpuHandle colorResource;
 	bool IsInitialized() const override { return true; }
 	bool IsOperational() const override { return true; }
 	GameRenderTargetKind ActiveRenderTargetKind() const override
 		{ return GAME_RENDER_TARGET_TEXTURE; }
 	RenderResult GetGameRenderTargetInfo(RenderBackBufferInfo *info) const override
 		{ if (!info) return RENDER_RESULT_INVALID_ARGUMENT; *info = target; return RENDER_RESULT_OK; }
+	RenderResult GetGameActiveColorTargetInfo(RenderBackBufferInfo *info,
+		GpuHandle *resource) const override
+	{
+		if (!info || !resource) return RENDER_RESULT_INVALID_ARGUMENT;
+		*info = target;
+		*resource = colorResource;
+		return RENDER_RESULT_OK;
+	}
 };
 
 struct HiddenWindow
@@ -159,6 +168,7 @@ void TestCopy(bool threaded, bool serial, unsigned int samples,
 	NativeW3DTextureHandle reflection;
 	Require(resources.CreateTexture(reflectionDescriptor, 0, 0, &reflection) ==
 		RENDER_RESULT_OK, "real 256-square reflection output");
+	gameOwner.colorResource = reflection.resource;
 	NativeW3DTextureHandle independent;
 	Require(resources.CreateTexture(backgroundDescriptor, &blueData, 1, &independent) ==
 		RENDER_RESULT_OK, "independent CPU texture");
@@ -361,6 +371,7 @@ void TestCopy(bool threaded, bool serial, unsigned int samples,
 	// The next pass restores the main output. Its exact-size single-sample
 	// copy / AA resolve must keep the original full-target semantics.
 	gameOwner.target = info;
+	gameOwner.colorResource = GpuHandle();
 	Require(context->beginFrame() == RENDER_RESULT_OK, "begin main target copy frame");
 	frameCleanup.open = true;
 	Require(

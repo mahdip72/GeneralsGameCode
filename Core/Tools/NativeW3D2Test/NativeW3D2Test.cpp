@@ -2591,7 +2591,7 @@ static_assert(NativeFixtureExitCode(0, true) == 77, "unsupported tests skip");
 static_assert(NativeFixtureExitCode(1, false) == 1, "failed tests fail");
 static_assert(NativeFixtureExitCode(1, true) == 1, "failures dominate skips");
 
-int TestPublicCopyPreflight(HWND window)
+int TestPublicCopyPreflight(HWND window, bool typedOnly = false)
 {
 	using namespace rts::render;
 	int result = 0;
@@ -2608,17 +2608,30 @@ int TestPublicCopyPreflight(HWND window)
 	result |= Check(owner.GetGameRenderTargetInfo(&mainInfo) == RENDER_RESULT_OK &&
 		mainInfo.width == 64 && mainInfo.height == 64 && mainInfo.multisampleCount == 4,
 		"public copy fixture has actual AA4 main layer");
+	RenderBackBufferInfo colorInfo;
+	GpuHandle colorResource(1, 1);
+	result |= Check(owner.GetGameActiveColorTargetInfo(&colorInfo, &colorResource) ==
+		RENDER_RESULT_OK && colorInfo.width == mainInfo.width &&
+		colorInfo.height == mainInfo.height && colorInfo.multisampleCount == 4 &&
+		!colorResource.isValid(), "active color query identifies actual AA4 backbuffer");
 	TextureDescriptor textureDescriptor;
 	textureDescriptor.width = textureDescriptor.height = 64;
 	textureDescriptor.format = mainInfo.format;
 	textureDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
 	textureDescriptor.usage = RENDER_USAGE_DEFAULT;
-	GpuHandle mainCopy, layer, layerCopy, smallCopy, wrongFormat, largeCopy, independent;
+	GpuHandle mainCopy, layer, layerCopy, smallCopy, wrongFormat, largeCopy, independent, depth;
 	bool created = owner.Resources().CreateTexture(textureDescriptor, 0, 0, &mainCopy) ==
 		RENDER_RESULT_OK;
 	textureDescriptor.width = textureDescriptor.height = 16;
 	textureDescriptor.binding |= RENDER_TEXTURE_RENDER_TARGET;
-	created = created && owner.Resources().CreateTexture(textureDescriptor, 0, 0, &layer) ==
+	// A valid CPU-backed image also permits the typed owner to borrow this
+	// exact selected color resource for the self-copy admission regression.
+	const unsigned int layerPixels[16 * 16] = {};
+	TextureSubresourceData layerData;
+	layerData.data = layerPixels;
+	layerData.rowPitch = 16 * sizeof(unsigned int);
+	layerData.slicePitch = sizeof(layerPixels);
+	created = created && owner.Resources().CreateTexture(textureDescriptor, &layerData, 1, &layer) ==
 		RENDER_RESULT_OK;
 	textureDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
 	textureDescriptor.width = textureDescriptor.height = 32;
@@ -2642,6 +2655,11 @@ int TestPublicCopyPreflight(HWND window)
 	data.data = &pixel;
 	data.rowPitch = data.slicePitch = sizeof(pixel);
 	created = created && owner.Resources().CreateTexture(textureDescriptor, &data, 1, &independent) ==
+		RENDER_RESULT_OK;
+	textureDescriptor.width = textureDescriptor.height = 16;
+	textureDescriptor.format = RENDER_FORMAT_D24_UNORM_S8_UINT;
+	textureDescriptor.binding = RENDER_TEXTURE_DEPTH_STENCIL;
+	created = created && owner.Resources().CreateTexture(textureDescriptor, 0, 0, &depth) ==
 		RENDER_RESULT_OK;
 	const NativeVertex vertices[3] = {};
 	const unsigned short indices[3] = { 0, 1, 2 };
@@ -2720,41 +2738,96 @@ int TestPublicCopyPreflight(HWND window)
 		owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
 		"public copy/acquire uses selected 16-square layer, not 64-square AA4 main");
 	const NativeW3DGpuContentLease savedLease = lease;
-	const GpuHandle rejected[] = { smallCopy, wrongFormat, largeCopy, GpuHandle() };
-	for (unsigned int scenario = 0; scenario < 4; ++scenario)
+	NativeW3DTextureOwner typedLayer, typedMainCopy, typedLayerCopy;
+	auto borrow = [&](GpuHandle resource, NativeW3DTextureOwner &destination)
 	{
-		const RenderResult expected = scenario == 3 ? RENDER_RESULT_INVALID_ARGUMENT :
+		NativeW3DTextureHandle handle;
+		NativeW3DTextureDescription description;
+		NativeW3DTextureCandidate candidate;
+		return owner.Resources().AcquireTexture(resource, &handle) == RENDER_RESULT_OK &&
+			owner.Resources().DescribeTexture(resource, &description) == RENDER_RESULT_OK &&
+			destination.BorrowCandidate(handle, description.descriptor, &candidate) == RENDER_RESULT_OK &&
+			destination.PublishCandidate(&candidate, 0) == RENDER_RESULT_OK;
+	};
+	if (typedOnly && !(borrow(layer, typedLayer) && borrow(mainCopy, typedMainCopy) &&
+		borrow(layerCopy, typedLayerCopy)))
+	{
+		(void)typedLayer.Reset();
+		(void)typedMainCopy.Reset();
+		(void)typedLayerCopy.Reset();
+		owner.Shutdown();
+		return result | Check(false, "typed copy fixture borrows actual current texture identities");
+	}
+	const GpuHandle rejected[] = { smallCopy, wrongFormat, largeCopy, GpuHandle(),
+		layer, mainCopy, layerCopy };
+	for (unsigned int scenario = typedOnly ? 4 : 0; scenario < 7; ++scenario)
+	{
+		const RenderResult expected = scenario >= 3 ? RENDER_RESULT_INVALID_ARGUMENT :
 			RENDER_RESULT_UNSUPPORTED;
-		result |= Check(owner.BeginGameDisplayIteration() == RENDER_RESULT_OK &&
-			select(scenario != 2) == RENDER_RESULT_OK &&
+		RenderTargetBinding noColor;
+		noColor.useBackBufferColor = noColor.useBackBufferDepth = false;
+		noColor.hasDepth = scenario == 6;
+		noColor.depth.resource = scenario == 6 ? depth : GpuHandle();
+		GameRenderCommand noColorCommand = {};
+		noColorCommand.type = GAME_RENDER_COMMAND_SET_RENDER_TARGET;
+		noColorCommand.input = &noColor;
+		noColorCommand.inputBytes = sizeof(noColor);
+		begin.value0 = scenario >= 5 ? 0 : RENDER_CLEAR_COLOR;
+		result |= Check(owner.BeginGameDisplayIteration() == RENDER_RESULT_OK,
+			"copy rejection begins at a healthy owner boundary");
+		result |= Check((scenario >= 5 ? owner.ExecuteGameRenderCommand(noColorCommand) :
+			select(scenario != 2)) == RENDER_RESULT_OK &&
 			owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK,
 			"public copy rejection begins with valid selected output");
+		if (scenario >= 4)
+		{
+			RenderBackBufferInfo source;
+			GpuHandle sourceResource = layer;
+			const RenderResult queried = owner.GetGameActiveColorTargetInfo(&source, &sourceResource);
+			result |= Check(scenario == 4 ? (queried == RENDER_RESULT_OK && sourceResource == layer) :
+				(queried == RENDER_RESULT_INVALID_ARGUMENT && !sourceResource.isValid() &&
+				 source.width == 0 && source.height == 0),
+				"active color query reports exact alias identity or clears absent-color output");
+		}
 		lease = savedLease;
-		const RenderResult rejectedResult = copy(rejected[scenario],
+		NativeW3DTextureOwner *typedDestination = scenario == 4 ? &typedLayer :
+			(scenario == 5 ? &typedMainCopy : &typedLayerCopy);
+		const RenderResult rejectedResult = typedOnly ? typedDestination->CopyActiveColorTarget(&lease) :
+			copy(rejected[scenario],
 			GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE);
 		result |= Check(rejectedResult == expected && !lease.isValid() && preserved(),
 			"public copy preflight clears stale lease and preserves CPU texture/static VB/IB");
+		// The direct typed owner returns its raw failure; the production title
+		// facade maps a false TextureClass copy to FAILED and records it. Model
+		// only that caller latch here without changing the typed-owner contract.
+		if (typedOnly) owner.RecordGameFailure(RENDER_RESULT_FAILED);
+		const RenderResult frameExpected = typedOnly ? RENDER_RESULT_FAILED : expected;
 		const RenderResult ended = owner.ExecuteGameRenderCommand(end);
 		const RenderResult drained = owner.Renderer().DrainThreaded();
 		// The producer rejects before admitting a copy: command/frame failure
 		// remains visible, while the backend fence completes its valid work.
-		result |= Check(ended == expected && drained == RENDER_RESULT_OK && preserved(),
+		result |= Check(ended == frameExpected && drained == RENDER_RESULT_OK && preserved(),
 			"rejected public command reports frame failure with successful fence and retained authority");
 		// Consume the failed completion without hiding it; the following display
 		// iteration may then render again against the still-valid resource table.
 		const RenderResult boundary = owner.BeginGameDisplayIteration();
-		result |= Check((boundary == expected || boundary == RENDER_RESULT_OK) &&
+		result |= Check((boundary == frameExpected || boundary == RENDER_RESULT_OK) &&
 			owner.BeginGameDisplayIteration() == RENDER_RESULT_OK && preserved(),
 			"public copy rejection does not require device recovery to retain geometry");
-		std::printf("PUBLIC_COPY_PREFLIGHT case=%u copy=%d end=%d drain=%d lease=%u authorities=%u\n",
-			scenario, rejectedResult, ended, drained, lease.isValid(), preserved());
+		std::printf("PUBLIC_COPY_PREFLIGHT typed=%u case=%u copy=%d end=%d drain=%d lease=%u authorities=%u\n",
+			typedOnly, scenario, rejectedResult, ended, drained, lease.isValid(), preserved());
 	}
+	begin.value0 = RENDER_CLEAR_COLOR;
 	result |= Check(select(true) == RENDER_RESULT_OK &&
 		owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
-		copy(layerCopy, GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE) == RENDER_RESULT_OK &&
+		(typedOnly ? typedLayerCopy.CopyActiveColorTarget(&lease) :
+		 copy(layerCopy, GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE)) == RENDER_RESULT_OK &&
 		lease.isValid() && owner.ExecuteGameRenderCommand(end) == RENDER_RESULT_OK &&
 		owner.Renderer().DrainThreaded() == RENDER_RESULT_OK && preserved(),
 		"valid public layer copy resumes after rejection without resource/device recovery");
+	result |= Check(typedLayer.Reset() == RENDER_RESULT_OK &&
+		typedMainCopy.Reset() == RENDER_RESULT_OK && typedLayerCopy.Reset() == RENDER_RESULT_OK,
+		"typed borrowed copy owners release before production owner shutdown");
 	result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
 		"public copy fixture releases owner and resources");
 	return result;
@@ -2804,7 +2877,8 @@ int main(int argc, char **argv)
 	}
 	if (copySerial || copyParallel)
 	{
-		const int copyResult = TestPublicCopyPreflight(window);
+		int copyResult = TestPublicCopyPreflight(window);
+		if (copyResult != 77) copyResult |= TestPublicCopyPreflight(window, true);
 		DestroyWindow(window);
 		return copyResult;
 	}

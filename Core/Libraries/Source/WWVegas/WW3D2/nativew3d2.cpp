@@ -2246,15 +2246,17 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			{
 				NativeW3DTextureDescription destination;
 				RenderBackBufferInfo source;
+				GpuHandle sourceResource;
 				result = m_resources.DescribeTexture(resource0, &destination);
 				if (result == RENDER_RESULT_OK)
-					result = GetGameRenderTargetInfo(&source);
+					result = GetGameActiveColorTargetInfo(&source, &sourceResource);
 				if (result == RENDER_RESULT_OK)
 				{
 					// Validate the selected logical layer before backend/queue entry.
 					// These rejections cannot have mutated resource content; accepted
 					// copy, fence, or texture-rebind failures remain fail-closed below.
-					if (source.width == 0 || source.height == 0 || source.multisampleCount == 0)
+					if ((sourceResource.isValid() && sourceResource == resource0) ||
+						source.width == 0 || source.height == 0 || source.multisampleCount == 0)
 						result = RENDER_RESULT_INVALID_ARGUMENT;
 					else if (source.format != destination.descriptor.format ||
 						source.width > destination.descriptor.width ||
@@ -3724,6 +3726,26 @@ rts::render::RenderResult NativeW3D2::GetGameRenderTargetInfo(
 	if (info == 0)
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	return ValidateGameRenderTargetBinding(m_gameRenderTargetBinding, info);
+}
+
+rts::render::RenderResult NativeW3D2::GetGameActiveColorTargetInfo(
+	rts::render::RenderBackBufferInfo *info,
+	rts::render::GpuHandle *colorResource) const
+{
+	using namespace rts::render;
+	if (info != 0)
+		*info = RenderBackBufferInfo();
+	if (colorResource != 0)
+		*colorResource = GpuHandle();
+	if (info == 0 || colorResource == 0 ||
+		(!m_gameRenderTargetBinding.useBackBufferColor &&
+		 !m_gameRenderTargetBinding.hasColor))
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	const RenderResult result = ValidateGameRenderTargetBinding(
+		m_gameRenderTargetBinding, info);
+	if (result == RENDER_RESULT_OK && m_gameRenderTargetBinding.hasColor)
+		*colorResource = m_gameRenderTargetBinding.color.resource;
+	return result;
 }
 
 rts::render::RenderResult NativeW3D2::QueueGameBackBufferCapture(

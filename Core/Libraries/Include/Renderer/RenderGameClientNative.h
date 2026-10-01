@@ -462,6 +462,19 @@ public:
 	// not acknowledge the request.
 	virtual bool ConsumeGameBackBufferCaptureSuccess() { return false; }
 	virtual void RecordGameFailure(RenderResult result) { (void)result; }
+	// Copy admission requires an actual selected color output, not merely
+	// target dimensions (which may describe a depth-only target). On success
+	// colorResource identifies the custom color texture; an invalid handle
+	// denotes the selected backbuffer. Unknown owners must not infer a source.
+	virtual RenderResult GetGameActiveColorTargetInfo(
+		RenderBackBufferInfo *info, GpuHandle *colorResource) const
+	{
+		if (info != 0)
+			*info = RenderBackBufferInfo();
+		if (colorResource != 0)
+			*colorResource = GpuHandle();
+		return RENDER_RESULT_UNSUPPORTED;
+	}
 };
 
 // These functions are a lifecycle hook for the existing native owner, not a

@@ -108,6 +108,9 @@ public:
 		rts::render::RenderBackBufferInfo *info) const;
 	virtual rts::render::RenderResult GetGameRenderTargetInfo(
 		rts::render::RenderBackBufferInfo *info) const;
+	virtual rts::render::RenderResult GetGameActiveColorTargetInfo(
+		rts::render::RenderBackBufferInfo *info,
+		rts::render::GpuHandle *colorResource) const;
 	virtual rts::render::RenderResult QueueGameBackBufferCapture(
 		const rts::render::RenderCaptureRequestDescriptor &descriptor,
 		rts::render::RenderCaptureHandle *handle);
