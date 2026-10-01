@@ -546,9 +546,7 @@ void AddDrawRun(std::vector<NativeSortedDraw> &draws,
 		return;
 	}
 
-	NativeSortedDraw draw;
-	draw.state = submission.state;
-	draw.packet = submission.packet;
+	NativeSortedDraw draw = { submission.state, submission.packet };
 	draw.packet.vertexBuffer = GpuHandle();
 	draw.packet.indexBuffer = GpuHandle();
 	draw.packet.vertexOffset = static_cast<unsigned int>(vertexOffset);
