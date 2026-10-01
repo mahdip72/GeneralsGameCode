@@ -1407,6 +1407,39 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 	}
+	if (asynchronousPublication &&
+		mode == RENDER_BUFFER_UPDATE_NO_OVERWRITE &&
+		slot->buffer.usage == RENDER_USAGE_DYNAMIC &&
+		slot->submissionBackendEpoch == bufferEpoch &&
+		slot->submissionInitializedBytes.size() == 1 &&
+		!slot->pendingBufferPublications.empty())
+	{
+		PendingBufferPublication &last =
+			slot->pendingBufferPublications.back();
+		const InitializedByteRange &submitted =
+			slot->submissionInitializedBytes[0];
+		if (last.sequence == submissionSequence &&
+			last.backendEpoch == bufferEpoch &&
+			last.initializedBytes.size() == 1 &&
+			last.initializedBytes[0].begin == submitted.begin &&
+			last.initializedBytes[0].end == submitted.end &&
+			destinationOffset == submitted.end)
+		{
+			const size_t nextEnd = destinationOffset + byteCount;
+			const NativeW3DContentAuthority nextAuthority =
+				slot->submissionAuthority == NATIVE_W3D_CONTENT_CPU ?
+				NATIVE_W3D_CONTENT_CPU : NATIVE_W3D_CONTENT_INVALID;
+			const RenderResult accepted = device->updateBufferResource(
+				handle, bytes, byteCount, destinationOffset, mode);
+			if (accepted != RENDER_RESULT_OK)
+				return accepted;
+			slot->submissionInitializedBytes[0].end = nextEnd;
+			last.initializedBytes[0].end = nextEnd;
+			slot->submissionAuthority = nextAuthority;
+			last.authority = nextAuthority;
+			return RENDER_RESULT_OK;
+		}
+	}
 
 	std::vector<InitializedByteRange> nextSubmissionRanges;
 	std::vector<InitializedByteRange> nextCommittedRanges;

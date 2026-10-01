@@ -5,6 +5,7 @@
 #include "nativew3d2.h"
 
 #include <climits>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <new>
@@ -1391,6 +1392,279 @@ int TestThreadedResourceCompletion()
 	return result;
 }
 
+int TestThreadedAdjacentBufferPublication()
+{
+	int result = 0;
+	FakeRenderControl control;
+	ThreadedRenderOptions options;
+	options.serial = false;
+	options.maxFramesInFlight = 3;
+	options.maxPacketBytes = 1024 * 1024;
+	options.maxPacketCommands = 128;
+	options.resourceCapacity = 2;
+	IRenderDevice *device = CreateThreadedRenderDevice(
+		CreateThreadedFakeRenderDevice, &control, options);
+	if (device == 0) return Check(false, "adjacent publication device allocates");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = reinterpret_cast<void *>(1);
+	parameters.width = 4;
+	parameters.height = 4;
+	result |= Check(device->initialize(parameters) == RENDER_RESULT_OK,
+		"adjacent publication device initializes");
+	NativeW3DResourceHost host(2);
+	NativeW3DResources resources(2);
+	result |= Check(host.Attach(device, device->immediateContext()) ==
+		RENDER_RESULT_OK && resources.BindHost(&host) == RENDER_RESULT_OK,
+		"adjacent publication fixture binds resource host");
+	unsigned int words[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+	BufferDescriptor descriptor;
+	descriptor.byteCount = sizeof(words);
+	descriptor.stride = sizeof(words[0]);
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	descriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle buffer;
+	result |= Check(resources.CreateBuffer(descriptor, 0, 0, &buffer) ==
+		RENDER_RESULT_OK, "adjacent publication buffer creates");
+	IRenderContext *context = device->immediateContext();
+	GpuHandle validated;
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words, 4, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words + 1, 4, 4,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words + 2, 4, 8,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK,
+		"same-sequence adjacent writes extend the accepted submission prefix");
+	result |= Check(resources.UpdateBuffer(buffer, words + 1, 4, 4,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words + 5, 4, 20,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words + 6, 4, 24,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK,
+		"overlap, gap, and multiple-range writes keep their general path");
+	result |= Check(context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words + 3, 4, 12,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK,
+		"later queued sequence cannot use the same-sequence fast path");
+	ThreadedRenderFrameCompletion first;
+	ThreadedRenderFrameCompletion second;
+	result |= Check(DrainThreadedRenderDevice(device) == RENDER_RESULT_OK &&
+		PollThreadedRenderCompletion(device, &first) &&
+		PollThreadedRenderCompletion(device, &second) &&
+		first.sequence < second.sequence &&
+		resources.PublishThreadedCompletion(first.sequence, false) ==
+			RENDER_RESULT_OK &&
+		resources.AcquireVertexBufferRange(buffer, 4, 0, 0, 3,
+			&validated) == RENDER_RESULT_OK && validated == buffer,
+		"first completion preserves its exact prefix while another frame is pending");
+	validated = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(buffer, 4, 0, 3, 1,
+			&validated) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!validated.isValid() &&
+		resources.PublishThreadedCompletion(second.sequence, false) ==
+			RENDER_RESULT_OK &&
+		resources.AcquireVertexBufferRange(buffer, 4, 0, 0, 4,
+			&validated) == RENDER_RESULT_OK && validated == buffer,
+		"second completion publishes only its own dependent extension");
+	const long failureCall = ReadCount(&control.updateCalls) + 1;
+	InterlockedExchange(&control.failUpdateOnCall, failureCall);
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words, 4, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words, 4, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words + 1, 4, 4,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+		DrainThreadedRenderDevice(device) == RENDER_RESULT_FAILED,
+		"later DISCARD plus adjacent append remains queued after owner failure");
+	ThreadedRenderFrameCompletion failed;
+	ThreadedRenderFrameCompletion recovered;
+	result |= Check(PollThreadedRenderCompletion(device, &failed) &&
+		PollThreadedRenderCompletion(device, &recovered) &&
+		failed.resourceFailure && !recovered.resourceFailure &&
+		resources.PublishThreadedCompletion(failed.sequence, true) ==
+			RENDER_RESULT_OK && resources.HasBufferAuthorityFailure(buffer) &&
+		resources.PublishThreadedCompletion(recovered.sequence, false) ==
+			RENDER_RESULT_OK && !resources.HasBufferAuthorityFailure(buffer) &&
+		resources.AcquireVertexBufferRange(buffer, 4, 0, 0, 2,
+			&validated) == RENDER_RESULT_OK && validated == buffer,
+		"same-sequence append preserves DISCARD restore-after-failure boundary");
+	InterlockedExchange(&control.failUpdateOnCall, 0);
+	result |= Check(device->recoverDevice() == RENDER_RESULT_OK &&
+		host.ReplaceContext(device->immediateContext()) == RENDER_RESULT_OK &&
+		resources.RestoreStaticBuffersAfterRecovery() == RENDER_RESULT_OK,
+		"backend epoch advances after adjacent publication");
+	result |= Check(resources.AcquireVertexBufferRange(buffer, 4, 0, 0, 1,
+			&validated) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!validated.isValid() &&
+		resources.UpdateBuffer(buffer, words, 4, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		resources.Shutdown() == RENDER_RESULT_OK &&
+		host.Detach() == RENDER_RESULT_OK,
+		"epoch change rejects stale ranges before a fresh synchronous DISCARD");
+	device->shutdown();
+	delete device;
+	return result;
+}
+
+int TestRejectedAdjacentBufferPublication()
+{
+	int result = 0;
+	FakeRenderControl control;
+	ThreadedRenderOptions options;
+	options.serial = false;
+	options.maxFramesInFlight = 2;
+	options.maxPacketBytes = sizeof(BufferDescriptor);
+	options.maxPacketCommands = 16;
+	options.resourceCapacity = 1;
+	IRenderDevice *device = CreateThreadedRenderDevice(
+		CreateThreadedFakeRenderDevice, &control, options);
+	if (device == 0) return Check(false, "rejected adjacent device allocates");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = reinterpret_cast<void *>(1);
+	parameters.width = 4;
+	parameters.height = 4;
+	result |= Check(device->initialize(parameters) == RENDER_RESULT_OK,
+		"rejected adjacent device initializes");
+	NativeW3DResourceHost host(1);
+	NativeW3DResources resources(1);
+	result |= Check(host.Attach(device, device->immediateContext()) ==
+		RENDER_RESULT_OK && resources.BindHost(&host) == RENDER_RESULT_OK,
+		"rejected adjacent fixture binds");
+	unsigned int words[32] = { 1, 2, 3, 4 };
+	BufferDescriptor descriptor;
+	descriptor.byteCount = sizeof(words);
+	descriptor.stride = sizeof(words[0]);
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	descriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle buffer;
+	result |= Check(resources.CreateBuffer(descriptor, 0, 0, &buffer) ==
+		RENDER_RESULT_OK, "rejected adjacent fixture creates buffer");
+	IRenderContext *context = device->immediateContext();
+	NativeW3DBufferDescription before;
+	NativeW3DBufferDescription after;
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words, 4, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words + 1, 4, 4,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		resources.DescribeBuffer(buffer, &before) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words + 2, 64, 8,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OUT_OF_MEMORY &&
+		resources.DescribeBuffer(buffer, &after) == RENDER_RESULT_OK &&
+		before.authority == after.authority &&
+		before.authorityEpoch == after.authorityEpoch,
+		"rejected adjacent packet cannot extend an accepted prefix");
+	result |= Check(resources.UpdateBuffer(buffer, words + 2, 4, 8,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK &&
+		resources.DescribeBuffer(buffer, &after) == RENDER_RESULT_OK &&
+		after.authority == before.authority,
+		"rejected adjacent tail stays absent until a later accepted append");
+	result |= Check(context->endFrame() == RENDER_RESULT_OUT_OF_MEMORY &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK,
+		"producer failure remains latched after enqueue rejection");
+	DrainThreadedRenderDevice(device);
+	result |= Check(ReadCount(&control.updateCalls) == 3,
+		"owner executes the three accepted writes but not the rejected append");
+	ThreadedRenderFrameCompletion completion;
+	if (PollThreadedRenderCompletion(device, &completion))
+		resources.PublishThreadedCompletion(completion.sequence,
+			completion.resourceFailure);
+	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+		host.Detach() == RENDER_RESULT_OK,
+		"rejected adjacent fixture releases resources");
+	device->shutdown();
+	delete device;
+	return result;
+}
+
+int BenchmarkThreadedAdjacentBufferPublication()
+{
+	int result = 0;
+	FakeRenderControl control;
+	ThreadedRenderOptions options;
+	options.serial = false;
+	options.maxFramesInFlight = 2;
+	options.maxPacketBytes = 65536;
+	options.maxPacketCommands = 2048;
+	options.resourceCapacity = 1;
+	IRenderDevice *device = CreateThreadedRenderDevice(
+		CreateThreadedFakeRenderDevice, &control, options);
+	if (device == 0) return Check(false, "adjacent benchmark device allocates");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = reinterpret_cast<void *>(1);
+	parameters.width = 4;
+	parameters.height = 4;
+	result |= Check(device->initialize(parameters) == RENDER_RESULT_OK,
+		"adjacent benchmark device initializes");
+	NativeW3DResourceHost host(1);
+	NativeW3DResources resources(1);
+	result |= Check(host.Attach(device, device->immediateContext()) ==
+		RENDER_RESULT_OK && resources.BindHost(&host) == RENDER_RESULT_OK,
+		"adjacent benchmark fixture binds");
+	unsigned int words[1024];
+	for (unsigned int i = 0; i < 1024; ++i) words[i] = i;
+	BufferDescriptor descriptor;
+	descriptor.byteCount = sizeof(words);
+	descriptor.stride = sizeof(words[0]);
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	descriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle buffer;
+	result |= Check(resources.CreateBuffer(descriptor, 0, 0, &buffer) ==
+		RENDER_RESULT_OK, "adjacent benchmark buffer creates");
+	IRenderContext *context = device->immediateContext();
+	for (unsigned int pass = 0; pass < 8 && result == 0; ++pass)
+	{
+		result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+			resources.UpdateBuffer(buffer, words, 4, 0,
+				RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK,
+			"adjacent benchmark starts a fresh frame and DISCARD");
+		const std::chrono::steady_clock::time_point start =
+			std::chrono::steady_clock::now();
+		for (unsigned int i = 1; i < 1024 && result == 0; ++i)
+			result |= Check(resources.UpdateBuffer(buffer, words + i, 4, i * 4,
+				RENDER_BUFFER_UPDATE_NO_OVERWRITE) == RENDER_RESULT_OK,
+				"adjacent benchmark accepts the production resource update");
+		const std::chrono::steady_clock::time_point end =
+			std::chrono::steady_clock::now();
+		const double milliseconds =
+			std::chrono::duration<double, std::milli>(end - start).count();
+		std::printf("adjacent_producer_pass=%u updates=1023 ms=%.3f\n",
+			pass + 1, milliseconds);
+		result |= Check(context->endFrame() == RENDER_RESULT_OK &&
+			SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK &&
+			DrainThreadedRenderDevice(device) == RENDER_RESULT_OK,
+			"adjacent benchmark frame completes successfully");
+		ThreadedRenderFrameCompletion completion;
+		GpuHandle validated;
+		result |= Check(PollThreadedRenderCompletion(device, &completion) &&
+			!completion.resourceFailure &&
+			resources.PublishThreadedCompletion(completion.sequence, false) ==
+				RENDER_RESULT_OK &&
+			resources.AcquireVertexBufferRange(buffer, 4, 0, 0, 1024,
+				&validated) == RENDER_RESULT_OK && validated == buffer,
+			"adjacent benchmark publishes the same full buffer each pass");
+	}
+	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
+		host.Detach() == RENDER_RESULT_OK,
+		"adjacent benchmark fixture releases resources");
+	device->shutdown();
+	delete device;
+	return result;
+}
+
 int TestThreadedBetweenFrameBufferUpdates()
 {
 	int result = 0;
@@ -2099,6 +2373,10 @@ int TestRawHandlesAcrossFreshBackends()
 
 int main()
 {
+	char benchmark[2] = {0};
+	if (GetEnvironmentVariableA("RTS_BUFFER_PUBLICATION_BENCH", benchmark,
+		sizeof(benchmark)) == 1 && benchmark[0] == '1')
+		return BenchmarkThreadedAdjacentBufferPublication();
 	int result = 0;
 	result |= TestBufferUpdatePreflight();
 	result |= TestRetiredBufferPublication();
@@ -2715,6 +2993,8 @@ int main()
 		device.LiveCount() == 0 && device.isOperational(),
 		"public borrowed shutdown succeeds after EndFrame and product cleanup preserves backend ownership");
 	result |= TestThreadedResourceCompletion();
+	result |= TestThreadedAdjacentBufferPublication();
+	result |= TestRejectedAdjacentBufferPublication();
 	result |= TestResourceLookupHints();
 	result |= TestThreadedNativeBufferOwnerFailureRecovery();
 	result |= TestThreadedBetweenFrameBufferUpdates();
