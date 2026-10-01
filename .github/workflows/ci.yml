@@ -162,6 +162,10 @@ jobs:
             tools: true
             extras: false
             product: false
+          - preset: "vc6"
+            tools: true
+            extras: false
+            product: false
           #- preset: "win32-vcpkg"
           #  tools: true
           #  extras: true
@@ -259,6 +263,10 @@ jobs:
       matrix:
         include:
           - preset: "win32-zerohour-authoring"
+            tools: true
+            extras: false
+            product: false
+          - preset: "vc6"
             tools: true
             extras: false
             product: false

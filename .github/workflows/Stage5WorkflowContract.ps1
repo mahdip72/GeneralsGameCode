@@ -34,6 +34,17 @@ function Assert-Stage5WorkflowLiteral {
         "$Context is missing required text '$Text'."
 }
 
+function Assert-Stage5AuthoringMatrixEntry {
+    param([string]$Job, [string]$Preset, [string]$Context)
+
+    $pattern = '(?m)^ {10}- preset: "' + [regex]::Escape($Preset) +
+        '"\r?\n {12}tools: true\r?\n {12}extras: false\r?\n' +
+        ' {12}product: false(?:\r?\n|$)'
+    $entryMatches = [regex]::Matches($Job, $pattern)
+    Assert-Stage5WorkflowCondition ($entryMatches.Count -eq 1) `
+        "$Context must have exactly one tools-only, non-product matrix entry for '$Preset'."
+}
+
 function Assert-Stage5CanonicalDownloadArtifactPins {
     param([string]$Content, [int]$ExpectedCount, [string]$Context)
 
@@ -4152,6 +4163,17 @@ foreach ($retiredLane in @(
     Assert-Stage5WorkflowNotContains $ci ([regex]::Escape($retiredLane)) `
         "retired 32-bit product lane $retiredLane"
 }
+
+$generalsAuthoringJob = Get-Stage5IndentedBlock $ci 'build-generals:' 2
+Assert-Stage5AuthoringMatrixEntry $generalsAuthoringJob `
+    'win32-generals-authoring' 'Generals modern Win32 authoring lane'
+Assert-Stage5AuthoringMatrixEntry $generalsAuthoringJob 'vc6' `
+    'Generals non-product VC6 authoring lane'
+$zeroHourAuthoringJob = Get-Stage5IndentedBlock $ci 'build-generalsmd-win32:' 2
+Assert-Stage5AuthoringMatrixEntry $zeroHourAuthoringJob `
+    'win32-zerohour-authoring' 'Zero Hour modern Win32 authoring lane'
+Assert-Stage5AuthoringMatrixEntry $zeroHourAuthoringJob 'vc6' `
+    'Zero Hour non-product VC6 authoring lane'
 
 Assert-Stage5CheckReplaysContract $check `
     'reusable Stage 5 installed-runtime replay workflow'
