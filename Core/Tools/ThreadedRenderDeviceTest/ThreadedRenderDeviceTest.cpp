@@ -7,6 +7,7 @@
 #include <windows.h>
 #endif
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -39,7 +40,8 @@ enum Event
 
 struct Fixture
 {
-	Fixture() : gateEvent(-1), gateEntered(false), gateReleased(false),
+	Fixture() : busyDraw(false), busyEntered(false), busyRelease(false),
+		gateEvent(-1), gateEntered(false), gateReleased(false),
 		wrongThread(false), failCreate(false), failDraw(false), failEnd(false),
 		failPresent(false), failCapture(false), failInitialize(false), failUpdate(false),
 		createFailureResult(RENDER_RESULT_OUT_OF_MEMORY), updateFailureResult(RENDER_RESULT_DEVICE_REMOVED),
@@ -56,6 +58,9 @@ struct Fixture
 	std::mutex mutex;
 	std::condition_variable changed;
 	std::thread::id owner;
+	// CPU-only benchmark context, inactive in ordinary contract tests.
+	bool busyDraw;
+	std::atomic<bool> busyEntered, busyRelease;
 	int gateEvent;
 	bool gateEntered, gateReleased, wrongThread;
 	bool failCreate, failDraw, failEnd, failPresent, failCapture, failInitialize, failUpdate;
@@ -323,7 +328,16 @@ public:
 	RenderResult setPrimitiveTopology(RenderPrimitiveTopology) override
 	{ f.event(TOPOLOGY); return RENDER_RESULT_OK; }
 	RenderResult draw(unsigned int, unsigned int) override
-	{ f.event(DRAW); CHECK(open); ++f.draws; return f.failDraw ? RENDER_RESULT_FAILED : RENDER_RESULT_OK; }
+	{
+		f.event(DRAW); CHECK(open); ++f.draws;
+		if (f.busyDraw)
+		{
+			f.busyEntered.store(true);
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!f.busyRelease.load()) CHECK(std::chrono::steady_clock::now() < deadline);
+		}
+		return f.failDraw ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
+	}
 	RenderResult drawIndexed(unsigned int, unsigned int, int) override
 	{ f.event(DRAW_INDEXED); CHECK(open); return RENDER_RESULT_OK; }
 	RenderResult endFrame() override
@@ -1249,6 +1263,160 @@ void CompletionAdmissionAndShutdown()
 	CHECK(f.destroys == 1);
 }
 
+void EmptyCompletionPollingPreservesOutputAndAuthority()
+{
+	Fixture f;
+	auto device = Device(f);
+	ThreadedRenderFrameCompletion completion;
+	completion.sequence = 987; completion.result = RENDER_RESULT_UNSUPPORTED;
+	completion.resourceFailure = completion.presented = completion.operational = true;
+	CHECK(!PollThreadedRenderCompletion(device.get(), 0));
+	CHECK(!PollThreadedRenderCompletion(0, &completion));
+	CHECK(!PollThreadedRenderCompletion(device.get(), &completion));
+	CHECK(completion.sequence == 987 && completion.result == RENDER_RESULT_UNSUPPORTED &&
+		completion.resourceFailure && completion.presented && completion.operational);
+	ReleaseGate release(f); f.gateEvent = BEGIN;
+	EmptyFrame(device.get()); f.waitForGate();
+	// A reserved/pending frame is not a completed record.
+	for (unsigned int i = 0; i < 128; ++i)
+		CHECK(!PollThreadedRenderCompletion(device.get(), &completion));
+	CHECK(completion.sequence == 987 && completion.result == RENDER_RESULT_UNSUPPORTED);
+	f.release(); CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+	bool offOwnerResult = true;
+	std::thread offOwner([&] { offOwnerResult = PollThreadedRenderCompletion(device.get(), &completion); });
+	offOwner.join();
+	CHECK(!offOwnerResult && completion.sequence == 987);
+	CHECK(!PollThreadedRenderCompletion(device.get(), 0));
+	CHECK(PollThreadedRenderCompletion(device.get(), &completion));
+	CHECK(completion.sequence == 1 && completion.result == RENDER_RESULT_OK &&
+		completion.presented && completion.operational && !completion.resourceFailure);
+	CHECK(!PollThreadedRenderCompletion(device.get(), &completion) && completion.sequence == 1);
+}
+
+void CompletionMailboxWrapAndRecoveryRetention()
+{
+	Fixture f;
+	auto device = Device(f);
+	ThreadedRenderFrameCompletion completion;
+	uint64_t expected = 0;
+	for (unsigned int round = 0; round < 4; ++round)
+	{
+		for (unsigned int i = 0; i < 64; ++i) EmptyFrame(device.get(), (i & 1) == 0);
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		CHECK(device->immediateContext()->beginFrame() == RENDER_RESULT_OUT_OF_MEMORY);
+		for (unsigned int i = 0; i < 32; ++i)
+		{
+			CHECK(PollThreadedRenderCompletion(device.get(), &completion));
+			CHECK(completion.sequence == ++expected && completion.presented == ((i & 1) == 0));
+		}
+		// Refill before draining the remaining records, crossing the ring boundary.
+		for (unsigned int i = 0; i < 32; ++i) EmptyFrame(device.get(), (i & 1) == 0);
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		CHECK(device->immediateContext()->beginFrame() == RENDER_RESULT_OUT_OF_MEMORY);
+		for (unsigned int i = 0; i < 64; ++i)
+		{
+			CHECK(PollThreadedRenderCompletion(device.get(), &completion));
+			CHECK(completion.sequence == ++expected && completion.presented == ((i & 1) == 0));
+		}
+		CHECK(!PollThreadedRenderCompletion(device.get(), &completion));
+	}
+	f.failPresent = true; EmptyFrame(device.get());
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_DEVICE_REMOVED);
+	f.failPresent = false;
+	CHECK(device->recoverDevice() == RENDER_RESULT_OK && device->isOperational());
+	// Recovery cannot erase the old asynchronous failure record.
+	CHECK(PollThreadedRenderCompletion(device.get(), &completion));
+	CHECK(completion.sequence == ++expected && completion.result == RENDER_RESULT_DEVICE_REMOVED &&
+		completion.outcome.hasDeviceRemoval() && !completion.operational && !completion.presented);
+	EmptyFrame(device.get()); device->shutdown();
+	CHECK(PollThreadedRenderCompletion(device.get(), &completion));
+	CHECK(completion.sequence == ++expected && completion.result == RENDER_RESULT_OK && completion.presented);
+	CHECK(!PollThreadedRenderCompletion(device.get(), &completion));
+}
+
+void ConcurrentCompletionPollingPreservesFifo()
+{
+	Fixture f;
+	auto device = Device(f);
+	ThreadedRenderFrameCompletion completion;
+	uint64_t popped = 0;
+	for (unsigned int i = 0; i < 512; ++i)
+	{
+		EmptyFrame(device.get());
+		// Race actual owner publication, without assuming a particular interleaving.
+		while (PollThreadedRenderCompletion(device.get(), &completion))
+			CHECK(completion.sequence == ++popped && completion.result == RENDER_RESULT_OK);
+		if ((i & 15) == 15)
+		{
+			CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+			while (PollThreadedRenderCompletion(device.get(), &completion))
+				CHECK(completion.sequence == ++popped && completion.result == RENDER_RESULT_OK);
+			CHECK(popped == i + 1);
+		}
+	}
+	CHECK(popped == 512 && !PollThreadedRenderCompletion(device.get(), &completion));
+}
+
+void BenchmarkCompletionPolling()
+{
+	const unsigned int calls = 2000000, warmup = 100000, rounds = 1000;
+	std::atomic<unsigned int> ready(0);
+	CHECK(ready.is_lock_free());
+	std::printf("atomic_size=%zu atomic_lock_free=%d calls=%u warmup=%u nonempty_calls=%u\n",
+		sizeof(ready), ready.is_lock_free(), calls, warmup, rounds * 64);
+	Fixture f;
+	auto device = Device(f);
+	ThreadedRenderFrameCompletion completion;
+	struct ReleaseBusyDraw
+	{
+		explicit ReleaseBusyDraw(Fixture &fixture) : state(fixture) {}
+		~ReleaseBusyDraw() { state.busyRelease.store(true); }
+		Fixture &state;
+	} releaseBusy(f);
+	for (unsigned int context = 0; context < 2; ++context)
+	{
+		if (context)
+		{
+			f.busyDraw = true;
+			CHECK(device->immediateContext()->beginFrame() == RENDER_RESULT_OK);
+			CHECK(device->immediateContext()->draw(3, 0) == RENDER_RESULT_OK);
+			CHECK(device->immediateContext()->endFrame() == RENDER_RESULT_OK);
+			CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!f.busyEntered.load()) { CHECK(std::chrono::steady_clock::now() < deadline); std::this_thread::yield(); }
+		}
+		for (unsigned int i = 0; i < warmup; ++i) CHECK(!PollThreadedRenderCompletion(device.get(), &completion));
+		const auto start = std::chrono::steady_clock::now();
+		unsigned int hits = 0;
+		for (unsigned int i = 0; i < calls; ++i) hits += PollThreadedRenderCompletion(device.get(), &completion);
+		const auto elapsed = std::chrono::steady_clock::now() - start;
+		f.busyRelease.store(true); // Release before any assertion can unwind the device.
+		CHECK(hits == 0);
+		std::printf("context=%s ns_per_call=%.6f hits=%u\n", context ? "owner_cpu_busy_draw" : "owner_idle",
+			std::chrono::duration<double, std::nano>(elapsed).count() / calls, hits);
+		if (context) { Complete(device.get()); f.busyDraw = false; }
+		else f.busyRelease.store(false);
+	}
+	double nonemptyNanoseconds = 0;
+	for (unsigned int round = 0; round < rounds; ++round)
+	{
+		for (unsigned int i = 0; i < 64; ++i) EmptyFrame(device.get(), false);
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		const auto start = std::chrono::steady_clock::now();
+		unsigned int hits = 0;
+		for (unsigned int i = 0; i < 64; ++i) hits += PollThreadedRenderCompletion(device.get(), &completion);
+		nonemptyNanoseconds += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
+		CHECK(hits == 64 && !PollThreadedRenderCompletion(device.get(), &completion));
+	}
+	std::printf("context=nonempty_64_batch ns_per_call=%.6f\n", nonemptyNanoseconds / (rounds * 64));
+	// Timer + loop-floor receipt; not subtracted from API timings.
+	volatile unsigned int sink = 0;
+	const auto start = std::chrono::steady_clock::now();
+	for (unsigned int i = 0; i < calls; ++i) sink = sink + (i & 1);
+	std::printf("context=volatile_loop_floor ns_per_call=%.6f sink=%u\n",
+		std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / calls, sink);
+}
+
 void ShutdownWithQueuedFrames()
 {
 	Fixture f;
@@ -1337,11 +1505,17 @@ void SentMessageOnlyLifecycleWaits()
 #endif
 }
 
-int main()
+int main(int argc, char **argv)
 {
 	try
 	{
 		CHECK(rts::JobSystem::instance().registerCurrentThread(rts::JOB_OWNER_GAME));
+		if (argc == 2 && std::strcmp(argv[1], "--benchmark-completion-poll") == 0)
+		{
+			BenchmarkCompletionPolling();
+			CHECK(rts::JobSystem::instance().unregisterCurrentThread(rts::JOB_OWNER_GAME));
+			return 0;
+		}
 		ProducerTextureBindingCachePreservesOrderedInvalidation();
 		SwapIntervalOwnerTransport();
 		GammaOwnerTransport();
@@ -1363,6 +1537,9 @@ int main()
 		OverlapAndBoundedBackpressure();
 		PacketSegmentationAndBudgetFailure();
 		CompletionAdmissionAndShutdown();
+		EmptyCompletionPollingPreservesOutputAndAuthority();
+		CompletionMailboxWrapAndRecoveryRetention();
+		ConcurrentCompletionPollingPreservesFifo();
 		ShutdownWithQueuedFrames();
 		SerialAndInitializationFailure();
 #ifdef _WIN32

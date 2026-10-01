@@ -10,6 +10,7 @@
 #include "Lib/FrameTimingDiagnostics.h"
 #include "Lib/MenuCriticalPathDiagnostics.h"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <condition_variable>
@@ -299,6 +300,7 @@ public:
 		m_textureFilterCapabilitiesResult(RENDER_RESULT_FAILED),
 		m_current(0), m_queueRead(0), m_queueCount(0), m_pending(0),
 		m_completionRead(0), m_completionCount(0), m_reservedCompletions(0),
+		m_completionReadyCount(0),
 		m_completedSequence(0), m_completedResult(RENDER_RESULT_OK),
 		m_recording(false), m_ended(false), m_nextSequence(1), m_sequence(0),
 		m_lastSequence(0), m_producerFailure(RENDER_RESULT_OK),
@@ -526,6 +528,9 @@ private:
 	enum { COMPLETION_CAPACITY = 64 };
 	ThreadedRenderFrameCompletion m_completions[COMPLETION_CAPACITY];
 	size_t m_completionRead, m_completionCount, m_reservedCompletions;
+	// Readiness only: payload, admission and all count mutations still require
+	// m_mutex. Serialize mirror stores with publication/pop to avoid lost records.
+	std::atomic<unsigned int> m_completionReadyCount;
 	uint64_t m_completedSequence;
 	RenderResult m_completedResult;
 	ThreadedRenderMetrics m_metrics;
@@ -1032,11 +1037,16 @@ void ThreadedRenderDevice::shutdown()
 bool ThreadedRenderDevice::poll(ThreadedRenderFrameCompletion *completion)
 {
 	if (!producer() || !completion) return false;
+	// An empty poll may linearize before a concurrent owner's publication.
+	// Nonempty readiness never permits reading completion payload without the lock.
+	if (!m_completionReadyCount.load(std::memory_order_seq_cst)) return false;
 	std::lock_guard<std::mutex> lock(m_mutex);
 	if (!m_completionCount) return false;
 	*completion = m_completions[m_completionRead];
 	m_completionRead = (m_completionRead + 1) % COMPLETION_CAPACITY;
 	--m_completionCount;
+	m_completionReadyCount.store(static_cast<unsigned int>(m_completionCount),
+		std::memory_order_seq_cst);
 	return true;
 }
 
@@ -2008,6 +2018,9 @@ void ThreadedRenderDevice::execute(Packet &packet)
 		++m_metrics.completedFrames;
 		if (frameResult != RENDER_RESULT_OK) ++m_metrics.failedFrames;
 		m_ownerFrameActive = false;
+		// Publish readiness only after the complete record and authoritative state.
+		m_completionReadyCount.store(static_cast<unsigned int>(m_completionCount),
+			std::memory_order_seq_cst);
 	}
 	if (packet.reply)
 	{
