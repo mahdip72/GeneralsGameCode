@@ -66,6 +66,42 @@ if(WIN32 AND NOT IS_VS6_BUILD)
 
         add_test(NAME core_localized_ui_font_refresh_tests
             COMMAND core_localized_ui_font_refresh_tests)
+
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            set(_resolution_refresh_generals_fragment
+                "${CMAKE_CURRENT_BINARY_DIR}/ResolutionRefreshCallbacks_Generals.inl")
+            set(_resolution_refresh_generalsmd_fragment
+                "${CMAKE_CURRENT_BINARY_DIR}/ResolutionRefreshCallbacks_GeneralsMD.inl")
+
+            add_custom_target(core_resolution_refresh_callback_fragments
+                COMMAND "${LOCALIZED_UI_FONT_POWERSHELL}"
+                    -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_CURRENT_SOURCE_DIR}/ExtractResolutionRefreshCallbacks.ps1"
+                    -SourceRoot "${CMAKE_SOURCE_DIR}"
+                    -OutputDirectory "${CMAKE_CURRENT_BINARY_DIR}"
+                BYPRODUCTS
+                    "${_resolution_refresh_generals_fragment}"
+                    "${_resolution_refresh_generalsmd_fragment}"
+                DEPENDS
+                    "${CMAKE_CURRENT_SOURCE_DIR}/ExtractResolutionRefreshCallbacks.ps1"
+                    "${CMAKE_SOURCE_DIR}/Generals/Code/GameEngine/Source/GameClient/GUI/GUICallbacks/Menus/MainMenu.cpp"
+                    "${CMAKE_SOURCE_DIR}/Generals/Code/GameEngine/Source/GameClient/GUI/GUICallbacks/Menus/OptionsMenu.cpp"
+                    "${CMAKE_SOURCE_DIR}/GeneralsMD/Code/GameEngine/Source/GameClient/GUI/GUICallbacks/Menus/MainMenu.cpp"
+                    "${CMAKE_SOURCE_DIR}/GeneralsMD/Code/GameEngine/Source/GameClient/GUI/GUICallbacks/Menus/OptionsMenu.cpp"
+                VERBATIM
+            )
+
+            add_executable(core_resolution_refresh_callback_tests
+                ResolutionRefreshCallbackTest.cpp)
+            add_dependencies(core_resolution_refresh_callback_tests
+                core_resolution_refresh_callback_fragments)
+            target_include_directories(core_resolution_refresh_callback_tests PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}"
+                "${CMAKE_CURRENT_BINARY_DIR}")
+            target_compile_features(core_resolution_refresh_callback_tests PRIVATE cxx_std_20)
+            add_test(NAME core_resolution_refresh_callback_tests
+                COMMAND core_resolution_refresh_callback_tests)
+        endif()
     endif()
 endif()
 
