@@ -700,14 +700,14 @@ bool mergeStatusPreparedCommands(const SimulationCommandBuffer *const *producerS
 			(index != 0 && command->orderKey().phase() <= previousOwnerOrder)) return false;
 		previousOwnerOrder = command->orderKey().phase();
 	}
-	for (unsigned index = 0; index != mergeResult.commandCount; ++index)
+	for (unsigned publicationIndex = 0; publicationIndex != mergeResult.commandCount; ++publicationIndex)
 	{
-		const SimulationCommand *command = merged[index].command();
+		const SimulationCommand *command = merged[publicationIndex].command();
 		const ObjectStatusTimerPayload *payload =
-			reinterpret_cast<const ObjectStatusTimerPayload *>(merged[index].payload());
-		output[index].objectID = command->orderKey().target().objectID();
-		output[index].ownerOrder = command->orderKey().phase();
-		output[index].expiredMask = payload->expiredMask;
+			reinterpret_cast<const ObjectStatusTimerPayload *>(merged[publicationIndex].payload());
+		output[publicationIndex].objectID = command->orderKey().target().objectID();
+		output[publicationIndex].ownerOrder = command->orderKey().phase();
+		output[publicationIndex].expiredMask = payload->expiredMask;
 	}
 	metrics.evaluatedSnapshots = snapshotCount;
 	metrics.emittedCommands = mergeResult.commandCount;
