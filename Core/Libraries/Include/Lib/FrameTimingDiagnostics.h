@@ -24,6 +24,7 @@ enum Phase
 	SceneObjectSubmit, SceneShadowPrepare, SceneShadowRender, SceneTrees,
 	SceneParticleSubmit, SceneOcclusion, SceneTranslucent,
 	SceneFlush, SceneMeshFlush, SceneStaticSort,
+	SceneProjectedShadows, SceneVolumeShadows, SmudgeRender, SmudgeColorCopy,
 	PhaseCount
 };
 
@@ -368,7 +369,8 @@ private:
 			"scene_object_submit", "scene_shadow_prepare", "scene_shadow_render",
 			"scene_trees", "scene_particle_submit", "scene_occlusion",
 			"scene_translucent", "scene_flush", "scene_mesh_flush",
-			"scene_static_sort"
+			"scene_static_sort", "scene_projected_shadows", "scene_volume_shadows",
+			"smudge_render", "smudge_color_copy"
 		};
 		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)

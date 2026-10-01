@@ -1020,6 +1020,8 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 	{
 		rts::frame_timing::ConditionalScope timing(
 			rts::frame_timing::SceneShadowRender, frameTimingActive);
+		rts::frame_timing::ConditionalScope projectedTiming(
+			rts::frame_timing::SceneProjectedShadows, frameTimingActive);
 		DoShadows(rinfo, false);	//draw all non-stencil shadows (decals) since they fall under other objects.
 	}
 
@@ -1056,6 +1058,8 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 	{
 		rts::frame_timing::ConditionalScope timing(
 			rts::frame_timing::SceneShadowRender, frameTimingActive);
+		rts::frame_timing::ConditionalScope volumeTiming(
+			rts::frame_timing::SceneVolumeShadows, frameTimingActive);
 		DoShadows(rinfo, true);	//draw all stencil shadows
 	}
 

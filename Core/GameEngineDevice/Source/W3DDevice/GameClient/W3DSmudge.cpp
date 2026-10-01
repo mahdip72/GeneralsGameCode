@@ -38,6 +38,7 @@
 #include "WW3D2/dx8indexbuffer.h"
 #include "WW3D2/vertmaterial.h"
 #include "Renderer/RenderGameClient.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 // Keep the source-level contract explicit without importing the renderer namespace.
 using rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE;
@@ -189,6 +190,9 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 		return;
 	}
 
+	const bool frameTimingActive = rts::frame_timing::IsActive();
+	rts::frame_timing::ConditionalScope smudgeTiming(
+		rts::frame_timing::SmudgeRender, frameTimingActive);
 	rts::render::RenderBackBufferInfo back_buffer_info;
 	if (rts::render::GetGameBackBufferInfo(&back_buffer_info) !=
 		rts::render::RENDER_RESULT_OK || back_buffer_info.width == 0 ||
@@ -302,12 +306,15 @@ void W3DSmudgeManager::render(RenderInfoClass &rinfo)
 	// Copy the visible color target into an alternate buffer through the
 	// renderer contract. The backend owns synchronization and resource
 	// transition; this call fails closed when the active target is unavailable.
+	rts::frame_timing::ConditionalScope copyTiming(
+		rts::frame_timing::SmudgeColorCopy, frameTimingActive);
 	if (m_backgroundTexture == nullptr || !m_backgroundTexture->Is_Initialized() ||
 		rts::render::CopyGameActiveTargetToTexture(m_backgroundTexture) !=
 		rts::render::RENDER_RESULT_OK)
 	{
 		return;
 	}
+	copyTiming.finish();
 
 
 	Matrix4x4 identity(true);
