@@ -2932,148 +2932,150 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 
-	rts::render::LegacyLogicalState logical;
-	if (!rts::render::GetTrackedLegacyLogicalState(&logical))
-		logical = rts::render::LegacyLogicalState();
+	rts::render::LegacyPipelineState pipeline;
+	if (!rts::render::GetTrackedLegacyPipelineState(&pipeline))
+		pipeline = rts::render::LegacyPipelineState();
+	rts::render::LegacyFogConstants fog;
+	rts::render::RenderFloat4 ambient;
 	unsigned int normalizedStencilByte = 0;
 	bool publishFog = false;
 	bool publishAmbient = false;
 	switch (state)
 	{
 	case rts::render::GAME_RENDER_STATE_ALPHA_BLEND_ENABLE:
-		logical.pipeline.blend.blendEnable = value != 0;
+		pipeline.blend.blendEnable = value != 0;
 		break;
 	case rts::render::GAME_RENDER_STATE_SOURCE_BLEND:
 		if (!IsValidGameBlendFactor(value))
 			goto invalid_state;
-		logical.pipeline.blend.sourceColor =
+		pipeline.blend.sourceColor =
 			static_cast<rts::render::RenderBlendFactor>(value);
-		logical.pipeline.blend.sourceAlpha =
+		pipeline.blend.sourceAlpha =
 			static_cast<rts::render::RenderBlendFactor>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_DESTINATION_BLEND:
 		if (!IsValidGameBlendFactor(value))
 			goto invalid_state;
-		logical.pipeline.blend.destinationColor =
+		pipeline.blend.destinationColor =
 			static_cast<rts::render::RenderBlendFactor>(value);
-		logical.pipeline.blend.destinationAlpha =
+		pipeline.blend.destinationAlpha =
 			static_cast<rts::render::RenderBlendFactor>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_COLOR_WRITE_MASK:
 		if ((value & ~0x0fU) != 0U)
 			goto invalid_state;
-		logical.pipeline.blend.colorWriteMask = value;
+		pipeline.blend.colorWriteMask = value;
 		break;
 	case rts::render::GAME_RENDER_STATE_DEPTH_ENABLE:
-		logical.pipeline.depthStencil.depthEnable = value != 0;
+		pipeline.depthStencil.depthEnable = value != 0;
 		break;
 	case rts::render::GAME_RENDER_STATE_DEPTH_WRITE:
-		logical.pipeline.depthStencil.depthWrite = value != 0;
+		pipeline.depthStencil.depthWrite = value != 0;
 		break;
 	case rts::render::GAME_RENDER_STATE_DEPTH_FUNCTION:
 		if (!IsValidGameCompare(value))
 			goto invalid_state;
-		logical.pipeline.depthStencil.depthFunction =
+		pipeline.depthStencil.depthFunction =
 			static_cast<rts::render::RenderCompareFunction>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_ALPHA_TEST_ENABLE:
-		logical.pipeline.alphaTestEnable = value != 0;
+		pipeline.alphaTestEnable = value != 0;
 		break;
 	case rts::render::GAME_RENDER_STATE_ALPHA_FUNCTION:
 		if (!IsValidGameCompare(value))
 			goto invalid_state;
-		logical.pipeline.alphaFunction =
+		pipeline.alphaFunction =
 			static_cast<rts::render::RenderCompareFunction>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_ALPHA_REFERENCE:
 		if (value > 0xffU)
 			goto invalid_state;
-		logical.pipeline.alphaReference = value;
+		pipeline.alphaReference = value;
 		break;
 	case rts::render::GAME_RENDER_STATE_TEXTURE_FACTOR:
-		logical.pipeline.textureFactor = value;
+		pipeline.textureFactor = value;
 		break;
 	case rts::render::GAME_RENDER_STATE_LIGHTING:
-		logical.pipeline.lightingEnable = value != 0;
+		pipeline.lightingEnable = value != 0;
 		break;
 	case rts::render::GAME_RENDER_STATE_NORMALIZE_NORMALS:
-		logical.pipeline.normalizeNormals = value != 0;
+		pipeline.normalizeNormals = value != 0;
 		break;
 	case rts::render::GAME_RENDER_STATE_Z_BIAS:
 		if (value > static_cast<unsigned int>(INT_MAX))
 			goto invalid_state;
 		// Positive game Z-bias brings coplanar geometry forward. The native
 		// rasterizer adds signed bias to depth, so translate at this seam only.
-		logical.pipeline.rasterizer.depthBias = -static_cast<int>(value);
+		pipeline.rasterizer.depthBias = -static_cast<int>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_BLEND_OPERATION:
 		if (!IsValidGameBlendOperation(value))
 			goto invalid_state;
-		logical.pipeline.blend.colorOperation =
+		pipeline.blend.colorOperation =
 			static_cast<rts::render::RenderBlendOperation>(value);
-		logical.pipeline.blend.alphaOperation =
+		pipeline.blend.alphaOperation =
 			static_cast<rts::render::RenderBlendOperation>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_STENCIL_ENABLE:
-		logical.pipeline.depthStencil.stencilEnable = value != 0;
+		pipeline.depthStencil.stencilEnable = value != 0;
 		break;
 	case rts::render::GAME_RENDER_STATE_STENCIL_FUNCTION:
 		if (!IsValidGameCompare(value))
 			goto invalid_state;
-		logical.pipeline.depthStencil.stencilFunction =
+		pipeline.depthStencil.stencilFunction =
 			static_cast<rts::render::RenderCompareFunction>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_STENCIL_REFERENCE:
 		if (!NormalizeGameStencilByte(value, &normalizedStencilByte))
 			goto invalid_state;
-		logical.pipeline.depthStencil.stencilReference = normalizedStencilByte;
+		pipeline.depthStencil.stencilReference = normalizedStencilByte;
 		break;
 	case rts::render::GAME_RENDER_STATE_STENCIL_READ_MASK:
 		if (!NormalizeGameStencilByte(value, &normalizedStencilByte))
 			goto invalid_state;
-		logical.pipeline.depthStencil.stencilReadMask = normalizedStencilByte;
+		pipeline.depthStencil.stencilReadMask = normalizedStencilByte;
 		break;
 	case rts::render::GAME_RENDER_STATE_STENCIL_WRITE_MASK:
 		if (!NormalizeGameStencilByte(value, &normalizedStencilByte))
 			goto invalid_state;
-		logical.pipeline.depthStencil.stencilWriteMask = normalizedStencilByte;
+		pipeline.depthStencil.stencilWriteMask = normalizedStencilByte;
 		break;
 	case rts::render::GAME_RENDER_STATE_STENCIL_FAIL_OPERATION:
 		if (!IsValidGameStencilOperation(value))
 			goto invalid_state;
-		logical.pipeline.depthStencil.stencilFail =
+		pipeline.depthStencil.stencilFail =
 			static_cast<rts::render::RenderStencilOperation>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_STENCIL_DEPTH_FAIL_OPERATION:
 		if (!IsValidGameStencilOperation(value))
 			goto invalid_state;
-		logical.pipeline.depthStencil.stencilDepthFail =
+		pipeline.depthStencil.stencilDepthFail =
 			static_cast<rts::render::RenderStencilOperation>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_STENCIL_PASS_OPERATION:
 		if (!IsValidGameStencilOperation(value))
 			goto invalid_state;
-		logical.pipeline.depthStencil.stencilPass =
+		pipeline.depthStencil.stencilPass =
 			static_cast<rts::render::RenderStencilOperation>(value);
 		break;
 	case rts::render::GAME_RENDER_STATE_CULL_MODE:
 		switch (value)
 		{
 		case rts::render::GAME_RENDER_CULL_NONE:
-			logical.pipeline.rasterizer.cullMode =
+			pipeline.rasterizer.cullMode =
 				rts::render::RENDER_CULL_NONE;
 			break;
 		case rts::render::GAME_RENDER_CULL_CLOCKWISE:
-			logical.pipeline.rasterizer.cullMode =
+			pipeline.rasterizer.cullMode =
 				rts::render::RENDER_CULL_BACK;
 			// The legacy value names the discarded winding. D3D11 names
 			// the surviving front faces when back-face culling is enabled.
-			logical.pipeline.rasterizer.frontCounterClockwise = true;
+			pipeline.rasterizer.frontCounterClockwise = true;
 			break;
 		case rts::render::GAME_RENDER_CULL_COUNTER_CLOCKWISE:
-			logical.pipeline.rasterizer.cullMode =
+			pipeline.rasterizer.cullMode =
 				rts::render::RENDER_CULL_BACK;
-			logical.pipeline.rasterizer.frontCounterClockwise = false;
+			pipeline.rasterizer.frontCounterClockwise = false;
 			break;
 		default:
 			goto invalid_state;
@@ -3092,10 +3094,16 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 			goto invalid_state;
 		break;
 	case rts::render::GAME_RENDER_STATE_FOG_ENABLE:
-		logical.constants.fog.enabled = value != 0;
-		logical.pipeline.fogMode = value != 0 ?
-			(logical.pipeline.fogMode == rts::render::RENDER_FOG_DISABLED ?
-				rts::render::RENDER_FOG_LINEAR : logical.pipeline.fogMode) :
+		{
+			rts::render::LegacyLogicalState logical;
+			if (!rts::render::GetTrackedLegacyLogicalState(&logical))
+				logical = rts::render::LegacyLogicalState();
+			fog = logical.constants.fog;
+		}
+		fog.enabled = value != 0;
+		pipeline.fogMode = value != 0 ?
+			(pipeline.fogMode == rts::render::RENDER_FOG_DISABLED ?
+				rts::render::RENDER_FOG_LINEAR : pipeline.fogMode) :
 			rts::render::RENDER_FOG_DISABLED;
 		publishFog = true;
 		break;
@@ -3106,15 +3114,15 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 			return rts::render::RENDER_RESULT_UNSUPPORTED;
 		}
 		if (value == rts::render::GAME_RENDER_FILL_WIREFRAME)
-			logical.pipeline.rasterizer.fillMode =
+			pipeline.rasterizer.fillMode =
 				rts::render::RENDER_FILL_WIREFRAME;
 		else if (value == rts::render::GAME_RENDER_FILL_SOLID)
-			logical.pipeline.rasterizer.fillMode = rts::render::RENDER_FILL_SOLID;
+			pipeline.rasterizer.fillMode = rts::render::RENDER_FILL_SOLID;
 		else
 			goto invalid_state;
 		break;
 	case rts::render::GAME_RENDER_STATE_AMBIENT_COLOR:
-		logical.constants.globalAmbient =
+		ambient =
 			rts::render::DecodeLegacyAmbientColor(value);
 		publishAmbient = true;
 		break;
@@ -3132,11 +3140,11 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 		goto invalid_state;
 	}
 
-	rts::render::TrackLegacyPipelineState(logical.pipeline);
+	rts::render::TrackLegacyPipelineState(pipeline);
 	if (publishFog)
-		rts::render::TrackLegacyFog(logical.constants.fog);
+		rts::render::TrackLegacyFog(fog);
 	if (publishAmbient)
-		rts::render::TrackLegacyGlobalAmbient(logical.constants.globalAmbient);
+		rts::render::TrackLegacyGlobalAmbient(ambient);
 	return rts::render::RENDER_RESULT_OK;
 
 invalid_state:
