@@ -412,7 +412,6 @@ RenderResult NativeW3DBufferOwner::Unlock()
 	{
 		memcpy(m_authoritative + m_lockOffset, m_staging, m_lockBytes);
 	}
-	if (result == RENDER_RESULT_OK)
 	FinishLock();
 	m_failedMutation = result != RENDER_RESULT_OK;
 	return result;
