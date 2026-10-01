@@ -46,16 +46,16 @@ struct Context
  Tick sequence, lastSequence, packet, commands, bytes;
  unsigned int control, recording;
 };
-struct Event { Tick begin, end; Context context; unsigned int kind, reason, depth; int result; };
+struct Event { Tick begin, end; Context context; unsigned int kind, reason, depth, resultKnown; int result; };
 struct Aggregate { Tick calls, ticks; };
 struct Lane
 {
- Lane() : used(0), dropped(0), qpcFailures(0), depth(0), threadId(0), limit(MaxEvents)
+ Lane() : dropped(0), warmupSkipped(0), qpcFailures(0), captureBeginQpc(0), used(0), depth(0), threadId(0), limit(MaxEvents)
  { memset(totals, 0, sizeof(totals)); }
  Event events[MaxEvents];
  Aggregate totals[KindCount][ReasonCount];
  Context context;
- Tick dropped, qpcFailures;
+ Tick dropped, warmupSkipped, qpcFailures, captureBeginQpc;
  unsigned int used, depth; DWORD threadId; unsigned int limit;
  Tick now() { LARGE_INTEGER value; if (!QueryPerformanceCounter(&value))
   { ++qpcFailures; return 0; } return static_cast<Tick>(value.QuadPart); }
@@ -63,6 +63,9 @@ struct Lane
  {
   Aggregate &total = totals[event.kind][event.reason]; ++total.calls;
   if (event.begin && event.end >= event.begin) total.ticks += event.end - event.begin;
+  // Gate by span BEGIN, never its completion: a startup wait spanning the
+  // capture boundary remains warmup detail even when it ends in the window.
+  if (event.begin < captureBeginQpc) { ++warmupSkipped; return; }
   if (used < limit) events[used++] = event; else ++dropped;
  }
 };
@@ -81,11 +84,11 @@ public:
  {
   if (m_lane) { m_event.context = m_lane->context; m_event.kind = kind;
    m_event.reason = CurrentReason(); m_event.depth = ++m_lane->depth;
-   m_event.result = 0; m_event.begin = m_lane->now(); }
+   m_event.resultKnown = 0; m_event.result = 0; m_event.begin = m_lane->now(); }
  }
  ~Scope() { if (m_lane) { m_event.end = m_lane->now();
   m_lane->record(m_event); --m_lane->depth; } }
- void result(int result) { if (m_lane) m_event.result = result; }
+ void result(int result) { if (m_lane) { m_event.resultKnown = 1; m_event.result = result; } }
 private: Lane *m_lane; Event m_event; Scope(const Scope &); Scope &operator=(const Scope &);
 };
 inline const char *ReasonName(unsigned int reason)
@@ -116,10 +119,25 @@ struct Anchor
 class Session
 {
 public:
- Session() : frequency(0), dumped(false), dumpSucceeded(false)
+ Session() : frequency(0), delayMilliseconds(0), captureBeginQpc(0), dumped(false), dumpSucceeded(false)
  {
   LARGE_INTEGER value; if (QueryPerformanceFrequency(&value)) frequency = value.QuadPart;
   start.capture(); producer.threadId = GetCurrentThreadId();
+  char delay[16] = {0}; const DWORD delayLength = GetEnvironmentVariableA("RTS_MENU_TRACE_DELAY_MS", delay, sizeof(delay));
+  if (delayLength > 0 && delayLength < sizeof(delay))
+  {
+   unsigned int requested = 0; bool valid = true;
+   for (DWORD i = 0; i < delayLength; ++i)
+   { if (delay[i] < '0' || delay[i] > '9') { valid = false; break; }
+    requested = requested * 10 + static_cast<unsigned int>(delay[i] - '0');
+    if (requested > 120000) { valid = false; break; } }
+   if (valid) delayMilliseconds = requested;
+  }
+  const Tick maximum = ~Tick(0);
+  const Tick delayTicks = delayMilliseconds && frequency > maximum / delayMilliseconds ? maximum :
+   frequency * delayMilliseconds / 1000;
+  captureBeginQpc = delayTicks > maximum - start.before ? maximum : start.before + delayTicks;
+  producer.captureBeginQpc = owner.captureBeginQpc = captureBeginQpc;
   char cap[16] = {0}; const DWORD length = GetEnvironmentVariableA("RTS_MENU_TRACE_CAP", cap, sizeof(cap));
   if (length > 0 && length < sizeof(cap)) { char *end = 0; unsigned long requested = strtoul(cap, &end, 10);
    if (*end == '\0' && requested > 0 && requested <= MaxEvents)
@@ -127,7 +145,8 @@ public:
   directory[0] = '\0'; const DWORD pathLength = GetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory, sizeof(directory));
   if (!pathLength || pathLength >= sizeof(directory)) directory[0] = '\0';
  }
- Lane producer, owner; Tick frequency; Anchor start, finish; bool dumped, dumpSucceeded;
+ Lane producer, owner; Tick frequency; unsigned int delayMilliseconds;
+ Tick captureBeginQpc; Anchor start, finish; bool dumped, dumpSucceeded;
  void dumpAfterJoin()
  {
   if (dumped) return; dumped = true; finish.capture();
@@ -141,27 +160,31 @@ public:
   length = snprintf(row, sizeof(row), "# TEMP inclusive CPU wall ticks; nested scopes overlap; owner execution includes backend, not GPU time\n# frequency=%llu,start_qpc_before=%llu,start_utc_filetime_100ns=%llu,start_qpc_after=%llu,end_qpc_before=%llu,end_utc_filetime_100ns=%llu,end_qpc_after=%llu\n",
    frequency, start.before, start.utc100ns, start.after, finish.before, finish.utc100ns, finish.after);
   write(file, row, length, ok);
-  const char *header = "row,lane,kind,reason,begin_qpc,end_qpc,sequence,last_sequence,packet,control,recording,commands,bytes,depth,result,calls,ticks\n";
+  length = snprintf(row, sizeof(row), "# detail_delay_ms=%u,capture_begin_qpc=%llu; result_known=0 means unobserved result (blank), not success; totals cover entire session including warmup\n",
+   delayMilliseconds, captureBeginQpc);
+  write(file, row, length, ok);
+  const char *header = "row,lane,kind,reason,begin_qpc,end_qpc,sequence,last_sequence,packet,control,recording,commands,bytes,depth,result_known,result,calls,ticks\n";
   write(file, header, static_cast<int>(strlen(header)), ok);
   for (unsigned int laneIndex = 0; laneIndex < 2; ++laneIndex)
   {
    Lane &lane = laneIndex == 0 ? producer : owner;
    const char *name = laneIndex == 0 ? "producer" : "owner";
-   length = snprintf(row, sizeof(row), "# lane=%s,thread=%lu,cap=%u,events=%u,dropped=%llu,qpc_failures=%llu,final_depth=%u\n",
-    name, lane.threadId, lane.limit, lane.used, lane.dropped, lane.qpcFailures, lane.depth);
+   length = snprintf(row, sizeof(row), "# lane=%s,thread=%lu,cap=%u,events=%u,warmup_skipped=%llu,cap_dropped=%llu,qpc_failures=%llu,final_depth=%u\n",
+    name, lane.threadId, lane.limit, lane.used, lane.warmupSkipped, lane.dropped, lane.qpcFailures, lane.depth);
    write(file, row, length, ok);
    for (unsigned int i = 0; i < lane.used; ++i)
    {
     const Event &e = lane.events[i]; const Context &c = e.context;
-    length = snprintf(row, sizeof(row), "event,%s,%s,%s,%llu,%llu,%llu,%llu,%llu,%u,%u,%llu,%llu,%u,%d,,\n",
+    char resultText[32] = {0}; if (e.resultKnown) snprintf(resultText, sizeof(resultText), "%d", e.result);
+    length = snprintf(row, sizeof(row), "event,%s,%s,%s,%llu,%llu,%llu,%llu,%llu,%u,%u,%llu,%llu,%u,%u,%s,,\n",
      name, KindName(e.kind), ReasonName(e.reason), e.begin, e.end,
-     c.sequence, c.lastSequence, c.packet, c.control, c.recording, c.commands, c.bytes, e.depth, e.result);
+     c.sequence, c.lastSequence, c.packet, c.control, c.recording, c.commands, c.bytes, e.depth, e.resultKnown, resultText);
     write(file, row, length, ok);
    }
    for (unsigned int k = 0; k < KindCount; ++k) for (unsigned int r = 0; r < ReasonCount; ++r)
    {
     const Aggregate &total = lane.totals[k][r]; if (!total.calls) continue;
-    length = snprintf(row, sizeof(row), "total,%s,%s,%s,,,,,,,,,,,,%llu,%llu\n",
+    length = snprintf(row, sizeof(row), "total,%s,%s,%s,,,,,,,,,,,,,%llu,%llu\n",
      name, KindName(k), ReasonName(r), total.calls, total.ticks);
     write(file, row, length, ok);
    }
