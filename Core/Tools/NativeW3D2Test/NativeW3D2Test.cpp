@@ -1728,6 +1728,173 @@ int TestNativeCommandsPreservePipelineState(NativeW3D2 *owner)
 	return result;
 }
 
+int TestTextureStageGetterValidity(NativeW3D2 *owner)
+{
+	using namespace rts::render;
+	int result = 0;
+	if (owner == 0 || !owner->IsOperational())
+		return Check(false, "texture-stage validity fixture has an operational owner");
+
+	LegacyLogicalState savedState;
+	RenderMatrix4 savedView;
+	if (!GetTrackedLegacyLogicalState(&savedState) ||
+		!GetTrackedLegacyTransform(LEGACY_TRANSFORM_VIEW, &savedView))
+		return Check(false, "texture-stage validity fixture starts from valid tracked state");
+
+	const unsigned int laterStage = LEGACY_TEXTURE_STAGE_COUNT - 1U;
+	LegacyPipelineState stalePipeline = savedState.pipeline;
+	LegacyTextureStageState staleStage = stalePipeline.textureStages[0];
+	staleStage.colorOperation = RENDER_TEXTURE_OP_ADD;
+	staleStage.textureCoordinateIndex = 3U;
+	staleStage.sampler.addressU = RENDER_TEXTURE_ADDRESS_BORDER;
+	staleStage.sampler.maximumMipLevel = GAME_TEXTURE_MAX_MIP_LEVEL_INDEX;
+	stalePipeline.textureStages[0] = staleStage;
+	staleStage = stalePipeline.textureStages[laterStage];
+	staleStage.colorOperation = RENDER_TEXTURE_OP_ADD;
+	staleStage.textureCoordinateIndex = 1U;
+	staleStage.sampler.addressU = RENDER_TEXTURE_ADDRESS_BORDER;
+	staleStage.sampler.maximumMipLevel = GAME_TEXTURE_MAX_MIP_LEVEL_INDEX;
+	stalePipeline.textureStages[laterStage] = staleStage;
+	TrackLegacyPipelineState(stalePipeline);
+
+	RenderMatrix4 retainedView;
+	for (unsigned int index = 0; index != 16U; ++index)
+		retainedView.values[index] = static_cast<float>(index + 1U);
+	result |= Check(TrackLegacyTransform(LEGACY_TRANSFORM_VIEW,
+		retainedView.values),
+		"texture-stage validity fixture tracks an unrelated view constant");
+
+	LegacyTextureStageState stage;
+	const bool seededStageZeroRead = GetTrackedLegacyTextureStageIfValid(0, &stage);
+	result |= Check(seededStageZeroRead && stage.colorOperation == RENDER_TEXTURE_OP_ADD,
+		"valid texture-stage getter reads stage zero");
+	const bool seededLaterStageRead =
+		GetTrackedLegacyTextureStageIfValid(laterStage, &stage);
+	result |= Check(seededLaterStageRead && stage.colorOperation == RENDER_TEXTURE_OP_ADD,
+		"valid texture-stage getter reads a later stage");
+	result |= Check(!GetTrackedLegacyTextureStageIfValid(
+		LEGACY_TEXTURE_STAGE_COUNT, &stage),
+		"valid texture-stage getter rejects an invalid index");
+	result |= Check(!GetTrackedLegacyTextureStageIfValid(0, 0),
+		"valid texture-stage getter rejects a null output");
+
+	TrackLegacyShaderBits(0xffffffffU);
+	LegacyTextureStageState rawStage;
+	LegacyTextureStageState invalidOutput;
+	invalidOutput.sampler.maximumMipLevel = 77U;
+	LegacyPipelineState invalidPipeline;
+	LegacyLogicalState invalidLogical;
+	const bool rawInvalidStageRead = GetTrackedLegacyTextureStage(0, &rawStage);
+	result |= Check(rawInvalidStageRead &&
+		rawStage.colorOperation == RENDER_TEXTURE_OP_ADD &&
+		rawStage.sampler.maximumMipLevel == GAME_TEXTURE_MAX_MIP_LEVEL_INDEX,
+		"legacy texture-stage getter still reads stored stage data while invalid");
+	const bool rejectedInvalidStageRead =
+		!GetTrackedLegacyTextureStageIfValid(0, &invalidOutput);
+	result |= Check(rejectedInvalidStageRead &&
+		invalidOutput.sampler.maximumMipLevel == 77U &&
+		!GetTrackedLegacyPipelineState(&invalidPipeline) &&
+		!GetTrackedLegacyLogicalState(&invalidLogical),
+		"validity-gated getter refuses stale stage data without validating the pipeline");
+
+	LegacyPipelineState defaults;
+	GameRenderCommand command = {};
+	command.type = GAME_RENDER_COMMAND_SET_TEXTURE_STAGE_STATE;
+	command.value0 = 0;
+	command.value1 = GAME_TEXTURE_STAGE_MAX_MIP_LEVEL;
+	command.value2 = 3U;
+	const RenderResult invalidStageZeroResult =
+		owner->ExecuteGameRenderCommand(command);
+	const bool invalidStageZeroRead = GetTrackedLegacyTextureStage(0, &stage);
+	result |= Check(invalidStageZeroResult == RENDER_RESULT_OK &&
+		invalidStageZeroRead &&
+		stage.colorOperation == defaults.textureStages[0].colorOperation &&
+		stage.alphaOperation == defaults.textureStages[0].alphaOperation &&
+		stage.textureCoordinateIndex == defaults.textureStages[0].textureCoordinateIndex &&
+		stage.sampler.addressU == defaults.textureStages[0].sampler.addressU &&
+		stage.sampler.maximumMipLevel == 3U,
+		"invalid pipeline uses stage-zero defaults for the production setter");
+	const bool invalidStageZeroStillInvalid =
+		!GetTrackedLegacyTextureStageIfValid(0, &invalidOutput);
+	result |= Check(invalidStageZeroStillInvalid &&
+		!GetTrackedLegacyPipelineState(&invalidPipeline) &&
+		!GetTrackedLegacyLogicalState(&invalidLogical),
+		"stage-zero setter does not seed shared pipeline validity");
+	command.value0 = laterStage;
+	command.value2 = 5U;
+	const RenderResult invalidLaterStageResult =
+		owner->ExecuteGameRenderCommand(command);
+	const bool invalidLaterStageRead = GetTrackedLegacyTextureStage(laterStage, &stage);
+	result |= Check(invalidLaterStageResult == RENDER_RESULT_OK &&
+		invalidLaterStageRead &&
+		stage.colorOperation == defaults.textureStages[laterStage].colorOperation &&
+		stage.alphaOperation == defaults.textureStages[laterStage].alphaOperation &&
+		stage.textureCoordinateIndex ==
+			defaults.textureStages[laterStage].textureCoordinateIndex &&
+		stage.sampler.addressU == defaults.textureStages[laterStage].sampler.addressU &&
+		stage.sampler.maximumMipLevel == 5U,
+		"invalid pipeline uses later-stage defaults for the production setter");
+	const bool invalidLaterStageStillInvalid =
+		!GetTrackedLegacyTextureStageIfValid(laterStage, &invalidOutput);
+	result |= Check(invalidLaterStageStillInvalid &&
+		!GetTrackedLegacyPipelineState(&invalidPipeline) &&
+		!GetTrackedLegacyLogicalState(&invalidLogical),
+		"later-stage setter does not seed shared pipeline validity");
+	RenderMatrix4 actualView;
+	result |= Check(GetTrackedLegacyTransform(LEGACY_TRANSFORM_VIEW, &actualView) &&
+		std::memcmp(actualView.values, retainedView.values,
+			sizeof(retainedView.values)) == 0,
+		"texture-stage setters preserve unrelated tracked constants while invalid");
+
+	LegacyPipelineState validPipeline;
+	TrackLegacyPipelineState(validPipeline);
+	LegacyTextureStageState validStage = validPipeline.textureStages[0];
+	validStage.colorOperation = RENDER_TEXTURE_OP_ADD;
+	validStage.textureCoordinateIndex = 2U;
+	validStage.sampler.addressU = RENDER_TEXTURE_ADDRESS_BORDER;
+	validStage.sampler.maximumMipLevel = 8U;
+	result |= Check(TrackLegacyTextureStage(0, validStage),
+		"texture-stage validity fixture seeds a nondefault valid stage");
+	validStage = validPipeline.textureStages[laterStage];
+	validStage.colorOperation = RENDER_TEXTURE_OP_ADD;
+	validStage.textureCoordinateIndex = 2U;
+	validStage.sampler.addressU = RENDER_TEXTURE_ADDRESS_BORDER;
+	validStage.sampler.maximumMipLevel = 6U;
+	result |= Check(TrackLegacyTextureStage(laterStage, validStage),
+		"texture-stage validity fixture seeds a nondefault later stage");
+	command.value0 = 0;
+	command.value2 = 4U;
+	const RenderResult validStageZeroResult =
+		owner->ExecuteGameRenderCommand(command);
+	const bool validStageZeroRead = GetTrackedLegacyTextureStageIfValid(0, &stage);
+	result |= Check(validStageZeroResult == RENDER_RESULT_OK && validStageZeroRead &&
+		stage.colorOperation == RENDER_TEXTURE_OP_ADD &&
+		stage.textureCoordinateIndex == 2U &&
+		stage.sampler.addressU == RENDER_TEXTURE_ADDRESS_BORDER &&
+		stage.sampler.maximumMipLevel == 4U,
+		"valid stage-zero setter preserves unrelated nondefault stage fields");
+	command.value0 = laterStage;
+	command.value2 = 5U;
+	const RenderResult validLaterStageResult =
+		owner->ExecuteGameRenderCommand(command);
+	const bool validLaterStageRead =
+		GetTrackedLegacyTextureStageIfValid(laterStage, &stage);
+	result |= Check(validLaterStageResult == RENDER_RESULT_OK && validLaterStageRead &&
+		stage.colorOperation == RENDER_TEXTURE_OP_ADD &&
+		stage.textureCoordinateIndex == 2U &&
+		stage.sampler.addressU == RENDER_TEXTURE_ADDRESS_BORDER &&
+		stage.sampler.maximumMipLevel == 5U,
+		"valid later-stage setter preserves unrelated nondefault stage fields");
+	result |= Check(GetTrackedLegacyTransform(LEGACY_TRANSFORM_VIEW, &actualView) &&
+		std::memcmp(actualView.values, retainedView.values,
+			sizeof(retainedView.values)) == 0,
+		"valid texture-stage setters preserve unrelated tracked constants");
+
+	TrackLegacyPipelineState(savedState.pipeline);
+	TrackLegacyTransform(LEGACY_TRANSFORM_VIEW, savedView.values);
+	return result;
+}
+
 int TestGetTransformWithInvalidPipeline(NativeW3D2 *owner)
 {
 	int result = 0;
@@ -2343,6 +2510,7 @@ int main(int argc, char **argv)
 		result |= TestNativeHardwareZBias(&w3d);
 		result |= TestNativeCameraBiasSequences(&w3d);
 		result |= TestNativeCommandsPreservePipelineState(&w3d);
+		result |= TestTextureStageGetterValidity(&w3d);
 		result |= TestGetTransformWithInvalidPipeline(&w3d);
 		{
 			using namespace rts::render;
