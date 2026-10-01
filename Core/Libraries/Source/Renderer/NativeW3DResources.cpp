@@ -2661,7 +2661,6 @@ const NativeW3DResources::Slot *NativeW3DResources::Find(
 	if (hintedIndex < m_impl->slots.size() &&
 		m_impl->slots[hintedIndex].handle == handle)
 	{
-		lookup.found();
 		return &m_impl->slots[hintedIndex];
 	}
 #if defined(_WIN64)
@@ -2683,13 +2682,11 @@ const NativeW3DResources::Slot *NativeW3DResources::Find(
 		hint.slot < m_impl->slots.size() &&
 		m_impl->slots[hint.slot].handle == handle)
 	{
-		lookup.found();
 		return &m_impl->slots[hint.slot];
 	}
 #endif
 	for (size_t index = 0; index < m_impl->slots.size(); ++index)
 	{
-		lookup.linearIteration();
 		if (m_impl->slots[index].handle == handle)
 		{
 #if defined(_WIN64)
@@ -2697,7 +2694,6 @@ const NativeW3DResources::Slot *NativeW3DResources::Find(
 			hint.handle = handle;
 			hint.slot = index;
 #endif
-			lookup.found();
 			return &m_impl->slots[index];
 		}
 	}
