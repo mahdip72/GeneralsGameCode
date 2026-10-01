@@ -41,6 +41,13 @@ struct Counts
 	unsigned long long qpcFailures;
 	unsigned long long resourceFindCalls, resourceFindLinearIterations;
 	unsigned long long resourceFindMisses;
+	unsigned long long threadedMetricsSnapshotAttempted;
+	unsigned long long threadedMetricsSnapshotValid;
+	unsigned long long threadedMetricsOwnerExecutionNanoseconds;
+	unsigned long long threadedMetricsCompletedFrames;
+	unsigned long long threadedMetricsSubmittedFrames;
+	unsigned long long threadedMetricsProducerWaitNanoseconds;
+	unsigned long long threadedMetricsBackpressureWaits;
 };
 
 inline const char *DurationName(unsigned int category)
@@ -92,7 +99,11 @@ public:
 				DurationName(i), DurationName(i));
 		if (used > 0 && used < static_cast<int>(sizeof(header)))
 			used += _snprintf(header + used, sizeof(header) - used,
-				",qpc_failures,resource_find_calls,resource_find_linear_iterations,resource_find_misses\n");
+				",qpc_failures,resource_find_calls,resource_find_linear_iterations,resource_find_misses"
+				",threaded_metrics_snapshot_attempted,threaded_metrics_snapshot_valid"
+				",threaded_metrics_owner_execution_nanoseconds,threaded_metrics_completed_frames"
+				",threaded_metrics_submitted_frames,threaded_metrics_producer_wait_nanoseconds"
+				",threaded_metrics_backpressure_waits\n");
 		if (used <= 0 || used >= static_cast<int>(sizeof(header)) ||
 			!buffer(header, static_cast<unsigned int>(used))) { close(); return false; }
 		return true;
@@ -118,9 +129,17 @@ public:
 				counts.durationCalls[i], counts.durationTicks[i]);
 		if (used > 0 && used < static_cast<int>(sizeof(row)))
 			used += _snprintf(row + used, sizeof(row) - used,
-				",%llu,%llu,%llu,%llu\n", counts.qpcFailures,
+				",%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+				counts.qpcFailures,
 				counts.resourceFindCalls, counts.resourceFindLinearIterations,
-				counts.resourceFindMisses);
+				counts.resourceFindMisses,
+				counts.threadedMetricsSnapshotAttempted,
+				counts.threadedMetricsSnapshotValid,
+				counts.threadedMetricsOwnerExecutionNanoseconds,
+				counts.threadedMetricsCompletedFrames,
+				counts.threadedMetricsSubmittedFrames,
+				counts.threadedMetricsProducerWaitNanoseconds,
+				counts.threadedMetricsBackpressureWaits);
 		if (used <= 0 || used >= static_cast<int>(sizeof(row)) ||
 			!buffer(row, static_cast<unsigned int>(used))) { close(); return false; }
 		++m_rows;
@@ -224,6 +243,25 @@ inline void Merge(Counts *destination, const Counts &source)
 	Add(&destination->resourceFindLinearIterations,
 		source.resourceFindLinearIterations);
 	Add(&destination->resourceFindMisses, source.resourceFindMisses);
+	// These are cumulative device snapshots, not additive per-scope counters.
+	destination->threadedMetricsSnapshotAttempted =
+		destination->threadedMetricsSnapshotAttempted != 0 ||
+			source.threadedMetricsSnapshotAttempted != 0;
+	if (destination->threadedMetricsSnapshotValid == 0 &&
+		source.threadedMetricsSnapshotValid != 0)
+	{
+		destination->threadedMetricsSnapshotValid = 1;
+		destination->threadedMetricsOwnerExecutionNanoseconds =
+			source.threadedMetricsOwnerExecutionNanoseconds;
+		destination->threadedMetricsCompletedFrames =
+			source.threadedMetricsCompletedFrames;
+		destination->threadedMetricsSubmittedFrames =
+			source.threadedMetricsSubmittedFrames;
+		destination->threadedMetricsProducerWaitNanoseconds =
+			source.threadedMetricsProducerWaitNanoseconds;
+		destination->threadedMetricsBackpressureWaits =
+			source.threadedMetricsBackpressureWaits;
+	}
 }
 
 class Scope

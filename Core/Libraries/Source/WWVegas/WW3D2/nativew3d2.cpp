@@ -3426,6 +3426,30 @@ rts::render::RenderResult NativeW3D2::SubmitGamePacket(
 	rts::render::NativeW3DTextureBindingCache *textureBindingCache,
 	rts::render::NativeW3DSortedBatchBindingCache *sortedBatchBindingCache)
 {
+#if defined(_WIN64)
+	rts::shadow_counters::Counts *shadowCounts =
+		rts::shadow_counters::Current();
+	if (shadowCounts != 0 &&
+		shadowCounts->threadedMetricsSnapshotAttempted == 0)
+	{
+		shadowCounts->threadedMetricsSnapshotAttempted = 1;
+		rts::render::ThreadedRenderMetrics metrics;
+		if (m_renderer.GetThreadedMetrics(&metrics))
+		{
+			shadowCounts->threadedMetricsSnapshotValid = 1;
+			shadowCounts->threadedMetricsOwnerExecutionNanoseconds =
+				metrics.ownerExecutionNanoseconds;
+			shadowCounts->threadedMetricsCompletedFrames =
+				metrics.completedFrames;
+			shadowCounts->threadedMetricsSubmittedFrames =
+				metrics.submittedFrames;
+			shadowCounts->threadedMetricsProducerWaitNanoseconds =
+				metrics.producerWaitNanoseconds;
+			shadowCounts->threadedMetricsBackpressureWaits =
+				metrics.backpressureWaits;
+		}
+	}
+#endif
 	rts::shadow_counters::DurationScope duration(
 		rts::shadow_counters::GamePacketSubmitDuration);
 	// Logical state and target selection may be prepared between frames, but a
