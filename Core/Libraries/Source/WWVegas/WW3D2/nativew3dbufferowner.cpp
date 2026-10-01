@@ -309,6 +309,8 @@ RenderResult NativeW3DBufferOwner::RecreateForDiscard()
 RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 	size_t byteCount, RenderBufferUpdateMode mode, void **data)
 {
+	rts::shadow_counters::DurationScope duration(
+		rts::shadow_counters::BufferLockDuration);
 	NativeGameRenderOwnerScope ownerScope;
 	if (data == 0)
 	{
@@ -392,6 +394,8 @@ RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 
 RenderResult NativeW3DBufferOwner::Unlock()
 {
+	rts::shadow_counters::DurationScope duration(
+		rts::shadow_counters::BufferUnlockDuration);
 	NativeGameRenderOwnerScope ownerScope;
 	if (!m_locked)
 	{

@@ -1,5 +1,6 @@
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/NativeW3DRenderState.h"
+#include "Lib/ShadowCounterDiagnostics.h"
 #include <Utility/interlocked_adapter.h>
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include "Renderer/ThreadedRenderDevice.h"
@@ -2653,6 +2654,7 @@ NativeW3DResources::Slot *NativeW3DResources::Find(GpuHandle handle)
 const NativeW3DResources::Slot *NativeW3DResources::Find(
 	GpuHandle handle) const
 {
+	rts::shadow_counters::ResourceFindScope lookup;
 	if (m_impl == 0 || !handle.isValid())
 	{
 		return 0;
@@ -2661,6 +2663,7 @@ const NativeW3DResources::Slot *NativeW3DResources::Find(
 	if (hintedIndex < m_impl->slots.size() &&
 		m_impl->slots[hintedIndex].handle == handle)
 	{
+		lookup.found();
 		return &m_impl->slots[hintedIndex];
 	}
 #if defined(_WIN64)
@@ -2682,11 +2685,13 @@ const NativeW3DResources::Slot *NativeW3DResources::Find(
 		hint.slot < m_impl->slots.size() &&
 		m_impl->slots[hint.slot].handle == handle)
 	{
+		lookup.found();
 		return &m_impl->slots[hint.slot];
 	}
 #endif
 	for (size_t index = 0; index < m_impl->slots.size(); ++index)
 	{
+		lookup.linearIteration();
 		if (m_impl->slots[index].handle == handle)
 		{
 #if defined(_WIN64)
@@ -2694,6 +2699,7 @@ const NativeW3DResources::Slot *NativeW3DResources::Find(
 			hint.handle = handle;
 			hint.slot = index;
 #endif
+			lookup.found();
 			return &m_impl->slots[index];
 		}
 	}

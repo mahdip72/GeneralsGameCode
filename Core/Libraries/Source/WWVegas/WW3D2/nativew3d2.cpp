@@ -1423,6 +1423,13 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	const rts::render::GameRenderCommand &command)
 {
+	const bool drawCommand =
+		command.type == rts::render::GAME_RENDER_COMMAND_DRAW_TRIANGLES ||
+		command.type == rts::render::GAME_RENDER_COMMAND_DRAW_STRIP ||
+		command.type == rts::render::GAME_RENDER_COMMAND_DRAW_SORTED_TRIANGLES;
+	rts::shadow_counters::DurationScope commandDuration(drawCommand ?
+		rts::shadow_counters::ExecuteDrawDuration :
+		rts::shadow_counters::ExecuteOtherDuration);
 	using namespace rts::render;
 	GameRenderCommandFailureScope failureCommandScope(&command);
 	// Completion publication is an owner-boundary operation. Service before the
@@ -2929,6 +2936,8 @@ rts::render::RenderResult NativeW3D2::ApplyGameShaderBits(
 rts::render::RenderResult NativeW3D2::SetGameRenderState(
 	unsigned int state, unsigned int value)
 {
+	rts::shadow_counters::DurationScope duration(
+		rts::shadow_counters::RenderStateSetterDuration);
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
 		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
@@ -3417,6 +3426,8 @@ rts::render::RenderResult NativeW3D2::SubmitGamePacket(
 	rts::render::NativeW3DTextureBindingCache *textureBindingCache,
 	rts::render::NativeW3DSortedBatchBindingCache *sortedBatchBindingCache)
 {
+	rts::shadow_counters::DurationScope duration(
+		rts::shadow_counters::GamePacketSubmitDuration);
 	// Logical state and target selection may be prepared between frames, but a
 	// draw is only valid inside the frame that owns the backend command stream.
 	// SubmitExternal is reserved for the legacy bridge and must not let this

@@ -11,6 +11,16 @@
 namespace rts { namespace shadow_counters {
 
 enum Phase { Projected, Volume };
+enum DurationCategory
+{
+	BufferLockDuration,
+	BufferUnlockDuration,
+	ExecuteDrawDuration,
+	ExecuteOtherDuration,
+	RenderStateSetterDuration,
+	GamePacketSubmitDuration,
+	DurationCategoryCount
+};
 enum { RenderStateSlots = 40, TextureStateSlots = 24, MaxRows = 10000 };
 
 inline void Add(unsigned long long *value, unsigned long long amount)
@@ -25,7 +35,27 @@ struct Counts
 	unsigned long long textureState[TextureStateSlots + 1];
 	unsigned long long renderCalls, textureCalls, draws, indices, vertices;
 	unsigned long long unlockAttempts, unlockRequestedBytes, unlockSuccessBytes;
+	unsigned long long qpcFrequencyHz;
+	unsigned long long durationCalls[DurationCategoryCount];
+	unsigned long long durationTicks[DurationCategoryCount];
+	unsigned long long qpcFailures;
+	unsigned long long resourceFindCalls, resourceFindLinearIterations;
+	unsigned long long resourceFindMisses;
 };
+
+inline const char *DurationName(unsigned int category)
+{
+	switch (category)
+	{
+	case BufferLockDuration: return "buffer_lock";
+	case BufferUnlockDuration: return "buffer_unlock";
+	case ExecuteDrawDuration: return "execute_draw";
+	case ExecuteOtherDuration: return "execute_other";
+	case RenderStateSetterDuration: return "render_state_setter";
+	case GamePacketSubmitDuration: return "packet_submit";
+	default: return "duration_invalid";
+	}
+}
 
 class Writer
 {
@@ -56,7 +86,13 @@ public:
 		for (unsigned int i = 0; i < TextureStateSlots && used > 0 && used < static_cast<int>(sizeof(header)); ++i)
 			used += _snprintf(header + used, sizeof(header) - used, ",texture_%u", i);
 		if (used > 0 && used < static_cast<int>(sizeof(header)))
-			used += _snprintf(header + used, sizeof(header) - used, ",texture_invalid\n");
+			used += _snprintf(header + used, sizeof(header) - used, ",texture_invalid,qpc_frequency_hz");
+		for (unsigned int i = 0; i < DurationCategoryCount && used > 0 && used < static_cast<int>(sizeof(header)); ++i)
+			used += _snprintf(header + used, sizeof(header) - used, ",%s_calls,%s_qpc_ticks",
+				DurationName(i), DurationName(i));
+		if (used > 0 && used < static_cast<int>(sizeof(header)))
+			used += _snprintf(header + used, sizeof(header) - used,
+				",qpc_failures,resource_find_calls,resource_find_linear_iterations,resource_find_misses\n");
 		if (used <= 0 || used >= static_cast<int>(sizeof(header)) ||
 			!buffer(header, static_cast<unsigned int>(used))) { close(); return false; }
 		return true;
@@ -75,7 +111,16 @@ public:
 		for (unsigned int i = 0; i <= TextureStateSlots && used > 0 && used < static_cast<int>(sizeof(row)); ++i)
 			used += _snprintf(row + used, sizeof(row) - used, ",%llu", counts.textureState[i]);
 		if (used > 0 && used < static_cast<int>(sizeof(row)))
-			used += _snprintf(row + used, sizeof(row) - used, "\n");
+			used += _snprintf(row + used, sizeof(row) - used, ",%llu",
+				counts.qpcFrequencyHz);
+		for (unsigned int i = 0; i < DurationCategoryCount && used > 0 && used < static_cast<int>(sizeof(row)); ++i)
+			used += _snprintf(row + used, sizeof(row) - used, ",%llu,%llu",
+				counts.durationCalls[i], counts.durationTicks[i]);
+		if (used > 0 && used < static_cast<int>(sizeof(row)))
+			used += _snprintf(row + used, sizeof(row) - used,
+				",%llu,%llu,%llu,%llu\n", counts.qpcFailures,
+				counts.resourceFindCalls, counts.resourceFindLinearIterations,
+				counts.resourceFindMisses);
 		if (used <= 0 || used >= static_cast<int>(sizeof(row)) ||
 			!buffer(row, static_cast<unsigned int>(used))) { close(); return false; }
 		++m_rows;
@@ -167,15 +212,40 @@ inline void Merge(Counts *destination, const Counts &source)
 	Add(&destination->unlockAttempts, source.unlockAttempts);
 	Add(&destination->unlockRequestedBytes, source.unlockRequestedBytes);
 	Add(&destination->unlockSuccessBytes, source.unlockSuccessBytes);
+	if (destination->qpcFrequencyHz == 0)
+		destination->qpcFrequencyHz = source.qpcFrequencyHz;
+	for (unsigned int i = 0; i < DurationCategoryCount; ++i)
+	{
+		Add(&destination->durationCalls[i], source.durationCalls[i]);
+		Add(&destination->durationTicks[i], source.durationTicks[i]);
+	}
+	Add(&destination->qpcFailures, source.qpcFailures);
+	Add(&destination->resourceFindCalls, source.resourceFindCalls);
+	Add(&destination->resourceFindLinearIterations,
+		source.resourceFindLinearIterations);
+	Add(&destination->resourceFindMisses, source.resourceFindMisses);
 }
 
 class Scope
 {
 public:
 	Scope(Phase phase, bool frameTimingActive) : m_phase(phase), m_previous(0),
-		m_active(frameTimingActive && Enabled() && Output().isOpen())
+		m_active(false)
 	{
-		if (m_active) { m_previous = Current(); Current() = &m_counts; }
+		if (!frameTimingActive || !Enabled() || !Output().isOpen())
+			return;
+		m_previous = Current();
+		if (m_previous != 0)
+			m_counts.qpcFrequencyHz = m_previous->qpcFrequencyHz;
+		else
+		{
+			LARGE_INTEGER frequency;
+			if (QueryPerformanceFrequency(&frequency) && frequency.QuadPart > 0)
+				m_counts.qpcFrequencyHz =
+					static_cast<unsigned long long>(frequency.QuadPart);
+		}
+		m_active = true;
+		Current() = &m_counts;
 	}
 	~Scope()
 	{
@@ -193,6 +263,90 @@ private:
 	bool m_active;
 	Scope(const Scope&);
 	Scope& operator=(const Scope&);
+};
+
+// Captures the active row at entry. The enclosing Scope owns that Counts for
+// the timer's lexical lifetime; do not re-read Current() on destruction, since
+// nested scopes temporarily replace it. Work is skipped without an active row.
+class DurationScope
+{
+public:
+	explicit DurationScope(DurationCategory category) : m_counts(Current()),
+		m_category(category), m_startTicks(0), m_started(false)
+	{
+		const unsigned int categoryIndex =
+			static_cast<unsigned int>(category);
+		if (m_counts == 0 || categoryIndex >= DurationCategoryCount)
+		{
+			m_counts = 0;
+			return;
+		}
+		if (m_counts->qpcFrequencyHz == 0)
+			return;
+		LARGE_INTEGER start;
+		if (QueryPerformanceCounter(&start) && start.QuadPart >= 0)
+		{
+			m_startTicks = start.QuadPart;
+			m_started = true;
+		}
+	}
+	~DurationScope()
+	{
+		if (m_counts == 0)
+			return;
+		Add(&m_counts->durationCalls[m_category], 1);
+		if (!m_started)
+		{
+			Add(&m_counts->qpcFailures, 1);
+			return;
+		}
+		LARGE_INTEGER finish;
+		if (!QueryPerformanceCounter(&finish) || finish.QuadPart < m_startTicks)
+		{
+			Add(&m_counts->qpcFailures, 1);
+			return;
+		}
+		Add(&m_counts->durationTicks[m_category],
+			static_cast<unsigned long long>(finish.QuadPart - m_startTicks));
+	}
+private:
+	Counts *m_counts;
+	DurationCategory m_category;
+	LONGLONG m_startTicks;
+	bool m_started;
+	DurationScope(const DurationScope&);
+	DurationScope& operator=(const DurationScope&);
+};
+
+class ResourceFindScope
+{
+public:
+	ResourceFindScope() : m_counts(Current()), m_linearIterations(0),
+		m_found(false)
+	{
+		if (m_counts != 0)
+			Add(&m_counts->resourceFindCalls, 1);
+	}
+	~ResourceFindScope()
+	{
+		if (m_counts == 0)
+			return;
+		Add(&m_counts->resourceFindLinearIterations, m_linearIterations);
+		if (!m_found)
+			Add(&m_counts->resourceFindMisses, 1);
+	}
+	void linearIteration()
+	{
+		if (m_counts != 0 && m_linearIterations != ULLONG_MAX)
+			++m_linearIterations;
+	}
+	void found() { if (m_counts != 0) m_found = true; }
+private:
+	Counts *m_counts;
+	unsigned long long m_linearIterations;
+	bool m_found;
+	ResourceFindScope(const ResourceFindScope&);
+	ResourceFindScope& operator=(const ResourceFindScope&);
 };
 
 inline void RenderState(unsigned int state)
@@ -234,7 +388,25 @@ inline void UnlockSuccess(size_t bytes)
 #else
 namespace rts { namespace shadow_counters {
 enum Phase { Projected, Volume };
+enum DurationCategory
+{
+	BufferLockDuration,
+	BufferUnlockDuration,
+	ExecuteDrawDuration,
+	ExecuteOtherDuration,
+	RenderStateSetterDuration,
+	GamePacketSubmitDuration,
+	DurationCategoryCount
+};
 class Scope { public: Scope(Phase, bool) {} };
+class DurationScope { public: explicit DurationScope(DurationCategory) {} };
+class ResourceFindScope
+{
+public:
+	ResourceFindScope() {}
+	void linearIteration() {}
+	void found() {}
+};
 inline void RenderState(unsigned int) {}
 inline void TextureState(unsigned int) {}
 inline void AcceptedDraw(unsigned int, unsigned int) {}
