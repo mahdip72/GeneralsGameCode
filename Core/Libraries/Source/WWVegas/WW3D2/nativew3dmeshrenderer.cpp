@@ -2055,6 +2055,7 @@ void DX8TextureCategoryClass::Render()
 						theAlphaShader = theShader;	//keep using additive blending.
 					}
 					vmaterial->Set_Opacity(mesh->Get_Alpha_Override());
+					rts::render::SetGameMaterial(vmaterial);
 					rts::render::SetGameShader(theAlphaShader);
 					rts::render::ApplyGameRenderStateChanges();
 					rts::render::SetGameRenderState(rts::render::GAME_RENDER_STATE_ALPHA_REFERENCE, static_cast<unsigned int>(static_cast<float>(0x60) * mesh->Get_Alpha_Override()));
@@ -2067,7 +2068,10 @@ void DX8TextureCategoryClass::Render()
 					rts::render::SetGameShader(theShader);	//restore previous value
 				}
 				else
+				{
+					rts::render::SetGameMaterial(vmaterial);
 					renderer->Render(mesh->Get_Base_Vertex_Offset());
+				}
 
 				if (oldMapper)	//did we override the uv offset?
 				{	oldMapper->Set_LastUsedSyncTime(oldUVOffsetSyncTime);
