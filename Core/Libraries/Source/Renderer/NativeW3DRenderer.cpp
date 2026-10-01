@@ -838,7 +838,12 @@ bool NativeW3DRenderer::IsBackendOperational() const
 
 bool NativeW3DRenderer::CanRecoverDevice() const
 {
-	return m_state != 0 && m_ownsBackend && !m_frameOpen &&
+	return !m_frameOpen && HasRecoverableOwnedDevice();
+}
+
+bool NativeW3DRenderer::HasRecoverableOwnedDevice() const
+{
+	return m_state != 0 && m_ownsBackend &&
 		IsOwnerThread() && m_state->IsOperational() &&
 		m_state->Device() != 0;
 }

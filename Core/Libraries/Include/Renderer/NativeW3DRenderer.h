@@ -273,6 +273,7 @@ private:
 	bool m_borrowedMode;
 
 	bool IsOwnerThread() const;
+	bool HasRecoverableOwnedDevice() const;
 	void RecordFrameFailure(RenderResult result);
 	RenderResult SetViewportInternal(const RenderViewport &viewport,
 		bool requireFacadeFrame);

@@ -880,8 +880,13 @@ rts::render::RenderResult NativeW3D2::RecoverDevice()
 {
 	if (rts::render::IsNativeGameRenderOwnerPinnedByCurrentThread() ||
 		m_borrowedBackend || !m_resources.IsOwnerThread() ||
-		!m_renderer.CanRecoverDevice())
+		(!m_renderer.CanRecoverDevice() &&
+			!(m_renderer.IsThreaded() && m_renderer.IsFrameOpen() &&
+				m_renderer.HasRecoverableOwnedDevice())))
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	// CanRecoverDevice requires a sealed frame. An owned threaded frame must
+	// reach cancellation first; RecoverOwnedDevice rechecks that requirement
+	// after the lifecycle fence. Borrowed/off-owner/pinned callers stay rejected.
 	// Hold the lifecycle authority over the complete recovery transaction,
 	// including the pre-recovery frame fence. A concurrent shutdown/replace
 	// must not detach the aggregate between this admission check and the
@@ -897,7 +902,11 @@ rts::render::RenderResult NativeW3D2::RecoverDevice()
 	{
 		const rts::render::RenderResult cancelResult =
 			CancelOpenThreadedFrame(rts::render::RENDER_RESULT_DEVICE_REMOVED);
-		if (cancelResult != rts::render::RENDER_RESULT_OK)
+		// Serial submission returns the completed cancellation reason; parallel
+		// submission returns enqueue success. Both have sealed the same failed
+		// frame, which must still be fenced and recovered below.
+		if (cancelResult != rts::render::RENDER_RESULT_OK &&
+			cancelResult != rts::render::RENDER_RESULT_DEVICE_REMOVED)
 			return cancelResult;
 	}
 	if (m_renderer.IsThreaded())

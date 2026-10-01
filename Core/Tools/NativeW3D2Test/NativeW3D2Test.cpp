@@ -6,6 +6,7 @@
 #include "Renderer/LegacyRenderState.h"
 #include "Renderer/NativeW3DRenderState.h"
 #include "Renderer/ThreadedRenderDevice.h"
+#include "Lib/PipelineExecutionPolicy.h"
 
 #include <cstdio>
 #include <climits>
@@ -1019,6 +1020,138 @@ int TestBorrowedThreadedCapture(HWND window)
 		"borrowed threaded NativeW3D2 shutdown leaves backend ownership external");
 	device->shutdown();
 	delete device;
+	return result;
+}
+
+int TestExplicitRecoveryWithOpenFrame(HWND window)
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3DRendererDescriptor descriptor;
+	descriptor.width = 64;
+	descriptor.height = 64;
+	descriptor.enableVsync = false;
+	descriptor.allowSoftwareFallback = true;
+	NativeW3D2 owner;
+	CountingResizeHook hook;
+	const RenderResult initialize = owner.Initialize(window, descriptor);
+	if (initialize == RENDER_RESULT_UNSUPPORTED) return 77;
+	result |= Check(initialize == RENDER_RESULT_OK,
+		"explicit open-frame recovery initializes the actual native owner");
+	if (initialize != RENDER_RESULT_OK) return result;
+	owner.SetGameCleanupHook(&hook);
+	result |= Check(owner.Renderer().IsThreaded(),
+		"explicit open-frame recovery uses the production threaded backend");
+
+	const NativeVertex vertices[3] = {
+		{ -0.8f, -0.8f, 0.0f, 0xff0000ffU },
+		{  0.0f,  0.8f, 0.0f, 0xff0000ffU },
+		{  0.8f, -0.8f, 0.0f, 0xff0000ffU }
+	};
+	BufferDescriptor buffer;
+	buffer.byteCount = sizeof(vertices);
+	buffer.stride = sizeof(vertices[0]);
+	buffer.binding = RENDER_BUFFER_VERTEX;
+	buffer.usage = RENDER_USAGE_IMMUTABLE;
+	GpuHandle staticBuffer;
+	GpuHandle dynamicBuffer;
+	result |= Check(owner.Resources().CreateBuffer(buffer, vertices,
+		sizeof(vertices), &staticBuffer) == RENDER_RESULT_OK,
+		"explicit recovery retains immutable CPU-backed bytes");
+	buffer.usage = RENDER_USAGE_DYNAMIC;
+	result |= Check(owner.Resources().CreateBuffer(buffer, vertices,
+		sizeof(vertices), &dynamicBuffer) == RENDER_RESULT_OK,
+		"explicit recovery creates authoritative dynamic bytes before cancellation");
+	const unsigned int pixel = 0xffffffffU;
+	TextureDescriptor texture;
+	texture.width = texture.height = texture.mipCount = texture.arrayCount = 1;
+	texture.dimension = RENDER_TEXTURE_2D;
+	texture.format = RENDER_FORMAT_B8G8R8A8_UNORM;
+	texture.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+	texture.usage = RENDER_USAGE_IMMUTABLE;
+	TextureSubresourceData data;
+	data.data = &pixel;
+	data.rowPitch = sizeof(pixel);
+	data.slicePitch = sizeof(pixel);
+	GpuHandle textureResource;
+	NativeW3DTextureHandle retainedTexture;
+	NativeW3DSurfaceHandle oldSurface;
+	result |= Check(owner.Resources().CreateTexture(texture, &data, 1,
+		&textureResource) == RENDER_RESULT_OK &&
+		owner.Resources().AcquireTexture(textureResource, &retainedTexture) ==
+			RENDER_RESULT_OK &&
+		owner.Resources().AcquireTextureSurface(retainedTexture, 0, 0,
+			&oldSurface) == RENDER_RESULT_OK,
+		"explicit recovery retains a typed surface from the old backend epoch");
+	ThreadedRenderMetrics before;
+	result |= Check(owner.Renderer().GetThreadedMetrics(&before) &&
+		owner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+		owner.Renderer().IsFrameOpen(),
+		"explicit recovery starts with a real open producer frame");
+	const RenderResult recover = owner.RecoverDevice();
+	ThreadedRenderMetrics after;
+	result |= Check(recover == RENDER_RESULT_OK && owner.IsOperational() &&
+		!owner.Renderer().IsFrameOpen() && hook.releaseCalls == 1 &&
+		hook.reacquireCalls == 1,
+		"expected frame cancellation does not bypass lifecycle cleanup and recovery");
+	result |= Check(owner.Renderer().GetThreadedMetrics(&after) &&
+		after.submittedFrames == before.submittedFrames + 1 &&
+		after.completedFrames == before.completedFrames + 1 &&
+		after.failedFrames == before.failedFrames + 1,
+		"recovery fences exactly one canceled frame before rebuilding the backend");
+	if (recover == RENDER_RESULT_OK)
+	{
+		GpuHandle validated;
+		result |= Check(owner.Resources().AcquireVertexBufferRange(staticBuffer,
+			sizeof(vertices[0]), 0, 0, 3, &validated) == RENDER_RESULT_OK &&
+			owner.Resources().AcquireVertexBufferRange(dynamicBuffer,
+				sizeof(vertices[0]), 0, 0, 3, &validated) ==
+				RENDER_RESULT_INVALID_ARGUMENT,
+			"recovery restores immutable bytes but invalidates old dynamic authority");
+		const unsigned int oldEpoch = oldSurface.backendEpoch;
+		result |= Check(owner.Resources().AcquireTextureSurface(retainedTexture,
+			0, 0, &oldSurface) == RENDER_RESULT_INVALID_ARGUMENT &&
+			!oldSurface.isValid(),
+			"recovery rejects and clears a cached old-backend surface");
+		NativeW3DSurfaceHandle newSurface;
+		result |= Check(owner.Resources().AcquireTexture(textureResource,
+			&retainedTexture) == RENDER_RESULT_OK &&
+			owner.Resources().AcquireTextureSurface(retainedTexture, 0, 0,
+				&newSurface) == RENDER_RESULT_OK && newSurface.backendEpoch != oldEpoch,
+			"recovery reacquires CPU-backed texture authority in the new backend epoch");
+		result |= Check(owner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+			owner.Renderer().EndFrame(false) == RENDER_RESULT_OK &&
+			owner.Renderer().FinalizeEndedFrame(false) == RENDER_RESULT_OK &&
+			owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
+			"the recovered backend accepts and completes the next real frame");
+	}
+	owner.SetGameCleanupHook(0);
+	result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
+		"explicit open-frame recovery shuts down without a stranded frame reservation");
+
+	// A successful cancellation must not hide an actual recovery callback failure.
+	NativeW3D2 failingOwner;
+	ThrowingCleanupHook failingHook;
+	result |= Check(failingOwner.Initialize(window, descriptor) == RENDER_RESULT_OK,
+		"open-frame reacquire failure fixture initializes");
+	if (failingOwner.IsOperational())
+	{
+		failingOwner.SetGameCleanupHook(&failingHook);
+		failingHook.owner = &failingOwner;
+		failingHook.probeReentry = true;
+		result |= Check(failingOwner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+			failingOwner.RecoverDevice() == RENDER_RESULT_FAILED &&
+			!failingOwner.IsOperational() && !failingOwner.Renderer().IsFrameOpen() &&
+			failingHook.releaseCalls == 1 && failingHook.reacquireCalls == 1,
+			"open-frame cancellation preserves real reacquire failure and fails closed");
+		result |= Check(failingHook.releaseShutdownResult ==
+			RENDER_RESULT_INVALID_ARGUMENT && failingHook.reacquireShutdownResult ==
+			RENDER_RESULT_INVALID_ARGUMENT,
+			"open-frame recovery retains lifecycle authority across cleanup callbacks");
+		failingOwner.SetGameCleanupHook(0);
+		result |= Check(failingOwner.Shutdown() == RENDER_RESULT_OK,
+			"failed open-frame recovery still releases owner resources");
+	}
 	return result;
 }
 
@@ -2436,6 +2569,16 @@ static_assert(NativeFixtureExitCode(1, true) == 1, "failures dominate skips");
 
 int main(int argc, char **argv)
 {
+	const bool explicitSerial = argc == 2 &&
+		std::strcmp(argv[1], "--explicit-open-recovery-serial") == 0;
+	const bool explicitParallel = argc == 2 &&
+		std::strcmp(argv[1], "--explicit-open-recovery-parallel") == 0;
+	// Startup policy is immutable after any execution owner starts. Run each
+	// production mode in its own process, before even the invalid-window probe.
+	if ((explicitSerial || explicitParallel) &&
+		!rts::SetPipelineExecutionMode(explicitSerial ?
+			rts::PIPELINE_EXECUTION_SERIAL : rts::PIPELINE_EXECUTION_PARALLEL))
+		return 1;
 	int result = 0;
 	bool skipped = false;
 	NativeW3D2 w3d;
@@ -2455,6 +2598,12 @@ int main(int argc, char **argv)
 	{
 		std::fprintf(stderr, "FAIL: could not create hidden native window\n");
 		return 1;
+	}
+	if (explicitSerial || explicitParallel)
+	{
+		const int recoveryResult = TestExplicitRecoveryWithOpenFrame(window);
+		DestroyWindow(window);
+		return recoveryResult;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--cpu-sorting-immediate") == 0)
 	{
