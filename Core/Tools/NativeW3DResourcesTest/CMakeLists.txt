@@ -49,3 +49,11 @@ set_target_properties(core_native_d3d11_smudge_copy_tests PROPERTIES
 add_test(NAME core_native_d3d11_smudge_copy_tests
     COMMAND core_native_d3d11_smudge_copy_tests)
 set_tests_properties(core_native_d3d11_smudge_copy_tests PROPERTIES TIMEOUT 30)
+
+add_executable(core_native_d3d11_copy_recovery_tests D3D11CopyRecoveryTest.cpp)
+target_link_libraries(core_native_d3d11_copy_recovery_tests PRIVATE core_renderer)
+set_target_properties(core_native_d3d11_copy_recovery_tests PROPERTIES
+    CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+add_test(NAME core_native_d3d11_copy_recovery_tests
+    COMMAND core_native_d3d11_copy_recovery_tests)
+set_tests_properties(core_native_d3d11_copy_recovery_tests PROPERTIES TIMEOUT 60)

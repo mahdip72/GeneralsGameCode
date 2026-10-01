@@ -1459,7 +1459,14 @@ public:
 		{
 			m_context->CopyResource(destinationTexture, sourceTexture);
 		}
-		const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+		// Once a copy or resolve has been issued its outcome may be unknown if
+		// removal is reported below. The prior upload is no longer a valid recovery
+		// image, even when this call cannot publish a successful content lease.
+		markTextureRecoverySourceUnavailable(destination);
+		RenderResult injectedResult = RENDER_RESULT_OK;
+		const HRESULT deviceResult = consumeResourceFault(
+			RENDER_RESOURCE_FAULT_TEXTURE_COPY_AFTER_ISSUE, &injectedResult) ?
+			TranslateInjectedFault(injectedResult) : m_device->GetDeviceRemovedReason();
 		destinationTexture->Release();
 		sourceTexture->Release();
 		if (FAILED(deviceResult))
@@ -1467,16 +1474,6 @@ public:
 			return TranslateResult(deviceResult);
 		}
 
-		// CopyResource makes the destination GPU-authoritative.  Any creation or
-		// refresh bytes retained before this point describe an older CPU upload and
-		// would restore stale pixels after device recovery.  Clear them now and
-		// let recreateTexture establish a deterministic cleared resource; the
-		// producer will repopulate it on the next render pass.
-		destination.gpuAuthoritative = true;
-		destination.shadow.clear();
-		destination.subresourceOffsets.clear();
-		destination.subresourceRowPitches.clear();
-		destination.subresourceSlicePitches.clear();
 		return rebindTextureResource(texture, reboundStages);
 	}
 
@@ -3433,7 +3430,7 @@ public:
 			return RENDER_RESULT_OK;
 		}
 		if (point < RENDER_RESOURCE_FAULT_TEXTURE_ALLOCATION ||
-			point > RENDER_RESOURCE_FAULT_RESIZE_TARGETS_RECOVERY_FAILURE ||
+			point > RENDER_RESOURCE_FAULT_TEXTURE_COPY_AFTER_ISSUE ||
 			failOnInvocation == 0 ||
 			(result != RENDER_RESULT_OUT_OF_MEMORY &&
 			 result != RENDER_RESULT_DEVICE_REMOVED &&
@@ -3896,11 +3893,9 @@ private:
 
 	void markTextureRecoverySourceUnavailable(ResourceSlot &slot)
 	{
-		// A refresh can fail after one or more subresources have already been
-		// written.  The native resource is then neither the previous complete
-		// image nor the newly requested complete image.  Retaining the previous
-		// shadow would make device recovery restore stale bytes over that partial
-		// update, so force deterministic clear/repopulation instead.
+		// An issued refresh/copy can fail after GPU writes. Its prior CPU shadow
+		// must not be replayed over an unknown or partially updated image during
+		// recovery; force deterministic output clear/repopulation instead.
 		slot.gpuAuthoritative = true;
 		slot.shadow.clear();
 		slot.subresourceOffsets.clear();

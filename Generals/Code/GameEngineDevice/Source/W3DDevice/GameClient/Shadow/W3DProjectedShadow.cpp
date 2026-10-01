@@ -356,6 +356,8 @@ W3DProjectedShadowManager::W3DProjectedShadowManager()
 	m_numDecalShadows = 0;
 	m_numProjectionShadows  = 0;
 	m_W3DShadowTextureManager = nullptr;
+	m_dynamicRenderTarget = nullptr;
+	m_dynamicDepthTarget = nullptr;
 	m_shadowCamera = nullptr;
 	m_shadowContext= nullptr;
 	m_drawEdgeX = 0;
@@ -369,6 +371,7 @@ W3DProjectedShadowManager::~W3DProjectedShadowManager()
 
 	ReleaseResources();
 	m_dynamicRenderTarget = nullptr;
+	m_dynamicDepthTarget = nullptr;
 	m_renderTargetHasAlpha = FALSE;
 	delete m_shadowContext;
 	REF_PTR_RELEASE(m_shadowCamera);
@@ -408,9 +411,21 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 
 	///@todo: We should allocate our render target pool here.
 
-	DEBUG_ASSERTCRASH(m_dynamicRenderTarget == nullptr, ("Acquire of existing shadow render target"));
+	DEBUG_ASSERTCRASH(m_dynamicRenderTarget == nullptr &&
+		m_dynamicDepthTarget == nullptr, ("Acquire of existing shadow render target"));
 
 	m_renderTargetHasAlpha=TRUE;
+	#if defined(_WIN64)
+	{
+		// The native capture cannot attach the larger swap-chain depth target.
+		// Reacquisition runs while the native owner is not operational, so choose
+		// the same-size color/depth pair at build time, as in Zero Hour.
+		(void)rts::render::CreateGameRenderTargetPair(
+			DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT,
+			WW3D_FORMAT_A8R8G8B8, WW3D_ZFORMAT_D24S8,
+			&m_dynamicRenderTarget, &m_dynamicDepthTarget);
+	}
+	#else
 	if ((m_dynamicRenderTarget=rts::render::CreateGameRenderTarget(
 		DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT,
 		WW3D_FORMAT_A8R8G8B8)) == nullptr)
@@ -423,12 +438,18 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 				DEFAULT_RENDER_TARGET_WIDTH, DEFAULT_RENDER_TARGET_HEIGHT,
 				WW3D_FORMAT_UNKNOWN);
 	}
+	#endif
 
 	if (m_dynamicRenderTarget == nullptr ||
 		!m_dynamicRenderTarget->Is_Initialized() ||
+		#if defined(_WIN64)
+		(m_dynamicDepthTarget == nullptr ||
+		 !m_dynamicDepthTarget->Is_Initialized()) ||
+		#endif
 		!rts::render::IsGameRendererInitialized())
 	{
 		REF_PTR_RELEASE(m_dynamicRenderTarget);
+		REF_PTR_RELEASE(m_dynamicDepthTarget);
 		return FALSE;
 	}
 
@@ -465,7 +486,16 @@ Bool W3DProjectedShadowManager::ReAcquireResources()
 void W3DProjectedShadowManager::ReleaseResources()
 {
 	invalidateCachedLightPositions();	//textures need to be updated
+	#if defined(_WIN64)
+	// Drop each projector's retained scratch pair before the native rebuild.
+	for (W3DProjectedShadow *shadow = m_shadowList; shadow; shadow = shadow->m_next)
+	{
+		if (shadow->m_shadowProjector != nullptr)
+			shadow->m_shadowProjector->Set_Render_Target(nullptr, nullptr);
+	}
+	#endif
 	REF_PTR_RELEASE(m_dynamicRenderTarget);	//need to create a new render target
+	REF_PTR_RELEASE(m_dynamicDepthTarget);
 	REF_PTR_RELEASE(shadowDecalIndexBufferOwner);
 	REF_PTR_RELEASE(shadowDecalVertexBufferOwner);
 }
@@ -2750,7 +2780,9 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 		objToLight =  objPos + objToLight * 2000.0f;
 
 		m_shadowProjector->Compute_Perspective_Projection(m_robj,objToLight);
-		m_shadowProjector->Set_Render_Target(TheW3DProjectedShadowManager->getRenderTarget());
+		m_shadowProjector->Set_Render_Target(
+			TheW3DProjectedShadowManager->getRenderTarget(),
+			TheW3DProjectedShadowManager->getDepthTarget());
 
 		//Set ambient to 0, so we get a black shadow on solid background
 
@@ -2764,8 +2796,17 @@ void W3DProjectedShadow::updateTexture(Vector3 &lightPos)
 		// Compute_Texture owns the native copy and publication boundary.  A
 		// failed copy returns false and leaves the light history unchanged, so
 		// the next update retries without a second acquire of the same lease.
-		if (!m_shadowProjector->Compute_Texture(m_robj,context,
-				native_renderer_active ? shadow_texture : nullptr))
+		const bool computed = m_shadowProjector->Compute_Texture(m_robj,context,
+			native_renderer_active ? shadow_texture : nullptr);
+		if (native_renderer_active)
+		{
+			// Set_Render_Target also selects the shared scratch target as this
+			// projector material's sampler. The native capture is copied into a
+			// distinct per-shadow texture; restore that sampler before terrain
+			// and object shadow passes (including after a failed capture).
+			m_shadowProjector->Set_Texture(shadow_texture);
+		}
+		if (!computed)
 		{
 			return;
 		}
