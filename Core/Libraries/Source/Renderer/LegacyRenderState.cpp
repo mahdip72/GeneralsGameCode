@@ -728,6 +728,18 @@ bool GetTrackedLegacyTextureStage(unsigned int index,
 	return true;
 }
 
+bool GetTrackedLegacyTextureStageIfValid(unsigned int index,
+	LegacyTextureStageState *textureStage)
+{
+	if (index >= LEGACY_TEXTURE_STAGE_COUNT || textureStage == 0 ||
+		!g_trackedPipelineStateValid)
+	{
+		return false;
+	}
+	*textureStage = g_trackedLogicalState.pipeline.textureStages[index];
+	return true;
+}
+
 void Publish_Render_Texture_Stage(unsigned int stage,
 	TextureBaseClass *texture)
 {

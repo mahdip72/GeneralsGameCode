@@ -1718,11 +1718,12 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		{
-			LegacyPipelineState pipeline;
-			if (!GetTrackedLegacyPipelineState(&pipeline))
-				pipeline = LegacyPipelineState();
-			LegacyTextureStageState &stage =
-				pipeline.textureStages[command.value0];
+			LegacyTextureStageState stage;
+			if (!GetTrackedLegacyTextureStageIfValid(command.value0, &stage))
+			{
+				LegacyPipelineState defaults;
+				stage = defaults.textureStages[command.value0];
+			}
 			RenderTextureArgument argument;
 			bool complement = false;
 			bool alphaReplicate = false;

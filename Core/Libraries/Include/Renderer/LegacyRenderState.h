@@ -483,6 +483,8 @@ bool TrackLegacyTextureStage(unsigned int index,
 	const LegacyTextureStageState &textureStage);
 bool GetTrackedLegacyTextureStage(unsigned int index,
 	LegacyTextureStageState *textureStage);
+bool GetTrackedLegacyTextureStageIfValid(unsigned int index,
+	LegacyTextureStageState *textureStage);
 bool TrackLegacyTexturePresence(unsigned int index, bool present);
 void TrackLegacyFog(const LegacyFogConstants &fog);
 bool TrackLegacyClipPlane(unsigned int index, const float *plane);
