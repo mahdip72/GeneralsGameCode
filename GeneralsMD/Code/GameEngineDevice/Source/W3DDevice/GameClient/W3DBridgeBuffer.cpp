@@ -691,6 +691,9 @@ void W3DBridgeBuffer::loadBridgesInVertexAndIndexBuffers(RefRenderObjListIterato
 	}
 	m_curNumBridgeVertices = 0;
 	m_curNumBridgeIndices = 0;
+	if (m_numBridges == 0) {
+		return;
+	}
 	VertexFormatXYZNDUV1 *vb;
 	UnsignedShort *ib;
 	// Lock the buffers.
