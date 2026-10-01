@@ -370,11 +370,16 @@ RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 		// authoritative shadow before a write has been accepted.
 		memset(m_authoritative, 0, m_authoritativeBytes);
 	}
-	memset(m_staging, 0, byteCount);
 	if (mode != RENDER_BUFFER_UPDATE_DISCARD && m_authoritative != 0 &&
 		m_authoritativeBytes == m_descriptor.byteCount)
 	{
+		// This complete authoritative copy initializes the requested range;
+		// clearing it first only writes the same staging bytes twice.
 		memcpy(m_staging, m_authoritative + destinationOffset, byteCount);
+	}
+	else
+	{
+		memset(m_staging, 0, byteCount);
 	}
 	m_lockOffset = destinationOffset;
 	m_lockBytes = byteCount;

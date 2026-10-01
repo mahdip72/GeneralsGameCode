@@ -983,8 +983,9 @@ int main(int argc, char **argv)
 	result |= Check(dynamicBuffer.Lock(8, 8,
 		RENDER_BUFFER_UPDATE_NO_OVERWRITE, &bytes) == RENDER_RESULT_OK &&
 		bytes == dynamicStaging &&
+		std::memcmp(bytes, dynamicBytes + 8, 8) == 0 &&
 		NativeW3DBufferOwnerTestAccess::StagingCapacity(dynamicBuffer) == 8,
-		"dynamic buffer reuses staging for a same-sized no-overwrite upload");
+		"dynamic no-overwrite reuses staging and seeds the exact authoritative range");
 	Fill(bytes, 8, 0x33);
 	std::memset(dynamicBytes + 8, 0x33, 8);
 	result |= Check(dynamicBuffer.Unlock() == RENDER_RESULT_OK &&
