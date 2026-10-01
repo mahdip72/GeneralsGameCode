@@ -56,6 +56,7 @@
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "Renderer/RenderGameClient.h"
 #include "Lib/FrameTimingDiagnostics.h"
+#include "Lib/ShadowCounterDiagnostics.h"
 #include "WW3D2/camera.h"
 #include "WW3D2/light.h"
 #include "WW3D2/matpass.h"
@@ -1022,6 +1023,8 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 			rts::frame_timing::SceneShadowRender, frameTimingActive);
 		rts::frame_timing::ConditionalScope projectedTiming(
 			rts::frame_timing::SceneProjectedShadows, frameTimingActive);
+		rts::shadow_counters::Scope projectedCounters(
+			rts::shadow_counters::Projected, frameTimingActive);
 		DoShadows(rinfo, false);	//draw all non-stencil shadows (decals) since they fall under other objects.
 	}
 
@@ -1060,6 +1063,8 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 			rts::frame_timing::SceneShadowRender, frameTimingActive);
 		rts::frame_timing::ConditionalScope volumeTiming(
 			rts::frame_timing::SceneVolumeShadows, frameTimingActive);
+		rts::shadow_counters::Scope volumeCounters(
+			rts::shadow_counters::Volume, frameTimingActive);
 		DoShadows(rinfo, true);	//draw all stencil shadows
 	}
 

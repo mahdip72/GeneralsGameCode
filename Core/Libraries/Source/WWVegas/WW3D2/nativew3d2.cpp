@@ -7,6 +7,7 @@
 #include "Renderer/LegacyAsyncFramePolicy.h"
 
 #include "Renderer/LegacyBridgeValidation.h"
+#include "Lib/ShadowCounterDiagnostics.h"
 #include "dx8indexbuffer.h"
 #include "nativew3dbufferowner.h"
 #include "nativew3dtextureowner.h"
@@ -1711,6 +1712,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		return RENDER_RESULT_OK;
 
 	case GAME_RENDER_COMMAND_SET_TEXTURE_STAGE_STATE:
+		rts::shadow_counters::TextureState(command.value1);
 		if (command.value0 >= LEGACY_TEXTURE_STAGE_COUNT || command.value1 >
 			static_cast<unsigned int>(GAME_TEXTURE_STAGE_MAX_MIP_LEVEL))
 		{
@@ -2932,6 +2934,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	rts::shadow_counters::RenderState(state);
 
 	rts::render::LegacyPipelineState pipeline;
 	if (!rts::render::GetTrackedLegacyPipelineState(&pipeline))
@@ -3432,12 +3435,15 @@ rts::render::RenderResult NativeW3D2::SubmitGamePacket(
 			packet);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	if (textureBindingCache != 0 || sortedBatchBindingCache != 0)
-	{
-		return m_renderer.SubmitInternal(m_resources, state, packet, true,
-			textureBindingCache, sortedBatchBindingCache);
-	}
-	return m_renderer.Submit(m_resources, state, packet);
+	const rts::render::RenderResult result =
+		textureBindingCache != 0 || sortedBatchBindingCache != 0 ?
+		m_renderer.SubmitInternal(m_resources, state, packet, true,
+			textureBindingCache, sortedBatchBindingCache) :
+		m_renderer.Submit(m_resources, state, packet);
+	if (result == rts::render::RENDER_RESULT_OK)
+		rts::shadow_counters::AcceptedDraw(packet.indexCount,
+			packet.vertexCount);
+	return result;
 }
 
 rts::render::RenderResult NativeW3D2::SubmitGameTriangles(
