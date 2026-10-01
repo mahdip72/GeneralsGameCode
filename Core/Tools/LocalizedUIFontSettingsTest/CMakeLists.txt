@@ -102,6 +102,49 @@ if(WIN32 AND NOT IS_VS6_BUILD)
             add_test(NAME core_resolution_refresh_callback_tests
                 COMMAND core_resolution_refresh_callback_tests)
         endif()
+
+        set(_global_language_reload_generals_fragment
+            "${CMAKE_CURRENT_BINARY_DIR}/GlobalLanguageReload_Generals.inl")
+        set(_global_language_reload_generalsmd_fragment
+            "${CMAKE_CURRENT_BINARY_DIR}/GlobalLanguageReload_GeneralsMD.inl")
+
+        add_custom_command(
+            OUTPUT
+                "${_global_language_reload_generals_fragment}"
+                "${_global_language_reload_generalsmd_fragment}"
+            COMMAND "${LOCALIZED_UI_FONT_POWERSHELL}"
+                -NoProfile -ExecutionPolicy Bypass
+                -File "${CMAKE_CURRENT_SOURCE_DIR}/ExtractGlobalLanguageReloadMethods.ps1"
+                -SourceRoot "${CMAKE_SOURCE_DIR}"
+                -OutputDirectory "${CMAKE_CURRENT_BINARY_DIR}"
+            DEPENDS
+                "${CMAKE_CURRENT_SOURCE_DIR}/ExtractGlobalLanguageReloadMethods.ps1"
+                "${CMAKE_CURRENT_SOURCE_DIR}/GlobalLanguageReloadMockTypes.inl"
+                "${CMAKE_CURRENT_SOURCE_DIR}/GlobalLanguageReloadAssertions.inl"
+                "${CMAKE_SOURCE_DIR}/Core/GameEngine/Source/GameClient/GlobalLanguage.cpp"
+                "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include/GameClient/GlobalLanguage.h"
+                "${CMAKE_SOURCE_DIR}/Generals/Code/GameEngine/Include/GameClient/FontDesc.h"
+                "${CMAKE_SOURCE_DIR}/GeneralsMD/Code/GameEngine/Include/GameClient/FontDesc.h"
+            VERBATIM
+        )
+
+        add_custom_target(core_global_language_reload_fragments
+            DEPENDS
+                "${_global_language_reload_generals_fragment}"
+                "${_global_language_reload_generalsmd_fragment}"
+        )
+
+        add_executable(core_global_language_reload_tests
+            GlobalLanguageReloadTest.cpp
+        )
+        add_dependencies(core_global_language_reload_tests
+            core_global_language_reload_fragments)
+        target_include_directories(core_global_language_reload_tests PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_BINARY_DIR}")
+        target_compile_features(core_global_language_reload_tests PRIVATE cxx_std_20)
+        add_test(NAME core_global_language_reload_tests
+            COMMAND core_global_language_reload_tests)
     endif()
 endif()
 

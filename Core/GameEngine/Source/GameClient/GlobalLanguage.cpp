@@ -120,17 +120,39 @@ void INI::parseLanguageDefinition( INI *ini )
 	ini->initFromINI( TheGlobalLanguageData, TheGlobalLanguageDataFieldParseTable );
 }
 
+static void resetLanguageDefinitionDefaults(GlobalLanguage *globalLanguage)
+{
+	globalLanguage->m_unicodeFontName.clear();
+	globalLanguage->m_unicodeFontFileName.clear();
+	globalLanguage->m_militaryCaptionSpeed = 0;
+	globalLanguage->m_useHardWrap = FALSE;
+	globalLanguage->m_resolutionFontSizeAdjustment = 0.7f;
+	globalLanguage->m_resolutionFontSizeMethod = GlobalLanguage::ResolutionFontSizeMethod_Default;
+	globalLanguage->m_militaryCaptionDelayMS = 750;
+
+	const FontDesc defaultFont;
+	globalLanguage->m_copyrightFont = defaultFont;
+	globalLanguage->m_messageFont = defaultFont;
+	globalLanguage->m_militaryCaptionTitleFont = defaultFont;
+	globalLanguage->m_militaryCaptionFont = defaultFont;
+	globalLanguage->m_superweaponCountdownNormalFont = defaultFont;
+	globalLanguage->m_superweaponCountdownReadyFont = defaultFont;
+	globalLanguage->m_namedTimerCountdownNormalFont = defaultFont;
+	globalLanguage->m_namedTimerCountdownReadyFont = defaultFont;
+	globalLanguage->m_drawableCaptionFont = defaultFont;
+	globalLanguage->m_defaultWindowFont = defaultFont;
+	globalLanguage->m_defaultDisplayStringFont = defaultFont;
+	globalLanguage->m_tooltipFontName = defaultFont;
+	globalLanguage->m_nativeDebugDisplay = defaultFont;
+	globalLanguage->m_drawGroupInfoFont = defaultFont;
+	globalLanguage->m_creditsTitleFont = defaultFont;
+	globalLanguage->m_creditsPositionFont = defaultFont;
+	globalLanguage->m_creditsNormalFont = defaultFont;
+}
+
 GlobalLanguage::GlobalLanguage()
 {
-	m_unicodeFontName.clear();
-	m_unicodeFontFileName.clear();
-	m_unicodeFontName.clear();
-	m_militaryCaptionSpeed = 0;
-	m_useHardWrap = FALSE;
-	m_resolutionFontSizeAdjustment = 0.7f;
-	m_resolutionFontSizeMethod = ResolutionFontSizeMethod_Default;
-	m_militaryCaptionDelayMS = 750;
-
+	resetLanguageDefinitionDefaults(this);
 	m_userResolutionFontSizeAdjustment = -1.0f;
 }
 
@@ -188,8 +210,7 @@ void GlobalLanguage::onResolutionChanged()
 		++it;
 	}
 	m_localFonts.clear();
-	m_resolutionFontSizeAdjustment = 0.7f;
-	m_resolutionFontSizeMethod = ResolutionFontSizeMethod_Default;
+	resetLanguageDefinitionDefaults(this);
 	init();
 	parseCustomDefinition();
 }
