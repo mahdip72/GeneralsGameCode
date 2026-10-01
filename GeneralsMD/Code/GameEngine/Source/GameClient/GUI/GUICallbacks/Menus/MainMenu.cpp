@@ -732,6 +732,9 @@ void DeclineResolution()
 		TheShell->recreateWindowLayouts();
 
 		TheInGameUI->recreateControlBar();
+#if defined(_WIN64)
+		TheInGameUI->refreshLocalizedFontResources();
+#endif
 	}
 }
 

@@ -71,6 +71,7 @@ set(GAMEENGINE_SRC
 #    Include/Common/KindOf.h
 #    Include/Common/LadderPreferences.h
     Include/Common/Language.h
+    Include/Common/LocalizedUIFontSettings.h
 #    Include/Common/LatchRestore.h
 #    Include/Common/List.h
     Include/Common/LocalFile.h

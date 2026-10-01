@@ -36,6 +36,7 @@ endif()
 
 # Build less useful tool/test binaries.
 if(RTS_BUILD_CORE_EXTRAS)
+    add_subdirectory(LocalizedUIFontSettingsTest)
     add_subdirectory(TestSupport)
     if(WIN32 AND NOT IS_VS6_BUILD)
         add_subdirectory(LauncherProcessContractTest)
