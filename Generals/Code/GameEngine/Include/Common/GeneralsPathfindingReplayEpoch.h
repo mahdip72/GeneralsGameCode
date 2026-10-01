@@ -70,7 +70,7 @@ inline Int GetGeneralsPathfindingRecordingEpoch(Int originalGameMode,
 {
 	return nativeRuntime && !networkGame &&
 		aiPlanningEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT &&
-		ShouldMarkGeneralsAICanonicalRecording(originalGameMode, true) ?
+		(originalGameMode == GAME_SINGLE_PLAYER || originalGameMode == GAME_SKIRMISH) ?
 		GENERALS_PATHFINDING_REPLAY_EPOCH_CURRENT :
 		GENERALS_PATHFINDING_REPLAY_EPOCH_LEGACY;
 }
@@ -78,8 +78,10 @@ inline Int GetGeneralsPathfindingRecordingEpoch(Int originalGameMode,
 inline Int GetGeneralsPathfindingPlaybackEpoch(const WideChar *versionTimeString,
 	Int originalGameMode, Bool nativeRuntime)
 {
+	// Pathfinding retains its independent local-only epoch contract. Network AI
+	// recordings being current must not enable network pathfinding playback.
 	return nativeRuntime &&
-		ShouldMarkGeneralsAICanonicalRecording(originalGameMode, true) ?
+		(originalGameMode == GAME_SINGLE_PLAYER || originalGameMode == GAME_SKIRMISH) ?
 		GetGeneralsPathfindingReplayEpoch(versionTimeString) :
 		GENERALS_PATHFINDING_REPLAY_EPOCH_LEGACY;
 }

@@ -162,9 +162,9 @@ void TestTopologyAndReplayGates()
 	// the current canonical epoch. Legacy/unmarked replay remains gated off.
 	assert(ShouldUseGeneralsAICanonicalPlanning(
 		true, false, false, false, true));
-	assert(!ShouldUseGeneralsAICanonicalPlanning(
-		false, true, false, false, true));
 	assert(ShouldUseGeneralsAICanonicalPlanning(
+		false, true, false, false, true));
+	assert(!ShouldUseGeneralsAICanonicalPlanning(
 		false, true, false, true, false));
 	assert(!ShouldUseGeneralsAICanonicalPlanning(
 		false, false, true, false, true));
@@ -176,8 +176,8 @@ void TestTopologyAndReplayGates()
 	assert(ShouldMarkGeneralsAICanonicalRecording(
 		GAME_SINGLE_PLAYER, true));
 	assert(ShouldMarkGeneralsAICanonicalRecording(GAME_SKIRMISH, true));
-	assert(!ShouldMarkGeneralsAICanonicalRecording(GAME_LAN, true));
-	assert(!ShouldMarkGeneralsAICanonicalRecording(GAME_INTERNET, true));
+	assert(ShouldMarkGeneralsAICanonicalRecording(GAME_LAN, true));
+	assert(ShouldMarkGeneralsAICanonicalRecording(GAME_INTERNET, true));
 	assert(!ShouldMarkGeneralsAICanonicalRecording(
 		GAME_SINGLE_PLAYER, false));
 	assert(!ShouldMarkGeneralsAICanonicalRecording(GAME_SKIRMISH, false));
@@ -186,10 +186,55 @@ void TestTopologyAndReplayGates()
 	assert(GetGeneralsAIRecordingEpoch(GAME_SKIRMISH, true) ==
 		SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
 	assert(GetGeneralsAIRecordingEpoch(GAME_LAN, true) ==
-		SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+		SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
 	assert(GetGeneralsAIRecordingEpoch(GAME_INTERNET, true) ==
-		SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+		SKIRMISH_AI_REPLAY_EPOCH_CURRENT);
 	SetGeneralsAICanonicalRuntimeEpoch(false);
+}
+
+void TestLiveRecordingAndPlaybackEpochMatrix()
+{
+	const Int gameModes[] =
+		{ GAME_SINGLE_PLAYER, GAME_SKIRMISH, GAME_LAN, GAME_INTERNET };
+	for (unsigned mode = 0; mode < sizeof(gameModes) / sizeof(gameModes[0]); ++mode)
+		for (unsigned runtime = 0; runtime < 2; ++runtime)
+			for (unsigned recording = 0; recording < 2; ++recording)
+				for (unsigned playback = 0; playback < 2; ++playback)
+					for (unsigned marker = 0; marker < 2; ++marker)
+					{
+						const Bool network = gameModes[mode] == GAME_LAN ||
+							gameModes[mode] == GAME_INTERNET;
+						assert(ShouldUseGeneralsAICanonicalPlanning(network,
+							recording != 0, playback != 0, marker != 0, runtime != 0) ==
+							(playback != 0 ? marker != 0 : runtime != 0));
+						assert(GetGeneralsAIRecordingEpoch(gameModes[mode], runtime != 0) ==
+							(runtime != 0 ? SKIRMISH_AI_REPLAY_EPOCH_CURRENT :
+								SKIRMISH_AI_REPLAY_EPOCH_LEGACY));
+					}
+	const Int invalidModes[] = { GAME_REPLAY, GAME_SHELL, GAME_NONE, -1, 999 };
+	for (unsigned mode = 0; mode < sizeof(invalidModes) / sizeof(invalidModes[0]); ++mode)
+		assert(!ShouldMarkGeneralsAICanonicalRecording(invalidModes[mode], true));
+	const rts::SimulationExecutionMode executionModes[] =
+		{ rts::SIMULATION_EXECUTION_SERIAL, rts::SIMULATION_EXECUTION_PARALLEL,
+			rts::SIMULATION_EXECUTION_SHADOW };
+	for (unsigned blocked = 0; blocked < 2; ++blocked)
+		for (unsigned ready = 0; ready < 2; ++ready)
+			for (unsigned workers = 1; workers <= 2; ++workers)
+				for (unsigned mode = 0; mode < 3; ++mode)
+				{
+					const rts::AIPlanningExecutionMode actual =
+						GetGeneralsAIPlanningExecutionMode(blocked != 0,
+							executionModes[mode], workers, ready != 0);
+					const Bool serial = blocked != 0 || ready == 0 || workers < 2 ||
+						executionModes[mode] == rts::SIMULATION_EXECUTION_SERIAL;
+					assert((actual == rts::AI_PLANNING_EXECUTION_SERIAL) == serial);
+					// A closed/open recorder and unavailable worker permission cannot
+					// change the current live owner oracle or authorize legacy playback.
+					assert(ShouldUseGeneralsAICanonicalPlanning(true, true,
+						false, false, true));
+					assert(!ShouldUseGeneralsAICanonicalPlanning(true, true,
+						true, false, true));
+				}
 }
 
 void MakeEnemySnapshot(GeneralsAIEnemyPlanningSnapshot *snapshot,
@@ -807,6 +852,7 @@ int main()
 #endif
 	TestGeneralsPathfindingReplayEpochContract();
 	TestTopologyAndReplayGates();
+	TestLiveRecordingAndPlaybackEpochMatrix();
 	TestGeneralsScoringAndUntrustedResults();
 	TestRetailOrderedInitialEnemyProjection();
 	TestCanonicalBatchAcrossTopologiesAndFailure();

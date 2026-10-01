@@ -22,9 +22,11 @@ inline Bool ShouldMarkGeneralsAICanonicalRecording(
 	{
 		case GAME_SINGLE_PLAYER:
 		case GAME_SKIRMISH:
-			return true;
 		case GAME_LAN:
 		case GAME_INTERNET:
+			// Fresh native network games use this same epoch even when negotiated
+			// worker admission falls back to the canonical owner implementation.
+			return true;
 		case GAME_REPLAY:
 		case GAME_SHELL:
 		case GAME_NONE:

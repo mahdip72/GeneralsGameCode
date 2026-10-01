@@ -298,7 +298,86 @@ function Test-RecorderContent {
     return @($violations)
 }
 
+function Test-AIRecordingEpochWiring {
+    param([string]$Recorder, [string]$AI, [bool]$Generals)
+    $violations = New-Object 'System.Collections.Generic.List[string]'
+    $start = Get-FunctionBody $Recorder 'void RecorderClass::startRecording('
+    $marker = if ($Generals) { 'MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);' }
+        else { '::MarkReplayVersionForSkirmishAIRecordingEpoch(versionTimeString);' }
+    $markerIndex = $start.IndexOf($marker, [StringComparison]::Ordinal)
+    $writeIndex = $start.IndexOf('writeNativeReplayWideString(m_file, versionTimeString.str())', [StringComparison]::Ordinal)
+    if ($markerIndex -lt 0 -or $writeIndex -le $markerIndex) {
+        $violations.Add('AI recording marker must precede serialization of the actual build-time field')
+    }
+    if ($Generals) {
+        if (-not [regex]::IsMatch($start,
+            'm_skirmishAIReplayEpoch\s*=\s*GetGeneralsAIRecordingEpoch\(originalGameMode,\s*IsGeneralsAICanonicalRuntimeEpoch\(\)\)')) {
+            $violations.Add('Generals recorder must select its AI epoch from the actual original game mode and runtime')
+        }
+        $guard = Get-FunctionBody $start 'if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT)'
+        if ($guard.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
+            $violations.Add('Generals must mark only a selected current AI recording epoch')
+        }
+        $gate = Get-FunctionBody $AI 'Bool ShouldUseCanonicalEnemyPlanning()'
+        if (-not [regex]::IsMatch($gate,
+            'ShouldUseGeneralsAICanonicalPlanning\(\s*TheGameLogic->isInMultiplayerGame\(\),\s*recording,\s*TheGameLogic->isInReplayGame\(\),\s*replayCurrent,\s*IsGeneralsAICanonicalRuntimeEpoch\(\)\)') -or
+            $gate.IndexOf('TheRecorder->hasOpenRecordingFile()', [StringComparison]::Ordinal) -lt 0 -or
+            $gate.IndexOf('TheRecorder->replayUsesSkirmishAIDeterministicPlanning()', [StringComparison]::Ordinal) -lt 0) {
+            $violations.Add('Generals live AI must call the tested runtime/playback policy with actual recorder state')
+        }
+        $batch = Get-FunctionBody $AI 'Bool RunSkirmishEnemyPlanningBatch()'
+        if (-not [regex]::IsMatch($batch, 'if\s*\(!ShouldUseCanonicalEnemyPlanning\(\)\)')) {
+            $violations.Add('Generals actual AI snapshot batch must consume its canonical epoch gate')
+        }
+    } else {
+        $gate = Get-FunctionBody $AI 'Bool ShouldRunCounterBasedEnemyPlanning()'
+        if (-not [regex]::IsMatch($gate,
+            'ShouldUseSkirmishAICounterRng\(\s*TheGameLogic->isInReplayGame\(\),') -or
+            $gate.IndexOf('hasOpenRecordingFile', [StringComparison]::Ordinal) -ge 0) {
+            $violations.Add('MD live counter-RNG must remain playback-gated, not recording-gated')
+        }
+    }
+    return @($violations)
+}
+
 if ($SelfTest) {
+    $goodGeneralsRecording = @'
+void RecorderClass::startRecording() {
+  m_skirmishAIReplayEpoch = GetGeneralsAIRecordingEpoch(originalGameMode, IsGeneralsAICanonicalRuntimeEpoch());
+  if (m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_CURRENT) {
+    MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);
+  }
+  writeNativeReplayWideString(m_file, versionTimeString.str());
+}
+'@
+    $goodGeneralsAI = @'
+Bool ShouldUseCanonicalEnemyPlanning() {
+  const Bool recording = TheRecorder && TheRecorder->hasOpenRecordingFile();
+  const Bool replayCurrent = TheRecorder && TheRecorder->replayUsesSkirmishAIDeterministicPlanning();
+  return ShouldUseGeneralsAICanonicalPlanning(TheGameLogic->isInMultiplayerGame(), recording,
+    TheGameLogic->isInReplayGame(), replayCurrent, IsGeneralsAICanonicalRuntimeEpoch());
+}
+Bool RunSkirmishEnemyPlanningBatch() { if (!ShouldUseCanonicalEnemyPlanning()) return true; }
+'@
+    if ((Test-AIRecordingEpochWiring $goodGeneralsRecording $goodGeneralsAI $true).Count -ne 0) {
+        throw 'known-good Generals AI recorder wiring rejected'
+    }
+    foreach ($mutation in @(
+        @($goodGeneralsRecording.Replace('IsGeneralsAICanonicalRuntimeEpoch()', 'true'), $goodGeneralsAI),
+        @($goodGeneralsRecording, $goodGeneralsAI.Replace('TheGameLogic->isInReplayGame()', 'recording')),
+        @($goodGeneralsRecording.Replace('MarkReplayVersionForSkirmishAICurrentEpoch(versionTimeString);', ''), $goodGeneralsAI),
+        @($goodGeneralsRecording, $goodGeneralsAI.Replace('if (!ShouldUseCanonicalEnemyPlanning())', 'if (false)'))
+    )) {
+        if ((Test-AIRecordingEpochWiring $mutation[0] $mutation[1] $true).Count -eq 0) {
+            throw 'mutated Generals AI recorder wiring was not rejected'
+        }
+    }
+    $goodMDRecording = 'void RecorderClass::startRecording() { ::MarkReplayVersionForSkirmishAIRecordingEpoch(versionTimeString); writeNativeReplayWideString(m_file, versionTimeString.str()); }'
+    $goodMDAI = 'Bool ShouldRunCounterBasedEnemyPlanning() { return ShouldUseSkirmishAICounterRng(TheGameLogic->isInReplayGame(), epoch); }'
+    if ((Test-AIRecordingEpochWiring $goodMDRecording $goodMDAI $false).Count -ne 0 -or
+        (Test-AIRecordingEpochWiring $goodMDRecording ($goodMDAI.Replace('TheGameLogic->isInReplayGame()', 'hasOpenRecordingFile()')) $false).Count -eq 0) {
+        throw 'MD playback-only AI gate wiring mutation coverage failed'
+    }
     $good = @'
 static constexpr std::uint64_t kNativeReplayMaxPayloadBytes = 1;
 void RecorderClass::startRecording() {
@@ -535,6 +614,11 @@ foreach ($relativePath in $paths) {
     $path = Join-Path $root ($relativePath -replace '/', '\')
     $content = [IO.File]::ReadAllText($path)
     foreach ($violation in (Test-RecorderContent $content)) {
+        $allViolations.Add("${relativePath}: $violation")
+    }
+    $aiRelativePath = $relativePath.Replace('Common/Recorder.cpp', 'GameLogic/AI/AI.cpp')
+    $aiContent = [IO.File]::ReadAllText((Join-Path $root $aiRelativePath))
+    foreach ($violation in (Test-AIRecordingEpochWiring $content $aiContent ($relativePath.StartsWith('Generals/')))) {
         $allViolations.Add("${relativePath}: $violation")
     }
 }

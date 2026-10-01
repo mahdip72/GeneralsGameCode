@@ -414,6 +414,8 @@ rts::AICounterRngKey MakeProductionPlanningRandomKey(UnsignedInt playerIndex)
 
 Bool ShouldUseCanonicalEnemyPlanning()
 {
+	// An open recording describes this live runtime; only playback may use its
+	// persisted marker to select behavior. Worker eligibility stays separate.
 	const Bool recording = TheRecorder && TheRecorder->hasOpenRecordingFile();
 	const Bool replayCurrent = TheRecorder &&
 		TheRecorder->replayUsesSkirmishAIDeterministicPlanning();

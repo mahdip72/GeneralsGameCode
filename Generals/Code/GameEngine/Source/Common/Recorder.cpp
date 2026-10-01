@@ -1206,9 +1206,9 @@ void RecorderClass::startRecording(GameDifficulty diff, Int originalGameMode, In
 	UnicodeString versionString = TheVersion->getUnicodeVersion();
 	UnicodeString versionTimeString = TheVersion->getUnicodeBuildTime();
 	#if defined(_WIN64)
-	// A current-epoch local recording must replay through the same canonical
-	// planning policy regardless of scheduler mode. Network recordings stay
-	// unmarked until the mixed-worker multiplayer epoch gate is available.
+	// Record the active fresh-game AI epoch, including LAN/Internet canonical
+	// owner fallback. Negotiated kernel permission changes topology, not AI
+	// behavior. The independent path epoch remains restricted to local games.
 	m_skirmishAIReplayEpoch = GetGeneralsAIRecordingEpoch(originalGameMode,
 		IsGeneralsAICanonicalRuntimeEpoch());
 	m_generalsPathfindingReplayEpoch = GetGeneralsPathfindingRecordingEpoch(

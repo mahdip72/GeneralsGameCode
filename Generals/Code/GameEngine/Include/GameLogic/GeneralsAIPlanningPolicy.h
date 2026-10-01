@@ -212,11 +212,12 @@ inline Bool ShouldUseGeneralsAICanonicalPlanning(
 	Bool isNetworkGame, Bool isRecordingGame, Bool isReplayGame,
 	Bool replayUsesCurrentEpoch, Bool runtimeUsesCurrentEpoch)
 {
-	// Network topology selects the negotiated execution lane; it must not turn
-	// off the current deterministic epoch.  An unmarked network recording/replay
-	// still takes the legacy branch through the explicit epoch inputs below.
+	// Recording observes the active runtime; it never selects live behavior.
+	// Only playback consumes its persisted epoch. Network admission chooses the
+	// execution lane, not whether the canonical owner oracle is current.
 	(void)isNetworkGame;
-	if (isRecordingGame || isReplayGame)
+	(void)isRecordingGame;
+	if (isReplayGame)
 		return replayUsesCurrentEpoch;
 	return runtimeUsesCurrentEpoch;
 }
