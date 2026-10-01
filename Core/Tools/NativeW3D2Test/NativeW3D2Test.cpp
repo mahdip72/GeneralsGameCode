@@ -2736,8 +2736,10 @@ int TestPublicCopyPreflight(HWND window)
 			"public copy preflight clears stale lease and preserves CPU texture/static VB/IB");
 		const RenderResult ended = owner.ExecuteGameRenderCommand(end);
 		const RenderResult drained = owner.Renderer().DrainThreaded();
-		result |= Check(ended == expected && drained == expected && preserved(),
-			"rejected public command remains a visible failed frame without authority revocation");
+		// The producer rejects before admitting a copy: command/frame failure
+		// remains visible, while the backend fence completes its valid work.
+		result |= Check(ended == expected && drained == RENDER_RESULT_OK && preserved(),
+			"rejected public command reports frame failure with successful fence and retained authority");
 		// Consume the failed completion without hiding it; the following display
 		// iteration may then render again against the still-valid resource table.
 		const RenderResult boundary = owner.BeginGameDisplayIteration();
