@@ -50,6 +50,7 @@ struct Row
 	unsigned int session, first, last, frames, samples, over33, over100;
 	char mode[32], phase[32];
 	double wall, total, average, p95, p99, maximum;
+	__int64 bucketBegin, bucketEnd, frequency;
 };
 
 std::vector<Row> rows(const std::string& directory)
@@ -65,15 +66,29 @@ std::vector<Row> rows(const std::string& directory)
 		return result;
 	char line[1024];
 	check(fgets(line, sizeof(line), file) != NULL, "CSV header is flushed");
+	check(strstr(line, ",bucket_begin_qpc,bucket_end_qpc,qpc_frequency") != NULL,
+		"CSV appends the documented bucket clock anchors");
 	while (fgets(line, sizeof(line), file))
 	{
 		Row row = {};
-		const int fields = sscanf(line, "%u,%31[^,],%u,%u,%u,%lf,%31[^,],%u,%lf,%lf,%lf,%lf,%lf,%u,%u",
+		const int fields = sscanf(line, "%u,%31[^,],%u,%u,%u,%lf,%31[^,],%u,%lf,%lf,%lf,%lf,%lf,%u,%u,%I64d,%I64d,%I64d",
 			&row.session, row.mode, &row.first, &row.last, &row.frames, &row.wall, row.phase, &row.samples,
-			&row.total, &row.average, &row.p95, &row.p99, &row.maximum, &row.over33, &row.over100);
-		check(fields == 15, "every CSV row has the documented fields");
-		if (fields == 15)
+			&row.total, &row.average, &row.p95, &row.p99, &row.maximum, &row.over33, &row.over100,
+			&row.bucketBegin, &row.bucketEnd, &row.frequency);
+		check(fields == 18, "every CSV row has the documented fields");
+		if (fields == 18)
+		{
+			check(row.bucketBegin > 0 && row.bucketEnd >= row.bucketBegin && row.frequency > 0,
+				"every bucket has ordered QPC anchors and a positive clock frequency");
+			if (row.frequency > 0)
+			{
+				const double wallDifference = static_cast<double>(row.bucketEnd - row.bucketBegin) *
+					1000.0 / row.frequency - row.wall;
+				check(wallDifference >= -0.001 && wallDifference <= 0.001,
+					"bucket clock duration agrees with rounded wall_ms");
+			}
 			result.push_back(row);
+		}
 	}
 	fclose(file);
 	return result;
@@ -246,7 +261,10 @@ void clientDisplayPhases(const std::string& directory)
 		rts::frame_timing::PointVBAcquire, rts::frame_timing::PointVBLock,
 		rts::frame_timing::PointVBCommit, rts::frame_timing::PointIBBind,
 		rts::frame_timing::PointVBBind, rts::frame_timing::PointDrawSubmit,
-		rts::frame_timing::PointTransformRestore
+		rts::frame_timing::PointTransformRestore,
+		rts::frame_timing::NativeSortingNodeOrder, rts::frame_timing::NativeSortingPrepare,
+		rts::frame_timing::NativeSortingTriangleSort, rts::frame_timing::NativeSortingChunkWork,
+		rts::frame_timing::NativeSortingOffsetReset, rts::frame_timing::NativeSortingSubmitChunk
 	};
 	const char *names[] = {
 		"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
@@ -267,7 +285,9 @@ void clientDisplayPhases(const std::string& directory)
 		"point_input_prepare", "point_transform_setup", "point_material_apply",
 		"point_shader_apply", "point_texture_apply", "point_chunk_lifetime",
 		"point_vb_acquire", "point_vb_lock", "point_vb_commit",
-		"point_ib_bind", "point_vb_bind", "point_draw_submit", "point_transform_restore"
+		"point_ib_bind", "point_vb_bind", "point_draw_submit", "point_transform_restore",
+		"native_sorting_node_order", "native_sorting_prepare", "native_sorting_triangle_sort",
+		"native_sorting_chunk_work", "native_sorting_offset_reset", "native_sorting_submit_chunk"
 	};
 	for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 	{
@@ -292,9 +312,13 @@ void clientDisplayPhases(const std::string& directory)
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
 	check(final.complete, "child diagnostic phases retain complete frame evidence");
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 61, "frame plus all sixty child diagnostic phases are emitted");
-	if (data.size() == 61)
+	check(data.size() == 67, "frame plus all sixty-six child diagnostic phases are emitted");
+	if (data.size() == 67)
 	{
+		for (std::size_t row = 1; row < data.size(); ++row)
+			check(data[row].bucketBegin == data[0].bucketBegin &&
+				data[row].bucketEnd == data[0].bucketEnd && data[row].frequency == data[0].frequency,
+				"all phases in one bucket share identical clock anchors");
 		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
 			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&
 				data[phase + 1].samples == 1, "child diagnostic phase name and exactly one sample");

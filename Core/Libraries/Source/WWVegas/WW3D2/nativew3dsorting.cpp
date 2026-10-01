@@ -705,8 +705,9 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 		return RENDER_RESULT_OK;
 	if (m_impl->flushing)
 		return RENDER_RESULT_FAILED;
+	const bool frameTimingActive = rts::frame_timing::IsActive();
 	rts::frame_timing::ConditionalScope sortingTiming(
-		rts::frame_timing::NativeSortingFlush, rts::frame_timing::IsActive());
+		rts::frame_timing::NativeSortingFlush, frameTimingActive);
 	FlushScope flushScope(m_impl->flushing);
 	FlushWorkspaceScope workspaceScope(m_impl->workspace);
 
@@ -720,6 +721,8 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 		std::vector<SortedNode> &nodes = m_impl->workspace.nodes;
 		std::vector<size_t> &positiveNodes = m_impl->workspace.positiveNodes;
 		std::vector<size_t> &unsortedNodes = m_impl->workspace.unsortedNodes;
+		rts::frame_timing::ConditionalScope nodeTiming(
+			rts::frame_timing::NativeSortingNodeOrder, frameTimingActive);
 		nodes.reserve(m_impl->submissions.size());
 		for (size_t index = 0; index < m_impl->submissions.size(); ++index)
 		{
@@ -771,8 +774,11 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			unsortedNodes.end());
 		nodeOrder.insert(nodeOrder.end(), positiveNodes.begin() + splice,
 			positiveNodes.end());
+		nodeTiming.finish();
 
 		std::vector<SortedTriangle> &triangles = m_impl->workspace.triangles;
+		rts::frame_timing::ConditionalScope prepareTiming(
+			rts::frame_timing::NativeSortingPrepare, frameTimingActive);
 		for (size_t order = 0; order < nodeOrder.size(); ++order)
 		{
 			const SortedNode &node = nodes[nodeOrder[order]];
@@ -788,14 +794,21 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			if (prepareResult != RENDER_RESULT_OK)
 				return prepareResult;
 		}
+		prepareTiming.finish();
 		if (triangles.empty())
 		{
 			RetireCompletedSubmissions(m_impl->submissions);
 			return RENDER_RESULT_OK;
 		}
 
+		rts::frame_timing::ConditionalScope triangleSortTiming(
+			rts::frame_timing::NativeSortingTriangleSort, frameTimingActive);
 		Sort(triangles.data(), triangles.data() + triangles.size());
+		triangleSortTiming.finish();
 
+		// Inclusive of per-chunk reset, geometry/run assembly and sink submission.
+		rts::frame_timing::ConditionalScope chunkTiming(
+			rts::frame_timing::NativeSortingChunkWork, frameTimingActive);
 		for (size_t chunkOffset = 0; chunkOffset < triangles.size(); )
 		{
 			std::vector<unsigned char> &chunkVertices =
@@ -808,8 +821,11 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 			chunkIndices.clear();
 			draws.clear();
 			runs.clear();
+			rts::frame_timing::ConditionalScope offsetTiming(
+				rts::frame_timing::NativeSortingOffsetReset, frameTimingActive);
 			std::vector<size_t> vertexOffsets(m_impl->submissions.size(),
 				std::numeric_limits<size_t>::max());
+			offsetTiming.finish();
 			const NativeDrawPacket *chunkPacket = 0;
 			const size_t maximumChunkEnd = std::min(triangles.size(),
 				chunkOffset + static_cast<size_t>(
@@ -875,12 +891,17 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 
 			if (local == 0)
 				return RENDER_RESULT_INVALID_ARGUMENT;
+			// Includes sink/upload/packet submission and accepted-prefix bookkeeping.
+			rts::frame_timing::ConditionalScope submitTiming(
+				rts::frame_timing::NativeSortingSubmitChunk, frameTimingActive);
 			const RenderResult result = SubmitChunk(sink, draws, runs, triangles,
 				chunkOffset, m_impl->submissions, chunkVertices, chunkIndices);
+			submitTiming.finish();
 			if (result != RENDER_RESULT_OK)
 				return result;
 			chunkOffset += local;
 		}
+		chunkTiming.finish();
 	}
 	catch (const std::bad_alloc &)
 	{

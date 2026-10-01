@@ -36,6 +36,9 @@ enum Phase
 	PointInputPrepare, PointTransformSetup, PointMaterialApply, PointShaderApply,
 	PointTextureApply, PointChunkLifetime, PointVBAcquire, PointVBLock,
 	PointVBCommit, PointIBBind, PointVBBind, PointDrawSubmit, PointTransformRestore,
+	// TEMP sorting-flush subdivision; chunk work includes its two children.
+	NativeSortingNodeOrder, NativeSortingPrepare, NativeSortingTriangleSort,
+	NativeSortingChunkWork, NativeSortingOffsetReset, NativeSortingSubmitChunk,
 	PhaseCount
 };
 
@@ -94,7 +97,9 @@ public:
 		m_path = path;
 		m_frequency = frequency.QuadPart;
 		setvbuf(m_file, NULL, _IOFBF, 16384);
-		fprintf(m_file, "session,mode,frame_begin,frame_end,logic_frames,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms\n");
+		// TEMP bucket anchors permit exact noncapture interval selection. Keep
+		// the existing columns in place and append the monotonic clock metadata.
+		fprintf(m_file, "session,mode,frame_begin,frame_end,logic_frames,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms,bucket_begin_qpc,bucket_end_qpc,qpc_frequency\n");
 	}
 
 	~Capture()
@@ -391,18 +396,21 @@ private:
 			"point_input_prepare", "point_transform_setup", "point_material_apply",
 			"point_shader_apply", "point_texture_apply", "point_chunk_lifetime",
 			"point_vb_acquire", "point_vb_lock", "point_vb_commit",
-			"point_ib_bind", "point_vb_bind", "point_draw_submit", "point_transform_restore"
+			"point_ib_bind", "point_vb_bind", "point_draw_submit", "point_transform_restore",
+			"native_sorting_node_order", "native_sorting_prepare", "native_sorting_triangle_sort",
+			"native_sorting_chunk_work", "native_sorting_offset_reset", "native_sorting_submit_chunk"
 		};
-		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
+		const __int64 bucketEnd = clock();
+		const double wall = static_cast<double>(bucketEnd - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)
 		{
 			const Stats& stats = m_stats[i];
 			if (!stats.count)
 				continue;
-			fprintf(m_file, "%u,%s,%u,%u,%u,%.3f,%s,%u,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u\n",
+			fprintf(m_file, "%u,%s,%u,%u,%u,%.3f,%s,%u,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u,%I64d,%I64d,%I64d\n",
 				m_session, m_mode, m_frameBegin, m_frameEnd, m_logicFrames, wall, names[i], stats.count,
 				stats.total, stats.total / stats.count, percentileUpper(stats, 95), percentileUpper(stats, 99),
-				stats.maximum, stats.over33, stats.over100);
+				stats.maximum, stats.over33, stats.over100, m_bucketStart, bucketEnd, m_frequency);
 			++m_rows;
 		}
 		const bool failed = ferror(m_file) != 0 || fflush(m_file) != 0;
