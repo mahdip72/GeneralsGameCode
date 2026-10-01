@@ -1578,9 +1578,30 @@ int TestRejectedAdjacentBufferPublication()
 	result |= Check(ReadCount(&control.updateCalls) == 3,
 		"owner executes the three accepted writes but not the rejected append");
 	ThreadedRenderFrameCompletion completion;
-	if (PollThreadedRenderCompletion(device, &completion))
+	result |= Check(PollThreadedRenderCompletion(device, &completion) &&
+		!completion.resourceFailure &&
 		resources.PublishThreadedCompletion(completion.sequence,
-			completion.resourceFailure);
+			completion.resourceFailure) == RENDER_RESULT_OK,
+		"accepted writes publish after a completed producer-rejected frame");
+	GpuHandle validated;
+	result |= Check(resources.AcquireVertexBufferRange(buffer, 4, 0, 0, 3,
+			&validated) == RENDER_RESULT_OK && validated == buffer,
+		"accepted prefix remains exactly initialized through byte 12");
+	validated = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(buffer, 4, 0, 3, 15,
+			&validated) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!validated.isValid(),
+		"rejected in-bounds tail bytes 12 through 72 remain unavailable");
+	validated = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(buffer, 4, 0, 3, 1,
+			&validated) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!validated.isValid(),
+		"first rejected tail word remains unavailable");
+	validated = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(buffer, 4, 0, 17, 1,
+			&validated) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!validated.isValid(),
+		"last rejected word remains unavailable and clears its output handle");
 	result |= Check(resources.Shutdown() == RENDER_RESULT_OK &&
 		host.Detach() == RENDER_RESULT_OK,
 		"rejected adjacent fixture releases resources");
