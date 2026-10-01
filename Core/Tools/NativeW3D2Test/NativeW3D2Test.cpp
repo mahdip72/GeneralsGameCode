@@ -1119,11 +1119,30 @@ int TestExplicitRecoveryWithOpenFrame(HWND window)
 			owner.Resources().AcquireTextureSurface(retainedTexture, 0, 0,
 				&newSurface) == RENDER_RESULT_OK && newSurface.backendEpoch != oldEpoch,
 			"recovery reacquires CPU-backed texture authority in the new backend epoch");
-		result |= Check(owner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
-			owner.Renderer().EndFrame(false) == RENDER_RESULT_OK &&
-			owner.Renderer().FinalizeEndedFrame(false) == RENDER_RESULT_OK &&
-			owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
-			"the recovered backend accepts and completes the next real frame");
+		// Service through the real next owner boundaries, not the renderer-only
+		// shortcut: the retained cancellation must report once, without a second
+		// cleanup/reacquire transaction after explicit recovery already completed.
+		const RenderResult reset = owner.ResetGameRenderFrameResources(true);
+		const RenderResult failedBoundary = owner.BeginGameDisplayIteration();
+		const RenderResult healthyBoundary = owner.BeginGameDisplayIteration();
+		result |= Check(reset == RENDER_RESULT_OK &&
+			failedBoundary == RENDER_RESULT_DEVICE_REMOVED &&
+			healthyBoundary == RENDER_RESULT_OK && owner.IsOperational() &&
+			hook.releaseCalls == 1 && hook.reacquireCalls == 1,
+			"next owner boundaries report cancellation once without repeating explicit recovery");
+		GameRenderCommand begin = {};
+		begin.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+		begin.value0 = RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH;
+		begin.float3 = begin.float4 = 1.0f;
+		GameRenderCommand end = {};
+		end.type = GAME_RENDER_COMMAND_END_RENDER;
+		result |= Check(healthyBoundary == RENDER_RESULT_OK &&
+			owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
+			owner.ExecuteGameRenderCommand(end) == RENDER_RESULT_OK &&
+			owner.Renderer().DrainThreaded() == RENDER_RESULT_OK &&
+			owner.ResetGameRenderFrameResources(true) == RENDER_RESULT_OK &&
+			hook.releaseCalls == 1 && hook.reacquireCalls == 1,
+			"normal commands complete the recovered frame with exactly one lifecycle transaction");
 	}
 	owner.SetGameCleanupHook(0);
 	result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
@@ -1148,6 +1167,11 @@ int TestExplicitRecoveryWithOpenFrame(HWND window)
 			RENDER_RESULT_INVALID_ARGUMENT && failingHook.reacquireShutdownResult ==
 			RENDER_RESULT_INVALID_ARGUMENT,
 			"open-frame recovery retains lifecycle authority across cleanup callbacks");
+		result |= Check(failingOwner.ResetGameRenderFrameResources(true) ==
+			RENDER_RESULT_INVALID_ARGUMENT &&
+			failingOwner.BeginGameDisplayIteration() == RENDER_RESULT_INVALID_ARGUMENT &&
+			failingHook.releaseCalls == 1 && failingHook.reacquireCalls == 1,
+			"later owner boundaries do not repeat the failed explicit reacquire attempt");
 		failingOwner.SetGameCleanupHook(0);
 		result |= Check(failingOwner.Shutdown() == RENDER_RESULT_OK,
 			"failed open-frame recovery still releases owner resources");

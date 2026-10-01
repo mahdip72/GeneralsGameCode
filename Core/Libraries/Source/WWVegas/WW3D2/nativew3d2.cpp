@@ -916,7 +916,20 @@ rts::render::RenderResult NativeW3D2::RecoverDevice()
 			m_renderer.IsBackendOperational())
 			return fenceResult;
 	}
-	return RecoverOwnedDevice();
+	// The fence may have retained a failed frame for the next display boundary.
+	// Associate this explicit recovery attempt with that exact outcome, just as
+	// ServiceThreadedCompletions does, without consuming its failure telemetry.
+	const rts::render::NativeW3DSubmissionSequence recoverySequence =
+		m_deferredFailureSequence;
+	const rts::render::RenderResult recoveryResult = RecoverOwnedDevice();
+	if (recoverySequence != 0 &&
+		m_deferredFailureSequence == recoverySequence)
+	{
+		m_deferredFailure.recordRecovery(recoveryResult);
+		m_deferredFailure.setOperational(m_renderer.IsBackendOperational());
+		m_recoveredFailureSequence = recoverySequence;
+	}
+	return recoveryResult;
 }
 
 rts::render::RenderResult NativeW3D2::ReAcquireGameResources()
