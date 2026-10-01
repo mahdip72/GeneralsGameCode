@@ -28,3 +28,13 @@ set_tests_properties(
     core_native_w3d2_open_recovery_parallel
     PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "renderer;native;recovery"
 )
+
+add_test(NAME core_native_w3d2_copy_preflight_serial
+    COMMAND core_native_w3d2_tests --copy-active-preflight-serial)
+add_test(NAME core_native_w3d2_copy_preflight_parallel
+    COMMAND core_native_w3d2_tests --copy-active-preflight-parallel)
+set_tests_properties(
+    core_native_w3d2_copy_preflight_serial
+    core_native_w3d2_copy_preflight_parallel
+    PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "renderer;native;copy"
+)

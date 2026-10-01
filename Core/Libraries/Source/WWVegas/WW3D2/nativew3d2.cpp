@@ -1289,6 +1289,16 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 {
 	using namespace rts::render;
 	GameRenderCommandFailureScope failureCommandScope(&command);
+	if ((command.type == GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE ||
+		command.type == GAME_RENDER_COMMAND_ACQUIRE_COPIED_TEXTURE_CONTENT) &&
+		command.output != 0 &&
+		command.outputBytes == sizeof(NativeW3DGpuContentLease))
+	{
+		// A rejected public copy/acquire must not leave a previous successful
+		// lease in a correctly-sized caller output, including owner/handle gates.
+		*static_cast<NativeW3DGpuContentLease *>(command.output) =
+			NativeW3DGpuContentLease();
+	}
 	// Completion publication is an owner-boundary operation. Service before the
 	// operational gate so an async removal can recover the owned device instead
 	// of being hidden by IsInitialized()/IsOperational() returning false.
@@ -2231,10 +2241,34 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					goto invalid_command;
 				lease = static_cast<NativeW3DGpuContentLease *>(command.output);
 			}
-			const RenderResult result = command.type ==
-				GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE ?
-				m_resources.CopyActiveColorTargetToTexture(resource0, lease) :
-				m_resources.AcquireGpuContentLease(resource0, lease);
+			RenderResult result = RENDER_RESULT_OK;
+			if (command.type == GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE)
+			{
+				NativeW3DTextureDescription destination;
+				RenderBackBufferInfo source;
+				result = m_resources.DescribeTexture(resource0, &destination);
+				if (result == RENDER_RESULT_OK)
+					result = GetGameRenderTargetInfo(&source);
+				if (result == RENDER_RESULT_OK)
+				{
+					// Validate the selected logical layer before backend/queue entry.
+					// These rejections cannot have mutated resource content; accepted
+					// copy, fence, or texture-rebind failures remain fail-closed below.
+					if (source.width == 0 || source.height == 0 || source.multisampleCount == 0)
+						result = RENDER_RESULT_INVALID_ARGUMENT;
+					else if (source.format != destination.descriptor.format ||
+						source.width > destination.descriptor.width ||
+						source.height > destination.descriptor.height ||
+						(source.multisampleCount > 1 &&
+						 (source.width != destination.descriptor.width ||
+						  source.height != destination.descriptor.height)))
+						result = RENDER_RESULT_UNSUPPORTED;
+				}
+				if (result == RENDER_RESULT_OK)
+					result = m_resources.CopyActiveColorTargetToTexture(resource0, lease);
+			}
+			else
+				result = m_resources.AcquireGpuContentLease(resource0, lease);
 			if (result != RENDER_RESULT_OK)
 				RecordGameFailure(result);
 			return result;

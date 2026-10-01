@@ -2591,16 +2591,187 @@ static_assert(NativeFixtureExitCode(0, true) == 77, "unsupported tests skip");
 static_assert(NativeFixtureExitCode(1, false) == 1, "failed tests fail");
 static_assert(NativeFixtureExitCode(1, true) == 1, "failures dominate skips");
 
+int TestPublicCopyPreflight(HWND window)
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3D2 owner;
+	NativeW3DRendererDescriptor descriptor;
+	descriptor.width = descriptor.height = 64;
+	descriptor.multisampleCount = 4;
+	descriptor.enableVsync = false;
+	const RenderResult initialized = owner.Initialize(window, descriptor);
+	if (initialized == RENDER_RESULT_UNSUPPORTED) return 77;
+	if (initialized != RENDER_RESULT_OK)
+		return Check(false, "public copy fixture initializes production owner");
+	RenderBackBufferInfo mainInfo;
+	result |= Check(owner.GetGameRenderTargetInfo(&mainInfo) == RENDER_RESULT_OK &&
+		mainInfo.width == 64 && mainInfo.height == 64 && mainInfo.multisampleCount == 4,
+		"public copy fixture has actual AA4 main layer");
+	TextureDescriptor textureDescriptor;
+	textureDescriptor.width = textureDescriptor.height = 64;
+	textureDescriptor.format = mainInfo.format;
+	textureDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+	textureDescriptor.usage = RENDER_USAGE_DEFAULT;
+	GpuHandle mainCopy, layer, layerCopy, smallCopy, wrongFormat, largeCopy, independent;
+	bool created = owner.Resources().CreateTexture(textureDescriptor, 0, 0, &mainCopy) ==
+		RENDER_RESULT_OK;
+	textureDescriptor.width = textureDescriptor.height = 16;
+	textureDescriptor.binding |= RENDER_TEXTURE_RENDER_TARGET;
+	created = created && owner.Resources().CreateTexture(textureDescriptor, 0, 0, &layer) ==
+		RENDER_RESULT_OK;
+	textureDescriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+	textureDescriptor.width = textureDescriptor.height = 32;
+	created = created && owner.Resources().CreateTexture(textureDescriptor, 0, 0, &layerCopy) ==
+		RENDER_RESULT_OK;
+	textureDescriptor.width = textureDescriptor.height = 8;
+	created = created && owner.Resources().CreateTexture(textureDescriptor, 0, 0, &smallCopy) ==
+		RENDER_RESULT_OK;
+	textureDescriptor.width = textureDescriptor.height = 32;
+	textureDescriptor.format = mainInfo.format == RENDER_FORMAT_B8G8R8A8_UNORM ?
+		RENDER_FORMAT_R8G8B8A8_UNORM : RENDER_FORMAT_B8G8R8A8_UNORM;
+	created = created && owner.Resources().CreateTexture(textureDescriptor, 0, 0, &wrongFormat) ==
+		RENDER_RESULT_OK;
+	textureDescriptor.format = mainInfo.format;
+	textureDescriptor.width = textureDescriptor.height = 128;
+	created = created && owner.Resources().CreateTexture(textureDescriptor, 0, 0, &largeCopy) ==
+		RENDER_RESULT_OK;
+	textureDescriptor.width = textureDescriptor.height = 1;
+	const unsigned int pixel = 0xff00ff00U;
+	TextureSubresourceData data;
+	data.data = &pixel;
+	data.rowPitch = data.slicePitch = sizeof(pixel);
+	created = created && owner.Resources().CreateTexture(textureDescriptor, &data, 1, &independent) ==
+		RENDER_RESULT_OK;
+	const NativeVertex vertices[3] = {};
+	const unsigned short indices[3] = { 0, 1, 2 };
+	BufferDescriptor bufferDescriptor;
+	bufferDescriptor.byteCount = sizeof(vertices);
+	bufferDescriptor.stride = sizeof(NativeVertex);
+	bufferDescriptor.usage = RENDER_USAGE_DEFAULT;
+	GpuHandle vertexBuffer, indexBuffer;
+	created = created && owner.Resources().CreateBuffer(bufferDescriptor, vertices,
+		sizeof(vertices), &vertexBuffer) == RENDER_RESULT_OK;
+	bufferDescriptor.byteCount = sizeof(indices);
+	bufferDescriptor.stride = sizeof(unsigned short);
+	bufferDescriptor.binding = RENDER_BUFFER_INDEX;
+	created = created && owner.Resources().CreateBuffer(bufferDescriptor, indices,
+		sizeof(indices), &indexBuffer) == RENDER_RESULT_OK;
+	if (!created)
+	{
+		owner.Shutdown();
+		return result | Check(false, "public copy fixture creates independent resources");
+	}
+	NativeW3DTextureDescription before;
+	result |= Check(owner.Resources().DescribeTexture(independent, &before) == RENDER_RESULT_OK,
+		"public copy fixture snapshots independent CPU authority");
+	auto preserved = [&]()
+	{
+		NativeW3DTextureDescription after;
+		GpuHandle vertex, index;
+		return owner.Resources().DescribeTexture(independent, &after) == RENDER_RESULT_OK &&
+			after.authority == before.authority && after.authorityEpoch == before.authorityEpoch &&
+			owner.Resources().AcquireVertexBufferRange(vertexBuffer, sizeof(NativeVertex),
+				0, 0, 3, &vertex) == RENDER_RESULT_OK &&
+			owner.Resources().AcquireIndexBufferRange(indexBuffer, RENDER_FORMAT_R16_UINT,
+				0, 0, 3, &index) == RENDER_RESULT_OK;
+	};
+	NativeW3DGpuContentLease lease;
+	auto copy = [&](GpuHandle destination, GameRenderCommandType type)
+	{
+		GameRenderCommand command = {};
+		command.type = type;
+		command.resource0.index = destination.index();
+		command.resource0.generation = destination.generation();
+		command.output = &lease;
+		command.outputBytes = sizeof(lease);
+		return owner.ExecuteGameRenderCommand(command);
+	};
+	RenderTargetBinding selected;
+	selected.useBackBufferColor = selected.useBackBufferDepth = false;
+	selected.hasColor = true;
+	selected.color.resource = layer;
+	auto select = [&](bool custom)
+	{
+		const RenderTargetBinding binding = custom ? selected : RenderTargetBinding();
+		GameRenderCommand command = {};
+		command.type = GAME_RENDER_COMMAND_SET_RENDER_TARGET;
+		command.input = &binding;
+		command.inputBytes = sizeof(binding);
+		return owner.ExecuteGameRenderCommand(command);
+	};
+	GameRenderCommand begin = {};
+	begin.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+	begin.value0 = RENDER_CLEAR_COLOR;
+	begin.float1 = begin.float3 = begin.float4 = 1.0f;
+	GameRenderCommand end = {};
+	end.type = GAME_RENDER_COMMAND_END_RENDER;
+	result |= Check(owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
+		copy(mainCopy, GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE) == RENDER_RESULT_OK &&
+		lease.isValid() && owner.ExecuteGameRenderCommand(end) == RENDER_RESULT_OK &&
+		owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
+		"public command performs exact-size AA4 main copy/resolve");
+	result |= Check(select(true) == RENDER_RESULT_OK &&
+		owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
+		copy(layerCopy, GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE) == RENDER_RESULT_OK &&
+		lease.isValid() && lease.resource == layerCopy &&
+		copy(layerCopy, GAME_RENDER_COMMAND_ACQUIRE_COPIED_TEXTURE_CONTENT) == RENDER_RESULT_OK &&
+		lease.isValid() && owner.ExecuteGameRenderCommand(end) == RENDER_RESULT_OK &&
+		owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
+		"public copy/acquire uses selected 16-square layer, not 64-square AA4 main");
+	const NativeW3DGpuContentLease savedLease = lease;
+	const GpuHandle rejected[] = { smallCopy, wrongFormat, largeCopy, GpuHandle() };
+	for (unsigned int scenario = 0; scenario < 4; ++scenario)
+	{
+		const RenderResult expected = scenario == 3 ? RENDER_RESULT_INVALID_ARGUMENT :
+			RENDER_RESULT_UNSUPPORTED;
+		result |= Check(owner.BeginGameDisplayIteration() == RENDER_RESULT_OK &&
+			select(scenario != 2) == RENDER_RESULT_OK &&
+			owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK,
+			"public copy rejection begins with valid selected output");
+		lease = savedLease;
+		const RenderResult rejectedResult = copy(rejected[scenario],
+			GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE);
+		result |= Check(rejectedResult == expected && !lease.isValid() && preserved(),
+			"public copy preflight clears stale lease and preserves CPU texture/static VB/IB");
+		const RenderResult ended = owner.ExecuteGameRenderCommand(end);
+		const RenderResult drained = owner.Renderer().DrainThreaded();
+		result |= Check(ended == expected && drained == expected && preserved(),
+			"rejected public command remains a visible failed frame without authority revocation");
+		// Consume the failed completion without hiding it; the following display
+		// iteration may then render again against the still-valid resource table.
+		const RenderResult boundary = owner.BeginGameDisplayIteration();
+		result |= Check((boundary == expected || boundary == RENDER_RESULT_OK) &&
+			owner.BeginGameDisplayIteration() == RENDER_RESULT_OK && preserved(),
+			"public copy rejection does not require device recovery to retain geometry");
+		std::printf("PUBLIC_COPY_PREFLIGHT case=%u copy=%d end=%d drain=%d lease=%u authorities=%u\n",
+			scenario, rejectedResult, ended, drained, lease.isValid(), preserved());
+	}
+	result |= Check(select(true) == RENDER_RESULT_OK &&
+		owner.ExecuteGameRenderCommand(begin) == RENDER_RESULT_OK &&
+		copy(layerCopy, GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE) == RENDER_RESULT_OK &&
+		lease.isValid() && owner.ExecuteGameRenderCommand(end) == RENDER_RESULT_OK &&
+		owner.Renderer().DrainThreaded() == RENDER_RESULT_OK && preserved(),
+		"valid public layer copy resumes after rejection without resource/device recovery");
+	result |= Check(owner.Shutdown() == RENDER_RESULT_OK,
+		"public copy fixture releases owner and resources");
+	return result;
+}
+
 int main(int argc, char **argv)
 {
 	const bool explicitSerial = argc == 2 &&
 		std::strcmp(argv[1], "--explicit-open-recovery-serial") == 0;
 	const bool explicitParallel = argc == 2 &&
 		std::strcmp(argv[1], "--explicit-open-recovery-parallel") == 0;
+	const bool copySerial = argc == 2 &&
+		std::strcmp(argv[1], "--copy-active-preflight-serial") == 0;
+	const bool copyParallel = argc == 2 &&
+		std::strcmp(argv[1], "--copy-active-preflight-parallel") == 0;
 	// Startup policy is immutable after any execution owner starts. Run each
 	// production mode in its own process, before even the invalid-window probe.
-	if ((explicitSerial || explicitParallel) &&
-		!rts::SetPipelineExecutionMode(explicitSerial ?
+	if ((explicitSerial || explicitParallel || copySerial || copyParallel) &&
+		!rts::SetPipelineExecutionMode((explicitSerial || copySerial) ?
 			rts::PIPELINE_EXECUTION_SERIAL : rts::PIPELINE_EXECUTION_PARALLEL))
 		return 1;
 	int result = 0;
@@ -2628,6 +2799,12 @@ int main(int argc, char **argv)
 		const int recoveryResult = TestExplicitRecoveryWithOpenFrame(window);
 		DestroyWindow(window);
 		return recoveryResult;
+	}
+	if (copySerial || copyParallel)
+	{
+		const int copyResult = TestPublicCopyPreflight(window);
+		DestroyWindow(window);
+		return copyResult;
 	}
 	if (argc == 2 && std::strcmp(argv[1], "--cpu-sorting-immediate") == 0)
 	{
