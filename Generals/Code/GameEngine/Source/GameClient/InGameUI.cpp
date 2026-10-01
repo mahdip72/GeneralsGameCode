@@ -1367,6 +1367,14 @@ void InGameUI::refreshLocalizedFontResources()
 	if (!m_iniFontSettingsValid || !TheGlobalLanguageData || !TheFontLibrary)
 		return;
 
+	// Rebind live Drawable-owned caption strings without changing list membership or text.
+	if (TheGameClient)
+	{
+		for (Drawable* drawable = TheGameClient->firstDrawable(); drawable;
+			drawable = drawable->getNextDrawable())
+			drawable->refreshCaptionFont();
+	}
+
 	Int adjustedSize = TheGlobalLanguageData->adjustFontSize(m_messagePointSize);
 	GameFont* font = TheFontLibrary->getFont(m_messageFont, adjustedSize, m_messageBold);
 	for (Int i = 0; i < MAX_UI_MESSAGES; ++i)

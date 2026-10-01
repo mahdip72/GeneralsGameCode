@@ -4284,6 +4284,23 @@ void Drawable::clearCaptionText()
 	m_captionDisplayString = nullptr;
 }
 
+/** Rebind existing world-caption strings after localized font descriptors change. */
+void Drawable::refreshCaptionFont()
+{
+	if ((!m_constructDisplayString && !m_captionDisplayString) ||
+		!TheInGameUI || !TheGlobalLanguageData || !TheFontLibrary)
+		return;
+
+	GameFont* font = TheFontLibrary->getFont(
+		TheInGameUI->getDrawableCaptionFontName(),
+		TheGlobalLanguageData->adjustFontSize(TheInGameUI->getDrawableCaptionPointSize()),
+		TheInGameUI->isDrawableCaptionBold());
+	if (m_constructDisplayString)
+		m_constructDisplayString->setFont(font);
+	if (m_captionDisplayString)
+		m_captionDisplayString->setFont(font);
+}
+
 //-------------------------------------------------------------------------------------------------
 UnicodeString Drawable::getCaptionText()
 {
