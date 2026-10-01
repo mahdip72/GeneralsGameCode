@@ -71,6 +71,7 @@ class Capture
 {
 public:
 	Capture() : m_file(NULL), m_finalizedHandle(INVALID_HANDLE_VALUE), m_owner(0), m_frequency(0), m_active(false),
+		m_bucketClockAnchors(false),
 		m_frameStart(0), m_bucketStart(0), m_rows(0), m_session(0),
 		m_frameBegin(0), m_frameEnd(0), m_logicFrames(0), m_mode("interactive"),
 		m_writeSucceeded(true), m_truncated(false), m_incomplete(false),
@@ -97,9 +98,15 @@ public:
 		m_path = path;
 		m_frequency = frequency.QuadPart;
 		setvbuf(m_file, NULL, _IOFBF, 16384);
-		// TEMP bucket anchors permit exact noncapture interval selection. Keep
-		// the existing columns in place and append the monotonic clock metadata.
-		fprintf(m_file, "session,mode,frame_begin,frame_end,logic_frames,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms,bucket_begin_qpc,bucket_end_qpc,qpc_frequency\n");
+		// TEMP diagnostic-only opt-in. Default output preserves the exact
+		// 15-column headless acceptance contract; this format is not acceptance.
+		char bucketClockFlag[2];
+		m_bucketClockAnchors = GetEnvironmentVariableA("RTS_FRAME_TIMING_BUCKET_ANCHORS",
+			bucketClockFlag, sizeof(bucketClockFlag)) == 1 && bucketClockFlag[0] == '1';
+		fprintf(m_file, "session,mode,frame_begin,frame_end,logic_frames,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms");
+		if (m_bucketClockAnchors)
+			fprintf(m_file, ",bucket_begin_qpc,bucket_end_qpc,qpc_frequency");
+		fprintf(m_file, "\n");
 	}
 
 	~Capture()
@@ -407,10 +414,13 @@ private:
 			const Stats& stats = m_stats[i];
 			if (!stats.count)
 				continue;
-			fprintf(m_file, "%u,%s,%u,%u,%u,%.3f,%s,%u,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u,%I64d,%I64d,%I64d\n",
+			fprintf(m_file, "%u,%s,%u,%u,%u,%.3f,%s,%u,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u",
 				m_session, m_mode, m_frameBegin, m_frameEnd, m_logicFrames, wall, names[i], stats.count,
 				stats.total, stats.total / stats.count, percentileUpper(stats, 95), percentileUpper(stats, 99),
-				stats.maximum, stats.over33, stats.over100, m_bucketStart, bucketEnd, m_frequency);
+				stats.maximum, stats.over33, stats.over100);
+			if (m_bucketClockAnchors)
+				fprintf(m_file, ",%I64d,%I64d,%I64d", m_bucketStart, bucketEnd, m_frequency);
+			fprintf(m_file, "\n");
 			++m_rows;
 		}
 		const bool failed = ferror(m_file) != 0 || fflush(m_file) != 0;
@@ -433,6 +443,7 @@ private:
 	std::atomic<DWORD> m_owner;
 	__int64 m_frequency;
 	bool m_active;
+	bool m_bucketClockAnchors;
 	__int64 m_frameStart, m_bucketStart;
 	unsigned int m_rows, m_session, m_frameBegin, m_frameEnd, m_logicFrames;
 	const char* m_mode;

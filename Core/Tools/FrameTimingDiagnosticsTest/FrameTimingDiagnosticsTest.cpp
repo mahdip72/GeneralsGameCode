@@ -53,7 +53,7 @@ struct Row
 	__int64 bucketBegin, bucketEnd, frequency;
 };
 
-std::vector<Row> rows(const std::string& directory)
+std::vector<Row> rows(const std::string& directory, bool bucketClockAnchors = false)
 {
 	const std::vector<std::string> paths = files(directory);
 	check(paths.size() == 1, "exactly one capture file");
@@ -66,19 +66,27 @@ std::vector<Row> rows(const std::string& directory)
 		return result;
 	char line[1024];
 	check(fgets(line, sizeof(line), file) != NULL, "CSV header is flushed");
-	check(strstr(line, ",bucket_begin_qpc,bucket_end_qpc,qpc_frequency") != NULL,
-		"CSV appends the documented bucket clock anchors");
+	check((strstr(line, ",bucket_begin_qpc,bucket_end_qpc,qpc_frequency") != NULL) == bucketClockAnchors,
+		"CSV bucket clock anchors require explicit diagnostic opt-in");
+	const int expectedFields = bucketClockAnchors ? 18 : 15;
 	while (fgets(line, sizeof(line), file))
 	{
 		Row row = {};
-		const int fields = sscanf(line, "%u,%31[^,],%u,%u,%u,%lf,%31[^,],%u,%lf,%lf,%lf,%lf,%lf,%u,%u,%I64d,%I64d,%I64d",
+		const int fields = sscanf(line, bucketClockAnchors ?
+			"%u,%31[^,],%u,%u,%u,%lf,%31[^,],%u,%lf,%lf,%lf,%lf,%lf,%u,%u,%I64d,%I64d,%I64d" :
+			"%u,%31[^,],%u,%u,%u,%lf,%31[^,],%u,%lf,%lf,%lf,%lf,%lf,%u,%u",
 			&row.session, row.mode, &row.first, &row.last, &row.frames, &row.wall, row.phase, &row.samples,
 			&row.total, &row.average, &row.p95, &row.p99, &row.maximum, &row.over33, &row.over100,
 			&row.bucketBegin, &row.bucketEnd, &row.frequency);
-		check(fields == 18, "every CSV row has the documented fields");
-		if (fields == 18)
+		int columnCount = 1;
+		for (const char *column = line; *column; ++column)
+			if (*column == ',') ++columnCount;
+		check(fields == expectedFields && columnCount == expectedFields,
+			"every CSV row has exactly the documented fields for its format");
+		if (fields == expectedFields && columnCount == expectedFields)
 		{
-			check(row.bucketBegin > 0 && row.bucketEnd >= row.bucketBegin && row.frequency > 0,
+			if (bucketClockAnchors)
+				check(row.bucketBegin > 0 && row.bucketEnd >= row.bucketBegin && row.frequency > 0,
 				"every bucket has ordered QPC anchors and a positive clock frequency");
 			if (row.frequency > 0)
 			{
@@ -224,7 +232,9 @@ void enabled(const std::string& directory, __int64 frequency)
 void clientDisplayPhases(const std::string& directory)
 {
 	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_BUCKET_ANCHORS", "1");
 	rts::frame_timing::Capture& capture = rts::frame_timing::Capture::instance();
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_BUCKET_ANCHORS", NULL);
 	check(!rts::frame_timing::IsActive(), "published singleton is inactive before its frame");
 	capture.beginSession("headless");
 	capture.beginFrame(0);
@@ -311,7 +321,7 @@ void clientDisplayPhases(const std::string& directory)
 	capture.endSession();
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
 	check(final.complete, "child diagnostic phases retain complete frame evidence");
-	const std::vector<Row> data = rows(directory);
+	const std::vector<Row> data = rows(directory, true);
 	check(data.size() == 67, "frame plus all sixty-six child diagnostic phases are emitted");
 	if (data.size() == 67)
 	{
@@ -395,6 +405,7 @@ void incomplete(const std::string& directory)
 
 int main()
 {
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_BUCKET_ANCHORS", NULL);
 	// CTest's working directory is the build tree, never the live game profile.
 	char relative[80], absolute[MAX_PATH];
 	_snprintf(relative, sizeof(relative), "FrameTimingDiagnosticsTest-%lu-%lu", GetCurrentProcessId(), GetTickCount());
