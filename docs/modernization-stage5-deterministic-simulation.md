@@ -469,7 +469,8 @@ resolution intersects those masks after exact build, content, map, roster,
 endpoint, and session-challenge validation. A mixed promoted/unpromoted session
 or any peer missing a bit leaves that kernel serial.
 
-The lockstep-v2 qualification uses two authenticated network peers and four
+The lockstep-v2 qualification uses two hash-verified installed peer processes
+communicating over endpoint-bound UDP and four
 local AI participants (`2v4`) through the common stop frame 4096. It records
 production command-origin contributions, frame/CRC checkpoints, clean transport
 shutdown, and executable-origin physical-worker telemetry for all six kernels.
@@ -703,6 +704,12 @@ The resulting installed-kernel disposition must remain `status=skipped` and
 `claim=false`; the readiness report must still retain
 `finalAcceptanceClaim=false`. This is an explicit exemption, not a
 qualification pass or release authority.
+
+`-ExternalQualificationExempt` skips only the `installedKernelExecution`
+evidence (`status=skipped`, `claim=false`); it does not waive the separately
+bound `performance-scaling` evidence. CI passes this flag only after the
+dedicated `Stage 5 External 16-Core Performance Qualification` job succeeds
+and stages its same-run report. The flag cannot bypass or replace that job.
 
 The request, artifact-set manifest, evidence envelopes, and attachments use
 manifest-relative paths. The aggregator independently computes every SHA-256,

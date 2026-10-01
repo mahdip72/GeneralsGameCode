@@ -76,6 +76,12 @@ The resulting installed-kernel disposition must remain `status=skipped` and
 `finalAcceptanceClaim=false`. This is an explicit exemption, not a
 qualification pass or release authority.
 
+`-ExternalQualificationExempt` skips only the `installedKernelExecution`
+evidence (`status=skipped`, `claim=false`); it does not waive the separately
+bound `performance-scaling` evidence. CI passes this flag only after the
+dedicated `Stage 5 External 16-Core Performance Qualification` job succeeds
+and stages its same-run report. The flag cannot bypass or replace that job.
+
 The reusable hosted replay workflow runs the full functional replay/AI matrix
 and native correctness checks on `windows-2022` without
 `-EnforcePerformance`. It cannot satisfy or report the physical-core
