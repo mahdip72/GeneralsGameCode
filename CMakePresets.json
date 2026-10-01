@@ -16,6 +16,7 @@
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
                 "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL",
                 "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT": "",
+                "CMAKE_USER_MAKE_RULES_OVERRIDE_CXX": "${sourceDir}/cmake/vc6-cxx-flags-override.cmake",
                 "CMAKE_BUILD_TYPE": "Release",
                 "RTS_FLAGS": "/W3",
                 "RTS_BUILD_PRODUCT": "OFF"
