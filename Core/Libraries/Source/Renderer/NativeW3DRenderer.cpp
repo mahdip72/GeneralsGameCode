@@ -1,7 +1,6 @@
 #include "Renderer/NativeW3DRenderer.h"
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/NativeW3DRenderState.h"
-#include <Utility/interlocked_adapter.h>
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include "Renderer/ThreadedRenderDevice.h"
 #include "Lib/PipelineExecutionPolicy.h"
@@ -19,37 +18,6 @@ namespace render
 {
 namespace
 {
-volatile long g_nativeDrawRejectionTraceEvents = 0;
-const long kMaxNativeDrawRejectionTraceEvents = 128L;
-
-bool ReserveNativeDrawRejectionTraceEvent()
-{
-#ifdef _WIN32
-	long observed = InterlockedCompareExchange(
-		&g_nativeDrawRejectionTraceEvents, 0, 0);
-	while (observed < kMaxNativeDrawRejectionTraceEvents)
-	{
-		const long previous = InterlockedCompareExchange(
-			&g_nativeDrawRejectionTraceEvents, observed + 1, observed);
-		if (previous == observed)
-			return true;
-		observed = previous;
-	}
-#else
-	long observed = __sync_add_and_fetch(
-		&g_nativeDrawRejectionTraceEvents, 0);
-	while (observed < kMaxNativeDrawRejectionTraceEvents)
-	{
-		const long previous = __sync_val_compare_and_swap(
-			&g_nativeDrawRejectionTraceEvents, observed + 1, observed);
-		if (previous == observed)
-			return true;
-		observed = previous;
-	}
-#endif
-	return false;
-}
-
 void PopulateLegacyLayout(const RenderVertexLayout &source,
 	LegacyVertexLayout &destination)
 {
@@ -119,70 +87,6 @@ bool ComputeDeclaredVertexStart(const NativeDrawPacket &packet,
 	return true;
 }
 
-void TraceNativeDrawRejection(const char *stage, RenderResult result,
-	bool requireFacadeFrame, bool frameOpen,
-	const NativeW3DResources &resources, const NativeDrawPacket &packet,
-	int vertexRangeProof, int indexRangeProof,
-	unsigned int textureStage)
-{
-	const char *path = getenv("RTS_RENDER_FAILURE_TRACE");
-	if (path == 0 || path[0] == '\0')
-		return;
-	if (!resources.IsOwnerThread() ||
-		!ReserveNativeDrawRejectionTraceEvent())
-		return;
-
-	NativeW3DBufferDescription vertexDescription;
-	NativeW3DBufferDescription indexDescription;
-	const RenderResult vertexDescribeResult = resources.DescribeBuffer(
-		packet.vertexBuffer, &vertexDescription);
-	const RenderResult indexDescribeResult = resources.DescribeBuffer(
-		packet.indexBuffer, &indexDescription);
-	unsigned int declaredVertexStart = 0;
-	const bool declaredVertexStartValid = ComputeDeclaredVertexStart(packet,
-		&declaredVertexStart);
-
-	FILE *trace = fopen(path, "ab");
-	if (trace == 0)
-		return;
-	fprintf(trace,
-		"renderer_failure_detail source=native-submit stage=%s result=%d frame_open=%d require_frame=%d owner_thread=%d indexed=%d vertex_format=%u topology=%u texture_mask=%u texture_stage=%u layout_stride=%u layout_elements=%u layout_pretransformed=%u vb=%u:%u vb_describe=%d vb_bytes=%llu vb_desc_stride=%u vb_binding=%u vb_usage=%u vb_authority=%d vb_authority_epoch=%u vertex_offset_bytes=%u vertex_stride=%u start_vertex=%u min_vertex=%u vertex_count=%u base_vertex=%d declared_start_valid=%d declared_start=%u vertex_range_proof=%d ib=%u:%u ib_describe=%d ib_bytes=%llu ib_desc_stride=%u ib_binding=%u ib_usage=%u ib_authority=%d ib_authority_epoch=%u index_offset_bytes=%u index_format=%u start_index=%u index_count=%u index_range_proof=%d\r\n",
-		stage,
-		static_cast<int>(result),
-		frameOpen ? 1 : 0,
-		requireFacadeFrame ? 1 : 0,
-		resources.IsOwnerThread() ? 1 : 0,
-		packet.indexed ? 1 : 0,
-		static_cast<unsigned int>(packet.vertexFormat),
-		static_cast<unsigned int>(packet.topology), packet.texturePresenceMask,
-		textureStage,
-		packet.vertexLayout.stride, packet.vertexLayout.elementCount,
-		packet.vertexLayout.preTransformed ? 1 : 0,
-		packet.vertexBuffer.index(), packet.vertexBuffer.generation(),
-		static_cast<int>(vertexDescribeResult),
-		static_cast<unsigned long long>(
-			vertexDescription.descriptor.byteCount),
-		vertexDescription.descriptor.stride,
-		vertexDescription.descriptor.binding,
-		static_cast<unsigned int>(vertexDescription.descriptor.usage),
-		static_cast<int>(vertexDescription.authority),
-		vertexDescription.authorityEpoch,
-		packet.vertexOffset, packet.vertexStride, packet.startVertex,
-		packet.minimumVertexIndex, packet.vertexCount, packet.baseVertex,
-		declaredVertexStartValid ? 1 : 0, declaredVertexStart,
-		vertexRangeProof,
-		packet.indexBuffer.index(), packet.indexBuffer.generation(),
-		static_cast<int>(indexDescribeResult),
-		static_cast<unsigned long long>(indexDescription.descriptor.byteCount),
-		indexDescription.descriptor.stride,
-		indexDescription.descriptor.binding,
-		static_cast<unsigned int>(indexDescription.descriptor.usage),
-		static_cast<int>(indexDescription.authority),
-		indexDescription.authorityEpoch,
-		packet.indexOffset, static_cast<unsigned int>(packet.indexFormat),
-		packet.startIndex, packet.indexCount, indexRangeProof);
-	fclose(trace);
-}
 }
 
 struct NativeW3DRenderer::DeferredShutdown
@@ -476,106 +380,64 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 	IRenderContext *context = m_state == 0 ? 0 : m_state->Context();
 	if (context == 0)
 	{
-		TraceNativeDrawRejection("context-null", RENDER_RESULT_INVALID_ARGUMENT,
-			requireFacadeFrame, m_frameOpen, resources, packet, -1, -1,
-			UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (requireFacadeFrame && !m_frameOpen)
 	{
-		TraceNativeDrawRejection("frame-closed",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (!IsOwnerThread())
 	{
-		TraceNativeDrawRejection("wrong-owner-thread",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (!resources.IsBoundTo(this))
 	{
-		TraceNativeDrawRejection("resources-not-bound",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (!packet.vertexBuffer.isValid())
 	{
-		TraceNativeDrawRejection("vertex-handle-invalid",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (packet.vertexStride == 0)
 	{
-		TraceNativeDrawRejection("vertex-stride-zero",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (packet.vertexLayout.stride != packet.vertexStride)
 	{
-		TraceNativeDrawRejection("vertex-layout-stride-mismatch",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (packet.vertexCount == 0)
 	{
-		TraceNativeDrawRejection("vertex-count-zero",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (packet.vertexLayout.elementCount >
 		RenderVertexLayout::MAX_ELEMENT_COUNT)
 	{
-		TraceNativeDrawRejection("vertex-layout-element-count",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	unsigned int declaredVertexStart = 0;
 	if (!ComputeDeclaredVertexStart(packet, &declaredVertexStart))
 	{
-		TraceNativeDrawRejection("declared-vertex-start",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (packet.vertexCount > UINT_MAX - declaredVertexStart)
 	{
-		TraceNativeDrawRejection("vertex-end-overflow",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, -1, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (!resources.IsVertexRangeValidForSubmission(packet.vertexBuffer,
 		packet.vertexStride, packet.vertexOffset, declaredVertexStart,
 		packet.vertexCount))
 	{
-		TraceNativeDrawRejection("vertex-range-proof-failed",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, 0, -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (packet.indexed && !resources.IsIndexRangeValidForSubmission(
 		packet.indexBuffer, packet.indexFormat, packet.indexOffset,
 		packet.startIndex, packet.indexCount))
 	{
-		TraceNativeDrawRejection("index-range-proof-failed",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, 1, 0, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if ((packet.texturePresenceMask & ~((1U << LEGACY_TEXTURE_STAGE_COUNT) - 1U)) != 0)
 	{
-		TraceNativeDrawRejection("texture-presence-mask",
-			RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-			resources, packet, 1, packet.indexed ? 1 : -1, UINT_MAX);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
@@ -584,10 +446,6 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 		const bool supplied = packet.textures[stage].isValid();
 		if (expected != supplied || !resources.IsTextureValidOrEmpty(packet.textures[stage]))
 		{
-			TraceNativeDrawRejection(expected != supplied ?
-				"texture-binding-shape" : "texture-handle-invalid",
-				RENDER_RESULT_INVALID_ARGUMENT, requireFacadeFrame, m_frameOpen,
-				resources, packet, 1, packet.indexed ? 1 : -1, stage);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 	}
@@ -614,18 +472,12 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 	}
 	if (result != RENDER_RESULT_OK)
 	{
-		TraceNativeDrawRejection("pipeline-layout", result,
-			requireFacadeFrame, m_frameOpen, resources, packet, 1,
-			packet.indexed ? 1 : -1, UINT_MAX);
 		return result;
 	}
 	result = context->setVertexBuffer(packet.vertexBuffer,
 		packet.vertexStride, packet.vertexOffset);
 	if (result != RENDER_RESULT_OK)
 	{
-		TraceNativeDrawRejection("backend-set-vertex-buffer", result,
-			requireFacadeFrame, m_frameOpen, resources, packet, 1,
-			packet.indexed ? 1 : -1, UINT_MAX);
 		return result;
 	}
 	if (textureBindingCache != 0)
@@ -633,9 +485,6 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 		result = textureBindingCache->Bind(context, packet.textures);
 		if (result != RENDER_RESULT_OK)
 		{
-			TraceNativeDrawRejection("backend-bind-texture-cache", result,
-				requireFacadeFrame, m_frameOpen, resources, packet, 1,
-				packet.indexed ? 1 : -1, UINT_MAX);
 			return result;
 		}
 	}
@@ -648,9 +497,6 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 				packet.textures[textureStage]);
 			if (result != RENDER_RESULT_OK)
 			{
-				TraceNativeDrawRejection("backend-bind-texture", result,
-					requireFacadeFrame, m_frameOpen, resources, packet, 1,
-					packet.indexed ? 1 : -1, textureStage);
 				return result;
 			}
 		}
@@ -660,20 +506,11 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 		context->setPrimitiveTopology(packet.topology);
 	if (result != RENDER_RESULT_OK)
 	{
-		TraceNativeDrawRejection("backend-set-topology", result,
-			requireFacadeFrame, m_frameOpen, resources, packet, 1,
-			packet.indexed ? 1 : -1, UINT_MAX);
 		return result;
 	}
 	if (!packet.indexed)
 	{
 		result = context->draw(packet.vertexCount, packet.startVertex);
-		if (result != RENDER_RESULT_OK)
-		{
-			TraceNativeDrawRejection("backend-draw", result,
-				requireFacadeFrame, m_frameOpen, resources, packet, 1, -1,
-				UINT_MAX);
-		}
 		return result;
 	}
 	result = sortedBatchBindingCache != 0 ?
@@ -683,19 +520,10 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 			packet.indexOffset);
 	if (result != RENDER_RESULT_OK)
 	{
-		TraceNativeDrawRejection("backend-set-index-buffer", result,
-			requireFacadeFrame, m_frameOpen, resources, packet, 1, 1,
-			UINT_MAX);
 		return result;
 	}
 	result = context->drawIndexed(packet.indexCount, packet.startIndex,
 		packet.baseVertex);
-	if (result != RENDER_RESULT_OK)
-	{
-		TraceNativeDrawRejection("backend-draw-indexed", result,
-			requireFacadeFrame, m_frameOpen, resources, packet, 1, 1,
-			UINT_MAX);
-	}
 	return result;
 }
 

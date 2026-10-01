@@ -1,5 +1,4 @@
 #include "Renderer/RendererDevice.h"
-#include "Lib/MenuCriticalPathDiagnostics.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -1805,12 +1804,8 @@ public:
 			if (transformResult != RENDER_RESULT_OK)
 				return transformResult;
 		}
-		HRESULT presentResult;
-		{
-			rts::menu_trace::Scope trace(rts::menu_trace::DxgiPresent);
-			presentResult = m_swapChain->Present(m_swapInterval, 0);
-			trace.result(static_cast<int>(presentResult));
-		}
+		const HRESULT presentResult = m_swapChain->Present(
+			m_swapInterval, 0);
 		if (FAILED(presentResult))
 		{
 			return TranslateResult(presentResult);

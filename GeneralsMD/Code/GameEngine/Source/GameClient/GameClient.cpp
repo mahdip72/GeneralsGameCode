@@ -55,7 +55,6 @@
 #include "GameClient/ControlBar.h"
 #include "GameClient/Diplomacy.h"
 #include "GameClient/Display.h"
-#include "Lib/FrameTimingDiagnostics.h"
 #include "GameClient/DisplayStringManager.h"
 #include "GameClient/Drawable.h"
 #include "GameClient/DrawGroupInfo.h"
@@ -526,7 +525,6 @@ DECLARE_PERF_TIMER(GameClient_draw)
 void GameClient::update()
 {
 	ASSERT_GAME_THREAD("GameClient::update");
-	const bool frameTimingActive = rts::frame_timing::IsActive();
 	USE_PERF_TIMER(GameClient_update)
 	PROFILER_FRAME_MARK;
 	PROFILER_SECTION_COLOR(0x2196F3);
@@ -605,16 +603,8 @@ void GameClient::update()
 		// native movie audio here so draining can advance the final video frames.
 		TheVideoPlayer->UPDATE();
 		// redraw all views, update the GUI
-		{
-			rts::frame_timing::ConditionalScope frameTiming(
-				rts::frame_timing::ClientDisplayUpdate, frameTimingActive);
-			TheDisplay->UPDATE();
-		}
-		{
-			rts::frame_timing::ConditionalScope frameTiming(
-				rts::frame_timing::ClientDisplayDraw, frameTimingActive);
-			TheDisplay->DRAW();
-		}
+		TheDisplay->UPDATE();
+		TheDisplay->DRAW();
 		return;
 	}
 
@@ -634,8 +624,6 @@ void GameClient::update()
 
 	if (!freezeTime)
 	{
-		rts::frame_timing::ConditionalScope frameTiming(
-			rts::frame_timing::ClientDrawables, frameTimingActive);
 		Int numPlayers = ThePlayerList->getPlayerCount();
 		Int numNonLocalPlayers = 0;
 		Int nonLocalPlayerIndices[MAX_PLAYER_COUNT];
@@ -737,22 +725,16 @@ void GameClient::update()
 
 	// update the terrain visuals
 	{
-		rts::frame_timing::ConditionalScope frameTiming(
-			rts::frame_timing::ClientTerrainVisual, frameTimingActive);
 		TheTerrainVisual->UPDATE();
 	}
 
 	// update display
 	{
-		rts::frame_timing::ConditionalScope frameTiming(
-			rts::frame_timing::ClientDisplayUpdate, frameTimingActive);
 		TheDisplay->UPDATE();
 	}
 
 	{
 		USE_PERF_TIMER(GameClient_draw)
-		rts::frame_timing::ConditionalScope frameTiming(
-			rts::frame_timing::ClientDisplayDraw, frameTimingActive);
 
 	// redraw all views, update the GUI
 	//if(TheGameLogic->getFrame() >= 2)

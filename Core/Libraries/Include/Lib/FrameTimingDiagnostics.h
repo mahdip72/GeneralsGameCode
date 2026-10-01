@@ -15,30 +15,6 @@ enum Phase
 	AudioVoiceCreate, AudioVoiceDestroy, AudioDecodeOpen, AudioDecodeRead,
 	RendererPresent, RendererTextureCollect, RendererTexturePrune,
 	WaterTrackTextureBind, WaterTrackModuleRender,
-	ClientDrawables, ClientTerrainVisual, ClientDisplayUpdate, ClientDisplayDraw,
-	DisplayPreframe, DisplayViews, DisplayRtt, DisplayBeginRender,
-	DisplayMainRender, DisplayEndRender,
-	RenderProducerWait,
-	ViewScene3D, ViewScene2D, NativeSortingFlush, NativeSkinRender,
-	HeightMapRender, NativeRigidBatchRender, WaterRender,
-	SceneObjectSubmit, SceneShadowPrepare, SceneShadowRender, SceneTrees,
-	SceneParticleSubmit, SceneOcclusion, SceneTranslucent,
-	SceneFlush, SceneMeshFlush, SceneStaticSort,
-	SceneProjectedShadows, SceneVolumeShadows, SmudgeRender, SmudgeColorCopy,
-	// TEMP particle producer partition: per-system/chunk owner scopes only.
-	ParticleVisibleBounds, ParticleOwnerCapture, ParticlePrepareJoin,
-	ParticleCompact, ParticleSerialGather, ParticleTextureLookup,
-	ParticlePointSubmit, ParticleVolumeSubmit, ParticleStreakSubmit,
-	ParticleSnowSubmit, ParticleSmudgeSubmit,
-	PointCenterTransform, PointUpdateArrays, PointPackedVertexFill,
-	NativeSortingQueue,
-	// TEMP point-submit residual partition; chunk lifetime is inclusive.
-	PointInputPrepare, PointTransformSetup, PointMaterialApply, PointShaderApply,
-	PointTextureApply, PointChunkLifetime, PointVBAcquire, PointVBLock,
-	PointVBCommit, PointIBBind, PointVBBind, PointDrawSubmit, PointTransformRestore,
-	// TEMP sorting-flush subdivision; chunk work includes its two children.
-	NativeSortingNodeOrder, NativeSortingPrepare, NativeSortingTriangleSort,
-	NativeSortingChunkWork, NativeSortingOffsetReset, NativeSortingSubmitChunk,
 	PhaseCount
 };
 
@@ -71,7 +47,6 @@ class Capture
 {
 public:
 	Capture() : m_file(NULL), m_finalizedHandle(INVALID_HANDLE_VALUE), m_owner(0), m_frequency(0), m_active(false),
-		m_bucketClockAnchors(false),
 		m_frameStart(0), m_bucketStart(0), m_rows(0), m_session(0),
 		m_frameBegin(0), m_frameEnd(0), m_logicFrames(0), m_mode("interactive"),
 		m_writeSucceeded(true), m_truncated(false), m_incomplete(false),
@@ -98,15 +73,7 @@ public:
 		m_path = path;
 		m_frequency = frequency.QuadPart;
 		setvbuf(m_file, NULL, _IOFBF, 16384);
-		// TEMP diagnostic-only opt-in. Default output preserves the exact
-		// 15-column headless acceptance contract; this format is not acceptance.
-		char bucketClockFlag[2];
-		m_bucketClockAnchors = GetEnvironmentVariableA("RTS_FRAME_TIMING_BUCKET_ANCHORS",
-			bucketClockFlag, sizeof(bucketClockFlag)) == 1 && bucketClockFlag[0] == '1';
-		fprintf(m_file, "session,mode,frame_begin,frame_end,logic_frames,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms");
-		if (m_bucketClockAnchors)
-			fprintf(m_file, ",bucket_begin_qpc,bucket_end_qpc,qpc_frequency");
-		fprintf(m_file, "\n");
+		fprintf(m_file, "session,mode,frame_begin,frame_end,logic_frames,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms\n");
 	}
 
 	~Capture()
@@ -382,45 +349,18 @@ private:
 			"recorder_update", "recorder_encode", "recorder_flush",
 			"audio_voice_create", "audio_voice_destroy", "audio_decode_open", "audio_decode_read",
 			"renderer_present", "renderer_texture_collect", "renderer_texture_prune",
-			"water_track_texture_bind", "water_track_module_render",
-			"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
-			"display_preframe", "display_views", "display_rtt", "display_begin_render",
-			"display_main_render", "display_end_render",
-			"render_producer_wait",
-			"view_scene_3d", "view_scene_2d", "native_sorting_flush", "native_skin_render",
-			"height_map_render", "native_rigid_batch_render", "water_render",
-			"scene_object_submit", "scene_shadow_prepare", "scene_shadow_render",
-			"scene_trees", "scene_particle_submit", "scene_occlusion",
-			"scene_translucent", "scene_flush", "scene_mesh_flush",
-			"scene_static_sort", "scene_projected_shadows", "scene_volume_shadows",
-			"smudge_render", "smudge_color_copy",
-			"particle_visible_bounds", "particle_owner_capture", "particle_prepare_join",
-			"particle_compact", "particle_serial_gather", "particle_texture_lookup",
-			"particle_point_submit", "particle_volume_submit", "particle_streak_submit",
-			"particle_snow_submit", "particle_smudge_submit",
-			"point_center_transform", "point_update_arrays", "point_packed_vertex_fill",
-			"native_sorting_queue",
-			"point_input_prepare", "point_transform_setup", "point_material_apply",
-			"point_shader_apply", "point_texture_apply", "point_chunk_lifetime",
-			"point_vb_acquire", "point_vb_lock", "point_vb_commit",
-			"point_ib_bind", "point_vb_bind", "point_draw_submit", "point_transform_restore",
-			"native_sorting_node_order", "native_sorting_prepare", "native_sorting_triangle_sort",
-			"native_sorting_chunk_work", "native_sorting_offset_reset", "native_sorting_submit_chunk"
+			"water_track_texture_bind", "water_track_module_render"
 		};
-		const __int64 bucketEnd = clock();
-		const double wall = static_cast<double>(bucketEnd - m_bucketStart) * 1000.0 / m_frequency;
+		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)
 		{
 			const Stats& stats = m_stats[i];
 			if (!stats.count)
 				continue;
-			fprintf(m_file, "%u,%s,%u,%u,%u,%.3f,%s,%u,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u",
+			fprintf(m_file, "%u,%s,%u,%u,%u,%.3f,%s,%u,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u\n",
 				m_session, m_mode, m_frameBegin, m_frameEnd, m_logicFrames, wall, names[i], stats.count,
 				stats.total, stats.total / stats.count, percentileUpper(stats, 95), percentileUpper(stats, 99),
 				stats.maximum, stats.over33, stats.over100);
-			if (m_bucketClockAnchors)
-				fprintf(m_file, ",%I64d,%I64d,%I64d", m_bucketStart, bucketEnd, m_frequency);
-			fprintf(m_file, "\n");
 			++m_rows;
 		}
 		const bool failed = ferror(m_file) != 0 || fflush(m_file) != 0;
@@ -443,7 +383,6 @@ private:
 	std::atomic<DWORD> m_owner;
 	__int64 m_frequency;
 	bool m_active;
-	bool m_bucketClockAnchors;
 	__int64 m_frameStart, m_bucketStart;
 	unsigned int m_rows, m_session, m_frameBegin, m_frameEnd, m_logicFrames;
 	const char* m_mode;
@@ -472,35 +411,6 @@ private:
 	Scope& operator=(const Scope&);
 };
 
-// Producer-only subphases share the existing opt-in capture. A false gate
-// never queries the clock or initializes a capture, and finish permits exact
-// boundaries without changing a caller's early-return/control-flow scope.
-class ConditionalScope
-{
-public:
-	ConditionalScope(Phase phase, bool enabled) :
-		m_capture(enabled ? &Capture::instance() : NULL), m_phase(phase),
-		m_start(m_capture != NULL && m_capture->isActive() ? Capture::clock() : 0) {}
-	ConditionalScope(Capture& capture, Phase phase, bool enabled) :
-		m_capture(enabled ? &capture : NULL), m_phase(phase),
-		m_start(m_capture != NULL && m_capture->isActive() ? Capture::clock() : 0) {}
-	~ConditionalScope() { finish(); }
-	void finish()
-	{
-		if (m_start)
-		{
-			m_capture->add(m_phase, Capture::clock() - m_start);
-			m_start = 0;
-		}
-	}
-private:
-	Capture* m_capture;
-	Phase m_phase;
-	__int64 m_start;
-	ConditionalScope(const ConditionalScope&);
-	ConditionalScope& operator=(const ConditionalScope&);
-};
-
 class Session
 {
 public:
@@ -519,12 +429,6 @@ inline bool IsActive() { return Capture::isInstanceActive(); }
 #else
 namespace rts { namespace frame_timing {
 class Scope { public: explicit Scope(Phase) {} };
-class ConditionalScope
-{
-public:
-	ConditionalScope(Phase, bool) {}
-	void finish() {}
-};
 class Session { public: explicit Session(const char*) {} };
 inline void BeginFrame(unsigned int) {}
 inline void EndFrame(unsigned int) {}

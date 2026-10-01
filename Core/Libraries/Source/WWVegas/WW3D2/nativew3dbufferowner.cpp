@@ -1,6 +1,5 @@
 #include "nativew3dbufferowner.h"
 #include "Renderer/RenderGameClientNative.h"
-#include "Lib/ShadowCounterDiagnostics.h"
 
 #include <cstring>
 #include <limits.h>
@@ -309,8 +308,6 @@ RenderResult NativeW3DBufferOwner::RecreateForDiscard()
 RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 	size_t byteCount, RenderBufferUpdateMode mode, void **data)
 {
-	rts::shadow_counters::DurationScope duration(
-		rts::shadow_counters::BufferLockDuration);
 	NativeGameRenderOwnerScope ownerScope;
 	if (data == 0)
 	{
@@ -394,14 +391,11 @@ RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 
 RenderResult NativeW3DBufferOwner::Unlock()
 {
-	rts::shadow_counters::DurationScope duration(
-		rts::shadow_counters::BufferUnlockDuration);
 	NativeGameRenderOwnerScope ownerScope;
 	if (!m_locked)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	rts::shadow_counters::UnlockAttempt(m_lockBytes);
 	NativeW3DResources *resources = ActiveResources();
 	ObserveAuthorityFailure(resources);
 	if (resources == 0 || m_staging == 0 ||
@@ -419,7 +413,6 @@ RenderResult NativeW3DBufferOwner::Unlock()
 		memcpy(m_authoritative + m_lockOffset, m_staging, m_lockBytes);
 	}
 	if (result == RENDER_RESULT_OK)
-		rts::shadow_counters::UnlockSuccess(m_lockBytes);
 	FinishLock();
 	m_failedMutation = result != RENDER_RESULT_OK;
 	return result;

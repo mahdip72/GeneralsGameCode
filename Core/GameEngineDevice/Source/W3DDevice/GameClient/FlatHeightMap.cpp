@@ -47,7 +47,6 @@
 //-----------------------------------------------------------------------------
 
 #include "W3DDevice/GameClient/FlatHeightMap.h"
-#include "Lib/FrameTimingDiagnostics.h"
 
 #include <stdlib.h>
 #include <WW3D2/assetmgr.h>
@@ -463,8 +462,6 @@ void FlatHeightMapRenderObjClass::updateCenter(CameraClass *camera, const Vector
 
 void FlatHeightMapRenderObjClass::Render(RenderInfoClass & rinfo)
 {
-	rts::frame_timing::ConditionalScope frameTimingScope(
-		rts::frame_timing::HeightMapRender, rts::frame_timing::IsActive());
 	//USE_PERF_TIMER(Terrain_Render)
 
 	Int devicePasses;

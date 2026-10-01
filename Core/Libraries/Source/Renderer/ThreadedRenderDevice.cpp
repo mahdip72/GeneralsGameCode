@@ -7,8 +7,6 @@
 #endif
 #include <windows.h>
 #endif
-#include "Lib/FrameTimingDiagnostics.h"
-#include "Lib/MenuCriticalPathDiagnostics.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -250,12 +248,11 @@ struct Packet
 	{
 		commands.clear(); bytes.clear(); sequence = 0; closeFrame = false;
 		finalFrame = false; present = false; failure = RENDER_RESULT_OK;
-		control = CONTROL_NONE; reply.reset(); traceOrdinal = 0;
+		control = CONTROL_NONE; reply.reset();
 	}
 	std::vector<Command> commands;
 	std::vector<unsigned char> bytes;
 	uint64_t sequence;
-	uint64_t traceOrdinal; // TEMP correlation only; never affects packet policy.
 	bool closeFrame, finalFrame, present;
 	RenderResult failure;
 	Control control;
@@ -310,7 +307,7 @@ public:
 		m_ownerFrameResult(RENDER_RESULT_OK), m_outsideFailure(RENDER_RESULT_OK),
 		m_drainFailure(RENDER_RESULT_OK), m_ownerVertexBuffer(),
 		m_ownerIndexBuffer(), m_ownerVertexStride(0), m_ownerVertexOffset(0),
-		m_ownerIndexSize(0), m_ownerIndexOffset(0), m_tracePacketOrdinal(0)
+		m_ownerIndexSize(0), m_ownerIndexOffset(0)
 	{
 		m_handles.reset(new GpuHandleAllocator(options.resourceCapacity));
 		if (m_handles->capacity() != options.resourceCapacity) throw std::bad_alloc();
@@ -448,9 +445,6 @@ private:
 	}
 	template <typename Predicate> void wait(std::unique_lock<std::mutex> &lock, Predicate ready)
 	{
-		rts::menu_trace::Scope trace(rts::menu_trace::ProducerWait, traceProducer());
-		rts::frame_timing::ConditionalScope producerWaitTiming(
-			rts::frame_timing::RenderProducerWait, rts::frame_timing::IsActive());
 		const Clock::time_point start = Clock::now();
 		m_waiting = true;
 		while (!ready())
@@ -495,18 +489,6 @@ private:
 		return value;
 	}
 	void publishMetadata(RenderResult, bool refreshInfo = false);
-	rts::menu_trace::Lane *traceProducer()
-	{
-		if (!m_trace) return 0;
-		rts::menu_trace::Context &context = m_trace->producer.context;
-		context.sequence = m_recording ? m_sequence : 0;
-		context.lastSequence = m_lastSequence;
-		context.recording = m_recording ? 1U : 0U;
-		context.packet = m_tracePacketOrdinal;
-		context.commands = m_current ? m_current->commands.size() : 0;
-		context.bytes = m_current ? m_current->bytes.size() : 0;
-		return &m_trace->producer;
-	}
 
 	ThreadedRenderBackendFactory m_factory;
 	void *m_factoryContext;
@@ -558,22 +540,12 @@ private:
 	unsigned int m_ownerIndexSize, m_ownerIndexOffset;
 	RenderFrameOutcome m_ownerOutcome;
 	RenderResult m_ownerFrameResult, m_outsideFailure, m_drainFailure;
-	std::unique_ptr<rts::menu_trace::Session> m_trace;
-	uint64_t m_tracePacketOrdinal;
 };
 
 RenderResult ThreadedRenderDevice::initialize(const RenderDeviceParameters &parameters)
 {
 	if (!producer() || m_initialized || m_thread.joinable() || m_stopping) return RENDER_RESULT_INVALID_ARGUMENT;
 	if (parameters.backend != RENDER_BACKEND_D3D11) return RENDER_RESULT_UNSUPPORTED;
-	// Configure both fixed lanes before the owner starts. Probe allocation failure
-	// disables diagnostics, never fails renderer initialization.
-	if (rts::menu_trace::Enabled())
-	{
-		try { m_trace.reset(new rts::menu_trace::Session); }
-		catch (...) { m_trace.reset(); }
-	}
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Lifecycle);
 	try { m_thread = std::thread(&ThreadedRenderDevice::run, this, parameters); }
 	catch (...) { return RENDER_RESULT_OUT_OF_MEMORY; }
 	std::unique_lock<std::mutex> lock(m_mutex);
@@ -588,7 +560,6 @@ bool ThreadedRenderDevice::acquire()
 	std::unique_lock<std::mutex> lock(m_mutex);
 	if (m_free.empty())
 	{
-		rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Backpressure);
 		++m_metrics.backpressureWaits;
 		wait(lock, [this] { return !m_free.empty(); });
 	}
@@ -729,12 +700,6 @@ RenderResult ThreadedRenderDevice::endFrame()
 RenderResult ThreadedRenderDevice::flush(Control control,
 	const std::shared_ptr<Reply> &reply, bool finalFrame, bool visible)
 {
-	rts::menu_trace::ReasonScope traceReason(
-		control == CONTROL_CAPTURE ? rts::menu_trace::Capture :
-		control == CONTROL_RESOURCE_FENCE ? rts::menu_trace::ResourceFence :
-		control == CONTROL_FENCE ? rts::menu_trace::Drain :
-		control != CONTROL_NONE ? rts::menu_trace::Lifecycle :
-		rts::menu_trace::Unknown, true);
 	if (control != CONTROL_NONE || finalFrame || visible)
 		invalidateProducerTextureCache();
 	acquire();
@@ -744,22 +709,12 @@ RenderResult ThreadedRenderDevice::flush(Control control,
 	m_current->present = visible;
 	m_current->failure = m_producerFailure;
 	m_current->sequence = m_recording ? m_sequence : 0;
-	if (m_trace)
-	{
-		m_current->traceOrdinal = ++m_tracePacketOrdinal;
-	}
 	std::unique_lock<std::mutex> lock(m_mutex);
 	m_metrics.peakPacketBytes = (std::max)(m_metrics.peakPacketBytes,
 		m_current->bytes.size() + m_current->commands.size() * sizeof(Command));
 	m_queue[(m_queueRead + m_queueCount) % m_queue.size()] = m_current;
 	++m_queueCount;
 	++m_pending;
-	if (m_trace)
-	{
-		rts::menu_trace::Lane *lane = traceProducer();
-		lane->context.control = static_cast<unsigned int>(control);
-		rts::menu_trace::Scope trace(rts::menu_trace::Enqueue, lane);
-	}
 	m_metrics.pendingPackets = static_cast<unsigned int>(m_pending);
 	m_metrics.peakPendingPackets = (std::max)(m_metrics.peakPendingPackets,
 		m_metrics.pendingPackets);
@@ -790,7 +745,6 @@ RenderResult ThreadedRenderDevice::submitFrame(bool visible)
 	// Serial reference/cancellation has no heap-allocated reply. In particular,
 	// shutdown cannot lose an accepted frame when allocation is exhausted.
 	std::unique_lock<std::mutex> lock(m_mutex);
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::SerialFrame);
 	wait(lock, [this, sequence] { return m_completedSequence >= sequence; });
 	return m_completedResult;
 }
@@ -813,7 +767,6 @@ RenderResult ThreadedRenderDevice::sync(Control control, const std::shared_ptr<R
 
 RenderResult ThreadedRenderDevice::drain()
 {
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Drain, true);
 	if (!usable()) return RENDER_RESULT_INVALID_ARGUMENT;
 	try { return sync(CONTROL_FENCE, std::make_shared<Reply>()); }
 	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__,
@@ -822,7 +775,6 @@ RenderResult ThreadedRenderDevice::drain()
 
 RenderResult ThreadedRenderDevice::fenceResourceMutation()
 {
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::ResourceFence, true);
 	if (!usable()) return RENDER_RESULT_INVALID_ARGUMENT;
 	try { return sync(CONTROL_RESOURCE_FENCE, std::make_shared<Reply>()); }
 	catch (...) { return fail(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__,
@@ -853,7 +805,6 @@ RenderResult ThreadedRenderDevice::rollbackResource(GpuHandle handle)
 
 RenderResult ThreadedRenderDevice::lifecycle(Control control, unsigned int width, unsigned int height)
 {
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Lifecycle, true);
 	if (!usable() || m_recording) return RENDER_RESULT_INVALID_ARGUMENT;
 	try
 	{
@@ -1016,7 +967,6 @@ void ThreadedRenderDevice::shutdown()
 	// ownership violation; never detach a live thread retaining this object.
 	if (std::this_thread::get_id() != m_producer || m_waiting) std::terminate();
 	if (!m_thread.joinable()) return;
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Lifecycle);
 	if (m_initialized)
 	{
 		if (m_recording) cancelFrame(RENDER_RESULT_FAILED);
@@ -1030,7 +980,6 @@ void ThreadedRenderDevice::shutdown()
 		wait(lock, [this] { return !m_started; });
 	}
 	m_thread.join();
-	if (m_trace) m_trace->dumpAfterJoin();
 	m_initialized = false;
 }
 
@@ -1973,9 +1922,7 @@ void ThreadedRenderDevice::execute(Packet &packet)
 	bool presented = false;
 	if (packet.finalFrame && packet.present && frameResult == RENDER_RESULT_OK)
 	{
-		rts::menu_trace::Scope trace(rts::menu_trace::BackendPresent);
 		frameResult = BackendCall([&] { return m_backend->present(); });
-		trace.result(static_cast<int>(frameResult));
 		m_ownerOutcome.recordPresentation(frameResult);
 		presented = frameResult == RENDER_RESULT_OK;
 		if (presented) m_ownerOutcome.markPresented();
@@ -2031,15 +1978,10 @@ void ThreadedRenderDevice::execute(Packet &packet)
 
 void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 {
-	rts::menu_trace::Bind traceLane(m_trace ? &m_trace->owner : 0);
-#if defined(_WIN64)
-	if (m_trace) m_trace->owner.threadId = GetCurrentThreadId();
-#endif
 	RenderResult initial = RENDER_RESULT_FAILED;
 	const bool registered = rts::JobSystem::instance().registerCurrentThread(rts::JOB_OWNER_RENDER);
 	try
 	{
-		rts::menu_trace::Scope trace(rts::menu_trace::Startup);
 		m_backend = registered ? m_factory(m_factoryContext) : 0;
 		initial = m_backend ? (m_backend->backend() == RENDER_BACKEND_D3D11 ?
 			m_backend->initialize(parameters) : RENDER_RESULT_UNSUPPORTED) :
@@ -2062,7 +2004,6 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 	{
 		Packet *packet = 0;
 		{
-			rts::menu_trace::Scope trace(rts::menu_trace::OwnerIdle);
 			std::unique_lock<std::mutex> lock(m_mutex);
 			m_changed.wait(lock, [this] { return m_queueCount || m_stopping; });
 			if (!m_queueCount && m_stopping) break;
@@ -2071,18 +2012,7 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 			m_ownerExecuting = true;
 		}
 		const Clock::time_point start = Clock::now();
-		if (m_trace)
-		{
-			rts::menu_trace::Context &context = m_trace->owner.context;
-			context.sequence = packet->sequence; context.packet = packet->traceOrdinal;
-			context.lastSequence = 0; context.control = static_cast<unsigned int>(packet->control);
-			context.recording = packet->sequence ? 1U : 0U;
-			context.commands = packet->commands.size(); context.bytes = packet->bytes.size();
-		}
-		{
-			rts::menu_trace::Scope trace(rts::menu_trace::OwnerPacket);
-			execute(*packet);
-		}
+		execute(*packet);
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_metrics.ownerExecutionNanoseconds += Nanoseconds(Clock::now() - start);
 		packet->reset();
@@ -2093,7 +2023,6 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 	}
 	if (m_backend)
 	{
-		rts::menu_trace::Scope trace(rts::menu_trace::Shutdown);
 		if (m_ownerFrameOpen && m_context) m_context->endFrame();
 		m_backend->shutdown();
 		delete m_backend;

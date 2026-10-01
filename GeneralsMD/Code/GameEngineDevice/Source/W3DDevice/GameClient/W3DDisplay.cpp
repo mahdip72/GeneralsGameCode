@@ -69,7 +69,6 @@ static void drawFramerateBar();
 #include "GameNetwork/NetworkInterface.h"
 #include "Common/ModelState.h"
 #include "Lib/BaseType.h"
-#include "Lib/FrameTimingDiagnostics.h"
 #include "W3DDevice/Common/W3DConvert.h"
 #include "W3DDevice/Common/RadarTerrainPrepare.h"
 #include "W3DDevice/GameClient/W3DAssetManager.h"
@@ -157,21 +156,6 @@ private:
 // DEFINE AND ENUMS ///////////////////////////////////////////////////////////
 
 #define no_SAMPLE_DYNAMIC_LIGHT	1
-
-// Temporary producer-side subphases reuse the existing opt-in CSV capture.
-static WW3DErrorType beginMainRenderWithTiming(float destAlpha, bool timingActive)
-{
-	rts::frame_timing::ConditionalScope timing(
-		rts::frame_timing::DisplayBeginRender, timingActive);
-	return WW3D::Begin_Render(true, true, Vector3(0.0f, 0.0f, 0.0f), destAlpha);
-}
-
-static WW3DErrorType endMainRenderWithTiming(bool timingActive)
-{
-	rts::frame_timing::ConditionalScope timing(
-		rts::frame_timing::DisplayEndRender, timingActive);
-	return WW3D::End_Render();
-}
 
 // End_Render failures can suppress native presentation. Report the first
 // failure in a continuous run without adding per-frame diagnostic traffic.
@@ -1973,7 +1957,6 @@ void W3DDisplay::step()
 //DECLARE_PERF_TIMER(W3DDisplay_draw)
 void W3DDisplay::draw()
 {
-	const bool frameTimingActive = rts::frame_timing::IsActive();
 	//USE_PERF_TIMER(W3DDisplay_draw)
 
 	extern HWND ApplicationHWnd;
@@ -2088,8 +2071,6 @@ AGAIN:
 	//update state of all the terrain tracks (fade, remove, etc.)
 	/// @todo: Is there a better place to put per-frame updates like this?
 
-	rts::frame_timing::ConditionalScope preframeTiming(
-		rts::frame_timing::DisplayPreframe, frameTimingActive);
 	if(TheGlobalData->m_loadScreenRender != TRUE)
 	{
 
@@ -2114,7 +2095,6 @@ AGAIN:
 
 	// TheSuperHackers @info This binds the WW3D update to the logic update.
 	WW3D::Sync(TheGameLogic->hasUpdated());
-	preframeTiming.finish();
 
 	static Int now;
 	now=timeGetTime();
@@ -2140,8 +2120,6 @@ AGAIN:
 			rts::render::IsGameRenderTargetOperational())
 		{	//Checking if we have the device before updating views because the heightmap crashes otherwise while
 			//trying to refresh the visible terrain geometry.
-			rts::frame_timing::ConditionalScope viewsTiming(
-				rts::frame_timing::DisplayViews, frameTimingActive);
 //			if(TheGlobalData->m_loadScreenRender != TRUE)
 				updateViews();
      		TheParticleSystemManager->update();//LORENZEN AND WILCZYNSKI MOVED THIS FROM ITS NATIVE POSITION, ABOVE
@@ -2154,9 +2132,6 @@ AGAIN:
                                            //-LORENZEN
 
 
-			viewsTiming.finish();
-			rts::frame_timing::ConditionalScope rttTiming(
-				rts::frame_timing::DisplayRtt, frameTimingActive);
 			if (TheWaterRenderObj && TheGlobalData->m_waterType == 2)
 				TheWaterRenderObj->updateRenderTargetTextures(primaryW3DView->get3DCamera());	//do a render into each texture
 
@@ -2181,22 +2156,19 @@ AGAIN:
 		{
 			//USE_PERF_TIMER(BigAssRenderLoop)
 			static Bool couldRender = true;
-			if ((TheGlobalData->m_breakTheMovie == FALSE) && (TheGlobalData->m_disableRender == false) && beginMainRenderWithTiming(TheWaterTransparency->m_minWaterOpacity, frameTimingActive) == WW3D_ERROR_OK)
+			if ((TheGlobalData->m_breakTheMovie == FALSE) && (TheGlobalData->m_disableRender == false) && WW3D::Begin_Render( true, true, Vector3( 0.0f, 0.0f, 0.0f ), TheWaterTransparency->m_minWaterOpacity ) == WW3D_ERROR_OK)
 			{
-				rts::frame_timing::ConditionalScope mainTiming(
-					rts::frame_timing::DisplayMainRender, frameTimingActive);
 
 				if(TheGlobalData->m_loadScreenRender == TRUE)
 				{
 					TheInGameUI->draw();
 					if( TheMouse )
 						TheMouse->draw();	//keep applying the current cursor style so it remains hidden if needed.
-					mainTiming.finish();
 					const bool captureArmed = rendererCaptureFrameGate.arm(
 						rts::render::IsNativeGameRendererActive());
 					if (captureArmed)
 						rts::render::RequestGameBackBufferCapture();
-					const WW3DErrorType endRenderResult = endMainRenderWithTiming(frameTimingActive);
+					const WW3DErrorType endRenderResult = WW3D::End_Render();
 					reportEndRenderFailure(endRenderResult);
 					const bool captureCompleted = captureArmed &&
 						rts::render::ConsumeGameBackBufferCaptureSuccess();
@@ -2295,12 +2267,11 @@ AGAIN:
 				}
 #endif
 				// render is all done!
-				mainTiming.finish();
 				const bool captureArmed = rendererCaptureFrameGate.arm(
 					rts::render::IsNativeGameRendererActive());
 				if (captureArmed)
 					rts::render::RequestGameBackBufferCapture();
-				const WW3DErrorType endRenderResult = endMainRenderWithTiming(frameTimingActive);
+				const WW3DErrorType endRenderResult = WW3D::End_Render();
 				reportEndRenderFailure(endRenderResult);
 				const bool captureCompleted = captureArmed &&
 					rts::render::ConsumeGameBackBufferCaptureSuccess();

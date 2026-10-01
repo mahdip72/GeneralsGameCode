@@ -50,10 +50,9 @@ struct Row
 	unsigned int session, first, last, frames, samples, over33, over100;
 	char mode[32], phase[32];
 	double wall, total, average, p95, p99, maximum;
-	__int64 bucketBegin, bucketEnd, frequency;
 };
 
-std::vector<Row> rows(const std::string& directory, bool bucketClockAnchors = false)
+std::vector<Row> rows(const std::string& directory)
 {
 	const std::vector<std::string> paths = files(directory);
 	check(paths.size() == 1, "exactly one capture file");
@@ -66,37 +65,20 @@ std::vector<Row> rows(const std::string& directory, bool bucketClockAnchors = fa
 		return result;
 	char line[1024];
 	check(fgets(line, sizeof(line), file) != NULL, "CSV header is flushed");
-	check((strstr(line, ",bucket_begin_qpc,bucket_end_qpc,qpc_frequency") != NULL) == bucketClockAnchors,
-		"CSV bucket clock anchors require explicit diagnostic opt-in");
-	const int expectedFields = bucketClockAnchors ? 18 : 15;
 	while (fgets(line, sizeof(line), file))
 	{
 		Row row = {};
-		const int fields = sscanf(line, bucketClockAnchors ?
-			"%u,%31[^,],%u,%u,%u,%lf,%31[^,],%u,%lf,%lf,%lf,%lf,%lf,%u,%u,%I64d,%I64d,%I64d" :
+		const int fields = sscanf(line,
 			"%u,%31[^,],%u,%u,%u,%lf,%31[^,],%u,%lf,%lf,%lf,%lf,%lf,%u,%u",
 			&row.session, row.mode, &row.first, &row.last, &row.frames, &row.wall, row.phase, &row.samples,
-			&row.total, &row.average, &row.p95, &row.p99, &row.maximum, &row.over33, &row.over100,
-			&row.bucketBegin, &row.bucketEnd, &row.frequency);
+			&row.total, &row.average, &row.p95, &row.p99, &row.maximum, &row.over33, &row.over100);
 		int columnCount = 1;
 		for (const char *column = line; *column; ++column)
 			if (*column == ',') ++columnCount;
-		check(fields == expectedFields && columnCount == expectedFields,
-			"every CSV row has exactly the documented fields for its format");
-		if (fields == expectedFields && columnCount == expectedFields)
-		{
-			if (bucketClockAnchors)
-				check(row.bucketBegin > 0 && row.bucketEnd >= row.bucketBegin && row.frequency > 0,
-				"every bucket has ordered QPC anchors and a positive clock frequency");
-			if (row.frequency > 0)
-			{
-				const double wallDifference = static_cast<double>(row.bucketEnd - row.bucketBegin) *
-					1000.0 / row.frequency - row.wall;
-				check(wallDifference >= -0.001 && wallDifference <= 0.001,
-					"bucket clock duration agrees with rounded wall_ms");
-			}
+		check(fields == 15 && columnCount == 15,
+			"every ordinary CSV row retains exactly the documented fifteen fields");
+		if (fields == 15 && columnCount == 15)
 			result.push_back(row);
-		}
 	}
 	fclose(file);
 	return result;
@@ -128,20 +110,6 @@ void disabled(const std::string& directory)
 		rts::frame_timing::Capture capture;
 		capture.beginSession("headless");
 		capture.beginFrame(0);
-		const unsigned int before = diagnosticClockCalls;
-		{
-			rts::frame_timing::ConditionalScope gated(capture,
-				rts::frame_timing::ClientDisplayDraw, false);
-			gated.finish();
-			rts::frame_timing::ConditionalScope inactive(capture,
-				rts::frame_timing::DisplayMainRender, true);
-			inactive.finish();
-			rts::frame_timing::ConditionalScope producerWait(
-				rts::frame_timing::RenderProducerWait, rts::frame_timing::IsActive());
-			producerWait.finish();
-		}
-		check(diagnosticClockCalls == before,
-			"disabled and inactive conditional scopes do not query the clock");
 		capture.add(rts::frame_timing::Logic, 100);
 		capture.endFrame(900);
 		capture.endSession();
@@ -229,110 +197,24 @@ void enabled(const std::string& directory, __int64 frequency)
 		strcmp(data.back().mode, "interactive") == 0, "destructor/session reset retains only new frame counts");
 }
 
-void clientDisplayPhases(const std::string& directory)
+void publishedSingletonGate(const std::string& directory)
 {
 	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
-	SetEnvironmentVariableA("RTS_FRAME_TIMING_BUCKET_ANCHORS", "1");
 	rts::frame_timing::Capture& capture = rts::frame_timing::Capture::instance();
-	SetEnvironmentVariableA("RTS_FRAME_TIMING_BUCKET_ANCHORS", NULL);
 	check(!rts::frame_timing::IsActive(), "published singleton is inactive before its frame");
 	capture.beginSession("headless");
 	capture.beginFrame(0);
 	check(rts::frame_timing::IsActive(), "producer frame activates the published singleton gate");
-	const rts::frame_timing::Phase phases[] = {
-		rts::frame_timing::ClientDrawables, rts::frame_timing::ClientTerrainVisual,
-		rts::frame_timing::ClientDisplayUpdate, rts::frame_timing::ClientDisplayDraw,
-		rts::frame_timing::DisplayPreframe, rts::frame_timing::DisplayViews,
-		rts::frame_timing::DisplayRtt, rts::frame_timing::DisplayBeginRender,
-		rts::frame_timing::DisplayMainRender, rts::frame_timing::DisplayEndRender,
-		rts::frame_timing::RenderProducerWait,
-		rts::frame_timing::ViewScene3D, rts::frame_timing::ViewScene2D,
-		rts::frame_timing::NativeSortingFlush, rts::frame_timing::NativeSkinRender,
-		rts::frame_timing::HeightMapRender, rts::frame_timing::NativeRigidBatchRender,
-		rts::frame_timing::WaterRender,
-		rts::frame_timing::SceneObjectSubmit, rts::frame_timing::SceneShadowPrepare,
-		rts::frame_timing::SceneShadowRender, rts::frame_timing::SceneTrees,
-		rts::frame_timing::SceneParticleSubmit, rts::frame_timing::SceneOcclusion,
-		rts::frame_timing::SceneTranslucent, rts::frame_timing::SceneFlush,
-		rts::frame_timing::SceneMeshFlush, rts::frame_timing::SceneStaticSort,
-		rts::frame_timing::SceneProjectedShadows, rts::frame_timing::SceneVolumeShadows,
-		rts::frame_timing::SmudgeRender, rts::frame_timing::SmudgeColorCopy,
-		rts::frame_timing::ParticleVisibleBounds, rts::frame_timing::ParticleOwnerCapture,
-		rts::frame_timing::ParticlePrepareJoin, rts::frame_timing::ParticleCompact,
-		rts::frame_timing::ParticleSerialGather, rts::frame_timing::ParticleTextureLookup,
-		rts::frame_timing::ParticlePointSubmit, rts::frame_timing::ParticleVolumeSubmit,
-		rts::frame_timing::ParticleStreakSubmit, rts::frame_timing::ParticleSnowSubmit,
-		rts::frame_timing::ParticleSmudgeSubmit, rts::frame_timing::PointCenterTransform,
-		rts::frame_timing::PointUpdateArrays, rts::frame_timing::PointPackedVertexFill,
-		rts::frame_timing::NativeSortingQueue,
-		rts::frame_timing::PointInputPrepare, rts::frame_timing::PointTransformSetup,
-		rts::frame_timing::PointMaterialApply, rts::frame_timing::PointShaderApply,
-		rts::frame_timing::PointTextureApply, rts::frame_timing::PointChunkLifetime,
-		rts::frame_timing::PointVBAcquire, rts::frame_timing::PointVBLock,
-		rts::frame_timing::PointVBCommit, rts::frame_timing::PointIBBind,
-		rts::frame_timing::PointVBBind, rts::frame_timing::PointDrawSubmit,
-		rts::frame_timing::PointTransformRestore,
-		rts::frame_timing::NativeSortingNodeOrder, rts::frame_timing::NativeSortingPrepare,
-		rts::frame_timing::NativeSortingTriangleSort, rts::frame_timing::NativeSortingChunkWork,
-		rts::frame_timing::NativeSortingOffsetReset, rts::frame_timing::NativeSortingSubmitChunk
-	};
-	const char *names[] = {
-		"client_drawables", "client_terrain_visual", "client_display_update", "client_display_draw",
-		"display_preframe", "display_views", "display_rtt", "display_begin_render",
-		"display_main_render", "display_end_render", "render_producer_wait",
-		"view_scene_3d", "view_scene_2d", "native_sorting_flush", "native_skin_render",
-		"height_map_render", "native_rigid_batch_render", "water_render",
-		"scene_object_submit", "scene_shadow_prepare", "scene_shadow_render",
-		"scene_trees", "scene_particle_submit", "scene_occlusion",
-		"scene_translucent", "scene_flush", "scene_mesh_flush", "scene_static_sort",
-		"scene_projected_shadows", "scene_volume_shadows", "smudge_render", "smudge_color_copy",
-		"particle_visible_bounds", "particle_owner_capture", "particle_prepare_join",
-		"particle_compact", "particle_serial_gather", "particle_texture_lookup",
-		"particle_point_submit", "particle_volume_submit", "particle_streak_submit",
-		"particle_snow_submit", "particle_smudge_submit",
-		"point_center_transform", "point_update_arrays", "point_packed_vertex_fill",
-		"native_sorting_queue",
-		"point_input_prepare", "point_transform_setup", "point_material_apply",
-		"point_shader_apply", "point_texture_apply", "point_chunk_lifetime",
-		"point_vb_acquire", "point_vb_lock", "point_vb_commit",
-		"point_ib_bind", "point_vb_bind", "point_draw_submit", "point_transform_restore",
-		"native_sorting_node_order", "native_sorting_prepare", "native_sorting_triangle_sort",
-		"native_sorting_chunk_work", "native_sorting_offset_reset", "native_sorting_submit_chunk"
-	};
-	for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
-	{
-		const unsigned int before = diagnosticClockCalls;
-		{
-			rts::frame_timing::ConditionalScope gated(capture, phases[phase], false);
-			gated.finish();
-		}
-		check(diagnosticClockCalls == before,
-			"false gate makes no clock query even inside an active capture");
-		{
-			rts::frame_timing::ConditionalScope active(phases[phase], true);
-			active.finish();
-			active.finish();
-		}
-		check(diagnosticClockCalls == before + 2,
-			"conditional phase begins and finishes once despite explicit finish and destructor");
-	}
+	capture.add(rts::frame_timing::Logic, 100);
 	capture.endFrame(900);
 	check(!rts::frame_timing::IsActive(), "ending the producer frame clears the singleton gate");
 	capture.endSession();
 	const rts::frame_timing::FinalizedCapture final = capture.finalize();
-	check(final.complete, "child diagnostic phases retain complete frame evidence");
-	const std::vector<Row> data = rows(directory, true);
-	check(data.size() == 67, "frame plus all sixty-six child diagnostic phases are emitted");
-	if (data.size() == 67)
-	{
-		for (std::size_t row = 1; row < data.size(); ++row)
-			check(data[row].bucketBegin == data[0].bucketBegin &&
-				data[row].bucketEnd == data[0].bucketEnd && data[row].frequency == data[0].frequency,
-				"all phases in one bucket share identical clock anchors");
-		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
-			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&
-				data[phase + 1].samples == 1, "child diagnostic phase name and exactly one sample");
-	}
+	check(final.complete, "published singleton gate retains complete frame evidence");
+	const std::vector<Row> data = rows(directory);
+	check(data.size() == 2 && strcmp(data[0].phase, "frame") == 0 &&
+		strcmp(data[1].phase, "logic") == 0,
+		"published singleton retains only the ordinary frame and logic rows");
 }
 
 void bounded(const std::string& directory)
@@ -405,7 +287,6 @@ void incomplete(const std::string& directory)
 
 int main()
 {
-	SetEnvironmentVariableA("RTS_FRAME_TIMING_BUCKET_ANCHORS", NULL);
 	// CTest's working directory is the build tree, never the live game profile.
 	char relative[80], absolute[MAX_PATH];
 	_snprintf(relative, sizeof(relative), "FrameTimingDiagnosticsTest-%lu-%lu", GetCurrentProcessId(), GetTickCount());
@@ -417,20 +298,20 @@ int main()
 		return 1; // Never reuse or remove a directory owned by another run.
 	const std::string disabledDir = root + "\\disabled", enabledDir = root + "\\enabled", boundedDir = root + "\\bounded";
 	const std::string finalizedDir = root + "\\finalized", incompleteDir = root + "\\incomplete";
-	const std::string clientDisplayDir = root + "\\client-display";
+	const std::string singletonDir = root + "\\singleton-gate";
 	check(CreateDirectoryA(disabledDir.c_str(), NULL) != FALSE, "create disabled case");
 	check(CreateDirectoryA(enabledDir.c_str(), NULL) != FALSE, "create enabled case");
 	check(CreateDirectoryA(boundedDir.c_str(), NULL) != FALSE, "create bounded case");
 	check(CreateDirectoryA(finalizedDir.c_str(), NULL) != FALSE, "create finalized case");
 	check(CreateDirectoryA(incompleteDir.c_str(), NULL) != FALSE, "create incomplete case");
-	check(CreateDirectoryA(clientDisplayDir.c_str(), NULL) != FALSE, "create client/display case");
+	check(CreateDirectoryA(singletonDir.c_str(), NULL) != FALSE, "create singleton gate case");
 	LARGE_INTEGER frequency;
 	if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
 		return 1;
 	inactiveSingleton(disabledDir);
 	disabled(disabledDir);
 	enabled(enabledDir, frequency.QuadPart);
-	clientDisplayPhases(clientDisplayDir);
+	publishedSingletonGate(singletonDir);
 	bounded(boundedDir);
 	finalized(finalizedDir);
 	incomplete(incompleteDir);
@@ -440,7 +321,7 @@ int main()
 	removeCase(boundedDir);
 	removeCase(finalizedDir);
 	removeCase(incompleteDir);
-	removeCase(clientDisplayDir);
+	removeCase(singletonDir);
 	check(RemoveDirectoryA(root.c_str()) != FALSE, "remove empty test root");
 	return failures ? 1 : 0;
 }

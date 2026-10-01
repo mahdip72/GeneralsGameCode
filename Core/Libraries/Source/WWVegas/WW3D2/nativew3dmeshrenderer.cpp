@@ -63,7 +63,6 @@
 #include "stripoptimizer.h"
 #include "meshgeometry.h"
 #include "mapper.h"
-#include "Lib/FrameTimingDiagnostics.h"
 
 /*
 ** Global Instance of the DX8MeshRender
@@ -859,8 +858,6 @@ void DX8RigidFVFCategoryContainer::Log(bool only_visible)
 void DX8RigidFVFCategoryContainer::Render()
 {
 	if (!Anything_To_Render()) return;
-	rts::frame_timing::ConditionalScope frameTimingScope(
-		rts::frame_timing::NativeRigidBatchRender, rts::frame_timing::IsActive());
 	AnythingToRender=false;
 
 	rts::render::SetGameVertexBuffer(vertex_buffer);
@@ -1410,8 +1407,6 @@ void DX8SkinFVFCategoryContainer::Render()
 		SNAPSHOT_SAY(("Nothing to render"));
 		return;
 	}
-	rts::frame_timing::ConditionalScope skinTiming(
-		rts::frame_timing::NativeSkinRender, rts::frame_timing::IsActive());
 	AnythingToRender=false;
 
 	rts::render::SetGameVertexBuffer(static_cast<const VertexBufferClass *>(nullptr));	// Free up the reference to the current vertex buffer

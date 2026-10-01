@@ -55,8 +55,6 @@
 #include "W3DDevice/GameClient/W3DCustomScene.h"
 #include "W3DDevice/GameClient/W3DShroud.h"
 #include "Renderer/RenderGameClient.h"
-#include "Lib/FrameTimingDiagnostics.h"
-#include "Lib/ShadowCounterDiagnostics.h"
 #include "WW3D2/camera.h"
 #include "WW3D2/light.h"
 #include "WW3D2/matpass.h"
@@ -1005,39 +1003,24 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 /**Draw everything that was submitted from this scene*/
 void RTS3DScene::Flush(RenderInfoClass & rinfo)
 {
-	const bool frameTimingActive = rts::frame_timing::IsActive();
-	rts::frame_timing::ConditionalScope frameTimingScope(
-		rts::frame_timing::SceneFlush, frameTimingActive);
 	// TheSuperHackers @bugfix Now always prepares shadows to guarantee correct state before doing any
 	// shadow draw calls. Originally just drawing shadows for trees would not properly prepare shadows.
 	{
-		rts::frame_timing::ConditionalScope timing(
-			rts::frame_timing::SceneShadowPrepare, frameTimingActive);
 		PrepareShadows();
 	}
 
 	//don't draw shadows in this mode because they interfere with destination alpha or are invisible (wireframe)
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 	{
-		rts::frame_timing::ConditionalScope timing(
-			rts::frame_timing::SceneShadowRender, frameTimingActive);
-		rts::frame_timing::ConditionalScope projectedTiming(
-			rts::frame_timing::SceneProjectedShadows, frameTimingActive);
-		rts::shadow_counters::Scope projectedCounters(
-			rts::shadow_counters::Projected, frameTimingActive);
 		DoShadows(rinfo, false);	//draw all non-stencil shadows (decals) since they fall under other objects.
 	}
 
 	{
-		rts::frame_timing::ConditionalScope timing(
-			rts::frame_timing::SceneMeshFlush, frameTimingActive);
 		rts::render::FlushGameRenderMeshes();	//draw all non-translucent objects.
 	}
 
 	//draw all non-translucent objects which were separated because they are hidden and need custom rendering.
 	{
-		rts::frame_timing::ConditionalScope timing(
-			rts::frame_timing::SceneOcclusion, frameTimingActive);
 #ifdef USE_NON_STENCIL_OCCLUSION
 		flushOccludedObjects(rinfo);
 #else
@@ -1051,33 +1034,21 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 
 	// Draw the trees last so they alpha blend onto everything correctly.
 	{
-		rts::frame_timing::ConditionalScope timing(
-			rts::frame_timing::SceneTrees, frameTimingActive);
 		DoTrees(rinfo);
 	}
 
 	//don't draw shadows in this mode because they interfere with destination alpha
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 	{
-		rts::frame_timing::ConditionalScope timing(
-			rts::frame_timing::SceneShadowRender, frameTimingActive);
-		rts::frame_timing::ConditionalScope volumeTiming(
-			rts::frame_timing::SceneVolumeShadows, frameTimingActive);
-		rts::shadow_counters::Scope volumeCounters(
-			rts::shadow_counters::Volume, frameTimingActive);
 		DoShadows(rinfo, true);	//draw all stencil shadows
 	}
 
 	{
-		rts::frame_timing::ConditionalScope timing(
-			rts::frame_timing::SceneStaticSort, frameTimingActive);
 		WW3D::Render_And_Clear_Static_Sort_Lists(rinfo);	//draws things like water
 	}
 
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 	{
-		rts::frame_timing::ConditionalScope timing(
-			rts::frame_timing::SceneTranslucent, frameTimingActive);
 		flushTranslucentObjects(rinfo);	//draw all translucent meshes which don't need per-polygon sorting.
 	}
 
@@ -1087,8 +1058,6 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 		//don't draw transparent in this mode because they interfere with destination alpha
 		if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 		{
-			rts::frame_timing::ConditionalScope timing(
-				rts::frame_timing::SceneParticleSubmit, frameTimingActive);
 			DoParticles(rinfo);	//queue up particles for rendering.
 		}
 
@@ -1317,9 +1286,6 @@ void RTS3DScene::Render(RenderInfoClass & rinfo)
 //=============================================================================
 void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 {
-	// Inclusive: visibility, frame updates, terrain and object submission.
-	rts::frame_timing::ConditionalScope frameTimingScope(
-		rts::frame_timing::SceneObjectSubmit, rts::frame_timing::IsActive());
 #ifdef DIRTY_CONDITION_FLAGS
 	StDrawableDirtyStuffLocker lockDirtyStuff;
 #endif

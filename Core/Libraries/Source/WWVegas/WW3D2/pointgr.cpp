@@ -85,7 +85,6 @@
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/LegacyColorPacking.h"
 #include "Renderer/PointGroupColorPacking.h"
-#include "Lib/FrameTimingDiagnostics.h"
 #include "rinfo.h"
 #include "camera.h"
 
@@ -780,9 +779,6 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 
 	// If no points, do nothing:
 	if (PointCount == 0) return;
-	const bool frameTimingActive = rts::frame_timing::IsActive();
-	rts::frame_timing::ConditionalScope inputTiming(
-		rts::frame_timing::PointInputPrepare, frameTimingActive);
 
 	WWASSERT(PointLoc && PointLoc->Get_Array());
 
@@ -883,7 +879,6 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	// Get the world and view matrices
 	Matrix4x4 view;
 	rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_VIEW, &view);
-	inputTiming.finish();
 
 	// Transform the point locations from worldspace to camera space if needed
 	// (i.e. if they are not already in camera space):
@@ -892,9 +887,6 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	// of the vertice to lay it down flat.
 
 	// (gth) changed this 'if' to use OR rather than AND... The way it was caused all emitters to break
-	rts::frame_timing::ConditionalScope centerTiming(
-		rts::frame_timing::PointCenterTransform,
-		frameTimingActive && Get_Flag(TRANSFORM) && Billboard);
 	if (Get_Flag(TRANSFORM) && Billboard) {
 		// Resize transformed location array if needed (2x guardband to prevent
 		// frequent reallocations):
@@ -914,41 +906,25 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 		}
 		current_loc = &transformed_loc[0];
 	}
-	centerTiming.finish();
 
 	// Update the arrays with the offsets.
 	int vnum, pnum;
 
-	rts::frame_timing::ConditionalScope arraysTiming(
-		rts::frame_timing::PointUpdateArrays, frameTimingActive);
 	Update_Arrays(current_loc, current_size, current_orient, current_frame,
 		PointCount, PointLoc->Get_Count(), vnum, pnum);
-	arraysTiming.finish();
 
 	// the locations are now in view space
 	// so set world and view matrices to identity and render
 
-	rts::frame_timing::ConditionalScope transformTiming(
-		rts::frame_timing::PointTransformSetup, frameTimingActive);
 	Matrix4x4 identity(true);
 	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,
 		identity);
 	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW,
 		identity);
-	transformTiming.finish();
 
-	rts::frame_timing::ConditionalScope materialTiming(
-		rts::frame_timing::PointMaterialApply, frameTimingActive);
 	rts::render::SetGameMaterial(PointMaterial);
-	materialTiming.finish();
-	rts::frame_timing::ConditionalScope shaderTiming(
-		rts::frame_timing::PointShaderApply, frameTimingActive);
 	rts::render::SetGameShader(Shader);
-	shaderTiming.finish();
-	rts::frame_timing::ConditionalScope textureTiming(
-		rts::frame_timing::PointTextureApply, frameTimingActive);
 	rts::render::SetGameTexture(0, Texture);
-	textureTiming.finish();
 
 	// Enable sorting if the primitives are translucent and alpha testing is not enabled.
 	// TheSuperHackers @bugfix stephanmeesters 30/06/2026 However, do not apply sorting to ground-aligned particles.
@@ -977,28 +953,19 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	while (current<vnum)
 	{
 		delta=MIN(vnum-current,MAX_VB_SIZE);
-		// Inclusive parent is declared before PointVerts so it includes its destruction.
-		rts::frame_timing::ConditionalScope chunkTiming(
-			rts::frame_timing::PointChunkLifetime, frameTimingActive);
-		rts::frame_timing::ConditionalScope acquireTiming(
-			rts::frame_timing::PointVBAcquire, frameTimingActive);
 		DynamicVBAccessClass PointVerts(
 			sort ? rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
 			rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,
 			dynamic_fvf_type, delta);
-		acquireTiming.finish();
 		if (!PointVerts.Is_Valid()) {
 			break;
 		}
 
 		// Copy in the data to the VB
 		{
-			rts::frame_timing::ConditionalScope lockTiming(
-				rts::frame_timing::PointVBLock, frameTimingActive);
 			DynamicVBAccessClass::WriteLockClass Lock(&PointVerts);
 			int i;
 			unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
-			lockTiming.finish();
 			if (!Lock.Is_Locked() || vb == nullptr) {
 				break;
 			}
@@ -1009,8 +976,6 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 				rts::render::PackLegacyARGB(DefaultPointColor[0],
 					DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
 
-			rts::frame_timing::ConditionalScope fillTiming(
-				rts::frame_timing::PointPackedVertexFill, frameTimingActive);
 			for (i = current; i < current + delta; i++)
 			{
 				/// @todo lorenzen sez: use pointer arithmetic throughout this block
@@ -1031,29 +996,16 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 				vb+=fvfinfo.Get_FVF_Size();
 			}
-			fillTiming.finish();
-			rts::frame_timing::ConditionalScope commitTiming(
-				rts::frame_timing::PointVBCommit, frameTimingActive);
 			if (!Lock.Commit()) {
 				break;
 			}
-			commitTiming.finish();
 		}
 
-		rts::frame_timing::ConditionalScope indexTiming(
-			rts::frame_timing::PointIBBind, frameTimingActive);
 		rts::render::SetGameIndexBuffer(indexbuffer, 0);
-		indexTiming.finish();
-		rts::frame_timing::ConditionalScope vertexTiming(
-			rts::frame_timing::PointVBBind, frameTimingActive);
 		if (!rts::render::SetGameVertexBuffer(PointVerts)) {
 			break;
 		}
-		vertexTiming.finish();
 
-		// Sorted submission includes Queue; it does not include the later scene Flush.
-		rts::frame_timing::ConditionalScope drawTiming(
-			rts::frame_timing::PointDrawSubmit, frameTimingActive);
 		if ( sort )
 		{
 				rts::render::DrawGameSortedTriangles(
@@ -1064,16 +1016,12 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 			rts::render::DrawGameTriangles(0, delta / verticesperprimitive, 0,
 				delta);
 		}
-		drawTiming.finish();
 
 		current+=delta;
 	}
 
 	// restore the matrices
-	rts::frame_timing::ConditionalScope restoreTiming(
-		rts::frame_timing::PointTransformRestore, frameTimingActive);
 	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
-	restoreTiming.finish();
 }
 
 
@@ -1776,9 +1724,6 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 
 	if (PointCount == 0)
 		return;
-	const bool frameTimingActive = rts::frame_timing::IsActive();
-	rts::frame_timing::ConditionalScope inputTiming(
-		rts::frame_timing::PointInputPrepare, frameTimingActive);
 
 	WWASSERT(PointLoc && PointLoc->Get_Array());
 
@@ -1814,15 +1759,12 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		// Get the world and view matrices
 		Matrix4x4 view;
 		rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_VIEW, &view);
-		inputTiming.finish();
 
 
 
 	//// VOLUME_PARTICLE LOOP ///////////////
 	for ( unsigned int t = 0; t < depth; ++t )
 	{
-		rts::frame_timing::ConditionalScope layerInputTiming(
-			rts::frame_timing::PointInputPrepare, frameTimingActive);
 
 
 
@@ -1894,16 +1836,11 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 
 
 
-		layerInputTiming.finish();
 		// Transform the point locations from worldspace to camera space if needed
 		// (i.e. if they are not already in camera space):
 
 		// need to interrupt this processing. If we are not billboarding, then we need the actual position
 		// of the vertice to lay it down flat.
-		// TEMP: these children repeat once per volume layer; parent is inclusive.
-		rts::frame_timing::ConditionalScope centerTiming(
-			rts::frame_timing::PointCenterTransform,
-			frameTimingActive && Get_Flag(TRANSFORM) && Billboard);
 		if (Get_Flag(TRANSFORM) && Billboard) {
 			// Resize transformed location array if needed (2x guardband to prevent
 			// frequent reallocations):
@@ -1942,7 +1879,6 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 			}
 			current_loc = &transformed_loc[0];
 		}
-		centerTiming.finish();
 
 		// Update the arrays with the offsets.
 		int vnum, pnum;
@@ -1953,36 +1889,20 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		//current_diffuse->Z *= attenuator;
 		//current_diffuse->W *= attenuator;
 
-		rts::frame_timing::ConditionalScope arraysTiming(
-			rts::frame_timing::PointUpdateArrays, frameTimingActive);
 		Update_Arrays(current_loc, current_size, current_orient, current_frame,
 			PointCount, PointLoc->Get_Count(), vnum, pnum);
-		arraysTiming.finish();
 
 		// the locations are now in view space
 		// so set world and view matrices to identity and render
 
-		rts::frame_timing::ConditionalScope transformTiming(
-			rts::frame_timing::PointTransformSetup, frameTimingActive);
 		Matrix4x4 identity(true);
 		rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,
 			identity);
 		rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW,
 			identity);
-		transformTiming.finish();
-
-		rts::frame_timing::ConditionalScope materialTiming(
-			rts::frame_timing::PointMaterialApply, frameTimingActive);
 		rts::render::SetGameMaterial(PointMaterial);
-		materialTiming.finish();
-		rts::frame_timing::ConditionalScope shaderTiming(
-			rts::frame_timing::PointShaderApply, frameTimingActive);
 		rts::render::SetGameShader(Shader);
-		shaderTiming.finish();
-		rts::frame_timing::ConditionalScope textureTiming(
-			rts::frame_timing::PointTextureApply, frameTimingActive);
 		rts::render::SetGameTexture(0, Texture);
-		textureTiming.finish();
 
 		// Enable sorting if the primitives are translucent and alpha testing is not enabled.
 		// TheSuperHackers @info Volumetric particles, both billboarded and ground-aligned, must have sorting enabled to
@@ -2011,28 +1931,19 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		while (current<vnum)
 		{
 			delta=MIN(vnum-current,MAX_VB_SIZE);
-			// Inclusive parent includes PointVerts and WriteLock destruction on every exit.
-			rts::frame_timing::ConditionalScope chunkTiming(
-				rts::frame_timing::PointChunkLifetime, frameTimingActive);
-			rts::frame_timing::ConditionalScope acquireTiming(
-				rts::frame_timing::PointVBAcquire, frameTimingActive);
 			DynamicVBAccessClass PointVerts(
 				sort ? rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
 				rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,
 				dynamic_fvf_type, delta);
-			acquireTiming.finish();
 			if (!PointVerts.Is_Valid()) {
 				break;
 			}
 
 			// Copy in the data to the VB
 			{
-				rts::frame_timing::ConditionalScope lockTiming(
-					rts::frame_timing::PointVBLock, frameTimingActive);
 				DynamicVBAccessClass::WriteLockClass Lock(&PointVerts);
 				int i;
 				unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
-				lockTiming.finish();
 				if (!Lock.Is_Locked() || vb == nullptr) {
 					break;
 				}
@@ -2044,8 +1955,6 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 						DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
 
 
-				rts::frame_timing::ConditionalScope fillTiming(
-					rts::frame_timing::PointPackedVertexFill, frameTimingActive);
 				for (i = current; i < current + delta; i++)
 				{
 					/// @todo lorenzen sez: use pointer arithmetic throughout this block
@@ -2067,39 +1976,25 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 					*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
 					vb+=fvfinfo.Get_FVF_Size();
 				}
-				fillTiming.finish();
-				rts::frame_timing::ConditionalScope commitTiming(
-					rts::frame_timing::PointVBCommit, frameTimingActive);
 				if (!Lock.Commit()) {
 					break;
 				}
-				commitTiming.finish();
 			}
 
-			rts::frame_timing::ConditionalScope indexTiming(
-				rts::frame_timing::PointIBBind, frameTimingActive);
 			rts::render::SetGameIndexBuffer(indexbuffer, 0);
-			indexTiming.finish();
-			rts::frame_timing::ConditionalScope vertexTiming(
-				rts::frame_timing::PointVBBind, frameTimingActive);
 			if (!rts::render::SetGameVertexBuffer(PointVerts)) {
 				break;
 			}
-			vertexTiming.finish();
 
 			/// @todo lorenzen sez: precompute these params, above
 
 
-			// Inclusive of native Queue for sorted draws, never the later scene Flush.
-			rts::frame_timing::ConditionalScope drawTiming(
-				rts::frame_timing::PointDrawSubmit, frameTimingActive);
 			if ( sort )
 					rts::render::DrawGameSortedTriangles(
 						0, delta / verticesperprimitive, 0, delta);
 			else
 				rts::render::DrawGameTriangles(0, delta / verticesperprimitive,
 					0, delta);
-			drawTiming.finish();
 
 
 			current+=delta;
@@ -2113,8 +2008,5 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 
 
 	// restore the matrices
-	rts::frame_timing::ConditionalScope restoreTiming(
-		rts::frame_timing::PointTransformRestore, frameTimingActive);
 	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
-	restoreTiming.finish();
 }

@@ -1,7 +1,5 @@
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/NativeW3DRenderState.h"
-#include "Lib/ShadowCounterDiagnostics.h"
-#include "Lib/MenuCriticalPathDiagnostics.h"
 #include <Utility/interlocked_adapter.h>
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include "Renderer/ThreadedRenderDevice.h"
@@ -1009,7 +1007,6 @@ RenderResult NativeW3DResources::CreateBuffer(
 	const BufferDescriptor &descriptor, const void *initialData,
 	size_t initialDataBytes, GpuHandle *handle)
 {
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::CreateBuffer);
 	if (handle == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -1136,7 +1133,6 @@ RenderResult NativeW3DResources::CreateTexture(
 	const TextureSubresourceData *initialData, unsigned int initialDataCount,
 	GpuHandle *handle)
 {
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::CreateTexture);
 	if (handle == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -1390,12 +1386,8 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 	}
 #endif
 	const bool asynchronousPublication = submissionSequence != 0;
-	rts::menu_trace::ReasonScope traceMutation(
-		asynchronousPublication ? rts::menu_trace::Unknown :
-		rts::menu_trace::OutsideBufferMutation, asynchronousPublication);
 	if (!asynchronousPublication && !slot->pendingBufferPublications.empty())
 	{
-		rts::menu_trace::ReasonScope tracePrior(rts::menu_trace::PriorBufferPublication);
 		// Terrain lighting can update before the next Begin_Render boundary.
 		// Preserve the previous frame's exact completion before publishing this
 		// synchronous write; a queued frame alone is not a failed mutation.
@@ -1583,7 +1575,6 @@ RenderResult NativeW3DResources::RestoreStaticBuffersAfterRecovery()
 RenderResult NativeW3DResources::RepublishStaticBuffers(
 	bool advanceBufferEpoch)
 {
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Lifecycle);
 	IRenderDevice *device = m_impl == 0 || m_impl->state == 0 ? 0 :
 		m_impl->state->Device();
 	if (device == 0 || !device->isOperational() ||
@@ -1715,7 +1706,6 @@ RenderResult NativeW3DResources::RefreshTexture(GpuHandle handle,
 	const TextureSubresourceData *subresources,
 	unsigned int subresourceCount)
 {
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::RefreshTexture);
 	IRenderDevice *device = m_impl == 0 || m_impl->state == 0 ? 0 :
 		m_impl->state->Device();
 	Slot *slot = Find(handle);
@@ -1759,7 +1749,6 @@ RenderResult NativeW3DResources::RefreshTexture(GpuHandle handle,
 	const bool asynchronousPublication = submissionSequence != 0;
 	if (!asynchronousPublication && !slot->pendingTexturePublications.empty())
 	{
-		rts::menu_trace::ReasonScope tracePrior(rts::menu_trace::PriorTexturePublication);
 		if (m_impl->completionFence != 0)
 		{
 			const RenderResult fenced = m_impl->completionFence(
@@ -1872,7 +1861,6 @@ RenderResult NativeW3DResources::DescribeTexture(GpuHandle handle,
 RenderResult NativeW3DResources::CopyActiveColorTargetToTexture(
 	GpuHandle handle, NativeW3DGpuContentLease *lease)
 {
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::CopyColor);
 	if (lease == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -2665,7 +2653,6 @@ NativeW3DResources::Slot *NativeW3DResources::Find(GpuHandle handle)
 const NativeW3DResources::Slot *NativeW3DResources::Find(
 	GpuHandle handle) const
 {
-	rts::shadow_counters::ResourceFindScope lookup;
 	if (m_impl == 0 || !handle.isValid())
 	{
 		return 0;

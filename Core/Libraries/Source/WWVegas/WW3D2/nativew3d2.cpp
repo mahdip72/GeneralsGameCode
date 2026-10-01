@@ -1,5 +1,4 @@
 #include "Utility/CppMacros.h"
-#include <Utility/interlocked_adapter.h>
 #include "nativew3d2.h"
 
 #include "Renderer/RenderGameClient.h"
@@ -7,8 +6,6 @@
 #include "Renderer/LegacyAsyncFramePolicy.h"
 
 #include "Renderer/LegacyBridgeValidation.h"
-#include "Lib/ShadowCounterDiagnostics.h"
-#include "Lib/MenuCriticalPathDiagnostics.h"
 #include "dx8indexbuffer.h"
 #include "nativew3dbufferowner.h"
 #include "nativew3dtextureowner.h"
@@ -25,36 +22,6 @@ namespace
 
 thread_local const rts::render::GameRenderCommand *g_failureCommand = 0;
 thread_local bool g_gameFailureStreakObserved = false;
-volatile long g_gameSubmitFailureTraceEvents = 0;
-const long kMaxGameSubmitFailureTraceEvents = 128L;
-
-bool ReserveGameSubmitFailureTraceEvent()
-{
-#ifdef _WIN32
-	long observed = InterlockedCompareExchange(
-		&g_gameSubmitFailureTraceEvents, 0, 0);
-	while (observed < kMaxGameSubmitFailureTraceEvents)
-	{
-		const long previous = InterlockedCompareExchange(
-			&g_gameSubmitFailureTraceEvents, observed + 1, observed);
-		if (previous == observed)
-			return true;
-		observed = previous;
-	}
-#else
-	long observed = __sync_add_and_fetch(
-		&g_gameSubmitFailureTraceEvents, 0);
-	while (observed < kMaxGameSubmitFailureTraceEvents)
-	{
-		const long previous = __sync_val_compare_and_swap(
-			&g_gameSubmitFailureTraceEvents, observed + 1, observed);
-		if (previous == observed)
-			return true;
-		observed = previous;
-	}
-#endif
-	return false;
-}
 
 class GameRenderCommandFailureScope
 {
@@ -123,132 +90,6 @@ void TraceGameFailure(rts::render::RenderResult result,
 				PackTraceHandle(command->resource1)));
 		fclose(trace);
 	}
-}
-
-void TraceGameSubmitRejection(const char *stage,
-	rts::render::RenderResult result, bool frameOpen,
-	const rts::render::NativeW3DResources &resources,
-	const rts::render::NativeDrawPacket &packet)
-{
-	const char *path = getenv("RTS_RENDER_FAILURE_TRACE");
-	if (path == 0 || path[0] == '\0')
-		return;
-	if (!resources.IsOwnerThread() ||
-		!ReserveGameSubmitFailureTraceEvent())
-		return;
-
-	rts::render::NativeW3DBufferDescription vertexDescription;
-	rts::render::NativeW3DBufferDescription indexDescription;
-	const rts::render::RenderResult vertexDescribeResult =
-		resources.DescribeBuffer(packet.vertexBuffer, &vertexDescription);
-	const rts::render::RenderResult indexDescribeResult =
-		resources.DescribeBuffer(packet.indexBuffer, &indexDescription);
-
-	FILE *trace = fopen(path, "ab");
-	if (trace == 0)
-		return;
-	fprintf(trace,
-		"renderer_failure_detail source=game-submit stage=%s result=%d frame_open=%d owner_thread=%d indexed=%d vertex_format=%u topology=%u texture_mask=%u layout_stride=%u layout_elements=%u layout_pretransformed=%u vb=%u:%u vb_describe=%d vb_bytes=%llu vb_desc_stride=%u vb_binding=%u vb_usage=%u vb_authority=%d vb_authority_epoch=%u vertex_offset_bytes=%u vertex_stride=%u start_vertex=%u min_vertex=%u vertex_count=%u base_vertex=%d ib=%u:%u ib_describe=%d ib_bytes=%llu ib_desc_stride=%u ib_binding=%u ib_usage=%u ib_authority=%d ib_authority_epoch=%u index_offset_bytes=%u index_format=%u start_index=%u index_count=%u\r\n",
-		stage,
-		static_cast<int>(result),
-		frameOpen ? 1 : 0,
-		resources.IsOwnerThread() ? 1 : 0,
-		packet.indexed ? 1 : 0,
-		static_cast<unsigned int>(packet.vertexFormat),
-		static_cast<unsigned int>(packet.topology), packet.texturePresenceMask,
-		packet.vertexLayout.stride, packet.vertexLayout.elementCount,
-		packet.vertexLayout.preTransformed ? 1 : 0,
-		packet.vertexBuffer.index(), packet.vertexBuffer.generation(),
-		static_cast<int>(vertexDescribeResult),
-		static_cast<unsigned long long>(
-			vertexDescription.descriptor.byteCount),
-		vertexDescription.descriptor.stride,
-		vertexDescription.descriptor.binding,
-		static_cast<unsigned int>(vertexDescription.descriptor.usage),
-		static_cast<int>(vertexDescription.authority),
-		vertexDescription.authorityEpoch,
-		packet.vertexOffset, packet.vertexStride, packet.startVertex,
-		packet.minimumVertexIndex, packet.vertexCount, packet.baseVertex,
-		packet.indexBuffer.index(), packet.indexBuffer.generation(),
-		static_cast<int>(indexDescribeResult),
-		static_cast<unsigned long long>(indexDescription.descriptor.byteCount),
-		indexDescription.descriptor.stride,
-		indexDescription.descriptor.binding,
-		static_cast<unsigned int>(indexDescription.descriptor.usage),
-		static_cast<int>(indexDescription.authority),
-		indexDescription.authorityEpoch,
-		packet.indexOffset, static_cast<unsigned int>(packet.indexFormat),
-		packet.startIndex, packet.indexCount);
-	fclose(trace);
-}
-
-void TraceGameDrawPrePacketRejection(const char *stage,
-	rts::render::RenderResult result, unsigned int displayIteration,
-	bool ownerThread, bool operational, bool frameOpen,
-	bool vertexBound, rts::render::GpuHandle vertexBuffer,
-	rts::render::RenderVertexFormat vertexFormat,
-	unsigned int vertexStride, unsigned int vertexOffset,
-	unsigned int vertexStream, unsigned int vertexLayoutStride,
-	unsigned int vertexLayoutElements, bool indexBound,
-	rts::render::GpuHandle indexBuffer, rts::render::RenderFormat indexFormat,
-	unsigned int indexOffset, int indexBaseVertex,
-	unsigned long long sortedVertexBytes,
-	unsigned int sortedVertexMinimum, unsigned int sortedVertexCount,
-	unsigned int sortedVertexSourceOffset,
-	unsigned long long sortedIndexBytes,
-	unsigned int sortedIndexStart, unsigned int sortedIndexCount,
-	const rts::render::GameRenderCommand &command,
-	int trackedStateAvailable)
-{
-	const char *path = getenv("RTS_RENDER_FAILURE_TRACE");
-	if (path == 0 || path[0] == '\0' || !ownerThread ||
-		!ReserveGameSubmitFailureTraceEvent())
-		return;
-	FILE *trace = fopen(path, "ab");
-	if (trace == 0)
-		return;
-	fprintf(trace,
-		"renderer_failure_detail source=game-prepacket stage=%s result=%d display_iteration=%u owner_thread=%d operational=%d frame_open=%d vertex_bound=%d vb=%u:%u vertex_format=%u vertex_stride=%u vertex_offset_bytes=%u vertex_stream=%u vertex_layout_stride=%u vertex_layout_elements=%u index_bound=%d ib=%u:%u index_format=%u index_offset_bytes=%u index_base_vertex=%d sorted_vb_bytes=%llu sorted_vb_minimum=%u sorted_vb_count=%u sorted_vb_source_offset_bytes=%u sorted_ib_bytes=%llu sorted_ib_start_index=%u sorted_ib_index_count=%u command=%u start_index=%u primitive_count=%u min_vertex=%u vertex_count=%u tracked_state_available=%d\r\n",
-		stage,
-		static_cast<int>(result),
-		displayIteration,
-		ownerThread ? 1 : 0,
-		operational ? 1 : 0,
-		frameOpen ? 1 : 0,
-		vertexBound ? 1 : 0,
-		vertexBuffer.index(), vertexBuffer.generation(),
-		static_cast<unsigned int>(vertexFormat), vertexStride, vertexOffset,
-		vertexStream, vertexLayoutStride, vertexLayoutElements,
-		indexBound ? 1 : 0,
-		indexBuffer.index(), indexBuffer.generation(),
-		static_cast<unsigned int>(indexFormat), indexOffset, indexBaseVertex,
-		sortedVertexBytes, sortedVertexMinimum, sortedVertexCount,
-		sortedVertexSourceOffset, sortedIndexBytes, sortedIndexStart,
-		sortedIndexCount,
-		static_cast<unsigned int>(command.type), command.value0, command.value1,
-		command.value2, command.value3, trackedStateAvailable);
-	fclose(trace);
-}
-
-void TraceGameDrawOffOwnerRejection(const char *stage,
-	rts::render::RenderResult result,
-	const rts::render::GameRenderCommand &command)
-{
-	const char *path = getenv("RTS_RENDER_FAILURE_TRACE");
-	if (path == 0 || path[0] == '\0' ||
-		!ReserveGameSubmitFailureTraceEvent())
-		return;
-	FILE *trace = fopen(path, "ab");
-	if (trace == 0)
-		return;
-	fprintf(trace,
-		"renderer_failure_detail source=game-prepacket stage=%s result=%d owner_thread=0 display_iteration=unavailable operational=unavailable frame_open=unavailable binding_state_sampled=0 command=%u start_index=%u primitive_count=%u min_vertex=%u vertex_count=%u resource0=%llu resource1=%llu\r\n",
-		stage, static_cast<int>(result),
-		static_cast<unsigned int>(command.type), command.value0, command.value1,
-		command.value2, command.value3,
-		static_cast<unsigned long long>(PackTraceHandle(command.resource0)),
-		static_cast<unsigned long long>(PackTraceHandle(command.resource1)));
-	fclose(trace);
 }
 
 rts::render::RenderResult BindNativeResourceOwners(
@@ -924,7 +765,6 @@ rts::render::RenderResult NativeW3D2::FenceBufferPublications(void *owner)
 
 rts::render::RenderResult NativeW3D2::FenceThreadedRender()
 {
-	rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Drain, true);
 	if (!m_renderer.IsThreaded())
 		return rts::render::RENDER_RESULT_OK;
 	const rts::render::RenderResult drainResult = m_renderer.DrainThreaded();
@@ -967,7 +807,6 @@ rts::render::RenderResult NativeW3D2::ServiceThreadedCompletions()
 			(m_recoveredFailureSequence == m_deferredFailureSequence &&
 				m_deferredFailure.recoveryResult() == RENDER_RESULT_OK)))
 	{
-		rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Lifecycle);
 		const RenderResult stalledResult = m_renderer.DrainThreaded();
 		const RenderResult publicationResult = PollThreadedCompletions();
 		result = FirstNativeThreadedFailure(result, stalledResult);
@@ -1385,7 +1224,6 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 		// Capture readback is a deliberate CPU owner fence. Drain the final
 		// packet, then poll through the aggregate so failed resource ranges and
 		// the matching presentation outcome are published before callbacks run.
-		rts::menu_trace::ReasonScope traceReason(rts::menu_trace::Capture);
 		const RenderResult drainResult = m_renderer.DrainThreaded();
 		ThreadedRenderFrameCompletion completion;
 		const NativeW3DSubmissionSequence submission =
@@ -1427,13 +1265,6 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	const rts::render::GameRenderCommand &command)
 {
-	const bool drawCommand =
-		command.type == rts::render::GAME_RENDER_COMMAND_DRAW_TRIANGLES ||
-		command.type == rts::render::GAME_RENDER_COMMAND_DRAW_STRIP ||
-		command.type == rts::render::GAME_RENDER_COMMAND_DRAW_SORTED_TRIANGLES;
-	rts::shadow_counters::DurationScope commandDuration(drawCommand ?
-		rts::shadow_counters::ExecuteDrawDuration :
-		rts::shadow_counters::ExecuteOtherDuration);
 	using namespace rts::render;
 	GameRenderCommandFailureScope failureCommandScope(&command);
 	// Completion publication is an owner-boundary operation. Service before the
@@ -1443,36 +1274,6 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	if (serviceResult != RENDER_RESULT_OK &&
 		!m_renderer.IsBackendOperational())
 	{
-		if (command.type == GAME_RENDER_COMMAND_DRAW_TRIANGLES ||
-			command.type == GAME_RENDER_COMMAND_DRAW_STRIP)
-		{
-			if (m_resources.IsOwnerThread())
-			{
-				LegacyLogicalState trackedState;
-				const int trackedStateAvailable =
-					GetTrackedLegacyLogicalState(&trackedState) ? 1 : 0;
-				TraceGameDrawPrePacketRejection(
-					"draw-threaded-completion-gate", serviceResult,
-					m_displayIterationEpoch, true, IsOperational(),
-					m_renderer.IsFrameOpen(), m_gameVertexBound,
-					m_gameVertexBuffer, m_gameVertexFormat, m_gameVertexStride,
-					m_gameVertexOffset, m_gameVertexStream,
-					m_gameVertexLayout.stride,
-					m_gameVertexLayout.elementCount, m_gameIndexBound,
-					m_gameIndexBuffer, m_gameIndexFormat, m_gameIndexOffset,
-					m_gameIndexBaseVertex,
-					static_cast<unsigned long long>(
-						m_gameSortedVertexBytes.size()),
-					m_gameSortedVertexMinimum, m_gameSortedVertexCount,
-					m_gameSortedVertexSourceOffset,
-					static_cast<unsigned long long>(m_gameSortedIndexBytes.size()),
-					m_gameSortedIndexStart, m_gameSortedIndexCount,
-					command, trackedStateAvailable);
-			}
-			else
-				TraceGameDrawOffOwnerRejection(
-					"draw-threaded-completion-gate", serviceResult, command);
-		}
 		RecordGameFailure(serviceResult);
 		return serviceResult;
 	}
@@ -1482,37 +1283,6 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		!IsWellFormedGameHandle(command.resource1) ||
 		!IsOperational() || !m_resources.IsOwnerThread())
 	{
-		if (command.type == GAME_RENDER_COMMAND_DRAW_TRIANGLES ||
-			command.type == GAME_RENDER_COMMAND_DRAW_STRIP)
-		{
-			if (m_resources.IsOwnerThread())
-			{
-				LegacyLogicalState trackedState;
-				const int trackedStateAvailable =
-					GetTrackedLegacyLogicalState(&trackedState) ? 1 : 0;
-				TraceGameDrawPrePacketRejection(
-					"draw-command-entry-gate", RENDER_RESULT_INVALID_ARGUMENT,
-					m_displayIterationEpoch, true, IsOperational(),
-					m_renderer.IsFrameOpen(), m_gameVertexBound,
-					m_gameVertexBuffer, m_gameVertexFormat, m_gameVertexStride,
-					m_gameVertexOffset, m_gameVertexStream,
-					m_gameVertexLayout.stride,
-					m_gameVertexLayout.elementCount, m_gameIndexBound,
-					m_gameIndexBuffer, m_gameIndexFormat, m_gameIndexOffset,
-					m_gameIndexBaseVertex,
-					static_cast<unsigned long long>(
-						m_gameSortedVertexBytes.size()),
-					m_gameSortedVertexMinimum, m_gameSortedVertexCount,
-					m_gameSortedVertexSourceOffset,
-					static_cast<unsigned long long>(m_gameSortedIndexBytes.size()),
-					m_gameSortedIndexStart, m_gameSortedIndexCount,
-					command, trackedStateAvailable);
-			}
-			else
-				TraceGameDrawOffOwnerRejection(
-					"draw-command-entry-gate", RENDER_RESULT_INVALID_ARGUMENT,
-					command);
-		}
 		RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -1723,7 +1493,6 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		return RENDER_RESULT_OK;
 
 	case GAME_RENDER_COMMAND_SET_TEXTURE_STAGE_STATE:
-		rts::shadow_counters::TextureState(command.value1);
 		if (command.value0 >= LEGACY_TEXTURE_STAGE_COUNT || command.value1 >
 			static_cast<unsigned int>(GAME_TEXTURE_STAGE_MAX_MIP_LEVEL))
 		{
@@ -2141,24 +1910,6 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				!m_gameVertexBound && !m_gameIndexBound &&
 				!m_gameSortedVertexBytes.empty() && !m_gameSortedIndexBytes.empty())
 				goto draw_cpu_sorting_buffers;
-			LegacyLogicalState trackedState;
-			const int trackedStateAvailable =
-				GetTrackedLegacyLogicalState(&trackedState) ? 1 : 0;
-			TraceGameDrawPrePacketRejection("draw-prerequisite-gate",
-				RENDER_RESULT_INVALID_ARGUMENT, m_displayIterationEpoch,
-				m_resources.IsOwnerThread(), IsOperational(),
-				m_renderer.IsFrameOpen(), m_gameVertexBound, m_gameVertexBuffer,
-				m_gameVertexFormat, m_gameVertexStride, m_gameVertexOffset,
-				m_gameVertexStream, m_gameVertexLayout.stride,
-				m_gameVertexLayout.elementCount, m_gameIndexBound,
-				m_gameIndexBuffer, m_gameIndexFormat, m_gameIndexOffset,
-				m_gameIndexBaseVertex,
-				static_cast<unsigned long long>(m_gameSortedVertexBytes.size()),
-				m_gameSortedVertexMinimum, m_gameSortedVertexCount,
-				m_gameSortedVertexSourceOffset,
-				static_cast<unsigned long long>(m_gameSortedIndexBytes.size()),
-				m_gameSortedIndexStart, m_gameSortedIndexCount,
-				command, trackedStateAvailable);
 			goto invalid_command;
 		}
 		{
@@ -2184,23 +1935,6 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			LegacyLogicalState state;
 			if (!GetTrackedLegacyLogicalState(&state))
 			{
-				TraceGameDrawPrePacketRejection(
-					"draw-tracked-state-unavailable",
-					RENDER_RESULT_INVALID_ARGUMENT, m_displayIterationEpoch,
-					m_resources.IsOwnerThread(), IsOperational(),
-					m_renderer.IsFrameOpen(), m_gameVertexBound,
-					m_gameVertexBuffer, m_gameVertexFormat, m_gameVertexStride,
-					m_gameVertexOffset, m_gameVertexStream,
-					m_gameVertexLayout.stride,
-					m_gameVertexLayout.elementCount, m_gameIndexBound,
-					m_gameIndexBuffer, m_gameIndexFormat, m_gameIndexOffset,
-					m_gameIndexBaseVertex,
-					static_cast<unsigned long long>(m_gameSortedVertexBytes.size()),
-					m_gameSortedVertexMinimum, m_gameSortedVertexCount,
-					m_gameSortedVertexSourceOffset,
-					static_cast<unsigned long long>(m_gameSortedIndexBytes.size()),
-					m_gameSortedIndexStart, m_gameSortedIndexCount,
-					command, 0);
 				goto invalid_command;
 			}
 			NativeDrawPacket packet;
@@ -2940,14 +2674,11 @@ rts::render::RenderResult NativeW3D2::ApplyGameShaderBits(
 rts::render::RenderResult NativeW3D2::SetGameRenderState(
 	unsigned int state, unsigned int value)
 {
-	rts::shadow_counters::DurationScope duration(
-		rts::shadow_counters::RenderStateSetterDuration);
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
 		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	rts::shadow_counters::RenderState(state);
 
 	rts::render::LegacyPipelineState pipeline;
 	if (!rts::render::GetTrackedLegacyPipelineState(&pipeline))
@@ -3430,58 +3161,19 @@ rts::render::RenderResult NativeW3D2::SubmitGamePacket(
 	rts::render::NativeW3DTextureBindingCache *textureBindingCache,
 	rts::render::NativeW3DSortedBatchBindingCache *sortedBatchBindingCache)
 {
-#if defined(_WIN64)
-	rts::shadow_counters::Counts *shadowCounts =
-		rts::shadow_counters::Current();
-	if (shadowCounts != 0 &&
-		shadowCounts->threadedMetricsSnapshotAttempted == 0)
-	{
-		shadowCounts->threadedMetricsSnapshotAttempted = 1;
-		rts::render::ThreadedRenderMetrics metrics;
-		if (m_renderer.GetThreadedMetrics(&metrics))
-		{
-			shadowCounts->threadedMetricsSnapshotValid = 1;
-			shadowCounts->threadedMetricsOwnerExecutionNanoseconds =
-				metrics.ownerExecutionNanoseconds;
-			shadowCounts->threadedMetricsCompletedFrames =
-				metrics.completedFrames;
-			shadowCounts->threadedMetricsSubmittedFrames =
-				metrics.submittedFrames;
-			shadowCounts->threadedMetricsProducerWaitNanoseconds =
-				metrics.producerWaitNanoseconds;
-			shadowCounts->threadedMetricsBackpressureWaits =
-				metrics.backpressureWaits;
-		}
-	}
-#endif
-	rts::shadow_counters::DurationScope duration(
-		rts::shadow_counters::GamePacketSubmitDuration);
 	// Logical state and target selection may be prepared between frames, but a
 	// draw is only valid inside the frame that owns the backend command stream.
 	// SubmitExternal is reserved for the legacy bridge and must not let this
 	// owner write to an indeterminate target.
 	if (!IsOperational())
-	{
-		TraceGameSubmitRejection("owner-not-operational",
-			rts::render::RENDER_RESULT_INVALID_ARGUMENT,
-			m_renderer.IsFrameOpen(), m_resources, packet);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
-	}
 	if (!m_renderer.IsFrameOpen())
-	{
-		TraceGameSubmitRejection("frame-closed",
-			rts::render::RENDER_RESULT_INVALID_ARGUMENT, false, m_resources,
-			packet);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
-	}
 	const rts::render::RenderResult result =
 		textureBindingCache != 0 || sortedBatchBindingCache != 0 ?
 		m_renderer.SubmitInternal(m_resources, state, packet, true,
 			textureBindingCache, sortedBatchBindingCache) :
 		m_renderer.Submit(m_resources, state, packet);
-	if (result == rts::render::RENDER_RESULT_OK)
-		rts::shadow_counters::AcceptedDraw(packet.indexCount,
-			packet.vertexCount);
 	return result;
 }
 
