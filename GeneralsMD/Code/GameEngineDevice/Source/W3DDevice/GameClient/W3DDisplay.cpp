@@ -2110,6 +2110,7 @@ AGAIN:
 	}
 
 	do {
+		bool renderTargetTexturesReady = true;
 		// The native render owner retires transient GPU-copy leases at its frame
 		// boundary.  The display only submits semantic render work here.
 
@@ -2133,11 +2134,11 @@ AGAIN:
 
 
 			if (TheWaterRenderObj && TheGlobalData->m_waterType == 2)
-				TheWaterRenderObj->updateRenderTargetTextures(primaryW3DView->get3DCamera());	//do a render into each texture
+				renderTargetTexturesReady = TheWaterRenderObj->updateRenderTargetTextures(primaryW3DView->get3DCamera());	//do a render into each texture
 
 			//Can't render into textures while rendering to screen so these textures need to be updated
 			//before we enter main rendering loop.
-			if (TheW3DProjectedShadowManager)
+			if (TheW3DProjectedShadowManager && renderTargetTexturesReady)
 				TheW3DProjectedShadowManager->updateRenderTargetTextures();
 		}
 
@@ -2156,7 +2157,7 @@ AGAIN:
 		{
 			//USE_PERF_TIMER(BigAssRenderLoop)
 			static Bool couldRender = true;
-			if ((TheGlobalData->m_breakTheMovie == FALSE) && (TheGlobalData->m_disableRender == false) && WW3D::Begin_Render( true, true, Vector3( 0.0f, 0.0f, 0.0f ), TheWaterTransparency->m_minWaterOpacity ) == WW3D_ERROR_OK)
+			if (renderTargetTexturesReady && (TheGlobalData->m_breakTheMovie == FALSE) && (TheGlobalData->m_disableRender == false) && WW3D::Begin_Render( true, true, Vector3( 0.0f, 0.0f, 0.0f ), TheWaterTransparency->m_minWaterOpacity ) == WW3D_ERROR_OK)
 			{
 
 				if(TheGlobalData->m_loadScreenRender == TRUE)

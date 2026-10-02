@@ -309,7 +309,7 @@ struct NativeW3DResources::Slot
 {
 	Slot() : kind(0), authority(NATIVE_W3D_CONTENT_INVALID),
 		authorityEpoch(0), backendEpoch(0), retired(false),
-		authorityFailure(false),
+		authorityFailure(false), textureTicket(0),
 		submissionAuthority(NATIVE_W3D_CONTENT_INVALID),
 		submissionBackendEpoch(0) {}
 	GpuHandle handle;
@@ -324,6 +324,9 @@ struct NativeW3DResources::Slot
 	// A successful range-authoritative DISCARD is not a failure and leaves this
 	// clear even though its whole-buffer authority is intentionally invalid.
 	bool authorityFailure;
+	// Protected by cleanupLock. This keeps deferred Queue pin acquisition O(1)
+	// after the existing exact-handle slot lookup, not a scan of every asset.
+	NativeW3DTextureCleanupTicket *textureTicket;
 	std::vector<InitializedByteRange> initializedBytes;
 	// Confirmed bytes are published only after the matching threaded frame
 	// completion. Submission bytes include accepted FIFO uploads so a draw in
@@ -351,8 +354,9 @@ class NativeW3DTextureCleanupTicket
 {
 public:
 	NativeW3DTextureCleanupTicket(void *table,
-		NativeW3DTextureHandle handle) :
-		m_table(table), m_handle(handle), m_fallback(), m_next(0)
+		NativeW3DTextureHandle handle, bool retireOnRelease, size_t slotIndex) :
+		m_table(table), m_handle(handle), m_fallback(), m_next(0),
+		m_references(1), m_retireOnRelease(retireOnRelease), m_slotIndex(slotIndex)
 	{
 	}
 
@@ -360,6 +364,9 @@ public:
 	NativeW3DTextureHandle m_handle;
 	NativeW3DOwnerFallbackEntry m_fallback;
 	NativeW3DTextureCleanupTicket *m_next;
+	size_t m_references;
+	bool m_retireOnRelease;
+	size_t m_slotIndex;
 
 private:
 	NativeW3DTextureCleanupTicket(const NativeW3DTextureCleanupTicket &);
@@ -416,6 +423,79 @@ struct NativeW3DResources::Impl
 		delete[] bufferCleanupTicketPool;
 	}
 };
+
+NativeW3DTextureRetention::NativeW3DTextureRetention() : m_ticket(0) {}
+
+NativeW3DTextureRetention::NativeW3DTextureRetention(
+	const NativeW3DTextureRetention &other) : m_ticket(other.m_ticket)
+{
+	if (m_ticket != 0 && !NativeW3DResources::AddTextureTicketReference(m_ticket))
+		throw std::bad_alloc();
+}
+
+NativeW3DTextureRetention &NativeW3DTextureRetention::operator=(
+	const NativeW3DTextureRetention &other)
+{
+	if (this != &other)
+	{
+		NativeW3DTextureRetention copy(other);
+		NativeW3DTextureCleanupTicket *old = m_ticket;
+		m_ticket = copy.m_ticket;
+		copy.m_ticket = old;
+	}
+	return *this;
+}
+
+#if (defined(_MSC_VER) && _MSC_VER >= 1900) || __cplusplus >= 201103L
+NativeW3DTextureRetention::NativeW3DTextureRetention(
+	NativeW3DTextureRetention &&other) noexcept : m_ticket(other.m_ticket)
+{
+	other.m_ticket = 0;
+}
+
+NativeW3DTextureRetention &NativeW3DTextureRetention::operator=(
+	NativeW3DTextureRetention &&other) noexcept
+{
+	// Transfer, rather than add, references while vector erase shifts the tail.
+	// The moved-from object releases our old ticket when it is destroyed/moved.
+	NativeW3DTextureCleanupTicket *old = m_ticket;
+	m_ticket = other.m_ticket;
+	other.m_ticket = old;
+	return *this;
+}
+#endif
+
+NativeW3DTextureRetention::~NativeW3DTextureRetention() { Reset(); }
+
+void NativeW3DTextureRetention::Reset()
+{
+	if (m_ticket != 0 && NativeW3DResources::ReleaseTextureCleanupTicket(
+		m_ticket) == RENDER_RESULT_OK)
+		m_ticket = 0;
+}
+
+bool NativeW3DTextureRetention::IsValid() const { return m_ticket != 0; }
+
+RenderResult NativeW3DResources::RetainTexture(GpuHandle resource,
+	NativeW3DTextureRetention *retention)
+{
+	if (retention == 0 || !IsOwnerThread())
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	NativeW3DTextureHandle handle;
+	const RenderResult acquired = AcquireTexture(resource, &handle);
+	if (acquired != RENDER_RESULT_OK)
+		return acquired;
+	NativeW3DTextureRetention candidate;
+	const RenderResult retained = AcquireTextureCleanupTicket(handle, false,
+		&candidate.m_ticket);
+	if (retained == RENDER_RESULT_OK)
+	{
+		NativeW3DTextureCleanupTicket *old = retention->m_ticket;
+		retention->m_ticket = candidate.m_ticket;
+		candidate.m_ticket = old;
+	}
+	return retained;
+}
 
 namespace
 {
@@ -2235,6 +2315,13 @@ bool NativeW3DResources::HasBufferCleanupTicket(const Impl *impl,
 RenderResult NativeW3DResources::CreateTextureCleanupTicket(
 	NativeW3DTextureHandle handle, NativeW3DTextureCleanupTicket **ticket)
 {
+	return AcquireTextureCleanupTicket(handle, true, ticket);
+}
+
+RenderResult NativeW3DResources::AcquireTextureCleanupTicket(
+	NativeW3DTextureHandle handle, bool retireOnRelease,
+	NativeW3DTextureCleanupTicket **ticket)
+{
 	if (ticket == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -2244,8 +2331,25 @@ RenderResult NativeW3DResources::CreateTextureCleanupTicket(
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	Slot *slot = Find(handle.resource);
+	{
+		ScopedResourceTableLock lock(m_impl->cleanupLock);
+		NativeW3DTextureCleanupTicket *existing = slot->textureTicket;
+		if (existing != 0)
+		{
+			// Zero references means cleanup has won; never resurrect it.
+			if (existing->m_references == 0 || existing->m_references ==
+				static_cast<size_t>(-1))
+				return RENDER_RESULT_FAILED;
+			++existing->m_references;
+			existing->m_retireOnRelease |= retireOnRelease;
+			*ticket = existing;
+			return RENDER_RESULT_OK;
+		}
+	}
 	NativeW3DTextureCleanupTicket *created =
-		new (std::nothrow) NativeW3DTextureCleanupTicket(m_impl, handle);
+		new (std::nothrow) NativeW3DTextureCleanupTicket(m_impl, handle,
+			retireOnRelease, static_cast<size_t>(slot - &m_impl->slots[0]));
 	if (created == 0)
 	{
 		return RENDER_RESULT_OUT_OF_MEMORY;
@@ -2255,9 +2359,23 @@ RenderResult NativeW3DResources::CreateTextureCleanupTicket(
 		ScopedResourceTableLock lock(m_impl->cleanupLock);
 		created->m_next = m_impl->cleanupTickets;
 		m_impl->cleanupTickets = created;
+		slot->textureTicket = created;
 	}
 	*ticket = created;
 	return RENDER_RESULT_OK;
+}
+
+bool NativeW3DResources::AddTextureTicketReference(
+	NativeW3DTextureCleanupTicket *ticket)
+{
+	Impl *impl = ticket == 0 ? 0 : static_cast<Impl *>(ticket->m_table);
+	if (impl == 0)
+		return false;
+	ScopedResourceTableLock lock(impl->cleanupLock);
+	if (ticket->m_references == 0 || ticket->m_references == static_cast<size_t>(-1))
+		return false;
+	++ticket->m_references;
+	return true;
 }
 
 RenderResult NativeW3DResources::ReleaseTextureCleanupTicket(
@@ -2269,19 +2387,27 @@ RenderResult NativeW3DResources::ReleaseTextureCleanupTicket(
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	NativeW3DRenderState *state = 0;
+	bool retireOnRelease = false;
 	{
 		ScopedResourceTableLock lock(impl->cleanupLock);
+		if (ticket->m_references == 0)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		if (--ticket->m_references != 0)
+			return RENDER_RESULT_OK;
+		retireOnRelease = ticket->m_retireOnRelease;
 		state = impl->state;
 		if (state != 0)
 		{
 			state->AddRef();
 		}
 	}
-	if (state == 0)
+	if (state == 0 || !retireOnRelease)
 	{
 		// The table fallback already destroyed every exact backend slot. Only
 		// this externally held logical token remains.
 		ForgetTextureCleanupTicket(impl, ticket);
+		if (state != 0)
+			state->Release();
 		return RENDER_RESULT_OK;
 	}
 	if (state->IsOwnerThread() &&
@@ -2301,6 +2427,12 @@ RenderResult NativeW3DResources::ReleaseTextureCleanupTicket(
 		// externally held logical ticket after the owner object disappears.
 		ForgetTextureCleanupTicket(impl, ticket);
 		result = RENDER_RESULT_OK;
+	}
+	else if (result != RENDER_RESULT_OK)
+	{
+		// Refused transfer: the caller still owns its original reference.
+		ScopedResourceTableLock lock(impl->cleanupLock);
+		ticket->m_references = 1;
 	}
 	state->Release();
 	return result;
@@ -2436,6 +2568,9 @@ void NativeW3DResources::ForgetTextureCleanupTicket(
 		if (*link == ticket)
 		{
 			*link = ticket->m_next;
+			if (ticket->m_slotIndex < impl->slots.size() &&
+				impl->slots[ticket->m_slotIndex].textureTicket == ticket)
+				impl->slots[ticket->m_slotIndex].textureTicket = 0;
 			ticket->m_next = 0;
 			ticket->m_table = 0;
 			forgotten = true;

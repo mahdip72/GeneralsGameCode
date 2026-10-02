@@ -556,6 +556,7 @@ WaterRenderObjClass::WaterRenderObjClass()
 	m_waterType = WATER_TYPE_0_TRANSLUCENT;
 	m_tod=TIME_OF_DAY_AFTERNOON;
 	m_pReflectionTexture=nullptr;
+	m_nativeReflectionReady=false;
 	m_pReflectionDepthTexture=nullptr;
 	m_skyBox=nullptr;
 	m_pDev=nullptr;
@@ -1036,6 +1037,7 @@ HRESULT WaterRenderObjClass::generateIndexBuffer(Int sizeX, Int sizeY)
 //-------------------------------------------------------------------------------------------------
 void WaterRenderObjClass::ReleaseResources()
 {
+	m_nativeReflectionReady = false;
 
 	REF_PTR_RELEASE(m_indexBuffer);
 
@@ -1134,6 +1136,7 @@ Bool WaterRenderObjClass::updateWhiteTexture()
 //-------------------------------------------------------------------------------------------------
 void WaterRenderObjClass::ReAcquireResources()
 {
+	m_nativeReflectionReady = false;
 	HRESULT hr;
 
 	// Reacquisition may be requested more than once by a device-reset owner.
@@ -1207,6 +1210,7 @@ void WaterRenderObjClass::ReAcquireResources()
 			return;
 		}
 
+		m_nativeReflectionReady = false;
 		REF_PTR_RELEASE(m_pReflectionTexture);
 		REF_PTR_RELEASE(m_pReflectionDepthTexture);
 		if (rts::render::CreateGameRenderTargetPair(
@@ -1694,30 +1698,32 @@ void WaterRenderObjClass::loadSetting( Setting *setting, TimeOfDay timeOfDay )
 	*	textures need to be updated before we start rendering to the main screen
 	* render target because the reflection pass uses a separate color target. */
 //-------------------------------------------------------------------------------------------------
-void WaterRenderObjClass::updateRenderTargetTextures(CameraClass *cam)
+bool WaterRenderObjClass::updateRenderTargetTextures(CameraClass *cam)
 {
 	if (m_waterType == WATER_TYPE_2_PVSHADER && m_pReflectionTexture != nullptr &&
 		(!rts::render::IsNativeGameRendererActive() ||
 			m_pReflectionDepthTexture != nullptr) &&
 		getClippedWaterPlane(cam, nullptr) &&
 		TheTerrainRenderObject && TheTerrainRenderObject->getMap())
-		renderMirror(cam);	//generate texture containing reflected scene
+		return renderMirror(cam);	//generate texture containing reflected scene
+	return true;
 }
 
 //-------------------------------------------------------------------------------------------------
 /** Renders the reflected scene into an offscreen texture. */
 //-------------------------------------------------------------------------------------------------
-void WaterRenderObjClass::renderMirror(CameraClass *cam)
+bool WaterRenderObjClass::renderMirror(CameraClass *cam)
 {
+	m_nativeReflectionReady = false;
 	if (cam == nullptr || m_pReflectionTexture == nullptr ||
 		(rts::render::IsNativeGameRendererActive() &&
 			m_pReflectionDepthTexture == nullptr))
 	{
-		return;
+		return !rts::render::IsNativeGameRendererActive();
 	}
 #ifdef EXTENDED_STATS
 	if (rts::render::GetGameDebugRenderStats().disableWater) {
-		return;
+		return true;
 	}
 #endif
 	Matrix3D	OldCameraMatrix=cam->Get_Transform();
@@ -1753,31 +1759,36 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 		m_pReflectionDepthTexture, !rts::render::IsNativeGameRendererActive());
 	if (!reflectionPass.IsReady())
 	{
-		return;
+		return !rts::render::IsNativeGameRendererActive();
 	}
 
 	// Clear the backbuffer
 	const rts::render::GameRenderColor clearColor =
 		{ 0.0f, 0.0f, 0.0f, 0.0f };
-	if (rts::render::ClearGameRenderTargets(false, true, clearColor, 0.0f) !=
-		rts::render::RENDER_RESULT_OK)
+	const rts::render::RenderResult clearResult =
+		rts::render::ClearGameRenderTargets(false, true, clearColor, 0.0f);
+	if (clearResult != rts::render::RENDER_RESULT_OK)
 	{
-		return;
+		reflectionPass.Fail(clearResult);
+		return !rts::render::IsNativeGameRendererActive();
 	}	//clearing only z-buffer since background always filled with clouds
-
-	cam->Set_Transform( reflectedTransform );
 
 	//Force reflected image to be drawn into full texture size - not a viewport inside texture.
 	Vector2 vMin,vMax,vOldMax,vOldMin;
  	cam->Get_Viewport(vOldMin,vOldMax);
  	vMax.X=vMax.Y=1.0f;
 	vMin.X=vMin.Y=0.0f;
+	const bool oldCullInverted = ShaderClass::Is_Backface_Culling_Inverted();
+	#if defined(_WIN64)
+	try
+	{
+	#endif
+	cam->Set_Transform( reflectedTransform );
  	cam->Set_Viewport(vMin,vMax);
 
 	cam->Apply();	//force an update of all the camera dependent parameters like frustum clip planes
 
 	//flip the winding order of polygons to draw the reflected back sides.
-	const bool oldCullInverted = ShaderClass::Is_Backface_Culling_Inverted();
 	ShaderClass::Invert_Backface_Culling(true);
 
 	// Render the scene
@@ -1785,7 +1796,17 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	if (m_tod == TIME_OF_DAY_NIGHT)
 		renderSkyBody(&reflectedTransform);
 
+	#if defined(_WIN64)
+		if (WW3D::Render(m_parentScene,cam) != WW3D_ERROR_OK)
+			reflectionPass.Fail(rts::render::RENDER_RESULT_FAILED);
+	}
+	catch (...)
+	{
+		reflectionPass.Fail(rts::render::RENDER_RESULT_FAILED);
+	}
+	#else
 	WW3D::Render(m_parentScene,cam);
+	#endif
 
 	cam->Set_Transform(OldCameraMatrix);	//restore original non-reflected matrix
  	cam->Set_Viewport(vOldMin,vOldMax);
@@ -1793,9 +1814,13 @@ void WaterRenderObjClass::renderMirror(CameraClass *cam)
 	ShaderClass::Invert_Backface_Culling(oldCullInverted);
 	// Restore the output before applying the original camera so its pixel
 	// viewport uses the back buffer dimensions, not the reflection texture.
-	reflectionPass.RestoreTarget();
-	cam->Apply();
-	reflectionPass.Finish();
+	const rts::render::RenderResult restored = reflectionPass.RestoreTarget();
+	if (!rts::render::IsNativeGameRendererActive() ||
+		restored == rts::render::RENDER_RESULT_OK)
+		cam->Apply();
+	const rts::render::RenderResult finished = reflectionPass.Finish();
+	m_nativeReflectionReady = finished == rts::render::RENDER_RESULT_OK;
+	return !rts::render::IsNativeGameRendererActive() || m_nativeReflectionReady;
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -2097,6 +2122,15 @@ void WaterRenderObjClass::drawSea(RenderInfoClass & rinfo)
 
 	if (!getClippedWaterPlane(&rinfo.Camera,&seaBox))
 		return;	//the sea is not visible
+	#if defined(_WIN64)
+	if (!m_nativeReflectionReady)
+	{
+		// Only visible, resource-ready water can sample the reflection. Preserve
+		// invisible/resource-less no-ops; never present a partial approximation.
+		rts::render::RecordGameRenderFailure(rts::render::RENDER_RESULT_FAILED);
+		return;
+	}
+	#endif
 
 	LegacyLogicalState previousState;
 	const bool havePreviousState =

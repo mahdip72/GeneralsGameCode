@@ -951,13 +951,19 @@ RenderResult DrawGameSortedIndexedTrianglesUP(unsigned int triangleCount,
 void SetGameRenderTarget(TextureClass *colorTexture,
 	ZTextureClass *depthTexture, bool useDefaultDepth)
 {
+	(void)SetGameRenderTargetChecked(colorTexture, depthTexture, useDefaultDepth);
+}
+
+RenderResult SetGameRenderTargetChecked(TextureClass *colorTexture,
+	ZTextureClass *depthTexture, bool useDefaultDepth)
+{
 	NativeGameRenderOwnerScope scope;
 	IGameRenderClientNativeOwner *owner = scope.Get();
 	if (!IsOperationalOwner(owner))
 	{
 		if (owner != 0)
 			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
-		return;
+		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	GameRenderCommand command;
 	InitializeCommand(&command, GAME_RENDER_COMMAND_SET_RENDER_TARGET);
@@ -971,7 +977,7 @@ void SetGameRenderTarget(TextureClass *colorTexture,
 		if (depthTexture != 0)
 		{
 			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
-			return;
+			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 	}
 	else
@@ -982,7 +988,7 @@ void SetGameRenderTarget(TextureClass *colorTexture,
 		if (!AcquireOutputSurface(colorTexture, &colorSurface))
 		{
 			owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
-			return;
+			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		CopyRenderTargetSubresource(colorSurface, &binding.color);
 		binding.useBackBufferColor = false;
@@ -992,7 +998,7 @@ void SetGameRenderTarget(TextureClass *colorTexture,
 			if (!AcquireOutputSurface(depthTexture, &depthSurface))
 			{
 				owner->RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
-				return;
+				return RENDER_RESULT_INVALID_ARGUMENT;
 			}
 			CopyRenderTargetSubresource(depthSurface, &binding.depth);
 			binding.useBackBufferDepth = false;
@@ -1006,8 +1012,9 @@ void SetGameRenderTarget(TextureClass *colorTexture,
 	}
 	command.input = &binding;
 	command.inputBytes = sizeof(binding);
-	if (SubmitCommand(owner, command) != RENDER_RESULT_OK)
-		return;
+	const RenderResult selected = SubmitCommand(owner, command);
+	if (selected != RENDER_RESULT_OK)
+		return selected;
 
 	// Accepted output selection relinquishes CPU recovery authority. A pre-frame
 	// selection is applied by Begin_Render before its clear; publish the exact
@@ -1022,6 +1029,23 @@ void SetGameRenderTarget(TextureClass *colorTexture,
 		publicationSucceeded = false;
 	if (!publicationSucceeded)
 		owner->RecordGameFailure(RENDER_RESULT_FAILED);
+	return publicationSucceeded ? RENDER_RESULT_OK : RENDER_RESULT_FAILED;
+}
+
+void RecordGameRenderFailure(RenderResult failure)
+{
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	if (owner != 0)
+		owner->RecordGameFailure(failure);
+}
+
+RenderResult EndGameTextureRenderPass(RenderResult failure)
+{
+	GameRenderCommand command;
+	InitializeCommand(&command, GAME_RENDER_COMMAND_END_TEXTURE_RENDER_PASS);
+	command.value0 = static_cast<unsigned int>(failure);
+	return DispatchCommand(command);
 }
 
 RenderResult CopyGameActiveTargetToTexture(TextureClass *destination)

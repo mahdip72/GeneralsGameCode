@@ -16,6 +16,28 @@ class NativeW3DTextureCandidate;
 class NativeW3DTextureOwner;
 class NativeW3DTextureCleanupTicket;
 
+// An owning lifetime reference, distinct from a GPU content/version lease.
+// Shares the exact cleanup ticket; it never retains a resource-table facade or
+// a title object. Copies are safe while an owner transfers its publication.
+class NativeW3DTextureRetention
+{
+public:
+	NativeW3DTextureRetention();
+	NativeW3DTextureRetention(const NativeW3DTextureRetention &other);
+	NativeW3DTextureRetention &operator=(const NativeW3DTextureRetention &other);
+#if (defined(_MSC_VER) && _MSC_VER >= 1900) || __cplusplus >= 201103L
+	NativeW3DTextureRetention(NativeW3DTextureRetention &&other) noexcept;
+	NativeW3DTextureRetention &operator=(NativeW3DTextureRetention &&other) noexcept;
+#endif
+	~NativeW3DTextureRetention();
+	void Reset();
+	bool IsValid() const;
+
+private:
+	friend class NativeW3DResources;
+	NativeW3DTextureCleanupTicket *m_ticket;
+};
+
 // A buffer owner cleanup ticket is drawn from the resource table's bounded
 // pool.  The ticket retains the table implementation until an owner-thread
 // callback retires the exact handle, so a foreign owner destructor never
@@ -180,6 +202,10 @@ public:
 		NativeW3DTextureHandle *handle);
 	RenderResult AcquireTexture(GpuHandle resource,
 		NativeW3DTextureHandle *handle) const;
+	// Retains allocation lifetime, not content authority. Raw registry textures
+	// receive a non-retiring ticket; their explicit Destroy refuses while pinned.
+	RenderResult RetainTexture(GpuHandle resource,
+		NativeW3DTextureRetention *retention);
 	// Passing an invalid surface acquires the requested subresource. Passing a
 	// valid cached surface validates its exact resource, attachment, backend,
 	// mip, slice, dimensions, and format; stale inputs are cleared on failure.
@@ -247,6 +273,7 @@ public:
 	bool IsValid(NativeW3DSurfaceHandle handle) const;
 
 private:
+	friend class NativeW3DTextureRetention;
 	friend class NativeW3DRenderer;
 	friend class NativeW3DBufferOwner;
 	friend class NativeW3DTextureCandidate;
@@ -296,6 +323,9 @@ private:
 	bool IsBoundTo(const NativeW3DRenderer *renderer) const;
 	RenderResult CreateTextureCleanupTicket(NativeW3DTextureHandle handle,
 		NativeW3DTextureCleanupTicket **ticket);
+	RenderResult AcquireTextureCleanupTicket(NativeW3DTextureHandle handle,
+		bool retireOnRelease, NativeW3DTextureCleanupTicket **ticket);
+	static bool AddTextureTicketReference(NativeW3DTextureCleanupTicket *ticket);
 	static RenderResult ReleaseTextureCleanupTicket(
 		NativeW3DTextureCleanupTicket *ticket);
 	RenderResult CreateBufferCleanupTicket(GpuHandle handle,

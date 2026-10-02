@@ -12,18 +12,30 @@ class GameTextureRenderPass
 {
 public:
 	GameTextureRenderPass(TextureClass *color, ZTextureClass *depth,
-		bool useDefaultDepth) : m_open(false), m_ready(false), m_restored(false)
+		bool useDefaultDepth) : m_open(false), m_ready(false), m_restored(false),
+		m_result(RENDER_RESULT_OK)
 	{
+	#if defined(_WIN64)
+		Fail(SetGameRenderTargetChecked(color, depth, useDefaultDepth));
+		if (m_result != RENDER_RESULT_OK)
+		{
+			RestoreTarget();
+			return;
+		}
+	#else
 		SetGameRenderTarget(color, depth, useDefaultDepth);
+	#endif
 		if (!IsGameRenderingToTexture())
 		{
+			if (IsNativeGameRendererActive()) Fail(RENDER_RESULT_FAILED);
 			RestoreTarget();
 			return;
 		}
 		if (IsNativeGameRendererActive())
 		{
 			const GameRenderColor unused = { 0.0f, 0.0f, 0.0f, 0.0f };
-			if (BeginGameRender(false, false, unused, 0.0f) != RENDER_RESULT_OK)
+			Fail(BeginGameRender(false, false, unused, 0.0f));
+			if (m_result != RENDER_RESULT_OK)
 			{
 				RestoreTarget();
 				return;
@@ -35,20 +47,39 @@ public:
 
 	~GameTextureRenderPass() { Finish(); }
 	bool IsReady() const { return m_ready; }
-	void RestoreTarget()
+	void Fail(RenderResult result)
+	{
+		if (m_result == RENDER_RESULT_OK)
+			m_result = result;
+	}
+	RenderResult RestoreTarget()
 	{
 		if (!m_restored)
 		{
+		#if defined(_WIN64)
+			if (m_open)
+				Fail(FlushGameSortedTriangles());
+			const RenderResult restored = SetGameRenderTargetChecked(0, 0, true);
+			Fail(restored);
+			m_restored = restored == RENDER_RESULT_OK;
+		#else
 			SetGameRenderTarget(0, 0, true);
 			m_restored = true;
+		#endif
 		}
+		return m_result;
 	}
 	RenderResult Finish()
 	{
 		RestoreTarget();
-		if (!m_open) return RENDER_RESULT_OK;
+		if (!m_open) return m_result;
 		m_open = false;
-		return EndGameRender(false);
+	#if defined(_WIN64)
+		Fail(EndGameTextureRenderPass(m_result));
+	#else
+		Fail(EndGameRender(false));
+	#endif
+		return m_result;
 	}
 
 private:
@@ -57,6 +88,7 @@ private:
 	bool m_open;
 	bool m_ready;
 	bool m_restored;
+	RenderResult m_result;
 };
 
 } }

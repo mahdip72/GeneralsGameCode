@@ -2,12 +2,14 @@
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/ThreadedRenderDevice.h"
 #include "nativew3dbufferowner.h"
+#include "nativew3dtextureowner.h"
 #include "nativew3d2.h"
 
 #include <climits>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <vector>
 #include <windows.h>
@@ -28,6 +30,13 @@ int Check(bool condition, const char *message)
 
 class FakeRenderDevice;
 
+struct PassDrawObservation
+{
+	RenderTargetBinding target;
+	RenderViewport viewport;
+	unsigned int shaderBits;
+};
+
 struct FakeRenderControl
 {
 	FakeRenderControl() : failCreate(0), failUpdate(0), failUpdateOnCall(0),
@@ -36,7 +45,10 @@ struct FakeRenderControl
 		failRefreshOnCall(0),
 		failCopy(0), failCopyResult(RENDER_RESULT_FAILED),
 		createCalls(0), updateCalls(0), refreshCalls(0),
-		copyCalls(0), refreshPixelSequence(0) {}
+		copyCalls(0), refreshPixelSequence(0), passMode(false),
+		failDraw(0), failDrawOnCall(0), drawCalls(0),
+		failTargetOnCall(0), targetCalls(0), failClearOnCall(0), clearCalls(0), presentCalls(0),
+		failViewportOnCall(0), viewportCalls(0), endCalls(0), reflectionColorCreates(0) {}
 	volatile long failCreate;
 	volatile long failUpdate;
 	volatile long failUpdateOnCall;
@@ -50,6 +62,26 @@ struct FakeRenderControl
 	volatile long refreshCalls;
 	volatile long copyCalls;
 	volatile long refreshPixelSequence;
+	// Enabled before a mock owner is started; observations are read only after
+	// its exact completion/drain. Existing fixtures retain their strict mock.
+	bool passMode;
+	volatile long failDraw;
+	volatile long failDrawOnCall;
+	volatile long drawCalls;
+	volatile long failTargetOnCall;
+	volatile long targetCalls;
+	volatile long failClearOnCall;
+	volatile long clearCalls;
+	volatile long presentCalls;
+	volatile long failViewportOnCall;
+	volatile long viewportCalls;
+	volatile long endCalls;
+	// Exact backend identity, observed only after hidden owner completion. A
+	// producer logical handle is translated before setRenderTargets reaches us.
+	volatile long reflectionColorCreates;
+	GpuHandle reflectionColor;
+	std::vector<PassDrawObservation> draws;
+	std::vector<PassDrawObservation> clears;
 };
 
 bool IsSet(volatile long *value)
@@ -65,8 +97,8 @@ long ReadCount(volatile long *value)
 class FakeRenderContext : public IRenderContext
 {
 public:
-	explicit FakeRenderContext(FakeRenderDevice *device) :
-		m_device(device), m_frameOpen(false) {}
+	explicit FakeRenderContext(FakeRenderDevice *device, FakeRenderControl *control) :
+		m_device(device), m_frameOpen(false), m_control(control), m_stateBits(0) {}
 
 	RenderResult beginFrame() override;
 	RenderResult updateBuffer(GpuHandle buffer, const void *data,
@@ -79,28 +111,54 @@ public:
 	RenderResult clearTargets(unsigned int, const RenderFloat4 &, float,
 		unsigned int) override
 	{
+		if (PassMode() && m_frameOpen)
+		{
+			const long call = InterlockedIncrement(&m_control->clearCalls);
+			if (call == ReadCount(&m_control->failClearOnCall))
+				return RENDER_RESULT_FAILED;
+			m_control->clears.push_back(Observation());
+		}
 		return m_frameOpen ? RENDER_RESULT_OK : RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	RenderResult setRenderTargets(const RenderTargetBinding &) override
+	RenderResult setRenderTargets(const RenderTargetBinding &binding) override
 	{
+		if (PassMode() && m_frameOpen)
+		{
+			const long call = InterlockedIncrement(&m_control->targetCalls);
+			if (call == ReadCount(&m_control->failTargetOnCall))
+				return RENDER_RESULT_FAILED;
+			m_target = binding;
+		}
 		return m_frameOpen ? RENDER_RESULT_OK : RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	RenderResult setRenderTargets(GpuHandle, GpuHandle) override
 	{
 		return m_frameOpen ? RENDER_RESULT_OK : RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	RenderResult setViewport(float, float, float, float, float, float) override
+	RenderResult setViewport(float x, float y, float width, float height,
+		float minDepth, float maxDepth) override
 	{
+		if (PassMode())
+		{
+			const long call = InterlockedIncrement(&m_control->viewportCalls);
+			if (!m_frameOpen) return RENDER_RESULT_INVALID_ARGUMENT;
+			if (call == ReadCount(&m_control->failViewportOnCall))
+				return RENDER_RESULT_FAILED;
+			m_viewport = RenderViewport(x, y, width, height, minDepth, maxDepth);
+			return RENDER_RESULT_OK;
+		}
 		return m_frameOpen ? RENDER_RESULT_OK : RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	RenderResult setLegacyState(const LegacyLogicalState &, LegacyVertexFormat,
+	RenderResult setLegacyState(const LegacyLogicalState &state, LegacyVertexFormat,
 		unsigned int) override
 	{
+		m_stateBits = state.pipeline.shaderBits;
 		return m_frameOpen ? RENDER_RESULT_OK : RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	RenderResult setLegacyStateForLayout(const LegacyLogicalState &,
+	RenderResult setLegacyStateForLayout(const LegacyLogicalState &state,
 		const LegacyVertexLayout &, unsigned int) override
 	{
+		m_stateBits = state.pipeline.shaderBits;
 		return m_frameOpen ? RENDER_RESULT_OK : RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	RenderResult setVertexBuffer(GpuHandle, unsigned int,
@@ -127,6 +185,13 @@ public:
 	}
 	RenderResult drawIndexed(unsigned int, unsigned int, int) override
 	{
+		if (PassMode() && m_frameOpen)
+		{
+			const long call = InterlockedIncrement(&m_control->drawCalls);
+			if (IsSet(&m_control->failDraw) || call == ReadCount(&m_control->failDrawOnCall))
+				return RENDER_RESULT_FAILED;
+			m_control->draws.push_back(Observation());
+		}
 		return m_frameOpen ? RENDER_RESULT_OK : RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	RenderResult endFrame() override;
@@ -134,8 +199,21 @@ public:
 	bool IsFrameOpen() const { return m_frameOpen; }
 
 private:
+	bool PassMode() const { return m_control != 0 && m_control->passMode; }
+	PassDrawObservation Observation() const
+	{
+		PassDrawObservation result;
+		result.target = m_target;
+		result.viewport = m_viewport;
+		result.shaderBits = m_stateBits;
+		return result;
+	}
 	FakeRenderDevice *m_device;
 	bool m_frameOpen;
+	FakeRenderControl *m_control;
+	RenderTargetBinding m_target;
+	RenderViewport m_viewport;
+	unsigned int m_stateBits;
 };
 
 struct FakeResource
@@ -156,7 +234,7 @@ class FakeRenderDevice : public IRenderDevice
 public:
 	explicit FakeRenderDevice(bool operational = true,
 		FakeRenderControl *control = 0) : m_handles(16), m_resources(16),
-		m_context(this), m_operational(operational), m_failDestroy(false),
+		m_context(this, control), m_operational(operational), m_failDestroy(false),
 		m_destroyCount(0),
 		m_refreshCount(0), m_control(control) {}
 
@@ -244,6 +322,16 @@ public:
 		resource.texture = true;
 		resource.textureDescriptor = descriptor;
 		*texture = handle;
+		if (m_control != 0 && m_control->passMode && initialData == 0 && initialDataCount == 0 &&
+			descriptor.width == 256 && descriptor.height == 256 && descriptor.mipCount == 1 &&
+			descriptor.arrayCount == 1 && descriptor.dimension == RENDER_TEXTURE_2D &&
+			descriptor.format == RENDER_FORMAT_R8G8B8A8_UNORM &&
+			descriptor.binding == (RENDER_TEXTURE_RENDER_TARGET | RENDER_TEXTURE_SHADER_RESOURCE) &&
+			descriptor.usage == RENDER_USAGE_DEFAULT)
+		{
+			m_control->reflectionColor = handle;
+			InterlockedIncrement(&m_control->reflectionColorCreates);
+		}
 		return RENDER_RESULT_OK;
 	}
 
@@ -372,7 +460,12 @@ public:
 		return width != 0 && height != 0 ? RENDER_RESULT_OK :
 			RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	RenderResult present() override { return RENDER_RESULT_OK; }
+	RenderResult present() override
+	{
+		if (m_control != 0 && m_control->passMode)
+			InterlockedIncrement(&m_control->presentCalls);
+		return RENDER_RESULT_OK;
+	}
 	RenderResult getBackBufferInfo(RenderBackBufferInfo *info) const override
 	{
 		if (info == 0)
@@ -512,6 +605,11 @@ RenderResult FakeRenderContext::beginFrame()
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	m_frameOpen = true;
+	if (PassMode())
+	{
+		m_target = RenderTargetBinding();
+		m_viewport = RenderViewport(0, 0, 4, 4, 0, 1);
+	}
 	return RENDER_RESULT_OK;
 }
 
@@ -530,6 +628,7 @@ RenderResult FakeRenderContext::endFrame()
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	if (PassMode()) InterlockedIncrement(&m_control->endCalls);
 	m_frameOpen = false;
 	return RENDER_RESULT_OK;
 }
@@ -746,6 +845,554 @@ int TestCopyExecutionFailures()
 			delete device;
 			std::printf("COPY_EXECUTION_FAILURE mode=%u result=%d checked\n", mode, failures[fault]);
 		}
+	return result;
+}
+
+RenderResult SelectPassTarget(NativeW3D2 &product, const RenderTargetBinding &target)
+{
+	GameRenderCommand command = {};
+	command.type = GAME_RENDER_COMMAND_SET_RENDER_TARGET;
+	command.input = &target;
+	command.inputBytes = sizeof(target);
+	return product.ExecuteGameRenderCommand(command);
+}
+
+RenderResult BeginPassFrame(NativeW3D2 &product, bool clear)
+{
+	GameRenderCommand command = {};
+	command.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+	command.value0 = clear ? RENDER_CLEAR_COLOR | RENDER_CLEAR_DEPTH : 0;
+	command.float4 = 1.0f;
+	return product.ExecuteGameRenderCommand(command);
+}
+
+bool CheckPassResult(unsigned int mode, const char *step, RenderResult actual)
+{
+	if (actual != RENDER_RESULT_OK)
+		std::fprintf(stderr, "PASS_STEP mode=%u step=%s actual=%d expected=%d\n",
+			mode, step, static_cast<int>(actual), static_cast<int>(RENDER_RESULT_OK));
+	return actual == RENDER_RESULT_OK;
+}
+
+RenderResult EndHiddenPass(NativeW3D2 &product, RenderResult first = RENDER_RESULT_OK)
+{
+	GameRenderCommand command = {};
+	command.type = GAME_RENDER_COMMAND_END_TEXTURE_RENDER_PASS;
+	command.value0 = first;
+	return product.ExecuteGameRenderCommand(command);
+}
+
+RenderResult QueuePassTriangle(NativeW3D2 &product, unsigned int stateBits, float z)
+{
+	struct Vertex { float x, y, z; unsigned int color; };
+	const Vertex vertices[] = { { 0, 0, z, 0xffffffffU },
+		{ 1, 0, z, 0xffffffffU }, { 0, 1, z, 0xffffffffU } };
+	const unsigned short indices[] = { 0, 1, 2 };
+	LegacyLogicalState state;
+	state.pipeline.shaderBits = stateBits;
+	NativeDrawPacket packet;
+	packet.vertexStride = sizeof(Vertex);
+	packet.vertexLayout.stride = sizeof(Vertex);
+	packet.vertexLayout.elementCount = 2;
+	packet.vertexLayout.elements[0].semantic = RENDER_VERTEX_SEMANTIC_POSITION;
+	packet.vertexLayout.elements[0].format = RENDER_VERTEX_DATA_FLOAT3;
+	packet.vertexLayout.elements[1].semantic = RENDER_VERTEX_SEMANTIC_DIFFUSE;
+	packet.vertexLayout.elements[1].format = RENDER_VERTEX_DATA_COLOR_BGRA8;
+	packet.vertexLayout.elements[1].byteOffset = sizeof(float) * 3;
+	packet.vertexCount = packet.indexCount = 3;
+	packet.indexed = true;
+	return product.QueueGameSortedTriangles(state, packet, vertices, sizeof(vertices),
+		indices, sizeof(indices), 0);
+}
+
+bool IsPassDraw(const PassDrawObservation &draw, unsigned int state,
+	GpuHandle color, const RenderViewport &viewport)
+{
+	return draw.shaderBits == state &&
+		(color.isValid() ? !draw.target.useBackBufferColor && draw.target.color.resource == color :
+		 draw.target.useBackBufferColor) &&
+		draw.viewport.x == viewport.x && draw.viewport.y == viewport.y &&
+		draw.viewport.width == viewport.width && draw.viewport.height == viewport.height &&
+		draw.viewport.minimumDepth == viewport.minimumDepth &&
+		draw.viewport.maximumDepth == viewport.maximumDepth;
+}
+
+// Borrowed backend lifetime must include Native2's destructor retry even when
+// the explicit checked Shutdown below fails. This is fixture ownership only.
+class ScopedPassDevice
+{
+public:
+	explicit ScopedPassDevice(IRenderDevice *device) : m_device(device) {}
+	~ScopedPassDevice() { m_device->shutdown(); delete m_device; }
+private:
+	ScopedPassDevice(const ScopedPassDevice &);
+	ScopedPassDevice &operator=(const ScopedPassDevice &);
+	IRenderDevice *m_device;
+};
+
+int CheckRejectedPassViewports(NativeW3D2 &product, FakeRenderControl &control)
+{
+	int result = 0;
+	const long calls = ReadCount(&control.viewportCalls);
+	const float nonfinite[] = { std::numeric_limits<float>::quiet_NaN(),
+		std::numeric_limits<float>::infinity() };
+	for (unsigned int field = 0; field < 6; ++field)
+		for (unsigned int value = 0; value < 2; ++value)
+		{
+			RenderViewport viewport(1, 2, 64, 48, .25f, .75f);
+			float *fields[] = { &viewport.x, &viewport.y, &viewport.width,
+				&viewport.height, &viewport.minimumDepth, &viewport.maximumDepth };
+			*fields[field] = nonfinite[value];
+			result |= Check(product.SetGameViewport(viewport) == RENDER_RESULT_INVALID_ARGUMENT,
+				"nonfinite public viewport is rejected without cache/command publication");
+		}
+	const RenderViewport invalid[] = { RenderViewport(-1, 0, 64, 48, 0, 1),
+		RenderViewport(0, -1, 64, 48, 0, 1), RenderViewport(0, 0, 0, 48, 0, 1),
+		RenderViewport(0, 0, 64, 0, 0, 1), RenderViewport(0, 0, -1, 48, 0, 1),
+		RenderViewport(0, 0, 64, -1, 0, 1), RenderViewport(0, 0, 64, 48, -.1f, 1),
+		RenderViewport(0, 0, 64, 48, 0, 1.1f), RenderViewport(0, 0, 64, 48, .75f, .25f) };
+	for (unsigned int index = 0; index < sizeof(invalid) / sizeof(invalid[0]); ++index)
+		result |= Check(product.SetGameViewport(invalid[index]) == RENDER_RESULT_INVALID_ARGUMENT,
+			"invalid public viewport range/extent is rejected without publication");
+	result |= Check(ReadCount(&control.viewportCalls) == calls,
+		"rejected viewport inputs never reach the backend context");
+	return result;
+}
+
+struct WrongOwnerViewport
+{
+	NativeW3D2 *product;
+	RenderResult result;
+};
+
+DWORD WINAPI SetViewportFromWrongOwner(void *parameter)
+{
+	WrongOwnerViewport *request = static_cast<WrongOwnerViewport *>(parameter);
+	request->result = request->product->SetGameViewport(RenderViewport(1, 2, 64, 48, 0, 1));
+	return 0;
+}
+
+int TestDeferredNativePassAdmissionsCpu()
+{
+	int result = 0;
+	{
+		NativeW3D2 unavailable;
+		result |= Check(unavailable.SetGameViewport(RenderViewport(0, 0, 4, 4, 0, 1)) ==
+			RENDER_RESULT_INVALID_ARGUMENT, "uninitialized public viewport refuses logical admission");
+	}
+	for (unsigned int mode = 0; mode < 3; ++mode)
+	{
+		FakeRenderControl control;
+		control.passMode = true;
+		ThreadedRenderOptions options;
+		options.serial = mode == 1;
+		IRenderDevice *device = mode == 0 ? new FakeRenderDevice(false, &control) :
+			CreateThreadedRenderDevice(CreateThreadedFakeRenderDevice, &control, options);
+		if (!device) return result | Check(false, "deferred pass mock allocation");
+		RenderDeviceParameters parameters;
+		parameters.backend = RENDER_BACKEND_D3D11;
+		parameters.window = reinterpret_cast<void *>(1);
+		parameters.width = parameters.height = 4;
+		if (device->initialize(parameters) != RENDER_RESULT_OK)
+		{
+			delete device;
+			return result | Check(false, "deferred pass mock initialization");
+		}
+		ScopedPassDevice deviceLifetime(device);
+		NativeW3D2 product;
+		const RenderResult attachment = product.AttachBackend(device, device->immediateContext());
+		result |= Check(attachment == RENDER_RESULT_OK,
+			"deferred pass attaches actual Native2 owner");
+		if (attachment != RENDER_RESULT_OK) return result;
+		TextureDescriptor descriptor;
+		descriptor.width = descriptor.height = 256;
+		descriptor.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+		descriptor.binding = RENDER_TEXTURE_RENDER_TARGET | RENDER_TEXTURE_SHADER_RESOURCE;
+		descriptor.usage = RENDER_USAGE_DEFAULT;
+		NativeW3DTextureHandle color;
+		const RenderResult allocation = product.Resources().CreateTexture(descriptor, 0, 0, &color);
+		result |= Check(allocation == RENDER_RESULT_OK,
+			"deferred pass reflection allocation");
+		if (allocation != RENDER_RESULT_OK) return result;
+		descriptor.format = RENDER_FORMAT_D24_UNORM_S8_UINT;
+		descriptor.binding = RENDER_TEXTURE_DEPTH_STENCIL;
+		NativeW3DTextureHandle depth;
+		const RenderResult depthAllocation = product.Resources().CreateTexture(descriptor, 0, 0, &depth);
+		result |= Check(depthAllocation == RENDER_RESULT_OK,
+			"deferred pass matching reflection depth allocation");
+		if (depthAllocation != RENDER_RESULT_OK) return result;
+		RenderTargetBinding reflection;
+		reflection.useBackBufferColor = reflection.useBackBufferDepth = false;
+		reflection.hasColor = reflection.hasDepth = true;
+		reflection.color.resource = color.resource;
+		reflection.depth.resource = depth.resource;
+		const RenderViewport mainViewport(7, 9, 640, 480, .25f, .75f);
+		const RenderViewport reflectedViewport(3, 5, 256, 256, 0, 1);
+		const RenderResult preframeViewport = product.SetGameViewport(mainViewport);
+		result |= Check(preframeViewport == RENDER_RESULT_OK &&
+			!product.Renderer().IsFrameOpen() && ReadCount(&control.viewportCalls) == 0,
+			"valid nondefault preframe viewport is logical only, no backend command");
+		result |= CheckRejectedPassViewports(product, control);
+		WrongOwnerViewport wrongOwner = { &product, RENDER_RESULT_OK };
+		HANDLE viewportThread = CreateThread(0, 0, SetViewportFromWrongOwner, &wrongOwner, 0, 0);
+		result |= Check(viewportThread != 0, "viewport wrong-owner fixture starts its joined worker");
+		if (viewportThread != 0)
+		{
+			WaitForSingleObject(viewportThread, INFINITE);
+			CloseHandle(viewportThread);
+			result |= Check(wrongOwner.result == RENDER_RESULT_INVALID_ARGUMENT &&
+				ReadCount(&control.viewportCalls) == 0,
+				"wrong-owner public viewport cannot mutate cache or dispatch context");
+		}
+		result |= Check(CheckPassResult(mode, "preframe MAIN viewport", preframeViewport) &&
+			CheckPassResult(mode, "preframe MAIN queue", QueuePassTriangle(product, 101, 1)) &&
+			CheckPassResult(mode, "reflection target", SelectPassTarget(product, reflection)) &&
+			CheckPassResult(mode, "reflection Begin/clear", BeginPassFrame(product, true)) &&
+			CheckPassResult(mode, "reflection viewport", product.SetGameViewport(reflectedViewport)) &&
+			CheckPassResult(mode, "reflection queue", QueuePassTriangle(product, 202, 2)) &&
+			CheckPassResult(mode, "reflection restore default", SelectPassTarget(product, RenderTargetBinding())) &&
+			CheckPassResult(mode, "reflection Finish", EndHiddenPass(product)),
+			"MAIN preframe admission survives reflection Begin/clear/restore/Finish");
+		result |= Check(ReadCount(&control.reflectionColorCreates) == 1 && control.reflectionColor.isValid(),
+			"hidden completion exposes one unique descriptor-matched backend reflection color");
+		const bool reflectionOnly = control.draws.size() == 1 && control.clears.size() == 1 &&
+			!control.clears[0].target.useBackBufferColor &&
+			IsPassDraw(control.draws[0], 202, control.reflectionColor, reflectedViewport);
+		if (!reflectionOnly)
+		{
+			std::fprintf(stderr, "DEFERRED_PASS_OBSERVATION mode=%u draws=%zu clears=%zu expectedShader=202 expectedColor=%u/%u expectedViewport=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+				mode, control.draws.size(), control.clears.size(), control.reflectionColor.index(), control.reflectionColor.generation(),
+				reflectedViewport.x, reflectedViewport.y, reflectedViewport.width, reflectedViewport.height,
+				reflectedViewport.minimumDepth, reflectedViewport.maximumDepth);
+			if (!control.draws.empty())
+			{
+				const PassDrawObservation &observed = control.draws[0];
+				std::fprintf(stderr, "DEFERRED_PASS_DRAW shader=%u backColor=%u hasColor=%u color=%u/%u viewport=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+					observed.shaderBits, static_cast<unsigned int>(observed.target.useBackBufferColor),
+					static_cast<unsigned int>(observed.target.hasColor), observed.target.color.resource.index(),
+					observed.target.color.resource.generation(), observed.viewport.x, observed.viewport.y,
+					observed.viewport.width, observed.viewport.height, observed.viewport.minimumDepth, observed.viewport.maximumDepth);
+			}
+			if (!control.clears.empty())
+				std::fprintf(stderr, "DEFERRED_PASS_CLEAR backColor=%u hasColor=%u color=%u/%u\n",
+					static_cast<unsigned int>(control.clears[0].target.useBackBufferColor),
+					static_cast<unsigned int>(control.clears[0].target.hasColor),
+					control.clears[0].target.color.resource.index(), control.clears[0].target.color.resource.generation());
+		}
+		result |= Check(reflectionOnly,
+			"hidden pass emits only reflection geometry, never inactive MAIN");
+		result |= Check(CheckPassResult(mode, "matching MAIN viewport", product.SetGameViewport(RenderViewport(0, 0, 4, 4, 0, 1))) &&
+			CheckPassResult(mode, "matching MAIN Begin/clear", BeginPassFrame(product, true)) &&
+			CheckPassResult(mode, "matching MAIN flush", product.FlushGameSortedTriangles()) &&
+			CheckPassResult(mode, "matching MAIN Finish", EndHiddenPass(product)),
+			"matching MAIN Begin activates original captured viewport only after successful clear");
+		result |= Check(control.draws.size() == 2 && control.clears.size() == 2 &&
+			control.clears[1].target.useBackBufferColor &&
+			IsPassDraw(control.draws[1], 101, GpuHandle(), mainViewport),
+			"MAIN state/bytes/viewport retained exactly once after reflection interval erasure");
+		if (mode == 0)
+		{
+			result |= Check(BeginPassFrame(product, false) == RENDER_RESULT_OK &&
+				product.SetGameViewport(mainViewport) == RENDER_RESULT_OK,
+				"direct in-frame viewport establishes successful prior cache");
+			result |= CheckRejectedPassViewports(product, control);
+			InterlockedExchange(&control.failViewportOnCall, ReadCount(&control.viewportCalls) + 1);
+			result |= Check(product.SetGameViewport(reflectedViewport) == RENDER_RESULT_FAILED,
+				"direct backend viewport failure is returned, not published as logical cache");
+			InterlockedExchange(&control.failViewportOnCall, 0);
+			const size_t beforeRejectedViewportDraw = control.draws.size();
+			result |= Check(QueuePassTriangle(product, 302, 1) == RENDER_RESULT_OK &&
+				product.FlushGameSortedTriangles() == RENDER_RESULT_OK && EndHiddenPass(product) == RENDER_RESULT_OK &&
+				control.draws.size() == beforeRejectedViewportDraw + 1 &&
+				IsPassDraw(control.draws.back(), 302, GpuHandle(), mainViewport),
+				"failed in-frame setter preserves actual subsequent captured viewport");
+			for (unsigned int fault = 0; fault < 3; ++fault)
+			{
+				const unsigned int bits = 303 + fault;
+				const size_t draws = control.draws.size();
+				result |= Check(QueuePassTriangle(product, bits, 1) == RENDER_RESULT_OK,
+					"failed Begin fixture admits owned MAIN work");
+				if (fault == 0)
+					InterlockedExchange(&control.failTargetOnCall, ReadCount(&control.targetCalls) + 1);
+				else if (fault == 1)
+					InterlockedExchange(&control.failClearOnCall, ReadCount(&control.clearCalls) + 1);
+				else
+					InterlockedExchange(&control.failViewportOnCall, ReadCount(&control.viewportCalls) + 1);
+				const long ends = ReadCount(&control.endCalls);
+				result |= Check(BeginPassFrame(product, true) == RENDER_RESULT_FAILED &&
+					!product.Renderer().IsFrameOpen() && control.draws.size() == draws &&
+					ReadCount(&control.endCalls) == ends + 1,
+					"target/clear/viewport failed Begin seals once without pending activation/draw");
+				InterlockedExchange(&control.failTargetOnCall, 0);
+				InterlockedExchange(&control.failClearOnCall, 0);
+				InterlockedExchange(&control.failViewportOnCall, 0);
+				result |= Check(SelectPassTarget(product, reflection) == RENDER_RESULT_OK &&
+					BeginPassFrame(product, true) == RENDER_RESULT_OK &&
+					SelectPassTarget(product, RenderTargetBinding()) == RENDER_RESULT_OK &&
+					EndHiddenPass(product) == RENDER_RESULT_OK && control.draws.size() == draws,
+					"later different-output healthy Begin cannot activate failed MAIN admission");
+				result |= Check(product.ReplaceBackendContext(0) == RENDER_RESULT_INVALID_ARGUMENT &&
+					BeginPassFrame(product, true) == RENDER_RESULT_OK &&
+					product.ReplaceBackendContext(device->immediateContext()) == RENDER_RESULT_INVALID_ARGUMENT &&
+					product.FlushGameSortedTriangles() == RENDER_RESULT_OK && EndHiddenPass(product) == RENDER_RESULT_OK &&
+					control.draws.size() == draws + 1 &&
+					IsPassDraw(control.draws.back(), bits, GpuHandle(), mainViewport),
+					"null/open-frame context replacement refusal preserves matching-output admission");
+			}
+			const size_t draws = control.draws.size();
+			result |= Check(QueuePassTriangle(product, 400, 1) == RENDER_RESULT_OK &&
+				product.ReplaceBackendContext(device->immediateContext()) == RENDER_RESULT_OK &&
+				BeginPassFrame(product, true) == RENDER_RESULT_OK &&
+				product.FlushGameSortedTriangles() == RENDER_RESULT_OK && EndHiddenPass(product) == RENDER_RESULT_OK &&
+				control.draws.size() == draws,
+				"successful explicit borrowed recovery discards old epoch instead of activating stale pending work");
+		}
+		else
+		{
+			const size_t draws = control.draws.size(), clears = control.clears.size();
+			const long ends = ReadCount(&control.endCalls);
+			InterlockedExchange(&control.failViewportOnCall, ReadCount(&control.viewportCalls) + 1);
+			result |= Check(product.SetGameViewport(mainViewport) == RENDER_RESULT_OK &&
+				BeginPassFrame(product, true) == RENDER_RESULT_OK &&
+				QueuePassTriangle(product, 405, 1) == RENDER_RESULT_OK,
+				"threaded Begin/viewport/queue is producer admission, not owner success");
+			const RenderResult finished = EndHiddenPass(product);
+			result |= Check(finished == RENDER_RESULT_FAILED && !product.Renderer().IsFrameOpen() &&
+				control.draws.size() == draws && control.clears.size() == clears &&
+				ReadCount(&control.endCalls) == ends + 1,
+				"threaded owner viewport failure skips clear/draw and hidden completion fails after one End");
+			InterlockedExchange(&control.failViewportOnCall, 0);
+		}
+		const size_t beforeRecovery = control.draws.size();
+		result |= Check(product.SetGameViewport(mainViewport) == RENDER_RESULT_OK &&
+			QueuePassTriangle(product, 406, 1) == RENDER_RESULT_OK &&
+			product.ReplaceBackendContext(device->immediateContext()) == RENDER_RESULT_OK &&
+			QueuePassTriangle(product, 407, 1) == RENDER_RESULT_OK &&
+			BeginPassFrame(product, true) == RENDER_RESULT_OK &&
+			product.FlushGameSortedTriangles() == RENDER_RESULT_OK && EndHiddenPass(product) == RENDER_RESULT_OK &&
+			control.draws.size() == beforeRecovery + 1 &&
+			IsPassDraw(control.draws.back(), 407, GpuHandle(), RenderViewport(0, 0, 4, 4, 0, 1)),
+			"checked borrowed replacement invalidates old MAIN/cache and healthy new pass uses default viewport");
+		result |= Check(ReadCount(&control.presentCalls) == 0 && product.Shutdown() == RENDER_RESULT_OK,
+			"deferred pass fixture stays hidden and releases old epoch pins on teardown");
+		result |= Check(product.SetGameViewport(mainViewport) == RENDER_RESULT_INVALID_ARGUMENT,
+			"shut-down public viewport refuses logical admission");
+		std::printf("DEFERRED_PASS_CPU mode=%u failures=%d\n", mode, result);
+	}
+	return result;
+}
+
+int TestSortedPassOwnershipCpu()
+{
+	int result = TestDeferredNativePassAdmissionsCpu();
+	if (result != 0) return result;
+	for (unsigned int mode = 0; mode < 3; ++mode)
+	{
+		FakeRenderControl control;
+		control.passMode = true;
+		ThreadedRenderOptions options;
+		options.serial = mode == 1;
+		IRenderDevice *device = mode == 0 ? new FakeRenderDevice(false, &control) :
+			CreateThreadedRenderDevice(CreateThreadedFakeRenderDevice, &control, options);
+		if (!device) return result | Check(false, "sorted pass mock allocation");
+		RenderDeviceParameters parameters;
+		parameters.backend = RENDER_BACKEND_D3D11;
+		parameters.window = reinterpret_cast<void *>(1);
+		parameters.width = parameters.height = 4;
+		if (device->initialize(parameters) != RENDER_RESULT_OK)
+		{
+			delete device;
+			return result | Check(false, "sorted pass mock initialization");
+		}
+		ScopedPassDevice deviceLifetime(device);
+		NativeW3D2 product;
+		const RenderResult attachment = product.AttachBackend(device, device->immediateContext());
+		result |= Check(attachment ==
+			RENDER_RESULT_OK, "actual Native2 pass fixture attachment");
+		if (attachment != RENDER_RESULT_OK) return result;
+		TextureDescriptor descriptor;
+		descriptor.width = descriptor.height = 256;
+		descriptor.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+		descriptor.binding = RENDER_TEXTURE_RENDER_TARGET | RENDER_TEXTURE_SHADER_RESOURCE;
+		descriptor.usage = RENDER_USAGE_DEFAULT;
+		NativeW3DTextureHandle color, depth;
+		const RenderResult colorAllocation = product.Resources().CreateTexture(descriptor, 0, 0, &color);
+		result |= Check(colorAllocation ==
+			RENDER_RESULT_OK, "reflection color allocation");
+		if (colorAllocation != RENDER_RESULT_OK) return result;
+		descriptor.format = RENDER_FORMAT_D24_UNORM_S8_UINT;
+		descriptor.binding = RENDER_TEXTURE_DEPTH_STENCIL;
+		const RenderResult depthAllocation = product.Resources().CreateTexture(descriptor, 0, 0, &depth);
+		result |= Check(depthAllocation ==
+			RENDER_RESULT_OK, "reflection depth allocation");
+		if (depthAllocation != RENDER_RESULT_OK) return result;
+		RenderTargetBinding reflection;
+		reflection.useBackBufferColor = reflection.useBackBufferDepth = false;
+		reflection.hasColor = reflection.hasDepth = true;
+		reflection.color.resource = color.resource;
+		reflection.depth.resource = depth.resource;
+		const RenderViewport reflectedViewport(3, 5, 256, 256, .125f, .875f);
+		const RenderViewport mainViewport(7, 9, 640, 480, 0, 1);
+		result |= Check(SelectPassTarget(product, reflection) == RENDER_RESULT_OK &&
+			BeginPassFrame(product, false) == RENDER_RESULT_OK &&
+			product.SetGameViewport(reflectedViewport) == RENDER_RESULT_OK &&
+			QueuePassTriangle(product, 11, 1) == RENDER_RESULT_OK &&
+			QueuePassTriangle(product, 22, 2) == RENDER_RESULT_OK,
+			"reflection queues immutable state/geometry/context through actual owner");
+		if (mode == 0)
+		{
+			// Actual typed copy path: no facade or logical-info replacement mock.
+			NativeW3DTextureOwner copyOwner;
+			NativeW3DTextureCandidate copyCandidate;
+			TextureDescriptor copyDescriptor;
+			copyDescriptor.width = copyDescriptor.height = 256;
+			copyDescriptor.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+			copyDescriptor.binding = RENDER_TEXTURE_RENDER_TARGET | RENDER_TEXTURE_SHADER_RESOURCE;
+			copyDescriptor.usage = RENDER_USAGE_DEFAULT;
+			std::vector<unsigned char> copyPixels(copyDescriptor.width * copyDescriptor.height * 4, 0);
+			TextureSubresourceData copyData;
+			copyData.data = &copyPixels[0]; copyData.rowPitch = copyDescriptor.width * 4;
+			copyData.slicePitch = copyPixels.size();
+			NativeW3DGpuContentLease oldCopyLease;
+			const int copySetupFailed = Check(copyOwner.CreateCandidate(copyDescriptor, &copyData, 1, &copyCandidate) == RENDER_RESULT_OK &&
+				copyOwner.PublishCandidate(&copyCandidate, 0) == RENDER_RESULT_OK &&
+				copyOwner.CopyActiveColorTarget(&oldCopyLease) == RENDER_RESULT_OK && oldCopyLease.isValid(),
+				"actual typed owner seeds a valid old copy lease before sorted failure");
+			result |= copySetupFailed;
+			if (copySetupFailed != 0) return result;
+			unsigned char cpuPixels[64] = {};
+			TextureDescriptor cpuDescriptor = copyDescriptor;
+			cpuDescriptor.width = cpuDescriptor.height = 4;
+			TextureSubresourceData cpuData;
+			cpuData.data = cpuPixels; cpuData.rowPitch = 16; cpuData.slicePitch = sizeof(cpuPixels);
+			NativeW3DTextureHandle independentCpu;
+			const unsigned int vertexData[] = {1, 2, 3, 4};
+			const unsigned short indexData[] = {0, 1, 2};
+			BufferDescriptor vertexDescriptor;
+			vertexDescriptor.byteCount = sizeof(vertexData);
+			vertexDescriptor.stride = sizeof(unsigned int);
+			vertexDescriptor.binding = RENDER_BUFFER_VERTEX;
+			BufferDescriptor indexDescriptor;
+			indexDescriptor.byteCount = sizeof(indexData);
+			indexDescriptor.stride = sizeof(unsigned short);
+			indexDescriptor.binding = RENDER_BUFFER_INDEX;
+			GpuHandle independentVertex, independentIndex;
+			result |= Check(product.Resources().CreateTexture(cpuDescriptor, &cpuData, 1, &independentCpu) == RENDER_RESULT_OK &&
+				product.Resources().CreateBuffer(vertexDescriptor, vertexData, sizeof(vertexData), &independentVertex) == RENDER_RESULT_OK &&
+				product.Resources().CreateBuffer(indexDescriptor, indexData, sizeof(indexData), &independentIndex) == RENDER_RESULT_OK,
+				"copy barrier fixture creates independent CPU texture/VB/IB authority");
+			NativeW3DTextureDescription cpuBefore;
+			NativeW3DBufferDescription vertexBefore, indexBefore;
+			result |= Check(product.Resources().DescribeTexture(independentCpu.resource, &cpuBefore) == RENDER_RESULT_OK &&
+				product.Resources().DescribeBuffer(independentVertex, &vertexBefore) == RENDER_RESULT_OK &&
+				product.Resources().DescribeBuffer(independentIndex, &indexBefore) == RENDER_RESULT_OK,
+				"copy barrier captures independent authority versions");
+			auto checkTypedCopyBarrier = [&]() {
+				NativeW3DGpuContentLease lease = oldCopyLease;
+				const long copies = ReadCount(&control.copyCalls);
+				RenderBackBufferInfo info;
+				info.width = 99;
+				GpuHandle source = color.resource;
+				NativeW3DTextureDescription cpuAfter;
+				NativeW3DBufferDescription vertexAfter, indexAfter;
+				result |= Check(product.GetGameActiveColorTargetInfo(&info, &source) == RENDER_RESULT_FAILED &&
+					info.width == 0 && !source.isValid() &&
+					copyOwner.CopyActiveColorTarget(&lease) == RENDER_RESULT_FAILED && !lease.isValid() &&
+					ReadCount(&control.copyCalls) == copies,
+					"typed copy refuses sorted physical-output barrier, clears stale lease, admits no backend copy");
+				result |= Check(product.Resources().DescribeTexture(independentCpu.resource, &cpuAfter) == RENDER_RESULT_OK &&
+					product.Resources().DescribeBuffer(independentVertex, &vertexAfter) == RENDER_RESULT_OK &&
+					product.Resources().DescribeBuffer(independentIndex, &indexAfter) == RENDER_RESULT_OK &&
+					cpuAfter.authority == cpuBefore.authority && cpuAfter.authorityEpoch == cpuBefore.authorityEpoch &&
+					vertexAfter.authority == vertexBefore.authority && vertexAfter.authorityEpoch == vertexBefore.authorityEpoch &&
+					indexAfter.authority == indexBefore.authority && indexAfter.authorityEpoch == indexBefore.authorityEpoch,
+					"refused typed copy preserves independent CPU/VB/IB authority versions");
+			};
+			InterlockedExchange(&control.failDrawOnCall, 2);
+			result |= Check(product.FlushGameSortedTriangles() == RENDER_RESULT_FAILED &&
+				control.draws.size() == 1 && !product.Resources().Destroy(color.resource) &&
+				!product.Resources().Destroy(depth.resource),
+				"partial accepted reflection retains both output tickets");
+			checkTypedCopyBarrier();
+			InterlockedExchange(&control.failDraw, 1);
+			result |= Check(SelectPassTarget(product, RenderTargetBinding()) == RENDER_RESULT_FAILED &&
+				product.ActiveRenderTargetKind() == GAME_RENDER_TARGET_BACK_BUFFER &&
+				EndHiddenPass(product) == RENDER_RESULT_FAILED && !product.Renderer().IsFrameOpen(),
+				"failed retry still restores MAIN logically and seals hidden frame exactly once");
+			result |= Check(product.SetGameViewport(mainViewport) == RENDER_RESULT_OK &&
+				QueuePassTriangle(product, 33, -100) == RENDER_RESULT_OK,
+				"new MAIN tail remains admitted after failed reflection");
+			InterlockedExchange(&control.failDraw, 0);
+			InterlockedExchange(&control.failDrawOnCall, 0);
+			result |= Check(BeginPassFrame(product, true) == RENDER_RESULT_OK &&
+				control.draws.size() == 2 && control.clears.size() == 1 &&
+				control.clears[0].target.useBackBufferColor,
+				"new Begin retries old cohort under reflection BEFORE clearing MAIN, not its tail");
+			result |= Check(product.FlushGameSortedTriangles() == RENDER_RESULT_OK &&
+				EndHiddenPass(product) == RENDER_RESULT_OK && control.draws.size() == 3,
+				"healthy tail flush follows clear without duplication");
+			if (control.draws.size() == 3)
+				result |= Check(ReadCount(&control.reflectionColorCreates) == 1 && control.reflectionColor.isValid() &&
+					IsPassDraw(control.draws[0], 11, control.reflectionColor, reflectedViewport) &&
+					IsPassDraw(control.draws[1], 22, control.reflectionColor, reflectedViewport) &&
+					IsPassDraw(control.draws[2], 33, GpuHandle(), mainViewport),
+					"exact reflected prefix/retry and MAIN tail keep state, original viewport and target");
+			// A successful draw with a failed physical restore is NOT a safe MAIN
+			// context. The full-ack cohort may retire without an empty draw on repair.
+			result |= Check(SelectPassTarget(product, reflection) == RENDER_RESULT_OK &&
+				BeginPassFrame(product, false) == RENDER_RESULT_OK &&
+				product.SetGameViewport(reflectedViewport) == RENDER_RESULT_OK &&
+				QueuePassTriangle(product, 44, 1) == RENDER_RESULT_OK,
+				"restore failure fixture queues a fresh reflection");
+			InterlockedExchange(&control.failTargetOnCall, ReadCount(&control.targetCalls) + 2);
+			result |= Check(product.FlushGameSortedTriangles() == RENDER_RESULT_FAILED,
+				"backend restore failure remains observable after accepted draw");
+			checkTypedCopyBarrier();
+			GameRenderCommand clear = {};
+			clear.type = GAME_RENDER_COMMAND_CLEAR_RENDER_TARGETS;
+			clear.value0 = RENDER_CLEAR_COLOR;
+			clear.float4 = 1;
+			const long clears = ReadCount(&control.clearCalls);
+			// Keep repair failing: the admission gate may attempt a checked repair,
+			// but cannot clear a context whose restore has not actually succeeded.
+			InterlockedExchange(&control.failTargetOnCall, ReadCount(&control.targetCalls) + 1);
+			result |= Check(product.ExecuteGameRenderCommand(clear) == RENDER_RESULT_FAILED &&
+				ReadCount(&control.clearCalls) == clears,
+				"unrepaired output barrier prevents a clear on the wrong physical target");
+			InterlockedExchange(&control.failTargetOnCall, 0);
+			const long draws = ReadCount(&control.drawCalls);
+			result |= Check(SelectPassTarget(product, RenderTargetBinding()) == RENDER_RESULT_OK &&
+				ReadCount(&control.drawCalls) == draws && EndHiddenPass(product) == RENDER_RESULT_FAILED,
+				"full accepted cohort retires on repair without empty submission; first frame error stays sticky");
+			NativeW3DGpuContentLease repairedLease;
+			const long copiesBeforeRepair = ReadCount(&control.copyCalls);
+			result |= Check(BeginPassFrame(product, true) == RENDER_RESULT_OK &&
+				copyOwner.CopyActiveColorTarget(&repairedLease) == RENDER_RESULT_OK && repairedLease.isValid() &&
+				ReadCount(&control.copyCalls) == copiesBeforeRepair + 1 && EndHiddenPass(product) == RENDER_RESULT_OK,
+				"checked repair plus healthy new frame restores actual typed-copy admission");
+			result |= Check(copyOwner.Reset() == RENDER_RESULT_OK,
+				"typed copy owner releases its exact ticket before product teardown");
+		}
+		else
+		{
+			// The producer accepts both draws. The actual serial/parallel owner
+			// fails execution later; only the hidden completion fence decides use.
+			InterlockedExchange(&control.failDrawOnCall, 1);
+			const RenderResult accepted = product.FlushGameSortedTriangles();
+			const RenderResult finished = EndHiddenPass(product);
+			result |= Check(accepted == RENDER_RESULT_OK && finished == RENDER_RESULT_FAILED &&
+				control.draws.empty() && !product.Renderer().IsFrameOpen(),
+				"producer-accepted hidden draw is refused after exact failed owner completion");
+			ThreadedRenderFrameCompletion residual;
+			result |= Check(!PollThreadedRenderCompletion(device, &residual),
+				"dedicated hidden fence consumed matching completion through normal publication");
+		}
+		result |= Check(ReadCount(&control.presentCalls) == 0,
+			"hidden passes never present successful or failed partial output");
+		result |= Check(product.Shutdown() == RENDER_RESULT_OK,
+			"pass fixture releases queued pins before old registry/backend teardown");
+		std::printf("SORTED_PASS_CPU mode=%u failures=%d\n", mode, result);
+	}
 	return result;
 }
 
@@ -2493,13 +3140,16 @@ int TestRawHandlesAcrossFreshBackends()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	if (argc == 2 && std::strcmp(argv[1], "--sorted-pass-ownership-cpu") == 0)
+		return TestSortedPassOwnershipCpu();
 	char benchmark[2] = {0};
 	if (GetEnvironmentVariableA("RTS_BUFFER_PUBLICATION_BENCH", benchmark,
 		sizeof(benchmark)) == 1 && benchmark[0] == '1')
 		return BenchmarkThreadedAdjacentBufferPublication();
 	int result = 0;
+	result |= TestSortedPassOwnershipCpu();
 	result |= TestBufferUpdatePreflight();
 	result |= TestCopyExecutionFailures();
 	result |= TestRetiredBufferPublication();

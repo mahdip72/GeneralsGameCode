@@ -411,6 +411,9 @@ NativeW3D2::NativeW3D2() : m_resourceHost(256), m_resources(4096),
 	m_line3DContext(&m_renderer, &m_resources),
 	m_activeRenderTargetKind(rts::render::GAME_RENDER_TARGET_UNKNOWN),
 	m_gameRenderTargetBinding(),
+	m_gameViewport(), m_gameViewportValid(false), m_sortedPassIdentity(1),
+	m_sortedFlushFailed(false), m_sortedReplayActive(false),
+	m_sortedContextRestoreFailed(false),
 	m_debugConsoleDisabled(false), m_gameFailure(), m_deferredFailure(),
 	m_deferredFailureSequence(0), m_recoveredFailureSequence(0),
 	m_asyncResourceFailure(false), m_rebuildingResources(false),
@@ -639,7 +642,7 @@ rts::render::RenderResult NativeW3D2::ReplaceBackendContext(
 	rts::render::IRenderContext *context)
 {
 	if (rts::render::IsNativeGameRenderOwnerPinnedByCurrentThread() ||
-		!m_borrowedBackend)
+		!m_borrowedBackend || context == 0 || m_renderer.IsFrameOpen())
 	{
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
@@ -676,6 +679,9 @@ rts::render::RenderResult NativeW3D2::ReplaceBackendContext(
 		// old output views no longer describe the new context, so only the default
 		// swap-chain binding may be carried into the next owner frame.
 		m_nativeSortingRenderer.Clear();
+		m_gameViewportValid = false;
+		m_sortedPassIdentity = 1;
+		m_sortedFlushFailed = m_sortedReplayActive = m_sortedContextRestoreFailed = false;
 		m_gameRenderTargetBinding = rts::render::RenderTargetBinding();
 		m_activeRenderTargetKind =
 			rts::render::GAME_RENDER_TARGET_BACK_BUFFER;
@@ -979,6 +985,9 @@ rts::render::RenderResult NativeW3D2::RecoverOwnedDevice()
 	// failed flush may retain them for a same-device retry, but recovery must
 	// retire them before title resources are released and reacquired.
 	m_nativeSortingRenderer.Clear();
+	m_gameViewportValid = false;
+	m_sortedPassIdentity = 1;
+	m_sortedFlushFailed = m_sortedReplayActive = m_sortedContextRestoreFailed = false;
 	m_gameResourcesOperational = false;
 	m_activeRenderTargetKind = rts::render::GAME_RENDER_TARGET_UNKNOWN;
 	m_gameRenderTargetBinding = rts::render::RenderTargetBinding();
@@ -1099,6 +1108,9 @@ rts::render::RenderResult NativeW3D2::Shutdown()
 	m_reacquiringResources = false;
 	m_reacquireFailure.reset();
 	m_nativeSortingRenderer.Clear();
+	m_gameViewportValid = false;
+	m_sortedPassIdentity = 1;
+	m_sortedFlushFailed = m_sortedReplayActive = m_sortedContextRestoreFailed = false;
 	m_gameFailure.reset();
 	m_deferredFailure = rts::render::RenderFrameOutcome();
 	m_deferredFailureSequence = 0;
@@ -1306,6 +1318,70 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 	return captureResult;
 }
 
+rts::render::RenderResult NativeW3D2::FinishGameTextureRenderFrame()
+{
+	using namespace rts::render;
+	if (!m_renderer.IsFrameOpen())
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	const NativeW3DSubmissionSequence previous = m_renderer.LastThreadedSubmissionSequence();
+	const RenderResult sorted = FlushGameSortedTriangles();
+	const RenderResult ended = FinishGameRenderFrame(false, false);
+	RenderResult result = FirstNativeThreadedFailure(sorted, ended);
+	if (m_renderer.IsThreaded())
+	{
+		// Even a failed EndFrame seals once. Publish its exact owner outcome
+		// before a hidden output can be consumed; SYNC remains nonblocking.
+		const NativeW3DSubmissionSequence sequence = m_renderer.LastThreadedSubmissionSequence();
+		const RenderResult drained = m_renderer.DrainThreaded();
+		ThreadedRenderFrameCompletion completion;
+		const RenderResult published = PollThreadedCompletions(sequence, &completion);
+		result = FirstNativeThreadedFailure(result, drained);
+		result = FirstNativeThreadedFailure(result, published);
+		if (sequence == 0 || sequence == previous || completion.sequence != sequence)
+			result = FirstNativeThreadedFailure(result, RENDER_RESULT_FAILED);
+		else
+		{
+			result = FirstNativeThreadedFailure(result, completion.result);
+			if (!completion.operational || completion.resourceFailure)
+				result = FirstNativeThreadedFailure(result, RENDER_RESULT_FAILED);
+		}
+	}
+	if (result != RENDER_RESULT_OK)
+		RecordGameFailure(result);
+	return result;
+}
+
+rts::render::RenderResult NativeW3D2::AdvanceSortedPassIdentity()
+{
+	using namespace rts::render;
+	if (m_sortedPassIdentity == ~static_cast<NativeW3DSubmissionSequence>(0))
+	{
+		if (!m_nativeSortingRenderer.Empty())
+			return RENDER_RESULT_FAILED;
+		m_sortedPassIdentity = 1;
+	}
+	else
+		++m_sortedPassIdentity;
+	return RENDER_RESULT_OK;
+}
+
+rts::render::RenderResult NativeW3D2::RestoreSortedContext()
+{
+	using namespace rts::render;
+	RenderResult target = RENDER_RESULT_FAILED;
+	RenderResult viewport = m_gameViewportValid ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
+	try { target = m_renderer.SetRenderTargetsExternal(m_gameRenderTargetBinding); }
+	catch (...) {}
+	if (m_gameViewportValid)
+	{
+		try { viewport = m_renderer.SetViewportExternal(m_gameViewport); }
+		catch (...) {}
+	}
+	const RenderResult result = FirstNativeThreadedFailure(target, viewport);
+	m_sortedContextRestoreFailed = result != RENDER_RESULT_OK;
+	return result;
+}
+
 rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	const rts::render::GameRenderCommand &command)
 {
@@ -1356,6 +1432,15 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 
 	const GpuHandle resource0 = ToGameGpuHandle(command.resource0);
 	const GpuHandle resource1 = ToGameGpuHandle(command.resource1);
+	// State preparation and checked target restoration remain admitted. Output
+	// consumption cannot pass a failed deferred cohort or an unverified restore.
+	if ((m_sortedFlushFailed || m_sortedContextRestoreFailed) &&
+		(command.type == GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE ||
+		 command.type == GAME_RENDER_COMMAND_ACQUIRE_COPIED_TEXTURE_CONTENT))
+	{
+		RecordGameFailure(RENDER_RESULT_FAILED);
+		return RENDER_RESULT_FAILED;
+	}
 
 	switch (command.type)
 	{
@@ -2287,6 +2372,15 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				RecordGameFailure(validationResult);
 				return validationResult;
 			}
+			RenderResult pendingResult = RENDER_RESULT_OK;
+			if (m_renderer.IsFrameOpen() && !m_nativeSortingRenderer.Empty())
+				pendingResult = FlushGameSortedTriangles();
+			// Restoration must still run after failure. A new custom output may
+			// not overwrite an unfinished pass, but default restoration is repair.
+			if (pendingResult != RENDER_RESULT_OK &&
+				(!requestedBinding.useBackBufferColor ||
+				 !requestedBinding.useBackBufferDepth))
+				return pendingResult;
 			if (m_renderer.IsFrameOpen())
 			{
 				const RenderResult result =
@@ -2305,7 +2399,11 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				(!requestedBinding.useBackBufferColor ||
 				 !requestedBinding.useBackBufferDepth) ?
 				GAME_RENDER_TARGET_TEXTURE : GAME_RENDER_TARGET_BACK_BUFFER;
-			return RENDER_RESULT_OK;
+			m_sortedContextRestoreFailed = false;
+			const RenderResult identityResult = AdvanceSortedPassIdentity();
+			if (identityResult != RENDER_RESULT_OK)
+				RecordGameFailure(identityResult);
+			return FirstNativeThreadedFailure(pendingResult, identityResult);
 		}
 
 	case GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE:
@@ -2375,6 +2473,21 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				RecordGameFailure(result);
 				return result;
 			}
+			// Complete the old failed output BEFORE a new clear can erase its
+			// admitted prefix. Later queued tail work keeps its own clear boundary.
+			if (m_nativeSortingRenderer.Empty())
+				m_sortedFlushFailed = false;
+			if (m_sortedFlushFailed && !m_nativeSortingRenderer.Empty())
+			{
+				const RenderResult retryResult = m_nativeSortingRenderer.Flush(*this, true);
+				if (retryResult != RENDER_RESULT_OK)
+				{
+					RecordGameFailure(retryResult);
+					(void)m_renderer.EndFrame(false);
+					return retryResult;
+				}
+				m_sortedFlushFailed = false;
+			}
 			// D3D11 beginFrame restores the swap-chain attachments. Reapply the last
 			// validated logical binding before any clear so a pre-frame target request
 			// becomes the actual output for this frame. This is an owner-local backend
@@ -2392,6 +2505,23 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					RecordGameFailure(endResult);
 				RecordGameFailure(targetResult);
 				return targetResult;
+			}
+			const RenderResult viewportResult = m_gameViewportValid ?
+				m_renderer.SetViewport(m_gameViewport) : RENDER_RESULT_OK;
+			if (viewportResult != RENDER_RESULT_OK)
+			{
+				m_sortedContextRestoreFailed = true;
+				RecordGameFailure(viewportResult);
+				(void)m_renderer.EndFrame(false);
+				return viewportResult;
+			}
+			m_sortedContextRestoreFailed = false;
+			const RenderResult identityResult = AdvanceSortedPassIdentity();
+			if (identityResult != RENDER_RESULT_OK)
+			{
+				RecordGameFailure(identityResult);
+				(void)m_renderer.EndFrame(false);
+				return identityResult;
 			}
 			if (command.value0 != 0U)
 			{
@@ -2411,6 +2541,11 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					return clearResult;
 				}
 			}
+			// Pre-frame bytes must not be replayed into a different hidden pass,
+			// or before this clear erases them. Commit activation only after every
+			// Begin admission step succeeds; captured state/viewport stay immutable.
+			m_nativeSortingRenderer.ActivateMatchingPass(m_gameRenderTargetBinding,
+				m_sortedPassIdentity);
 		}
 		return RENDER_RESULT_OK;
 
@@ -2421,6 +2556,23 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			!IsFiniteGameFloat(command.float3) || !IsValidGameClearDepth(command.float4))
 			goto invalid_command;
 		{
+			if (!m_nativeSortingRenderer.Empty())
+			{
+				const RenderResult pendingResult = FlushGameSortedTriangles();
+				if (pendingResult != RENDER_RESULT_OK)
+					return pendingResult;
+			}
+			if (m_sortedContextRestoreFailed)
+			{
+				RecordGameFailure(RENDER_RESULT_FAILED);
+				return RENDER_RESULT_FAILED;
+			}
+			const RenderResult identityResult = AdvanceSortedPassIdentity();
+			if (identityResult != RENDER_RESULT_OK)
+			{
+				RecordGameFailure(identityResult);
+				return identityResult;
+			}
 			const RenderResult result = m_renderer.ClearExternal(command.value0,
 				RenderFloat4(command.float0, command.float1, command.float2,
 					command.float3), command.float4, command.value1);
@@ -2441,6 +2593,11 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	case GAME_RENDER_COMMAND_END_RENDER:
 		return FinishGameRenderFrame(command.value0 != 0U,
 			command.value0 != 0U);
+	case GAME_RENDER_COMMAND_END_TEXTURE_RENDER_PASS:
+		if (command.value0 > static_cast<unsigned int>(RENDER_RESULT_FAILED))
+			goto invalid_command;
+		RecordGameFailure(static_cast<RenderResult>(command.value0));
+		return FinishGameTextureRenderFrame();
 
 	case GAME_RENDER_COMMAND_FLIP_RENDERER:
 		if (!m_renderer.IsFrameOpen())
@@ -2461,6 +2618,13 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			{
 				RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
 				return RENDER_RESULT_INVALID_ARGUMENT;
+			}
+			// Ordinary resize is not an intentional discard/recovery boundary.
+			// The caller must drain retained passes before releasing their outputs.
+			if (!m_nativeSortingRenderer.Empty())
+			{
+				RecordGameFailure(RENDER_RESULT_FAILED);
+				return RENDER_RESULT_FAILED;
 			}
 			// Resize invalidates every title-owned default/present resource. Keep
 			// the aggregate non-operational until the complete release/resize/
@@ -3293,10 +3457,26 @@ void NativeW3D2::SetGameLegacyPixelProgram(
 rts::render::RenderResult NativeW3D2::SetGameViewport(
 	const rts::render::RenderViewport &viewport)
 {
-	if (!IsOperational())
+	if (!m_resources.IsOwnerThread() || !IsOperational() ||
+		!IsFiniteGameFloat(viewport.x) || !IsFiniteGameFloat(viewport.y) ||
+		!IsFiniteGameFloat(viewport.width) || !IsFiniteGameFloat(viewport.height) ||
+		!IsFiniteGameFloat(viewport.minimumDepth) ||
+		!IsFiniteGameFloat(viewport.maximumDepth) ||
+		viewport.x < 0.0f || viewport.y < 0.0f ||
+		viewport.width <= 0.0f || viewport.height <= 0.0f ||
+		viewport.minimumDepth < 0.0f || viewport.maximumDepth > 1.0f ||
+		viewport.minimumDepth > viewport.maximumDepth)
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
-	return m_renderer.IsFrameOpen() ? m_renderer.SetViewport(viewport) :
-		m_renderer.SetViewportExternal(viewport);
+	// Backend viewport commands belong to an open frame. Pre-frame preparation
+	// retains the logical value without issuing an out-of-frame command.
+	const rts::render::RenderResult result = m_renderer.IsFrameOpen() ?
+		m_renderer.SetViewport(viewport) : rts::render::RENDER_RESULT_OK;
+	if (result == rts::render::RENDER_RESULT_OK)
+	{
+		m_gameViewport = viewport;
+		m_gameViewportValid = true;
+	}
+	return result;
 }
 
 rts::render::RenderResult NativeW3D2::SubmitGamePacket(
@@ -3313,6 +3493,8 @@ rts::render::RenderResult NativeW3D2::SubmitGamePacket(
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	if (!m_renderer.IsFrameOpen())
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	if (!m_sortedReplayActive && (m_sortedFlushFailed || m_sortedContextRestoreFailed))
+		return rts::render::RENDER_RESULT_FAILED;
 	const rts::render::RenderResult result =
 		textureBindingCache != 0 || sortedBatchBindingCache != 0 ?
 		m_renderer.SubmitInternal(m_resources, state, packet, true,
@@ -3337,13 +3519,52 @@ rts::render::RenderResult NativeW3D2::QueueGameSortedTriangles(
 	size_t vertexBytes, const void *indexData, size_t indexBytes,
 	const rts::render::GameBoundingSphere *sphere)
 {
-	if (!IsOperational())
+	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
 		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	const rts::render::RenderResult result = m_nativeSortingRenderer.Queue(state,
-		packet, vertexData, vertexBytes, indexData, indexBytes, sphere);
+	using namespace rts::render;
+	NativeSortedPass pass;
+	pass.captured = true;
+	pass.identity = m_sortedPassIdentity;
+	const bool awaitMatchingBegin = !m_renderer.IsFrameOpen();
+	pass.target = m_gameRenderTargetBinding;
+	if (!m_gameViewportValid)
+	{
+		RenderBackBufferInfo target;
+		const RenderResult info = GetGameRenderTargetInfo(&target);
+		if (info != RENDER_RESULT_OK)
+		{
+			RecordGameFailure(info);
+			return info;
+		}
+		m_gameViewport = RenderViewport(0, 0, static_cast<float>(target.width),
+			static_cast<float>(target.height), 0, 1);
+		m_gameViewportValid = true;
+	}
+	pass.viewport = m_gameViewport;
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		if (packet.textures[stage].isValid())
+		{
+			const RenderResult retained = m_resources.RetainTexture(packet.textures[stage],
+				&pass.textures[stage]);
+			if (retained != RENDER_RESULT_OK)
+			{
+				RecordGameFailure(retained);
+				return retained;
+			}
+		}
+	}
+	RenderResult result = RENDER_RESULT_OK;
+	if (!pass.target.useBackBufferColor && pass.target.hasColor)
+		result = m_resources.RetainTexture(pass.target.color.resource, &pass.color);
+	if (result == RENDER_RESULT_OK && !pass.target.useBackBufferDepth && pass.target.hasDepth)
+		result = m_resources.RetainTexture(pass.target.depth.resource, &pass.depth);
+	if (result == RENDER_RESULT_OK)
+		result = m_nativeSortingRenderer.Queue(state, packet, vertexData, vertexBytes,
+			indexData, indexBytes, sphere, &pass, awaitMatchingBegin);
 	if (result != rts::render::RENDER_RESULT_OK)
 		RecordGameFailure(result);
 	return result;
@@ -3351,13 +3572,24 @@ rts::render::RenderResult NativeW3D2::QueueGameSortedTriangles(
 
 rts::render::RenderResult NativeW3D2::FlushGameSortedTriangles()
 {
-	if (!IsOperational())
+	if (!IsOperational() || !m_resources.IsOwnerThread() ||
+		(!m_renderer.IsFrameOpen() && !m_nativeSortingRenderer.Empty()))
 	{
 		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
+	if (m_sortedContextRestoreFailed)
+	{
+		const rts::render::RenderResult restored = RestoreSortedContext();
+		if (restored != rts::render::RENDER_RESULT_OK)
+		{
+			RecordGameFailure(restored);
+			return restored;
+		}
+	}
 	const rts::render::RenderResult result =
 		m_nativeSortingRenderer.Flush(*this);
+	m_sortedFlushFailed = result != rts::render::RENDER_RESULT_OK;
 	if (result != rts::render::RENDER_RESULT_OK)
 		RecordGameFailure(result);
 	return result;
@@ -3487,6 +3719,45 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 	}
 
 	return result;
+}
+
+rts::render::RenderResult NativeW3D2::SubmitNativeSortedPassBatch(
+	const rts::render::NativeSortedPass &pass,
+	const rts::render::NativeSortedDraw *draws, unsigned int drawCount,
+	const void *vertexData, size_t vertexBytes, const void *indexData,
+	size_t indexBytes, unsigned int *submittedDrawCount)
+{
+	using namespace rts::render;
+	if (submittedDrawCount != 0)
+		*submittedDrawCount = 0;
+	if (!pass.captured)
+		return SubmitNativeSortedBatch(draws, drawCount, vertexData, vertexBytes,
+			indexData, indexBytes, submittedDrawCount);
+	if (!IsOperational() || !m_resources.IsOwnerThread() ||
+		!m_renderer.IsFrameOpen() || m_sortedReplayActive)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	RenderResult result = ValidateGameRenderTargetBinding(pass.target, 0);
+	if (result != RENDER_RESULT_OK)
+		return result;
+	m_sortedReplayActive = true;
+	try
+	{
+		result = m_renderer.SetRenderTargetsExternal(pass.target);
+		if (result == RENDER_RESULT_OK)
+			result = m_renderer.SetViewport(pass.viewport);
+		if (result == RENDER_RESULT_OK)
+			result = SubmitNativeSortedBatch(draws, drawCount, vertexData,
+				vertexBytes, indexData, indexBytes, submittedDrawCount);
+	}
+	catch (...)
+	{
+		result = RENDER_RESULT_FAILED;
+	}
+	// A replay never publishes the retained target as the producer's active
+	// target and never makes old content authority valid. Restore on ALL exits.
+	const RenderResult restored = RestoreSortedContext();
+	m_sortedReplayActive = false;
+	return FirstNativeThreadedFailure(result, restored);
 }
 
 rts::render::RenderResult NativeW3D2::BeginGameDisplayIteration()
@@ -3827,6 +4098,11 @@ rts::render::RenderResult NativeW3D2::GetGameActiveColorTargetInfo(
 		(!m_gameRenderTargetBinding.useBackBufferColor &&
 		 !m_gameRenderTargetBinding.hasColor))
 		return RENDER_RESULT_INVALID_ARGUMENT;
+	// Typed texture-owner copies also query this operation-specific seam and
+	// bypass ExecuteGameRenderCommand. Logical output is not a safe physical
+	// source until retained sorting and any failed restoration are repaired.
+	if (m_sortedFlushFailed || m_sortedContextRestoreFailed)
+		return RENDER_RESULT_FAILED;
 	const RenderResult result = ValidateGameRenderTargetBinding(
 		m_gameRenderTargetBinding, info);
 	if (result == RENDER_RESULT_OK && m_gameRenderTargetBinding.hasColor)

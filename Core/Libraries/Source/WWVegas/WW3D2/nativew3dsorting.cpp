@@ -21,6 +21,7 @@
 #include <math.h>
 #include <new>
 #include <string.h>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -41,17 +42,23 @@ const unsigned long long MAX_RETAINED_FLUSH_WORKSPACE_BYTES =
 struct SortedSubmission
 {
 	SortedSubmission() : state(), packet(), vertices(), indices(), sphere(),
-		hasSphere(false), insertionOrder(0), submittedTriangles() {}
+		hasSphere(false), awaitingBegin(false), insertionOrder(0), submittedTriangles() {}
 
 	LegacyLogicalState state;
 	NativeDrawPacket packet;
+	NativeSortedPass pass;
 	std::vector<unsigned char> vertices;
 	std::vector<unsigned short> indices;
 	GameBoundingSphere sphere;
 	bool hasSphere;
+	bool awaitingBegin;
 	size_t insertionOrder;
 	std::vector<unsigned char> submittedTriangles;
 };
+
+static_assert(std::is_nothrow_move_constructible<SortedSubmission>::value &&
+	std::is_nothrow_move_assignable<SortedSubmission>::value,
+	"Acknowledged interval erasure must not allocate or add resource references");
 
 struct SortedNode
 {
@@ -99,6 +106,7 @@ struct FlushWorkspace
 	std::vector<unsigned short> chunkIndices;
 	std::vector<NativeSortedDraw> draws;
 	std::vector<DrawRun> runs;
+	std::vector<size_t> vertexOffsets;
 
 	void Clear()
 	{
@@ -112,6 +120,7 @@ struct FlushWorkspace
 		chunkIndices.clear();
 		draws.clear();
 		runs.clear();
+		vertexOffsets.clear();
 	}
 
 	unsigned long long RetainedCapacityBytes() const
@@ -122,7 +131,7 @@ struct FlushWorkspace
 			VectorCapacityBytes(nodeOrder) + VectorCapacityBytes(triangles) +
 			VectorCapacityBytes(chunkVertices) +
 			VectorCapacityBytes(chunkIndices) + VectorCapacityBytes(draws) +
-			VectorCapacityBytes(runs);
+			VectorCapacityBytes(runs) + VectorCapacityBytes(vertexOffsets);
 	}
 
 	void TrimToRetainedCapacityBudget()
@@ -136,6 +145,7 @@ struct FlushWorkspace
 		ReleaseCapacity(chunkVertices, retainedBytes);
 		ReleaseCapacity(chunkIndices, retainedBytes);
 		ReleaseCapacity(runs, retainedBytes);
+		ReleaseCapacity(vertexOffsets, retainedBytes);
 		ReleaseCapacity(nodes, retainedBytes);
 		ReleaseCapacity(positiveNodes, retainedBytes);
 		ReleaseCapacity(unsortedNodes, retainedBytes);
@@ -181,6 +191,8 @@ struct FlushScope
 unsigned int g_nativeSortingLastFlushScratchAllocationCount = 0;
 unsigned int g_nativeSortingLastFlushPreparedGrowthCount = 0;
 unsigned long long g_nativeSortingLastFlushWorkspaceCapacityBytes = 0;
+unsigned long long g_nativeSortingLastOffsetInitializations = 0;
+unsigned long long g_nativeSortingLastOffsetResets = 0;
 #endif
 
 class FlushWorkspaceScope
@@ -600,8 +612,8 @@ RenderResult SubmitChunk(NativeSortedGeometrySink &sink,
 	const std::vector<NativeSortedDraw> &draws,
 	const std::vector<DrawRun> &runs,
 	const std::vector<SortedTriangle> &triangles, size_t chunkOffset,
-	std::vector<SortedSubmission> &submissions, size_t cohortSize,
-	size_t &acknowledgedCohortSize,
+	std::vector<SortedSubmission> &submissions, size_t cohortStart, size_t cohortSize,
+	size_t &acknowledgedCohortStart, size_t &acknowledgedCohortSize,
 	const std::vector<unsigned char> &vertices,
 	const std::vector<unsigned short> &indices)
 {
@@ -609,7 +621,8 @@ RenderResult SubmitChunk(NativeSortedGeometrySink &sink,
 		indices.empty())
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	unsigned int submittedDrawCount = 0;
-	const RenderResult result = sink.SubmitNativeSortedBatch(draws.data(),
+	const NativeSortedPass &pass = submissions[cohortStart].pass;
+	const RenderResult result = sink.SubmitNativeSortedPassBatch(pass, draws.data(),
 		static_cast<unsigned int>(draws.size()), vertices.data(),
 		vertices.size(), indices.data(),
 		indices.size() * sizeof(unsigned short), &submittedDrawCount);
@@ -620,7 +633,10 @@ RenderResult SubmitChunk(NativeSortedGeometrySink &sink,
 	// Seal on any valid acknowledgement, including a successful earlier chunk
 	// before a later failure. Queue continues appending outside this cohort.
 	if (submittedDrawCount != 0 && acknowledgedCohortSize == 0)
+	{
+		acknowledgedCohortStart = cohortStart;
 		acknowledgedCohortSize = cohortSize;
+	}
 	if (result != RENDER_RESULT_OK)
 		return result;
 	return submittedDrawCount == draws.size() ? RENDER_RESULT_OK :
@@ -628,6 +644,30 @@ RenderResult SubmitChunk(NativeSortedGeometrySink &sink,
 }
 
 } // namespace
+
+static bool SameSortedTarget(const rts::render::RenderTargetBinding &a,
+	const rts::render::RenderTargetBinding &b)
+{
+	return a.useBackBufferColor == b.useBackBufferColor &&
+		a.useBackBufferDepth == b.useBackBufferDepth &&
+		a.hasColor == b.hasColor && a.hasDepth == b.hasDepth &&
+		a.color.resource == b.color.resource && a.color.mip == b.color.mip &&
+		a.color.arraySlice == b.color.arraySlice &&
+		a.depth.resource == b.depth.resource && a.depth.mip == b.depth.mip &&
+		a.depth.arraySlice == b.depth.arraySlice;
+}
+
+static bool SameSortedPass(const rts::render::NativeSortedPass &a,
+	const rts::render::NativeSortedPass &b)
+{
+	if (!a.captured || !b.captured)
+		return a.captured == b.captured;
+	return a.identity == b.identity && SameSortedTarget(a.target, b.target) &&
+		a.viewport.x == b.viewport.x && a.viewport.y == b.viewport.y &&
+		a.viewport.width == b.viewport.width && a.viewport.height == b.viewport.height &&
+		a.viewport.minimumDepth == b.viewport.minimumDepth &&
+		a.viewport.maximumDepth == b.viewport.maximumDepth;
+}
 
 namespace rts
 {
@@ -639,11 +679,12 @@ struct NativeSortingRenderer::Impl
 	std::vector<SortedSubmission> submissions;
 	FlushWorkspace workspace;
 	size_t nextInsertionOrder;
+	size_t acknowledgedCohortStart;
 	size_t acknowledgedCohortSize;
 	bool flushing;
 
 	Impl() : submissions(), workspace(), nextInsertionOrder(1),
-		acknowledgedCohortSize(0), flushing(false) {}
+		acknowledgedCohortStart(0), acknowledgedCohortSize(0), flushing(false) {}
 };
 
 NativeSortingRenderer::NativeSortingRenderer() : m_impl(new Impl())
@@ -659,11 +700,13 @@ NativeSortingRenderer::~NativeSortingRenderer()
 RenderResult NativeSortingRenderer::Queue(const LegacyLogicalState &state,
 	const NativeDrawPacket &packet, const void *vertexData,
 	size_t vertexBytes, const void *indexData, size_t indexBytes,
-	const GameBoundingSphere *boundingSphere)
+	const GameBoundingSphere *boundingSphere, const NativeSortedPass *pass,
+	bool awaitMatchingBegin)
 {
 	size_t requiredVertexBytes = 0;
 	size_t requiredIndexBytes = 0;
-	if (m_impl == 0 || !ValidateSubmission(packet, vertexData, vertexBytes,
+	if (m_impl == 0 || (awaitMatchingBegin && (pass == 0 || !pass->captured)) ||
+		!ValidateSubmission(packet, vertexData, vertexBytes,
 		indexData, indexBytes, boundingSphere, &requiredVertexBytes,
 		&requiredIndexBytes))
 		return RENDER_RESULT_INVALID_ARGUMENT;
@@ -673,6 +716,9 @@ RenderResult NativeSortingRenderer::Queue(const LegacyLogicalState &state,
 		SortedSubmission submission;
 		submission.state = state;
 		submission.packet = packet;
+		if (pass != 0)
+			submission.pass = *pass;
+		submission.awaitingBegin = awaitMatchingBegin;
 		submission.vertices.resize(requiredVertexBytes);
 		memcpy(submission.vertices.data(), vertexData, requiredVertexBytes);
 		submission.indices.resize(packet.indexCount);
@@ -700,11 +746,30 @@ RenderResult NativeSortingRenderer::Queue(const LegacyLogicalState &state,
 	return RENDER_RESULT_OK;
 }
 
-RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
+void NativeSortingRenderer::ActivateMatchingPass(const RenderTargetBinding &target,
+	NativeW3DSubmissionSequence identity)
+{
+	if (m_impl == 0 || m_impl->flushing)
+		return;
+	for (size_t index = 0; index < m_impl->submissions.size(); ++index)
+	{
+		SortedSubmission &submission = m_impl->submissions[index];
+		if (submission.awaitingBegin && SameSortedTarget(submission.pass.target, target))
+		{
+			submission.pass.identity = identity;
+			submission.awaitingBegin = false;
+		}
+	}
+}
+
+RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink,
+	bool firstCohortOnly)
 {
 #if defined(RTS_NATIVE_SORTING_TESTS)
 	g_nativeSortingLastFlushScratchAllocationCount = 0;
 	g_nativeSortingLastFlushPreparedGrowthCount = 0;
+	g_nativeSortingLastOffsetInitializations = 0;
+	g_nativeSortingLastOffsetResets = 0;
 #endif
 	if (m_impl == 0 || m_impl->submissions.empty())
 		return RENDER_RESULT_OK;
@@ -716,8 +781,23 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink)
 nextCohort:
 	const bool retryingAcknowledgedCohort =
 		m_impl->acknowledgedCohortSize != 0;
-	const size_t cohortSize = retryingAcknowledgedCohort ?
-		m_impl->acknowledgedCohortSize : m_impl->submissions.size();
+	size_t cohortStart = m_impl->acknowledgedCohortStart;
+	size_t cohortSize = m_impl->acknowledgedCohortSize;
+	if (!retryingAcknowledgedCohort)
+	{
+		cohortStart = 0;
+		while (cohortStart < m_impl->submissions.size() &&
+			m_impl->submissions[cohortStart].awaitingBegin)
+			++cohortStart;
+		if (cohortStart == m_impl->submissions.size())
+			return RENDER_RESULT_OK;
+		cohortSize = 1;
+		while (cohortStart + cohortSize < m_impl->submissions.size() &&
+			!m_impl->submissions[cohortStart + cohortSize].awaitingBegin && SameSortedPass(
+			m_impl->submissions[cohortStart].pass,
+			m_impl->submissions[cohortStart + cohortSize].pass))
+			++cohortSize;
+	}
 	try
 	{
 		// SortingTriangleScratchLease is synchronously fenced by each kernel
@@ -729,7 +809,7 @@ nextCohort:
 		std::vector<size_t> &positiveNodes = m_impl->workspace.positiveNodes;
 		std::vector<size_t> &unsortedNodes = m_impl->workspace.unsortedNodes;
 		nodes.reserve(cohortSize);
-		for (size_t index = 0; index < cohortSize; ++index)
+		for (size_t index = cohortStart; index < cohortStart + cohortSize; ++index)
 		{
 			const SortedSubmission &submission = m_impl->submissions[index];
 			if (!retryingAcknowledgedCohort && !HasPendingTriangles(submission))
@@ -817,6 +897,11 @@ nextCohort:
 			triangles.resize(pendingCount);
 		}
 
+		std::vector<size_t> &vertexOffsets = m_impl->workspace.vertexOffsets;
+		vertexOffsets.assign(cohortSize, std::numeric_limits<size_t>::max());
+	#if defined(RTS_NATIVE_SORTING_TESTS)
+		g_nativeSortingLastOffsetInitializations += cohortSize;
+	#endif
 		for (size_t chunkOffset = 0; chunkOffset < triangles.size(); )
 		{
 			std::vector<unsigned char> &chunkVertices =
@@ -828,9 +913,18 @@ nextCohort:
 			chunkVertices.clear();
 			chunkIndices.clear();
 			draws.clear();
+			// Reset only offsets referenced by the preceding chunk. A submission
+			// may occur in several runs; repeated resets are harmless and bounded
+			// by emitted triangles, not cohortSize multiplied by chunk count.
+			for (size_t run = 0; run < runs.size(); ++run)
+			{
+				vertexOffsets[runs[run].submissionIndex - cohortStart] =
+					std::numeric_limits<size_t>::max();
+			#if defined(RTS_NATIVE_SORTING_TESTS)
+				++g_nativeSortingLastOffsetResets;
+			#endif
+			}
 			runs.clear();
-			std::vector<size_t> vertexOffsets(cohortSize,
-				std::numeric_limits<size_t>::max());
 			const NativeDrawPacket *chunkPacket = 0;
 			const size_t maximumChunkEnd = std::min(triangles.size(),
 				chunkOffset + static_cast<size_t>(
@@ -846,9 +940,10 @@ nextCohort:
 				const size_t submissionIndex = triangle.submissionIndex;
 				const SortedSubmission &submission = m_impl->submissions[
 					submissionIndex];
-				if (submissionIndex >= vertexOffsets.size())
+				if (submissionIndex < cohortStart || submissionIndex - cohortStart >= vertexOffsets.size())
 					return RENDER_RESULT_INVALID_ARGUMENT;
-				if (vertexOffsets[submissionIndex] ==
+				const size_t relativeIndex = submissionIndex - cohortStart;
+				if (vertexOffsets[relativeIndex] ==
 					std::numeric_limits<size_t>::max())
 				{
 					if (chunkPacket != 0 &&
@@ -871,10 +966,10 @@ nextCohort:
 					const size_t vertexOffset = chunkVertices.size();
 					chunkVertices.insert(chunkVertices.end(),
 						submission.vertices.begin(), submission.vertices.end());
-					vertexOffsets[submissionIndex] = vertexOffset;
+					vertexOffsets[relativeIndex] = vertexOffset;
 				}
 
-				const size_t vertexOffset = vertexOffsets[submissionIndex];
+				const size_t vertexOffset = vertexOffsets[relativeIndex];
 				const size_t stride = submission.packet.vertexStride;
 				if (stride == 0 || vertexOffset % stride != 0)
 					return RENDER_RESULT_INVALID_ARGUMENT;
@@ -897,8 +992,9 @@ nextCohort:
 			if (local == 0)
 				return RENDER_RESULT_INVALID_ARGUMENT;
 			const RenderResult result = SubmitChunk(sink, draws, runs, triangles,
-				chunkOffset, m_impl->submissions, cohortSize,
-				m_impl->acknowledgedCohortSize, chunkVertices, chunkIndices);
+				chunkOffset, m_impl->submissions, cohortStart, cohortSize,
+				m_impl->acknowledgedCohortStart, m_impl->acknowledgedCohortSize,
+				chunkVertices, chunkIndices);
 			if (result != RENDER_RESULT_OK)
 				return result;
 			chunkOffset += local;
@@ -916,17 +1012,18 @@ nextCohort:
 	// Reaching this point means every chunk was fully acknowledged. Failures
 	// return above with their unacknowledged triangles retained for retry, so
 	// scanning every acknowledgement byte again here is unnecessary.
-	m_impl->acknowledgedCohortSize = 0;
-	if (cohortSize < m_impl->submissions.size())
+	m_impl->submissions.erase(m_impl->submissions.begin() + cohortStart,
+		m_impl->submissions.begin() + cohortStart + cohortSize);
+	m_impl->acknowledgedCohortStart = m_impl->acknowledgedCohortSize = 0;
+	if (!m_impl->submissions.empty())
 	{
 		// Rare retry-only tail: preserve admission, but never interleave new
 		// work with a prefix already emitted from the acknowledged cohort.
-		m_impl->submissions.erase(m_impl->submissions.begin(),
-			m_impl->submissions.begin() + cohortSize);
 		m_impl->workspace.Clear();
+		if (firstCohortOnly)
+			return RENDER_RESULT_OK;
 		goto nextCohort;
 	}
-	m_impl->submissions.clear();
 	return RENDER_RESULT_OK;
 }
 
@@ -935,7 +1032,7 @@ void NativeSortingRenderer::Clear()
 	if (m_impl != 0)
 	{
 		m_impl->submissions.clear();
-		m_impl->acknowledgedCohortSize = 0;
+		m_impl->acknowledgedCohortStart = m_impl->acknowledgedCohortSize = 0;
 	}
 }
 
@@ -948,6 +1045,16 @@ bool NativeSortingRenderer::Empty() const
 }
 
 #if defined(RTS_NATIVE_SORTING_TESTS)
+unsigned long long NativeSortingRendererTestLastOffsetInitializations()
+{
+	return g_nativeSortingLastOffsetInitializations;
+}
+
+unsigned long long NativeSortingRendererTestLastOffsetResets()
+{
+	return g_nativeSortingLastOffsetResets;
+}
+
 unsigned int NativeSortingRendererTestLastFlushScratchAllocationCount()
 {
 	return g_nativeSortingLastFlushScratchAllocationCount;

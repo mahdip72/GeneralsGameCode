@@ -1,10 +1,15 @@
+#include "Utility/CppMacros.h"
 #include "nativew3dtextureowner.h"
 #include "Renderer/NativeW3DRenderer.h"
 #include "Renderer/NativeW3DRenderState.h"
+#include "nativew3dsorting.h"
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace rts
@@ -1505,9 +1510,199 @@ int TestForeignFacadeTerminalRecoveryCleanup()
 	return result;
 }
 
-int main()
+int TestDeferredTextureRetentionCpu()
 {
+	using namespace rts::render;
+	int result = 0;
+	FakeRenderDevice device;
+	NativeW3DResourceHost host(32);
+	NativeW3DResources resources(64);
+	result |= Check(host.Attach(&device, device.immediateContext()) == RENDER_RESULT_OK &&
+		resources.BindHost(&host) == RENDER_RESULT_OK &&
+		BindNativeW3DTextureResources(&resources) == RENDER_RESULT_OK,
+		"retention fixture binds the actual resource/texture-owner seam");
+	unsigned char top[64] = {}, lower[16] = {};
+	TextureSubresourceData data[2];
+	MakeCpuData(top, lower, data);
+	const TextureDescriptor descriptor = MakeCpuDescriptor();
+	NativeW3DTextureOwner owner;
+	NativeW3DTextureCandidate candidate;
+	result |= Check(owner.CreateCandidate(descriptor, data, 2, &candidate) == RENDER_RESULT_OK &&
+		owner.PublishCandidate(&candidate, 0) == RENDER_RESULT_OK,
+		"retention fixture publishes one actual owner ticket");
+	NativeW3DTextureHandle original;
+	result |= Check(owner.AcquireForSampling(&original) == RENDER_RESULT_OK,
+		"published owner exposes its checked sampling identity");
+	const unsigned int before = device.DestroyCount();
+	NativeW3DTextureRetention retained;
+	result |= Check(resources.RetainTexture(original.resource, &retained) == RENDER_RESULT_OK,
+		"deferred consumer retains the exact existing ticket");
+	NativeW3DTextureRetention second(retained);
+	NativeW3DTextureRetention third;
+	third = second;
+	third = third;
+	NativeW3DTextureRetention moved(std::move(third));
+	third = std::move(moved);
+	result |= Check(third.IsValid() && !moved.IsValid(),
+		"move construction/assignment transfers the exact ticket without a new reference");
+	result |= Check(owner.Reset() == RENDER_RESULT_OK && resources.IsValid(original) &&
+		device.DestroyCount() == before && !resources.Destroy(original.resource),
+		"last title owner release cannot retire a deferred consumer's allocation");
+	result |= Check(resources.Shutdown() == RENDER_RESULT_FAILED && resources.IsValid(original),
+		"ordinary registry shutdown refuses a live deferred ticket");
+	RenderResult wrongThread = RENDER_RESULT_OK;
+	std::thread wrongRetention([&]() {
+		NativeW3DTextureRetention local;
+		wrongThread = resources.RetainTexture(original.resource, &local);
+	});
+	wrongRetention.join();
+	result |= Check(wrongThread == RENDER_RESULT_INVALID_ARGUMENT && resources.IsValid(original),
+		"foreign acquisition cannot change deferred ownership");
+	retained.Reset(); third.Reset();
+	std::thread lastRelease([&]() { second.Reset(); });
+	lastRelease.join();
+	result |= Check(host.PendingCleanup() == 1 && device.DestroyCount() == before,
+		"last foreign retention transfers exactly one preallocated cleanup");
+	unsigned int drained = 0;
+	result |= Check(host.DrainCleanup(0, &drained) == RENDER_RESULT_OK && drained == 1 &&
+		!resources.IsValid(original) && device.DestroyCount() == before + 1,
+		"owner cleanup retires the exact resource once after the final retention");
+	result |= Check(resources.RetainTexture(original.resource, &retained) != RENDER_RESULT_OK,
+		"retention cannot resurrect a retired generation");
+
+	// A zero-reference queued cleanup is also non-retainable BEFORE its slot dies.
+	std::unique_ptr<NativeW3DTextureOwner> retiring(new NativeW3DTextureOwner());
+	NativeW3DTextureCandidate retiringCandidate;
+	result |= Check(retiring->CreateCandidate(descriptor, data, 2, &retiringCandidate) == RENDER_RESULT_OK &&
+		retiring->PublishCandidate(&retiringCandidate, 0) == RENDER_RESULT_OK,
+		"retiring-state fixture creates an actual ticket");
+	NativeW3DTextureHandle retiringHandle;
+	result |= Check(retiring->AcquireForSampling(&retiringHandle) == RENDER_RESULT_OK,
+		"retiring fixture captures its checked identity before owner release");
+	const unsigned int retiringDestroys = device.DestroyCount();
+	const unsigned int retiringGeneration = retiring->PublicationGeneration();
+	RenderResult foreignReset = RENDER_RESULT_OK;
+	std::thread resetRefusal([&]() { foreignReset = retiring->Reset(); });
+	resetRefusal.join();
+	result |= Check(foreignReset == RENDER_RESULT_INVALID_ARGUMENT &&
+		retiring->PublicationGeneration() == retiringGeneration && resources.IsValid(retiringHandle) &&
+		host.PendingCleanup() == 0 && device.DestroyCount() == retiringDestroys,
+		"foreign explicit Reset refuses mutation before the independent destructor transfer");
+	std::thread transfer([&]() { retiring.reset(); });
+	transfer.join();
+	result |= Check(host.PendingCleanup() == 1 && device.DestroyCount() == retiringDestroys,
+		"foreign original owner destructor transfers cleanup without backend destruction");
+	result |= Check(resources.IsValid(retiringHandle) &&
+		resources.RetainTexture(retiringHandle.resource, &retained) == RENDER_RESULT_FAILED,
+		"zero-reference accepted cleanup cannot be resurrected while structurally live");
+	result |= Check(host.DrainCleanup(0, &drained) == RENDER_RESULT_OK && drained == 1 &&
+		host.PendingCleanup() == 0 && !resources.IsValid(retiringHandle) &&
+		device.DestroyCount() == retiringDestroys + 1,
+		"retiring-state cleanup drains normally");
+
+	// Raw handles keep their original explicit-destruction policy, not ownership.
+	NativeW3DTextureHandle raw;
+	result |= Check(resources.CreateTexture(descriptor, data, 2, &raw) == RENDER_RESULT_OK &&
+		resources.RetainTexture(raw.resource, &retained) == RENDER_RESULT_OK,
+		"raw registry textures acquire non-retiring retention");
+	result |= Check(!resources.DestroyTexture(raw) && !resources.RetireTexture(raw),
+		"explicit raw destruction/refusal cannot bypass deferred ownership");
+	retained.Reset();
+	result |= Check(resources.IsValid(raw) && resources.DestroyTexture(raw),
+		"last raw retention release does not destroy its caller-owned resource");
+	NativeW3DTextureOwner transferOwner;
+	NativeW3DTextureCandidate transferCandidate;
+	result |= Check(transferOwner.CreateCandidate(descriptor, data, 2,
+		&transferCandidate) == RENDER_RESULT_OK,
+		"owning candidate exists before public publication");
+	raw = transferCandidate.Handle();
+	result |= Check(resources.RetainTexture(raw.resource, &retained) == RENDER_RESULT_OK,
+		"deferred retention precedes the candidate-to-owner transfer");
+	const unsigned int beforeUpgrade = device.DestroyCount();
+	result |= Check(transferOwner.PublishCandidate(&transferCandidate, 0) == RENDER_RESULT_OK &&
+		transferOwner.Reset() == RENDER_RESULT_OK &&
+		resources.IsValid(raw) && device.DestroyCount() == beforeUpgrade,
+		"owning publication shares one exact control; owner release waits for pin");
+	retained.Reset();
+	result |= Check(!resources.IsValid(raw) && device.DestroyCount() == beforeUpgrade + 1,
+		"transferred control retires once at its final retention");
+
+	// Actual sorter storage, not a stand-in container, owns pins through failure,
+	// acknowledged nodes, appended tails and Clear.
+	class PrefixSink : public NativeSortedGeometrySink
+	{
+	public:
+		bool fail = true;
+		RenderResult SubmitNativeSortedBatch(const NativeSortedDraw *, unsigned int count,
+			const void *, size_t, const void *, size_t, unsigned int *accepted) override
+		{
+			*accepted = fail ? 1U : count;
+			return fail ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
+		}
+	} sink;
+	NativeW3DTextureOwner queued;
+	NativeW3DTextureCandidate queuedCandidate;
+	result |= Check(queued.CreateCandidate(descriptor, data, 2, &queuedCandidate) == RENDER_RESULT_OK &&
+		queued.PublishCandidate(&queuedCandidate, 0) == RENDER_RESULT_OK,
+		"queued ownership fixture publishes a fresh texture");
+	NativeW3DTextureHandle queuedHandle;
+	result |= Check(queued.AcquireForSampling(&queuedHandle) == RENDER_RESULT_OK,
+		"queue fixture captures its checked sampled identity");
+	NativeSortingRenderer sorter;
+	struct Vertex { float x, y, z; unsigned int color; } vertices[3] = {};
+	const unsigned short indices[] = {0, 1, 2};
+	NativeDrawPacket packet;
+	packet.vertexStride = sizeof(Vertex); packet.vertexCount = 3; packet.indexCount = 3;
+	packet.vertexLayout.stride = sizeof(Vertex);
+	packet.indexed = true; packet.texturePresenceMask = 1; packet.textures[0] = queuedHandle.resource;
+	LegacyLogicalState state; state.texturePresenceMask = 1;
+	{
+		NativeSortedPass pass; pass.captured = true; pass.identity = 1;
+		pass.viewport = RenderViewport(0, 0, 4, 4, 0, 1);
+		result |= Check(resources.RetainTexture(queuedHandle.resource, &pass.textures[0]) == RENDER_RESULT_OK,
+			"actual queue context owns its sampled resource");
+		state.pipeline.shaderBits = 99;
+		result |= Check(sorter.Queue(state, packet, vertices, sizeof(vertices), indices,
+			sizeof(indices), 0, &pass, true) == RENDER_RESULT_OK,
+			"inactive MAIN prefix owns its sampled ticket independently of the active interval");
+		pass.target.useBackBufferColor = false;
+		pass.target.hasColor = true;
+		pass.target.color.resource = queuedHandle.resource;
+		state.pipeline.shaderBits = 1;
+		result |= Check(sorter.Queue(state, packet, vertices, sizeof(vertices), indices,
+			sizeof(indices), 0, &pass) == RENDER_RESULT_OK, "actual first queued node owns its context");
+		state.pipeline.shaderBits = 2;
+		result |= Check(sorter.Queue(state, packet, vertices, sizeof(vertices), indices,
+			sizeof(indices), 0, &pass) == RENDER_RESULT_OK, "actual second queued node owns its context");
+	}
+	result |= Check(queued.Reset() == RENDER_RESULT_OK && sorter.Flush(sink) == RENDER_RESULT_FAILED &&
+		resources.IsValid(queuedHandle), "partial accepted-prefix failure keeps the texture live");
+	{
+		NativeSortedPass tail; tail.captured = true; tail.identity = 2;
+		result |= Check(resources.RetainTexture(queuedHandle.resource, &tail.textures[0]) == RENDER_RESULT_OK &&
+			sorter.Queue(state, packet, vertices, sizeof(vertices), indices, sizeof(indices), 0,
+				&tail) == RENDER_RESULT_OK, "later tail acquires its own exact retention");
+	}
+	sink.fail = false;
+	result |= Check(sorter.Flush(sink, true) == RENDER_RESULT_OK && !sorter.Empty() &&
+		resources.IsValid(queuedHandle), "middle cohort erasure retains both inactive-prefix and tail tickets");
+	sorter.ActivateMatchingPass(RenderTargetBinding(), 3);
+	result |= Check(sorter.Flush(sink, true) == RENDER_RESULT_OK && !sorter.Empty() &&
+		resources.IsValid(queuedHandle), "activated prefix erasure retains the independently owned tail ticket");
+	sorter.Clear();
+	result |= Check(!resources.IsValid(queuedHandle), "Clear releases the final tail retention once");
+	result |= Check(UnbindNativeW3DTextureResources(&resources) == RENDER_RESULT_OK &&
+		resources.Shutdown() == RENDER_RESULT_OK && host.Detach() == RENDER_RESULT_OK,
+		"retention fixture releases all actual tokens before shutdown");
+	return result;
+}
+
+int main(int argc, char **argv)
+{
+	if (argc == 2 && std::strcmp(argv[1], "--deferred-texture-retention-cpu") == 0)
+		return TestDeferredTextureRetentionCpu();
 	return TestNeutralTextureOwnership() |
+		TestDeferredTextureRetentionCpu() |
 		TestNativeD3D11RetirementFault() |
 		TestLateRegistryTicketLifetime() |
 		TestQueuedCleanupRecoveryFailure() |

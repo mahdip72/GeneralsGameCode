@@ -56,6 +56,10 @@ public:
 	virtual rts::render::GameRenderTargetKind ActiveRenderTargetKind() const;
 	virtual rts::render::RenderResult ExecuteGameRenderCommand(
 		const rts::render::GameRenderCommand &command);
+	// Valid owner-local viewport requests outside a frame update logical state
+	// only; the next Begin applies it before clear/queued-pass activation.
+	// In-frame requests update the cache only after command admission succeeds.
+	// Admission does not acknowledge owner execution or repair a failed pass.
 	virtual rts::render::RenderResult SetGameViewport(
 		const rts::render::RenderViewport &viewport);
 	virtual rts::render::RenderResult ApplyGameShaderBits(
@@ -128,6 +132,12 @@ public:
 		unsigned int drawCount, const void *vertexData, size_t vertexBytes,
 		const void *indexData, size_t indexBytes,
 		unsigned int *submittedDrawCount);
+	virtual rts::render::RenderResult SubmitNativeSortedPassBatch(
+		const rts::render::NativeSortedPass &pass,
+		const rts::render::NativeSortedDraw *draws, unsigned int drawCount,
+		const void *vertexData, size_t vertexBytes,
+		const void *indexData, size_t indexBytes,
+		unsigned int *submittedDrawCount);
 
 	// Target state is published by the existing bridge/native render-owner
 	// lifecycle.  The hooks are intentionally neutral so the bridge can update
@@ -164,6 +174,12 @@ private:
 	// The neutral logical target survives between frames. The renderer binds
 	// its defaults at BeginFrame, then reapplies this POD binding before clear.
 	rts::render::RenderTargetBinding m_gameRenderTargetBinding;
+	rts::render::RenderViewport m_gameViewport;
+	bool m_gameViewportValid;
+	rts::render::NativeW3DSubmissionSequence m_sortedPassIdentity;
+	bool m_sortedFlushFailed;
+	bool m_sortedReplayActive;
+	bool m_sortedContextRestoreFailed;
 	bool m_debugConsoleDisabled;
 	rts::render::RenderFrameFailureLatch m_gameFailure;
 	// Threaded completion is producer-owned state.  The completion sequence is
@@ -283,6 +299,9 @@ private:
 		rts::render::RenderResult reason);
 	rts::render::RenderResult FinishGameRenderFrame(bool capture,
 		bool present);
+	rts::render::RenderResult FinishGameTextureRenderFrame();
+	rts::render::RenderResult RestoreSortedContext();
+	rts::render::RenderResult AdvanceSortedPassIdentity();
 	rts::render::RenderResult ValidateGameRenderTargetBinding(
 		const rts::render::RenderTargetBinding &binding,
 		rts::render::RenderBackBufferInfo *info) const;

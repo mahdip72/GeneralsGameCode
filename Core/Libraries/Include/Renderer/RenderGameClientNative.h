@@ -117,7 +117,11 @@ enum GameRenderCommandType
 	GAME_RENDER_COMMAND_GET_DEVICE_DESC,
 	GAME_RENDER_COMMAND_GET_RESOLUTION,
 	GAME_RENDER_COMMAND_GET_TARGET_RESOLUTION,
-	GAME_RENDER_COMMAND_DRAW_SORTED_INDEXED_TRIANGLES_UP
+	GAME_RENDER_COMMAND_DRAW_SORTED_INDEXED_TRIANGLES_UP,
+	// Hidden output completion is an explicit fence, never the timing SYNC.
+	// value0=first hidden-pass RenderResult; closes once, fences the exact
+	// newly submitted completion, never presents (unlike ordinary END_RENDER).
+	GAME_RENDER_COMMAND_END_TEXTURE_RENDER_PASS
 };
 
 // Exact synchronous byte views for sorted indexed UP submission. The native

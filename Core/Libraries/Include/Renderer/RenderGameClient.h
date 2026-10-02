@@ -443,6 +443,12 @@ RenderResult DrawGameSortedIndexedTrianglesUP(unsigned int triangleCount,
 
 void SetGameRenderTarget(TextureClass *colorTexture,
 	ZTextureClass *depthTexture, bool useDefaultDepth);
+#if defined(_WIN64)
+RenderResult SetGameRenderTargetChecked(TextureClass *colorTexture,
+	ZTextureClass *depthTexture, bool useDefaultDepth);
+RenderResult EndGameTextureRenderPass(RenderResult failure = RENDER_RESULT_OK);
+void RecordGameRenderFailure(RenderResult failure);
+#endif
 
 RenderResult GetGameBackBufferInfo(RenderBackBufferInfo *info);
 RenderResult GetGameRenderTargetInfo(RenderBackBufferInfo *info);

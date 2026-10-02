@@ -8,6 +8,7 @@
 #define RTS_WW3D2_NATIVEW3DSORTING_H
 
 #include "Renderer/NativeW3DRenderer.h"
+#include "Renderer/NativeW3DResources.h"
 #include "Renderer/RenderGameClient.h"
 
 #include <stddef.h>
@@ -16,6 +17,21 @@ namespace rts
 {
 namespace render
 {
+
+// Output affinity and owning resource references for one deferred pass. A
+// content lease is deliberately not substituted for these allocation pins.
+struct NativeSortedPass
+{
+	NativeSortedPass() : captured(false), identity(0), target(), viewport(),
+		textures(), color(), depth() {}
+	bool captured;
+	NativeW3DSubmissionSequence identity;
+	RenderTargetBinding target;
+	RenderViewport viewport;
+	NativeW3DTextureRetention textures[LEGACY_TEXTURE_STAGE_COUNT];
+	NativeW3DTextureRetention color;
+	NativeW3DTextureRetention depth;
+};
 
 // A draw group is one contiguous run of triangles that originated from the
 // same legacy sorting node.  The packet deliberately contains no temporary
@@ -43,6 +59,15 @@ public:
 		const void *vertexData, size_t vertexBytes,
 		const void *indexData, size_t indexBytes,
 		unsigned int *submittedDrawCount) = 0;
+	virtual RenderResult SubmitNativeSortedPassBatch(const NativeSortedPass &,
+		const NativeSortedDraw *draws, unsigned int drawCount,
+		const void *vertexData, size_t vertexBytes,
+		const void *indexData, size_t indexBytes,
+		unsigned int *submittedDrawCount)
+	{
+		return SubmitNativeSortedBatch(draws, drawCount, vertexData, vertexBytes,
+			indexData, indexBytes, submittedDrawCount);
+	}
 };
 
 class NativeSortingRenderer
@@ -68,8 +93,19 @@ public:
 	RenderResult Queue(const LegacyLogicalState &state,
 		const NativeDrawPacket &packet, const void *vertexData,
 		size_t vertexBytes, const void *indexData, size_t indexBytes,
-		const GameBoundingSphere *boundingSphere);
-	RenderResult Flush(NativeSortedGeometrySink &sink);
+		const GameBoundingSphere *boundingSphere,
+		const NativeSortedPass *pass = 0, bool awaitMatchingBegin = false);
+	// Native no-frame admissions keep their captured bytes/state/viewport, but
+	// cannot draw before a successful Begin for this exact output. Activation
+	// commits only after target/viewport/clear admission succeeds. Generic Queue
+	// callers remain immediately active. Inactive nodes are never rearranged.
+	void ActivateMatchingPass(const RenderTargetBinding &target,
+		NativeW3DSubmissionSequence identity);
+	// Distinct contiguous captured passes are never co-sorted. The optional
+	// single-cohort drain retries an older failed pass before a new clear without
+	// prematurely drawing newly admitted tail work ahead of that clear.
+	RenderResult Flush(NativeSortedGeometrySink &sink,
+		bool firstCohortOnly = false);
 
 	// Teardown is the one intentional discard point.  A failed Flush never
 	// calls this method and therefore keeps every command available for retry.

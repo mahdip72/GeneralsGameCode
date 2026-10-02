@@ -107,7 +107,7 @@ public:
 	void updateMapOverrides();	///< used to update any map specific map overrides for water appearance.
 	void setTimeOfDay(TimeOfDay tod); ///<change sky/water for time of day
 	void toggleCloudLayer(Bool state)	{	m_useCloudLayer=state;}	///<enables/disables the cloud layer
-	void updateRenderTargetTextures(CameraClass *cam);	///< renders into any required textures.
+	bool updateRenderTargetTextures(CameraClass *cam);	///< false prevents native sampling/presentation of a failed refresh.
 	void ReleaseResources();	///< Release all renderer resources so the device can be reset.
 	void ReAcquireResources();  ///< Reacquire all resources after device reset.
 	Real getWaterHeight(Real x, Real y);	///<return water height at given point - for use by WB.
@@ -173,6 +173,7 @@ protected:
 	Real				m_fBumpFrame;	///<current animation frame
 	Real				m_fBumpScale;	///<scales bump map uv perturbation
 	TextureClass * m_pReflectionTexture;	///<render target for reflection
+	bool m_nativeReflectionReady;
 	ZTextureClass *m_pReflectionDepthTexture;	///<matching depth target for reflection
 	RenderObjClass	*m_skyBox;		///<box around level
 	WaterTracksRenderSystem *m_waterTrackSystem;	///<object responsible for rendering water wakes
@@ -257,7 +258,7 @@ protected:
 	void renderSkyBody(Matrix3D *mat);	///<draw the sky body (sun, moon, etc.)
 	void renderWaterMesh();			///<draw the water surface mesh (deformed 3d mesh).
 	HRESULT initBumpMap(TextureClass **pTex, TextureClass *pBumpSource);	///<copies data into bump-map format.
-	void renderMirror(CameraClass *cam);	///< Draw reflected scene into texture
+	bool renderMirror(CameraClass *cam);	///< Draw reflected scene into texture
 	void drawSea(RenderInfoClass & rinfo);	///< Draw the surface of the water
 	///bounding box of frustum clipped polygon plane
 	Bool getClippedWaterPlane(CameraClass *cam, AABoxClass *box);

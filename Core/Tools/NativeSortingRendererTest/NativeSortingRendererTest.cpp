@@ -17,6 +17,8 @@ bool NativeSortingRendererTestRetireMixedPending();
 unsigned int NativeSortingRendererTestLastFlushScratchAllocationCount();
 unsigned int NativeSortingRendererTestLastFlushPreparedGrowthCount();
 unsigned long long NativeSortingRendererTestLastFlushWorkspaceCapacityBytes();
+unsigned long long NativeSortingRendererTestLastOffsetInitializations();
+unsigned long long NativeSortingRendererTestLastOffsetResets();
 
 namespace
 {
@@ -149,6 +151,25 @@ public:
 	unsigned int acceptedOnFailure;
 	bool requireHomogeneous;
 	std::vector<CapturedBatch> batches;
+};
+
+class PassRecordingSink : public RecordingSink
+{
+public:
+	std::vector<NativeW3DSubmissionSequence> passIdentities;
+	std::vector<GpuHandle> targets;
+	std::vector<RenderViewport> viewports;
+	RenderResult SubmitNativeSortedPassBatch(const NativeSortedPass &pass,
+		const NativeSortedDraw *draws, unsigned int drawCount,
+		const void *vertices, size_t vertexBytes, const void *indices,
+		size_t indexBytes, unsigned int *accepted) override
+	{
+		passIdentities.push_back(pass.identity);
+		targets.push_back(pass.target.color.resource);
+		viewports.push_back(pass.viewport);
+		return SubmitNativeSortedBatch(draws, drawCount, vertices, vertexBytes,
+			indices, indexBytes, accepted);
+	}
 };
 
 bool CaptureAcceptedDrawStream(const RecordingSink &sink,
@@ -905,7 +926,8 @@ bool CaptureAcceptedTriangleStream(const RecordingSink &sink,
 	return true;
 }
 
-void QueueTieCohort(NativeSortingRenderer &renderer, bool mixedLayouts)
+void QueueTieCohort(NativeSortingRenderer &renderer, bool mixedLayouts,
+	const NativeSortedPass *pass = 0, bool awaitBegin = false)
 {
 	// More than the insertion-sort threshold; each node has unique attributes,
 	// and acknowledged nodes must remain in the legacy quicksort input.
@@ -932,7 +954,7 @@ void QueueTieCohort(NativeSortingRenderer &renderer, bool mixedLayouts)
 			packet.vertexLayout.elements[2].format = RENDER_VERTEX_DATA_FLOAT2;
 			packet.vertexLayout.elements[2].byteOffset = sizeof(TestVertex);
 			CHECK(renderer.Queue(state, packet, vertices, sizeof(vertices),
-				indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+				indices, sizeof(indices), 0, pass, awaitBegin) == RENDER_RESULT_OK);
 		}
 		else
 		{
@@ -940,7 +962,7 @@ void QueueTieCohort(NativeSortingRenderer &renderer, bool mixedLayouts)
 			for (unsigned int corner = 0; corner < 3; ++corner)
 				memcpy(&narrow[corner], &vertices[corner], sizeof(TestVertex));
 			CHECK(renderer.Queue(state, packet, narrow, sizeof(narrow),
-				indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+				indices, sizeof(indices), 0, pass, awaitBegin) == RENDER_RESULT_OK);
 		}
 	}
 }
@@ -1074,6 +1096,172 @@ void TestIndexChunkCohortQueueExtension()
 
 }
 
+void QueueCapturedPassTriangle(NativeSortingRenderer &renderer,
+	const NativeSortedPass &pass, unsigned int bits, float depth, bool awaitBegin = false)
+{
+	std::vector<TestVertex> vertices;
+	MakeVertices(vertices, std::vector<float>{depth, depth, depth});
+	const unsigned short indices[] = {0, 1, 2};
+	LegacyLogicalState state;
+	state.pipeline.shaderBits = bits;
+	CHECK(renderer.Queue(state, MakePacket(3, 3), vertices.data(),
+		vertices.size() * sizeof(TestVertex), indices, sizeof(indices), 0,
+		&pass, awaitBegin) == RENDER_RESULT_OK);
+}
+
+void TestDeferredOutputIntervalAndRetry()
+{
+	NativeSortedPass main;
+	main.captured = true;
+	main.identity = 1;
+	main.viewport = RenderViewport(7, 9, 640, 480, .25f, .75f);
+	NativeSortedPass reflected = main;
+	reflected.identity = 2;
+	reflected.target.useBackBufferColor = false;
+	reflected.target.hasColor = true;
+	reflected.target.color.resource = GpuHandle(17, 3);
+	reflected.viewport = RenderViewport(3, 5, 256, 256, 0, 1);
+	for (unsigned int accepted : {0U, 1U, 24U})
+	{
+		NativeSortingRenderer reference;
+		PassRecordingSink expectedSink;
+		QueueTieCohort(reference, false, &reflected);
+		CHECK(reference.Flush(expectedSink) == RENDER_RESULT_OK);
+		QueueCapturedPassTriangle(reference, reflected, 9000, -100);
+		CHECK(reference.Flush(expectedSink) == RENDER_RESULT_OK);
+		QueueCapturedPassTriangle(reference, main, 33, -200);
+		CHECK(reference.Flush(expectedSink) == RENDER_RESULT_OK);
+		NativeSortingRenderer renderer;
+		PassRecordingSink sink;
+		QueueCapturedPassTriangle(renderer, main, 33, -200, true);
+		CHECK(renderer.Flush(sink) == RENDER_RESULT_OK && sink.calls == 0 && !renderer.Empty());
+		// Activation is full output equality, not two invalid color handles.
+		RenderTargetBinding wrong = main.target;
+		wrong.useBackBufferColor = false;
+		wrong.hasColor = true;
+		renderer.ActivateMatchingPass(wrong, 77);
+		CHECK(renderer.Flush(sink) == RENDER_RESULT_OK && sink.calls == 0);
+		renderer.ActivateMatchingPass(reflected.target, 2);
+		QueueTieCohort(renderer, false, &reflected);
+		sink.failCall = 1;
+		sink.acceptedOnFailure = accepted;
+		CHECK(renderer.Flush(sink) == RENDER_RESULT_FAILED);
+		QueueCapturedPassTriangle(renderer, reflected, 9000, -100, true);
+		if (accepted == 1)
+		{
+			sink.failCall = sink.calls + 1;
+			sink.acceptedOnFailure = 2;
+			CHECK(renderer.Flush(sink) == RENDER_RESULT_FAILED);
+		}
+		sink.failCall = 0;
+		const unsigned int calls = sink.calls;
+		CHECK(renderer.Flush(sink, true) == RENDER_RESULT_OK && !renderer.Empty());
+		if (accepted == 24) CHECK(sink.calls == calls); // No empty resubmission.
+		CHECK(NativeSortingRendererTestLastOffsetInitializations() == 24);
+		CHECK(renderer.Flush(sink) == RENDER_RESULT_OK && !renderer.Empty());
+		renderer.ActivateMatchingPass(reflected.target, 3);
+		CHECK(renderer.Flush(sink) == RENDER_RESULT_OK && !renderer.Empty());
+		renderer.ActivateMatchingPass(main.target, 4);
+		CHECK(renderer.Flush(sink) == RENDER_RESULT_OK && renderer.Empty());
+		CHECK(sink.passIdentities.back() == 4 && sink.viewports.back().x == 7 &&
+			sink.viewports.back().minimumDepth == .25f);
+		std::vector<CapturedDraw> expected, actual;
+		CHECK(CaptureAcceptedTriangleStream(expectedSink, expected));
+		CHECK(CaptureAcceptedTriangleStream(sink, actual));
+		CHECK(expected.size() == 26 && SameAcceptedDrawStream(expected, actual));
+	}
+	// Explicit teardown releases both inactive and active intervals.
+	NativeSortingRenderer renderer;
+	QueueCapturedPassTriangle(renderer, main, 1, 0, true);
+	QueueCapturedPassTriangle(renderer, reflected, 2, 0);
+	renderer.Clear();
+	CHECK(renderer.Empty());
+}
+
+void TestCapturedPassFailureAndTail()
+{
+	for (unsigned int accepted = 0; accepted <= 2; ++accepted)
+	{
+		NativeSortedPass reflection;
+		reflection.captured = true;
+		reflection.identity = 19;
+		reflection.target.useBackBufferColor = false;
+		reflection.target.hasColor = true;
+		reflection.target.color.resource = GpuHandle(17, 3);
+		reflection.viewport = RenderViewport(3, 5, 256, 256, .125f, .875f);
+		NativeSortedPass main;
+		main.captured = true;
+		main.identity = 20;
+		main.viewport = RenderViewport(0, 0, 640, 480, 0, 1);
+		NativeSortingRenderer renderer;
+		QueueCapturedPassTriangle(renderer, reflection, 11, 1);
+		QueueCapturedPassTriangle(renderer, reflection, 22, 2);
+		PassRecordingSink sink;
+		sink.failCall = 1;
+		sink.acceptedOnFailure = accepted;
+		CHECK(renderer.Flush(sink) == RENDER_RESULT_FAILED);
+		QueueCapturedPassTriangle(renderer, main, 33, -100);
+		CHECK(renderer.Flush(sink, true) == RENDER_RESULT_OK);
+		CHECK(!renderer.Empty()); // New pass must wait for its own clear.
+		for (size_t call = 0; call < sink.targets.size(); ++call)
+		{
+			CHECK(sink.passIdentities[call] == 19);
+			CHECK(sink.targets[call] == reflection.target.color.resource);
+			CHECK(sink.viewports[call].x == 3 && sink.viewports[call].y == 5 &&
+				sink.viewports[call].width == 256 && sink.viewports[call].height == 256 &&
+				sink.viewports[call].minimumDepth == .125f &&
+				sink.viewports[call].maximumDepth == .875f);
+		}
+		CHECK(renderer.Flush(sink) == RENDER_RESULT_OK && renderer.Empty());
+		CHECK(sink.passIdentities.back() == 20 && !sink.targets.back().isValid());
+		std::vector<CapturedDraw> stream;
+		CHECK(CaptureAcceptedTriangleStream(sink, stream));
+		CHECK(stream.size() == 3);
+		if (stream.size() == 3)
+			CHECK(stream[0].state == 11 && stream[1].state == 22 && stream[2].state == 33);
+	}
+	// Equal target identity but changed viewport/clear identity is another pass.
+	NativeSortingRenderer renderer;
+	NativeSortedPass a;
+	a.captured = true; a.identity = 5;
+	a.viewport = RenderViewport(0, 0, 256, 256, 0, 1);
+	NativeSortedPass b = a;
+	b.viewport.width = 128;
+	QueueCapturedPassTriangle(renderer, a, 44, 3);
+	QueueCapturedPassTriangle(renderer, b, 55, -3);
+	PassRecordingSink sink;
+	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
+	CHECK(sink.calls == 2 && sink.viewports[0].width == 256 && sink.viewports[1].width == 128);
+}
+
+void TestLinearOffsetWorkspaceAlternatingLayouts()
+{
+	NativeSortingRenderer renderer;
+	const unsigned int count = 257;
+	const unsigned short indices[] = {0, 1, 2};
+	for (unsigned int node = 0; node < count; ++node)
+	{
+		TestVertex vertices[3] = {};
+		for (unsigned int i = 0; i < 3; ++i) vertices[i].z = static_cast<float>(node);
+		NativeDrawPacket packet = MakePacket(3, 3);
+		if (node & 1U) packet.vertexLayout.elementCount = 1;
+		LegacyLogicalState state;
+		state.pipeline.shaderBits = node;
+		CHECK(renderer.Queue(state, packet, vertices, sizeof(vertices), indices,
+			sizeof(indices), 0) == RENDER_RESULT_OK);
+	}
+	RecordingSink sink;
+	sink.requireHomogeneous = true;
+	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
+	CHECK(sink.calls == count);
+	CHECK(NativeSortingRendererTestLastOffsetInitializations() == count);
+	CHECK(NativeSortingRendererTestLastOffsetResets() == count - 1);
+	CHECK(NativeSortingRendererTestLastFlushWorkspaceCapacityBytes() <= 24ULL * 1024ULL * 1024ULL);
+	std::vector<CapturedDraw> stream;
+	CHECK(CaptureAcceptedTriangleStream(sink, stream) && stream.size() == count);
+	for (size_t i = 0; i < stream.size(); ++i) CHECK(stream[i].state == i);
+}
+
 int main()
 {
 	// Keep this focused test within the project validation budget even when the
@@ -1092,6 +1280,9 @@ int main()
 	TestCanonicalTieRetryAndQueueExtension();
 	TestMixedLayoutCohortAndClear();
 	TestIndexChunkCohortQueueExtension();
+	TestCapturedPassFailureAndTail();
+	TestDeferredOutputIntervalAndRetry();
+	TestLinearOffsetWorkspaceAlternatingLayouts();
 	CHECK(NativeSortingRendererTestRetireAllComplete());
 	CHECK(NativeSortingRendererTestRetireMixedPending());
 	return failures == 0 ? 0 : 1;
