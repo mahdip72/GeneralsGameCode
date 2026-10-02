@@ -626,7 +626,7 @@ void DebugResourceOwnerTransport()
 		f.lastFaultResult == RENDER_RESULT_FAILED);
 	CHECK(device->configureResourceFaultInjection(
 		static_cast<RenderResourceFaultPoint>(
-			RENDER_RESOURCE_FAULT_RESIZE_TARGETS_RECOVERY_FAILURE + 1), 1,
+			RENDER_RESOURCE_FAULT_TEXTURE_COPY_AFTER_ISSUE + 1), 1,
 		RENDER_RESULT_FAILED) == RENDER_RESULT_INVALID_ARGUMENT &&
 		f.faultConfigCalls == 5);
 }
