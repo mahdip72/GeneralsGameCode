@@ -72,6 +72,23 @@ enum AIPlanningSubphase
 	AI_PLANNING_SUBPHASE_TEAM_PRODUCTION = 1
 };
 
+enum AIProductionCounterFitMode
+{
+	AI_PRODUCTION_COUNTER_FIT_BALANCED = 0,
+	AI_PRODUCTION_COUNTER_FIT_FORTIFY = 1,
+	AI_PRODUCTION_COUNTER_FIT_ASSAULT = 2
+};
+
+// Captured PlayerList slots, not live Player pointers. Zero Hour reads cached
+// targets sequentially; later due owners must observe earlier planned targets.
+struct AIEnemyPlanningOrderState
+{
+	uint32_t playerCount;
+	int32_t playerIndices[AI_PLANNING_MAX_PLAYERS];
+	int32_t cachedEnemyIndices[AI_PLANNING_MAX_PLAYERS];
+	uint32_t alliedSkirmishMasks[AI_PLANNING_MAX_PLAYERS];
+};
+
 enum AIPlanningExecutionMode
 {
 	AI_PLANNING_EXECUTION_SERIAL = 0,
@@ -237,6 +254,10 @@ struct AIProductionPlanningSnapshot
 	int32_t retryReserve;
 	int32_t difficulty;
 	int32_t contextInfluencePercent;
+	// Default-zero retail/Generals facts retain the 300-point clamp. Source
+	// facts apply the mode once; owner-serial facts are already mode-adjusted.
+	uint32_t allowExpandedCounterFit;
+	uint32_t productionCounterFitMode;
 	uint32_t retryWithoutInitialReserve;
 	uint32_t candidateCount;
 	AICounterRngKey tieBreakKey;
@@ -506,6 +527,9 @@ void ClearAIPlayerPlanningResult(AIPlayerPlanningResult *result);
 
 bool PlanAIEnemyTarget(const AIEnemyPlanningSnapshot &snapshot,
 	AIEnemyPlanningResult *result);
+bool ProjectAIEnemyPlanningOrder(const AIEnemyPlanningOrderState &state,
+	const uint32_t *ownerSourceOrdinals, AIPlayerPlanningSnapshot *snapshots,
+	uint32_t snapshotCount);
 bool PlanAIProduction(const AIProductionPlanningSnapshot &snapshot,
 	AIProductionPlanningResult *result);
 bool PlanAIProductionSelectionOwnerSerial(

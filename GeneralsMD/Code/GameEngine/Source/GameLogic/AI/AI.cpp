@@ -576,6 +576,25 @@ Bool RunSkirmishEnemyPlanningBatch()
 	{
 	std::vector<AISkirmishPlayer *> owners;
 	std::vector<rts::AIPlayerPlanningSnapshot> snapshots;
+	std::vector<uint32_t> ownerSourceOrdinals;
+	rts::AIEnemyPlanningOrderState orderState = {};
+	if (ThePlayerList->getPlayerCount() > rts::AI_PLANNING_MAX_PLAYERS)
+		return false;
+	orderState.playerCount = (uint32_t)ThePlayerList->getPlayerCount();
+	for (uint32_t source = 0U; source < orderState.playerCount; ++source)
+	{
+		Player *player = ThePlayerList->getNthPlayer((Int)source);
+		orderState.playerIndices[source] = player ? player->getPlayerIndex() : -1;
+		Player *enemy = player ? player->getCachedCurrentEnemy() : nullptr;
+		orderState.cachedEnemyIndices[source] = enemy ? enemy->getPlayerIndex() : -1;
+		for (uint32_t ally = 0U; player && ally < orderState.playerCount; ++ally)
+		{
+			Player *other = ThePlayerList->getNthPlayer((Int)ally);
+			if (other && other != player && other->isSkirmishAIPlayer() &&
+				player->getRelationship(other->getDefaultTeam()) == ALLIES)
+				orderState.alliedSkirmishMasks[source] |= 1U << ally;
+		}
+	}
 	for (Int sourceOrdinal = 0; sourceOrdinal < ThePlayerList->getPlayerCount(); ++sourceOrdinal)
 	{
 		Player *player = ThePlayerList->getNthPlayer(sourceOrdinal);
@@ -606,12 +625,22 @@ Bool RunSkirmishEnemyPlanningBatch()
 		rts::RecordAIPlanningOwnerCapture(snapshot.enemyTarget.candidateCount);
 		owners.push_back(owner);
 		snapshots.push_back(snapshot);
+		ownerSourceOrdinals.push_back((uint32_t)sourceOrdinal);
 	}
 	performanceBatch.end();
 	if (snapshots.empty())
 	{
 		performanceBatch.notAdmitted();
 		return true;
+	}
+	// Preserve main's cached-target reads in PlayerList order before independent
+	// workers validate these immutable projected snapshots. Nothing live changes.
+	if (!rts::ProjectAIEnemyPlanningOrder(orderState,
+		&ownerSourceOrdinals[0], &snapshots[0], (uint32_t)snapshots.size()))
+	{
+		performanceBatch.abort();
+		rts::RecordAIPlanningOwnerCommit(false);
+		return false;
 	}
 
 	std::vector<rts::AIPlayerPlanningResult> committed(snapshots.size());

@@ -301,6 +301,27 @@ int32_t SourceCounterFit(const AIProductionPlanningSnapshot &snapshot,
 	return ClampInt32(score, 0, 300);
 }
 
+bool HasValidProductionCounterFitPolicy(const AIProductionPlanningSnapshot &snapshot)
+{
+	return snapshot.allowExpandedCounterFit <= 1U &&
+		snapshot.productionCounterFitMode <= AI_PRODUCTION_COUNTER_FIT_ASSAULT &&
+		(snapshot.allowExpandedCounterFit != 0U ||
+		 snapshot.productionCounterFitMode == AI_PRODUCTION_COUNTER_FIT_BALANCED);
+}
+
+int32_t ApplyProductionCounterFitMode(int32_t score,
+	const AIProductionPlanningSnapshot &snapshot)
+{
+	if (snapshot.allowExpandedCounterFit != 0U)
+	{
+		if (snapshot.productionCounterFitMode == AI_PRODUCTION_COUNTER_FIT_ASSAULT)
+			return ClampInt32(score * 2, 0, 500);
+		if (snapshot.productionCounterFitMode == AI_PRODUCTION_COUNTER_FIT_FORTIFY)
+			return ClampInt32(score * 3 / 2, 0, 400);
+	}
+	return score;
+}
+
 bool BuildSourceCandidateFact(const AIProductionPlanningSnapshot &snapshot,
 	uint32_t candidateIndex, AIProductionCandidateFact *fact)
 {
@@ -319,7 +340,8 @@ bool BuildSourceCandidateFact(const AIProductionPlanningSnapshot &snapshot,
 		!ComputeSourceProduction(snapshot, source, true,
 		&fact->plannedCost, &fact->factoryWaitFrames))
 		return false;
-	fact->counterFitScore = SourceCounterFit(snapshot, source);
+	fact->counterFitScore = ApplyProductionCounterFitMode(
+		SourceCounterFit(snapshot, source), snapshot);
 	bool hasGround = false;
 	bool hasAir = false;
 	for (uint32_t i = 0U; i < source.unitCount; ++i)
@@ -374,7 +396,8 @@ AIProductionCandidateScore ScoreProductionCandidate(
 	memset(&result, 0, sizeof(result));
 	result.sourceOrdinal = candidate.sourceOrdinal;
 	result.candidateStableId = candidate.candidateStableId;
-	result.counterFitScore = ClampInt32(candidate.counterFitScore, 0, 300);
+	result.counterFitScore = ClampInt32(candidate.counterFitScore, 0,
+		snapshot.allowExpandedCounterFit != 0U ? 500 : 300);
 	result.economyScore = EconomyScore(snapshot.resources,
 		candidate.minimumCost, candidate.plannedCost, reserve);
 	result.factoryWaitScore = FactoryWaitScore(candidate.factoryWaitFrames,
@@ -1572,6 +1595,7 @@ bool WriteAIPlanningReferenceProductionSnapshot(
 	const AIProductionPlanningSourceFacts &facts = snapshot.sourceFacts;
 	if (snapshot.candidateCount > AI_PLANNING_MAX_PRODUCTION_CANDIDATES ||
 		facts.factoryCount > AI_PLANNING_MAX_PRODUCTION_FACTORIES ||
+		!HasValidProductionCounterFitPolicy(snapshot) ||
 		!writer.u32(tag + 0U, snapshot.frame) ||
 		!writer.u32(tag + 1U, snapshot.ownerPlayerIndex) ||
 		!writer.i32(tag + 2U, snapshot.resources) ||
@@ -1647,7 +1671,8 @@ bool WriteAIPlanningReferenceProductionSnapshot(
 					return false;
 		}
 	}
-	return true;
+	return writer.u32(tag + 71U, snapshot.allowExpandedCounterFit) &&
+		writer.u32(tag + 72U, snapshot.productionCounterFitMode);
 }
 
 bool WriteAIPlanningReferenceEnemyResult(
@@ -2031,10 +2056,88 @@ bool PlanAIEnemyTarget(const AIEnemyPlanningSnapshot &snapshot,
 	return true;
 }
 
+bool ProjectAIEnemyPlanningOrder(const AIEnemyPlanningOrderState &state,
+	const uint32_t *ownerSourceOrdinals, AIPlayerPlanningSnapshot *snapshots,
+	uint32_t snapshotCount)
+{
+	if (state.playerCount == 0U || state.playerCount > AI_PLANNING_MAX_PLAYERS ||
+		snapshotCount > AI_PLANNING_MAX_PLAYERS ||
+		(snapshotCount != 0U && (ownerSourceOrdinals == 0 || snapshots == 0)))
+		return false;
+	const uint32_t validMask = (1U << state.playerCount) - 1U;
+	int32_t targets[AI_PLANNING_MAX_PLAYERS];
+	for (uint32_t source = 0U; source < state.playerCount; ++source)
+	{
+		if (state.playerIndices[source] < -1 ||
+			state.playerIndices[source] >= AI_PLANNING_MAX_PLAYERS ||
+			state.cachedEnemyIndices[source] < -1 ||
+			state.cachedEnemyIndices[source] >= AI_PLANNING_MAX_PLAYERS ||
+			(state.alliedSkirmishMasks[source] & ~validMask) != 0U ||
+			(state.alliedSkirmishMasks[source] & (1U << source)) != 0U)
+			return false;
+		if (state.playerIndices[source] < 0 &&
+			(state.cachedEnemyIndices[source] != -1 || state.alliedSkirmishMasks[source] != 0U))
+			return false;
+		for (uint32_t ally = 0U; ally < state.playerCount; ++ally)
+			if ((state.alliedSkirmishMasks[source] & (1U << ally)) != 0U &&
+				state.playerIndices[ally] < 0)
+				return false;
+		for (uint32_t prior = 0U; prior < source; ++prior)
+			if (state.playerIndices[source] >= 0 &&
+				state.playerIndices[source] == state.playerIndices[prior])
+				return false;
+		targets[source] = state.cachedEnemyIndices[source];
+	}
+
+	AIEnemyPlanningSnapshot projected[AI_PLANNING_MAX_PLAYERS];
+	for (uint32_t owner = 0U; owner < snapshotCount; ++owner)
+	{
+		const uint32_t source = ownerSourceOrdinals[owner];
+		const AIPlayerPlanningSnapshot &input = snapshots[owner];
+		if (source >= state.playerCount || state.playerIndices[source] < 0 ||
+			(owner != 0U && source <= ownerSourceOrdinals[owner - 1U]) ||
+			input.planEnemyTarget != 1U || input.planProduction != 0U ||
+			input.playerIndex != (uint32_t)state.playerIndices[source] ||
+			input.enemyTarget.ownerPlayerIndex != input.playerIndex ||
+			input.enemyTarget.currentEnemyPlayerIndex != targets[source] ||
+			input.enemyTarget.frame != input.frame ||
+			input.enemyTarget.candidateCount > AI_PLANNING_MAX_PLAYERS)
+			return false;
+		projected[owner] = input.enemyTarget;
+		for (uint32_t candidateIndex = 0U;
+			candidateIndex < projected[owner].candidateCount; ++candidateIndex)
+		{
+			AIEnemyCandidateFact &candidate = projected[owner].candidates[candidateIndex];
+			if (candidate.sourceOrdinal >= state.playerCount ||
+				candidate.sourceOrdinal == source || candidate.playerIndex < 0 ||
+				state.playerIndices[candidate.sourceOrdinal] != candidate.playerIndex ||
+				(candidateIndex != 0U && candidate.sourceOrdinal <=
+				 projected[owner].candidates[candidateIndex - 1U].sourceOrdinal))
+				return false;
+			candidate.targetingThisAI =
+				targets[candidate.sourceOrdinal] == (int32_t)input.playerIndex ? 1U : 0U;
+			candidate.alliedAIsTargeting = 0;
+			for (uint32_t ally = 0U; ally < state.playerCount; ++ally)
+				if ((state.alliedSkirmishMasks[source] & (1U << ally)) != 0U &&
+					targets[ally] == candidate.playerIndex)
+					++candidate.alliedAIsTargeting;
+		}
+		AIEnemyPlanningResult result;
+		if (!PlanAIEnemyTarget(projected[owner], &result))
+			return false;
+		targets[source] = result.selectedPlayerIndex;
+	}
+	// No partially projected input is visible if any table/member is rejected.
+	for (uint32_t owner = 0U; owner < snapshotCount; ++owner)
+		snapshots[owner].enemyTarget = projected[owner];
+	return true;
+}
+
 bool PlanAIProduction(const AIProductionPlanningSnapshot &snapshot,
 	AIProductionPlanningResult *result)
 {
-	if (result == 0 || snapshot.candidateCount > AI_PLANNING_MAX_PRODUCTION_CANDIDATES)
+	if (result == 0 || snapshot.candidateCount > AI_PLANNING_MAX_PRODUCTION_CANDIDATES ||
+		!HasValidProductionCounterFitPolicy(snapshot))
 		return false;
 
 	memset(result, 0, sizeof(*result));
@@ -2136,7 +2239,8 @@ bool PlanAIProductionSelectionOwnerSerial(
 	const AIProductionCandidateFact *candidates, uint32_t candidateCount,
 	AIProductionSelectionResult *result)
 {
-	if (result == 0 || (candidateCount != 0U && candidates == 0))
+	if (result == 0 || (candidateCount != 0U && candidates == 0) ||
+		!HasValidProductionCounterFitPolicy(context))
 		return false;
 
 	memset(result, 0, sizeof(*result));

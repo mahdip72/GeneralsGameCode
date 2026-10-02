@@ -7076,6 +7076,12 @@ Bool AISkirmishPlayer::finishAdaptiveProductionPlanningSnapshot(
 	SkirmishAIDecisionDifficulty difficulty = getDecisionDifficulty();
 	snapshot->difficulty = (Int)difficulty;
 	snapshot->contextInfluencePercent = GetSkirmishAIContextInfluencePercent(difficulty);
+	snapshot->allowExpandedCounterFit = usesProductionBehavior() ? 1U : 0U;
+	snapshot->productionCounterFitMode = rts::AI_PRODUCTION_COUNTER_FIT_BALANCED;
+	if (snapshot->allowExpandedCounterFit && m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY)
+		snapshot->productionCounterFitMode = rts::AI_PRODUCTION_COUNTER_FIT_FORTIFY;
+	else if (snapshot->allowExpandedCounterFit && m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT)
+		snapshot->productionCounterFitMode = rts::AI_PRODUCTION_COUNTER_FIT_ASSAULT;
 
 	// Source facts already contain the one-time enemy/object/nav observations and
 	// each candidate's immutable unit/weapon/factory facts. Feedback counters are
@@ -7214,6 +7220,7 @@ Bool AISkirmishPlayer::selectTeamToBuildCounterSerialFallback(
 	const SkirmishAIDecisionDifficulty difficulty = getDecisionDifficulty();
 	context.difficulty = (Int)difficulty;
 	context.contextInfluencePercent = GetSkirmishAIContextInfluencePercent(difficulty);
+	context.allowExpandedCounterFit = usesProductionBehavior() ? 1U : 0U;
 
 	Int enemyAircraftValue = 0;
 	Int enemyVehicleValue = 0;

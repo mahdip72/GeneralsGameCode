@@ -3,11 +3,14 @@
 #include "Lib/JobFloatingPointState.h"
 #include "Lib/JobSystem.h"
 #include "../TestSupport/LocalCapacityTestLane.h"
+// Released main's decision helpers are the oracle, not copied score formulas.
+#include "../../../GeneralsMD/Code/GameEngine/Include/GameLogic/SkirmishAIDecision.h"
 
 #if defined(NDEBUG)
 #undef NDEBUG
 #endif
 #include <cassert>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -482,6 +485,229 @@ bool FailBatch(const rts::AIPlayerPlanningSnapshot *, uint32_t,
 	rts::AIPlayerPlanningResult *, void *)
 {
 	return false;
+}
+
+void TestReleasedProductionModeParity()
+{
+	// Actual shared source derivation and unbounded owner reduction are checked
+	// against main's unchanged scoring helpers, including the lost-mode witness.
+	std::vector<rts::AIPlayerPlanningSnapshot> input(1U);
+	rts::ClearAIPlayerPlanningSnapshot(&input[0]);
+	input[0].frame = 910U;
+	input[0].playerIndex = 1U;
+	input[0].planProduction = 1U;
+	rts::AIProductionPlanningSnapshot &snapshot = input[0].production;
+	snapshot.frame = input[0].frame;
+	snapshot.ownerPlayerIndex = input[0].playerIndex;
+	snapshot.resources = 2000;
+	snapshot.logicFramesPerSecond = 30;
+	snapshot.candidateCount = 2U;
+	snapshot.allowExpandedCounterFit = 1U;
+	snapshot.tieBreakKey = MakeTestRandomKey();
+	snapshot.sourceFacts.valid = 1U;
+	snapshot.sourceFacts.factoryCount = 2U;
+	snapshot.sourceFacts.enemyAircraftValue = 100;
+	std::vector<rts::AIProductionCandidateFact> overflow(
+		rts::AI_PLANNING_MAX_PRODUCTION_CANDIDATES + 1U);
+	for (uint32_t i = 0U; i < 2U; ++i)
+	{
+		snapshot.sourceFacts.factories[i].valid = 1U;
+		snapshot.sourceFacts.factories[i].projectedFrames = i == 0U ? 540 : 0;
+		rts::AIProductionCandidateFact &fact = snapshot.candidates[i];
+		fact.sourceOrdinal = i;
+		fact.candidateStableId = 20U + i;
+		fact.configuredPriority = 100;
+		fact.eligible = 1U;
+		fact.minimumCost = fact.plannedCost = 600;
+		fact.factoryWaitFrames = i == 0U ? 540 : 0;
+		rts::AIProductionCandidateSourceFact &source = snapshot.sourceFacts.candidates[i];
+		source.valid = 1U;
+		source.unitCount = 2U;
+		for (uint32_t unitIndex = 0U; unitIndex < 2U; ++unitIndex)
+		{
+			rts::AIProductionUnitSourceFact &unit = source.units[unitIndex];
+			unit.cost = 100;
+			unit.minUnits = unit.maxUnits = i == 0U ?
+				(unitIndex == 0U ? 5 : 1) : 3;
+			unit.compatibleFactoryMask = 1U << i;
+			unit.productionQuantity[i] = 1U;
+			if (unitIndex == 0U) unit.flags = rts::AI_PRODUCTION_SOURCE_ATTACKS_AIRCRAFT;
+		}
+	}
+	const SkirmishAIProductionMode modes[] = {
+		SKIRMISH_AI_PRODUCTION_BALANCED, SKIRMISH_AI_PRODUCTION_FORTIFY,
+		SKIRMISH_AI_PRODUCTION_ASSAULT };
+	for (uint32_t mode = 0U; mode < 3U; ++mode)
+	{
+		snapshot.productionCounterFitMode = mode;
+		for (int difficulty = 0; difficulty < 3; ++difficulty)
+		{
+			snapshot.difficulty = difficulty;
+			snapshot.contextInfluencePercent = GetSkirmishAIContextInfluencePercent(
+				(SkirmishAIDecisionDifficulty)difficulty);
+			SkirmishAITeamScoreResult expected[2];
+			for (uint32_t i = 0U; i < 2U; ++i)
+			{
+				SkirmishAITeamScoreInput stable = {};
+				stable.configuredPriority = 100;
+				stable.counterFitScore = GetSkirmishAIProductionCounterFitScore(
+					i == 0U ? 250 : 150, modes[mode]);
+				stable.resources = snapshot.resources;
+				stable.minimumCost = stable.plannedCost = 600;
+				stable.factoryWaitFrames = i == 0U ? 540 : 0;
+				stable.logicFramesPerSecond = 30;
+				stable.difficulty = (SkirmishAIDecisionDifficulty)difficulty;
+				expected[i] = ScoreSkirmishAITeam(stable, true);
+				overflow[i] = snapshot.candidates[i];
+				overflow[i].counterFitScore = stable.counterFitScore;
+			}
+			rts::AIProductionPlanningResult result;
+			assert(rts::PlanAIProduction(snapshot, &result));
+			for (uint32_t i = 0U; i < 2U; ++i)
+			{
+				assert(result.candidateScores[i].counterFitScore == expected[i].counterFitScore);
+				assert(result.candidateScores[i].factoryWaitScore == expected[i].factoryWaitScore);
+				assert(result.candidateScores[i].finalScore == expected[i].finalScore);
+			}
+			if (mode == rts::AI_PRODUCTION_COUNTER_FIT_ASSAULT)
+				assert(result.selectedStableId == 20U); // main350>300; old adapter100<150
+			rts::AIProductionSelectionResult ownerResult;
+			assert(rts::RequiresAIProductionOwnerSerialFallback((uint32_t)overflow.size()));
+			assert(rts::PlanAIProductionSelectionOwnerSerial(snapshot, &overflow[0],
+				(uint32_t)overflow.size(), &ownerResult));
+			assert(ownerResult.selectedStableId == result.selectedStableId);
+			assert(ownerResult.selectedScore == result.selectedScore);
+			assert(ownerResult.tieCount == result.tieCount);
+			for (uint32_t execution = 0U; execution < 3U; ++execution)
+			{
+				rts::AIPlayerPlanningResult committed[1], serial[1], parallel[1];
+				rts::AIPlanningBatchStatus status;
+				assert(rts::ExecuteAIPlanningBatch((rts::AIPlanningExecutionMode)execution,
+					&input[0], 1U, committed, serial, parallel, RunBatch, 0, &status));
+				assert(rts::EqualAIProductionPlanningResult(result, committed[0].production));
+				assert(rts::ExecuteAIPlanningBatch((rts::AIPlanningExecutionMode)execution,
+					&input[0], 1U, committed, serial, parallel, FailBatch, 0, &status));
+				assert(rts::EqualAIProductionPlanningResult(result, committed[0].production));
+			}
+		}
+	}
+	// Default-zero legacy/Generals policy remains capped300; invalid policy is
+	// refused in both bounded and overflow lanes, rather than silently ignored.
+	snapshot.sourceFacts.valid = 0U;
+	snapshot.productionCounterFitMode = rts::AI_PRODUCTION_COUNTER_FIT_BALANCED;
+	snapshot.allowExpandedCounterFit = 0U;
+	snapshot.candidates[0].counterFitScore = 500;
+	rts::AIProductionPlanningResult result;
+	assert(rts::PlanAIProduction(snapshot, &result));
+	assert(result.candidateScores[0].counterFitScore == 300);
+#if defined(_WIN64)
+	// Both policy fields must participate in the canonical immutable-input
+	// identity, even when a fixture's pre-scored candidates happen to be equal.
+	rts::AIPlanningReferencePlayerInputView view = { &input[0], 1U, 1U };
+	rts::performance::KernelPerformanceDigest policyDigests[3];
+	for (uint32_t policy = 0U; policy < 3U; ++policy)
+	{
+		snapshot.allowExpandedCounterFit = policy != 0U ? 1U : 0U;
+		snapshot.productionCounterFitMode = policy == 2U ?
+			rts::AI_PRODUCTION_COUNTER_FIT_FORTIFY : rts::AI_PRODUCTION_COUNTER_FIT_BALANCED;
+		rts::performance::KernelPerformanceCanonicalWriter writer;
+		assert(writer.begin(1U));
+		assert(rts::WriteAIPlanningReferenceInput(writer, &view));
+		policyDigests[policy] = writer.finish();
+		assert(policyDigests[policy].valid);
+	}
+	assert(!policyDigests[0].equals(policyDigests[1]));
+	assert(!policyDigests[1].equals(policyDigests[2]));
+#endif
+	snapshot.allowExpandedCounterFit = 2U;
+	snapshot.productionCounterFitMode = rts::AI_PRODUCTION_COUNTER_FIT_BALANCED;
+	assert(!rts::PlanAIProduction(snapshot, &result));
+	rts::AIProductionSelectionResult ownerResult;
+	assert(!rts::PlanAIProductionSelectionOwnerSerial(snapshot, &overflow[0],
+		(uint32_t)overflow.size(), &ownerResult));
+	snapshot.allowExpandedCounterFit = 1U;
+	snapshot.productionCounterFitMode = 3U;
+	assert(!rts::PlanAIProduction(snapshot, &result));
+	assert(!rts::PlanAIProductionSelectionOwnerSerial(snapshot, &overflow[0],
+		(uint32_t)overflow.size(), &ownerResult));
+	snapshot.allowExpandedCounterFit = 0U;
+	snapshot.productionCounterFitMode = rts::AI_PRODUCTION_COUNTER_FIT_ASSAULT;
+	assert(!rts::PlanAIProduction(snapshot, &result));
+}
+
+void TestReleasedAlliedTargetOrder()
+{
+	rts::AIEnemyPlanningOrderState state = {};
+	state.playerCount = 4U;
+	for (uint32_t source = 0U; source < state.playerCount; ++source)
+	{
+		state.playerIndices[source] = (int32_t)source;
+		state.cachedEnemyIndices[source] = -1;
+	}
+	state.alliedSkirmishMasks[0] = 1U << 1;
+	state.alliedSkirmishMasks[1] = 1U << 0;
+	std::vector<rts::AIPlayerPlanningSnapshot> snapshots(2U);
+	const uint32_t sourceOrdinals[2] = { 0U, 1U };
+	for (uint32_t owner = 0U; owner < 2U; ++owner)
+	{
+		rts::ClearAIPlayerPlanningSnapshot(&snapshots[owner]);
+		snapshots[owner].frame = 911U;
+		snapshots[owner].playerIndex = owner;
+		snapshots[owner].planEnemyTarget = 1U;
+		rts::AIEnemyPlanningSnapshot &enemy = snapshots[owner].enemyTarget;
+		enemy.frame = snapshots[owner].frame;
+		enemy.ownerPlayerIndex = owner;
+		enemy.candidateCount = 2U;
+		for (uint32_t candidate = 0U; candidate < 2U; ++candidate)
+		{
+			enemy.candidates[candidate].sourceOrdinal = candidate + 2U;
+			enemy.candidates[candidate].playerIndex = (int32_t)candidate + 2;
+			enemy.candidates[candidate].knownAssetValue = 100;
+			enemy.candidates[candidate].hasKnownObject = 1U;
+			enemy.candidates[candidate].hasKnownUnit = 1U;
+		}
+	}
+	// Main's actual helpers choose2 for the first AI and3 for the next once
+	// the allied150 penalty is visible. Unprojected snapshots choose2 twice.
+	SkirmishAIEnemyScoreInput stable = {};
+	stable.knownAssetScore = GetSkirmishAIKnownAssetScore(100, 100);
+	const int unclaimed = ScoreSkirmishAIEnemy(stable).totalScore;
+	stable.alliedAIsTargeting = 1;
+	const int claimed = ScoreSkirmishAIEnemy(stable).totalScore;
+	assert(unclaimed == 300 && claimed == 150);
+	assert(ShouldReplaceSkirmishAITargetCandidate(true, unclaimed, 3, claimed, 2));
+	rts::AIPlayerPlanningResult results[2];
+	assert(rts::PlanAIPlayerBatchSerial(&snapshots[0], 2U, results));
+	assert(results[0].enemyTarget.selectedPlayerIndex == 2);
+	assert(results[1].enemyTarget.selectedPlayerIndex == 2);
+	assert(rts::ProjectAIEnemyPlanningOrder(state, sourceOrdinals, &snapshots[0], 2U));
+	assert(snapshots[1].enemyTarget.candidates[0].alliedAIsTargeting == 1);
+	for (uint32_t execution = 0U; execution < 3U; ++execution)
+	{
+		rts::AIPlayerPlanningResult serial[2], parallel[2];
+		rts::AIPlanningBatchStatus status;
+		assert(rts::ExecuteAIPlanningBatch((rts::AIPlanningExecutionMode)execution,
+			&snapshots[0], 2U, results, serial, parallel, RunBatch, 0, &status));
+		assert(results[0].enemyTarget.selectedPlayerIndex == 2);
+		assert(results[1].enemyTarget.selectedPlayerIndex == 3);
+		assert(rts::ExecuteAIPlanningBatch((rts::AIPlanningExecutionMode)execution,
+			&snapshots[0], 2U, results, serial, parallel, FailBatch, 0, &status));
+		assert(results[0].enemyTarget.selectedPlayerIndex == 2);
+		assert(results[1].enemyTarget.selectedPlayerIndex == 3);
+	}
+	// Invalid/overflow capture leaves both inputs untouched for main's owner
+	// fallback; no prefix is published and the later target can still be due.
+	const std::vector<rts::AIPlayerPlanningSnapshot> before = snapshots;
+	const uint32_t reversed[2] = { 1U, 0U };
+	assert(!rts::ProjectAIEnemyPlanningOrder(state, reversed, &snapshots[0], 2U));
+	state.alliedSkirmishMasks[1] |= 1U << 5;
+	assert(!rts::ProjectAIEnemyPlanningOrder(state, sourceOrdinals, &snapshots[0], 2U));
+	state.alliedSkirmishMasks[1] = 1U << 0;
+	state.playerCount = rts::AI_PLANNING_MAX_PLAYERS + 1U;
+	assert(!rts::ProjectAIEnemyPlanningOrder(state, sourceOrdinals, &snapshots[0], 2U));
+	for (uint32_t owner = 0U; owner < 2U; ++owner)
+		assert(memcmp(&before[owner].enemyTarget, &snapshots[owner].enemyTarget,
+			sizeof(rts::AIEnemyPlanningSnapshot)) == 0);
 }
 
 bool MalformedCountBatch(const rts::AIPlayerPlanningSnapshot *snapshots,
@@ -1616,6 +1842,8 @@ int main(int argc, char **argv)
 	TestCounterRngGoldenVector();
 	TestEnemyScoringAndHysteresis();
 	TestProductionScoringTieAndRetry();
+	TestReleasedProductionModeParity();
+	TestReleasedAlliedTargetOrder();
 	TestProductionWinnerAndTieForgeryRejection();
 	TestProductionOwnerSerialOverflowBoundary();
 	TestAIOwnerProductionBookkeeping();
