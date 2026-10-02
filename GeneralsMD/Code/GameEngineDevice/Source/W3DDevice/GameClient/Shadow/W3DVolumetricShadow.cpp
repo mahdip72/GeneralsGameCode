@@ -49,6 +49,7 @@
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
 #include "Lib/BaseType.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "Common/GlobalData.h"
 #include "Common/DrawModule.h"
@@ -1308,6 +1309,7 @@ void W3DVolumetricShadow::getRenderCost(RenderCost & rc) const
 /************************************ New Buffered Rendering Code ************************/
 void W3DVolumetricShadow::RenderVolume(Int meshIndex, Int lightIndex)
 {
+	rts::frame_timing::Scope submissionTiming(rts::frame_timing::RendererVolumeSubmit);
 	HLodClass *hlod=(HLodClass *)m_robj;
 	MeshClass *mesh=nullptr;
 
@@ -1843,6 +1845,7 @@ void W3DVolumetricShadow::SetGeometry( W3DShadowGeometry *geometry )
 */
 void W3DVolumetricShadow::Update()
 {
+	rts::frame_timing::Scope preparationTiming(rts::frame_timing::RendererVolumePrepare);
 	static Int currentTime, lastTime, delay = 0;
 	// OBJECT_PILE
 	// static Vector3 originCompareVector(0,0,9999);
@@ -3511,6 +3514,7 @@ void W3DVolumetricShadowManager::renderStencilShadows()
 
 void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 {
+	rts::frame_timing::Scope shadowTiming(rts::frame_timing::RendererVolumeShadows);
 	W3DVolumetricShadow *shadow;
 	Int numRenderedShadows = 0;
 

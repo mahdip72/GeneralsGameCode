@@ -7,6 +7,7 @@
 #endif
 #include <windows.h>
 #endif
+#include "Lib/FrameTimingDiagnostics.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -616,6 +617,7 @@ size_t ThreadedRenderDevice::copyPayload(const void *data, size_t bytes)
 RenderResult ThreadedRenderDevice::append(Command command, const void *payload,
 	size_t bytes, bool requireFrame)
 {
+	rts::frame_timing::Scope enqueueTiming(rts::frame_timing::RendererCommandEnqueue);
 	if (!usable() || (requireFrame && (!m_recording || m_ended)))
 		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
 			static_cast<uint64_t>(command.operation), bytes,
@@ -1269,7 +1271,7 @@ RenderResult ThreadedRenderDevice::setLegacyStateForLayout(const LegacyLogicalSt
 		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
 			layout.elementCount, LegacyVertexLayout::MAX_ELEMENT_COUNT, mask,
 			m_sequence);
-	LayoutState payload; payload.state = state; payload.layout = layout;
+	LayoutState payload = { state, layout };
 	Command command(OP_LEGACY_LAYOUT); command.integers[0] = mask;
 	return append(command, &payload, sizeof(payload));
 }
@@ -1512,7 +1514,8 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		std::vector<InitializedRange> nextRanges;
 		try
 		{
-			nextRanges = slot.initializedBytes;
+			if (static_cast<RenderBufferUpdateMode>(u[0]) != RENDER_BUFFER_UPDATE_DISCARD)
+				nextRanges = slot.initializedBytes;
 			RecordInitializedRange(nextRanges, command.destinationOffset,
 				command.dataBytes,
 				static_cast<RenderBufferUpdateMode>(u[0]) == RENDER_BUFFER_UPDATE_DISCARD);
@@ -2000,6 +2003,14 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 		if (initial != RENDER_RESULT_OK) m_operational = false;
 		m_changed.notify_all();
 	}
+#if defined(_WIN64)
+	rts::frame_timing::Capture ownerCapture(rts::frame_timing::Capture::RenderOwnerStream);
+	ownerCapture.beginSession("render_owner");
+	const bool ownerCaptureEnabled = ownerCapture.isEnabled();
+	// Keep owner-side scopes off the game-thread capture even when owner
+	// telemetry is disabled. One binding covers the loop, not each packet.
+	rts::frame_timing::BindCapture ownerBinding(ownerCapture);
+#endif
 	for (;;)
 	{
 		Packet *packet = 0;
@@ -2012,7 +2023,15 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 			m_ownerExecuting = true;
 		}
 		const Clock::time_point start = Clock::now();
-		execute(*packet);
+#if defined(_WIN64)
+		if (ownerCaptureEnabled && packet->sequence != 0)
+		{
+			rts::frame_timing::ExecutionPacket timing(ownerCapture, packet->sequence);
+			execute(*packet);
+		}
+		else
+#endif
+			execute(*packet);
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_metrics.ownerExecutionNanoseconds += Nanoseconds(Clock::now() - start);
 		packet->reset();
@@ -2021,6 +2040,9 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 		m_metrics.pendingPackets = static_cast<unsigned int>(m_pending);
 		m_changed.notify_all();
 	}
+#if defined(_WIN64)
+	ownerCapture.endSession();
+#endif
 	if (m_backend)
 	{
 		if (m_ownerFrameOpen && m_context) m_context->endFrame();

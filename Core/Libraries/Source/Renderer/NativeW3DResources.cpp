@@ -1529,7 +1529,8 @@ RenderResult NativeW3DResources::UpdateBuffer(GpuHandle handle,
 	bool restoresAfterFailure = false;
 	try
 	{
-		if (slot->submissionBackendEpoch == bufferEpoch)
+		if (mode != RENDER_BUFFER_UPDATE_DISCARD &&
+			slot->submissionBackendEpoch == bufferEpoch)
 		{
 			nextSubmissionRanges = slot->submissionInitializedBytes;
 		}

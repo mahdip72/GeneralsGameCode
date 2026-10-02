@@ -1,4 +1,5 @@
 #include "Renderer/RendererDevice.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -1797,6 +1798,7 @@ public:
 
 	virtual RenderResult present()
 	{
+		rts::frame_timing::Scope presentTiming(rts::frame_timing::RendererPresent);
 		if (!isOwner() || m_frameOpen)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
@@ -1962,6 +1964,7 @@ public:
 		const void *data, size_t byteCount, size_t destinationOffset,
 		RenderBufferUpdateMode mode)
 	{
+		rts::frame_timing::Scope uploadTiming(rts::frame_timing::RendererBufferUpload);
 		if (!isOwner() || data == 0 || byteCount == 0 ||
 			!m_handles->isLive(buffer))
 		{
@@ -2056,9 +2059,10 @@ public:
 			m_context->Unmap(slot.resource, 0);
 			if (maintainImage)
 			{
+				rts::frame_timing::Scope shadowTiming(rts::frame_timing::RendererBufferShadow);
 				if (mode == RENDER_BUFFER_UPDATE_DISCARD)
 				{
-					std::fill(slot.bufferImage.begin(), slot.bufferImage.end(), 0);
+					std::fill(slot.bufferImage.begin() + byteCount, slot.bufferImage.end(), 0);
 				}
 				memcpy(&slot.bufferImage[destinationOffset], data, byteCount);
 			}
@@ -2079,6 +2083,7 @@ public:
 		m_context->UpdateSubresource(slot.resource, 0, &destination, data, 0, 0);
 		if (maintainImage)
 		{
+			rts::frame_timing::Scope shadowTiming(rts::frame_timing::RendererBufferShadow);
 			memcpy(&slot.bufferImage[destinationOffset], data, byteCount);
 		}
 		ApplyBufferRangeUpdate(&slot.initializedBufferRanges,
@@ -3064,6 +3069,7 @@ public:
 
 	virtual RenderResult draw(unsigned int vertexCount, unsigned int startVertex)
 	{
+		rts::frame_timing::Scope validationTiming(rts::frame_timing::RendererDrawValidation);
 		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
 			!m_vertexBufferBound || !m_handles->isLive(m_boundVertexBuffer))
 		{
@@ -3090,6 +3096,8 @@ public:
 		{
 			return transformResult;
 		}
+		validationTiming.finish();
+		rts::frame_timing::Scope submissionTiming(rts::frame_timing::RendererDrawSubmit);
 		m_context->Draw(vertexCount, startVertex);
 		return RENDER_RESULT_OK;
 	}
@@ -3097,6 +3105,7 @@ public:
 	virtual RenderResult drawIndexed(unsigned int indexCount,
 		unsigned int startIndex, int baseVertex)
 	{
+		rts::frame_timing::Scope validationTiming(rts::frame_timing::RendererDrawValidation);
 		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
 			!m_vertexBufferBound || !m_indexBufferBound ||
 			!m_handles->isLive(m_boundVertexBuffer) ||
@@ -3243,6 +3252,8 @@ public:
 		{
 			return transformResult;
 		}
+		validationTiming.finish();
+		rts::frame_timing::Scope submissionTiming(rts::frame_timing::RendererDrawSubmit);
 		m_context->DrawIndexed(indexCount, startIndex, baseVertex);
 		return RENDER_RESULT_OK;
 	}
@@ -4380,6 +4391,7 @@ private:
 		unsigned int vertexLayoutFlags, unsigned int texturePresenceMask,
 		unsigned int cubeTextureMask)
 	{
+		rts::frame_timing::Scope packingTiming(rts::frame_timing::RendererConstantPack);
 		LegacyTransformConstants shaderConstants;
 		RenderMatrix4 worldViewMatrix;
 		MultiplyMatrices(state.constants.world.values, state.constants.view.values,
@@ -4644,6 +4656,8 @@ private:
 			m_transformConstantsChanged = false;
 			return S_OK;
 		}
+		packingTiming.finish();
+		rts::frame_timing::Scope uploadTiming(rts::frame_timing::RendererConstantUpload);
 		ID3D11Buffer *constantBuffer =
 			m_transformConstants[m_transformConstantCursor];
 		m_transformConstantCursor = (m_transformConstantCursor + 1) %

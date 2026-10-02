@@ -205,6 +205,28 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         "\t\tif (hasTextures && (forcePipeline || !m_pipelineHasTextures ||"
         "\n\t\tm_boundBlendDescriptor =")
 
+    # Supplement real-backend pixel/lifecycle coverage with the exact buffer
+    # update method against a recording Map double, exposing private mirror
+    # bytes and failed-map boundaries without a new production debug API.
+    d3d11_sampler_fragment(D3D11BufferRangeMethods
+        "enum ResourceKind" "\nRenderResult TranslateResult(")
+    d3d11_sampler_fragment(D3D11BufferResourceSlot
+        "struct ResourceSlot" "\nstruct LegacyTransformConstants")
+    d3d11_sampler_fragment(D3D11BufferAdvanceVersion
+        "\tvoid advanceBufferContentVersion(" "\n\tstatic bool isElementRangeWithinBuffer(")
+    d3d11_sampler_fragment(D3D11BufferUpdateResource
+        "\tvirtual RenderResult updateBufferResource(" "\n\tvirtual RenderResult clear(")
+    add_executable(core_d3d11_buffer_discard_contract_tests
+        D3D11BufferDiscardContractTest.cpp)
+    target_include_directories(core_d3d11_buffer_discard_contract_tests PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(core_d3d11_buffer_discard_contract_tests PRIVATE core_renderer)
+    set_target_properties(core_d3d11_buffer_discard_contract_tests PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME core_d3d11_buffer_discard_contract_tests
+        COMMAND core_d3d11_buffer_discard_contract_tests)
+    set_tests_properties(core_d3d11_buffer_discard_contract_tests PROPERTIES TIMEOUT 30)
+
     add_executable(core_d3d11_sampler_rollover_tests
         D3D11SamplerRolloverTest.cpp)
     target_include_directories(core_d3d11_sampler_rollover_tests PRIVATE

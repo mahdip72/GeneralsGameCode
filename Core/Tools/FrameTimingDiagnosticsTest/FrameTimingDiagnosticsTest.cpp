@@ -3,6 +3,12 @@
 namespace
 {
 unsigned int diagnosticClockCalls = 0;
+unsigned int diagnosticThreadIdCalls = 0;
+DWORD WINAPI CountDiagnosticThreadIdCalls()
+{
+	++diagnosticThreadIdCalls;
+	return GetCurrentThreadId();
+}
 BOOL WINAPI CountDiagnosticClockCalls(LARGE_INTEGER *value)
 {
 	++diagnosticClockCalls;
@@ -12,8 +18,10 @@ BOOL WINAPI CountDiagnosticClockCalls(LARGE_INTEGER *value)
 
 // Count the real header's clock calls without changing its production clock.
 #define QueryPerformanceCounter CountDiagnosticClockCalls
+#define GetCurrentThreadId CountDiagnosticThreadIdCalls
 #include "Lib/FrameTimingDiagnostics.h"
 #undef QueryPerformanceCounter
+#undef GetCurrentThreadId
 
 #include <string>
 #include <vector>
@@ -106,17 +114,50 @@ void inactiveSingleton(const std::string& directory)
 void disabled(const std::string& directory)
 {
 	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL);
+	const unsigned int before = diagnosticClockCalls;
 	{
 		rts::frame_timing::Capture capture;
 		capture.beginSession("headless");
 		capture.beginFrame(0);
+		const rts::frame_timing::Phase rendererPhases[] = {
+			rts::frame_timing::RendererConstantPack,
+			rts::frame_timing::RendererConstantUpload,
+			rts::frame_timing::RendererBufferUpload,
+			rts::frame_timing::RendererDrawValidation,
+			rts::frame_timing::RendererDrawSubmit,
+			rts::frame_timing::RendererBufferShadow,
+			rts::frame_timing::RendererSceneLights,
+			rts::frame_timing::RendererProjectedShadows,
+			rts::frame_timing::RendererVolumeShadows,
+			rts::frame_timing::RendererSorting,
+			rts::frame_timing::RendererParticles,
+			rts::frame_timing::RendererSkinRender,
+			rts::frame_timing::RendererCommandEnqueue,
+			rts::frame_timing::RendererVolumePrepare,
+			rts::frame_timing::RendererVolumeSubmit,
+			rts::frame_timing::RendererProjectedTerrain,
+			rts::frame_timing::RendererProjectedDecal,
+			rts::frame_timing::RendererProjectedFlush,
+			rts::frame_timing::RendererParticlePrepare,
+			rts::frame_timing::RendererParticleSubmit
+		};
+		const unsigned int threadCallsBeforeScopes = diagnosticThreadIdCalls;
+		for (std::size_t phase = 0; phase < sizeof(rendererPhases) / sizeof(rendererPhases[0]); ++phase)
+		{
+			rts::frame_timing::Scope timing(capture, rendererPhases[phase]);
+			timing.finish();
+			timing.finish();
+		}
 		capture.add(rts::frame_timing::Logic, 100);
+		check(diagnosticThreadIdCalls == threadCallsBeforeScopes,
+			"disabled hot-path scopes and add do not query thread identity");
 		capture.endFrame(900);
 		capture.endSession();
 		check(!capture.isActive(), "disabled capture remains inactive");
 		check(!capture.finalize().complete,
 			"disabled capture cannot provide complete receipt evidence");
 	}
+	check(diagnosticClockCalls == before, "disabled renderer scopes and repeated finish make no clock queries");
 	check(files(directory).empty(), "disabled capture creates no output");
 }
 
@@ -150,10 +191,44 @@ void enabled(const std::string& directory, __int64 frequency)
 		for (int module = 0; module < 3; ++module)
 			capture.add(rts::frame_timing::WaterTrackModuleRender,
 				frequency / 2000);
+		const rts::frame_timing::Phase rendererPhases[] = {
+			rts::frame_timing::RendererConstantPack,
+			rts::frame_timing::RendererConstantUpload,
+			rts::frame_timing::RendererBufferUpload,
+			rts::frame_timing::RendererDrawValidation,
+			rts::frame_timing::RendererDrawSubmit,
+			rts::frame_timing::RendererBufferShadow,
+			rts::frame_timing::RendererSceneLights,
+			rts::frame_timing::RendererProjectedShadows,
+			rts::frame_timing::RendererVolumeShadows,
+			rts::frame_timing::RendererSorting,
+			rts::frame_timing::RendererParticles,
+			rts::frame_timing::RendererSkinRender,
+			rts::frame_timing::RendererCommandEnqueue,
+			rts::frame_timing::RendererVolumePrepare,
+			rts::frame_timing::RendererVolumeSubmit,
+			rts::frame_timing::RendererProjectedTerrain,
+			rts::frame_timing::RendererProjectedDecal,
+			rts::frame_timing::RendererProjectedFlush,
+			rts::frame_timing::RendererParticlePrepare,
+			rts::frame_timing::RendererParticleSubmit
+		};
+		for (std::size_t phase = 0; phase < sizeof(rendererPhases) / sizeof(rendererPhases[0]); ++phase)
+		{
+			unsigned int finishedAt = 0;
+			{
+				rts::frame_timing::Scope timing(capture, rendererPhases[phase]);
+				timing.finish();
+				finishedAt = diagnosticClockCalls;
+				timing.finish();
+				check(diagnosticClockCalls == finishedAt, "repeated finish does not query the clock");
+			}
+			check(diagnosticClockCalls == finishedAt, "destruction after finish does not query the clock");
+		}
 		capture.endFrame(1000); // Forces the headless periodic bucket without sleeping.
 		std::vector<Row> data = rows(directory);
-		check(data.size() == 15, "periodic flush writes frame, logic, simulation, and water-track phases before session ends");
-		if (data.size() == 15)
+		check(data.size() == 35, "periodic flush writes existing phases and all twenty renderer phases before session ends");
+		if (data.size() == 35)
 		{
 			const Row& logic = data[1];
 			check(strcmp(logic.phase, "logic") == 0 && logic.samples == 20, "logic sample count");
@@ -177,6 +252,18 @@ void enabled(const std::string& directory, __int64 frequency)
 				data[13].samples == 1, "water track texture bind phase and sample count");
 			check(strcmp(data[14].phase, "water_track_module_render") == 0 &&
 				data[14].samples == 3, "water track module count and phase name");
+			const char *rendererNames[] = {
+				"renderer_constant_pack", "renderer_constant_upload", "renderer_buffer_upload",
+				"renderer_draw_validation", "renderer_draw_submit", "renderer_buffer_shadow",
+				"renderer_scene_lights", "renderer_projected_shadows", "renderer_volume_shadows",
+				"renderer_sorting", "renderer_particles", "renderer_skin_render",
+				"renderer_command_enqueue", "renderer_volume_prepare", "renderer_volume_submit",
+				"renderer_projected_terrain", "renderer_projected_decal", "renderer_projected_flush",
+				"renderer_particle_prepare", "renderer_particle_submit"
+			};
+			for (std::size_t phase = 0; phase < sizeof(rendererNames) / sizeof(rendererNames[0]); ++phase)
+				check(strcmp(data[phase + 15].phase, rendererNames[phase]) == 0 &&
+					data[phase + 15].samples == 1, "renderer phase names and finished scopes emit exactly one sample");
 		}
 		capture.beginFrame(1000);
 		capture.endFrame(1005);
@@ -184,7 +271,7 @@ void enabled(const std::string& directory, __int64 frequency)
 		capture.endFrame(0); // Game teardown can reset GameLogic before EndFrame.
 		capture.endSession();
 		data = rows(directory);
-		check(data.size() == 16 && data.back().frames == 5 &&
+		check(data.size() == 36 && data.back().frames == 5 &&
 			data.back().first == 1000 && data.back().last == 1005,
 			"session end preserves the final pre-reset frame range");
 		capture.beginSession("interactive");
@@ -193,7 +280,7 @@ void enabled(const std::string& directory, __int64 frequency)
 		// Destructor must retain this final partial bucket without endSession.
 	}
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 17 && data.back().session == 2 && data.back().frames == 1 &&
+	check(data.size() == 37 && data.back().session == 2 && data.back().frames == 1 &&
 		strcmp(data.back().mode, "interactive") == 0, "destructor/session reset retains only new frame counts");
 }
 

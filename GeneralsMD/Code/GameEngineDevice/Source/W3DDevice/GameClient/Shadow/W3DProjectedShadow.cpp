@@ -45,6 +45,7 @@
 #include "WW3D2/assetmgr.h"
 #include "WW3D2/texproject.h"
 #include "Lib/BaseType.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "Common/GlobalData.h"
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
@@ -789,6 +790,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadowParallel(
 ///Renders shadow on part of terrain covered by world-space bounding box.
 Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *shadow, AABoxClass &box)
 {
+	rts::frame_timing::Scope terrainTiming(rts::frame_timing::RendererProjectedTerrain);
 	const Int parallelResult = renderProjectedTerrainShadowParallel(shadow, box);
 	if (ProjectedShadowParallelAttemptHandled(parallelResult))
 		return parallelResult;
@@ -1047,6 +1049,7 @@ Int W3DProjectedShadowManager::renderProjectedTerrainShadow(W3DProjectedShadow *
 
 void W3DProjectedShadowManager::flushDecals(W3DShadowTexture *texture, ShadowType type)
 {
+	rts::frame_timing::Scope flushTiming(rts::frame_timing::RendererProjectedFlush);
 	static	Matrix4x4 mWorld(true);	//initialize to identity matrix
 
 	if (nShadowDecalVertsInBatch == 0 && nShadowDecalPolysInBatch == 0)
@@ -1386,6 +1389,7 @@ Int W3DProjectedShadowManager::queueDecalParallel(W3DProjectedShadow *shadow)
  */
 void W3DProjectedShadowManager::queueDecal(W3DProjectedShadow *shadow)
 {
+	rts::frame_timing::Scope decalTiming(rts::frame_timing::RendererProjectedDecal);
 	if (rts::UseParallelPipelines() &&
 		GetRadarTerrainPrepareService().isInitialized() &&
 		(shadow == 0 || ProjectedTerrainGridMayReachParallelThreshold(
@@ -1962,6 +1966,7 @@ void W3DProjectedShadowManager::prepareShadows()
 
 Int W3DProjectedShadowManager::renderShadows(RenderInfoClass & rinfo)
 {
+	rts::frame_timing::Scope shadowTiming(rts::frame_timing::RendererProjectedShadows);
 	Int projectionCount=0;
 
 	if (!TheTerrainRenderObject)
