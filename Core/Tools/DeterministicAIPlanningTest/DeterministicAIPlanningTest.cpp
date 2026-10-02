@@ -591,6 +591,27 @@ void TestReleasedProductionModeParity()
 			}
 		}
 	}
+	// Exercise saturation above both mode caps, not just the exact500 boundary.
+	snapshot.sourceFacts.candidates[0].unitCount = 1U;
+	snapshot.sourceFacts.candidates[0].units[0].minUnits = 6;
+	snapshot.sourceFacts.candidates[0].units[0].maxUnits = 6;
+	for (uint32_t mode = 1U; mode < 3U; ++mode)
+	{
+		snapshot.productionCounterFitMode = mode;
+		const int saturated = GetSkirmishAIProductionCounterFitScore(300, modes[mode]);
+		assert(saturated == (mode == rts::AI_PRODUCTION_COUNTER_FIT_FORTIFY ? 400 : 500));
+		rts::AIProductionPlanningResult result;
+		assert(rts::PlanAIProduction(snapshot, &result));
+		assert(result.candidateScores[0].counterFitScore == saturated);
+		overflow[0].counterFitScore = saturated;
+		overflow[1].counterFitScore = GetSkirmishAIProductionCounterFitScore(150, modes[mode]);
+		rts::AIProductionSelectionResult ownerResult;
+		assert(rts::PlanAIProductionSelectionOwnerSerial(snapshot, &overflow[0],
+			(uint32_t)overflow.size(), &ownerResult));
+		assert(ownerResult.selectedStableId == result.selectedStableId);
+		assert(ownerResult.selectedScore == result.selectedScore);
+		assert(ownerResult.tieCount == result.tieCount);
+	}
 	// Default-zero legacy/Generals policy remains capped300; invalid policy is
 	// refused in both bounded and overflow lanes, rather than silently ignored.
 	snapshot.sourceFacts.valid = 0U;
@@ -676,6 +697,7 @@ void TestReleasedAlliedTargetOrder()
 	const int claimed = ScoreSkirmishAIEnemy(stable).totalScore;
 	assert(unclaimed == 300 && claimed == 150);
 	assert(ShouldReplaceSkirmishAITargetCandidate(true, unclaimed, 3, claimed, 2));
+	const std::vector<rts::AIPlayerPlanningSnapshot> unprojected = snapshots;
 	rts::AIPlayerPlanningResult results[2];
 	assert(rts::PlanAIPlayerBatchSerial(&snapshots[0], 2U, results));
 	assert(results[0].enemyTarget.selectedPlayerIndex == 2);
@@ -695,6 +717,17 @@ void TestReleasedAlliedTargetOrder()
 		assert(results[0].enemyTarget.selectedPlayerIndex == 2);
 		assert(results[1].enemyTarget.selectedPlayerIndex == 3);
 	}
+	// Owner0 would rewrite this captured stale count, but an invalid owner1
+	// must prevent even that first staged input from being published.
+	std::vector<rts::AIPlayerPlanningSnapshot> lateInvalid = unprojected;
+	lateInvalid[0].enemyTarget.candidates[0].alliedAIsTargeting = 7;
+	lateInvalid[1].enemyTarget.candidates[0].sourceOrdinal = state.playerCount;
+	const std::vector<rts::AIPlayerPlanningSnapshot> beforeLateFailure = lateInvalid;
+	assert(!rts::ProjectAIEnemyPlanningOrder(state, sourceOrdinals,
+		&lateInvalid[0], 2U));
+	for (uint32_t owner = 0U; owner < 2U; ++owner)
+		assert(memcmp(&beforeLateFailure[owner].enemyTarget, &lateInvalid[owner].enemyTarget,
+			sizeof(rts::AIEnemyPlanningSnapshot)) == 0);
 	// Invalid/overflow capture leaves both inputs untouched for main's owner
 	// fallback; no prefix is published and the later target can still be due.
 	const std::vector<rts::AIPlayerPlanningSnapshot> before = snapshots;
