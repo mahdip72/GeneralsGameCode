@@ -26,6 +26,28 @@ namespace render
 class NativeW3DRecoveryTestAccess
 {
 public:
+	static IRenderDevice *BorrowCompletionDevice(NativeW3DRenderer *renderer)
+	{
+		return renderer->BorrowThreadedCompletionDevice();
+	}
+
+	static RenderResult PollCompletions(NativeW3D2 *owner,
+		NativeW3DSubmissionSequence wanted,
+		ThreadedRenderFrameCompletion *matched)
+	{
+		return owner->PollThreadedCompletions(wanted, matched);
+	}
+
+	static RenderResult ServiceCompletions(NativeW3D2 *owner)
+	{
+		return owner->ServiceThreadedCompletions();
+	}
+
+	static NativeW3DSubmissionSequence DeferredFailure(NativeW3D2 *owner)
+	{
+		return owner->m_deferredFailureSequence;
+	}
+
 	static void RecordFrameFailure(NativeW3DRenderer *renderer, RenderResult result)
 	{
 		renderer->RecordFrameFailure(result);
@@ -188,12 +210,16 @@ struct CaptureProbe
 struct ThreadedCaptureFactoryContext
 {
 	ThreadedCaptureFactoryContext() : failCapture(false), failClear(false),
-		presentCalls(0), captureCalls(0) {}
+		failUpdateRemoval(false),
+		presentCalls(0), captureCalls(0), destroyCalls(0), destroyRefusals(0) {}
 
 	bool failCapture;
 	bool failClear;
+	bool failUpdateRemoval;
 	unsigned int presentCalls;
 	unsigned int captureCalls;
+	unsigned int destroyCalls;
+	unsigned int destroyRefusals;
 };
 
 struct ThrowingCleanupHook : public rts::render::GameRenderCleanupHook
@@ -332,7 +358,14 @@ public:
 
 	bool destroyResource(rts::render::GpuHandle resource) override
 	{
-		return m_backend != 0 && m_backend->destroyResource(resource);
+		if (m_backend == 0)
+			return false;
+		if (m_contextState != 0)
+			++m_contextState->destroyCalls;
+		const bool destroyed = m_backend->destroyResource(resource);
+		if (!destroyed && m_contextState != 0)
+			++m_contextState->destroyRefusals;
+		return destroyed;
 	}
 
 	rts::render::RenderResult recoverDevice() override
@@ -423,6 +456,8 @@ public:
 		const void *data, size_t byteCount, size_t destinationOffset,
 		rts::render::RenderBufferUpdateMode mode) override
 	{
+		if (m_contextState != 0 && m_contextState->failUpdateRemoval)
+			return rts::render::RENDER_RESULT_DEVICE_REMOVED;
 		return m_backendContext == 0 ?
 			rts::render::RENDER_RESULT_INVALID_ARGUMENT :
 			m_backendContext->updateBuffer(buffer, data, byteCount,
@@ -838,6 +873,346 @@ int TestSortedScratchRendering(NativeW3D2 *owner)
 		HasNativeCapturePixel(48, 32, 0, 255, 0),
 		"successive sorted scratch updates preserve both rendered batches");
 	std::remove("D3D11RendererCapture.tga");
+	return result;
+}
+
+struct PollCompletionFromWorkerRequest
+{
+	NativeW3D2 *owner;
+	bool refusedBorrow;
+	bool refusedPublicPoll;
+	rts::render::RenderResult result;
+};
+
+DWORD WINAPI PollCompletionFromWorker(void *parameter)
+{
+	using namespace rts::render;
+	PollCompletionFromWorkerRequest *request =
+		static_cast<PollCompletionFromWorkerRequest *>(parameter);
+	ThreadedRenderFrameCompletion completed;
+	request->refusedBorrow = NativeW3DRecoveryTestAccess::BorrowCompletionDevice(
+		&request->owner->Renderer()) == 0;
+	request->refusedPublicPoll =
+		!request->owner->Renderer().PollThreadedCompletion(&completed);
+	request->result = NativeW3DRecoveryTestAccess::PollCompletions(
+		request->owner, 0, 0);
+	return 0;
+}
+
+int TestPinnedCompletionPolling(HWND window)
+{
+	using namespace rts::render;
+	int result = 0;
+	{
+		NativeW3D2 empty;
+		ThreadedRenderFrameCompletion untouched;
+		untouched.sequence = 7;
+		result |= Check(NativeW3DRecoveryTestAccess::BorrowCompletionDevice(
+			&empty.Renderer()) == 0 &&
+			!empty.Renderer().PollThreadedCompletion(&untouched) &&
+			NativeW3DRecoveryTestAccess::PollCompletions(&empty, 7, &untouched) ==
+				RENDER_RESULT_OK && untouched.sequence == 7,
+			"unattached polling retains public refusal and leaves match untouched");
+	}
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = window;
+	parameters.width = parameters.height = 64;
+	parameters.enableVsync = false;
+	parameters.allowSoftwareFallback = true;
+	IRenderDevice *immediate = CreateD3D11RenderDevice();
+	if (immediate == 0)
+		return result | Check(false, "poll fixture allocates immediate backend");
+	const RenderResult immediateInitialize = immediate->initialize(parameters);
+	if (immediateInitialize != RENDER_RESULT_OK)
+	{
+		immediate->shutdown();
+		delete immediate;
+		return immediateInitialize == RENDER_RESULT_UNSUPPORTED ? 77 :
+			result | Check(false, "poll fixture initializes immediate backend");
+	}
+	{
+		NativeW3D2 unthreaded;
+		result |= Check(unthreaded.AttachBackend(immediate,
+			immediate->immediateContext()) == RENDER_RESULT_OK,
+			"poll fixture attaches nonthreaded backend");
+		NativeGameRenderOwnerScope scope;
+		ThreadedRenderFrameCompletion untouched;
+		untouched.sequence = 7;
+		result |= Check(NativeW3DRecoveryTestAccess::BorrowCompletionDevice(
+			&unthreaded.Renderer()) == 0 &&
+			!unthreaded.Renderer().PollThreadedCompletion(&untouched) &&
+			NativeW3DRecoveryTestAccess::PollCompletions(&unthreaded, 7,
+				&untouched) == RENDER_RESULT_OK && untouched.sequence == 7 &&
+			NativeW3DRecoveryTestAccess::ServiceCompletions(&unthreaded) ==
+				RENDER_RESULT_OK,
+			"pinned nonthreaded polling retains ordinary early return");
+	}
+	immediate->shutdown();
+	delete immediate;
+
+	ThreadedCaptureFactoryContext factoryContext;
+	ThreadedRenderOptions options;
+	options.serial = true;
+	options.maxFramesInFlight = 2;
+	options.maxPacketBytes = 1024 * 1024;
+	options.maxPacketCommands = 256;
+	options.resourceCapacity = 16;
+	IRenderDevice *device = CreateThreadedRenderDevice(
+		CreateThreadedCaptureBackend, &factoryContext, options);
+	if (device == 0)
+		return result | Check(false, "poll fixture allocates threaded backend");
+	const RenderResult initialize = device->initialize(parameters);
+	if (initialize != RENDER_RESULT_OK)
+	{
+		device->shutdown();
+		delete device;
+		return initialize == RENDER_RESULT_UNSUPPORTED ? 77 :
+			result | Check(false, "poll fixture initializes threaded backend");
+	}
+	NativeW3D2 owner;
+	result |= Check(owner.AttachBackend(device, device->immediateContext()) ==
+		RENDER_RESULT_OK, "poll fixture attaches threaded aggregate");
+	{
+		NativeGameRenderOwnerScope scope;
+		ThreadedRenderFrameCompletion matched;
+		matched.sequence = 7;
+		result |= Check(scope.Get() == &owner &&
+			NativeW3DRecoveryTestAccess::BorrowCompletionDevice(
+				&owner.Renderer()) == device &&
+			!owner.Renderer().PollThreadedCompletion(0) &&
+			NativeW3DRecoveryTestAccess::PollCompletions(&owner, 7, &matched) ==
+				RENDER_RESULT_OK && matched.sequence == 0 &&
+			NativeW3DRecoveryTestAccess::ServiceCompletions(&owner) ==
+				RENDER_RESULT_OK,
+			"pinned empty mailbox resets match and services successfully");
+	}
+	PollCompletionFromWorkerRequest request = { &owner, false, false,
+		RENDER_RESULT_FAILED };
+	HANDLE thread = CreateThread(0, 0, PollCompletionFromWorker, &request, 0, 0);
+	result |= Check(thread != 0, "off-owner poll worker starts");
+	if (thread != 0)
+	{
+		WaitForSingleObject(thread, INFINITE);
+		CloseHandle(thread);
+		result |= Check(request.refusedBorrow && request.refusedPublicPoll &&
+			request.result == RENDER_RESULT_OK,
+			"wrong-thread private and public polling retain original refusal");
+	}
+	const unsigned int bytes[6] = { 1, 2, 3, 4, 5, 6 };
+	BufferDescriptor descriptor;
+	descriptor.byteCount = sizeof(bytes);
+	descriptor.stride = sizeof(bytes[0]);
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	descriptor.usage = RENDER_USAGE_DEFAULT;
+	GpuHandle buffer, retired;
+	result |= Check(owner.Resources().CreateBuffer(descriptor, 0, 0, &buffer) ==
+		RENDER_RESULT_OK && owner.Resources().CreateBuffer(descriptor, 0, 0,
+			&retired) == RENDER_RESULT_OK,
+		"poll fixture creates pending and retiring ranges");
+	NativeW3DSubmissionSequence sequences[2] = {};
+	for (unsigned int frame = 0; frame != 2; ++frame)
+	{
+		result |= Check(owner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+			owner.Resources().UpdateBuffer(buffer, bytes + frame * 3,
+				3 * sizeof(bytes[0]), frame * 3 * sizeof(bytes[0])) ==
+				RENDER_RESULT_OK &&
+			owner.Resources().UpdateBuffer(retired, bytes, sizeof(bytes), 0) ==
+				RENDER_RESULT_OK &&
+			owner.Renderer().EndFrame(false) == RENDER_RESULT_OK &&
+			owner.Renderer().FinalizeEndedFrame(false) == RENDER_RESULT_OK,
+			"poll fixture seals a frame without aggregate servicing");
+		sequences[frame] = owner.Renderer().LastThreadedSubmissionSequence();
+	}
+	const unsigned int beforeDestroyCalls = factoryContext.destroyCalls;
+	const unsigned int beforeDestroyRefusals = factoryContext.destroyRefusals;
+	RenderResourceStatistics beforeRetirement, afterRetirement;
+	result |= Check(owner.Renderer().DrainThreaded() == RENDER_RESULT_OK &&
+		sequences[0] != 0 && sequences[1] > sequences[0] &&
+		NativeW3DRecoveryTestAccess::GetResourceStatistics(&owner.Renderer(),
+			&beforeRetirement) == RENDER_RESULT_OK && beforeRetirement.bufferCount >= 2 &&
+		NativeW3DRecoveryTestAccess::ConfigureResourceFault(&owner.Renderer(),
+			RENDER_RESOURCE_FAULT_BUFFER_DESTRUCTION, 1,
+			RENDER_RESULT_FAILED) == RENDER_RESULT_OK &&
+		owner.Resources().RetireBuffer(retired),
+		"two FIFO completions precede refused destruction and exact-slot retirement");
+	NativeW3DBufferDescription retiredDescription;
+	GpuHandle retiredRange = retired;
+	// Rollback refusal is a synchronous control reply, not a failed frame.
+	// A successful destroy would remove the slot and reduce backend counts;
+	// failed retirement retains that exact slot while refusing draw authority.
+	result |= Check(NativeW3DRecoveryTestAccess::GetResourceStatistics(
+		&owner.Renderer(), &afterRetirement) == RENDER_RESULT_OK &&
+		factoryContext.destroyCalls == beforeDestroyCalls + 1 &&
+		factoryContext.destroyRefusals == beforeDestroyRefusals + 1 &&
+		afterRetirement.bufferCount == beforeRetirement.bufferCount &&
+		afterRetirement.liveHandles == beforeRetirement.liveHandles &&
+		afterRetirement.nativeResourceCount == beforeRetirement.nativeResourceCount &&
+		owner.Resources().DescribeBuffer(retired, &retiredDescription) == RENDER_RESULT_OK &&
+		retiredDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
+		!owner.Resources().IsValid(retired) &&
+		owner.Resources().AcquireVertexBufferRange(retired, sizeof(bytes[0]),
+			0, 0, 6, &retiredRange) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!retiredRange.isValid() && owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
+		"actual destruction refusal retains allocation and exact retired slot without poisoning the frame fence");
+	NativeW3DResources *foreign = new NativeW3DResources(2);
+	GpuHandle foreignBuffer;
+	result |= Check(foreign->Bind(&owner.Renderer()) == RENDER_RESULT_OK &&
+		foreign->CreateBuffer(descriptor, bytes, sizeof(bytes), &foreignBuffer) ==
+			RENDER_RESULT_OK, "foreign cleanup table binds to shared state");
+	DestroyResourcesRequest cleanup = { foreign };
+	thread = CreateThread(0, 0, DestroyResourcesFromWorker, &cleanup, 0, 0);
+	result |= Check(thread != 0, "foreign cleanup worker starts");
+	if (thread != 0)
+	{
+		WaitForSingleObject(thread, INFINITE);
+		CloseHandle(thread);
+		result |= Check(cleanup.resources == 0 &&
+			owner.Renderer().PendingCleanup() == 1,
+			"foreign destruction queues cleanup before pinned polling");
+	}
+	else
+		delete foreign;
+	{
+		NativeGameRenderOwnerScope scope;
+		ThreadedRenderFrameCompletion matched;
+		GpuHandle range;
+		retiredRange = retired;
+		result |= Check(NativeW3DRecoveryTestAccess::PollCompletions(&owner,
+			sequences[0], &matched) == RENDER_RESULT_OK &&
+			matched.sequence == sequences[0] && matched.result == RENDER_RESULT_OK &&
+			owner.Resources().AcquireVertexBufferRange(buffer, sizeof(bytes[0]),
+				0, 0, 6, &range) == RENDER_RESULT_OK && range.isValid() &&
+			!owner.Resources().IsValid(retired) &&
+			owner.Resources().DescribeBuffer(retired, &retiredDescription) == RENDER_RESULT_OK &&
+			retiredDescription.authority == NATIVE_W3D_CONTENT_INVALID &&
+			owner.Resources().AcquireVertexBufferRange(retired, sizeof(bytes[0]),
+				0, 0, 6, &retiredRange) == RENDER_RESULT_INVALID_ARGUMENT &&
+			!retiredRange.isValid() &&
+			(thread == 0 || owner.Renderer().PendingCleanup() == 1),
+			"pinned FIFO poll matches wanted sequence, publishes ranges, skips retired slot and does not drain foreign cleanup");
+		matched.sequence = 7;
+		result |= Check(NativeW3DRecoveryTestAccess::PollCompletions(&owner,
+			sequences[1], &matched) == RENDER_RESULT_OK && matched.sequence == 0,
+			"wanted matching still consumes all later FIFO completions");
+	}
+	result |= Check(owner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+		owner.Renderer().PendingCleanup() == 0 &&
+		owner.Renderer().EndFrame(false) == RENDER_RESULT_OK &&
+		owner.Renderer().FinalizeEndedFrame(false) == RENDER_RESULT_OK &&
+		owner.Renderer().DrainThreaded() == RENDER_RESULT_OK,
+		"subsequent frame boundary drains queued cleanup");
+	{
+		NativeGameRenderOwnerScope scope;
+		result |= Check(NativeW3DRecoveryTestAccess::ServiceCompletions(&owner) ==
+			RENDER_RESULT_OK, "subsequent service obtains a fresh poll borrow");
+	}
+	factoryContext.failClear = true;
+	NativeW3DSubmissionSequence firstFailure = 0;
+	for (unsigned int frame = 0; frame != 2; ++frame)
+	{
+		result |= Check(owner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+			owner.Renderer().ClearExternal(RENDER_CLEAR_COLOR,
+				RenderFloat4(), 1.0f, 0) == RENDER_RESULT_OK &&
+			owner.Renderer().EndFrame(false) == RENDER_RESULT_OK &&
+			owner.Renderer().FinalizeEndedFrame(false) == RENDER_RESULT_FAILED,
+			"poll fixture queues independent failed clear frames");
+		if (frame == 0)
+			firstFailure = owner.Renderer().LastThreadedSubmissionSequence();
+	}
+	factoryContext.failClear = false;
+	result |= Check(owner.Renderer().DrainThreaded() == RENDER_RESULT_FAILED,
+		"failed frame results remain observable at the original fence");
+	{
+		NativeGameRenderOwnerScope scope;
+		ThreadedRenderFrameCompletion matched;
+		result |= Check(NativeW3DRecoveryTestAccess::PollCompletions(&owner,
+			firstFailure, &matched) == RENDER_RESULT_OK &&
+			matched.sequence == firstFailure && matched.result == RENDER_RESULT_FAILED &&
+			NativeW3DRecoveryTestAccess::DeferredFailure(&owner) == firstFailure,
+			"pinned polling retains the first FIFO failure and wanted failure record");
+		result |= Check(owner.BeginGameDisplayIteration() == RENDER_RESULT_FAILED &&
+			NativeW3DRecoveryTestAccess::DeferredFailure(&owner) == 0,
+			"ordinary display boundary consumes the retained failure before resource-only test");
+	}
+	// Outside a frame this upload produces no frame-mailbox completion. The
+	// borrowed owner cannot recover the external device, so recovery fails closed.
+	factoryContext.failUpdateRemoval = true;
+	result |= Check(device->updateBufferResource(buffer, bytes, sizeof(bytes), 0) ==
+		RENDER_RESULT_OK && owner.Renderer().DrainThreaded() ==
+			RENDER_RESULT_DEVICE_REMOVED,
+		"resource-only packet reports removal without a frame mailbox");
+	factoryContext.failUpdateRemoval = false;
+	{
+		NativeGameRenderOwnerScope scope;
+		ThreadedRenderFrameCompletion matched;
+		result |= Check(NativeW3DRecoveryTestAccess::PollCompletions(&owner, 0,
+			&matched) == RENDER_RESULT_OK && matched.sequence == 0 &&
+			NativeW3DRecoveryTestAccess::ServiceCompletions(&owner) !=
+				RENDER_RESULT_OK &&
+			NativeW3DRecoveryTestAccess::DeferredFailure(&owner) != 0,
+			"live post-poll probe retains mailbox-free failure and failed recovery");
+		GameRenderCommand command = {};
+		command.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+		result |= Check(owner.ExecuteGameRenderCommand(command) ==
+			RENDER_RESULT_INVALID_ARGUMENT && !owner.Renderer().IsFrameOpen(),
+			"next command rejects the failed backend instead of retaining old operational state");
+	}
+	(void)owner.Shutdown();
+	result |= Check(NativeW3DRecoveryTestAccess::BorrowCompletionDevice(
+		&owner.Renderer()) == 0, "shutdown ends all device borrows");
+	device->shutdown();
+	delete device;
+	return result;
+}
+
+int TestPinnedOwnedRecoveryFailure(HWND window)
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3D2 owner;
+	NativeW3DRendererDescriptor descriptor;
+	descriptor.width = descriptor.height = 64;
+	descriptor.enableVsync = false;
+	descriptor.allowSoftwareFallback = true;
+	const RenderResult initialize = owner.Initialize(window, descriptor);
+	if (initialize == RENDER_RESULT_UNSUPPORTED) return 77;
+	result |= Check(initialize == RENDER_RESULT_OK,
+		"pinned terminal recovery fixture initializes owned backend");
+	if (initialize != RENDER_RESULT_OK) return result;
+	CountingResizeHook hook;
+	owner.SetGameCleanupHook(&hook);
+	// The existing recovery transaction rejects an unexpected bound registry
+	// after backend recovery. This deterministic production refusal tears down
+	// the owned facade, not merely its operational flag.
+	NativeW3DResources extraRegistry(1);
+	result |= Check(extraRegistry.Bind(&owner.Renderer()) == RENDER_RESULT_OK &&
+		owner.Renderer().SetGamma(1.1f, 0.0f, 1.0f, false, true) ==
+			RENDER_RESULT_OK &&
+		NativeW3DRecoveryTestAccess::ConfigureResourceFault(&owner.Renderer(),
+			RENDER_RESOURCE_FAULT_PRESENTATION_PASS, 1,
+			RENDER_RESULT_DEVICE_REMOVED) == RENDER_RESULT_OK &&
+		owner.Renderer().BeginFrame() == RENDER_RESULT_OK &&
+		owner.Renderer().EndFrame(true) == RENDER_RESULT_OK &&
+		owner.Renderer().DrainThreaded() == RENDER_RESULT_DEVICE_REMOVED,
+		"owned fixture seals removal before pinned completion recovery");
+	{
+		NativeGameRenderOwnerScope scope;
+		result |= Check(scope.Get() == &owner &&
+			NativeW3DRecoveryTestAccess::ServiceCompletions(&owner) != RENDER_RESULT_OK &&
+			!owner.Renderer().HasBackendState() &&
+			NativeW3DRecoveryTestAccess::BorrowCompletionDevice(&owner.Renderer()) == 0 &&
+			hook.releaseCalls == 1 && hook.reacquireCalls == 0,
+			"pinned service ends polling before callback and terminal recovery deletes facade");
+		GameRenderCommand command = {};
+		command.type = GAME_RENDER_COMMAND_BEGIN_RENDER;
+		result |= Check(owner.ExecuteGameRenderCommand(command) ==
+			RENDER_RESULT_INVALID_ARGUMENT && !owner.Renderer().IsFrameOpen() &&
+			NativeW3DRecoveryTestAccess::ServiceCompletions(&owner) == RENDER_RESULT_OK,
+			"next command and poll observe detached state without a stale device borrow");
+	}
+	(void)extraRegistry.Shutdown();
+	(void)owner.Shutdown();
 	return result;
 }
 
@@ -2042,6 +2417,201 @@ int TestNativeCameraBiasSequences(NativeW3D2 *owner)
 	return result;
 }
 
+int TestOwnedLogicalStateCapture()
+{
+	using namespace rts::render;
+	int result = 0;
+	ResetTrackedLegacyState();
+	bool valid = true;
+	const LegacyLogicalState unseeded = CaptureTrackedLegacyLogicalState(valid);
+	LegacyLogicalState prior;
+	result |= Check(!valid && !HasTrackedLegacyPipelineState() &&
+		!GetTrackedLegacyLogicalState(&prior) && unseeded.texturePresenceMask == 0,
+		"owned capture reports reset validity without seeding or changing the old getter");
+	LegacyPipelineState pipeline;
+	pipeline.textureFactor = 0x12345678U;
+	pipeline.rasterizer.depthBias = -7;
+	pipeline.textureStages[LEGACY_TEXTURE_STAGE_COUNT - 1].projectedCoordinates = true;
+	pipeline.textureStages[LEGACY_TEXTURE_STAGE_COUNT - 1].bumpEnvironmentLuminanceOffset = 19;
+	TrackLegacyPipelineState(pipeline);
+	RenderMatrix4 transform;
+	for (unsigned int element = 0; element != 16; ++element)
+		transform.values[element] = static_cast<float>(element + 1);
+	const float constants[4] = { 23, 29, 31, 37 };
+	result |= Check(TrackLegacyTransform(LEGACY_TRANSFORM_WORLD, transform.values) &&
+		TrackLegacyTransform(LEGACY_TRANSFORM_TEXTURE7, transform.values) &&
+		TrackLegacyVertexShaderConstants(LEGACY_VERTEX_CONSTANT_COUNT - 1, constants, 1) &&
+		TrackLegacyPixelShaderConstants(LEGACY_PIXEL_CONSTANT_COUNT - 1, constants, 1) &&
+		TrackLegacyTexturePresence(LEGACY_TEXTURE_STAGE_COUNT - 1, true) &&
+		GetTrackedLegacyLogicalState(&prior),
+		"owned capture fixture publishes pipeline, transforms, final constants and texture presence");
+	MarkLegacyStatePublicationFailure();
+	const LegacyLogicalState captured = CaptureTrackedLegacyLogicalState(valid);
+	result |= Check(valid && HasLegacyStatePublicationFailure() &&
+		BuildLegacyShaderKey(captured.pipeline, 0, captured.texturePresenceMask) ==
+			BuildLegacyShaderKey(prior.pipeline, 0, prior.texturePresenceMask) &&
+		captured.pipeline.textureFactor == prior.pipeline.textureFactor &&
+		captured.pipeline.rasterizer.depthBias == prior.pipeline.rasterizer.depthBias &&
+		captured.pipeline.textureStages[LEGACY_TEXTURE_STAGE_COUNT - 1].bumpEnvironmentLuminanceOffset == 19 &&
+		std::memcmp(captured.constants.world.values, prior.constants.world.values, sizeof(transform.values)) == 0 &&
+		std::memcmp(captured.constants.textureTransforms[LEGACY_TEXTURE_STAGE_COUNT - 1].values,
+			prior.constants.textureTransforms[LEGACY_TEXTURE_STAGE_COUNT - 1].values, sizeof(transform.values)) == 0 &&
+		std::memcmp(captured.constants.vertexShaderConstants, prior.constants.vertexShaderConstants,
+			sizeof(prior.constants.vertexShaderConstants)) == 0 &&
+		std::memcmp(captured.constants.pixelShaderConstants, prior.constants.pixelShaderConstants,
+			sizeof(prior.constants.pixelShaderConstants)) == 0,
+		"owned capture matches the existing getter and does not clear the separate failure latch");
+	pipeline.textureFactor = 0;
+	TrackLegacyPipelineState(pipeline);
+	transform.setIdentity();
+	TrackLegacyTransform(LEGACY_TRANSFORM_WORLD, transform.values);
+	ResetTrackedLegacyState();
+	bool resetValid = true;
+	const LegacyLogicalState reset = CaptureTrackedLegacyLogicalState(resetValid);
+	result |= Check(!resetValid && !HasTrackedLegacyPipelineState() &&
+		valid && captured.pipeline.textureFactor == 0x12345678U &&
+		captured.pipeline.rasterizer.depthBias == -7 &&
+		captured.pipeline.textureStages[LEGACY_TEXTURE_STAGE_COUNT - 1].projectedCoordinates &&
+		captured.texturePresenceMask == (1U << (LEGACY_TEXTURE_STAGE_COUNT - 1)) &&
+		std::memcmp(captured.constants.world.values, prior.constants.world.values, sizeof(transform.values)) == 0 &&
+		std::memcmp(captured.constants.vertexShaderConstants, prior.constants.vertexShaderConstants,
+			sizeof(prior.constants.vertexShaderConstants)) == 0 &&
+		reset.texturePresenceMask == 0,
+		"captured value and its validity remain independent after tracked mutation and reset");
+	SeedTrackedLegacyPipelineState();
+	TrackLegacyShaderBits(0xffffffffU);
+	bool invalidValid = true;
+	const LegacyLogicalState invalid = CaptureTrackedLegacyLogicalState(invalidValid);
+	result |= Check(!invalidValid && !HasTrackedLegacyPipelineState() &&
+		!GetTrackedLegacyLogicalState(&prior) && invalid.texturePresenceMask == 0,
+		"owned capture retains invalid-shader rejection semantics");
+	ResetTrackedLegacyState();
+	return result;
+}
+
+int TestTrackedPipelineValidityQuery(NativeW3D2 *owner)
+{
+	using namespace rts::render;
+	int result = 0;
+	if (owner == 0 || !owner->IsOperational())
+		return Check(false, "pipeline validity fixture has an operational owner");
+	ResetTrackedLegacyState();
+	LegacyPipelineState pipeline;
+	result |= Check(!HasTrackedLegacyPipelineState() &&
+		!HasTrackedLegacyPipelineState() && !GetTrackedLegacyPipelineState(&pipeline),
+		"validity query leaves a reset pipeline unseeded");
+	RenderMatrix4 world;
+	world.values[12] = 13;
+	result |= Check(TrackLegacyTransform(LEGACY_TRANSFORM_WORLD, world.values) &&
+		!HasTrackedLegacyPipelineState(),
+		"constant mutation and validity query do not seed the pipeline");
+	SeedTrackedLegacyPipelineState();
+	LegacyPipelineState defaults;
+	LegacyLogicalState logical;
+	result |= Check(HasTrackedLegacyPipelineState() &&
+		!GetTrackedLegacyPipelineState(0) && GetTrackedLegacyLogicalState(&logical) &&
+		BuildLegacyShaderKey(logical.pipeline, 0, 0) == BuildLegacyShaderKey(defaults, 0, 0) &&
+		std::memcmp(logical.constants.world.values, world.values, sizeof(world.values)) == 0,
+		"explicit seed publishes default pipeline without resetting constants");
+	pipeline.textureFactor = 0x12345678U;
+	pipeline.textureStages[LEGACY_TEXTURE_STAGE_COUNT - 1].bumpEnvironmentLuminanceOffset = 19;
+	TrackLegacyPipelineState(pipeline);
+	MarkLegacyStatePublicationFailure();
+	result |= Check(HasTrackedLegacyPipelineState() &&
+		HasTrackedLegacyPipelineState() && GetTrackedLegacyLogicalState(&logical) &&
+		logical.pipeline.textureFactor == pipeline.textureFactor &&
+		logical.pipeline.textureStages[LEGACY_TEXTURE_STAGE_COUNT - 1].bumpEnvironmentLuminanceOffset == 19 &&
+		logical.constants.world.values[12] == 13 && HasLegacyStatePublicationFailure(),
+		"read-only validity queries retain mutation values and the separate failure latch");
+	TrackLegacyShaderBits(0xffffffffU);
+	result |= Check(!HasTrackedLegacyPipelineState() &&
+		!GetTrackedLegacyPipelineState(&pipeline) && HasLegacyStatePublicationFailure(),
+		"invalid shader decoding invalidates queried state without changing failure publication");
+	ResetTrackedLegacyState();
+	const GameRenderCommandType types[] = {
+		GAME_RENDER_COMMAND_SET_TRANSFORM, GAME_RENDER_COMMAND_APPLY_RENDER_STATE_CHANGES,
+		GAME_RENDER_COMMAND_SET_VERTEX_SHADER_CONSTANTS, GAME_RENDER_COMMAND_SET_PIXEL_SHADER_CONSTANTS
+	};
+	RenderMatrix4 view;
+	view.values[12] = 5;
+	const RenderFloat4 constants(23, 29, 31, 37);
+	for (unsigned int index = 0; index != sizeof(types) / sizeof(types[0]); ++index)
+	{
+		GameRenderCommand command = {};
+		command.type = types[index];
+		if (index == 0)
+		{
+			command.value0 = LEGACY_TRANSFORM_VIEW;
+			command.input = &view; command.inputBytes = sizeof(view);
+		}
+		else if (index >= 2)
+		{
+			command.value0 = index == 2 ? LEGACY_VERTEX_CONSTANT_COUNT - 1 : LEGACY_PIXEL_CONSTANT_COUNT - 1;
+			command.value1 = 1;
+			command.input = &constants; command.inputBytes = sizeof(constants);
+		}
+		result |= Check(owner->BeginGameDisplayIteration() == RENDER_RESULT_OK,
+			"validity command fixture begins a clean display iteration");
+		ResetTrackedLegacyState();
+		TrackLegacyTransform(LEGACY_TRANSFORM_WORLD, world.values);
+		result |= Check(!HasTrackedLegacyPipelineState() &&
+			owner->ExecuteGameRenderCommand(command) == RENDER_RESULT_OK &&
+			HasTrackedLegacyPipelineState() && GetTrackedLegacyLogicalState(&logical) &&
+			BuildLegacyShaderKey(logical.pipeline, 0, 0) == BuildLegacyShaderKey(defaults, 0, 0) &&
+			logical.constants.world.values[12] == 13,
+			"valid production command seeds an unseeded pipeline without changing retained constants");
+		if (index == 0)
+			result |= Check(std::memcmp(logical.constants.view.values, view.values, sizeof(view.values)) == 0,
+				"unseeded transform command publishes the exact requested matrix");
+		else if (index >= 2)
+		{
+			const RenderFloat4 &actual = index == 2 ? logical.constants.vertexShaderConstants[command.value0] :
+				logical.constants.pixelShaderConstants[command.value0];
+			result |= Check(std::memcmp(&actual, &constants, sizeof(constants)) == 0,
+				"unseeded shader command publishes the exact last register");
+		}
+		if (index == 1) continue;
+		for (unsigned int malformed = 0; malformed != 4; ++malformed)
+		{
+			GameRenderCommand rejected = command;
+			RenderMatrix4 nonfinite = view;
+			if (malformed == 0) rejected.input = 0;
+			else if (malformed == 1) --rejected.inputBytes;
+			else if (malformed == 2) rejected.value0 = index == 0 ? LEGACY_TRANSFORM_COUNT :
+				(index == 2 ? LEGACY_VERTEX_CONSTANT_COUNT : LEGACY_PIXEL_CONSTANT_COUNT);
+			else if (index == 0)
+			{
+				nonfinite.values[15] = std::numeric_limits<float>::quiet_NaN();
+				rejected.input = &nonfinite;
+			}
+			else rejected.value1 = 0;
+			result |= Check(owner->BeginGameDisplayIteration() == RENDER_RESULT_OK,
+				"rejected validity command starts a clean display iteration");
+			ResetTrackedLegacyState();
+			TrackLegacyTransform(LEGACY_TRANSFORM_WORLD, world.values);
+			RenderMatrix4 after;
+			result |= Check(owner->ExecuteGameRenderCommand(rejected) == RENDER_RESULT_INVALID_ARGUMENT &&
+				!HasTrackedLegacyPipelineState() && !GetTrackedLegacyLogicalState(&logical) &&
+				GetTrackedLegacyTransform(LEGACY_TRANSFORM_WORLD, &after) &&
+				std::memcmp(after.values, world.values, sizeof(world.values)) == 0,
+				"invalid production arguments neither seed the pipeline nor mutate retained constants");
+		}
+	}
+	result |= Check(owner->BeginGameDisplayIteration() == RENDER_RESULT_OK,
+		"validity fixture clears its last rejected display iteration");
+	ResetTrackedLegacyState();
+	TrackLegacyTransform(LEGACY_TRANSFORM_WORLD, world.values);
+	TrackLegacyPipelineState(pipeline);
+	GameRenderCommand invalidate = {};
+	invalidate.type = GAME_RENDER_COMMAND_INVALIDATE_RENDER_STATE_CACHE;
+	result |= Check(owner->ExecuteGameRenderCommand(invalidate) == RENDER_RESULT_OK &&
+		HasTrackedLegacyPipelineState() && GetTrackedLegacyLogicalState(&logical) &&
+		BuildLegacyShaderKey(logical.pipeline, 0, 0) == BuildLegacyShaderKey(defaults, 0, 0) &&
+		logical.constants.world.values[12] == 13,
+		"cache invalidation still reseeds deterministic pipeline defaults only");
+	return result;
+}
+
 int TestNativeCommandsPreservePipelineState(NativeW3D2 *owner)
 {
 	int result = 0;
@@ -2374,8 +2944,41 @@ int TestGetTransformWithInvalidPipeline(NativeW3D2 *owner)
 	result |= Check(owner->ExecuteGameRenderCommand(command) ==
 		RENDER_RESULT_INVALID_ARGUMENT && !GetTrackedLegacyLogicalState(&logical),
 		"draw submission remains rejected while the tracked pipeline is invalid");
+	const GameRenderCommand primitiveUp = command;
+	const unsigned short indices[3] = { 0, 1, 2 };
+	GameSortedIndexedTrianglesUPData sorted = {};
+	sorted.vertices = vertices; sorted.vertexBytes = sizeof(vertices);
+	sorted.indices = indices; sorted.indexBytes = sizeof(indices);
+	command = GameRenderCommand();
+	command.type = GAME_RENDER_COMMAND_DRAW_SORTED_INDEXED_TRIANGLES_UP;
+	command.value0 = 1; command.value1 = 3;
+	command.value2 = 3 * sizeof(float); command.value3 = GAME_VERTEX_XYZ;
+	command.input = &sorted; command.inputBytes = sizeof(sorted);
+	result |= Check(owner->ExecuteGameRenderCommand(command) == RENDER_RESULT_INVALID_ARGUMENT &&
+		!HasTrackedLegacyPipelineState(),
+		"sorted UP draw also rejects invalid captured state before retaining a draw");
 
 	owner->BeginGameDisplayIteration();
+	ResetTrackedLegacyState();
+	SeedTrackedLegacyPipelineState();
+	const RenderResult begin = owner->Renderer().BeginFrame();
+	const RenderResult immediate = begin == RENDER_RESULT_OK ?
+		owner->ExecuteGameRenderCommand(primitiveUp) : begin;
+	const RenderResult deferred = immediate == RENDER_RESULT_OK ?
+		owner->ExecuteGameRenderCommand(command) : immediate;
+	// Both submissions own the previously captured logical state. Resetting the
+	// global tracker cannot change an admitted immediate or deferred draw.
+	ResetTrackedLegacyState();
+	const RenderResult flushed = deferred == RENDER_RESULT_OK ?
+		owner->FlushGameSortedTriangles() : deferred;
+	const RenderResult ended = begin == RENDER_RESULT_OK ?
+		owner->Renderer().EndFrame(false) : begin;
+	const RenderResult finalized = ended == RENDER_RESULT_OK ?
+		owner->Renderer().FinalizeEndedFrame(false) : ended;
+	result |= Check(immediate == RENDER_RESULT_OK && deferred == RENDER_RESULT_OK &&
+		flushed == RENDER_RESULT_OK && finalized == RENDER_RESULT_OK &&
+		owner->Renderer().DrainThreaded() == RENDER_RESULT_OK && !HasTrackedLegacyPipelineState(),
+		"valid immediate and sorted UP draws execute owned captured state after a tracker reset");
 	ResetTrackedLegacyState();
 	SeedTrackedLegacyPipelineState();
 	return result;
@@ -3181,6 +3784,13 @@ int main(int argc, char **argv)
 		DestroyWindow(window);
 		return copyResult;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--pinned-completion-poll") == 0)
+	{
+		int pollResult = TestPinnedCompletionPolling(window);
+		if (pollResult != 77) pollResult |= TestPinnedOwnedRecoveryFailure(window);
+		DestroyWindow(window);
+		return pollResult;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--cpu-sorting-immediate") == 0)
 	{
 		const int immediateResult = TestCpuSortingImmediateTriangles(window);
@@ -3234,6 +3844,8 @@ int main(int argc, char **argv)
 			"native WW3D2 restores the fixture resolution after MSAA resize");
 		result |= TestNativeHardwareZBias(&w3d);
 		result |= TestNativeCameraBiasSequences(&w3d);
+		result |= TestOwnedLogicalStateCapture();
+		result |= TestTrackedPipelineValidityQuery(&w3d);
 		result |= TestNativeCommandsPreservePipelineState(&w3d);
 		result |= TestTextureStageGetterValidity(&w3d);
 		result |= TestGetTransformWithInvalidPipeline(&w3d);

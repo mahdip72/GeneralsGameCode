@@ -155,6 +155,7 @@ public:
 	unsigned int DisplayIterationEpoch() const;
 
 private:
+	friend class rts::render::NativeW3DRecoveryTestAccess;
 	NativeW3D2(const NativeW3D2 &);
 	NativeW3D2 &operator=(const NativeW3D2 &);
 
@@ -268,6 +269,13 @@ private:
 	rts::render::RenderResult PollThreadedCompletions(
 		rts::render::NativeW3DSubmissionSequence wanted = 0,
 		rts::render::ThreadedRenderFrameCompletion *matched = 0);
+	// A non-null device is borrowed only while this published owner is pinned.
+	// Null retains the ordinary per-poll facade checks for unpinned callers.
+	// The helper clears the caller's borrow before live failure probes or return.
+	rts::render::RenderResult PollThreadedCompletionsFromDevice(
+		rts::render::IRenderDevice *&device,
+		rts::render::NativeW3DSubmissionSequence wanted,
+		rts::render::ThreadedRenderFrameCompletion *matched);
 	rts::render::RenderResult UploadTransientBuffer(
 		const rts::render::BufferDescriptor &descriptor, const void *data,
 		size_t dataBytes, rts::render::GpuHandle *buffer,

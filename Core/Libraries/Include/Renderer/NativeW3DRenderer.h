@@ -276,6 +276,9 @@ private:
 	bool m_borrowedMode;
 
 	bool IsOwnerThread() const;
+	// A pinned aggregate may borrow this producer-owned device only for its
+	// nonblocking completion poll. End the borrow before lifecycle or callbacks.
+	IRenderDevice *BorrowThreadedCompletionDevice() const;
 	bool HasRecoverableOwnedDevice() const;
 	void RecordFrameFailure(RenderResult result);
 	RenderResult SetViewportInternal(const RenderViewport &viewport,

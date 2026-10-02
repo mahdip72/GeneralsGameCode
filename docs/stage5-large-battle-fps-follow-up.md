@@ -92,8 +92,26 @@ Its physical client was 1920 by 1080 on a 3840 by 2160 primary display at
 Menu text fit the controls. This observation does not establish continuous-video
 parity, other-resolution coverage, or a matched performance gain. Colored light
 pulses around moving vehicles and nearby trees still need a comparable reference.
+This was the first, pre-commit optimization batch, not the subsequent
+effect/submission batch. Its inspected game SHA-256 was
+`EF9C2B06B473291388B00DA6545D33A4DD7B66F92524F37EA75A99B79DB2FA9B`.
 Both normal Release products built and twelve focused renderer/diagnostic suites
-passed. The inspected game and launcher exited with code zero.
+passed for that batch only. The inspected game and launcher exited with code
+zero. The first batch was subsequently committed at
+`b59123c0946ee51b4940d43c6630a68096a2a614`.
+
+The subsequent effect/submission batch adds a guarded billboard packing path,
+pipeline-validity queries, owned-value draw snapshots, and pinned completion
+polling. Its tested source is that commit plus eleven source/test changes,
+identified by frozen source-manifest SHA-256
+`A3DA993EB526ACCBD44AF26BC33DA95EC00178FAB034E77F866B381C57087771`.
+Both normal Release products built and all nineteen selected suites passed
+(`effects-submission-build-04` and `effects-submission-tests-02`). This includes
+the corrected completion-poll fixture and serial/parallel recovery tests.
+The isolated game's SHA-256 is
+`57A8DFE6412FEE7266D02E7AA3D79D222231835017B01A614F8B132F5E33EFB9`.
+These results do not establish battle FPS or visual fidelity. The source pin
+predates this documentation clarification; no compiled source changed with it.
 
 The accepted stable installation and live profile remain unchanged. Matched
 before/after battle timings, successful temporal visual inspection, independent

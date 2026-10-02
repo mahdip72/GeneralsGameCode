@@ -469,6 +469,8 @@ void TrackLegacyPixelProgram(RenderLegacyPixelProgram program);
 void TrackLegacyVertexProgram(RenderLegacyVertexProgram program);
 void TrackLegacyCullState(bool enabled, bool frontCounterClockwise);
 void TrackLegacyPipelineState(const LegacyPipelineState &state);
+// Query validity without copying or seeding the tracked pipeline.
+bool HasTrackedLegacyPipelineState();
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state);
 bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values);
 bool GetTrackedLegacyTransform(LegacyTransformSlot slot,
@@ -491,6 +493,8 @@ bool TrackLegacyClipPlane(unsigned int index, const float *plane);
 RenderFloat4 DecodeLegacyAmbientColor(unsigned int color);
 void TrackLegacyGlobalAmbient(const RenderFloat4 &ambient);
 bool GetTrackedLegacyLogicalState(LegacyLogicalState *state);
+// Return an owned snapshot even when invalid; callers must check valid before use.
+LegacyLogicalState CaptureTrackedLegacyLogicalState(bool &valid);
 
 // Shared contract helpers for the fixed-function texture-transform and
 // camera-space-normal paths.  These remain C++98-compatible and are also used

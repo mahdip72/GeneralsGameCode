@@ -732,20 +732,46 @@ rts::render::RenderResult NativeW3D2::PollThreadedCompletions(
 	rts::render::ThreadedRenderFrameCompletion *matched)
 {
 	using namespace rts::render;
+	if (IsNativeGameRenderOwnerPinnedByCurrentThread() &&
+		GetGameRenderClientNativeOwner() == this)
+	{
+		IRenderDevice *device = m_renderer.BorrowThreadedCompletionDevice();
+		if (device == 0)
+			return RENDER_RESULT_OK;
+		if (!m_resources.IsOwnerThread())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		return PollThreadedCompletionsFromDevice(device, wanted, matched);
+	}
 	if (!m_renderer.IsThreaded())
 		return RENDER_RESULT_OK;
 	if (!m_resources.IsOwnerThread())
 		return RENDER_RESULT_INVALID_ARGUMENT;
+	IRenderDevice *device = 0;
+	return PollThreadedCompletionsFromDevice(device, wanted, matched);
+}
+
+rts::render::RenderResult NativeW3D2::PollThreadedCompletionsFromDevice(
+	rts::render::IRenderDevice *&device,
+	rts::render::NativeW3DSubmissionSequence wanted,
+	rts::render::ThreadedRenderFrameCompletion *matched)
+{
+	using namespace rts::render;
 	if (matched != 0)
 		*matched = ThreadedRenderFrameCompletion();
 	RenderResult result = RENDER_RESULT_OK;
 	ThreadedRenderFrameCompletion completed;
-	while (m_renderer.PollThreadedCompletion(&completed))
+	// Neither publication nor failure retention invokes callbacks or drains
+	// cleanup. Preserve their authority checks and the exact FIFO failure order.
+	while (device != 0 ? PollThreadedRenderCompletion(device, &completed) :
+		m_renderer.PollThreadedCompletion(&completed))
 	{
 		const RenderResult publication = PublishThreadedCompletion(
 			completed.sequence, completed.resourceFailure);
 		if (publication != RENDER_RESULT_OK)
 		{
+			// Failure handling observes live operational state. End the borrow
+			// first and use the ordinary facade for the remaining FIFO records.
+			device = 0;
 			m_asyncResourceFailure = true;
 			result = FirstNativeThreadedFailure(result, publication);
 			RenderFrameOutcome publicationFailure;
@@ -761,6 +787,7 @@ rts::render::RenderResult NativeW3D2::PollThreadedCompletions(
 		if (completed.result != RENDER_RESULT_OK)
 			RememberThreadedFailure(completed.outcome, completed.sequence);
 	}
+	device = 0;
 	return result;
 }
 
@@ -802,11 +829,27 @@ bool NativeW3D2::CanRebuildResources() const
 rts::render::RenderResult NativeW3D2::ServiceThreadedCompletions()
 {
 	using namespace rts::render;
-	if (!m_renderer.IsThreaded())
-		return RENDER_RESULT_OK;
-	if (!m_resources.IsOwnerThread())
-		return RENDER_RESULT_INVALID_ARGUMENT;
-	RenderResult result = PollThreadedCompletions();
+	RenderResult result = RENDER_RESULT_OK;
+	if (IsNativeGameRenderOwnerPinnedByCurrentThread() &&
+		GetGameRenderClientNativeOwner() == this)
+	{
+		IRenderDevice *device = m_renderer.BorrowThreadedCompletionDevice();
+		if (device == 0)
+			return RENDER_RESULT_OK;
+		if (!m_resources.IsOwnerThread())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		result = PollThreadedCompletionsFromDevice(device, 0, 0);
+	}
+	else
+	{
+		if (!m_renderer.IsThreaded())
+			return RENDER_RESULT_OK;
+		if (!m_resources.IsOwnerThread())
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		result = PollThreadedCompletions();
+	}
+	// The device borrow has ended. Operational status can change asynchronously;
+	// every probe, wait, callback and recovery below must observe the live facade.
 	// Resource-only packets have no frame completion. If their owner-side fence
 	// reports a removal, retain a synthetic outcome so recovery is still driven
 	// by the next render-owner boundary.
@@ -1560,8 +1603,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					return RENDER_RESULT_INVALID_ARGUMENT;
 				}
 			}
-			LegacyPipelineState pipeline;
-			if (!GetTrackedLegacyPipelineState(&pipeline))
+			if (!HasTrackedLegacyPipelineState())
 				SeedTrackedLegacyPipelineState();
 		}
 		if (!TrackLegacyTransform(
@@ -1997,8 +2039,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 
 	case GAME_RENDER_COMMAND_APPLY_RENDER_STATE_CHANGES:
 		{
-			LegacyPipelineState pipeline;
-			if (!GetTrackedLegacyPipelineState(&pipeline))
+			if (!HasTrackedLegacyPipelineState())
 				SeedTrackedLegacyPipelineState();
 		}
 		return RENDER_RESULT_OK;
@@ -2023,8 +2064,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					sizeof(RenderFloat4), &expectedBytes) ||
 				command.inputBytes != expectedBytes)
 				goto invalid_command;
-			LegacyPipelineState pipeline;
-			if (!GetTrackedLegacyPipelineState(&pipeline))
+			if (!HasTrackedLegacyPipelineState())
 				SeedTrackedLegacyPipelineState();
 			const float *values = static_cast<const float *>(command.input);
 			const bool tracked = command.type ==
@@ -2071,8 +2111,9 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			}
 			if (indexCount == 0U)
 				goto invalid_command;
-			LegacyLogicalState state;
-			if (!GetTrackedLegacyLogicalState(&state))
+			bool stateValid = false;
+			const LegacyLogicalState state = CaptureTrackedLegacyLogicalState(stateValid);
+			if (!stateValid)
 			{
 				goto invalid_command;
 			}
@@ -2162,8 +2203,9 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				m_gameSortedVertexBytes.size() != static_cast<size_t>(
 					m_gameSortedVertexCount) * m_gameVertexStride)
 				goto invalid_command;
-			LegacyLogicalState state;
-			if (!GetTrackedLegacyLogicalState(&state))
+			bool stateValid = false;
+			const LegacyLogicalState state = CaptureTrackedLegacyLogicalState(stateValid);
+			if (!stateValid)
 				goto invalid_command;
 			NativeDrawPacket packet;
 			packet.vertexBuffer = GpuHandle();
@@ -2273,8 +2315,9 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				if (vertexIndex >= command.value1)
 					goto invalid_command;
 			}
-			LegacyLogicalState state;
-			if (!GetTrackedLegacyLogicalState(&state))
+			bool stateValid = false;
+			const LegacyLogicalState state = CaptureTrackedLegacyLogicalState(stateValid);
+			if (!stateValid)
 				goto invalid_command;
 			NativeDrawPacket packet;
 			packet.vertexStride = command.value2;
@@ -2328,8 +2371,9 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			if (!DecodeLegacyFvfVertexLayout(command.value3, command.value2,
 				&layout))
 				goto invalid_command;
-			LegacyLogicalState state;
-			if (!GetTrackedLegacyLogicalState(&state))
+			bool stateValid = false;
+			const LegacyLogicalState state = CaptureTrackedLegacyLogicalState(stateValid);
+			if (!stateValid)
 				goto invalid_command;
 			BufferDescriptor descriptor;
 			descriptor.byteCount = expectedBytes;
