@@ -48,6 +48,8 @@
 #include "GameLogic/Weapon.h"
 #include "GameLogic/LogicRandomValue.h"
 
+#include "Lib/PhysicsIntegrationKernel.h"
+
 const Real DEFAULT_MASS = 1.0f;
 
 const Real DEFAULT_SHOCK_YAW = 0.05f;
@@ -211,6 +213,7 @@ PhysicsBehavior::PhysicsBehavior( Thing *thing, const ModuleData* moduleData ) :
 	m_pitchRate = 0.0f;
 	m_mass = getPhysicsBehaviorModuleData()->m_mass;
 	m_motiveForceExpires = 0;
+	m_physicsGeneration = 1;
 
 	m_flags = 0;
 	m_extraBounciness = 0.0f;
@@ -336,6 +339,8 @@ void PhysicsBehavior::applyForce( const Coord3D *force )
 	m_accel.x += modForce.x * massInv;
 	m_accel.y += modForce.y * massInv;
 	m_accel.z += modForce.z * massInv;
+	if (!getFlag(IS_IN_UPDATE))
+		touchPhysicsGeneration();
 
 	//DEBUG_ASSERTCRASH(!(_isnan(m_accel.x) || _isnan(m_accel.y) || _isnan(m_accel.z)), ("PhysicsBehavior::applyForce accel NAN!"));
 	//DEBUG_ASSERTCRASH(!(_isnan(m_vel.x) || _isnan(m_vel.y) || _isnan(m_vel.z)), ("PhysicsBehavior::applyForce vel NAN!"));
@@ -614,14 +619,280 @@ void PhysicsBehavior::setBounceSound(const AudioEventRTS* bounceSound)
  * @todo Currently, only translations are integrated. Rotations should also be integrated. (MSB)
  */
 
+Bool PhysicsBehavior::captureIntegrationPrefixSnapshot(
+	rts::PhysicsIntegrationSnapshot &snapshot, UnsignedInt frame,
+	UnsignedInt worldEpoch, UnsignedInt wakePriority,
+	UnsignedInt heapOrdinal) const
+{
+	const Object *obj = getObject();
+	static NameKeyType physicsNameKey = NAMEKEY("PhysicsBehavior");
+	if (obj == nullptr || getModuleNameKey() != physicsNameKey ||
+		obj->getPhysics() != this || obj->isDestroyed() || obj->isContained() ||
+		obj->isDisabledByType(DISABLED_HELD) || getIsStunned() ||
+		obj->testStatus(OBJECT_STATUS_DECK_HEIGHT_OFFSET) ||
+		(obj->getAI() != nullptr &&
+		 obj->getAI()->getCurLocomotorSetType() == LOCOMOTORSET_TAXIING))
+		return false;
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.frame = frame;
+	snapshot.worldEpoch = worldEpoch;
+	snapshot.objectID = static_cast<unsigned>(obj->getID());
+	snapshot.motionGeneration = obj->getMotionGeneration();
+	snapshot.physicsGeneration = m_physicsGeneration;
+	snapshot.wakePriority = wakePriority;
+	snapshot.heapOrdinal = heapOrdinal;
+	if (getFlag(APPLY_FRICTION2D_WHEN_AIRBORNE))
+		snapshot.flags |= rts::PHYSICS_INTEGRATION_APPLY_FRICTION_2D_WHEN_AIRBORNE;
+	if (obj->isSignificantlyAboveTerrain())
+		snapshot.flags |= rts::PHYSICS_INTEGRATION_SIGNIFICANTLY_ABOVE_TERRAIN;
+	if (isMotive()) snapshot.flags |= rts::PHYSICS_INTEGRATION_MOTIVE;
+	if (obj->testStatus(OBJECT_STATUS_BRAKING))
+		snapshot.flags |= rts::PHYSICS_INTEGRATION_BRAKING;
+	if (obj->isKindOf(KINDOF_PROJECTILE))
+		snapshot.flags |= rts::PHYSICS_INTEGRATION_PROJECTILE;
+	if (getFlag(HAS_PITCHROLLYAW))
+		snapshot.flags |= rts::PHYSICS_INTEGRATION_HAS_PITCH_ROLL_YAW;
+	if (obj->isAboveTerrain())
+		snapshot.flags |= rts::PHYSICS_INTEGRATION_AIRBORNE_AT_START;
+	if (getFlag(UPDATE_EVER_RUN))
+		snapshot.flags |= rts::PHYSICS_INTEGRATION_UPDATE_EVER_RUN;
+	if (getFlag(WAS_AIRBORNE_LAST_FRAME))
+		snapshot.flags |= rts::PHYSICS_INTEGRATION_WAS_AIRBORNE_LAST_FRAME;
+
+	const Matrix3D *matrix = obj->getTransformMatrix();
+	for (unsigned row = 0; row != 3; ++row)
+		for (unsigned column = 0; column != 4; ++column)
+			snapshot.matrix[row * 4 + column] = (*matrix)[row][column];
+	const Coord3D *position = obj->getPosition();
+	snapshot.position[0] = position->x;
+	snapshot.position[1] = position->y;
+	snapshot.position[2] = position->z;
+	snapshot.acceleration[0] = m_accel.x;
+	snapshot.acceleration[1] = m_accel.y;
+	snapshot.acceleration[2] = m_accel.z;
+	snapshot.velocity[0] = m_vel.x;
+	snapshot.velocity[1] = m_vel.y;
+	snapshot.velocity[2] = m_vel.z;
+	snapshot.yawRate = m_yawRate;
+	snapshot.rollRate = m_rollRate;
+	snapshot.pitchRate = m_pitchRate;
+	snapshot.gravity = TheGlobalData->m_gravity;
+	// Match legacy applyForce(): a transport's live mass includes its cargo.
+	snapshot.mass = getMass();
+	snapshot.forwardFriction = getForwardFriction();
+	snapshot.lateralFriction = getLateralFriction();
+	snapshot.aerodynamicFriction = getAerodynamicFriction();
+	snapshot.pitchRollYawFactor = getPhysicsBehaviorModuleData()->m_pitchRollYawFactor;
+	snapshot.centerOfMassOffset = getCenterOfMassOffset();
+	const Coord3D *direction = obj->getUnitDirectionVector2D();
+	snapshot.directionX = direction->x;
+	snapshot.directionY = direction->y;
+	return rts::ValidatePhysicsIntegrationSnapshot(snapshot);
+}
+
+//-------------------------------------------------------------------------------------------------
+Bool PhysicsBehavior::computeIntegrationPrefixSerialOracle(
+	const rts::PhysicsIntegrationSnapshot &snapshot,
+	rts::PhysicsIntegrationOutput &output)
+{
+	if (!rts::ValidatePhysicsIntegrationSnapshot(snapshot))
+		return FALSE;
+
+	Coord3D acceleration;
+	acceleration.x = snapshot.acceleration[0];
+	acceleration.y = snapshot.acceleration[1];
+	acceleration.z = snapshot.acceleration[2];
+	Coord3D velocity;
+	velocity.x = snapshot.velocity[0];
+	velocity.y = snapshot.velocity[1];
+	velocity.z = snapshot.velocity[2];
+	Real yawRate = snapshot.yawRate;
+	Real rollRate = snapshot.rollRate;
+	Real pitchRate = snapshot.pitchRate;
+
+	acceleration.z += snapshot.gravity;
+	const Bool groundFriction =
+		(snapshot.flags & rts::PHYSICS_INTEGRATION_APPLY_FRICTION_2D_WHEN_AIRBORNE) != 0 ||
+		(snapshot.flags & rts::PHYSICS_INTEGRATION_SIGNIFICANTLY_ABOVE_TERRAIN) == 0;
+	if (groundFriction)
+	{
+		const Real damping = 1.0f - DEFAULT_LATERAL_FRICTION;
+		pitchRate *= damping;
+		rollRate *= damping;
+		yawRate *= damping;
+		if (velocity.x || velocity.y)
+		{
+			const Real negativeDirectionY = -snapshot.directionY;
+			const Real lateralDot = velocity.x * negativeDirectionY +
+				velocity.y * snapshot.directionX;
+			const Real lateralVelocityX = lateralDot * negativeDirectionY;
+			const Real lateralVelocityY = lateralDot * snapshot.directionX;
+			const Real lateralForce = snapshot.mass * snapshot.lateralFriction;
+			Coord3D force;
+			force.x = -(lateralForce * lateralVelocityX);
+			force.y = -(lateralForce * lateralVelocityY);
+			force.z = 0.0f;
+			const Bool motive =
+				(snapshot.flags & rts::PHYSICS_INTEGRATION_MOTIVE) != 0;
+			if (!motive)
+			{
+				const Real forwardDot = velocity.x * snapshot.directionX +
+					velocity.y * snapshot.directionY;
+				const Real forwardVelocityX = forwardDot * snapshot.directionX;
+				const Real forwardVelocityY = forwardDot * snapshot.directionY;
+				const Real forwardForce = snapshot.mass * snapshot.forwardFriction;
+				force.x += -(forwardForce * forwardVelocityX);
+				force.y += -(forwardForce * forwardVelocityY);
+			}
+			Coord3D modifiedForce = force;
+			if (motive)
+			{
+				const Real projectedLateralDot = force.x * negativeDirectionY +
+					force.y * snapshot.directionX;
+				modifiedForce.x = projectedLateralDot * negativeDirectionY;
+				modifiedForce.y = projectedLateralDot * snapshot.directionX;
+			}
+			const Real inverseMass = 1.0f / snapshot.mass;
+			acceleration.x += modifiedForce.x * inverseMass;
+			acceleration.y += modifiedForce.y * inverseMass;
+			acceleration.z += modifiedForce.z * inverseMass;
+		}
+	}
+	else
+	{
+		const Real aerodynamics = -snapshot.aerodynamicFriction;
+		acceleration.x += velocity.x * aerodynamics;
+		acceleration.y += velocity.y * aerodynamics;
+		acceleration.z += velocity.z * aerodynamics;
+		const Real damping = 1.0f + aerodynamics;
+		pitchRate *= damping;
+		rollRate *= damping;
+		yawRate *= damping;
+	}
+	UnsignedInt outputFlags = snapshot.flags;
+	if (pitchRate != 0.0f || rollRate != 0.0f || yawRate != 0.0f)
+		outputFlags |= rts::PHYSICS_INTEGRATION_HAS_PITCH_ROLL_YAW;
+	else
+		outputFlags &= ~rts::PHYSICS_INTEGRATION_HAS_PITCH_ROLL_YAW;
+
+	velocity.x += acceleration.x;
+	velocity.y += acceleration.y;
+	velocity.z += acceleration.z;
+	const Real threshold = 0.001f;
+	if (fabsf(velocity.x) < threshold) velocity.x = 0.0f;
+	if (fabsf(velocity.y) < threshold) velocity.y = 0.0f;
+	if (fabsf(velocity.z) < threshold) velocity.z = 0.0f;
+
+	Matrix3D matrix;
+	for (unsigned matrixRow = 0; matrixRow != 3; ++matrixRow)
+		for (unsigned matrixColumn = 0; matrixColumn != 4; ++matrixColumn)
+			matrix[matrixRow][matrixColumn] =
+				snapshot.matrix[matrixRow * 4 + matrixColumn];
+	if ((snapshot.flags & rts::PHYSICS_INTEGRATION_BRAKING) != 0)
+	{
+		if ((snapshot.flags & rts::PHYSICS_INTEGRATION_PROJECTILE) == 0)
+			matrix.Adjust_Z_Translation(velocity.z);
+	}
+	else
+	{
+		matrix.Adjust_X_Translation(velocity.x);
+		matrix.Adjust_Y_Translation(velocity.y);
+		matrix.Adjust_Z_Translation(velocity.z);
+	}
+
+	if ((outputFlags & rts::PHYSICS_INTEGRATION_HAS_PITCH_ROLL_YAW) != 0)
+	{
+		const Real yawRateToUse = yawRate * snapshot.pitchRollYawFactor;
+		Real pitchRateToUse = pitchRate * snapshot.pitchRollYawFactor;
+		const Real rollRateToUse = rollRate * snapshot.pitchRollYawFactor;
+		if (snapshot.centerOfMassOffset != 0.0f)
+		{
+			const Vector3 xVector = matrix.Get_X_Vector();
+			const Real xy = sqrtf(sqr(xVector.X) + sqr(xVector.Y));
+			const Real pitchAngle = atan2(xVector.Z, xy);
+			const Real remainingAngle = snapshot.centerOfMassOffset > 0.0f ?
+				((PI / 2) - pitchAngle) : (-(PI / 2) + pitchAngle);
+			pitchRateToUse *= Sin(remainingAngle);
+		}
+		matrix.Rotate_X(rollRateToUse);
+		matrix.Rotate_Y(pitchRateToUse);
+		matrix.Rotate_Z(yawRateToUse);
+	}
+
+	output.frame = snapshot.frame;
+	output.worldEpoch = snapshot.worldEpoch;
+	output.objectID = snapshot.objectID;
+	output.motionGeneration = snapshot.motionGeneration;
+	output.physicsGeneration = snapshot.physicsGeneration;
+	output.wakePriority = snapshot.wakePriority;
+	output.heapOrdinal = snapshot.heapOrdinal;
+	output.flags = outputFlags;
+	for (unsigned outputRow = 0; outputRow != 3; ++outputRow)
+		for (unsigned outputColumn = 0; outputColumn != 4; ++outputColumn)
+			output.matrix[outputRow * 4 + outputColumn] =
+				matrix[outputRow][outputColumn];
+	output.acceleration[0] = acceleration.x;
+	output.acceleration[1] = acceleration.y;
+	output.acceleration[2] = acceleration.z;
+	output.velocity[0] = velocity.x;
+	output.velocity[1] = velocity.y;
+	output.velocity[2] = velocity.z;
+	output.yawRate = yawRate;
+	output.rollRate = rollRate;
+	output.pitchRate = pitchRate;
+	return rts::ValidatePhysicsIntegrationOutput(snapshot, output) ? TRUE : FALSE;
+}
+
 DECLARE_PERF_TIMER(PhysicsBehavior)
 UpdateSleepTime PhysicsBehavior::update()
+{
+	return updateImpl(nullptr, nullptr, 0, nullptr
+#if defined(_WIN64)
+		, nullptr
+#endif
+		);
+}
+
+UpdateSleepTime PhysicsBehavior::updateFromPreparedIntegrationPrefix(
+	const rts::PhysicsIntegrationSnapshot &snapshot,
+	const rts::PhysicsIntegrationOutput &output,
+	rts::PhysicsIntegrationMetricCounter commitStart,
+	rts::PhysicsIntegrationMetricCounter &commitNanoseconds
+#if defined(_WIN64)
+	, const rts::performance::KernelPerformanceBatch *performanceBatch
+#endif
+	)
+{
+	return updateImpl(&snapshot, &output, commitStart, &commitNanoseconds
+#if defined(_WIN64)
+		, performanceBatch
+#endif
+		);
+}
+
+UpdateSleepTime PhysicsBehavior::updateImpl(
+	const rts::PhysicsIntegrationSnapshot *snapshot,
+	const rts::PhysicsIntegrationOutput *output,
+	rts::PhysicsIntegrationMetricCounter commitStart,
+	rts::PhysicsIntegrationMetricCounter *commitNanoseconds
+#if defined(_WIN64)
+	, const rts::performance::KernelPerformanceBatch *performanceBatch
+#endif
+	)
 {
 	USE_PERF_TIMER(PhysicsBehavior)
 
 	Object*														obj = getObject();
 	const PhysicsBehaviorModuleData*	d = getPhysicsBehaviorModuleData();
-	Bool															airborneAtStart = obj->isAboveTerrain();
+	const Bool usePrepared = snapshot != nullptr && output != nullptr &&
+		rts::ValidatePhysicsIntegrationOutput(*snapshot, *output) &&
+		snapshot->objectID == static_cast<unsigned>(obj->getID()) &&
+		snapshot->motionGeneration == obj->getMotionGeneration() &&
+		snapshot->physicsGeneration == m_physicsGeneration;
+	Bool															airborneAtStart = usePrepared ?
+		((snapshot->flags & rts::PHYSICS_INTEGRATION_AIRBORNE_AT_START) != 0) :
+		obj->isAboveTerrain();
 	Real															activeVelZ = 0;
 	Coord3D														bounceForce;
 	Bool															gotBounceForce = false;
@@ -641,6 +912,41 @@ UpdateSleepTime PhysicsBehavior::update()
 	if (!obj->isDisabledByType(DISABLED_HELD))
 	{
 		Matrix3D mtx = *obj->getTransformMatrix();
+		Real oldPosZ = mtx.Get_Z_Translation();
+		if (usePrepared)
+		{
+#if defined(_WIN64)
+			const rts::performance::KernelPerformanceBatch preparedBatch =
+				performanceBatch != nullptr ? *performanceBatch :
+				rts::performance::KernelPerformanceBatch();
+			rts::performance::KernelPerformanceLedger *performanceLedger =
+				preparedBatch.valid() ?
+				&rts::performance::KernelPerformanceLedger::instance() : 0;
+			rts::performance::KernelPerformanceScope commitScope(
+				performanceLedger, preparedBatch,
+				rts::performance::KERNEL_PERFORMANCE_COMMIT);
+#endif
+			for (unsigned row = 0; row != 3; ++row)
+				for (unsigned column = 0; column != 4; ++column)
+					mtx[row][column] = output->matrix[row * 4 + column];
+			m_accel.x = output->acceleration[0];
+			m_accel.y = output->acceleration[1];
+			m_accel.z = output->acceleration[2];
+			m_vel.x = output->velocity[0];
+			m_vel.y = output->velocity[1];
+			m_vel.z = output->velocity[2];
+			m_yawRate = output->yawRate;
+			m_rollRate = output->rollRate;
+			m_pitchRate = output->pitchRate;
+			setFlag(HAS_PITCHROLLYAW,
+				(output->flags & rts::PHYSICS_INTEGRATION_HAS_PITCH_ROLL_YAW) != 0);
+			m_velMag = INVALID_VEL_MAG;
+			if (commitNanoseconds != nullptr)
+				*commitNanoseconds +=
+					rts::PhysicsIntegrationClockNowNanoseconds() - commitStart;
+		}
+		else
+		{
 
 		applyGravitationalForces();
 		applyFrictionalForces();
@@ -657,8 +963,6 @@ UpdateSleepTime PhysicsBehavior::update()
 		if (fabsf(m_vel.z) < THRESH) m_vel.z = 0.0f;
 
 		m_velMag = INVALID_VEL_MAG;
-
-		Real oldPosZ = mtx.Get_Z_Translation();
 
 		// integrate velocity into position
 		if (obj->testStatus(OBJECT_STATUS_BRAKING))
@@ -748,6 +1052,7 @@ UpdateSleepTime PhysicsBehavior::update()
 			mtx.Rotate_X(rollRateToUse);
 			mtx.Rotate_Y(pitchRateToUse);
 			mtx.Rotate_Z(yawRateToUse);
+		}
 		}
 
 		// do not allow object to pass through the ground
@@ -1021,6 +1326,7 @@ void PhysicsBehavior::scrubVelocityZ( Real desiredVelocity )
 		}
 	}
 	m_velMag = INVALID_VEL_MAG;
+	touchPhysicsGeneration();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1043,6 +1349,7 @@ void PhysicsBehavior::scrubVelocity2D( Real desiredVelocity )
 		m_vel.y *= desiredVelocity;
 	}
 	m_velMag = INVALID_VEL_MAG;
+	touchPhysicsGeneration();
 }
 
 //-------------------------------------------------------------------------------------------------
@@ -1061,6 +1368,7 @@ void PhysicsBehavior::transferVelocityTo(PhysicsBehavior* that) const
 	{
 		that->m_vel.add(m_vel);
 		that->m_velMag = INVALID_VEL_MAG;
+		that->touchPhysicsGeneration();
 	}
 }
 
@@ -1068,7 +1376,10 @@ void PhysicsBehavior::transferVelocityTo(PhysicsBehavior* that) const
 void PhysicsBehavior::addVelocityTo( const Coord3D *vel)
 {
 	if (vel != nullptr)
+	{
 		m_vel.add( *vel );
+		touchPhysicsGeneration();
+	}
 }
 
 //-------------------------------------------------------------------------------------------------

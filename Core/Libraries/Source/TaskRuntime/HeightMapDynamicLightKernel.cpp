@@ -218,7 +218,8 @@ static Real clampReal(Real value, Real low, Real high)
 }
 
 static unsigned computeDiffuse(const HeightMapDynamicLightVertex &vertex,
-	const HeightMapDynamicLightSceneLight *lights, unsigned lightCount)
+	const HeightMapDynamicLightSceneLight *lights, unsigned lightCount,
+	const double *farRangeSquared)
 {
 	if (!vertex.applyLighting)
 		return vertex.diffuse;
@@ -248,6 +249,13 @@ static unsigned computeDiffuse(const HeightMapDynamicLightVertex &vertex,
 			directionZ = vertex.z - light.positionZ;
 			const Real distanceSquared = directionX * directionX +
 				directionY * directionY + directionZ * directionZ;
+			/* A range at least one unit wide and a distance beyond twice
+			 * that range are far from the sqrt-to-Real boundary.  The
+			 * original range test must reject this light even after rounding.
+			 * Keep every contributing light on the original arithmetic path. */
+			if (farRangeSquared != 0 && farRangeSquared[lightIndex] > 0.0 &&
+				static_cast<double>(distanceSquared) > farRangeSquared[lightIndex])
+				continue;
 			const Real distance = dynamicLightSqrt(distanceSquared);
 			if (distance >= light.range || light.midRange < 0.1)
 				continue;
@@ -299,7 +307,70 @@ static unsigned computeDiffuse(const HeightMapDynamicLightVertex &vertex,
 		(alpha << 24);
 }
 
+static Real nearestDistanceToAxis(Real point, Real minimum, Real maximum)
+{
+	if (point < minimum)
+		return minimum - point;
+	if (point > maximum)
+		return point - maximum;
+	return 0.0f;
+}
+
 } // namespace
+
+bool ValidateHeightMapDynamicLightSceneLights(
+	const HeightMapDynamicLightSceneLight *lights, unsigned lightCount)
+{
+	if (lightCount > HEIGHTMAP_DYNAMIC_LIGHT_MAX_LIGHTS ||
+		(lightCount != 0 && lights == 0))
+		return false;
+	for (unsigned index = 0; index < lightCount; ++index)
+		if (!validLight(lights[index]))
+			return false;
+	return true;
+}
+
+bool HeightMapDynamicLightMayContributeToVertexBounds(
+	const HeightMapDynamicLightSceneLight &light,
+	const HeightMapDynamicLightVertexBounds &vertexBounds)
+{
+	Real dx;
+	Real dy;
+	Real dz;
+	Real distanceSquared;
+	Real distance;
+
+	/* Invalid input fails open. Production validates the full light list before
+	 * selection and independently validates captured vertices before publish. */
+	if (!validLight(light) || !finiteReal(vertexBounds.minX) ||
+		!finiteReal(vertexBounds.minY) || !finiteReal(vertexBounds.minZ) ||
+		!finiteReal(vertexBounds.maxX) || !finiteReal(vertexBounds.maxY) ||
+		!finiteReal(vertexBounds.maxZ) ||
+		vertexBounds.minX > vertexBounds.maxX ||
+		vertexBounds.minY > vertexBounds.maxY ||
+		vertexBounds.minZ > vertexBounds.maxZ)
+		return true;
+	if (light.type != HEIGHTMAP_DYNAMIC_LIGHT_POINT &&
+		light.type != HEIGHTMAP_DYNAMIC_LIGHT_SPOT)
+		return true;
+	if (!light.enabled || light.range <= 0.0 || light.midRange < 0.1)
+		return false;
+
+	/* Each component is the minimum possible float displacement from the
+	 * light to any captured vertex in that axis. Float multiply/add and sqrt
+	 * then follow the same monotone arithmetic as computeDiffuse, so rejecting
+	 * only when this lower-bound distance is outside the double range cannot
+	 * discard a contributing vertex (including float-vs-double edge cases). */
+	dx = nearestDistanceToAxis(light.positionX, vertexBounds.minX,
+		vertexBounds.maxX);
+	dy = nearestDistanceToAxis(light.positionY, vertexBounds.minY,
+		vertexBounds.maxY);
+	dz = nearestDistanceToAxis(light.positionZ, vertexBounds.minZ,
+		vertexBounds.maxZ);
+	distanceSquared = dx * dx + dy * dy + dz * dz;
+	distance = dynamicLightSqrt(distanceSquared);
+	return static_cast<double>(distance) < light.range;
+}
 
 bool PrepareHeightMapDynamicLightRows(
 	const HeightMapDynamicLightSnapshot &snapshot,
@@ -311,6 +382,24 @@ bool PrepareHeightMapDynamicLightRows(
 	if (yBegin == yEnd)
 		/* RadarTerrainPrepareService uses an empty second stripe for one row. */
 		return true;
+#if !defined(HEIGHTMAP_DYNAMIC_LIGHT_PARITY_BASELINE)
+	double farRangeSquared[HEIGHTMAP_DYNAMIC_LIGHT_MAX_LIGHTS];
+	for (unsigned lightIndex = 0; lightIndex < snapshot.lightCount;
+		++lightIndex)
+	{
+		const HeightMapDynamicLightSceneLight &light =
+			snapshot.lights[lightIndex];
+		farRangeSquared[lightIndex] = 0.0;
+		if (light.enabled &&
+			(light.type == HEIGHTMAP_DYNAMIC_LIGHT_POINT ||
+				light.type == HEIGHTMAP_DYNAMIC_LIGHT_SPOT) &&
+			light.range >= 1.0)
+		{
+			const double twiceRange = light.range * 2.0;
+			farRangeSquared[lightIndex] = twiceRange * twiceRange;
+		}
+	}
+#endif
 
 	for (row = yBegin; row < yEnd; ++row)
 	{
@@ -328,7 +417,11 @@ bool PrepareHeightMapDynamicLightRows(
 				reinterpret_cast<HeightMapDynamicLightVertex *>(outputRow)[column];
 			outputVertex = inputVertex;
 			outputVertex.diffuse = computeDiffuse(inputVertex, snapshot.lights,
-				snapshot.lightCount);
+#if defined(HEIGHTMAP_DYNAMIC_LIGHT_PARITY_BASELINE)
+				snapshot.lightCount, 0);
+#else
+				snapshot.lightCount, farRangeSquared);
+#endif
 		}
 	}
 	return true;
@@ -398,7 +491,7 @@ bool ValidatePreparedHeightMapDynamicLightOutput(
 			const HeightMapDynamicLightVertex &vertex =
 				reinterpret_cast<const HeightMapDynamicLightVertex *>(outputRow)[column];
 			if (vertex.diffuse != computeDiffuse(inputVertex, snapshot.lights,
-				snapshot.lightCount))
+				snapshot.lightCount, 0))
 				return false;
 		}
 	}

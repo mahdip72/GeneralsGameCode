@@ -25,7 +25,7 @@ if ($module -notmatch '_WIN32_WINNT=0x0A00' -or $module -notmatch 'WINVER=0x0A00
     throw 'Native XAudio2 module does not declare the Windows 10 API contract.'
 }
 
-$runtimeModule = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/legacy-product-runtime.cmake') -Raw
+$runtimeModule = Get-Content -LiteralPath (Join-Path $SourceRoot 'cmake/native-product-runtime.cmake') -Raw
 if ($runtimeModule -notmatch 'rts_xaudio2') {
     throw 'The native product runtime boundary does not retain the XAudio2 contract.'
 }

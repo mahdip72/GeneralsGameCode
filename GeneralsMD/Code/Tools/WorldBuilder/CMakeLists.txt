@@ -1,3 +1,7 @@
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    return()
+endif()
+
 set(WORLDBUILDER_SRC
     "src/addplayerdialog.cpp"
     "src/AutoEdgeOutTool.cpp"
@@ -202,6 +206,9 @@ add_executable(z_worldbuilder WIN32)
 target_sources(z_worldbuilder PRIVATE ${WORLDBUILDER_SRC})
 
 target_include_directories(z_worldbuilder PRIVATE
+    "${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/GeneralsMD/WW3D2"
+    "${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas"
+    "${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/WWVegas/WW3D2"
     ${CMAKE_CURRENT_SOURCE_DIR}
     include
     res

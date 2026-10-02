@@ -39,7 +39,7 @@
 #include "WWLib/chunkio.h"
 #include "WWLib/win.h"		// for lstrcpy, can this be improved?
 #include "assetmgr.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 
 #ifndef SAFE_DELETE
 #define SAFE_DELETE(pointer) { delete pointer; pointer = nullptr; }

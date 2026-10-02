@@ -40,6 +40,9 @@
 #include "Common/Xfer.h"
 
 #include "GameClient/TerrainVisual.h"
+#if defined(_WIN64)
+#include "GameClient/MapUtil.h"
+#endif
 #include "GameClient/View.h"
 
 #include "GameLogic/AI.h"
@@ -1250,6 +1253,11 @@ Bool TerrainLogic::loadMap( AsciiString filename, Bool query )
 	// sanity
 	if( filename.isEmpty() )
 		return FALSE;
+#if defined(_WIN64)
+	NetworkMapReadGuard mapRead(filename.str(), noteRecoveredMapFile);
+	if (!mapRead.ready())
+		return FALSE;
+#endif
 
 	// copy filename
 	m_filenameString = filename;

@@ -53,6 +53,27 @@ private:
 	mutable UnsignedInt m_readCalls = 0;
 };
 
+class BudgetVirtualAudioSource final : public AudioVirtualFileSource
+{
+public:
+	explicit BudgetVirtualAudioSource(std::vector<std::uint8_t> bytes) : m_bytes(std::move(bytes)) {}
+	Bool readFile(const AsciiString &fileName, std::vector<std::uint8_t> &bytes,
+		std::string &identity) const override
+	{
+		const std::string name = fileName.str() == nullptr ? "" : fileName.str();
+		if (name.rfind("archive\\budget-", 0) != 0) return FALSE;
+		++m_readCalls;
+		bytes = m_bytes;
+		identity = name;
+		return TRUE;
+	}
+	UnsignedInt getReadCalls() const { return m_readCalls; }
+
+private:
+	std::vector<std::uint8_t> m_bytes;
+	mutable UnsignedInt m_readCalls = 0;
+};
+
 void writeWaveFrames(const std::filesystem::path &path, UnsignedInt frames,
 	UnsignedInt sampleRate = 48000, UnsignedShort channels = 2)
 {
@@ -511,6 +532,89 @@ int runCatalogTest(int argc, char *argv[])
 		"new loose overrides invalidate virtual cache hits while active archive PCM stays immutable");
 	cachedFirst.reset();
 	cachedSecond.reset();
+	const std::filesystem::path twoSecondPath = root / "two-second.wav";
+	writeWaveFile(twoSecondPath, 2000U);
+	MemoryVirtualAudioSource twoSecondArchive("archive\\two-second.wav",
+		readBinaryFile(twoSecondPath));
+	twoSecondArchive.setAlias("archive\\two-second-alias.wav");
+	FileAudioAssetSource twoSecondSource(AsciiString(root.string().c_str()), &twoSecondArchive);
+	const AsciiString twoSecondName("archive\\two-second.wav");
+	const AsciiString twoSecondAlias("archive\\two-second-alias.wav");
+	constexpr std::size_t twoSecondPcmBytes = 2000U * 48U * 4U;
+	twoSecondSource.setSamplePcmCacheBudget(twoSecondPcmBytes);
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedFirst)
+		&& twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& twoSecondArchive.getReadCalls() == 1U,
+		"two-second sample reuses one bounded PCM cache entry across concurrent voices");
+	AudioPcmChunk firstSecond, secondSecond;
+	check(cachedFirst->readPcm(firstSecond, 48000U)
+		&& cachedSecond->readPcm(secondSecond, 48000U)
+		&& firstSecond.data == secondSecond.data
+		&& firstSecond.startSample == 0 && secondSecond.startSample == 0,
+		"concurrent two-second voices have independent matching first chunks");
+	check(cachedFirst->readPcm(firstSecond, 48000U)
+		&& firstSecond.startSample == 48000 && !cachedSecond->isEnded()
+		&& cachedSecond->readPcm(secondSecond, 48000U)
+		&& secondSecond.startSample == 48000 && firstSecond.data == secondSecond.data
+		&& cachedFirst->isEnded() && cachedSecond->isEnded(),
+		"both cached voices preserve complete second chunks and independent cursors");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	check(twoSecondSource.openPcmSampleStream(twoSecondAlias, cachedFirst)
+		&& twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& twoSecondArchive.getReadCalls() == 3U,
+		"a one-sample budget evicts unpinned two-second PCM without exceeding its cap");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	twoSecondSource.setSamplePcmCacheBudget(twoSecondPcmBytes - 1U);
+	const UnsignedInt readsBeforeBudgetRefusal = twoSecondArchive.getReadCalls();
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedFirst)
+		&& twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& twoSecondArchive.getReadCalls() == readsBeforeBudgetRefusal + 2U,
+		"a two-second sample larger than the byte budget remains uncached");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	twoSecondSource.setSamplePcmCacheBudget(twoSecondPcmBytes);
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedFirst),
+		"two-second PCM can be pinned by an active voice before source replacement");
+	const std::filesystem::path replacementPath = root / "replacement-second.wav";
+	writeWaveFile(replacementPath, 1500U);
+	MemoryVirtualAudioSource twoSecondReplacement("archive\\two-second.wav",
+		readBinaryFile(replacementPath));
+	twoSecondSource.setVirtualFileSource(&twoSecondReplacement);
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& cachedFirst->durationMS() == 2000.0f
+		&& cachedSecond->durationMS() == 1500.0f
+		&& twoSecondReplacement.getReadCalls() == 1U,
+		"source mutation leaves active two-second PCM immutable and opens new bytes");
+	cachedSecond.reset();
+	check(twoSecondSource.openPcmSampleStream(twoSecondName, cachedSecond)
+		&& twoSecondReplacement.getReadCalls() == 2U,
+		"pinned old PCM retains its charge so the replacement stays uncached");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	const std::filesystem::path threeSecondPath = root / "three-second.wav";
+	writeWaveFile(threeSecondPath, 3000U);
+	MemoryVirtualAudioSource threeSecondArchive("archive\\three-second.wav",
+		readBinaryFile(threeSecondPath));
+	FileAudioAssetSource threeSecondSource(AsciiString(root.string().c_str()), &threeSecondArchive);
+	threeSecondSource.setSamplePcmCacheBudget(4194304U);
+	const AsciiString threeSecondName("archive\\three-second.wav");
+	check(threeSecondSource.openPcmSampleStream(threeSecondName, cachedFirst)
+		&& threeSecondSource.openPcmSampleStream(threeSecondName, cachedSecond)
+		&& threeSecondArchive.getReadCalls() == 1U
+		&& cachedFirst->durationMS() == 3000.0f,
+		"three-second cap admits complete multi-chunk PCM within the installed byte budget");
+	for (UnsignedInt second = 0; second < 3U; ++second) {
+		AudioPcmChunk chunk;
+		check(cachedFirst->readPcm(chunk, 48000U)
+			&& chunk.frameCount == 48000U && chunk.startSample == second * 48000U,
+			"three-second cached playback retains every ordered output chunk");
+	}
+	check(cachedFirst->isEnded() && cachedSecond->durationMS() == 3000.0f,
+		"three-second cached playback ends only after the full source duration");
+	cachedFirst.reset();
+	cachedSecond.reset();
 #if defined(RTS_NATIVE_AUDIO_ASSET_SOURCE_TEST_HOOK)
 	cachedSource.setVirtualFileSource(&cachedArchive);
 	cachedSource.setSamplePcmCacheBudget(192000U);
@@ -529,6 +633,65 @@ int runCatalogTest(int argc, char *argv[])
 		"a failed cache fill does not poison subsequent complete sample reuse");
 	cachedFirst.reset();
 	cachedSecond.reset();
+#endif
+
+#if defined(_WIN64)
+	BudgetVirtualAudioSource nativeBudgetArchive(readBinaryFile(twoSecondPath));
+	FileAudioAssetSource nativeBudgetSource(AsciiString(root.string().c_str()), &nativeBudgetArchive);
+	nativeBudgetSource.setSamplePcmCacheBudget(8U * 1024U * 1024U);
+	for (UnsignedInt index = 0; index < 11U; ++index) {
+		const std::string name = "archive\\budget-" + std::to_string(index) + ".wav";
+		check(nativeBudgetSource.openPcmSampleStream(AsciiString(name.c_str()), cachedFirst),
+			"native default budget opens each two-second sample");
+		cachedFirst.reset();
+	}
+	check(nativeBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst)
+		&& nativeBudgetArchive.getReadCalls() == 11U,
+		"explicit 8 MiB budget retains eleven two-second samples beyond 4 MiB");
+	cachedFirst.reset();
+	for (UnsignedInt index = 11U; index < 22U; ++index) {
+		const std::string name = "archive\\budget-" + std::to_string(index) + ".wav";
+		check(nativeBudgetSource.openPcmSampleStream(AsciiString(name.c_str()), cachedFirst),
+			"native cache admits later samples within its bounded LRU");
+		cachedFirst.reset();
+	}
+	check(nativeBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-1.wav"), cachedFirst)
+		&& nativeBudgetArchive.getReadCalls() == 23U,
+		"native 8 MiB cache evicts its oldest unpinned sample at the byte bound");
+	cachedFirst.reset();
+	BudgetVirtualAudioSource exactFourArchive(readBinaryFile(twoSecondPath));
+	FileAudioAssetSource exactFourSource(AsciiString(root.string().c_str()), &exactFourArchive);
+	exactFourSource.setSamplePcmCacheBudget(4U * 1024U * 1024U);
+	for (UnsignedInt index = 0; index < 11U; ++index) {
+		const std::string name = "archive\\budget-" + std::to_string(index) + ".wav";
+		check(exactFourSource.openPcmSampleStream(AsciiString(name.c_str()), cachedFirst),
+			"exact 4 MiB cache opens each two-second sample");
+		cachedFirst.reset();
+	}
+	check(exactFourSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst)
+		&& exactFourArchive.getReadCalls() == 12U,
+		"direct 4 MiB setter evicts instead of silently growing to 8 MiB");
+	cachedFirst.reset();
+	BudgetVirtualAudioSource customBudgetArchive(readBinaryFile(twoSecondPath));
+	FileAudioAssetSource customBudgetSource(AsciiString(root.string().c_str()), &customBudgetArchive);
+	customBudgetSource.setSamplePcmCacheBudget(0);
+	check(customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst)
+		&& customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedSecond)
+		&& customBudgetArchive.getReadCalls() == 2U,
+		"zero budget still disables native sample caching");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	customBudgetSource.setSamplePcmCacheBudget(twoSecondPcmBytes);
+	check(customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst),
+		"custom one-entry budget admits its first sample");
+	cachedFirst.reset();
+	check(customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-1.wav"), cachedFirst),
+		"custom one-entry budget evicts for its second sample");
+	cachedFirst.reset();
+	check(customBudgetSource.openPcmSampleStream(AsciiString("archive\\budget-0.wav"), cachedFirst)
+		&& customBudgetArchive.getReadCalls() == 5U,
+		"native default promotion does not override smaller custom byte budgets");
+	cachedFirst.reset();
 #endif
 
 	const std::filesystem::path genericPath = root / "main.aiff";
@@ -565,13 +728,76 @@ int runCatalogTest(int argc, char *argv[])
 	const std::filesystem::path longPath = root / "long.wav";
 	const std::filesystem::path longAdpcmPath = root / "long_adpcm.wav";
 	writeWaveFile(longPath, 5000U);
-	MemoryVirtualAudioSource uncachedLongArchive("archive\\long-cache-bypass.wav", readBinaryFile(longPath));
-	FileAudioAssetSource uncachedLongSource(AsciiString(root.string().c_str()), &uncachedLongArchive);
-	uncachedLongSource.setSamplePcmCacheBudget(1920000U);
-	check(uncachedLongSource.openPcmSampleStream(AsciiString("archive\\long-cache-bypass.wav"), cachedFirst)
-		&& uncachedLongSource.openPcmSampleStream(AsciiString("archive\\long-cache-bypass.wav"), cachedSecond)
-		&& uncachedLongArchive.getReadCalls() == 2U,
-		"long sound effects remain sequential streams even when the cache budget could hold them");
+	MemoryVirtualAudioSource ambientArchive("archive\\ambient.wav", readBinaryFile(longPath));
+	FileAudioAssetSource ambientSource(AsciiString(root.string().c_str()), &ambientArchive);
+	ambientSource.setSamplePcmCacheBudget(1920000U);
+	check(ambientSource.openPcmSampleStream(AsciiString("archive\\ambient.wav"), cachedFirst)
+		&& ambientSource.openPcmSampleStream(AsciiString("archive\\ambient.wav"), cachedSecond)
+		&& ambientArchive.getReadCalls() == 1U,
+		"five-second ambience reuses complete decoded PCM across concurrent voices");
+	AudioPcmChunk ambientFirst, ambientSecond;
+	for (UnsignedInt second = 0; second < 5U; ++second) {
+		check(cachedFirst->readPcm(ambientFirst, 48000U)
+			&& cachedSecond->readPcm(ambientSecond, 48000U)
+			&& ambientFirst.startSample == second * 48000U
+			&& ambientFirst.data == ambientSecond.data,
+			"cached ambience keeps independent cursors and identical PCM");
+	}
+	check(cachedFirst->isEnded() && cachedSecond->isEnded(),
+		"cached ambience ends after its full five-second duration");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	const std::filesystem::path exactCacheLimitPath = root / "exact-cache-limit.wav";
+	writeWaveFile(exactCacheLimitPath, 8000U);
+	MemoryVirtualAudioSource exactCacheLimitArchive("archive\\exact-cache-limit.wav",
+		readBinaryFile(exactCacheLimitPath));
+	FileAudioAssetSource exactCacheLimitSource(AsciiString(root.string().c_str()),
+		&exactCacheLimitArchive);
+	exactCacheLimitSource.setSamplePcmCacheBudget(8U * 1024U * 1024U);
+	check(exactCacheLimitSource.openPcmSampleStream(
+		AsciiString("archive\\exact-cache-limit.wav"), cachedFirst)
+		&& exactCacheLimitSource.openPcmSampleStream(
+			AsciiString("archive\\exact-cache-limit.wav"), cachedSecond)
+		&& exactCacheLimitArchive.getReadCalls() == 1U
+		&& cachedFirst->durationMS() == 8000.0f && cachedSecond->durationMS() == 8000.0f,
+		"an eight-second sample at the duration limit is cached and shared");
+	for (UnsignedInt second = 0; second < 8U; ++second) {
+		check(cachedFirst->readPcm(ambientFirst, 48000U)
+			&& cachedSecond->readPcm(ambientSecond, 48000U)
+			&& ambientFirst.startSample == second * 48000U
+			&& ambientFirst.data == ambientSecond.data,
+			"cached eight-second boundary streams preserve every matching PCM chunk");
+	}
+	check(cachedFirst->isEnded() && cachedSecond->isEnded(),
+		"cached eight-second boundary streams end after all eight chunks");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	const std::filesystem::path justOverCacheLimitPath = root / "just-over-cache-limit.wav";
+	writeWaveFile(justOverCacheLimitPath, 8001U);
+	MemoryVirtualAudioSource justOverCacheLimitArchive("archive\\just-over-cache-limit.wav",
+		readBinaryFile(justOverCacheLimitPath));
+	FileAudioAssetSource justOverCacheLimitSource(AsciiString(root.string().c_str()),
+		&justOverCacheLimitArchive);
+	justOverCacheLimitSource.setSamplePcmCacheBudget(8U * 1024U * 1024U);
+	check(justOverCacheLimitSource.openPcmSampleStream(
+		AsciiString("archive\\just-over-cache-limit.wav"), cachedFirst)
+		&& justOverCacheLimitSource.openPcmSampleStream(
+			AsciiString("archive\\just-over-cache-limit.wav"), cachedSecond)
+		&& justOverCacheLimitArchive.getReadCalls() == 2U
+		&& cachedFirst->durationMS() > 8000.0f && cachedSecond->durationMS() > 8000.0f,
+		"a sample one millisecond above the duration limit remains an uncached stream");
+	cachedFirst.reset();
+	cachedSecond.reset();
+	const std::filesystem::path overLimitPath = root / "over-limit.wav";
+	writeWaveFile(overLimitPath, 9000U);
+	MemoryVirtualAudioSource overLimitArchive("archive\\over-limit.wav",
+		readBinaryFile(overLimitPath));
+	FileAudioAssetSource overLimitSource(AsciiString(root.string().c_str()), &overLimitArchive);
+	overLimitSource.setSamplePcmCacheBudget(8U * 1024U * 1024U);
+	check(overLimitSource.openPcmSampleStream(AsciiString("archive\\over-limit.wav"), cachedFirst)
+		&& overLimitSource.openPcmSampleStream(AsciiString("archive\\over-limit.wav"), cachedSecond)
+		&& overLimitArchive.getReadCalls() == 2U,
+		"sound effects above the eight-second cap remain sequential streams");
 	cachedFirst.reset();
 	cachedSecond.reset();
 	check(runFFmpeg(ffmpegExecutable, longPath, "adpcm_ima_wav", longAdpcmPath) == 0,

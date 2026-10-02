@@ -39,10 +39,6 @@
 
 #pragma once
 
-#ifndef DX8_WRAPPER_H
-//#include "dx8wrapper.h"
-#endif
-
 enum MipCountType
 {
 	MIP_LEVELS_ALL=0,		// generate all mipmap levels down to 1x1 size
@@ -137,7 +133,7 @@ public:
 	static void _Set_Default_Mip_Filter(FilterType filter);
 
 private:
-	// State not contained in the Direct3D texture object:
+	// State not contained in the renderer texture object:
 	FilterType TextureMinFilter;
 	FilterType TextureMagFilter;
 	FilterType MipMapFilter;

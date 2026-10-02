@@ -45,6 +45,14 @@
 class	VertexMaterialClass;
 class RenderInfoClass;
 
+namespace rts
+{
+namespace render
+{
+struct NativeLine3DGeometry;
+}
+}
+
 /*
 ** Line3DClass -- Render3DObject for rendering 3D line segments.
 ** These are conceptually cylinders with a given width - some approximation
@@ -95,6 +103,13 @@ class Line3DClass : public RenderObjClass
 		// Reset the line opacity
 		void Set_Opacity(float opacity);
 
+		// Export the line's local box and packed diffuse color through the
+		// backend-neutral native geometry contract.  This is deliberately a
+		// data-only seam: the VC6 renderer keeps using Render(), while the
+		// native source cohort can submit the same geometry through D3D11.
+		bool Build_Native_Geometry(
+			struct rts::render::NativeLine3DGeometry *geometry) const;
+
 		// For non-opaque lines, allow them to render last.
 		virtual void							Set_Sort_Level(int level) override { SortLevel = level; }
 		virtual int							Get_Sort_Level() const override { return SortLevel; }
@@ -114,4 +129,11 @@ class Line3DClass : public RenderObjClass
 		// color
 		Vector4						Color;
 		char														SortLevel;
-};
+		// Native buffers are opaque sidecar state for the x64 source cohort.
+		// Keep them out of the 32-bit class so the VC6 Line3D ABI remains the
+		// historical layout consumed by the compatibility renderer.
+#if defined(_WIN64)
+		void *NativeLine3DBuffers;
+		void *NativeLine3DSubmitterPtr;
+#endif
+	};

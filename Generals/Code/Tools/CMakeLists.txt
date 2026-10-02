@@ -15,17 +15,17 @@ if(RTS_BUILD_GENERALS_EXTRAS AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     add_subdirectory(PATCHGET)
 endif()
 
-# Native x64 product builds always need the launcher in their installed
-# product graph.  Keep the legacy Win32 option behavior: Win32 gets it only
-# when the extras preset is selected.
+# Native x64 product builds always need the launcher in their installed graph.
+# Historical Win32 authoring graphs get it only with their extras.
 if(RTS_BUILD_GENERALS_EXTRAS OR (CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_BUILD_PRODUCT))
     add_subdirectory(Launcher)
 endif()
 
 # Exercise the shared native runtime contracts through the Generals title
-# graph as well as Zero Hour. The utility remains outside the legacy Win32
-# product so the retail differential-oracle dependencies stay unchanged.
+# graph as well as Zero Hour. The utility remains outside historical Win32
+# authoring graphs unless their extras are enabled.
 if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND
         (RTS_BUILD_GENERALS_EXTRAS OR RTS_BUILD_PRODUCT))
     add_subdirectory(RuntimeRegressionTests)
+    add_subdirectory(DeterministicAIPlanningTest)
 endif()

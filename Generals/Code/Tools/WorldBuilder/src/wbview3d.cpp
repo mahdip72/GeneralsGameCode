@@ -2279,7 +2279,7 @@ void WbView3d::OnPaint()
 		CMainFrame::GetMainFrame()->adjustWindowSize();
 		m_firstPaint = false;
 	}
-	DX8Wrapper::SetCleanupHook(this);
+	rts::render::SetGameCleanupHook(this);
 
 }
 

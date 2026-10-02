@@ -53,6 +53,9 @@
 #include "Common/AsciiString.h"
 #include "Common/FileSystem.h" // for typedefs, etc.
 #include "Common/STLTypedefs.h"
+#if defined(_WIN64) && RTS_ZEROHOUR
+#include <set>
+#endif
 
 //----------------------------------------------------------------------------
 //           Forward References
@@ -146,6 +149,13 @@ public:
 	// Unprotected this for copy-protection routines
 	ArchiveFile* getArchiveFile(const AsciiString& filename, FileInstance instance = 0) const;
 
+#if defined(_WIN64) && RTS_ZEROHOUR
+	// The 2160p Control Bar Pro overlays must not replace ordinary menu assets
+	// at lower resolutions. Kept here so archive lookup and its test share a rule.
+	static Bool isArchiveEligibleForResolution(
+		const AsciiString& archiveName, Int width, Int height);
+#endif
+
 	void loadMods();
 
 	ArchivedDirectoryInfo* friend_getArchivedDirectoryInfo(const Char* directory);
@@ -166,6 +176,11 @@ protected:
 
 	ArchiveFileMap m_archiveFileMap;
 	ArchivedDirectoryInfo m_rootDirectory;
+#if defined(_WIN64) && RTS_ZEROHOUR
+	// Populated once as archives are indexed. Asset opens avoid name copies.
+	std::set<const ArchiveFile *> m_2160Archives;
+	std::set<const ArchiveFile *> m_zeroHourRootArchives;
+#endif
 };
 
 

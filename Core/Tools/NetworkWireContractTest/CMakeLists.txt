@@ -3,7 +3,9 @@ add_executable(core_network_wire_contract_tests
 )
 
 target_link_libraries(core_network_wire_contract_tests PRIVATE
+    core_config
     core_runtime_epoch_contract
+    core_task_runtime
 )
 
 target_include_directories(core_network_wire_contract_tests PRIVATE

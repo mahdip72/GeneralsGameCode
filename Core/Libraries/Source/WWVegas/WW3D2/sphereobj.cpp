@@ -85,13 +85,24 @@
 #include "WWLib/wwstring.h"
 #include "camera.h"
 #include "statistics.h"
-#include "dx8wrapper.h"
-#include "dx8vertexbuffer.h"
-#include "dx8indexbuffer.h"
-#include "sortingrenderer.h"
+#include "WW3D2/dx8vertexbuffer.h"
+#include "WW3D2/dx8indexbuffer.h"
+#include "Renderer/RenderGameClient.h"
+#include "Renderer/LegacyColorPacking.h"
 #include "visrasterizer.h"
 
 static bool Sphere_Array_Valid = false;
+
+static rts::render::GameBoundingSphere ToGameBoundingSphere(
+	const SphereClass &sphere)
+{
+	rts::render::GameBoundingSphere result;
+	result.centerX = sphere.Center.X;
+	result.centerY = sphere.Center.Y;
+	result.centerZ = sphere.Center.Z;
+	result.radius = sphere.Radius;
+	return result;
+}
 
 SphereMeshClass SphereMeshArray[SPHERE_NUM_LOD];
 float SphereLODCosts[SPHERE_NUM_LOD + 1];	// SPHERE_NUM_LOD doesn't include the null LOD
@@ -468,18 +479,26 @@ void SphereRenderObjClass::render_sphere()
 	} else {
 		SphereShader.Set_Texturing (ShaderClass::TEXTURING_DISABLE);
 	}
-	DX8Wrapper::Set_Shader(SphereShader);
-	DX8Wrapper::Set_Texture(0,SphereTexture);
-	DX8Wrapper::Set_Material(SphereMaterial);
+	rts::render::SetGameShader(SphereShader);
+	rts::render::SetGameTexture(0, SphereTexture);
+	rts::render::SetGameMaterial(SphereMaterial);
 
 	// Enable sorting if the primitive is translucent, alpha testing is not enabled, and sorting is enabled globally.
 	const bool sort = (SphereShader.Get_Dst_Blend_Func() != ShaderClass::DSTBLEND_ZERO) && (SphereShader.Get_Alpha_Test() == ShaderClass::ALPHATEST_DISABLE) && (WW3D::Is_Sorting_Enabled());
- 	const unsigned int buffer_type = sort ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8;
+	const rts::render::GameBufferType buffer_type = sort ?
+		rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+		rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE;
 
 	DynamicVBAccessClass vb(buffer_type, dynamic_fvf_type, mesh.Vertex_ct);
+	if (!vb.Is_Valid()) {
+		return;
+	}
 	{
 		DynamicVBAccessClass::WriteLockClass Lock(&vb);
 		VertexFormatXYZNDUV2 *vb = Lock.Get_Formatted_Vertex_Array();
+		if (!Lock.Is_Locked() || vb == nullptr) {
+			return;
+		}
 
 		for (int i=0; i<mesh.Vertex_ct; i++)
 		{
@@ -492,7 +511,8 @@ void SphereRenderObjClass::render_sphere()
 			vb->nz = mesh.vtx_normal[i].Z;
 
 			if (Flags & USE_ALPHA_VECTOR) {
-				vb->diffuse = DX8Wrapper::Convert_Color(mesh.dcg[i]);
+				vb->diffuse = rts::render::PackLegacyARGB(
+					mesh.dcg[i].X, mesh.dcg[i].Y, mesh.dcg[i].Z, mesh.dcg[i].W);
 			} else {
 				vb->diffuse = 0xFFFFFFFF;		// TODO could combine the material color with this and turn off lighting
 			}
@@ -503,27 +523,43 @@ void SphereRenderObjClass::render_sphere()
 			}
 			vb++;
 		}
+		if (!Lock.Commit()) {
+			return;
+		}
 	}
 
 	DynamicIBAccessClass ib(buffer_type, mesh.face_ct*3);
+	if (!ib.Is_Valid()) {
+		return;
+	}
 	{
 		DynamicIBAccessClass::WriteLockClass Lock(&ib);
 		unsigned short *mem=Lock.Get_Index_Array();
+		if (!Lock.Is_Locked() || mem == nullptr) {
+			return;
+		}
 		for (int i=0; i<mesh.face_ct; i++)
 		{
 			mem[3*i]=mesh.tri_poly[i].I;
 			mem[3*i+1]=mesh.tri_poly[i].J;
 			mem[3*i+2]=mesh.tri_poly[i].K;
 		}
+		if (!Lock.Commit()) {
+			return;
+		}
 	}
 
-	DX8Wrapper::Set_Vertex_Buffer(vb);
-	DX8Wrapper::Set_Index_Buffer(ib,0);
+	if (!rts::render::SetGameVertexBuffer(vb) ||
+		!rts::render::SetGameIndexBuffer(ib, 0)) {
+		return;
+	}
 
 	if (sort) {
-		SortingRendererClass::Insert_Triangles(Get_Bounding_Sphere(), 0, mesh.face_ct, 0, mesh.Vertex_ct);
+		rts::render::DrawGameSortedTriangles(
+			ToGameBoundingSphere(Get_Bounding_Sphere()), 0, mesh.face_ct, 0,
+			mesh.Vertex_ct);
 	} else {
-		DX8Wrapper::Draw_Triangles(0,mesh.face_ct,0,mesh.Vertex_ct);
+		rts::render::DrawGameTriangles(0, mesh.face_ct, 0, mesh.Vertex_ct);
 	}
 
 }
@@ -659,7 +695,8 @@ void SphereRenderObjClass::Render(RenderInfoClass & rinfo)
 		// Camera Align
 		if (Flags & USE_CAMERA_ALIGN) {
 			Matrix4x4 view,ident(true);
-			DX8Wrapper::Get_Transform(D3DTS_VIEW,view);
+			rts::render::GetGameTransform(
+				rts::render::GAME_TRANSFORM_VIEW, &view);
 
 			Vector4 wpos(Transform[0][3],Transform[1][3],Transform[2][3],1);
 			Vector4 cpos;
@@ -670,12 +707,16 @@ void SphereRenderObjClass::Render(RenderInfoClass & rinfo)
 							1.0f, 0.0f, 0.0f, cpos.Z);
 
 			tm.Scale(real_scale);
-			DX8Wrapper::Set_Transform(D3DTS_WORLD,ident);
-			DX8Wrapper::Set_Transform(D3DTS_VIEW,tm);
+			rts::render::SetGameTransform(
+				rts::render::GAME_TRANSFORM_WORLD, ident);
+			rts::render::SetGameTransform(
+				rts::render::GAME_TRANSFORM_VIEW, tm);
 			render_sphere();
-			DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+			rts::render::SetGameTransform(
+				rts::render::GAME_TRANSFORM_VIEW, view);
 		} else {
-			DX8Wrapper::Set_Transform(D3DTS_WORLD,temp);
+			rts::render::SetGameTransform(
+				rts::render::GAME_TRANSFORM_WORLD, temp);
 			render_sphere();
 		}
 	}

@@ -860,6 +860,9 @@ static void saveOptions()
 				TheWritableGlobalData->m_xResolution = xres;
 				TheWritableGlobalData->m_yResolution = yres;
 
+#if defined(_WIN64)
+				TheGlobalLanguageData->onResolutionChanged();
+#endif
 				TheHeaderTemplateManager->onResolutionChanged();
 				TheMouse->onResolutionChanged();
 
@@ -877,6 +880,9 @@ static void saveOptions()
 
 				TheInGameUI->recreateControlBar();
 				TheInGameUI->refreshCustomUiResources();
+#if defined(_WIN64)
+				TheInGameUI->refreshLocalizedFontResources();
+#endif
 			}
 		}
 	}

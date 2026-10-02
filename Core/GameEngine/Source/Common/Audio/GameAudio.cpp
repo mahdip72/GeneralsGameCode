@@ -86,6 +86,7 @@ static const char* TheSpeakerTypes[] =
 static const Int TheSpeakerTypesCount = sizeof(TheSpeakerTypes) / sizeof(TheSpeakerTypes[0]);
 
 static void parseSpeakerType( INI *ini, void *instance, void *store, const void *userData );
+static void parseNativeSamplePcmCacheBudget( INI *ini, void *instance, void *store, const void *userData );
 
 // Field Parse table for Audio Settings ///////////////////////////////////////////////////////////
 static const FieldParse audioSettingsFieldParseTable[] =
@@ -123,6 +124,10 @@ static const FieldParse audioSettingsFieldParseTable[] =
 	{ "TimeBetweenDrawableSounds", INI::parseDurationUnsignedInt, nullptr,							offsetof( AudioSettings, m_drawableAmbientFrames) },
 	{ "TimeToFadeAudio",			INI::parseDurationUnsignedInt,			nullptr,							offsetof( AudioSettings, m_fadeAudioFrames) },
 	{ "AudioFootprintInBytes",INI::parseUnsignedInt,							nullptr,							offsetof( AudioSettings, m_maxCacheSize) },
+	// Optional native SFX PCM cache override. Unlike AudioFootprintInBytes,
+	// this can explicitly request 4 MiB (or zero) without the x64 64 MiB default.
+	{ "NativeSamplePcmCacheBudgetInBytes", parseNativeSamplePcmCacheBudget, nullptr,
+		offsetof( AudioSettings, m_nativeSamplePcmCacheBudgetInBytes) },
 	{ "Relative2DVolume",			INI::parsePercentToReal,						nullptr,							offsetof( AudioSettings, m_relative2DVolume ) },
 	{ "DefaultSoundVolume",		INI::parsePercentToReal,						nullptr,							offsetof( AudioSettings, m_defaultSoundVolume) },
 	{ "Default3DSoundVolume",	INI::parsePercentToReal,						nullptr,							offsetof( AudioSettings, m_default3DSoundVolume) },
@@ -1212,5 +1217,11 @@ void parseSpeakerType( INI *ini, void *instance, void *store, const void* userDa
 	ini->parseAsciiString( ini, instance, &str, userData );
 
 	(*(UnsignedInt*)store) = TheAudio->translateSpeakerTypeToUnsignedInt(str);
+}
+
+void parseNativeSamplePcmCacheBudget( INI *ini, void *instance, void *store, const void *userData )
+{
+	INI::parseUnsignedInt(ini, instance, store, userData);
+	static_cast<AudioSettings *>(instance)->m_hasNativeSamplePcmCacheBudget = TRUE;
 }
 

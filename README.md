@@ -61,22 +61,24 @@ report bugs, and contribute to the project!
 
 ## Building the Game Yourself
 
-We provide support for building the project on Windows and Linux. For detailed build instructions, check the
-[Wiki](https://github.com/TheSuperHackers/GeneralsGameCode/wiki/build_guides), which includes guides for VS6, VS2022,
-Docker, CLion, and links to forks supporting additional versions.
+We provide support for the native x64 game product on Windows and for
+non-product development tools on the other documented hosts. For detailed build
+instructions, check the [Wiki](https://github.com/TheSuperHackers/GeneralsGameCode/wiki/build_guides).
+The legacy Win32/VC6 game product and its D3D8, Miles, and Bink runtime have
+been retired; the remaining 32-bit presets are authoring/diagnostic only.
 
 ### Quick Start
 
 **Windows (Visual Studio 2022)**
 ```bash
-cmake --preset win32
-cmake --build build/win32 --config Release
+cmake --preset x64-zerohour-vcpkg-product
+cmake --build --preset x64-zerohour-vcpkg-product --parallel 4
 ```
 
-**Linux (via Docker)**
+**Linux (device-free development graph)**
 ```bash
-./scripts/docker-build.sh              # Build using Docker
-./scripts/docker-install.sh --detect # Install to your game
+cmake --preset unix
+cmake --build --preset unix --parallel 4
 ```
 
 ### Dependency management
@@ -90,7 +92,8 @@ re-compiling everything.
 
 ### Profiling
 
-Tracy profiling is supported in the CMake presets `win32-profile` and `x64-profile`.
+Tracy profiling of the supported product is available through `x64-profile`.
+`win32-profile` is retained only for non-product compatibility diagnostics.
 Use `tracy-profiler.exe` from [Tracy v0.13.1](https://github.com/wolfpld/tracy/releases/tag/v0.13.1).
 If you get an error when using Tracy, try removing `dbghelp.dll` from the game binary directory.
 

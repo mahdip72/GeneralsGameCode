@@ -41,6 +41,8 @@
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "WinMain.h"
+#include "../../../Generals/Code/Main/WindowDpi.h"
+#include "GameClient/GameWindow.h"
 #include "Lib/BaseType.h"
 #include "Common/CommandLine.h"
 #include "Common/CriticalSection.h"
@@ -86,6 +88,7 @@ const char *gAppPrefix = ""; /// So WB can have a different debug log file name.
 static Bool gInitializing = false;
 static Bool gDoPaint = true;
 static Bool isWinMainActive = false;
+static UINT gDpiPrechangeSizeTarget = 0;
 
 static HBITMAP gLoadScreenBitmap = nullptr;
 
@@ -103,6 +106,8 @@ static const char *messageToString(unsigned int message)
 	case WM_DESTROY: return  "WM_DESTROY";
 	case WM_MOVE: return  "WM_MOVE";
 	case WM_SIZE: return  "WM_SIZE";
+	case WM_DPICHANGED: return "WM_DPICHANGED";
+	case WM_GETDPISCALEDSIZE: return "WM_GETDPISCALEDSIZE";
 	case WM_ACTIVATE: return  "WM_ACTIVATE";
 	case WM_SETFOCUS: return  "WM_SETFOCUS";
 	case WM_KILLFOCUS: return  "WM_KILLFOCUS";
@@ -411,6 +416,53 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 				break;
 			}
 
+			case WM_GETDPISCALEDSIZE:
+			{
+				gDpiPrechangeSizeTarget = 0;
+				SIZE *pendingSize = static_cast<SIZE *>(WindowMsgDataToPointer(
+					static_cast<WindowMsgData>(lParam)));
+				// Fullscreen sizing belongs to the display-mode owner; don't let
+				// Windows linearly scale its pending size during a monitor move.
+				if (!TheGlobalData || !TheGlobalData->m_windowed)
+					return WindowDpi::PreservePendingWindowSize(pendingSize);
+
+				const BOOL sizeAdjusted = WindowDpi::AdjustPendingWindowSizeForDpi(
+					hWnd, (UINT)wParam, pendingSize);
+				if (sizeAdjusted)
+					gDpiPrechangeSizeTarget = (UINT)wParam;
+				return sizeAdjusted;
+			}
+
+			case WM_DPICHANGED:
+			{
+				const UINT dpi = LOWORD(wParam);
+				const BOOL hasPmV2PrechangeSize =
+					gDpiPrechangeSizeTarget != 0 && gDpiPrechangeSizeTarget == dpi;
+				gDpiPrechangeSizeTarget = 0;
+
+				// The renderer owns fullscreen mode transitions. For windowed mode,
+				// retain the client render size and Windows' suggested position.
+				if (TheGlobalData && TheGlobalData->m_windowed)
+				{
+					const RECT *suggestedRect = static_cast<const RECT *>(
+						WindowMsgDataToPointer(static_cast<WindowMsgData>(lParam)));
+					if (suggestedRect)
+					{
+						if (hasPmV2PrechangeSize)
+							WindowDpi::ApplyDpiChangedRect(hWnd, suggestedRect);
+						else
+						{
+							RECT adjustedRect = *suggestedRect;
+							if (!WindowDpi::AdjustDpiChangedRectForClientSize(hWnd, &adjustedRect))
+								adjustedRect = *suggestedRect;
+							WindowDpi::ApplyDpiChangedRect(hWnd, &adjustedRect);
+						}
+					}
+				}
+
+				return 0;
+			}
+
 			//-------------------------------------------------------------------------
 			case WM_SIZE:
 			{
@@ -464,11 +516,11 @@ LRESULT CALLBACK WndProc( HWND hWnd, UINT message,
 			{
 				if ((bool) wParam != isWinMainActive)
 				{
-					// TheSuperHackers @bugfix xezon 11/05/2025 This event originally called DX8Wrapper::Reset_Device,
+					// TheSuperHackers @bugfix xezon 11/05/2025 This event originally reset the compatibility device,
 					// intended to clear resources on a lost device in fullscreen, but effectively also in
 					// windowed mode, if the DXMaximizedWindowedMode shim was applied in newer versions of Windows,
 					// which lead to unfortunate application crashing. Resetting the device on WM_ACTIVATEAPP instead
-					// of TestCooperativeLevel() == D3DERR_DEVICENOTRESET is not a requirement. There are other code
+					// of the cooperative-level reset signal is not a requirement. There are other code
 					// paths that take care of that.
 
 					isWinMainActive = (BOOL) wParam;
@@ -739,7 +791,7 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 	else
 	{
 		// The VC6 SDK hides the multimonitor declarations behind WINVER 0x0500.
-		// This path is only used by the legacy D3D8 fullscreen bootstrap; D3D11
+		// This path is only used by the legacy fullscreen bootstrap; the native renderer
 		// fullscreen takes the windowed bootstrap above and positions the window
 		// through its modern presentation path.
 		rect.left = 0;

@@ -18,8 +18,9 @@ if(MINGW)
     target_link_options(core_parallel_visibility_tests PRIVATE -mconsole)
 endif()
 
-add_test(NAME core_parallel_visibility_tests COMMAND core_parallel_visibility_tests)
+add_test(NAME core_parallel_visibility_tests COMMAND core_parallel_visibility_tests
+    --local-capacity)
 set_tests_properties(core_parallel_visibility_tests PROPERTIES TIMEOUT 60)
 add_test(NAME core_parallel_visibility_serial_policy_test
-    COMMAND core_parallel_visibility_tests --serial-policy)
+    COMMAND core_parallel_visibility_tests --local-capacity --serial-policy)
 set_tests_properties(core_parallel_visibility_serial_policy_test PROPERTIES TIMEOUT 30)

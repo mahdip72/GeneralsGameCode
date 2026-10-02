@@ -54,6 +54,8 @@
 #include "Common/OptionPreferences.h"
 #include "Common/version.h"
 
+#include "Lib/ValidationProfileRoot.h"
+
 #include "GameLogic/AI.h"
 #include "GameLogic/Weapon.h"
 #include "GameLogic/Module/BodyModule.h"
@@ -63,6 +65,8 @@
 #include "GameClient/TerrainVisual.h"
 
 #include "GameNetwork/FirewallHelper.h"
+
+#include <stdlib.h>
 
 // PUBLIC DATA ////////////////////////////////////////////////////////////////////////////////////
 GlobalData* TheWritableGlobalData = nullptr;				///< The global data singleton
@@ -1372,6 +1376,20 @@ UnsignedInt GlobalData::generateExeCRC()
 
 AsciiString GlobalData::BuildUserDataPathFromRegistry()
 {
+	char processLocalProfileRoot[MAX_PATH];
+	const rts::validation::ProcessLocalProfileRootResult profileRootResult =
+		rts::validation::ReadProcessLocalProfileRoot(
+			processLocalProfileRoot, sizeof(processLocalProfileRoot));
+	if (profileRootResult == rts::validation::PROCESS_LOCAL_PROFILE_ROOT_VALID)
+		return AsciiString(processLocalProfileRoot);
+	if (profileRootResult == rts::validation::PROCESS_LOCAL_PROFILE_ROOT_INVALID)
+	{
+		// A present validation override must never fall back to the user's live
+		// Documents folder when it is malformed or unavailable.
+		DEBUG_CRASH(("RTS_STAGE5_VALIDATION_PROFILE_ROOT is invalid; refusing live Documents fallback."));
+		exit(1);
+	}
+
 #if defined(_MSC_VER) && (_MSC_VER < 1300)
 	// VC6 lacks FOLDERID_Documents and KF_FLAG_DEFAULT
 	const GUID FOLDERID_Documents = { 0xFDD39AD0, 0x238F, 0x46AF, 0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7 };

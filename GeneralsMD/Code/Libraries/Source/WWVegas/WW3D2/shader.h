@@ -38,7 +38,6 @@
 
 #include "WWLib/always.h"
 
-class DX8Wrapper;
 struct W3dMaterial3Struct;
 class StringClass;
 
@@ -76,10 +75,8 @@ enum ShaderShiftConstants
 
 class ShaderClass
 {
-	friend DX8Wrapper;
-
-	void	Apply();
 public:
+	void	Apply();
 
 	enum AlphaTestType
 	{
@@ -321,7 +318,7 @@ public:
 	StaticSortCategoryType	Get_SS_Category() const;
 	int							Guess_Sort_Level() const;
 
-	// DX 8 state management routines
+	// Renderer state management routines
 	static void	Invalidate() { ShaderDirty=true; }
 
 	// Global backface culling invert.  This interface can be used to globally invert all backface
@@ -439,6 +436,9 @@ protected:
 
 	unsigned int ShaderBits;
 
+	// Kept public for the legacy inline state publisher. The
+	// field remains static and retains its historical storage/ABI contract.
+public:
 	static bool ShaderDirty;
 	static unsigned long CurrentShader;
 };

@@ -37,6 +37,7 @@
 #include "Common/SpecialPowerType.h"
 #include "Common/Snapshot.h"
 #include "Common/STLTypedefs.h"
+#include "Common/LocalizedUIFontSettings.h"
 #include "Common/SubsystemInterface.h"
 #include "Common/UnicodeString.h"
 #include "GameClient/DisplayString.h"
@@ -57,6 +58,7 @@ class WindowLayout;
 class Anim2DTemplate;
 class Anim2D;
 class Shadow;
+struct FontDesc;
 enum LegalBuildCode CPP_11(: Int);
 enum KindOfType CPP_11(: Int);
 enum ShadowType CPP_11(: Int);
@@ -554,6 +556,7 @@ public:  // ********************************************************************
 
 	virtual void recreateControlBar();
 	virtual void refreshCustomUiResources();
+	void refreshLocalizedFontResources();
 	virtual void refreshNetworkLatencyResources();
 	virtual void refreshRenderFpsResources();
 	virtual void refreshSystemTimeResources();
@@ -689,6 +692,23 @@ protected:
 
 	void addMessageText( const UnicodeString& formattedMessage, const RGBColor *rgbColor = nullptr );  ///< internal workhorse for adding plain text for messages
 	void removeMessageAtIndex( Int i );				///< remove the message at index i
+	void captureIniFontSettings();
+	void applyLocalizedFontSettings();
+	void applyLocalizedFontSetting(Int index, const FontDesc* localized,
+		AsciiString& fontName, Int& pointSize, Bool& bold);
+	typedef LocalizedUIFontSettings<AsciiString, Int, Bool> InGameUIFontSettings;
+	enum
+	{
+		UI_FONT_DRAWABLE_CAPTION,
+		UI_FONT_MESSAGE,
+		UI_FONT_MILITARY_TITLE,
+		UI_FONT_MILITARY_BODY,
+		UI_FONT_SUPERWEAPON_NORMAL,
+		UI_FONT_SUPERWEAPON_READY,
+		UI_FONT_NAMED_TIMER_NORMAL,
+		UI_FONT_NAMED_TIMER_READY,
+		UI_FONT_SETTING_COUNT
+	};
 
 	void updateFloatingText();						///< Update function to move our floating text
 	void drawFloatingText();							///< Draw all our floating text
@@ -917,6 +937,9 @@ protected:
 	Bool												m_militaryCaptionRandomizeTyping;
 	Int													m_militaryCaptionDelayMS;
 	Int													m_militaryCaptionSpeed;
+
+	InGameUIFontSettings			m_iniFontSettings[UI_FONT_SETTING_COUNT];
+	Bool										m_iniFontSettingsValid;
 
 	RadiusDecalTemplate					m_radiusCursors[RADIUSCURSOR_COUNT];
 	RadiusDecal									m_curRadiusCursor;

@@ -139,6 +139,7 @@ public:
 	AsciiString generateLadderGameResultsPacket();
 	void markGameAsQM() { m_isQM = TRUE; }
 	Bool isQMGame() { return m_isQM; }
+	void bindQuickMatchMapIdentity();
 
 	virtual void init();
 	virtual void resetAccepted() override;															///< Reset the accepted flag on all players

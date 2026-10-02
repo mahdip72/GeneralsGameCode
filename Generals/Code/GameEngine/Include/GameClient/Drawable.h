@@ -561,6 +561,7 @@ public:
 	// caption text methods -----------------------------------------------------------
 	void setCaptionText( const UnicodeString& captionText );
 	void clearCaptionText();
+	void refreshCaptionFont();
 	UnicodeString getCaptionText();
 	//---------------------------------------------------------------------------------
 

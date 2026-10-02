@@ -165,6 +165,8 @@ size_t writeObject(UnsignedByte *dest, const T &value)
 
 inline size_t writeBytes(UnsignedByte *dest, const UnsignedByte *src, size_t len)
 {
+	if (len == 0)
+		return 0;
 	memcpy(dest, src, len);
 	return len;
 }

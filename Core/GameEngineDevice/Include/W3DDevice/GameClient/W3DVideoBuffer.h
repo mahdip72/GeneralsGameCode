@@ -78,12 +78,20 @@ class W3DVideoBuffer : public VideoBuffer
 		SurfaceClass	*m_surface;
 		Bool m_surfaceLocked;
 		void *m_lockedMemory;
-		Bool m_framePublished;
+		Bool m_nativePublicationPath;
+		// A failed native unlock is a visible poisoned frame, but the texture's
+		// retained CPU shadow remains available for the next lock/retry.
+		Bool m_nativePublicationPending;
 
 	public:
 
 		W3DVideoBuffer( Type format );
 		virtual ~W3DVideoBuffer() override;
+
+		// Select the native publication contract once per allocation. This keeps
+		// a backend transition from changing the interpretation of a locked
+		// legacy surface.
+		static Bool UsesNativeD3D11PublicationPath();
 
 		virtual	Bool		allocate( UnsignedInt width, UnsignedInt height) override; ///< Allocates buffer
 		virtual void		free() override;					///< Free buffer
@@ -91,7 +99,6 @@ class W3DVideoBuffer : public VideoBuffer
 		static Bool		ComputeDirectBGRA8SlicePitch(Type format,
 			UnsignedInt width, UnsignedInt height, UnsignedInt pitch,
 			size_t *slice_pitch);
-		virtual Bool		publishLockedFrame() override;	///< Publish an opaque BGRA8 frame before unlock
 		virtual void		unlock() override;				///< Release buffer
 		virtual Bool		valid() override;				///< Is the buffer valid to use
 

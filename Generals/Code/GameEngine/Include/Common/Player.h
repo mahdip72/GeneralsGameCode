@@ -439,9 +439,14 @@ public:
 
 	/// Get the enemy an ai player is currently focused on.  NOTE - Can be nullptr.
 	Player  *getCurrentEnemy();
+	Player  *getCachedCurrentEnemy() const;
 
 	/// Is this player a skirmish ai player?
 	Bool isSkirmishAIPlayer();
+#if defined(_WIN64)
+	/// Stage 5 owner-side orchestration only; workers never receive this pointer.
+	AIPlayer *getAIPlayerForPlanning() const { return m_ai; }
+#endif
 
 	/// Have the ai check for bridges.
 	virtual Bool checkBridges(Object *unit, Waypoint *way);

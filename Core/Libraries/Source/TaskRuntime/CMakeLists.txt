@@ -3,6 +3,21 @@ add_library(core_task_runtime STATIC)
 target_sources(core_task_runtime PRIVATE
     TaskRuntime.cpp
     PipelineExecutionPolicy.cpp
+    SimulationExecutionPolicy.cpp
+    MultiplayerSimulationPolicy.cpp
+    SimulationCommandBuffer.cpp
+	SimulationReadView.cpp
+	ObjectComputationIsland.cpp
+	SimulationPhaseGraph.cpp
+	SimulationPhaseGraphOwnerAdapter.cpp
+    DeterministicCrcStream.cpp
+    DeterministicCrcRuntimeAdapter.cpp
+        DeterministicCrcSnapshot.cpp
+        DeterministicCrcJobSystemAdapter.cpp
+        ObjectStatusTimerKernel.cpp
+    CollisionCandidateKernel.cpp
+    PhysicsIntegrationKernel.cpp
+    ImmutableSpatialQuery.cpp
     RadarTerrainKernel.cpp
     RadarOverlayKernel.cpp
     HeightMapTerrainKernel.cpp
@@ -19,6 +34,11 @@ target_sources(core_task_runtime PRIVATE
 
 if(NOT IS_VS6_BUILD)
     target_sources(core_task_runtime PRIVATE
+        ImmutableSpatialQueryRuntime.cpp
+        CounterBasedRng.cpp
+        DeterministicAIPlanning.cpp
+        DeterministicPathSearch.cpp
+        DeterministicPathBatch.cpp
         JobSystem.cpp
         ResourceIoPipeline.cpp
         ModelAssetBytes.cpp
@@ -60,6 +80,13 @@ else()
     )
 endif()
 
+# The modern scheduler has real allocation-failure and worker-start rollback
+# paths that throw and catch C++ exceptions. Keep unwind semantics enabled for
+# this target while leaving the VC6/C++98 adapter on its legacy flags.
+if(MSVC AND NOT IS_VS6_BUILD)
+    target_compile_options(core_task_runtime PRIVATE /EHsc)
+endif()
+
 if(RTS_BUILD_CORE_EXTRAS)
     target_compile_definitions(core_task_runtime PRIVATE
         RTS_BUILD_CORE_EXTRAS
@@ -70,5 +97,19 @@ if(UNIX)
     find_package(Threads REQUIRED)
     target_link_libraries(core_task_runtime PRIVATE
         Threads::Threads
+    )
+endif()
+
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT IS_VS6_BUILD)
+    target_sources(core_task_runtime PRIVATE
+        PerformanceReceipt.cpp
+        KernelPerformanceDiagnostics.cpp
+        KernelPerformanceReference.cpp
+    )
+endif()
+
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT IS_VS6_BUILD)
+    target_link_libraries(core_task_runtime PRIVATE
+        bcrypt
     )
 endif()

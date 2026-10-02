@@ -21,11 +21,6 @@
 #include "ddsfile.h"
 #include "WWLib/ffactory.h"
 #include "WWLib/bufffile.h"
-#include "formconv.h"
-#include "dx8wrapper.h"
-#include "bitmaphandler.h"
-#include "colorspace.h"
-#include "legacytexturecompat.h"
 
 #include <string.h>
 
@@ -36,6 +31,25 @@ namespace
 // the asset loader.
 const unsigned DDS_FILE_CAPS2_CUBEMAP = 0x00000200;
 const unsigned DDS_FILE_CAPS2_VOLUME = 0x00200000;
+
+const unsigned DDS_FILE_FOURCC_DXT1 = 0x31545844;
+const unsigned DDS_FILE_FOURCC_DXT2 = 0x32545844;
+const unsigned DDS_FILE_FOURCC_DXT3 = 0x33545844;
+const unsigned DDS_FILE_FOURCC_DXT4 = 0x34545844;
+const unsigned DDS_FILE_FOURCC_DXT5 = 0x35545844;
+
+static WW3DFormat Legacy_DDS_FourCC_To_WW3DFormat(unsigned fourCC)
+{
+	switch (fourCC)
+	{
+	case DDS_FILE_FOURCC_DXT1: return WW3D_FORMAT_DXT1;
+	case DDS_FILE_FOURCC_DXT2: return WW3D_FORMAT_DXT2;
+	case DDS_FILE_FOURCC_DXT3: return WW3D_FORMAT_DXT3;
+	case DDS_FILE_FOURCC_DXT4: return WW3D_FORMAT_DXT4;
+	case DDS_FILE_FOURCC_DXT5: return WW3D_FORMAT_DXT5;
+	default: return WW3D_FORMAT_UNKNOWN;
+	}
+}
 
 bool Is_Supported_DDS_Format(WW3DFormat format)
 {
@@ -82,93 +96,6 @@ static unsigned Legacy_DDS_Max_Mip_Levels
 	return maximum_levels;
 }
 
-}
-
-namespace
-{
-static bool Legacy_DDS_Name_Is_Compatible(const char *filename)
-{
-	const size_t length = filename != 0 ? strlen(filename) : 0;
-	return length >= 4 && filename[length - 4] == '.';
-}
-
-static bool Legacy_DDS_Format_To_Neutral(
-	WW3DFormat format, LegacyTextureDDSFormat *neutralFormat)
-{
-	if (neutralFormat == 0) return false;
-	switch (format)
-	{
-	case WW3D_FORMAT_DXT1: *neutralFormat = LEGACY_TEXTURE_DDS_DXT1; return true;
-	case WW3D_FORMAT_DXT2: *neutralFormat = LEGACY_TEXTURE_DDS_DXT2; return true;
-	case WW3D_FORMAT_DXT3: *neutralFormat = LEGACY_TEXTURE_DDS_DXT3; return true;
-	case WW3D_FORMAT_DXT4: *neutralFormat = LEGACY_TEXTURE_DDS_DXT4; return true;
-	case WW3D_FORMAT_DXT5: *neutralFormat = LEGACY_TEXTURE_DDS_DXT5; return true;
-	default: return false;
-	}
-}
-
-static const unsigned char *Legacy_DDS_Get_Level_Data(void *context,
-	UINT level)
-{
-	DDSFileClass *dds = static_cast<DDSFileClass *>(context);
-	if (dds == 0 || level >= dds->Get_Mip_Level_Count()) return 0;
-	return dds->Get_Memory_Pointer(level);
-}
-
-static UINT Legacy_DDS_Get_Level_Size(void *context, UINT level)
-{
-	DDSFileClass *dds = static_cast<DDSFileClass *>(context);
-	if (dds == 0 || level >= dds->Get_Mip_Level_Count()) return 0;
-	return dds->Get_Level_Size(level);
-}
-
-static void Legacy_DDS_Release(void *context)
-{
-	delete static_cast<DDSFileClass *>(context);
-}
-
-static bool Legacy_DDS_Decode(const char *filename,
-	LegacyTextureDDSImage *image)
-{
-	DDSFileClass *dds;
-	LegacyTextureDDSFormat neutralFormat;
-	if (image == 0) return false;
-	memset(image, 0, sizeof(*image));
-	if (!Legacy_DDS_Name_Is_Compatible(filename)) return false;
-	dds = new DDSFileClass(filename, 0);
-	if (dds == 0 || !dds->Is_Available() || dds->Get_Type() != DDS_TEXTURE ||
-		!dds->Load())
-	{
-		delete dds;
-		return false;
-	}
-	if (dds->Get_Full_Width() == 0 || dds->Get_Full_Height() == 0 ||
-		dds->Get_Mip_Level_Count() == 0 ||
-		!Legacy_DDS_Format_To_Neutral(dds->Get_Format(), &neutralFormat))
-	{
-		delete dds;
-		return false;
-	}
-	image->context = dds;
-	image->width = dds->Get_Full_Width();
-	image->height = dds->Get_Full_Height();
-	image->mipLevels = dds->Get_Mip_Level_Count();
-	image->format = neutralFormat;
-	image->getLevelData = &Legacy_DDS_Get_Level_Data;
-	image->getLevelSize = &Legacy_DDS_Get_Level_Size;
-	image->release = &Legacy_DDS_Release;
-	return true;
-}
-
-struct Legacy_DDS_Compat_Registration
-{
-	Legacy_DDS_Compat_Registration()
-	{
-		LegacyTextureCreation_Register_DDS_Decode_Callback(&Legacy_DDS_Decode);
-	}
-};
-
-Legacy_DDS_Compat_Registration g_legacyDDSCompatRegistration;
 }
 
 // ----------------------------------------------------------------------------
@@ -243,7 +170,7 @@ DDSFileClass::DDSFileClass(const char* name,unsigned reduction_factor)
 
 void DDSFileClass::Initialize_Header()
 {
-	Format=D3DFormat_To_WW3DFormat((D3DFORMAT)SurfaceDesc.PixelFormat.FourCC);
+	Format=Legacy_DDS_FourCC_To_WW3DFormat(SurfaceDesc.PixelFormat.FourCC);
 	if (!Is_Supported_DDS_Format(Format))
 	{
 		WWASSERT_PRINT(0,"File loading failed: unsupported DDS texture format");
@@ -640,6 +567,199 @@ WWINLINE static unsigned short ARGB8888_To_RGB565(unsigned argb_)
 	return rgb;
 }
 
+static unsigned Legacy_DDS_Block_Bytes(WW3DFormat format)
+{
+	if (format==WW3D_FORMAT_DXT1) return 8;
+	if (format==WW3D_FORMAT_DXT2 || format==WW3D_FORMAT_DXT3 ||
+		format==WW3D_FORMAT_DXT4 || format==WW3D_FORMAT_DXT5) return 16;
+	return 0;
+}
+
+static bool Legacy_DDS_Destination_Pitch_Is_Valid(
+	WW3DFormat format,unsigned width,unsigned pitch)
+{
+	const unsigned block_bytes=Legacy_DDS_Block_Bytes(format);
+	if (block_bytes!=0)
+	{
+		if (width>((unsigned)-1)-3U) return false;
+		const unsigned blocks=(width+3U)/4U;
+		return blocks<=((unsigned)-1)/block_bytes &&
+			pitch>=blocks*block_bytes;
+	}
+	const unsigned bytes_per_pixel=Get_Bytes_Per_Pixel(format);
+	return bytes_per_pixel!=0 && width<=((unsigned)-1)/bytes_per_pixel &&
+		pitch>=width*bytes_per_pixel;
+}
+
+static bool Legacy_DDS_Copy_Compressed_Rows(
+	const unsigned char *source,unsigned width,unsigned height,
+	WW3DFormat format,unsigned char *destination,unsigned destination_pitch)
+{
+	const unsigned block_bytes=Legacy_DDS_Block_Bytes(format);
+	if (source==0 || destination==0 || block_bytes==0 ||
+		!Legacy_DDS_Destination_Pitch_Is_Valid(
+			format,width,destination_pitch)) return false;
+	const unsigned row_bytes=((width+3U)/4U)*block_bytes;
+	const unsigned rows=(height+3U)/4U;
+	for (unsigned row=0;row<rows;++row)
+	{
+		memcpy(destination+row*destination_pitch,source+row*row_bytes,row_bytes);
+	}
+	return true;
+}
+
+static void Legacy_DDS_RGB_To_HSV(Vector3 &hsv,const Vector3 &rgb)
+{
+	float max=WWMath::Max(rgb.X,rgb.Y);
+	max=WWMath::Max(max,rgb.Z);
+	float min=WWMath::Min(rgb.X,rgb.Y);
+	min=WWMath::Min(min,rgb.Z);
+	hsv.Z=max;
+	hsv.Y=(max!=0.0f)?((max-min)/max):0.0f;
+	if (hsv.Y==0.0f) hsv.X=-1.0f;
+	else
+	{
+		const float delta=max-min;
+		if (rgb.X==max) hsv.X=(rgb.Y-rgb.Z)/delta;
+		else if (rgb.Y==max) hsv.X=2.0f+(rgb.Z-rgb.X)/delta;
+		else hsv.X=4.0f+(rgb.X-rgb.Y)/delta;
+		hsv.X*=60.0f;
+		if (hsv.X<0.0f) hsv.X+=360.0f;
+	}
+}
+
+static void Legacy_DDS_HSV_To_RGB(Vector3 &rgb,const Vector3 &hsv)
+{
+	float h=hsv.X;
+	const float s=hsv.Y;
+	const float v=hsv.Z;
+	if (s==0.0f)
+	{
+		rgb.Set(v,v,v);
+		return;
+	}
+	if (h==360.0f) h=0.0f;
+	h/=60.0f;
+	const int i=WWMath::Floor(h);
+	const float f=h-i;
+	const float p=v*(1.0f-s);
+	const float q=v*(1.0f-(s*f));
+	const float t=v*(1.0f-(s*(1.0f-f)));
+	switch (i)
+	{
+	case 0: rgb.Set(v,t,p); break;
+	case 1: rgb.Set(q,v,p); break;
+	case 2: rgb.Set(p,v,t); break;
+	case 3: rgb.Set(p,q,v); break;
+	case 4: rgb.Set(t,p,v); break;
+	case 5: rgb.Set(v,p,q); break;
+	}
+}
+
+static void Recolor(unsigned &rgba,const Vector3 &hsv_shift)
+{
+	const float alpha=((rgba&0xff000000U)>>24)/255.0f;
+	Vector3 rgb(
+		((rgba&0x00ff0000U)>>16)/255.0f,
+		((rgba&0x0000ff00U)>>8)/255.0f,
+		(rgba&0x000000ffU)/255.0f);
+	Vector3 hsv;
+	Legacy_DDS_RGB_To_HSV(hsv,rgb);
+	if (hsv.X<0.0f) hsv+=Vector3(0.0f,0.0f,hsv_shift.Z);
+	else hsv+=hsv_shift;
+	if (hsv.X<0.0f) hsv.X+=360.0f;
+	if (hsv.X>360.0f) hsv.X-=360.0f;
+	hsv.Y=WWMath::Clamp(hsv.Y,0.0f,1.0f);
+	hsv.Z=WWMath::Clamp(hsv.Z,0.0f,1.0f);
+	Legacy_DDS_HSV_To_RGB(rgb,hsv);
+	rgba=(unsigned)rgb.Convert_To_ARGB(alpha);
+}
+
+static void Legacy_DDS_Write_B8G8R8A8(
+	unsigned char *destination,WW3DFormat format,const unsigned &argb_value)
+{
+	const unsigned char *argb=(const unsigned char *)&argb_value;
+	switch (format)
+	{
+	case WW3D_FORMAT_A8R8G8B8:
+	case WW3D_FORMAT_X8R8G8B8:
+		*(unsigned *)destination=argb_value;
+		break;
+	case WW3D_FORMAT_R8G8B8:
+		destination[0]=argb[0]; destination[1]=argb[1]; destination[2]=argb[2];
+		break;
+	case WW3D_FORMAT_A4R4G4B4:
+		*(unsigned short *)destination=(unsigned short)(
+			((argb[3]&0xf0)<<8)|((argb[2]&0xf0)<<4)|
+			(argb[1]&0xf0)|((argb[0]&0xf0)>>4));
+		break;
+	case WW3D_FORMAT_A1R5G5B5:
+		*(unsigned short *)destination=(unsigned short)(
+			(argb[3]?0x8000:0)|((argb[2]&0xf8)<<7)|
+			((argb[1]&0xf8)<<2)|((argb[0]&0xf8)>>3));
+		break;
+	case WW3D_FORMAT_R5G6B5:
+		*(unsigned short *)destination=(unsigned short)(
+			((argb[2]&0xf8)<<8)|((argb[1]&0xfc)<<3)|((argb[0]&0xf8)>>3));
+		break;
+	case WW3D_FORMAT_R3G3B2:
+		destination[0]=(unsigned char)(
+			(argb[2]&0xe0)|((argb[1]&0xe0)>>3)|((argb[0]&0xc0)>>6));
+		break;
+	case WW3D_FORMAT_L8:
+		destination[0]=(unsigned char)(((unsigned)argb[0]*0x1275U+
+			(unsigned)argb[1]*0xb725U+(unsigned)argb[2]*0x3666U)>>16);
+		break;
+	case WW3D_FORMAT_A8:
+		destination[0]=argb[0];
+		break;
+	default:
+		WWASSERT(0);
+		break;
+	}
+}
+
+bool DDSFileClass::Copy_4x4_Block_From_Memory_Clipped(
+	const unsigned char* source_memory,
+	unsigned char* dest_ptr,
+	unsigned dest_pitch,
+	WW3DFormat dest_format,
+	unsigned level,
+	unsigned source_x,
+	unsigned source_y,
+	unsigned dest_width,
+	unsigned dest_height,
+	const Vector3& hsv_shift) const
+{
+	const unsigned remaining_width=dest_width-source_x;
+	const unsigned remaining_height=dest_height-source_y;
+	if (remaining_width>=4 && remaining_height>=4)
+	{
+		return Get_4x4_Block_From_Memory(source_memory,dest_ptr,dest_pitch,
+			dest_format,level,source_x,source_y,hsv_shift);
+	}
+
+	const unsigned dest_bpp=Get_Bytes_Per_Pixel(dest_format);
+	if (dest_bpp==0 || dest_bpp>4)
+	{
+		WWASSERT_PRINT(0,"Unsupported partial DDS block destination format");
+		return false;
+	}
+	unsigned char temporary_pixels[4*4*4];
+	const unsigned temporary_pitch=dest_bpp*4;
+	const bool contains_alpha=Get_4x4_Block_From_Memory(
+		source_memory,temporary_pixels,temporary_pitch,dest_format,
+		level,source_x,source_y,hsv_shift);
+	const unsigned copy_width=remaining_width<4 ? remaining_width : 4;
+	const unsigned copy_height=remaining_height<4 ? remaining_height : 4;
+	for (unsigned row=0;row<copy_height;++row)
+	{
+		memcpy(dest_ptr+row*dest_pitch,temporary_pixels+row*temporary_pitch,
+			copy_width*dest_bpp);
+	}
+	return contains_alpha;
+}
+
 
 // ----------------------------------------------------------------------------
 //
@@ -647,30 +767,6 @@ WWINLINE static unsigned short ARGB8888_To_RGB565(unsigned argb_)
 // Copy_Level_To_Surface function (see below).
 //
 // ----------------------------------------------------------------------------
-
-void DDSFileClass::Copy_Level_To_Surface(unsigned level,IDirect3DSurface8* d3d_surface,const Vector3& hsv_shift)
-{
-	WWASSERT(d3d_surface);
-	// Verify that the destination surface size matches the source surface size
-	D3DSURFACE_DESC surface_desc;
-	DX8_ErrorCode(d3d_surface->GetDesc(&surface_desc));
-
-	// First lock the surface
-	D3DLOCKED_RECT locked_rect;
-	DX8_ErrorCode(d3d_surface->LockRect(&locked_rect,nullptr,0));
-
-	Copy_Level_To_Surface(
-		level,
-		D3DFormat_To_WW3DFormat(surface_desc.Format),
-		surface_desc.Width,
-		surface_desc.Height,
-		reinterpret_cast<unsigned char*>(locked_rect.pBits),
-		locked_rect.Pitch,
-		hsv_shift);
-
-	// Finally, unlock the surface
-	DX8_ErrorCode(d3d_surface->UnlockRect());
-}
 
 // ----------------------------------------------------------------------------
 //
@@ -701,6 +797,12 @@ void DDSFileClass::Copy_Level_To_Surface
 		WWASSERT_PRINT(DDSMemory,"Surface mip level pointer is missing");
 		return;
 	}
+	if (!Legacy_DDS_Destination_Pitch_Is_Valid(
+		dest_format,dest_width,dest_pitch))
+	{
+		WWASSERT_PRINT(0,"Surface destination pitch is invalid");
+		return;
+	}
 
 	// If the format and size is a match just copy the contents
 	bool has_hsv_shift = hsv_shift[0]!=0.0f || hsv_shift[1]!=0.0f || hsv_shift[2]!=0.0f;
@@ -708,9 +810,10 @@ void DDSFileClass::Copy_Level_To_Surface
 		// If hue shift, we can't just copy...
 		if (has_hsv_shift) {
 			if (Format==WW3D_FORMAT_DXT1) {
-				const unsigned* src_ptr=reinterpret_cast<const unsigned*>(Get_Memory_Pointer(level));
-				unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface);
+				const unsigned* source_base=reinterpret_cast<const unsigned*>(Get_Memory_Pointer(level));
 				for (unsigned y=0;y<dest_height;y+=4) {
+					const unsigned* src_ptr=source_base+(y/4)*((dest_width+3)/4)*2;
+					unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface+(y/4)*dest_pitch);
 					for (unsigned x=0;x<dest_width;x+=4) {
 						unsigned cols=*src_ptr++;		// Bytes 1-4 of color block
 						unsigned col0=RGB565_To_ARGB8888((unsigned short)(cols>>16));
@@ -727,9 +830,10 @@ void DDSFileClass::Copy_Level_To_Surface
 				}
 			}
 			else if (Format==WW3D_FORMAT_DXT5) {
-				const unsigned* src_ptr=reinterpret_cast<const unsigned*>(Get_Memory_Pointer(level));
-				unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface);
+				const unsigned* source_base=reinterpret_cast<const unsigned*>(Get_Memory_Pointer(level));
 				for (unsigned y=0;y<dest_height;y+=4) {
+					const unsigned* src_ptr=source_base+(y/4)*((dest_width+3)/4)*4;
+					unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface+(y/4)*dest_pitch);
 					for (unsigned x=0;x<dest_width;x+=4) {
 						*dest_ptr++=*src_ptr++;		// Bytes 1-4 of alpha block
 						*dest_ptr++=*src_ptr++;		// Bytes 5-8 of alpha block
@@ -753,8 +857,9 @@ void DDSFileClass::Copy_Level_To_Surface
 
 		}
 		else {
-			unsigned compressed_size=Get_Level_Size(level);
-			memcpy(dest_surface,Get_Memory_Pointer(level),compressed_size);
+			if (!Legacy_DDS_Copy_Compressed_Rows(Get_Memory_Pointer(level),
+				dest_width,dest_height,Format,dest_surface,dest_pitch))
+				WWASSERT_PRINT(0,"Surface compressed copy failed");
 		}
 	}
 	else {
@@ -766,9 +871,10 @@ void DDSFileClass::Copy_Level_To_Surface
 			if (Format==WW3D_FORMAT_DXT1 && dest_format==WW3D_FORMAT_DXT2) {
 				// If hue shift, we can't just copy...
 				if (has_hsv_shift) {
-					const unsigned* src_ptr=reinterpret_cast<const unsigned*>(Get_Memory_Pointer(level));
-					unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface);
+					const unsigned* source_base=reinterpret_cast<const unsigned*>(Get_Memory_Pointer(level));
 					for (unsigned y=0;y<dest_height;y+=4) {
+						const unsigned* src_ptr=source_base+(y/4)*((dest_width+3)/4)*2;
+						unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface+(y/4)*dest_pitch);
 						for (unsigned x=0;x<dest_width;x+=4) {
 							*dest_ptr++=0xffffffff;		// Bytes 1-4 of alpha block
 							*dest_ptr++=0xffffffff;		// Bytes 5-8 of alpha block
@@ -789,9 +895,10 @@ void DDSFileClass::Copy_Level_To_Surface
 					}
 				}
 				else {
-					const unsigned* src_ptr=reinterpret_cast<const unsigned*>(Get_Memory_Pointer(level));
-					unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface);
+					const unsigned* source_base=reinterpret_cast<const unsigned*>(Get_Memory_Pointer(level));
 					for (unsigned y=0;y<dest_height;y+=4) {
+						const unsigned* src_ptr=source_base+(y/4)*((dest_width+3)/4)*2;
+						unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface+(y/4)*dest_pitch);
 						for (unsigned x=0;x<dest_width;x+=4) {
 							*dest_ptr++=0xffffffff;		// Bytes 1-4 of alpha block
 							*dest_ptr++=0xffffffff;		// Bytes 5-8 of alpha block
@@ -810,7 +917,9 @@ void DDSFileClass::Copy_Level_To_Surface
 					unsigned char* dest_ptr=dest_surface;
 					dest_ptr+=y*dest_pitch;
 					for (unsigned x=0;x<dest_width;x+=4,dest_ptr+=dest_bpp*4) {
-						contains_alpha|=Get_4x4_Block(dest_ptr,dest_pitch,dest_format,level,x,y,hsv_shift);
+						contains_alpha|=Copy_4x4_Block_From_Memory_Clipped(
+							Get_Memory_Pointer(level),dest_ptr,dest_pitch,
+							dest_format,level,x,y,dest_width,dest_height,hsv_shift);
 					}
 				}
 				if (Format==WW3D_FORMAT_DXT1 && contains_alpha) {
@@ -862,6 +971,12 @@ void DDSFileClass::Copy_CubeMap_Level_To_Surface
 		WWASSERT_PRINT(DDSMemory,"Surface mip level pointer is missing");
 		return;
 	}
+	if (!Legacy_DDS_Destination_Pitch_Is_Valid(
+		dest_format,dest_width,dest_pitch))
+	{
+		WWASSERT_PRINT(0,"Cube surface destination pitch is invalid");
+		return;
+	}
 
 	// If the format and size is a match just copy the contents
 	bool has_hsv_shift = hsv_shift[0]!=0.0f || hsv_shift[1]!=0.0f || hsv_shift[2]!=0.0f;
@@ -872,10 +987,11 @@ void DDSFileClass::Copy_CubeMap_Level_To_Surface
 		{
 			if (Format==WW3D_FORMAT_DXT1)
 			{
-				const unsigned* src_ptr=reinterpret_cast<const unsigned*>(Get_CubeMap_Memory_Pointer(face,level));
-				unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface);
+				const unsigned* source_base=reinterpret_cast<const unsigned*>(Get_CubeMap_Memory_Pointer(face,level));
 				for (unsigned y=0;y<dest_height;y+=4)
 				{
+					const unsigned* src_ptr=source_base+(y/4)*((dest_width+3)/4)*2;
+					unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface+(y/4)*dest_pitch);
 					for (unsigned x=0;x<dest_width;x+=4)
 					{
 						unsigned cols=*src_ptr++;		// Bytes 1-4 of color block
@@ -894,10 +1010,11 @@ void DDSFileClass::Copy_CubeMap_Level_To_Surface
 			}
 			else if (Format==WW3D_FORMAT_DXT5)
 			{
-				const unsigned* src_ptr=reinterpret_cast<const unsigned*>(Get_CubeMap_Memory_Pointer(face,level));
-				unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface);
+				const unsigned* source_base=reinterpret_cast<const unsigned*>(Get_CubeMap_Memory_Pointer(face,level));
 				for (unsigned y=0;y<dest_height;y+=4)
 				{
+					const unsigned* src_ptr=source_base+(y/4)*((dest_width+3)/4)*4;
+					unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface+(y/4)*dest_pitch);
 					for (unsigned x=0;x<dest_width;x+=4)
 					{
 						*dest_ptr++=*src_ptr++;		// Bytes 1-4 of alpha block
@@ -924,8 +1041,10 @@ void DDSFileClass::Copy_CubeMap_Level_To_Surface
 		}
 		else
 		{
-			unsigned compressed_size=Get_Level_Size(level);
-			memcpy(dest_surface,Get_CubeMap_Memory_Pointer(face,level),compressed_size);
+			if (!Legacy_DDS_Copy_Compressed_Rows(
+				Get_CubeMap_Memory_Pointer(face,level),dest_width,dest_height,
+				Format,dest_surface,dest_pitch))
+				WWASSERT_PRINT(0,"Cube surface compressed copy failed");
 		}
 	}
 	else
@@ -941,10 +1060,11 @@ void DDSFileClass::Copy_CubeMap_Level_To_Surface
 				// If hue shift, we can't just copy...
 				if (has_hsv_shift)
 				{
-					const unsigned* src_ptr=reinterpret_cast<const unsigned*>(Get_CubeMap_Memory_Pointer(face,level));
-					unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface);
+					const unsigned* source_base=reinterpret_cast<const unsigned*>(Get_CubeMap_Memory_Pointer(face,level));
 					for (unsigned y=0;y<dest_height;y+=4)
 					{
+						const unsigned* src_ptr=source_base+(y/4)*((dest_width+3)/4)*2;
+						unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface+(y/4)*dest_pitch);
 						for (unsigned x=0;x<dest_width;x+=4)
 						{
 							*dest_ptr++=0xffffffff;		// Bytes 1-4 of alpha block
@@ -967,10 +1087,11 @@ void DDSFileClass::Copy_CubeMap_Level_To_Surface
 				}
 				else
 				{
-					const unsigned* src_ptr=reinterpret_cast<const unsigned*>(Get_CubeMap_Memory_Pointer(face,level));
-					unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface);
+					const unsigned* source_base=reinterpret_cast<const unsigned*>(Get_CubeMap_Memory_Pointer(face,level));
 					for (unsigned y=0;y<dest_height;y+=4)
 					{
+						const unsigned* src_ptr=source_base+(y/4)*((dest_width+3)/4)*2;
+						unsigned* dest_ptr=reinterpret_cast<unsigned*>(dest_surface+(y/4)*dest_pitch);
 						for (unsigned x=0;x<dest_width;x+=4)
 						{
 							*dest_ptr++=0xffffffff;		// Bytes 1-4 of alpha block
@@ -993,9 +1114,10 @@ void DDSFileClass::Copy_CubeMap_Level_To_Surface
 					dest_ptr+=y*dest_pitch;
 					for (unsigned x=0;x<dest_width;x+=4,dest_ptr+=dest_bpp*4)
 					{
-						contains_alpha|=Get_4x4_Block_From_Memory(
+						contains_alpha|=Copy_4x4_Block_From_Memory_Clipped(
 							Get_CubeMap_Memory_Pointer(face,level),dest_ptr,
-							dest_pitch,dest_format,level,x,y,hsv_shift);
+							dest_pitch,dest_format,level,x,y,
+							dest_width,dest_height,hsv_shift);
 					}
 				}
 				if (Format==WW3D_FORMAT_DXT1 && contains_alpha)
@@ -1417,7 +1539,7 @@ bool DDSFileClass::Get_4x4_Block_From_Memory(
 						}
 						line>>=2;
 
-						BitmapHandlerClass::Write_B8G8R8A8(tmp_dest_ptr,dest_format,dest_pixel);
+						Legacy_DDS_Write_B8G8R8A8(tmp_dest_ptr,dest_format,dest_pixel);
 						tmp_dest_ptr+=dest_bpp;
 					}
 				}
@@ -1442,7 +1564,7 @@ bool DDSFileClass::Get_4x4_Block_From_Memory(
 						}
 						line>>=2;
 
-						BitmapHandlerClass::Write_B8G8R8A8(tmp_dest_ptr,dest_format,dest_pixel);
+						Legacy_DDS_Write_B8G8R8A8(tmp_dest_ptr,dest_format,dest_pixel);
 						tmp_dest_ptr+=dest_bpp;
 					}
 				}
@@ -1531,7 +1653,7 @@ bool DDSFileClass::Get_4x4_Block_From_Memory(
 					}
 					line>>=2;
 
-					BitmapHandlerClass::Write_B8G8R8A8(tmp_dest_ptr,dest_format,dest_pixel);
+					Legacy_DDS_Write_B8G8R8A8(tmp_dest_ptr,dest_format,dest_pixel);
 					tmp_dest_ptr+=dest_bpp;
 				}
 			}
@@ -1573,7 +1695,7 @@ bool DDSFileClass::Get_4x4_Block_From_Memory(
 					}
 					line>>=2;
 
-					BitmapHandlerClass::Write_B8G8R8A8(tmp_dest_ptr,dest_format,dest_pixel);
+					Legacy_DDS_Write_B8G8R8A8(tmp_dest_ptr,dest_format,dest_pixel);
 					tmp_dest_ptr+=dest_bpp;
 				}
 			}

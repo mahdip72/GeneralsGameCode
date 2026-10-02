@@ -26,11 +26,15 @@ else()
         CXX_STANDARD_REQUIRED YES
         CXX_EXTENSIONS NO
     )
+    if(MSVC)
+        target_compile_options(core_job_system_tests PRIVATE /EHsc)
+    endif()
 endif()
 
 if(MINGW)
     target_link_options(core_job_system_tests PRIVATE -mconsole)
 endif()
 
-add_test(NAME core_job_system_tests COMMAND core_job_system_tests)
+add_test(NAME core_job_system_tests COMMAND core_job_system_tests
+    --local-capacity)
 set_tests_properties(core_job_system_tests PROPERTIES TIMEOUT 30)

@@ -123,7 +123,6 @@ public:
 protected:
 	// Update arrays.
 	void						Update_Arrays(Vector3 *point_loc,
-									Vector4 *point_diffuse,
 									float *point_size,
 									unsigned char *point_orientation,
 									unsigned char *point_frame,
@@ -203,7 +202,7 @@ protected:
 	// arrays, and the Shutdown function (which is called by WW3D::Shutdown()
 	// releases them.
 public:
-	static void				_Init();
+	static bool				_Init();
 	static void				_Shutdown();
 
 private:

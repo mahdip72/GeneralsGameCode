@@ -18,11 +18,11 @@
 
 #include "texturethumbnail.h"
 #include "WWLib/hashtemplate.h"
-#include "missingtexture.h"
+#include "WW3D2/missingtexture.h"
 #include "WWLib/TARGA.h"
 #include "ww3dformat.h"
 #include "ddsfile.h"
-#include "textureloader.h"
+#include "WW3D2/textureloader.h"
 #include "bitmaphandler.h"
 #include "WWLib/ffactory.h"
 #include "WWLib/RAWFILE.h"

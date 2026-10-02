@@ -37,6 +37,7 @@ foreach(_skinning_target IN LISTS _skinning_test_targets)
     if(MINGW)
         target_link_options(${_skinning_target} PRIVATE -mconsole)
     endif()
-    add_test(NAME ${_skinning_target} COMMAND ${_skinning_target})
+    add_test(NAME ${_skinning_target} COMMAND ${_skinning_target}
+        --local-capacity)
     set_tests_properties(${_skinning_target} PROPERTIES TIMEOUT 90)
 endforeach()

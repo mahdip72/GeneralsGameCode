@@ -45,6 +45,7 @@
 
 // FORWARD REFERENCES /////////////////////////////////////////////////////////////////////////////
 class Drawable;
+class WorldHeightMap;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 enum {MAX_WAYPOINTS=25};
@@ -283,6 +284,10 @@ private:
 	Bool		m_lastScreenToTerrainValid;
 	ICoord2D	m_lastScreenToTerrainScreen;
 	Coord3D		m_lastScreenToTerrainWorld;
+	const WorldHeightMap *m_shellTerrainSizedMap;
+	Int			m_shellTerrainDrawWidth;
+	Int			m_shellTerrainDrawHeight;
+	float		m_shellTerrainViewportAspect;
 
 	Coord3D m_previousLookAtPosition;
 	Coord2D m_scrollAmount;													///< scroll speed
@@ -330,7 +335,7 @@ private:
 	void pitchCameraOneFrame();							///< Do one frame of a pitch camera movement.
 	void getAxisAlignedViewRegion(Region3D &axisAlignedRegion);	///< Find 3D Region enclosing all possible drawables.
 	void calcDeltaScroll(Coord2D &screenDelta);
-	bool getDesiredTerrainDrawSize(ICoord2D &dimensions) const;
+	bool getDesiredTerrainDrawSize(ICoord2D &dimensions);
 	void updateTerrain();
 
 	// (gth) C&C3 animation controlled camera feature

@@ -28,8 +28,13 @@
 #include "streakRender.h"
 #include "ww3d.h"
 #include "rinfo.h"
-#include "dx8wrapper.h"
-#include "sortingrenderer.h"
+#include "w3d_file.h"
+#include "WW3D2/vertmaterial.h"
+#include "WW3D2/dx8vertexbuffer.h"
+#include "WW3D2/dx8indexbuffer.h"
+#include "Renderer/RenderGameClient.h"
+#include "Renderer/LegacyColorPacking.h"
+#include "WWMath/sphere.h"
 #include "WWMath/vp.h"
 #include "WWMath/Vector3i.h"
 #include "WWLib/RANDOM.h"
@@ -50,6 +55,17 @@
 #define MAX_STREAK_POINT_BUFFER_SIZE (1 + STREAK_CHUNK_SIZE)
 // This macro depends on the assumption that each line segment is two polys.
 #define MAX_STREAK_POLY_BUFFER_SIZE (STREAK_CHUNK_SIZE * 2)
+
+static rts::render::GameBoundingSphere ToGameBoundingSphere(
+	const SphereClass &sphere)
+{
+	rts::render::GameBoundingSphere result;
+	result.centerX = sphere.Center.X;
+	result.centerY = sphere.Center.Y;
+	result.centerZ = sphere.Center.Z;
+	result.radius = sphere.Radius;
+	return result;
+}
 
 
 
@@ -311,11 +327,11 @@ void StreakRendererClass::RenderStreak
 )
 {
 	Matrix4x4 view;
-	DX8Wrapper::Get_Transform(D3DTS_VIEW,view);
+	rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_VIEW, &view);
 
 	Matrix4x4 identity(true);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,identity);
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,identity);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD, identity);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, identity);
 
 	/*
 	** Handle texture UV offset animation (done once for entire line).
@@ -1277,7 +1293,7 @@ void StreakRendererClass::RenderStreak
 
 		// If color is not white or opacity not 100%, enable gradient in shader and in renderer - otherwise disable.
 		//unsigned int rgba;
-		//rgba=DX8Wrapper::Convert_Color(Color,Opacity);
+		// Gradient modulation is carried by the renderer-neutral shader state.
 		//bool rgba_all=(rgba==0xFFFFFFFF);
 
 //		int colorIndex = 0;
@@ -1286,7 +1302,7 @@ void StreakRendererClass::RenderStreak
 //			//vertexArray[vertexIndex].diffuse = rgba;/// OLD WAY COLORS THEM ALL TO THE COLOR,OPACITY MEMBERS /////////////////
 //			unsigned int perPointARGB;
 //			colorIndex = MIN(vertexIndex / 2, point_cnt);
-//			perPointARGB = DX8Wrapper::Convert_Color( colors[colorIndex] );// twice as many verts as points? or so?
+		//			perPointARGB = PackLegacyARGB(colors[colorIndex]);// twice as many verts as points? or so?
 //			vertexArray[vertexIndex].diffuse = perPointARGB;
 //			vertexArray[vertexIndex].u1 = (float)((vertexIndex&2) == 2);
 //			vertexArray[vertexIndex].v1 = (float)((vertexIndex&1) == 1);
@@ -1303,7 +1319,7 @@ void StreakRendererClass::RenderStreak
 
 		VertexMaterialClass *mat;
 		mat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-		DX8Wrapper::Set_Material(mat);
+		rts::render::SetGameMaterial(mat);
 		REF_PTR_RELEASE(mat);
 
 		// If Texture is non-null enable texturing in shader - otherwise disable.
@@ -1322,20 +1338,24 @@ void StreakRendererClass::RenderStreak
 		** Render
 		*/
 
-		DynamicVBAccessClass Verts((sorting?BUFFER_TYPE_DYNAMIC_SORTING:BUFFER_TYPE_DYNAMIC_DX8),dynamic_fvf_type,vnum);
+		rts::render::GameBufferType buffer_type = sorting ?
+			rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+			rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE;
+		DynamicVBAccessClass Verts(buffer_type, dynamic_fvf_type, vnum);
+		if (!Verts.Is_Valid()) {
+			rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
+			return;
+		}
 		// Copy in the data to the  VB
 		{
 			DynamicVBAccessClass::WriteLockClass Lock(&Verts);
 			unsigned int i;
 			unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
+			if (!Lock.Is_Locked() || vb == nullptr) {
+				rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
+				return;
+			}
 			const FVFInfoClass& fvfinfo=Verts.FVF_Info();
-			int segIdx = 0;
-			unsigned int argb = 0x00000000;
-
-			unsigned int oddEven = 0;
-
-			//oddEven = ( personalities[0] & 1 );
-
 			const unsigned verticesOffset = fvfinfo.Get_Location_Offset();
 			const unsigned diffuseOffset = fvfinfo.Get_Diffuse_Offset();
 			const unsigned textureOffset = fvfinfo.Get_Tex_Offset(0);
@@ -1349,19 +1369,34 @@ void StreakRendererClass::RenderStreak
 				vertex->X = vertexArray[i].x;
 				vertex->Y = vertexArray[i].y;
 				vertex->Z = vertexArray[i].z;
-				*reinterpret_cast<unsigned int *>(vb + diffuseOffset) = DX8Wrapper::Convert_Color_Clamp(colors[MIN((i/2), point_cnt)]); // TODO: Does not work correctly when subdivision are not 0
+				const Vector4 &color = colors[MIN((i/2), point_cnt)];
+				*reinterpret_cast<unsigned int *>(vb + diffuseOffset) =
+					rts::render::PackLegacyARGB(color.X, color.Y, color.Z,
+					color.W); // TODO: Does not work correctly when subdivision are not 0
 				Vector2 *texture = reinterpret_cast<Vector2 *>(vb + textureOffset);
 				texture->U = vertexArray[i].u1;
 				texture->V = vertexArray[i].v1;
 				vb += vbSize;
 			}
+			if (!Lock.Commit()) {
+				rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
+				return;
+			}
 		}
 
-		DynamicIBAccessClass ib_access((sorting?BUFFER_TYPE_DYNAMIC_SORTING:BUFFER_TYPE_DYNAMIC_DX8),triangleIndex*3);
+		DynamicIBAccessClass ib_access(buffer_type, triangleIndex * 3);
+		if (!ib_access.Is_Valid()) {
+			rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
+			return;
+		}
 		{
 			unsigned int i;
 			DynamicIBAccessClass::WriteLockClass lock(&ib_access);
 			unsigned short* inds=lock.Get_Index_Array();
+			if (!lock.Is_Locked() || inds == nullptr) {
+				rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
+				return;
+			}
 
 			for (i=0; i<triangleIndex; i++)
 			{
@@ -1369,26 +1404,34 @@ void StreakRendererClass::RenderStreak
 				*inds++=v_index_array[i].J;
 				*inds++=v_index_array[i].K;
 			}
+			if (!lock.Commit()) {
+				rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
+				return;
+			}
 		}
 
 
-		DX8Wrapper::Set_Index_Buffer(ib_access,0);
-		DX8Wrapper::Set_Vertex_Buffer(Verts);
-		DX8Wrapper::Set_Texture(0,Texture);
-		DX8Wrapper::Set_Shader(shader);
+		if (!rts::render::SetGameIndexBuffer(ib_access, 0) ||
+			!rts::render::SetGameVertexBuffer(Verts)) {
+			rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
+			return;
+		}
+		rts::render::SetGameTexture(0, Texture);
+		rts::render::SetGameShader(shader);
 
 		if (sorting)
 		{
-			SortingRendererClass::Insert_Triangles(obj_sphere,0,triangleIndex,0,vnum);
+			rts::render::DrawGameSortedTriangles(
+				ToGameBoundingSphere(obj_sphere), 0, triangleIndex, 0, vnum);
 		}
 		else
 		{
-			DX8Wrapper::Draw_Triangles(0,triangleIndex,0,vnum);
+			rts::render::DrawGameTriangles(0, triangleIndex, 0, vnum);
 		}
 
 	}
 
-	DX8Wrapper::Set_Transform(D3DTS_VIEW,view);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_VIEW, view);
 
 }
 

@@ -214,6 +214,10 @@ foreach ($relativePath in $relativeFiles) {
     $currentText = [IO.File]::ReadAllText($currentPath)
     $currentMatches = @(Get-LiveRendererBypassMatches $currentText $relativePath)
     $totalMatches += $currentMatches.Count
+    # A nonnegative baseline cannot be exceeded by zero current matches.
+    if ($currentMatches.Count -eq 0) {
+        continue
+    }
 
     $baselineText = ''
     $baselinePathExists = @(& git -C $sourceRootPath ls-tree -r --name-only $Baseline -- $relativePath)

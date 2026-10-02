@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://generalsgamecode.invalid/schemas/stage5-reviewed-native-kernel-fixture.json",
+  "title": "GeneralsGameCode reviewed native dense kernel fixture",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "evidenceKind",
+    "reviewStatus",
+    "reviewScope",
+    "reviewedUtc",
+    "reviewedBy",
+    "title",
+    "sourceCommit",
+    "artifactSetSha256",
+    "runtimeClosure",
+    "executableSha256",
+    "fixture",
+    "requirements"
+  ],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "evidenceKind": { "type": "string", "const": "stage5-reviewed-native-kernel-fixture" },
+    "reviewStatus": { "type": "string", "const": "approved" },
+    "reviewScope": { "type": "string", "const": "native-dense-eight-player-kernel-execution-v1" },
+    "reviewedUtc": { "$ref": "#/$defs/canonicalUtc" },
+    "reviewedBy": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@ -]*$"
+    },
+    "title": { "type": "string", "enum": ["Generals", "ZeroHour"] },
+    "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "artifactSetSha256": { "$ref": "#/$defs/sha256" },
+    "runtimeClosure": { "$ref": "#/$defs/runtimeClosure" },
+    "executableSha256": { "$ref": "#/$defs/sha256" },
+    "fixture": { "$ref": "#/$defs/fixture" },
+    "requirements": { "$ref": "#/$defs/requirements" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9A-F]{64}$"
+    },
+    "canonicalUtc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{7}Z$"
+    },
+    "runtimeClosure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependencyManifestSha256", "closureSha256"],
+      "properties": {
+        "dependencyManifestSha256": { "$ref": "#/$defs/sha256" },
+        "closureSha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "source",
+        "profileRelativePath",
+        "mapKey",
+        "sha256",
+        "byteCount",
+        "seed",
+        "frameBudget",
+        "expectedPlayerCount",
+        "minimumInitialUnitCount",
+        "minimumPeakUnitCount"
+      ],
+      "properties": {
+        "id": { "type": "string", "const": "dense-eight-player" },
+        "kind": { "type": "string", "const": "native-map" },
+        "source": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-][A-Za-z0-9_. -]{0,127}\\.map$"
+        },
+        "profileRelativePath": {
+          "type": "string",
+          "pattern": "^Maps\\\\[A-Za-z0-9_-][A-Za-z0-9_. -]{0,63}\\\\[A-Za-z0-9_-][A-Za-z0-9_. -]{0,127}\\.map$"
+        },
+        "mapKey": {
+          "type": "string",
+          "pattern": "^Maps\\\\[A-Za-z0-9_-][A-Za-z0-9_. -]{0,63}\\\\[A-Za-z0-9_-][A-Za-z0-9_. -]{0,127}\\.map$"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "byteCount": { "type": "integer", "minimum": 16384, "maximum": 67108864 },
+        "seed": { "type": "integer", "minimum": 1, "maximum": 2147483647 },
+        "frameBudget": { "type": "integer", "minimum": 1, "maximum": 108000 },
+        "expectedPlayerCount": { "const": 8 },
+        "minimumInitialUnitCount": { "type": "integer", "minimum": 8000 },
+        "minimumPeakUnitCount": { "type": "integer", "minimum": 8000 }
+      }
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nativeMapLoad",
+        "exactEightPlayerRoster",
+        "naturalVictory",
+        "naturallyClosedReplay",
+        "requiredKernelFamilies"
+      ],
+      "properties": {
+        "nativeMapLoad": { "const": true },
+        "exactEightPlayerRoster": { "const": true },
+        "naturalVictory": { "const": true },
+        "naturallyClosedReplay": { "const": true },
+        "requiredKernelFamilies": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "prefixItems": [
+            { "type": "string", "const": "physics" },
+            { "type": "string", "const": "status" },
+            { "type": "string", "const": "collision" },
+            { "type": "string", "const": "ai-planning" },
+            { "type": "string", "const": "spatial" },
+            { "type": "string", "const": "path" }
+          ],
+          "items": false
+        }
+      }
+    }
+  }
+}

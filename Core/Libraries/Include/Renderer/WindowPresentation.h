@@ -91,6 +91,32 @@ inline bool ReadWindowStyle(HWND window, int index, DWORD *value)
 	return true;
 }
 
+inline bool AdjustWindowRectForWindowDpi(HWND window, RECT *rect,
+	DWORD style, DWORD exStyle)
+{
+	// Resolve the APIs at runtime so the legacy Windows target can still load.
+	HMODULE user32 = GetModuleHandleA("user32.dll");
+	if (user32 != 0)
+	{
+		typedef UINT (WINAPI *GetDpiForWindowProc)(HWND);
+		typedef BOOL (WINAPI *AdjustWindowRectExForDpiProc)(
+			LPRECT, DWORD, BOOL, DWORD, UINT);
+		GetDpiForWindowProc getDpiForWindow =
+			reinterpret_cast<GetDpiForWindowProc>(
+				GetProcAddress(user32, "GetDpiForWindow"));
+		AdjustWindowRectExForDpiProc adjustForDpi =
+			reinterpret_cast<AdjustWindowRectExForDpiProc>(
+				GetProcAddress(user32, "AdjustWindowRectExForDpi"));
+		if (getDpiForWindow != 0 && adjustForDpi != 0)
+		{
+			const UINT dpi = getDpiForWindow(window);
+			if (dpi != 0)
+				return adjustForDpi(rect, style, FALSE, exStyle, dpi) != FALSE;
+		}
+	}
+	return AdjustWindowRectEx(rect, style, FALSE, exStyle) != FALSE;
+}
+
 inline bool WriteWindowStyle(HWND window, int index, DWORD value)
 {
 	if (window == 0)

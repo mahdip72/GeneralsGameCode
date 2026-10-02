@@ -63,6 +63,33 @@ function Get-TokenViolations {
         }
     }
 
+    $policyStart = $Source.IndexOf(
+        'Bool ConnectionManager::resolveNetworkSimulationPolicy()',
+        [StringComparison]::Ordinal)
+    $policyEnd = if ($policyStart -ge 0) {
+        $Source.IndexOf('void ConnectionManager::beginNetworkHello()', $policyStart,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    if ($policyStart -lt 0 -or $policyEnd -lt 0) {
+        $violations.Add('network simulation-policy resolution path is missing')
+    } else {
+        $policy = $Source.Substring($policyStart, $policyEnd - $policyStart)
+        $resolveIndex = $policy.IndexOf(
+            'if (!rts::ResolveMultiplayerSimulationSessionPolicy(',
+            [StringComparison]::Ordinal)
+        $rejectionIndex = if ($resolveIndex -ge 0) {
+            $policy.IndexOf('return FALSE;', $resolveIndex,
+                [StringComparison]::Ordinal)
+        } else { -1 }
+        $publishIndex = $policy.IndexOf(
+            'm_networkSimulationPolicyResolved = TRUE;',
+            [StringComparison]::Ordinal)
+        if ($resolveIndex -lt 0 -or $rejectionIndex -lt $resolveIndex -or
+            $publishIndex -lt $rejectionIndex) {
+            $violations.Add('NET3 policy rejection must fail closed before resolved-policy publication')
+        }
+    }
+
     $ackStart = $Source.IndexOf('Bool ConnectionManager::sendNetworkHelloAck(',
         [StringComparison]::Ordinal)
     $ackEnd = if ($ackStart -ge 0) {
@@ -580,6 +607,23 @@ function Get-TokenViolations {
                 $violations.Add("NET3 handshake must retain its bounded retry/timeout failure gate '$required'")
             }
         }
+        $completeIndex = $service.IndexOf('IsNetworkHelloComplete(',
+            [StringComparison]::Ordinal)
+        $resolveIndex = $service.IndexOf('if (!resolveNetworkSimulationPolicy())',
+            [StringComparison]::Ordinal)
+        $rejectIndex = if ($resolveIndex -ge 0) {
+            $service.IndexOf('rejectNetworkHello(-1,', $resolveIndex,
+                [StringComparison]::Ordinal)
+        } else { -1 }
+        $openIndex = $service.IndexOf('m_networkHelloRequired = FALSE;',
+            [StringComparison]::Ordinal)
+        $drainIndex = $service.IndexOf('drainNetworkHelloPendingCommands();',
+            [StringComparison]::Ordinal)
+        if ($completeIndex -lt 0 -or $resolveIndex -lt $completeIndex -or
+            $rejectIndex -lt $resolveIndex -or $openIndex -lt $rejectIndex -or
+            $drainIndex -lt $openIndex) {
+            $violations.Add('NET3 policy rejection must close the Hello gate before command drain')
+        }
     }
 
     $deferStart = $Source.IndexOf('void ConnectionManager::deferNetworkMessage(',
@@ -936,15 +980,25 @@ function Get-TokenViolations {
         }
     }
 
-    $nativeStart = $RuntimeCMake.IndexOf('elseif(RTS_BUILD_PRODUCT', [StringComparison]::Ordinal)
+    $moduleMarker = "# RTS_NATIVE_PRODUCT_RUNTIME_MODULE`n"
+    $nativeStart = $RuntimeCMake.IndexOf($moduleMarker, [StringComparison]::Ordinal)
+    if ($nativeStart -ge 0) {
+        $win32Block = $RuntimeCMake.Substring(0, $nativeStart)
+        $nativeBlock = $RuntimeCMake.Substring($nativeStart + $moduleMarker.Length)
+    } else {
+        # Retain the compact combined-block fixture accepted by the self-test.
+        $nativeStart = $RuntimeCMake.IndexOf('elseif(RTS_BUILD_PRODUCT', [StringComparison]::Ordinal)
+        if ($nativeStart -ge 0) {
+            $win32Block = $RuntimeCMake.Substring(0, $nativeStart)
+            $nativeBlock = $RuntimeCMake.Substring($nativeStart)
+        }
+    }
     if ($nativeStart -lt 0) {
         $violations.Add('native runtime dependency block is missing')
     } else {
-        $nativeBlock = $RuntimeCMake.Substring($nativeStart)
-        if ($nativeBlock -notmatch '(?m)^        bcrypt$') {
+        if ($nativeBlock -notmatch '(?m)^\s*bcrypt$') {
             $violations.Add('native runtime dependency block does not link bcrypt')
         }
-        $win32Block = $RuntimeCMake.Substring(0, $nativeStart)
         if ($win32Block -match '(?m)^\s*bcrypt$') {
             $violations.Add('Win32 legacy runtime must not link bcrypt')
         }
@@ -977,11 +1031,31 @@ inline bool IsNetworkFrameResendResponseAuthorized(
         (expectedOriginMask & (1U << claimedSlot)) != 0U;
 }
 inline bool IsNetworkFrameResendResponseComplete(...) { return true; }
+Bool ConnectionManager::resolveNetworkSimulationPolicy() {
+    if (!rts::ResolveMultiplayerSimulationSessionPolicy(
+            localPeer, remotePeers, remotePeerCount, requestedKernelMask,
+            m_networkSimulationSessionPolicy)) {
+        return FALSE;
+    }
+    m_networkSimulationPolicyResolved = TRUE;
+    return TRUE;
+}
 void ConnectionManager::beginNetworkHello() {
     generateNetworkHelloToken(&m_networkHelloLocalToken);
     sendNetworkHello(i);
 }
 void ConnectionManager::serviceNetworkHello() {
+    if (IsNetworkHelloComplete(m_networkHelloExpectedSlots,
+            validatedSlots, acknowledgedSlots)) {
+        if (!resolveNetworkSimulationPolicy()) {
+            rejectNetworkHello(-1,
+                "NET3 simulation policy roster could not be resolved");
+            return;
+        }
+        m_networkHelloRequired = FALSE;
+        drainNetworkHelloPendingCommands();
+        return;
+    }
     if ((m_networkHelloExpectedSlots & (1U << i)) != 0U) {
         if (!m_networkHelloValidated[i] || !m_networkHelloAckReceived[i]) {
             sendNetworkHello(i);
@@ -1482,6 +1556,22 @@ void NAT::connectionUpdate() {
     if (-not ((Get-TokenViolations $failOpen $goodCMake $goodNAT) -match 'fail closed')) {
         throw 'fail-open relay fixture was not rejected'
     }
+    $ignoredPolicyResult = $goodSource.Replace(
+        'if (!rts::ResolveMultiplayerSimulationSessionPolicy(',
+        'if (false && !rts::ResolveMultiplayerSimulationSessionPolicy(')
+    if ($ignoredPolicyResult -ceq $goodSource -or
+        -not ((Get-TokenViolations $ignoredPolicyResult $goodCMake $goodNAT) -match
+            'policy rejection must fail closed')) {
+        throw 'ignored simulation-policy rejection fixture was not rejected'
+    }
+    $openedRejectedPolicy = $goodSource.Replace(
+        'if (!resolveNetworkSimulationPolicy()) {',
+        'if (false) {')
+    if ($openedRejectedPolicy -ceq $goodSource -or
+        -not ((Get-TokenViolations $openedRejectedPolicy $goodCMake $goodNAT) -match
+            'policy rejection must close')) {
+        throw 'policy-rejection Hello-gate bypass fixture was not rejected'
+    }
     $slotBeforeIntegrity = $goodSource.Replace(
         "    DecodeAndValidateNetworkHelloRecord(message);`n    findNetworkHelloSlot(identity);",
         "    findNetworkHelloSlot(identity);`n    DecodeAndValidateNetworkHelloRecord(message);")
@@ -1680,7 +1770,9 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
 }
 $root = (Resolve-Path -LiteralPath $SourceRoot).Path
 $source = [IO.File]::ReadAllText((Join-Path $root 'Core/GameEngine/Source/GameNetwork/ConnectionManager.cpp'))
-$runtimeCMake = [IO.File]::ReadAllText((Join-Path $root 'cmake/legacy-product-runtime.cmake'))
+$runtimeCMake = [IO.File]::ReadAllText((Join-Path $root 'cmake/legacy-product-runtime.cmake')) +
+    "`n# RTS_NATIVE_PRODUCT_RUNTIME_MODULE`n" +
+    [IO.File]::ReadAllText((Join-Path $root 'cmake/native-product-runtime.cmake'))
 $epochHeader = [IO.File]::ReadAllText((Join-Path $root 'Core/Libraries/Include/Lib/NetworkEpochHandshake.h'))
 $source = $source + "`n" + $epochHeader + "`n" +
     [IO.File]::ReadAllText((Join-Path $root 'Core/GameEngine/Source/GameNetwork/DisconnectManager.cpp')) + "`n" +

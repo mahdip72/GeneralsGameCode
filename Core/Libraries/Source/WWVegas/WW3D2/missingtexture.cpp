@@ -1,151 +1,144 @@
 /*
-**	Command & Conquer Generals Zero Hour(tm)
-**	Copyright 2025 Electronic Arts Inc.
+** Command & Conquer Generals Zero Hour(tm)
+** Copyright 2026 TheSuperHackers
 **
-**	This program is free software: you can redistribute it and/or modify
-**	it under the terms of the GNU General Public License as published by
-**	the Free Software Foundation, either version 3 of the License, or
-**	(at your option) any later version.
-**
-**	This program is distributed in the hope that it will be useful,
-**	but WITHOUT ANY WARRANTY; without even the implied warranty of
-**	MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-**	GNU General Public License for more details.
-**
-**	You should have received a copy of the GNU General Public License
-**	along with this program.  If not, see <http://www.gnu.org/licenses/>.
+** Native missing-texture publication.  The x86/VC6 implementation is kept
+** under Core/LegacyRenderer and is selected by the x86 build graph.
 */
 
-// 08/05/02 KM Texture class redesign
+#include "Utility/CppMacros.h"
 #include "missingtexture.h"
 #include "texture.h"
-#include "texturemipgenerator.h"
-#include "dx8wrapper.h"
+#if defined(_WIN64)
+#include "Renderer/RendererDevice.h"
+#endif
 
-static unsigned missing_image_width=128;
-static unsigned missing_image_height=128;
-static unsigned missing_image_depth=24;
+static unsigned missing_image_width = 128;
+static unsigned missing_image_height = 128;
+static unsigned missing_image_depth = 24;
 
 extern unsigned int missing_image_palette[];
 extern unsigned int missing_image_pixels[];
 
-static IDirect3DTexture8 * _MissingTexture = nullptr;
+static TextureClass * _MissingTexture = nullptr;
 
-IDirect3DTexture8* MissingTexture::_Get_Missing_Texture()
+TextureClass* MissingTexture::_Get_Missing_Texture()
 {
-	WWASSERT(_MissingTexture);
-	_MissingTexture->AddRef();
+	if (_MissingTexture == nullptr) return nullptr;
+	_MissingTexture->Add_Ref();
 	return _MissingTexture;
 }
 
-IDirect3DSurface8* MissingTexture::_Create_Missing_Surface()
+SurfaceClass* MissingTexture::_Create_Missing_Surface()
 {
-	IDirect3DSurface8 *texture_surface = nullptr;
-	DX8_ErrorCode(_MissingTexture->GetSurfaceLevel(0, &texture_surface));
-	D3DSURFACE_DESC texture_surface_desc;
-	::ZeroMemory(&texture_surface_desc, sizeof(D3DSURFACE_DESC));
-	DX8_ErrorCode(texture_surface->GetDesc(&texture_surface_desc));
-
-	IDirect3DSurface8 *surface = nullptr;
-	DX8CALL(CreateImageSurface(
-		texture_surface_desc.Width,
-		texture_surface_desc.Height,
-		texture_surface_desc.Format,
-		&surface));
-	DX8CALL(CopyRects(texture_surface, nullptr, 0, surface, nullptr));
-	texture_surface->Release();
+	if (_MissingTexture == nullptr) return nullptr;
+	SurfaceClass *source = _MissingTexture->Get_Surface_Level(0);
+	if (source == nullptr) return nullptr;
+	SurfaceClass::SurfaceDescription description;
+	source->Get_Description(description);
+	SurfaceClass *surface = NEW_REF(SurfaceClass, (description.Width,
+		description.Height, description.Format));
+	if (surface == nullptr || !surface->Copy_Native_No_Publish(0, 0, 0, 0,
+		description.Width, description.Height, source))
+	{
+		REF_PTR_RELEASE(surface);
+		REF_PTR_RELEASE(source);
+		return nullptr;
+	}
+	REF_PTR_RELEASE(source);
 	return surface;
 }
 
 void MissingTexture::_Init()
 {
-	WWASSERT(!_MissingTexture);
-
-	IDirect3DTexture8* tex=DX8Wrapper::_Create_DX8_Texture
-	(
+	WWASSERT(_MissingTexture == nullptr);
+	TextureClass *texture = NEW_REF(TextureClass, (
 		missing_image_width,
 		missing_image_height,
 		WW3D_FORMAT_A8R8G8B8,
-		MIP_LEVELS_ALL
-	);
-
-	D3DLOCKED_RECT locked_rect;
-	RECT rect;
-	rect.left=0;
-	rect.right=missing_image_width;
-	rect.top=0;
-	rect.bottom=missing_image_height;
-	DX8_ErrorCode(
-		tex->LockRect(
-			0,
-			&locked_rect,
-			&rect,
-			0));
-
-	unsigned *buffer=(unsigned*)locked_rect.pBits;
-	unsigned char *pixels=(unsigned char *)missing_image_pixels;
-	for (unsigned y=0;y<missing_image_height;y++)
+		MIP_LEVELS_ALL,
+		TextureBaseClass::POOL_MANAGED,
+		false,
+		false));
+	if (texture == nullptr || !texture->Is_Initialized())
 	{
-		for (unsigned x=0; x<missing_image_width; x++)
-		{
-			//*buffer++=missing_image_palette[*pixels++];
-			*buffer++=0x7FFF00FF;
-		}
-		buffer=(unsigned*)locked_rect.pBits;
-		buffer+=locked_rect.Pitch/sizeof(unsigned)*y;
+		REF_PTR_RELEASE(texture);
+		return;
 	}
 
-	DX8_ErrorCode(tex->UnlockRect(0));
-
-	// The missing texture is always A8R8G8B8 with power-of-two levels.  The
-	// internal generator is characterized against the legacy box filter for
-	// this exact 2:1 path and keeps mip generation inside the engine boundary.
-	DX8_ErrorCode(Generate_DX8_Texture_Mip_Levels(tex));
-
-	_MissingTexture=tex;
-/*
-	//Load an 8-bit tga and generate text representation
-	FILE *fp;
-	fp=fopen("missing.tga","rb");
-	if (fp)
+	SurfaceClass *surface = texture->Get_Surface_Level(0);
+	if (surface == nullptr)
 	{
-		char image[128*128];	//make enough storage for image and palette
-		char palette[256*3];
-		fread(image,18,1,fp);	//skip over the header
-		fread(palette,256,3,fp);	//read the palette
-		fread(image,1,128*128,fp);
-		FILE *output=fopen("missing.txt","w");
-		fprintf(output,"palette:\n");
-		for (int i=0; i<256; i++)
-		{	int color=(((int)palette[i*3+0] & 0x000000ff)|(((int)palette[i*3+1] << 8)&0x0000ff00)|(((int)palette[i*3+2] << 16)&0x00ff0000)) | 0x7f000000;
-			fprintf(output,"0x%.8X",color);
-			if ((i&7) == 7)	//check for end of 8 element line
-				fprintf(output,",\n");	//new line
-			else
-				fprintf(output,",");	//continue existing line
-		}
-		fprintf(output,"image:\n");
-		for (int y=0; y<128; y++)
-		{
-			for (int x=0; x<32; x++)
-			{	int color=*((int *)(&image[y*128+x*4]));
-				fprintf(output,"0x%.8X",color);
-				if ((x&7)==7)	//check for end of 8 element line
-					fprintf(output,",\n");	//new line
-				else
-					fprintf(output,",");	//continue existing line
-			}
-		}
-		fclose(output);
-		fclose(fp);
+		REF_PTR_RELEASE(texture);
+		return;
 	}
-*/
+	int pitch = 0;
+	unsigned char *bits = static_cast<unsigned char *>(surface->Lock(&pitch));
+	const unsigned int bytes_per_pixel = ::Get_Bytes_Per_Pixel(
+		WW3D_FORMAT_A8R8G8B8);
+	if (bits == nullptr || pitch < static_cast<int>(missing_image_width *
+		bytes_per_pixel))
+	{
+		REF_PTR_RELEASE(surface);
+		REF_PTR_RELEASE(texture);
+		return;
+	}
+	for (unsigned int y = 0; y < missing_image_height; ++y)
+	{
+		unsigned int *row = reinterpret_cast<unsigned int *>(bits +
+			static_cast<size_t>(y) * static_cast<size_t>(pitch));
+		for (unsigned int x = 0; x < missing_image_width; ++x)
+			row[x] = 0x7FFF00FF;
+	}
+	if (!surface->Unlock_Native_Surface() ||
+		!texture->Generate_Native_Mip_Levels())
+	{
+		REF_PTR_RELEASE(surface);
+		REF_PTR_RELEASE(texture);
+		return;
+	}
+	REF_PTR_RELEASE(surface);
+
+	// Re-publish the prepared image with the native missing bit set.  The
+	// public texture API owns the descriptor and deep-copies every mip, so no
+	// transient surface or device object escapes this utility.
+	rts::render::TextureDescriptor descriptor;
+	descriptor.width = missing_image_width;
+	descriptor.height = missing_image_height;
+	descriptor.mipCount = texture->Get_Mip_Level_Count();
+	descriptor.arrayCount = 1;
+	descriptor.dimension = rts::render::RENDER_TEXTURE_2D;
+	descriptor.format = rts::render::RENDER_FORMAT_B8G8R8A8_UNORM;
+	descriptor.binding = rts::render::RENDER_TEXTURE_SHADER_RESOURCE;
+	descriptor.usage = rts::render::RENDER_USAGE_IMMUTABLE;
+	rts::render::TextureSubresourceData subresources[MIP_LEVELS_MAX];
+	for (unsigned int mip = 0; mip < descriptor.mipCount; ++mip)
+	{
+		const unsigned char *data = nullptr;
+		size_t row_pitch = 0;
+		size_t slice_pitch = 0;
+		if (!texture->Get_Native_Subresource_Data(mip, 0, &data, &row_pitch,
+			&slice_pitch))
+		{
+			REF_PTR_RELEASE(texture);
+			return;
+		}
+		subresources[mip].data = data;
+		subresources[mip].rowPitch = row_pitch;
+		subresources[mip].slicePitch = slice_pitch;
+	}
+	if (!texture->Apply_Native_Texture(descriptor, subresources,
+		descriptor.mipCount, WW3D_FORMAT_A8R8G8B8, true, false, true))
+	{
+		REF_PTR_RELEASE(texture);
+		return;
+	}
+	_MissingTexture = texture;
 }
 
 void MissingTexture::_Deinit()
 {
-	_MissingTexture->Release();
-	_MissingTexture=nullptr;
+	REF_PTR_RELEASE(_MissingTexture);
 }
 
 unsigned int missing_image_palette[]={

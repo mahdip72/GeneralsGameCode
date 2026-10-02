@@ -92,7 +92,7 @@ void W3DParticleSystemManager::reset()
 	// particle manager is destroyed later and its reusable render helpers can
 	// still retain the last particle textures. Drop those references while the
 	// graphics runtime is alive so their eventual destructors never release a
-	// legacy COM object after the D3D8 compatibility module has been unloaded.
+	// stale graphics-runtime object after the renderer has been unloaded.
 	if (m_pointGroup != nullptr)
 		m_pointGroup->Set_Texture(nullptr);
 	if (m_streakLine != nullptr)
@@ -408,6 +408,7 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 				const UnsignedInt volumeParticleDepth = sys->getVolumeParticleDepth();
 				if( sys->isUsingVolumeParticles() && volumeParticleDepth > DEFAULT_VOLUME_PARTICLE_DEPTH )
 				{
+					// Inclusive: layer transforms, expansion, packing and submission.
 					m_pointGroup->RenderVolumeParticle( rinfo, volumeParticleDepth);
 				}
 				else
@@ -446,7 +447,9 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 
 	//Draw any particles belonging to weather effects
 	if (TheSnowManager)
+	{
 		((W3DSnowManager *)TheSnowManager)->render(rinfo);
+	}
 
 	//Now process screen smudges which are particles that distort the background behind them.
 	if(TheSmudgeManager)

@@ -1,0 +1,9 @@
+/* Keep the pre-cull kernel as an independent translation unit so the
+ * equivalence test compares complete output buffers, including padding. */
+#define HEIGHTMAP_DYNAMIC_LIGHT_PARITY_BASELINE 1
+#define PrepareHeightMapDynamicLightRows BaselinePrepareHeightMapDynamicLightRows
+#define ValidateHeightMapDynamicLightSceneLights BaselineValidateHeightMapDynamicLightSceneLights
+#define HeightMapDynamicLightMayContributeToVertexBounds BaselineHeightMapDynamicLightMayContributeToVertexBounds
+#define ValidatePreparedHeightMapDynamicLightStructure BaselineValidatePreparedHeightMapDynamicLightStructure
+#define ValidatePreparedHeightMapDynamicLightOutput BaselineValidatePreparedHeightMapDynamicLightOutput
+#include "../../Libraries/Source/TaskRuntime/HeightMapDynamicLightKernel.cpp"

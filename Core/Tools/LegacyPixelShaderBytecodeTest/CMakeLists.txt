@@ -1,10 +1,16 @@
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    # The token streams are consumed only by the Win32 compatibility adapter;
+    # native x64 must not compile or link this legacy source.
+    return()
+endif()
+
 add_executable(core_legacy_pixel_shader_bytecode_tests
     LegacyPixelShaderBytecodeTest.cpp
-    ../../GameEngineDevice/Source/W3DDevice/Common/System/LegacyPixelShaderBytecode.cpp
+    ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/GameEngineDevice/Source/W3DDevice/Common/System/LegacyPixelShaderBytecode.cpp
 )
 
 target_include_directories(core_legacy_pixel_shader_bytecode_tests PRIVATE
-    ../../GameEngineDevice/Include
+    ${CMAKE_SOURCE_DIR}/Core/LegacyRenderer/GameEngineDevice/Include
 )
 
 if(IS_VS6_BUILD)

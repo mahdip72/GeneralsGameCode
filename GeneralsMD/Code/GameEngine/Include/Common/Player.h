@@ -454,6 +454,10 @@ public:
 
 	/// Is this player a skirmish ai player?
 	Bool isSkirmishAIPlayer();
+#if defined(_WIN64)
+	/// Stage 5 owner-side orchestration only; workers never receive this pointer.
+	AIPlayer *getAIPlayerForPlanning() const { return m_ai; }
+#endif
 	/// Preserve critical reconstruction money at the actual purchase boundary.
 	Bool canSpendForSkirmishAIRecovery(Int cost, const ThingTemplate *thing,
 		Bool isUpgrade, Bool refreshProductionReserve = FALSE) const;

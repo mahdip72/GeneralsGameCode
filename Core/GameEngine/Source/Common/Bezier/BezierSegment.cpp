@@ -290,12 +290,12 @@ const float BezierSegment::s_bezBasisMatrix[4][4] = {
 
 void BezierSegment::transformBasis(const float input[4], float output[4])
 {
-	// D3DXVec4Transform used two pairwise SSE additions. Preserve its
+	// The historical vector transform used two pairwise SSE additions. Preserve its
 	// single-precision rounding points as well as its row-vector convention;
 	// replay flight paths depend on the resulting bits.
 #if defined(_MSC_VER) && _MSC_VER < 1300 && defined(_M_IX86)
 	// VC6 otherwise evaluates these expressions with extended x87 precision,
-	// unlike the single-precision SSE instructions used by D3DXVec4Transform.
+	// unlike the single-precision SSE instructions used by the historical helper.
 	const unsigned int previousControl = _control87(0, 0);
 	_control87(_PC_24, _MCW_PC);
 #endif

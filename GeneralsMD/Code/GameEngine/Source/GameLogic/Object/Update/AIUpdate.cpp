@@ -493,7 +493,8 @@ void AIUpdateInterface::doPathfind( PathfindServicesInterface *pathfinder )
 			ignoreObstacle(victim);
 		}
 	}
-	Bool pathFound = computePath(pathfinder, &m_requestedDestination);
+	Bool pathFound = computePath(pathfinder, &m_requestedDestination,
+		!attackPathFallback && m_isFinalGoal && isDoingGroundMovement());
 	RecordSkirmishAIPathFailureForObject(
 		getObject(), isDoingGroundMovement(), m_isFinalGoal, FALSE, FALSE,
 		attackPathFallback, pathFound);
@@ -1731,7 +1732,8 @@ Bool AIUpdateInterface::computeQuickPath( const Coord3D *destination )
 /**
  * Invoke the pathfinder to compute a path to the desired location.
  */
-Bool AIUpdateInterface::computePath( PathfindServicesInterface *pathServices, Coord3D *destination )
+Bool AIUpdateInterface::computePath( PathfindServicesInterface *pathServices, Coord3D *destination,
+	Bool allowDirectPathOffload )
 {
 
 	if (!m_isBlockedAndStuck)	{
@@ -1789,8 +1791,18 @@ Bool AIUpdateInterface::computePath( PathfindServicesInterface *pathServices, Co
 			theNewPath = pathServices->patchPath( getObject(), m_locomotorSet,
 				getPath(), m_isBlockedAndStuck);
 		}	else {
-			theNewPath = pathServices->findPath( getObject(), m_locomotorSet, getObject()->getPosition(),
-				destination);
+			const Bool useDirectPathOffload = allowDirectPathOffload && m_isFinalGoal &&
+				!m_isBlockedAndStuck && isDoingGroundMovement() &&
+				!canPathThroughUnits() && getIgnoredObstacleID() == INVALID_ID &&
+				!getObject()->isKindOf(KINDOF_DOZER) &&
+				!getObject()->isKindOf(KINDOF_HARVESTER) &&
+				getObject()->getCrusherLevel() == 0 &&
+				getObject()->getLayer() == LAYER_GROUND &&
+				m_locomotorSet.getValidSurfaces() == LOCOMOTORSURFACE_GROUND &&
+				!m_locomotorSet.isDownhillOnly() &&
+				!(getCurLocomotor() && getCurLocomotor()->isUltraAccurate());
+			theNewPath = pathServices->findPath( getObject(), m_locomotorSet,
+				getObject()->getPosition(), destination, useDirectPathOffload);
 		}
 	}
 	if (theNewPath==nullptr && m_path==nullptr) {

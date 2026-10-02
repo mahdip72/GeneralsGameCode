@@ -452,7 +452,8 @@ public:
 
 	// Pathfinding ---------------------------------------------------------------------------------------
 private:
-	Bool computePath( PathfindServicesInterface *pathfinder, Coord3D *destination );	///< computes path to destination, returns false if no path
+	Bool computePath( PathfindServicesInterface *pathfinder, Coord3D *destination,
+		Bool allowDirectPathOffload = FALSE );	///< computes path to destination, returns false if no path
 	Bool computeAttackPath(PathfindServicesInterface *pathfinder,  const Object *victim, const Coord3D* victimPos );	///< computes path to attack the current target, returns false if no path
 	void tryQueueForPath();	///< Queue this path request, or schedule a retry if the queue is full.
 #ifdef ALLOW_SURRENDER
@@ -467,6 +468,15 @@ public:
 	void requestSafePath( ObjectID repulsor1 );	///< computes path to attack the current target, returns false if no path
 
 	Bool isWaitingForPath() const {return m_waitingForPath;}
+	Bool isOrdinaryFinalPathRequestForBatch() const
+	{
+		return m_waitingForPath && m_isFinalGoal && !m_isAttackPath &&
+			!m_isApproachPath && !m_isSafePath;
+	}
+	const Coord3D *getRequestedPathDestinationForBatch() const
+	{
+		return &m_requestedDestination;
+	}
 	Bool isAttackPath() const {return m_isAttackPath;} ///< True if we have a path to an attack location.
 	void cancelPath(); ///< Called if we no longer need the path.
 	Path* getPath() { return m_path; }				///< return the agent's current path

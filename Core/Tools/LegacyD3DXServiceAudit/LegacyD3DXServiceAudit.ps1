@@ -4,13 +4,13 @@ param(
 )
 
 $files = @(
-    'Core/Libraries/Source/WWVegas/WW3D2/legacytexturecompat.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/legacytexturecompat.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/surfaceblit.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/surfaceblit.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/texturemipgenerator.cpp',
-    'Core/Libraries/Source/WWVegas/WW3D2/texturemipgenerator.h',
-    'Core/Libraries/Source/WWVegas/WW3D2/dx8wrapper.cpp'
+    'Core/LegacyRenderer/WWVegas/WW3D2/legacytexturecompat.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/legacytexturecompat.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceblit_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/surfaceblit.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texturemipgenerator_legacy.cpp',
+    'Core/LegacyRenderer/WWVegas/WW3D2/texturemipgenerator.h',
+    'Core/LegacyRenderer/WWVegas/WW3D2/dx8wrapper.cpp'
 )
 
 $servicePattern = '(?i)\bD3DX(?:[A-Za-z0-9_]+|_[A-Za-z0-9_]+)\b|<d3dx[^>]*>'

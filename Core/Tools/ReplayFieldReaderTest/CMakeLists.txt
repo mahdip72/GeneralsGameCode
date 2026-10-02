@@ -18,3 +18,15 @@ set_target_properties(core_replay_field_reader_tests PROPERTIES
 
 add_test(NAME core_replay_field_reader_tests COMMAND core_replay_field_reader_tests)
 set_tests_properties(core_replay_field_reader_tests PROPERTIES TIMEOUT 30)
+
+add_executable(core_replay_path_contract_tests ReplayPathContractTest.cpp)
+target_include_directories(core_replay_path_contract_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+)
+set_target_properties(core_replay_path_contract_tests PROPERTIES
+    CXX_STANDARD 98
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS NO
+)
+add_test(NAME core_replay_path_contract_tests COMMAND core_replay_path_contract_tests)
+set_tests_properties(core_replay_path_contract_tests PROPERTIES TIMEOUT 30)

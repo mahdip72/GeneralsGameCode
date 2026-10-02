@@ -168,9 +168,11 @@ int runNative(const rts::render::RenderFrameOutcome &outcome,
 	rts::render::RenderResult frameResult, bool lost, unsigned frames,
 	const char *message, bool visible = true)
 {
+	// Native device loss and recovery stay inside the bridge/render owner. The
+	// x64 facade has no D3D8 cooperative-level device to query, including when
+	// End_Frame reports device removal separately from its completion outcome.
 	return runScene(outcome, frameResult, visible, true, true, true, D3D_OK,
-		lost, frames, 0, visible && frameResult ==
-			rts::render::RENDER_RESULT_DEVICE_REMOVED ? 1 : 0, message);
+		lost, frames, 0, 0, message);
 }
 }
 

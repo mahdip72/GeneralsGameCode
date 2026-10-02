@@ -46,6 +46,7 @@ target_include_directories(g_guiedit PRIVATE
 )
 
 target_link_libraries(g_guiedit PRIVATE
+    comdlg32
     comctl32
     d3d8lib
     g_gameengine

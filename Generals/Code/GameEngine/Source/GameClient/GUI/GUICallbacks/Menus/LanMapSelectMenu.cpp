@@ -381,8 +381,10 @@ WindowMsgHandledType LanMapSelectMenuSystem( GameWindow *window, UnsignedInt msg
 					if (it != TheMapCache->end())
 					{
 						TheLAN->GetMyGame()->getSlot(0)->setMapAvailability(true);
-						TheLAN->GetMyGame()->setMapCRC( it->second.m_CRC );
+						TheLAN->GetMyGame()->setMapCRC( GetMapFileCRC(TheLAN->GetMyGame()->getMap()) );
 						TheLAN->GetMyGame()->setMapSize( it->second.m_filesize );
+						TheLAN->GetMyGame()->getSlot(0)->setMapAvailability(
+							TheLAN->GetMyGame()->getMapCRC() != 0U);
 
 						TheLAN->GetMyGame()->resetStartSpots();
 						TheLAN->GetMyGame()->adjustSlotsForMap(); // BGC- adjust the slots for the new map.

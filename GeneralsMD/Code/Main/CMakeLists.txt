@@ -12,7 +12,7 @@ target_link_libraries(z_generals PRIVATE
     core_debug
     core_profile_legacy
     imm32
-    rts_legacy_product_runtime
+    rts_product_runtime
     vfw32
     winmm
     z_gameengine

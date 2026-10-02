@@ -38,12 +38,10 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 #include "ww3dformat.h"
+// Legacy device-backed implementation; native format helpers live in the product source.
 #include "WWMath/vector4.h"
 #include "WWDebug/wwdebug.h"
 #include "WWLib/TARGA.h"
-#include "dx8wrapper.h"
-#include "dx8caps.h"
-#include <d3d8.h>
 
  /*
 	WW3D_FORMAT_UNKNOWN=0,
@@ -128,7 +126,10 @@ unsigned char RGB_to_CIEY(Vector4 color)
 void Vector4_to_Color(unsigned int *outc,const Vector4 &inc,const WW3DFormat format)
 {
 	// convert to ARGB 32-bit
-	unsigned int color=DX8Wrapper::Convert_Color(inc);
+	const unsigned int color = ((unsigned int)(inc.W * 255.0f) << 24) |
+		((unsigned int)(inc.X * 255.0f) << 16) |
+		((unsigned int)(inc.Y * 255.0f) << 8) |
+		(unsigned int)(inc.Z * 255.0f);
 	unsigned char *argb=(unsigned char*) &color;
 	unsigned char r,g,b,a,lum;
 
@@ -304,86 +305,35 @@ void Get_WW3D_Format(WW3DFormat& src_format,unsigned& src_bpp,const Targa& targa
 
 WW3DFormat Get_Valid_Texture_Format(WW3DFormat format, bool is_compression_allowed)
 {
-	int w,h,bits;
-	bool windowed;
-
-	if (!DX8Wrapper::Get_Current_Caps()->Support_DXTC() ||
-		!is_compression_allowed) {
-		switch (format) {
-		case WW3D_FORMAT_DXT1: format=WW3D_FORMAT_R8G8B8; break;
+	/* Native uploads have one canonical color target and one SNORM bump layout. */
+	if (format == WW3D_FORMAT_UNKNOWN)
+		return WW3D_FORMAT_A8R8G8B8;
+	if (!is_compression_allowed)
+	{
+		switch (format)
+		{
+		case WW3D_FORMAT_DXT1: return WW3D_FORMAT_X8R8G8B8;
 		case WW3D_FORMAT_DXT2:
 		case WW3D_FORMAT_DXT3:
 		case WW3D_FORMAT_DXT4:
-		case WW3D_FORMAT_DXT5: format=WW3D_FORMAT_A8R8G8B8; break;
+		case WW3D_FORMAT_DXT5: return WW3D_FORMAT_A8R8G8B8;
 		default: break;
 		}
 	}
-	else {
-		switch (format) {
-		case WW3D_FORMAT_DXT1:
-			// NVidia hack - switch to DXT2 is there is no DXT1 support (which is disabled on NVidia cards)
-			if (!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(WW3D_FORMAT_DXT1) &&
-				DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(WW3D_FORMAT_DXT2)) {
-				format=WW3D_FORMAT_DXT2;
-			}
-			break;
-		case WW3D_FORMAT_DXT2:
-		case WW3D_FORMAT_DXT3:
-		case WW3D_FORMAT_DXT4:
-		case WW3D_FORMAT_DXT5:
-			if (!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(format)) format=WW3D_FORMAT_A8R8G8B8;
-			break;
-		}
+	if (format == WW3D_FORMAT_R8G8B8)
+		return WW3D_FORMAT_X8R8G8B8;
+	/* These layouts have no lossless native upload representation. */
+	switch (format)
+	{
+	case WW3D_FORMAT_P8:
+	case WW3D_FORMAT_A8P8:
+	case WW3D_FORMAT_L6V5U5:
+	case WW3D_FORMAT_X8L8V8U8:
+		return WW3D_FORMAT_A8R8G8B8;
+	default:
+		return format;
 	}
-
-	if (format==WW3D_FORMAT_R8G8B8) {
-		format=WW3D_FORMAT_X8R8G8B8;
-	}
-
-	WW3D::Get_Device_Resolution(w,h,bits,windowed);
-	if (WW3D::Get_Texture_Bitdepth()==16) bits=16;
-
-	// if the device bitdepth is 16, don't allow 32 bit textures
-	if (bits<=16) {
-		switch (format) {
-		case WW3D_FORMAT_A8R8G8B8: return WW3D_FORMAT_A4R4G4B4;
-		case WW3D_FORMAT_X8R8G8B8:
-		case WW3D_FORMAT_R8G8B8: return WW3D_FORMAT_R5G6B5;
-		case WW3D_FORMAT_A4R4G4B4:
-		case WW3D_FORMAT_A1R5G5B5:
-		case WW3D_FORMAT_R5G6B5:
-		case WW3D_FORMAT_L8:
-		case WW3D_FORMAT_A8:
-		case WW3D_FORMAT_P8:
-		default:
-			// Basically, anything goes here (just make sure the most common 32 bit formats are converted to 16 bit
-			break;
-		}
-
-	}
-
-	// Fallback if the hardware doesn't support the texture format
-	if (!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(format)) {
-		format=WW3D_FORMAT_A8R8G8B8;
-		if (!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(format)) {
-			format=WW3D_FORMAT_A4R4G4B4;
-			if (!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(format)) {
-				// If still no luck, try non-alpha formats
-
-				format=WW3D_FORMAT_X8R8G8B8;
-				if (!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(format)) {
-					format=WW3D_FORMAT_R5G6B5;
-					if (!DX8Wrapper::Get_Current_Caps()->Support_Texture_Format(format)) {
-						WWASSERT_PRINT(0,("No valid texture format found"));
-					}
-				}
-			}
-		}
-	}
-
-	return format;
 }
-
 unsigned Get_Bytes_Per_Pixel(WW3DFormat format)
 {
 	switch (format) {

@@ -18,7 +18,7 @@ endif()
 # Add main build targets
 add_subdirectory(Code)
 
-if(TARGET g_launcher)
+if(TARGET g_launcher AND TARGET g_generals)
     set(_RTS_GENERATED_LAUNCHER_LCF_GENERALS
         "${CMAKE_CURRENT_BINARY_DIR}/launcher.lcf")
     rts_generate_launcher_lcf(g_generals
@@ -26,7 +26,7 @@ if(TARGET g_launcher)
 endif()
 
 # Keep registry discovery isolated from the user-controlled install prefix.
-# Only the legacy Win32 path may use the registry value as a fallback.
+# Registry values are diagnostic only and never become install destinations.
 set(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS "${RTS_INSTALL_PREFIX_GENERALS}")
 if("${CMAKE_HOST_SYSTEM}" MATCHES "Windows" AND "${CMAKE_SYSTEM}" MATCHES "Windows"
         AND CMAKE_SIZEOF_VOID_P EQUAL 4)
@@ -53,10 +53,6 @@ if("${CMAKE_HOST_SYSTEM}" MATCHES "Windows" AND "${CMAKE_SYSTEM}" MATCHES "Windo
         RTS_REGISTRY_INSTALL_PREFIX_GENERALS
         "Generals install path from registry")
 
-    if(NOT RTS_INSTALL_PREFIX_GENERALS)
-        set(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS
-            "${RTS_REGISTRY_INSTALL_PREFIX_GENERALS}")
-    endif()
 endif()
 
 # Native products have no compatible retail registry location.  Keep an
@@ -66,7 +62,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT _RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS)
     set(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS "Generals")
 endif()
 
-if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS)
+if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS AND TARGET g_generals)
     install(TARGETS g_generals RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
     install(FILES $<TARGET_PDB_FILE:g_generals> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}" OPTIONAL)
 
@@ -102,18 +98,6 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS)
 
     rts_install_asan_runtime("${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
 
-    if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET d3d8to9)
-        install(TARGETS d3d8to9
-            RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
-        install(FILES ${RTS_NATIVE_D3DX_RUNTIME_DLLS}
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
-        install(FILES "${RTS_NATIVE_D3D8_COMPAT_LICENSE}"
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}/licenses/native-d3d8-compat"
-            RENAME "d3d8to9-LICENSE.md")
-        install(FILES ${RTS_NATIVE_D3DX_LICENSE_FILES}
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}/licenses/native-d3d8-compat")
-    endif()
-
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET g_launcher)
         install(TARGETS g_launcher RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
         install(FILES $<TARGET_PDB_FILE:g_launcher> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}" OPTIONAL)
@@ -121,15 +105,17 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS)
             DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
     endif()
 
-    # Exercise the Generals title graph from the exact disposable native
-    # runtime that is promoted. Keep this test-only utility out of Win32.
+    # Exercise the Generals title graph beside the exact disposable native
+    # runtime. Keep validation-only binaries outside the promoted title tree.
     if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND TARGET g_skirmish_ai_runner_contract_tests)
         install(TARGETS g_skirmish_ai_runner_contract_tests
-            RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
+            RUNTIME DESTINATION "Validation/Generals")
         install(FILES $<TARGET_PDB_FILE:g_skirmish_ai_runner_contract_tests>
-            DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}" OPTIONAL)
+            DESTINATION "Validation/Generals" OPTIONAL)
     endif()
+endif()
 
+if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS)
     if(TARGET g_worldbuilder)
         install(TARGETS g_worldbuilder RUNTIME DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}")
         install(FILES $<TARGET_PDB_FILE:g_worldbuilder> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}" OPTIONAL)
@@ -165,7 +151,7 @@ if(_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS)
         install(FILES $<TARGET_PDB_FILE:g_w3dview> DESTINATION "${_RTS_EFFECTIVE_INSTALL_PREFIX_GENERALS}" OPTIONAL)
     endif()
 else()
-    message(STATUS "Generals install path not found. Registry keys for 'Generals' not found. "
+    message(STATUS "No explicit Generals install prefix was supplied. "
                    "Generals targets will be built, but not installed. "
-                   "You can specify the path manually by setting RTS_INSTALL_PREFIX_GENERALS.")
+                   "Set RTS_INSTALL_PREFIX_GENERALS to a task-owned disposable path to install.")
 endif()

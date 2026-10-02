@@ -34,8 +34,11 @@ add_subdirectory(GameEngine)
 # Platform specific GameEngine code
 add_subdirectory(GameEngineDevice)
 
-# Contains the main game exe target.
-add_subdirectory(Main)
+# The authoring graph deliberately reuses the title libraries without
+# producing or packaging a game executable.
+if(RTS_BUILD_ZEROHOUR_PRODUCT)
+    add_subdirectory(Main)
+endif()
 
 if (RTS_BUILD_ZEROHOUR_TOOLS OR RTS_BUILD_ZEROHOUR_EXTRAS OR
         (CMAKE_SIZEOF_VOID_P EQUAL 8 AND RTS_BUILD_PRODUCT))

@@ -31,6 +31,7 @@
 
 // INCLUDES ///////////////////////////////////////////////////////////////////////////////////////
 #include <windows.h>
+#include <commdlg.h>
 
 #include "GameClient/GameWindow.h"
 #include "GameClient/WindowLayout.h"

@@ -38,7 +38,8 @@
 
 #pragma once
 
-#include "dx8wrapper.h"
+#include "Renderer/LegacyColorPacking.h"
+#include <WWMath/vector4.h>
 #include <WWMath/wwmath.h>
 
 void RGB_To_HSV(Vector3 &hsv,const Vector3 &rgb);
@@ -146,7 +147,8 @@ inline void Recolor(Vector3 &rgb, const Vector3 &hsv_shift)
 
 inline void Recolor(unsigned& rgba, const Vector3 &hsv_shift)
 {
-	Vector4 rgba_v = DX8Wrapper::Convert_Color(rgba);
+	const rts::render::LegacyPackedColor unpacked = rts::render::UnpackLegacyARGB(rgba);
+	Vector4 rgba_v(unpacked.red, unpacked.green, unpacked.blue, unpacked.alpha);
 	Recolor((Vector3&)rgba_v, hsv_shift);
-	rgba = DX8Wrapper::Convert_Color(rgba_v);
+	rgba = rts::render::PackLegacyARGB(rgba_v.X, rgba_v.Y, rgba_v.Z, rgba_v.W);
 }

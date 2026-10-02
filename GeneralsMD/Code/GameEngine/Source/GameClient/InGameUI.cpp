@@ -1067,6 +1067,7 @@ InGameUI::InGameUI()
 
 	m_currentlyPlayingMovie.clear();
 	m_militarySubtitle = nullptr;
+	m_iniFontSettingsValid = FALSE;
 	m_popupMessageData = nullptr;
 	m_waypointMode = FALSE;
 	m_clientQuiet = FALSE;
@@ -1304,64 +1305,196 @@ InGameUI::~InGameUI()
 }
 
 //-------------------------------------------------------------------------------------------------
+void InGameUI::captureIniFontSettings()
+{
+	m_iniFontSettingsValid = FALSE;
+
+	m_iniFontSettings[UI_FONT_DRAWABLE_CAPTION].name = m_drawableCaptionFont;
+	m_iniFontSettings[UI_FONT_DRAWABLE_CAPTION].pointSize = m_drawableCaptionPointSize;
+	m_iniFontSettings[UI_FONT_DRAWABLE_CAPTION].bold = m_drawableCaptionBold;
+	m_iniFontSettings[UI_FONT_MESSAGE].name = m_messageFont;
+	m_iniFontSettings[UI_FONT_MESSAGE].pointSize = m_messagePointSize;
+	m_iniFontSettings[UI_FONT_MESSAGE].bold = m_messageBold;
+	m_iniFontSettings[UI_FONT_MILITARY_TITLE].name = m_militaryCaptionTitleFont;
+	m_iniFontSettings[UI_FONT_MILITARY_TITLE].pointSize = m_militaryCaptionTitlePointSize;
+	m_iniFontSettings[UI_FONT_MILITARY_TITLE].bold = m_militaryCaptionTitleBold;
+	m_iniFontSettings[UI_FONT_MILITARY_BODY].name = m_militaryCaptionFont;
+	m_iniFontSettings[UI_FONT_MILITARY_BODY].pointSize = m_militaryCaptionPointSize;
+	m_iniFontSettings[UI_FONT_MILITARY_BODY].bold = m_militaryCaptionBold;
+	m_iniFontSettings[UI_FONT_SUPERWEAPON_NORMAL].name = m_superweaponNormalFont;
+	m_iniFontSettings[UI_FONT_SUPERWEAPON_NORMAL].pointSize = m_superweaponNormalPointSize;
+	m_iniFontSettings[UI_FONT_SUPERWEAPON_NORMAL].bold = m_superweaponNormalBold;
+	m_iniFontSettings[UI_FONT_SUPERWEAPON_READY].name = m_superweaponReadyFont;
+	m_iniFontSettings[UI_FONT_SUPERWEAPON_READY].pointSize = m_superweaponReadyPointSize;
+	m_iniFontSettings[UI_FONT_SUPERWEAPON_READY].bold = m_superweaponReadyBold;
+	m_iniFontSettings[UI_FONT_NAMED_TIMER_NORMAL].name = m_namedTimerNormalFont;
+	m_iniFontSettings[UI_FONT_NAMED_TIMER_NORMAL].pointSize = m_namedTimerNormalPointSize;
+	m_iniFontSettings[UI_FONT_NAMED_TIMER_NORMAL].bold = m_namedTimerNormalBold;
+	m_iniFontSettings[UI_FONT_NAMED_TIMER_READY].name = m_namedTimerReadyFont;
+	m_iniFontSettings[UI_FONT_NAMED_TIMER_READY].pointSize = m_namedTimerReadyPointSize;
+	m_iniFontSettings[UI_FONT_NAMED_TIMER_READY].bold = m_namedTimerReadyBold;
+
+	m_iniFontSettingsValid = TRUE;
+}
+
+void InGameUI::applyLocalizedFontSetting(Int index, const FontDesc* localized,
+	AsciiString& fontName, Int& pointSize, Bool& bold)
+{
+	const InGameUIFontSettings& iniFallback = m_iniFontSettings[index];
+	InGameUIFontSettings localizedSettings = iniFallback;
+	Bool hasLocalizedSettings = FALSE;
+	if (localized && localized->name.isNotEmpty())
+	{
+		localizedSettings.name = localized->name;
+		localizedSettings.pointSize = localized->size;
+		localizedSettings.bold = localized->bold;
+		hasLocalizedSettings = TRUE;
+	}
+
+	const InGameUIFontSettings selected = ResolveLocalizedUIFontSettings(
+		iniFallback, localizedSettings, hasLocalizedSettings != FALSE);
+	fontName = selected.name;
+	pointSize = selected.pointSize;
+	bold = selected.bold;
+}
+
+void InGameUI::applyLocalizedFontSettings()
+{
+	if (!m_iniFontSettingsValid)
+		return;
+
+	applyLocalizedFontSetting(UI_FONT_DRAWABLE_CAPTION,
+		TheGlobalLanguageData ? &TheGlobalLanguageData->m_drawableCaptionFont : nullptr,
+		m_drawableCaptionFont, m_drawableCaptionPointSize, m_drawableCaptionBold);
+	applyLocalizedFontSetting(UI_FONT_MESSAGE,
+		TheGlobalLanguageData ? &TheGlobalLanguageData->m_messageFont : nullptr,
+		m_messageFont, m_messagePointSize, m_messageBold);
+	applyLocalizedFontSetting(UI_FONT_MILITARY_TITLE,
+		TheGlobalLanguageData ? &TheGlobalLanguageData->m_militaryCaptionTitleFont : nullptr,
+		m_militaryCaptionTitleFont, m_militaryCaptionTitlePointSize, m_militaryCaptionTitleBold);
+	applyLocalizedFontSetting(UI_FONT_MILITARY_BODY,
+		TheGlobalLanguageData ? &TheGlobalLanguageData->m_militaryCaptionFont : nullptr,
+		m_militaryCaptionFont, m_militaryCaptionPointSize, m_militaryCaptionBold);
+	applyLocalizedFontSetting(UI_FONT_SUPERWEAPON_NORMAL,
+		TheGlobalLanguageData ? &TheGlobalLanguageData->m_superweaponCountdownNormalFont : nullptr,
+		m_superweaponNormalFont, m_superweaponNormalPointSize, m_superweaponNormalBold);
+	applyLocalizedFontSetting(UI_FONT_SUPERWEAPON_READY,
+		TheGlobalLanguageData ? &TheGlobalLanguageData->m_superweaponCountdownReadyFont : nullptr,
+		m_superweaponReadyFont, m_superweaponReadyPointSize, m_superweaponReadyBold);
+	applyLocalizedFontSetting(UI_FONT_NAMED_TIMER_NORMAL,
+		TheGlobalLanguageData ? &TheGlobalLanguageData->m_namedTimerCountdownNormalFont : nullptr,
+		m_namedTimerNormalFont, m_namedTimerNormalPointSize, m_namedTimerNormalBold);
+	applyLocalizedFontSetting(UI_FONT_NAMED_TIMER_READY,
+		TheGlobalLanguageData ? &TheGlobalLanguageData->m_namedTimerCountdownReadyFont : nullptr,
+		m_namedTimerReadyFont, m_namedTimerReadyPointSize, m_namedTimerReadyBold);
+}
+
+void InGameUI::refreshLocalizedFontResources()
+{
+	applyLocalizedFontSettings();
+	if (!m_iniFontSettingsValid || !TheGlobalLanguageData || !TheFontLibrary)
+		return;
+
+	// Rebind live Drawable-owned caption strings without changing list membership or text.
+	if (TheGameClient)
+	{
+		for (Drawable* drawable = TheGameClient->firstDrawable(); drawable;
+			drawable = drawable->getNextDrawable())
+			drawable->refreshCaptionFont();
+	}
+
+	Int adjustedSize = TheGlobalLanguageData->adjustFontSize(m_messagePointSize);
+	GameFont* font = TheFontLibrary->getFont(m_messageFont, adjustedSize, m_messageBold);
+	for (Int i = 0; i < MAX_UI_MESSAGES; ++i)
+	{
+		if (m_uiMessages[i].displayString)
+			m_uiMessages[i].displayString->setFont(font);
+	}
+
+	for (Int playerIndex = 0; playerIndex < MAX_PLAYER_COUNT; ++playerIndex)
+	{
+		for (SuperweaponMap::iterator mapIt = m_superweapons[playerIndex].begin();
+			mapIt != m_superweapons[playerIndex].end(); ++mapIt)
+		{
+			for (SuperweaponList::iterator infoIt = mapIt->second.begin();
+				infoIt != mapIt->second.end(); ++infoIt)
+			{
+				SuperweaponInfo* info = *infoIt;
+				if (!info)
+					continue;
+				if (info->m_ready)
+					info->setFont(m_superweaponReadyFont, m_superweaponReadyPointSize,
+						m_superweaponReadyBold);
+				else
+					info->setFont(m_superweaponNormalFont, m_superweaponNormalPointSize,
+						m_superweaponNormalBold);
+			}
+		}
+	}
+
+	for (NamedTimerMapIt timerIt = m_namedTimers.begin(); timerIt != m_namedTimers.end(); ++timerIt)
+	{
+		NamedTimerInfo* info = timerIt->second;
+		if (!info || !info->displayString)
+			continue;
+		const Bool ready = info->isCountdown && info->timestamp == 0;
+		const AsciiString& name = ready ? m_namedTimerReadyFont : m_namedTimerNormalFont;
+		const Int pointSize = ready ? m_namedTimerReadyPointSize : m_namedTimerNormalPointSize;
+		const Bool bold = ready ? m_namedTimerReadyBold : m_namedTimerNormalBold;
+		adjustedSize = TheGlobalLanguageData->adjustFontSize(pointSize);
+		info->displayString->setFont(TheFontLibrary->getFont(name, adjustedSize, bold));
+	}
+
+	if (m_militarySubtitle)
+	{
+		Int lineY = m_militarySubtitle->position.y;
+		DisplayString* currentLine = nullptr;
+		for (Int lineIndex = 0; lineIndex < MAX_SUBTITLE_LINES &&
+			static_cast<UnsignedInt>(lineIndex) <= m_militarySubtitle->currentDisplayString;
+			++lineIndex)
+		{
+			DisplayString* line = m_militarySubtitle->displayStrings[lineIndex];
+			if (!line)
+				continue;
+			const AsciiString& name = lineIndex == 0 ?
+				m_militaryCaptionTitleFont : m_militaryCaptionFont;
+			const Int pointSize = lineIndex == 0 ?
+				m_militaryCaptionTitlePointSize : m_militaryCaptionPointSize;
+			const Bool bold = lineIndex == 0 ?
+				m_militaryCaptionTitleBold : m_militaryCaptionBold;
+			adjustedSize = TheGlobalLanguageData->adjustFontSize(pointSize);
+			line->setFont(TheFontLibrary->getFont(name, adjustedSize, bold));
+
+			if (static_cast<UnsignedInt>(lineIndex) < m_militarySubtitle->currentDisplayString)
+			{
+				Int lineHeight = 0;
+				line->getSize(nullptr, &lineHeight);
+				lineY += lineHeight;
+			}
+			else
+				currentLine = line;
+		}
+
+		m_militarySubtitle->blockPos.y = lineY;
+		if (currentLine)
+		{
+			Int lineWidth = 0;
+			currentLine->getSize(&lineWidth, nullptr);
+			m_militarySubtitle->blockPos.x = m_militarySubtitle->position.x + lineWidth;
+		}
+	}
+}
+
+//-------------------------------------------------------------------------------------------------
 /** Initialize the in game user interface */
 //-------------------------------------------------------------------------------------------------
 void InGameUI::init()
 {
 	INI ini;
 	ini.loadFileDirectory( "Data\\INI\\InGameUI", INI_LOAD_OVERWRITE, nullptr );
+	captureIniFontSettings();
 
-	//override INI values with language localized values:
-	if (TheGlobalLanguageData)
-	{
-		if (TheGlobalLanguageData->m_drawableCaptionFont.name.isNotEmpty())
-		{	m_drawableCaptionFont = TheGlobalLanguageData->m_drawableCaptionFont.name;
-			m_drawableCaptionPointSize = TheGlobalLanguageData->m_drawableCaptionFont.size;
-			m_drawableCaptionBold = TheGlobalLanguageData->m_drawableCaptionFont.bold;
-		}
-
-		if (TheGlobalLanguageData->m_messageFont.name.isNotEmpty())
-		{	m_messageFont = TheGlobalLanguageData->m_messageFont.name;
-			m_messagePointSize = TheGlobalLanguageData->m_messageFont.size;
-			m_messageBold = TheGlobalLanguageData->m_messageFont.bold;
-		}
-
-		if (TheGlobalLanguageData->m_militaryCaptionTitleFont.name.isNotEmpty())
-		{	m_militaryCaptionTitleFont = TheGlobalLanguageData->m_militaryCaptionTitleFont.name;
-			m_militaryCaptionTitlePointSize = TheGlobalLanguageData->m_militaryCaptionTitleFont.size;
-			m_militaryCaptionTitleBold = TheGlobalLanguageData->m_militaryCaptionTitleFont.bold;
-		}
-
-		if (TheGlobalLanguageData->m_militaryCaptionFont.name.isNotEmpty())
-		{	m_militaryCaptionFont = TheGlobalLanguageData->m_militaryCaptionFont.name;
-			m_militaryCaptionPointSize = TheGlobalLanguageData->m_militaryCaptionFont.size;
-			m_militaryCaptionBold = TheGlobalLanguageData->m_militaryCaptionFont.bold;
-		}
-
-		if (TheGlobalLanguageData->m_superweaponCountdownNormalFont.name.isNotEmpty())
-		{	m_superweaponNormalFont = TheGlobalLanguageData->m_superweaponCountdownNormalFont.name;
-			m_superweaponNormalPointSize = TheGlobalLanguageData->m_superweaponCountdownNormalFont.size;
-			m_superweaponNormalBold = TheGlobalLanguageData->m_superweaponCountdownNormalFont.bold;
-		}
-
-		if (TheGlobalLanguageData->m_superweaponCountdownReadyFont.name.isNotEmpty())
-		{	m_superweaponReadyFont = TheGlobalLanguageData->m_superweaponCountdownReadyFont.name;
-			m_superweaponReadyPointSize = TheGlobalLanguageData->m_superweaponCountdownReadyFont.size;
-			m_superweaponReadyBold = TheGlobalLanguageData->m_superweaponCountdownReadyFont.bold;
-		}
-
-		if (TheGlobalLanguageData->m_namedTimerCountdownNormalFont.name.isNotEmpty())
-		{	m_namedTimerNormalFont = TheGlobalLanguageData->m_namedTimerCountdownNormalFont.name;
-			m_namedTimerNormalPointSize = TheGlobalLanguageData->m_namedTimerCountdownNormalFont.size;
-			m_namedTimerNormalBold = TheGlobalLanguageData->m_namedTimerCountdownNormalFont.bold;
-		}
-
-		if (TheGlobalLanguageData->m_namedTimerCountdownReadyFont.name.isNotEmpty())
-		{	m_namedTimerReadyFont = TheGlobalLanguageData->m_namedTimerCountdownReadyFont.name;
-			m_namedTimerReadyPointSize = TheGlobalLanguageData->m_namedTimerCountdownReadyFont.size;
-			m_namedTimerReadyBold = TheGlobalLanguageData->m_namedTimerCountdownReadyFont.bold;
-		}
-	}
+	applyLocalizedFontSettings();
 
 	/**@ todo we used to put in the hint spy translator, but it's difficult
 	to order the translators when the code is not centralized so it has

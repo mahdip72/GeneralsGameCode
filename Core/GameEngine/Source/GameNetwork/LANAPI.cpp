@@ -915,7 +915,15 @@ void LANAPI::RequestGameCreate( UnicodeString gameName, Bool isDirectConnect )
 
 	AsciiString mapName = pref.getPreferredMap();
 
+	TheMapCache->updateCache();
 	myGame->setMap(mapName);
+	const MapMetaData *mapData = TheMapCache->findMap(myGame->getMap());
+	if (mapData)
+	{
+		myGame->setMapCRC(GetMapFileCRC(myGame->getMap()));
+		myGame->setMapSize(mapData->m_filesize);
+		myGame->getSlot(0)->setMapAvailability(myGame->getMapCRC() != 0U);
+	}
 	myGame->setIsDirectConnect(isDirectConnect);
 
 	myGame->setLastHeard(timeGetTime());

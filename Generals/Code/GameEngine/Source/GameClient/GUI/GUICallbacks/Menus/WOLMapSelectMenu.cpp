@@ -432,8 +432,10 @@ WindowMsgHandledType WOLMapSelectMenuSystem( GameWindow *window, UnsignedInt msg
 					if (it != TheMapCache->end())
 					{
 						TheGameSpyGame->getGameSpySlot(0)->setMapAvailability(TRUE);
-						TheGameSpyGame->setMapCRC( it->second.m_CRC );
+						TheGameSpyGame->setMapCRC( GetMapFileCRC(TheGameSpyGame->getMap()) );
 						TheGameSpyGame->setMapSize( it->second.m_filesize );
+						TheGameSpyGame->getGameSpySlot(0)->setMapAvailability(
+							TheGameSpyGame->getMapCRC() != 0U);
 					}
 
 					TheGameSpyGame->adjustSlotsForMap(); // BGC- adjust the slots for the new map.

@@ -56,6 +56,15 @@ std::vector<Pixels> run(bool threaded, bool serial, unsigned frameSlots)
 	parameters.enableVsync = false;
 	require(device->initialize(parameters) == RENDER_RESULT_OK, "initialize hidden native flip swap chain");
 	if (threaded) require(factory.owner.load(), "native backend factory executes on registered render owner");
+	unsigned int swapInterval = 0xffffffffU;
+	require(device->getSwapInterval(&swapInterval) == RENDER_RESULT_OK &&
+		swapInterval == 0, "native swap interval starts at immediate when vsync is disabled");
+	require(device->setSwapInterval(RENDER_SWAP_INTERVAL_MAX) == RENDER_RESULT_OK &&
+		device->getSwapInterval(&swapInterval) == RENDER_RESULT_OK &&
+		swapInterval == RENDER_SWAP_INTERVAL_MAX, "native swap interval transports the maximum legacy interval");
+	require(device->setSwapInterval(4) == RENDER_RESULT_INVALID_ARGUMENT &&
+		device->getSwapInterval(&swapInterval) == RENDER_RESULT_OK &&
+		swapInterval == RENDER_SWAP_INTERVAL_MAX, "native swap interval rejects values outside the legacy contract");
 	IRenderContext *context = device->immediateContext();
 	require(context != 0, "native context exists");
 	struct Vertex { float x, y, z; unsigned color; };
@@ -80,9 +89,15 @@ std::vector<Pixels> run(bool threaded, bool serial, unsigned frameSlots)
 			require(device->resize(0, 0) == RENDER_RESULT_OK, "minimize preserves native targets");
 			width = 96; height = 48;
 			require(device->resize(width, height) == RENDER_RESULT_OK, "resize flushes queued frames safely");
+			require(device->getSwapInterval(&swapInterval) == RENDER_RESULT_OK &&
+				swapInterval == RENDER_SWAP_INTERVAL_MAX, "native swap interval survives swap-chain resize");
 		}
 		if (frame == 12)
+		{
 			require(device->recoverDevice() == RENDER_RESULT_OK, "recreate native device with durable buffer handle");
+			require(device->getSwapInterval(&swapInterval) == RENDER_RESULT_OK &&
+				swapInterval == RENDER_SWAP_INTERVAL_MAX, "native swap interval survives device recovery");
+		}
 		RenderBackBufferInfo info;
 		require(device->getBackBufferInfo(&info) == RENDER_RESULT_OK && info.width == width && info.height == height,
 			"cached native back-buffer dimensions match lifecycle transitions");
@@ -140,6 +155,251 @@ std::vector<Pixels> run(bool threaded, bool serial, unsigned frameSlots)
 		"native debug layer has no validation errors");
 	device->shutdown();
 	return captures;
+}
+
+Pixels runBufferPreserveRegression(bool threaded, bool serial,
+	unsigned frameSlots)
+{
+	HiddenWindow window;
+	NativeFactoryState factory;
+	ThreadedRenderOptions options;
+	options.serial = serial;
+	options.maxFramesInFlight = frameSlots;
+	std::unique_ptr<IRenderDevice> device(threaded ?
+		CreateThreadedRenderDevice(nativeFactory, &factory, options) :
+		CreateD3D11RenderDevice());
+	require(device.get() != 0, "create buffer-preserve native device");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = window.value;
+	parameters.width = parameters.height = 64;
+	parameters.enableDebugLayer = true;
+	parameters.enableVsync = false;
+	require(device->initialize(parameters) == RENDER_RESULT_OK,
+		"initialize buffer-preserve native swap chain");
+	if (threaded)
+	{
+		require(factory.owner.load(),
+			"buffer-preserve backend factory executes on render owner");
+	}
+	IRenderContext *context = device->immediateContext();
+	require(context != 0, "buffer-preserve native context exists");
+	struct Vertex { float x, y, z; unsigned int color; };
+	Vertex vertices[6] = {
+		{ -0.95f, -0.75f, 0.0f, 0xffff0000U },
+		{ -0.30f, -0.75f, 0.0f, 0xffff0000U },
+		{ -0.625f, 0.75f, 0.0f, 0xffff0000U },
+		{ 0.30f, -0.75f, 0.0f, 0xff00ff00U },
+		{ 0.95f, -0.75f, 0.0f, 0xff00ff00U },
+		{ 0.625f, 0.75f, 0.0f, 0xff00ff00U }
+	};
+	const unsigned short indices[6] = { 0, 1, 2, 0, 1, 2 };
+	BufferDescriptor vertexDescriptor;
+	vertexDescriptor.byteCount = sizeof(vertices);
+	vertexDescriptor.stride = sizeof(Vertex);
+	vertexDescriptor.binding = RENDER_BUFFER_VERTEX;
+	vertexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle vertexBuffer;
+	require(device->createBuffer(vertexDescriptor, vertices, sizeof(vertices),
+		&vertexBuffer) == RENDER_RESULT_OK,
+		"create mutable buffer-preserve vertex stream");
+	BufferDescriptor indexDescriptor;
+	indexDescriptor.byteCount = sizeof(indices);
+	indexDescriptor.stride = sizeof(unsigned short);
+	indexDescriptor.binding = RENDER_BUFFER_INDEX;
+	indexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle indexBuffer;
+	require(device->createBuffer(indexDescriptor, indices, sizeof(indices),
+		&indexBuffer) == RENDER_RESULT_OK,
+		"create mutable buffer-preserve index stream");
+	LegacyLogicalState logical;
+	logical.pipeline.rasterizer.cullMode = RENDER_CULL_NONE;
+	require(context->beginFrame() == RENDER_RESULT_OK &&
+		context->clear(RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f), 1.0f, 0) ==
+			RENDER_RESULT_OK &&
+		context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+			RENDER_RESULT_OK &&
+		context->setLegacyState(logical, RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			RENDER_RESULT_OK &&
+		context->setVertexBuffer(vertexBuffer, sizeof(Vertex), 0) ==
+			RENDER_RESULT_OK &&
+		context->setIndexBuffer(indexBuffer, RENDER_FORMAT_R16_UINT, 0) ==
+			RENDER_RESULT_OK &&
+		context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK && context->drawIndexed(3, 0, 0) ==
+			RENDER_RESULT_OK,
+		"queue original left triangle before overlapping buffer updates");
+	const Vertex replacementVertices[3] = {
+		{ -0.30f, -0.50f, 0.0f, 0xff0000ffU },
+		{ 0.30f, -0.50f, 0.0f, 0xff0000ffU },
+		{ 0.0f, 0.50f, 0.0f, 0xff0000ffU }
+	};
+	const unsigned short replacementIndices[3] = { 3, 4, 5 };
+	require(context->updateBuffer(vertexBuffer, replacementVertices,
+		sizeof(replacementVertices), 0, RENDER_BUFFER_UPDATE_PRESERVE) ==
+			RENDER_RESULT_OK &&
+		context->updateBuffer(indexBuffer, replacementIndices,
+			sizeof(replacementIndices), 0, RENDER_BUFFER_UPDATE_PRESERVE) ==
+			RENDER_RESULT_OK,
+		"partially preserve overlapping vertex and index prefixes");
+	require(context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK &&
+		context->drawIndexed(3, 3, 0) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK,
+		"queue updated and unchanged-tail indexed draws after preserve");
+	Pixels pixels(64 * 64 * 4);
+	RenderFormat format = RENDER_FORMAT_UNKNOWN;
+	require(device->captureBackBuffer(pixels.data(), pixels.size(), 64 * 4,
+		&format) == RENDER_RESULT_OK && format == RENDER_FORMAT_B8G8R8A8_UNORM,
+		"capture D3D11 queued preserve regression before flip");
+	const unsigned char *left = &pixels[(32 * 64 + 12) * 4];
+	const unsigned char *center = &pixels[(32 * 64 + 32) * 4];
+	const unsigned char *right = &pixels[(32 * 64 + 52) * 4];
+	require(left[0] < 16 && left[1] < 16 && left[2] > 240,
+		"overlapping preserve leaves the earlier queued red draw intact");
+	require(center[0] > 240 && center[1] < 16 && center[2] < 16,
+		"unchanged index tail still selects the newly published blue vertices");
+	require(right[0] < 16 && right[1] > 240 && right[2] < 16,
+		"unchanged vertex tail survives the partial vertex preserve");
+	require(device->present() == RENDER_RESULT_OK,
+		"present buffer-preserve regression frame");
+	if (threaded)
+	{
+		require(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK,
+			"drain queued buffer-preserve commands");
+		ThreadedRenderFrameCompletion completion;
+		unsigned int completions = 0;
+		while (PollThreadedRenderCompletion(device.get(), &completion))
+		{
+			require(completion.result == RENDER_RESULT_OK && completion.presented &&
+				completion.operational && !completion.resourceFailure,
+				"buffer-preserve frame completed without deferred native failure");
+			++completions;
+		}
+		require(completions == 1,
+			"buffer-preserve regression produced one queued frame completion");
+	}
+	require(device->destroyResource(indexBuffer) &&
+		device->destroyResource(vertexBuffer),
+		"destroy buffer-preserve regression resources");
+	device->shutdown();
+	return pixels;
+}
+
+Pixels runUnrelatedBufferDestroyRegression(bool threaded,
+	bool destroyVertexBuffer)
+{
+	HiddenWindow window;
+	NativeFactoryState factory;
+	ThreadedRenderOptions options;
+	options.serial = false;
+	options.maxFramesInFlight = 2;
+	std::unique_ptr<IRenderDevice> device(threaded ?
+		CreateThreadedRenderDevice(nativeFactory, &factory, options) :
+		CreateD3D11RenderDevice());
+	require(device.get() != 0, "create unrelated-buffer-destroy native device");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = window.value;
+	parameters.width = parameters.height = 64;
+	parameters.enableDebugLayer = true;
+	parameters.enableVsync = false;
+	require(device->initialize(parameters) == RENDER_RESULT_OK,
+		"initialize unrelated-buffer-destroy native swap chain");
+	if (threaded)
+	{
+		require(factory.owner.load(),
+			"unrelated-buffer-destroy backend factory executes on render owner");
+	}
+	IRenderContext *context = device->immediateContext();
+	require(context != 0, "unrelated-buffer-destroy native context exists");
+	struct Vertex { float x, y, z; unsigned int color; };
+	const Vertex vertices[3] = {
+		{ -0.8f, -0.8f, 0.0f, 0xffff0000U },
+		{ 0.8f, -0.8f, 0.0f, 0xffff0000U },
+		{ 0.0f, 0.8f, 0.0f, 0xffff0000U }
+	};
+	BufferDescriptor vertexDescriptor;
+	vertexDescriptor.byteCount = sizeof(vertices);
+	vertexDescriptor.stride = sizeof(Vertex);
+	vertexDescriptor.binding = RENDER_BUFFER_VERTEX;
+	vertexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+	GpuHandle boundVertexBuffer;
+	require(device->createBuffer(vertexDescriptor, vertices, sizeof(vertices),
+		&boundVertexBuffer) == RENDER_RESULT_OK,
+		"create bound vertex buffer A");
+	GpuHandle unrelatedBuffer;
+	GpuHandle boundIndexBuffer;
+	if (destroyVertexBuffer)
+	{
+		require(device->createBuffer(vertexDescriptor, vertices, sizeof(vertices),
+			&unrelatedBuffer) == RENDER_RESULT_OK,
+			"create unrelated vertex buffer B");
+	}
+	else
+	{
+		const unsigned short indices[3] = { 0, 1, 2 };
+		BufferDescriptor indexDescriptor;
+		indexDescriptor.byteCount = sizeof(indices);
+		indexDescriptor.stride = sizeof(unsigned short);
+		indexDescriptor.binding = RENDER_BUFFER_INDEX;
+		indexDescriptor.usage = RENDER_USAGE_DYNAMIC;
+		require(device->createBuffer(indexDescriptor, indices, sizeof(indices),
+			&boundIndexBuffer) == RENDER_RESULT_OK,
+			"create bound index buffer A");
+		require(device->createBuffer(indexDescriptor, indices, sizeof(indices),
+			&unrelatedBuffer) == RENDER_RESULT_OK,
+			"create unrelated index buffer B");
+	}
+	LegacyLogicalState logical;
+	logical.pipeline.rasterizer.cullMode = RENDER_CULL_NONE;
+	require(context->beginFrame() == RENDER_RESULT_OK &&
+		context->clear(RenderFloat4(0.0f, 0.0f, 0.0f, 1.0f), 1.0f, 0) ==
+			RENDER_RESULT_OK &&
+		context->setViewport(0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f) ==
+			RENDER_RESULT_OK &&
+		context->setLegacyState(logical, RENDER_VERTEX_POSITION3_COLOR, 0) ==
+			RENDER_RESULT_OK &&
+		context->setVertexBuffer(boundVertexBuffer, sizeof(Vertex), 0) ==
+			RENDER_RESULT_OK &&
+		(destroyVertexBuffer || context->setIndexBuffer(boundIndexBuffer,
+			RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK) &&
+		context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK,
+		"bind buffer A before destroying unrelated buffer B");
+	require(device->destroyResource(unrelatedBuffer),
+		"destroy unrelated buffer B mid-frame");
+	require((destroyVertexBuffer ? context->draw(3, 0) :
+		context->drawIndexed(3, 0, 0)) == RENDER_RESULT_OK &&
+		context->endFrame() == RENDER_RESULT_OK,
+		"draw bound buffer A after unrelated buffer B is destroyed");
+	Pixels pixels(64 * 64 * 4);
+	RenderFormat format = RENDER_FORMAT_UNKNOWN;
+	require(device->captureBackBuffer(pixels.data(), pixels.size(), 64 * 4,
+		&format) == RENDER_RESULT_OK && format == RENDER_FORMAT_B8G8R8A8_UNORM,
+		"capture unrelated-buffer-destroy regression frame");
+	const unsigned char *center = &pixels[(32 * 64 + 32) * 4];
+	require(center[0] < 16 && center[1] < 16 && center[2] > 240,
+		"draw after unrelated destruction still uses the bound red buffer A");
+	require(device->present() == RENDER_RESULT_OK,
+		"present unrelated-buffer-destroy regression frame");
+	if (threaded)
+	{
+		require(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK,
+			"drain unrelated-buffer-destroy commands");
+		ThreadedRenderFrameCompletion completion;
+		require(PollThreadedRenderCompletion(device.get(), &completion) &&
+			completion.result == RENDER_RESULT_OK && completion.presented &&
+			completion.operational && !completion.resourceFailure,
+			"unrelated-buffer-destroy frame completes without resource failure");
+	}
+	require(device->destroyResource(boundVertexBuffer) &&
+		(!boundIndexBuffer.isValid() || device->destroyResource(boundIndexBuffer)),
+		"destroy remaining unrelated-buffer-destroy resources");
+	if (threaded)
+		require(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK,
+			"drain unrelated-buffer-destroy resource cleanup");
+	device->shutdown();
+	return pixels;
 }
 
 std::vector<Pixels> runTexturePipeline(bool threaded, bool serial,
@@ -204,6 +464,7 @@ std::vector<Pixels> runTexturePipeline(bool threaded, bool serial,
 	BufferDescriptor vertexDescriptor;
 	vertexDescriptor.byteCount = sizeof(vertices);
 	vertexDescriptor.stride = sizeof(TexturedVertex);
+	vertexDescriptor.usage = RENDER_USAGE_DEFAULT;
 	GpuHandle vertexBuffer;
 	require(device->createBuffer(vertexDescriptor, vertices, sizeof(vertices),
 		&vertexBuffer) == RENDER_RESULT_OK,
@@ -317,6 +578,10 @@ std::vector<Pixels> runTexturePipeline(bool threaded, bool serial,
 		{
 			require(device->recoverDevice() == RENDER_RESULT_OK,
 				"recover native texture pipeline with live logical resources");
+			require(device->updateBufferResource(vertexBuffer, vertices,
+				sizeof(vertices), 0, RENDER_BUFFER_UPDATE_PRESERVE) ==
+					RENDER_RESULT_OK,
+				"republish descriptor-only vertex bytes after native recovery");
 			// Recovery intentionally invalidates GPU-authoritative copies. The
 			// source texture must instead come back from its latest refreshed
 			// two-mip shadow on this frame.
@@ -426,6 +691,107 @@ std::vector<Pixels> runTexturePipeline(bool threaded, bool serial,
 	device->shutdown();
 	return captures;
 }
+
+void runGammaPass()
+{
+	HiddenWindow window;
+	std::unique_ptr<IRenderDevice> device(CreateD3D11RenderDevice());
+	require(device.get() != 0, "create native gamma device");
+	RenderDeviceParameters parameters;
+	parameters.backend = RENDER_BACKEND_D3D11;
+	parameters.window = window.value;
+	parameters.width = parameters.height = 64;
+	parameters.enableDebugLayer = true;
+	parameters.enableVsync = false;
+	require(device->initialize(parameters) == RENDER_RESULT_OK,
+		"initialize native gamma swap chain");
+	IRenderContext *context = device->immediateContext();
+	require(context != 0, "native gamma context exists");
+	float gamma = 0.0f, brightness = 0.0f, contrast = 0.0f;
+	bool calibrate = true, useLimit = true;
+	require(device->setGamma(2.0f, 0.0f, 1.0f, false, false) ==
+		RENDER_RESULT_OK, "set native postprocess gamma without curve limit");
+	require(device->getGamma(&gamma, &brightness, &contrast, &calibrate,
+		&useLimit) == RENDER_RESULT_OK && gamma == 2.0f &&
+		brightness == 0.0f && contrast == 1.0f && !calibrate && !useLimit,
+		"native gamma state preserves both legacy switches");
+
+	auto renderClear = [&](unsigned int width, unsigned int height)
+	{
+		require(context->beginFrame() == RENDER_RESULT_OK,
+			"begin native gamma frame");
+		require(context->clear(RenderFloat4(0.25f, 0.25f, 0.25f, 1.0f),
+			1.0f, 0) == RENDER_RESULT_OK &&
+			context->setViewport(0.0f, 0.0f, static_cast<float>(width),
+				static_cast<float>(height), 0.0f, 1.0f) == RENDER_RESULT_OK &&
+			context->endFrame() == RENDER_RESULT_OK,
+			"record native gamma clear before present");
+	};
+	auto captureCenter = [&](unsigned int width, unsigned int height)
+	{
+		Pixels pixels(width * height * 4);
+		RenderFormat format = RENDER_FORMAT_UNKNOWN;
+		require(device->captureBackBuffer(pixels.data(), pixels.size(),
+			width * 4, &format) == RENDER_RESULT_OK &&
+			format == RENDER_FORMAT_B8G8R8A8_UNORM,
+			"capture native gamma back buffer before or after injected present");
+		const unsigned char *center = pixels.data() +
+			(height / 2 * width + width / 2) * 4;
+		return std::vector<unsigned char>(center, center + 4);
+	};
+	auto expectChannelRange = [](const std::vector<unsigned char> &pixel,
+		unsigned char minimum, unsigned char maximum, const char *message)
+	{
+		require(pixel[0] >= minimum && pixel[0] <= maximum &&
+			pixel[1] >= minimum && pixel[1] <= maximum &&
+			pixel[2] >= minimum && pixel[2] <= maximum, message);
+	};
+
+	renderClear(64, 64);
+	const std::vector<unsigned char> source = captureCenter(64, 64);
+	expectChannelRange(source, 56, 72,
+		"pre-present capture remains the untransformed clear color");
+	require(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_PRESENTATION_PASS, 1, RENDER_RESULT_FAILED) ==
+		RENDER_RESULT_OK, "inject native gamma pass failure before flip");
+	require(device->present() == RENDER_RESULT_FAILED,
+		"native gamma pass failure prevents swap-chain Present");
+	const std::vector<unsigned char> transformed = captureCenter(64, 64);
+	expectChannelRange(transformed, 112, 144,
+		"injected pre-flip readback observes the gamma transform");
+
+	// The pass resources are tied to the swap-chain dimensions and must be
+	// recreated after both ordinary resize and full device recovery.
+	require(device->resize(96, 48) == RENDER_RESULT_OK,
+		"resize native gamma swap chain");
+	renderClear(96, 48);
+	require(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_PRESENTATION_PASS, 1, RENDER_RESULT_FAILED) ==
+		RENDER_RESULT_OK && device->present() == RENDER_RESULT_FAILED,
+		"resized native gamma pass remains fault-injectable before flip");
+	expectChannelRange(captureCenter(96, 48), 112, 144,
+		"resized native gamma pass transforms clear pixels");
+	require(device->recoverDevice() == RENDER_RESULT_OK,
+		"recover native gamma device");
+	renderClear(96, 48);
+	require(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_PRESENTATION_PASS, 1, RENDER_RESULT_FAILED) ==
+		RENDER_RESULT_OK && device->present() == RENDER_RESULT_FAILED,
+		"recovered native gamma pass remains fault-injectable before flip");
+	expectChannelRange(captureCenter(96, 48), 112, 144,
+		"recovered native gamma pass transforms clear pixels");
+
+	// Identity must bypass the pass entirely.  A pending pass fault therefore
+	// cannot turn an ordinary identity Present into a false failure.
+	require(device->setGamma(1.0f, 0.0f, 1.0f, false, true) ==
+		RENDER_RESULT_OK, "set native gamma identity");
+	renderClear(96, 48);
+	require(device->configureResourceFaultInjection(
+		RENDER_RESOURCE_FAULT_PRESENTATION_PASS, 1, RENDER_RESULT_FAILED) ==
+		RENDER_RESULT_OK && device->present() == RENDER_RESULT_OK,
+		"identity gamma bypasses the postprocess pass");
+	device->shutdown();
+}
 }
 
 int main()
@@ -437,6 +803,21 @@ int main()
 		require(run(true, true, 2) == reference, "serial native owner pixels equal direct D3D11 reference");
 		require(run(true, false, 2) == reference, "two-slot native owner pixels equal direct D3D11 reference");
 		require(run(true, false, 3) == reference, "three-slot native owner pixels equal direct D3D11 reference");
+		const Pixels preserveReference = runBufferPreserveRegression(false,
+			false, 2);
+		require(runBufferPreserveRegression(true, false, 2) ==
+			preserveReference,
+			"queued direct and threaded overlapping-preserve pixels match");
+		const Pixels unrelatedVertexReference =
+			runUnrelatedBufferDestroyRegression(false, true);
+		require(runUnrelatedBufferDestroyRegression(true, true) ==
+			unrelatedVertexReference,
+			"direct and threaded draws survive unrelated vertex-buffer destruction");
+		const Pixels unrelatedIndexReference =
+			runUnrelatedBufferDestroyRegression(false, false);
+		require(runUnrelatedBufferDestroyRegression(true, false) ==
+			unrelatedIndexReference,
+			"direct and threaded draws survive unrelated index-buffer destruction");
 		const std::vector<Pixels> textureReference = runTexturePipeline(false, false, 2);
 		require(runTexturePipeline(true, true, 2) == textureReference,
 			"serial native texture/copy pixels equal direct D3D11 reference");
@@ -444,6 +825,7 @@ int main()
 			"two-slot native texture/copy pixels equal direct D3D11 reference");
 		require(runTexturePipeline(true, false, 3) == textureReference,
 			"three-slot native texture/copy pixels equal direct D3D11 reference");
+		runGammaPass();
 		require(rts::JobSystem::instance().unregisterCurrentThread(rts::JOB_OWNER_GAME), "release producer owner");
 		std::puts("Real D3D11 threaded pixel/lifecycle contracts passed");
 		return 0;

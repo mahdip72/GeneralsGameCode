@@ -36,12 +36,10 @@
 #include "GameClient/View.h"
 #include "WW3D2/camera.h"
 #include "WW3D2/light.h"
-#include "WW3D2/dx8wrapper.h"
 #include "WW3D2/hlod.h"
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
 #include "Lib/BaseType.h"
-#include "W3DDevice/GameClient/HeightMap.h"
 #include "Common/GlobalData.h"
 #include "W3DDevice/GameClient/W3DVolumetricShadow.h"
 #include "W3DDevice/GameClient/W3DProjectedShadow.h"
@@ -131,15 +129,17 @@ Bool W3DShadowManager::init()
 {
 	Bool result=TRUE;
 
-	if	(TheW3DVolumetricShadowManager && TheW3DVolumetricShadowManager->init())
+	if	(TheW3DVolumetricShadowManager &&
+		(!TheW3DVolumetricShadowManager->init() ||
+		 !TheW3DVolumetricShadowManager->ReAcquireResources()))
 	{
-		if (TheW3DVolumetricShadowManager->ReAcquireResources())
-			result = TRUE;
+		result = FALSE;
 	}
-	if ( TheW3DProjectedShadowManager && TheW3DProjectedShadowManager->init())
+	if (TheW3DProjectedShadowManager &&
+		(!TheW3DProjectedShadowManager->init() ||
+		 !TheW3DProjectedShadowManager->ReAcquireResources()))
 	{
-		if (TheW3DProjectedShadowManager->ReAcquireResources())
-			result = TRUE;
+		result = FALSE;
 	}
 
 	return result;

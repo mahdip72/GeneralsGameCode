@@ -280,6 +280,16 @@ Bool FileSystem::doesFileExist(const Char *filename, FileInstance instance) cons
 	return FALSE;
 }
 
+#if defined(_WIN64)
+void FileSystem::noteExternalFileReplacement(const Char *filename)
+{
+#if ENABLE_FILESYSTEM_EXISTENCE_CACHE
+	FastCriticalSectionClass::LockClass lock(m_fileExistMutex);
+	m_fileExist[filename] = FileExistData();
+#endif
+}
+#endif
+
 //============================================================================
 // FileSystem::getFileListInDirectory
 //============================================================================

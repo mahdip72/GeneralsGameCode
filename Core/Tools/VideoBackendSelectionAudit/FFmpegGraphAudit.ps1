@@ -43,7 +43,7 @@ $cmakeArguments = @(
     '-B', $BuildRoot,
     '-G', 'Visual Studio 17 2022',
     '-A', 'Win32',
-    '-DRTS_BUILD_PRODUCT=ON',
+    '-DRTS_BUILD_PRODUCT=OFF',
     '-DRTS_BUILD_ZEROHOUR=ON',
     '-DRTS_BUILD_GENERALS=OFF',
     '-DRTS_BUILD_CORE_TOOLS=OFF',
@@ -83,8 +83,28 @@ if ($null -eq $runtimeTestProject) {
     throw 'FFmpeg-only CMake graph did not generate the Zero Hour runtime regression project.'
 }
 $runtimeTestProjectContent = Get-Content -LiteralPath $runtimeTestProject.FullName -Raw
-if ($runtimeTestProjectContent -match '(?i)binkstub|BinkVideoPlayer') {
-    throw 'FFmpeg-only runtime regression utility retains a direct or transitive Bink dependency.'
+$legacyGraphForbiddenTokens = '(?i)binkstub|BinkVideoPlayer|rts_(?:generals|zerohour)_legacy_renderer|milesstub'
+if ($runtimeTestProjectContent -match $legacyGraphForbiddenTokens) {
+    throw 'FFmpeg-only runtime regression utility retains a forbidden legacy video, renderer, or Miles dependency.'
+}
+
+# The runtime utility reaches the title WW3D2 and GameEngineDevice targets
+# through transitive links.  Check those generated projects as well: a
+# configure-only audit can otherwise miss an architecture helper that emits a
+# dangling library outside the utility project itself.
+foreach ($projectName in @(
+    'z_ww3d2.vcxproj',
+    'z_gameenginedevice.vcxproj'
+)) {
+    $project = Get-ChildItem -LiteralPath $BuildRoot -Recurse -Filter $projectName |
+        Select-Object -First 1
+    if ($null -eq $project) {
+        throw "FFmpeg-only CMake graph did not generate $projectName."
+    }
+    $projectContent = Get-Content -LiteralPath $project.FullName -Raw
+    if ($projectContent -match $legacyGraphForbiddenTokens) {
+        throw "FFmpeg-only $projectName retains a forbidden legacy video, renderer, or Miles dependency."
+    }
 }
 
 if ((Get-Content -LiteralPath $solution.FullName -Raw) -notmatch 'z_runtime_regression_tests') {
@@ -94,6 +114,25 @@ if ((Get-Content -LiteralPath $solution.FullName -Raw) -notmatch 'z_runtime_regr
 $toolsTestFile = Join-Path $BuildRoot 'Core/Tools/CTestTestfile.cmake'
 if (-not (Test-Path -LiteralPath $toolsTestFile) -or (Get-Content -LiteralPath $toolsTestFile -Raw) -notmatch 'core_video_backend_selection_audit') {
     throw 'Video backend source audit is unavailable in an ordinary CMake test configuration.'
+}
+
+# CMake accepts an unknown plain library token during generation.  Compile and
+# link the focused FFmpeg contract utility so missing graph targets cannot be
+# reported as a pass merely because configuration succeeded.  Use the same VS
+# environment as configuration and cap MSBuild at two workers to keep this
+# diagnostic lane resource-bounded.
+$buildCommand = '"' + $CMakeCommand + '" --build "' + $BuildRoot +
+    '" --config Release --target core_ffmpeg_graph_link_probe -- /m:2'
+& cmd.exe /d /c ('call "' + $vsDevCmd + '" -arch=x64 -host_arch=x64 && ' + $buildCommand)
+if ($LASTEXITCODE -ne 0) {
+    throw 'FFmpeg-only CMake graph link probe failed to compile or link.'
+}
+
+$contractExecutable = Get-ChildItem -LiteralPath $BuildRoot -Recurse -Filter 'core_ffmpeg_graph_link_probe.exe' |
+    Where-Object { $_.FullName -match '(?i)\\Release\\' } |
+    Select-Object -First 1
+if ($null -eq $contractExecutable) {
+    throw 'FFmpeg-only graph link probe reported success without producing its Release executable.'
 }
 
 Write-Output 'FFmpeg-only CMake graph audit passed.'

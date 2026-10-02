@@ -329,13 +329,15 @@ namespace
 	{
 	public:
 		CountingPcmStream(UnsignedInt totalFrames, std::vector<UnsignedInt> &readStarts,
-			std::vector<UnsignedInt> &readBounds, Real durationMS) :
+			std::vector<UnsignedInt> &readBounds, Real durationMS, int &destroyedCount) :
 			m_totalFrames(totalFrames),
 			m_readStarts(readStarts),
 			m_readBounds(readBounds),
-			m_durationMS(durationMS)
+			m_durationMS(durationMS),
+			m_destroyedCount(destroyedCount)
 		{
 		}
+		~CountingPcmStream() override { ++m_destroyedCount; }
 
 		UnsignedInt sampleRate() const override { return 48000U; }
 		Real durationMS() const override
@@ -368,6 +370,7 @@ namespace
 		std::vector<UnsignedInt> &m_readStarts;
 		std::vector<UnsignedInt> &m_readBounds;
 		Real m_durationMS;
+		int &m_destroyedCount;
 	};
 
 	class StreamingAudioAssetSource final : public AudioAssetSource
@@ -404,7 +407,7 @@ namespace
 		{
 			++openStreamCalls;
 			stream = std::make_unique<CountingPcmStream>(
-				m_totalFrames, readStarts, readBounds, m_durationMS);
+				m_totalFrames, readStarts, readBounds, m_durationMS, destroyedStreamCount);
 			return TRUE;
 		}
 		const void *getFileIdentity(const AsciiString &) const override
@@ -413,6 +416,7 @@ namespace
 		}
 
 		mutable int openStreamCalls = 0;
+		mutable int destroyedStreamCount = 0;
 		mutable int getDurationCalls = 0;
 		mutable int decodePcmCalls = 0;
 		mutable int decodePcmAtCalls = 0;
@@ -552,6 +556,29 @@ int main()
 #if defined(_MSC_VER)
 	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
+	AudioSettings cacheBudgetSettings;
+	cacheBudgetSettings.m_maxCacheSize = 4194304U;
+#if defined(_WIN64)
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 67108864U,
+		"shipped legacy 4 MiB value defaults to a 64 MiB x64 native SFX cache");
+#else
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 4194304U,
+		"shipped legacy 4 MiB value remains exact on non-x64 builds");
+#endif
+	cacheBudgetSettings.m_hasNativeSamplePcmCacheBudget = TRUE;
+	cacheBudgetSettings.m_nativeSamplePcmCacheBudgetInBytes = 4194304U;
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 4194304U,
+		"explicit native 4 MiB override remains exact");
+	cacheBudgetSettings.m_nativeSamplePcmCacheBudgetInBytes = 0;
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 0,
+		"explicit native zero disables cache despite the legacy default");
+	cacheBudgetSettings.m_hasNativeSamplePcmCacheBudget = FALSE;
+	cacheBudgetSettings.m_maxCacheSize = 123456U;
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 123456U,
+		"non-default legacy cache budget remains exact");
+	cacheBudgetSettings.m_maxCacheSize = 0;
+	check(cacheBudgetSettings.nativeSamplePcmCacheBudgetInBytes() == 0,
+		"legacy zero cache budget remains disabled");
 	const std::filesystem::path realRoot = std::filesystem::temp_directory_path()
 		/ ("rts-native-audio-manager-real-source-" + std::to_string(GetCurrentProcessId()));
 	std::filesystem::create_directories(realRoot);
@@ -938,6 +965,7 @@ int main()
 	FakeVoice *streamingVoice = streamingEngine->lastVoice;
 	check(streamingVoice != nullptr && streamingVoice->submitCalls == 2
 		&& streamingSource.openStreamCalls == 1
+		&& streamingSource.destroyedStreamCount == 0
 		&& streamingSource.decodePcmCalls == 0 && streamingSource.decodePcmAtCalls == 0
 		&& streamingSource.readStarts.size() == 2
 		&& streamingSource.readStarts[0] == 0U
@@ -951,14 +979,123 @@ int main()
 	check(streamingVoice != nullptr && streamingVoice->submitCalls == 3
 		&& streamingSource.readStarts.size() == 3
 		&& streamingSource.readStarts[2] == 96000U
+		&& streamingSource.destroyedStreamCount == 1
+		&& streamingManager.isCurrentlyPlaying(streamingHandle)
 		&& streamingSource.decodePcmCalls == 0 && streamingSource.decodePcmAtCalls == 0,
-		"streaming completion reads the next linear chunk without decode fallback");
+		"final accepted SFX chunk releases its source while queued playback remains active");
 	streamingManager.stopAudio(AudioAffect_Sound);
 	streamingManager.update();
 	check(!streamingManager.isCurrentlyPlaying(streamingHandle),
 		"stopping streaming playback releases its stream-backed handle");
 	streamingManager.closeDevice();
 	deleteInstance(streamingInfo);
+
+	StreamingAudioAssetSource shortSource(96000U);
+	std::unique_ptr<FakeEngine> shortOwnedEngine = std::make_unique<FakeEngine>();
+	FakeEngine *shortEngine = shortOwnedEngine.get();
+	XAudio2AudioService shortService(std::move(shortOwnedEngine));
+	XAudio2AudioManager shortManager(&shortService, &shortSource);
+	shortManager.openDevice();
+	AudioEventInfo *shortInfo = newInstance(AudioEventInfo);
+	*shortInfo = *fixtureInfo;
+	shortInfo->m_attackSounds.clear();
+	shortInfo->m_decaySounds.clear();
+	shortInfo->m_sounds.clear();
+	shortInfo->m_sounds.push_back(AsciiString("short-stream.wav"));
+	FixtureEvent firstShortEvent(AsciiString("first-short-stream"));
+	FixtureEvent secondShortEvent(AsciiString("second-short-stream"));
+	firstShortEvent.setAudioEventInfo(shortInfo);
+	secondShortEvent.setAudioEventInfo(shortInfo);
+	const AudioHandle firstShortHandle = shortManager.addAudioEvent(&firstShortEvent);
+	const AudioHandle secondShortHandle = shortManager.addAudioEvent(&secondShortEvent);
+	shortManager.update();
+	shortManager.update();
+	check(shortManager.isCurrentlyPlaying(firstShortHandle)
+		&& shortManager.isCurrentlyPlaying(secondShortHandle)
+		&& shortSource.openStreamCalls == 2 && shortSource.destroyedStreamCount == 2
+		&& shortEngine->voices.size() == 2U
+		&& shortEngine->voices[0]->submittedAudio.size() == 2U
+		&& shortEngine->voices[1]->submittedAudio.size() == 2U,
+		"concurrent two-second SFX release independent sources after two accepted prequeue chunks");
+	shortManager.pauseAudio(AudioAffect_Sound);
+	shortManager.resumeAudio(AudioAffect_Sound);
+	check(shortSource.openStreamCalls == 2 && shortSource.destroyedStreamCount == 2
+		&& shortManager.isCurrentlyPlaying(firstShortHandle)
+		&& shortManager.isCurrentlyPlaying(secondShortHandle),
+		"pause and resume keep queued SFX playback without reopening released streams");
+	for (int chunk = 0; chunk != 2; ++chunk) {
+		check(shortEngine->voices[0]->completeOldestBuffer()
+			&& shortEngine->voices[1]->completeOldestBuffer(),
+			"both concurrent SFX voices complete their own accepted chunks");
+		shortManager.update();
+	}
+	check(!shortManager.isCurrentlyPlaying(firstShortHandle)
+		&& !shortManager.isCurrentlyPlaying(secondShortHandle)
+		&& shortSource.openStreamCalls == 2,
+		"concurrent SFX finish without reading or reopening released sources");
+	shortInfo->m_control = AC_LOOP;
+	shortInfo->m_loopCount = 2;
+	FixtureEvent shortLoopEvent(AsciiString("short-loop-stream"));
+	shortLoopEvent.setAudioEventInfo(shortInfo);
+	const AudioHandle shortLoopHandle = shortManager.addAudioEvent(&shortLoopEvent);
+	shortManager.update();
+	shortManager.update();
+	check(shortManager.isCurrentlyPlaying(shortLoopHandle)
+		&& shortSource.openStreamCalls == 3 && shortSource.destroyedStreamCount == 3,
+		"first loop opens and releases its fully queued SFX stream");
+	FakeVoice *shortLoopVoice = shortEngine->lastVoice;
+	check(shortLoopVoice != nullptr && shortLoopVoice->completeOldestBuffer(),
+		"loop completes its first queued chunk");
+	shortManager.update();
+	check(shortLoopVoice != nullptr && shortLoopVoice->completeOldestBuffer(),
+		"loop completes its second queued chunk");
+	shortManager.update();
+	check(shortManager.isCurrentlyPlaying(shortLoopHandle)
+		&& shortSource.openStreamCalls == 4 && shortSource.destroyedStreamCount == 4,
+		"next loop reopens and independently releases the newly accepted SFX stream");
+	shortManager.closeDevice();
+	deleteInstance(shortInfo);
+
+	StreamingAudioAssetSource speechSource(96000U);
+	std::unique_ptr<FakeEngine> speechOwnedEngine = std::make_unique<FakeEngine>();
+	XAudio2AudioService speechService(std::move(speechOwnedEngine));
+	XAudio2AudioManager speechManager(&speechService, &speechSource);
+	speechManager.openDevice();
+	AudioEventInfo *earlySpeechInfo = newInstance(AudioEventInfo);
+	*earlySpeechInfo = *fixtureInfo;
+	earlySpeechInfo->m_soundType = AT_Streaming;
+	earlySpeechInfo->m_attackSounds.clear();
+	earlySpeechInfo->m_decaySounds.clear();
+	earlySpeechInfo->m_sounds.clear();
+	earlySpeechInfo->m_sounds.push_back(AsciiString("speech-stream.wav"));
+	earlySpeechInfo->m_filename = AsciiString("speech-stream.wav");
+	FixtureEvent speechEvent(AsciiString("speech-stream"));
+	speechEvent.setAudioEventInfo(earlySpeechInfo);
+	const AudioHandle speechHandle = speechManager.addAudioEvent(&speechEvent);
+	speechManager.update();
+	speechManager.update();
+	check(speechManager.isCurrentlyPlaying(speechHandle)
+		&& speechSource.openStreamCalls == 1 && speechSource.destroyedStreamCount == 0,
+		"fully queued speech retains its stream until playback ends");
+	speechManager.killAudioEventImmediately(speechHandle);
+	AudioEventInfo *earlyMusicInfo = newInstance(AudioEventInfo);
+	*earlyMusicInfo = *earlySpeechInfo;
+	earlyMusicInfo->m_audioName = AsciiString("early-unpin-music");
+	earlyMusicInfo->m_soundType = AT_Music;
+	earlyMusicInfo->m_filename = AsciiString("music-stream.wav");
+	FixtureEvent earlyMusicEvent(AsciiString("early-unpin-music"));
+	earlyMusicEvent.setAudioEventInfo(earlyMusicInfo);
+	speechManager.addTrackName(AsciiString("early-unpin-music"));
+	speechManager.setActiveMusicTrackForTest(AsciiString("early-unpin-music"));
+	const AudioHandle earlyMusicHandle = speechManager.addAudioEvent(&earlyMusicEvent);
+	speechManager.update();
+	speechManager.update();
+	check(speechManager.isCurrentlyPlaying(earlyMusicHandle)
+		&& speechSource.openStreamCalls == 2 && speechSource.destroyedStreamCount == 1,
+		"fully queued music retains its stream while only completed speech was released");
+	speechManager.closeDevice();
+	deleteInstance(earlyMusicInfo);
+	deleteInstance(earlySpeechInfo);
 
 	StreamingAudioAssetSource unknownDurationSource(1200U, 0.0f, TRUE);
 	std::unique_ptr<FakeEngine> unknownDurationOwnedEngine = std::make_unique<FakeEngine>();
@@ -1505,6 +1642,104 @@ int main()
 	manager.update();
 	check(!manager.isCurrentlyPlaying(inaudibleHandle) && engine->activeVoiceCount == 0,
 		"ordinary 3D loops retire below the minimum volume before reaching maximum range");
+	{
+		std::unique_ptr<FakeEngine> churnOwnedEngine = std::make_unique<FakeEngine>();
+		FakeEngine *churnEngine = churnOwnedEngine.get();
+		XAudio2AudioService churnService(std::move(churnOwnedEngine));
+		StreamingAudioAssetSource churnSource(48000U);
+		XAudio2AudioManager churnManager(&churnService, &churnSource);
+		AudioSettings churnSettings;
+		churnSettings.m_use3DSoundRangeVolumeFade = TRUE;
+		churnSettings.m_3DSoundRangeVolumeFadeExponent = 1.0f;
+		churnSettings.m_minVolume = 0.01f;
+		churnManager.setAudioSettingsForTest(&churnSettings);
+		churnManager.openDevice();
+		AudioEventInfo *churnInfo = newInstance(AudioEventInfo);
+		*churnInfo = *lifecycleInfo;
+		churnInfo->m_audioName = AsciiString("permanent-ambient-retry");
+		churnInfo->m_loopCount = 0;
+		g_nativeAudioObjectPositionForTest.set(99.5f, 0.0f, 0.0f);
+		for (int retry = 0; retry < 12; ++retry) {
+			FixtureEvent ambient(AsciiString("permanent-ambient-retry"));
+			ambient.setAudioEventInfo(churnInfo);
+			ambient.setObjectID(static_cast<ObjectID>(77U));
+			const AudioHandle handle = churnManager.addAudioEvent(&ambient);
+			churnManager.update();
+			check(handle != AHSV_Error && handle != AHSV_NotForLocal
+				&& !churnManager.isCurrentlyPlaying(handle)
+				&& churnManager.getPendingAudioRequestCount() == 0U
+				&& churnManager.getActiveAudioCount() == 0U
+				&& churnEngine->activeVoiceCount == 0
+				&& churnEngine->voices.empty() && churnSource.openStreamCalls == 0,
+				"inaudible permanent 3D ambient retries retain no record and open no PCM or voice");
+		}
+		g_nativeAudioObjectPositionForTest.set(10.0f, 0.0f, 0.0f);
+		FixtureEvent audibleAmbient(AsciiString("permanent-ambient-retry"));
+		audibleAmbient.setAudioEventInfo(churnInfo);
+		audibleAmbient.setObjectID(static_cast<ObjectID>(77U));
+		const AudioHandle audibleHandle = churnManager.addAudioEvent(&audibleAmbient);
+		churnManager.update();
+		check(churnManager.isCurrentlyPlaying(audibleHandle)
+			&& churnManager.getActiveAudioCount() == 1U
+			&& churnEngine->activeVoiceCount == 1
+			&& churnEngine->voices.size() == 1U
+			&& churnSource.openStreamCalls == 1
+			&& churnEngine->lastVoice != nullptr && churnEngine->lastVoice->startCalls == 1,
+			"the same permanent ambient is admitted and started once when it becomes audible");
+		g_nativeAudioObjectPositionForTest.set(99.5f, 0.0f, 0.0f);
+		churnManager.update();
+		check(!churnManager.isCurrentlyPlaying(audibleHandle)
+			&& churnEngine->activeVoiceCount == 0,
+			"the audible ambient still retires when its owner moves below the volume threshold");
+		churnManager.setChannelLimitsForTest(1U, 1U, 1U);
+		AudioEventInfo *orderedLowInfo = newInstance(AudioEventInfo);
+		*orderedLowInfo = *lowInfo;
+		AudioEventInfo *orderedHighInfo = newInstance(AudioEventInfo);
+		*orderedHighInfo = *orderedLowInfo;
+		orderedHighInfo->m_priority = AP_HIGH;
+		AudioEventInfo *orderedMediumInfo = newInstance(AudioEventInfo);
+		*orderedMediumInfo = *orderedLowInfo;
+		orderedMediumInfo->m_priority = AP_NORMAL;
+		Coord3D nearPosition;
+		nearPosition.set(10.0f, 0.0f, 0.0f);
+		Coord3D quietPosition;
+		quietPosition.set(99.5f, 0.0f, 0.0f);
+		FixtureEvent orderedLow(AsciiString("ordered-low"));
+		orderedLow.setAudioEventInfo(orderedLowInfo);
+		orderedLow.setPosition(&nearPosition);
+		const AudioHandle orderedLowHandle = churnManager.addAudioEvent(&orderedLow);
+		churnManager.update();
+		check(churnManager.isCurrentlyPlaying(orderedLowHandle)
+			&& churnManager.getNumAvailable3DSamples() == 0U,
+			"one-voice ordered fixture begins with an audible low-priority owner");
+		const int opensBeforeOrderedRequests = churnSource.openStreamCalls;
+		const std::size_t voicesBeforeOrderedRequests = churnEngine->voices.size();
+		FixtureEvent orderedHigh(AsciiString("ordered-high-inaudible"));
+		orderedHigh.setAudioEventInfo(orderedHighInfo);
+		orderedHigh.setPosition(&quietPosition);
+		const AudioHandle orderedHighHandle = churnManager.addAudioEvent(&orderedHigh);
+		FixtureEvent orderedMedium(AsciiString("ordered-medium-audible"));
+		orderedMedium.setAudioEventInfo(orderedMediumInfo);
+		orderedMedium.setPosition(&nearPosition);
+		const AudioHandle orderedMediumHandle = churnManager.addAudioEvent(&orderedMedium);
+		check(orderedHighHandle != AHSV_NoSound && orderedMediumHandle != AHSV_NoSound
+			&& churnManager.getPendingAudioRequestCount() == 2U,
+			"both replacement candidates retain their FIFO request reservations");
+		churnManager.update();
+		check(!churnManager.isCurrentlyPlaying(orderedLowHandle)
+			&& !churnManager.isCurrentlyPlaying(orderedHighHandle)
+			&& !churnManager.isCurrentlyPlaying(orderedMediumHandle)
+			&& churnManager.getActiveAudioCount() == 0U
+			&& churnEngine->activeVoiceCount == 0
+			&& churnSource.openStreamCalls == opensBeforeOrderedRequests
+			&& churnEngine->voices.size() == voicesBeforeOrderedRequests,
+			"inaudible high priority reserves the channel until retirement and blocks later medium audio");
+		churnManager.closeDevice();
+		deleteInstance(orderedLowInfo);
+		deleteInstance(orderedHighInfo);
+		deleteInstance(orderedMediumInfo);
+		deleteInstance(churnInfo);
+	}
 
 	g_nativeAudioObjectPositionForTest.set(10.0f, 0.0f, 0.0f);
 	FixtureEvent nullPositionLoop(AsciiString("lifecycle-null-position"));

@@ -1,3 +1,7 @@
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    return()
+endif()
+
 add_executable(core_texture_mip_buffer_tests
     TextureMipBufferTest.cpp
     ../../Libraries/Source/WWVegas/WW3D2/bitmaphandler.cpp

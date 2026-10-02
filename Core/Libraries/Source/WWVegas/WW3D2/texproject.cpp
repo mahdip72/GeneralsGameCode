@@ -74,17 +74,18 @@
  * - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
 
+#include "Utility/CppMacros.h"
 #include "texproject.h"
 #include "vertmaterial.h"
 #include "shader.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "rendobj.h"
 #include "rinfo.h"
 #include "camera.h"
 #include "matpass.h"
 #include "bwrender.h"
 #include "assetmgr.h"
-#include "dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
 
 
 // DEBUG DEBUG
@@ -97,7 +98,7 @@ const float INTENSITY_RATE_OF_CHANGE			= 1.0f;			// change in intensity per seco
 
 static void Restore_Default_Render_Target()
 {
-	DX8Wrapper::Set_Render_Target((IDirect3DSurface8 *)nullptr);
+	rts::render::SetGameRenderTarget(nullptr, nullptr, true);
 }
 
 
@@ -1121,7 +1122,7 @@ bool TexProjectClass::Compute_Texture
 (
 	RenderObjClass * model,
 	SpecialRenderInfoClass * context,
-	TextureClass * d3d11_copy_target
+	TextureClass * native_copy_target
 )
 {
 	if ((model == nullptr) || (context == nullptr))
@@ -1148,12 +1149,12 @@ bool TexProjectClass::Compute_Texture
 		/*
 		** Set the render target
 		*/
-		// The D3D11 copy target deliberately renders without depth because it is
-		// smaller than the swap chain. Preserve the historical D3D8 behavior,
+		// The native copy target deliberately renders without depth because it is
+		// smaller than the swap chain. Preserve the historical legacy behavior,
 		// which attaches the default depth surface when ztarget is absent.
-		DX8Wrapper::Set_Render_Target_With_Z(rtarget, ztarget,
-			!DX8Wrapper::Is_D3D11_Backend_Active());
-		if (!DX8Wrapper::Is_Render_To_Texture())
+		rts::render::SetGameRenderTarget(rtarget, ztarget,
+			!rts::render::IsNativeGameRendererActive());
+		if (!rts::render::IsGameRenderingToTexture())
 		{
 			Restore_Default_Render_Target();
 			return false;
@@ -1184,27 +1185,25 @@ bool TexProjectClass::Compute_Texture
 		}
 		WW3D::Render(*model,*context);
 		bool copy_succeeded = true;
-		if (d3d11_copy_target != nullptr &&
-			DX8Wrapper::Is_D3D11_Backend_Active())
+		if (native_copy_target != nullptr &&
+			rts::render::IsNativeGameRendererActive())
 		{
-			copy_succeeded = DX8Wrapper::Copy_Active_Render_Target_To_Texture(
-				d3d11_copy_target->Peek_D3D_Base_Texture()) ==
+			copy_succeeded = rts::render::CopyGameActiveTargetToTexture(
+				native_copy_target) ==
 				rts::render::RENDER_RESULT_OK;
 		}
 		SNAPSHOT_SAY(("TexProjectCLass::End_Render()"));
 		WW3D::End_Render(false);
 		WW3D::Activate_Snapshot(snapshot);	// End_Render() ends the shapsnot, so restore the state
-		if (copy_succeeded && d3d11_copy_target != nullptr &&
-			DX8Wrapper::Is_D3D11_Backend_Active())
+		if (copy_succeeded && native_copy_target != nullptr &&
+			rts::render::IsNativeGameRendererActive())
 		{
 			// End_Render finalizes the hidden producer frame.  A failed frame
 			// invalidates its copy, so verify publication before advancing the
 			// shadow's bounds/history and suppressing regeneration.
-			copy_succeeded =
-				DX8Wrapper::Acquire_D3D11_Copied_Texture_Content(
-					d3d11_copy_target->Peek_D3D_Base_Texture());
+			copy_succeeded = rts::render::AcquireGameCopiedTextureContent(
+				native_copy_target);
 		}
-
 		Restore_Default_Render_Target();
 		if (!copy_succeeded)
 		{

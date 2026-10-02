@@ -44,11 +44,59 @@
 
 
 #include "matrixmapper.h"
-#include "dx8wrapper.h"
+#include "Renderer/RenderGameClient.h"
 
 namespace
 {
 	const uint32 CANONICAL_MAPPER_MATRIX = 0x100u;
+
+	static rts::render::GameRenderTransformSlot MatrixMapperTextureTransformSlot(
+		unsigned int stage)
+	{
+		return static_cast<rts::render::GameRenderTransformSlot>(
+			rts::render::GAME_TRANSFORM_TEXTURE0 + stage);
+	}
+
+	static void SetMatrixMapperTextureTransform(unsigned int stage,
+		const Matrix3D &matrix)
+	{
+		rts::render::SetGameTransform(MatrixMapperTextureTransformSlot(stage), matrix);
+	}
+
+	static void SetMatrixMapperTextureTransform(unsigned int stage,
+		const Matrix4x4 &matrix)
+	{
+		rts::render::SetGameTransform(MatrixMapperTextureTransformSlot(stage), matrix);
+	}
+
+	static void SetMatrixMapperTextureCoordinateCameraPosition(unsigned int stage)
+	{
+		rts::render::SetGameTextureStageState(stage,
+			rts::render::GAME_TEXTURE_STAGE_COORDINATE_INDEX,
+		rts::render::GAME_TEXTURE_COORDINATE_CAMERA_POSITION);
+	}
+
+	static void SetMatrixMapperTextureCoordinateCameraNormal(unsigned int stage)
+	{
+		rts::render::SetGameTextureStageState(stage,
+			rts::render::GAME_TEXTURE_STAGE_COORDINATE_INDEX,
+		rts::render::GAME_TEXTURE_COORDINATE_CAMERA_NORMAL);
+	}
+
+	static void SetMatrixMapperTextureTransformCount2(unsigned int stage)
+	{
+		rts::render::SetGameTextureStageState(stage,
+			rts::render::GAME_TEXTURE_STAGE_TRANSFORM_FLAGS,
+		rts::render::GAME_TEXTURE_TRANSFORM_COUNT2);
+	}
+
+	static void SetMatrixMapperTextureTransformProjectedCount3(unsigned int stage)
+	{
+		rts::render::SetGameTextureStageState(stage,
+			rts::render::GAME_TEXTURE_STAGE_TRANSFORM_FLAGS,
+			rts::render::GAME_TEXTURE_TRANSFORM_PROJECTED |
+			rts::render::GAME_TEXTURE_TRANSFORM_COUNT3);
+	}
 }
 
 /***********************************************************************************************
@@ -232,9 +280,9 @@ void MatrixMapperClass::Apply(int uv_array_index)
 		/*
 		** Orthographic projection
 		*/
-		DX8Wrapper::Set_Transform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + Stage),ViewToPixel);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(uv_array_index,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_CAMERASPACEPOSITION);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(uv_array_index,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_COUNT2);
+		SetMatrixMapperTextureTransform(Stage,ViewToPixel);
+		SetMatrixMapperTextureCoordinateCameraPosition(uv_array_index);
+		SetMatrixMapperTextureTransformCount2(uv_array_index);
 		break;
 	case PERSPECTIVE_PROJECTION:
 		/*
@@ -243,9 +291,9 @@ void MatrixMapperClass::Apply(int uv_array_index)
 		m[0]=ViewToPixel[0];
 		m[1]=ViewToPixel[1];
 		m[2]=ViewToPixel[3];
-		DX8Wrapper::Set_Transform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + Stage),m);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(uv_array_index,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_CAMERASPACEPOSITION);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(uv_array_index,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_PROJECTED|D3DTTFF_COUNT3);
+		SetMatrixMapperTextureTransform(Stage,m);
+		SetMatrixMapperTextureCoordinateCameraPosition(uv_array_index);
+		SetMatrixMapperTextureTransformProjectedCount3(uv_array_index);
 		break;
 	case DEPTH_GRADIENT:
 		/*
@@ -256,9 +304,9 @@ void MatrixMapperClass::Apply(int uv_array_index)
 		*/
 		m[0].Set(0,0,0,GradientUCoord);
 		m[1]=ViewToPixel[2];
-		DX8Wrapper::Set_Transform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + Stage),m);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(uv_array_index,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_CAMERASPACEPOSITION);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(uv_array_index,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_COUNT2);
+		SetMatrixMapperTextureTransform(Stage,m);
+		SetMatrixMapperTextureCoordinateCameraPosition(uv_array_index);
+		SetMatrixMapperTextureTransformCount2(uv_array_index);
 		break;
 	case NORMAL_GRADIENT:
 		/*
@@ -269,9 +317,9 @@ void MatrixMapperClass::Apply(int uv_array_index)
 		*/
 		m[0].Set(0,0,0,GradientUCoord);
 		m[1].Set(ViewSpaceProjectionNormal.X,ViewSpaceProjectionNormal.Y,ViewSpaceProjectionNormal.Z, 0);
-		DX8Wrapper::Set_Transform((D3DTRANSFORMSTATETYPE)(D3DTS_TEXTURE0 + Stage),m);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(uv_array_index,D3DTSS_TEXCOORDINDEX,D3DTSS_TCI_CAMERASPACENORMAL);
-		DX8Wrapper::Set_DX8_Texture_Stage_State(uv_array_index,D3DTSS_TEXTURETRANSFORMFLAGS,D3DTTFF_COUNT2);
+		SetMatrixMapperTextureTransform(Stage,m);
+		SetMatrixMapperTextureCoordinateCameraNormal(uv_array_index);
+		SetMatrixMapperTextureTransformCount2(uv_array_index);
 		break;
 	}
 

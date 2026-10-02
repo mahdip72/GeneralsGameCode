@@ -60,6 +60,10 @@
 #include "GameLogic/Module/SupplyTruckAIUpdate.h"
 #include "GameLogic/Module/SupplyWarehouseDockUpdate.h"
 #include "GameLogic/PartitionManager.h"
+#if defined(_WIN64)
+#include "Lib/DeterministicAIPlanning.h"
+#include <new>
+#endif
 
 
 #define SUPPLY_CENTER_CLOSE_DIST (20*PATHFIND_CELL_SIZE_F)
@@ -84,6 +88,12 @@ m_supplySourceAttackCheckFrame(0),
 m_attackedSupplyCenter(INVALID_ID),
 m_teamSeconds(10),
 m_curWarehouseID(INVALID_ID)
+#if defined(_WIN64)
+,m_stagedProductionPlanningSnapshot(nullptr),
+m_stagedProductionPlanningResult(nullptr),
+m_productionPlanningHandledFrame(0xffffffffU),
+m_productionPlanningQueueUpdatedFrame(0xffffffffU)
+#endif
 {
 	m_frameLastBuildingBuilt = TheGameLogic->getFrame();
 	p->setCanBuildUnits(false); // turn off ai production by default.
@@ -103,8 +113,105 @@ m_curWarehouseID(INVALID_ID)
 // ------------------------------------------------------------------------------------------------
 AIPlayer::~AIPlayer()
 {
+	#if defined(_WIN64)
+	discardStagedProductionPlanningResult();
+	#endif
 	clearTeamsInQueue();
 }
+
+#if defined(_WIN64)
+// The timer tick in doTeamBuilding happens after AI::update has captured the
+// frame.  Predict the post-tick boundary so a staged result is consumed by
+// the existing owner-thread processTeamBuilding call on this same frame.
+Bool AIPlayer::isProductionPlanningDue() const
+{
+	if (!m_player->getCanBuildUnits())
+		return false;
+	// doTeamBuilding resets m_teamDelay after the timer-expiry branch. A
+	// timer-expiry frame is therefore due even when the previous delay has not
+	// yet reached its normal retry boundary.
+	return rts::IsAIProductionPlanningDue(m_readyToBuildTeam,
+		m_teamTimer, m_teamDelay);
+}
+
+void AIPlayer::prepareProductionPlanningQueue()
+{
+	queueUnits();
+	m_productionPlanningQueueUpdatedFrame =
+		(UnsignedInt)TheGameLogic->getFrame();
+}
+
+Bool AIPlayer::consumeProductionPlanningQueue()
+{
+	const Bool updated = m_productionPlanningQueueUpdatedFrame ==
+		(UnsignedInt)TheGameLogic->getFrame();
+	if (updated)
+		m_productionPlanningQueueUpdatedFrame = 0xffffffffU;
+	return updated;
+}
+
+Bool AIPlayer::stageProductionPlanningResult(
+	const rts::AIProductionPlanningSnapshot &snapshot,
+	const rts::AIProductionPlanningResult &result)
+{
+	discardStagedProductionPlanningResult();
+	m_stagedProductionPlanningSnapshot =
+		new (std::nothrow) rts::AIProductionPlanningSnapshot(snapshot);
+	m_stagedProductionPlanningResult =
+		new (std::nothrow) rts::AIProductionPlanningResult(result);
+	if (!m_stagedProductionPlanningSnapshot || !m_stagedProductionPlanningResult)
+	{
+		discardStagedProductionPlanningResult();
+		return false;
+	}
+	return true;
+}
+
+Bool AIPlayer::hasStagedProductionPlanningResult() const
+{
+	return m_stagedProductionPlanningSnapshot != nullptr &&
+		m_stagedProductionPlanningResult != nullptr &&
+		m_stagedProductionPlanningSnapshot->frame ==
+			(UnsignedInt)TheGameLogic->getFrame();
+}
+
+Bool AIPlayer::takeStagedProductionPlanningResult(
+	rts::AIProductionPlanningSnapshot *snapshot,
+	rts::AIProductionPlanningResult *result)
+{
+	if (!snapshot || !result || !hasStagedProductionPlanningResult())
+	{
+		discardStagedProductionPlanningResult();
+		return false;
+	}
+	*snapshot = *m_stagedProductionPlanningSnapshot;
+	*result = *m_stagedProductionPlanningResult;
+	discardStagedProductionPlanningResult();
+	return true;
+}
+
+void AIPlayer::discardStagedProductionPlanningResult()
+{
+	delete m_stagedProductionPlanningSnapshot;
+	m_stagedProductionPlanningSnapshot = nullptr;
+	delete m_stagedProductionPlanningResult;
+	m_stagedProductionPlanningResult = nullptr;
+}
+
+void AIPlayer::markProductionPlanningHandled()
+{
+	m_productionPlanningHandledFrame = (UnsignedInt)TheGameLogic->getFrame();
+}
+
+Bool AIPlayer::consumeProductionPlanningHandled()
+{
+	const Bool handled = m_productionPlanningHandledFrame ==
+		(UnsignedInt)TheGameLogic->getFrame();
+	if (handled)
+		m_productionPlanningHandledFrame = 0xffffffffU;
+	return handled;
+}
+#endif
 
 // ------------------------------------------------------------------------------------------------
 /** Invoked when a structure I am building is finished building. */
@@ -1545,6 +1652,18 @@ Bool AIPlayer::selectTeamToReinforce( Int minPriority )
 // ------------------------------------------------------------------------------------------------
 Bool AIPlayer::selectTeamToBuild()
 {
+	#if defined(_WIN64)
+	if (hasStagedProductionPlanningResult())
+	{
+		rts::AIProductionPlanningSnapshot snapshot;
+		rts::AIProductionPlanningResult result;
+		if (!takeStagedProductionPlanningResult(&snapshot, &result))
+			return false;
+		if (!result.valid || !result.hasSelection)
+			return false;
+		return commitProductionPlanningResult(snapshot, result);
+	}
+	#endif
 
 	// find the highest priority of all teams
 	Player::PlayerTeamList::const_iterator t;
@@ -1605,26 +1724,192 @@ Bool AIPlayer::selectTeamToBuild()
 
 		i++;
 	}
-	if (teamProto) {
-		if (!teamProto->getTemplateInfo()->m_hasHomeLocation && !isSkirmishAI()) {
-			AsciiString teamStr = "Error : team '";
-			teamStr.concat(teamProto->getName());
-			teamStr.concat("' has no Home Position (or Origin).");
-			TheScriptEngine->AppendDebugMessage(teamStr, false);
-		}
-		// Build it at low priority, as we have selected it automagically.
-		buildSpecificAITeam(teamProto, false);
-		m_readyToBuildTeam = false;
-		m_teamTimer = m_teamSeconds*LOGICFRAMES_PER_SECOND;
-		if (m_player->getMoney()->countMoney() < TheAI->getAiData()->m_resourcesPoor) {
-			m_teamTimer = m_teamTimer/TheAI->getAiData()->m_teamPoorMod;
-		}	else if (m_player->getMoney()->countMoney() > TheAI->getAiData()->m_resourcesWealthy) {
-			m_teamTimer = m_teamTimer/TheAI->getAiData()->m_teamWealthyMod;
-		}
+	return queueSelectedTeam(teamProto);
+}
+
+// ------------------------------------------------------------------------------------------------
+/** Queue an automatically selected team and apply the common production delay policy. */
+// ------------------------------------------------------------------------------------------------
+Bool AIPlayer::queueSelectedTeam( TeamPrototype *teamProto )
+{
+	if (!teamProto)
+		return false;
+
+	if (!teamProto->getTemplateInfo()->m_hasHomeLocation && !isSkirmishAI()) {
+		AsciiString teamStr = "Error : team '";
+		teamStr.concat(teamProto->getName());
+		teamStr.concat("' has no Home Position (or Origin).");
+		TheScriptEngine->AppendDebugMessage(teamStr, false);
+	}
+	// Build it at low priority, as we have selected it automagically.
+	buildSpecificAITeam(teamProto, false);
+	m_readyToBuildTeam = false;
+	m_teamTimer = m_teamSeconds*LOGICFRAMES_PER_SECOND;
+	if (m_player->getMoney()->countMoney() < TheAI->getAiData()->m_resourcesPoor) {
+		m_teamTimer = m_teamTimer/TheAI->getAiData()->m_teamPoorMod;
+	} else if (m_player->getMoney()->countMoney() > TheAI->getAiData()->m_resourcesWealthy) {
+		m_teamTimer = m_teamTimer/TheAI->getAiData()->m_teamWealthyMod;
+	}
+	return true;
+}
+
+#if defined(_WIN64)
+// ------------------------------------------------------------------------------------------------
+/** Capture the retail production candidate lane without exposing live game objects to workers. */
+// ------------------------------------------------------------------------------------------------
+Bool AIPlayer::captureLegacyProductionPlanningSnapshot(
+	rts::AIProductionPlanningSnapshot *snapshot,
+	const rts::AICounterRngKey &baseRandomKey )
+{
+	if (!snapshot)
+		return false;
+	rts::ClearAIProductionPlanningSnapshot(snapshot);
+	snapshot->frame = TheGameLogic->getFrame();
+	snapshot->ownerPlayerIndex = (UnsignedInt)m_player->getPlayerIndex();
+	snapshot->logicFramesPerSecond = LOGICFRAMES_PER_SECOND;
+	snapshot->resources = m_player->getMoney()->countMoney();
+	snapshot->initialReserve = 0;
+	snapshot->retryReserve = 0;
+	snapshot->retryWithoutInitialReserve = 0;
+	snapshot->difficulty = rts::AI_PLANNING_DIFFICULTY_EASY;
+	snapshot->contextInfluencePercent = 0;
+	snapshot->tieBreakKey = baseRandomKey;
+	snapshot->tieBreakKey.frame = snapshot->frame;
+	snapshot->tieBreakKey.domain = rts::AI_COUNTER_RNG_DOMAIN_PLAYER_PLANNING;
+	snapshot->tieBreakKey.playerIndex = snapshot->ownerPlayerIndex;
+	snapshot->tieBreakKey.ownerStableId = snapshot->ownerPlayerIndex;
+	snapshot->tieBreakKey.sourceStableId = 0;
+	snapshot->tieBreakKey.eventKind = rts::AI_COUNTER_RNG_EVENT_PRODUCTION_TIE;
+	snapshot->tieBreakKey.eventOrdinal = 0;
+	snapshot->tieBreakKey.drawOrdinal = 0;
+
+	UnsignedInt sourceOrdinal = 0;
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end(); ++teamIt, ++sourceOrdinal)
+	{
+		TeamPrototype *prototype = *teamIt;
+		if (!isAGoodIdeaToBuildTeam(prototype))
+			continue;
+		if (snapshot->candidateCount >= rts::AI_PLANNING_MAX_PRODUCTION_CANDIDATES)
+			return false;
+		rts::AIProductionCandidateFact &fact =
+			snapshot->candidates[snapshot->candidateCount++];
+		fact.sourceOrdinal = sourceOrdinal;
+		fact.candidateStableId = (UnsignedInt)prototype->getID();
+		fact.configuredPriority = prototype->getTemplateInfo()->m_productionPriority;
+		fact.eligible = 1;
+	}
+	return true;
+}
+
+Bool AIPlayer::prepareLegacyProductionPlanningSnapshot(
+	rts::AIProductionPlanningSnapshot *snapshot,
+	const rts::AICounterRngKey &baseRandomKey,
+	Bool *handled)
+{
+	if (!snapshot || !handled)
+		return false;
+	*handled = false;
+	if (!captureLegacyProductionPlanningSnapshot(snapshot, baseRandomKey))
+		return false;
+
+	// Reinforcement remains an owner-side decision at exactly the same
+	// boundary as the retail selector.  Only the expensive production score
+	// is admitted to the immutable batch when reinforcement declines.
+	const Int invalidPriority = -99999;
+	Int highestPriority = invalidPriority;
+	for (UnsignedInt i = 0; i < snapshot->candidateCount; ++i)
+	{
+		if (snapshot->candidates[i].configuredPriority > highestPriority)
+			highestPriority = snapshot->candidates[i].configuredPriority;
+	}
+	if (selectTeamToReinforce(highestPriority))
+	{
+		// The retail process path queues existing work again after a successful
+		// reinforcement selection.  Keep that owner-side pass before marking the
+		// batched production boundary handled.
+		queueUnits();
+		markProductionPlanningHandled();
+		*handled = true;
 		return true;
 	}
-	return false;
+	if (snapshot->candidateCount == 0U)
+	{
+		markProductionPlanningHandled();
+		*handled = true;
+	}
+	return true;
 }
+
+// ------------------------------------------------------------------------------------------------
+/** Resolve a POD selection to a live prototype and publish it on the owner thread. */
+// ------------------------------------------------------------------------------------------------
+Bool AIPlayer::validateProductionPlanningBatchCommit(
+	const rts::AIProductionPlanningSnapshot &snapshot,
+	const rts::AIProductionPlanningResult &result ) const
+{
+	// ExecuteAIPlanningBatchOnJobSystem has already performed the canonical
+	// numeric validation for this staged batch.  This boundary check is kept
+	// structural and owner-only so production does not recompute the oracle a
+	// second time in the normal path.
+	if (!result.valid ||
+		snapshot.frame != (UnsignedInt)TheGameLogic->getFrame() ||
+		snapshot.ownerPlayerIndex != (UnsignedInt)m_player->getPlayerIndex() ||
+		result.orderKey.frame != snapshot.frame ||
+		result.orderKey.playerIndex != snapshot.ownerPlayerIndex ||
+		result.orderKey.subphase != rts::AI_PLANNING_SUBPHASE_TEAM_PRODUCTION ||
+		result.orderKey.emissionOrdinal != 0U ||
+		result.selectedSourceOrdinal != result.orderKey.sourceOrdinal)
+		return false;
+	if (!result.hasSelection)
+		return result.selectedSourceOrdinal == rts::AI_PLANNING_INVALID_ORDINAL &&
+			result.orderKey.sourceOrdinal == rts::AI_PLANNING_INVALID_ORDINAL &&
+			result.selectedStableId == 0U && result.tieCount == 0U;
+
+	Bool snapshotMember = false;
+	for (UnsignedInt i = 0; i < snapshot.candidateCount; ++i)
+	{
+		const rts::AIProductionCandidateFact &candidate = snapshot.candidates[i];
+		if (candidate.eligible &&
+			candidate.sourceOrdinal == result.selectedSourceOrdinal &&
+			candidate.candidateStableId == result.selectedStableId)
+		{
+			snapshotMember = true;
+			break;
+		}
+	}
+	return snapshotMember;
+}
+
+Bool AIPlayer::commitProductionPlanningResult(
+	const rts::AIProductionPlanningSnapshot &snapshot,
+	const rts::AIProductionPlanningResult &result )
+{
+	if (!validateProductionPlanningBatchCommit(snapshot, result) ||
+		!result.hasSelection)
+		return false;
+
+	TeamPrototype *teamProto = nullptr;
+	UnsignedInt sourceOrdinal = 0U;
+	Player::PlayerTeamList::const_iterator teamIt;
+	for (teamIt = m_player->getPlayerTeams()->begin();
+		teamIt != m_player->getPlayerTeams()->end(); ++teamIt, ++sourceOrdinal)
+	{
+		if (sourceOrdinal == result.selectedSourceOrdinal)
+		{
+			if ((UnsignedInt)(*teamIt)->getID() != result.selectedStableId)
+				return false;
+			teamProto = *teamIt;
+			break;
+		}
+	}
+	if (!teamProto)
+		return false;
+
+	return queueSelectedTeam(teamProto);
+}
+#endif
 
 // ------------------------------------------------------------------------------------------------
 /** Build a specific team.  If priorityBuild, put at front of queue with priority set. */
@@ -2604,9 +2889,19 @@ void AIPlayer::doTeamBuilding()
 		// happens, like a building is added or a unit finished, the timers are shortcut.
 		m_teamDelay--;
 		if (m_teamDelay<1) {
+			#if defined(_WIN64)
+			if (!consumeProductionPlanningQueue())
+				queueUnits(); // update the queues.
+			#else
 			queueUnits(); // update the queues.
+			#endif
 			if (m_readyToBuildTeam) {
+				#if defined(_WIN64)
+				if (!consumeProductionPlanningHandled())
+					processTeamBuilding();
+				#else
 				processTeamBuilding();
+				#endif
 			}
 			m_teamDelay = 5*LOGICFRAMES_PER_SECOND; // check again in 5 seconds.
 			// Note that this timer gets shortcut when a unit or building is completed.

@@ -201,7 +201,10 @@ target_link_libraries(g_gameenginedevice PRIVATE
     stb
 )
 
+rts_attach_title_game_engine_device(g_gameenginedevice GENERALS)
+
 target_link_libraries(g_gameenginedevice PUBLIC
     corei_gameenginedevice_public
+	core_renderer
     g_gameengine
 )

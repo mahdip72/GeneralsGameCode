@@ -28,6 +28,9 @@ constexpr UnsignedInt OUTPUT_SAMPLE_RATE = 48000U;
 constexpr UnsignedShort OUTPUT_CHANNELS = 2U;
 constexpr std::size_t OUTPUT_BYTES_PER_FRAME = OUTPUT_CHANNELS * sizeof(std::int16_t);
 constexpr UnsignedInt MAX_OUTPUT_FRAMES = OUTPUT_SAMPLE_RATE;
+// Shell-map ambience commonly lasts four to seven seconds and may be played
+// by many emitters. Keep complete PCM within the existing byte budget.
+constexpr UnsignedInt MAX_CACHED_SAMPLE_FRAMES = 8U * OUTPUT_SAMPLE_RATE;
 
 struct WaveInfo
 {
@@ -1524,9 +1527,9 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 		}
 		if (!openPcmStream(fileName, stream) || stream == nullptr) return FALSE;
 		const Real duration = stream->durationMS();
-		if (!std::isfinite(duration) || duration <= 0.0f || duration > 1000.0f) return TRUE;
+		if (!std::isfinite(duration) || duration <= 0.0f || duration > 8000.0f) return TRUE;
 		const UnsignedInt frameLimit = static_cast<UnsignedInt>(std::min<std::size_t>(
-			MAX_OUTPUT_FRAMES, cache.budget->limit / OUTPUT_BYTES_PER_FRAME));
+			MAX_CACHED_SAMPLE_FRAMES, cache.budget->limit / OUTPUT_BYTES_PER_FRAME));
 		const double expectedFrames = std::ceil(static_cast<double>(duration)
 			* OUTPUT_SAMPLE_RATE / 1000.0);
 		if (frameLimit == 0 || static_cast<double>(duration) * OUTPUT_SAMPLE_RATE / 1000.0
@@ -1534,12 +1537,27 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 				* OUTPUT_BYTES_PER_FRAME)) return TRUE;
 
 		AudioPcmChunk pcm;
-		if (!stream->readPcm(pcm, frameLimit) || pcm.frameCount == 0
-			|| pcm.frameCount > frameLimit || pcm.sampleRate != OUTPUT_SAMPLE_RATE
-			|| pcm.channels != OUTPUT_CHANNELS
-			|| pcm.format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN
-			|| pcm.data.size() != static_cast<std::size_t>(pcm.frameCount) * OUTPUT_BYTES_PER_FRAME) {
-			return openUncached();
+		while (pcm.frameCount < frameLimit) {
+			AudioPcmChunk part;
+			const UnsignedInt request = std::min(MAX_OUTPUT_FRAMES,
+				frameLimit - pcm.frameCount);
+			if (!stream->readPcm(part, request)) {
+				if (pcm.frameCount == 0 || !stream->isEnded()) return openUncached();
+				break;
+			}
+			if (part.frameCount == 0 || part.frameCount > request
+				|| part.sampleRate != OUTPUT_SAMPLE_RATE || part.channels != OUTPUT_CHANNELS
+				|| part.format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN
+				|| part.data.size() != static_cast<std::size_t>(part.frameCount)
+					* OUTPUT_BYTES_PER_FRAME) return openUncached();
+			if (pcm.frameCount == 0) {
+				pcm = std::move(part);
+			} else {
+				if (pcm.sourceChannels != part.sourceChannels) pcm.sourceChannels = 0;
+				pcm.data.insert(pcm.data.end(), part.data.begin(), part.data.end());
+				pcm.frameCount += part.frameCount;
+			}
+			if (stream->isEnded()) break;
 		}
 		if (!stream->isEnded()) {
 			AudioPcmChunk extra;

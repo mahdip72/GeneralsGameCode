@@ -7,6 +7,15 @@ add_library(core_renderer STATIC
     RendererDevice.cpp
 )
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # The target-kind capability is the only native GameEngineDevice seam
+    # published before the title command implementation handoff.  It is
+    # neutral and does not pull the compatibility adapter into x64.
+    target_sources(core_renderer PRIVATE
+        RenderGameClientNativeCapability.cpp
+    )
+endif()
+
 if(WIN32 AND NOT IS_VS6_BUILD)
     set(_rts_fxc_roots)
     foreach(_rts_fxc_root IN ITEMS
@@ -84,9 +93,16 @@ if(WIN32 AND NOT IS_VS6_BUILD)
     set(renderer_sea_wave_vertex_shader_header "${renderer_generated_dir}/LegacySeaWaveVS.h")
     set(renderer_sea_wave_pixel_shader_header "${renderer_generated_dir}/LegacySeaWavePS.h")
     set(renderer_textured_vertex_shader_header "${renderer_generated_dir}/LegacyTexturedVS.h")
+    set(renderer_textured_unweighted_vertex_shader_header "${renderer_generated_dir}/LegacyTexturedUnweightedVS.h")
     set(renderer_textured_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedPS.h")
     set(renderer_textured_fixed1_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedFixed1PS.h")
     set(renderer_textured_fixed2_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedFixed2PS.h")
+    set(renderer_presentation_shader_source
+        "${CMAKE_CURRENT_SOURCE_DIR}/Shaders/PresentationColorTransform.hlsl")
+    set(renderer_presentation_vertex_shader_header
+        "${renderer_generated_dir}/PresentationColorTransformVS.h")
+    set(renderer_presentation_pixel_shader_header
+        "${renderer_generated_dir}/PresentationColorTransformPS.h")
 
     function(add_legacy_pixel_program_shader output_variable file_name symbol program)
         set(output_path "${renderer_generated_dir}/${file_name}")
@@ -184,6 +200,16 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         VERBATIM
     )
     add_custom_command(
+        OUTPUT "${renderer_textured_unweighted_vertex_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T vs_5_0 /E VSTextured
+            /D LEGACY_UNWEIGHTED_VERTEX_INPUT=1
+            /Fh "${renderer_textured_unweighted_vertex_shader_header}"
+            /Vn g_LegacyTexturedUnweightedVS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
         OUTPUT "${renderer_textured_pixel_shader_header}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
         COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSTextured
@@ -215,6 +241,27 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         VERBATIM
     )
 
+    add_custom_command(
+        OUTPUT "${renderer_presentation_vertex_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T vs_5_0 /E VSMain
+            /Fh "${renderer_presentation_vertex_shader_header}"
+            /Vn g_PresentationColorTransformVS
+            "${renderer_presentation_shader_source}"
+        DEPENDS "${renderer_presentation_shader_source}"
+        VERBATIM
+    )
+    add_custom_command(
+        OUTPUT "${renderer_presentation_pixel_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSMain
+            /Fh "${renderer_presentation_pixel_shader_header}"
+            /Vn g_PresentationColorTransformPS
+            "${renderer_presentation_shader_source}"
+        DEPENDS "${renderer_presentation_shader_source}"
+        VERBATIM
+    )
+
     target_sources(core_renderer PRIVATE
         D3D11RenderDevice.cpp
         ThreadedRenderDevice.cpp
@@ -225,6 +272,7 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         "${renderer_sea_wave_vertex_shader_header}"
         "${renderer_sea_wave_pixel_shader_header}"
         "${renderer_textured_vertex_shader_header}"
+        "${renderer_textured_unweighted_vertex_shader_header}"
         "${renderer_textured_pixel_shader_header}"
         "${renderer_textured_fixed1_pixel_shader_header}"
         "${renderer_textured_fixed2_pixel_shader_header}"
@@ -236,6 +284,8 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         "${renderer_flat_terrain_base_pixel_shader_header}"
         "${renderer_flat_terrain_noise_pixel_shader_header}"
         "${renderer_flat_terrain_noise2_pixel_shader_header}"
+        "${renderer_presentation_vertex_shader_header}"
+        "${renderer_presentation_pixel_shader_header}"
     )
     target_include_directories(core_renderer PRIVATE
         "${renderer_generated_dir}"
@@ -253,9 +303,11 @@ endif()
 
 target_include_directories(core_renderer PUBLIC
     ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+    ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
 )
 
-target_link_libraries(core_renderer PRIVATE
+# Public renderer headers use the fixed-width integer compatibility adapter.
+target_link_libraries(core_renderer PUBLIC
     core_utility_no_pch
 )
 

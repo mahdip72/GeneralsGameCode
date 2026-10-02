@@ -20,7 +20,8 @@ if(MINGW)
     target_link_options(effect_prepare_tests PRIVATE -mconsole)
 endif()
 
-add_test(NAME effect_prepare_tests COMMAND effect_prepare_tests)
+add_test(NAME effect_prepare_tests COMMAND effect_prepare_tests --local-capacity)
 set_tests_properties(effect_prepare_tests PROPERTIES TIMEOUT 60)
-add_test(NAME effect_prepare_serial_tests COMMAND effect_prepare_tests --serial)
+add_test(NAME effect_prepare_serial_tests COMMAND effect_prepare_tests
+    --local-capacity --serial)
 set_tests_properties(effect_prepare_serial_tests PROPERTIES TIMEOUT 60)

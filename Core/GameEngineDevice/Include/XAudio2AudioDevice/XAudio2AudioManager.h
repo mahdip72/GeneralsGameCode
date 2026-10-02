@@ -140,6 +140,7 @@ private:
 		Bool waitingForGeneratedDelay = FALSE;
 		Bool voiceOpen = FALSE;
 		Bool needsVoiceService = FALSE;
+		Bool deferPhaseStart = FALSE;
 		AsciiString assetFileName;
 		std::unique_ptr<AudioPcmStream> pcmStream;
 		AudioPcmChunk pendingPcm;
@@ -184,6 +185,7 @@ private:
 	const PlayingAudio *findPlaying(AudioHandle handle) const;
 	PlayingAudio *findLowestPriority(Channel channel, const AudioEventRTS &incoming);
 	Real effectiveVolume(const PlayingAudio &playing) const;
+	Bool isBelow3DVolumeThreshold(const PlayingAudio &playing) const;
 	Real outputVolume(const PlayingAudio &playing) const;
 	void recordMusicCompletion(PlayingAudio &playing);
 	void updatePlayingVolumes();

@@ -142,8 +142,18 @@ void ownerOnlyEmission()
 		foreign.join();
 		check(foreignScopes.load(std::memory_order_relaxed) != 0,
 			"foreign timing thread exercised bounded scopes");
+		bool foreignFinalized = true;
+		std::thread finalizer([&capture, &foreignFinalized]() {
+			capture.endSession();
+			foreignFinalized = capture.finalize().closed;
+		});
+		finalizer.join();
+		check(!foreignFinalized && capture.isActive(),
+			"foreign thread cannot end or finalize the owner capture");
 		capture.endFrame(1000);
 		capture.endSession();
+		check(capture.finalize().complete,
+			"owner finalization succeeds after foreign finalization rejection");
 	}
 
 	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL);
@@ -151,10 +161,75 @@ void ownerOnlyEmission()
 		"only the owner emits the voice-create timing row");
 	removeCapture(directory);
 }
+
+void foreignBeginSessionCannotStealOwner()
+{
+	char relative[96], absolute[MAX_PATH];
+	_snprintf(relative, sizeof(relative), "FrameTimingDiagnosticsForeignBegin-%lu-%lu",
+		GetCurrentProcessId(), GetTickCount());
+	const DWORD pathLength = GetFullPathNameA(relative, sizeof(absolute), absolute, NULL);
+	check(pathLength != 0 && pathLength < sizeof(absolute),
+		"foreign begin-session fixture path is bounded");
+	if (pathLength == 0 || pathLength >= sizeof(absolute))
+		return;
+	const std::string directory = absolute;
+	check(CreateDirectoryA(directory.c_str(), NULL) != FALSE,
+		"foreign begin-session fixture directory is newly created");
+	if (failures != 0)
+		return;
+
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	LARGE_INTEGER frequency = {};
+	check(QueryPerformanceFrequency(&frequency) != FALSE && frequency.QuadPart > 0,
+		"foreign begin-session fixture has a performance counter");
+	if (frequency.QuadPart <= 0)
+	{
+		SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL);
+		removeCapture(directory);
+		return;
+	}
+
+	{
+		rts::frame_timing::Capture capture;
+		capture.beginSession("headless");
+		capture.beginFrame(200);
+
+		std::atomic<bool> entered(false), go(false), returned(false);
+		std::thread foreign([&capture, &entered, &go, &returned]() {
+			entered.store(true, std::memory_order_release);
+			while (!go.load(std::memory_order_acquire))
+				std::this_thread::yield();
+			capture.beginSession("headless");
+			returned.store(true, std::memory_order_release);
+		});
+
+		check(waitFor(entered), "foreign begin-session thread enters within bound");
+		go.store(true, std::memory_order_release);
+		check(waitFor(returned), "foreign begin-session attempt returns within bound");
+		foreign.join();
+
+		capture.endFrame(201);
+		capture.endSession();
+		const rts::frame_timing::FinalizedCapture final = capture.finalize();
+		check(final.complete && final.sessionCount == 1,
+			"foreign begin-session cannot steal the owner capture");
+		capture.beginSession("headless");
+		const rts::frame_timing::FinalizedCapture repeated = capture.finalize();
+		check(repeated.closed && repeated.complete && repeated.path == final.path &&
+			repeated.sessionCount == final.sessionCount,
+			"same owner retains idempotent finalization after physical close");
+	}
+
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL);
+	check(countPhase(directory, "frame") == 1,
+		"foreign begin-session leaves the owner frame in the original session");
+	removeCapture(directory);
+}
 }
 
 int main()
 {
 	ownerOnlyEmission();
+	foreignBeginSessionCannotStealOwner();
 	return failures == 0 ? 0 : 1;
 }

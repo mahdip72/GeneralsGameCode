@@ -1,4 +1,6 @@
 #include "Lib/ResourceIoPipeline.h"
+#include "../../Libraries/Source/WWVegas/WW3D2/textureloadupdate.h"
+#include "../TestSupport/LocalCapacityTestLane.h"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -125,6 +127,126 @@ void consume(rts::ResourceIoPipeline &pipeline, const rts::ResourceIoTicket &tic
 	check(pipeline.take(ticket, status, operation), "completed ticket transfers its operation to owner");
 	check(status == expected, "completion has the expected success/failure/cancellation state");
 	delete operation;
+}
+
+void testTextureLoadUpdateBudget()
+{
+	typedef TextureLoadUpdateBudget Budget;
+	bool foregroundNext = false;
+	Budget boundary(100, foregroundNext);
+	check(boundary.Next(true, true, 100) == Budget::RESOURCE, "first update starts with resource publication");
+	check(boundary.Next(true, true, 103) == Budget::FOREGROUND, "both queues share elapsed slice and alternate");
+	check(boundary.Next(true, true, 104) == Budget::NONE, "exact 4ms boundary rejects another nonpreemptible task");
+
+	foregroundNext = false;
+	Budget rollover(0xfffffffeU, foregroundNext);
+	check(rollover.Next(true, true, 0xfffffffeU) == Budget::RESOURCE, "rollover fixture admits first task");
+	check(rollover.Next(true, true, 1) == Budget::FOREGROUND, "32-bit rollover leaves 3ms available");
+	check(rollover.Next(true, true, 2) == Budget::NONE, "32-bit rollover exhausts slice at 4ms");
+
+	foregroundNext = false;
+	Budget count(0, foregroundNext);
+	unsigned resources = 0, foregrounds = 0;
+	for (unsigned task = 0; task < Budget::MAXIMUM_TASKS; ++task)
+	{
+		const Budget::Queue queue = count.Next(true, true, 0);
+		check(queue == (task % 2 == 0 ? Budget::RESOURCE : Budget::FOREGROUND),
+			"shared count alternates actual admissions from both queues");
+		resources += queue == Budget::RESOURCE;
+		foregrounds += queue == Budget::FOREGROUND;
+	}
+	check(resources == 4 && foregrounds == 4 && count.Next(true, true, 0) == Budget::NONE,
+		"eight combined admissions, not eight from each queue");
+
+	Budget unavailable(0, foregroundNext);
+	check(unavailable.Next(false, false, 100) == Budget::NONE, "empty queues do not consume an admission");
+	check(unavailable.Next(false, true, 100) == Budget::FOREGROUND,
+		"one task progresses even if IO admission consumed the slice");
+	check(unavailable.Next(true, true, 100) == Budget::NONE, "slow admission never permits a second task");
+
+	foregroundNext = false;
+	Budget failed(0, foregroundNext);
+	for (unsigned task = 0; task < Budget::MAXIMUM_TASKS; ++task)
+		check(failed.Next(true, false, 0) == Budget::RESOURCE, "failed or retrying tasks are charged on admission");
+	check(failed.Next(true, false, 0) == Budget::NONE, "failure cannot reset or bypass the count budget");
+
+	foregroundNext = false;
+	resources = foregrounds = 0;
+	for (unsigned frame = 0; frame < 24; ++frame)
+	{
+		const unsigned tick = frame * 100;
+		Budget sustained(tick, foregroundNext);
+		const Budget::Queue queue = sustained.Next(true, true, tick);
+		check(queue == (frame % 2 == 0 ? Budget::RESOURCE : Budget::FOREGROUND),
+			"slow sustained bursts alternate first queue across updates");
+		resources += queue == Budget::RESOURCE;
+		foregrounds += queue == Budget::FOREGROUND;
+		check(sustained.Next(true, true, tick + 250) == Budget::NONE,
+			"a slow publication never admits a second over-budget task");
+	}
+	check(resources == 12 && foregrounds == 12, "neither ready queue starves in sustained slow bursts");
+
+	Budget drain(0, foregroundNext, false);
+	for (unsigned task = 0; task < Budget::MAXIMUM_TASKS; ++task)
+		check(drain.Next(true, false, 0xffffffffU) == Budget::RESOURCE, "explicit progress batches ignore elapsed time");
+	check(drain.Next(true, false, 0) == Budget::NONE, "untimed progress retains its eight-task batch bound");
+}
+
+void testTextureLoadExplicitProgress()
+{
+	typedef TextureLoadUpdateBudget Budget;
+	rts::JobSystemConfig jobs = rts::JobSystem::startupConfig(); jobs.workerCount = 2;
+	check(rts::JobSystem::instance().start(jobs), "texture budget progress pool starts");
+	rts::ResourceIoPipeline pipeline;
+	rts::ResourceIoConfig config; config.decodeByteBudget = 128;
+	check(pipeline.start(config, rts::JobSystem::instance().createGroup()), "texture budget progress pipeline starts");
+	const std::vector<unsigned char> bytes(16, 11);
+	rts::ResourceIoTicket c, a, b;
+	check(pipeline.submit(new Source(bytes), new Decode(64), rts::JOB_PRIORITY_STREAMING, c), "C retains 64 bytes");
+	check(pipeline.submit(new Source(bytes), new Decode(96), rts::JOB_PRIORITY_STREAMING, a), "A requires 96 bytes");
+	check(pipeline.submit(new Source(bytes), new Decode(64), rts::JOB_PRIORITY_STREAMING, b), "B is explicit first-use ticket");
+	check(pipeline.wait(c), "first result completes before timed deferral");
+	bool foregroundNext = true;
+	Budget update(0, foregroundNext);
+	check(update.Next(true, true, 0) == Budget::FOREGROUND, "foreground work may consume the ordinary slice");
+	check(update.Next(true, false, 4) == Budget::NONE, "ready resource remains deferred after exhausted slice");
+	check(pipeline.metrics().decodeBytes == 64, "deferred output remains accounted, not released early");
+	check(!pipeline.wait(b), "first-use wait reports retained-output pressure for owner progress");
+	Budget progress(0, foregroundNext, false);
+	check(progress.Next(true, false, 250) == Budget::RESOURCE, "explicit progress is independent of exhausted update");
+	consume(pipeline, c, rts::RESOURCE_IO_SUCCEEDED);
+	check(pipeline.wait(a), "earlier A proceeds after owner publication");
+	check(progress.Next(true, false, 500) == Budget::RESOURCE, "explicit progress may publish another slow result");
+	consume(pipeline, a, rts::RESOURCE_IO_SUCCEEDED);
+	check(pipeline.wait(b), "first-use B completes after ordered progress without a budget deadlock");
+	consume(pipeline, b, rts::RESOURCE_IO_SUCCEEDED);
+
+	std::vector<rts::ResourceIoTicket> tickets(12);
+	for (rts::ResourceIoTicket &ticket : tickets)
+		check(pipeline.submit(new Source(bytes), new Decode(8), rts::JOB_PRIORITY_STREAMING, ticket), "drain input admitted");
+	check(pipeline.wait(tickets.back()), "finite drain inputs finish within retained-byte bound");
+	unsigned drained = 0, batches = 0;
+	while (drained < tickets.size())
+	{
+		Budget batch(0, foregroundNext, false);
+		++batches;
+		while (drained < tickets.size())
+		{
+			// The last decode may finish before an earlier worker retires its
+			// JobHandle. The loader likewise checks each FIFO head before take.
+			check(pipeline.wait(tickets[drained]), "explicit drain waits for the current FIFO head's final access");
+			if (batch.Next(pipeline.isComplete(tickets[drained]), false, 1000) != Budget::RESOURCE) break;
+			consume(pipeline, tickets[drained++], rts::RESOURCE_IO_SUCCEEDED);
+		}
+	}
+	check(drained == 12 && batches == 2, "explicit drain advances across count-only batches in FIFO order");
+	rts::ResourceIoTicket failed;
+	check(pipeline.submit(new Source(bytes), new Decode(8, 0, 3), rts::JOB_PRIORITY_NORMAL, failed), "failure input admitted");
+	check(pipeline.wait(failed), "failed decode still completes for owner retirement");
+	consume(pipeline, failed, rts::RESOURCE_IO_DECODE_FAILED);
+	check(pipeline.empty() && pipeline.metrics().decodeBytes == 0 && pipeline.metrics().inputBytes == 0,
+		"success, failure and drain release all accounted bytes");
+	pipeline.shutdown(); rts::JobSystem::instance().shutdown();
 }
 void testParity(unsigned workers)
 {
@@ -345,11 +467,39 @@ void testOwnedNativeRange()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	if (argc == 2 && std::strcmp(argv[1], "--texture-load-budget") == 0)
+	{
+		owner = std::this_thread::get_id();
+		testTextureLoadUpdateBudget();
+		testTextureLoadExplicitProgress();
+		check(wrongDestructionThread.load() == 0, "budget fixture retirement remains owner-only");
+		check(sourcesDestroyed.load() == decodersDestroyed.load(), "budget fixture ownership balances");
+		std::printf("texture load update budget: %s (%d failures)\n", failures ? "FAIL" : "PASS", failures);
+		return failures ? 1 : 0;
+	}
+	bool localCapacity = false;
+	if (!rts_test::ParseTestCapacityLane(argc, argv, &localCapacity))
+	{
+		std::fprintf(stderr, "Usage: core_resource_io_pipeline_tests "
+			"[--local-capacity|--external-qualification]\n");
+		return 2;
+	}
+	rts_test::PrintTestCapacityLane(localCapacity);
 	owner = std::this_thread::get_id();
 	const unsigned workers[] = {1, 2, 4, 8, 16, 0};
-	for (unsigned count : workers) testParity(count);
+	const unsigned localWorkers[] = {1, 2, 4, 8, 12};
+	if (localCapacity)
+	{
+		std::printf("resource IO lane: local-capacity (explicit workers 1, 2, 4, 8, 12; "
+			"external high-core/automatic lane excluded)\n");
+		for (unsigned count : localWorkers) testParity(count);
+	}
+	else
+	{
+		for (unsigned count : workers) testParity(count);
+	}
 	testFaultsAndPressure();
 	testOverlapCancellationAndShutdown();
 	testSerialFallback();

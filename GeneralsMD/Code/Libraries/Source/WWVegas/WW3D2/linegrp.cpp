@@ -39,15 +39,47 @@
 
 #include "WWLib/sharebuf.h"
 #include "linegrp.h"
-#include "texture.h"
+#include "WW3D2/texture.h"
 #include "vertmaterial.h"
-#include "dx8wrapper.h"
 #include "WWMath/wwmath.h"
 #include "rinfo.h"
 #include "camera.h"
-#include "dx8indexbuffer.h"
-#include "dx8vertexbuffer.h"
+#if !defined(_WIN64)
+#include "WW3D2/dx8indexbuffer.h"
+#include "WW3D2/dx8vertexbuffer.h"
+#endif
+#include "Renderer/LegacyColorPacking.h"
+#include "Renderer/RenderGameClient.h"
+
+#if !defined(_WIN64)
 #include "sortingrenderer.h"
+#endif
+
+#include <string.h>
+
+// This is the serialized XYZNDUV2 vertex layout expressed as a title-owned
+// value type.  The old source filled only position, diffuse, and the first UV
+// pair; zeroing the complete record retains the old implicit zero values for
+// normals and the second UV pair without importing a backend FVF header.
+struct LineGroupVertex
+{
+	float x;
+	float y;
+	float z;
+	float nx;
+	float ny;
+	float nz;
+	unsigned int diffuse;
+	float u1;
+	float v1;
+	float u2;
+	float v2;
+};
+
+static unsigned int PackLineGroupColor(const Vector4 &color)
+{
+	return rts::render::PackLegacyARGB(color.X, color.Y, color.Z, color.W);
+}
 
 // Line groups are a rendering primitive similar to point groups
 // They are tetrahedra which are aligned with the view plane with their centers
@@ -256,17 +288,34 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 		Shader.Set_Texturing(ShaderClass::TEXTURING_DISABLE);
 	}
 
+	const bool sort = (Shader.Get_Dst_Blend_Func() != ShaderClass::DSTBLEND_ZERO) &&
+		(Shader.Get_Alpha_Test() == ShaderClass::ALPHATEST_DISABLE) &&
+		(WW3D::Is_Sorting_Enabled());
+
+#if defined(_WIN64)
+	// The legacy dynamic buffers and sorting kernel use R16 vertex ranges.
+	// Refuse an unrepresentable group before integer multiplication/index
+	// construction; valid groups retain their original indexed geometry.
+	if (sort && (LineCount < 0 ||
+		(LineMode != TETRAHEDRON && LineMode != PRISM) ||
+		LineCount > 65535 / (LineMode == TETRAHEDRON ? 4 : 6))) {
+		rts::render::NativeGameRenderOwnerScope scope;
+		if (scope.Get() != 0) {
+			scope.Get()->RecordGameFailure(
+				rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		}
+		return;
+	}
+#endif
+
 	VertexMaterialClass * linemat = VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
-	DX8Wrapper::Set_Material(linemat);
-	DX8Wrapper::Set_Shader(Shader);
-	DX8Wrapper::Set_Texture(0, Texture);
+	rts::render::SetGameMaterial(linemat);
+	rts::render::SetGameShader(Shader);
+	rts::render::SetGameTexture(0, Texture);
 	REF_PTR_RELEASE(linemat);
 
 	WWASSERT(StartLineLoc && StartLineLoc->Get_Array());
 	WWASSERT(EndLineLoc && EndLineLoc->Get_Array());
-
-	// Enable sorting if the primitives are translucent and alpha testing is not enabled.
-	const bool sort = (Shader.Get_Dst_Blend_Func() != ShaderClass::DSTBLEND_ZERO) && (Shader.Get_Alpha_Test() == ShaderClass::ALPHATEST_DISABLE) && (WW3D::Is_Sorting_Enabled());
 
 	// the 3 offsets in view space
 	const static Vector3 offset_a = Vector3(WWMath::Cos(WWMATH_PI / 2),			WWMath::Sin(WWMATH_PI /2 ), 0);
@@ -281,10 +330,11 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 
 	// Save off the view matrix
 	Matrix4x4 view;
-	DX8Wrapper::Get_Transform(D3DTS_VIEW, view);
+	rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_VIEW, &view);
 
 	Matrix4x4 identity(true);
-	DX8Wrapper::Set_Transform(D3DTS_WORLD, identity);
+	rts::render::SetGameTransform(
+		rts::render::GAME_TRANSFORM_WORLD, identity);
 
 	// if the points are in world space, transform the offsets
 	if (Get_Flag(TRANSFORM)) {
@@ -296,7 +346,8 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 			Matrix3D::Transform_Vector(xform_mat, offset[i], &offset[i]);
 		}
 	} else {
-		DX8Wrapper::Set_Transform(D3DTS_VIEW, identity);
+		rts::render::SetGameTransform(
+			rts::render::GAME_TRANSFORM_VIEW, identity);
 	}
 
 	int num_tris=0;
@@ -319,16 +370,25 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 	// construct the tetrahedra in the index buffers
 	// assume first vertex is the apex, followed by offset[0-3]
 
-	DynamicIBAccessClass iba(sort?BUFFER_TYPE_DYNAMIC_SORTING:BUFFER_TYPE_DYNAMIC_DX8,num_indices);
+#if defined(_WIN64)
+	unsigned short *indices = W3DNEWARRAY unsigned short[num_indices];
+	unsigned short *ibptr = indices;
+	unsigned short index_line, idx;
+#else
+	DynamicIBAccessClass iba(
+		sort ? rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+		rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,
+		num_indices);
 
 	{
 		DynamicIBAccessClass::WriteLockClass lock(&iba);
 		unsigned short *ibptr = lock.Get_Index_Array();
-		unsigned short j, idx;
+		unsigned short index_line, idx;
+#endif
 		switch (LineMode)	{
 			case TETRAHEDRON:
-				for (j=0; j<LineCount; j++) {
-					idx = 4 * j;
+				for (index_line=0; index_line<LineCount; index_line++) {
+					idx = 4 * index_line;
 					// apex, offset[1], offset[0]
 					*ibptr++	= idx + 0;
 					*ibptr++	= idx + 2;
@@ -348,8 +408,8 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 				}
 				break;
 			case PRISM:
-				for (j=0; j<LineCount; j++) {
-					idx = 6 * j;
+				for (index_line=0; index_line<LineCount; index_line++) {
+					idx = 6 * index_line;
 					// starting cap 0,1,2
 					*ibptr++ = idx + 0;
 					*ibptr++ = idx + 1;
@@ -382,16 +442,28 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 				}
 				break;
 		}
+#if !defined(_WIN64)
 	}
+#endif
 
 	// make the vertex buffers
 
-	DynamicVBAccessClass vba(sort ? BUFFER_TYPE_DYNAMIC_SORTING : BUFFER_TYPE_DYNAMIC_DX8,dynamic_fvf_type,num_vertices);
+#if defined(_WIN64)
+	LineGroupVertex *vertices = W3DNEWARRAY LineGroupVertex[num_vertices];
+	memset(vertices, 0, sizeof(LineGroupVertex) * num_vertices);
+	LineGroupVertex *vb = vertices;
+#else
+	DynamicVBAccessClass vba(
+		sort ? rts::render::GAME_BUFFER_TYPE_DYNAMIC_SORTED :
+		rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,
+		rts::render::GAME_VERTEX_XYZNDUV2, num_vertices);
 
 	{
 		DynamicVBAccessClass::WriteLockClass lock(&vba);
 
-		VertexFormatXYZNDUV2 *vb = lock.Get_Formatted_Vertex_Array();
+		LineGroupVertex *vb = reinterpret_cast<LineGroupVertex *>(
+			lock.Get_Formatted_Vertex_Array());
+#endif
 
 		Vector3 loc, start, end;
 		int point, j;
@@ -417,7 +489,7 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 					vb->x			= end.X;
 					vb->y			= end.Y;
 					vb->z			= end.Z;
-					vb->diffuse	= DX8Wrapper::Convert_Color(taildiffuse);
+					vb->diffuse	= PackLineGroupColor(taildiffuse);
 					vb->u1		= ucoord;
 					vb->v1		= 1.0f;
 					vb++;
@@ -427,7 +499,7 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 						vb->x			= loc.X;
 						vb->y			= loc.Y;
 						vb->z			= loc.Z;
-						vb->diffuse	= DX8Wrapper::Convert_Color(diffuse);
+						vb->diffuse	= PackLineGroupColor(diffuse);
 						vb->u1		= ucoord;
 						vb->v1		= 0.0f;
 						vb++;
@@ -440,7 +512,7 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 						vb->x			= loc.X;
 						vb->y			= loc.Y;
 						vb->z			= loc.Z;
-						vb->diffuse	= DX8Wrapper::Convert_Color(diffuse);
+						vb->diffuse	= PackLineGroupColor(diffuse);
 						vb->u1		= ucoord;
 						vb->v1		= 0.0f;
 						vb++;
@@ -454,7 +526,7 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 						vb->x			= loc.X;
 						vb->y			= loc.Y;
 						vb->z			= loc.Z;
-						vb->diffuse	= DX8Wrapper::Convert_Color(taildiffuse);
+						vb->diffuse	= PackLineGroupColor(taildiffuse);
 						vb->u1		= ucoord;
 						vb->v1		= 1.0f;
 						vb++;
@@ -463,19 +535,49 @@ void	LineGroupClass::Render(RenderInfoClass &rinfo)
 			}
 
 		}
+#if !defined(_WIN64)
 	}
+#endif
 
-	DX8Wrapper::Set_Index_Buffer(iba, 0);
-	DX8Wrapper::Set_Vertex_Buffer(vba);
-
+#if defined(_WIN64)
+	if (sort) {
+		// Retain the original R16 triangles in the global translucent queue.
+		// This no-sphere submission matches the legacy Insert_Triangles call;
+		// depth is computed per triangle from the captured world/view state.
+		(void)rts::render::DrawGameSortedIndexedTrianglesUP(num_tris,
+			vertices, num_vertices, sizeof(LineGroupVertex),
+			rts::render::GAME_VERTEX_XYZNDUV2, indices,
+			static_cast<size_t>(num_vertices) * sizeof(LineGroupVertex),
+			static_cast<size_t>(num_indices) * sizeof(unsigned short));
+	} else {
+	// The neutral UP operation is the indexed-draw equivalent for native
+	// rendering. Expand the already-built index order so the triangle winding
+	// and per-face ordering remain byte-for-byte equivalent to the old path.
+	LineGroupVertex *expanded = W3DNEWARRAY LineGroupVertex[num_indices];
+	for (int index = 0; index < num_indices; ++index) {
+		expanded[index] = vertices[indices[index]];
+	}
+	(void)rts::render::DrawGamePrimitiveUP(
+		rts::render::GAME_PRIMITIVE_TRIANGLE_LIST, num_tris, expanded,
+		static_cast<unsigned int>(sizeof(LineGroupVertex)),
+		rts::render::GAME_VERTEX_XYZNDUV2);
+	delete [] expanded;
+	}
+	delete [] vertices;
+	delete [] indices;
+#else
+	rts::render::SetGameIndexBuffer(iba, 0);
+	rts::render::SetGameVertexBuffer(vba);
 	if (sort) {
 		SortingRendererClass::Insert_Triangles(0, num_tris, 0, num_vertices);
 	} else {
-		DX8Wrapper::Draw_Triangles(0, num_tris, 0, num_vertices);
+		rts::render::DrawGameTriangles(0, num_tris, 0, num_vertices);
 	}
+#endif
 
 	// restore the matrices
-	DX8Wrapper::Set_Transform(D3DTS_VIEW, view);
+	rts::render::SetGameTransform(
+		rts::render::GAME_TRANSFORM_VIEW, view);
 }
 
 int LineGroupClass::Get_Polygon_Count()

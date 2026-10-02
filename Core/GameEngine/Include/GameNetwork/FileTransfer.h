@@ -45,4 +45,4 @@ AsciiString GetAssetUsageFromMap( AsciiString path );
 AsciiString GetReadmeFromMap( AsciiString path );
 
 // The meat of file (map) transfers
-Bool DoAnyMapTransfers(GameInfo *game);
+Bool DoAnyMapTransfers(GameInfo *game, Bool allowSidecarTransfer = TRUE);

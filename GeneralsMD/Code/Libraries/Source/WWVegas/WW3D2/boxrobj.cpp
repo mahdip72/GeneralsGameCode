@@ -97,10 +97,11 @@
 #include "rinfo.h"
 #include "coltest.h"
 #include "inttest.h"
-#include "dx8wrapper.h"
-#include "dx8indexbuffer.h"
-#include "dx8vertexbuffer.h"
-#include "dx8fvf.h"
+#include "Renderer/RenderGameClient.h"
+#include "WW3D2/dx8indexbuffer.h"
+#include "WW3D2/dx8vertexbuffer.h"
+#include "WW3D2/dx8fvf.h"
+#include "WWMath/vector4.h"
 #include "sortingrenderer.h"
 #include "visrasterizer.h"
 #include "meshgeometry.h"
@@ -458,11 +459,12 @@ void BoxRenderObjClass::render_box(RenderInfoClass & rinfo,const Vector3 & cente
 		/*
 		** Dump the box vertices into the sorting dynamic vertex buffer.
 		*/
-		DWORD color = DX8Wrapper::Convert_Color(Color,Opacity);
+		DWORD color = rts::render::ConvertGameColorClamp(
+			Vector4(Color.X,Color.Y,Color.Z,Opacity));
 
-		int buffer_type = BUFFER_TYPE_DYNAMIC_DX8;
-
-		DynamicVBAccessClass vbaccess(buffer_type,dynamic_fvf_type,NUM_BOX_VERTS);
+		DynamicVBAccessClass vbaccess(
+			rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,
+			dynamic_fvf_type,NUM_BOX_VERTS);
 		{
 			DynamicVBAccessClass::WriteLockClass lock(&vbaccess);
 			//unsigned char *vb=(unsigned char *) lock.Get_Vertex_Array();
@@ -490,7 +492,9 @@ void BoxRenderObjClass::render_box(RenderInfoClass & rinfo,const Vector3 & cente
 		/*
 		** Dump the faces into the sorting dynamic index buffer.
 		*/
-		DynamicIBAccessClass ibaccess(buffer_type,NUM_BOX_FACES*3);
+		DynamicIBAccessClass ibaccess(
+			rts::render::GAME_BUFFER_TYPE_DYNAMIC_IMMEDIATE,
+			NUM_BOX_FACES*3);
 		{
 			DynamicIBAccessClass::WriteLockClass lock(&ibaccess);
 			unsigned short * indices = lock.Get_Index_Array();
@@ -504,14 +508,14 @@ void BoxRenderObjClass::render_box(RenderInfoClass & rinfo,const Vector3 & cente
 		/*
 		** Apply the shader and material
 		*/
-		DX8Wrapper::Set_Material(_BoxMaterial);
-		DX8Wrapper::Set_Shader(_BoxShader);
-		DX8Wrapper::Set_Texture(0,nullptr);
+		rts::render::SetGameMaterial(_BoxMaterial);
+		rts::render::SetGameShader(_BoxShader);
+		rts::render::SetGameTexture(0,nullptr);
 
-		DX8Wrapper::Set_Index_Buffer(ibaccess,0);
-		DX8Wrapper::Set_Vertex_Buffer(vbaccess);
+		rts::render::SetGameIndexBuffer(ibaccess,0);
+		rts::render::SetGameVertexBuffer(vbaccess);
 
-		DX8Wrapper::Draw_Triangles(buffer_type,0,NUM_BOX_FACES,0,NUM_BOX_VERTS);
+		rts::render::DrawGameTriangles(0,NUM_BOX_FACES,0,NUM_BOX_VERTS);
 	}
 }
 
@@ -701,7 +705,7 @@ void AABoxRenderObjClass::Render(RenderInfoClass & rinfo)
 {
 	Matrix3D temp(1);
 	temp.Translate(Transform.Get_Translation());
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,temp);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,temp);
 	render_box(rinfo,ObjSpaceCenter,ObjSpaceExtent);
 }
 
@@ -1085,7 +1089,7 @@ int OBBoxRenderObjClass::Class_ID() const
  *=============================================================================================*/
 void OBBoxRenderObjClass::Render(RenderInfoClass & rinfo)
 {
-	DX8Wrapper::Set_Transform(D3DTS_WORLD,Transform);
+	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD,Transform);
 	render_box(rinfo,ObjSpaceCenter,ObjSpaceExtent);
 }
 

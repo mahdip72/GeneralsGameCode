@@ -10,6 +10,37 @@ option(RTS_BUILD_OPTION_DEBUG "Build code with the \"Debug\" configuration." OFF
 option(RTS_BUILD_OPTION_ASAN "Build code with Address Sanitizer." OFF)
 option(RTS_BUILD_OPTION_VC6_FULL_DEBUG "Build VC6 with full debug info." OFF)
 option(RTS_BUILD_OPTION_FFMPEG "Enable FFmpeg support" OFF)
+option(RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY
+    "Embed reviewed lockstep-v2 Stage 5 authority in an x64 Release product build"
+    OFF)
+
+set(RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK 0)
+if(RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY)
+    if(NOT WIN32 OR IS_VS6_BUILD OR NOT RTS_BUILD_PRODUCT)
+        message(FATAL_ERROR
+            "Stage 5 multiplayer promotion requires a native Windows product build")
+    endif()
+    if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+        message(FATAL_ERROR
+            "Stage 5 multiplayer promotion requires a native x64 product build")
+    endif()
+    if(RTS_BUILD_OPTION_DEBUG OR RTS_BUILD_OPTION_PROFILE OR
+            RTS_BUILD_OPTION_PROFILE_TRACY OR RTS_BUILD_OPTION_ASAN)
+        message(FATAL_ERROR
+            "Stage 5 multiplayer promotion is available only to the normal Release product")
+    endif()
+    # Six kernels completed the separate installed lockstep-v2 qualification:
+    # physics, status, collision, AI planning, immutable spatial, and path.
+    set(RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK 63)
+endif()
+
+# A VC6 product install must be rooted in a task-owned disposable subtree.
+# Presets provide the build-local default; an explicitly approved scratch root
+# may be supplied by an isolated packaging job.
+set(RTS_TASK_OWNED_INSTALL_ROOT "" CACHE PATH
+    "Disposable root required for VC6 product installs")
+set(RTS_APPROVED_SCRATCH_ROOT "" CACHE PATH
+    "Explicitly approved scratch root for VC6 product installs")
 
 if(RTS_BUILD_PRODUCT AND NOT RTS_BUILD_ZEROHOUR AND NOT RTS_BUILD_GENERALS)
     set(RTS_BUILD_ZEROHOUR TRUE)
@@ -25,24 +56,37 @@ add_feature_info(DebugBuild RTS_BUILD_OPTION_DEBUG "Building as a \"Debug\" buil
 add_feature_info(AddressSanitizer RTS_BUILD_OPTION_ASAN "Building with address sanitizer")
 add_feature_info(Vc6FullDebug RTS_BUILD_OPTION_VC6_FULL_DEBUG "Building VC6 with full debug info")
 add_feature_info(FFmpegSupport RTS_BUILD_OPTION_FFMPEG "Building with FFmpeg support")
+add_feature_info(Stage5PromotedMultiplayerAuthority
+    RTS_BUILD_STAGE5_PROMOTED_MULTIPLAYER_AUTHORITY
+    "Embedding post-gate Stage 5 multiplayer authority")
 
 set(RTS_BUILD_OUTPUT_SUFFIX "" CACHE STRING "Suffix appended to output names of installable targets")
 
+include(${CMAKE_CURRENT_LIST_DIR}/task-owned-install-prefix.cmake)
+
 if(RTS_BUILD_ZEROHOUR)
+    cmake_dependent_option(RTS_BUILD_ZEROHOUR_PRODUCT
+        "Build the Zero Hour game executable"
+        ON "RTS_BUILD_PRODUCT" OFF)
     option(RTS_BUILD_ZEROHOUR_TOOLS "Build tools for Zero Hour" ON)
     option(RTS_BUILD_ZEROHOUR_EXTRAS "Build extra tools/tests for Zero Hour" OFF)
     option(RTS_BUILD_ZEROHOUR_DOCS "Build documentation for Zero Hour" OFF)
 
+    add_feature_info(ZeroHourProduct RTS_BUILD_ZEROHOUR_PRODUCT "Build the Zero Hour game executable")
     add_feature_info(ZeroHourTools RTS_BUILD_ZEROHOUR_TOOLS "Build Zero Hour Mod Tools")
     add_feature_info(ZeroHourExtras RTS_BUILD_ZEROHOUR_EXTRAS "Build Zero Hour Extra Tools/Tests")
     add_feature_info(ZeroHourDocs RTS_BUILD_ZEROHOUR_DOCS "Build Zero Hour Documentation")
 endif()
 
 if(RTS_BUILD_GENERALS)
+    cmake_dependent_option(RTS_BUILD_GENERALS_PRODUCT
+        "Build the Generals game executable"
+        ON "RTS_BUILD_PRODUCT" OFF)
     option(RTS_BUILD_GENERALS_TOOLS "Build tools for Generals" ON)
     option(RTS_BUILD_GENERALS_EXTRAS "Build extra tools/tests for Generals" OFF)
     option(RTS_BUILD_GENERALS_DOCS "Build documentation for Generals" OFF)
 
+    add_feature_info(GeneralsProduct RTS_BUILD_GENERALS_PRODUCT "Build the Generals game executable")
     add_feature_info(GeneralsTools RTS_BUILD_GENERALS_TOOLS "Build Generals Mod Tools")
     add_feature_info(GeneralsExtras RTS_BUILD_GENERALS_EXTRAS "Build Generals Extra Tools/Tests")
     add_feature_info(GeneralsDocs RTS_BUILD_GENERALS_DOCS "Build Generals Documentation")
@@ -67,7 +111,7 @@ if(MSVC)
     # Keep the legacy 32-bit/VC6 oracle unchanged while making modern x64
     # targets fail at compile time if one is reintroduced.
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-        target_compile_options(core_x64_portability_config INTERFACE /we4302 /we4311)
+        target_compile_options(core_x64_portability_config INTERFACE /we4302 /we4311 /we4312)
     endif()
 endif()
 
@@ -96,3 +140,8 @@ if(RTS_BUILD_OPTION_PROFILE_TRACY)
 else()
     add_library(core_profile_tracy INTERFACE)
 endif()
+
+# The generator expression also keeps an accidentally selected Debug
+# configuration from inheriting authority from a Release-configured build tree.
+target_compile_definitions(core_config INTERFACE
+    "$<$<CONFIG:Release>:RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK=${RTS_LOCKSTEP_V2_PRODUCT_PROMOTED_KERNEL_MASK}>")

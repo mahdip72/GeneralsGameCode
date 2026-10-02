@@ -47,6 +47,7 @@
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DScene.h"
 #include "W3DDevice/Common/W3DConvert.h"
+#include "Renderer/RenderGameClient.h"
 #include "WW3D2/ww3d.h"
 #include "WW3D2/hanim.h"
 
@@ -183,7 +184,7 @@ void DebugHintObject::initData()
 		ib[2]=2;
 	}
 
-	m_vertexBufferTile = NEW_REF(DX8VertexBufferClass,(DX8_FVF_XYZDUV1,3,DX8VertexBufferClass::USAGE_DEFAULT));
+	m_vertexBufferTile = NEW_REF(DX8VertexBufferClass,(rts::render::GAME_VERTEX_XYZDUV1,3,DX8VertexBufferClass::USAGE_DEFAULT));
 
 	//go with a preset material for now.
 	m_vertexMaterialClass = VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
@@ -240,18 +241,18 @@ void DebugHintObject::Render(RenderInfoClass & rinfo)
 	SphereClass bounds(Vector3(m_myLoc.x, m_myLoc.y, m_myLoc.z), m_mySize);
 	if (!rinfo.Camera.Cull_Sphere(bounds))
 	{
-		DX8Wrapper::Set_Material(m_vertexMaterialClass);
-		DX8Wrapper::Set_Shader(m_shaderClass);
-		DX8Wrapper::Set_Texture(0, nullptr);
-		DX8Wrapper::Set_Index_Buffer(m_indexBuffer,0);
-		DX8Wrapper::Set_Vertex_Buffer(m_vertexBufferTile);
+		rts::render::SetGameMaterial(m_vertexMaterialClass);
+		rts::render::SetGameShader(m_shaderClass);
+		rts::render::SetGameTexture(0, nullptr);
+		rts::render::SetGameIndexBuffer(m_indexBuffer,0);
+		rts::render::SetGameVertexBuffer(m_vertexBufferTile);
 
 		Matrix3D tm(Transform);
 		Vector3 vec(m_myLoc.x, m_myLoc.y, m_myLoc.z);
 		tm.Set_Translation(vec);
-		DX8Wrapper::Set_Transform(D3DTS_WORLD, tm);
+		rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD, tm);
 
-		DX8Wrapper::Draw_Triangles(	0, 1, 0, 3);
+		rts::render::DrawGameTriangles(	0, 1, 0, 3);
 	}
 }
 #endif // RTS_DEBUG
@@ -421,7 +422,7 @@ void W3DInGameUI::draw()
 	// repaint all our windows
 
 #ifdef EXTENDED_STATS
-	if (!DX8Wrapper::stats.m_disableConsole) {
+	if (!rts::render::IsGameDebugConsoleDisabled()) {
 #endif
 
 #ifdef DO_UNIT_TIMINGS

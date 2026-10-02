@@ -222,13 +222,17 @@ private:
 	enum {PARTITION_WIDTH_HEIGHT = 100};
 	DX8VertexBufferClass	*m_vertexTree[MAX_BUFFERS];	///<Tree vertex buffer.
 	DX8IndexBufferClass			*m_indexTree[MAX_BUFFERS];	///<indices defining a triangles for the tree drawing.
-	DWORD					m_dwTreePixelShader;	///<handle to D3D pixel shader
-	DWORD					m_dwTreeVertexShader;	///<handle to D3D vertex shader
+	unsigned int				m_dwTreePixelShader;	///<opaque tree pixel-program handle
+	unsigned int				m_dwTreeVertexShader;	///<opaque tree vertex-program handle
 
 	Short		m_areaPartition[PARTITION_WIDTH_HEIGHT*PARTITION_WIDTH_HEIGHT];
 	Region2D m_bounds;
 
 	TextureClass *m_treeTexture;	///<Trees texture
+#if defined(_WIN64)
+	Int			m_textureLOD;
+	Bool			m_hasExplicitTextureLOD;
+#endif
 	Int			m_textureWidth;				///<Width in pixels m_treeTexture;
 	Int			m_textureHeight;				///<Width in pixels m_treeTexture;
 	Int			m_curNumTreeVertices[MAX_BUFFERS]; ///<Number of vertices used in m_vertexTree.
@@ -270,6 +274,7 @@ protected:
 	void cull(const CameraClass * camera);						 ///< Culls the trees.
 	UnsignedInt  doLighting(const Vector3 *normal,
 		const GlobalData::TerrainLighting	*objectLighting,
+		const Vector3 *lightRays,
 		const Vector3 *emissive, UnsignedInt vertexDiffuse, Real scale) const;
 #if 0 // sort is no longer used and messes up the order. jba [6/6/2003]
 	void sort( Int iterations );								 ///< Performs partial bubble sort.

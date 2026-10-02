@@ -13,7 +13,7 @@ target_link_libraries(g_generals PRIVATE
     g_gameenginedevice
     gi_always
     imm32
-    rts_legacy_product_runtime
+    rts_product_runtime
     vfw32
     winmm
 )
