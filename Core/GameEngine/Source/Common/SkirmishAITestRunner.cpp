@@ -6877,6 +6877,7 @@ Bool SameAlliedDiagnostics(const AISkirmishPlayer::AlliedCoordinationDiagnostics
 {
 	return a.assaultActive == b.assaultActive && a.assaultLaunched == b.assaultLaunched &&
 		a.strategyResumePending == b.strategyResumePending &&
+		a.assaultTeamCount == b.assaultTeamCount &&
 		a.holdAdmissionValid == b.holdAdmissionValid && a.holdAdmissionFrame == b.holdAdmissionFrame &&
 		a.homeDamageValid == b.homeDamageValid && a.homeDamageFrame == b.homeDamageFrame &&
 		a.heldDamageValid == b.heldDamageValid && a.heldDamageFrame == b.heldDamageFrame &&
@@ -6888,6 +6889,34 @@ Bool SameAlliedDiagnostics(const AISkirmishPlayer::AlliedCoordinationDiagnostics
 		a.donationCooldownActive == b.donationCooldownActive &&
 		a.nextDonationFrame == b.nextDonationFrame &&
 		a.receiptCooldownActive == b.receiptCooldownActive && a.mayDonateFrame == b.mayDonateFrame;
+}
+
+Bool CaptureAlliedFixtureAssaultRoster(AISkirmishPlayer *ai, std::vector<UnsignedInt> *ids)
+{
+	const Int count = ai->getAlliedCoordinationDiagnostics().assaultTeamCount;
+	if (count < 0 || count > 16) return FALSE;
+	ids->clear();
+	for (Int index = 0; index < count; ++index)
+	{
+		const UnsignedInt id = ai->getAlliedAssaultTeamID(index);
+		if (id == 0 || (index > 0 && id <= ids->back()) || !ai->isAlliedAssaultTeam(id)) return FALSE;
+		ids->push_back(id);
+	}
+	return TRUE;
+}
+
+Bool AlliedFixtureAssaultRosterContains(const std::vector<UnsignedInt> &ids, UnsignedInt teamID)
+{
+	for (size_t index = 0; index < ids.size(); ++index) if (ids[index] == teamID) return TRUE;
+	return FALSE;
+}
+
+void PrintAlliedFixtureAssaultRoster(const char *record, UnsignedInt frame, Int slot,
+	const std::vector<UnsignedInt> &ids)
+{
+	printf("%s frame=%u slot=%d count=%u team_ids=", record, frame, slot, static_cast<UnsignedInt>(ids.size()));
+	for (size_t index = 0; index < ids.size(); ++index) printf("%s%u", index == 0 ? "" : ",", ids[index]);
+	printf("\n");
 }
 
 Bool RoundTripAlliedFixture()
@@ -6903,6 +6932,7 @@ Bool RoundTripAlliedFixture()
 	Int starvation[7];
 	UnsignedInt relief[7];
 	std::vector<UnsignedInt> supportIDs[7];
+	std::vector<UnsignedInt> assaultIDs[7];
 	const UnsignedInt frame = TheGameLogic->getFrame();
 	const Bool evaluated = TheAI->hasAlliedEvaluation();
 	const UnsignedInt nextEvaluation = TheAI->getNextAlliedEvaluationFrame();
@@ -6912,6 +6942,7 @@ Bool RoundTripAlliedFixture()
 		Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
 		if (!ai || !player) return FALSE;
 		before[slot - 1] = ai->getAlliedCoordinationDiagnostics();
+		if (!CaptureAlliedFixtureAssaultRoster(ai, &assaultIDs[slot - 1])) return FALSE;
 		playerIndices[slot - 1] = player->getPlayerIndex();
 		starvation[slot - 1] = TheAI->getAlliedStarvationStreak(playerIndices[slot - 1]);
 		relief[slot - 1] = TheAI->getAlliedRecipientReliefUntil(playerIndices[slot - 1]);
@@ -6928,7 +6959,9 @@ Bool RoundTripAlliedFixture()
 		s_allied.cancellationPendingAtSave[participant] =
 			state.strategyResumePending;
 		if (state.strategyResumePending &&
-			(!state.holdAdmissionValid || state.holdAdmissionFrame > frame)) return FALSE;
+			(!state.holdAdmissionValid || state.holdAdmissionFrame > frame || state.assaultTeamCount <= 0 ||
+			 !AlliedFixtureAssaultRosterContains(assaultIDs[s_allied.cancellationSlots[participant] - 1],
+				s_allied.cancellationTeams[participant]))) return FALSE;
 	}
 	AsciiString filename;
 	filename.format("SkirmishAIAllied_%s.sav", s_runner.runNonce);
@@ -6959,6 +6992,8 @@ Bool RoundTripAlliedFixture()
 			TheAI->getAlliedRecipientReliefUntil(playerIndices[slot - 1]) != relief[slot - 1]) return FALSE;
 		for (Int team = 0; team < before[slot - 1].supportTeamCount; ++team)
 			if (ai->getAlliedSupportTeamID(team) != supportIDs[slot - 1][team]) return FALSE;
+		std::vector<UnsignedInt> reboundAssaultIDs;
+		if (!CaptureAlliedFixtureAssaultRoster(ai, &reboundAssaultIDs) || reboundAssaultIDs != assaultIDs[slot - 1]) return FALSE;
 		if (before[slot - 1].assaultActive &&
 			!TheGameLogic->findObjectByID(before[slot - 1].targetID)) return FALSE;
 	}
@@ -6972,10 +7007,14 @@ Bool RoundTripAlliedFixture()
 			s_allied.cancellationPendingAtSave[participant]) return FALSE;
 	}
 	++s_allied.checks;
+	for (Int slot = 1; slot <= 7; ++slot)
+		if (!assaultIDs[slot - 1].empty())
+			PrintAlliedFixtureAssaultRoster("SKIRMISH_AI_ALLIED_ROSTER_SAVE_LOAD_ASSERT", frame, slot, assaultIDs[slot - 1]);
 	s_allied.postLoadEvaluation = TheAI->getNextAlliedEvaluationFrame();
 	s_allied.postLoadBlockedEvaluations = 0;
 	printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_ASSERT frame=%u file=%s "
 		"player_slots=7 central_cadence=preserved commitments=preserved support_ids=preserved damage_latches=preserved "
+		"admitted_rosters=preserved_nonzero "
 		"cooldown_until=%u remaining_frames=%u strategy_resume_pending=preserved_nonzero "
 		"pending_at_save=%d,%d pending_after_load=%d,%d hold_admission=preserved "
 		"hold_admission_valid=%d,%d hold_admission_frame=%u,%u post_load_protection=pending\n",
@@ -6996,17 +7035,21 @@ void BeginAlliedCancellation(Int firstSlot, Int secondSlot, ObjectID targetID,
 	if (s_allied.cancellationIssued || releaseFrame <= frame) return;
 	const Int slots[2] = { firstSlot, secondSlot };
 	Object *held[2] = { nullptr, nullptr };
+	std::vector<UnsignedInt> rosters[2];
 	for (Int participant = 0; participant < 2; ++participant)
 	{
 		Player *player = ThePlayerList->getPlayerFromSlotIndex(slots[participant]);
 		AISkirmishPlayer *skirmish = GetAlliedFixtureAI(slots[participant]);
 		Coord3D home;
 		if (!player || !skirmish || !skirmish->getBaseCenter(&home)) return;
+		if (!CaptureAlliedFixtureAssaultRoster(skirmish, &rosters[participant]) || rosters[participant].empty()) return;
 		for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
 		{
 			AIUpdateInterface *ai = object->getAIUpdateInterface();
 			const Coord3D *guard = ai ? ai->getGuardLocation() : nullptr;
 			if (IsSkirmishAIRecoveryCombatUnit(object, player) && object->getTeam() && ai && guard &&
+				AlliedFixtureAssaultRosterContains(rosters[participant], object->getTeam()->getID()) &&
+				skirmish->isAlliedAssaultTeam(object->getTeam()->getID()) &&
 				skirmish->isAlliedAssaultHoldingTeam(object->getTeam()->getID()) &&
 				ai->getLastCommandSource() == CMD_FROM_AI && ai->getGuardTargetType() == GUARDTARGET_LOCATION)
 			{
@@ -7025,6 +7068,7 @@ void BeginAlliedCancellation(Int firstSlot, Int secondSlot, ObjectID targetID,
 		s_allied.cancellationMembers[participant] = held[participant]->getID();
 		s_allied.cancellationTeams[participant] = held[participant]->getTeam()->getID();
 		s_allied.cancellationPositions[participant] = *held[participant]->getPosition();
+		PrintAlliedFixtureAssaultRoster("SKIRMISH_AI_ALLIED_CANCELLATION_ROSTER_ASSERT", frame, slots[participant], rosters[participant]);
 	}
 	s_allied.cancellationIssued = TRUE;
 	s_allied.cancellationTarget = targetID;
@@ -7044,16 +7088,20 @@ Bool RetainHeldAlliedAssaultProbes(Int firstSlot, Int secondSlot)
 	const Int slots[2] = { firstSlot, secondSlot };
 	Int captured[2] = { 0, 0 };
 	std::vector<AlliedMovementProbe> probes;
+	std::vector<UnsignedInt> rosters[2];
 	for (Int participant = 0; participant < 2; ++participant)
 	{
 		Player *player = ThePlayerList->getPlayerFromSlotIndex(slots[participant]);
 		AISkirmishPlayer *skirmish = GetAlliedFixtureAI(slots[participant]);
 		Coord3D home;
 		if (!player || !skirmish || !skirmish->getBaseCenter(&home)) return FALSE;
+		if (!CaptureAlliedFixtureAssaultRoster(skirmish, &rosters[participant]) || rosters[participant].empty()) return FALSE;
 		for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
 		{
 			if (captured[participant] >= 64 || !IsSkirmishAIRecoveryCombatUnit(object, player) ||
-				!object->getTeam() || !skirmish->isAlliedAssaultHoldingTeam(object->getTeam()->getID())) continue;
+				!object->getTeam() || !skirmish->isAlliedAssaultTeam(object->getTeam()->getID()) ||
+				!AlliedFixtureAssaultRosterContains(rosters[participant], object->getTeam()->getID()) ||
+				!skirmish->isAlliedAssaultHoldingTeam(object->getTeam()->getID())) continue;
 			AIUpdateInterface *ai = object->getAIUpdateInterface();
 			const Coord3D *guard = ai ? ai->getGuardLocation() : nullptr;
 			if (!ai || !guard || ai->getLastCommandSource() != CMD_FROM_AI ||
@@ -7072,8 +7120,10 @@ Bool RetainHeldAlliedAssaultProbes(Int firstSlot, Int secondSlot)
 	}
 	if (captured[0] == 0 || captured[1] == 0) return FALSE;
 	s_allied.assaultProbes.swap(probes);
+	for (Int participant = 0; participant < 2; ++participant)
+		PrintAlliedFixtureAssaultRoster("SKIRMISH_AI_ALLIED_ADMITTED_ROSTER_ASSERT", TheGameLogic->getFrame(), slots[participant], rosters[participant]);
 	printf("SKIRMISH_AI_ALLIED_HELD_PROBES_ASSERT frame=%u slots=%d,%d members=%d,%d "
-		"offensive_hold_predicate=1 ai_home_guard=1\n", TheGameLogic->getFrame(),
+		"offensive_hold_predicate=1 admitted_roster_membership=1 ai_home_guard=1\n", TheGameLogic->getFrame(),
 		firstSlot, secondSlot, captured[0], captured[1]);
 	fflush(stdout);
 	return TRUE;
