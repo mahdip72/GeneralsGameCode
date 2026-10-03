@@ -2,6 +2,8 @@
 
 // Shared opt-in owner-thread diagnostics. Set RTS_FRAME_TIMING_DIR to an existing
 // directory; no output or clock queries occur when the variable is absent.
+// Render-owner sidecars require their own explicit RTS_RENDER_OWNER_TIMING_DIR
+// opt-in. Keep it separate from strict one-CSV game/scaling receipt directories.
 namespace rts { namespace frame_timing {
 
 enum Phase
@@ -15,6 +17,23 @@ enum Phase
 	AudioVoiceCreate, AudioVoiceDestroy, AudioDecodeOpen, AudioDecodeRead,
 	RendererPresent, RendererTextureCollect, RendererTexturePrune,
 	WaterTrackTextureBind, WaterTrackModuleRender,
+	RendererConstantPack, RendererConstantUpload, RendererBufferUpload,
+	RendererDrawValidation, RendererDrawSubmit, RendererBufferShadow,
+	RendererSceneLights, RendererProjectedShadows, RendererVolumeShadows,
+	RendererSorting, RendererParticles, RendererSkinRender,
+	RendererCommandEnqueue, RendererVolumePrepare, RendererVolumeSubmit,
+	RendererProjectedTerrain, RendererProjectedDecal, RendererProjectedFlush,
+	RendererParticlePrepare, RendererParticleSubmit,
+	RendererProjectedSceneMeshDrain,
+	RendererTextureOwnerDrain,
+	RendererTextureCopyPublication,
+	AudioAssetResolve, AudioVirtualRead, AudioFfmpegProbe, AudioStreamOpen,
+	AudioSampleLookup, AudioSampleHit, AudioSampleMiss, AudioSampleFill,
+	AudioSampleFallback,
+	RendererVolumeParticle, RendererVolumeParticleTransform,
+	RendererVolumeParticleUpdateArrays, RendererVolumeParticlePackSubmit,
+	RendererVolumeStaticDraw, RendererVolumeDynamicDraw,
+	RendererVolumeDynamicUpload, RendererVolumeDynamicCommands,
 	PhaseCount
 };
 
@@ -46,15 +65,18 @@ struct FinalizedCapture
 class Capture
 {
 public:
-	Capture() : m_file(NULL), m_finalizedHandle(INVALID_HANDLE_VALUE), m_owner(0), m_frequency(0), m_active(false),
+	enum Stream { GameStream, RenderOwnerStream };
+	Capture(Stream stream = GameStream) : m_file(NULL), m_finalizedHandle(INVALID_HANDLE_VALUE), m_owner(0), m_frequency(0), m_active(false),
 		m_frameStart(0), m_bucketStart(0), m_rows(0), m_session(0),
 		m_frameBegin(0), m_frameEnd(0), m_logicFrames(0), m_mode("interactive"),
 		m_writeSucceeded(true), m_truncated(false), m_incomplete(false),
-		m_finalized(false), m_frameSamples(0), m_firstFrame(0), m_lastFrame(0)
+		m_finalized(false), m_frameSamples(0), m_firstFrame(0), m_lastFrame(0),
+		m_stream(stream), m_sequenceBegin(0), m_sequenceEnd(0), m_executionPackets(0)
 	{
 		memset(m_stats, 0, sizeof(m_stats));
 		char directory[MAX_PATH];
-		const DWORD length = GetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory, sizeof(directory));
+		const DWORD length = GetEnvironmentVariableA(m_stream == RenderOwnerStream ?
+			"RTS_RENDER_OWNER_TIMING_DIR" : "RTS_FRAME_TIMING_DIR", directory, sizeof(directory));
 		if (length == 0 || length >= sizeof(directory))
 			return;
 		const DWORD attributes = GetFileAttributesA(directory);
@@ -63,8 +85,12 @@ public:
 			!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
 			return;
 		char path[MAX_PATH + 80];
-		_snprintf(path, sizeof(path), "%s\\frame-timing-%lu-%lu.csv", directory,
-			GetCurrentProcessId(), GetTickCount());
+		if (m_stream == RenderOwnerStream)
+			_snprintf(path, sizeof(path), "%s\\render-owner-timing-%lu-%lu-%lu.csv", directory,
+				GetCurrentProcessId(), GetCurrentThreadId(), GetTickCount());
+		else
+			_snprintf(path, sizeof(path), "%s\\frame-timing-%lu-%lu.csv", directory,
+				GetCurrentProcessId(), GetTickCount());
 		path[sizeof(path) - 1] = '\0';
 		// Exclusive creation never replaces a previous capture.
 		m_file = _fsopen(path, "w+x", _SH_DENYWR);
@@ -73,7 +99,9 @@ public:
 		m_path = path;
 		m_frequency = frequency.QuadPart;
 		setvbuf(m_file, NULL, _IOFBF, 16384);
-		fprintf(m_file, "session,mode,frame_begin,frame_end,logic_frames,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms\n");
+		fprintf(m_file, m_stream == RenderOwnerStream ?
+			"session,mode,sequence_begin,sequence_end,executed_packets,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms\n" :
+			"session,mode,frame_begin,frame_end,logic_frames,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms\n");
 	}
 
 	~Capture()
@@ -125,7 +153,8 @@ public:
 		if (!m_file)
 			return;
 		++m_session;
-		m_mode = mode != NULL && mode[0] == 'h' ? "headless" : "interactive";
+		m_mode = m_stream == RenderOwnerStream ? "render_owner" :
+			(mode != NULL && mode[0] == 'h' ? "headless" : "interactive");
 	}
 
 	void endSession()
@@ -164,7 +193,7 @@ public:
 	void beginFrame(unsigned int frame)
 	{
 		const DWORD owner = m_owner.load(std::memory_order_acquire);
-		if (owner != GetCurrentThreadId() || !m_file)
+		if (owner == 0 || owner != GetCurrentThreadId() || !m_file)
 			return;
 		if (m_active)
 			m_incomplete = true;
@@ -196,6 +225,8 @@ public:
 			m_incomplete = true;
 		add(FrameTotal, end - m_frameStart);
 		++m_frameSamples;
+		if (m_stream == RenderOwnerStream)
+			++m_executionPackets;
 		if (frame > m_lastFrame)
 			m_lastFrame = frame;
 		if (frame >= m_frameEnd)
@@ -210,10 +241,36 @@ public:
 			flush();
 	}
 
+	// Each immutable packet segment is measured independently. A producer frame
+	// may have several segments with the same sequence; queue gaps are excluded.
+	void beginExecutionPacket(unsigned __int64 sequence)
+	{
+		if (m_stream != RenderOwnerStream || sequence == 0)
+			return;
+		beginFrame(0);
+		if (!isActive())
+			return;
+		if (m_executionPackets == 0)
+			m_sequenceBegin = sequence;
+		m_sequenceEnd = sequence;
+	}
+
+	void endExecutionPacket()
+	{
+		if (m_stream == RenderOwnerStream)
+			endFrame(0);
+	}
+
+	bool isEnabled() const
+	{
+		const DWORD owner = m_owner.load(std::memory_order_acquire);
+		return owner != 0 && owner == GetCurrentThreadId() && m_file != NULL;
+	}
+
 	bool isActive() const
 	{
 		const DWORD owner = m_owner.load(std::memory_order_acquire);
-		if (owner != GetCurrentThreadId())
+		if (owner == 0 || owner != GetCurrentThreadId())
 			return false;
 		return m_file != NULL && m_active;
 	}
@@ -349,24 +406,50 @@ private:
 			"recorder_update", "recorder_encode", "recorder_flush",
 			"audio_voice_create", "audio_voice_destroy", "audio_decode_open", "audio_decode_read",
 			"renderer_present", "renderer_texture_collect", "renderer_texture_prune",
-			"water_track_texture_bind", "water_track_module_render"
+			"water_track_texture_bind", "water_track_module_render",
+			"renderer_constant_pack", "renderer_constant_upload", "renderer_buffer_upload",
+			"renderer_draw_validation", "renderer_draw_submit", "renderer_buffer_shadow",
+			"renderer_scene_lights", "renderer_projected_shadows", "renderer_volume_shadows",
+			"renderer_sorting", "renderer_particles", "renderer_skin_render",
+			"renderer_command_enqueue", "renderer_volume_prepare", "renderer_volume_submit",
+			"renderer_projected_terrain", "renderer_projected_decal", "renderer_projected_flush",
+			"renderer_particle_prepare", "renderer_particle_submit",
+			"renderer_projected_scene_mesh_drain", "renderer_texture_owner_drain",
+			"renderer_texture_copy_publication",
+			"audio_asset_resolve", "audio_virtual_read", "audio_ffmpeg_probe", "audio_stream_open",
+			"audio_sample_lookup", "audio_sample_hit", "audio_sample_miss", "audio_sample_fill",
+			"audio_sample_uncached_fallback",
+			"renderer_volume_particle", "renderer_volume_particle_transform",
+			"renderer_volume_particle_update_arrays", "renderer_volume_particle_pack_submit",
+			"renderer_volume_static_draw", "renderer_volume_dynamic_draw",
+			"renderer_volume_dynamic_upload", "renderer_volume_dynamic_commands"
 		};
+		static_assert(sizeof(names) / sizeof(names[0]) == PhaseCount,
+			"Every diagnostic phase must retain its CSV name");
 		const double wall = static_cast<double>(clock() - m_bucketStart) * 1000.0 / m_frequency;
 		for (unsigned int i = 0; i < PhaseCount && m_rows < MaxRows; ++i)
 		{
 			const Stats& stats = m_stats[i];
 			if (!stats.count)
 				continue;
-			fprintf(m_file, "%u,%s,%u,%u,%u,%.3f,%s,%u,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u\n",
-				m_session, m_mode, m_frameBegin, m_frameEnd, m_logicFrames, wall, names[i], stats.count,
-				stats.total, stats.total / stats.count, percentileUpper(stats, 95), percentileUpper(stats, 99),
-				stats.maximum, stats.over33, stats.over100);
+			if (m_stream == RenderOwnerStream)
+				fprintf(m_file, "%u,%s,%llu,%llu,%llu,%.3f,%s,%u,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u\n",
+					m_session, m_mode, m_sequenceBegin, m_sequenceEnd, m_executionPackets, wall,
+					i == FrameTotal ? "execution_packet" : names[i], stats.count,
+					stats.total, stats.total / stats.count, percentileUpper(stats, 95), percentileUpper(stats, 99),
+					stats.maximum, stats.over33, stats.over100);
+			else
+				fprintf(m_file, "%u,%s,%u,%u,%u,%.3f,%s,%u,%.3f,%.4f,%.4f,%.4f,%.4f,%u,%u\n",
+					m_session, m_mode, m_frameBegin, m_frameEnd, m_logicFrames, wall, names[i], stats.count,
+					stats.total, stats.total / stats.count, percentileUpper(stats, 95), percentileUpper(stats, 99),
+					stats.maximum, stats.over33, stats.over100);
 			++m_rows;
 		}
 		const bool failed = ferror(m_file) != 0 || fflush(m_file) != 0;
 		memset(m_stats, 0, sizeof(m_stats));
 		m_bucketStart = 0;
 		m_logicFrames = 0;
+		m_executionPackets = 0;
 		if (failed || m_rows >= MaxRows)
 		{
 			m_writeSucceeded = m_writeSucceeded && !failed;
@@ -391,18 +474,66 @@ private:
 	bool m_writeSucceeded, m_truncated, m_incomplete, m_finalized;
 	unsigned __int64 m_frameSamples;
 	unsigned int m_firstFrame, m_lastFrame;
+	Stream m_stream;
+	unsigned __int64 m_sequenceBegin, m_sequenceEnd, m_executionPackets;
 	Capture(const Capture&);
 	Capture& operator=(const Capture&);
+};
+
+inline Capture*& BoundCaptureSlot()
+{
+	static thread_local Capture *capture = NULL;
+	return capture;
+}
+
+class BindCapture
+{
+public:
+	explicit BindCapture(Capture& capture) : m_previous(BoundCaptureSlot())
+	{ BoundCaptureSlot() = &capture; }
+	~BindCapture() { BoundCaptureSlot() = m_previous; }
+private:
+	Capture *m_previous;
+	BindCapture(const BindCapture&);
+	BindCapture& operator=(const BindCapture&);
+};
+
+inline Capture& SelectedCapture()
+{
+	Capture *capture = BoundCaptureSlot();
+	return capture ? *capture : Capture::instance();
+}
+
+class ExecutionPacket
+{
+public:
+	ExecutionPacket(Capture& capture, unsigned __int64 sequence) : m_capture(capture), m_binding(capture)
+	{ m_capture.beginExecutionPacket(sequence); }
+	~ExecutionPacket() { m_capture.endExecutionPacket(); }
+private:
+	Capture& m_capture;
+	BindCapture m_binding;
+	ExecutionPacket(const ExecutionPacket&);
+	ExecutionPacket& operator=(const ExecutionPacket&);
 };
 
 class Scope
 {
 public:
-	explicit Scope(Phase phase) : m_capture(Capture::instance()), m_phase(phase),
+	explicit Scope(Phase phase) : m_capture(SelectedCapture()), m_phase(phase),
 		m_start(m_capture.isActive() ? Capture::clock() : 0) {}
 	Scope(Capture& capture, Phase phase) : m_capture(capture), m_phase(phase),
 		m_start(m_capture.isActive() ? Capture::clock() : 0) {}
-	~Scope() { if (m_start) m_capture.add(m_phase, Capture::clock() - m_start); }
+	~Scope() { finish(); }
+	void finish()
+	{
+		if (!m_start)
+			return;
+		const __int64 start = m_start;
+		m_start = 0;
+		if (m_capture.isActive())
+			m_capture.add(m_phase, Capture::clock() - start);
+	}
 private:
 	Capture& m_capture;
 	Phase m_phase;
@@ -428,7 +559,7 @@ inline bool IsActive() { return Capture::isInstanceActive(); }
 } }
 #else
 namespace rts { namespace frame_timing {
-class Scope { public: explicit Scope(Phase) {} };
+class Scope { public: explicit Scope(Phase) {} void finish() {} };
 class Session { public: explicit Session(const char*) {} };
 inline void BeginFrame(unsigned int) {}
 inline void EndFrame(unsigned int) {}

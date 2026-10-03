@@ -87,6 +87,7 @@
 #include "Renderer/PointGroupColorPacking.h"
 #include "rinfo.h"
 #include "camera.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 // Upgraded to DX8 2/2/01 HY
 
@@ -770,6 +771,112 @@ int PointGroupClass::Get_Polygon_Count()
  *   02/08/2001 HY  : Upgraded to DX8                                     *
  *========================================================================*/
 static SimpleVecClass<unsigned long> remap;
+bool PointGroupClass::Can_Pack_Billboard_Quads(unsigned fvf, unsigned stride) const
+{
+#if defined(_WIN64) && defined(RTS_RENDERER_HAS_D3D11)
+	return fvf == dynamic_fvf_type && stride == sizeof(VertexFormatXYZNDUV2) &&
+		PointMode == QUADS && Billboard && (Flags & (1 << TRANSFORM)) &&
+		PointCount > 0 && PointLoc && PointSize && PointOrientation &&
+		!APT && !PointFrame && FrameRowColumnCountLog2 == 0 &&
+		DefaultPointFrame == 0;
+#else
+	return false;
+#endif
+}
+
+void PointGroupClass::Pack_Vertex_Chunk(unsigned char *vertices,
+	const FVFInfoClass &fvfinfo, Vector4 *diffuse,
+	int first_vertex, int vertex_count) const
+{
+	const int verticesperpoint = PointMode == QUADS ? 4 : 3;
+	unsigned int packedColor = 0;
+	int packedPointIndex = -1;
+	const unsigned int defaultColor = diffuse ? 0 :
+		rts::render::PackLegacyARGB(DefaultPointColor[0],
+			DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
+	for (int i = first_vertex; i < first_vertex + vertex_count; ++i) {
+		*(Vector3*)(vertices+fvfinfo.Get_Location_Offset())=VertexLoc[i];
+		*(Vector3*)(vertices+fvfinfo.Get_Normal_Offset())=Vector3(0.0f,0.0f,1.0f);
+		unsigned int diffuseColor = defaultColor;
+		if (diffuse) {
+			rts::render::PackPointGroupColorForVertex(diffuse,
+				i, verticesperpoint, packedPointIndex, packedColor);
+			diffuseColor = packedColor;
+		}
+		*(unsigned int*)(vertices+fvfinfo.Get_Diffuse_Offset()) = diffuseColor;
+		*(Vector2*)(vertices+fvfinfo.Get_Tex_Offset(0))=VertexUV[i];
+		*(Vector2*)(vertices+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
+		vertices+=fvfinfo.Get_FVF_Size();
+	}
+}
+
+bool PointGroupClass::Pack_Billboard_Quad_Chunk(unsigned char *vertices,
+	const FVFInfoClass &fvfinfo, const Matrix4x4 &view,
+	int first_vertex, int vertex_count) const
+{
+	// Reject before writing; the caller must not publish a partially packed VB.
+	if (!Can_Pack_Billboard_Quads(fvfinfo.Get_FVF(), fvfinfo.Get_FVF_Size()) ||
+		!vertices || first_vertex < 0 || vertex_count < 0 ||
+		first_vertex % 4 != 0 || vertex_count % 4 != 0 ||
+		first_vertex / 4 > PointCount ||
+		vertex_count / 4 > PointCount - first_vertex / 4) {
+		return false;
+	}
+	const Vector3 *locations = PointLoc->Get_Array();
+	const float *sizes = PointSize->Get_Array();
+	const unsigned char *orientations = PointOrientation->Get_Array();
+	const Vector4 *diffuse = PointDiffuse ? PointDiffuse->Get_Array() : nullptr;
+	const unsigned int defaultColor = diffuse ? 0 :
+		rts::render::PackLegacyARGB(DefaultPointColor[0],
+			DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
+	const Vector2 *uv = _QuadVertexUVFrameTable[0];
+	for (int point = first_vertex / 4;
+		point < first_vertex / 4 + vertex_count / 4; ++point) {
+		// Match the generic path's Vector4 result and Vector3 float stores before
+		// its table-offset multiply/add. No trig, fused matrix/offset expression,
+		// or different corner order is introduced here.
+		Vector4 result = view * locations[point];
+		Vector3 center;
+		center.X = result.X;
+		center.Y = result.Y;
+		center.Z = result.Z;
+		const unsigned int color = diffuse ? rts::render::PackLegacyARGB(
+			diffuse[point][0], diffuse[point][1], diffuse[point][2], diffuse[point][3]) :
+			defaultColor;
+		for (int corner = 0; corner < 4; ++corner) {
+			const Vector3 position = center +
+				_QuadVertexLocationOrientationTable[orientations[point]][corner] * sizes[point];
+			*(Vector3*)(vertices+fvfinfo.Get_Location_Offset()) = position;
+			*(Vector3*)(vertices+fvfinfo.Get_Normal_Offset()) = Vector3(0.0f,0.0f,1.0f);
+			*(unsigned int*)(vertices+fvfinfo.Get_Diffuse_Offset()) = color;
+			*(Vector2*)(vertices+fvfinfo.Get_Tex_Offset(0)) = uv[corner];
+			*(Vector2*)(vertices+fvfinfo.Get_Tex_Offset(1)) = Vector2(0.0f,0.0f);
+			vertices += fvfinfo.Get_FVF_Size();
+		}
+	}
+	return true;
+}
+
+void PointGroupClass::Prepare_Vertex_Arrays(const Matrix4x4 &view,
+	Vector3 *locations, float *sizes, unsigned char *orientations,
+	unsigned char *frames, int &vertex_count, int &polygon_count)
+{
+	if (Get_Flag(TRANSFORM) && Billboard) {
+		if (transformed_loc.Length() < PointCount) {
+			transformed_loc.Resize(PointCount * 2);
+		}
+		for (int i=0; i<PointCount; i++) {
+			Vector4 result=view*locations[i];
+			transformed_loc[i].X=result.X;
+			transformed_loc[i].Y=result.Y;
+			transformed_loc[i].Z=result.Z;
+		}
+		locations = &transformed_loc[0];
+	}
+	Update_Arrays(locations, sizes, orientations, frames,
+		PointCount, PointLoc->Get_Count(), vertex_count, polygon_count);
+}
+
 void PointGroupClass::Render(RenderInfoClass &rinfo)
 {
 	/// @todo lorenzen asks: is particle culling in the shader perhaps faster than in DoParticles? Fix winding and find out...
@@ -879,39 +986,19 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	// Get the world and view matrices
 	Matrix4x4 view;
 	rts::render::GetGameTransform(rts::render::GAME_TRANSFORM_VIEW, &view);
-
-	// Transform the point locations from worldspace to camera space if needed
-	// (i.e. if they are not already in camera space):
-
-	// need to interrupt this processing. If we are not billboarding, then we need the actual position
-	// of the vertice to lay it down flat.
-
-	// (gth) changed this 'if' to use OR rather than AND... The way it was caused all emitters to break
-	if (Get_Flag(TRANSFORM) && Billboard) {
-		// Resize transformed location array if needed (2x guardband to prevent
-		// frequent reallocations):
-		if (transformed_loc.Length() < PointCount) {
-			transformed_loc.Resize(PointCount * 2);
-		}
-		// Not using vector processor class because we are discarding w
-		// Keep the CPU-side transform so the active renderer does not transform
-		// 3 times per particle when we can do it once
-		for (int i=0; i<PointCount; i++)
-		{
-			/// @todo lorenzen sez: use pointer arithmetic here and a fast while loop
-			Vector4 result=view*current_loc[i];
-			transformed_loc[i].X=result.X;
-			transformed_loc[i].Y=result.Y;
-			transformed_loc[i].Z=result.Z;
-		}
-		current_loc = &transformed_loc[0];
-	}
+	const bool fused_billboards = Can_Pack_Billboard_Quads(
+		dynamic_fvf_type, sizeof(VertexFormatXYZNDUV2));
 
 	// Update the arrays with the offsets.
 	int vnum, pnum;
 
-	Update_Arrays(current_loc, current_size, current_orient, current_frame,
-		PointCount, PointLoc->Get_Count(), vnum, pnum);
+	if (fused_billboards) {
+		vnum = PointCount * 4;
+		pnum = PointCount * 2;
+	} else {
+		Prepare_Vertex_Arrays(view, current_loc, current_size, current_orient,
+			current_frame, vnum, pnum);
+	}
 
 	// the locations are now in view space
 	// so set world and view matrices to identity and render
@@ -935,7 +1022,6 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 	                  WW3D::Is_Sorting_Enabled();
 
 	IndexBufferClass *indexbuffer;
-	const int verticesperpoint = PointMode == QUADS ? 4 : 3;
 	int	verticesperprimitive;/// lorenzen fixed
 	int current;
 	int delta;
@@ -964,37 +1050,17 @@ void PointGroupClass::Render(RenderInfoClass &rinfo)
 		// Copy in the data to the VB
 		{
 			DynamicVBAccessClass::WriteLockClass Lock(&PointVerts);
-			int i;
 			unsigned char *vb=(unsigned char*)Lock.Get_Formatted_Vertex_Array();
 			if (!Lock.Is_Locked() || vb == nullptr) {
 				break;
 			}
 			const FVFInfoClass& fvfinfo=PointVerts.FVF_Info();
-			unsigned int packedColor = 0;
-			int packedPointIndex = -1;
-			const unsigned int defaultColor = current_diffuse ? 0 :
-				rts::render::PackLegacyARGB(DefaultPointColor[0],
-					DefaultPointColor[1], DefaultPointColor[2], DefaultPointAlpha);
-
-			for (i = current; i < current + delta; i++)
-			{
-				/// @todo lorenzen sez: use pointer arithmetic throughout this block
-				/// @todo lorenzen sez: delare thes locals outside this loop
-				/// @todo lorenzen sez: use a fast while loop
-				// Copy Locations
-				*(Vector3*)(vb+fvfinfo.Get_Location_Offset())=VertexLoc[i];
-				*(Vector3*)(vb+fvfinfo.Get_Normal_Offset())=Vector3(0.0f,0.0f,1.0f);
-				unsigned int diffuseColor = defaultColor;
-				if (current_diffuse)
-				{
-					rts::render::PackPointGroupColorForVertex(current_diffuse,
-						i, verticesperpoint, packedPointIndex, packedColor);
-					diffuseColor = packedColor;
+			if (fused_billboards) {
+				if (!Pack_Billboard_Quad_Chunk(vb, fvfinfo, view, current, delta)) {
+					break;
 				}
-				*(unsigned int*)(vb+fvfinfo.Get_Diffuse_Offset()) = diffuseColor;
-				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(0))=VertexUV[i];
-				*(Vector2*)(vb+fvfinfo.Get_Tex_Offset(1))=Vector2(0.0f,0.0f);
-				vb+=fvfinfo.Get_FVF_Size();
+			} else {
+				Pack_Vertex_Chunk(vb, fvfinfo, current_diffuse, current, delta);
 			}
 			if (!Lock.Commit()) {
 				break;
@@ -1710,6 +1776,8 @@ void PointGroupClass::_Shutdown()
 #define MAX_VOLUME_PARTICLE_DEPTH ( 16 )
 void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int depth )
 {
+	rts::frame_timing::Scope volumeParticleTiming(
+		rts::frame_timing::RendererVolumeParticle);
 
 	if ( depth <= DEFAULT_VOLUME_PARTICLE_DEPTH) //oops,wrong number
 	{
@@ -1842,6 +1910,8 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		// need to interrupt this processing. If we are not billboarding, then we need the actual position
 		// of the vertice to lay it down flat.
 		if (Get_Flag(TRANSFORM) && Billboard) {
+			rts::frame_timing::Scope volumeTransformTiming(
+				rts::frame_timing::RendererVolumeParticleTransform);
 			// Resize transformed location array if needed (2x guardband to prevent
 			// frequent reallocations):
 			if (transformed_loc.Length() < PointCount) {
@@ -1889,8 +1959,15 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		//current_diffuse->Z *= attenuator;
 		//current_diffuse->W *= attenuator;
 
-		Update_Arrays(current_loc, current_size, current_orient, current_frame,
-			PointCount, PointLoc->Get_Count(), vnum, pnum);
+		{
+			rts::frame_timing::Scope volumeUpdateArraysTiming(
+				rts::frame_timing::RendererVolumeParticleUpdateArrays);
+			Update_Arrays(current_loc, current_size, current_orient, current_frame,
+				PointCount, PointLoc->Get_Count(), vnum, pnum);
+		}
+
+		rts::frame_timing::Scope volumePackSubmitTiming(
+			rts::frame_timing::RendererVolumeParticlePackSubmit);
 
 		// the locations are now in view space
 		// so set world and view matrices to identity and render

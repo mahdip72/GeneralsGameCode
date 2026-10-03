@@ -1,4 +1,5 @@
 #include "AudioDevice/AudioAssetSource.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 #include <algorithm>
 #include <cctype>
@@ -164,7 +165,7 @@ bool readWaveInfo(const std::string &path, WaveInfo &info)
 	}
 	const std::uint64_t bytesPerFrame = static_cast<std::uint64_t>(info.channels) * sizeof(std::int16_t);
 	return bytesPerFrame != 0 && info.dataBytes >= bytesPerFrame
-		&& info.dataBytes / bytesPerFrame <= std::numeric_limits<std::uint64_t>::max();
+		&& info.dataBytes / bytesPerFrame <= (std::numeric_limits<std::uint64_t>::max)();
 }
 
 bool readWaveInfo(const std::vector<std::uint8_t> &bytes, WaveInfo &info)
@@ -321,7 +322,7 @@ bool decodeWave(const std::string &path, AudioPcmChunk &chunk,
 		return false;
 	}
 	const std::uint64_t sourceOffset = info.dataOffset + firstSourceFrame * sourceBytesPerFrame;
-	if (sourceOffset > std::numeric_limits<std::streamoff>::max()) {
+	if (sourceOffset > (std::numeric_limits<std::streamoff>::max)()) {
 		return false;
 	}
 	input.seekg(static_cast<std::streamoff>(sourceOffset), std::ios::beg);
@@ -516,6 +517,12 @@ int64_t seekMemoryFFmpeg(void *opaque, int64_t offset, int whence)
 	return target;
 }
 
+int findAudioStreamInfo(AVFormatContext *format)
+{
+	rts::frame_timing::Scope timing(rts::frame_timing::AudioFfmpegProbe);
+	return avformat_find_stream_info(format, nullptr);
+}
+
 bool openMemoryFFmpeg(const std::vector<std::uint8_t> &bytes,
 	MemoryFFmpegInput &input, AVFormatContext *&format, AVIOContext *&avio)
 {
@@ -550,7 +557,7 @@ bool openMemoryFFmpeg(const std::vector<std::uint8_t> &bytes,
 	if (avformat_open_input(&format, nullptr, nullptr, nullptr) < 0 || format == nullptr) {
 		return false;
 	}
-	return avformat_find_stream_info(format, nullptr) >= 0;
+	return findAudioStreamInfo(format) >= 0;
 }
 
 void closeMemoryFFmpeg(AVFormatContext *&format, AVIOContext *&avio)
@@ -603,7 +610,7 @@ public:
 		}
 		while (!m_pending.empty() && chunk.frameCount < maxFrames) {
 			AudioPcmChunk &source = m_pending.front();
-			const UnsignedInt frames = std::min(maxFrames - chunk.frameCount,
+			const UnsignedInt frames = (std::min)(maxFrames - chunk.frameCount,
 				source.frameCount);
 			const std::size_t bytes = static_cast<std::size_t>(frames)
 				* OUTPUT_BYTES_PER_FRAME;
@@ -665,7 +672,7 @@ public:
 	{
 		close();
 		if (path.empty() || avformat_open_input(&m_format, path.c_str(), nullptr, nullptr) < 0
-			|| m_format == nullptr || avformat_find_stream_info(m_format, nullptr) < 0) {
+			|| m_format == nullptr || findAudioStreamInfo(m_format) < 0) {
 			close();
 			return false;
 		}
@@ -940,7 +947,7 @@ bool getFFmpegDuration(const std::string &path, Real &durationMS)
 	if (avformat_open_input(&format, path.c_str(), nullptr, nullptr) < 0 || format == nullptr) {
 		return false;
 	}
-	const bool hasInfo = avformat_find_stream_info(format, nullptr) >= 0;
+	const bool hasInfo = findAudioStreamInfo(format) >= 0;
 	const int streamIndex = hasInfo
 		? av_find_best_stream(format, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0) : -1;
 	bool success = false;
@@ -998,7 +1005,7 @@ bool decodeWithFFmpeg(const std::string &path, AudioPcmChunk &chunk,
 	AVFrame *frame = nullptr;
 	bool success = false;
 	if (avformat_open_input(&format, path.c_str(), nullptr, nullptr) < 0 || format == nullptr
-		|| avformat_find_stream_info(format, nullptr) < 0) {
+		|| findAudioStreamInfo(format) < 0) {
 		avformat_close_input(&format);
 		return false;
 	}
@@ -1218,7 +1225,7 @@ struct FileAudioAssetSource::SamplePcmCache
 			chunk.channels = source.channels;
 			chunk.sourceChannels = source.sourceChannels;
 			chunk.format = source.format;
-			chunk.frameCount = std::min({ maxFrames, MAX_OUTPUT_FRAMES,
+			chunk.frameCount = (std::min)({ maxFrames, MAX_OUTPUT_FRAMES,
 				source.frameCount - m_nextFrame });
 			chunk.startSample = m_nextFrame;
 			const std::size_t begin = static_cast<std::size_t>(m_nextFrame) * OUTPUT_BYTES_PER_FRAME;
@@ -1300,6 +1307,7 @@ FileAudioAssetSource::FileAudioAssetSource(const AsciiString &rootDirectory,
 Bool FileAudioAssetSource::readVirtualFile(const AsciiString &fileName,
 	std::vector<std::uint8_t> &bytes, std::string &identity) const
 {
+	rts::frame_timing::Scope timing(rts::frame_timing::AudioVirtualRead);
 	bytes.clear();
 	identity.clear();
 	if (m_virtualSource == nullptr || !m_virtualSource->readFile(fileName, bytes, identity)
@@ -1338,6 +1346,7 @@ const void *FileAudioAssetSource::rememberVirtualIdentity(const AsciiString &fil
 
 std::string FileAudioAssetSource::resolvePath(const AsciiString &fileName) const
 {
+	rts::frame_timing::Scope timing(rts::frame_timing::AudioAssetResolve);
 	try {
 		std::filesystem::path path(fileName.str() == nullptr ? "" : fileName.str());
 		const bool hasRoot = !m_rootDirectory.empty();
@@ -1437,6 +1446,7 @@ Bool FileAudioAssetSource::decodePcm(const AsciiString &fileName, AudioPcmChunk 
 Bool FileAudioAssetSource::openPcmStream(const AsciiString &fileName,
 	std::unique_ptr<AudioPcmStream> &stream) const
 {
+	rts::frame_timing::Scope timing(rts::frame_timing::AudioStreamOpen);
 	stream.reset();
 	const std::string path = resolvePath(fileName);
 	if (path.empty()) {
@@ -1473,6 +1483,7 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 {
 	stream.reset();
 	auto openUncached = [&]() -> Bool {
+		rts::frame_timing::Scope timing(rts::frame_timing::AudioSampleFallback);
 		stream.reset();
 		try {
 			return openPcmStream(fileName, stream);
@@ -1489,6 +1500,7 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 	try {
 		SamplePcmCache &cache = *m_samplePcmCache;
 		const std::string key = fileName.str() == nullptr ? "" : fileName.str();
+		rts::frame_timing::Scope lookupTiming(rts::frame_timing::AudioSampleLookup);
 		for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
 			if (it->fileName != key) continue;
 			bool unchanged = true;
@@ -1506,12 +1518,20 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 				unchanged = !error && !looseExists;
 			}
 			if (unchanged) {
+				lookupTiming.finish();
+				// Fresh-entry branch invocations; allocation may still fail.
+				rts::frame_timing::Scope hitTiming(rts::frame_timing::AudioSampleHit);
 				stream = std::make_unique<SamplePcmCache::Stream>(it->pcm);
 				cache.entries.splice(cache.entries.begin(), cache.entries, it);
 				return TRUE;
 			}
 			cache.entries.erase(it);
 			break;
+		}
+		lookupTiming.finish();
+		// Counts lookup misses, not successful opens or admitted cache entries.
+		{
+			rts::frame_timing::Scope missTiming(rts::frame_timing::AudioSampleMiss);
 		}
 		SamplePcmCache::Entry entry;
 		entry.fileName = key;
@@ -1536,20 +1556,27 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 			> frameLimit || !cache.makeRoom(static_cast<std::size_t>(expectedFrames)
 				* OUTPUT_BYTES_PER_FRAME)) return TRUE;
 
+		rts::frame_timing::Scope fillTiming(rts::frame_timing::AudioSampleFill);
+		// End the fill attempt before every explicit fallback, just as exception
+		// unwinding ends it before the outer catch. Neither metric is a success count.
+		auto openAfterFill = [&]() -> Bool {
+			fillTiming.finish();
+			return openUncached();
+		};
 		AudioPcmChunk pcm;
 		while (pcm.frameCount < frameLimit) {
 			AudioPcmChunk part;
-			const UnsignedInt request = std::min(MAX_OUTPUT_FRAMES,
+			const UnsignedInt request = (std::min)(MAX_OUTPUT_FRAMES,
 				frameLimit - pcm.frameCount);
 			if (!stream->readPcm(part, request)) {
-				if (pcm.frameCount == 0 || !stream->isEnded()) return openUncached();
+				if (pcm.frameCount == 0 || !stream->isEnded()) return openAfterFill();
 				break;
 			}
 			if (part.frameCount == 0 || part.frameCount > request
 				|| part.sampleRate != OUTPUT_SAMPLE_RATE || part.channels != OUTPUT_CHANNELS
 				|| part.format != AudioPcmFormat::SIGNED_16_INTERLEAVED_LITTLE_ENDIAN
 				|| part.data.size() != static_cast<std::size_t>(part.frameCount)
-					* OUTPUT_BYTES_PER_FRAME) return openUncached();
+					* OUTPUT_BYTES_PER_FRAME) return openAfterFill();
 			if (pcm.frameCount == 0) {
 				pcm = std::move(part);
 			} else {
@@ -1561,18 +1588,18 @@ Bool FileAudioAssetSource::openPcmSampleStream(const AsciiString &fileName,
 		}
 		if (!stream->isEnded()) {
 			AudioPcmChunk extra;
-			if (stream->readPcm(extra, 1U) || !stream->isEnded()) return openUncached();
+			if (stream->readPcm(extra, 1U) || !stream->isEnded()) return openAfterFill();
 		}
 		const bool looseExists = std::filesystem::exists(entry.path, error);
-		if (error || looseExists != entry.loose) return openUncached();
+		if (error || looseExists != entry.loose) return openAfterFill();
 		if (entry.loose) {
 			const auto size = std::filesystem::file_size(entry.path, error);
-			if (error || size != entry.fileSize) return openUncached();
+			if (error || size != entry.fileSize) return openAfterFill();
 			const auto time = std::filesystem::last_write_time(entry.path, error);
-			if (error || time != entry.writeTime) return openUncached();
+			if (error || time != entry.writeTime) return openAfterFill();
 		}
 		pcm.data.shrink_to_fit();
-		if (!cache.makeRoom(pcm.data.capacity())) return openUncached();
+		if (!cache.makeRoom(pcm.data.capacity())) return openAfterFill();
 		entry.pcm = std::make_shared<SamplePcmCache::Pcm>(std::move(pcm), cache.budget);
 		stream = std::make_unique<SamplePcmCache::Stream>(entry.pcm);
 		cache.entries.push_front(std::move(entry));

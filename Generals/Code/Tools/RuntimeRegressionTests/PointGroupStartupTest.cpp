@@ -3,6 +3,10 @@
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/LegacyColorPacking.h"
 #include "Renderer/PointGroupColorPacking.h"
+#include "dx8vertexbuffer.h"
+#include "WW3D2/vertmaterial.h"
+#include "WWMath/matrix4.h"
+#include "WWMath/wwmath.h"
 
 #include <cstdio>
 #include <cstring>
@@ -60,6 +64,176 @@ int CheckPackedQuadColors()
 		}
 	}
 	return 0;
+}
+
+class BillboardPointGroup : public PointGroupClass
+{
+public:
+	using PointGroupClass::Can_Pack_Billboard_Quads;
+	using PointGroupClass::Pack_Billboard_Quad_Chunk;
+	using PointGroupClass::Pack_Vertex_Chunk;
+	using PointGroupClass::Prepare_Vertex_Arrays;
+
+	void Reference(const Matrix4x4 &view, unsigned char *vertices,
+		const FVFInfoClass &fvf, int first, int count)
+	{
+		int vertexCount = 0, polygonCount = 0;
+		Prepare_Vertex_Arrays(view, PointLoc->Get_Array(), PointSize->Get_Array(),
+			PointOrientation->Get_Array(), nullptr, vertexCount, polygonCount);
+		Pack_Vertex_Chunk(vertices, fvf,
+			PointDiffuse ? PointDiffuse->Get_Array() : nullptr, first, count);
+	}
+};
+
+struct BillboardInput
+{
+	explicit BillboardInput(int count)
+		: locations(new ShareBufferClass<Vector3>(count, "billboard locations")),
+		colors(new ShareBufferClass<Vector4>(count, "billboard colors")),
+		sizes(new ShareBufferClass<float>(count, "billboard sizes")),
+		orientations(new ShareBufferClass<unsigned char>(count, "billboard orientations")),
+		frames(new ShareBufferClass<unsigned char>(count, "billboard frames")),
+		apt(new ShareBufferClass<unsigned int>(count, "billboard APT"))
+	{
+		const float testSizes[] = {0.0f, -0.0f, 0.0001f, 0.5f, 8.25f, -2.0f, 1024.0f};
+		for (int i = 0; i < count; ++i) {
+			locations->Get_Array()[i] = Vector3((i % 11) * 0.125f - 4.0f,
+				(i % 17) * -1.25f, (i % 23) * 3.125f - 50.0f);
+			colors->Get_Array()[i] = Vector4((i % 7) / 6.0f, (i % 11) / 10.0f,
+				(i % 13) / 12.0f, (i % 17) / 16.0f);
+			sizes->Get_Array()[i] = testSizes[i % 7];
+			orientations->Get_Array()[i] = static_cast<unsigned char>(i);
+			frames->Get_Array()[i] = 0;
+			apt->Get_Array()[i] = static_cast<unsigned int>(i);
+		}
+	}
+	~BillboardInput()
+	{
+		apt->Release_Ref(); frames->Release_Ref(); orientations->Release_Ref();
+		sizes->Release_Ref(); colors->Release_Ref(); locations->Release_Ref();
+	}
+	void Set(BillboardPointGroup &group, int active, bool useColors = true)
+	{
+		group.Set_Arrays(locations, useColors ? colors : nullptr, nullptr,
+			sizes, orientations, nullptr, active);
+		group.Set_Point_Mode(PointGroupClass::QUADS);
+		group.Set_Billboard(true);
+		group.Set_Flag(PointGroupClass::TRANSFORM, true);
+		group.Set_Frame_Row_Column_Count_Log2(0);
+		group.Set_Point_Frame(0);
+		group.Set_Point_Color(Vector3(0.125f, 0.625f, 0.875f));
+		group.Set_Point_Alpha(0.375f);
+	}
+	ShareBufferClass<Vector3> *locations;
+	ShareBufferClass<Vector4> *colors;
+	ShareBufferClass<float> *sizes;
+	ShareBufferClass<unsigned char> *orientations;
+	ShareBufferClass<unsigned char> *frames;
+	ShareBufferClass<unsigned int> *apt;
+};
+
+int CheckBillboardPackingParity()
+{
+	int result = 0;
+	BillboardInput input(513);
+	BillboardPointGroup group;
+	const FVFInfoClass fvf(dynamic_fvf_type);
+	Matrix4x4 views[3];
+	views[0].Make_Identity();
+	views[1].Init(0.0f, -1.0f, 0.0f, 12.25f,
+		1.0f, 0.0f, 0.0f, -7.5f, 0.0f, 0.0f, 1.0f, 0.125f,
+		0.0f, 0.0f, 0.0f, 1.0f);
+	views[2].Init(0.913f, -0.217f, 0.341f, -135.5f,
+		0.279f, 0.956f, -0.094f, 11.25f, -0.294f, 0.181f, 0.938f, 1024.125f,
+		0.0f, 0.0f, 0.0f, 1.0f);
+	const int pointCounts[] = {1, 255, 256, 511, 512, 513};
+	const ShaderClass shaders[] = {ShaderClass::_PresetAdditiveSpriteShader,
+		ShaderClass::_PresetAlphaSpriteShader, ShaderClass::_PresetATestSpriteShader,
+		ShaderClass::_PresetMultiplicativeSpriteShader};
+	const float sizeCases[] = {0.0f, -0.0f, 0.0001f, 0.5f, 8.25f, -2.0f, 1024.0f};
+	for (unsigned size = 0; size < sizeof(sizeCases) / sizeof(sizeCases[0]); ++size) {
+		for (int point = 0; point < 513; ++point)
+			input.sizes->Get_Array()[point] = sizeCases[size];
+		for (int matrix = 0; matrix < 3; ++matrix) {
+			for (int colors = 0; colors < 2; ++colors) {
+				for (int shader = 0; shader < 4; ++shader) {
+					group.Set_Shader(shaders[shader]);
+					for (unsigned test = 0; test < sizeof(pointCounts) / sizeof(pointCounts[0]); ++test) {
+						const int points = pointCounts[test];
+						input.Set(group, points, colors != 0);
+						const size_t bytes = points * 4 * fvf.Get_FVF_Size();
+						std::vector<unsigned char> expected(bytes + 32, 0xa5);
+						std::vector<unsigned char> actual(bytes + 32, 0xa5);
+						for (int first = 0; first < points * 4; first += 2048) {
+							const int remaining = points * 4 - first;
+							const int count = remaining < 2048 ? remaining : 2048;
+							const size_t offset = 16 + first * fvf.Get_FVF_Size();
+							group.Reference(views[matrix], &expected[offset], fvf, first, count);
+							result |= Check(group.Pack_Billboard_Quad_Chunk(&actual[offset],
+								fvf, views[matrix], first, count), "actual fused billboard chunk accepts eligible data");
+						}
+						result |= Check(expected == actual,
+							"fused stream matches production transform, Update_Arrays and generic pack bytes plus guards");
+					}
+				}
+			}
+		}
+	}
+	return result;
+}
+
+int CheckBillboardPackingExclusions()
+{
+	int result = 0;
+	BillboardInput input(4);
+	BillboardPointGroup group;
+	const FVFInfoClass fvf(dynamic_fvf_type);
+	const Matrix4x4 view(true);
+	std::vector<unsigned char> untouched(4 * 4 * fvf.Get_FVF_Size(), 0xa5);
+	std::vector<unsigned char> output = untouched;
+	input.Set(group, 4);
+	result |= Check(group.Can_Pack_Billboard_Quads(dynamic_fvf_type, fvf.Get_FVF_Size()),
+		"normal native billboard route is eligible");
+	result |= Check(!group.Can_Pack_Billboard_Quads(DX8_FVF_XYZ, fvf.Get_FVF_Size()) &&
+		!group.Can_Pack_Billboard_Quads(dynamic_fvf_type, fvf.Get_FVF_Size() - 4),
+		"other vertex formats and strides retain generic packing");
+	for (int test = 0; test < 9; ++test) {
+		input.Set(group, 4);
+		switch (test) {
+			case 0: group.Set_Point_Mode(PointGroupClass::TRIS); break;
+			case 1: group.Set_Billboard(false); break;
+			case 2: group.Set_Flag(PointGroupClass::TRANSFORM, false); break;
+			case 3: group.Set_Arrays(input.locations, input.colors, input.apt,
+				input.sizes, input.orientations, nullptr, 4); break;
+			case 4: group.Set_Arrays(input.locations, input.colors, nullptr,
+				input.sizes, input.orientations, input.frames, 4); break;
+			case 5: group.Set_Arrays(input.locations, input.colors, nullptr,
+				nullptr, input.orientations, nullptr, 4); break;
+			case 6: group.Set_Arrays(input.locations, input.colors, nullptr,
+				input.sizes, nullptr, nullptr, 4); break;
+			case 7: group.Set_Frame_Row_Column_Count_Log2(1); break;
+			case 8: group.Set_Point_Mode(PointGroupClass::SCREENSPACE); break;
+		}
+		result |= Check(!group.Can_Pack_Billboard_Quads(dynamic_fvf_type, fvf.Get_FVF_Size()) &&
+			!group.Pack_Billboard_Quad_Chunk(output.data(), fvf, view, 0, 16) && output == untouched,
+			"excluded geometry rejects fused packing before writing");
+	}
+	input.Set(group, 4);
+	group.Set_Point_Frame(1);
+	result |= Check(!group.Pack_Billboard_Quad_Chunk(output.data(), fvf, view, 0, 16),
+		"nondefault frames retain generic table handling");
+	input.Set(group, 0);
+	result |= Check(!group.Pack_Billboard_Quad_Chunk(output.data(), fvf, view, 0, 0),
+		"empty groups retain Render's early return");
+	input.Set(group, 4);
+	result |= Check(!group.Pack_Billboard_Quad_Chunk(nullptr, fvf, view, 0, 16) &&
+		!group.Pack_Billboard_Quad_Chunk(output.data(), fvf, view, -4, 4) &&
+		!group.Pack_Billboard_Quad_Chunk(output.data(), fvf, view, 0, -4) &&
+		!group.Pack_Billboard_Quad_Chunk(output.data(), fvf, view, 1, 4) &&
+		!group.Pack_Billboard_Quad_Chunk(output.data(), fvf, view, 0, 3) &&
+		!group.Pack_Billboard_Quad_Chunk(output.data(), fvf, view, 12, 8) && output == untouched,
+		"invalid chunk boundaries and null output reject without writes");
+	return result;
 }
 
 class PointGroupDevice;
@@ -256,15 +430,74 @@ int RunFailureCase(unsigned int failCreateOn, unsigned int failUpdateOn,
 		"PointGroup production failure fixture shuts down without live handles");
 	return result;
 }
+
+int RunPackingCase(unsigned int failCreateOn, unsigned int failUpdateOn)
+{
+	int result = 0;
+	PointGroupDevice device;
+	NativeW3DResourceHost host(8);
+	NativeW3DResources resources(8);
+	result |= Check(host.Attach(&device, device.immediateContext()) == RENDER_RESULT_OK &&
+		resources.BindHost(&host) == RENDER_RESULT_OK &&
+		BindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK,
+		"billboard production fixture binds owner resources");
+	const bool initialized = PointGroupClass::_Init();
+	result |= Check(initialized, "billboard parity uses actual production startup tables");
+	if (initialized) {
+		if (failCreateOn == 0 && failUpdateOn == 0) {
+			result |= CheckBillboardPackingParity();
+			result |= CheckBillboardPackingExclusions();
+		} else {
+			device.FailCreateOn(failCreateOn);
+			device.FailUpdateOn(failUpdateOn);
+			BillboardInput input(1);
+			BillboardPointGroup group;
+			input.Set(group, 1);
+			{
+				DynamicVBAccessClass vertices(BUFFER_TYPE_DYNAMIC_DX8, dynamic_fvf_type, 4);
+				if (failCreateOn != 0) {
+					result |= Check(!vertices.Is_Valid(),
+						"failed production dynamic VB creation is rejected before fused writes");
+				} else {
+					result |= Check(vertices.Is_Valid(), "production dynamic VB acquired for failed commit");
+					if (vertices.Is_Valid()) {
+						DynamicVBAccessClass::WriteLockClass lock(&vertices);
+						result |= Check(lock.Is_Locked(), "production billboard write lock acquired");
+						if (lock.Is_Locked()) {
+							const Matrix4x4 view(true);
+							result |= Check(group.Pack_Billboard_Quad_Chunk(
+								reinterpret_cast<unsigned char *>(lock.Get_Formatted_Vertex_Array()),
+								vertices.FVF_Info(), view, 0, 4), "fused bytes reach production dynamic lock");
+							result |= Check(!lock.Commit(),
+								"failed production dynamic upload is not acknowledged by commit");
+						}
+					}
+				}
+			}
+			DynamicVBAccessClass::_Deinit();
+		}
+	}
+	PointGroupClass::_Shutdown();
+	result |= Check(UnbindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK &&
+		resources.Shutdown() == RENDER_RESULT_OK && host.Detach() == RENDER_RESULT_OK &&
+		device.LiveCount() == 0, "billboard production fixture releases tables, scratch and native handles");
+	return result;
+}
 }
 
 int main()
 {
 	int result = 0;
+	WWMath::Init();
+	VertexMaterialClass::Init();
 	result |= CheckPackedQuadColors();
+	result |= RunPackingCase(0, 0);
+	result |= RunPackingCase(3, 0);
+	result |= RunPackingCase(0, 3);
 	result |= RunFailureCase(2, 0, 2, 1,
 		"actual PointGroup second allocation failure rolls back its first buffer");
 	result |= RunFailureCase(0, 2, 2, 2,
 		"actual PointGroup second upload failure rolls back both buffers");
+	VertexMaterialClass::Shutdown();
 	return result;
 }

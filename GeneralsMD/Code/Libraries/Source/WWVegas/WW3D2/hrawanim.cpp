@@ -55,6 +55,7 @@
 #include "WWLib/chunkio.h"
 #include "assetmgr.h"
 #include "htree.h"
+#include "WW3D2/RawAnimationFrame.h"
 
 /***********************************************************************************************
  * NodeMotionStruct::NodeMotionStruct -- constructor                                           *
@@ -454,7 +455,7 @@ void HRawAnimClass::Get_Translation(Vector3& trans, int pividx, float frame ) co
 	}
 
 //	int frame0 = (int)frame;
-	int frame0=WWMath::Float_To_Long(frame-0.499999f);
+	int frame0=rts::animation::SelectRawAnimationFrame0(frame);
 
 	int frame1 = frame0 + 1;
 
@@ -512,7 +513,7 @@ void HRawAnimClass::Get_Translation(Vector3& trans, int pividx, float frame ) co
 void HRawAnimClass::Get_Orientation(Quaternion& q, int pividx,float frame) const
 {
 //	int frame0 = (int)frame;
-	int frame0 = WWMath::Float_To_Long(frame-0.499999f);
+	int frame0 = rts::animation::SelectRawAnimationFrame0(frame);
 	int frame1 = frame0 + 1;
 
 	float ratio = frame - (float)frame0;
@@ -597,7 +598,7 @@ void HRawAnimClass::Get_Transform(Matrix3D& mtx, int pividx, float frame ) const
 //		return;
 //	}
 
-	int frame0=WWMath::Float_To_Long(frame-0.499999f);
+	int frame0=rts::animation::SelectRawAnimationFrame0(frame);
 
 	int frame1 = frame0 + 1;
 

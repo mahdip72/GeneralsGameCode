@@ -15,6 +15,7 @@
 #if defined(_WIN64) && !defined(NOMINMAX)
 #define NOMINMAX
 #endif
+#include "Lib/FrameTimingDiagnostics.h"
 
 #include <algorithm>
 #include <limits>
@@ -87,11 +88,13 @@ struct SortedTriangle
 
 struct DrawRun
 {
-	DrawRun() : submissionIndex(0), firstTriangle(0), triangleCount(0) {}
+	DrawRun() : lastSubmissionIndex(0), firstTriangle(0), triangleCount(0),
+		chunkIndexed(false) {}
 
-	size_t submissionIndex;
+	size_t lastSubmissionIndex;
 	size_t firstTriangle;
 	size_t triangleCount;
+	bool chunkIndexed; // This run's indices address the complete packed chunk.
 };
 
 struct FlushWorkspace
@@ -107,6 +110,7 @@ struct FlushWorkspace
 	std::vector<NativeSortedDraw> draws;
 	std::vector<DrawRun> runs;
 	std::vector<size_t> vertexOffsets;
+	std::vector<size_t> touchedSubmissionIndexes;
 
 	void Clear()
 	{
@@ -121,6 +125,7 @@ struct FlushWorkspace
 		draws.clear();
 		runs.clear();
 		vertexOffsets.clear();
+		touchedSubmissionIndexes.clear();
 	}
 
 	unsigned long long RetainedCapacityBytes() const
@@ -131,7 +136,8 @@ struct FlushWorkspace
 			VectorCapacityBytes(nodeOrder) + VectorCapacityBytes(triangles) +
 			VectorCapacityBytes(chunkVertices) +
 			VectorCapacityBytes(chunkIndices) + VectorCapacityBytes(draws) +
-			VectorCapacityBytes(runs) + VectorCapacityBytes(vertexOffsets);
+			VectorCapacityBytes(runs) + VectorCapacityBytes(vertexOffsets) +
+			VectorCapacityBytes(touchedSubmissionIndexes);
 	}
 
 	void TrimToRetainedCapacityBudget()
@@ -146,6 +152,7 @@ struct FlushWorkspace
 		ReleaseCapacity(chunkIndices, retainedBytes);
 		ReleaseCapacity(runs, retainedBytes);
 		ReleaseCapacity(vertexOffsets, retainedBytes);
+		ReleaseCapacity(touchedSubmissionIndexes, retainedBytes);
 		ReleaseCapacity(nodes, retainedBytes);
 		ReleaseCapacity(positiveNodes, retainedBytes);
 		ReleaseCapacity(unsortedNodes, retainedBytes);
@@ -551,18 +558,280 @@ bool SameChunkGeometry(const NativeDrawPacket &left,
 	return true;
 }
 
-void AddDrawRun(std::vector<NativeSortedDraw> &draws,
+bool SameFloatBits(const float &left, const float &right)
+{
+	return memcmp(&left, &right, sizeof(left)) == 0;
+}
+
+bool SameRenderFloat4(const RenderFloat4 &left, const RenderFloat4 &right)
+{
+	return SameFloatBits(left.x, right.x) &&
+		SameFloatBits(left.y, right.y) &&
+		SameFloatBits(left.z, right.z) &&
+		SameFloatBits(left.w, right.w);
+}
+
+bool SameRenderMatrix4(const RenderMatrix4 &left, const RenderMatrix4 &right)
+{
+	for (unsigned int index = 0; index < 16; ++index)
+	{
+		if (!SameFloatBits(left.values[index], right.values[index]))
+			return false;
+	}
+	return true;
+}
+
+bool SameLegacyBlendState(const LegacyBlendState &left,
+	const LegacyBlendState &right)
+{
+	return left.blendEnable == right.blendEnable &&
+		left.sourceColor == right.sourceColor &&
+		left.destinationColor == right.destinationColor &&
+		left.colorOperation == right.colorOperation &&
+		left.sourceAlpha == right.sourceAlpha &&
+		left.destinationAlpha == right.destinationAlpha &&
+		left.alphaOperation == right.alphaOperation &&
+		left.colorWriteMask == right.colorWriteMask;
+}
+
+bool SameLegacyDepthStencilState(const LegacyDepthStencilState &left,
+	const LegacyDepthStencilState &right)
+{
+	return left.depthEnable == right.depthEnable &&
+		left.depthWrite == right.depthWrite &&
+		left.depthFunction == right.depthFunction &&
+		left.stencilEnable == right.stencilEnable &&
+		left.stencilReadMask == right.stencilReadMask &&
+		left.stencilWriteMask == right.stencilWriteMask &&
+		left.stencilReference == right.stencilReference &&
+		left.stencilFunction == right.stencilFunction &&
+		left.stencilFail == right.stencilFail &&
+		left.stencilDepthFail == right.stencilDepthFail &&
+		left.stencilPass == right.stencilPass;
+}
+
+bool SameLegacyRasterizerState(const LegacyRasterizerState &left,
+	const LegacyRasterizerState &right)
+{
+	return left.fillMode == right.fillMode &&
+		left.cullMode == right.cullMode &&
+		left.frontCounterClockwise == right.frontCounterClockwise &&
+		left.scissorEnable == right.scissorEnable &&
+		left.depthBias == right.depthBias &&
+		SameFloatBits(left.slopeScaledDepthBias, right.slopeScaledDepthBias);
+}
+
+bool SameLegacySamplerState(const LegacySamplerState &left,
+	const LegacySamplerState &right)
+{
+	return left.addressU == right.addressU &&
+		left.addressV == right.addressV &&
+		left.addressW == right.addressW &&
+		left.minification == right.minification &&
+		left.magnification == right.magnification &&
+		left.mipmapping == right.mipmapping &&
+		left.maximumAnisotropy == right.maximumAnisotropy &&
+		left.maximumMipLevel == right.maximumMipLevel &&
+		SameFloatBits(left.mipLodBias, right.mipLodBias) &&
+		SameRenderFloat4(left.borderColor, right.borderColor);
+}
+
+bool SameLegacyTextureStageState(const LegacyTextureStageState &left,
+	const LegacyTextureStageState &right)
+{
+	return left.colorOperation == right.colorOperation &&
+		left.colorArgument0 == right.colorArgument0 &&
+		left.colorArgument1 == right.colorArgument1 &&
+		left.colorArgument2 == right.colorArgument2 &&
+		left.alphaOperation == right.alphaOperation &&
+		left.alphaArgument0 == right.alphaArgument0 &&
+		left.alphaArgument1 == right.alphaArgument1 &&
+		left.alphaArgument2 == right.alphaArgument2 &&
+		left.colorArgument0Complement == right.colorArgument0Complement &&
+		left.colorArgument0AlphaReplicate == right.colorArgument0AlphaReplicate &&
+		left.colorArgument1Complement == right.colorArgument1Complement &&
+		left.colorArgument1AlphaReplicate == right.colorArgument1AlphaReplicate &&
+		left.colorArgument2Complement == right.colorArgument2Complement &&
+		left.colorArgument2AlphaReplicate == right.colorArgument2AlphaReplicate &&
+		left.alphaArgument0Complement == right.alphaArgument0Complement &&
+		left.alphaArgument0AlphaReplicate == right.alphaArgument0AlphaReplicate &&
+		left.alphaArgument1Complement == right.alphaArgument1Complement &&
+		left.alphaArgument1AlphaReplicate == right.alphaArgument1AlphaReplicate &&
+		left.alphaArgument2Complement == right.alphaArgument2Complement &&
+		left.alphaArgument2AlphaReplicate == right.alphaArgument2AlphaReplicate &&
+		left.resultArgument == right.resultArgument &&
+		left.textureCoordinateIndex == right.textureCoordinateIndex &&
+		left.cameraSpacePosition == right.cameraSpacePosition &&
+		left.cameraSpaceNormal == right.cameraSpaceNormal &&
+		left.cameraSpaceReflectionVector == right.cameraSpaceReflectionVector &&
+		left.textureTransformEnable == right.textureTransformEnable &&
+		left.projectedCoordinates == right.projectedCoordinates &&
+		left.textureTransformCount == right.textureTransformCount &&
+		SameFloatBits(left.bumpEnvironmentMatrix00,
+			right.bumpEnvironmentMatrix00) &&
+		SameFloatBits(left.bumpEnvironmentMatrix01,
+			right.bumpEnvironmentMatrix01) &&
+		SameFloatBits(left.bumpEnvironmentMatrix10,
+			right.bumpEnvironmentMatrix10) &&
+		SameFloatBits(left.bumpEnvironmentMatrix11,
+			right.bumpEnvironmentMatrix11) &&
+		SameFloatBits(left.bumpEnvironmentLuminanceScale,
+			right.bumpEnvironmentLuminanceScale) &&
+		SameFloatBits(left.bumpEnvironmentLuminanceOffset,
+			right.bumpEnvironmentLuminanceOffset) &&
+		SameLegacySamplerState(left.sampler, right.sampler);
+}
+
+bool SameLegacyPipelineState(const LegacyPipelineState &left,
+	const LegacyPipelineState &right)
+{
+	if (left.shaderBits != right.shaderBits ||
+		left.pixelProgram != right.pixelProgram ||
+		left.vertexProgram != right.vertexProgram ||
+		!SameLegacyBlendState(left.blend, right.blend) ||
+		!SameLegacyDepthStencilState(left.depthStencil, right.depthStencil) ||
+		!SameLegacyRasterizerState(left.rasterizer, right.rasterizer) ||
+		left.fogMode != right.fogMode ||
+		left.rangeFogEnable != right.rangeFogEnable ||
+		left.secondaryGradientEnable != right.secondaryGradientEnable ||
+		left.nPatchEnable != right.nPatchEnable ||
+		left.lightingEnable != right.lightingEnable ||
+		left.normalizeNormals != right.normalizeNormals ||
+		left.alphaTestEnable != right.alphaTestEnable ||
+		left.alphaFunction != right.alphaFunction ||
+		left.alphaReference != right.alphaReference ||
+		left.textureFactor != right.textureFactor ||
+		left.clipPlaneEnableMask != right.clipPlaneEnableMask ||
+		left.ambientMaterialSource != right.ambientMaterialSource ||
+		left.diffuseMaterialSource != right.diffuseMaterialSource ||
+		left.emissiveMaterialSource != right.emissiveMaterialSource ||
+		left.specularMaterialSource != right.specularMaterialSource)
+		return false;
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		if (!SameLegacyTextureStageState(left.textureStages[stage],
+			right.textureStages[stage]))
+			return false;
+	}
+	return true;
+}
+
+bool SameLegacyMaterialState(const LegacyMaterialState &left,
+	const LegacyMaterialState &right)
+{
+	return SameRenderFloat4(left.diffuse, right.diffuse) &&
+		SameRenderFloat4(left.ambient, right.ambient) &&
+		SameRenderFloat4(left.specular, right.specular) &&
+		SameRenderFloat4(left.emissive, right.emissive) &&
+		SameFloatBits(left.specularPower, right.specularPower);
+}
+
+bool SameLegacyLightState(const LegacyLightState &left,
+	const LegacyLightState &right)
+{
+	return left.enabled == right.enabled && left.type == right.type &&
+		SameRenderFloat4(left.diffuse, right.diffuse) &&
+		SameRenderFloat4(left.specular, right.specular) &&
+		SameRenderFloat4(left.ambient, right.ambient) &&
+		SameRenderFloat4(left.position, right.position) &&
+		SameRenderFloat4(left.direction, right.direction) &&
+		SameFloatBits(left.range, right.range) &&
+		SameFloatBits(left.falloff, right.falloff) &&
+		SameFloatBits(left.attenuation0, right.attenuation0) &&
+		SameFloatBits(left.attenuation1, right.attenuation1) &&
+		SameFloatBits(left.attenuation2, right.attenuation2) &&
+		SameFloatBits(left.theta, right.theta) &&
+		SameFloatBits(left.phi, right.phi);
+}
+
+bool SameLegacyFogConstants(const LegacyFogConstants &left,
+	const LegacyFogConstants &right)
+{
+	return left.enabled == right.enabled &&
+		SameRenderFloat4(left.color, right.color) &&
+		SameFloatBits(left.start, right.start) &&
+		SameFloatBits(left.end, right.end) &&
+		SameFloatBits(left.density, right.density);
+}
+
+bool SameLegacyFixedFunctionConstants(
+	const LegacyFixedFunctionConstants &left,
+	const LegacyFixedFunctionConstants &right)
+{
+	if (!SameRenderMatrix4(left.world, right.world) ||
+		!SameRenderMatrix4(left.view, right.view) ||
+		!SameRenderMatrix4(left.projection, right.projection) ||
+		!SameLegacyMaterialState(left.material, right.material) ||
+		!SameLegacyFogConstants(left.fog, right.fog) ||
+		!SameRenderFloat4(left.globalAmbient, right.globalAmbient))
+		return false;
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		if (!SameRenderMatrix4(left.textureTransforms[stage],
+			right.textureTransforms[stage]))
+			return false;
+	}
+	for (unsigned int light = 0; light < LEGACY_LIGHT_COUNT; ++light)
+	{
+		if (!SameLegacyLightState(left.lights[light], right.lights[light]))
+			return false;
+	}
+	for (unsigned int plane = 0; plane < LEGACY_CLIP_PLANE_COUNT; ++plane)
+	{
+		if (!SameRenderFloat4(left.clipPlanes[plane], right.clipPlanes[plane]))
+			return false;
+	}
+	for (unsigned int index = 0; index < LEGACY_VERTEX_CONSTANT_COUNT; ++index)
+	{
+		if (!SameRenderFloat4(left.vertexShaderConstants[index],
+			right.vertexShaderConstants[index]))
+			return false;
+	}
+	for (unsigned int index = 0; index < LEGACY_PIXEL_CONSTANT_COUNT; ++index)
+	{
+		if (!SameRenderFloat4(left.pixelShaderConstants[index],
+			right.pixelShaderConstants[index]))
+			return false;
+	}
+	return true;
+}
+
+bool SameLegacyLogicalState(const LegacyLogicalState &left,
+	const LegacyLogicalState &right)
+{
+	return SameLegacyPipelineState(left.pipeline, right.pipeline) &&
+		SameLegacyFixedFunctionConstants(left.constants, right.constants) &&
+		left.texturePresenceMask == right.texturePresenceMask;
+}
+
+bool SameSortedDrawBindings(const NativeSortedDraw &left,
+	const SortedSubmission &right)
+{
+	// Compare every logical field because raw structure bytes include padding.
+	if (!SameLegacyLogicalState(left.state, right.state) ||
+		!SameChunkGeometry(left.packet, right.packet) ||
+		left.packet.texturePresenceMask != right.packet.texturePresenceMask)
+		return false;
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		if (left.packet.textures[stage] != right.packet.textures[stage])
+			return false;
+	}
+	return true;
+}
+
+void ExtendDrawRun(std::vector<NativeSortedDraw> &draws,
+	std::vector<DrawRun> &runs, size_t submissionIndex)
+{
+	++runs.back().triangleCount;
+	draws.back().packet.indexCount += 3;
+	runs.back().lastSubmissionIndex = submissionIndex;
+}
+
+void StartDrawRun(std::vector<NativeSortedDraw> &draws,
 	std::vector<DrawRun> &runs, const SortedSubmission &submission,
 	size_t submissionIndex, size_t localTriangle, size_t vertexOffset)
 {
-	if (!runs.empty() && runs.back().submissionIndex == submissionIndex &&
-		runs.back().firstTriangle + runs.back().triangleCount == localTriangle)
-	{
-		runs.back().triangleCount += 1;
-		draws.back().packet.indexCount += 3;
-		return;
-	}
-
 	NativeSortedDraw draw = { submission.state, submission.packet };
 	draw.packet.vertexBuffer = GpuHandle();
 	draw.packet.indexBuffer = GpuHandle();
@@ -576,7 +845,7 @@ void AddDrawRun(std::vector<NativeSortedDraw> &draws,
 	draw.packet.indexed = true;
 
 	DrawRun run;
-	run.submissionIndex = submissionIndex;
+	run.lastSubmissionIndex = submissionIndex;
 	run.firstTriangle = localTriangle;
 	run.triangleCount = 1;
 	draws.push_back(draw);
@@ -765,6 +1034,7 @@ void NativeSortingRenderer::ActivateMatchingPass(const RenderTargetBinding &targ
 RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink,
 	bool firstCohortOnly)
 {
+	rts::frame_timing::Scope sortingTiming(rts::frame_timing::RendererSorting);
 #if defined(RTS_NATIVE_SORTING_TESTS)
 	g_nativeSortingLastFlushScratchAllocationCount = 0;
 	g_nativeSortingLastFlushPreparedGrowthCount = 0;
@@ -898,6 +1168,8 @@ nextCohort:
 		}
 
 		std::vector<size_t> &vertexOffsets = m_impl->workspace.vertexOffsets;
+		std::vector<size_t> &touchedSubmissionIndexes =
+			m_impl->workspace.touchedSubmissionIndexes;
 		vertexOffsets.assign(cohortSize, std::numeric_limits<size_t>::max());
 	#if defined(RTS_NATIVE_SORTING_TESTS)
 		g_nativeSortingLastOffsetInitializations += cohortSize;
@@ -913,17 +1185,18 @@ nextCohort:
 			chunkVertices.clear();
 			chunkIndices.clear();
 			draws.clear();
-			// Reset only offsets referenced by the preceding chunk. A submission
-			// may occur in several runs; repeated resets are harmless and bounded
-			// by emitted triangles, not cohortSize multiplied by chunk count.
-			for (size_t run = 0; run < runs.size(); ++run)
+			// A coalesced draw may span several submissions, so chunk ownership
+			// cannot be recovered from DrawRun alone. Reset each packed source once.
+			for (size_t touched = 0;
+				touched < touchedSubmissionIndexes.size(); ++touched)
 			{
-				vertexOffsets[runs[run].submissionIndex - cohortStart] =
+				vertexOffsets[touchedSubmissionIndexes[touched]] =
 					std::numeric_limits<size_t>::max();
 			#if defined(RTS_NATIVE_SORTING_TESTS)
 				++g_nativeSortingLastOffsetResets;
 			#endif
 			}
+			touchedSubmissionIndexes.clear();
 			runs.clear();
 			const NativeDrawPacket *chunkPacket = 0;
 			const size_t maximumChunkEnd = std::min(triangles.size(),
@@ -967,6 +1240,7 @@ nextCohort:
 					chunkVertices.insert(chunkVertices.end(),
 						submission.vertices.begin(), submission.vertices.end());
 					vertexOffsets[relativeIndex] = vertexOffset;
+					touchedSubmissionIndexes.push_back(relativeIndex);
 				}
 
 				const size_t vertexOffset = vertexOffsets[relativeIndex];
@@ -978,15 +1252,116 @@ nextCohort:
 					vertexBase + triangle.j > MAX_SORTING_INDEX_COUNT ||
 					vertexBase + triangle.k > MAX_SORTING_INDEX_COUNT)
 					return RENDER_RESULT_INVALID_ARGUMENT;
-				// Each draw binds vertexOffset at the beginning of this submission.
-				// D3D11 adds the index to that offset, so indices stay local here.
-				chunkIndices.push_back(triangle.i);
-				chunkIndices.push_back(triangle.j);
-				chunkIndices.push_back(triangle.k);
 				if (vertexOffset > std::numeric_limits<unsigned int>::max())
 					return RENDER_RESULT_OUT_OF_MEMORY;
-				AddDrawRun(draws, runs, submission, submissionIndex, local,
-					vertexOffset);
+
+				const bool adjacentToPreviousRun = !runs.empty() &&
+					runs.back().firstTriangle + runs.back().triangleCount == local;
+				const bool sameSourceRun = adjacentToPreviousRun &&
+					runs.back().lastSubmissionIndex == submissionIndex;
+				const bool sameBindingsRun = adjacentToPreviousRun &&
+					runs.back().lastSubmissionIndex != submissionIndex &&
+					SameSortedDrawBindings(draws.back(), submission);
+				if (sameSourceRun || sameBindingsRun)
+				{
+					DrawRun &run = runs.back();
+					NativeSortedDraw &draw = draws.back();
+					if (sameBindingsRun && !sameSourceRun && !run.chunkIndexed)
+					{
+						// Existing local indices address one source's byte-offset view.
+						// Rebase the whole adjacent run before changing its IA offset to 0.
+						size_t expandedVertexCount = 0;
+						for (size_t previous = 0;
+							previous < run.triangleCount; ++previous)
+						{
+							const size_t previousTriangleIndex = chunkOffset +
+								run.firstTriangle + previous;
+							const SortedTriangle &previousTriangle = triangles[
+								previousTriangleIndex];
+							if (previousTriangle.submissionIndex >=
+								m_impl->submissions.size() ||
+								previousTriangle.submissionIndex < cohortStart ||
+								previousTriangle.submissionIndex - cohortStart >=
+								vertexOffsets.size())
+								return RENDER_RESULT_INVALID_ARGUMENT;
+							const size_t previousRelativeIndex =
+								previousTriangle.submissionIndex - cohortStart;
+							const size_t previousVertexOffset =
+								vertexOffsets[previousRelativeIndex];
+							if (previousVertexOffset ==
+								std::numeric_limits<size_t>::max() ||
+								previousVertexOffset % stride != 0)
+								return RENDER_RESULT_INVALID_ARGUMENT;
+							const size_t previousVertexBase =
+								previousVertexOffset / stride;
+							const SortedSubmission &previousSubmission =
+								m_impl->submissions[
+									previousTriangle.submissionIndex];
+							const size_t vertexEnd = previousVertexBase +
+								previousSubmission.packet.vertexCount;
+							if (vertexEnd > MAX_SORTING_VERTEX_CAPACITY)
+								return RENDER_RESULT_INVALID_ARGUMENT;
+							expandedVertexCount = std::max(expandedVertexCount,
+								vertexEnd);
+							const size_t rebased[] = {
+								previousVertexBase + previousTriangle.i,
+								previousVertexBase + previousTriangle.j,
+								previousVertexBase + previousTriangle.k
+							};
+							const size_t indexStart =
+								(run.firstTriangle + previous) * 3;
+							for (unsigned int corner = 0; corner < 3; ++corner)
+							{
+								if (rebased[corner] > MAX_SORTING_INDEX_COUNT ||
+									indexStart + corner >= chunkIndices.size())
+									return RENDER_RESULT_INVALID_ARGUMENT;
+								chunkIndices[indexStart + corner] =
+									static_cast<unsigned short>(rebased[corner]);
+							}
+						}
+						if (expandedVertexCount >
+							std::numeric_limits<unsigned int>::max())
+							return RENDER_RESULT_OUT_OF_MEMORY;
+						draw.packet.vertexOffset = 0;
+						draw.packet.vertexCount = static_cast<unsigned int>(
+							expandedVertexCount);
+						run.chunkIndexed = true;
+					}
+
+					if (run.chunkIndexed)
+					{
+						const size_t vertexEnd = vertexBase +
+							submission.packet.vertexCount;
+						if (vertexEnd > MAX_SORTING_VERTEX_CAPACITY ||
+							vertexEnd > std::numeric_limits<unsigned int>::max())
+							return RENDER_RESULT_INVALID_ARGUMENT;
+						chunkIndices.push_back(static_cast<unsigned short>(
+							vertexBase + triangle.i));
+						chunkIndices.push_back(static_cast<unsigned short>(
+							vertexBase + triangle.j));
+						chunkIndices.push_back(static_cast<unsigned short>(
+							vertexBase + triangle.k));
+						draw.packet.vertexCount = std::max(
+							draw.packet.vertexCount,
+							static_cast<unsigned int>(vertexEnd));
+					}
+					else
+					{
+						// Each draw binds this source's byte offset, so indices stay local.
+						chunkIndices.push_back(triangle.i);
+						chunkIndices.push_back(triangle.j);
+						chunkIndices.push_back(triangle.k);
+					}
+					ExtendDrawRun(draws, runs, submissionIndex);
+				}
+				else
+				{
+					chunkIndices.push_back(triangle.i);
+					chunkIndices.push_back(triangle.j);
+					chunkIndices.push_back(triangle.k);
+					StartDrawRun(draws, runs, submission, submissionIndex, local,
+						vertexOffset);
+				}
 			}
 
 			if (local == 0)

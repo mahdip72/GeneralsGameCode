@@ -152,6 +152,15 @@ set_tests_properties(core_renderer_contract_tests PROPERTIES TIMEOUT 30)
 
 if(WIN32 AND NOT IS_VS6_BUILD)
 
+    # Production collector with a recording driver; no graphics device.
+    add_executable(core_d3d11_gpu_frame_timing_tests
+        D3D11GpuFrameTimingTest.cpp)
+    set_target_properties(core_d3d11_gpu_frame_timing_tests PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME core_d3d11_gpu_frame_timing_tests
+        COMMAND core_d3d11_gpu_frame_timing_tests)
+    set_tests_properties(core_d3d11_gpu_frame_timing_tests PROPERTIES TIMEOUT 30)
+
     # Execute the production sampler lifetime methods and their real gather/
     # bind callsites against a recording device. Missing or duplicate markers
     # fail configuration; the generated proof records exact normalized bodies.
@@ -205,6 +214,28 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         "\t\tif (hasTextures && (forcePipeline || !m_pipelineHasTextures ||"
         "\n\t\tm_boundBlendDescriptor =")
 
+    # Supplement real-backend pixel/lifecycle coverage with the exact buffer
+    # update method against a recording Map double, exposing private mirror
+    # bytes and failed-map boundaries without a new production debug API.
+    d3d11_sampler_fragment(D3D11BufferRangeMethods
+        "enum ResourceKind" "\nRenderResult TranslateResult(")
+    d3d11_sampler_fragment(D3D11BufferResourceSlot
+        "struct ResourceSlot" "\nstruct LegacyTransformConstants")
+    d3d11_sampler_fragment(D3D11BufferAdvanceVersion
+        "\tvoid advanceBufferContentVersion(" "\n\tstatic bool isElementRangeWithinBuffer(")
+    d3d11_sampler_fragment(D3D11BufferUpdateResource
+        "\tvirtual RenderResult updateBufferResource(" "\n\tvirtual RenderResult clear(")
+    add_executable(core_d3d11_buffer_discard_contract_tests
+        D3D11BufferDiscardContractTest.cpp)
+    target_include_directories(core_d3d11_buffer_discard_contract_tests PRIVATE
+        "${CMAKE_CURRENT_BINARY_DIR}")
+    target_link_libraries(core_d3d11_buffer_discard_contract_tests PRIVATE core_renderer)
+    set_target_properties(core_d3d11_buffer_discard_contract_tests PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME core_d3d11_buffer_discard_contract_tests
+        COMMAND core_d3d11_buffer_discard_contract_tests)
+    set_tests_properties(core_d3d11_buffer_discard_contract_tests PROPERTIES TIMEOUT 30)
+
     add_executable(core_d3d11_sampler_rollover_tests
         D3D11SamplerRolloverTest.cpp)
     target_include_directories(core_d3d11_sampler_rollover_tests PRIVATE
@@ -234,3 +265,57 @@ add_test(NAME core_w3d_video_buffer_format_selection_tests
 set_tests_properties(core_w3d_video_buffer_format_selection_tests PROPERTIES
     TIMEOUT 30
 )
+
+# The fixture calls the shared production interval selector and existing
+# quaternion math. All three interpolation entrypoints in both titles must
+# remain connected to that selector; this supplements, not replaces, execution.
+if(WIN32)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/RawAnimationFrameSourceProof.txt" "")
+    foreach(raw_title Generals GeneralsMD)
+        set(raw_source "${CMAKE_SOURCE_DIR}/${raw_title}/Code/Libraries/Source/WWVegas/WW3D2/hrawanim.cpp")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${raw_source}")
+        file(READ "${raw_source}" raw_contents)
+        string(REPLACE "\r\n" "\n" raw_contents "${raw_contents}")
+        file(SHA256 "${raw_source}" raw_source_hash)
+        file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/RawAnimationFrameSourceProof.txt"
+            "${raw_title}_source_sha256=${raw_source_hash}\n")
+        foreach(raw_method Get_Translation Get_Orientation Get_Transform)
+            string(FIND "${raw_contents}" "void HRawAnimClass::${raw_method}(" raw_start)
+            if(raw_start LESS 0)
+                message(FATAL_ERROR "Raw animation method missing: ${raw_title}/${raw_method}")
+            endif()
+            string(SUBSTRING "${raw_contents}" ${raw_start} -1 raw_body)
+            string(FIND "${raw_body}" "\n}" raw_end)
+            if(raw_end LESS 0)
+                message(FATAL_ERROR "Raw animation method end missing: ${raw_title}/${raw_method}")
+            endif()
+            string(SUBSTRING "${raw_body}" 0 ${raw_end} raw_body)
+            string(REGEX MATCHALL "rts::animation::SelectRawAnimationFrame0\\(frame\\)" raw_calls "${raw_body}")
+            list(LENGTH raw_calls raw_call_count)
+            if(NOT raw_call_count EQUAL 1 OR raw_body MATCHES "Float_To_Long")
+                message(FATAL_ERROR "Raw interval selector disconnected: ${raw_title}/${raw_method}")
+            endif()
+            string(SHA256 raw_body_hash "${raw_body}")
+            file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/RawAnimationFrameSourceProof.txt"
+                "${raw_title}_${raw_method}_sha256=${raw_body_hash}\n")
+        endforeach()
+    endforeach()
+    add_executable(core_raw_animation_frame_tests RawAnimationFrameTest.cpp)
+    target_include_directories(core_raw_animation_frame_tests PRIVATE
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+        ${CMAKE_SOURCE_DIR}/Dependencies/Utility)
+    target_link_libraries(core_raw_animation_frame_tests PRIVATE
+        core_wwmath
+        core_wwstub
+        core_wwdebug
+        core_wwlib
+        winmm)
+    if(IS_VS6_BUILD)
+        target_link_libraries(core_raw_animation_frame_tests PRIVATE stlport)
+    endif()
+    set_target_properties(core_raw_animation_frame_tests PROPERTIES
+        CXX_STANDARD 98 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME core_raw_animation_frame_tests COMMAND core_raw_animation_frame_tests)
+    set_tests_properties(core_raw_animation_frame_tests PROPERTIES TIMEOUT 30)
+endif()

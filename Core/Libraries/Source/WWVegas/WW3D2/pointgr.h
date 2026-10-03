@@ -46,6 +46,8 @@
 class VertexMaterialClass;
 class RenderInfoClass;
 class TextureClass;
+class FVFInfoClass;
+class Matrix4x4;
 
 /*
 ** PointGroupClass -- a custom object for rendering
@@ -121,6 +123,19 @@ public:
 	void						RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int depth);
 
 protected:
+	// Native ordinary billboards can write the final stream without intermediate
+	// vertex/UV arrays. The generic writer remains the shipping fallback oracle.
+	bool Can_Pack_Billboard_Quads(unsigned fvf, unsigned stride) const;
+	bool Pack_Billboard_Quad_Chunk(unsigned char *vertices,
+		const FVFInfoClass &fvfinfo, const Matrix4x4 &view,
+		int first_vertex, int vertex_count) const;
+	void Pack_Vertex_Chunk(unsigned char *vertices,
+		const FVFInfoClass &fvfinfo, Vector4 *diffuse,
+		int first_vertex, int vertex_count) const;
+	void Prepare_Vertex_Arrays(const Matrix4x4 &view, Vector3 *locations,
+		float *sizes, unsigned char *orientations, unsigned char *frames,
+		int &vertex_count, int &polygon_count);
+
 	// Update arrays.
 	void						Update_Arrays(Vector3 *point_loc,
 									float *point_size,

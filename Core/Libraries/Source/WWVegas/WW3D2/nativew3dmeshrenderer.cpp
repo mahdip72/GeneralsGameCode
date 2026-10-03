@@ -41,6 +41,7 @@
 //#define ENABLE_STRIPING
 
 #include "Utility/CppMacros.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "dx8renderer.h"
 #include "dx8polygonrenderer.h"
 #include "dx8vertexbuffer.h"
@@ -1402,6 +1403,7 @@ void DX8SkinFVFCategoryContainer::Log(bool only_visible)
 
 void DX8SkinFVFCategoryContainer::Render()
 {
+	rts::frame_timing::Scope skinTiming(rts::frame_timing::RendererSkinRender);
 	SNAPSHOT_SAY(("DX8SkinFVFCategoryContainer::Render()"));
 	if (!Anything_To_Render()) {
 		SNAPSHOT_SAY(("Nothing to render"));

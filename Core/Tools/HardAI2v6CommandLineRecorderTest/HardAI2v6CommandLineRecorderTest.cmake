@@ -179,10 +179,27 @@ function(_hard_ai_2v6_add_title_test target title test_name)
 		parseRunSkirmishAITest4v2ForStartup
 		parseRunSkirmishAITestPractical1v7ForStartup
 		parseRunSkirmishAITestHardAI2v6ForStartup)
+	# These callbacks exist only in the production Zero Hour title guard.
+	# Do not replace them with dependency stubs in the supported title lane.
+	if(title STREQUAL "GeneralsMD")
+		list(APPEND _connected_callbacks
+			parseRunRenderedBattleDiagnosticForStartup parseRunRenderedBattleDiagnostic)
+		# RTS_ZEROHOUR also activates parseReplay's legacy-save rejection. Keep
+		# its exact startup marker and rejection helper ahead of that callback.
+		_hard_ai_2v6_extract_until(_command
+			"static Bool s_skirmishAILegacySaveTestSeenAtStartup = FALSE;"
+			";" _legacy_save_startup_marker)
+		_hard_ai_2v6_extract_block(_command
+			"static void rejectSkirmishAILegacySaveTest(" FALSE _legacy_save_reject)
+		string(APPEND _command_source
+			"\n${_legacy_save_startup_marker}\n${_legacy_save_reject}\n")
+	endif()
 	# The extracted callbacks call this exact helper, so retain source order:
 	# TryParse -> parseSkirmishAITestSeedArgument -> parseRun callbacks.
 	_hard_ai_2v6_extract_block(_runner "Bool TryParseSkirmishAITestSeed(" FALSE _seed_parser)
 	string(APPEND _command_source "\n${_seed_parser}\n")
+	_hard_ai_2v6_extract_block(_runner "Bool ValidateRenderedBattleDiagnosticArguments(" FALSE _rendered_admission)
+	string(APPEND _command_source "\n${_rendered_admission}\n")
 	_hard_ai_2v6_extract_block(_command
 		"Bool parseSkirmishAITestSeedArgument(" FALSE _seed_argument)
 	string(APPEND _command_source "\n${_seed_argument}\n")
@@ -263,9 +280,9 @@ function(_hard_ai_2v6_add_title_test target title test_name)
 		"${CMAKE_CURRENT_BINARY_DIR}"
 		"${CMAKE_SOURCE_DIR}/Core/GameEngine/Include")
 	if(title STREQUAL "Generals")
-		target_compile_definitions(${target} PRIVATE HARD_AI2V6_GENERALS)
+		target_compile_definitions(${target} PRIVATE HARD_AI2V6_GENERALS RTS_ZEROHOUR=0)
 	else()
-		target_compile_definitions(${target} PRIVATE HARD_AI2V6_ZERO_HOUR)
+		target_compile_definitions(${target} PRIVATE HARD_AI2V6_ZERO_HOUR RTS_ZEROHOUR=1)
 	endif()
 	target_compile_definitions(${target} PRIVATE
 		HARD_AI2V6_GLOBAL_DATA_COMMAND_LINE_DATA_INC="${_prefix}CommandLineData.inc"

@@ -961,6 +961,32 @@ Int parseRunSkirmishAITestPractical1v7ForStartup(char *args[], int num)
 	return 2;
 }
 
+#if RTS_ZEROHOUR
+Int parseRunRenderedBattleDiagnosticForStartup(char *args[], int num)
+{
+	Int seed = 0;
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+	TheWritableGlobalData->m_headless = FALSE;
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_playIntro = FALSE;
+	TheWritableGlobalData->m_playSizzle = FALSE;
+	return 2;
+}
+
+Int parseRunRenderedBattleDiagnostic(char *args[], int num)
+{
+	Int seed = 0;
+	parseSkirmishAITestSeedArgument(args, num, &seed);
+	if (!TheWritableGlobalData->m_commandLineData.requestRenderedBattleDiagnostic(seed))
+	{
+		printf("RENDERED_BATTLE_DIAGNOSTIC_FAIL reason=duplicate_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+	return 2;
+}
+#endif
+
 Int parseSimulationMode(char *args[], int num)
 {
 	if (num <= 1 || args == 0 || args[1] == 0)
@@ -1713,6 +1739,7 @@ static CommandLineParam paramsForStartup[] =
 	// Explicit full-engine Stage 1 recovery fixture; one case/faction per process.
 #if RTS_ZEROHOUR
 	{ "-runSkirmishAIRecoveryTest", parseRunSkirmishAIRecoveryTestForStartup },
+	{ "-runRenderedBattleDiagnostic", parseRunRenderedBattleDiagnosticForStartup },
 	// Explicit snapshot-only legacy-save probe; the argument is a leaf .sav name.
 	{ "-runSkirmishAILegacySaveTest", parseRunSkirmishAILegacySaveTestForStartup },
 #endif
@@ -1753,6 +1780,7 @@ static CommandLineParam paramsForEngineInit[] =
 #endif
 #if RTS_ZEROHOUR
 	{ "-runSkirmishAIRecoveryTest", parseRunSkirmishAIRecoveryTest },
+	{ "-runRenderedBattleDiagnostic", parseRunRenderedBattleDiagnostic },
 	{ "-runSkirmishAILegacySaveTest", parseRunSkirmishAILegacySaveTest },
 #endif
 	{ "-nologo", parseNoLogo }, // TheSuperHackers @tweak Is now available in Release builds.
@@ -1986,6 +2014,18 @@ static void parseCommandLine(const CommandLineParam* params, int numParams)
 		token = nextParam(nullptr, "\" ");
 	}
 	int argc = argv.size();
+	const char *renderedBattleError = nullptr;
+	Bool renderedBattleSupported = FALSE;
+#if RTS_ZEROHOUR
+	renderedBattleSupported = TRUE;
+#endif
+	if (!ValidateRenderedBattleDiagnosticArguments(argc, argv.empty() ? nullptr : &argv[0],
+		renderedBattleSupported, &renderedBattleError))
+	{
+		printf("RENDERED_BATTLE_DIAGNOSTIC_FAIL reason=%s\n", renderedBattleError);
+		fflush(stdout);
+		exit(2);
+	}
 	rts::ai_fixture::MapRequest reviewedMapRequest;
 	const char *reviewedMapError = 0;
 	bool reviewedMapSupported = false;

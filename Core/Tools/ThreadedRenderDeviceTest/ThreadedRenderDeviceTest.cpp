@@ -6,6 +6,7 @@
 #endif
 #include <windows.h>
 #endif
+#include "Lib/FrameTimingDiagnostics.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -70,6 +71,8 @@ struct Fixture
 	unsigned int failEndFrames;
 	float stateValue;
 	unsigned int layoutStride, layoutOffset;
+	LegacyLogicalState layoutState;
+	LegacyVertexLayout layoutValue;
 	unsigned int swapIntervalSetCalls, swapIntervalGetCalls;
 	unsigned int gammaSetCalls, gammaGetCalls;
 	unsigned int faultConfigCalls, resourceStatisticsCalls;
@@ -317,6 +320,7 @@ public:
 	RenderResult setLegacyStateForLayout(const LegacyLogicalState &state, const LegacyVertexLayout &layout, unsigned int) override
 	{
 		f.event(LAYOUT); f.stateValue = state.constants.world.values[0];
+		f.layoutState = state; f.layoutValue = layout;
 		f.layoutStride = layout.stride; f.layoutOffset = layout.elements[0].byteOffset; return RENDER_RESULT_OK;
 	}
 	RenderResult setVertexBuffer(GpuHandle handle, unsigned int, unsigned int) override
@@ -329,6 +333,7 @@ public:
 	{ f.event(TOPOLOGY); return RENDER_RESULT_OK; }
 	RenderResult draw(unsigned int, unsigned int) override
 	{
+		rts::frame_timing::Scope timing(rts::frame_timing::RendererDrawSubmit);
 		f.event(DRAW); CHECK(open); ++f.draws;
 		if (f.busyDraw)
 		{
@@ -385,6 +390,79 @@ void EmptyFrame(IRenderDevice *device, bool visible = true)
 	CHECK(context->endFrame() == RENDER_RESULT_OK);
 	CHECK(SubmitThreadedRenderFrame(device, visible) == RENDER_RESULT_OK);
 }
+
+#if defined(_WIN64)
+void RenderOwnerDiagnosticsFollowActualPacketExecution()
+{
+	CHECK(SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL));
+	char relative[96], absolute[MAX_PATH];
+	_snprintf(relative, sizeof(relative), "ThreadedRenderTiming-%lu-%lu", GetCurrentProcessId(), GetTickCount());
+	const DWORD length = GetFullPathNameA(relative, sizeof(absolute), absolute, NULL);
+	CHECK(length && length < sizeof(absolute) && CreateDirectoryA(absolute, NULL));
+	for (unsigned int enabled = 0; enabled != 2; ++enabled)
+	{
+		const std::string directory = std::string(absolute) + (enabled ? "\\enabled" : "\\disabled");
+		CHECK(CreateDirectoryA(directory.c_str(), NULL));
+		CHECK(SetEnvironmentVariableA("RTS_RENDER_OWNER_TIMING_DIR", enabled ? directory.c_str() : NULL));
+		Fixture fixture;
+		ThreadedRenderOptions options; options.maxPacketCommands = 2;
+		auto device = Device(fixture, options);
+		IRenderContext *context = device->immediateContext();
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		for (unsigned int draw = 0; draw != 6; ++draw)
+			CHECK(context->draw(3, 0) == RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), true) == RENDER_RESULT_OK);
+		CHECK(Complete(device.get()).presented);
+		fixture.failDraw = true;
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		for (unsigned int draw = 0; draw != 3; ++draw)
+			CHECK(context->draw(3, 0) == RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(Complete(device.get(), RENDER_RESULT_FAILED).outcome.hasCommandFailure());
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(CancelThreadedRenderFrame(device.get(), RENDER_RESULT_FAILED) == RENDER_RESULT_OK);
+		CHECK(Complete(device.get(), RENDER_RESULT_FAILED).outcome.hasCommandFailure());
+		ThreadedRenderMetrics metrics;
+		CHECK(GetThreadedRenderMetrics(device.get(), &metrics) && metrics.completedFrames == 3);
+		device->shutdown();
+		CHECK(!fixture.wrongThread && fixture.draws == 7);
+		WIN32_FIND_DATAA entry;
+		HANDLE search = FindFirstFileA((directory + "\\frame-timing-*.csv").c_str(), &entry);
+		CHECK(search == INVALID_HANDLE_VALUE); // Main receipt namespace remains untouched.
+		search = FindFirstFileA((directory + "\\render-owner-timing-*.csv").c_str(), &entry);
+		if (!enabled)
+			CHECK(search == INVALID_HANDLE_VALUE);
+		else
+		{
+			CHECK(search != INVALID_HANDLE_VALUE);
+			const std::string path = directory + "\\" + entry.cFileName;
+			CHECK(!FindNextFileA(search, &entry)); FindClose(search);
+			FILE *file = fopen(path.c_str(), "rb"); CHECK(file != NULL);
+			char line[1024]; CHECK(fgets(line, sizeof(line), file));
+			CHECK(strstr(line, "session,mode,sequence_begin,sequence_end,executed_packets,") == line);
+			unsigned int rows = 0;
+			while (fgets(line, sizeof(line), file))
+			{
+				unsigned int session = 0, samples = 0;
+				unsigned __int64 first = 0, last = 0, packets = 0;
+				char mode[32], phase[32]; double wall = 0;
+				CHECK(sscanf(line, "%u,%31[^,],%llu,%llu,%llu,%lf,%31[^,],%u",
+					&session, mode, &first, &last, &packets, &wall, phase, &samples) == 8);
+				CHECK(strcmp(mode, "render_owner") == 0 && first == 1 && last == 3 && packets > metrics.completedFrames);
+				if (strcmp(phase, "execution_packet") == 0) CHECK(samples == packets);
+				else CHECK(strcmp(phase, "renderer_draw_submit") == 0 && samples == fixture.draws);
+				++rows;
+			}
+			CHECK(rows == 2); fclose(file); CHECK(DeleteFileA(path.c_str()));
+		}
+		CHECK(RemoveDirectoryA(directory.c_str()));
+	}
+	CHECK(SetEnvironmentVariableA("RTS_RENDER_OWNER_TIMING_DIR", NULL));
+	CHECK(RemoveDirectoryA(absolute));
+}
+#endif
 
 void ProducerTextureBindingCachePreservesOrderedInvalidation()
 {
@@ -667,6 +745,15 @@ void OwnershipAndDeepCopy()
 	LegacyLogicalState state; state.constants.world.values[0] = 9;
 	CHECK(context->setLegacyState(state, RENDER_VERTEX_POSITION3_COLOR, 0) == RENDER_RESULT_OK);
 	LegacyVertexLayout layout; layout.stride = 24; layout.elementCount = 1; layout.elements[0].byteOffset = 12;
+	const unsigned int lastStage = LEGACY_TEXTURE_STAGE_COUNT - 1;
+	const unsigned int lastVertexConstant = LEGACY_VERTEX_CONSTANT_COUNT - 1;
+	const unsigned int lastPixelConstant = LEGACY_PIXEL_CONSTANT_COUNT - 1;
+	state.pipeline.textureStages[lastStage].projectedCoordinates = true;
+	state.pipeline.textureStages[lastStage].bumpEnvironmentLuminanceOffset = 17;
+	state.constants.textureTransforms[lastStage].values[15] = 23;
+	state.constants.vertexShaderConstants[lastVertexConstant] = RenderFloat4(29, 31, 37, 41);
+	state.constants.pixelShaderConstants[lastPixelConstant] = RenderFloat4(43, 47, 53, 59);
+	const LegacyLogicalState expectedLayoutState = state;
 	CHECK(context->setLegacyStateForLayout(state, layout, 0) == RENDER_RESULT_OK);
 	CHECK(context->setVertexBuffer(vertex, sizeof(unsigned int), 0) == RENDER_RESULT_OK);
 	CHECK(context->setIndexBuffer(index, RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK);
@@ -683,6 +770,11 @@ void OwnershipAndDeepCopy()
 	std::memset(bytes, 99, sizeof(bytes)); std::memset(top, 99, sizeof(top)); std::memset(mip, 99, sizeof(mip));
 	std::memset(subresources, 0, sizeof(subresources));
 	state.constants.world.values[0] = 99; layout.stride = 99; layout.elements[0].byteOffset = 99;
+	state.pipeline.textureStages[lastStage].projectedCoordinates = false;
+	state.pipeline.textureStages[lastStage].bumpEnvironmentLuminanceOffset = 99;
+	state.constants.textureTransforms[lastStage].values[15] = 99;
+	state.constants.vertexShaderConstants[lastVertexConstant] = RenderFloat4(99, 99, 99, 99);
+	state.constants.pixelShaderConstants[lastPixelConstant] = RenderFloat4(99, 99, 99, 99);
 	f.release();
 	const ThreadedRenderFrameCompletion completion = Complete(device.get());
 	CHECK(completion.presented && completion.outcome.wasPresented() && completion.outcome.frameEnded());
@@ -692,6 +784,14 @@ void OwnershipAndDeepCopy()
 	CHECK(f.textureBytes.size() == 20 && f.textureBytes.front() == 33 && f.textureBytes.back() == 44);
 	CHECK(f.refreshBytes.size() == 20 && f.refreshBytes.front() == 55 && f.refreshBytes.back() == 66);
 	CHECK(f.stateValue == 9 && f.layoutStride == 24 && f.layoutOffset == 12);
+	CHECK(f.layoutValue.elementCount == 1 &&
+		f.layoutState.pipeline.textureStages[lastStage].projectedCoordinates &&
+		f.layoutState.pipeline.textureStages[lastStage].bumpEnvironmentLuminanceOffset == 17 &&
+		f.layoutState.constants.textureTransforms[lastStage].values[15] == 23);
+	CHECK(std::memcmp(&f.layoutState.constants.vertexShaderConstants[lastVertexConstant],
+		&expectedLayoutState.constants.vertexShaderConstants[lastVertexConstant], sizeof(RenderFloat4)) == 0);
+	CHECK(std::memcmp(&f.layoutState.constants.pixelShaderConstants[lastPixelConstant],
+		&expectedLayoutState.constants.pixelShaderConstants[lastPixelConstant], sizeof(RenderFloat4)) == 0);
 	CHECK(f.targets.hasColor && !f.targets.useBackBufferColor && !f.targets.hasDepth && !f.targets.useBackBufferDepth);
 	unsigned int count = 0;
 	CHECK(device->getDebugValidationErrorCount(&count) == RENDER_RESULT_OK && count == 7);
@@ -890,6 +990,55 @@ void FailurePublicationAndRecovery()
 	f.failPresent = false;
 	CHECK(device->recoverDevice() == RENDER_RESULT_OK && device->isOperational());
 	EmptyFrame(device.get()); CHECK(Complete(device.get()).presented);
+}
+
+void FragmentedBufferDiscardReplacesRanges()
+{
+	Fixture f;
+	auto device = Device(f);
+	IRenderContext *context = device->immediateContext();
+	unsigned int words[4] = { 11, 13, 17, 19 };
+	BufferDescriptor descriptor;
+	descriptor.byteCount = sizeof(words);
+	descriptor.stride = sizeof(words[0]);
+	descriptor.usage = RENDER_USAGE_DYNAMIC;
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	GpuHandle buffer;
+	CHECK(device->createBuffer(descriptor, 0, 0, &buffer) == RENDER_RESULT_OK);
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, words, sizeof(words[0]), 0,
+		RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, words + 3, sizeof(words[3]), 3 * sizeof(words[0]),
+		RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(buffer, sizeof(words[0]), 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 3) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get()).presented && f.draws == 2);
+	// DISCARD replaces two separated initialized ranges with only its prefix.
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, words, sizeof(words[0]), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(buffer, sizeof(words[0]), 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 3) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get(), RENDER_RESULT_FAILED).resourceFailure && f.draws == 3);
+	// A subsequent PRESERVE adds its range without reviving the old tail or hole.
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, words + 2, sizeof(words[2]), 2 * sizeof(words[0]),
+		RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(buffer, sizeof(words[0]), 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 2) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 1) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get(), RENDER_RESULT_FAILED).resourceFailure && f.draws == 5);
+	CHECK(device->destroyResource(buffer));
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
 }
 
 void BufferUpdateFailureRecoveryRestoresBinding()
@@ -1516,6 +1665,9 @@ int main(int argc, char **argv)
 			CHECK(rts::JobSystem::instance().unregisterCurrentThread(rts::JOB_OWNER_GAME));
 			return 0;
 		}
+#if defined(_WIN64)
+		RenderOwnerDiagnosticsFollowActualPacketExecution();
+#endif
 		ProducerTextureBindingCachePreservesOrderedInvalidation();
 		SwapIntervalOwnerTransport();
 		GammaOwnerTransport();
@@ -1526,6 +1678,7 @@ int main(int argc, char **argv)
 		GenerationsAndResourceFailure();
 		ProducerFailureTraceIsOptInAndRateLimited();
 		FailurePublicationAndRecovery();
+		FragmentedBufferDiscardReplacesRanges();
 		BufferUpdateFailureRecoveryRestoresBinding();
 		BufferMutationFailureIsIsolated();
 		SuccessfulCpuUploadSurvivesUnrelatedFrameFailure();

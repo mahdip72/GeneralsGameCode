@@ -124,6 +124,8 @@ void ownerOnlyEmission()
 				{
 					rts::frame_timing::Scope timing(capture,
 						rts::frame_timing::AudioVoiceCreate);
+					timing.finish();
+					timing.finish();
 				}
 				foreignScopes.fetch_add(1, std::memory_order_relaxed);
 				exercised.store(true, std::memory_order_release);

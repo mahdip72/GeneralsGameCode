@@ -36,6 +36,7 @@
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "Lib/BaseType.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "Common/GameUtility.h"
 #include "Common/GlobalData.h"
 #include "Common/PerfTimer.h"
@@ -924,6 +925,7 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 	if (!drawableHidden)
 	{
 		//standard scene lights
+		rts::frame_timing::Scope lightTiming(rts::frame_timing::RendererSceneLights);
 		RefRenderObjListIterator it2(&LightList);
 		for (it2.First(); !it2.Is_Done(); it2.Next())
 		{
@@ -954,6 +956,7 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
     }
 
 		lightEnv.Pre_Render_Update(rinfo.Camera.Get_Transform());
+		lightTiming.finish();
 		rinfo.light_environment = &lightEnv;
 
 		if (drawInfo)

@@ -829,6 +829,19 @@ bool NativeW3DRenderer::IsThreaded() const
 #endif
 }
 
+IRenderDevice *NativeW3DRenderer::BorrowThreadedCompletionDevice() const
+{
+	// Device() proves owner affinity. Queued foreign cleanup does not change
+	// that affinity; only a later owner lifecycle/drain can detach the backend.
+	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+#if defined(RTS_RENDERER_HAS_D3D11)
+	return device != 0 && IsThreadedRenderDevice(device) ? device : 0;
+#else
+	(void)device;
+	return 0;
+#endif
+}
+
 bool NativeW3DRenderer::IsBackendOperational() const
 {
 	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();

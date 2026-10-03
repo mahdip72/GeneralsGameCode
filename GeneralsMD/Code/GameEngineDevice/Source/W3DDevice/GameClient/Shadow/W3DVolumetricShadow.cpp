@@ -49,6 +49,7 @@
 #include "WW3D2/mesh.h"
 #include "WW3D2/meshmdl.h"
 #include "Lib/BaseType.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "Common/GlobalData.h"
 #include "Common/DrawModule.h"
@@ -1308,6 +1309,7 @@ void W3DVolumetricShadow::getRenderCost(RenderCost & rc) const
 /************************************ New Buffered Rendering Code ************************/
 void W3DVolumetricShadow::RenderVolume(Int meshIndex, Int lightIndex)
 {
+	rts::frame_timing::Scope submissionTiming(rts::frame_timing::RendererVolumeSubmit);
 	HLodClass *hlod=(HLodClass *)m_robj;
 	MeshClass *mesh=nullptr;
 
@@ -1376,6 +1378,9 @@ void W3DVolumetricShadow::RenderMeshVolume(Int meshIndex, Int lightIndex, const 
 		!ibSlot->m_IB->m_DX8IndexBuffer->Is_Valid())
 		return;
 
+	// Admitted submission only; earlier world/VB/FVF preparation is outside.
+	rts::frame_timing::Scope staticDrawTiming(rts::frame_timing::RendererVolumeStaticDraw);
+
 	DEBUG_ASSERTCRASH(ibSlot->m_size >= numIndex,("Overflowing Shadow Index Buffer Slot"));
 
 	rts::render::SetGameIndexBuffer(ibSlot->m_IB->m_DX8IndexBuffer,
@@ -1418,6 +1423,10 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 	if( numVerts == 0 || numPolys == 0 )
 		return;
 
+
+	// Admission is not draw success: failed lock/unlock paths remain measured.
+	rts::frame_timing::Scope dynamicDrawTiming(rts::frame_timing::RendererVolumeDynamicDraw);
+	rts::frame_timing::Scope dynamicUploadTiming(rts::frame_timing::RendererVolumeDynamicUpload);
 
 	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowVertsInBuf,
 		SHADOW_VERTEX_SIZE, numVerts))	//check if room for model verts
@@ -1510,6 +1519,9 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 		ResetVolumetricStreamAfterUploadFailure();
 		return;
 	}
+
+	dynamicUploadTiming.finish();
+	rts::frame_timing::Scope dynamicCommandsTiming(rts::frame_timing::RendererVolumeDynamicCommands);
 
 	rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
 		static_cast<unsigned short>(nShadowStartBatchVertex));
@@ -1843,6 +1855,7 @@ void W3DVolumetricShadow::SetGeometry( W3DShadowGeometry *geometry )
 */
 void W3DVolumetricShadow::Update()
 {
+	rts::frame_timing::Scope preparationTiming(rts::frame_timing::RendererVolumePrepare);
 	static Int currentTime, lastTime, delay = 0;
 	// OBJECT_PILE
 	// static Vector3 originCompareVector(0,0,9999);
@@ -3511,6 +3524,7 @@ void W3DVolumetricShadowManager::renderStencilShadows()
 
 void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 {
+	rts::frame_timing::Scope shadowTiming(rts::frame_timing::RendererVolumeShadows);
 	W3DVolumetricShadow *shadow;
 	Int numRenderedShadows = 0;
 

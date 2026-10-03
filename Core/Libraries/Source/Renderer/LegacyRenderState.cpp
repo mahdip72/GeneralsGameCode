@@ -574,6 +574,11 @@ void TrackLegacyPipelineState(const LegacyPipelineState &state)
 	g_trackedPipelineStateValid = true;
 }
 
+bool HasTrackedLegacyPipelineState()
+{
+	return g_trackedPipelineStateValid;
+}
+
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state)
 {
 	if (state == 0 || !g_trackedPipelineStateValid)
@@ -844,6 +849,12 @@ bool GetTrackedLegacyLogicalState(LegacyLogicalState *state)
 	}
 	*state = g_trackedLogicalState;
 	return true;
+}
+
+LegacyLogicalState CaptureTrackedLegacyLogicalState(bool &valid)
+{
+	valid = g_trackedPipelineStateValid;
+	return g_trackedLogicalState;
 }
 
 bool IsLegacyTextureTransformCountValid(unsigned int count)

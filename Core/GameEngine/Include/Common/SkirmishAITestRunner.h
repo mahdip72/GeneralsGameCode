@@ -51,7 +51,9 @@ enum SkirmishAITestScenario
 		SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7,
 	// Eight occupied hard-AI slots: two allied against six. The local player
 	// is the engine-created replay observer, not a GameInfo slot.
-	SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6
+	SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6,
+	// Explicit test-only rendered combat diagnostic; not AI/replay acceptance.
+	SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC
 };
 
 // CLI: -runSkirmishAIRecoveryTest <positive-seed> <case> <FactionTemplate>.
@@ -101,6 +103,44 @@ enum SkirmishAITestProgress
 	SKIRMISH_AI_TEST_COMPLETE,
 	SKIRMISH_AI_TEST_TIMED_OUT
 };
+
+enum
+{
+	RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER = 32,
+	RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES = 1800,
+	RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS = 120000,
+	RENDERED_BATTLE_DIAGNOSTIC_PLACEMENT_SCHEMA_VERSION = 2,
+	RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT = 9,
+	RENDERED_BATTLE_DIAGNOSTIC_LOCAL_STEP = 22,
+	RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP = 8
+};
+// Pure admission/roster helpers used by the production diagnostic and fixture.
+// Ordinary command lines are accepted unchanged when the new flag is absent.
+Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv,
+	Bool supported, const char **reason);
+const char *GetRenderedBattleDiagnosticFactionName(Int slot);
+const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit);
+Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset);
+// Version 2: original 49 centers first, then a row-major 9x9 grid inset by
+// 403/366 formation + 22 local movement + 22 footprint = 447/410.
+// Invalid extents have no candidates; too-small extents
+// retain only the original search. Failure leaves the supplied center intact.
+Int GetRenderedBattleDiagnosticSearchCount(Real loX, Real loY, Real hiX, Real hiY);
+Bool GetRenderedBattleDiagnosticSearchCenter(Real loX, Real loY, Real hiX, Real hiY,
+	Int candidate, Coord3D *center);
+// Fixed local stencil, mirrored in X by battle side; no RNG or world queries.
+Bool GetRenderedBattleDiagnosticLocalOffset(Int slot, Int trial, Coord3D *offset);
+// Geometry radii are the uninflated template radii. Same total clearance as
+// the world occupancy gate: current+1, previous, then 2 additional units.
+Bool AreRenderedBattleDiagnosticPositionsSeparated(const Coord3D &a, Real radiusA,
+	const Coord3D &b, Real radiusB);
+// Retain at most eight arenas by descending valid prefix, ascending index.
+// Arrays have LOCAL_ARENA_CAP entries; rejected inserts preserve them/count.
+Bool RememberRenderedBattleDiagnosticArena(Int candidate, Int validUnits,
+	Int *candidates, Int *validPrefixes, Int *count);
+// Bounded append: failure preserves the prior bytes and length.
+Bool AppendRenderedBattleDiagnosticReportRecord(char *buffer, UnsignedInt capacity,
+	UnsignedInt *used, const char *record, UnsignedInt recordBytes);
 
 struct SkirmishAITestSlotPlan
 {

@@ -214,9 +214,17 @@ struct MapMetaData
 class MapCache
 {
 public:
-	const MapMetaData *findMap(const char *) const { return &map; }
-private:
+	MapCache() : present(true), lookups(0) {}
+	const MapMetaData *findMap(const char *path) const
+	{
+		++lookups;
+		requestedPath = path;
+		return present ? &map : 0;
+	}
 	MapMetaData map;
+	bool present;
+	mutable unsigned lookups;
+	mutable std::string requestedPath;
 };
 MapCache *TheMapCache = 0;
 class GameSlot
@@ -514,6 +522,44 @@ void RunLifetimeCase(unsigned scenario)
 	Check(!GameThreadOwnership::IsAttached(),
 		"actual GameMain releases owner identity only after receipt finalization");
 }
+
+void RunMapAdmissionFailureCase(SkirmishAITestScenario scenario, unsigned rejection)
+{
+	caseName = "fresh-map-admission-failure";
+	Check(TheGameLogic == 0 && TheGameEngine == 0 && TheSkirmishGameInfo == 0 &&
+		currentRuntime == 0 && !GameThreadOwnership::IsAttached(),
+		"map rejection cases begin after the actual lifetime cleanup");
+	outcome = Outcome();
+	globalData = GlobalData();
+	s_runner = SkirmishAITestRunnerState();
+	s_runner.armed = TRUE;
+	s_runner.seed = 17;
+	s_runner.scenario = scenario;
+	MapCache cache;
+	if (rejection == 0) cache.present = false;
+	if (rejection == 1) cache.map.m_doesExist = FALSE;
+	if (rejection == 2) cache.map.m_isMultiplayer = FALSE;
+	if (rejection == 3)
+		cache.map.m_numPlayers = ExpectedSkirmishAITestAiCount(scenario) +
+			(IsSkirmishAITestHardAI2v6(scenario) ? 0 : 1) - 1;
+	TheMapCache = &cache;
+	const Bool started = StartSkirmishAITestRunner();
+	const bool rendered = scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC;
+	Check(started == FALSE && s_runner.failed && !s_runner.started &&
+		s_runner.failureReason != 0 && strcmp(s_runner.failureReason, rendered ?
+			"fortress_avalanche_unavailable" : "twilight_flame_unavailable") == 0,
+		"actual map admission rejects with the requested scenario's map failure reason");
+	Check(cache.lookups == 1 && cache.requestedPath == (rendered ?
+		"Maps\\Fortress Avalanche\\Fortress Avalanche.map" :
+		"Maps\\Twilight Flame\\Twilight Flame.map"),
+		"actual startup checks the unchanged scenario-selected map path exactly once");
+	Check(outcome.messages == 0 && outcome.instances == 0 && outcome.randomInitCalls == 0 &&
+		TheSkirmishGameInfo == 0 && currentRuntime == 0 &&
+		s_runner.expectedMapCRC == 0 && s_runner.expectedMapSize == 0,
+		"failed map admission creates no lobby, NEW_GAME, receipt, RNG or accepted identity");
+	TheMapCache = 0;
+	s_runner = SkirmishAITestRunnerState();
+}
 } // namespace performance_receipt_fresh_producer_fixture
 
 int RunPerformanceReceiptFreshProducerTitleTests()
@@ -551,6 +597,16 @@ int RunPerformanceReceiptFreshProducerTitleTests()
 	for (unsigned i = 0; i != ARRAY_SIZE(inputs); ++i)
 		environment.set(inputs[i][0], inputs[i][1]);
 	for (unsigned scenario = 0; scenario != 5; ++scenario) RunLifetimeCase(scenario);
+	const SkirmishAITestScenario mapScenarios[] = {
+		SKIRMISH_AI_TEST_SCENARIO_4V3, SKIRMISH_AI_TEST_SCENARIO_4V2,
+		SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7, SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6,
+#if RTS_ZEROHOUR
+		SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC,
+#endif
+	};
+	for (unsigned scenario = 0; scenario != ARRAY_SIZE(mapScenarios); ++scenario)
+		for (unsigned rejection = 0; rejection != 4; ++rejection)
+			RunMapAdmissionFailureCase(mapScenarios[scenario], rejection);
 	if (failures != 0) return 1;
 	printf("Fresh receipt producer lifetime title tests passed.\n");
 	return 0;
