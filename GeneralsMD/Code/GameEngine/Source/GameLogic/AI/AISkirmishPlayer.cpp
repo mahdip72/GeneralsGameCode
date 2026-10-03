@@ -7591,7 +7591,7 @@ static void CollectSkirmishAlliedDamageSafety(Object *object, void *userData)
 		object->isDestroyed() ||
 		object->testStatus(OBJECT_STATUS_SOLD)) return;
 	const Bool actualBuilder = object->isKindOf(KINDOF_DOZER) &&
-		!object->testStatus(OBJECT_STATUS_UNMANNED) && object->getAIUpdateInterface() &&
+		!object->isDisabledByType(DISABLED_UNMANNED) && object->getAIUpdateInterface() &&
 		object->getAIUpdateInterface()->getDozerAIInterface();
 	const Bool builder = actualBuilder && !object->isEffectivelyDead();
 	if (builder) ++context->liveBuilders;
@@ -7651,7 +7651,7 @@ static Bool IsSkirmishAlliedSoleBuilderAtDamage(Player *player, Object *victim)
 				if (!object || object->getControllingPlayer() != player ||
 					(object->isEffectivelyDead() && object != victim) || object->isDestroyed() ||
 					object->testStatus(OBJECT_STATUS_SOLD) ||
-					object->testStatus(OBJECT_STATUS_UNMANNED) || !object->isKindOf(KINDOF_DOZER) ||
+					object->isDisabledByType(DISABLED_UNMANNED) || !object->isKindOf(KINDOF_DOZER) ||
 					!object->getAIUpdateInterface() ||
 					!object->getAIUpdateInterface()->getDozerAIInterface()) continue;
 				// Positive clipped damage proves the victim was alive before this
@@ -7676,7 +7676,7 @@ void AISkirmishPlayer::notifyAlliedDamage(Object *object, const DamageInfo *dama
 	Bool homeDamage = (m_baseCenterSet && dx * dx + dy * dy <= radius * radius) ||
 		object->isKindOf(KINDOF_COMMANDCENTER);
 	if (!homeDamage && object->isKindOf(KINDOF_DOZER) &&
-		!object->testStatus(OBJECT_STATUS_UNMANNED) && object->getAIUpdateInterface() &&
+		!object->isDisabledByType(DISABLED_UNMANNED) && object->getAIUpdateInterface() &&
 		object->getAIUpdateInterface()->getDozerAIInterface())
 		homeDamage = object->getID() == GetSkirmishAlliedRecoveryBuilderID(m_player, m_recoveryConstructionID) ||
 			IsSkirmishAlliedSoleBuilderAtDamage(m_player, object);
