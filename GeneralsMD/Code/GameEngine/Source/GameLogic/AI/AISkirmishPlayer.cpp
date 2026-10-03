@@ -8576,8 +8576,12 @@ void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
 	}
 	std::sort(teams.begin(), teams.end(), IsSkirmishAITacticalTeamBefore);
 	Int queries = 0;
+	// Each five-second owner evaluation advances the cyclic sorted-ID scan.
+	// Failed probes cannot permanently hide later teams, and the frame survives saves.
+	const size_t teamStart = teams.empty() ? 0 :
+		(TheGameLogic->getFrame() / (5 * LOGICFRAMES_PER_SECOND)) % teams.size();
 	for (size_t i = 0; i < teams.size() && m_alliedSupportTeamIDs.size() < 4 && queries < 4; ++i) {
-		Team *team = teams[i];
+		Team *team = teams[(teamStart + i) % teams.size()];
 		std::map<UnsignedInt, TacticalTeamState>::const_iterator state = m_tacticalTeams.find(team->getID());
 		if (state != m_tacticalTeams.end() &&
 			(state->second.retreating || state->second.woundedReserve ||
