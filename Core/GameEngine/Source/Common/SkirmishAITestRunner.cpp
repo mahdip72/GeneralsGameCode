@@ -34,6 +34,7 @@
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/Damage.h"
+#include "GameLogic/Weapon.h"
 #include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/TerrainLogic.h"
 #include "GameLogic/Module/AIUpdate.h"
@@ -7264,6 +7265,68 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 				IsSkirmishAIRecoveryCombatUnit(object, enemy)) { source = object; break; }
 		}
 		if (!members[0] || !members[1] || !source || leader->getAttackedFrame() == frame) return;
+		// Exercise the actual public command dispatcher while both retained
+		// offensive recipients still belong to the unreleased allied hold.
+		for (Int participant = 0; participant < 2; ++participant)
+		{
+			AISkirmishPlayer *ownerAI = GetAlliedFixtureAI(s_allied.assaultSlots[participant]);
+			AIUpdateInterface *unitAI = members[participant]->getAIUpdateInterface();
+			const Coord3D *guard = unitAI ? unitAI->getGuardLocation() : nullptr;
+			Coord3D home;
+			if (!ownerAI->shouldHoldAlliedScriptCommand(members[participant]) || !unitAI || !guard ||
+				!ownerAI->getBaseCenter(&home) || unitAI->getLastCommandSource() != CMD_FROM_AI ||
+				unitAI->getGuardTargetType() != GUARDTARGET_LOCATION ||
+				AlliedFixtureDistanceSquared(*guard, home) > 50.0f * 50.0f)
+			{ FailSkirmishAITest("allied_script_probe_not_currently_home_held"); RequestSkirmishAITestStop(); return; }
+			const Coord3D guardBefore = *guard;
+			const UnsignedInt teamBefore = members[participant]->getTeam()->getID();
+			const Int stateBefore = unitAI->getCurrentStateID();
+			for (Int command = 0; command < 2; ++command)
+			{
+				if (command == 0)
+					unitAI->aiAttackMoveToPosition(target->getPosition(), NO_MAX_SHOTS_LIMIT, CMD_FROM_SCRIPT);
+				else
+					unitAI->aiMoveToPosition(target->getPosition(), CMD_FROM_SCRIPT);
+				guard = unitAI->getGuardLocation();
+				const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ownerAI->getAlliedCoordinationDiagnostics();
+				if (!members[participant]->getTeam() || members[participant]->getTeam()->getID() != teamBefore ||
+					members[participant]->getControllingPlayer() != players[participant] ||
+					!guard || unitAI->getLastCommandSource() != CMD_FROM_AI ||
+					unitAI->getCurrentStateID() != stateBefore || unitAI->getGuardTargetType() != GUARDTARGET_LOCATION ||
+					AlliedFixtureDistanceSquared(*guard, guardBefore) > 1.0f ||
+					!ownerAI->shouldHoldAlliedScriptCommand(members[participant]) ||
+					!state.assaultActive || state.assaultLaunched || state.targetID != s_allied.assaultTarget ||
+					state.leaderIndex != s_allied.assaultLeader || state.assaultFrame != s_allied.assaultRelease)
+				{ FailSkirmishAITest("allied_script_command_replaced_held_order"); RequestSkirmishAITestStop(); return; }
+				++s_allied.checks;
+				printf("SKIRMISH_AI_ALLIED_SCRIPT_HOLD_ASSERT frame=%u release=%u slot=%d member=%u team=%u "
+					"command=%s source=script guard_unchanged=1 owner_source=ai launched=0\n",
+					frame, s_allied.assaultRelease, s_allied.assaultSlots[participant],
+					members[participant]->getID(), members[participant]->getTeam()->getID(),
+					command == 0 ? "attack_move" : "move");
+				fflush(stdout);
+			}
+		}
+		// A real mobile hostile infantry recipient provides a bounded non-held
+		// contrast, without changing the retained owners' ordinary army orders.
+		for (Int slot = 1; slot <= 7; ++slot)
+		{
+			AISkirmishPlayer *sourceOwner = GetAlliedFixtureAI(slot);
+			AIUpdateInterface *sourceAI = source->getAIUpdateInterface();
+			if (!sourceOwner || !sourceAI || !source->isKindOf(KINDOF_INFANTRY) ||
+				source->getControllingPlayer() != ThePlayerList->getPlayerFromSlotIndex(slot) ||
+				sourceOwner->shouldHoldAlliedScriptCommand(source)) continue;
+			Coord3D localGoal = *source->getPosition();
+			localGoal.x += 32.0f;
+			sourceAI->aiAttackMoveToPosition(&localGoal, NO_MAX_SHOTS_LIMIT, CMD_FROM_SCRIPT);
+			if (sourceAI->getLastCommandSource() != CMD_FROM_SCRIPT || sourceAI->getCurrentStateID() != AI_ATTACK_MOVE_TO)
+			{ FailSkirmishAITest("allied_script_nonheld_command_not_admitted"); RequestSkirmishAITestStop(); return; }
+			++s_allied.checks;
+			printf("SKIRMISH_AI_ALLIED_SCRIPT_NONHELD_ASSERT frame=%u slot=%d member=%u "
+				"predicate=0 source=script attack_move_admitted=1\n", frame, slot, source->getID());
+			fflush(stdout);
+			break;
+		}
 		Object *victim = members[leaderParticipant];
 		const Real before = victim->getBodyModule()->getHealth();
 		const UnsignedInt attackedBefore = leader->getAttackedFrame();
