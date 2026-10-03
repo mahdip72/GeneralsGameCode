@@ -7249,6 +7249,53 @@ void ObserveAlliedCancellationResume(UnsignedInt frame)
 
 // Negative phase uses real body damage and normal leader/follower updates.
 // Retained identities come from the exact offensive hold predicate above.
+void PrintAlliedWithdrawalSurvivorFailure(UnsignedInt frame, Int failedParticipant)
+{
+	printf("SKIRMISH_AI_ALLIED_WITHDRAWAL_SURVIVOR_FAILURE frame=%u failed_participant=%d "
+		"release=%u canceled=%d ordinary=%d,%d target=%u leader=%d\n", frame, failedParticipant,
+		s_allied.assaultRelease, s_allied.withdrawalCanceled, s_allied.withdrawalOrdinary[0],
+		s_allied.withdrawalOrdinary[1], s_allied.assaultTarget, s_allied.assaultLeader);
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		Player *expectedOwner = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[participant]);
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(s_allied.assaultSlots[participant]);
+		Object *member = TheGameLogic->findObjectByID(s_allied.withdrawalMembers[participant]);
+		Player *actualOwner = member ? member->getControllingPlayer() : nullptr;
+		AIUpdateInterface *unitAI = member ? member->getAIUpdateInterface() : nullptr;
+		const Coord3D *position = member ? member->getPosition() : nullptr;
+		printf("SKIRMISH_AI_ALLIED_WITHDRAWAL_SURVIVOR_STATE frame=%u participant=%d slot=%d "
+			"original_member=%u original_team=%u found=%d expected_owner=%d actual_owner=%d owner_active=%d "
+			"actual_team=%u health=%g destroyed=%d dead=%d contained=%d disabled=%d "
+			"structure=%d immobile=%d dozer=%d harvester=%d projectile=%d mine=%d can_attack=%d "
+			"combat_predicate=%d position=%g,%g,%g ai_state=%d last_source=%d ordinary_already_observed=%d\n",
+			frame, participant, s_allied.assaultSlots[participant], s_allied.withdrawalMembers[participant],
+			s_allied.withdrawalTeams[participant], member != nullptr, expectedOwner ? expectedOwner->getPlayerIndex() : -1,
+			actualOwner ? actualOwner->getPlayerIndex() : -1, expectedOwner ? expectedOwner->isPlayerActive() : FALSE,
+			member && member->getTeam() ? member->getTeam()->getID() : 0,
+			member && member->getBodyModule() ? member->getBodyModule()->getHealth() : -1.0f,
+			member ? member->isDestroyed() : FALSE, member ? member->isEffectivelyDead() : FALSE,
+			member ? member->isContained() : FALSE, member ? member->isDisabled() : FALSE,
+			member ? member->isKindOf(KINDOF_STRUCTURE) : FALSE, member ? member->isKindOf(KINDOF_IMMOBILE) : FALSE,
+			member ? member->isKindOf(KINDOF_DOZER) : FALSE, member ? member->isKindOf(KINDOF_HARVESTER) : FALSE,
+			member ? member->isKindOf(KINDOF_PROJECTILE) : FALSE, member ? member->isKindOf(KINDOF_MINE) : FALSE,
+			member ? member->isAbleToAttack() : FALSE, IsSkirmishAIRecoveryCombatUnit(member, expectedOwner),
+			position ? position->x : 0.0f, position ? position->y : 0.0f, position ? position->z : 0.0f,
+			unitAI ? unitAI->getCurrentStateID() : -1, unitAI ? static_cast<Int>(unitAI->getLastCommandSource()) : -1,
+			s_allied.withdrawalOrdinary[participant]);
+		if (!ai) { printf("SKIRMISH_AI_ALLIED_WITHDRAWAL_OWNER_STATE participant=%d ai_present=0\n", participant); continue; }
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
+		printf("SKIRMISH_AI_ALLIED_WITHDRAWAL_OWNER_STATE participant=%d ai_present=1 current_mode=%d "
+			"strategic_target=%u active=%d launched=%d pending=%d admission_valid=%d admission=%u "
+			"leader=%d enemy=%d target=%u release=%u expiry=%u home_damage_valid=%d home_damage=%u "
+			"held_damage_valid=%d held_damage=%u\n", participant, static_cast<Int>(ai->getAlliedCurrentStrategyMode()),
+			ai->getAlliedCurrentStrategicTargetID(), state.assaultActive, state.assaultLaunched, state.strategyResumePending,
+			state.holdAdmissionValid, state.holdAdmissionFrame, state.leaderIndex, state.enemyIndex,
+			state.targetID, state.assaultFrame, state.assaultExpiryFrame, state.homeDamageValid, state.homeDamageFrame,
+			state.heldDamageValid, state.heldDamageFrame);
+	}
+	fflush(stdout);
+}
+
 void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 {
 	if (!s_allied.assaultRetained || s_allied.withdrawalComplete) return;
@@ -7418,7 +7465,8 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 		Object *member = TheGameLogic->findObjectByID(s_allied.withdrawalMembers[participant]);
 		if (!ai || !IsSkirmishAIRecoveryCombatUnit(member, players[participant]) ||
 			!member->getTeam() || member->getTeam()->getID() != s_allied.withdrawalTeams[participant])
-		{ FailSkirmishAITest("allied_withdrawal_held_survivor_lost"); RequestSkirmishAITestStop(); return; }
+		{ PrintAlliedWithdrawalSurvivorFailure(frame, participant);
+		  FailSkirmishAITest("allied_withdrawal_held_survivor_lost"); RequestSkirmishAITestStop(); return; }
 		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
 		if (!s_allied.withdrawalCanceled && state.assaultLaunched)
 		{ FailSkirmishAITest("allied_withdrawal_retained_owner_launched"); RequestSkirmishAITestStop(); return; }
