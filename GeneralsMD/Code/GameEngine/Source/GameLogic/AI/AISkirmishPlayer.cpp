@@ -8399,10 +8399,11 @@ Bool AISkirmishPlayer::shouldHoldAlliedScriptCommand(const Object *object) const
 {
 	// Legacy Team accessors lack const overloads; the recipient predicate only reads them.
 	if (!usesAlliedCoordinationBehavior() ||
-		(!isAlliedAssaultHolding() && !m_alliedStrategyResumePending) ||
 		!IsSkirmishStrategyOffensiveRecipient(const_cast<Object *>(object), m_player)) return false;
 	const UnsignedInt teamID = object->getTeam()->getID();
-	return !isAlliedSupportTeam(teamID) && !isAlliedCommandProtectedTeam(teamID);
+	// Support retains command ownership until its returning roster actually reaches home.
+	return !isAlliedCommandProtectedTeam(teamID) &&
+		(isAlliedSupportTeam(teamID) || isAlliedAssaultHolding() || m_alliedStrategyResumePending);
 }
 
 Bool AISkirmishPlayer::isAlliedAssaultHoldingTeam(UnsignedInt teamID) const
