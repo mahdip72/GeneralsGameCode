@@ -6866,6 +6866,8 @@ Bool SameAlliedDiagnostics(const AISkirmishPlayer::AlliedCoordinationDiagnostics
 	return a.assaultActive == b.assaultActive && a.assaultLaunched == b.assaultLaunched &&
 		a.strategyResumePending == b.strategyResumePending &&
 		a.holdAdmissionValid == b.holdAdmissionValid && a.holdAdmissionFrame == b.holdAdmissionFrame &&
+		a.homeDamageValid == b.homeDamageValid && a.homeDamageFrame == b.homeDamageFrame &&
+		a.heldDamageValid == b.heldDamageValid && a.heldDamageFrame == b.heldDamageFrame &&
 		a.leaderIndex == b.leaderIndex && a.enemyIndex == b.enemyIndex &&
 		a.targetID == b.targetID && a.assaultFrame == b.assaultFrame &&
 		a.assaultExpiryFrame == b.assaultExpiryFrame &&
@@ -6961,7 +6963,7 @@ Bool RoundTripAlliedFixture()
 	s_allied.postLoadEvaluation = TheAI->getNextAlliedEvaluationFrame();
 	s_allied.postLoadBlockedEvaluations = 0;
 	printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_ASSERT frame=%u file=%s "
-		"player_slots=7 central_cadence=preserved commitments=preserved support_ids=preserved "
+		"player_slots=7 central_cadence=preserved commitments=preserved support_ids=preserved damage_latches=preserved "
 		"cooldown_until=%u remaining_frames=%u strategy_resume_pending=preserved_nonzero "
 		"pending_at_save=%d,%d pending_after_load=%d,%d hold_admission=preserved "
 		"hold_admission_valid=%d,%d hold_admission_frame=%u,%u post_load_protection=pending\n",
@@ -7341,11 +7343,18 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 			}
 		}
 		Object *victim = members[leaderParticipant];
+		const UnsignedInt victimTeamID = victim->getTeam()->getID();
 		const Real before = victim->getBodyModule()->getHealth();
 		const UnsignedInt attackedBefore = leader->getAttackedFrame();
+		const ObjectID sourceWitnessID = source->getID();
+		Player *sourceOwner = source->getControllingPlayer();
+		const UnsignedInt sourceMask = sourceOwner->getPlayerMask();
+		if (!sourceMask || (sourceMask & (sourceMask - 1)) != 0 ||
+			!sourceOwner->isPlayerActive() || leader->getRelationship(source->getTeam()) != ENEMIES)
+		{ FailSkirmishAITest("allied_withdrawal_exact_hostile_mask_unproven"); RequestSkirmishAITestStop(); return; }
 		DamageInfo damage;
-		damage.in.m_sourceID = source->getID();
-		damage.in.m_sourcePlayerMask = source->getControllingPlayer()->getPlayerMask();
+		damage.in.m_sourceID = INVALID_ID;
+		damage.in.m_sourcePlayerMask = sourceMask;
 		damage.in.m_damageType = DAMAGE_UNRESISTABLE;
 		damage.in.m_amount = 1.0f;
 		const ObjectID victimID = victim->getID();
@@ -7355,21 +7364,50 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 		{ FailSkirmishAITest("allied_withdrawal_damage_killed_member"); RequestSkirmishAITestStop(); return; }
 		members[leaderParticipant] = victim;
 		const Real after = victim->getBodyModule()->getHealth();
-		if (after <= 0 || after >= before || damage.out.m_actualDamageDealt <= 0 ||
-			leader->getAttackedFrame() != frame || leader->getAttackedFrame() == attackedBefore ||
+		if (after <= 0 || after >= before || damage.out.m_actualDamageClipped <= 0 ||
 			!IsLiveSkirmishAIRecoveryObject(target))
 		{ FailSkirmishAITest("allied_withdrawal_real_damage_boundary_unproven"); RequestSkirmishAITestStop(); return; }
+		AISkirmishPlayer *leaderAI = GetAlliedFixtureAI(s_allied.assaultSlots[leaderParticipant]);
+		if (!leaderAI)
+		{ FailSkirmishAITest("allied_withdrawal_damage_owner_missing"); RequestSkirmishAITestStop(); return; }
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics hitState = leaderAI->getAlliedCoordinationDiagnostics();
+		if (!hitState.heldDamageValid || hitState.heldDamageFrame != frame)
+		{ FailSkirmishAITest("allied_withdrawal_masked_hit_not_latched"); RequestSkirmishAITestStop(); return; }
+		// Heal through the real body boundary before any ordinary owner update.
+		// Healing replaces the body's last-damage record but must retain the hit.
+		DamageInfo healing;
+		healing.in.m_sourceID = INVALID_ID;
+		healing.in.m_damageType = DAMAGE_HEALING;
+		healing.in.m_amount = 1.0f;
+		victim->attemptDamage(&healing);
+		victim = TheGameLogic->findObjectByID(victimID);
+		source = TheGameLogic->findObjectByID(sourceWitnessID);
+		target = TheGameLogic->findObjectByID(s_allied.assaultTarget);
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics healedState = leaderAI->getAlliedCoordinationDiagnostics();
+		if (!IsSkirmishAIRecoveryCombatUnit(victim, leader) || !victim->getBodyModule() ||
+			!victim->getTeam() || victim->getTeam()->getID() != victimTeamID ||
+			victim->getBodyModule()->getHealth() <= after || victim->getBodyModule()->getHealth() < before ||
+			healing.out.m_actualDamageClipped >= 0 || !leader->isPlayerActive() ||
+			!IsLiveSkirmishAIRecoveryObject(source) || source->getControllingPlayer() != sourceOwner ||
+			!sourceOwner->isPlayerActive() || !source->getTeam() || leader->getRelationship(source->getTeam()) != ENEMIES ||
+			!IsLiveSkirmishAIRecoveryObject(target) || !healedState.heldDamageValid || healedState.heldDamageFrame != frame ||
+			healedState.homeDamageValid != hitState.homeDamageValid || healedState.homeDamageFrame != hitState.homeDamageFrame)
+		{ FailSkirmishAITest("allied_withdrawal_healing_erased_masked_hit"); RequestSkirmishAITestStop(); return; }
+		members[leaderParticipant] = victim;
 		for (Int participant = 0; participant < 2; ++participant)
 		{
 			s_allied.withdrawalMembers[participant] = members[participant]->getID();
 			s_allied.withdrawalTeams[participant] = members[participant]->getTeam()->getID();
 		}
 		s_allied.withdrawalFaultIssued = TRUE;
-		printf("SKIRMISH_AI_ALLIED_WITHDRAWAL_FAULT frame=%u release=%u leader=%d source=%u victim=%u "
-			"health_before=%g health_after=%g attacked_before=%u attacked_after=%u target=%u admission=%u nonlethal=1\n",
+		printf("SKIRMISH_AI_ALLIED_WITHDRAWAL_FAULT frame=%u release=%u leader=%d source_witness=%u victim=%u "
+			"health_before=%g health_after=%g attacked_before=%u attacked_after=%u target=%u admission=%u "
+			"masked_source_hit=1 source_mask=%u health_healed=%g healing_clipped=%g held_damage_frame=%u "
+			"healed_before_owner_update=1 nonlethal=1\n",
 			frame, s_allied.assaultRelease, s_allied.assaultLeader, source->getID(), victim->getID(),
 			before, after, attackedBefore, leader->getAttackedFrame(), s_allied.assaultTarget,
-			s_allied.assaultAdmissionFrames[leaderParticipant]);
+			s_allied.assaultAdmissionFrames[leaderParticipant], sourceMask, victim->getBodyModule()->getHealth(),
+			healing.out.m_actualDamageClipped, healedState.heldDamageFrame);
 		fflush(stdout);
 		return;
 	}
