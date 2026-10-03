@@ -41,6 +41,7 @@ struct SkirmishAIAlliedPlayerFacts
 	Int immediateThreat;
 	Int distress;
 	Int cash;
+	Int starvationCashLimit;
 	Int protectedReserve;
 	Int combatValue;
 	Int localCombatValue;
@@ -51,6 +52,7 @@ struct SkirmishAIAlliedPlayerFacts
 
 	ObjectID targetObjectID;
 	UnsignedInt alliedMask;
+	UnsignedInt enemyMask;
 	SkirmishStrategyMode mode;
 };
 
@@ -124,7 +126,8 @@ namespace SkirmishAIAlliedCoordinationPolicy
 			return FALSE;
 
 		// A one-sided ally bit is enough to keep this pair out of assault targeting.
-		return !MaskContains(players[playerIndex]->alliedMask, enemyIndex) &&
+		return MaskContains(players[playerIndex]->enemyMask, enemyIndex) &&
+			!MaskContains(players[playerIndex]->alliedMask, enemyIndex) &&
 			!MaskContains(players[enemyIndex]->alliedMask, playerIndex);
 	}
 
@@ -175,6 +178,8 @@ namespace SkirmishAIAlliedCoordinationPolicy
 	inline Bool IsStarving(const SkirmishAIAlliedPlayerFacts *fact)
 	{
 		return IsLivePlayer(fact) &&
+			fact->starvationCashLimit > 0 &&
+			fact->cash >= 0 && fact->cash <= fact->starvationCashLimit &&
 			ClampMetric(fact->economyHealth) <= 25 &&
 			(fact->missingIncome || fact->missingProduction) && fact->recoverable;
 	}
