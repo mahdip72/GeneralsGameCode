@@ -119,6 +119,14 @@ struct AlliedFixtureState
 	UnsignedInt withdrawalTeams[2];
 	Bool assaultRetained;
 	Bool assaultLaunched;
+	UnsignedInt assaultLastIntactFrame;
+	Bool positiveAbortActive;
+	Bool positiveAbortCanceled;
+	UnsignedInt positiveAbortFrame;
+	Int positiveAbortCount;
+	ObjectID positiveAbortMembers[2];
+	UnsignedInt positiveAbortTeams[2];
+	Bool positiveAbortOrdinary[2];
 	Bool returnFireIssued;
 	UnsignedInt returnFireFrame;
 	UnsignedInt returnFireEvaluation;
@@ -166,7 +174,8 @@ struct AlliedFixtureState
 		firstStarvationFrame(0), sawSupportReturning(FALSE),
 		coordinatedReleaseFrame(0), postLoadEvaluation(0), postLoadBlockedEvaluations(0),
 		withdrawalFaultIssued(FALSE), withdrawalCanceled(FALSE), withdrawalComplete(FALSE),
-		assaultRetained(FALSE), assaultLaunched(FALSE), returnFireIssued(FALSE), returnFireFrame(0),
+		assaultRetained(FALSE), assaultLaunched(FALSE), assaultLastIntactFrame(0), positiveAbortActive(FALSE),
+		positiveAbortCanceled(FALSE), positiveAbortFrame(0), positiveAbortCount(0), returnFireIssued(FALSE), returnFireFrame(0),
 		returnFireEvaluation(0), returnFireMember(INVALID_ID), returnFireSource(INVALID_ID),
 		returnFireTeam(0), returnFireParticipant(-1), assaultLeader(-1), assaultEnemy(-1),
 		assaultTarget(INVALID_ID), assaultRelease(0), assaultExpiry(0),
@@ -179,6 +188,9 @@ struct AlliedFixtureState
 		withdrawalMembers[0] = withdrawalMembers[1] = INVALID_ID;
 		withdrawalTeams[0] = withdrawalTeams[1] = 0;
 		assaultSlots[0] = assaultSlots[1] = -1;
+		positiveAbortMembers[0] = positiveAbortMembers[1] = INVALID_ID;
+		positiveAbortTeams[0] = positiveAbortTeams[1] = 0;
+		positiveAbortOrdinary[0] = positiveAbortOrdinary[1] = FALSE;
 		assaultAdmissionFrames[0] = assaultAdmissionFrames[1] = 0;
 		assaultMoved[0] = assaultMoved[1] = FALSE;
 		assaultMovedMembers[0] = assaultMovedMembers[1] = INVALID_ID;
@@ -7124,6 +7136,7 @@ void ObserveAlliedCoordination(UnsignedInt frame)
 					s_allied.assaultAdmissionFrames[0] = a.holdAdmissionFrame;
 					s_allied.assaultAdmissionFrames[1] = b.holdAdmissionFrame;
 					s_allied.assaultExpiry = a.assaultExpiryFrame;
+					s_allied.assaultLastIntactFrame = frame;
 				}
 				++s_allied.checks;
 				printf("SKIRMISH_AI_ALLIED_COORDINATION_ASSERT frame=%u slots=%d,%d "
@@ -7260,6 +7273,30 @@ void ObserveAlliedCancellationResume(UnsignedInt frame)
 
 // Negative phase uses real body damage and normal leader/follower updates.
 // Retained identities come from the exact offensive hold predicate above.
+Bool HasAlliedFixtureOrdinaryOrder(AISkirmishPlayer *ai, AIUpdateInterface *unitAI)
+{
+	const SkirmishStrategyMode mode = ai->getAlliedCurrentStrategyMode();
+	if (mode == SKIRMISH_STRATEGY_BALANCED) return unitAI->getCurrentStateID() == AI_IDLE;
+	if (mode == SKIRMISH_STRATEGY_FORTIFY)
+	{
+		Coord3D home;
+		const Coord3D *guard = unitAI->getGuardLocation();
+		return ai->getBaseCenter(&home) && guard && unitAI->getCurrentStateID() == AI_GUARD &&
+			unitAI->getGuardMode() == GUARDMODE_GUARD_WITHOUT_PURSUIT && unitAI->getGuardTargetType() == GUARDTARGET_LOCATION &&
+			AlliedFixtureDistanceSquared(*guard, home) <= 50.0f * 50.0f;
+	}
+	if (mode == SKIRMISH_STRATEGY_ASSAULT)
+	{
+		const ObjectID targetID = ai->getAlliedCurrentStrategicTargetID();
+		Object *target = TheGameLogic->findObjectByID(targetID);
+		const Coord3D *goal = unitAI->getGoalPosition();
+		return (targetID == INVALID_ID && unitAI->getCurrentStateID() == AI_IDLE) ||
+			(IsLiveSkirmishAIRecoveryObject(target) && goal && unitAI->getCurrentStateID() == AI_ATTACK_MOVE_TO &&
+			 AlliedFixtureDistanceSquared(*goal, *target->getPosition()) <= 200.0f * 200.0f);
+	}
+	return FALSE;
+}
+
 void PrintAlliedWithdrawalSurvivorFailure(UnsignedInt frame, Int failedParticipant)
 {
 	printf("SKIRMISH_AI_ALLIED_WITHDRAWAL_SURVIVOR_FAILURE frame=%u failed_participant=%d "
@@ -7494,25 +7531,7 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 		const SkirmishStrategyMode mode = ai->getAlliedCurrentStrategyMode();
 		if (mode != SKIRMISH_STRATEGY_FORTIFY &&
 			(facts->immediateThreat >= 60 || facts->baseIntegrity < 65)) continue;
-		Bool ordinary = mode == SKIRMISH_STRATEGY_BALANCED && unitAI->getCurrentStateID() == AI_IDLE;
-		if (mode == SKIRMISH_STRATEGY_FORTIFY)
-		{
-			Coord3D home;
-			const Coord3D *guard = unitAI->getGuardLocation();
-			ordinary = ai->getBaseCenter(&home) && guard && unitAI->getCurrentStateID() == AI_GUARD &&
-				unitAI->getGuardMode() == GUARDMODE_GUARD_WITHOUT_PURSUIT && unitAI->getGuardTargetType() == GUARDTARGET_LOCATION &&
-				AlliedFixtureDistanceSquared(*guard, home) <= 50.0f * 50.0f;
-		}
-		if (mode == SKIRMISH_STRATEGY_ASSAULT)
-		{
-			Object *ordinaryTarget = TheGameLogic->findObjectByID(ai->getAlliedCurrentStrategicTargetID());
-			const Coord3D *goal = unitAI->getGoalPosition();
-			ordinary = IsLiveSkirmishAIRecoveryObject(ordinaryTarget) && goal &&
-				unitAI->getCurrentStateID() == AI_ATTACK_MOVE_TO &&
-				AlliedFixtureDistanceSquared(*goal, *ordinaryTarget->getPosition()) <= 200.0f * 200.0f;
-			if (ai->getAlliedCurrentStrategicTargetID() == INVALID_ID && unitAI->getCurrentStateID() == AI_IDLE)
-				ordinary = TRUE;
-		}
+		const Bool ordinary = HasAlliedFixtureOrdinaryOrder(ai, unitAI);
 		if (ordinary && !s_allied.withdrawalOrdinary[participant])
 		{
 			s_allied.withdrawalOrdinary[participant] = TRUE;
@@ -7564,6 +7583,12 @@ void PrintAlliedAssaultFailure(UnsignedInt frame, const char *reason)
 		target ? target->isEffectivelyDead() : FALSE, target ? target->isDestroyed() : FALSE,
 		targetOwner ? targetOwner->getPlayerIndex() : -1, targetOwner ? targetOwner->isPlayerActive() : FALSE,
 		static_cast<UnsignedInt>(s_allied.assaultProbes.size()));
+	printf("SKIRMISH_AI_ALLIED_ASSAULT_ABORT_MONITOR active=%d canceled=%d attempt=%d abort_frame=%u "
+		"ordinary=%d,%d members=%u,%u teams=%u,%u last_intact=%u\n", s_allied.positiveAbortActive,
+		s_allied.positiveAbortCanceled, s_allied.positiveAbortCount, s_allied.positiveAbortFrame,
+		s_allied.positiveAbortOrdinary[0], s_allied.positiveAbortOrdinary[1],
+		s_allied.positiveAbortMembers[0], s_allied.positiveAbortMembers[1],
+		s_allied.positiveAbortTeams[0], s_allied.positiveAbortTeams[1], s_allied.assaultLastIntactFrame);
 	for (Int participant = 0; participant < 2; ++participant)
 	{
 		Player *owner = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[participant]);
@@ -7699,9 +7724,158 @@ void ObserveAlliedLaunchedReturnFire(UnsignedInt frame)
 	RequestSkirmishAITestStop();
 }
 
+Bool BeginAlliedPositiveLeaderAbort(UnsignedInt frame)
+{
+	if (!s_allied.withdrawalComplete || s_allied.assaultLaunched || s_allied.returnFireIssued ||
+		frame >= s_allied.assaultRelease || s_allied.assaultLastIntactFrame >= frame) return FALSE;
+	Int leaderParticipant = -1;
+	AISkirmishPlayer::AlliedCoordinationDiagnostics states[2];
+	Player *owners[2];
+	Object *target = TheGameLogic->findObjectByID(s_allied.assaultTarget);
+	if (!IsLiveSkirmishAIRecoveryObject(target) || !target->getControllingPlayer() ||
+		!target->getControllingPlayer()->isPlayerActive() ||
+		target->getControllingPlayer()->getPlayerIndex() != s_allied.assaultEnemy || !target->getTeam()) return FALSE;
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		owners[participant] = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[participant]);
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(s_allied.assaultSlots[participant]);
+		if (!owners[participant] || !owners[participant]->isPlayerActive() || !ai ||
+			owners[participant]->getRelationship(target->getTeam()) != ENEMIES) return FALSE;
+		states[participant] = ai->getAlliedCoordinationDiagnostics();
+		if (states[participant].assaultLaunched) return FALSE;
+		if (states[participant].strategyResumePending &&
+			(!states[participant].holdAdmissionValid ||
+			 states[participant].holdAdmissionFrame != s_allied.assaultAdmissionFrames[participant])) return FALSE;
+		if (owners[participant]->getPlayerIndex() == s_allied.assaultLeader) leaderParticipant = participant;
+		// A follower may still observe the original announcement for one owner
+		// update. An active replacement identity is never a legitimate retry.
+		if (states[participant].assaultActive &&
+			(states[participant].leaderIndex != s_allied.assaultLeader || states[participant].enemyIndex != s_allied.assaultEnemy ||
+			 states[participant].targetID != s_allied.assaultTarget || states[participant].assaultFrame != s_allied.assaultRelease ||
+			 states[participant].assaultExpiryFrame != s_allied.assaultExpiry || !states[participant].holdAdmissionValid ||
+			 states[participant].holdAdmissionFrame != s_allied.assaultAdmissionFrames[participant])) return FALSE;
+	}
+	if (leaderParticipant < 0 || states[leaderParticipant].assaultActive) return FALSE;
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics &leader = states[leaderParticipant];
+	const UnsignedInt admission = s_allied.assaultAdmissionFrames[leaderParticipant];
+	const Bool heldHit = leader.heldDamageValid && leader.heldDamageFrame >= admission &&
+		leader.heldDamageFrame <= frame && frame - leader.heldDamageFrame <= 10 * LOGICFRAMES_PER_SECOND;
+	const Bool homeHit = leader.homeDamageValid && leader.homeDamageFrame >= admission &&
+		leader.homeDamageFrame <= frame && frame - leader.homeDamageFrame <= 10 * LOGICFRAMES_PER_SECOND;
+	if (!heldHit && !homeHit) return FALSE;
+	ObjectID members[2] = { INVALID_ID, INVALID_ID };
+	UnsignedInt teams[2] = { 0, 0 };
+	Real health[2] = { -1.0f, -1.0f };
+	for (size_t index = 0; index < s_allied.assaultProbes.size(); ++index)
+	{
+		const AlliedMovementProbe &probe = s_allied.assaultProbes[index];
+		Object *member = TheGameLogic->findObjectByID(probe.objectID);
+		if (!IsSkirmishAIRecoveryCombatUnit(member, owners[probe.participant]) || !member->getBodyModule() ||
+			!member->getTeam() || member->getTeam()->getID() != probe.teamID ||
+			member->getBodyModule()->getHealth() <= health[probe.participant]) continue;
+		members[probe.participant] = probe.objectID;
+		teams[probe.participant] = probe.teamID;
+		health[probe.participant] = member->getBodyModule()->getHealth();
+	}
+	if (members[0] == INVALID_ID || members[1] == INVALID_ID) return FALSE;
+	s_allied.positiveAbortActive = TRUE;
+	s_allied.positiveAbortCanceled = FALSE;
+	s_allied.positiveAbortFrame = frame;
+	++s_allied.positiveAbortCount;
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		s_allied.positiveAbortMembers[participant] = members[participant];
+		s_allied.positiveAbortTeams[participant] = teams[participant];
+		s_allied.positiveAbortOrdinary[participant] = FALSE;
+	}
+	printf("SKIRMISH_AI_ALLIED_POSITIVE_LEADER_ABORT frame=%u attempt=%d last_intact=%u slots=%d,%d leader=%d "
+		"enemy=%d target=%u release=%u expiry=%u admission=%u held_hit=%d held_hit_frame=%u home_hit=%d home_hit_frame=%u "
+		"members=%u,%u teams=%u,%u target_alive=1 launches=0\n", frame, s_allied.positiveAbortCount,
+		s_allied.assaultLastIntactFrame, s_allied.assaultSlots[0], s_allied.assaultSlots[1], s_allied.assaultLeader,
+		s_allied.assaultEnemy, s_allied.assaultTarget, s_allied.assaultRelease, s_allied.assaultExpiry, admission,
+		heldHit, leader.heldDamageFrame, homeHit, leader.homeDamageFrame, members[0], members[1], teams[0], teams[1]);
+	fflush(stdout);
+	return TRUE;
+}
+
+void ObserveAlliedPositiveLeaderAbort(UnsignedInt frame)
+{
+	Bool bothCanceled = TRUE;
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		Player *owner = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[participant]);
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(s_allied.assaultSlots[participant]);
+		if (!owner || !owner->isPlayerActive() || !ai)
+		{ PrintAlliedAssaultFailure(frame, "allied_positive_abort_owner_lost"); FailSkirmishAITest("allied_positive_abort_owner_lost"); RequestSkirmishAITestStop(); return; }
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
+		if (state.assaultLaunched || (s_allied.positiveAbortCanceled && state.assaultActive) || (state.assaultActive &&
+			(state.leaderIndex != s_allied.assaultLeader || state.enemyIndex != s_allied.assaultEnemy ||
+			 state.targetID != s_allied.assaultTarget || state.assaultFrame != s_allied.assaultRelease ||
+			 state.assaultExpiryFrame != s_allied.assaultExpiry || !state.holdAdmissionValid ||
+			 state.holdAdmissionFrame != s_allied.assaultAdmissionFrames[participant])) ||
+			(state.strategyResumePending && (!state.holdAdmissionValid ||
+			 state.holdAdmissionFrame != s_allied.assaultAdmissionFrames[participant])))
+		{ PrintAlliedAssaultFailure(frame, "allied_positive_abort_launch_or_identity_changed"); FailSkirmishAITest("allied_positive_abort_launch_or_identity_changed"); RequestSkirmishAITestStop(); return; }
+		bothCanceled = bothCanceled && !state.assaultActive;
+		if (s_allied.positiveAbortOrdinary[participant]) continue;
+		Object *member = TheGameLogic->findObjectByID(s_allied.positiveAbortMembers[participant]);
+		if (!IsSkirmishAIRecoveryCombatUnit(member, owner) || !member->getTeam() ||
+			member->getTeam()->getID() != s_allied.positiveAbortTeams[participant])
+		{ PrintAlliedAssaultFailure(frame, "allied_positive_abort_survivor_lost"); FailSkirmishAITest("allied_positive_abort_survivor_lost"); RequestSkirmishAITestStop(); return; }
+		if (state.assaultActive || state.strategyResumePending) continue;
+		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(owner->getPlayerIndex());
+		AIUpdateInterface *unitAI = member->getAIUpdateInterface();
+		if (!facts || !facts->valid || !facts->alive || !unitAI || unitAI->getLastCommandSource() != CMD_FROM_AI) continue;
+		const SkirmishStrategyMode mode = ai->getAlliedCurrentStrategyMode();
+		if (mode != SKIRMISH_STRATEGY_FORTIFY && (facts->immediateThreat >= 60 || facts->baseIntegrity < 65)) continue;
+		const Bool ordinary = HasAlliedFixtureOrdinaryOrder(ai, unitAI);
+		if (!ordinary) continue;
+		s_allied.positiveAbortOrdinary[participant] = TRUE;
+		++s_allied.checks;
+		printf("SKIRMISH_AI_ALLIED_POSITIVE_ABORT_RESUME_ASSERT frame=%u attempt=%d abort_frame=%u slot=%d "
+			"member=%u team=%u mode=%d pending=0 threat=%d base=%d ai_state=%d source=ai surviving_original_held_member=1\n",
+			frame, s_allied.positiveAbortCount, s_allied.positiveAbortFrame, s_allied.assaultSlots[participant],
+			member->getID(), member->getTeam()->getID(), static_cast<Int>(mode), facts->immediateThreat,
+			facts->baseIntegrity, unitAI->getCurrentStateID());
+		fflush(stdout);
+	}
+	if (!s_allied.positiveAbortCanceled)
+	{
+		if (frame >= s_allied.assaultRelease)
+		{ PrintAlliedAssaultFailure(frame, "allied_positive_abort_cancellation_missed_release"); FailSkirmishAITest("allied_positive_abort_cancellation_missed_release"); RequestSkirmishAITestStop(); return; }
+		if (bothCanceled)
+		{
+			s_allied.positiveAbortCanceled = TRUE;
+			printf("SKIRMISH_AI_ALLIED_POSITIVE_ABORT_CANCEL_ASSERT frame=%u attempt=%d release=%u owners_canceled=2 launches=0\n",
+				frame, s_allied.positiveAbortCount, s_allied.assaultRelease);
+			fflush(stdout);
+		}
+	}
+	if (!bothCanceled || !s_allied.positiveAbortOrdinary[0] || !s_allied.positiveAbortOrdinary[1]) return;
+	printf("SKIRMISH_AI_ALLIED_POSITIVE_ABORT_RETIRED frame=%u attempt=%d abort_frame=%u release=%u "
+		"owners_canceled=2 launches=0 ordinary_proofs=2 deadline_start=%u\n", frame, s_allied.positiveAbortCount,
+		s_allied.positiveAbortFrame, s_allied.assaultRelease, s_allied.startFrame);
+	fflush(stdout);
+	// Retire only observations of this fully proven aborted attempt. The
+	// initial negative proof and fixed total deadline are never restarted.
+	s_allied.positiveAbortActive = FALSE;
+	s_allied.assaultRetained = FALSE;
+	s_allied.assaultLaunched = FALSE;
+	s_allied.assaultProbes.clear();
+	s_allied.assaultMoved[0] = s_allied.assaultMoved[1] = FALSE;
+	s_allied.assaultMovedMembers[0] = s_allied.assaultMovedMembers[1] = INVALID_ID;
+	s_allied.assaultMovedTeams[0] = s_allied.assaultMovedTeams[1] = 0;
+	s_allied.returnFireIssued = FALSE;
+	s_allied.returnFireFrame = s_allied.returnFireEvaluation = 0;
+	s_allied.returnFireMember = s_allied.returnFireSource = INVALID_ID;
+	s_allied.returnFireTeam = 0;
+	s_allied.returnFireParticipant = -1;
+}
+
 void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 {
 	if (!s_allied.assaultRetained) return;
+	if (s_allied.positiveAbortActive) { ObserveAlliedPositiveLeaderAbort(frame); return; }
 	if (frame >= s_allied.assaultExpiry)
 	{ PrintAlliedAssaultFailure(frame, "allied_assault_expired_without_live_movement"); FailSkirmishAITest("allied_assault_expired_without_live_movement"); RequestSkirmishAITestStop(); return; }
 	Bool bothLaunched = TRUE;
@@ -7715,13 +7889,15 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 			state.enemyIndex != s_allied.assaultEnemy || state.targetID != s_allied.assaultTarget ||
 			state.assaultFrame != s_allied.assaultRelease || state.assaultExpiryFrame != s_allied.assaultExpiry ||
 			!state.holdAdmissionValid || state.holdAdmissionFrame != s_allied.assaultAdmissionFrames[participant])
-		{ PrintAlliedAssaultFailure(frame, "allied_assault_retained_commitment_changed"); FailSkirmishAITest("allied_assault_retained_commitment_changed"); RequestSkirmishAITestStop(); return; }
+		{ if (BeginAlliedPositiveLeaderAbort(frame)) { ObserveAlliedPositiveLeaderAbort(frame); return; }
+		  PrintAlliedAssaultFailure(frame, "allied_assault_retained_commitment_changed"); FailSkirmishAITest("allied_assault_retained_commitment_changed"); RequestSkirmishAITestStop(); return; }
 		if (s_allied.assaultLaunched && !state.assaultLaunched)
 		{ PrintAlliedAssaultFailure(frame, "allied_assault_launched_state_lost"); FailSkirmishAITest("allied_assault_launched_state_lost"); RequestSkirmishAITestStop(); return; }
 		if (state.assaultLaunched && frame < s_allied.assaultRelease)
 		{ PrintAlliedAssaultFailure(frame, "allied_assault_launched_before_release"); FailSkirmishAITest("allied_assault_launched_before_release"); RequestSkirmishAITestStop(); return; }
 		bothLaunched = bothLaunched && state.assaultLaunched;
 	}
+	s_allied.assaultLastIntactFrame = frame;
 	if (frame < s_allied.assaultRelease || !bothLaunched) return;
 	if (!s_allied.assaultLaunched)
 	{
