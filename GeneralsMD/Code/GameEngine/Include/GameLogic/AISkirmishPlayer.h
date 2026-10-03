@@ -42,6 +42,7 @@
 #include "GameLogic/SkirmishAITunnelRoute.h"
 
 class BuildListInfo;
+class DamageInfo;
 class SpecialPowerTemplate;
 class ThingTemplate;
 enum ProductionID CPP_11(: Int);
@@ -94,12 +95,17 @@ public:	// AIPlayer interface methods.
 		UnsignedInt now);
 	Bool donateToAlly(Int recipientIndex, Int amount);
 	void notifyReceivedAlliedMoney(UnsignedInt currentFrame);
+	void notifyAlliedDamage(Object *object, const DamageInfo *damage);
 	struct AlliedCoordinationDiagnostics {
 		Bool assaultActive;
 		Bool assaultLaunched;
 		Bool strategyResumePending;
 		Bool holdAdmissionValid;
 		UnsignedInt holdAdmissionFrame;
+		Bool homeDamageValid;
+		UnsignedInt homeDamageFrame;
+		Bool heldDamageValid;
+		UnsignedInt heldDamageFrame;
 		Int leaderIndex;
 		Int enemyIndex;
 		ObjectID targetID;
@@ -481,6 +487,10 @@ protected:
 	Bool m_alliedStrategyResumePending;
 	Bool m_alliedHoldAdmissionValid;
 	UnsignedInt m_alliedHoldAdmissionFrame;
+	Bool m_alliedHomeDamageValid;
+	UnsignedInt m_alliedHomeDamageFrame;
+	Bool m_alliedHeldDamageValid;
+	UnsignedInt m_alliedHeldDamageFrame;
 	Bool m_alliedResumeAttackSafe;
 	UnsignedInt m_alliedResumeSafetyFrame;
 	Int m_alliedLeaderIndex;

@@ -45,6 +45,7 @@
 #include "GameClient/InGameUI.h"
 #include "GameClient/ParticleSys.h"
 #include "GameLogic/AI.h"
+#include "GameLogic/AISkirmishPlayer.h"
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/Armor.h"
 #include "GameLogic/GameLogic.h"
@@ -565,6 +566,15 @@ void ActiveBody::attemptDamage( DamageInfo *damageInfo )
 		// record the actual damage done from this, and when it happened
 		damageInfo->out.m_actualDamageDealt = amount;
 		damageInfo->out.m_actualDamageClipped = m_prevHealth - m_currentHealth;
+		// Allied safety records the actual hostile event before healing, damage
+		// callbacks, or onDie can replace its metadata/remove the victim.
+		if (damageInfo->out.m_actualDamageClipped > 0.0f) {
+			Player *owner = obj->getControllingPlayer();
+			AISkirmishPlayer *alliedAI = owner && owner->isSkirmishAIPlayer() ?
+				static_cast<AISkirmishPlayer *>(owner->getAIPlayerForPlanning()) : 0;
+			if (alliedAI && alliedAI->usesAlliedCoordinationBehavior())
+				alliedAI->notifyAlliedDamage(obj, damageInfo);
+		}
 
 		// then copy the whole DamageInfo struct for easy lookup
 		// (object pointer loses scope as soon as atteptdamage's caller ends)
