@@ -8589,9 +8589,21 @@ void AISkirmishPlayer::updateAlliedAssignments()
 	if (m_alliedAssaultActive) {
 		Object *target = 0;
 		Player *leader = FindSkirmishAlliedPlayer(m_alliedLeaderIndex);
+		Bool leaderAnnouncementValid = true;
+		if (!m_alliedAssaultLaunched && m_alliedLeaderIndex != m_player->getPlayerIndex()) {
+			AISkirmishPlayer *leaderAI = leader && leader->isSkirmishAIPlayer() ?
+				static_cast<AISkirmishPlayer *>(leader->getAIPlayerForPlanning()) : 0;
+			// The leader may already have launched this same plan earlier in the owner update loop.
+			leaderAnnouncementValid = leaderAI && leaderAI->m_alliedAssaultActive &&
+				leaderAI->m_alliedLeaderIndex == m_alliedLeaderIndex &&
+				leaderAI->m_alliedEnemyIndex == m_alliedEnemyIndex &&
+				leaderAI->m_alliedTargetID == m_alliedTargetID &&
+				leaderAI->m_alliedAssaultFrame == m_alliedAssaultFrame;
+		}
 		if (!own || !own->alive || own->immediateThreat >= 60 || recentAttack ||
 			m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY ||
 			(m_alliedLeaderIndex != m_player->getPlayerIndex() && !IsSkirmishMutualLiveAlly(m_player, leader)) ||
+			!leaderAnnouncementValid ||
 			IsSkirmishStrategyFrameReached(now, m_alliedAssaultExpiryFrame) ||
 			!resolveAlliedAssaultTarget(&target)) {
 			clearAlliedAssault();
