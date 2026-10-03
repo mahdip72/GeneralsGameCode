@@ -620,6 +620,8 @@ protected:
 	void setGoalPositionClipped(const Coord3D* in, CommandSourceType cmdSource);
 
 	virtual Bool isAllowedToRespondToAiCommands(const AICommandParms* parms) const;
+	/// Read-only, per-recipient allied hold check before derived command side effects.
+	Bool isAlliedScriptCommandHeld(const AICommandParms* parms) const;
 
 	// getAttitude is protected because other places should call getMoodMatrixValue to get all the facts they need to consider.
 	AttitudeType getAttitude() const;				///< get the current behavior modifier state.

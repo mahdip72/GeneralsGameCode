@@ -47,6 +47,7 @@
 #define DEFINE_SCIENCE_AVAILABILITY_NAMES
 
 #include "Common/ActionManager.h"
+#include "Common/AlliedMoneyTransfer.h"
 #include "Common/BuildAssistant.h"
 #include "Common/CRCDebug.h"
 #include "Common/DisabledTypes.h"
@@ -76,6 +77,7 @@
 #include "GameClient/Eva.h"
 #include "GameClient/GameClient.h"
 #include "GameClient/GameText.h"
+#include "GameClient/InGameUI.h"
 
 #include "GameLogic/AI.h"
 #include "GameLogic/SkirmishAIDecision.h"
@@ -1152,6 +1154,46 @@ void Player::becomingLocalPlayer(Bool yes)
 Bool Player::isSkirmishAIPlayer()
 {
 	return m_ai ? m_ai->isSkirmishAI() : false;
+}
+
+Bool Player::transferMoneyToAlly(Int recipientPlayerIndex, Int amount)
+{
+	if (!TheGameLogic || !ThePlayerList || recipientPlayerIndex < 0 ||
+		recipientPlayerIndex >= MAX_PLAYER_COUNT)
+		return false;
+	const GameMode mode = TheGameLogic->getGameMode();
+	// Recorded transfers must also execute during playback, with no UI authority.
+	if (mode != GAME_SKIRMISH && mode != GAME_LAN && mode != GAME_INTERNET && mode != GAME_REPLAY)
+		return false;
+	Player *recipient = ThePlayerList->getNthPlayer(recipientPlayerIndex);
+	if (!recipient || !getDefaultTeam() || !recipient->getDefaultTeam())
+		return false;
+	const Bool mutualAllies = getRelationship(recipient->getDefaultTeam()) == ALLIES &&
+		recipient->getRelationship(getDefaultTeam()) == ALLIES;
+	if (!AlliedMoneyTransfer::CanTransfer(amount, m_money.countMoney(),
+		recipient->getMoney()->countMoney(), recipient != this, isPlayerActive(),
+		recipient->isPlayerActive(), mutualAllies))
+		return false;
+	const UnsignedInt withdrawn = m_money.withdraw(static_cast<UnsignedInt>(amount));
+	if (withdrawn != static_cast<UnsignedInt>(amount))
+		return false;
+	// Gifts are not harvested income, and must not inflate the income academy metric.
+	recipient->getMoney()->deposit(withdrawn, TRUE, FALSE, FALSE);
+	if (recipient->isSkirmishAIPlayer())
+		static_cast<AISkirmishPlayer *>(recipient->getAIPlayerForPlanning())->
+			notifyReceivedAlliedMoney(TheGameLogic->getFrame());
+	if (TheInGameUI)
+	{
+		Player *local = ThePlayerList->getLocalPlayer();
+		UnicodeString feedback;
+		if (local == this)
+			feedback.format(L"Sent $%d to %ls.", amount, recipient->getPlayerDisplayName().str());
+		else if (local == recipient)
+			feedback.format(L"Received $%d from %ls.", amount, getPlayerDisplayName().str());
+		if (!feedback.isEmpty())
+			TheInGameUI->message(UnicodeString(L"%ls"), feedback.str());
+	}
+	return true;
 }
 
 Bool Player::canSpendForSkirmishAIRecovery(

@@ -38,6 +38,9 @@
 #include "Common/NameKeyGenerator.h"
 #include "Common/ThingFactory.h"
 #include "Common/Player.h"
+#if defined(RTS_ZEROHOUR)
+#include "Common/AlliedMoneyTransfer.h"
+#endif
 #include "Common/PlayerList.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/MessageStream.h"
@@ -491,6 +494,23 @@ void GameLogic::logicMessageDispatcher( GameMessage *msg, void *userData )
 			onEnableRetaliationMode(msg);
 			break;
 		}
+#if defined(RTS_ZEROHOUR)
+		case GameMessage::MSG_TRANSFER_MONEY_TO_ALLY:
+		{
+			// Authority comes from the synchronized message actor, never a donor argument.
+			const Bool validArguments = msg->getArgumentCount() == 2 &&
+				msg->getArgumentDataType(0) == ARGUMENTDATATYPE_INTEGER &&
+				msg->getArgumentDataType(1) == ARGUMENTDATATYPE_INTEGER;
+			Bool transferred = false;
+			if (validArguments &&
+				AlliedMoneyTransfer::IsHumanAmountValid(msg->getArgument(1)->integer))
+				transferred = msgPlayer->transferMoneyToAlly(msg->getArgument(0)->integer,
+					msg->getArgument(1)->integer);
+			if (!transferred && msgPlayer == ThePlayerList->getLocalPlayer() && TheInGameUI)
+				TheInGameUI->message(UnicodeString(L"Money transfer rejected. Check your cash and the ally's status."));
+			break;
+		}
+#endif
 		case GameMessage::MSG_DO_WEAPON_AT_LOCATION:
 		{
 			onDoWeaponAtLocation(msg, currentlySelectedGroup);

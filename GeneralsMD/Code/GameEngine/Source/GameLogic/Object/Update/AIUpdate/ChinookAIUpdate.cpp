@@ -1287,6 +1287,10 @@ void ChinookAIUpdate::privateCombatDrop( Object* target, const Coord3D& pos, Com
 //-------------------------------------------------------------------------------------------------
 void ChinookAIUpdate::aiDoCommand(const AICommandParms* parms)
 {
+	// Keep the healing reservation when this script cannot command a held recipient.
+	if (isAlliedScriptCommandHeld(parms))
+		return;
+
 #if RETAIL_COMPATIBLE_CRC
 	// this gets reset every time a command is issued.
 	setAirfieldForHealing(INVALID_ID);

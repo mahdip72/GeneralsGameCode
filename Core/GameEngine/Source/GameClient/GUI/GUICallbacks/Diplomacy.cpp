@@ -33,6 +33,12 @@
 #include "Common/GlobalData.h"
 #include "Common/MultiplayerSettings.h"
 #include "Common/Player.h"
+#if defined(RTS_ZEROHOUR)
+#include "Common/AlliedMoneyTransfer.h"
+#include "Common/MessageStream.h"
+#include "GameClient/GadgetPushButton.h"
+#include "GameClient/GadgetSlider.h"
+#endif
 #include "Common/PlayerList.h"
 #include "Common/PlayerTemplate.h"
 #include "Common/Recorder.h"
@@ -93,6 +99,183 @@ WindowMsgHandledType BuddyControlSystem( GameWindow *window, UnsignedInt msg,
 														 WindowMsgData mData1, WindowMsgData mData2);
 void InitBuddyControls(Int type);
 void updateBuddyInfo();
+#if defined(RTS_ZEROHOUR)
+static GameWindow *buttonGiveMoney[MAX_SLOTS] = {nullptr};
+static GameWindow *moneyAmountSlider = nullptr;
+static GameWindow *moneyAmountLabel = nullptr;
+static GameWindow *moneyAmountLess = nullptr;
+static GameWindow *moneyAmountMore = nullptr;
+static Int selectedMoneyAmount = 1000;
+
+static Bool canShowMoneyControls()
+{
+	if (!TheGameLogic || !TheRecorder || TheRecorder->isPlaybackMode())
+		return false;
+	const GameMode mode = TheGameLogic->getGameMode();
+	return mode == GAME_SKIRMISH || mode == GAME_LAN || mode == GAME_INTERNET;
+}
+
+static Bool isEligibleMoneyRecipient(Player *donor, Player *recipient)
+{
+	return donor && recipient && donor != recipient && donor->isPlayerActive() &&
+		recipient->isPlayerActive() && donor->getDefaultTeam() && recipient->getDefaultTeam() &&
+		donor->getRelationship(recipient->getDefaultTeam()) == ALLIES &&
+		recipient->getRelationship(donor->getDefaultTeam()) == ALLIES;
+}
+
+static GameWindow *createMoneyButton(GameWindow *parent, const char *name,
+	Int x, Int y, Int width, Int height, GameFont *font, const WideChar *text)
+{
+	WinInstanceData data;
+	data.m_id = NAMEKEY(name);
+	data.m_style = GWS_PUSH_BUTTON | GWS_MOUSE_TRACK;
+	GameWindow *button = TheWindowManager->gogoGadgetPushButton(parent,
+		WIN_STATUS_ENABLED | WIN_STATUS_NO_FOCUS, x, y, width, height, &data, font, TRUE);
+	if (button)
+	{
+		button->winSetOwner(theWindow);
+		GadgetButtonSetText(button, UnicodeString(text));
+	}
+	return button;
+}
+
+static void createMoneyControls()
+{
+	if (moneyAmountSlider || !winInGame || !theWindow)
+		return;
+	GameWindow *hide = TheWindowManager->winGetWindowFromId(theWindow, NAMEKEY("Diplomacy.wnd:ButtonHide"));
+	if (!hide)
+		return;
+	Int hideX, hideY, hideWidth, hideHeight;
+	hide->winGetPosition(&hideX, &hideY);
+	hide->winGetSize(&hideWidth, &hideHeight);
+	GameFont *font = staticTextSide[0] ? staticTextSide[0]->winGetInstanceData()->getFont() :
+		hide->winGetInstanceData()->getFont();
+	// Anchor to the installed layout's footer, retaining its resolution scaling.
+	const Int left = hideX / 32;
+	const Int usableWidth = hideX - left * 2;
+	if (usableWidth < 200 || hideHeight < 12)
+		return;
+	const Int labelWidth = usableWidth * 2 / 5;
+	const Int buttonWidth = usableWidth / 16;
+	const Int sliderWidth = usableWidth - labelWidth - 2 * buttonWidth - left * 3;
+	WinInstanceData data;
+	data.m_id = NAMEKEY("Diplomacy.wnd:AlliedMoneyAmountLabel");
+	data.m_style = GWS_STATIC_TEXT;
+	TextData textData;
+	memset(&textData, 0, sizeof(textData));
+	textData.centeredVertically = TRUE;
+	moneyAmountLabel = TheWindowManager->gogoGadgetStaticText(theWindow, WIN_STATUS_ENABLED,
+		left, hideY, labelWidth, hideHeight, &data, &textData, font, TRUE);
+	moneyAmountLess = createMoneyButton(theWindow, "Diplomacy.wnd:AlliedMoneyLess",
+		left + labelWidth, hideY, buttonWidth, hideHeight, font, L"-");
+	data.init();
+	data.m_id = NAMEKEY("Diplomacy.wnd:AlliedMoneySlider");
+	data.m_style = GWS_HORZ_SLIDER | GWS_MOUSE_TRACK;
+	SliderData sliderData;
+	memset(&sliderData, 0, sizeof(sliderData));
+	sliderData.minVal = 1;
+	sliderData.maxVal = AlliedMoneyTransfer::MAX_HUMAN_AMOUNT / AlliedMoneyTransfer::HUMAN_AMOUNT_STEP;
+	moneyAmountSlider = TheWindowManager->gogoGadgetSlider(theWindow, WIN_STATUS_ENABLED,
+		left * 2 + labelWidth + buttonWidth, hideY, sliderWidth, hideHeight,
+		&data, &sliderData, font, TRUE);
+	if (moneyAmountSlider)
+		moneyAmountSlider->winSetOwner(theWindow);
+	moneyAmountMore = createMoneyButton(theWindow, "Diplomacy.wnd:AlliedMoneyMore",
+		left * 3 + labelWidth + buttonWidth + sliderWidth, hideY,
+		buttonWidth, hideHeight, font, L"+");
+	for (Int row = 0; row < MAX_SLOTS; ++row)
+	{
+		if (!staticTextSide[row])
+			continue;
+		Int x, y, width, height;
+		staticTextSide[row]->winGetPosition(&x, &y);
+		staticTextSide[row]->winGetSize(&width, &height);
+		const Int giveWidth = width / 4;
+		const Int gap = width / 32;
+		AsciiString name;
+		name.format("Diplomacy.wnd:GiveMoney%d", row);
+		buttonGiveMoney[row] = createMoneyButton(winInGame, name.str(),
+			x + width - giveWidth, y, giveWidth, height,
+			staticTextSide[row]->winGetInstanceData()->getFont(), L"Give");
+		if (buttonGiveMoney[row])
+			staticTextSide[row]->winSetSize(width - giveWidth - gap, height);
+	}
+}
+
+static void updateMoneyControls()
+{
+	const Bool visible = canShowMoneyControls() && winInGame && !winInGame->winIsHidden();
+	Player *donor = ThePlayerList ? ThePlayerList->getLocalPlayer() : nullptr;
+	const UnsignedInt availableCash = donor ? donor->getMoney()->countMoney() : 0;
+	UnsignedInt maxAmount = availableCash;
+	if (maxAmount > AlliedMoneyTransfer::MAX_HUMAN_AMOUNT)
+		maxAmount = AlliedMoneyTransfer::MAX_HUMAN_AMOUNT;
+	maxAmount -= maxAmount % AlliedMoneyTransfer::HUMAN_AMOUNT_STEP;
+	if (maxAmount >= AlliedMoneyTransfer::MIN_HUMAN_AMOUNT)
+	{
+		if (selectedMoneyAmount > static_cast<Int>(maxAmount))
+			selectedMoneyAmount = static_cast<Int>(maxAmount);
+		if (selectedMoneyAmount < AlliedMoneyTransfer::MIN_HUMAN_AMOUNT)
+			selectedMoneyAmount = AlliedMoneyTransfer::MIN_HUMAN_AMOUNT;
+	}
+	GameWindow *controls[] = {moneyAmountLabel, moneyAmountSlider, moneyAmountLess, moneyAmountMore};
+	for (Int control = 0; control < 4; ++control)
+		if (controls[control])
+			controls[control]->winHide(!visible);
+	const Bool donorEnabled = visible && donor && donor->isPlayerActive() && maxAmount >= 100;
+	if (moneyAmountSlider)
+	{
+		Int sliderMax = static_cast<Int>(maxAmount / AlliedMoneyTransfer::HUMAN_AMOUNT_STEP);
+		// A two-position disabled slider avoids the gadget's division by zero at a single value.
+		if (sliderMax < 2)
+			sliderMax = 2;
+		Int oldMin, oldMax;
+		GadgetSliderGetMinMax(moneyAmountSlider, &oldMin, &oldMax);
+		if (oldMax != sliderMax)
+			TheWindowManager->winSendSystemMsg(moneyAmountSlider, GSM_SET_MIN_MAX, 1, sliderMax);
+		GadgetSliderSetPosition(moneyAmountSlider, maxAmount >= AlliedMoneyTransfer::MIN_HUMAN_AMOUNT ?
+			selectedMoneyAmount / AlliedMoneyTransfer::HUMAN_AMOUNT_STEP : 1);
+		moneyAmountSlider->winEnable(donorEnabled && maxAmount > 100);
+	}
+	if (moneyAmountLess)
+		moneyAmountLess->winEnable(donorEnabled && selectedMoneyAmount > 100);
+	if (moneyAmountMore)
+		moneyAmountMore->winEnable(donorEnabled && selectedMoneyAmount < static_cast<Int>(maxAmount));
+	if (moneyAmountLabel)
+	{
+		UnicodeString label;
+		if (maxAmount < AlliedMoneyTransfer::MIN_HUMAN_AMOUNT)
+			label.format(L"Need at least $100 (cash $%u)", availableCash);
+		else
+			label.format(L"Give $%d (max $%u)", selectedMoneyAmount, maxAmount);
+		GadgetStaticTextSetText(moneyAmountLabel, label);
+	}
+	for (Int row = 0; row < MAX_SLOTS; ++row)
+	{
+		if (!buttonGiveMoney[row])
+			continue;
+		Player *recipient = slotNumInRow[row] >= 0 ?
+			ThePlayerList->getPlayerFromSlotIndex(slotNumInRow[row]) : nullptr;
+		const Bool eligible = visible && isEligibleMoneyRecipient(donor, recipient);
+		buttonGiveMoney[row]->winHide(!eligible);
+		buttonGiveMoney[row]->winEnable(eligible && donorEnabled &&
+			AlliedMoneyTransfer::CanTransfer(selectedMoneyAmount, donor->getMoney()->countMoney(),
+				recipient->getMoney()->countMoney(), TRUE, TRUE, TRUE, TRUE));
+	}
+}
+
+static void resetMoneyControls()
+{
+	for (Int row = 0; row < MAX_SLOTS; ++row)
+		buttonGiveMoney[row] = nullptr;
+	moneyAmountSlider = nullptr;
+	moneyAmountLabel = nullptr;
+	moneyAmountLess = nullptr;
+	moneyAmountMore = nullptr;
+	selectedMoneyAmount = 1000;
+}
+#endif
 static void grabWindowPointers()
 {
 	for (Int i=0; i<MAX_SLOTS; ++i)
@@ -142,6 +325,10 @@ static void releaseWindowPointers()
 
 static void updateFunc( WindowLayout *layout, void *param )
 {
+#if defined(RTS_ZEROHOUR)
+	if (theWindow && !theWindow->winIsHidden())
+		updateMoneyControls();
+#endif
 	if (theAnimateWindowManager && TheGlobalData->m_animateWindows)
 	{
 		Bool wasFinished = theAnimateWindowManager->isFinished();
@@ -245,7 +432,11 @@ void ShowDiplomacy( Bool immediate )
 	radioButtonInGame->winHide(TRUE);
 	radioButtonBuddies->winHide(TRUE);
 	GadgetRadioSetSelection(radioButtonInGame, FALSE);
-	if (TheRecorder->isMultiplayer())
+	if (TheRecorder->isMultiplayer()
+#if defined(RTS_ZEROHOUR)
+		|| TheGameLogic->isInSkirmishGame()
+#endif
+		)
 	{
 		winInGame->winHide(FALSE);
 		winBuddies->winHide(TRUE);
@@ -265,6 +456,10 @@ void ShowDiplomacy( Bool immediate )
 	TheInGameUI->registerWindowLayout(theLayout);
 	grabWindowPointers();
 	PopulateInGameDiplomacyPopup();
+#if defined(RTS_ZEROHOUR)
+	createMoneyControls();
+	updateMoneyControls();
+#endif
 
 	if(TheGameSpyInfo && TheGameSpyInfo->getLocalProfileID() != 0)
 	{
@@ -281,6 +476,9 @@ void ShowDiplomacy( Bool immediate )
 // ------------------------------------------------------------------------------------------------
 void ResetDiplomacy()
 {
+#if defined(RTS_ZEROHOUR)
+	resetMoneyControls();
+#endif
 	if(theLayout)
 	{
 		TheInGameUI->unregisterWindowLayout(theLayout);
@@ -385,6 +583,20 @@ WindowMsgHandledType DiplomacySystem( GameWindow *window, UnsignedInt msg,
 	}
 	switch( msg )
 	{
+#if defined(RTS_ZEROHOUR)
+		case GSM_SLIDER_TRACK:
+		case GSM_SLIDER_DONE:
+		{
+			if (moneyAmountSlider && WindowMsgDataToPointer(mData1) == moneyAmountSlider)
+			{
+				selectedMoneyAmount = GadgetSliderGetPosition(moneyAmountSlider) *
+					AlliedMoneyTransfer::HUMAN_AMOUNT_STEP;
+				updateMoneyControls();
+				return MSG_HANDLED;
+			}
+			break;
+		}
+#endif
 		//---------------------------------------------------------------------------------------------
 		case GGM_FOCUS_CHANGE:
 		{
@@ -408,6 +620,37 @@ WindowMsgHandledType DiplomacySystem( GameWindow *window, UnsignedInt msg,
 		case GBM_SELECTED:
 		{
 			GameWindow *control = static_cast<GameWindow *>(WindowMsgDataToPointer(mData1));
+#if defined(RTS_ZEROHOUR)
+			if (control && (control == moneyAmountLess || control == moneyAmountMore))
+			{
+				selectedMoneyAmount += control == moneyAmountLess ?
+					-AlliedMoneyTransfer::HUMAN_AMOUNT_STEP : AlliedMoneyTransfer::HUMAN_AMOUNT_STEP;
+				updateMoneyControls();
+				return MSG_HANDLED;
+			}
+			for (Int row = 0; row < MAX_SLOTS; ++row)
+			{
+				if (!control || control != buttonGiveMoney[row])
+					continue;
+				Player *donor = ThePlayerList->getLocalPlayer();
+				Player *recipient = slotNumInRow[row] >= 0 ?
+					ThePlayerList->getPlayerFromSlotIndex(slotNumInRow[row]) : nullptr;
+				if (!canShowMoneyControls() || !isEligibleMoneyRecipient(donor, recipient) ||
+					!AlliedMoneyTransfer::IsHumanAmountValid(selectedMoneyAmount) ||
+					!AlliedMoneyTransfer::CanTransfer(selectedMoneyAmount, donor->getMoney()->countMoney(),
+						recipient->getMoney()->countMoney(), TRUE, TRUE, TRUE, TRUE))
+				{
+					TheInGameUI->message(UnicodeString(L"Cannot give money. Check your cash and the ally's status."));
+					return MSG_HANDLED;
+				}
+				GameMessage *command = TheMessageStream->appendMessage(GameMessage::MSG_TRANSFER_MONEY_TO_ALLY);
+				command->appendIntegerArgument(recipient->getPlayerIndex());
+				command->appendIntegerArgument(selectedMoneyAmount);
+				TheInGameUI->message(UnicodeString(L"Queued $%d for %ls."),
+					selectedMoneyAmount, recipient->getPlayerDisplayName().str());
+				return MSG_HANDLED;
+			}
+#endif
 			NameKeyType controlID = (NameKeyType)control->winGetWindowId();
 			static NameKeyType buttonHideID = NAMEKEY( "Diplomacy.wnd:ButtonHide" );
 			if (controlID == buttonHideID)
