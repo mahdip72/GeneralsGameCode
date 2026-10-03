@@ -130,7 +130,9 @@ struct AlliedFixtureState
 	ObjectID cancellationMembers[2];
 	UnsignedInt cancellationTeams[2];
 	Coord3D cancellationPositions[2];
-	Bool cancellationResumed[2];
+	Bool cancellationOrdinaryQualified[2];
+	Bool cancellationPendingAtSave[2];
+	Bool cancellationPendingAfterLoad[2];
 	ObjectID cancellationTarget;
 	UnsignedInt cancellationRelease;
 	AlliedFixtureState() : active(FALSE), fixtureCase(-1), startFrame(0),
@@ -154,7 +156,9 @@ struct AlliedFixtureState
 			cancellationSlots[participant] = -1;
 			cancellationMembers[participant] = INVALID_ID;
 			cancellationTeams[participant] = 0;
-			cancellationResumed[participant] = FALSE;
+			cancellationOrdinaryQualified[participant] = FALSE;
+			cancellationPendingAtSave[participant] = FALSE;
+			cancellationPendingAfterLoad[participant] = FALSE;
 		}
 	}
 };
@@ -6870,6 +6874,9 @@ Bool RoundTripAlliedFixture()
 	if (!s_allied.cancellationIssued ||
 		(!before[s_allied.cancellationSlots[0] - 1].strategyResumePending &&
 		 !before[s_allied.cancellationSlots[1] - 1].strategyResumePending)) return FALSE;
+	for (Int participant = 0; participant < 2; ++participant)
+		s_allied.cancellationPendingAtSave[participant] =
+			before[s_allied.cancellationSlots[participant] - 1].strategyResumePending;
 	AsciiString filename;
 	filename.format("SkirmishAIAllied_%s.sav", s_runner.runNonce);
 	UnicodeString description;
@@ -6902,14 +6909,25 @@ Bool RoundTripAlliedFixture()
 		if (before[slot - 1].assaultActive &&
 			!TheGameLogic->findObjectByID(before[slot - 1].targetID)) return FALSE;
 	}
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		AISkirmishPlayer *rebound = GetAlliedFixtureAI(s_allied.cancellationSlots[participant]);
+		if (!rebound) return FALSE;
+		s_allied.cancellationPendingAfterLoad[participant] =
+			rebound->getAlliedCoordinationDiagnostics().strategyResumePending;
+		if (s_allied.cancellationPendingAfterLoad[participant] !=
+			s_allied.cancellationPendingAtSave[participant]) return FALSE;
+	}
 	++s_allied.checks;
 	s_allied.postLoadEvaluation = TheAI->getNextAlliedEvaluationFrame();
 	s_allied.postLoadBlockedEvaluations = 0;
 	printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_ASSERT frame=%u file=%s "
 		"player_slots=7 central_cadence=preserved commitments=preserved support_ids=preserved "
 		"cooldown_until=%u remaining_frames=%u strategy_resume_pending=preserved_nonzero "
-		"post_load_protection=pending\n",
-		frame, saved.filename.str(), s_allied.aidCooldownUntil, s_allied.aidCooldownUntil - frame);
+		"pending_at_save=%d,%d pending_after_load=%d,%d post_load_protection=pending\n",
+		frame, saved.filename.str(), s_allied.aidCooldownUntil, s_allied.aidCooldownUntil - frame,
+		s_allied.cancellationPendingAtSave[0], s_allied.cancellationPendingAtSave[1],
+		s_allied.cancellationPendingAfterLoad[0], s_allied.cancellationPendingAfterLoad[1]);
 	fflush(stdout);
 	return TRUE;
 }
@@ -7061,7 +7079,12 @@ void ObserveAlliedCancellationResume(UnsignedInt frame)
 		bothCanceled = bothCanceled && !state.assaultActive;
 		anyPending = anyPending || state.strategyResumePending;
 		if (!s_allied.cancellationSaved || state.assaultActive || state.strategyResumePending ||
-			s_allied.cancellationResumed[participant]) continue;
+			s_allied.cancellationOrdinaryQualified[participant]) continue;
+		// Only an owner saved and rebound with pending=true can qualify a
+		// pending-to-clear transition. Other owners qualify ordinary state only.
+		if (s_allied.cancellationPendingAtSave[participant] &&
+			!s_allied.cancellationPendingAfterLoad[participant])
+		{ FailSkirmishAITest("allied_cancellation_pending_transition_unproven"); RequestSkirmishAITestStop(); return; }
 		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(player->getPlayerIndex());
 		const UnsignedInt attacked = player->getAttackedFrame();
 		if (!facts || !facts->valid || !facts->alive || facts->immediateThreat >= 60 ||
@@ -7090,11 +7113,16 @@ void ObserveAlliedCancellationResume(UnsignedInt frame)
 				AlliedFixtureDistanceSquared(*member->getPosition(), s_allied.cancellationPositions[participant]) >= 25.0f * 25.0f;
 		}
 		if (!ordinaryOrder) continue;
-		s_allied.cancellationResumed[participant] = TRUE;
+		s_allied.cancellationOrdinaryQualified[participant] = TRUE;
 		++s_allied.checks;
-		printf("SKIRMISH_AI_ALLIED_CANCELLATION_RESUME_ASSERT frame=%u slot=%d member=%u "
-			"mode=%d pending=0 surviving_held_member=1 safe_ordinary_order=1\n", frame,
-			slot, s_allied.cancellationMembers[participant], static_cast<Int>(mode));
+		printf("%s frame=%u slot=%d member=%u mode=%d pending_at_save=%d pending=0 "
+			"transition=%s surviving_held_member=1 safe_ordinary_order=1\n",
+			s_allied.cancellationPendingAtSave[participant] ?
+				"SKIRMISH_AI_ALLIED_CANCELLATION_RESUME_ASSERT" :
+				"SKIRMISH_AI_ALLIED_CANCELLATION_ORDINARY_STATE_ASSERT",
+			frame, slot, s_allied.cancellationMembers[participant], static_cast<Int>(mode),
+			s_allied.cancellationPendingAtSave[participant],
+			s_allied.cancellationPendingAtSave[participant] ? "pending_to_clear" : "not_claimed");
 		fflush(stdout);
 	}
 	if (!s_allied.cancellationSaved)
@@ -7117,7 +7145,7 @@ void ObserveAlliedCancellationResume(UnsignedInt frame)
 		fflush(stdout);
 		return;
 	}
-	if (s_allied.cancellationResumed[0] && s_allied.cancellationResumed[1] &&
+	if (s_allied.cancellationOrdinaryQualified[0] && s_allied.cancellationOrdinaryQualified[1] &&
 		s_allied.postLoadProtectionVerified)
 	{
 		s_runner.endFrame = frame;
