@@ -26,7 +26,7 @@ int s_failures = 0;
 		} \
 	} while (0)
 
-static void InitializeFacts(SkirmishAIAlliedPlayerFactsfacts[16])
+static void InitializeFacts(SkirmishAIAlliedPlayerFacts facts[16])
 {
 	memset(facts, 0, sizeof(SkirmishAIAlliedPlayerFacts) * 16);
 	for (Int i = 0; i < 16; ++i)
@@ -62,7 +62,7 @@ static void MakeStarving(SkirmishAIAlliedPlayerFacts *fact)
 	fact->recoverable = TRUE;
 }
 
-static void AddMutualAlliance(SkirmishAIAlliedPlayerFactsfacts[16], Int first, Int second)
+static void AddMutualAlliance(SkirmishAIAlliedPlayerFacts facts[16], Int first, Int second)
 {
 	facts[first].alliedMask |= ((UnsignedInt)1U << second);
 	facts[second].alliedMask |= ((UnsignedInt)1U << first);
@@ -96,7 +96,7 @@ static Bool SameDecision(const SkirmishAIAlliedDecision& left,
 
 static void TestPlayerZeroAndStarvationLifecycle()
 {
-	SkirmishAIAlliedPlayerFactsfacts[16];
+	SkirmishAIAlliedPlayerFacts facts[16];
 	InitializeFacts(facts);
 	MakeLive(&facts[0], 0, FALSE);
 	MakeStarving(&facts[0]);
@@ -172,7 +172,7 @@ static void TestPlayerZeroAndStarvationLifecycle()
 
 static void TestHumanStarvationCashBoundary()
 {
-	SkirmishAIAlliedPlayerFactsfacts[16];
+	SkirmishAIAlliedPlayerFacts facts[16];
 	InitializeFacts(facts);
 	MakeLive(&facts[0], 0, FALSE);
 	MakeStarving(&facts[0]);
@@ -218,7 +218,7 @@ static void TestHumanStarvationCashBoundary()
 
 static void TestDonationBoundariesAndDeterministicPair()
 {
-	SkirmishAIAlliedPlayerFactsfacts[16];
+	SkirmishAIAlliedPlayerFacts facts[16];
 	InitializeFacts(facts);
 	MakeLive(&facts[0], 0, FALSE);
 	MakeStarving(&facts[0]);
@@ -303,7 +303,7 @@ static void TestDonationBoundariesAndDeterministicPair()
 
 static void TestAssaultCohortDeterminismAndDeclines()
 {
-	SkirmishAIAlliedPlayerFactsfacts[16];
+	SkirmishAIAlliedPlayerFacts facts[16];
 	InitializeFacts(facts);
 	for (Int i = 0; i <= 4; ++i)
 		MakeLive(&facts[i], i, i < 3);
@@ -397,7 +397,7 @@ static void TestAssaultCohortDeterminismAndDeclines()
 
 static void TestSupportSelectionAndMoneyRules()
 {
-	SkirmishAIAlliedPlayerFactsfacts[16];
+	SkirmishAIAlliedPlayerFacts facts[16];
 	InitializeFacts(facts);
 	MakeLive(&facts[0], 0, TRUE);
 	facts[0].immediateThreat = 49;
