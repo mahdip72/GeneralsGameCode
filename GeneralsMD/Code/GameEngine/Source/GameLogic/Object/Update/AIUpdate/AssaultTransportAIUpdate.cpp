@@ -82,6 +82,11 @@ AssaultTransportAIUpdate::~AssaultTransportAIUpdate()
 //-------------------------------------------------------------------------------------------------
 void AssaultTransportAIUpdate::aiDoCommand(const AICommandParms* parms)
 {
+	// Rejected scripts must not become deferred CMD_FROM_AI attacks in update().
+	// Apply only the new allied gate here, preserving legacy permission ordering.
+	if (isAlliedScriptCommandHeld(parms))
+		return;
+
 	//Inspect the command and reset everything when necessary.
 	if( parms->m_cmdSource != CMD_FROM_AI )
 	{
