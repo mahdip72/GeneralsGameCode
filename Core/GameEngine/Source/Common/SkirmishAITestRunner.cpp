@@ -4218,9 +4218,9 @@ Bool StartSkirmishAITestRunner()
 	InitRandom(static_cast<UnsignedInt>(plan.seed));
 
 #if defined(_WIN64)
-	if (!s_recovery.active && !s_allied.active &&
+	if (!s_recovery.active &&
 		!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) &&
-		!s_performanceReceiptAttempted)
+		!s_allied.active && !s_performanceReceiptAttempted)
 	{
 		s_performanceReceiptAttempted = true;
 		s_performanceReceipt.reset(new PerformanceReceiptRuntime);
