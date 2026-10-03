@@ -947,6 +947,13 @@ void AI::updateAlliedCoordination()
 	AISkirmishPlayer *owners[SKIRMISH_AI_ALLIED_MAX_PLAYERS];
 	memset(captured, 0, sizeof(captured));
 	memset(owners, 0, sizeof(owners));
+	// Empty roster slots still need unique identities: the policy rejects
+	// duplicate indices before testing validity, including absent players.
+	for (Int slot = 0; slot < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++slot) {
+		captured[slot].playerIndex = slot;
+		captured[slot].targetEnemyIndex = -1;
+		captured[slot].targetObjectID = INVALID_ID;
+	}
 	// Actual player indices, never pointer order, name, or a local UI player.
 	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
 		Player *player = ThePlayerList->getNthPlayer(i);
