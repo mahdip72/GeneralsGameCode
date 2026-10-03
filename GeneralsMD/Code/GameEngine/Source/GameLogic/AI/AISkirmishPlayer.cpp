@@ -8659,6 +8659,8 @@ void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
 		m_alliedSupportTeamIDs.push_back(team->getID());
 		budget -= value;
 	}
+	// Admission rotates, but persisted IDs and later command order stay canonical.
+	std::sort(m_alliedSupportTeamIDs.begin(), m_alliedSupportTeamIDs.end());
 	if (!m_alliedSupportTeamIDs.empty()) {
 		m_alliedSupportRecipientIndex = recipientIndex;
 		m_alliedSupportReturning = false;
