@@ -34,6 +34,7 @@
 #include "Common/GameType.h"
 #include "GameLogic/Damage.h"
 #include "Common/STLTypedefs.h"
+#include "GameLogic/SkirmishAIAlliedCoordination.h"
 
 class AIGroup;
 class AttackPriorityInfo;
@@ -251,6 +252,16 @@ public:
 	virtual void init() override;						///< initialize AI to default values
 	virtual void reset() override;						///< reset the AI system to prepare for a new map
 	virtual void update() override;					///< do one frame of AI computation
+	const SkirmishAIAlliedPlayerFacts *getAlliedPlayerFacts(Int playerIndex) const;
+	Bool hasAlliedEvaluation() const { return m_alliedEvaluationScheduled; }
+	UnsignedInt getNextAlliedEvaluationFrame() const { return m_nextAlliedEvaluationFrame; }
+	Int getAlliedStarvationStreak(Int index) const {
+		return index >= 0 && index < SKIRMISH_AI_ALLIED_MAX_PLAYERS ? m_alliedStarvationStreaks[index] : 0;
+	}
+	UnsignedInt getAlliedRecipientReliefUntil(Int index) const {
+		return index >= 0 && index < SKIRMISH_AI_ALLIED_MAX_PLAYERS &&
+			m_alliedRecipientCooldownActive[index] ? m_alliedRecipientReliefUntil[index] : 0;
+	}
 
 	Pathfinder *pathfinder() { return m_pathfinder; }	///< public access to the pathfind system
 	enum
@@ -298,6 +309,15 @@ public:
 	UnsignedInt getNextGroupID() { return ++m_nextGroupID; }
 
 protected:
+	void resetAlliedCoordination();
+	void updateAlliedCoordination();
+	void xferAlliedCoordination(Xfer *xfer);
+	Bool m_alliedEvaluationScheduled;
+	UnsignedInt m_nextAlliedEvaluationFrame;
+	Int m_alliedStarvationStreaks[SKIRMISH_AI_ALLIED_MAX_PLAYERS];
+	Bool m_alliedRecipientCooldownActive[SKIRMISH_AI_ALLIED_MAX_PLAYERS];
+	UnsignedInt m_alliedRecipientReliefUntil[SKIRMISH_AI_ALLIED_MAX_PLAYERS];
+	SkirmishAIAlliedPlayerFacts m_alliedPlayerFacts[SKIRMISH_AI_ALLIED_MAX_PLAYERS];
 	Pathfinder *m_pathfinder;							///< the pathfinding system
 	std::list<AIGroup *> m_groupList;			///< the list of AIGroups
 	TAiData *m_aiData;

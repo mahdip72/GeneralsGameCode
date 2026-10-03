@@ -38,6 +38,7 @@
 #include "Lib/DeterministicAIPlanning.h"
 #endif
 #include "GameLogic/SkirmishAIStrategy.h"
+#include "GameLogic/SkirmishAIAlliedCoordination.h"
 #include "GameLogic/SkirmishAITunnelRoute.h"
 
 class BuildListInfo;
@@ -86,6 +87,31 @@ public:	// AIPlayer interface methods.
 
 	virtual Bool isSkirmishAI() override {return true;}
 	Bool usesCriticalRecoveryBehavior() const;
+	Bool usesAlliedCoordinationBehavior() const;
+	static void captureAlliedPlayerFacts(Player *player,
+		SkirmishAIAlliedPlayerFacts *facts);
+	void commitAlliedCoordination(const SkirmishAIAlliedDecision &decision,
+		UnsignedInt now);
+	Bool donateToAlly(Int recipientIndex, Int amount);
+	void notifyReceivedAlliedMoney(UnsignedInt currentFrame);
+	struct AlliedCoordinationDiagnostics {
+		Bool assaultActive;
+		Bool assaultLaunched;
+		Int leaderIndex;
+		Int enemyIndex;
+		ObjectID targetID;
+		UnsignedInt assaultFrame;
+		UnsignedInt assaultExpiryFrame;
+		Int supportRecipientIndex;
+		Int supportTeamCount;
+		Bool supportReturning;
+		Bool donationCooldownActive;
+		UnsignedInt nextDonationFrame;
+		Bool receiptCooldownActive;
+		UnsignedInt mayDonateFrame;
+	};
+	AlliedCoordinationDiagnostics getAlliedCoordinationDiagnostics() const;
+	UnsignedInt getAlliedSupportTeamID(Int index) const;
 	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing,
 		Bool isUpgrade, Bool refreshProductionReserve);
 
@@ -250,6 +276,16 @@ protected:
 	void updateTunnelTransit(Team *team, TacticalTeamState &state,
 		UnsignedInt now);
 	void updateDefensePatrol();
+	void resetAlliedCoordination();
+	void updateAlliedAssignments();
+	void recallAlliedSupport();
+	void dispatchAlliedSupport(Int recipientIndex, Int budget);
+	Bool isAlliedSupportTeam(UnsignedInt teamID) const;
+	Bool isAlliedAssaultHolding() const;
+	Bool resolveAlliedAssaultTarget(Object **target) const;
+	Player *getPinnedAlliedEnemy() const;
+	void clearAlliedAssault();
+	void xferAlliedCoordination(Xfer *xfer);
 	const ThingTemplate *findTunnelContainBuildTemplate() const;
 	Bool isTunnelBuildBuilderAvailable(Object *builder) const;
 	Bool validatePendingTunnelBuild(BuildListInfo *info,
@@ -423,6 +459,25 @@ protected:
 	UnsignedInt m_frameToCheckEnemy;
 	Player			*m_currentEnemy;
 	Int m_currentEnemyPlayerIndex;
+	Bool m_alliedAssaultActive;
+	Bool m_alliedAssaultLaunched;
+	Int m_alliedLeaderIndex;
+	Int m_alliedEnemyIndex;
+	ObjectID m_alliedTargetID;
+	UnsignedInt m_alliedAssaultFrame;
+	UnsignedInt m_alliedAssaultExpiryFrame;
+	UnsignedInt m_alliedNextHoldFrame;
+	Bool m_alliedReceiptCooldownActive;
+	UnsignedInt m_alliedMayDonateFrame;
+	Int m_alliedSupportRecipientIndex;
+	Bool m_alliedSupportReturning;
+	UnsignedInt m_alliedNextSupportFrame;
+	std::vector<UnsignedInt> m_alliedSupportTeamIDs;
+	// Only consumed during the same owner frame as the immutable roster capture.
+	Bool m_alliedCapturedStrategyAvailable;
+	UnsignedInt m_alliedCapturedStrategyFrame;
+	SkirmishStrategyMetrics m_alliedCapturedStrategyMetrics;
+	ObjectID m_alliedCapturedStrategyTargetID;
 	SkirmishStrategyState m_strategyState;
 	Bool m_strategyTargetFallbackPending;
 	ObjectID m_strategyTargetFallbackAfterID;

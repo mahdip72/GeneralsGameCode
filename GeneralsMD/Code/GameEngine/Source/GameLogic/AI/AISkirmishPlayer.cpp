@@ -1910,6 +1910,7 @@ m_curRightFlankRightDefenseAngle(0),
 	m_defenseQuietPatrolWaypoint.zero();
 	InitializeSkirmishStrategyState(
 		&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
+	resetAlliedCoordination();
 	p->setCanBuildUnits(true); // turn on ai production by default.
 }
 
@@ -6619,6 +6620,9 @@ static Bool ShouldUseCounterBasedSkirmishAIPlanning()
 #if defined(_WIN64)
 Bool AISkirmishPlayer::isEnemyPlanningDue() const
 {
+	// A live shared plan owns enemy identity. Avoid staging a different native
+	// result and then changing it after its reference receipt was committed.
+	if (getPinnedAlliedEnemy()) return false;
 	Bool currentEnemyInvalid = m_currentEnemy &&
 		(m_player->getRelationship(m_currentEnemy->getDefaultTeam()) != ENEMIES ||
 		 !(usesProductionBehavior()
@@ -7435,6 +7439,76 @@ Bool AISkirmishPlayer::usesStrategyBehavior() const
 			SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 }
 
+Bool AISkirmishPlayer::usesAlliedCoordinationBehavior() const
+{
+	return usesStrategyBehavior() &&
+		ShouldUseSkirmishAIAlliedCoordinationBehavior(
+			TheGameLogic->isInReplayGame(), TheRecorder ?
+			TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+}
+
+void AISkirmishPlayer::resetAlliedCoordination()
+{
+	m_alliedAssaultActive = false;
+	m_alliedAssaultLaunched = false;
+	m_alliedLeaderIndex = -1;
+	m_alliedEnemyIndex = -1;
+	m_alliedTargetID = INVALID_ID;
+	m_alliedAssaultFrame = 0;
+	m_alliedAssaultExpiryFrame = 0;
+	m_alliedNextHoldFrame = 0;
+	m_alliedReceiptCooldownActive = false;
+	m_alliedMayDonateFrame = 0;
+	m_alliedSupportRecipientIndex = -1;
+	m_alliedSupportReturning = false;
+	m_alliedNextSupportFrame = 0;
+	m_alliedSupportTeamIDs.clear();
+	m_alliedCapturedStrategyAvailable = false;
+	m_alliedCapturedStrategyFrame = 0;
+	m_alliedCapturedStrategyTargetID = INVALID_ID;
+}
+
+void AISkirmishPlayer::notifyReceivedAlliedMoney(UnsignedInt currentFrame)
+{
+	if (!usesAlliedCoordinationBehavior())
+		return;
+	m_alliedReceiptCooldownActive = true;
+	m_alliedMayDonateFrame = currentFrame + 120 * LOGICFRAMES_PER_SECOND;
+}
+
+Bool AISkirmishPlayer::donateToAlly(Int recipientIndex, Int amount)
+{
+	if (!usesAlliedCoordinationBehavior() || amount < 500 || !TheAI)
+		return false;
+	const UnsignedInt now = TheGameLogic->getFrame();
+	const SkirmishAIAlliedPlayerFacts *facts =
+		TheAI->getAlliedPlayerFacts(m_player->getPlayerIndex());
+	if (!facts || facts->economyHealth < 75 || facts->baseIntegrity < 80 ||
+		facts->immediateThreat > 40 ||
+		(m_alliedReceiptCooldownActive &&
+		 !IsSkirmishStrategyFrameReached(now, m_alliedMayDonateFrame)) ||
+		(m_strategyState.donationCooldownActive &&
+		 !IsSkirmishStrategyFrameReached(now, m_strategyState.nextDonationFrame)))
+		return false;
+	// A reserve is a protected balance, not a sum of mutually exclusive plans.
+	// Refresh after captures so the current recovery/build commitments win.
+	refreshStrategyProductionReserve();
+	Int reserve = m_strategyProductionReserveCost;
+	const Int recovery = getActiveRecoveryReserveCost();
+	const Int rebuild = getCriticalRebuildReserve(0);
+	if (recovery > reserve) reserve = recovery;
+	if (rebuild > reserve) reserve = rebuild;
+	if (facts->protectedReserve > reserve) reserve = facts->protectedReserve;
+	const Int cash = m_player->getMoney()->countMoney();
+	Int available = cash > reserve ? cash - reserve : 0;
+	if (cash / 5 < available) available = cash / 5;
+	if (amount > available || !m_player->transferMoneyToAlly(recipientIndex, amount))
+		return false;
+	m_strategyState.donationCooldownActive = true;
+	m_strategyState.nextDonationFrame = now + 120 * LOGICFRAMES_PER_SECOND;
+	return true;
+}
+
 void AISkirmishPlayer::collectStrategyMetrics(
 	SkirmishStrategyMetrics *metrics, ObjectID *strategicTargetID)
 {
@@ -7913,6 +7987,651 @@ void AISkirmishPlayer::collectStrategyMetrics(
 	metrics->hasStrategicTarget = preserveHiddenTarget || routeAvailable;
 	if (routeAvailable)
 		*strategicTargetID = selectedTarget->getID();
+}
+
+static Bool HasSkirmishAlliedSupplySource(Player *player,
+	const Coord3D *position, Real centerRadius)
+{
+	if (!player || !position || !ThePartitionManager) return false;
+	PartitionFilterAcceptByKindOf supply(MAKE_KINDOF_MASK(KINDOF_SUPPLY_SOURCE),
+		KINDOFMASK_NONE);
+	PartitionFilterPlayerAffiliation affiliation(player,
+		ALLOW_ALLIES | ALLOW_NEUTRAL, true);
+	PartitionFilterAlive alive;
+	PartitionFilterOnMap onMap;
+	PartitionFilter *filters[] = { &supply, &affiliation, &alive, &onMap, 0 };
+	ObjectIterator *iter = ThePartitionManager->iterateObjectsInRange(position,
+		20 * PATHFIND_CELL_SIZE_F + centerRadius, FROM_BOUNDINGSPHERE_2D, filters);
+	MemoryPoolObjectHolder hold(iter);
+	static const NameKeyType warehouseKey = NAMEKEY("SupplyWarehouseDockUpdate");
+	for (Object *source = iter->first(); source; source = iter->next()) {
+		SupplyWarehouseDockUpdate *warehouse =
+			(SupplyWarehouseDockUpdate *)source->findUpdateModule(warehouseKey);
+		if (warehouse && warehouse->getBoxesStored() > 0) return true;
+	}
+	return false;
+}
+
+static Bool HasSkirmishAlliedRecoveryRoute(Player *player,
+	Bool missingIncome, Bool missingProduction)
+{
+	// Cash alone cannot resurrect an eliminated player. Require a live builder
+	// with a usable construction command or a completed factory capable of
+	// restoring a builder. Abandoned scaffolds and permanently invalid products
+	// are not a recovery route. This also admits a surviving bare dozer/worker.
+	if (!player || !TheGameLogic || !TheBuildAssistant || !TheControlBar)
+		return false;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (object->getControllingPlayer() != player ||
+			object->isEffectivelyDead() || object->isDestroyed() ||
+			object->testStatus(OBJECT_STATUS_SOLD) ||
+			object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+			object->isContained() || object->isDisabledByType(DISABLED_UNMANNED))
+			continue;
+		AIUpdateInterface *ai = object->getAIUpdateInterface();
+		const Bool builder = ai && ai->getDozerAIInterface();
+		if (!builder && !object->getProductionUpdateInterface()) continue;
+		const CommandSet *commands = TheControlBar->findCommandSet(object->getCommandSetString());
+		if (!commands) continue;
+		for (Int command = 0; command < MAX_COMMANDS_PER_SET; ++command) {
+			const CommandButton *button = commands->getCommandButton(command);
+			const ThingTemplate *plan = button ? button->getThingTemplate() : 0;
+			if (!plan) continue;
+			const Bool restoresBuilder = !builder &&
+				button->getCommandType() == GUI_COMMAND_UNIT_BUILD &&
+				plan->isKindOf(KINDOF_DOZER);
+			const Bool restoresInfrastructure = builder &&
+				button->getCommandType() == GUI_COMMAND_DOZER_CONSTRUCT &&
+				((missingIncome &&
+				  (plan->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+				   IsSkirmishAIRenewableIncomeStructure(plan))) ||
+				 (missingProduction &&
+				  (plan->isKindOf(KINDOF_FS_BARRACKS) ||
+				   plan->isKindOf(KINDOF_FS_WARFACTORY) ||
+				   plan->isKindOf(KINDOF_FS_AIRFIELD))) ||
+				 plan->isKindOf(KINDOF_COMMANDCENTER));
+			if (!restoresBuilder && !restoresInfrastructure) continue;
+			const CanMakeType admission = TheBuildAssistant->canMakeUnit(object, plan);
+			if (admission != CANMAKE_OK && admission != CANMAKE_NO_MONEY &&
+				admission != CANMAKE_QUEUE_FULL &&
+				admission != CANMAKE_PARKING_PLACES_FULL)
+				continue;
+			if (restoresBuilder) {
+				ProductionUpdateInterface *production = object->getProductionUpdateInterface();
+				if (CanSkirmishAIRecoveryUpdateAdvance(object,
+					static_cast<ProductionUpdate *>(production))) return true;
+			} else if (!plan->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+				HasSkirmishAlliedSupplySource(player, object->getPosition(),
+					plan->getTemplateGeometryInfo().getBoundingCircleRadius())) {
+				// A map with only depleted warehouses needs renewable income or
+				// another real construction route instead of a dead supply center.
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
+	SkirmishAIAlliedPlayerFacts *facts)
+{
+	memset(facts, 0, sizeof(*facts));
+	facts->playerIndex = player ? player->getPlayerIndex() : -1;
+	facts->targetEnemyIndex = -1;
+	facts->targetObjectID = INVALID_ID;
+	facts->mode = SKIRMISH_STRATEGY_BALANCED;
+	if (!player || !TheGameLogic || !TheAI || !TheAI->getAiData() ||
+		facts->playerIndex < 0 || facts->playerIndex >= SKIRMISH_AI_ALLIED_MAX_PLAYERS ||
+		(player->getPlayerType() != PLAYER_HUMAN &&
+		 player->getPlayerType() != PLAYER_COMPUTER) || !player->isPlayerActive())
+		return;
+	facts->valid = true;
+	facts->alive = !player->isPlayerDead() && player->hasAnyObjects();
+	facts->isAI = player->isSkirmishAIPlayer();
+	for (Int ally = 0; ally < ThePlayerList->getPlayerCount(); ++ally) {
+		Player *other = ThePlayerList->getNthPlayer(ally);
+		const Int index = other ? other->getPlayerIndex() : -1;
+		if (index >= 0 && index < SKIRMISH_AI_ALLIED_MAX_PLAYERS &&
+			other->getDefaultTeam() && player->getRelationship(other->getDefaultTeam()) == ALLIES)
+			facts->alliedMask |= 1U << index;
+	}
+	if (!facts->alive) return;
+	AISkirmishPlayer *owner = facts->isAI ?
+		static_cast<AISkirmishPlayer *>(player->getAIPlayerForPlanning()) : 0;
+	if (owner && !owner->usesAlliedCoordinationBehavior()) {
+		facts->valid = false;
+		return;
+	}
+	Coord3D base;
+	base.zero();
+	Object *anchor = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (object->getControllingPlayer() == player &&
+			!object->isEffectivelyDead() && !object->isDestroyed() &&
+			(object->isKindOf(KINDOF_COMMANDCENTER) ||
+			 (!anchor && (object->isKindOf(KINDOF_STRUCTURE) || object->isKindOf(KINDOF_DOZER))))) {
+			if (!anchor ||
+				(object->isKindOf(KINDOF_COMMANDCENTER) && !anchor->isKindOf(KINDOF_COMMANDCENTER)) ||
+				(object->isKindOf(KINDOF_COMMANDCENTER) == anchor->isKindOf(KINDOF_COMMANDCENTER) &&
+				 object->getID() < anchor->getID())) anchor = object;
+		}
+	}
+	if (owner && owner->m_baseCenterSet) base = owner->m_baseCenter;
+	else if (anchor) base = *anchor->getPosition();
+	const Real radius = owner && owner->m_baseRadius > 0.0f ?
+		owner->m_baseRadius + 500.0f : 800.0f;
+	const Real radiusSqr = radius * radius;
+	Int incomes = 0;
+	Int production = 0;
+	Int commandHealth = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object;
+		object = object->getNextObject()) {
+		if (object->isEffectivelyDead() || object->isDestroyed() ||
+			object->testStatus(OBJECT_STATUS_SOLD)) continue;
+		Player *controlling = object->getControllingPlayer();
+		const Int health = GetSkirmishStrategyHealthPercent(object);
+		const Int cost = controlling ? object->getTemplate()->calcCostToBuild(controlling) : 0;
+		const Int value = cost > 0 ? (Int)((__int64)cost * health / 100) : 0;
+		const Real dx = object->getPosition()->x - base.x;
+		const Real dy = object->getPosition()->y - base.y;
+		const Bool local = dx * dx + dy * dy <= radiusSqr;
+		if (controlling == player) {
+			if (!object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION)) {
+				if (object->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+					HasSkirmishAlliedSupplySource(player, object->getPosition(),
+						object->getTemplate()->getTemplateGeometryInfo().getBoundingCircleRadius()))
+					++incomes;
+				else if (IsSkirmishAIRenewableIncomeStructure(object->getTemplate()) ||
+					(object->isKindOf(KINDOF_MONEY_HACKER) && object->getAIUpdateInterface() &&
+					 object->getAIUpdateInterface()->getHackInternetAIInterface() &&
+					 object->getAIUpdateInterface()->getHackInternetAIInterface()->isHacking()))
+					++incomes;
+				if (object->isKindOf(KINDOF_FS_BARRACKS) ||
+					object->isKindOf(KINDOF_FS_WARFACTORY) ||
+					object->isKindOf(KINDOF_FS_AIRFIELD)) ++production;
+				if (object->isKindOf(KINDOF_COMMANDCENTER))
+					commandHealth = AddSkirmishStrategyValue(commandHealth, health);
+			}
+			if (IsSkirmishStrategyCombatObject(object) && !object->isContained()) {
+				facts->combatValue = AddSkirmishStrategyValue(facts->combatValue, value);
+				if (local) facts->localCombatValue = AddSkirmishStrategyValue(facts->localCombatValue, value);
+			}
+		} else if (local && controlling && controlling->getDefaultTeam() &&
+			player->getRelationship(controlling->getDefaultTeam()) == ENEMIES &&
+			IsSkirmishStrategyIntelEligible(object, player) && IsSkirmishStrategyCombatObject(object))
+			facts->localEnemyValue = AddSkirmishStrategyValue(facts->localEnemyValue, value);
+	}
+	const Int poor = TheAI->getAiData()->m_resourcesPoor > 0 ? TheAI->getAiData()->m_resourcesPoor : 2500;
+	const Int wealthy = TheAI->getAiData()->m_resourcesWealthy > poor ?
+		TheAI->getAiData()->m_resourcesWealthy :
+		(Int)((__int64)poor * 4 > 2147483647 ? 2147483647 : (__int64)poor * 4);
+	facts->cash = player->getMoney()->countMoney();
+	Int cashScore = facts->cash <= poor ?
+		(Int)((__int64)(facts->cash > 0 ? facts->cash : 0) * 50 / poor) :
+		facts->cash >= wealthy ? 100 :
+		50 + (Int)((__int64)(facts->cash - poor) * 50 / (wealthy - poor));
+	facts->economyHealth = GetSkirmishAIRenewableEconomyHealth(cashScore, incomes,
+		GetSkirmishAIRenewableIncomeTarget(SKIRMISH_AI_DIFFICULTY_NORMAL));
+	facts->baseIntegrity = ClampSkirmishStrategyPercent(commandHealth);
+	facts->armyReadiness = GetSkirmishStrategyValuePercent(facts->combatValue, wealthy);
+	facts->immediateThreat = GetSkirmishStrategyValuePercent(facts->localEnemyValue, poor);
+	if (facts->localEnemyValue > 0) {
+		const Int relative = (Int)((__int64)facts->localEnemyValue * 100 /
+			((__int64)facts->localEnemyValue + facts->localCombatValue));
+		if (relative > facts->immediateThreat) facts->immediateThreat = relative;
+	}
+	const UnsignedInt now = TheGameLogic->getFrame();
+	if (player->getAttackedFrame() != 0 &&
+		now - player->getAttackedFrame() <= 10 * LOGICFRAMES_PER_SECOND && facts->immediateThreat < 60)
+		facts->immediateThreat = 60;
+	facts->missingIncome = incomes == 0;
+	facts->missingProduction = production == 0;
+	facts->recoverable = (facts->missingIncome || facts->missingProduction) &&
+		HasSkirmishAlliedRecoveryRoute(player, facts->missingIncome, facts->missingProduction);
+	if (owner) {
+		ObjectID targetID = INVALID_ID;
+		owner->collectStrategyMetrics(&owner->m_alliedCapturedStrategyMetrics, &targetID);
+		owner->m_alliedCapturedStrategyAvailable = true;
+		owner->m_alliedCapturedStrategyFrame = now;
+		owner->m_alliedCapturedStrategyTargetID = targetID;
+		const SkirmishStrategyMetrics &metrics = owner->m_alliedCapturedStrategyMetrics;
+		facts->mode = owner->m_strategyState.currentMode;
+		facts->economyHealth = metrics.economyHealth;
+		facts->baseIntegrity = metrics.baseIntegrity;
+		facts->armyReadiness = metrics.armyReadiness;
+		facts->immediateThreat = metrics.immediateThreat;
+		facts->targetEnemyIndex = owner->m_currentEnemy ? owner->m_currentEnemy->getPlayerIndex() : -1;
+		facts->targetObjectID = targetID;
+		facts->targetScore = 70 * metrics.enemyOpportunity + 30 * metrics.attackConfidence;
+		facts->hasReadyForce = metrics.availableCombatValue > 0 && metrics.armyReadiness >= 60;
+		owner->refreshStrategyProductionReserve();
+		facts->protectedReserve = owner->m_strategyProductionReserveCost;
+		const Int recovery = owner->getActiveRecoveryReserveCost();
+		const Int rebuild = owner->getCriticalRebuildReserve(0);
+		if (recovery > facts->protectedReserve) facts->protectedReserve = recovery;
+		if (rebuild > facts->protectedReserve) facts->protectedReserve = rebuild;
+		facts->donationBlocked =
+			(owner->m_strategyState.donationCooldownActive &&
+			 !IsSkirmishStrategyFrameReached(now, owner->m_strategyState.nextDonationFrame)) ||
+			(owner->m_alliedReceiptCooldownActive &&
+			 !IsSkirmishStrategyFrameReached(now, owner->m_alliedMayDonateFrame));
+		const __int64 enemyReserve = (__int64)facts->localEnemyValue * 5 / 4;
+		const Int combatReserve = enemyReserve > poor ?
+			(Int)(enemyReserve > 2147483647 ? 2147483647 : enemyReserve) : poor;
+		facts->supportAvailableValue = facts->localCombatValue > combatReserve ?
+			facts->localCombatValue - combatReserve : 0;
+	}
+	facts->distress = facts->immediateThreat;
+	const Int integrityDistress = 100 - facts->baseIntegrity;
+	if (integrityDistress > facts->distress) facts->distress = integrityDistress;
+}
+
+static Bool IsSkirmishAITacticalTeamBefore(Team *left, Team *right);
+
+static Player *FindSkirmishAlliedPlayer(Int playerIndex)
+{
+	for (Int i = 0; ThePlayerList && i < ThePlayerList->getPlayerCount(); ++i) {
+		Player *player = ThePlayerList->getNthPlayer(i);
+		if (player && player->getPlayerIndex() == playerIndex) return player;
+	}
+	return 0;
+}
+
+static Team *FindSkirmishAlliedTeam(Player *player, UnsignedInt teamID)
+{
+	if (!player) return 0;
+	for (Player::PlayerTeamList::const_iterator prototype = player->getPlayerTeams()->begin();
+		prototype != player->getPlayerTeams()->end(); ++prototype) {
+		for (DLINK_ITERATOR<Team> instance = (*prototype)->iterate_TeamInstanceList();
+			!instance.done(); instance.advance())
+			if (instance.cur()->getID() == teamID) return instance.cur();
+	}
+	return 0;
+}
+
+static Bool IsSkirmishMutualLiveAlly(Player *player, Player *other)
+{
+	return player && other && player != other && player->getDefaultTeam() &&
+		other->getDefaultTeam() && player->isPlayerActive() && other->isPlayerActive() &&
+		!player->isPlayerDead() && !other->isPlayerDead() &&
+		player->getRelationship(other->getDefaultTeam()) == ALLIES &&
+		other->getRelationship(player->getDefaultTeam()) == ALLIES;
+}
+
+AISkirmishPlayer::AlliedCoordinationDiagnostics
+AISkirmishPlayer::getAlliedCoordinationDiagnostics() const
+{
+	AlliedCoordinationDiagnostics d;
+	d.assaultActive = m_alliedAssaultActive;
+	d.assaultLaunched = m_alliedAssaultLaunched;
+	d.leaderIndex = m_alliedLeaderIndex;
+	d.enemyIndex = m_alliedEnemyIndex;
+	d.targetID = m_alliedTargetID;
+	d.assaultFrame = m_alliedAssaultFrame;
+	d.assaultExpiryFrame = m_alliedAssaultExpiryFrame;
+	d.supportRecipientIndex = m_alliedSupportRecipientIndex;
+	d.supportTeamCount = (Int)m_alliedSupportTeamIDs.size();
+	d.supportReturning = m_alliedSupportReturning;
+	d.donationCooldownActive = m_strategyState.donationCooldownActive;
+	d.nextDonationFrame = m_strategyState.nextDonationFrame;
+	d.receiptCooldownActive = m_alliedReceiptCooldownActive;
+	d.mayDonateFrame = m_alliedMayDonateFrame;
+	return d;
+}
+
+UnsignedInt AISkirmishPlayer::getAlliedSupportTeamID(Int index) const
+{
+	return index >= 0 && (size_t)index < m_alliedSupportTeamIDs.size() ?
+		m_alliedSupportTeamIDs[index] : 0;
+}
+
+void AISkirmishPlayer::xferAlliedCoordination(Xfer *xfer)
+{
+	xfer->xferBool(&m_alliedAssaultActive);
+	xfer->xferBool(&m_alliedAssaultLaunched);
+	xfer->xferInt(&m_alliedLeaderIndex);
+	xfer->xferInt(&m_alliedEnemyIndex);
+	xfer->xferObjectID(&m_alliedTargetID);
+	xfer->xferUnsignedInt(&m_alliedAssaultFrame);
+	xfer->xferUnsignedInt(&m_alliedAssaultExpiryFrame);
+	xfer->xferUnsignedInt(&m_alliedNextHoldFrame);
+	xfer->xferBool(&m_alliedReceiptCooldownActive);
+	xfer->xferUnsignedInt(&m_alliedMayDonateFrame);
+	xfer->xferInt(&m_alliedSupportRecipientIndex);
+	xfer->xferBool(&m_alliedSupportReturning);
+	xfer->xferUnsignedInt(&m_alliedNextSupportFrame);
+	UnsignedInt count = (UnsignedInt)m_alliedSupportTeamIDs.size();
+	xfer->xferUnsignedInt(&count);
+	if (xfer->getXferMode() == XFER_LOAD) m_alliedSupportTeamIDs.clear();
+	for (UnsignedInt i = 0; i < count; ++i) {
+		UnsignedInt teamID = xfer->getXferMode() == XFER_LOAD ? 0 : m_alliedSupportTeamIDs[i];
+		xfer->xferUnsignedInt(&teamID);
+		if (xfer->getXferMode() == XFER_LOAD && i < 4 && teamID != 0)
+			m_alliedSupportTeamIDs.push_back(teamID);
+	}
+	if (xfer->getXferMode() == XFER_LOAD) {
+		std::sort(m_alliedSupportTeamIDs.begin(), m_alliedSupportTeamIDs.end());
+		m_alliedSupportTeamIDs.erase(std::unique(m_alliedSupportTeamIDs.begin(),
+			m_alliedSupportTeamIDs.end()), m_alliedSupportTeamIDs.end());
+		m_alliedCapturedStrategyAvailable = false;
+		m_alliedCapturedStrategyFrame = 0;
+		m_alliedCapturedStrategyTargetID = INVALID_ID;
+	}
+}
+
+Bool AISkirmishPlayer::isAlliedSupportTeam(UnsignedInt teamID) const
+{
+	if (!usesAlliedCoordinationBehavior()) return false;
+	for (size_t i = 0; i < m_alliedSupportTeamIDs.size(); ++i)
+		if (m_alliedSupportTeamIDs[i] == teamID) return true;
+	return false;
+}
+
+Bool AISkirmishPlayer::isAlliedAssaultHolding() const
+{
+	return usesAlliedCoordinationBehavior() && m_alliedAssaultActive &&
+		!m_alliedAssaultLaunched && !IsSkirmishStrategyFrameReached(
+			TheGameLogic->getFrame(), m_alliedAssaultFrame);
+}
+
+void AISkirmishPlayer::clearAlliedAssault()
+{
+	m_alliedAssaultActive = false;
+	m_alliedAssaultLaunched = false;
+	m_alliedLeaderIndex = -1;
+	m_alliedEnemyIndex = -1;
+	m_alliedTargetID = INVALID_ID;
+	m_alliedAssaultFrame = 0;
+	m_alliedAssaultExpiryFrame = 0;
+	m_alliedNextHoldFrame = 0;
+}
+
+Player *AISkirmishPlayer::getPinnedAlliedEnemy() const
+{
+	if (!usesAlliedCoordinationBehavior() || !m_alliedAssaultActive ||
+		IsSkirmishStrategyFrameReached(TheGameLogic->getFrame(), m_alliedAssaultExpiryFrame))
+		return 0;
+	Player *enemy = FindSkirmishAlliedPlayer(m_alliedEnemyIndex);
+	return enemy && enemy->getDefaultTeam() && enemy->isPlayerActive() &&
+		!enemy->isPlayerDead() && m_player->getRelationship(enemy->getDefaultTeam()) == ENEMIES &&
+		enemy->hasOffensiveTargetableObjects() ? enemy : 0;
+}
+
+Bool AISkirmishPlayer::resolveAlliedAssaultTarget(Object **target) const
+{
+	*target = 0;
+	Player *enemy = getPinnedAlliedEnemy();
+	Object *object = enemy && TheGameLogic ? TheGameLogic->findObjectByID(m_alliedTargetID) : 0;
+	if (!object || object->getControllingPlayer() != enemy ||
+		!IsSkirmishStrategyIntelEligible(object, m_player) ||
+		!IsSkirmishStrategyStaticTarget(object) || object->isEffectivelyDead() ||
+		object->isDestroyed() || object->testStatus(OBJECT_STATUS_SOLD)) return false;
+	*target = object;
+	return true;
+}
+
+void AISkirmishPlayer::commitAlliedCoordination(
+	const SkirmishAIAlliedDecision &decision, UnsignedInt now)
+{
+	if (!usesAlliedCoordinationBehavior() || !TheAI) return;
+	const Int index = m_player->getPlayerIndex();
+	if (index < 0 || index >= SKIRMISH_AI_ALLIED_MAX_PLAYERS) return;
+	const SkirmishAIAlliedPlayerFacts *own = TheAI->getAlliedPlayerFacts(index);
+	if (!own || !own->alive) return;
+	m_alliedCapturedStrategyMetrics.alliedDistress = 0;
+	for (Int ally = 0; ally < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++ally) {
+		const SkirmishAIAlliedPlayerFacts *other = TheAI->getAlliedPlayerFacts(ally);
+		if (other && other->alive && (own->alliedMask & (1U << ally)) &&
+			ally != index && other->distress > m_alliedCapturedStrategyMetrics.alliedDistress)
+			m_alliedCapturedStrategyMetrics.alliedDistress = other->distress;
+	}
+	if (m_alliedSupportRecipientIndex >= 0) {
+		const SkirmishAIAlliedPlayerFacts *recipient =
+			TheAI->getAlliedPlayerFacts(m_alliedSupportRecipientIndex);
+		if (!recipient || !recipient->alive || recipient->distress < 40 ||
+			own->immediateThreat >= 50 || own->baseIntegrity < 35 ||
+			!IsSkirmishMutualLiveAlly(m_player, FindSkirmishAlliedPlayer(m_alliedSupportRecipientIndex)))
+			recallAlliedSupport();
+	} else if (!m_alliedSupportReturning && decision.supportRecipientIndices[index] >= 0 &&
+		decision.supportBudgets[index] > 0) {
+		dispatchAlliedSupport(decision.supportRecipientIndices[index],
+			decision.supportBudgets[index]);
+	}
+	if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY ||
+		own->immediateThreat >= 60 || own->baseIntegrity < 65 || m_recoveryImpossible) {
+		clearAlliedAssault();
+		return;
+	}
+	if (m_alliedAssaultActive) {
+		Object *target = 0;
+		if (IsSkirmishStrategyFrameReached(now, m_alliedAssaultExpiryFrame) ||
+			!resolveAlliedAssaultTarget(&target)) clearAlliedAssault();
+		else return; // A plan's announced release frame is immutable.
+	}
+	if (m_strategyState.alliedCoordinationCooldownActive &&
+		!IsSkirmishStrategyFrameReached(now, m_strategyState.nextAlliedCoordinationFrame)) return;
+	const Int leader = decision.assaultLeaderIndices[index];
+	const Int enemyIndex = decision.assaultEnemyIndices[index];
+	Object *target = decision.assaultTargetIDs[index] != INVALID_ID ?
+		TheGameLogic->findObjectByID(decision.assaultTargetIDs[index]) : 0;
+	Player *enemy = FindSkirmishAlliedPlayer(enemyIndex);
+	Player *leaderPlayer = FindSkirmishAlliedPlayer(leader);
+	if (leader < 0 || !enemy || !enemy->getDefaultTeam() ||
+		m_player->getRelationship(enemy->getDefaultTeam()) != ENEMIES ||
+		(leader != index && !IsSkirmishMutualLiveAlly(m_player, leaderPlayer)) ||
+		!target || target->getControllingPlayer() != enemy ||
+		!IsSkirmishStrategyIntelEligible(target, m_player) ||
+		!IsSkirmishStrategyStaticTarget(target) || target->isEffectivelyDead() || target->isDestroyed() ||
+		target->testStatus(OBJECT_STATUS_SOLD))
+		return;
+	// Each participant proves its own usable approach. Their routes may differ.
+	std::vector<SkirmishStrategyCapabilityCandidate> ground;
+	std::vector<SkirmishStrategyCapabilityCandidate> air;
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject()) {
+		if (!IsSkirmishStrategyOffensiveRecipient(object, m_player) ||
+			isAlliedSupportTeam(object->getTeam()->getID())) continue;
+		std::map<UnsignedInt, TacticalTeamState>::const_iterator state =
+			m_tacticalTeams.find(object->getTeam()->getID());
+		if (state != m_tacticalTeams.end() &&
+			(state->second.retreating || state->second.woundedReserve ||
+			 state->second.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE)) continue;
+		if (object->isKindOf(KINDOF_AIRCRAFT)) AppendSkirmishStrategyCapabilityCandidate(&air, object, 1);
+		else AppendSkirmishStrategyCapabilityCandidate(&ground, object, 1);
+	}
+	SortSkirmishStrategyCapabilityCandidates(&ground);
+	SortSkirmishStrategyCapabilityCandidates(&air);
+	Int queries = 0;
+	if (!HasSkirmishStrategyTargetCapability(target, air, ground, &queries, true)) return;
+	m_alliedAssaultActive = true;
+	m_alliedAssaultLaunched = false;
+	m_alliedLeaderIndex = leader;
+	m_alliedEnemyIndex = enemyIndex;
+	m_alliedTargetID = target->getID();
+	m_alliedAssaultFrame = now + 20 * LOGICFRAMES_PER_SECOND;
+	if (leader != index && leaderPlayer && leaderPlayer->isSkirmishAIPlayer()) {
+		AISkirmishPlayer *leaderAI = static_cast<AISkirmishPlayer *>(leaderPlayer->getAIPlayerForPlanning());
+		if (!leaderAI || !leaderAI->m_alliedAssaultActive || leaderAI->m_alliedAssaultLaunched ||
+			leaderAI->m_alliedTargetID != m_alliedTargetID ||
+			leaderAI->m_alliedEnemyIndex != m_alliedEnemyIndex ||
+			IsSkirmishStrategyFrameReached(now, leaderAI->m_alliedAssaultFrame)) {
+			clearAlliedAssault();
+			return;
+		}
+		m_alliedAssaultFrame = leaderAI->m_alliedAssaultFrame;
+	}
+	m_alliedAssaultExpiryFrame = m_alliedAssaultFrame + 90 * LOGICFRAMES_PER_SECOND;
+	m_alliedNextHoldFrame = now;
+	m_strategyState.alliedCoordinationCooldownActive = true;
+	m_strategyState.nextAlliedCoordinationFrame = m_alliedAssaultExpiryFrame;
+	m_currentEnemy = enemy;
+	m_currentEnemyPlayerIndex = enemyIndex;
+	m_frameToCheckEnemy = now + 5 * LOGICFRAMES_PER_SECOND;
+}
+
+void AISkirmishPlayer::recallAlliedSupport()
+{
+	m_alliedSupportRecipientIndex = -1;
+	m_alliedSupportReturning = !m_alliedSupportTeamIDs.empty();
+	m_alliedNextSupportFrame = 0;
+	// Cancel the outgoing command even if the team has not left home yet.
+	for (size_t i = 0; TheAI && m_baseCenterSet && i < m_alliedSupportTeamIDs.size(); ++i) {
+		Team *team = FindSkirmishAlliedTeam(m_player, m_alliedSupportTeamIDs[i]);
+		AIGroupPtr group = TheAI->createGroup();
+		if (!team || !group) continue;
+		for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList(); !member.done(); member.advance()) {
+			Object *object = member.cur();
+			if (IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team)) group->add(object);
+		}
+		if (!group->isEmpty())
+			group->groupGuardPosition(&m_baseCenter, GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+	}
+}
+
+void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
+{
+	Player *recipient = FindSkirmishAlliedPlayer(recipientIndex);
+	const SkirmishAIAlliedPlayerFacts *own = TheAI->getAlliedPlayerFacts(m_player->getPlayerIndex());
+	const SkirmishAIAlliedPlayerFacts *need = TheAI->getAlliedPlayerFacts(recipientIndex);
+	if (!IsSkirmishMutualLiveAlly(m_player, recipient) || !own || !need ||
+		need->distress < 70 || own->immediateThreat >= 50 || !m_baseCenterSet) return;
+	if (budget > own->supportAvailableValue) budget = own->supportAvailableValue;
+	Object *anchor = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
+		if (object->getControllingPlayer() == recipient && object->isKindOf(KINDOF_STRUCTURE) &&
+			!object->isEffectivelyDead() && !object->isDestroyed() &&
+			(!anchor || object->getID() < anchor->getID())) anchor = object;
+	if (!anchor) return;
+	std::vector<Team *> teams;
+	for (Player::PlayerTeamList::const_iterator prototype = m_player->getPlayerTeams()->begin();
+		prototype != m_player->getPlayerTeams()->end(); ++prototype) {
+		for (DLINK_ITERATOR<Team> instance = (*prototype)->iterate_TeamInstanceList();
+			!instance.done(); instance.advance()) {
+			Team *team = instance.cur();
+			if (IsSkirmishStrategyOffensiveTeam(team, m_player)) teams.push_back(team);
+		}
+	}
+	std::sort(teams.begin(), teams.end(), IsSkirmishAITacticalTeamBefore);
+	Int queries = 0;
+	for (size_t i = 0; i < teams.size() && m_alliedSupportTeamIDs.size() < 4 && queries < 4; ++i) {
+		Team *team = teams[i];
+		std::map<UnsignedInt, TacticalTeamState>::const_iterator state = m_tacticalTeams.find(team->getID());
+		if (state != m_tacticalTeams.end() &&
+			(state->second.retreating || state->second.woundedReserve ||
+			 state->second.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE)) continue;
+		Int value = 0;
+		Object *representative = 0;
+		Bool eligible = true;
+		const Real homeRadius = m_baseRadius + 500.0f;
+		for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList(); !member.done(); member.advance()) {
+			Object *object = member.cur();
+			if (!IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team) ||
+				GetSkirmishStrategyHealthPercent(object) < 60) { eligible = false; break; }
+			const Real dx = object->getPosition()->x - m_baseCenter.x;
+			const Real dy = object->getPosition()->y - m_baseCenter.y;
+			if (dx * dx + dy * dy > homeRadius * homeRadius) { eligible = false; break; }
+			const Int cost = object->getTemplate()->calcCostToBuild(m_player);
+			value = AddSkirmishStrategyValue(value,
+				cost > 0 ? (Int)((__int64)cost * GetSkirmishStrategyHealthPercent(object) / 100) : 0);
+			if (!representative || object->getID() < representative->getID()) representative = object;
+		}
+		if (!eligible || !representative || value <= 0 || value > budget) continue;
+		++queries;
+		if (!representative->isKindOf(KINDOF_AIRCRAFT) &&
+			!TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+				representative->getAIUpdateInterface()->getLocomotorSet(),
+				representative->getPosition(), anchor->getPosition())) continue;
+		m_alliedSupportTeamIDs.push_back(team->getID());
+		budget -= value;
+	}
+	if (!m_alliedSupportTeamIDs.empty()) {
+		m_alliedSupportRecipientIndex = recipientIndex;
+		m_alliedSupportReturning = false;
+		m_alliedNextSupportFrame = 0;
+	}
+}
+
+void AISkirmishPlayer::updateAlliedAssignments()
+{
+	if (!usesAlliedCoordinationBehavior() || !TheAI) return;
+	const UnsignedInt now = TheGameLogic->getFrame();
+	const SkirmishAIAlliedPlayerFacts *own = TheAI->getAlliedPlayerFacts(m_player->getPlayerIndex());
+	const Bool recentAttack = m_player->getAttackedFrame() != 0 &&
+		now - m_player->getAttackedFrame() <= 10 * LOGICFRAMES_PER_SECOND;
+	if (m_alliedAssaultActive) {
+		Object *target = 0;
+		Player *leader = FindSkirmishAlliedPlayer(m_alliedLeaderIndex);
+		if (!own || !own->alive || own->immediateThreat >= 60 || recentAttack ||
+			m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY ||
+			(m_alliedLeaderIndex != m_player->getPlayerIndex() && !IsSkirmishMutualLiveAlly(m_player, leader)) ||
+			IsSkirmishStrategyFrameReached(now, m_alliedAssaultExpiryFrame) ||
+			!resolveAlliedAssaultTarget(&target)) {
+			clearAlliedAssault();
+		} else if (!m_alliedAssaultLaunched && IsSkirmishStrategyFrameReached(now, m_alliedAssaultFrame)) {
+			m_alliedAssaultLaunched = true;
+			m_strategyState.currentMode = SKIRMISH_STRATEGY_ASSAULT;
+			m_strategyState.pendingMode = SKIRMISH_STRATEGY_NONE;
+			m_strategyState.pendingSinceFrame = 0;
+			m_strategyState.modeEntryFrame = now;
+			m_strategyState.assaultEntryCombatValue = own->combatValue;
+			m_strategyState.strategicTargetID = m_alliedTargetID;
+			m_strategyState.strategicTargetObserved = true;
+			m_strategyState.strategicTargetLastSeenFrame = now;
+			commandOffensiveTeams(SKIRMISH_STRATEGY_ASSAULT, target);
+		} else if (!m_alliedAssaultLaunched && IsSkirmishStrategyFrameReached(now, m_alliedNextHoldFrame)) {
+			m_alliedNextHoldFrame = now + 2 * LOGICFRAMES_PER_SECOND;
+			commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0);
+		}
+	}
+	if (m_alliedSupportRecipientIndex >= 0) {
+		const SkirmishAIAlliedPlayerFacts *need = TheAI->getAlliedPlayerFacts(m_alliedSupportRecipientIndex);
+		if (!own || own->immediateThreat >= 50 || recentAttack || own->baseIntegrity < 35 ||
+			!need || !need->alive || need->distress < 40 ||
+			!IsSkirmishMutualLiveAlly(m_player, FindSkirmishAlliedPlayer(m_alliedSupportRecipientIndex)))
+			recallAlliedSupport();
+	}
+	if (m_alliedSupportTeamIDs.empty() ||
+		!IsSkirmishStrategyFrameReached(now, m_alliedNextSupportFrame)) return;
+	m_alliedNextSupportFrame = now + 2 * LOGICFRAMES_PER_SECOND;
+	Player *recipient = FindSkirmishAlliedPlayer(m_alliedSupportRecipientIndex);
+	Object *anchor = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); recipient && object; object = object->getNextObject())
+		if (object->getControllingPlayer() == recipient && object->isKindOf(KINDOF_STRUCTURE) &&
+			!object->isEffectivelyDead() && !object->isDestroyed() &&
+			(!anchor || object->getID() < anchor->getID())) anchor = object;
+	if (!m_alliedSupportReturning && !anchor) recallAlliedSupport();
+	for (size_t i = 0; i < m_alliedSupportTeamIDs.size();) {
+		Team *team = FindSkirmishAlliedTeam(m_player, m_alliedSupportTeamIDs[i]);
+		AIGroupPtr group = TheAI->createGroup();
+		Bool any = false;
+		Bool home = true;
+		if (team && group) {
+			for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList(); !member.done(); member.advance()) {
+				Object *object = member.cur();
+				if (!IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team)) continue;
+				group->add(object);
+				any = true;
+				const Real dx = object->getPosition()->x - m_baseCenter.x;
+				const Real dy = object->getPosition()->y - m_baseCenter.y;
+				const Real radius = m_baseRadius + 150.0f;
+				if (dx * dx + dy * dy > radius * radius) home = false;
+			}
+		}
+		if (!any || (m_alliedSupportReturning && home)) {
+			m_alliedSupportTeamIDs.erase(m_alliedSupportTeamIDs.begin() + i);
+			continue;
+		}
+		if (m_alliedSupportReturning)
+			group->groupGuardPosition(&m_baseCenter, GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+		else if (anchor)
+			group->groupGuardPosition(anchor->getPosition(), GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
+		++i;
+	}
+	if (m_alliedSupportTeamIDs.empty()) {
+		m_alliedSupportRecipientIndex = -1;
+		m_alliedSupportReturning = false;
+	}
 }
 
 static Bool IsSkirmishTacticalRetreatPointSafe(
@@ -8439,6 +9158,7 @@ enum {
 
 void AISkirmishPlayer::updateTacticalTeams()
 {
+	if (isAlliedAssaultHolding()) return;
 	if (!ShouldUseCurrentSkirmishAITacticalBehavior() || !usesStrategyBehavior() ||
 		!m_player || !TheAI ||
 		!TheAI->pathfinder() || !m_baseCenterSet)
@@ -8457,7 +9177,8 @@ void AISkirmishPlayer::updateTacticalTeams()
 		for (DLINK_ITERATOR<Team> instance = (*prototype)->iterate_TeamInstanceList();
 			!instance.done(); instance.advance()) {
 			Team *team = instance.cur();
-			if (!IsSkirmishStrategyOffensiveTeam(team, m_player))
+			if (!IsSkirmishStrategyOffensiveTeam(team, m_player) ||
+				isAlliedSupportTeam(team->getID()))
 				continue;
 			std::map<UnsignedInt, TacticalTeamState>::const_iterator previous =
 				m_tacticalTeams.find(team->getID());
@@ -10153,6 +10874,7 @@ void AISkirmishPlayer::commandOffensiveTeams(
 			!teamInstance.done(); teamInstance.advance()) {
 			Team *candidate = teamInstance.cur();
 			if (IsSkirmishStrategyOffensiveTeam(candidate, m_player) &&
+				!isAlliedSupportTeam(candidate->getID()) &&
 				candidate->hasAnyObjects()) {
 				SkirmishStrategyGroupRecipientContext context;
 				context.player = m_player;
@@ -10216,6 +10938,7 @@ void AISkirmishPlayer::applyStrategyMode(
 	SkirmishStrategyMode previousMode, SkirmishStrategyMode currentMode,
 	ObjectID previousTargetID)
 {
+	if (isAlliedAssaultHolding() && currentMode != SKIRMISH_STRATEGY_FORTIFY) return;
 	// Strategy commands are transition impulses.  Native team scripts retain
 	// ownership on later frames; stable modes must not keep overwriting them.
 	if (previousMode == currentMode &&
@@ -10265,7 +10988,21 @@ Bool AISkirmishPlayer::updateStrategy()
 		return false;
 	SkirmishStrategyMetrics metrics;
 	ObjectID targetID = INVALID_ID;
-	collectStrategyMetrics(&metrics, &targetID);
+	if (usesAlliedCoordinationBehavior() && m_alliedCapturedStrategyAvailable &&
+		m_alliedCapturedStrategyFrame == currentFrame) {
+		metrics = m_alliedCapturedStrategyMetrics;
+		targetID = m_alliedCapturedStrategyTargetID;
+		m_alliedCapturedStrategyAvailable = false;
+	} else {
+		collectStrategyMetrics(&metrics, &targetID);
+	}
+	if (usesAlliedCoordinationBehavior() && m_alliedAssaultActive && m_alliedAssaultLaunched) {
+		Object *sharedTarget = 0;
+		if (resolveAlliedAssaultTarget(&sharedTarget)) {
+			targetID = sharedTarget->getID();
+			metrics.hasStrategicTarget = true;
+		}
+	}
 	const Bool tunnelBuildPendingForTarget = targetID != INVALID_ID &&
 		m_tunnelBuildTargetID == targetID &&
 		(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
@@ -10675,6 +11412,12 @@ void AISkirmishPlayer::acquireEnemyLegacy()
 */
 void AISkirmishPlayer::acquireEnemy()
 {
+	Player *pinnedEnemy = getPinnedAlliedEnemy();
+	if (pinnedEnemy) {
+		m_currentEnemy = pinnedEnemy;
+		m_currentEnemyPlayerIndex = pinnedEnemy->getPlayerIndex();
+		return;
+	}
 	const Bool productionBehavior = usesProductionBehavior();
 	std::vector<SkirmishEnemyCandidate> candidates;
 	Int maximumKnownAssetValue = 0;
@@ -11875,6 +12618,8 @@ void AISkirmishPlayer::checkReadyTeams()
  */
 Bool AISkirmishPlayer::canActivateReadyTeam( const TeamInQueue *team ) const
 {
+	if (team && isAlliedAssaultHolding() && !team->m_reinforcement &&
+		IsSkirmishStrategyOffensiveTeamType(team->m_team, m_player)) return false;
 	if (!team || !usesStrategyBehavior() ||
 		m_strategyState.currentMode != SKIRMISH_STRATEGY_FORTIFY)
 		return true;
@@ -11975,6 +12720,7 @@ void AISkirmishPlayer::update()
 		strategyAllowedAfterRecovery)
 		applyStrategyMode(
 			previousMode, m_strategyState.currentMode, previousTargetID);
+	updateAlliedAssignments();
 	if (strategyAllowedAfterRecovery)
 		updateTacticalTeams();
 	if (strategyAllowedAfterRecovery)
@@ -12097,6 +12843,7 @@ void AISkirmishPlayer::adjustBuildList(BuildListInfo *list)
  */
 void AISkirmishPlayer::newMap()
 {
+	resetAlliedCoordination();
 	InitializeSkirmishStrategyState(
 		&m_strategyState, TheGameLogic ? TheGameLogic->getFrame() : 0);
 	m_strategyTargetFallbackPending = false;
@@ -13478,6 +14225,8 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 			xfer->xferBool(&collector);
 		}
 	}
+	if (ShouldIncludeSkirmishAIAlliedCoordinationCRCFields(replay, replayEpoch))
+		xferAlliedCoordination(xfer);
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -13502,13 +14251,14 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	 * 16: Quiet defense patrol waypoint and bounded hold deadline
 	 * 17: Generated forward tunnel targets and bounded live exits
 	 * 18: Per-target forward retry and bounded full-tunnel wait
-	 * 19: Exhausted forward targets and committed alternate-target observation */
+	 * 19: Exhausted forward targets and committed alternate-target observation
+	 * 20: Allied assault, support ownership, and received-money relay guard */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 19;
+	XferVersion currentVersion = 20;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -13835,6 +14585,10 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 		xferGeneratedDefenseBuilds(xfer);
 	else if (xfer->getXferMode() == XFER_LOAD)
 		m_generatedDefenseBuilds.clear();
+	if (version >= 20)
+		xferAlliedCoordination(xfer);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		resetAlliedCoordination();
 	if (xfer->getXferMode() == XFER_LOAD) {
 		m_tunnelBuildLockedBuilderID = INVALID_ID;
 		m_defenseBuildLockedBuilderID = INVALID_ID;
@@ -13853,6 +14607,37 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::loadPostProcess()
 {
+	// IDs are resolved after player/team snapshots load. Preserve valid future
+	// frames and cooldowns exactly; invalid ownership cancels only that plan.
+	if (!usesAlliedCoordinationBehavior()) {
+		resetAlliedCoordination();
+	} else {
+		const UnsignedInt now = TheGameLogic ? TheGameLogic->getFrame() : 0;
+		Player *enemy = FindSkirmishAlliedPlayer(m_alliedEnemyIndex);
+		Player *leader = FindSkirmishAlliedPlayer(m_alliedLeaderIndex);
+		Object *target = TheGameLogic && m_alliedTargetID != INVALID_ID ?
+			TheGameLogic->findObjectByID(m_alliedTargetID) : 0;
+		if (m_alliedAssaultActive && (!enemy || !enemy->getDefaultTeam() ||
+			m_player->getRelationship(enemy->getDefaultTeam()) != ENEMIES ||
+			(m_alliedLeaderIndex != m_player->getPlayerIndex() &&
+			 !IsSkirmishMutualLiveAlly(m_player, leader)) || !target ||
+			target->getControllingPlayer() != enemy ||
+			IsSkirmishStrategyFrameReached(now, m_alliedAssaultExpiryFrame)))
+			clearAlliedAssault();
+		for (size_t i = 0; i < m_alliedSupportTeamIDs.size();) {
+			Team *team = FindSkirmishAlliedTeam(m_player, m_alliedSupportTeamIDs[i]);
+			if (!IsSkirmishStrategyOffensiveTeam(team, m_player))
+				m_alliedSupportTeamIDs.erase(m_alliedSupportTeamIDs.begin() + i);
+			else ++i;
+		}
+		if (m_alliedSupportRecipientIndex >= 0 &&
+			!IsSkirmishMutualLiveAlly(m_player, FindSkirmishAlliedPlayer(m_alliedSupportRecipientIndex)))
+			recallAlliedSupport();
+		if (m_alliedSupportTeamIDs.empty()) {
+			m_alliedSupportRecipientIndex = -1;
+			m_alliedSupportReturning = false;
+		}
+	}
 	if (TheGameLogic) {
 		for (std::map<ObjectID, Bool>::const_iterator role =
 			m_stage3CollectorRolesToRestore.begin();
