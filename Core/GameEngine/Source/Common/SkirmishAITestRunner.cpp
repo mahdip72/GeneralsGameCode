@@ -8038,6 +8038,9 @@ void ObserveAlliedSupport(UnsignedInt frame)
 				AlliedFixtureDistanceSquared(*member->getPosition(), home) <=
 				(homeRadius + 100.0f) * (homeRadius + 100.0f) ||
 				AlliedFixtureDistanceSquared(*member->getPosition(), *guard) > 300.0f * 300.0f) return;
+			// Protected tactical ownership is deliberately outside the script
+			// gate. Keep this witness pinned and wait for real support eligibility.
+			if (!donorAI->isAlliedSupportMember(member) || !donorAI->shouldHoldAlliedScriptCommand(member)) return;
 			Bool guardedAllyAnchor = FALSE;
 			for (Object *anchor = TheGameLogic->getFirstObject(); anchor; anchor = anchor->getNextObject())
 				if (IsLiveSkirmishAIRecoveryObject(anchor) && anchor->getControllingPlayer() == recipient &&
@@ -8068,6 +8071,7 @@ void ObserveAlliedSupport(UnsignedInt frame)
 			AIUpdateInterface *unitAI = member->getAIUpdateInterface();
 			const Coord3D *guard = unitAI ? unitAI->getGuardLocation() : nullptr;
 			if (!s_allied.supportReturningScriptChecked && unitAI && guard &&
+				donorAI->isAlliedSupportMember(member) && donorAI->shouldHoldAlliedScriptCommand(member) &&
 				unitAI->getLastCommandSource() == CMD_FROM_AI && unitAI->getGuardTargetType() == GUARDTARGET_LOCATION &&
 				AlliedFixtureDistanceSquared(*guard, home) <= 50.0f * 50.0f &&
 				AlliedFixtureDistanceSquared(*member->getPosition(), home) > homeRadius * homeRadius)
@@ -8118,6 +8122,7 @@ void ObserveAlliedSupport(UnsignedInt frame)
 			for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
 				if (IsSkirmishAIRecoveryCombatUnit(object, ThePlayerList->getPlayerFromSlotIndex(slot)) &&
 					object->getTeam() && object->getTeam()->getID() == teamID &&
+					donor->isAlliedSupportMember(object) && donor->shouldHoldAlliedScriptCommand(object) &&
 					AlliedFixtureDistanceSquared(*object->getPosition(), home) <=
 					(donor->getAlliedSupportHomeRadius() + 350.0f) * (donor->getAlliedSupportHomeRadius() + 350.0f))
 				{ trackedMember = object; trackedTeam = teamID; break; }
