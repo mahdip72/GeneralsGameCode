@@ -7277,9 +7277,8 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 				!state.holdAdmissionValid || state.holdAdmissionFrame != s_allied.assaultAdmissionFrames[participant])
 			{ FailSkirmishAITest("allied_withdrawal_pre_fault_hold_changed"); RequestSkirmishAITestStop(); return; }
 		}
-		// Frame-resolution body history cannot distinguish a pre-admission hit
-		// from one later in that same frame. Inject only strictly after admission.
-		if (frame <= s_allied.assaultAdmissionFrames[leaderParticipant]) return;
+		// The hold is already observable before this event. Fresh admission
+		// clears the old held-hit latch, so a later hit in this frame qualifies.
 		Object *members[2] = { nullptr, nullptr };
 		for (size_t index = 0; index < s_allied.assaultProbes.size(); ++index)
 		{
@@ -7299,7 +7298,7 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 				leader->getRelationship(object->getTeam()) == ENEMIES &&
 				IsSkirmishAIRecoveryCombatUnit(object, enemy)) { source = object; break; }
 		}
-		if (!members[0] || !members[1] || !source || leader->getAttackedFrame() == frame) return;
+		if (!members[0] || !members[1] || !source) return;
 		// Exercise the actual public command dispatcher while both retained
 		// offensive recipients still belong to the unreleased allied hold.
 		for (Int participant = 0; participant < 2; ++participant)
@@ -7403,11 +7402,12 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 		printf("SKIRMISH_AI_ALLIED_WITHDRAWAL_FAULT frame=%u release=%u leader=%d source_witness=%u victim=%u "
 			"health_before=%g health_after=%g attacked_before=%u attacked_after=%u target=%u admission=%u "
 			"masked_source_hit=1 source_mask=%u health_healed=%g healing_clipped=%g held_damage_frame=%u "
-			"healed_before_owner_update=1 nonlethal=1\n",
+			"healed_before_owner_update=1 same_frame_admission=%d nonlethal=1\n",
 			frame, s_allied.assaultRelease, s_allied.assaultLeader, source->getID(), victim->getID(),
 			before, after, attackedBefore, leader->getAttackedFrame(), s_allied.assaultTarget,
 			s_allied.assaultAdmissionFrames[leaderParticipant], sourceMask, victim->getBodyModule()->getHealth(),
-			healing.out.m_actualDamageClipped, healedState.heldDamageFrame);
+			healing.out.m_actualDamageClipped, healedState.heldDamageFrame,
+			frame == s_allied.assaultAdmissionFrames[leaderParticipant]);
 		fflush(stdout);
 		return;
 	}
