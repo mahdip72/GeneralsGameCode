@@ -338,12 +338,13 @@ static void TestAssaultCohortDeterminismAndDeclines()
 	STAGE5_CHECK(decision.assaultEnemyIndices[1] == 3);
 	STAGE5_CHECK(decision.assaultTargetIDs[0] == (ObjectID)40);
 	STAGE5_CHECK(decision.assaultLeaderIndices[2] == -1);
-	// A neutral relation invalidates an otherwise-ready cohort participant.
-	facts[1].enemyMask &= ~(((UnsignedInt)1U) << 4);
+	// A neutral relation to leader 0's selected target invalidates the cohort.
+	facts[1].enemyMask &= ~(((UnsignedInt)1U) << 3);
 	EvaluateSkirmishAIAlliedCoordination(facts, 16, previous, &decision);
 	STAGE5_CHECK(decision.assaultLeaderIndices[0] == -1);
+	STAGE5_CHECK(decision.assaultLeaderIndices[1] == -1);
 	STAGE5_CHECK(decision.assaultLeaderIndices[2] == -1);
-	facts[1].enemyMask |= ((UnsignedInt)1U << 4);
+	facts[1].enemyMask |= ((UnsignedInt)1U << 3);
 	EvaluateSkirmishAIAlliedCoordination(facts, 16, previous, &decision);
 
 	// The one-sided edge blocks player 1's higher-scoring target for leader 0.
