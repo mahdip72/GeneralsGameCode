@@ -598,6 +598,11 @@ Int parseRunSkirmishAITestForStartup(char *args[], int num)
 #if RTS_ZEROHOUR
 static void parseSkirmishAIAlliedArguments(char *args[], int num, Int *seed, Int *fixtureCase)
 {
+#if !defined(_WIN64)
+	printf("SKIRMISH_AI_ALLIED_FIXTURE_FAIL seed=0 reason=native_x64_only\n");
+	fflush(stdout);
+	exit(2);
+#endif
 	if (num < 3 || !TryParseSkirmishAITestSeed(args[1], seed) ||
 		!TryParseSkirmishAIAlliedFixtureCase(args[2], fixtureCase))
 	{

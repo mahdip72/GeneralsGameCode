@@ -3553,11 +3553,15 @@ Bool TryParseSkirmishAIAlliedFixtureCase(const char *text, Int *fixtureCase)
 
 Bool ConfigureSkirmishAIAlliedFixture(Int fixtureCase)
 {
+#if !RTS_ZEROHOUR || !defined(_WIN64)
+	return FALSE;
+#else
 	if (s_alliedRequestedCase >= 0 || fixtureCase < 0 ||
 		fixtureCase >= SKIRMISH_AI_ALLIED_FIXTURE_CASE_COUNT)
 		return FALSE;
 	s_alliedRequestedCase = fixtureCase;
 	return TRUE;
+#endif
 }
 
 Bool TryParseSkirmishAIRecoveryFixtureCase(const char *text, Int *fixtureCase)
@@ -6668,7 +6672,7 @@ void UpdateSkirmishAIRecoveryFixture()
 
 namespace
 {
-#if RTS_ZEROHOUR
+#if RTS_ZEROHOUR && defined(_WIN64)
 Bool CheckAlliedTransferCommand(Player *donor, Player *recipient, Int amount,
 	Bool accepted, Int argumentShape = 0)
 {
@@ -6755,6 +6759,16 @@ AISkirmishPlayer *GetAlliedFixtureAI(Int slot)
 	Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
 	AIPlayer *ai = player ? player->getAIPlayerForPlanning() : nullptr;
 	return ai && ai->isSkirmishAI() ? static_cast<AISkirmishPlayer *>(ai) : nullptr;
+}
+
+Player *FindAlliedFixturePlayer(Int playerIndex)
+{
+	for (Int ordinal = 0; ordinal < ThePlayerList->getPlayerCount(); ++ordinal)
+	{
+		Player *player = ThePlayerList->getNthPlayer(ordinal);
+		if (player && player->getPlayerIndex() == playerIndex) return player;
+	}
+	return nullptr;
 }
 
 Bool SameAlliedDiagnostics(const AISkirmishPlayer::AlliedCoordinationDiagnostics &a,
@@ -6923,7 +6937,7 @@ void ObserveAlliedSupport(UnsignedInt frame)
 		if (!donor) continue;
 		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = donor->getAlliedCoordinationDiagnostics();
 		if (state.supportTeamCount <= 0 || state.supportRecipientIndex < 0) continue;
-		Player *recipient = ThePlayerList->getNthPlayer(state.supportRecipientIndex);
+		Player *recipient = FindAlliedFixturePlayer(state.supportRecipientIndex);
 		if (!recipient || !recipient->isPlayerActive()) continue;
 		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(
 			ThePlayerList->getPlayerFromSlotIndex(slot)->getPlayerIndex());
@@ -7084,7 +7098,7 @@ void UpdateSkirmishAIAlliedFixture()
 		RequestSkirmishAITestStop();
 		return;
 	}
-#if RTS_ZEROHOUR
+#if RTS_ZEROHOUR && defined(_WIN64)
 	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_TRANSFER_COMMAND)
 	{
 		if (!RunAlliedTransferCommands()) FailSkirmishAITest("allied_transfer_assertion");

@@ -232,7 +232,8 @@ void SetSkirmishAITestFinalDigest(UnsignedInt digest);
 void ArmSkirmishAITestRunner(Int seed,
 	SkirmishAITestScenario scenario = SKIRMISH_AI_TEST_SCENARIO_4V3);
 void ArmSkirmishAIRecoveryFixtureRunner(Int seed, Int fixtureCase, Int faction);
-// Opt-in full-engine allied fixtures; never a fresh-match/replay acceptance lane.
+// Opt-in native x64 Zero Hour full-engine allied fixtures; never a
+// fresh-match/replay acceptance lane.
 enum SkirmishAIAlliedFixtureCase
 {
 	SKIRMISH_AI_ALLIED_TRANSFER_COMMAND,
