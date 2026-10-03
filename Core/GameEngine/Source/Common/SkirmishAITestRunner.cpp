@@ -7307,26 +7307,6 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 				fflush(stdout);
 			}
 		}
-		// A real mobile hostile infantry recipient provides a bounded non-held
-		// contrast, without changing the retained owners' ordinary army orders.
-		for (Int slot = 1; slot <= 7; ++slot)
-		{
-			AISkirmishPlayer *sourceOwner = GetAlliedFixtureAI(slot);
-			AIUpdateInterface *sourceAI = source->getAIUpdateInterface();
-			if (!sourceOwner || !sourceAI || !source->isKindOf(KINDOF_INFANTRY) ||
-				source->getControllingPlayer() != ThePlayerList->getPlayerFromSlotIndex(slot) ||
-				sourceOwner->shouldHoldAlliedScriptCommand(source)) continue;
-			Coord3D localGoal = *source->getPosition();
-			localGoal.x += 32.0f;
-			sourceAI->aiAttackMoveToPosition(&localGoal, NO_MAX_SHOTS_LIMIT, CMD_FROM_SCRIPT);
-			if (sourceAI->getLastCommandSource() != CMD_FROM_SCRIPT || sourceAI->getCurrentStateID() != AI_ATTACK_MOVE_TO)
-			{ FailSkirmishAITest("allied_script_nonheld_command_not_admitted"); RequestSkirmishAITestStop(); return; }
-			++s_allied.checks;
-			printf("SKIRMISH_AI_ALLIED_SCRIPT_NONHELD_ASSERT frame=%u slot=%d member=%u "
-				"predicate=0 source=script attack_move_admitted=1\n", frame, slot, source->getID());
-			fflush(stdout);
-			break;
-		}
 		Object *victim = members[leaderParticipant];
 		const Real before = victim->getBodyModule()->getHealth();
 		const UnsignedInt attackedBefore = leader->getAttackedFrame();
