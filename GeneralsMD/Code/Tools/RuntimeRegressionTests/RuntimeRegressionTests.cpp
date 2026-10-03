@@ -3079,12 +3079,12 @@ static void TestSkirmishAIReplayEpoch()
 
 	UnicodeString currentEpoch = unmarked;
 	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
-	CHECK(currentEpoch == repeatedCurrentEpoch);
-	UnicodeString repeatedCurrentEpoch = currentEpoch;
+	CHECK(GetSkirmishAIReplayEpoch(currentEpoch) == GetSkirmishAIReplayRecordingEpoch());
 	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(currentEpoch));
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayRecordingEpoch()));
 	CHECK(ShouldUseSkirmishAICounterRng(TRUE, GetSkirmishAIReplayRecordingEpoch()) ==
 		BuildSupportsSkirmishAICounterRngPlanning());
+	UnicodeString repeatedCurrentEpoch = currentEpoch;
 	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
 	CHECK(currentEpoch == repeatedCurrentEpoch);
 
