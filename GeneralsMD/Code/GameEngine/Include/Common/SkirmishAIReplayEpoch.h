@@ -308,8 +308,8 @@ inline Bool BuildSupportsSkirmishAICounterRngPlanning()
 inline Int GetSkirmishAIReplayRecordingEpoch()
 {
 	return BuildSupportsSkirmishAICounterRngPlanning() ?
-		SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG :
-		SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG;
+		SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG :
+		SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG;
 }
 
 inline void MarkReplayVersionForSkirmishAIRecordingEpoch(
