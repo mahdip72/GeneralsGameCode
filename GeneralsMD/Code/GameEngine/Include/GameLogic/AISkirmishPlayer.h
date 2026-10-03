@@ -118,6 +118,7 @@ public:	// AIPlayer interface methods.
 	ObjectID getAlliedCurrentStrategicTargetID() const { return m_strategyState.strategicTargetID; }
 	Bool isAlliedAssaultHoldingTeam(UnsignedInt teamID) const;
 	Bool shouldHoldAlliedScriptCommand(const Object *object) const;
+	Bool isAlliedSupportMember(const Object *object) const;
 	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing,
 		Bool isUpgrade, Bool refreshProductionReserve);
 

@@ -5956,7 +5956,6 @@ Bool AISkirmishPlayer::selectTeamToReinforce( Int minPriority )
 					origin = *team->getFirstItemIn_TeamMemberList()->getPosition();
 				Object *recruit = team->tryToRecruit(
 					thing, &origin, TheAI->getAiData()->m_maxRecruitDistance);
-				if (recruit && isAlliedSupportTeam(recruit->getTeam()->getID())) recruit = 0;
 				std::vector<Object *> producers;
 				if (!recruit) {
 					FindSkirmishAICompatibleProducers(m_player, thing, &producers);
@@ -8372,6 +8371,14 @@ Bool AISkirmishPlayer::isAlliedSupportTeam(UnsignedInt teamID) const
 	for (size_t i = 0; i < m_alliedSupportTeamIDs.size(); ++i)
 		if (m_alliedSupportTeamIDs[i] == teamID) return true;
 	return false;
+}
+
+Bool AISkirmishPlayer::isAlliedSupportMember(const Object *object) const
+{
+	// Use the actual command-recipient predicate, leaving incidental noncombat members recruitable.
+	return usesAlliedCoordinationBehavior() &&
+		IsSkirmishStrategyOffensiveRecipient(const_cast<Object *>(object), m_player) &&
+		isAlliedSupportTeam(object->getTeam()->getID());
 }
 
 Bool AISkirmishPlayer::isAlliedAssaultHolding() const
@@ -12343,7 +12350,6 @@ void AISkirmishPlayer::recruitSpecificAITeam(TeamPrototype *teamProto, Real recr
 				int count = unitInfo[i].maxUnits;
 				while (count>0) {
 					Object *unit = theTeam->tryToRecruit(thing, &teamProto->getTemplateInfo()->m_homeLocation, recruitRadius);
-					if (unit && isAlliedSupportTeam(unit->getTeam()->getID())) unit = 0;
 					if (unit)
 					{
 						unitsRecruited++;
