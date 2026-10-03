@@ -245,6 +245,8 @@ enum SkirmishAIAlliedFixtureCase
 };
 Bool TryParseSkirmishAIAlliedFixtureCase(const char *text, Int *fixtureCase);
 Bool ConfigureSkirmishAIAlliedFixture(Int fixtureCase);
+// Read-only opt-in for live allied-fixture diagnostics, false in other lanes.
+Bool IsSkirmishAIAlliedFixtureActive();
 Bool IsSkirmishAITestRunnerArmed();
 Bool StartSkirmishAITestRunner();
 void UpdateSkirmishAITestRunner();

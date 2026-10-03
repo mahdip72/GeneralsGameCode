@@ -30,6 +30,10 @@
 
 #include <algorithm>
 #include <vector>
+#if defined(_WIN64)
+#include <stdio.h>
+#include "Common/SkirmishAITestRunner.h"
+#endif
 
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
@@ -8842,6 +8846,107 @@ Bool AISkirmishPlayer::isAlliedAssaultHoldingTeam(UnsignedInt teamID) const
 	return context.found;
 }
 
+#if defined(_WIN64)
+enum SkirmishAlliedCancellationReason {
+	SKIRMISH_ALLIED_CANCEL_FORTIFY = 1U << 0,
+	SKIRMISH_ALLIED_CANCEL_THREAT = 1U << 1,
+	SKIRMISH_ALLIED_CANCEL_BASE = 1U << 2,
+	SKIRMISH_ALLIED_CANCEL_RECOVERY = 1U << 3,
+	SKIRMISH_ALLIED_CANCEL_EXPIRY = 1U << 4,
+	SKIRMISH_ALLIED_CANCEL_TARGET = 1U << 5,
+	SKIRMISH_ALLIED_CANCEL_FORCE = 1U << 6,
+	SKIRMISH_ALLIED_CANCEL_FACTS = 1U << 7,
+	SKIRMISH_ALLIED_CANCEL_NOT_ALIVE = 1U << 8,
+	SKIRMISH_ALLIED_CANCEL_HOME_DAMAGE = 1U << 9,
+	SKIRMISH_ALLIED_CANCEL_HELD_DAMAGE = 1U << 10,
+	SKIRMISH_ALLIED_CANCEL_ADMISSION = 1U << 11,
+	SKIRMISH_ALLIED_CANCEL_LEADER_ALLY = 1U << 12,
+	SKIRMISH_ALLIED_CANCEL_LEADER_ANNOUNCEMENT = 1U << 13
+};
+
+static void PrintSkirmishAlliedCancellation(AISkirmishPlayer *ai, Player *owner,
+	const SkirmishAIAlliedPlayerFacts *facts, const char *location, UnsignedInt reasons,
+	Bool recoveryImpossible, Bool forceAvailable, Bool recentHomeDamage,
+	Bool recentHeldDamage, Int leaderAnnouncementValid, Int targetResolved)
+{
+	if (!IsSkirmishAIAlliedFixtureActive() || !ai || !owner || !TheGameLogic) return;
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics d = ai->getAlliedCoordinationDiagnostics();
+	if (!d.assaultActive) return;
+	Player *enemy = FindSkirmishAlliedPlayer(d.enemyIndex);
+	Player *leader = FindSkirmishAlliedPlayer(d.leaderIndex);
+	Object *target = TheGameLogic->findObjectByID(d.targetID);
+	Player *targetOwner = target ? target->getControllingPlayer() : 0;
+	const Bool leaderIsOwner = d.leaderIndex == owner->getPlayerIndex();
+	printf("SKIRMISH_AI_ALLIED_CANCEL frame=%u location=%s reason_mask=%u owner=%d "
+		"active=%d launched=%d pending=%d leader=%d enemy=%d target=%u release=%u expiry=%u "
+		"admission_valid=%d admission=%u roster_count=%d mode=%d strategic_target=%u "
+		"next_evaluation=%u facts_present=%d facts_valid=%d facts_alive=%d facts_mode=%d "
+		"facts_ready=%d facts_enemy=%d facts_target=%u economy=%d base=%d army=%d threat=%d "
+		"recovery_impossible=%d force_available=%d recent_home_damage=%d recent_held_damage=%d "
+		"home_damage_valid=%d home_damage=%u held_damage_valid=%d held_damage=%u "
+		"leader_active=%d leader_dead=%d leader_mutual=%d leader_announcement=%d target_resolved=%d\n",
+		TheGameLogic->getFrame(), location, reasons, owner->getPlayerIndex(),
+		d.assaultActive, d.assaultLaunched, d.strategyResumePending, d.leaderIndex, d.enemyIndex,
+		d.targetID, d.assaultFrame, d.assaultExpiryFrame, d.holdAdmissionValid, d.holdAdmissionFrame,
+		d.assaultTeamCount, (Int)ai->getAlliedCurrentStrategyMode(), ai->getAlliedCurrentStrategicTargetID(),
+		TheAI ? TheAI->getNextAlliedEvaluationFrame() : 0,
+		facts != 0, facts ? facts->valid : 0, facts ? facts->alive : 0, facts ? (Int)facts->mode : -1,
+		facts ? facts->hasReadyForce : 0, facts ? facts->targetEnemyIndex : -1,
+		facts ? facts->targetObjectID : INVALID_ID,
+		facts ? facts->economyHealth : -1, facts ? facts->baseIntegrity : -1,
+		facts ? facts->armyReadiness : -1, facts ? facts->immediateThreat : -1,
+		recoveryImpossible, forceAvailable, recentHomeDamage, recentHeldDamage,
+		d.homeDamageValid, d.homeDamageFrame, d.heldDamageValid, d.heldDamageFrame,
+		leader ? leader->isPlayerActive() : 0, leader ? leader->isPlayerDead() : 1,
+		leaderIsOwner ? -1 : (Int)IsSkirmishMutualLiveAlly(owner, leader),
+		leaderAnnouncementValid, targetResolved);
+	printf("SKIRMISH_AI_ALLIED_CANCEL_TARGET frame=%u owner=%d target=%u found=%d "
+		"target_owner=%d target_owner_active=%d enemy_active=%d enemy_dead=%d relationship=%d "
+		"static=%d dead=%d destroyed=%d sold=%d under_construction=%d shroud=%d intel=%d "
+		"visible_intel=%d stealthed=%d detected=%d masked=%d\n",
+		TheGameLogic->getFrame(), owner->getPlayerIndex(), d.targetID, target != 0,
+		targetOwner ? targetOwner->getPlayerIndex() : -1, targetOwner ? targetOwner->isPlayerActive() : 0,
+		enemy ? enemy->isPlayerActive() : 0, enemy ? enemy->isPlayerDead() : 1,
+		enemy && enemy->getDefaultTeam() ? (Int)owner->getRelationship(enemy->getDefaultTeam()) : -1,
+		target ? IsSkirmishStrategyStaticTarget(target) : 0, target ? target->isEffectivelyDead() : 1,
+		target ? target->isDestroyed() : 1, target ? target->testStatus(OBJECT_STATUS_SOLD) : 0,
+		target ? target->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) : 0,
+		target ? (Int)target->getShroudedStatus(owner->getPlayerIndex()) : -1,
+		IsSkirmishStrategyIntelEligible(target, owner),
+		target ? IsSkirmishAIIntelEligible(target->isKindOf(KINDOF_STRUCTURE), TRUE, FALSE,
+			target->testStatus(OBJECT_STATUS_STEALTHED), target->testStatus(OBJECT_STATUS_DETECTED),
+			target->testStatus(OBJECT_STATUS_MASKED)) : 0,
+		target ? target->testStatus(OBJECT_STATUS_STEALTHED) : 0,
+		target ? target->testStatus(OBJECT_STATUS_DETECTED) : 0,
+		target ? target->testStatus(OBJECT_STATUS_MASKED) : 0);
+	// Walk only the bounded stored roster after a real cancellation decision.
+	for (Int i = 0; i < d.assaultTeamCount && i < MAX_SKIRMISH_ALLIED_ASSAULT_TEAMS; ++i) {
+		const UnsignedInt id = ai->getAlliedAssaultTeamID(i);
+		Team *team = FindSkirmishAlliedTeam(owner, id);
+		Bool support = false;
+		for (Int j = 0; j < d.supportTeamCount && j < 4; ++j)
+			if (ai->getAlliedSupportTeamID(j) == id) support = true;
+		Int members = 0, live = 0, combatRecipients = 0, contained = 0;
+		if (team) {
+			for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+				!member.done(); member.advance()) {
+				Object *object = member.cur();
+				++members;
+				if (!object->isEffectivelyDead() && !object->isDestroyed()) ++live;
+				if (ai->isAlliedAssaultMember(object)) ++combatRecipients;
+				if (object->isContained()) ++contained;
+			}
+		}
+		printf("SKIRMISH_AI_ALLIED_CANCEL_TEAM frame=%u owner=%d index=%d team=%u found=%d "
+			"active=%d offensive=%d members=%d live=%d combat_recipients=%d contained=%d support=%d\n",
+			TheGameLogic->getFrame(), owner->getPlayerIndex(), i, id, team != 0,
+			team ? team->isActive() : 0, IsSkirmishStrategyOffensiveTeam(team, owner),
+			members, live, combatRecipients, contained, support);
+	}
+	fflush(stdout);
+}
+#endif
+
 void AISkirmishPlayer::clearAlliedAssault()
 {
 	if (m_alliedAssaultActive)
@@ -8993,13 +9098,36 @@ void AISkirmishPlayer::commitAlliedCoordination(
 	}
 	if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY ||
 		own->immediateThreat >= 60 || own->baseIntegrity < 65 || m_recoveryImpossible) {
+#if defined(_WIN64)
+		if (IsSkirmishAIAlliedFixtureActive() && m_alliedAssaultActive) {
+			UnsignedInt reasons = 0;
+			if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY) reasons |= SKIRMISH_ALLIED_CANCEL_FORTIFY;
+			if (own->immediateThreat >= 60) reasons |= SKIRMISH_ALLIED_CANCEL_THREAT;
+			if (own->baseIntegrity < 65) reasons |= SKIRMISH_ALLIED_CANCEL_BASE;
+			if (m_recoveryImpossible) reasons |= SKIRMISH_ALLIED_CANCEL_RECOVERY;
+			PrintSkirmishAlliedCancellation(this, m_player, own, "central_safety", reasons,
+				m_recoveryImpossible, hasAlliedAssaultForce(), m_alliedRecentHomeDamage,
+				m_alliedRecentHeldDamage, -1, -1);
+		}
+#endif
 		clearAlliedAssault();
 		return;
 	}
 	if (m_alliedAssaultActive) {
 		Object *target = 0;
 		if (IsSkirmishStrategyFrameReached(now, m_alliedAssaultExpiryFrame) ||
-			!resolveAlliedAssaultTarget(&target)) clearAlliedAssault();
+			!resolveAlliedAssaultTarget(&target)) {
+#if defined(_WIN64)
+			if (IsSkirmishAIAlliedFixtureActive()) {
+				const Bool expired = IsSkirmishStrategyFrameReached(now, m_alliedAssaultExpiryFrame);
+				PrintSkirmishAlliedCancellation(this, m_player, own, "central_target",
+					expired ? SKIRMISH_ALLIED_CANCEL_EXPIRY : SKIRMISH_ALLIED_CANCEL_TARGET,
+					m_recoveryImpossible, hasAlliedAssaultForce(), m_alliedRecentHomeDamage,
+					m_alliedRecentHeldDamage, -1, expired ? -1 : 0);
+			}
+#endif
+			clearAlliedAssault();
+		}
 		else return; // A plan's announced release frame is immutable.
 	}
 	if (m_alliedStrategyResumePending) return;
@@ -9237,6 +9365,30 @@ void AISkirmishPlayer::updateAlliedAssignments()
 			!leaderAnnouncementValid ||
 			IsSkirmishStrategyFrameReached(now, m_alliedAssaultExpiryFrame) ||
 			!resolveAlliedAssaultTarget(&target)) {
+#if defined(_WIN64)
+			if (IsSkirmishAIAlliedFixtureActive()) {
+				UnsignedInt reasons = 0;
+				const Bool force = hasAlliedAssaultForce();
+				if (!force) reasons |= SKIRMISH_ALLIED_CANCEL_FORCE;
+				if (!own) reasons |= SKIRMISH_ALLIED_CANCEL_FACTS;
+				if (own && !own->alive) reasons |= SKIRMISH_ALLIED_CANCEL_NOT_ALIVE;
+				if (own && own->immediateThreat >= 60) reasons |= SKIRMISH_ALLIED_CANCEL_THREAT;
+				if (m_alliedRecentHomeDamage) reasons |= SKIRMISH_ALLIED_CANCEL_HOME_DAMAGE;
+				if (!m_alliedAssaultLaunched && m_alliedRecentHeldDamage) reasons |= SKIRMISH_ALLIED_CANCEL_HELD_DAMAGE;
+				if (!m_alliedAssaultLaunched && !m_alliedHoldAdmissionValid) reasons |= SKIRMISH_ALLIED_CANCEL_ADMISSION;
+				if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY) reasons |= SKIRMISH_ALLIED_CANCEL_FORTIFY;
+				if (m_alliedLeaderIndex != m_player->getPlayerIndex() && !IsSkirmishMutualLiveAlly(m_player, leader))
+					reasons |= SKIRMISH_ALLIED_CANCEL_LEADER_ALLY;
+				if (!leaderAnnouncementValid) reasons |= SKIRMISH_ALLIED_CANCEL_LEADER_ANNOUNCEMENT;
+				if (IsSkirmishStrategyFrameReached(now, m_alliedAssaultExpiryFrame)) reasons |= SKIRMISH_ALLIED_CANCEL_EXPIRY;
+				// The original resolver is evaluated only after all earlier predicates pass.
+				const Int targetResolved = reasons == 0 ? 0 : -1;
+				if (reasons == 0) reasons |= SKIRMISH_ALLIED_CANCEL_TARGET;
+				PrintSkirmishAlliedCancellation(this, m_player, own, "owner_assignment", reasons,
+					m_recoveryImpossible, force, m_alliedRecentHomeDamage, m_alliedRecentHeldDamage,
+					leaderAnnouncementValid, targetResolved);
+			}
+#endif
 			clearAlliedAssault();
 		} else if (!m_alliedAssaultLaunched && IsSkirmishStrategyFrameReached(now, m_alliedAssaultFrame)) {
 			m_alliedAssaultLaunched = true;

@@ -3665,6 +3665,15 @@ Bool ConfigureSkirmishAIAlliedFixture(Int fixtureCase)
 #endif
 }
 
+Bool IsSkirmishAIAlliedFixtureActive()
+{
+#if RTS_ZEROHOUR && defined(_WIN64)
+	return s_allied.active;
+#else
+	return FALSE;
+#endif
+}
+
 Bool TryParseSkirmishAIRecoveryFixtureCase(const char *text, Int *fixtureCase)
 {
 	return TryParseSkirmishAIRecoveryNamedValue(
