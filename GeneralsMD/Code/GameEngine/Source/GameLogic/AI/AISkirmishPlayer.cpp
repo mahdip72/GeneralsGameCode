@@ -8378,6 +8378,19 @@ Bool AISkirmishPlayer::isAlliedAssaultHolding() const
 		!m_alliedAssaultLaunched;
 }
 
+Bool AISkirmishPlayer::isAlliedAssaultHoldingTeam(UnsignedInt teamID) const
+{
+	if (!isAlliedAssaultHolding() || !m_player || isAlliedSupportTeam(teamID)) return false;
+	Team *team = FindSkirmishAlliedTeam(m_player, teamID);
+	if (!IsSkirmishStrategyOffensiveTeam(team, m_player) || !team->hasAnyObjects()) return false;
+	SkirmishStrategyGroupRecipientContext context;
+	context.player = m_player;
+	context.group = 0;
+	context.found = false;
+	team->iterateObjects(CollectSkirmishStrategyGroupRecipient, &context);
+	return context.found;
+}
+
 void AISkirmishPlayer::clearAlliedAssault()
 {
 	if (m_alliedAssaultActive && !m_alliedAssaultLaunched)

@@ -116,6 +116,7 @@ public:	// AIPlayer interface methods.
 	Real getAlliedSupportHomeRadius() const { return m_baseRadius + 150.0f; }
 	SkirmishStrategyMode getAlliedCurrentStrategyMode() const { return m_strategyState.currentMode; }
 	ObjectID getAlliedCurrentStrategicTargetID() const { return m_strategyState.strategicTargetID; }
+	Bool isAlliedAssaultHoldingTeam(UnsignedInt teamID) const;
 	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing,
 		Bool isUpgrade, Bool refreshProductionReserve);
 
