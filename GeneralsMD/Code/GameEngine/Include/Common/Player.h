@@ -235,6 +235,8 @@ public:
 	/// return the Player's Money sub-object
 	Money *getMoney() { return &m_money; }
 	const Money *getMoney() const { return &m_money; }
+	/// Transfer the exact amount to an active mutual ally on the logic owner thread.
+	Bool transferMoneyToAlly(Int recipientPlayerIndex, Int amount);
 
 	UnsignedInt getSupplyBoxValue();///< Many things can affect the value of a crate, but at heart it is a GlobalData ratio.
 
