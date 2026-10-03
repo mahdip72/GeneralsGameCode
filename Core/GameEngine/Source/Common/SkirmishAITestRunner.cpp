@@ -6763,7 +6763,7 @@ Bool CheckAlliedTransferCommand(Player *donor, Player *recipient, Int amount,
 	const UnsignedInt receiptBefore = skirmishAI ?
 		skirmishAI->getAlliedCoordinationDiagnostics().mayDonateFrame : 0;
 	CommandList commands;
-	GameMessage *message = NEW GameMessage(GameMessage::MSG_TRANSFER_MONEY_TO_ALLY);
+	GameMessage *message = newInstance(GameMessage)(GameMessage::MSG_TRANSFER_MONEY_TO_ALLY);
 	message->friend_setPlayerIndex(donor->getPlayerIndex());
 	if (argumentShape == 1)
 		message->appendRealArgument(static_cast<Real>(recipient->getPlayerIndex()));
