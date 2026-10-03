@@ -117,6 +117,7 @@ public:	// AIPlayer interface methods.
 	SkirmishStrategyMode getAlliedCurrentStrategyMode() const { return m_strategyState.currentMode; }
 	ObjectID getAlliedCurrentStrategicTargetID() const { return m_strategyState.strategicTargetID; }
 	Bool isAlliedAssaultHoldingTeam(UnsignedInt teamID) const;
+	Bool shouldHoldAlliedScriptCommand(const Object *object) const;
 	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing,
 		Bool isUpgrade, Bool refreshProductionReserve);
 
@@ -289,6 +290,7 @@ protected:
 	void dispatchAlliedSupport(Int recipientIndex, Int budget);
 	Bool isAlliedSupportTeam(UnsignedInt teamID) const;
 	Bool isActiveTacticalTunnelTeam(UnsignedInt teamID) const;
+	Bool isAlliedCommandProtectedTeam(UnsignedInt teamID) const;
 	Bool isAlliedAssaultHolding() const;
 	Bool resolveAlliedAssaultTarget(Object **target) const;
 	Player *getPinnedAlliedEnemy() const;

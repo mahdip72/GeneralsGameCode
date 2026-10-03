@@ -8385,10 +8385,28 @@ Bool AISkirmishPlayer::isActiveTacticalTunnelTeam(UnsignedInt teamID) const
 		state->second.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE;
 }
 
+Bool AISkirmishPlayer::isAlliedCommandProtectedTeam(UnsignedInt teamID) const
+{
+	std::map<UnsignedInt, TacticalTeamState>::const_iterator state = m_tacticalTeams.find(teamID);
+	return state != m_tacticalTeams.end() &&
+		(state->second.retreating || state->second.woundedReserve ||
+		 state->second.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE);
+}
+
+Bool AISkirmishPlayer::shouldHoldAlliedScriptCommand(const Object *object) const
+{
+	// Legacy Team accessors lack const overloads; the recipient predicate only reads them.
+	if (!usesAlliedCoordinationBehavior() ||
+		(!isAlliedAssaultHolding() && !m_alliedStrategyResumePending) ||
+		!IsSkirmishStrategyOffensiveRecipient(const_cast<Object *>(object), m_player)) return false;
+	const UnsignedInt teamID = object->getTeam()->getID();
+	return !isAlliedSupportTeam(teamID) && !isAlliedCommandProtectedTeam(teamID);
+}
+
 Bool AISkirmishPlayer::isAlliedAssaultHoldingTeam(UnsignedInt teamID) const
 {
 	if (!isAlliedAssaultHolding() || !m_player || isAlliedSupportTeam(teamID) ||
-		isActiveTacticalTunnelTeam(teamID)) return false;
+		isAlliedCommandProtectedTeam(teamID)) return false;
 	Team *team = FindSkirmishAlliedTeam(m_player, teamID);
 	if (!IsSkirmishStrategyOffensiveTeam(team, m_player) || !team->hasAnyObjects()) return false;
 	SkirmishStrategyGroupRecipientContext context;
@@ -11002,7 +11020,8 @@ void AISkirmishPlayer::commandOffensiveTeams(
 	if (!TheAI || !m_player)
 		return;
 	// Allied release/resumption may already have cleared their hold flags.
-	const Bool protectTransit = usesAlliedCoordinationBehavior() &&
+	// Preserve tactical retreat, wounded reserve and transit ownership on those impulses.
+	const Bool protectTacticalOrders = usesAlliedCoordinationBehavior() &&
 		(preserveTunnelTransit || isAlliedAssaultHolding() || m_alliedStrategyResumePending);
 	std::vector<Team *> teams;
 	Player::PlayerTeamList::const_iterator prototype;
@@ -11014,7 +11033,7 @@ void AISkirmishPlayer::commandOffensiveTeams(
 			Team *candidate = teamInstance.cur();
 			if (IsSkirmishStrategyOffensiveTeam(candidate, m_player) &&
 				!isAlliedSupportTeam(candidate->getID()) &&
-				(!protectTransit || !isActiveTacticalTunnelTeam(candidate->getID())) &&
+				(!protectTacticalOrders || !isAlliedCommandProtectedTeam(candidate->getID())) &&
 				candidate->hasAnyObjects()) {
 				SkirmishStrategyGroupRecipientContext context;
 				context.player = m_player;
