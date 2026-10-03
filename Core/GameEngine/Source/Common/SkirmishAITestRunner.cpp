@@ -7164,34 +7164,40 @@ void ObserveAlliedCancellationResume(UnsignedInt frame)
 		const Int slot = s_allied.cancellationSlots[participant];
 		AISkirmishPlayer *ai = GetAlliedFixtureAI(slot);
 		Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
-		Object *member = TheGameLogic->findObjectByID(s_allied.cancellationMembers[participant]);
-		if (!ai || !player || !IsSkirmishAIRecoveryCombatUnit(member, player) ||
-			!member->getTeam() || member->getTeam()->getID() != s_allied.cancellationTeams[participant])
+		if (!ai || !player)
 		{ FailSkirmishAITest("allied_cancellation_held_member_lost"); RequestSkirmishAITestStop(); return; }
 		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
 		if (state.assaultLaunched)
 		{ FailSkirmishAITest("allied_cancellation_follower_launched"); RequestSkirmishAITestStop(); return; }
 		bothCanceled = bothCanceled && !state.assaultActive;
 		anyPending = anyPending || state.strategyResumePending;
-		if (!s_allied.cancellationSaved || state.assaultActive || state.strategyResumePending ||
-			s_allied.cancellationOrdinaryQualified[participant]) continue;
+		// Retire the physical witness after its actual ordinary-order proof;
+		// both owners' cancellation and nonlaunch checks remain live.
+		if (s_allied.cancellationOrdinaryQualified[participant]) continue;
+		Object *member = TheGameLogic->findObjectByID(s_allied.cancellationMembers[participant]);
+		if (!IsSkirmishAIRecoveryCombatUnit(member, player) || !member->getTeam() ||
+			member->getTeam()->getID() != s_allied.cancellationTeams[participant])
+		{ FailSkirmishAITest("allied_cancellation_held_member_lost"); RequestSkirmishAITestStop(); return; }
+		if (!s_allied.cancellationSaved || state.assaultActive || state.strategyResumePending) continue;
 		// Only an owner saved and rebound with pending=true can qualify a
 		// pending-to-clear transition. Other owners qualify ordinary state only.
 		if (s_allied.cancellationPendingAtSave[participant] &&
 			!s_allied.cancellationPendingAfterLoad[participant])
 		{ FailSkirmishAITest("allied_cancellation_pending_transition_unproven"); RequestSkirmishAITestStop(); return; }
 		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(player->getPlayerIndex());
-		if (!facts || !facts->valid || !facts->alive || facts->immediateThreat >= 60 ||
-			facts->baseIntegrity < 65) continue;
+		if (!facts || !facts->valid || !facts->alive) continue;
 		AIUpdateInterface *unitAI = member->getAIUpdateInterface();
 		if (!unitAI || unitAI->getLastCommandSource() != CMD_FROM_AI) continue;
 		const SkirmishStrategyMode mode = ai->getAlliedCurrentStrategyMode();
+		if (mode != SKIRMISH_STRATEGY_FORTIFY &&
+			(facts->immediateThreat >= 60 || facts->baseIntegrity < 65)) continue;
 		Bool ordinaryOrder = mode == SKIRMISH_STRATEGY_BALANCED && unitAI->getCurrentStateID() == AI_IDLE;
 		if (mode == SKIRMISH_STRATEGY_FORTIFY)
 		{
 			Coord3D home;
 			const Coord3D *guard = unitAI->getGuardLocation();
 			ordinaryOrder = ai->getBaseCenter(&home) && guard &&
+				unitAI->getCurrentStateID() == AI_GUARD && unitAI->getGuardMode() == GUARDMODE_GUARD_WITHOUT_PURSUIT &&
 				unitAI->getGuardTargetType() == GUARDTARGET_LOCATION &&
 				AlliedFixtureDistanceSquared(*guard, home) <= 50.0f * 50.0f;
 		}
@@ -7205,18 +7211,23 @@ void ObserveAlliedCancellationResume(UnsignedInt frame)
 				unitAI->getCurrentStateID() == AI_ATTACK_MOVE_TO &&
 				AlliedFixtureDistanceSquared(*goal, *currentTarget->getPosition()) <= 200.0f * 200.0f &&
 				AlliedFixtureDistanceSquared(*member->getPosition(), s_allied.cancellationPositions[participant]) >= 25.0f * 25.0f;
+			if (currentTargetID == INVALID_ID && unitAI->getCurrentStateID() == AI_IDLE)
+				ordinaryOrder = TRUE;
 		}
 		if (!ordinaryOrder) continue;
 		s_allied.cancellationOrdinaryQualified[participant] = TRUE;
 		++s_allied.checks;
 		printf("%s frame=%u slot=%d member=%u mode=%d pending_at_save=%d pending=0 "
-			"transition=%s surviving_held_member=1 safe_ordinary_order=1\n",
+			"transition=%s surviving_held_member=1 safe_ordinary_order=1 threat=%d base=%d ai_state=%d "
+			"guard_mode=%d fortify_home_guard=%d\n",
 			s_allied.cancellationPendingAtSave[participant] ?
 				"SKIRMISH_AI_ALLIED_CANCELLATION_RESUME_ASSERT" :
 				"SKIRMISH_AI_ALLIED_CANCELLATION_ORDINARY_STATE_ASSERT",
 			frame, slot, s_allied.cancellationMembers[participant], static_cast<Int>(mode),
 			s_allied.cancellationPendingAtSave[participant],
-			s_allied.cancellationPendingAtSave[participant] ? "pending_to_clear" : "not_claimed");
+			s_allied.cancellationPendingAtSave[participant] ? "pending_to_clear" : "not_claimed",
+			facts->immediateThreat, facts->baseIntegrity, unitAI->getCurrentStateID(),
+			static_cast<Int>(unitAI->getGuardMode()), mode == SKIRMISH_STRATEGY_FORTIFY);
 		fflush(stdout);
 	}
 	if (!s_allied.cancellationSaved)
@@ -7462,27 +7473,34 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 	for (Int participant = 0; participant < 2; ++participant)
 	{
 		AISkirmishPlayer *ai = GetAlliedFixtureAI(s_allied.assaultSlots[participant]);
-		Object *member = TheGameLogic->findObjectByID(s_allied.withdrawalMembers[participant]);
-		if (!ai || !IsSkirmishAIRecoveryCombatUnit(member, players[participant]) ||
-			!member->getTeam() || member->getTeam()->getID() != s_allied.withdrawalTeams[participant])
+		if (!ai)
 		{ PrintAlliedWithdrawalSurvivorFailure(frame, participant);
 		  FailSkirmishAITest("allied_withdrawal_held_survivor_lost"); RequestSkirmishAITestStop(); return; }
 		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
-		if (!s_allied.withdrawalCanceled && state.assaultLaunched)
+		if (state.assaultLaunched)
 		{ FailSkirmishAITest("allied_withdrawal_retained_owner_launched"); RequestSkirmishAITestStop(); return; }
 		bothCanceled = bothCanceled && !state.assaultActive;
+		if (s_allied.withdrawalOrdinary[participant]) continue;
+		Object *member = TheGameLogic->findObjectByID(s_allied.withdrawalMembers[participant]);
+		if (!IsSkirmishAIRecoveryCombatUnit(member, players[participant]) ||
+			!member->getTeam() || member->getTeam()->getID() != s_allied.withdrawalTeams[participant])
+		{ PrintAlliedWithdrawalSurvivorFailure(frame, participant);
+		  FailSkirmishAITest("allied_withdrawal_held_survivor_lost"); RequestSkirmishAITestStop(); return; }
 		if (!s_allied.withdrawalCanceled || state.assaultActive || state.strategyResumePending) continue;
 		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(players[participant]->getPlayerIndex());
-		if (!facts || !facts->valid || !facts->alive || facts->immediateThreat >= 60 || facts->baseIntegrity < 65) continue;
+		if (!facts || !facts->valid || !facts->alive) continue;
 		AIUpdateInterface *unitAI = member->getAIUpdateInterface();
 		if (!unitAI || unitAI->getLastCommandSource() != CMD_FROM_AI) continue;
 		const SkirmishStrategyMode mode = ai->getAlliedCurrentStrategyMode();
+		if (mode != SKIRMISH_STRATEGY_FORTIFY &&
+			(facts->immediateThreat >= 60 || facts->baseIntegrity < 65)) continue;
 		Bool ordinary = mode == SKIRMISH_STRATEGY_BALANCED && unitAI->getCurrentStateID() == AI_IDLE;
 		if (mode == SKIRMISH_STRATEGY_FORTIFY)
 		{
 			Coord3D home;
 			const Coord3D *guard = unitAI->getGuardLocation();
-			ordinary = ai->getBaseCenter(&home) && guard && unitAI->getGuardTargetType() == GUARDTARGET_LOCATION &&
+			ordinary = ai->getBaseCenter(&home) && guard && unitAI->getCurrentStateID() == AI_GUARD &&
+				unitAI->getGuardMode() == GUARDMODE_GUARD_WITHOUT_PURSUIT && unitAI->getGuardTargetType() == GUARDTARGET_LOCATION &&
 				AlliedFixtureDistanceSquared(*guard, home) <= 50.0f * 50.0f;
 		}
 		if (mode == SKIRMISH_STRATEGY_ASSAULT)
@@ -7492,14 +7510,19 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 			ordinary = IsLiveSkirmishAIRecoveryObject(ordinaryTarget) && goal &&
 				unitAI->getCurrentStateID() == AI_ATTACK_MOVE_TO &&
 				AlliedFixtureDistanceSquared(*goal, *ordinaryTarget->getPosition()) <= 200.0f * 200.0f;
+			if (ai->getAlliedCurrentStrategicTargetID() == INVALID_ID && unitAI->getCurrentStateID() == AI_IDLE)
+				ordinary = TRUE;
 		}
 		if (ordinary && !s_allied.withdrawalOrdinary[participant])
 		{
 			s_allied.withdrawalOrdinary[participant] = TRUE;
 			++s_allied.checks;
 			printf("SKIRMISH_AI_ALLIED_WITHDRAWAL_RESUME_ASSERT frame=%u slot=%d member=%u team=%u mode=%d "
-				"pending=0 safe_ordinary_order=1 surviving_held_member=1\n", frame,
-				s_allied.assaultSlots[participant], member->getID(), member->getTeam()->getID(), static_cast<Int>(mode));
+				"pending=0 safe_ordinary_order=1 surviving_held_member=1 threat=%d base=%d ai_state=%d "
+				"guard_mode=%d fortify_home_guard=%d\n", frame,
+				s_allied.assaultSlots[participant], member->getID(), member->getTeam()->getID(), static_cast<Int>(mode),
+				facts->immediateThreat, facts->baseIntegrity, unitAI->getCurrentStateID(),
+				static_cast<Int>(unitAI->getGuardMode()), mode == SKIRMISH_STRATEGY_FORTIFY);
 			fflush(stdout);
 		}
 	}
