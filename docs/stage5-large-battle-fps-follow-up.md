@@ -117,3 +117,50 @@ The accepted stable installation and live profile remain unchanged. Matched
 before/after battle timings, successful temporal visual inspection, independent
 review gates, relevant simulations and replay validation remain pending.
 External physical-core qualification is deferred, not passed.
+
+## Refinement contracts
+
+Nested native-capability scopes retain one shared lock for the outer scope
+instead of reacquiring it for each nested draw operation. The lifecycle admission,
+owner identity, nesting bounds and final unlock remain unchanged. Material
+publication snapshots only the pipeline it consumes, without copying unrelated
+constants or transforms. Neither structural change proves an FPS improvement.
+
+The recoil repair handles shared barrel metadata becoming available after an
+instance was allocated. It synchronizes the instance count before client use,
+preserves existing recoil histories and validates the entire mixed FX/recoil
+slot after FX callbacks. The regression includes first-use, mixed-barrel and
+existing-history cases. Recoil serialization layout remains unchanged.
+
+The x64 raw-animation sampler now chooses the enclosing key interval for finite,
+nonnegative, integer-conversion-safe phases. The previous conversion could choose
+the preceding key pair below a half-frame and extrapolate past it. The China
+Helix rotor's actual quaternion keys expose a discontinuity where its angular
+increment changes. The repair preserves artwork, interpolation policy and loop
+timing. Negative, nonfinite and conversion-unsafe phases retain the historical
+conversion. Both title paths use the shared C++98-compatible selector.
+
+The rotor regression uses the actual Helix keys and production quaternion/matrix
+math. It is not a full hierarchy-loader or rendered-game test. Pristine bone
+poses also feed launch offsets and serialized matrices, so this correction is
+not assumed to be simulation-neutral. Fresh same-candidate replay and live rotor
+inspection remain required. Existing executable/content replay checks stay intact.
+
+The opt-in rendered-battle diagnostic retains its fixed seed and all terrain,
+occupancy, ground-placement and attack-path admission checks. It reports Fortress
+Avalanche's unavailable-map reason only for that scenario. Other scenarios keep
+their existing map and reason. A production-body fixture checks all four metadata
+rejection conditions in both titles without creating a lobby, RNG or NEW_GAME.
+Its bounded battle completion is not an ordinary full AI match or replay gate.
+
+The particle source audit follows both packing helpers and their actual call
+branches instead of requiring the moved writes inline. Network recorder tests
+retain the intended AI-only marker while requiring pathfinding epoch zero.
+These fixture corrections do not change production AI or network behavior.
+
+Ten independent Luna source reviews found no P0/P1. Two smaller diagnostic
+findings received fixes and targeted supplemental review. Higher-tier reviews,
+combined candidate validation and CI still need completion. A locked desktop
+prevented the latest foreground inspection. Its loading surface and background
+timings do not count as animated-menu, battle, rotor or FPS acceptance. The
+accepted stable game and user profile remain unchanged.

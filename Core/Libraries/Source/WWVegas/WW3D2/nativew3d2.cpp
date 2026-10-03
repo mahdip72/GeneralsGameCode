@@ -6,6 +6,7 @@
 #include "Renderer/LegacyAsyncFramePolicy.h"
 
 #include "Renderer/LegacyBridgeValidation.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "dx8indexbuffer.h"
 #include "nativew3dbufferowner.h"
 #include "nativew3dtextureowner.h"
@@ -1372,6 +1373,8 @@ rts::render::RenderResult NativeW3D2::FinishGameTextureRenderFrame()
 	RenderResult result = FirstNativeThreadedFailure(sorted, ended);
 	if (m_renderer.IsThreaded())
 	{
+		rts::frame_timing::Scope ownerDrainTiming(
+			rts::frame_timing::RendererTextureOwnerDrain);
 		// Even a failed EndFrame seals once. Publish its exact owner outcome
 		// before a hidden output can be consumed; SYNC remains nonblocking.
 		const NativeW3DSubmissionSequence sequence = m_renderer.LastThreadedSubmissionSequence();
@@ -1572,7 +1575,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 						material.textureCoordinateIndex[stage];
 				}
 			}
-			TrackLegacyPipelineState(logical.pipeline);
+			TrackLegacyPipelineState(pipeline);
 			TrackLegacyMaterial(material.material);
 		}
 		return RENDER_RESULT_OK;
@@ -2495,7 +2498,11 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 							result = RENDER_RESULT_UNSUPPORTED;
 					}
 					if (result == RENDER_RESULT_OK)
+					{
+						rts::frame_timing::Scope copyPublicationTiming(
+							rts::frame_timing::RendererTextureCopyPublication);
 						result = m_resources.CopyActiveColorTargetToTexture(resource0, lease);
+					}
 				}
 			}
 			else

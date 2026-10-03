@@ -56,7 +56,7 @@ std::vector<std::string> files(const std::string& directory)
 struct Row
 {
 	unsigned int session, first, last, frames, samples, over33, over100;
-	char mode[32], phase[32];
+	char mode[32], phase[64];
 	double wall, total, average, p95, p99, maximum;
 };
 
@@ -77,7 +77,7 @@ std::vector<Row> rows(const std::string& directory)
 	{
 		Row row = {};
 		const int fields = sscanf(line,
-			"%u,%31[^,],%u,%u,%u,%lf,%31[^,],%u,%lf,%lf,%lf,%lf,%lf,%u,%u",
+			"%u,%31[^,],%u,%u,%u,%lf,%63[^,],%u,%lf,%lf,%lf,%lf,%lf,%u,%u",
 			&row.session, row.mode, &row.first, &row.last, &row.frames, &row.wall, row.phase, &row.samples,
 			&row.total, &row.average, &row.p95, &row.p99, &row.maximum, &row.over33, &row.over100);
 		int columnCount = 1;
@@ -139,7 +139,17 @@ void disabled(const std::string& directory)
 			rts::frame_timing::RendererProjectedDecal,
 			rts::frame_timing::RendererProjectedFlush,
 			rts::frame_timing::RendererParticlePrepare,
-			rts::frame_timing::RendererParticleSubmit
+			rts::frame_timing::RendererParticleSubmit,
+			rts::frame_timing::RendererProjectedSceneMeshDrain,
+			rts::frame_timing::RendererTextureOwnerDrain,
+			rts::frame_timing::RendererTextureCopyPublication
+		};
+		const rts::frame_timing::Phase audioPhases[] = {
+			rts::frame_timing::AudioAssetResolve, rts::frame_timing::AudioVirtualRead,
+			rts::frame_timing::AudioFfmpegProbe, rts::frame_timing::AudioStreamOpen,
+			rts::frame_timing::AudioSampleLookup, rts::frame_timing::AudioSampleHit,
+			rts::frame_timing::AudioSampleMiss, rts::frame_timing::AudioSampleFill,
+			rts::frame_timing::AudioSampleFallback
 		};
 		const unsigned int threadCallsBeforeScopes = diagnosticThreadIdCalls;
 		for (std::size_t phase = 0; phase < sizeof(rendererPhases) / sizeof(rendererPhases[0]); ++phase)
@@ -149,6 +159,18 @@ void disabled(const std::string& directory)
 			timing.finish();
 		}
 		capture.add(rts::frame_timing::Logic, 100);
+		rts::frame_timing::BindCapture captureBinding(capture);
+		for (std::size_t phase = 0; phase < sizeof(audioPhases) / sizeof(audioPhases[0]); ++phase)
+		{
+			rts::frame_timing::Scope timing(capture, audioPhases[phase]);
+			timing.finish();
+			timing.finish();
+			// Exercise the production overload with the disabled capture selected,
+			// without consuming the singleton used by later activation tests.
+			rts::frame_timing::Scope productionTiming(audioPhases[phase]);
+			productionTiming.finish();
+			productionTiming.finish();
+		}
 		check(diagnosticThreadIdCalls == threadCallsBeforeScopes,
 			"disabled hot-path scopes and add do not query thread identity");
 		capture.endFrame(900);
@@ -159,6 +181,198 @@ void disabled(const std::string& directory)
 	}
 	check(diagnosticClockCalls == before, "disabled renderer scopes and repeated finish make no clock queries");
 	check(files(directory).empty(), "disabled capture creates no output");
+}
+
+void audioStages(const std::string& directory)
+{
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	{
+		rts::frame_timing::Capture capture;
+		capture.beginSession("headless");
+		capture.beginFrame(0);
+		const rts::frame_timing::Phase phases[] = {
+			rts::frame_timing::AudioAssetResolve, rts::frame_timing::AudioVirtualRead,
+			rts::frame_timing::AudioFfmpegProbe, rts::frame_timing::AudioStreamOpen,
+			rts::frame_timing::AudioSampleLookup, rts::frame_timing::AudioSampleHit,
+			rts::frame_timing::AudioSampleMiss, rts::frame_timing::AudioSampleFill,
+			rts::frame_timing::AudioSampleFallback
+		};
+		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
+		{
+			rts::frame_timing::Scope timing(capture, phases[phase]);
+			timing.finish();
+			const unsigned int finishedAt = diagnosticClockCalls;
+			timing.finish();
+			check(diagnosticClockCalls == finishedAt, "audio timing finishes exactly once");
+		}
+		capture.endFrame(900);
+		capture.endSession();
+	}
+	const std::vector<Row> data = rows(directory);
+	const char *names[] = {
+		"audio_asset_resolve", "audio_virtual_read", "audio_ffmpeg_probe", "audio_stream_open",
+		"audio_sample_lookup", "audio_sample_hit", "audio_sample_miss", "audio_sample_fill",
+		"audio_sample_uncached_fallback"
+	};
+	check(data.size() == 10, "frame plus all nine audio stages retain the CSV schema");
+	if (data.size() == 10)
+		for (std::size_t phase = 0; phase < sizeof(names) / sizeof(names[0]); ++phase)
+			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&
+				data[phase + 1].samples == 1, "audio stage name and invocation count");
+}
+
+void volumeParticleStages(const std::string& directory)
+{
+	const rts::frame_timing::Phase phases[] = {
+		rts::frame_timing::RendererVolumeParticle,
+		rts::frame_timing::RendererVolumeParticleTransform,
+		rts::frame_timing::RendererVolumeParticleUpdateArrays,
+		rts::frame_timing::RendererVolumeParticlePackSubmit
+	};
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL);
+	const unsigned int disabledClockCalls = diagnosticClockCalls;
+	{
+		rts::frame_timing::Capture capture;
+		capture.beginSession("headless");
+		capture.beginFrame(0);
+		rts::frame_timing::BindCapture captureBinding(capture);
+		const unsigned int beforeScopes = diagnosticClockCalls;
+		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
+		{
+			rts::frame_timing::Scope timing(phases[phase]);
+			timing.finish();
+			timing.finish();
+		}
+		check(diagnosticClockCalls == beforeScopes,
+			"disabled production volume-particle scopes do not query the clock");
+		capture.endFrame(900);
+		capture.endSession();
+	}
+	check(diagnosticClockCalls == disabledClockCalls,
+		"disabled volume-particle capture remains clock-free");
+	check(files(directory).empty(), "disabled volume-particle scopes create no output");
+
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	{
+		rts::frame_timing::Capture capture;
+		capture.beginSession("headless");
+		capture.beginFrame(0);
+		rts::frame_timing::BindCapture captureBinding(capture);
+		{
+			rts::frame_timing::Scope timing(phases[0]);
+			timing.finish();
+			const unsigned int finishedAt = diagnosticClockCalls;
+			timing.finish();
+			check(diagnosticClockCalls == finishedAt,
+				"volume-particle whole-call timing finishes exactly once");
+		}
+		for (int layer = 0; layer < 3; ++layer)
+		{
+			for (std::size_t phase = 1; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
+			{
+				rts::frame_timing::Scope timing(phases[phase]);
+				timing.finish();
+				const unsigned int finishedAt = diagnosticClockCalls;
+				timing.finish();
+				check(diagnosticClockCalls == finishedAt,
+					"volume-particle layer timing finishes exactly once");
+			}
+		}
+		capture.endFrame(900);
+		capture.endSession();
+	}
+	const std::vector<Row> data = rows(directory);
+	const char *names[] = {
+		"renderer_volume_particle", "renderer_volume_particle_transform",
+		"renderer_volume_particle_update_arrays", "renderer_volume_particle_pack_submit"
+	};
+	const unsigned int samples[] = { 1, 3, 3, 3 };
+	check(data.size() == 5, "frame plus four volume-particle phases retain the CSV schema");
+	if (data.size() == 5)
+		for (std::size_t phase = 0; phase < sizeof(names) / sizeof(names[0]); ++phase)
+			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&
+				data[phase + 1].samples == samples[phase],
+				"volume-particle phase name and whole-call/layer counts");
+}
+
+void volumeShadowStages(const std::string& directory)
+{
+	const rts::frame_timing::Phase phases[] = {
+		rts::frame_timing::RendererVolumeStaticDraw,
+		rts::frame_timing::RendererVolumeDynamicDraw,
+		rts::frame_timing::RendererVolumeDynamicUpload,
+		rts::frame_timing::RendererVolumeDynamicCommands
+	};
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL);
+	const unsigned int beforeDisabled = diagnosticClockCalls;
+	{
+		rts::frame_timing::Capture capture;
+		rts::frame_timing::BindCapture binding(capture);
+		capture.beginSession("headless");
+		capture.beginFrame(0);
+		for (std::size_t phase = 0; phase < sizeof(phases) / sizeof(phases[0]); ++phase)
+		{
+			rts::frame_timing::Scope timing(phases[phase]);
+			timing.finish();
+			timing.finish();
+		}
+		capture.endFrame(1);
+		capture.endSession();
+	}
+	check(diagnosticClockCalls == beforeDisabled,
+		"disabled production volume-shadow stages remain clock-free");
+	check(files(directory).empty(), "disabled volume-shadow stages create no output");
+	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
+	{
+		rts::frame_timing::Capture capture;
+		rts::frame_timing::BindCapture binding(capture);
+		capture.beginSession("headless");
+		capture.beginFrame(0);
+		for (int pass = 0; pass < 2; ++pass)
+		{
+			rts::frame_timing::Scope timing(phases[0]);
+			timing.finish();
+			const unsigned int finishedAt = diagnosticClockCalls;
+			timing.finish();
+			check(diagnosticClockCalls == finishedAt, "static volume timing finishes once");
+		}
+		for (int attempt = 0; attempt < 3; ++attempt)
+		{
+			rts::frame_timing::Scope dynamicTiming(phases[1]);
+			{
+				rts::frame_timing::Scope uploadTiming(phases[2]);
+				uploadTiming.finish();
+				const unsigned int finishedAt = diagnosticClockCalls;
+				uploadTiming.finish();
+				check(diagnosticClockCalls == finishedAt, "dynamic upload timing finishes once");
+			}
+			// Model an admitted upload failure: no command phase follows.
+			if (attempt < 2)
+			{
+				rts::frame_timing::Scope commandTiming(phases[3]);
+				commandTiming.finish();
+				const unsigned int finishedAt = diagnosticClockCalls;
+				commandTiming.finish();
+				check(diagnosticClockCalls == finishedAt, "dynamic command timing finishes once");
+			}
+			dynamicTiming.finish();
+			const unsigned int finishedAt = diagnosticClockCalls;
+			dynamicTiming.finish();
+			check(diagnosticClockCalls == finishedAt, "dynamic volume timing finishes once");
+		}
+		capture.endFrame(900);
+		capture.endSession();
+	}
+	const std::vector<Row> data = rows(directory);
+	const char *names[] = { "renderer_volume_static_draw", "renderer_volume_dynamic_draw",
+		"renderer_volume_dynamic_upload", "renderer_volume_dynamic_commands" };
+	const unsigned int samples[] = { 2, 3, 3, 2 };
+	check(data.size() == 5, "frame plus four volume-shadow stages retain the CSV schema");
+	if (data.size() == 5)
+		for (std::size_t phase = 0; phase < sizeof(names) / sizeof(names[0]); ++phase)
+			check(strcmp(data[phase + 1].phase, names[phase]) == 0 &&
+				data[phase + 1].samples == samples[phase],
+				"volume-shadow stage name and admitted attempt counts");
 }
 
 void enabled(const std::string& directory, __int64 frequency)
@@ -211,7 +425,10 @@ void enabled(const std::string& directory, __int64 frequency)
 			rts::frame_timing::RendererProjectedDecal,
 			rts::frame_timing::RendererProjectedFlush,
 			rts::frame_timing::RendererParticlePrepare,
-			rts::frame_timing::RendererParticleSubmit
+			rts::frame_timing::RendererParticleSubmit,
+			rts::frame_timing::RendererProjectedSceneMeshDrain,
+			rts::frame_timing::RendererTextureOwnerDrain,
+			rts::frame_timing::RendererTextureCopyPublication
 		};
 		for (std::size_t phase = 0; phase < sizeof(rendererPhases) / sizeof(rendererPhases[0]); ++phase)
 		{
@@ -227,8 +444,8 @@ void enabled(const std::string& directory, __int64 frequency)
 		}
 		capture.endFrame(1000); // Forces the headless periodic bucket without sleeping.
 		std::vector<Row> data = rows(directory);
-		check(data.size() == 35, "periodic flush writes existing phases and all twenty renderer phases before session ends");
-		if (data.size() == 35)
+		check(data.size() == 38, "periodic flush writes existing phases and all twenty-three renderer phases before session ends");
+		if (data.size() == 38)
 		{
 			const Row& logic = data[1];
 			check(strcmp(logic.phase, "logic") == 0 && logic.samples == 20, "logic sample count");
@@ -259,7 +476,9 @@ void enabled(const std::string& directory, __int64 frequency)
 				"renderer_sorting", "renderer_particles", "renderer_skin_render",
 				"renderer_command_enqueue", "renderer_volume_prepare", "renderer_volume_submit",
 				"renderer_projected_terrain", "renderer_projected_decal", "renderer_projected_flush",
-				"renderer_particle_prepare", "renderer_particle_submit"
+				"renderer_particle_prepare", "renderer_particle_submit",
+				"renderer_projected_scene_mesh_drain", "renderer_texture_owner_drain",
+				"renderer_texture_copy_publication"
 			};
 			for (std::size_t phase = 0; phase < sizeof(rendererNames) / sizeof(rendererNames[0]); ++phase)
 				check(strcmp(data[phase + 15].phase, rendererNames[phase]) == 0 &&
@@ -271,7 +490,7 @@ void enabled(const std::string& directory, __int64 frequency)
 		capture.endFrame(0); // Game teardown can reset GameLogic before EndFrame.
 		capture.endSession();
 		data = rows(directory);
-		check(data.size() == 36 && data.back().frames == 5 &&
+		check(data.size() == 39 && data.back().frames == 5 &&
 			data.back().first == 1000 && data.back().last == 1005,
 			"session end preserves the final pre-reset frame range");
 		capture.beginSession("interactive");
@@ -280,7 +499,7 @@ void enabled(const std::string& directory, __int64 frequency)
 		// Destructor must retain this final partial bucket without endSession.
 	}
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 37 && data.back().session == 2 && data.back().frames == 1 &&
+	check(data.size() == 40 && data.back().session == 2 && data.back().frames == 1 &&
 		strcmp(data.back().mode, "interactive") == 0, "destructor/session reset retains only new frame counts");
 }
 
@@ -386,18 +605,27 @@ int main()
 	const std::string disabledDir = root + "\\disabled", enabledDir = root + "\\enabled", boundedDir = root + "\\bounded";
 	const std::string finalizedDir = root + "\\finalized", incompleteDir = root + "\\incomplete";
 	const std::string singletonDir = root + "\\singleton-gate";
+	const std::string audioDir = root + "\\audio-stages";
+	const std::string volumeParticleDir = root + "\\volume-particle-stages";
+	const std::string volumeShadowDir = root + "\\volume-shadow-stages";
 	check(CreateDirectoryA(disabledDir.c_str(), NULL) != FALSE, "create disabled case");
 	check(CreateDirectoryA(enabledDir.c_str(), NULL) != FALSE, "create enabled case");
 	check(CreateDirectoryA(boundedDir.c_str(), NULL) != FALSE, "create bounded case");
 	check(CreateDirectoryA(finalizedDir.c_str(), NULL) != FALSE, "create finalized case");
 	check(CreateDirectoryA(incompleteDir.c_str(), NULL) != FALSE, "create incomplete case");
 	check(CreateDirectoryA(singletonDir.c_str(), NULL) != FALSE, "create singleton gate case");
+	check(CreateDirectoryA(audioDir.c_str(), NULL) != FALSE, "create audio stages case");
+	check(CreateDirectoryA(volumeParticleDir.c_str(), NULL) != FALSE, "create volume-particle stages case");
+	check(CreateDirectoryA(volumeShadowDir.c_str(), NULL) != FALSE, "create volume-shadow stages case");
 	LARGE_INTEGER frequency;
 	if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart <= 0)
 		return 1;
 	inactiveSingleton(disabledDir);
 	disabled(disabledDir);
 	enabled(enabledDir, frequency.QuadPart);
+	audioStages(audioDir);
+	volumeParticleStages(volumeParticleDir);
+	volumeShadowStages(volumeShadowDir);
 	publishedSingletonGate(singletonDir);
 	bounded(boundedDir);
 	finalized(finalizedDir);
@@ -409,6 +637,9 @@ int main()
 	removeCase(finalizedDir);
 	removeCase(incompleteDir);
 	removeCase(singletonDir);
+	removeCase(audioDir);
+	removeCase(volumeParticleDir);
+	removeCase(volumeShadowDir);
 	check(RemoveDirectoryA(root.c_str()) != FALSE, "remove empty test root");
 	return failures ? 1 : 0;
 }

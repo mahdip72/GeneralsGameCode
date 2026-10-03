@@ -7,6 +7,7 @@
 #include <dxgi1_2.h>
 
 #include "D3D11ResultTranslation.h"
+#include "D3D11GpuFrameTiming.h"
 #include "IndexedDrawValidationCache.h"
 #include "LegacyFixedFunctionPS.h"
 #include "LegacyFixedFunctionVS.h"
@@ -833,6 +834,7 @@ public:
 			return TranslateResult(result);
 		}
 		m_initialized = true;
+		m_gpuTiming.attach(m_device, m_context);
 		return RENDER_RESULT_OK;
 	}
 
@@ -842,7 +844,9 @@ public:
 		{
 			return;
 		}
+		m_gpuTiming.release(detail::GpuTimingShutdownPending);
 		shutdownInternal();
+		m_gpuTiming.writeOnShutdown();
 	}
 
 	virtual IRenderContext *immediateContext()
@@ -1532,6 +1536,7 @@ public:
 		}
 		m_parameters.width = m_width;
 		m_parameters.height = m_height;
+		m_gpuTiming.release(detail::GpuTimingDeviceReleased);
 		m_indexedDrawValidation.clear();
 		m_indexRangeSummaries.clear();
 		m_activeRenderTarget = 0;
@@ -1619,6 +1624,7 @@ public:
 		m_renderTargetsBound = defaultRenderTarget() != 0;
 		markTextureBindingsEmpty();
 		m_viewportBound = defaultRenderTarget() != 0;
+		m_gpuTiming.attach(m_device, m_context);
 		return RENDER_RESULT_OK;
 	}
 
@@ -1637,6 +1643,7 @@ public:
 			// resize until a non-zero client area is reported.
 			return RENDER_RESULT_OK;
 		}
+		m_gpuTiming.resize();
 		if (m_swapChain != 0)
 		{
 			const unsigned int previousWidth = m_width;
@@ -1805,27 +1812,42 @@ public:
 		}
 		if (m_swapChain == 0)
 		{
+			m_gpuTiming.cancel(detail::GpuTimingUnpresented);
 			// Headless passes have no Present call to surface asynchronous device
 			// removal.  Query the device at this lifecycle boundary instead of
 			// silently reporting success after a lost GPU.
 			return TranslateResult(m_device->GetDeviceRemovedReason());
 		}
+		const bool gammaApplied = !isPresentationIdentity() && isDefaultBackBufferTarget();
+		if (m_gpuTiming.enabled()) m_gpuTiming.beforeResolve(gpuTimingFrameInfo(gammaApplied));
 		const RenderResult resolveResult = resolveBackBuffer();
 		if (resolveResult != RENDER_RESULT_OK)
+		{
+			m_gpuTiming.cancel(detail::GpuTimingPresentFailed);
 			return resolveResult;
-		if (!isPresentationIdentity() && isDefaultBackBufferTarget())
+		}
+		m_gpuTiming.afterResolve();
+		if (gammaApplied)
 		{
 			const RenderResult transformResult = applyPresentationGamma();
 			if (transformResult != RENDER_RESULT_OK)
+			{
+				m_gpuTiming.cancel(detail::GpuTimingPresentFailed);
 				return transformResult;
+			}
 		}
+		m_gpuTiming.beforePresent();
+		const uint64_t cpuPresentStart = m_gpuTiming.cpuPresentStart();
 		const HRESULT presentResult = m_swapChain->Present(
 			m_swapInterval, 0);
+		m_gpuTiming.cpuPresentEnd(cpuPresentStart, presentResult);
 		if (FAILED(presentResult))
 		{
 			return TranslateResult(presentResult);
 		}
-		return TranslateResult(m_device->GetDeviceRemovedReason());
+		const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+		if (FAILED(deviceResult)) m_gpuTiming.failPresentation(deviceResult);
+		return TranslateResult(deviceResult);
 	}
 
 	virtual RenderResult setSwapInterval(unsigned int interval)
@@ -1926,6 +1948,7 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		if (m_gpuTiming.enabled()) m_gpuTiming.begin(gpuTimingFrameInfo(false));
 		bindDefaultRenderTargets();
 		bindDefaultViewport(m_width, m_height);
 		bool needsTextureReset = !m_textureBindingsValid;
@@ -3285,6 +3308,7 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		m_gpuTiming.markReadback();
 		const RenderResult resolveResult = resolveBackBuffer();
 		if (resolveResult != RENDER_RESULT_OK)
 			return resolveResult;
@@ -3589,6 +3613,16 @@ private:
 		m_viewportMaximumDepth = viewport.MaxDepth;
 		m_viewportBound = true;
 		m_transformConstantsChanged = true;
+	}
+
+	detail::GpuTimingFrameInfo gpuTimingFrameInfo(bool gammaApplied) const
+	{
+		detail::GpuTimingFrameInfo info;
+		info.width = m_width; info.height = m_height; info.samples = m_multisampleCount;
+		info.gamma = m_gamma; info.brightness = m_brightness; info.contrast = m_contrast;
+		info.gammaLimit = m_gammaUseLimit; info.gammaApplied = gammaApplied;
+		info.swapInterval = m_swapInterval; info.presentFlags = 0;
+		return info;
 	}
 
 	RenderResult resolveBackBuffer()
@@ -5947,6 +5981,7 @@ private:
 
 	void shutdownInternal()
 	{
+		m_gpuTiming.release(detail::GpuTimingDeviceReleased);
 		m_frameOpen = false;
 		m_pipelineBound = false;
 		m_vertexBufferBound = false;
@@ -6185,6 +6220,7 @@ private:
 		}
 	}
 
+	detail::D3D11GpuFrameTiming m_gpuTiming;
 	ID3D11Device *m_device;
 	ID3D11DeviceContext *m_context;
 	D3D_FEATURE_LEVEL m_featureLevel;

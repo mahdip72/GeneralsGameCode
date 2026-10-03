@@ -2099,7 +2099,12 @@ Int W3DProjectedShadowManager::renderShadows(RenderInfoClass & rinfo)
 		}
 
 		flushDecals(lastShadowDecalTexture,lastShadowType);	//make sure there are not any unrendered decals left over.
-		rts::render::FlushGameRenderMeshes();	//draw all the shadow receiving objects
+		{
+			// This also drains ordinary scene meshes queued before shadow projection.
+			// Keep it separate from decal flushing without changing either draw order.
+			rts::frame_timing::Scope meshDrainTiming(rts::frame_timing::RendererProjectedSceneMeshDrain);
+			rts::render::FlushGameRenderMeshes();	//draw all the shadow receiving objects
+		}
 	}
 	if (m_decalList)
 	{

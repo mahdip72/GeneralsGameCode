@@ -24,6 +24,16 @@ enum Phase
 	RendererCommandEnqueue, RendererVolumePrepare, RendererVolumeSubmit,
 	RendererProjectedTerrain, RendererProjectedDecal, RendererProjectedFlush,
 	RendererParticlePrepare, RendererParticleSubmit,
+	RendererProjectedSceneMeshDrain,
+	RendererTextureOwnerDrain,
+	RendererTextureCopyPublication,
+	AudioAssetResolve, AudioVirtualRead, AudioFfmpegProbe, AudioStreamOpen,
+	AudioSampleLookup, AudioSampleHit, AudioSampleMiss, AudioSampleFill,
+	AudioSampleFallback,
+	RendererVolumeParticle, RendererVolumeParticleTransform,
+	RendererVolumeParticleUpdateArrays, RendererVolumeParticlePackSubmit,
+	RendererVolumeStaticDraw, RendererVolumeDynamicDraw,
+	RendererVolumeDynamicUpload, RendererVolumeDynamicCommands,
 	PhaseCount
 };
 
@@ -403,7 +413,16 @@ private:
 			"renderer_sorting", "renderer_particles", "renderer_skin_render",
 			"renderer_command_enqueue", "renderer_volume_prepare", "renderer_volume_submit",
 			"renderer_projected_terrain", "renderer_projected_decal", "renderer_projected_flush",
-			"renderer_particle_prepare", "renderer_particle_submit"
+			"renderer_particle_prepare", "renderer_particle_submit",
+			"renderer_projected_scene_mesh_drain", "renderer_texture_owner_drain",
+			"renderer_texture_copy_publication",
+			"audio_asset_resolve", "audio_virtual_read", "audio_ffmpeg_probe", "audio_stream_open",
+			"audio_sample_lookup", "audio_sample_hit", "audio_sample_miss", "audio_sample_fill",
+			"audio_sample_uncached_fallback",
+			"renderer_volume_particle", "renderer_volume_particle_transform",
+			"renderer_volume_particle_update_arrays", "renderer_volume_particle_pack_submit",
+			"renderer_volume_static_draw", "renderer_volume_dynamic_draw",
+			"renderer_volume_dynamic_upload", "renderer_volume_dynamic_commands"
 		};
 		static_assert(sizeof(names) / sizeof(names[0]) == PhaseCount,
 			"Every diagnostic phase must retain its CSV name");

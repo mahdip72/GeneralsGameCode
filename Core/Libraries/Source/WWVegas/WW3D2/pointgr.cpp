@@ -87,6 +87,7 @@
 #include "Renderer/PointGroupColorPacking.h"
 #include "rinfo.h"
 #include "camera.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 // Upgraded to DX8 2/2/01 HY
 
@@ -1775,6 +1776,8 @@ void PointGroupClass::_Shutdown()
 #define MAX_VOLUME_PARTICLE_DEPTH ( 16 )
 void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int depth )
 {
+	rts::frame_timing::Scope volumeParticleTiming(
+		rts::frame_timing::RendererVolumeParticle);
 
 	if ( depth <= DEFAULT_VOLUME_PARTICLE_DEPTH) //oops,wrong number
 	{
@@ -1907,6 +1910,8 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		// need to interrupt this processing. If we are not billboarding, then we need the actual position
 		// of the vertice to lay it down flat.
 		if (Get_Flag(TRANSFORM) && Billboard) {
+			rts::frame_timing::Scope volumeTransformTiming(
+				rts::frame_timing::RendererVolumeParticleTransform);
 			// Resize transformed location array if needed (2x guardband to prevent
 			// frequent reallocations):
 			if (transformed_loc.Length() < PointCount) {
@@ -1954,8 +1959,15 @@ void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int 
 		//current_diffuse->Z *= attenuator;
 		//current_diffuse->W *= attenuator;
 
-		Update_Arrays(current_loc, current_size, current_orient, current_frame,
-			PointCount, PointLoc->Get_Count(), vnum, pnum);
+		{
+			rts::frame_timing::Scope volumeUpdateArraysTiming(
+				rts::frame_timing::RendererVolumeParticleUpdateArrays);
+			Update_Arrays(current_loc, current_size, current_orient, current_frame,
+				PointCount, PointLoc->Get_Count(), vnum, pnum);
+		}
+
+		rts::frame_timing::Scope volumePackSubmitTiming(
+			rts::frame_timing::RendererVolumeParticlePackSubmit);
 
 		// the locations are now in view space
 		// so set world and view matrices to identity and render

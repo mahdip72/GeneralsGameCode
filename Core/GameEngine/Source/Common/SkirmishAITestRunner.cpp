@@ -29,10 +29,13 @@
 #endif
 #include "GameLogic/AIPathfind.h"
 #include "GameClient/MapUtil.h"
+#include "GameClient/View.h"
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/TerrainLogic.h"
+#include "GameLogic/Weapon.h"
 #include "GameLogic/Module/AIUpdate.h"
+#include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameLogic/Module/HackInternetAIUpdate.h"
 #include "GameLogic/Module/ProductionUpdate.h"
@@ -44,6 +47,7 @@
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/SimulationExecutionPolicy.h"
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
+#include "Lib/ValidationProfileRoot.h"
 #if defined(_WIN64)
 #include "Common/FileSystem.h"
 #include "Common/Stage5MapResolution.h"
@@ -60,8 +64,11 @@
 #endif
 
 #include <errno.h>
+#include <float.h>
 #include <limits.h>
+#include <math.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #if defined(_WIN32)
@@ -2286,6 +2293,8 @@ const char *SkirmishAITestScenarioName(SkirmishAITestScenario scenario)
 		return "4v2";
 	if (scenario == SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7)
 		return "practical-1v7";
+	if (scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC)
+		return "rendered-battle-diagnostic";
 	if (IsSkirmishAITestHardAI2v6(scenario))
 		return "hard-ai-2v6";
 	return "4v3";
@@ -3652,6 +3661,812 @@ Bool TryParseSkirmishAITestSeed(const char *text, Int *seed)
 	return TRUE;
 }
 
+
+Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv,
+	Bool supported, const char **reason)
+{
+	if (reason) *reason = nullptr;
+	Int requests = 0;
+	for (Int i = 1; argv && i < argc; ++i)
+		if (argv[i] && stricmp(argv[i], "-runRenderedBattleDiagnostic") == 0)
+			++requests;
+	if (requests == 0) return TRUE;
+	const char *error = !supported ? "unsupported_title" :
+		(requests != 1 ? "duplicate_option" : nullptr);
+	for (Int i = 1; !error && i < argc; ++i)
+	{
+		if (!argv[i]) { error = "invalid_arguments"; break; }
+		if (stricmp(argv[i], "-runRenderedBattleDiagnostic") == 0)
+		{
+			Int seed = 0;
+			if (i + 1 >= argc || !TryParseSkirmishAITestSeed(argv[i + 1], &seed))
+				error = "invalid_seed";
+			else ++i;
+			continue;
+		}
+		const char *conflicts[] = {
+			"-headless", "-noFPSLimit", "-replay", "-jobs", "-loadsave",
+			"-runSkirmishAITest", "-runSkirmishAITest4v2",
+			"-runSkirmishAITestPractical1v7", "-runSkirmishAITestHardAI2v6",
+			"-runSkirmishAIRecoveryTest", "-runSkirmishAILegacySaveTest",
+			"-runStage5PerformanceFixture", "-skirmishAITestReviewedMap",
+			"-installedNet3Validation", "-installedLockstepV2Validation",
+			"-benchmark", "-map", "-mod", "-noshaders", "-particleEdit"
+		};
+		for (UnsignedInt j = 0; j < ARRAY_SIZE(conflicts); ++j)
+			if (stricmp(argv[i], conflicts[j]) == 0)
+				error = "conflicting_option";
+	}
+	if (reason) *reason = error;
+	return error == nullptr;
+}
+
+const char *GetRenderedBattleDiagnosticFactionName(Int slot)
+{
+	static const char *names[] = { "FactionAmerica", "FactionChina", "FactionGLA", "FactionAmerica" };
+	return slot >= 0 && slot < SKIRMISH_AI_TEST_SLOT_COUNT ? names[slot % 4] : nullptr;
+}
+
+const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit)
+{
+	static const char *names[3][4] = {
+		{ "AmericaTankCrusader", "AmericaVehicleHumvee", "AmericaInfantryRanger", "AmericaInfantryMissileDefender" },
+		{ "ChinaTankBattleMaster", "ChinaTankGattling", "ChinaInfantryRedguard", "ChinaInfantryTankHunter" },
+		{ "GLATankScorpion", "GLAVehicleTechnical", "GLAInfantryRebel", "GLAInfantryTunnelDefender" }
+	};
+	if (slot < 0 || slot >= SKIRMISH_AI_TEST_SLOT_COUNT ||
+		unit < 0 || unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER) return nullptr;
+	const Int faction = slot % 4 == 3 ? 0 : slot % 4;
+	return names[faction][unit % 4];
+}
+
+Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset)
+{
+	if (!offset || !GetRenderedBattleDiagnosticObjectName(slot, unit)) return FALSE;
+	// Two mirrored fronts, 44-unit spacing, four non-overlapping player bands.
+	offset->x = (slot < 4 ? -1.0f : 1.0f) * (95.0f + (unit % 8) * 44.0f);
+	offset->y = ((slot % 4) - 1.5f) * 200.0f + (unit / 8 - 1.5f) * 44.0f;
+	offset->z = 0.0f;
+	return TRUE;
+}
+
+Int GetRenderedBattleDiagnosticSearchCount(Real loX, Real loY, Real hiX, Real hiY)
+{
+	// Comparison form rejects both infinities and NaNs without a title/compiler
+	// specific finite-value API. These helpers are used only by the diagnostic.
+	if (!(loX >= -FLT_MAX && loX <= FLT_MAX && loY >= -FLT_MAX && loY <= FLT_MAX &&
+		hiX >= -FLT_MAX && hiX <= FLT_MAX && hiY >= -FLT_MAX && hiY <= FLT_MAX &&
+		loX <= hiX && loY <= hiY)) return 0;
+	// Full nine-offset envelope, including the maximum tested footprint.
+	if (static_cast<double>(hiX) - loX < 894.0 ||
+		static_cast<double>(hiY) - loY < 820.0) return 49;
+	return 49 + 9 * 9;
+}
+
+Bool GetRenderedBattleDiagnosticSearchCenter(Real loX, Real loY, Real hiX, Real hiY,
+	Int candidate, Coord3D *center)
+{
+	if (!center || candidate < 0 ||
+		candidate >= GetRenderedBattleDiagnosticSearchCount(loX, loY, hiX, hiY)) return FALSE;
+	Coord3D result;
+	if (candidate < 49)
+	{
+		// Preserve the original arithmetic, fixed positions and ordering exactly.
+		result.x = (loX + hiX) * 0.5f + (candidate % 7 - 3) * 240.0f;
+		result.y = (loY + hiY) * 0.5f + (candidate / 7 - 3) * 240.0f;
+	}
+	else
+	{
+		const Int grid = candidate - 49;
+		// Fixed denominator 8, never a reciprocal of a possibly zero map span.
+		// Exact-fit extents deliberately retain all 81 (coincident) grid entries.
+		result.x = static_cast<Real>(static_cast<double>(loX) + 447.0 +
+			(static_cast<double>(hiX) - loX - 894.0) * (grid % 9) / 8.0);
+		result.y = static_cast<Real>(static_cast<double>(loY) + 410.0 +
+			(static_cast<double>(hiY) - loY - 820.0) * (grid / 9) / 8.0);
+	}
+	if (!(result.x >= -FLT_MAX && result.x <= FLT_MAX &&
+		result.y >= -FLT_MAX && result.y <= FLT_MAX)) return FALSE;
+	result.z = 0.0f;
+	*center = result;
+	return TRUE;
+}
+
+Bool GetRenderedBattleDiagnosticLocalOffset(Int slot, Int trial, Coord3D *offset)
+{
+	if (!offset || slot < 0 || slot >= SKIRMISH_AI_TEST_SLOT_COUNT ||
+		trial < 0 || trial >= RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT) return FALSE;
+	static const Int stencil[9][2] = {
+		{0, 0}, {22, 0}, {-22, 0}, {0, -22}, {0, 22},
+		{22, -22}, {22, 22}, {-22, -22}, {-22, 22}
+	};
+	Coord3D result;
+	result.x = static_cast<Real>((slot < 4 ? -1 : 1) * stencil[trial][0]);
+	result.y = static_cast<Real>(stencil[trial][1]);
+	result.z = 0.0f;
+	*offset = result;
+	return TRUE;
+}
+
+Bool AreRenderedBattleDiagnosticPositionsSeparated(const Coord3D &a, Real radiusA,
+	const Coord3D &b, Real radiusB)
+{
+	if (!(radiusA > 0.0f && radiusA <= 21.0f && radiusB > 0.0f && radiusB <= 21.0f &&
+		a.x >= -FLT_MAX && a.x <= FLT_MAX && a.y >= -FLT_MAX && a.y <= FLT_MAX &&
+		a.z >= -FLT_MAX && a.z <= FLT_MAX && b.x >= -FLT_MAX && b.x <= FLT_MAX &&
+		b.y >= -FLT_MAX && b.y <= FLT_MAX && b.z >= -FLT_MAX && b.z <= FLT_MAX))
+		return FALSE;
+	// Symmetric uninflated radii + three units; doubles avoid squared-distance
+	// overflow for finite inputs without clamping any position or geometry.
+	const double dx = static_cast<double>(a.x) - b.x;
+	const double dy = static_cast<double>(a.y) - b.y;
+	const double separation = static_cast<double>(radiusA) + radiusB + 3.0;
+	return dx * dx + dy * dy >= separation * separation;
+}
+
+Bool RememberRenderedBattleDiagnosticArena(Int candidate, Int validUnits,
+	Int *candidates, Int *validPrefixes, Int *count)
+{
+	if (!candidates || !validPrefixes || !count || *count < 0 ||
+		*count > RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP || candidate < 0 ||
+		candidate >= 130 || validUnits < 0 ||
+		validUnits >= SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER)
+		return FALSE;
+	Int index;
+	for (index = 0; index < *count; ++index)
+		if (candidates[index] == candidate) return FALSE;
+	Int insertion = 0;
+	while (insertion < *count && (validPrefixes[insertion] > validUnits ||
+		(validPrefixes[insertion] == validUnits && candidates[insertion] < candidate)))
+		++insertion;
+	if (insertion >= RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP) return FALSE;
+	const Int last = *count < RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP ?
+		*count : RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP - 1;
+	for (index = last; index > insertion; --index)
+	{
+		candidates[index] = candidates[index - 1];
+		validPrefixes[index] = validPrefixes[index - 1];
+	}
+	candidates[insertion] = candidate; validPrefixes[insertion] = validUnits;
+	if (*count < RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP) ++*count;
+	return TRUE;
+}
+
+Bool AppendRenderedBattleDiagnosticReportRecord(char *buffer, UnsignedInt capacity,
+	UnsignedInt *used, const char *record, UnsignedInt recordBytes)
+{
+	if (!buffer || !used || !record || *used >= capacity ||
+		recordBytes >= capacity - *used) return FALSE;
+	memcpy(buffer + *used, record, recordBytes);
+	*used += recordBytes; buffer[*used] = '\0';
+	return TRUE;
+}
+
+namespace
+{
+Bool IsRenderedBattleDiagnostic(SkirmishAITestScenario scenario)
+{
+	return scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC;
+}
+Bool IsRenderedSkirmishScenario(SkirmishAITestScenario scenario)
+{
+	return IsRenderedBattleDiagnostic(scenario) || IsSkirmishAITestPracticalControllerScenario(scenario);
+}
+struct RenderedBattleDiagnosticState
+{
+	Bool staged;
+	Coord3D center;
+	ObjectID ids[SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER];
+	UnsignedInt startFrame, startTick, nextSummaryFrame;
+	Int created, samplesWithAttacks, samplesWithLoss;
+	const char *completionReason, *setupFailure;
+	char report[32768], reportPath[MAX_PATH], reportPendingPath[MAX_PATH], suppliedSourceHash[65];
+	UnsignedInt reportBytes, reportRecords;
+	Bool reportFailed;
+	HANDLE reportFile;
+	RenderedBattleDiagnosticState() : reportFile(INVALID_HANDLE_VALUE) { reset(); }
+	~RenderedBattleDiagnosticState() { closeReportFile(); }
+	Bool closeReportFile()
+	{
+		if (reportFile == INVALID_HANDLE_VALUE) return TRUE;
+		const HANDLE file = reportFile;
+		reportFile = INVALID_HANDLE_VALUE;
+		return CloseHandle(file) != FALSE;
+	}
+	void reset()
+	{
+		// Rearming/abandonment closes the exact reserved handle. Never delete an
+		// incomplete pending report or replace an existing published artifact.
+		closeReportFile();
+		staged = FALSE; created = 0; startFrame = startTick = nextSummaryFrame = 0;
+		samplesWithAttacks = samplesWithLoss = 0; completionReason = "incomplete";
+		setupFailure = "runtime_state_unavailable";
+		center.x = center.y = center.z = 0.0f;
+		memset(ids, 0, sizeof(ids));
+		report[0] = reportPath[0] = reportPendingPath[0] = suppliedSourceHash[0] = '\0';
+		reportBytes = reportRecords = 0; reportFailed = FALSE;
+	}
+} s_renderedBattle;
+
+void RecordRenderedBattleDiagnostic(const char *format, ...)
+{
+	char line[2048];
+	va_list args; va_start(args, format);
+	const Int bytes = _vsnprintf(line, sizeof(line), format, args);
+	va_end(args);
+	if (bytes < 0 || bytes >= static_cast<Int>(sizeof(line)) ||
+		s_renderedBattle.reportRecords >= 32 ||
+		!AppendRenderedBattleDiagnosticReportRecord(s_renderedBattle.report,
+			sizeof(s_renderedBattle.report), &s_renderedBattle.reportBytes,
+			line, static_cast<UnsignedInt>(bytes)))
+	{
+		s_renderedBattle.reportFailed = TRUE;
+		return;
+	}
+	++s_renderedBattle.reportRecords;
+	printf("%s", line);
+}
+
+Bool PrepareRenderedBattleDiagnosticReportPath()
+{
+	if (s_renderedBattle.reportFile != INVALID_HANDLE_VALUE) return FALSE;
+	char isolated[MAX_PATH], resolved[MAX_PATH];
+	if (!TheGlobalData ||
+		rts::validation::ReadProcessLocalProfileRoot(isolated, sizeof(isolated)) !=
+			rts::validation::PROCESS_LOCAL_PROFILE_ROOT_VALID) return FALSE;
+	const char *actual = TheGlobalData->getPath_UserData().str();
+	const DWORD length = GetFullPathNameA(actual, sizeof(resolved), resolved, nullptr);
+	if (!length || length >= sizeof(resolved)) return FALSE;
+	for (DWORD i = 0; i < length; ++i) if (resolved[i] == '/') resolved[i] = '\\';
+	DWORD actualLength = length;
+	while (actualLength > 3 && resolved[actualLength - 1] == '\\') resolved[--actualLength] = '\0';
+	DWORD isolatedLength = strlen(isolated);
+	for (DWORD i = 0; i < isolatedLength; ++i) if (isolated[i] == '/') isolated[i] = '\\';
+	while (isolatedLength > 3 && isolated[isolatedLength - 1] == '\\') isolated[--isolatedLength] = '\0';
+	if (_stricmp(resolved, isolated) != 0) return FALSE;
+	const Int written = _snprintf(s_renderedBattle.reportPath, sizeof(s_renderedBattle.reportPath),
+		"%s\\RenderedBattleDiagnostic-%u-%s.txt", isolated,
+		static_cast<UnsignedInt>(GetCurrentProcessId()), s_runner.runNonce);
+	if (written < 0 || written >= static_cast<Int>(sizeof(s_renderedBattle.reportPath)) - 8)
+	{
+		s_renderedBattle.reportPath[0] = '\0'; return FALSE;
+	}
+	char sourceHash[65];
+	const DWORD sourceLength = GetEnvironmentVariableA(
+		"RTS_RENDERED_BATTLE_DIAGNOSTIC_SOURCE_SHA256", sourceHash, sizeof(sourceHash));
+	if (sourceLength)
+	{
+		if (sourceLength != 64 || !IsHexString(sourceHash, 64))
+		{
+			s_renderedBattle.reportPath[0] = '\0'; return FALSE;
+		}
+		memcpy(s_renderedBattle.suppliedSourceHash, sourceHash, sizeof(sourceHash));
+	}
+	const Int pendingLength = _snprintf(s_renderedBattle.reportPendingPath,
+		sizeof(s_renderedBattle.reportPendingPath), "%s.pending", s_renderedBattle.reportPath);
+	if (pendingLength < 0 || pendingLength >= static_cast<Int>(sizeof(s_renderedBattle.reportPendingPath)))
+	{
+		s_renderedBattle.reportPath[0] = '\0'; return FALSE;
+	}
+	// Reserve durable export capability before any match/world mutation. All
+	// final writes use this same handle; no reopen or overwrite is permitted.
+	s_renderedBattle.reportFile = CreateFileA(s_renderedBattle.reportPendingPath,
+		GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (s_renderedBattle.reportFile == INVALID_HANDLE_VALUE)
+	{
+		s_renderedBattle.reportPath[0] = '\0'; return FALSE;
+	}
+	return TRUE;
+}
+
+Bool WriteRenderedBattleDiagnosticReport(Int exitCode)
+{
+	if (!s_renderedBattle.reportPath[0] || s_renderedBattle.reportFile == INVALID_HANDLE_VALUE)
+	{
+		s_renderedBattle.closeReportFile(); return FALSE;
+	}
+	const HANDLE file = s_renderedBattle.reportFile;
+	DWORD written = 0;
+	Bool ok = WriteFile(file, s_renderedBattle.report, s_renderedBattle.reportBytes,
+		&written, nullptr) && written == s_renderedBattle.reportBytes && FlushFileBuffers(file);
+	char footer[256];
+	const Int footerBytes = _snprintf(footer, sizeof(footer),
+		"RENDERED_BATTLE_DIAGNOSTIC_REPORT_WRITE status=complete diagnostic_exit_code=%d "
+		"records=%u bytes=%u buffer_failed=%d validation=requires_published_txt_and_matching_process_exit\n",
+		exitCode, s_renderedBattle.reportRecords, s_renderedBattle.reportBytes,
+		s_renderedBattle.reportFailed ? 1 : 0);
+	if (ok && footerBytes > 0 && footerBytes < static_cast<Int>(sizeof(footer)))
+		ok = WriteFile(file, footer, static_cast<DWORD>(footerBytes), &written, nullptr) &&
+			written == static_cast<DWORD>(footerBytes) && FlushFileBuffers(file);
+	else ok = FALSE;
+	if (!s_renderedBattle.closeReportFile()) ok = FALSE;
+	if (ok) ok = MoveFileExA(s_renderedBattle.reportPendingPath,
+		s_renderedBattle.reportPath, MOVEFILE_WRITE_THROUGH);
+	return ok;
+}
+
+Bool BindRenderedBattleFactions(SkirmishAITestPlan *plan)
+{
+	for (Int slot = 0; slot < SKIRMISH_AI_TEST_SLOT_COUNT; ++slot)
+	{
+		const Int index = FindPlayerTemplateIndex(GetRenderedBattleDiagnosticFactionName(slot));
+		if (index < 0) return FALSE;
+		plan->slots[slot].playerTemplate = index;
+	}
+	return TRUE;
+}
+
+enum RenderedBattlePreflightRejection
+{
+	RB_PREFLIGHT_ACCEPTED = 0, RB_PREFLIGHT_BOUNDS, RB_PREFLIGHT_MISSING_CELL,
+	RB_PREFLIGHT_SURFACE, RB_PREFLIGHT_FOOTPRINT_HEIGHT, RB_PREFLIGHT_OCCUPIED,
+	RB_PREFLIGHT_CENTER_HEIGHT, RB_PREFLIGHT_GROUND_PATH, RB_PREFLIGHT_ATTACK_GOAL_PATH,
+	RB_PREFLIGHT_PLANNED_PAIR, RB_PREFLIGHT_REASON_COUNT
+};
+
+struct RenderedBattlePreflightFailure
+{
+	Int reason, candidate, slot, unit, validUnits, cellType, cellFlags, phase, trial, plannedIndex;
+	Coord3D center, position, query, target, blockerPosition;
+	Real radius, heightDelta, blockerRadius;
+	ObjectID blocker;
+	RenderedBattlePreflightFailure()
+		: reason(RB_PREFLIGHT_ACCEPTED), candidate(-1), slot(-1), unit(-1),
+		  validUnits(0), cellType(-1), cellFlags(-1), phase(0), trial(-1), plannedIndex(-1), radius(0.0f),
+		  heightDelta(0.0f), blockerRadius(0.0f), blocker(INVALID_ID)
+	{
+		center.x = center.y = center.z = 0.0f;
+		position = query = target = blockerPosition = center;
+	}
+};
+
+const char *RenderedBattlePreflightReasonName(Int reason)
+{
+	static const char *names[] = { "accepted", "bounds", "missing_cell", "surface",
+		"footprint_height", "occupied", "center_height", "ground_path", "attack_goal_path", "planned_pair" };
+	return reason >= 0 && reason < RB_PREFLIGHT_REASON_COUNT ? names[reason] : "unknown";
+}
+
+void RecordRenderedBattlePreflightFailure(const RenderedBattlePreflightFailure &failure,
+	const char *exampleKind)
+{
+	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_REJECT example=%s "
+		"candidate=%d slot=%d unit=%d valid_units=%d reason=%s phase=%s local_trial=%d planned_index=%d "
+		"center=(%.3f,%.3f,%.3f) "
+		"position=(%.3f,%.3f,%.3f) query=(%.3f,%.3f,%.3f) target=(%.3f,%.3f,%.3f) "
+		"radius=%.3f query_grid=(%.0f,%.0f) cell_type=%d cell_flags=%d height_delta=%.3f "
+		"blocker_id=%u blocker_position=(%.3f,%.3f,%.3f) blocker_radius=%.3f\n",
+		exampleKind, failure.candidate, failure.slot, failure.unit, failure.validUnits,
+		RenderedBattlePreflightReasonName(failure.reason), failure.phase ? "local9" : "nominal",
+		failure.trial, failure.plannedIndex,
+		failure.center.x, failure.center.y, failure.center.z,
+		failure.position.x, failure.position.y, failure.position.z,
+		failure.query.x, failure.query.y, failure.query.z,
+		failure.target.x, failure.target.y, failure.target.z, failure.radius,
+		floor(failure.query.x / PATHFIND_CELL_SIZE_F),
+		floor(failure.query.y / PATHFIND_CELL_SIZE_F),
+		failure.cellType, failure.cellFlags, failure.heightDelta,
+		static_cast<UnsignedInt>(failure.blocker), failure.blockerPosition.x,
+		failure.blockerPosition.y, failure.blockerPosition.z, failure.blockerRadius);
+}
+
+Bool PreflightRenderedBattlePosition(const Coord3D &position, Real radius,
+	const Region3D &extent, Pathfinder *pathfinder, RenderedBattlePreflightFailure *failure)
+{
+	failure->position = failure->query = failure->target = position;
+	failure->radius = radius;
+	failure->cellType = failure->cellFlags = -1;
+	if (position.x - radius < extent.lo.x || position.x + radius > extent.hi.x ||
+		position.y - radius < extent.lo.y || position.y + radius > extent.hi.y)
+	{
+		failure->reason = RB_PREFLIGHT_BOUNDS; return FALSE;
+	}
+	// Validate terrain across the footprint, not only its center.
+	for (Int y = -1; y <= 1; ++y)
+		for (Int x = -1; x <= 1; ++x)
+		{
+			Coord3D p = position; p.x += x * radius; p.y += y * radius;
+			PathfindCell *cell = pathfinder->getCell(LAYER_GROUND, &p);
+			failure->query = p;
+			failure->cellType = cell ? static_cast<Int>(cell->getType()) : -1;
+			failure->cellFlags = cell ? static_cast<Int>(cell->getFlags()) : -1;
+			if (!cell || !pathfinder->validMovementPosition(FALSE, LOCOMOTORSURFACE_GROUND, cell))
+			{
+				failure->reason = cell ? RB_PREFLIGHT_SURFACE : RB_PREFLIGHT_MISSING_CELL;
+				return FALSE;
+			}
+			const double heightDelta = fabs(TheTerrainLogic->getGroundHeight(p.x, p.y) - position.z);
+			if (heightDelta > 8.0f)
+			{
+				failure->heightDelta = heightDelta;
+				failure->reason = RB_PREFLIGHT_FOOTPRINT_HEIGHT; return FALSE;
+			}
+		}
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
+	{
+		if (object->isDestroyed()) continue;
+		const Real dx = object->getPosition()->x - position.x;
+		const Real dy = object->getPosition()->y - position.y;
+		const Real separation = radius + object->getGeometryInfo().getBoundingCircleRadius() + 2.0f;
+		if (dx * dx + dy * dy < separation * separation)
+		{
+			failure->reason = RB_PREFLIGHT_OCCUPIED;
+			failure->query = position;
+			failure->cellType = failure->cellFlags = -1;
+			failure->blocker = object->getID();
+			failure->blockerPosition = *object->getPosition();
+			failure->blockerRadius = object->getGeometryInfo().getBoundingCircleRadius();
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+// Both placement phases retain the same terrain, world occupancy and route gates.
+// Row targets use the original absolute center-X, not a relative unit-X offset.
+Bool PreflightRenderedBattleUnitPosition(const Coord3D &p, Real radius,
+	const Coord3D &center, Int slot, const Region3D &extent, Pathfinder *pathfinder,
+	RenderedBattlePreflightFailure *failure)
+{
+	if (!PreflightRenderedBattlePosition(p, radius + 1.0f, extent, pathfinder, failure)) return FALSE;
+	if (!(fabs(p.z - center.z) <= 8.0f))
+	{
+		failure->reason = RB_PREFLIGHT_CENTER_HEIGHT;
+		failure->query = p; failure->cellType = failure->cellFlags = -1;
+		failure->heightDelta = fabs(p.z - center.z); return FALSE;
+	}
+	Coord3D target = p;
+	target.x = center.x + (slot < 4 ? 95.0f : -95.0f);
+	target.z = TheTerrainLogic->getGroundHeight(target.x, target.y);
+	failure->target = target;
+	if (!pathfinder->isGroundPathPassable(FALSE, p, LAYER_GROUND, target, 4))
+	{
+		failure->reason = RB_PREFLIGHT_GROUND_PATH;
+		// The route API supplies no rejected-cell location; retain its endpoints.
+		failure->query = p; failure->cellType = failure->cellFlags = -1; return FALSE;
+	}
+	target = center;
+	target.x += slot < 4 ? 95.0f : -95.0f;
+	target.y += ((slot % 4) - 1.5f) * 200.0f;
+	target.z = TheTerrainLogic->getGroundHeight(target.x, target.y);
+	failure->target = target;
+	if (!pathfinder->isGroundPathPassable(FALSE, p, LAYER_GROUND, target, 4))
+	{
+		failure->reason = RB_PREFLIGHT_ATTACK_GOAL_PATH;
+		failure->query = p; failure->cellType = failure->cellFlags = -1; return FALSE;
+	}
+	return TRUE;
+}
+
+Bool StageRenderedBattleDiagnostic()
+{
+	if (!TheThingFactory || !TheTerrainLogic || !TheTacticalView || !ThePartitionManager ||
+		!TheAI || !TheAI->pathfinder() || !ThePlayerList->getLocalPlayer()) return FALSE;
+	Pathfinder *pathfinder = TheAI->pathfinder();
+	if (TheGameInfo->getNumPlayers() != 8 || TheGameInfo->getNumNonObserverPlayers() != 8 ||
+		TheGameInfo->getLocalSlotNum() != 0 ||
+		ThePlayerList->getLocalPlayer() != ThePlayerList->getPlayerFromSlotIndex(0)) return FALSE;
+	const ThingTemplate *templates[8][4];
+	Real radii[8][4];
+	Player *players[8];
+	s_renderedBattle.setupFailure = "player_or_faction_invalid";
+	for (Int slot = 0; slot < 8; ++slot)
+	{
+		s_renderedBattle.setupFailure = "player_or_faction_invalid";
+		const GameSlot *gameSlot = TheGameInfo->getConstSlot(slot);
+		players[slot] = ThePlayerList->getPlayerFromSlotIndex(slot);
+		if (!gameSlot || gameSlot->getTeamNumber() != (slot < 4 ? 0 : 1) ||
+			gameSlot->getStartPos() != slot ||
+			gameSlot->getState() != (slot == 0 ? SLOT_PLAYER : SLOT_BRUTAL_AI) ||
+			!players[slot] || !players[slot]->getPlayerTemplate() || players[slot]->isPlayerObserver() ||
+			players[slot]->getPlayerTemplate()->getName().compareNoCase(
+				GetRenderedBattleDiagnosticFactionName(slot)) != 0) return FALSE;
+		for (Int type = 0; type < 4; ++type)
+		{
+			s_renderedBattle.setupFailure = "object_template_or_geometry_invalid";
+			templates[slot][type] = TheThingFactory->findTemplate(
+				AsciiString(GetRenderedBattleDiagnosticObjectName(slot, type)), FALSE);
+			if (!templates[slot][type] || templates[slot][type]->isKindOf(KINDOF_DRAWABLE_ONLY) ||
+				(!templates[slot][type]->isKindOf(KINDOF_VEHICLE) &&
+				 !templates[slot][type]->isKindOf(KINDOF_INFANTRY))) return FALSE;
+			radii[slot][type] = templates[slot][type]->getTemplateGeometryInfo().getBoundingCircleRadius();
+			if (!(radii[slot][type] > 0.0f && radii[slot][type] <= 21.0f)) return FALSE;
+		}
+	}
+	Region3D extent; TheTerrainLogic->getExtent(&extent);
+	s_renderedBattle.setupFailure = "formation_terrain_or_occupancy_invalid";
+	Coord3D positions[8 * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER];
+	Bool found = FALSE;
+	Int rejected[RB_PREFLIGHT_REASON_COUNT] = {0}, trialRejected[RB_PREFLIGHT_REASON_COUNT] = {0};
+	Int examined = 0, nominalExamined = 0, localExamined = 0, selected = -1, selectedPhase = -1;
+	Int maxValidUnits = 0, exampleCount = 0, unitTrials = 0, localUnitTrials = 0;
+	Int acceptedUnitTrials = 0, selectedAdoptedOffsets = 0, pairComparisons = 0;
+	Int retained[RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP];
+	Int retainedPrefixes[RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP], retainedCount = 0;
+	RenderedBattlePreflightFailure examples[2], furthest;
+	const Int searchCount = GetRenderedBattleDiagnosticSearchCount(
+		extent.lo.x, extent.lo.y, extent.hi.x, extent.hi.y);
+	// Nominal fixed order first, then at most eight ranked failed arenas. Each
+	// unit uses at most nine deterministic trials, with no backtracking or RNG.
+	// No object is created until all 256 positions pass every live gate.
+	for (Int phase = 0; phase < 2 && !found; ++phase)
+		for (Int ordinal = 0; ordinal < (phase ? retainedCount : searchCount) && !found; ++ordinal)
+		{
+			const Int candidate = phase ? retained[ordinal] : ordinal;
+			RenderedBattlePreflightFailure failure;
+			failure.candidate = candidate; failure.phase = phase;
+			Coord3D center;
+			if (!GetRenderedBattleDiagnosticSearchCenter(extent.lo.x, extent.lo.y,
+				extent.hi.x, extent.hi.y, candidate, &center)) break;
+			++examined;
+			if (phase) ++localExamined; else ++nominalExamined;
+			center.z = TheTerrainLogic->getGroundHeight(center.x, center.y);
+			failure.center = center;
+			const Bool centerAccepted = PreflightRenderedBattlePosition(center, 20.0f, extent, pathfinder, &failure);
+			Bool arenaAccepted = centerAccepted;
+			Int validUnits = 0, adoptedOffsets = 0;
+			for (Int slot = 0; slot < 8 && arenaAccepted; ++slot)
+				for (Int unit = 0; unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER && arenaAccepted; ++unit)
+				{
+					Bool unitAccepted = FALSE;
+					for (Int trial = 0; trial < (phase ? RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT : 1) && !unitAccepted; ++trial)
+					{
+						// Fresh metadata per trial: no stale blocker, delta, cell or target.
+						RenderedBattlePreflightFailure attempt;
+						attempt.candidate = candidate; attempt.phase = phase; attempt.trial = trial;
+						attempt.slot = slot; attempt.unit = unit; attempt.validUnits = validUnits;
+						attempt.center = center;
+						Coord3D p, local;
+						++unitTrials; if (phase) ++localUnitTrials;
+						if (!GetRenderedBattleDiagnosticOffset(slot, unit, &p) ||
+							!GetRenderedBattleDiagnosticLocalOffset(slot, trial, &local))
+							attempt.reason = RB_PREFLIGHT_BOUNDS;
+						else
+						{
+							p.x += center.x + local.x; p.y += center.y + local.y;
+							p.z = TheTerrainLogic->getGroundHeight(p.x, p.y);
+							const Real radius = radii[slot][unit % 4];
+							unitAccepted = PreflightRenderedBattleUnitPosition(p, radius, center, slot,
+								extent, pathfinder, &attempt);
+							// World occupancy cannot see the not-yet-created roster.
+							// Add symmetric clearance against all accepted positions.
+							for (Int previous = 0; previous < validUnits && unitAccepted; ++previous)
+							{
+								++pairComparisons;
+								const Real previousRadius = radii[previous / RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER][previous % 4];
+								if (!AreRenderedBattleDiagnosticPositionsSeparated(p, radius, positions[previous], previousRadius))
+								{
+									unitAccepted = FALSE; attempt.reason = RB_PREFLIGHT_PLANNED_PAIR;
+									attempt.plannedIndex = previous; attempt.query = p;
+									attempt.cellType = attempt.cellFlags = -1;
+									attempt.blockerPosition = positions[previous]; attempt.blockerRadius = previousRadius;
+								}
+							}
+						}
+						if (unitAccepted)
+						{
+							positions[validUnits++] = p; ++acceptedUnitTrials;
+							attempt.validUnits = validUnits;
+							if (trial) ++adoptedOffsets;
+						}
+						else ++trialRejected[attempt.reason];
+						failure = attempt;
+					}
+					arenaAccepted = unitAccepted;
+				}
+			if (validUnits > maxValidUnits) maxValidUnits = validUnits;
+			found = arenaAccepted;
+			if (found)
+			{
+				s_renderedBattle.center = center; selected = candidate; selectedPhase = phase;
+				selectedAdoptedOffsets = adoptedOffsets;
+			}
+			else
+			{
+				++rejected[failure.reason];
+				if (!phase && centerAccepted &&
+					center.x - 447.0f >= extent.lo.x && center.x + 447.0f <= extent.hi.x &&
+					center.y - 410.0f >= extent.lo.y && center.y + 410.0f <= extent.hi.y)
+					RememberRenderedBattleDiagnosticArena(candidate, validUnits, retained, retainedPrefixes, &retainedCount);
+				if (exampleCount == 0 || (exampleCount == 1 && failure.reason != examples[0].reason))
+					examples[exampleCount++] = failure;
+				if (furthest.candidate < 0 || failure.validUnits > furthest.validUnits) furthest = failure;
+			}
+		}
+	// Two aggregates and at most three examples remain within the 32-record cap.
+	// Arena counts are terminal gates; trial counts include rejected local trials.
+	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY examined=%d selected=%d "
+		"search_schema=legacy49_then_extent9x9_local9_v2 placement_schema=2 selected_phase=%s "
+		"search_capacity=%d base_search_capacity=%d nominal_examined=%d local_examined=%d "
+		"legacy_candidates=49 grid_candidates=%d grid_columns=9 grid_rows=9 grid_inset_x=447 grid_inset_y=410 "
+		"local_step=22 local_trials=9 local_arena_cap=8 retained_arenas=%d "
+		"max_valid_units=%d bounds=%d missing_cell=%d surface=%d footprint_height=%d occupied=%d "
+		"center_height=%d ground_path=%d attack_goal_path=%d planned_pair=%d "
+		"extent_lo=(%.3f,%.3f,%.3f) extent_hi=(%.3f,%.3f,%.3f) "
+		"grid_hi=(%d,%d) cell_size=10 candidate_step=240 candidate_span=720 "
+		"formation_x=403 formation_y=366 footprint_margin_max=22 height_limit=8 path_diameter_cells=4 "
+		"frame=%u in_game=%d loading=%d loaded_identity_valid=%d map_crc=%08X map_size=%u\n",
+		examined, selected, selectedPhase < 0 ? "none" : (selectedPhase ? "local9" : "nominal"),
+		searchCount + RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP, searchCount, nominalExamined, localExamined,
+		searchCount > 49 ? searchCount - 49 : 0, retainedCount,
+		maxValidUnits, rejected[RB_PREFLIGHT_BOUNDS], rejected[RB_PREFLIGHT_MISSING_CELL],
+		rejected[RB_PREFLIGHT_SURFACE], rejected[RB_PREFLIGHT_FOOTPRINT_HEIGHT], rejected[RB_PREFLIGHT_OCCUPIED],
+		rejected[RB_PREFLIGHT_CENTER_HEIGHT], rejected[RB_PREFLIGHT_GROUND_PATH],
+		rejected[RB_PREFLIGHT_ATTACK_GOAL_PATH], rejected[RB_PREFLIGHT_PLANNED_PAIR],
+		extent.lo.x, extent.lo.y, extent.lo.z, extent.hi.x, extent.hi.y, extent.hi.z,
+		pathfinder->getExtent()->x, pathfinder->getExtent()->y, TheGameLogic->getFrame(),
+		TheGameLogic->isInGame() ? 1 : 0, TheGameLogic->isLoadingMap() ? 1 : 0,
+		s_runner.loadedStateValidated ? 1 : 0, s_runner.loadedMapCRC, s_runner.loadedMapSize);
+	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_PLACEMENT_SUMMARY "
+		"unit_trials=%d local_unit_trials=%d accepted_unit_trials=%d selected_adopted_offsets=%d "
+		"pair_comparisons=%d bounds=%d missing_cell=%d surface=%d footprint_height=%d occupied=%d "
+		"center_height=%d ground_path=%d attack_goal_path=%d planned_pair=%d\n",
+		unitTrials, localUnitTrials, acceptedUnitTrials, selectedAdoptedOffsets, pairComparisons,
+		trialRejected[RB_PREFLIGHT_BOUNDS], trialRejected[RB_PREFLIGHT_MISSING_CELL],
+		trialRejected[RB_PREFLIGHT_SURFACE], trialRejected[RB_PREFLIGHT_FOOTPRINT_HEIGHT],
+		trialRejected[RB_PREFLIGHT_OCCUPIED], trialRejected[RB_PREFLIGHT_CENTER_HEIGHT],
+		trialRejected[RB_PREFLIGHT_GROUND_PATH], trialRejected[RB_PREFLIGHT_ATTACK_GOAL_PATH],
+		trialRejected[RB_PREFLIGHT_PLANNED_PAIR]);
+	for (Int example = 0; example < exampleCount; ++example)
+		RecordRenderedBattlePreflightFailure(examples[example], example ? "different_reason" : "first");
+	if (furthest.candidate >= 0 &&
+		(exampleCount == 0 || furthest.candidate != examples[0].candidate || furthest.phase != examples[0].phase) &&
+		(exampleCount < 2 || furthest.candidate != examples[1].candidate || furthest.phase != examples[1].phase))
+		RecordRenderedBattlePreflightFailure(furthest, "furthest_progress");
+	if (!found) return FALSE;
+	s_renderedBattle.setupFailure = "partial_creation_or_object_invalid";
+	try
+	{
+		for (Int slot = 0; slot < 8; ++slot)
+			for (Int unit = 0; unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER; ++unit)
+			{
+				Object *object = TheThingFactory->newObject(templates[slot][unit % 4], players[slot]->getDefaultTeam());
+				s_renderedBattle.ids[s_renderedBattle.created++] = object->getID();
+				MoveSkirmishAIRecoveryObject(object, &positions[slot * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER + unit]);
+				object->setOrientation(slot < 4 ? 0.0f : 3.14159265358979323846f);
+				const Real objectRadius = object->getGeometryInfo().getBoundingCircleRadius();
+				if (!object->getAIUpdateInterface() || !object->getBodyModule() ||
+					!object->getDrawable() ||
+					!(objectRadius > 0.0f && objectRadius <= 21.0f) ||
+					!pathfinder->validMovementPosition(FALSE, LAYER_GROUND,
+						object->getAIUpdateInterface()->getLocomotorSet(), object->getPosition()))
+					return FALSE;
+			}
+		s_renderedBattle.setupFailure = "attack_move_rejected";
+		for (Int index = 0; index < s_renderedBattle.created; ++index)
+		{
+			Object *object = TheGameLogic->findObjectByID(s_renderedBattle.ids[index]);
+			const Int slot = index / RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+			Coord3D target = s_renderedBattle.center;
+			target.x += slot < 4 ? 95.0f : -95.0f;
+			target.y += ((slot % 4) - 1.5f) * 200.0f;
+			target.z = TheTerrainLogic->getGroundHeight(target.x, target.y);
+			object->getAIUpdateInterface()->aiAttackMoveToPosition(&target, NO_MAX_SHOTS_LIMIT, CMD_FROM_SCRIPT);
+			AIUpdateInterface *ai = object->getAIUpdateInterface();
+			if (ai->getLastCommandSource() != CMD_FROM_SCRIPT ||
+				ai->getCurrentStateID() != AI_ATTACK_MOVE_TO || !ai->getGoalPosition()) return FALSE;
+		}
+	}
+	catch (...) { return FALSE; }
+	for (Int slot = 0; slot < 8; ++slot)
+	{
+		char roster[1024];
+		Int bytes = _snprintf(roster, sizeof(roster),
+			"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d ids=",
+			slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1,
+			RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER);
+		for (Int unit = 0; unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER; ++unit)
+		{
+			if (bytes < 0 || bytes >= static_cast<Int>(sizeof(roster)))
+			{
+				s_renderedBattle.reportFailed = TRUE; return FALSE;
+			}
+			const Int appended = _snprintf(roster + bytes, sizeof(roster) - bytes, "%s%u", unit ? "," : "",
+				static_cast<UnsignedInt>(s_renderedBattle.ids[slot * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER + unit]));
+			if (appended < 0 || appended >= static_cast<Int>(sizeof(roster)) - bytes)
+			{
+				s_renderedBattle.reportFailed = TRUE; return FALSE;
+			}
+			bytes += appended;
+		}
+		if (bytes < 0 || bytes >= static_cast<Int>(sizeof(roster)) - 1)
+		{
+			s_renderedBattle.reportFailed = TRUE; return FALSE;
+		}
+		roster[bytes++] = '\n'; roster[bytes] = '\0';
+		RecordRenderedBattleDiagnostic("%s", roster);
+		if (s_renderedBattle.reportFailed) return FALSE;
+	}
+	// Diagnostic-only local reveal; normal object sight and enemy targeting remain unchanged.
+	ThePartitionManager->doShroudReveal(s_renderedBattle.center.x, s_renderedBattle.center.y,
+		700.0f, 1 << ThePlayerList->getLocalPlayer()->getPlayerIndex());
+	TheTacticalView->setAngleToDefault(); TheTacticalView->setPitchToDefault();
+	TheTacticalView->stopDoingScriptedCamera(); TheTacticalView->setCameraLock(INVALID_ID);
+	TheTacticalView->setZoomToDefault(); TheTacticalView->lookAt(&s_renderedBattle.center);
+	s_renderedBattle.startFrame = TheGameLogic->getFrame();
+	s_renderedBattle.startTick = GetTickCount();
+	s_renderedBattle.nextSummaryFrame = s_renderedBattle.startFrame;
+	s_renderedBattle.staged = TRUE;
+	s_runner.lastObservedFrame = s_renderedBattle.startFrame;
+	s_runner.stalledStartMilliseconds = s_renderedBattle.startTick;
+	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_STAGED seed=%d frame=%u tick=%u created=%d "
+		"camera=(%.1f,%.1f,%.1f) yaw=default pitch=default zoom=1 scripted_camera=stopped "
+		"camera_lock=none local_reveal_radius=700 "
+		"frame_cap=%d wall_cap_ms=%d map_crc=%08X map_size=%u\n",
+		s_runner.seed, s_renderedBattle.startFrame, s_renderedBattle.startTick,
+		s_renderedBattle.created, s_renderedBattle.center.x, s_renderedBattle.center.y,
+		s_renderedBattle.center.z, RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES,
+		RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS, s_runner.loadedMapCRC, s_runner.loadedMapSize);
+	fflush(stdout);
+	return TRUE;
+}
+
+void UpdateRenderedBattleDiagnostic()
+{
+	if (TheGlobalData->m_headless || !TheGlobalData->m_useFpsLimit)
+	{
+		FailSkirmishAITest("rendered_mode_or_pacing_changed"); RequestSkirmishAITestStop(); return;
+	}
+	if (!s_renderedBattle.staged && !StageRenderedBattleDiagnostic())
+	{
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_SETUP_FAIL created=%d\n", s_renderedBattle.created);
+		FailSkirmishAITest(s_renderedBattle.setupFailure); RequestSkirmishAITestStop(); return;
+	}
+	const UnsignedInt frame = TheGameLogic->getFrame(), tick = GetTickCount();
+	const UnsignedInt elapsed = ElapsedMilliseconds(s_renderedBattle.startTick, tick);
+	if (frame == s_runner.lastObservedFrame)
+	{
+		if (IsSkirmishAITestProgressStalled(ElapsedMilliseconds(s_runner.stalledStartMilliseconds, tick)))
+		{
+			FailSkirmishAITest("rendered_frame_stalled"); RequestSkirmishAITestStop(); return;
+		}
+	}
+	else { s_runner.lastObservedFrame = frame; s_runner.stalledStartMilliseconds = tick; }
+	TheTacticalView->setAngleToDefault(); TheTacticalView->setPitchToDefault();
+	TheTacticalView->setZoomToDefault();
+	TheTacticalView->lookAt(&s_renderedBattle.center);
+	// Sparse bounded summaries; no full roster walk on ordinary diagnostic frames.
+	if (frame < s_renderedBattle.nextSummaryFrame &&
+		frame - s_renderedBattle.startFrame < RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES &&
+		elapsed < RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS) return;
+	Int alive[2] = {0, 0}, attacking = 0;
+	Real health[2] = {0.0f, 0.0f}, positionSum[2] = {0.0f, 0.0f};
+	for (Int index = 0; index < s_renderedBattle.created; ++index)
+	{
+		Object *object = TheGameLogic->findObjectByID(s_renderedBattle.ids[index]);
+		if (!IsLiveSkirmishAIRecoveryObject(object)) continue;
+		const Int team = index / (4 * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER);
+		++alive[team]; health[team] += object->getBodyModule()->getHealth();
+		positionSum[team] += object->getPosition()->x + object->getPosition()->y;
+		if (object->getAIUpdateInterface()->isAttacking()) ++attacking;
+	}
+	// Always retain the fresh terminal sample, including a wall cap between
+	// sparse sample boundaries. The bounded report remains below 32 records.
+	if (frame >= s_renderedBattle.nextSummaryFrame ||
+		frame - s_renderedBattle.startFrame >= RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES ||
+		elapsed >= RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS)
+	{
+		if (attacking > 0) ++s_renderedBattle.samplesWithAttacks;
+		if (alive[0] + alive[1] < s_renderedBattle.created) ++s_renderedBattle.samplesWithLoss;
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_SAMPLE frame=%u tick=%u elapsed_ms=%u "
+			"alive0=%d alive1=%d health0=%.3f health1=%.3f position_sum0=%.3f position_sum1=%.3f "
+			"attacking=%d camera=combat\n", frame, tick, elapsed, alive[0], alive[1],
+			health[0], health[1], positionSum[0], positionSum[1], attacking);
+		fflush(stdout); s_renderedBattle.nextSummaryFrame = frame + 150;
+	}
+	if (frame - s_renderedBattle.startFrame >= RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES ||
+		elapsed >= RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS)
+	{
+		s_renderedBattle.completionReason = elapsed >= RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS ?
+			"wall_cap" : "frame_cap";
+		s_runner.endFrame = frame;
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_STOP reason=%s frame=%u tick=%u alive0=%d alive1=%d\n",
+			s_renderedBattle.completionReason, frame, tick, alive[0], alive[1]);
+		RequestSkirmishAITestStop();
+	}
+}
+} // namespace
+
 Bool SetSkirmishAITestExecutableHashInput(const char *sha256)
 {
 	if (sha256 == nullptr || strlen(sha256) != 64)
@@ -3690,7 +4505,7 @@ Bool ShouldBypassFramePacingForSkirmishAITest(Bool runnerArmed)
 	// Automated headless gates run without pacing. The practical controller
 	// lane keeps normal presentation/input cadence so it remains playable.
 	return !s_runner.armed ||
-		!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario);
+		!IsRenderedSkirmishScenario(s_runner.scenario);
 }
 
 void BuildSkirmishAITestPlan(Int seed, SkirmishAITestPlan *plan)
@@ -3705,16 +4520,19 @@ void BuildSkirmishAITestPlan(Int seed, SkirmishAITestScenario scenario,
 		return;
 	if (scenario != SKIRMISH_AI_TEST_SCENARIO_4V2 &&
 		scenario != SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7 &&
+		!IsRenderedBattleDiagnostic(scenario) &&
 		!IsSkirmishAITestHardAI2v6(scenario))
 		scenario = SKIRMISH_AI_TEST_SCENARIO_4V3;
 
 	plan->seed = seed;
-	plan->mapName = "Maps\\Twilight Flame\\Twilight Flame.map";
+	// Diagnostic-only stock eight-player map; ordinary AI/replay plans stay unchanged.
+	plan->mapName = IsRenderedBattleDiagnostic(scenario) ? "Maps\\Fortress Avalanche\\Fortress Avalanche.map" :
+		"Maps\\Twilight Flame\\Twilight Flame.map";
 
 	const Bool hardAI2v6 = IsSkirmishAITestHardAI2v6(scenario);
 	SkirmishAITestSlotPlan &localSlot = plan->slots[0];
 	localSlot.state = hardAI2v6 ? SLOT_BRUTAL_AI : SLOT_PLAYER;
-	localSlot.isController = IsSkirmishAITestPracticalControllerScenario(scenario);
+	localSlot.isController = IsRenderedSkirmishScenario(scenario);
 	if (hardAI2v6)
 	{
 		localSlot.playerTemplate = PLAYERTEMPLATE_RANDOM;
@@ -3758,7 +4576,7 @@ void BuildSkirmishAITestPlan(Int seed, SkirmishAITestScenario scenario,
 			slot.startPosition = i;
 			slot.teamNumber = i < 2 ? 0 : 1;
 		}
-		else if (IsSkirmishAITestPracticalControllerScenario(scenario))
+		else if (IsRenderedSkirmishScenario(scenario))
 		{
 			slot.color = i;
 			slot.startPosition = i;
@@ -3830,8 +4648,10 @@ Bool IsSkirmishAITestProgressStalled(UnsignedInt elapsedMilliseconds)
 void ArmSkirmishAITestRunner(Int seed, SkirmishAITestScenario scenario)
 {
 	s_recovery.reset();
+	s_renderedBattle.reset();
 	if (scenario != SKIRMISH_AI_TEST_SCENARIO_4V2 &&
 		scenario != SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7 &&
+		!IsRenderedBattleDiagnostic(scenario) &&
 		!IsSkirmishAITestHardAI2v6(scenario))
 		scenario = SKIRMISH_AI_TEST_SCENARIO_4V3;
 	s_runner.armed = TRUE;
@@ -3940,6 +4760,20 @@ Bool StartSkirmishAITestRunner()
 {
 	if (!s_runner.armed)
 		return TRUE;
+	// BEGIN RENDERED_BATTLE_DIAGNOSTIC_PROFILE_PREFLIGHT
+	if (IsRenderedBattleDiagnostic(s_runner.scenario))
+	{
+		if (!PrepareRenderedBattleDiagnosticReportPath())
+		{
+			FailSkirmishAITest("isolated_report_profile_or_source_hash_invalid");
+			return FALSE;
+		}
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_BEGIN seed=%d map=Fortress_Avalanche "
+			"executable_sha256_observed=%s executable_sha256_supplied=%s source_sha256_supplied=%s\n",
+			s_runner.seed, s_executableHashObserved, s_executableHashInput,
+			s_renderedBattle.suppliedSourceHash[0] ? s_renderedBattle.suppliedSourceHash : "not_supplied");
+	}
+	// END RENDERED_BATTLE_DIAGNOSTIC_PROFILE_PREFLIGHT
 #if defined(_WIN64)
 	// Explicit native trace intent is a caller contract, not a game-start
 	// fallback. Reject it before observing or mutating any game, global, lobby,
@@ -3969,6 +4803,16 @@ Bool StartSkirmishAITestRunner()
 
 	SkirmishAITestPlan plan;
 	BuildSkirmishAITestPlan(s_runner.seed, s_runner.scenario, &plan);
+	// BEGIN RENDERED_BATTLE_DIAGNOSTIC_WORLD_PREFLIGHT
+	if (IsRenderedBattleDiagnostic(s_runner.scenario))
+	{
+		if (TheGlobalData->m_headless || !BindRenderedBattleFactions(&plan))
+		{
+			FailSkirmishAITest("rendered_faction_or_mode_invalid");
+			return FALSE;
+		}
+	}
+	// END RENDERED_BATTLE_DIAGNOSTIC_WORLD_PREFLIGHT
 	if (s_recovery.active)
 	{
 #if !RTS_ZEROHOUR
@@ -4010,7 +4854,8 @@ Bool StartSkirmishAITestRunner()
 	if (!map || !map->m_doesExist || !map->m_isMultiplayer ||
 		map->m_numPlayers < expectedMapPlayers)
 	{
-		FailSkirmishAITest("twilight_flame_unavailable");
+		FailSkirmishAITest(IsRenderedBattleDiagnostic(s_runner.scenario) ?
+			"fortress_avalanche_unavailable" : "twilight_flame_unavailable");
 		return FALSE;
 	}
 	DEBUG_LOG(("SkirmishAITestRunner::start phase=map_ready"));
@@ -4066,21 +4911,23 @@ Bool StartSkirmishAITestRunner()
 	// The practical controller lane is intentionally interactive.  Automated
 	// lanes remain headless and continue to be the replay-gate scenarios.
 	TheWritableGlobalData->m_headless =
-		IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) ? FALSE : TRUE;
+		IsRenderedSkirmishScenario(s_runner.scenario) ? FALSE : TRUE;
 	TheWritableGlobalData->m_shellMapOn = FALSE;
-	if (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
+	if (!IsRenderedSkirmishScenario(s_runner.scenario))
 		TheWritableGlobalData->m_useFpsLimit = FALSE;
+	if (IsRenderedBattleDiagnostic(s_runner.scenario))
+		TheWritableGlobalData->m_useFpsLimit = TRUE;
 	// Automated lanes keep logical and local retaliation modes disabled so the
 	// recorder does not capture an irrelevant frame-zero preference
 	// synchronization command.
-	if (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
+	if (!IsRenderedSkirmishScenario(s_runner.scenario))
 		TheWritableGlobalData->m_clientRetaliationModeEnabled = FALSE;
 	TheRecorder->setArchiveEnabled(FALSE);
 	InitRandom(static_cast<UnsignedInt>(plan.seed));
 
 #if defined(_WIN64)
 	if (!s_recovery.active &&
-		!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) &&
+		!IsRenderedSkirmishScenario(s_runner.scenario) &&
 		!s_performanceReceiptAttempted)
 	{
 		s_performanceReceiptAttempted = true;
@@ -4119,6 +4966,12 @@ Bool StartSkirmishAITestRunner()
 			plan.seed, GetSkirmishAIRecoveryFixtureCaseName(s_recovery.fixtureCase),
 			GetSkirmishAIRecoveryFactionName(s_recovery.faction),
 			GetSkirmishAIRecoveryFactionTemplateName(s_recovery.faction), reportedMapName);
+	}
+	else if (IsRenderedBattleDiagnostic(s_runner.scenario))
+	{
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_START seed=%d map=\"%s\" expected_players=8 "
+			"expected_ai=7 expected_teams=4v4 pacing=normal replay_acceptance=not_applicable\n",
+			plan.seed, reportedMapName);
 	}
 	else if (IsSkirmishAITest4v2(s_runner.scenario))
 	{
@@ -4207,6 +5060,13 @@ void UpdateSkirmishAITestRunner()
 
 	SkirmishAITestPlan expectedPlan;
 	BuildSkirmishAITestPlan(s_runner.seed, s_runner.scenario, &expectedPlan);
+	if (IsRenderedBattleDiagnostic(s_runner.scenario) &&
+		!BindRenderedBattleFactions(&expectedPlan))
+	{
+		FailSkirmishAITest("rendered_faction_missing");
+		RequestSkirmishAITestStop();
+		return;
+	}
 	if (s_recovery.active)
 		expectedPlan.slots[1].playerTemplate = s_recovery.templateIndex;
 #if defined(_WIN64)
@@ -4251,6 +5111,12 @@ void UpdateSkirmishAITestRunner()
 #endif
 	}
 
+	if (IsRenderedBattleDiagnostic(s_runner.scenario))
+	{
+		TheRecorder->setArchiveEnabled(FALSE);
+		UpdateRenderedBattleDiagnostic();
+		return;
+	}
 	if (s_recovery.active)
 	{
 		TheWritableGlobalData->m_useFpsLimit = FALSE;
@@ -6606,6 +7472,36 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 		FailSkirmishAITest("engine_exit");
 	if (!s_runner.finished && !s_runner.failed)
 		FailSkirmishAITest("incomplete");
+	// BEGIN RENDERED_BATTLE_DIAGNOSTIC_FINALIZER
+	if (IsRenderedBattleDiagnostic(s_runner.scenario))
+	{
+		if (s_renderedBattle.reportFailed)
+			FailSkirmishAITest("diagnostic_report_overflow");
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_%s seed=%d reason=%s created=%d end_frame=%u "
+			"attack_samples=%d loss_samples=%d executable_sha256=%s "
+			"engine_exit_code=%d diagnostic_exit_code=%d terminal_sample=%s "
+			"acceptance=not_ai_or_replay heavy_conflict=requires_sample_review\n",
+			s_runner.failed ? "FAIL" : "COMPLETE", s_runner.seed,
+			s_runner.failed ? s_runner.failureReason : s_renderedBattle.completionReason,
+			s_renderedBattle.created, s_runner.endFrame, s_renderedBattle.samplesWithAttacks,
+			s_renderedBattle.samplesWithLoss, s_executableHashObserved, engineExitCode,
+			s_runner.failed ? 1 : 0, s_runner.finished && !s_runner.failed
+				? "fresh_cap_sample" : "unavailable_teardown_last_sparse");
+		if (s_renderedBattle.reportFailed)
+			FailSkirmishAITest("diagnostic_report_overflow");
+		const Bool written = WriteRenderedBattleDiagnosticReport(s_runner.failed ? 1 : 0);
+		if (!written) FailSkirmishAITest("diagnostic_report_write_failed");
+		char result[512];
+		_snprintf(result, sizeof(result),
+			"RENDERED_BATTLE_DIAGNOSTIC_WRITE_RESULT status=%s diagnostic_exit_code=%d path=\"%s\"\n",
+			written ? "published" : "failed", s_runner.failed ? 1 : 0,
+			s_renderedBattle.reportPath[0] ? s_renderedBattle.reportPath : "none");
+		result[sizeof(result) - 1] = '\0';
+		printf("%s", result); OutputDebugStringA(result);
+		fflush(stdout);
+		return s_runner.failed ? 1 : 0;
+	}
+	// END RENDERED_BATTLE_DIAGNOSTIC_FINALIZER
 
 	if (s_recovery.active)
 	{

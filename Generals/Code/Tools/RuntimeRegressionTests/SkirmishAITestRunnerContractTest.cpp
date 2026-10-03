@@ -39,6 +39,7 @@
 #include "XferCrcSnapshotTest.h"
 #include "WW3D2/textureloader.h"
 
+#include <limits>
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
@@ -539,8 +540,16 @@ static void TestLifecycle()
 		CHECK(recorder.m_skirmishAIReplayEpoch == 1);
 		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
 	}
-	const Int otherModes[] =
-		{ GAME_LAN, GAME_INTERNET, GAME_REPLAY, GAME_SHELL, GAME_NONE, -1, 999 };
+	const Int networkModes[] = { GAME_LAN, GAME_INTERNET };
+	for (unsigned i = 0; i < sizeof(networkModes) / sizeof(networkModes[0]); ++i)
+	{
+		CHECK(recorder.recordEpoch(networkModes[i]) ==
+			L"native build [GeneralsAIPlanningEpoch=1]");
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+		CHECK(recorder.playbackEpoch(current, networkModes[i], 4, TRUE));
+		CHECK(recorder.m_generalsPathfindingReplayEpoch == 0);
+	}
+	const Int otherModes[] = { GAME_REPLAY, GAME_SHELL, GAME_NONE, -1, 999 };
 	for (unsigned i = 0; i < sizeof(otherModes) / sizeof(otherModes[0]); ++i)
 	{
 		CHECK(recorder.recordEpoch(otherModes[i]) == L"native build");
@@ -1505,6 +1514,314 @@ int RunPerformanceReceiptFreshCallerFenceTitleTests();
 int RunPerformanceReceiptTraceFileTests(const wchar_t *freshRoot, bool reparseAliasOnly);
 #endif
 
+static void TestRenderedBattleDiagnosticSearch()
+{
+	// Pure placement only: no terrain, occupancy or route validity is implied.
+	CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, 4860.0f, 4690.0f) == 130);
+	for (Int candidate = 0; candidate < 49; ++candidate)
+	{
+		Coord3D center;
+		CHECK(GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 4860.0f, 4690.0f, candidate, &center));
+		CHECK(center.x == (0.0f + 4860.0f) * 0.5f + (candidate % 7 - 3) * 240.0f);
+		CHECK(center.y == (0.0f + 4690.0f) * 0.5f + (candidate / 7 - 3) * 240.0f);
+		CHECK(center.z == 0.0f);
+	}
+	for (Int grid = 0; grid < 81; ++grid)
+	{
+		Coord3D center;
+		CHECK(GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 4860.0f, 4690.0f, 49 + grid, &center));
+		CHECK(center.x == 447.0f + (grid % 9) * 495.75f);
+		CHECK(center.y == 410.0f + (grid / 9) * 483.75f);
+		CHECK(center.x - 403.0f - 22.0f - 22.0f >= 0.0f && center.x + 403.0f + 22.0f + 22.0f <= 4860.0f);
+		CHECK(center.y - 366.0f - 22.0f - 22.0f >= 0.0f && center.y + 366.0f + 22.0f + 22.0f <= 4690.0f);
+		CHECK(center.z == 0.0f);
+	}
+	Coord3D center = { 1.0f, 2.0f, 3.0f };
+	CHECK(GetRenderedBattleDiagnosticSearchCenter(100.0f, -200.0f, 4960.0f, 4490.0f, 49, &center));
+	CHECK(center.x == 547.0f && center.y == 210.0f);
+	CHECK(GetRenderedBattleDiagnosticSearchCenter(100.0f, -200.0f, 4960.0f, 4490.0f, 129, &center));
+	CHECK(center.x == 4513.0f && center.y == 4080.0f);
+	CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, 894.0f, 820.0f) == 130);
+	for (Int candidate = 49; candidate < 130; ++candidate)
+	{
+		CHECK(GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 894.0f, 820.0f, candidate, &center));
+		CHECK(center.x == 447.0f && center.y == 410.0f);
+	}
+	CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, 893.5f, 820.0f) == 49);
+	CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, 894.0f, 819.5f) == 49);
+	CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, 0.0f, 0.0f) == 49);
+	CHECK(GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 893.5f, 820.0f, 48, &center));
+	center.x = 1.0f; center.y = 2.0f; center.z = 3.0f;
+	CHECK(!GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 893.5f, 820.0f, 49, &center));
+	CHECK(!GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 4860.0f, 4690.0f, -1, &center));
+	CHECK(!GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 4860.0f, 4690.0f, 130, &center));
+	CHECK(!GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 4860.0f, 4690.0f, 0, nullptr));
+	CHECK(GetRenderedBattleDiagnosticSearchCount(1.0f, 0.0f, 0.0f, 4690.0f) == 0);
+	CHECK(!GetRenderedBattleDiagnosticSearchCenter(1.0f, 0.0f, 0.0f, 4690.0f, 0, &center));
+	const Real invalid[] = { std::numeric_limits<Real>::quiet_NaN(),
+		std::numeric_limits<Real>::infinity(), -std::numeric_limits<Real>::infinity() };
+	for (Int index = 0; index < 3; ++index)
+	{
+		CHECK(GetRenderedBattleDiagnosticSearchCount(invalid[index], 0.0f, 4860.0f, 4690.0f) == 0);
+		CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, invalid[index], 4860.0f, 4690.0f) == 0);
+		CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, invalid[index], 4690.0f) == 0);
+		CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, 4860.0f, invalid[index]) == 0);
+		CHECK(!GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, invalid[index], 4690.0f, 49, &center));
+	}
+	CHECK(center.x == 1.0f && center.y == 2.0f && center.z == 3.0f);
+}
+
+static void TestRenderedBattleDiagnosticLocalPlacement()
+{
+	// Pure coordinates, ranking and planned geometry only, never map admission.
+	CHECK(RENDERED_BATTLE_DIAGNOSTIC_PLACEMENT_SCHEMA_VERSION == 2);
+	CHECK(RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT == 9);
+	CHECK(RENDERED_BATTLE_DIAGNOSTIC_LOCAL_STEP == 22);
+	CHECK(RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP == 8);
+	const Int stencil[9][2] = { {0,0}, {22,0}, {-22,0}, {0,-22}, {0,22},
+		{22,-22}, {22,22}, {-22,-22}, {-22,22} };
+	for (Int slot = 0; slot < 8; ++slot)
+		for (Int trial = 0; trial < 9; ++trial)
+		{
+			Coord3D local;
+			CHECK(GetRenderedBattleDiagnosticLocalOffset(slot, trial, &local));
+			CHECK(local.x == (slot < 4 ? -1 : 1) * stencil[trial][0]);
+			CHECK(local.y == stencil[trial][1] && local.z == 0.0f);
+		}
+	Coord3D unchanged = {1.0f, 2.0f, 3.0f};
+	CHECK(!GetRenderedBattleDiagnosticLocalOffset(-1, 0, &unchanged));
+	CHECK(!GetRenderedBattleDiagnosticLocalOffset(8, 0, &unchanged));
+	CHECK(!GetRenderedBattleDiagnosticLocalOffset(0, -1, &unchanged));
+	CHECK(!GetRenderedBattleDiagnosticLocalOffset(0, 9, &unchanged));
+	CHECK(!GetRenderedBattleDiagnosticLocalOffset(0, 0, nullptr));
+	CHECK(unchanged.x == 1.0f && unchanged.y == 2.0f && unchanged.z == 3.0f);
+	// Every grid point supports the full fixed formation + all nine offsets
+	// and maximum footprint, including the exact-fit map without division by 0.
+	for (Int grid = 0; grid < 81; ++grid)
+	{
+		Coord3D center, exact;
+		CHECK(GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 4860.0f, 4690.0f, 49 + grid, &center));
+		CHECK(GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 894.0f, 820.0f, 49 + grid, &exact));
+		for (Int slot = 0; slot < 8; ++slot)
+			for (Int unit = 0; unit < 32; ++unit)
+				for (Int trial = 0; trial < 9; ++trial)
+				{
+					Coord3D base, local;
+					CHECK(GetRenderedBattleDiagnosticOffset(slot, unit, &base));
+					CHECK(GetRenderedBattleDiagnosticLocalOffset(slot, trial, &local));
+					const Real x = base.x + local.x, y = base.y + local.y;
+					CHECK(center.x + x - 22.0f >= 0.0f && center.x + x + 22.0f <= 4860.0f);
+					CHECK(center.y + y - 22.0f >= 0.0f && center.y + y + 22.0f <= 4690.0f);
+					CHECK(exact.x + x - 22.0f >= 0.0f && exact.x + x + 22.0f <= 894.0f);
+					CHECK(exact.y + y - 22.0f >= 0.0f && exact.y + y + 22.0f <= 820.0f);
+				}
+	}
+	Coord3D first = {0.0f, 0.0f, 0.0f}, second = {18.0f, 0.0f, 7.0f};
+	CHECK(AreRenderedBattleDiagnosticPositionsSeparated(first, 10.0f, second, 5.0f));
+	CHECK(AreRenderedBattleDiagnosticPositionsSeparated(second, 5.0f, first, 10.0f));
+	second.x = 17.999f;
+	CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(first, 10.0f, second, 5.0f));
+	CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(second, 5.0f, first, 10.0f));
+	second.x = 18.001f;
+	CHECK(AreRenderedBattleDiagnosticPositionsSeparated(first, 10.0f, second, 5.0f));
+	second.x = 9.0f; second.y = 12.0f;
+	CHECK(AreRenderedBattleDiagnosticPositionsSeparated(first, 7.0f, second, 5.0f)); // 15 exact diagonal
+	CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(first, 7.001f, second, 5.0f));
+	CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(first, 1.0f, first, 1.0f));
+	// Avoiding one world blocker is insufficient if a local trial overlaps a
+	// different planned unit. This contract adds admission, never removes it.
+	Coord3D prior = {44.0f, 0.0f, 0.0f}, displaced = {22.0f, 0.0f, 0.0f};
+	CHECK(AreRenderedBattleDiagnosticPositionsSeparated(first, 10.0f, prior, 10.0f));
+	CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(displaced, 10.0f, prior, 10.0f));
+	const Real invalidRadii[] = {0.0f, -1.0f, 21.001f, std::numeric_limits<Real>::quiet_NaN(),
+		std::numeric_limits<Real>::infinity(), -std::numeric_limits<Real>::infinity()};
+	for (Int index = 0; index < 6; ++index)
+	{
+		CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(first, invalidRadii[index], prior, 1.0f));
+		CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(first, 1.0f, prior, invalidRadii[index]));
+	}
+	const Real invalidCoords[] = {std::numeric_limits<Real>::quiet_NaN(),
+		std::numeric_limits<Real>::infinity(), -std::numeric_limits<Real>::infinity()};
+	for (Int index = 0; index < 3; ++index)
+		for (Int axis = 0; axis < 3; ++axis)
+		{
+			Coord3D invalid = prior;
+			if (axis == 0) invalid.x = invalidCoords[index];
+			if (axis == 1) invalid.y = invalidCoords[index];
+			if (axis == 2) invalid.z = invalidCoords[index];
+			CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(first, 1.0f, invalid, 1.0f));
+			CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(invalid, 1.0f, first, 1.0f));
+		}
+	Int candidates[9], prefixes[9], count = 0;
+	for (Int index = 0; index < 9; ++index) candidates[index] = prefixes[index] = -99;
+	for (Int candidate = 9; candidate >= 0; --candidate)
+		CHECK(RememberRenderedBattleDiagnosticArena(candidate, 100, candidates, prefixes, &count));
+	CHECK(count == 8);
+	for (Int index = 0; index < 8; ++index)
+		CHECK(candidates[index] == index && prefixes[index] == 100); // earliest ties retained
+	CHECK(RememberRenderedBattleDiagnosticArena(129, 255, candidates, prefixes, &count));
+	CHECK(candidates[0] == 129 && prefixes[0] == 255 && candidates[7] == 6);
+	CHECK(!RememberRenderedBattleDiagnosticArena(128, 99, candidates, prefixes, &count));
+	CHECK(!RememberRenderedBattleDiagnosticArena(129, 254, candidates, prefixes, &count));
+	CHECK(!RememberRenderedBattleDiagnosticArena(-1, 100, candidates, prefixes, &count));
+	CHECK(!RememberRenderedBattleDiagnosticArena(130, 100, candidates, prefixes, &count));
+	CHECK(!RememberRenderedBattleDiagnosticArena(10, -1, candidates, prefixes, &count));
+	CHECK(!RememberRenderedBattleDiagnosticArena(10, 256, candidates, prefixes, &count));
+	CHECK(!RememberRenderedBattleDiagnosticArena(10, 100, nullptr, prefixes, &count));
+	CHECK(!RememberRenderedBattleDiagnosticArena(10, 100, candidates, nullptr, &count));
+	CHECK(!RememberRenderedBattleDiagnosticArena(10, 100, candidates, prefixes, nullptr));
+	count = -1;
+	CHECK(!RememberRenderedBattleDiagnosticArena(10, 100, candidates, prefixes, &count));
+	CHECK(count == -1);
+	count = 9;
+	CHECK(!RememberRenderedBattleDiagnosticArena(10, 100, candidates, prefixes, &count));
+	CHECK(count == 9);
+	CHECK(candidates[0] == 129 && prefixes[0] == 255 && candidates[7] == 6 && prefixes[7] == 100);
+	CHECK(candidates[8] == -99 && prefixes[8] == -99);
+}
+
+static void TestRenderedBattleDiagnosticContract()
+{
+	TestRenderedBattleDiagnosticSearch();
+	TestRenderedBattleDiagnosticLocalPlacement();
+	char report[8] = "";
+	UnsignedInt used = 0;
+	CHECK(AppendRenderedBattleDiagnosticReportRecord(report, sizeof(report), &used, "abc\n", 4));
+	CHECK(used == 4 && strcmp(report, "abc\n") == 0);
+	CHECK(!AppendRenderedBattleDiagnosticReportRecord(report, sizeof(report), &used, "defg", 4));
+	CHECK(used == 4 && strcmp(report, "abc\n") == 0);
+	CHECK(AppendRenderedBattleDiagnosticReportRecord(report, sizeof(report), &used, "def", 3));
+	CHECK(used == 7 && report[7] == '\0' && strcmp(report, "abc\ndef") == 0);
+	CHECK(!AppendRenderedBattleDiagnosticReportRecord(report, sizeof(report), &used, "x", 1));
+	CHECK(used == 7 && strcmp(report, "abc\ndef") == 0);
+	CHECK(!AppendRenderedBattleDiagnosticReportRecord(nullptr, sizeof(report), &used, "x", 1));
+	CHECK(!AppendRenderedBattleDiagnosticReportRecord(report, sizeof(report), nullptr, "x", 1));
+	CHECK(!AppendRenderedBattleDiagnosticReportRecord(report, sizeof(report), &used, nullptr, 1));
+	CHECK(!AppendRenderedBattleDiagnosticReportRecord(report, 0, &used, "x", 1));
+	used = 8;
+	CHECK(!AppendRenderedBattleDiagnosticReportRecord(report, sizeof(report), &used, "x", 1));
+	CHECK(used == 8 && strcmp(report, "abc\ndef") == 0);
+	// New enum appended; existing scenario numeric values retain their meanings.
+	CHECK(SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6 == 3);
+	CHECK(SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC == 4);
+	const char *reason = nullptr;
+	const char *ordinary[] = { "game", "-headless", "-noFPSLimit", "-replay", "old.rep" };
+	CHECK(ValidateRenderedBattleDiagnosticArguments(5, ordinary, FALSE, &reason));
+	CHECK(reason == nullptr);
+	const char *valid[] = { "game", "-win", "-nologo", "-xres", "1920", "-yres", "1080",
+		"-simulationMode", "parallel", "-workerPolicy", "auto", "-runRenderedBattleDiagnostic", "1729" };
+	CHECK(ValidateRenderedBattleDiagnosticArguments(13, valid, TRUE, &reason));
+	CHECK(!ValidateRenderedBattleDiagnosticArguments(13, valid, FALSE, &reason));
+	CHECK(strcmp(reason, "unsupported_title") == 0);
+	const char *invalidSeed[] = { "game", "-runRenderedBattleDiagnostic", "0" };
+	CHECK(!ValidateRenderedBattleDiagnosticArguments(3, invalidSeed, TRUE, &reason));
+	const char *missingSeed[] = { "game", "-runRenderedBattleDiagnostic" };
+	CHECK(!ValidateRenderedBattleDiagnosticArguments(2, missingSeed, TRUE, &reason));
+	const char *duplicate[] = { "game", "-runRenderedBattleDiagnostic", "1729",
+		"-runRenderedBattleDiagnostic", "1729" };
+	CHECK(!ValidateRenderedBattleDiagnosticArguments(5, duplicate, TRUE, &reason));
+	const char *conflicts[] = { "-headless", "-noFPSLimit", "-replay", "-loadsave",
+		"-runSkirmishAITestPractical1v7", "-runSkirmishAITestHardAI2v6",
+		"-runSkirmishAIRecoveryTest", "-runStage5PerformanceFixture", "-mod", "-map" };
+	for (UnsignedInt i = 0; i < sizeof(conflicts) / sizeof(conflicts[0]); ++i)
+	{
+		const char *before[] = { "game", conflicts[i], "-runRenderedBattleDiagnostic", "1729" };
+		const char *after[] = { "game", "-runRenderedBattleDiagnostic", "1729", conflicts[i] };
+		CHECK(!ValidateRenderedBattleDiagnosticArguments(4, before, TRUE, &reason));
+		CHECK(!ValidateRenderedBattleDiagnosticArguments(4, after, TRUE, &reason));
+	}
+#if RTS_ZEROHOUR
+	CommandLineData commandLine;
+	CHECK(!commandLine.hasRenderedBattleDiagnosticRequest());
+	CHECK(commandLine.getRenderedBattleDiagnosticSeed() == 0);
+	CHECK(!commandLine.requestRenderedBattleDiagnostic(0));
+	CHECK(!commandLine.hasRenderedBattleDiagnosticRequest());
+	CHECK(commandLine.requestRenderedBattleDiagnostic(1729));
+	CHECK(commandLine.getRenderedBattleDiagnosticSeed() == 1729);
+	CHECK(!commandLine.requestRenderedBattleDiagnostic(1730));
+	CHECK(!commandLine.requestSkirmishAITest(1730));
+	CHECK(!commandLine.requestSkirmishAITest4v2(1730));
+	CHECK(!commandLine.requestSkirmishAITestPractical1v7(1730));
+	CHECK(!commandLine.requestSkirmishAIRecoveryTest(1730, 0, 0));
+#if defined(_WIN64)
+	CHECK(!commandLine.requestSkirmishAITestHardAI2v6(1730));
+#endif
+	CommandLineData practical;
+	CHECK(practical.requestSkirmishAITestPractical1v7(1729));
+	CHECK(!practical.hasRenderedBattleDiagnosticRequest());
+	CHECK(!practical.requestRenderedBattleDiagnostic(1729));
+#endif
+	SkirmishAITestPlan plan;
+	BuildSkirmishAITestPlan(1729, SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC, &plan);
+	CHECK(plan.seed == 1729);
+	// Bounded stock metadata proves eight starts; live terrain/occupancy/routes
+	// remain production preflight requirements, not synthetic fixture passes.
+	CHECK(strcmp(plan.mapName, "Maps\\Fortress Avalanche\\Fortress Avalanche.map") == 0);
+	SkirmishAITestPlan ordinaryPlan;
+	BuildSkirmishAITestPlan(1729, SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7, &ordinaryPlan);
+	CHECK(strcmp(ordinaryPlan.mapName, "Maps\\Twilight Flame\\Twilight Flame.map") == 0);
+	CHECK(plan.slots[0].isController && plan.slots[0].state == SLOT_PLAYER);
+	for (Int slot = 0; slot < 8; ++slot)
+	{
+		CHECK(plan.slots[slot].teamNumber == (slot < 4 ? 0 : 1));
+		CHECK(plan.slots[slot].startPosition == slot);
+		if (slot) CHECK(plan.slots[slot].state == SLOT_BRUTAL_AI && !plan.slots[slot].isController);
+		CHECK(strcmp(GetRenderedBattleDiagnosticFactionName(slot),
+			GetRenderedBattleDiagnosticFactionName((slot + 4) % 8)) == 0);
+		for (Int unit = 0; unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER; ++unit)
+		{
+			CHECK(GetRenderedBattleDiagnosticObjectName(slot, unit) != nullptr);
+			Coord3D a, mirror;
+			CHECK(GetRenderedBattleDiagnosticOffset(slot, unit, &a));
+			CHECK(GetRenderedBattleDiagnosticOffset((slot + 4) % 8, unit, &mirror));
+			CHECK(a.x == -mirror.x && a.y == mirror.y && a.z == 0.0f);
+			// Exact formation envelope reported by the live preflight diagnostic.
+			// These pure helper checks do not qualify real map terrain or routes.
+			CHECK(slot < 4 ? (a.x >= -403.0f && a.x <= -95.0f) :
+				(a.x >= 95.0f && a.x <= 403.0f));
+			CHECK(a.y >= -366.0f && a.y <= 366.0f);
+			if (slot == 0 && unit == 0) CHECK(a.x == -95.0f && a.y == -366.0f);
+			if (slot == 7 && unit == 31) CHECK(a.x == 403.0f && a.y == 366.0f);
+			for (Int otherSlot = 0; otherSlot <= slot; ++otherSlot)
+				for (Int otherUnit = 0; otherUnit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER; ++otherUnit)
+				{
+					if (otherSlot == slot && otherUnit >= unit) break;
+					Coord3D p; CHECK(GetRenderedBattleDiagnosticOffset(otherSlot, otherUnit, &p));
+					const Real dx = p.x - a.x, dy = p.y - a.y;
+					CHECK(dx * dx + dy * dy >= 44.0f * 44.0f);
+				}
+		}
+	}
+	CHECK(strcmp(GetRenderedBattleDiagnosticObjectName(0, 0), "AmericaTankCrusader") == 0);
+	CHECK(strcmp(GetRenderedBattleDiagnosticObjectName(1, 3), "ChinaInfantryTankHunter") == 0);
+	CHECK(strcmp(GetRenderedBattleDiagnosticObjectName(2, 2), "GLAInfantryRebel") == 0);
+	// Stock Zero Hour Object identifiers, not localized unit display names.
+	for (Int unit = 0; unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER; ++unit)
+	{
+		if (unit % 4 == 1)
+		{
+			CHECK(strcmp(GetRenderedBattleDiagnosticObjectName(1, unit), "ChinaTankGattling") == 0);
+			CHECK(strcmp(GetRenderedBattleDiagnosticObjectName(5, unit), "ChinaTankGattling") == 0);
+		}
+		if (unit % 4 == 3)
+		{
+			CHECK(strcmp(GetRenderedBattleDiagnosticObjectName(2, unit), "GLAInfantryTunnelDefender") == 0);
+			CHECK(strcmp(GetRenderedBattleDiagnosticObjectName(6, unit), "GLAInfantryTunnelDefender") == 0);
+		}
+	}
+	CHECK(GetRenderedBattleDiagnosticFactionName(-1) == nullptr);
+	CHECK(GetRenderedBattleDiagnosticFactionName(8) == nullptr);
+	CHECK(GetRenderedBattleDiagnosticObjectName(0, -1) == nullptr);
+	CHECK(GetRenderedBattleDiagnosticObjectName(0, 32) == nullptr);
+	CHECK(!GetRenderedBattleDiagnosticOffset(0, 0, nullptr));
+	SkirmishAITestLoadedState loaded = { plan.mapName, plan.mapName, plan.mapName, 0x1234u, 65536u, 1729 };
+	CHECK(IsExpectedSkirmishAITestLoadedState(plan, 0x1234u, 65536u, &loaded));
+	loaded.mapCRC = 0x4321u;
+	CHECK(!IsExpectedSkirmishAITestLoadedState(plan, 0x1234u, 65536u, &loaded));
+	CHECK(RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES == 1800);
+	CHECK(RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS == 120000);
+}
+
 int main(int argc, char **argv)
 {
 #if defined(_WIN64)
@@ -1622,6 +1939,7 @@ int main(int argc, char **argv)
 	}
 
 	CHECK(!IsSkirmishAITestRunnerArmed());
+	TestRenderedBattleDiagnosticContract();
 #if defined(_WIN64)
 	TestPerformanceReceiptOwnerLifecycle();
 #endif

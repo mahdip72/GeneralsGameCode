@@ -1,0 +1,412 @@
+// Recording-driver proof of the production collector, not GPU timing or FPS.
+#include "../../Libraries/Source/Renderer/D3D11GpuFrameTiming.h"
+#include <vector>
+#include <math.h>
+
+namespace
+{
+using namespace rts::render::detail;
+int Check(bool condition, const char *message)
+{
+	if (!condition) fprintf(stderr, "FAIL: %s\n", message);
+	return condition ? 0 : 1;
+}
+struct RecordingQuery
+{
+	RecordingQuery(bool disjoint) : disjoint(disjoint), released(false), begun(false), ended(false), value(0), ends(0) {}
+	bool disjoint, released, begun, ended;
+	uint64_t value;
+	unsigned int ends;
+};
+struct RecordingState
+{
+	RecordingState() : creates(0), releases(0), begins(0), ends(0), reads(0), clocks(0), failCreate(0), tickCalls(0), ownerTickMs(0xfffffff0U),
+		failRead(false), ready(true), disjoint(false),
+		frequency(1000), timestamp(100), cpuTick(100), unsafeUse(false), metadataCalls(0), metadataValid(true) {}
+	~RecordingState() { for (size_t index = 0; index < queries.size(); ++index) delete queries[index]; }
+	unsigned int creates, releases, begins, ends, reads, clocks, failCreate;
+	unsigned int tickCalls;
+	uint32_t ownerTickMs;
+	bool failRead, ready, disjoint;
+	uint64_t frequency, timestamp, cpuTick;
+	bool unsafeUse;
+	unsigned int metadataCalls;
+	bool metadataValid;
+	std::vector<RecordingQuery *> queries;
+};
+struct RecordingDriver
+{
+	typedef RecordingQuery Query;
+	RecordingDriver(RecordingState *state = 0) : state(state) {}
+	bool create(bool disjoint, Query **query)
+	{
+		++state->creates;
+		if (state->failCreate == state->creates) { *query = 0; return false; }
+		*query = new Query(disjoint); state->queries.push_back(*query); return true;
+	}
+	void release(Query *query)
+	{
+		if (query->released) state->unsafeUse = true;
+		query->released = true; ++state->releases;
+	}
+	void begin(Query *query)
+	{
+		if (query->released || !query->disjoint) state->unsafeUse = true;
+		query->begun = true; query->ended = false; ++state->begins;
+	}
+	void end(Query *query)
+	{
+		if (query->released) state->unsafeUse = true;
+		query->ended = true; query->value = state->timestamp;
+		state->timestamp += 100; ++query->ends; ++state->ends;
+	}
+	GpuTimingRead readDisjoint(Query *query, uint64_t& frequency, bool& disjoint)
+	{
+		++state->reads;
+		if (query->released || !query->ended || !query->disjoint) state->unsafeUse = true;
+		frequency = state->frequency; disjoint = state->disjoint;
+		return state->failRead ? GpuTimingReadFailed : (state->ready ? GpuTimingReady : GpuTimingNotReady);
+	}
+	GpuTimingRead readTimestamp(Query *query, uint64_t& value)
+	{
+		++state->reads;
+		if (query->released || !query->ended || query->disjoint) state->unsafeUse = true;
+		value = query->value;
+		return state->failRead ? GpuTimingReadFailed : (state->ready ? GpuTimingReady : GpuTimingNotReady);
+	}
+	uint64_t clock() { ++state->clocks; state->cpuTick += 50; return state->cpuTick; }
+	uint64_t cpuFrequency() { return 1000; }
+	uint32_t ownerTick() { ++state->tickCalls; return state->ownerTickMs; }
+	GpuTimingDeviceInfo deviceInfo()
+	{
+		++state->metadataCalls;
+		GpuTimingDeviceInfo info;
+		info.identityValid = state->metadataValid; info.vendorId = 4318; info.deviceId = 1234;
+		info.luidLow = 5678; info.luidHigh = 0xfffffff0U;
+		info.featureLevel = D3D_FEATURE_LEVEL_11_0; info.debugLayer = true;
+		return info;
+	}
+	RecordingState *state;
+	// Deliberately no Flush, fence, wait, or sleep capability.
+};
+typedef GpuTimingCapture<RecordingDriver> Capture;
+GpuTimingFrameInfo Info()
+{
+	GpuTimingFrameInfo info;
+	info.width = 3840; info.height = 2160; info.samples = 4;
+	info.gamma = 1.1f; info.brightness = 0.1f; info.contrast = 1.2f;
+	info.gammaApplied = true; info.swapInterval = 1;
+	return info;
+}
+void Present(Capture& capture, long result = 0)
+{
+	capture.beforeResolve(Info()); capture.afterResolve(); capture.beforePresent();
+	const uint64_t start = capture.cpuPresentStart(); capture.cpuPresentEnd(start, result);
+}
+int DisabledAndIntervals()
+{
+	RecordingState state;
+	Capture capture;
+	capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture);
+	capture.markReadback(); capture.poll(); capture.resize(); capture.release(GpuTimingShutdownPending);
+	int result = Check(state.creates == 0 && state.reads == 0 && state.ends == 0 && state.clocks == 0 && state.tickCalls == 0 && state.metadataCalls == 0 && capture.recordCount() == 0,
+		"disabled allocates no queries and calls no GPU or clocks");
+	capture.enable(); capture.attach(RecordingDriver(&state));
+	result |= Check(state.creates == Capture::SlotCount * (Capture::StampCount + 1), "fixed query pool allocated once");
+	capture.begin(Info()); state.ownerTickMs = 32; capture.markReadback(); Present(capture); capture.poll();
+	const GpuTimingRecord& row = capture.record(0);
+	result |= Check(row.status == GpuTimingComplete && row.epoch == 1 && row.ordinal == 1 && row.info.samples == 4 &&
+		row.info.width == 3840 && row.info.gammaApplied && row.readback && row.presentCalled,
+		"complete row retains settings, epoch ordinal and readback contamination");
+	result |= Check(row.ownerBeginTickMs == 0xfffffff0U && state.tickCalls == 1 &&
+		static_cast<uint32_t>(state.ownerTickMs - row.ownerBeginTickMs) == 48U,
+		"owner begin tick survives metadata refresh and supports modulo32 wrap arithmetic");
+	result |= Check(fabs(row.totalMs - 300.0) < 0.001 && fabs(row.sceneMs - 100.0) < 0.001 &&
+		fabs(row.resolveMs - 100.0) < 0.001 && fabs(row.gammaMs - 100.0) < 0.001 && fabs(row.cpuPresentMs - 50.0) < 0.001,
+		"four timestamps partition GPU elapsed work with separate CPU Present");
+	const unsigned int clocks = state.clocks;
+	capture.beforePresent(); capture.cpuPresentEnd(capture.cpuPresentStart(), -1);
+	result |= Check(state.clocks == clocks && row.status == GpuTimingComplete,
+		"Present without sampled begin cannot mutate the previous row");
+	return result | Check(!state.unsafeUse, "queries read only when ended and live");
+}
+int ReadbackBoundaryAssociation()
+{
+	RecordingState state; state.ready = false;
+	Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+	capture.begin(Info()); capture.beforeResolve(Info()); capture.afterResolve(); capture.beforePresent();
+	const unsigned int ends = state.ends, reads = state.reads, clocks = state.clocks;
+	capture.markReadback();
+	int result = Check(capture.counters().readbacks == 1 && !capture.record(0).readback &&
+		capture.record(0).status == GpuTimingPending && state.ends == ends && state.reads == reads && state.clocks == clocks,
+		"readback after GPU interval increments counter without contaminating pending row");
+	const uint64_t start = capture.cpuPresentStart(); capture.cpuPresentEnd(start, 0);
+	result |= Check(capture.record(0).presentCalled && capture.record(0).cpuPresentMs == 50.0,
+		"readback boundary guard preserves CPU Present record linkage");
+	state.ready = true; capture.poll();
+	const double total = capture.record(0).totalMs;
+	capture.markReadback();
+	result |= Check(capture.counters().readbacks == 2 && !capture.record(0).readback &&
+		capture.record(0).status == GpuTimingComplete && capture.record(0).totalMs == total,
+		"readback after Present and collection cannot mutate completed row");
+	state.ready = false; capture.begin(Info()); capture.cancel(GpuTimingUnpresented);
+	capture.markReadback();
+	result |= Check(capture.counters().readbacks == 3 && !capture.record(1).readback &&
+		capture.record(1).status == GpuTimingUnpresented && capture.counters().pending == 1,
+		"readback after cancel counts attempt without contaminating cancelled row");
+	for (unsigned int index = 1; index < Capture::SlotCount; ++index)
+	{
+		capture.begin(Info()); Present(capture);
+	}
+	capture.begin(Info()); capture.markReadback();
+	result |= Check(capture.counters().skippedFull == 1 && capture.counters().readbacks == 4 &&
+		capture.recordCount() == Capture::SlotCount + 1 && capture.counters().pending == Capture::SlotCount,
+		"readback after unsampled ring-full begin is counter-only");
+	for (unsigned int index = 0; index < capture.recordCount(); ++index)
+		result |= Check(!capture.record(index).readback, "outside-interval readbacks leave every retained row unmarked");
+	return result | Check(!state.unsafeUse, "readback association cases preserve query lifetime and readiness");
+}
+int FullRingAndBudget()
+{
+	RecordingState state; state.ready = false;
+	Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+	int result = 0;
+	for (unsigned int index = 0; index < Capture::SlotCount; ++index)
+	{
+		const unsigned int reads = state.reads;
+		capture.begin(Info()); Present(capture);
+		result |= Check(state.reads - reads <= Capture::PollBudget, "begin observes fixed read budget");
+	}
+	const unsigned int creates = state.creates, ends = state.ends;
+	capture.begin(Info()); Present(capture);
+	result |= Check(capture.recordCount() == Capture::SlotCount && capture.counters().skippedFull == 1 &&
+		capture.counters().pending == Capture::SlotCount && state.creates == creates && state.ends == ends,
+		"full ring skips without allocation, query reuse or wait");
+	result |= Check(state.tickCalls == Capture::SlotCount, "ring-full skips do not query owner tick");
+	for (unsigned int index = 0; index < state.queries.size(); ++index)
+		result |= Check(state.queries[index]->ends == 1, "not-ready queries never reissued");
+	state.ready = true;
+	const unsigned int reads = state.reads;
+	capture.poll();
+	result |= Check(state.reads - reads == Capture::PollBudget && capture.counters().budgetExhaustions == 1 &&
+		capture.counters().pending != 0, "ready backlog stops at fixed polling budget");
+	for (unsigned int index = 0; index < Capture::SlotCount; ++index) capture.poll();
+	return result | Check(capture.counters().complete == Capture::SlotCount && capture.counters().pending == 0 &&
+		capture.counters().notReady != 0 && !state.unsafeUse, "partial reads resume and ready slots collected");
+}
+int CancelAndLifecycle()
+{
+	RecordingState state; state.ready = false;
+	Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+	capture.begin(Info()); capture.begin(Info());
+	int result = Check(capture.record(0).status == GpuTimingUnpresented && capture.counters().cancelled == 1 &&
+		capture.counters().pending == 2 && state.queries[0]->ends == 1,
+		"ordinary cancel closes disjoint query but retains pending slot");
+	state.ready = true; capture.poll();
+	result |= Check(capture.record(0).status == GpuTimingUnpresented && capture.record(0).totalMs == -1.0 &&
+		capture.counters().pending == 1 && !state.unsafeUse, "cancelled slot requires only disjoint readiness");
+	const unsigned int oldCreates = state.creates;
+	capture.resize();
+	result |= Check(capture.record(1).status == GpuTimingResizeDropped && capture.counters().resizeDropped == 1 &&
+		state.releases == oldCreates && state.creates == oldCreates * 2, "resize replaces pending queries with fresh pool");
+	capture.begin(Info()); Present(capture); capture.attach(RecordingDriver(&state));
+	result |= Check(capture.record(2).status == GpuTimingDeviceReleased && capture.counters().deviceDropped == 1,
+		"recreation drops pending old-device results");
+	capture.begin(Info()); Present(capture); capture.poll();
+	result |= Check(capture.record(3).epoch == 2 && capture.record(3).ordinal == 1 && capture.record(3).status == GpuTimingComplete,
+		"epoch increments and ordinal restarts with earlier rows retained");
+	state.ready = false; capture.begin(Info()); Present(capture);
+	const unsigned int reads = state.reads;
+	capture.release(GpuTimingShutdownPending);
+	result |= Check(capture.record(4).status == GpuTimingShutdownPending && capture.counters().shutdownPending == 1 &&
+		capture.counters().pending == 0 && state.reads == reads && !state.unsafeUse,
+		"shutdown loss needs no poll or GPU drain");
+	capture.reset();
+	return result | Check(!capture.enabled() && capture.recordCount() == 0 && capture.counters().framesBegun == 0,
+		"reset starts independent collector lifecycle");
+}
+int InvalidAndFailure()
+{
+	int result = 0;
+	{
+		RecordingState state; state.failCreate = 7;
+		Capture capture; capture.enable(); capture.attach(RecordingDriver(&state)); capture.begin(Info());
+		result |= Check(capture.counters().allocationFailures == 1 && capture.counters().skippedUnavailable == 1 &&
+			state.releases == 6 && capture.recordCount() == 0, "partial allocation releases every query and disables diagnostic");
+	}
+	{
+		RecordingState state;
+		Capture capture; capture.enable(); capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture);
+		state.failRead = true; capture.poll();
+		const unsigned int reads = state.reads;
+		capture.begin(Info()); capture.poll();
+		result |= Check(capture.record(0).status == GpuTimingReadinessFailed && capture.counters().readinessFailures == 1 &&
+			capture.counters().skippedUnavailable == 1 && state.reads == reads && state.releases == state.creates,
+			"read failure drops rows and disables only diagnostic");
+	}
+	{
+		RecordingState state;
+		Capture capture; capture.enable(); capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture);
+		state.disjoint = true; capture.poll();
+		result |= Check(capture.record(0).status == GpuTimingDisjoint && capture.record(0).totalMs == -1.0 &&
+			capture.counters().disjoint == 1 && state.reads == 1, "disjoint publishes no duration");
+	}
+	{
+		RecordingState state;
+		Capture capture; capture.enable(); capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture);
+		state.frequency = 0; capture.poll();
+		result |= Check(capture.record(0).status == GpuTimingInvalid && capture.record(0).totalMs == -1.0,
+			"zero frequency cannot appear as fast valid sample");
+	}
+	{
+		RecordingState state;
+		Capture capture; capture.enable(); capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture, -1); capture.poll();
+		result |= Check(capture.record(0).status == GpuTimingPresentFailed && capture.record(0).presentResult == -1 &&
+			capture.counters().complete == 0, "failed Present never becomes complete frame");
+	}
+	{
+		RecordingState state;
+		Capture capture; capture.enable(); capture.attach(RecordingDriver(&state)); capture.begin(Info());
+		capture.beforeResolve(Info()); capture.cancel(GpuTimingPresentFailed); capture.poll();
+		result |= Check(capture.record(0).status == GpuTimingPresentFailed && capture.record(0).totalMs == -1.0 &&
+			!capture.record(0).presentCalled && state.reads == 1 && capture.counters().pending == 0 && !state.unsafeUse,
+			"failed resolve never reads timestamps that were not issued");
+	}
+	return result;
+}
+int FailedPresentThenLoss()
+{
+	int result = 0;
+	for (unsigned int loss = 0; loss < 4; ++loss)
+	{
+		RecordingState state; state.ready = false;
+		Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+		capture.begin(Info()); Present(capture, -1);
+		if (loss == 0) capture.resize();
+		else if (loss == 1) capture.attach(RecordingDriver(&state));
+		else if (loss == 2) capture.release(GpuTimingShutdownPending);
+		else { state.failRead = true; capture.poll(); }
+		result |= Check(capture.record(0).status == GpuTimingPresentFailed && capture.record(0).presentResult == -1 &&
+			capture.record(0).totalMs == -1.0 && capture.counters().complete == 0 && capture.counters().pending == 0,
+			"known Present failure survives immediate unresolved-query loss");
+		const GpuTimingCounters& counts = capture.counters();
+		result |= Check((loss != 0 || counts.resizeDropped == 1) && (loss != 1 || counts.deviceDropped == 1) &&
+			(loss != 2 || counts.shutdownPending == 1) && (loss != 3 || (counts.readinessFailures == 1 && counts.invalid == 1)),
+			"actual query-loss reason remains separately accounted");
+	}
+	return result;
+}
+struct RecordingOutput
+{
+	enum Failure { None, Open, Header, Frame, Summary, Stream, Flush, Close, Publish };
+	explicit RecordingOutput(Failure failure) : failure(failure), closeCalls(0), publishCalls(0), frameCalls(0),
+		pending(false), finalFile(false), footer(false), rowStatus(GpuTimingOpen), rowTick(0), metadataRows(0), identityEpoch(0), identityValid(0) {}
+	bool open() { pending = failure != Open; return failure != Open; }
+	bool header() { return failure != Header; }
+	bool frame(const GpuTimingRecord& row)
+	{ ++frameCalls; rowStatus = row.status; rowTick = row.ownerBeginTickMs; return failure != Frame; }
+	bool summary(const char *name, uint64_t value, uint64_t epoch = 0)
+	{
+		if (failure == Summary) return false;
+		if (epoch != 0) ++metadataRows;
+		if (strcmp(name, "adapter_identity_valid") == 0) { identityEpoch = epoch; identityValid = value; }
+		if (strcmp(name, "export_end") == 0) footer = true;
+		return true;
+	}
+	bool healthy() { return failure != Stream; }
+	bool flush() { return failure != Flush; }
+	bool close() { ++closeCalls; return failure != Close; }
+	bool publish()
+	{
+		++publishCalls;
+		if (failure == Publish) return false;
+		pending = false; finalFile = true; return true;
+	}
+	Failure failure;
+	unsigned int closeCalls, publishCalls, frameCalls;
+	bool pending, finalFile, footer;
+	GpuTimingStatus rowStatus;
+	uint32_t rowTick;
+	unsigned int metadataRows;
+	uint64_t identityEpoch, identityValid;
+};
+int CheckedExport()
+{
+	int result = 0;
+	const char *header = GpuTimingCsvHeader();
+	unsigned int columns = 1;
+	for (const char *cursor = header; *cursor != 0; ++cursor) if (*cursor == ',') ++columns;
+	result |= Check(columns == GpuTimingCsvColumns && strstr(header, ",owner_begin_tick_ms,count\n") != 0,
+		"production header includes owner tick with count as final column");
+	for (unsigned int failure = RecordingOutput::None; failure <= RecordingOutput::Publish; ++failure)
+	{
+		RecordingState state;
+		Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+		capture.begin(Info()); capture.cancel(GpuTimingUnpresented); capture.poll();
+		capture.release(GpuTimingShutdownPending);
+		RecordingOutput output(static_cast<RecordingOutput::Failure>(failure));
+		const bool exported = ExportGpuTimingCapture(capture, output);
+		result |= Check(exported == (failure == RecordingOutput::None) && output.closeCalls == 1 &&
+			capture.counters().ioFailures == (failure == RecordingOutput::None ? 0U : 1U),
+			"production exporter checks every stage and always closes without rendering failure");
+		result |= Check(output.publishCalls == (failure == RecordingOutput::None || failure == RecordingOutput::Publish ? 1U : 0U),
+			"publication is attempted only after all writes, stream, flush and close succeed");
+		if (failure == RecordingOutput::None)
+			result |= Check(output.finalFile && !output.pending && output.footer && output.frameCalls == 1 &&
+				output.rowStatus == GpuTimingUnpresented && output.rowTick == 0xfffffff0U &&
+				output.metadataRows == 8 && output.identityEpoch == 1 && output.identityValid == 1,
+				"export retains cancelled sample status and original owner tick");
+		else
+			result |= Check(!output.finalFile && (failure == RecordingOutput::Open || output.pending),
+				"failed export leaves no completed final file and retains pending staging");
+		if (failure == RecordingOutput::Close || failure == RecordingOutput::Publish)
+			result |= Check(output.footer && output.pending && !output.finalFile,
+				"footer alone does not publish a close- or rename-failed pending export");
+	}
+	return result;
+}
+int DeviceIdentityBounds()
+{
+	RecordingState state;
+	Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+	int result = Check(capture.deviceCount() == 1 && state.metadataCalls == 1 &&
+		capture.deviceInfo(0).epoch == 1 && capture.deviceInfo(0).identityValid &&
+		capture.deviceInfo(0).vendorId == 4318 && capture.deviceInfo(0).luidHigh == 0xfffffff0U &&
+		capture.deviceInfo(0).debugLayer && capture.deviceInfo(0).featureLevel == D3D_FEATURE_LEVEL_11_0,
+		"once-per-attach device identity retains scalar bits and actual epoch association");
+	capture.begin(Info()); Present(capture); capture.poll(); capture.resize();
+	result |= Check(state.metadataCalls == 1, "frame and resize do not recollect device identity");
+	state.metadataValid = false;
+	capture.attach(RecordingDriver(&state));
+	result |= Check(capture.deviceInfo(1).epoch == 2 && !capture.deviceInfo(1).identityValid &&
+		capture.counters().deviceMetadataFailures == 1, "missing identity remains explicitly invalid");
+	for (unsigned int index = 2; index < Capture::DeviceCapacity + 1; ++index) capture.attach(RecordingDriver(&state));
+	result |= Check(capture.deviceCount() == Capture::DeviceCapacity && state.metadataCalls == Capture::DeviceCapacity &&
+		capture.counters().deviceMetadataDropped == 1, "bounded device metadata overflow is reported without overwrite");
+	capture.reset();
+	return result | Check(capture.deviceCount() == 0 && !state.unsafeUse, "lifecycle reset clears identity count safely");
+}
+int RecordCap()
+{
+	RecordingState state;
+	Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+	for (unsigned int index = 0; index < Capture::RecordCapacity; ++index) { capture.begin(Info()); Present(capture); }
+	const unsigned int creates = state.creates;
+	capture.begin(Info()); Present(capture);
+	const unsigned int ends = state.ends;
+	capture.begin(Info()); Present(capture);
+	return Check(capture.recordCount() == Capture::RecordCapacity && capture.counters().skippedCap == 2 &&
+		capture.counters().framesBegun == Capture::RecordCapacity + 2 && capture.counters().complete == Capture::RecordCapacity &&
+		state.creates == creates && state.ends == ends && state.tickCalls == Capture::RecordCapacity && !state.unsafeUse,
+		"record cap retains old evidence and accounts for every dropped frame");
+}
+}
+int main()
+{
+	int result = DisabledAndIntervals(); result |= ReadbackBoundaryAssociation();
+	result |= FullRingAndBudget(); result |= CancelAndLifecycle();
+	result |= InvalidAndFailure(); result |= RecordCap();
+	result |= FailedPresentThenLoss(); result |= CheckedExport(); result |= DeviceIdentityBounds();
+	if (!result) puts("GPU timing collector contracts passed (recording driver, no GPU)");
+	return result;
+}

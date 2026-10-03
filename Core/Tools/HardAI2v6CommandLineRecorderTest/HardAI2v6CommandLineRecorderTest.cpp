@@ -219,6 +219,17 @@ struct UnexpectedCallback
 	const char *name;
 };
 
+#if RTS_ZEROHOUR
+// External legacy-save request authority is a controlled dependency. The
+// actual startup marker, reject helper and callback bodies are extracted.
+static Bool s_legacySaveRequested = FALSE;
+static Bool IsSkirmishAILegacySaveTestRequested() { return s_legacySaveRequested; }
+static void ArmSkirmishAIRecoveryFixtureRunner(Int, Int, Int)
+{
+	throw UnexpectedCallback("ArmSkirmishAIRecoveryFixtureRunner");
+}
+#endif
+
 static void CaptureExit(Int code)
 {
 	throw CommandLineExit(code);
@@ -257,6 +268,10 @@ static void Check(Bool condition, const char *message)
 
 static void Reset(const char *command)
 {
+#if RTS_ZEROHOUR
+	s_skirmishAILegacySaveTestSeenAtStartup = FALSE;
+	s_legacySaveRequested = FALSE;
+#endif
 	s_scenario = Scenario();
 	s_scenario.command = command == 0 ? "game" : command;
 	s_globalData = GlobalData();
@@ -390,6 +405,110 @@ static void TestExistingModesRemainInert()
 			s_scenario.armedScenario != static_cast<Int>(SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6),
 			"existing scenario does not arm hard-ai-2v6");
 	}
+}
+
+static void TestRenderedBattleActualDispatch()
+{
+	Int exitCode = 0;
+	Reset("game -win -nologo -workerPolicy auto -runRenderedBattleDiagnostic 1729");
+#if RTS_ZEROHOUR
+	Check(!s_globalData.m_commandLineData.hasRenderedBattleDiagnosticRequest(),
+		"rendered request is default-off before dispatch");
+	Check(RunPass(TRUE, &exitCode), "actual rendered startup dispatch succeeds");
+	Check(!s_globalData.m_commandLineData.hasRenderedBattleDiagnosticRequest(),
+		"rendered startup does not prematurely arm the request");
+	Check(!s_globalData.m_headless && s_globalData.m_useFpsLimit &&
+		s_globalData.m_framesPerSecondLimit == 30 && s_globalData.m_windowed &&
+		!s_globalData.m_playIntro && !s_globalData.m_playSizzle && !s_globalData.m_shellMapOn,
+		"actual rendered startup preserves normal pacing and suppresses intro only");
+	Check(s_scenario.multiInstanceCalls == 0 && s_scenario.skipPrimaryCalls == 0,
+		"rendered startup does not enter the headless instance path");
+	Check(RunPass(FALSE, &exitCode), "actual rendered init dispatch succeeds");
+	Check(s_globalData.m_commandLineData.hasRenderedBattleDiagnosticRequest() &&
+		s_globalData.m_commandLineData.getRenderedBattleDiagnosticSeed() == 1729,
+		"actual rendered handler retains the exact positive seed");
+	Check(RunPass(TRUE, &exitCode), "repeated rendered startup is inert");
+	RunActualGameMainArmingBranch();
+	Check(s_scenario.armCalls == 1 && s_scenario.armedSeed == 1729 &&
+		s_scenario.armedScenario == static_cast<Int>(SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC),
+		"actual GameMain selects the independently named rendered scenario");
+#else
+	Check(!RunPass(TRUE, &exitCode) && exitCode == 2,
+		"Generals rejects rendered diagnostic in actual startup dispatch");
+	Reset("game -runRenderedBattleDiagnostic 1729");
+	Check(!RunPass(FALSE, &exitCode) && exitCode == 2,
+		"Generals rejects rendered diagnostic in actual init dispatch");
+	Check(!s_globalData.m_headless && s_globalData.m_useFpsLimit &&
+		s_globalData.m_playIntro && s_globalData.m_playSizzle && s_globalData.m_shellMapOn,
+		"unsupported title rejection precedes startup mutations");
+#endif
+	const char *invalid[] = {
+		"game -runRenderedBattleDiagnostic", "game -runRenderedBattleDiagnostic 0",
+		"game -runRenderedBattleDiagnostic -1", "game -runRenderedBattleDiagnostic bogus",
+		"game -runRenderedBattleDiagnostic 1729 -runRenderedBattleDiagnostic 1730" };
+	for (unsigned i = 0; i < ARRAY_SIZE(invalid); ++i)
+		for (unsigned pass = 0; pass < 2; ++pass)
+		{
+			Reset(invalid[i]);
+			Check(!RunPass(pass == 0, &exitCode) && exitCode == 2,
+				"invalid rendered request rejected by both real dispatch passes");
+#if RTS_ZEROHOUR
+			Check(!s_globalData.m_commandLineData.hasRenderedBattleDiagnosticRequest(),
+				"invalid dispatch never arms rendered request");
+#endif
+			Check(!s_globalData.m_headless && s_globalData.m_useFpsLimit &&
+				s_globalData.m_playIntro, "invalid dispatch leaves startup state untouched");
+		}
+	const char *mixed[] = { "-headless", "-noFPSLimit", "-replay old.rep",
+		"-runSkirmishAITestHardAI2v6 1733", "-runSkirmishAITestPractical1v7 1733" };
+	for (unsigned i = 0; i < ARRAY_SIZE(mixed); ++i)
+		for (unsigned order = 0; order < 2; ++order)
+			for (unsigned pass = 0; pass < 2; ++pass)
+			{
+				std::string command = "game ";
+				command += order == 0 ? mixed[i] : "-runRenderedBattleDiagnostic 1729";
+				command += " ";
+				command += order == 0 ? "-runRenderedBattleDiagnostic 1729" : mixed[i];
+				Reset(command.c_str());
+				Check(!RunPass(pass == 0, &exitCode) && exitCode == 2,
+					"mixed modes fail before handler side effects in both orders/passes");
+				Check(!s_globalData.m_headless && s_globalData.m_useFpsLimit &&
+					s_globalData.m_playIntro && s_scenario.armCalls == 0,
+					"mixed-mode rejection retains ordinary startup defaults");
+#if RTS_ZEROHOUR
+				Check(!s_globalData.m_commandLineData.hasRenderedBattleDiagnosticRequest(),
+					"mixed modes never arm rendered request");
+#endif
+			}
+}
+
+static void TestZeroHourLegacySaveReplayGuards()
+{
+#if RTS_ZEROHOUR
+	Int exitCode = 0;
+	// Replay is registered only in the production startup table. Exercise each
+	// legacy guard through that real dispatch, not an invented init-table row.
+	for (unsigned guard = 0; guard < 2; ++guard)
+	{
+		Reset("game -replay old.rep");
+		if (guard == 0) s_skirmishAILegacySaveTestSeenAtStartup = TRUE;
+		else s_legacySaveRequested = TRUE;
+		Check(!RunPass(TRUE, &exitCode) && exitCode == 2,
+			"actual replay dispatch rejects either legacy-save guard");
+		Check(s_globalData.m_simulateReplays.empty() && s_globalData.m_playIntro &&
+			s_scenario.multiInstanceCalls == 0 && s_scenario.skipPrimaryCalls == 0,
+			"legacy replay rejection precedes replay/startup side effects");
+	}
+	Reset("game -runSkirmishAITestHardAI2v6 1733");
+	s_legacySaveRequested = TRUE;
+	Check(!RunPass(FALSE, &exitCode) && exitCode == 2,
+		"actual hard AI request rejects an existing legacy-save request");
+	Check(!s_globalData.m_commandLineData.hasSkirmishAITestHardAI2v6Request(),
+		"legacy conflict never arms a hard AI request");
+	Reset("game -replay old.rep");
+	Check(RunFullCommandLine(&exitCode) && s_globalData.m_simulateReplays.size() == 1,
+		"ordinary replay remains accepted after fixture dependency reset");
+#endif
 }
 
 // -------------------------------------------------------------------------
@@ -586,6 +705,8 @@ int main()
 	TestInvalidHardSeedsAreFatal();
 	TestHardAndExistingModesAreMutuallyExclusive();
 	TestExistingModesRemainInert();
+	TestRenderedBattleActualDispatch();
+	TestZeroHourLegacySaveReplayGuards();
 	TestRecorderLocalIndexRoundTrip();
 	TestMalformedLocalIndexRemainsRejected();
 	if (s_failures != 0)

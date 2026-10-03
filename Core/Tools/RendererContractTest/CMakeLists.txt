@@ -152,6 +152,15 @@ set_tests_properties(core_renderer_contract_tests PROPERTIES TIMEOUT 30)
 
 if(WIN32 AND NOT IS_VS6_BUILD)
 
+    # Production collector with a recording driver; no graphics device.
+    add_executable(core_d3d11_gpu_frame_timing_tests
+        D3D11GpuFrameTimingTest.cpp)
+    set_target_properties(core_d3d11_gpu_frame_timing_tests PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME core_d3d11_gpu_frame_timing_tests
+        COMMAND core_d3d11_gpu_frame_timing_tests)
+    set_tests_properties(core_d3d11_gpu_frame_timing_tests PROPERTIES TIMEOUT 30)
+
     # Execute the production sampler lifetime methods and their real gather/
     # bind callsites against a recording device. Missing or duplicate markers
     # fail configuration; the generated proof records exact normalized bodies.
