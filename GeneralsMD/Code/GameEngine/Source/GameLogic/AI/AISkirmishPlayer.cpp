@@ -5913,6 +5913,7 @@ Bool AISkirmishPlayer::selectTeamToReinforce( Int minPriority )
 				!teamIt.done(); teamIt.advance()) {
 				Team *team = teamIt.cur();
 				if (team && team->hasAnyUnits() &&
+					!isAlliedSupportTeam(team->getID()) &&
 					HasSkirmishAIReinforcementDeficit(team))
 					candidates.push_back(team);
 			}
@@ -5955,6 +5956,7 @@ Bool AISkirmishPlayer::selectTeamToReinforce( Int minPriority )
 					origin = *team->getFirstItemIn_TeamMemberList()->getPosition();
 				Object *recruit = team->tryToRecruit(
 					thing, &origin, TheAI->getAiData()->m_maxRecruitDistance);
+				if (recruit && isAlliedSupportTeam(recruit->getTeam()->getID())) recruit = 0;
 				std::vector<Object *> producers;
 				if (!recruit) {
 					FindSkirmishAICompatibleProducers(m_player, thing, &producers);
@@ -8621,6 +8623,24 @@ void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
 		(TheGameLogic->getFrame() / (5 * LOGICFRAMES_PER_SECOND)) % teams.size();
 	for (size_t i = 0; i < teams.size() && m_alliedSupportTeamIDs.size() < 4 && queries < 4; ++i) {
 		Team *team = teams[(teamStart + i) % teams.size()];
+		// Produced recruits can already belong to the target team before their ready-queue join.
+		// Admit only a stable roster whose complete value and ground routes are proven below.
+		Bool pendingReinforcement = false;
+		for (DLINK_ITERATOR<TeamInQueue> queued = iterate_TeamBuildQueue();
+			!queued.done(); queued.advance()) {
+			if (queued.cur()->m_reinforcement && queued.cur()->m_team == team) {
+				pendingReinforcement = true;
+				break;
+			}
+		}
+		for (DLINK_ITERATOR<TeamInQueue> ready = iterate_TeamReadyQueue();
+			!pendingReinforcement && !ready.done(); ready.advance()) {
+			if (ready.cur()->m_reinforcement && ready.cur()->m_team == team) {
+				pendingReinforcement = true;
+				break;
+			}
+		}
+		if (pendingReinforcement) continue;
 		std::map<UnsignedInt, TacticalTeamState>::const_iterator state = m_tacticalTeams.find(team->getID());
 		if (state != m_tacticalTeams.end() &&
 			(state->second.retreating || state->second.woundedReserve ||
@@ -12334,6 +12354,7 @@ void AISkirmishPlayer::recruitSpecificAITeam(TeamPrototype *teamProto, Real recr
 				int count = unitInfo[i].maxUnits;
 				while (count>0) {
 					Object *unit = theTeam->tryToRecruit(thing, &teamProto->getTemplateInfo()->m_homeLocation, recruitRadius);
+					if (unit && isAlliedSupportTeam(unit->getTeam()->getID())) unit = 0;
 					if (unit)
 					{
 						unitsRecruited++;
@@ -12783,6 +12804,9 @@ void AISkirmishPlayer::checkReadyTeams()
  */
 Bool AISkirmishPlayer::canActivateReadyTeam( const TeamInQueue *team ) const
 {
+	// Keep even pre-existing queued joins from changing an admitted or returning support roster.
+	if (team && team->m_reinforcement && team->m_team &&
+		isAlliedSupportTeam(team->m_team->getID())) return false;
 	if (team && (isAlliedAssaultHolding() ||
 		(usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending)) && !team->m_reinforcement &&
 		IsSkirmishStrategyOffensiveTeamType(team->m_team, m_player)) return false;
