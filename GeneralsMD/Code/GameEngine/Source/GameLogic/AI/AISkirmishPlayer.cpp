@@ -8596,7 +8596,7 @@ Bool AISkirmishPlayer::isAlliedAssaultTeam(UnsignedInt teamID) const
 
 Bool AISkirmishPlayer::isAlliedAssaultMember(const Object *object) const
 {
-	Team *team = object ? object->getTeam() : 0;
+	Team *team = object ? const_cast<Team *>(object->getTeam()) : 0;
 	return usesAlliedCoordinationBehavior() && IsSkirmishStrategyOffensiveTeam(team, m_player) &&
 		isAlliedAssaultTeam(team->getID()) &&
 		(IsSkirmishStrategyPotentialOffensiveRecipient(const_cast<Object *>(object), m_player, team) ||
