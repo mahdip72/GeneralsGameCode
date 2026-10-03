@@ -8129,8 +8129,12 @@ void UpdateSkirmishAIAlliedFixture()
 		return;
 	}
 #if RTS_ZEROHOUR && defined(_WIN64)
-	// Check the unchanged deadlines before a case can report success.
-	if (frame - s_allied.startFrame > 18000 ||
+	// Check the fixed deadlines before a case can report success.
+	// Coordination observes cancellation/resumption and then a second natural
+	// cohort after the first cohort's unchanged cooldown, plus travel and a
+	// later central evaluation. Other cases retain their single-phase budget.
+	const UnsignedInt maxFrames = s_allied.fixtureCase == SKIRMISH_AI_ALLIED_COORDINATION_LIVE ? 30000 : 18000;
+	if (frame - s_allied.startFrame > maxFrames ||
 		ElapsedMilliseconds(s_runner.startupStartMilliseconds, GetTickCount()) > 600000)
 	{
 		PrintAlliedFixtureTimeoutDiagnostics(frame);
