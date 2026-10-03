@@ -97,6 +97,7 @@ public:	// AIPlayer interface methods.
 	struct AlliedCoordinationDiagnostics {
 		Bool assaultActive;
 		Bool assaultLaunched;
+		Bool strategyResumePending;
 		Int leaderIndex;
 		Int enemyIndex;
 		ObjectID targetID;
@@ -285,6 +286,7 @@ protected:
 	Bool resolveAlliedAssaultTarget(Object **target) const;
 	Player *getPinnedAlliedEnemy() const;
 	void clearAlliedAssault();
+	void resumeAlliedStrategy();
 	void xferAlliedCoordination(Xfer *xfer);
 	const ThingTemplate *findTunnelContainBuildTemplate() const;
 	Bool isTunnelBuildBuilderAvailable(Object *builder) const;
@@ -461,6 +463,9 @@ protected:
 	Int m_currentEnemyPlayerIndex;
 	Bool m_alliedAssaultActive;
 	Bool m_alliedAssaultLaunched;
+	Bool m_alliedStrategyResumePending;
+	Bool m_alliedResumeAttackSafe;
+	UnsignedInt m_alliedResumeSafetyFrame;
 	Int m_alliedLeaderIndex;
 	Int m_alliedEnemyIndex;
 	ObjectID m_alliedTargetID;

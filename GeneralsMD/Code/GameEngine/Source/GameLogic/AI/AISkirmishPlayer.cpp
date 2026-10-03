@@ -7451,6 +7451,9 @@ void AISkirmishPlayer::resetAlliedCoordination()
 {
 	m_alliedAssaultActive = false;
 	m_alliedAssaultLaunched = false;
+	m_alliedStrategyResumePending = false;
+	m_alliedResumeAttackSafe = false;
+	m_alliedResumeSafetyFrame = 0;
 	m_alliedLeaderIndex = -1;
 	m_alliedEnemyIndex = -1;
 	m_alliedTargetID = INVALID_ID;
@@ -8266,6 +8269,7 @@ AISkirmishPlayer::getAlliedCoordinationDiagnostics() const
 	AlliedCoordinationDiagnostics d;
 	d.assaultActive = m_alliedAssaultActive;
 	d.assaultLaunched = m_alliedAssaultLaunched;
+	d.strategyResumePending = m_alliedStrategyResumePending;
 	d.leaderIndex = m_alliedLeaderIndex;
 	d.enemyIndex = m_alliedEnemyIndex;
 	d.targetID = m_alliedTargetID;
@@ -8332,12 +8336,13 @@ Bool AISkirmishPlayer::isAlliedSupportTeam(UnsignedInt teamID) const
 Bool AISkirmishPlayer::isAlliedAssaultHolding() const
 {
 	return usesAlliedCoordinationBehavior() && m_alliedAssaultActive &&
-		!m_alliedAssaultLaunched && !IsSkirmishStrategyFrameReached(
-			TheGameLogic->getFrame(), m_alliedAssaultFrame);
+		!m_alliedAssaultLaunched;
 }
 
 void AISkirmishPlayer::clearAlliedAssault()
 {
+	if (m_alliedAssaultActive && !m_alliedAssaultLaunched)
+		m_alliedStrategyResumePending = true;
 	m_alliedAssaultActive = false;
 	m_alliedAssaultLaunched = false;
 	m_alliedLeaderIndex = -1;
@@ -8346,6 +8351,27 @@ void AISkirmishPlayer::clearAlliedAssault()
 	m_alliedAssaultFrame = 0;
 	m_alliedAssaultExpiryFrame = 0;
 	m_alliedNextHoldFrame = 0;
+}
+
+void AISkirmishPlayer::resumeAlliedStrategy()
+{
+	if (!usesAlliedCoordinationBehavior() || !m_alliedStrategyResumePending ||
+		m_alliedAssaultActive) return;
+	const UnsignedInt now = TheGameLogic->getFrame();
+	const Bool fortifying = m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY;
+	if (!fortifying && m_alliedResumeSafetyFrame != now) return;
+	const Bool recentAttack = m_player->getAttackedFrame() != 0 &&
+		now - m_player->getAttackedFrame() <= 10 * LOGICFRAMES_PER_SECOND;
+	if (!fortifying && (!m_alliedResumeAttackSafe || recentAttack)) {
+		// An abort does not promote an attack. Keep the safe home command until
+		// another actual strategy evaluation establishes normal ownership.
+		commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0);
+		return;
+	}
+	m_alliedStrategyResumePending = false;
+	// NONE forces one normal strategy impulse even when mode/target stayed
+	// unchanged while the shared hold suppressed its original transition.
+	applyStrategyMode(SKIRMISH_STRATEGY_NONE, m_strategyState.currentMode, INVALID_ID);
 }
 
 Player *AISkirmishPlayer::getPinnedAlliedEnemy() const
@@ -8462,6 +8488,7 @@ void AISkirmishPlayer::commitAlliedCoordination(
 		m_alliedAssaultFrame = leaderAI->m_alliedAssaultFrame;
 	}
 	m_alliedAssaultExpiryFrame = m_alliedAssaultFrame + 90 * LOGICFRAMES_PER_SECOND;
+	m_alliedStrategyResumePending = false;
 	m_alliedNextHoldFrame = now;
 	m_strategyState.alliedCoordinationCooldownActive = true;
 	m_strategyState.nextAlliedCoordinationFrame = m_alliedAssaultExpiryFrame;
@@ -8570,6 +8597,7 @@ void AISkirmishPlayer::updateAlliedAssignments()
 			clearAlliedAssault();
 		} else if (!m_alliedAssaultLaunched && IsSkirmishStrategyFrameReached(now, m_alliedAssaultFrame)) {
 			m_alliedAssaultLaunched = true;
+			m_alliedStrategyResumePending = false;
 			m_strategyState.currentMode = SKIRMISH_STRATEGY_ASSAULT;
 			m_strategyState.pendingMode = SKIRMISH_STRATEGY_NONE;
 			m_strategyState.pendingSinceFrame = 0;
@@ -9158,7 +9186,8 @@ enum {
 
 void AISkirmishPlayer::updateTacticalTeams()
 {
-	if (isAlliedAssaultHolding()) return;
+	if (isAlliedAssaultHolding() ||
+		(usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending)) return;
 	if (!ShouldUseCurrentSkirmishAITacticalBehavior() || !usesStrategyBehavior() ||
 		!m_player || !TheAI ||
 		!TheAI->pathfinder() || !m_baseCenterSet)
@@ -10939,6 +10968,8 @@ void AISkirmishPlayer::applyStrategyMode(
 	ObjectID previousTargetID)
 {
 	if (isAlliedAssaultHolding() && currentMode != SKIRMISH_STRATEGY_FORTIFY) return;
+	if (usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending &&
+		currentMode != SKIRMISH_STRATEGY_FORTIFY) return;
 	// Strategy commands are transition impulses.  Native team scripts retain
 	// ownership on later frames; stable modes must not keep overwriting them.
 	if (previousMode == currentMode &&
@@ -10995,6 +11026,10 @@ Bool AISkirmishPlayer::updateStrategy()
 		m_alliedCapturedStrategyAvailable = false;
 	} else {
 		collectStrategyMetrics(&metrics, &targetID);
+	}
+	if (usesAlliedCoordinationBehavior()) {
+		m_alliedResumeSafetyFrame = currentFrame;
+		m_alliedResumeAttackSafe = metrics.immediateThreat < 60 && metrics.baseIntegrity >= 65;
 	}
 	if (usesAlliedCoordinationBehavior() && m_alliedAssaultActive && m_alliedAssaultLaunched) {
 		Object *sharedTarget = 0;
@@ -12618,7 +12653,8 @@ void AISkirmishPlayer::checkReadyTeams()
  */
 Bool AISkirmishPlayer::canActivateReadyTeam( const TeamInQueue *team ) const
 {
-	if (team && isAlliedAssaultHolding() && !team->m_reinforcement &&
+	if (team && (isAlliedAssaultHolding() ||
+		(usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending)) && !team->m_reinforcement &&
 		IsSkirmishStrategyOffensiveTeamType(team->m_team, m_player)) return false;
 	if (!team || !usesStrategyBehavior() ||
 		m_strategyState.currentMode != SKIRMISH_STRATEGY_FORTIFY)
@@ -12721,6 +12757,7 @@ void AISkirmishPlayer::update()
 		applyStrategyMode(
 			previousMode, m_strategyState.currentMode, previousTargetID);
 	updateAlliedAssignments();
+	resumeAlliedStrategy();
 	if (strategyAllowedAfterRecovery)
 		updateTacticalTeams();
 	if (strategyAllowedAfterRecovery)
@@ -14226,7 +14263,10 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 		}
 	}
 	if (ShouldIncludeSkirmishAIAlliedCoordinationCRCFields(replay, replayEpoch))
+	{
 		xferAlliedCoordination(xfer);
+		xfer->xferBool(&m_alliedStrategyResumePending);
+	}
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -14252,13 +14292,14 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	 * 17: Generated forward tunnel targets and bounded live exits
 	 * 18: Per-target forward retry and bounded full-tunnel wait
 	 * 19: Exhausted forward targets and committed alternate-target observation
-	 * 20: Allied assault, support ownership, and received-money relay guard */
+	 * 20: Allied assault, support ownership, and received-money relay guard
+	 * 21: Pending return to ordinary strategy after an allied hold abort */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 20;
+	XferVersion currentVersion = 21;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -14589,6 +14630,14 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 		xferAlliedCoordination(xfer);
 	else if (xfer->getXferMode() == XFER_LOAD)
 		resetAlliedCoordination();
+	if (version >= 21)
+		xfer->xferBool(&m_alliedStrategyResumePending);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		m_alliedStrategyResumePending = false;
+	if (xfer->getXferMode() == XFER_LOAD) {
+		m_alliedResumeAttackSafe = false;
+		m_alliedResumeSafetyFrame = 0;
+	}
 	if (xfer->getXferMode() == XFER_LOAD) {
 		m_tunnelBuildLockedBuilderID = INVALID_ID;
 		m_defenseBuildLockedBuilderID = INVALID_ID;
