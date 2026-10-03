@@ -135,6 +135,8 @@ struct AlliedFixtureState
 	Coord3D supportInitialPosition;
 	Coord3D supportAwayPosition;
 	Bool supportFaultIssued;
+	Bool supportAssignedScriptChecked;
+	Bool supportReturningScriptChecked;
 	Bool cancellationIssued;
 	Bool cancellationSaved;
 	Bool postLoadProtectionVerified;
@@ -159,6 +161,7 @@ struct AlliedFixtureState
 		assaultRetained(FALSE), assaultLaunched(FALSE), assaultLeader(-1), assaultEnemy(-1),
 		assaultTarget(INVALID_ID), assaultRelease(0), assaultExpiry(0),
 		supportTeamID(0), supportMemberID(INVALID_ID), supportFaultIssued(FALSE),
+		supportAssignedScriptChecked(FALSE), supportReturningScriptChecked(FALSE),
 		cancellationIssued(FALSE), cancellationSaved(FALSE), postLoadProtectionVerified(FALSE),
 		cancellationTarget(INVALID_ID), cancellationRelease(0)
 	{
@@ -7503,6 +7506,40 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 	}
 }
 
+Bool CheckAlliedSupportScriptHold(AISkirmishPlayer *ownerAI, Player *owner, Object *member,
+	const Coord3D &scriptGoal, const char *phase, UnsignedInt frame)
+{
+	AIUpdateInterface *unitAI = member->getAIUpdateInterface();
+	const Coord3D *guard = unitAI ? unitAI->getGuardLocation() : nullptr;
+	if (!ownerAI->isAlliedSupportMember(member) || !ownerAI->shouldHoldAlliedScriptCommand(member) ||
+		!unitAI || !guard || unitAI->getLastCommandSource() != CMD_FROM_AI ||
+		unitAI->getGuardTargetType() != GUARDTARGET_LOCATION)
+	{ FailSkirmishAITest("allied_support_script_probe_not_owned_guard"); RequestSkirmishAITestStop(); return FALSE; }
+	const Coord3D guardBefore = *guard;
+	const Int stateBefore = unitAI->getCurrentStateID();
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics assignmentBefore = ownerAI->getAlliedCoordinationDiagnostics();
+	for (Int command = 0; command < 2; ++command)
+	{
+		if (command == 0) unitAI->aiAttackMoveToPosition(&scriptGoal, NO_MAX_SHOTS_LIMIT, CMD_FROM_SCRIPT);
+		else unitAI->aiMoveToPosition(&scriptGoal, CMD_FROM_SCRIPT);
+		guard = unitAI->getGuardLocation();
+		if (!IsSkirmishAIRecoveryCombatUnit(member, owner) || !member->getTeam() ||
+			member->getID() != s_allied.supportMemberID || member->getTeam()->getID() != s_allied.supportTeamID ||
+			!guard || unitAI->getLastCommandSource() != CMD_FROM_AI || unitAI->getCurrentStateID() != stateBefore ||
+			unitAI->getGuardTargetType() != GUARDTARGET_LOCATION ||
+			AlliedFixtureDistanceSquared(*guard, guardBefore) > 1.0f ||
+			!ownerAI->isAlliedSupportMember(member) || !ownerAI->shouldHoldAlliedScriptCommand(member) ||
+			!SameAlliedDiagnostics(assignmentBefore, ownerAI->getAlliedCoordinationDiagnostics()))
+		{ FailSkirmishAITest("allied_support_script_command_replaced_owned_guard"); RequestSkirmishAITestStop(); return FALSE; }
+		++s_allied.checks;
+		printf("SKIRMISH_AI_ALLIED_SUPPORT_SCRIPT_HOLD_ASSERT frame=%u phase=%s member=%u team=%u "
+			"command=%s source=script guard_unchanged=1 owner_source=ai assignment_unchanged=1\n",
+			frame, phase, member->getID(), member->getTeam()->getID(), command == 0 ? "attack_move" : "move");
+		fflush(stdout);
+	}
+	return TRUE;
+}
+
 void ObserveAlliedSupport(UnsignedInt frame)
 {
 	if (s_allied.supportDonorSlot >= 0)
@@ -7542,6 +7579,8 @@ void ObserveAlliedSupport(UnsignedInt frame)
 					AlliedFixtureDistanceSquared(*guard, *anchor->getPosition()) <= 50.0f * 50.0f)
 				{ guardedAllyAnchor = TRUE; break; }
 			if (!guardedAllyAnchor) return;
+			if (!CheckAlliedSupportScriptHold(donorAI, donor, member, home, "assigned", frame)) return;
+			s_allied.supportAssignedScriptChecked = TRUE;
 			s_allied.supportAwayPosition = *member->getPosition();
 			s_allied.supportFaultIssued = TRUE;
 			++s_allied.checks;
@@ -7558,10 +7597,23 @@ void ObserveAlliedSupport(UnsignedInt frame)
 			return;
 		}
 		if (state.supportRecipientIndex < 0 && state.supportReturning && state.supportTeamCount > 0)
+		{
 			s_allied.sawSupportReturning = TRUE;
+			AIUpdateInterface *unitAI = member->getAIUpdateInterface();
+			const Coord3D *guard = unitAI ? unitAI->getGuardLocation() : nullptr;
+			if (!s_allied.supportReturningScriptChecked && unitAI && guard &&
+				unitAI->getLastCommandSource() == CMD_FROM_AI && unitAI->getGuardTargetType() == GUARDTARGET_LOCATION &&
+				AlliedFixtureDistanceSquared(*guard, home) <= 50.0f * 50.0f &&
+				AlliedFixtureDistanceSquared(*member->getPosition(), home) > homeRadius * homeRadius)
+			{
+				if (!CheckAlliedSupportScriptHold(donorAI, donor, member, s_allied.supportAwayPosition, "returning", frame)) return;
+				s_allied.supportReturningScriptChecked = TRUE;
+			}
+		}
 		if (state.supportTeamCount == 0 && state.supportRecipientIndex < 0 && !state.supportReturning)
 		{
-			if (!s_allied.sawSupportReturning ||
+			if (!s_allied.sawSupportReturning || !s_allied.supportAssignedScriptChecked ||
+				!s_allied.supportReturningScriptChecked ||
 				AlliedFixtureDistanceSquared(*member->getPosition(), home) > homeRadius * homeRadius ||
 				AlliedFixtureDistanceSquared(*member->getPosition(), s_allied.supportAwayPosition) < 25.0f * 25.0f)
 			{ FailSkirmishAITest("allied_support_cleared_without_surviving_home_return"); RequestSkirmishAITestStop(); return; }
