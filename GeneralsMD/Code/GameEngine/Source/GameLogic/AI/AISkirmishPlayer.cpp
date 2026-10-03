@@ -7502,7 +7502,8 @@ Bool AISkirmishPlayer::donateToAlly(Int recipientIndex, Int amount)
 	if (recovery > reserve) reserve = recovery;
 	if (rebuild > reserve) reserve = rebuild;
 	if (facts->protectedReserve > reserve) reserve = facts->protectedReserve;
-	const Int cash = m_player->getMoney()->countMoney();
+	const UnsignedInt rawCash = m_player->getMoney()->countMoney();
+	const Int cash = (Int)(rawCash > 0x7fffffffU ? 0x7fffffffU : rawCash);
 	Int available = cash > reserve ? cash - reserve : 0;
 	if (cash / 5 < available) available = cash / 5;
 	if (amount > available || !m_player->transferMoneyToAlly(recipientIndex, amount))
@@ -7781,7 +7782,10 @@ void AISkirmishPlayer::collectStrategyMetrics(
 	const Int wealthy = TheAI->getAiData()->m_resourcesWealthy > poor ?
 		TheAI->getAiData()->m_resourcesWealthy :
 		(Int)(fallbackWealthy > 2147483647 ? 2147483647 : fallbackWealthy);
-	const Int money = m_player->getMoney()->countMoney();
+	const UnsignedInt rawMoney = m_player->getMoney()->countMoney();
+	// Preserve earlier replay epochs while keeping allied aid metrics within the signed policy range.
+	const Int money = usesAlliedCoordinationBehavior() && rawMoney > 0x7fffffffU ?
+		2147483647 : (Int)rawMoney;
 	Int cashScore = 0;
 	if (money <= poor)
 		cashScore = ClampSkirmishStrategyPercent(
@@ -8170,7 +8174,8 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 	const Int wealthy = TheAI->getAiData()->m_resourcesWealthy > poor ?
 		TheAI->getAiData()->m_resourcesWealthy :
 		(Int)((__int64)poor * 4 > 2147483647 ? 2147483647 : (__int64)poor * 4);
-	facts->cash = player->getMoney()->countMoney();
+	const UnsignedInt rawCash = player->getMoney()->countMoney();
+	facts->cash = (Int)(rawCash > 0x7fffffffU ? 0x7fffffffU : rawCash);
 	Int cashScore = facts->cash <= poor ?
 		(Int)((__int64)(facts->cash > 0 ? facts->cash : 0) * 50 / poor) :
 		facts->cash >= wealthy ? 100 :
