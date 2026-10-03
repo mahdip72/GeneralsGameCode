@@ -8082,6 +8082,46 @@ static Bool HasSkirmishAlliedRecoveryRoute(Player *player,
 	return false;
 }
 
+static Object *FindSkirmishAlliedDefenseAnchor(Player *player)
+{
+	if (!player || !TheGameLogic) return 0;
+	Coord3D base;
+	AIPlayer *owner = player->isSkirmishAIPlayer() ? player->getAIPlayerForPlanning() : 0;
+	const Bool hasBase = owner && owner->getBaseCenter(&base);
+	Object *anchor = 0;
+	Int bestPriority = -1;
+	Real bestDistance = 0.0f;
+	Bool bestCoreStructure = false;
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject()) {
+		if (object->getControllingPlayer() != player || object->isEffectivelyDead() ||
+			object->isDestroyed() || object->testStatus(OBJECT_STATUS_SOLD) ||
+			object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) || object->isContained() ||
+			object->isDisabledByType(DISABLED_UNMANNED)) continue;
+		const Int priority = object->isKindOf(KINDOF_COMMANDCENTER) ? 3 :
+			object->isKindOf(KINDOF_STRUCTURE) ? 2 : object->isKindOf(KINDOF_DOZER) ? 1 : 0;
+		if (!priority) continue;
+		const Bool coreStructure = object->isKindOf(KINDOF_FS_SUPPLY_CENTER) ||
+			object->isKindOf(KINDOF_FS_BARRACKS) || object->isKindOf(KINDOF_FS_WARFACTORY) ||
+			object->isKindOf(KINDOF_FS_AIRFIELD) || object->isKindOf(KINDOF_FS_POWER) ||
+			IsSkirmishAIRenewableIncomeStructure(object->getTemplate());
+		const Real dx = hasBase ? object->getPosition()->x - base.x : 0.0f;
+		const Real dy = hasBase ? object->getPosition()->y - base.y : 0.0f;
+		const Real distance = dx * dx + dy * dy;
+		if (!anchor || priority > bestPriority ||
+			(priority == bestPriority &&
+			 (hasBase ? distance < bestDistance : coreStructure && !bestCoreStructure)) ||
+			(priority == bestPriority &&
+			 (hasBase ? distance == bestDistance : coreStructure == bestCoreStructure) &&
+			 object->getID() < anchor->getID())) {
+			anchor = object;
+			bestPriority = priority;
+			bestDistance = distance;
+			bestCoreStructure = coreStructure;
+		}
+	}
+	return anchor;
+}
+
 void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 	SkirmishAIAlliedPlayerFacts *facts)
 {
@@ -8117,19 +8157,7 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 	}
 	Coord3D base;
 	base.zero();
-	Object *anchor = 0;
-	for (Object *object = TheGameLogic->getFirstObject(); object;
-		object = object->getNextObject()) {
-		if (object->getControllingPlayer() == player &&
-			!object->isEffectivelyDead() && !object->isDestroyed() &&
-			(object->isKindOf(KINDOF_COMMANDCENTER) ||
-			 (!anchor && (object->isKindOf(KINDOF_STRUCTURE) || object->isKindOf(KINDOF_DOZER))))) {
-			if (!anchor ||
-				(object->isKindOf(KINDOF_COMMANDCENTER) && !anchor->isKindOf(KINDOF_COMMANDCENTER)) ||
-				(object->isKindOf(KINDOF_COMMANDCENTER) == anchor->isKindOf(KINDOF_COMMANDCENTER) &&
-				 object->getID() < anchor->getID())) anchor = object;
-		}
-	}
+	Object *anchor = FindSkirmishAlliedDefenseAnchor(player);
 	if (owner && owner->m_baseCenterSet) base = owner->m_baseCenter;
 	else if (anchor) base = *anchor->getPosition();
 	const Real radius = owner && owner->m_baseRadius > 0.0f ?
@@ -8535,11 +8563,7 @@ void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
 	if (!IsSkirmishMutualLiveAlly(m_player, recipient) || !own || !need ||
 		need->distress < 70 || own->immediateThreat >= 50 || !m_baseCenterSet) return;
 	if (budget > own->supportAvailableValue) budget = own->supportAvailableValue;
-	Object *anchor = 0;
-	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
-		if (object->getControllingPlayer() == recipient && object->isKindOf(KINDOF_STRUCTURE) &&
-			!object->isEffectivelyDead() && !object->isDestroyed() &&
-			(!anchor || object->getID() < anchor->getID())) anchor = object;
+	Object *anchor = FindSkirmishAlliedDefenseAnchor(recipient);
 	if (!anchor) return;
 	std::vector<Team *> teams;
 	for (Player::PlayerTeamList::const_iterator prototype = m_player->getPlayerTeams()->begin();
@@ -8646,11 +8670,7 @@ void AISkirmishPlayer::updateAlliedAssignments()
 		!IsSkirmishStrategyFrameReached(now, m_alliedNextSupportFrame)) return;
 	m_alliedNextSupportFrame = now + 2 * LOGICFRAMES_PER_SECOND;
 	Player *recipient = FindSkirmishAlliedPlayer(m_alliedSupportRecipientIndex);
-	Object *anchor = 0;
-	for (Object *object = TheGameLogic->getFirstObject(); recipient && object; object = object->getNextObject())
-		if (object->getControllingPlayer() == recipient && object->isKindOf(KINDOF_STRUCTURE) &&
-			!object->isEffectivelyDead() && !object->isDestroyed() &&
-			(!anchor || object->getID() < anchor->getID())) anchor = object;
+	Object *anchor = FindSkirmishAlliedDefenseAnchor(recipient);
 	if (!m_alliedSupportReturning && !anchor) recallAlliedSupport();
 	for (size_t i = 0; i < m_alliedSupportTeamIDs.size();) {
 		Team *team = FindSkirmishAlliedTeam(m_player, m_alliedSupportTeamIDs[i]);

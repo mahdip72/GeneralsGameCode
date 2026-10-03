@@ -113,6 +113,7 @@ public:	// AIPlayer interface methods.
 	};
 	AlliedCoordinationDiagnostics getAlliedCoordinationDiagnostics() const;
 	UnsignedInt getAlliedSupportTeamID(Int index) const;
+	Real getAlliedSupportHomeRadius() const { return m_baseRadius + 150.0f; }
 	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing,
 		Bool isUpgrade, Bool refreshProductionReserve);
 
