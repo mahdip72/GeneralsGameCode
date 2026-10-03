@@ -8583,7 +8583,9 @@ void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
 			(state->second.retreating || state->second.woundedReserve ||
 			 state->second.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE)) continue;
 		Int value = 0;
-		Object *representative = 0;
+		Object *groundRepresentatives[4] = { 0, 0, 0, 0 };
+		Int groundCapabilityCount = 0;
+		Bool anyMember = false;
 		Bool eligible = true;
 		const Real homeRadius = m_baseRadius + 500.0f;
 		for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList(); !member.done(); member.advance()) {
@@ -8596,14 +8598,47 @@ void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
 			const Int cost = object->getTemplate()->calcCostToBuild(m_player);
 			value = AddSkirmishStrategyValue(value,
 				cost > 0 ? (Int)((__int64)cost * GetSkirmishStrategyHealthPercent(object) / 100) : 0);
-			if (!representative || object->getID() < representative->getID()) representative = object;
+			anyMember = true;
+			if (!object->isKindOf(KINDOF_AIRCRAFT)) {
+				AIUpdateInterface *ai = object->getAIUpdateInterface();
+				if (!ai) { eligible = false; break; }
+				const LocomotorSet &locomotor = ai->getLocomotorSet();
+				Int capability = 0;
+				for (; capability < groundCapabilityCount; ++capability) {
+					AIUpdateInterface *otherAI = groundRepresentatives[capability]->getAIUpdateInterface();
+					const LocomotorSet &other = otherAI->getLocomotorSet();
+					if (locomotor.getValidSurfaces() == other.getValidSurfaces() &&
+						locomotor.isDownhillOnly() == other.isDownhillOnly() &&
+						ai->getCurLocomotorSetType() == otherAI->getCurLocomotorSetType()) break;
+				}
+				if (capability == groundCapabilityCount) {
+					// Decline a team whose full ground capability set cannot be proven in this batch.
+					if (groundCapabilityCount >= 4 - queries) { eligible = false; break; }
+					groundRepresentatives[groundCapabilityCount++] = object;
+				} else if (object->getID() < groundRepresentatives[capability]->getID()) {
+					groundRepresentatives[capability] = object;
+				}
+			}
 		}
-		if (!eligible || !representative || value <= 0 || value > budget) continue;
-		++queries;
-		if (!representative->isKindOf(KINDOF_AIRCRAFT) &&
-			!TheAI->pathfinder()->clientSafeQuickDoesPathExist(
+		if (!eligible || !anyMember || value <= 0 || value > budget) continue;
+		std::sort(groundRepresentatives, groundRepresentatives + groundCapabilityCount,
+			IsSkirmishAIProducerIDBefore);
+		for (Int capability = 0; capability < groundCapabilityCount; ++capability) {
+			Object *representative = groundRepresentatives[capability];
+			Coord3D approach;
+			if (!GetSkirmishAIStrategyGroundApproach(representative->getPosition(), anchor, 0, &approach)) {
+				eligible = false;
+				break;
+			}
+			++queries;
+			if (!TheAI->pathfinder()->clientSafeQuickDoesPathExist(
 				representative->getAIUpdateInterface()->getLocomotorSet(),
-				representative->getPosition(), anchor->getPosition())) continue;
+				representative->getPosition(), &approach)) {
+				eligible = false;
+				break;
+			}
+		}
+		if (!eligible) continue;
 		m_alliedSupportTeamIDs.push_back(team->getID());
 		budget -= value;
 	}
