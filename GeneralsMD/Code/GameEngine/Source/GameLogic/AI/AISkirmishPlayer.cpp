@@ -8646,8 +8646,8 @@ void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
 			(state->second.retreating || state->second.woundedReserve ||
 			 state->second.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE)) continue;
 		Int value = 0;
-		Object *groundRepresentatives[4] = { 0, 0, 0, 0 };
-		Int groundCapabilityCount = 0;
+		Object *groundMembers[4] = { 0, 0, 0, 0 };
+		Int groundMemberCount = 0;
 		Bool anyMember = false;
 		Bool eligible = true;
 		const Real homeRadius = m_baseRadius + 500.0f;
@@ -8665,38 +8665,26 @@ void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
 			if (!object->isKindOf(KINDOF_AIRCRAFT)) {
 				AIUpdateInterface *ai = object->getAIUpdateInterface();
 				if (!ai) { eligible = false; break; }
-				const LocomotorSet &locomotor = ai->getLocomotorSet();
-				Int capability = 0;
-				for (; capability < groundCapabilityCount; ++capability) {
-					AIUpdateInterface *otherAI = groundRepresentatives[capability]->getAIUpdateInterface();
-					const LocomotorSet &other = otherAI->getLocomotorSet();
-					if (locomotor.getValidSurfaces() == other.getValidSurfaces() &&
-						locomotor.isDownhillOnly() == other.isDownhillOnly() &&
-						ai->getCurLocomotorSetType() == otherAI->getCurLocomotorSetType()) break;
-				}
-				if (capability == groundCapabilityCount) {
-					// Decline a team whose full ground capability set cannot be proven in this batch.
-					if (groundCapabilityCount >= 4 - queries) { eligible = false; break; }
-					groundRepresentatives[groundCapabilityCount++] = object;
-				} else if (object->getID() < groundRepresentatives[capability]->getID()) {
-					groundRepresentatives[capability] = object;
-				}
+				// Equal locomotors do not prove connectivity from different starting cells.
+				// Effective zones are private to Pathfinder, so prove each ground member's route.
+				if (groundMemberCount >= 4 - queries) { eligible = false; break; }
+				groundMembers[groundMemberCount++] = object;
 			}
 		}
 		if (!eligible || !anyMember || value <= 0 || value > budget) continue;
-		std::sort(groundRepresentatives, groundRepresentatives + groundCapabilityCount,
+		std::sort(groundMembers, groundMembers + groundMemberCount,
 			IsSkirmishAIProducerIDBefore);
-		for (Int capability = 0; capability < groundCapabilityCount; ++capability) {
-			Object *representative = groundRepresentatives[capability];
+		for (Int groundIndex = 0; groundIndex < groundMemberCount; ++groundIndex) {
+			Object *groundMember = groundMembers[groundIndex];
 			Coord3D approach;
-			if (!GetSkirmishAIStrategyGroundApproach(representative->getPosition(), anchor, 0, &approach)) {
+			if (!GetSkirmishAIStrategyGroundApproach(groundMember->getPosition(), anchor, 0, &approach)) {
 				eligible = false;
 				break;
 			}
 			++queries;
 			if (!TheAI->pathfinder()->clientSafeQuickDoesPathExist(
-				representative->getAIUpdateInterface()->getLocomotorSet(),
-				representative->getPosition(), &approach)) {
+				groundMember->getAIUpdateInterface()->getLocomotorSet(),
+				groundMember->getPosition(), &approach)) {
 				eligible = false;
 				break;
 			}
