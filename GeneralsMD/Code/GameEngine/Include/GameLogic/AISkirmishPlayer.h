@@ -98,6 +98,8 @@ public:	// AIPlayer interface methods.
 		Bool assaultActive;
 		Bool assaultLaunched;
 		Bool strategyResumePending;
+		Bool holdAdmissionValid;
+		UnsignedInt holdAdmissionFrame;
 		Int leaderIndex;
 		Int enemyIndex;
 		ObjectID targetID;
@@ -114,6 +116,7 @@ public:	// AIPlayer interface methods.
 	AlliedCoordinationDiagnostics getAlliedCoordinationDiagnostics() const;
 	UnsignedInt getAlliedSupportTeamID(Int index) const;
 	Real getAlliedSupportHomeRadius() const { return m_baseRadius + 150.0f; }
+	Real getAlliedSafetyHomeRadius() const { return (m_baseRadius > 0.0f ? m_baseRadius : 0.0f) + 500.0f; }
 	SkirmishStrategyMode getAlliedCurrentStrategyMode() const { return m_strategyState.currentMode; }
 	ObjectID getAlliedCurrentStrategicTargetID() const { return m_strategyState.strategicTargetID; }
 	Bool isAlliedAssaultHoldingTeam(UnsignedInt teamID) const;
@@ -269,7 +272,7 @@ protected:
 	void refreshStrategyProductionState();
 	Bool updateStrategy();
 	void collectStrategyMetrics( SkirmishStrategyMetrics *metrics,
-		ObjectID *strategicTargetID );
+		ObjectID *strategicTargetID, Int *alliedSafetyThreat = 0 );
 	void applyStrategyMode( SkirmishStrategyMode previousMode,
 		SkirmishStrategyMode currentMode, ObjectID previousTargetID,
 		Bool preserveTunnelTransit = false );
@@ -297,6 +300,8 @@ protected:
 	Player *getPinnedAlliedEnemy() const;
 	void clearAlliedAssault();
 	void resumeAlliedStrategy();
+	void queryAlliedDamageSafety();
+	void invalidateAlliedSafetyCache();
 	void xferAlliedCoordination(Xfer *xfer);
 	const ThingTemplate *findTunnelContainBuildTemplate() const;
 	Bool isTunnelBuildBuilderAvailable(Object *builder) const;
@@ -474,6 +479,8 @@ protected:
 	Bool m_alliedAssaultActive;
 	Bool m_alliedAssaultLaunched;
 	Bool m_alliedStrategyResumePending;
+	Bool m_alliedHoldAdmissionValid;
+	UnsignedInt m_alliedHoldAdmissionFrame;
 	Bool m_alliedResumeAttackSafe;
 	UnsignedInt m_alliedResumeSafetyFrame;
 	Int m_alliedLeaderIndex;
@@ -493,6 +500,11 @@ protected:
 	UnsignedInt m_alliedCapturedStrategyFrame;
 	SkirmishStrategyMetrics m_alliedCapturedStrategyMetrics;
 	ObjectID m_alliedCapturedStrategyTargetID;
+	Int m_alliedCapturedSafetyThreat;
+	Bool m_alliedDamageSafetyValid;
+	UnsignedInt m_alliedDamageSafetyFrame;
+	Bool m_alliedRecentHomeDamage;
+	Bool m_alliedRecentHeldDamage;
 	SkirmishStrategyState m_strategyState;
 	Bool m_strategyTargetFallbackPending;
 	ObjectID m_strategyTargetFallbackAfterID;

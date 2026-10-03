@@ -48,6 +48,7 @@
 #include "Common/WellKnownKeys.h"
 #include "Common/Xfer.h"
 #include "GameLogic/GameLogic.h"
+#include "GameLogic/Damage.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/AISkirmishPlayer.h"
 #include "GameLogic/SidesList.h"
@@ -7453,6 +7454,8 @@ void AISkirmishPlayer::resetAlliedCoordination()
 	m_alliedAssaultActive = false;
 	m_alliedAssaultLaunched = false;
 	m_alliedStrategyResumePending = false;
+	m_alliedHoldAdmissionValid = false;
+	m_alliedHoldAdmissionFrame = 0;
 	m_alliedResumeAttackSafe = false;
 	m_alliedResumeSafetyFrame = 0;
 	m_alliedLeaderIndex = -1;
@@ -7470,6 +7473,16 @@ void AISkirmishPlayer::resetAlliedCoordination()
 	m_alliedCapturedStrategyAvailable = false;
 	m_alliedCapturedStrategyFrame = 0;
 	m_alliedCapturedStrategyTargetID = INVALID_ID;
+	invalidateAlliedSafetyCache();
+}
+
+void AISkirmishPlayer::invalidateAlliedSafetyCache()
+{
+	m_alliedCapturedSafetyThreat = 0;
+	m_alliedDamageSafetyValid = false;
+	m_alliedDamageSafetyFrame = 0;
+	m_alliedRecentHomeDamage = false;
+	m_alliedRecentHeldDamage = false;
 }
 
 void AISkirmishPlayer::notifyReceivedAlliedMoney(UnsignedInt currentFrame)
@@ -7514,8 +7527,119 @@ Bool AISkirmishPlayer::donateToAlly(Int recipientIndex, Int amount)
 	return true;
 }
 
+// Allied safety deliberately does not treat an unrelated frontline exchange as
+// a home emergency. Body history is already deterministic and saved by the body.
+static Bool HasSkirmishAlliedHostileDamage(Object *object, Player *owner,
+	UnsignedInt now, UnsignedInt *damageFrame)
+{
+	BodyModuleInterface *body = object ? object->getBodyModule() : 0;
+	if (!body || !owner) return false;
+	const UnsignedInt frame = body->getLastDamageTimestamp();
+	const DamageInfo *damage = body->getLastDamageInfo();
+	if (frame == 0xffffffffU || now - frame > 10 * LOGICFRAMES_PER_SECOND ||
+		!damage || damage->out.m_actualDamageClipped <= 0.0f) return false;
+	Object *source = TheGameLogic->findObjectByID(damage->in.m_sourceID);
+	Player *attacker = source ? source->getControllingPlayer() : 0;
+	if (!attacker && damage->in.m_sourcePlayerMask != 0) {
+		// A destroyed source may still have a saved unique player mask. Ambiguous
+		// or absent attribution cannot establish hostile damage.
+		for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
+			Player *candidate = ThePlayerList->getNthPlayer(i);
+			if (candidate && candidate->getPlayerMask() == damage->in.m_sourcePlayerMask) {
+				attacker = candidate;
+				break;
+			}
+		}
+	}
+	if (!attacker || !attacker->getDefaultTeam() ||
+		owner->getRelationship(attacker->getDefaultTeam()) != ENEMIES) return false;
+	*damageFrame = frame;
+	return true;
+}
+
+struct SkirmishAlliedDamageSafetyContext
+{
+	Player *player;
+	AISkirmishPlayer *owner;
+	UnsignedInt now;
+	Coord3D base;
+	Real radiusSquared;
+	Bool hasBase;
+	ObjectID recoveryBuilderID;
+	Int liveBuilders;
+	Bool damagedBuilder;
+	Bool homeDamage;
+	Bool heldDamage;
+	Bool checkHeld;
+	UnsignedInt holdAdmissionFrame;
+};
+
+static void CollectSkirmishAlliedDamageSafety(Object *object, void *userData)
+{
+	SkirmishAlliedDamageSafetyContext *context =
+		static_cast<SkirmishAlliedDamageSafetyContext *>(userData);
+	if (!object || object->getControllingPlayer() != context->player ||
+		object->isDestroyed() ||
+		object->testStatus(OBJECT_STATUS_SOLD)) return;
+	const Bool actualBuilder = object->isKindOf(KINDOF_DOZER) &&
+		!object->testStatus(OBJECT_STATUS_UNMANNED) && object->getAIUpdateInterface() &&
+		object->getAIUpdateInterface()->getDozerAIInterface();
+	const Bool builder = actualBuilder && !object->isEffectivelyDead();
+	if (builder) ++context->liveBuilders;
+	UnsignedInt damageFrame = 0;
+	if (!HasSkirmishAlliedHostileDamage(object, context->player,
+		context->now, &damageFrame)) return;
+	const Real dx = object->getPosition()->x - context->base.x;
+	const Real dy = object->getPosition()->y - context->base.y;
+	if ((context->hasBase && dx * dx + dy * dy <= context->radiusSquared) ||
+		object->isKindOf(KINDOF_COMMANDCENTER) ||
+		(actualBuilder && object->getID() == context->recoveryBuilderID))
+		context->homeDamage = true;
+	if (builder) context->damagedBuilder = true;
+	// Use stable command ownership, not the unit's post-hit guard/reaction state.
+	if (context->checkHeld && context->owner &&
+		IsSkirmishStrategyFrameReached(damageFrame, context->holdAdmissionFrame + 1) &&
+		context->owner->shouldHoldAlliedScriptCommand(object) &&
+		!context->owner->isAlliedSupportMember(object))
+		context->heldDamage = true;
+}
+
+static void InitSkirmishAlliedDamageSafety(SkirmishAlliedDamageSafetyContext *context,
+	Player *player, const Coord3D &base, Bool hasBase, Real radius,
+	ObjectID recoveryBuilderID)
+{
+	context->player = player;
+	context->owner = 0;
+	context->now = TheGameLogic->getFrame();
+	context->base = base;
+	context->radiusSquared = radius * radius;
+	context->hasBase = hasBase;
+	context->recoveryBuilderID = recoveryBuilderID;
+	context->liveBuilders = 0;
+	context->damagedBuilder = false;
+	context->homeDamage = false;
+	context->heldDamage = false;
+	context->checkHeld = false;
+	context->holdAdmissionFrame = 0;
+}
+
+static Bool HasSkirmishAlliedHomeDamage(const SkirmishAlliedDamageSafetyContext &context)
+{
+	// GLA collectors are builders too. Only the sole surviving builder is
+	// critical everywhere; ordinary collecting/expansion workers stay local.
+	return context.homeDamage || (context.liveBuilders == 1 && context.damagedBuilder);
+}
+
+static ObjectID GetSkirmishAlliedRecoveryBuilderID(Player *player, ObjectID constructionID)
+{
+	Object *construction = TheGameLogic->findObjectByID(constructionID);
+	return construction && construction->getControllingPlayer() == player &&
+		!construction->isEffectivelyDead() && !construction->isDestroyed() &&
+		!construction->testStatus(OBJECT_STATUS_SOLD) ? construction->getBuilderID() : INVALID_ID;
+}
+
 void AISkirmishPlayer::collectStrategyMetrics(
-	SkirmishStrategyMetrics *metrics, ObjectID *strategicTargetID)
+	SkirmishStrategyMetrics *metrics, ObjectID *strategicTargetID, Int *alliedSafetyThreat)
 {
 	metrics->economyHealth = 0;
 	metrics->baseIntegrity = 0;
@@ -7585,9 +7709,16 @@ void AISkirmishPlayer::collectStrategyMetrics(
 	Bool persistedTargetVisible = false;
 	const Real threatRadius = (m_baseRadius > 0.0f ? m_baseRadius : 0.0f) + 500.0f;
 	const Real threatRadiusSquared = threatRadius * threatRadius;
+	SkirmishAlliedDamageSafetyContext alliedSafety;
+	if (alliedSafetyThreat) {
+		InitSkirmishAlliedDamageSafety(&alliedSafety, m_player, m_baseCenter,
+			m_baseCenterSet, threatRadius,
+			GetSkirmishAlliedRecoveryBuilderID(m_player, m_recoveryConstructionID));
+	}
 
 	for (Object *object = TheGameLogic->getFirstObject(); object;
 		object = object->getNextObject()) {
+		if (alliedSafetyThreat) CollectSkirmishAlliedDamageSafety(object, &alliedSafety);
 		const Bool isPersistedAssaultTarget =
 			(m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT ||
 			 m_strategyState.pendingMode == SKIRMISH_STRATEGY_ASSAULT) &&
@@ -7848,6 +7979,11 @@ void AISkirmishPlayer::collectStrategyMetrics(
 				((__int64)enemyLocalCombatValue + ownLocalCombatValue)));
 	metrics->immediateThreat = absoluteThreat > relativeThreat ?
 		absoluteThreat : relativeThreat;
+	if (alliedSafetyThreat) {
+		*alliedSafetyThreat = metrics->immediateThreat;
+		if (HasSkirmishAlliedHomeDamage(alliedSafety) && *alliedSafetyThreat < 60)
+			*alliedSafetyThreat = 60;
+	}
 	const UnsignedInt attackedFrame = m_player->getAttackedFrame();
 	if (attackedFrame != 0 &&
 		TheGameLogic->getFrame() - attackedFrame <= 10 * LOGICFRAMES_PER_SECOND &&
@@ -8167,8 +8303,16 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 	Int incomes = 0;
 	Int production = 0;
 	Int commandHealth = 0;
+	SkirmishAlliedDamageSafetyContext humanSafety;
+	if (!owner)
+		InitSkirmishAlliedDamageSafety(&humanSafety, player, base, anchor != 0,
+			radius, anchor && anchor->isKindOf(KINDOF_COMMANDCENTER) &&
+			(anchor->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+			 anchor->testStatus(OBJECT_STATUS_RECONSTRUCTING)) ?
+			anchor->getBuilderID() : INVALID_ID);
 	for (Object *object = TheGameLogic->getFirstObject(); object;
 		object = object->getNextObject()) {
+		if (!owner) CollectSkirmishAlliedDamageSafety(object, &humanSafety);
 		if (object->isEffectivelyDead() || object->isDestroyed() ||
 			object->testStatus(OBJECT_STATUS_SOLD)) continue;
 		Player *controlling = object->getControllingPlayer();
@@ -8226,8 +8370,7 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 		if (relative > facts->immediateThreat) facts->immediateThreat = relative;
 	}
 	const UnsignedInt now = TheGameLogic->getFrame();
-	if (player->getAttackedFrame() != 0 &&
-		now - player->getAttackedFrame() <= 10 * LOGICFRAMES_PER_SECOND && facts->immediateThreat < 60)
+	if (!owner && HasSkirmishAlliedHomeDamage(humanSafety) && facts->immediateThreat < 60)
 		facts->immediateThreat = 60;
 	facts->missingIncome = incomes == 0;
 	facts->missingProduction = production == 0;
@@ -8235,7 +8378,8 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 		HasSkirmishAlliedRecoveryRoute(player, facts->missingIncome, facts->missingProduction);
 	if (owner) {
 		ObjectID targetID = INVALID_ID;
-		owner->collectStrategyMetrics(&owner->m_alliedCapturedStrategyMetrics, &targetID);
+		owner->collectStrategyMetrics(&owner->m_alliedCapturedStrategyMetrics, &targetID,
+			&owner->m_alliedCapturedSafetyThreat);
 		owner->m_alliedCapturedStrategyAvailable = true;
 		owner->m_alliedCapturedStrategyFrame = now;
 		owner->m_alliedCapturedStrategyTargetID = targetID;
@@ -8244,7 +8388,7 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 		facts->economyHealth = metrics.economyHealth;
 		facts->baseIntegrity = metrics.baseIntegrity;
 		facts->armyReadiness = metrics.armyReadiness;
-		facts->immediateThreat = metrics.immediateThreat;
+		facts->immediateThreat = owner->m_alliedCapturedSafetyThreat;
 		facts->targetEnemyIndex = owner->m_currentEnemy ? owner->m_currentEnemy->getPlayerIndex() : -1;
 		facts->targetObjectID = targetID;
 		facts->targetScore = 70 * metrics.enemyOpportunity + 30 * metrics.attackConfidence;
@@ -8310,6 +8454,8 @@ AISkirmishPlayer::getAlliedCoordinationDiagnostics() const
 	d.assaultActive = m_alliedAssaultActive;
 	d.assaultLaunched = m_alliedAssaultLaunched;
 	d.strategyResumePending = m_alliedStrategyResumePending;
+	d.holdAdmissionValid = m_alliedHoldAdmissionValid;
+	d.holdAdmissionFrame = m_alliedHoldAdmissionFrame;
 	d.leaderIndex = m_alliedLeaderIndex;
 	d.enemyIndex = m_alliedEnemyIndex;
 	d.targetID = m_alliedTargetID;
@@ -8362,6 +8508,7 @@ void AISkirmishPlayer::xferAlliedCoordination(Xfer *xfer)
 		m_alliedCapturedStrategyAvailable = false;
 		m_alliedCapturedStrategyFrame = 0;
 		m_alliedCapturedStrategyTargetID = INVALID_ID;
+		invalidateAlliedSafetyCache();
 	}
 }
 
@@ -8441,6 +8588,31 @@ void AISkirmishPlayer::clearAlliedAssault()
 	m_alliedNextHoldFrame = 0;
 }
 
+void AISkirmishPlayer::queryAlliedDamageSafety()
+{
+	const UnsignedInt now = TheGameLogic->getFrame();
+	if (m_alliedDamageSafetyValid && m_alliedDamageSafetyFrame == now) return;
+	m_alliedDamageSafetyValid = true;
+	m_alliedDamageSafetyFrame = now;
+	m_alliedRecentHomeDamage = false;
+	m_alliedRecentHeldDamage = false;
+	const UnsignedInt attacked = m_player->getAttackedFrame();
+	if (attacked == 0 || now - attacked > 10 * LOGICFRAMES_PER_SECOND) return;
+	// One recent-attack-gated owned-object pass per owner/frame. No world,
+	// teammate strategy, route, or target evaluation is performed here.
+	SkirmishAlliedDamageSafetyContext context;
+	InitSkirmishAlliedDamageSafety(&context, m_player, m_baseCenter,
+		m_baseCenterSet, getAlliedSafetyHomeRadius(),
+		GetSkirmishAlliedRecoveryBuilderID(m_player, m_recoveryConstructionID));
+	context.owner = this;
+	context.checkHeld = m_alliedHoldAdmissionValid &&
+		(isAlliedAssaultHolding() || m_alliedStrategyResumePending);
+	context.holdAdmissionFrame = m_alliedHoldAdmissionFrame;
+	m_player->iterateObjects(CollectSkirmishAlliedDamageSafety, &context);
+	m_alliedRecentHomeDamage = HasSkirmishAlliedHomeDamage(context);
+	m_alliedRecentHeldDamage = context.heldDamage;
+}
+
 void AISkirmishPlayer::resumeAlliedStrategy()
 {
 	if (!usesAlliedCoordinationBehavior() || !m_alliedStrategyResumePending ||
@@ -8448,15 +8620,17 @@ void AISkirmishPlayer::resumeAlliedStrategy()
 	const UnsignedInt now = TheGameLogic->getFrame();
 	const Bool fortifying = m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY;
 	if (!fortifying && m_alliedResumeSafetyFrame != now) return;
-	const Bool recentAttack = m_player->getAttackedFrame() != 0 &&
-		now - m_player->getAttackedFrame() <= 10 * LOGICFRAMES_PER_SECOND;
-	if (!fortifying && (!m_alliedResumeAttackSafe || recentAttack)) {
+	queryAlliedDamageSafety();
+	if (!fortifying && (!m_alliedResumeAttackSafe ||
+		m_alliedRecentHomeDamage || m_alliedRecentHeldDamage)) {
 		// An abort does not promote an attack. Keep the safe home command until
 		// another actual strategy evaluation establishes normal ownership.
 		commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0, true);
 		return;
 	}
 	m_alliedStrategyResumePending = false;
+	m_alliedHoldAdmissionValid = false;
+	m_alliedHoldAdmissionFrame = 0;
 	// NONE forces one normal strategy impulse even when mode/target stayed
 	// unchanged while the shared hold suppressed its original transition.
 	applyStrategyMode(SKIRMISH_STRATEGY_NONE, m_strategyState.currentMode, INVALID_ID, true);
@@ -8577,6 +8751,11 @@ void AISkirmishPlayer::commitAlliedCoordination(
 	}
 	m_alliedAssaultExpiryFrame = m_alliedAssaultFrame + 90 * LOGICFRAMES_PER_SECOND;
 	m_alliedStrategyResumePending = false;
+	// This owner's accepted hold may start after the leader's announcement.
+	// Frame-resolution body metadata cannot order earlier/later hits within
+	// this frame; only strict subsequent-frame outside-home damage is proof.
+	m_alliedHoldAdmissionValid = true;
+	m_alliedHoldAdmissionFrame = now;
 	m_alliedNextHoldFrame = now;
 	m_strategyState.alliedCoordinationCooldownActive = true;
 	m_strategyState.nextAlliedCoordinationFrame = m_alliedAssaultExpiryFrame;
@@ -8715,8 +8894,8 @@ void AISkirmishPlayer::updateAlliedAssignments()
 	if (!usesAlliedCoordinationBehavior() || !TheAI) return;
 	const UnsignedInt now = TheGameLogic->getFrame();
 	const SkirmishAIAlliedPlayerFacts *own = TheAI->getAlliedPlayerFacts(m_player->getPlayerIndex());
-	const Bool recentAttack = m_player->getAttackedFrame() != 0 &&
-		now - m_player->getAttackedFrame() <= 10 * LOGICFRAMES_PER_SECOND;
+	if (m_alliedAssaultActive || m_alliedSupportRecipientIndex >= 0 || m_alliedStrategyResumePending)
+		queryAlliedDamageSafety();
 	if (m_alliedAssaultActive) {
 		Object *target = 0;
 		Player *leader = FindSkirmishAlliedPlayer(m_alliedLeaderIndex);
@@ -8731,7 +8910,9 @@ void AISkirmishPlayer::updateAlliedAssignments()
 				leaderAI->m_alliedTargetID == m_alliedTargetID &&
 				leaderAI->m_alliedAssaultFrame == m_alliedAssaultFrame;
 		}
-		if (!own || !own->alive || own->immediateThreat >= 60 || recentAttack ||
+		if (!own || !own->alive || own->immediateThreat >= 60 ||
+			m_alliedRecentHomeDamage || (!m_alliedAssaultLaunched && m_alliedRecentHeldDamage) ||
+			(!m_alliedAssaultLaunched && !m_alliedHoldAdmissionValid) ||
 			m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY ||
 			(m_alliedLeaderIndex != m_player->getPlayerIndex() && !IsSkirmishMutualLiveAlly(m_player, leader)) ||
 			!leaderAnnouncementValid ||
@@ -8757,7 +8938,7 @@ void AISkirmishPlayer::updateAlliedAssignments()
 	}
 	if (m_alliedSupportRecipientIndex >= 0) {
 		const SkirmishAIAlliedPlayerFacts *need = TheAI->getAlliedPlayerFacts(m_alliedSupportRecipientIndex);
-		if (!own || own->immediateThreat >= 50 || recentAttack || own->baseIntegrity < 35 ||
+		if (!own || own->immediateThreat >= 50 || m_alliedRecentHomeDamage || own->baseIntegrity < 35 ||
 			!need || !need->alive || need->distress < 40 ||
 			!IsSkirmishMutualLiveAlly(m_player, FindSkirmishAlliedPlayer(m_alliedSupportRecipientIndex)))
 			recallAlliedSupport();
@@ -11165,17 +11346,20 @@ Bool AISkirmishPlayer::updateStrategy()
 		return false;
 	SkirmishStrategyMetrics metrics;
 	ObjectID targetID = INVALID_ID;
+	const Bool alliedBehavior = usesAlliedCoordinationBehavior();
+	Int alliedSafetyThreat = 0;
 	if (usesAlliedCoordinationBehavior() && m_alliedCapturedStrategyAvailable &&
 		m_alliedCapturedStrategyFrame == currentFrame) {
 		metrics = m_alliedCapturedStrategyMetrics;
+		alliedSafetyThreat = m_alliedCapturedSafetyThreat;
 		targetID = m_alliedCapturedStrategyTargetID;
 		m_alliedCapturedStrategyAvailable = false;
 	} else {
-		collectStrategyMetrics(&metrics, &targetID);
+		collectStrategyMetrics(&metrics, &targetID, alliedBehavior ? &alliedSafetyThreat : 0);
 	}
 	if (usesAlliedCoordinationBehavior()) {
 		m_alliedResumeSafetyFrame = currentFrame;
-		m_alliedResumeAttackSafe = metrics.immediateThreat < 60 && metrics.baseIntegrity >= 65;
+		m_alliedResumeAttackSafe = alliedSafetyThreat < 60 && metrics.baseIntegrity >= 65;
 	}
 	if (usesAlliedCoordinationBehavior() && m_alliedAssaultActive && m_alliedAssaultLaunched) {
 		Object *sharedTarget = 0;
@@ -14415,6 +14599,8 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	{
 		xferAlliedCoordination(xfer);
 		xfer->xferBool(&m_alliedStrategyResumePending);
+		xfer->xferBool(&m_alliedHoldAdmissionValid);
+		xfer->xferUnsignedInt(&m_alliedHoldAdmissionFrame);
 	}
 }
 
@@ -14442,13 +14628,14 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	 * 18: Per-target forward retry and bounded full-tunnel wait
 	 * 19: Exhausted forward targets and committed alternate-target observation
 	 * 20: Allied assault, support ownership, and received-money relay guard
-	 * 21: Pending return to ordinary strategy after an allied hold abort */
+	 * 21: Pending return to ordinary strategy after an allied hold abort
+	 * 22: Per-owner allied hold admission cutoff for positive hostile damage */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 21;
+	XferVersion currentVersion = 22;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -14783,9 +14970,21 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 		xfer->xferBool(&m_alliedStrategyResumePending);
 	else if (xfer->getXferMode() == XFER_LOAD)
 		m_alliedStrategyResumePending = false;
+	if (version >= 22) {
+		xfer->xferBool(&m_alliedHoldAdmissionValid);
+		xfer->xferUnsignedInt(&m_alliedHoldAdmissionFrame);
+	} else if (xfer->getXferMode() == XFER_LOAD) {
+		// Older snapshots cannot establish this owner's pre-join history.
+		// Cancel an unlaunched hold and requalify ordinary ownership safely.
+		m_alliedHoldAdmissionValid = false;
+		m_alliedHoldAdmissionFrame = 0;
+		if (m_alliedAssaultActive && !m_alliedAssaultLaunched)
+			clearAlliedAssault();
+	}
 	if (xfer->getXferMode() == XFER_LOAD) {
 		m_alliedResumeAttackSafe = false;
 		m_alliedResumeSafetyFrame = 0;
+		invalidateAlliedSafetyCache();
 	}
 	if (xfer->getXferMode() == XFER_LOAD) {
 		m_tunnelBuildLockedBuilderID = INVALID_ID;
