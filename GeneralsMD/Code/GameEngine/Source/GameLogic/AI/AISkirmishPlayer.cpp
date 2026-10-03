@@ -8026,6 +8026,8 @@ static Bool HasSkirmishAlliedRecoveryRoute(Player *player,
 	// with a usable construction command or a completed factory capable of
 	// restoring a builder. Abandoned scaffolds and permanently invalid products
 	// are not a recovery route. This also admits a surviving bare dozer/worker.
+	// Rebuilding a command center preserves the multi-step recovery foundation:
+	// replace builders, rebuild power/prerequisites, then restore income or production.
 	if (!player || !TheGameLogic || !TheBuildAssistant || !TheControlBar)
 		return false;
 	for (Object *object = TheGameLogic->getFirstObject(); object;
@@ -8099,9 +8101,12 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 	for (Int ally = 0; ally < ThePlayerList->getPlayerCount(); ++ally) {
 		Player *other = ThePlayerList->getNthPlayer(ally);
 		const Int index = other ? other->getPlayerIndex() : -1;
-		if (index >= 0 && index < SKIRMISH_AI_ALLIED_MAX_PLAYERS &&
-			other->getDefaultTeam() && player->getRelationship(other->getDefaultTeam()) == ALLIES)
-			facts->alliedMask |= 1U << index;
+		if (index >= 0 && index < SKIRMISH_AI_ALLIED_MAX_PLAYERS && other->getDefaultTeam()) {
+			if (player->getRelationship(other->getDefaultTeam()) == ALLIES)
+				facts->alliedMask |= 1U << index;
+			else if (player->getRelationship(other->getDefaultTeam()) == ENEMIES)
+				facts->enemyMask |= 1U << index;
+		}
 	}
 	if (!facts->alive) return;
 	AISkirmishPlayer *owner = facts->isAI ?
@@ -8171,6 +8176,7 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 			facts->localEnemyValue = AddSkirmishStrategyValue(facts->localEnemyValue, value);
 	}
 	const Int poor = TheAI->getAiData()->m_resourcesPoor > 0 ? TheAI->getAiData()->m_resourcesPoor : 2500;
+	facts->starvationCashLimit = poor;
 	const Int wealthy = TheAI->getAiData()->m_resourcesWealthy > poor ?
 		TheAI->getAiData()->m_resourcesWealthy :
 		(Int)((__int64)poor * 4 > 2147483647 ? 2147483647 : (__int64)poor * 4);

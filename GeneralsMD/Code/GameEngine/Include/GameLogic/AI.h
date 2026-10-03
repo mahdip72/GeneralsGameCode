@@ -312,6 +312,7 @@ protected:
 	void resetAlliedCoordination();
 	void updateAlliedCoordination();
 	void xferAlliedCoordination(Xfer *xfer);
+	void xferAlliedFactExtensions(Xfer *xfer);
 	Bool m_alliedEvaluationScheduled;
 	UnsignedInt m_nextAlliedEvaluationFrame;
 	Int m_alliedStarvationStreaks[SKIRMISH_AI_ALLIED_MAX_PLAYERS];

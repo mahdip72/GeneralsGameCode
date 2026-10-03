@@ -1053,6 +1053,20 @@ void AI::xferAlliedCoordination(Xfer *xfer)
 	}
 }
 
+void AI::xferAlliedFactExtensions(Xfer *xfer)
+{
+	// Keep the complete version-2 block unchanged and append version-3 facts.
+	for (Int i = 0; i < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++i) {
+		SkirmishAIAlliedPlayerFacts &facts = m_alliedPlayerFacts[i];
+		xfer->xferInt(&facts.starvationCashLimit);
+		xfer->xferUnsignedInt(&facts.enemyMask);
+		if (xfer->getXferMode() == XFER_LOAD) {
+			if (facts.starvationCashLimit < 0) facts.starvationCashLimit = 0;
+			facts.enemyMask &= 0x0000ffffU;
+		}
+	}
+}
+
 /**
  * Destroy the AI system
  */
@@ -1723,8 +1737,10 @@ void AI::crc( Xfer *xfer )
 	if (ShouldIncludeSkirmishAIAlliedCoordinationCRCFields(
 			TheGameLogic && TheGameLogic->isInReplayGame(),
 			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
-				SKIRMISH_AI_REPLAY_EPOCH_LEGACY))
+				SKIRMISH_AI_REPLAY_EPOCH_LEGACY)) {
 		xferAlliedCoordination(xfer);
+		xferAlliedFactExtensions(xfer);
+	}
 }
 
 //-----------------------------------------------------------------------------
@@ -1732,13 +1748,23 @@ void AI::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 2;
+	XferVersion currentVersion = 3;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 	if (version >= 2)
 		xferAlliedCoordination(xfer);
 	else if (xfer->getXferMode() == XFER_LOAD)
 		resetAlliedCoordination();
+	if (version >= 3)
+		xferAlliedFactExtensions(xfer);
+	else if (xfer->getXferMode() == XFER_LOAD) {
+		// Old snapshots have no proof of low cash or hostile relationships.
+		// Fail closed until the next owner-thread roster capture.
+		for (Int i = 0; i < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++i) {
+			m_alliedPlayerFacts[i].starvationCashLimit = 0;
+			m_alliedPlayerFacts[i].enemyMask = 0;
+		}
+	}
 }
 
 //-----------------------------------------------------------------------------
