@@ -4,11 +4,14 @@
 #include "Renderer/RenderTexturePublication.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 #if defined(_WIN64)
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <stdexcept>
+#include <type_traits>
 #endif
 
 #if __cplusplus >= 201103L
@@ -17,8 +20,11 @@
 
 namespace
 {
+bool emitOwnerTrace = false;
 int Check(bool condition, const char *message)
 {
+	if (emitOwnerTrace)
+		printf("%s=%u\n", message, condition ? 1u : 0u);
 	if (condition)
 	{
 		return 0;
@@ -313,10 +319,214 @@ int TestNativeOwnerLifecycleExclusion()
 #endif
 	return result;
 }
+
+int TestNativeOwnerNonLifoPins()
+{
+	int result = 0;
+#if defined(_WIN64)
+	using namespace rts::render;
+	static_assert(!std::is_copy_constructible<NativeGameRenderOwnerScope>::value &&
+		!std::is_move_constructible<NativeGameRenderOwnerScope>::value &&
+		!std::is_copy_constructible<NativeGameRenderOwnerLifecycleScope>::value &&
+		!std::is_move_constructible<NativeGameRenderOwnerLifecycleScope>::value,
+		"owner scopes cannot transfer their same-thread participation by copy or move");
+	FakeNativeOwner owner, replacement;
+	owner.initialized = owner.operational = true;
+	SetGameRenderClientNativeOwner(&owner);
+	NativeGameRenderOwnerScope *first = new NativeGameRenderOwnerScope;
+	NativeGameRenderOwnerScope *last = new NativeGameRenderOwnerScope;
+	delete first;
+	result |= Check(last->Get() == &owner &&
+		IsNativeGameRenderOwnerPinnedByCurrentThread() && IsNativeGameRendererActive(),
+		"non-LIFO first destruction preserves the last live pin and recursive query");
+	SetGameRenderClientNativeOwner(&replacement);
+	result |= Check(GetGameRenderClientNativeOwner() == &owner,
+		"non-LIFO last live pin still rejects same-thread publication");
+	delete last;
+	result |= Check(!IsNativeGameRenderOwnerPinnedByCurrentThread(),
+		"non-LIFO last destruction releases the command pin");
+	SetGameRenderClientNativeOwner(&replacement);
+	result |= Check(GetGameRenderClientNativeOwner() == &replacement,
+		"publication succeeds after the last non-LIFO pin ends");
+	SetGameRenderClientNativeOwner(0);
+	{
+		NativeGameRenderOwnerScope empty;
+		NativeGameRenderOwnerScope nestedEmpty;
+		result |= Check(empty.Get() == 0 && nestedEmpty.Get() == 0 &&
+			IsNativeGameRenderOwnerPinnedByCurrentThread() && !IsNativeGameRendererActive(),
+			"null owner still participates in nested lifetime pinning");
+		SetGameRenderClientNativeOwner(&owner);
+		result |= Check(GetGameRenderClientNativeOwner() == 0,
+			"null nested pins reject same-thread publication too");
+	}
+	result |= Check(!IsNativeGameRenderOwnerPinnedByCurrentThread(),
+		"null owner pins release normally");
+#endif
+	return result;
+}
+
+int TestNativeOwnerLifecycleBeforePins()
+{
+	int result = 0;
+#if defined(_WIN64)
+	using namespace rts::render;
+	FakeNativeOwner owner;
+	owner.initialized = owner.operational = true;
+	SetGameRenderClientNativeOwner(&owner);
+	NativeGameRenderOwnerLifecycleScope *lifecycle = new NativeGameRenderOwnerLifecycleScope;
+	NativeGameRenderOwnerScope *first = new NativeGameRenderOwnerScope;
+	NativeGameRenderOwnerScope *last = new NativeGameRenderOwnerScope;
+	result |= Check(lifecycle->IsAcquired() && first->Get() == &owner && last->Get() == &owner,
+		"lifecycle-before-command admits two command pins under its separate gate");
+	lifecycle->Publish(0);
+	result |= Check(GetGameRenderClientNativeOwner() == &owner,
+		"lifecycle-before-command cannot publish while either command pin lives");
+	delete lifecycle;
+	delete first;
+	result |= Check(IsNativeGameRenderOwnerPinnedByCurrentThread() &&
+		last->Get() == &owner && IsNativeGameRendererActive(),
+		"destroyed lifecycle and first pin leave the last command gate held");
+	SetGameRenderClientNativeOwner(0);
+	result |= Check(GetGameRenderClientNativeOwner() == &owner,
+		"last command rejects publication after its earlier lifecycle ended");
+	delete last;
+	SetGameRenderClientNativeOwner(0);
+	result |= Check(!IsNativeGameRenderOwnerPinnedByCurrentThread() &&
+		GetGameRenderClientNativeOwner() == 0,
+		"last command releases its own gate after early lifecycle destruction");
+	{
+		NativeGameRenderOwnerLifecycleScope remaining;
+		{
+			NativeGameRenderOwnerScope firstQuery, nestedQuery;
+		}
+		result |= Check(remaining.IsAcquired() && IsNativeGameRenderOwnerPinnedByCurrentThread(),
+			"last nested pin release does not release the surviving lifecycle gate");
+		remaining.Publish(&owner);
+		result |= Check(remaining.Get() == &owner,
+			"surviving lifecycle publishes after all its command pins return");
+	}
+	SetGameRenderClientNativeOwner(0);
+#endif
+	return result;
+}
+
+#if defined(_WIN64)
+class CheckedNativeOwner : public FakeNativeOwner
+{
+public:
+	CheckedNativeOwner() : throwQuery(false), initializedCalls(0), operationalCalls(0),
+		fogCalls(0), recordedFailures(0), callbackPinned(false) {}
+	virtual bool IsInitialized() const
+	{
+		++initializedCalls;
+		if (throwQuery) throw std::runtime_error("owner query fixture");
+		return initialized;
+	}
+	virtual bool IsOperational() const { ++operationalCalls; return operational; }
+	virtual rts::render::RenderResult SetGameFogState(const rts::render::LegacyFogConstants &)
+	{
+		++fogCalls;
+		rts::render::NativeGameRenderOwnerScope nested;
+		callbackPinned = nested.Get() == this && rts::render::IsNativeGameRendererActive();
+		rts::render::SetGameRenderClientNativeOwner(0);
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	virtual void RecordGameFailure(rts::render::RenderResult value)
+	{
+		if (value == rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
+			rts::render::IsNativeGameRenderOwnerPinnedByCurrentThread() &&
+			rts::render::IsNativeGameRendererActive()) ++recordedFailures;
+	}
+	bool throwQuery;
+	mutable unsigned int initializedCalls, operationalCalls;
+	unsigned int fogCalls, recordedFailures;
+	bool callbackPinned;
+};
+#endif
+
+int TestNativeOwnerValidationAndUnwind()
+{
+	int result = 0;
+#if defined(_WIN64)
+	using namespace rts::render;
+	CheckedNativeOwner owner;
+	owner.initialized = owner.operational = true;
+	SetGameRenderClientNativeOwner(&owner);
+	{
+		NativeGameRenderOwnerScope outer;
+		result |= Check(IsNativeGameRendererActive(), "nested query validates an operational owner");
+		owner.operational = false;
+		result |= Check(!IsNativeGameRendererActive(),
+			"nested query revalidates changed operational state rather than caching it");
+		owner.initialized = false;
+		const unsigned int before = owner.operationalCalls;
+		result |= Check(!IsNativeGameRendererActive() && owner.operationalCalls == before,
+			"nested uninitialized owner preserves validation short circuit");
+		owner.initialized = owner.operational = true;
+		owner.throwQuery = true;
+		bool caught = false;
+		try { IsNativeGameRendererActive(); }
+		catch (const std::runtime_error &) { caught = true; }
+		owner.throwQuery = false;
+		result |= Check(caught && IsNativeGameRenderOwnerPinnedByCurrentThread() &&
+			outer.Get() == &owner && IsNativeGameRendererActive(),
+			"nested query exception unwinds only its own participation");
+		LegacyFogConstants fog;
+		result |= Check(SetGameFogState(fog) == RENDER_RESULT_INVALID_ARGUMENT &&
+			owner.fogCalls == 1 && owner.recordedFailures == 1 && owner.callbackPinned &&
+			GetGameRenderClientNativeOwner() == &owner,
+			"failed command retains nested callbacks, failure reporting and publication exclusion");
+	}
+	owner.throwQuery = true;
+	bool caught = false;
+	try { IsNativeGameRendererActive(); }
+	catch (const std::runtime_error &) { caught = true; }
+	owner.throwQuery = false;
+	result |= Check(caught && !IsNativeGameRenderOwnerPinnedByCurrentThread(),
+		"outer query exception releases its last pin");
+	SetGameRenderClientNativeOwner(0);
+	result |= Check(GetGameRenderClientNativeOwner() == 0,
+		"publication remains usable after exception and failed command paths");
+#endif
+	return result;
+}
+
+int TestNativeOwnerForeignNonLifoExclusion()
+{
+	int result = 0;
+#if defined(_WIN64)
+	using namespace rts::render;
+	FakeNativeOwner owner;
+	owner.initialized = owner.operational = true;
+	SetGameRenderClientNativeOwner(&owner);
+	NativeGameRenderOwnerScope *first = new NativeGameRenderOwnerScope;
+	NativeGameRenderOwnerScope *last = new NativeGameRenderOwnerScope;
+	std::atomic<bool> started(false), acquired(false), foreignSawPin(true);
+	std::thread foreign([&]() {
+		foreignSawPin.store(IsNativeGameRenderOwnerPinnedByCurrentThread());
+		started.store(true);
+		NativeGameRenderOwnerScope pin;
+		acquired.store(pin.Get() == &owner);
+	});
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	while (!started.load() && std::chrono::steady_clock::now() < deadline)
+		std::this_thread::yield();
+	delete first;
+	result |= Check(started.load() && !foreignSawPin.load() && !acquired.load() &&
+		last->Get() == &owner && IsNativeGameRenderOwnerPinnedByCurrentThread(),
+		"foreign command cannot bypass the surviving non-LIFO pin gate");
+	delete last;
+	foreign.join();
+	result |= Check(acquired.load(), "foreign command acquires after last same-thread pin releases");
+	SetGameRenderClientNativeOwner(0);
+#endif
+	return result;
+}
 }
 
 int main()
 {
+	emitOwnerTrace = getenv("RTS_OWNER_PIN_TRACE") != 0;
 	int result = 0;
 	result |= TestNativeRenderTargetCapability();
 	result |= TestProjectionSeamDeclaration();
@@ -324,5 +534,9 @@ int main()
 	result |= TestTextureFormatCapability();
 	result |= TestNativeOwnerCallbackReentry();
 	result |= TestNativeOwnerLifecycleExclusion();
+	result |= TestNativeOwnerNonLifoPins();
+	result |= TestNativeOwnerLifecycleBeforePins();
+	result |= TestNativeOwnerValidationAndUnwind();
+	result |= TestNativeOwnerForeignNonLifoExclusion();
 	return result;
 }

@@ -3944,6 +3944,8 @@ int main(int argc, char **argv)
 			command.type = GAME_RENDER_COMMAND_SET_MATERIAL;
 			command.input = &material;
 			command.inputBytes = sizeof(material);
+			LegacyLogicalState materialBefore;
+			GetTrackedLegacyLogicalState(&materialBefore);
 			// Render2D submits its prelit material for each batch, while an
 			// unchanged ShaderClass may skip reapplying its combiners.
 			for (unsigned int batch = 0; batch < 2; ++batch)
@@ -3960,6 +3962,22 @@ int main(int argc, char **argv)
 					!actual.textureStages[0].projectedCoordinates &&
 					actual.textureStages[0].textureTransformCount == 0U,
 					"repeated UI material preserves shader combiners and resets mapping");
+				LegacyLogicalState materialAfter;
+				result |= Check(GetTrackedLegacyLogicalState(&materialAfter) &&
+					std::memcmp(&materialAfter.constants.world, &materialBefore.constants.world,
+						sizeof(materialBefore.constants.world)) == 0 &&
+					std::memcmp(&materialAfter.constants.view, &materialBefore.constants.view,
+						sizeof(materialBefore.constants.view)) == 0 &&
+					std::memcmp(&materialAfter.constants.projection, &materialBefore.constants.projection,
+						sizeof(materialBefore.constants.projection)) == 0 &&
+					std::memcmp(materialAfter.constants.textureTransforms, materialBefore.constants.textureTransforms,
+						sizeof(materialBefore.constants.textureTransforms)) == 0 &&
+					std::memcmp(materialAfter.constants.vertexShaderConstants, materialBefore.constants.vertexShaderConstants,
+						sizeof(materialBefore.constants.vertexShaderConstants)) == 0 &&
+					std::memcmp(materialAfter.constants.pixelShaderConstants, materialBefore.constants.pixelShaderConstants,
+						sizeof(materialBefore.constants.pixelShaderConstants)) == 0 &&
+					materialAfter.texturePresenceMask == materialBefore.texturePresenceMask,
+					"pipeline-only material admission preserves transforms, shader constants and textures");
 			}
 			TrackLegacyPipelineState(savedPipeline);
 		}

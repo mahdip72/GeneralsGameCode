@@ -1540,24 +1540,25 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					return RENDER_RESULT_INVALID_ARGUMENT;
 				}
 			}
-			LegacyLogicalState logical;
-			if (!GetTrackedLegacyLogicalState(&logical))
-				logical = LegacyLogicalState();
-			logical.pipeline.lightingEnable = material.lightingEnable;
-			logical.pipeline.ambientMaterialSource =
+			// Material publication changes only the pipeline and material below;
+			// do not copy unrelated transforms, lights and shader constants.
+			LegacyPipelineState pipeline;
+			if (!GetTrackedLegacyPipelineState(&pipeline))
+				pipeline = LegacyPipelineState();
+			pipeline.lightingEnable = material.lightingEnable;
+			pipeline.ambientMaterialSource =
 				material.ambientMaterialSource;
-			logical.pipeline.diffuseMaterialSource =
+			pipeline.diffuseMaterialSource =
 				material.diffuseMaterialSource;
-			logical.pipeline.emissiveMaterialSource =
+			pipeline.emissiveMaterialSource =
 				material.emissiveMaterialSource;
-			logical.constants.material = material.material;
 			for (unsigned int stage = 0;
 				stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 			{
 				if ((material.textureStageResetMask & (1U << stage)) != 0U)
 				{
 					LegacyTextureStageState &stageState =
-						logical.pipeline.textureStages[stage];
+						pipeline.textureStages[stage];
 					// A material without a mapper resets coordinate generation only.
 					// Combiners and samplers belong to shader/texture state and must
 					// survive consecutive draws using the same cached ShaderClass.
