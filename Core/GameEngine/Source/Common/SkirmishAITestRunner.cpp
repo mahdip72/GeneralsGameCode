@@ -123,6 +123,16 @@ struct AlliedFixtureState
 	Coord3D supportInitialPosition;
 	Coord3D supportAwayPosition;
 	Bool supportFaultIssued;
+	Bool cancellationIssued;
+	Bool cancellationSaved;
+	Bool postLoadProtectionVerified;
+	Int cancellationSlots[2];
+	ObjectID cancellationMembers[2];
+	UnsignedInt cancellationTeams[2];
+	Coord3D cancellationPositions[2];
+	Bool cancellationResumed[2];
+	ObjectID cancellationTarget;
+	UnsignedInt cancellationRelease;
 	AlliedFixtureState() : active(FALSE), fixtureCase(-1), startFrame(0),
 		checks(0), saveLoaded(FALSE), sawFortifyDecline(FALSE),
 		sawCoordination(FALSE), nextEvaluation(0), supportDonorSlot(-1),
@@ -133,10 +143,19 @@ struct AlliedFixtureState
 		coordinatedReleaseFrame(0), postLoadEvaluation(0), postLoadBlockedEvaluations(0),
 		assaultRetained(FALSE), assaultLaunched(FALSE), assaultLeader(-1), assaultEnemy(-1),
 		assaultTarget(INVALID_ID), assaultRelease(0), assaultExpiry(0),
-		supportTeamID(0), supportMemberID(INVALID_ID), supportFaultIssued(FALSE)
+		supportTeamID(0), supportMemberID(INVALID_ID), supportFaultIssued(FALSE),
+		cancellationIssued(FALSE), cancellationSaved(FALSE), postLoadProtectionVerified(FALSE),
+		cancellationTarget(INVALID_ID), cancellationRelease(0)
 	{
 		assaultSlots[0] = assaultSlots[1] = -1;
 		assaultMoved[0] = assaultMoved[1] = FALSE;
+		for (Int participant = 0; participant < 2; ++participant)
+		{
+			cancellationSlots[participant] = -1;
+			cancellationMembers[participant] = INVALID_ID;
+			cancellationTeams[participant] = 0;
+			cancellationResumed[participant] = FALSE;
+		}
 	}
 };
 AlliedFixtureState s_allied;
@@ -6809,6 +6828,7 @@ Bool SameAlliedDiagnostics(const AISkirmishPlayer::AlliedCoordinationDiagnostics
 	const AISkirmishPlayer::AlliedCoordinationDiagnostics &b)
 {
 	return a.assaultActive == b.assaultActive && a.assaultLaunched == b.assaultLaunched &&
+		a.strategyResumePending == b.strategyResumePending &&
 		a.leaderIndex == b.leaderIndex && a.enemyIndex == b.enemyIndex &&
 		a.targetID == b.targetID && a.assaultFrame == b.assaultFrame &&
 		a.assaultExpiryFrame == b.assaultExpiryFrame &&
@@ -6847,6 +6867,9 @@ Bool RoundTripAlliedFixture()
 		for (Int team = 0; team < before[slot - 1].supportTeamCount; ++team)
 			supportIDs[slot - 1].push_back(ai->getAlliedSupportTeamID(team));
 	}
+	if (!s_allied.cancellationIssued ||
+		(!before[s_allied.cancellationSlots[0] - 1].strategyResumePending &&
+		 !before[s_allied.cancellationSlots[1] - 1].strategyResumePending)) return FALSE;
 	AsciiString filename;
 	filename.format("SkirmishAIAllied_%s.sav", s_runner.runNonce);
 	UnicodeString description;
@@ -6884,10 +6907,60 @@ Bool RoundTripAlliedFixture()
 	s_allied.postLoadBlockedEvaluations = 0;
 	printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_ASSERT frame=%u file=%s "
 		"player_slots=7 central_cadence=preserved commitments=preserved support_ids=preserved "
-		"cooldown_until=%u remaining_frames=%u post_load_protection=pending\n",
+		"cooldown_until=%u remaining_frames=%u strategy_resume_pending=preserved_nonzero "
+		"post_load_protection=pending\n",
 		frame, saved.filename.str(), s_allied.aidCooldownUntil, s_allied.aidCooldownUntil - frame);
 	fflush(stdout);
 	return TRUE;
+}
+
+void BeginAlliedCancellation(Int firstSlot, Int secondSlot, ObjectID targetID,
+	UnsignedInt releaseFrame, UnsignedInt frame)
+{
+	if (s_allied.cancellationIssued || releaseFrame <= frame) return;
+	const Int slots[2] = { firstSlot, secondSlot };
+	Object *held[2] = { nullptr, nullptr };
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(slots[participant]);
+		AISkirmishPlayer *skirmish = GetAlliedFixtureAI(slots[participant]);
+		Coord3D home;
+		if (!player || !skirmish || !skirmish->getBaseCenter(&home)) return;
+		for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
+		{
+			AIUpdateInterface *ai = object->getAIUpdateInterface();
+			const Coord3D *guard = ai ? ai->getGuardLocation() : nullptr;
+			if (IsSkirmishAIRecoveryCombatUnit(object, player) && object->getTeam() && ai && guard &&
+				skirmish->isAlliedAssaultHoldingTeam(object->getTeam()->getID()) &&
+				ai->getLastCommandSource() == CMD_FROM_AI && ai->getGuardTargetType() == GUARDTARGET_LOCATION)
+			{
+				const Real dx = guard->x - home.x;
+				const Real dy = guard->y - home.y;
+				if (dx * dx + dy * dy <= 50.0f * 50.0f) { held[participant] = object; break; }
+			}
+		}
+		if (!held[participant]) return;
+	}
+	Object *target = TheGameLogic->findObjectByID(targetID);
+	if (!IsLiveSkirmishAIRecoveryObject(target)) return;
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		s_allied.cancellationSlots[participant] = slots[participant];
+		s_allied.cancellationMembers[participant] = held[participant]->getID();
+		s_allied.cancellationTeams[participant] = held[participant]->getTeam()->getID();
+		s_allied.cancellationPositions[participant] = *held[participant]->getPosition();
+	}
+	s_allied.cancellationIssued = TRUE;
+	s_allied.cancellationTarget = targetID;
+	s_allied.cancellationRelease = releaseFrame;
+	// Use the real world-state loss boundary. No commitment or resume flag is
+	// written by the fixture; normal owner updates must cancel the cohort.
+	DestroySkirmishAIRecoveryObject(target);
+	printf("SKIRMISH_AI_ALLIED_CANCELLATION_FAULT frame=%u release=%u target=%u "
+		"held_slots=%d,%d held_members=%u,%u trigger=shared_target_loss\n",
+		frame, releaseFrame, targetID, slots[0], slots[1],
+		s_allied.cancellationMembers[0], s_allied.cancellationMembers[1]);
+	fflush(stdout);
 }
 
 void ObserveAlliedCoordination(UnsignedInt frame)
@@ -6946,14 +7019,12 @@ void ObserveAlliedCoordination(UnsignedInt frame)
 					a.assaultFrame, a.assaultExpiryFrame, s_allied.sawFortifyDecline);
 				fflush(stdout);
 				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
-					s_allied.sawAid && !s_allied.saveLoaded && s_allied.aidCooldownUntil > frame &&
+					s_allied.sawAid && !s_allied.saveLoaded &&
+					slot != s_allied.aidRecipientSlot && peer != s_allied.aidRecipientSlot &&
+					s_allied.aidCooldownUntil > frame &&
 					s_allied.aidCooldownUntil - frame >= 20 * LOGICFRAMES_PER_SECOND)
 				{
-					if (!RoundTripAlliedFixture())
-					{
-						FailSkirmishAITest("allied_save_load_assertion");
-						RequestSkirmishAITestStop();
-					}
+					BeginAlliedCancellation(slot, peer, a.targetID, a.assaultFrame, frame);
 					return;
 				}
 			}
@@ -6966,6 +7037,92 @@ Real AlliedFixtureDistanceSquared(const Coord3D &a, const Coord3D &b)
 	const Real dx = a.x - b.x;
 	const Real dy = a.y - b.y;
 	return dx * dx + dy * dy;
+}
+
+void ObserveAlliedCancellationResume(UnsignedInt frame)
+{
+	if (!s_allied.cancellationIssued) return;
+	Object *lostTarget = TheGameLogic->findObjectByID(s_allied.cancellationTarget);
+	if (IsLiveSkirmishAIRecoveryObject(lostTarget)) return;
+	Bool bothCanceled = TRUE;
+	Bool anyPending = FALSE;
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		const Int slot = s_allied.cancellationSlots[participant];
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(slot);
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
+		Object *member = TheGameLogic->findObjectByID(s_allied.cancellationMembers[participant]);
+		if (!ai || !player || !IsSkirmishAIRecoveryCombatUnit(member, player) ||
+			!member->getTeam() || member->getTeam()->getID() != s_allied.cancellationTeams[participant])
+		{ FailSkirmishAITest("allied_cancellation_held_member_lost"); RequestSkirmishAITestStop(); return; }
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
+		if (state.assaultLaunched)
+		{ FailSkirmishAITest("allied_cancellation_follower_launched"); RequestSkirmishAITestStop(); return; }
+		bothCanceled = bothCanceled && !state.assaultActive;
+		anyPending = anyPending || state.strategyResumePending;
+		if (!s_allied.cancellationSaved || state.assaultActive || state.strategyResumePending ||
+			s_allied.cancellationResumed[participant]) continue;
+		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(player->getPlayerIndex());
+		const UnsignedInt attacked = player->getAttackedFrame();
+		if (!facts || !facts->valid || !facts->alive || facts->immediateThreat >= 60 ||
+			facts->baseIntegrity < 65 || (attacked != 0 && frame - attacked < 10 * LOGICFRAMES_PER_SECOND)) continue;
+		AIUpdateInterface *unitAI = member->getAIUpdateInterface();
+		if (!unitAI || unitAI->getLastCommandSource() != CMD_FROM_AI) continue;
+		const SkirmishStrategyMode mode = ai->getAlliedCurrentStrategyMode();
+		Bool ordinaryOrder = mode == SKIRMISH_STRATEGY_BALANCED && unitAI->getCurrentStateID() == AI_IDLE;
+		if (mode == SKIRMISH_STRATEGY_FORTIFY)
+		{
+			Coord3D home;
+			const Coord3D *guard = unitAI->getGuardLocation();
+			ordinaryOrder = ai->getBaseCenter(&home) && guard &&
+				unitAI->getGuardTargetType() == GUARDTARGET_LOCATION &&
+				AlliedFixtureDistanceSquared(*guard, home) <= 50.0f * 50.0f;
+		}
+		if (mode == SKIRMISH_STRATEGY_ASSAULT)
+		{
+			const ObjectID currentTargetID = ai->getAlliedCurrentStrategicTargetID();
+			Object *currentTarget = TheGameLogic->findObjectByID(currentTargetID);
+			const Coord3D *goal = unitAI->getGoalPosition();
+			ordinaryOrder = currentTargetID != s_allied.cancellationTarget &&
+				IsLiveSkirmishAIRecoveryObject(currentTarget) && goal &&
+				unitAI->getCurrentStateID() == AI_ATTACK_MOVE_TO &&
+				AlliedFixtureDistanceSquared(*goal, *currentTarget->getPosition()) <= 200.0f * 200.0f &&
+				AlliedFixtureDistanceSquared(*member->getPosition(), s_allied.cancellationPositions[participant]) >= 25.0f * 25.0f;
+		}
+		if (!ordinaryOrder) continue;
+		s_allied.cancellationResumed[participant] = TRUE;
+		++s_allied.checks;
+		printf("SKIRMISH_AI_ALLIED_CANCELLATION_RESUME_ASSERT frame=%u slot=%d member=%u "
+			"mode=%d pending=0 surviving_held_member=1 safe_ordinary_order=1\n", frame,
+			slot, s_allied.cancellationMembers[participant], static_cast<Int>(mode));
+		fflush(stdout);
+	}
+	if (!s_allied.cancellationSaved)
+	{
+		if (!bothCanceled)
+		{
+			if (frame >= s_allied.cancellationRelease)
+			{ FailSkirmishAITest("allied_cancellation_missed_release"); RequestSkirmishAITestStop(); }
+			return;
+		}
+		if (!anyPending)
+		{ FailSkirmishAITest("allied_cancellation_no_observable_pending_window"); RequestSkirmishAITestStop(); return; }
+		if (!RoundTripAlliedFixture())
+		{ FailSkirmishAITest("allied_pending_resume_save_load_assertion"); RequestSkirmishAITestStop(); return; }
+		s_allied.cancellationSaved = TRUE;
+		++s_allied.checks;
+		printf("SKIRMISH_AI_ALLIED_CANCELLATION_SAVE_ASSERT frame=%u slots=%d,%d "
+			"plans_canceled=2 launches=0 pending_nonzero=1 saved=1\n",
+			frame, s_allied.cancellationSlots[0], s_allied.cancellationSlots[1]);
+		fflush(stdout);
+		return;
+	}
+	if (s_allied.cancellationResumed[0] && s_allied.cancellationResumed[1] &&
+		s_allied.postLoadProtectionVerified)
+	{
+		s_runner.endFrame = frame;
+		RequestSkirmishAITestStop();
+	}
 }
 
 void ObserveAlliedAssaultLaunch(UnsignedInt frame)
@@ -7299,9 +7456,7 @@ void ObserveAlliedAid(UnsignedInt frame)
 			fflush(stdout);
 			if (s_allied.postLoadBlockedEvaluations >= 2)
 			{
-				s_runner.endFrame = frame;
-				RequestSkirmishAITestStop();
-				return;
+				s_allied.postLoadProtectionVerified = TRUE;
 			}
 		}
 	}
@@ -7336,6 +7491,16 @@ void UpdateSkirmishAIAlliedFixture()
 		return;
 	}
 #if RTS_ZEROHOUR && defined(_WIN64)
+	// Check the unchanged deadlines before a case can report success.
+	if (frame - s_allied.startFrame > 18000 ||
+		ElapsedMilliseconds(s_runner.startupStartMilliseconds, GetTickCount()) > 600000)
+	{
+		FailSkirmishAITest("allied_fixture_assertions_timeout");
+		RequestSkirmishAITestStop();
+		return;
+	}
+#endif
+#if RTS_ZEROHOUR && defined(_WIN64)
 	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_TRANSFER_COMMAND)
 	{
 		if (!RunAlliedTransferCommands()) FailSkirmishAITest("allied_transfer_assertion");
@@ -7348,6 +7513,9 @@ void UpdateSkirmishAIAlliedFixture()
 	if (s_runner.ending) return;
 	ObserveAlliedCoordination(frame);
 	if (s_runner.ending) return;
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD)
+		ObserveAlliedCancellationResume(frame);
+	if (s_runner.ending) return;
 	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_COORDINATION_LIVE)
 		ObserveAlliedAssaultLaunch(frame);
 	if (s_runner.ending) return;
@@ -7355,12 +7523,6 @@ void UpdateSkirmishAIAlliedFixture()
 		ObserveAlliedSupport(frame);
 	if (s_runner.ending) return;
 #endif
-	if (frame - s_allied.startFrame > 18000 ||
-		ElapsedMilliseconds(s_runner.startupStartMilliseconds, GetTickCount()) > 600000)
-	{
-		FailSkirmishAITest("allied_fixture_assertions_timeout");
-		RequestSkirmishAITestStop();
-	}
 }
 }
 
