@@ -7548,11 +7548,70 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 	}
 }
 
+void PrintAlliedAssaultFailure(UnsignedInt frame, const char *reason)
+{
+	Object *target = TheGameLogic->findObjectByID(s_allied.assaultTarget);
+	Player *targetOwner = target ? target->getControllingPlayer() : nullptr;
+	printf("SKIRMISH_AI_ALLIED_ASSAULT_FAILURE frame=%u reason=%s retained=%d launched=%d moved=%d,%d "
+		"return_fire=%d fault_frame=%u fault_evaluation=%u saved_slots=%d,%d saved_leader=%d saved_enemy=%d "
+		"saved_target=%u saved_release=%u saved_expiry=%u saved_admission=%u,%u target_found=%d target_dead=%d "
+		"target_destroyed=%d target_owner=%d target_owner_active=%d probes=%u\n", frame, reason,
+		s_allied.assaultRetained, s_allied.assaultLaunched, s_allied.assaultMoved[0], s_allied.assaultMoved[1],
+		s_allied.returnFireIssued, s_allied.returnFireFrame, s_allied.returnFireEvaluation,
+		s_allied.assaultSlots[0], s_allied.assaultSlots[1], s_allied.assaultLeader, s_allied.assaultEnemy,
+		s_allied.assaultTarget, s_allied.assaultRelease, s_allied.assaultExpiry,
+		s_allied.assaultAdmissionFrames[0], s_allied.assaultAdmissionFrames[1], target != nullptr,
+		target ? target->isEffectivelyDead() : FALSE, target ? target->isDestroyed() : FALSE,
+		targetOwner ? targetOwner->getPlayerIndex() : -1, targetOwner ? targetOwner->isPlayerActive() : FALSE,
+		static_cast<UnsignedInt>(s_allied.assaultProbes.size()));
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		Player *owner = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[participant]);
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(s_allied.assaultSlots[participant]);
+		const SkirmishAIAlliedPlayerFacts *facts = owner && TheAI ? TheAI->getAlliedPlayerFacts(owner->getPlayerIndex()) : nullptr;
+		printf("SKIRMISH_AI_ALLIED_ASSAULT_OWNER participant=%d slot=%d owner=%d owner_active=%d ai_present=%d "
+			"target_relationship=%d facts_present=%d facts_valid=%d facts_alive=%d economy=%d base=%d army=%d threat=%d\n",
+			participant, s_allied.assaultSlots[participant], owner ? owner->getPlayerIndex() : -1,
+			owner ? owner->isPlayerActive() : FALSE, ai != nullptr,
+			owner && target && target->getTeam() ? static_cast<Int>(owner->getRelationship(target->getTeam())) : -1,
+			facts != nullptr, facts ? facts->valid : FALSE, facts ? facts->alive : FALSE,
+			facts ? facts->economyHealth : -1, facts ? facts->baseIntegrity : -1,
+			facts ? facts->armyReadiness : -1, facts ? facts->immediateThreat : -1);
+		if (!ai) continue;
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
+		printf("SKIRMISH_AI_ALLIED_ASSAULT_STATE participant=%d mode=%d strategic_target=%u active=%d launched=%d "
+			"pending=%d admission_valid=%d admission=%u leader=%d enemy=%d target=%u release=%u expiry=%u "
+			"home_damage_valid=%d home_damage=%u held_damage_valid=%d held_damage=%u\n", participant,
+			static_cast<Int>(ai->getAlliedCurrentStrategyMode()), ai->getAlliedCurrentStrategicTargetID(),
+			state.assaultActive, state.assaultLaunched, state.strategyResumePending, state.holdAdmissionValid,
+			state.holdAdmissionFrame, state.leaderIndex, state.enemyIndex, state.targetID, state.assaultFrame,
+			state.assaultExpiryFrame, state.homeDamageValid, state.homeDamageFrame, state.heldDamageValid, state.heldDamageFrame);
+	}
+	for (size_t index = 0; index < s_allied.assaultProbes.size(); ++index)
+	{
+		const AlliedMovementProbe &probe = s_allied.assaultProbes[index];
+		Object *member = TheGameLogic->findObjectByID(probe.objectID);
+		Player *owner = member ? member->getControllingPlayer() : nullptr;
+		const Coord3D *position = member ? member->getPosition() : nullptr;
+		AIUpdateInterface *unitAI = member ? member->getAIUpdateInterface() : nullptr;
+		printf("SKIRMISH_AI_ALLIED_ASSAULT_PROBE participant=%d original_member=%u original_team=%u found=%d "
+			"owner=%d team=%u health=%g dead=%d destroyed=%d contained=%d position=%g,%g,%g ai_state=%d last_source=%d\n",
+			probe.participant, probe.objectID, probe.teamID, member != nullptr, owner ? owner->getPlayerIndex() : -1,
+			member && member->getTeam() ? member->getTeam()->getID() : 0,
+			member && member->getBodyModule() ? member->getBodyModule()->getHealth() : -1.0f,
+			member ? member->isEffectivelyDead() : FALSE, member ? member->isDestroyed() : FALSE,
+			member ? member->isContained() : FALSE, position ? position->x : 0.0f,
+			position ? position->y : 0.0f, position ? position->z : 0.0f,
+			unitAI ? unitAI->getCurrentStateID() : -1, unitAI ? static_cast<Int>(unitAI->getLastCommandSource()) : -1);
+	}
+	fflush(stdout);
+}
+
 void ObserveAlliedLaunchedReturnFire(UnsignedInt frame)
 {
 	Object *target = TheGameLogic->findObjectByID(s_allied.assaultTarget);
 	if (!IsLiveSkirmishAIRecoveryObject(target))
-	{ FailSkirmishAITest("allied_return_fire_shared_target_lost"); RequestSkirmishAITestStop(); return; }
+	{ PrintAlliedAssaultFailure(frame, "allied_return_fire_shared_target_lost"); FailSkirmishAITest("allied_return_fire_shared_target_lost"); RequestSkirmishAITestStop(); return; }
 	if (!s_allied.returnFireIssued)
 	{
 		const UnsignedInt nextEvaluation = TheAI ? TheAI->getNextAlliedEvaluationFrame() : 0;
@@ -7598,7 +7657,7 @@ void ObserveAlliedLaunchedReturnFire(UnsignedInt frame)
 				member->getBodyModule()->getHealth() <= 0 || member->getBodyModule()->getHealth() >= before ||
 				damage.out.m_actualDamageClipped <= 0 || owner->getAttackedFrame() != frame ||
 				owner->getAttackedFrame() == attackedBefore)
-			{ FailSkirmishAITest("allied_return_fire_real_nonlethal_damage_unproven"); RequestSkirmishAITestStop(); return; }
+			{ PrintAlliedAssaultFailure(frame, "allied_return_fire_real_nonlethal_damage_unproven"); FailSkirmishAITest("allied_return_fire_real_nonlethal_damage_unproven"); RequestSkirmishAITestStop(); return; }
 			s_allied.returnFireIssued = TRUE;
 			s_allied.returnFireFrame = frame;
 			s_allied.returnFireEvaluation = nextEvaluation;
@@ -7624,7 +7683,7 @@ void ObserveAlliedLaunchedReturnFire(UnsignedInt frame)
 		!member->getTeam() || member->getTeam()->getID() != s_allied.returnFireTeam ||
 		!IsLiveSkirmishAIRecoveryObject(source) || !source->getControllingPlayer() ||
 		!source->getControllingPlayer()->isPlayerActive() || !source->getTeam() || owner->getRelationship(source->getTeam()) != ENEMIES)
-	{ FailSkirmishAITest("allied_return_fire_living_witness_lost"); RequestSkirmishAITestStop(); return; }
+	{ PrintAlliedAssaultFailure(frame, "allied_return_fire_living_witness_lost"); FailSkirmishAITest("allied_return_fire_living_witness_lost"); RequestSkirmishAITestStop(); return; }
 	// Observe normal owner updates and a genuinely later central evaluation.
 	// Tactical retaliation may change the unit order; the unchanged launched
 	// cohort is checked by ObserveAlliedAssaultLaunch on every intervening frame.
@@ -7644,23 +7703,23 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 {
 	if (!s_allied.assaultRetained) return;
 	if (frame >= s_allied.assaultExpiry)
-	{ FailSkirmishAITest("allied_assault_expired_without_live_movement"); RequestSkirmishAITestStop(); return; }
+	{ PrintAlliedAssaultFailure(frame, "allied_assault_expired_without_live_movement"); FailSkirmishAITest("allied_assault_expired_without_live_movement"); RequestSkirmishAITestStop(); return; }
 	Bool bothLaunched = TRUE;
 	for (Int participant = 0; participant < 2; ++participant)
 	{
 		AISkirmishPlayer *ai = GetAlliedFixtureAI(s_allied.assaultSlots[participant]);
 		Player *owner = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[participant]);
-		if (!ai || !owner || !owner->isPlayerActive()) { FailSkirmishAITest("allied_assault_participant_lost"); RequestSkirmishAITestStop(); return; }
+		if (!ai || !owner || !owner->isPlayerActive()) { PrintAlliedAssaultFailure(frame, "allied_assault_participant_lost"); FailSkirmishAITest("allied_assault_participant_lost"); RequestSkirmishAITestStop(); return; }
 		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
 		if (!state.assaultActive || state.leaderIndex != s_allied.assaultLeader ||
 			state.enemyIndex != s_allied.assaultEnemy || state.targetID != s_allied.assaultTarget ||
 			state.assaultFrame != s_allied.assaultRelease || state.assaultExpiryFrame != s_allied.assaultExpiry ||
 			!state.holdAdmissionValid || state.holdAdmissionFrame != s_allied.assaultAdmissionFrames[participant])
-		{ FailSkirmishAITest("allied_assault_retained_commitment_changed"); RequestSkirmishAITestStop(); return; }
+		{ PrintAlliedAssaultFailure(frame, "allied_assault_retained_commitment_changed"); FailSkirmishAITest("allied_assault_retained_commitment_changed"); RequestSkirmishAITestStop(); return; }
 		if (s_allied.assaultLaunched && !state.assaultLaunched)
-		{ FailSkirmishAITest("allied_assault_launched_state_lost"); RequestSkirmishAITestStop(); return; }
+		{ PrintAlliedAssaultFailure(frame, "allied_assault_launched_state_lost"); FailSkirmishAITest("allied_assault_launched_state_lost"); RequestSkirmishAITestStop(); return; }
 		if (state.assaultLaunched && frame < s_allied.assaultRelease)
-		{ FailSkirmishAITest("allied_assault_launched_before_release"); RequestSkirmishAITestStop(); return; }
+		{ PrintAlliedAssaultFailure(frame, "allied_assault_launched_before_release"); FailSkirmishAITest("allied_assault_launched_before_release"); RequestSkirmishAITestStop(); return; }
 		bothLaunched = bothLaunched && state.assaultLaunched;
 	}
 	if (frame < s_allied.assaultRelease || !bothLaunched) return;
@@ -7668,7 +7727,7 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 	{
 		Object *target = TheGameLogic->findObjectByID(s_allied.assaultTarget);
 		if (!IsLiveSkirmishAIRecoveryObject(target))
-		{ FailSkirmishAITest("allied_assault_launch_target_lost"); RequestSkirmishAITestStop(); return; }
+		{ PrintAlliedAssaultFailure(frame, "allied_assault_launch_target_lost"); FailSkirmishAITest("allied_assault_launch_target_lost"); RequestSkirmishAITestStop(); return; }
 		s_allied.assaultLaunched = TRUE;
 		s_allied.assaultTargetPosition = *target->getPosition();
 		Int surviving[2] = { 0, 0 };
@@ -7685,7 +7744,7 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 			++surviving[probe.participant];
 		}
 		if (surviving[0] == 0 || surviving[1] == 0)
-		{ FailSkirmishAITest("allied_assault_held_members_lost_before_release"); RequestSkirmishAITestStop(); return; }
+		{ PrintAlliedAssaultFailure(frame, "allied_assault_held_members_lost_before_release"); FailSkirmishAITest("allied_assault_held_members_lost_before_release"); RequestSkirmishAITestStop(); return; }
 		printf("SKIRMISH_AI_ALLIED_LAUNCH_ASSERT frame=%u release=%u slots=%d,%d target=%u probes=%u\n",
 			frame, s_allied.assaultRelease, s_allied.assaultSlots[0], s_allied.assaultSlots[1],
 			s_allied.assaultTarget, static_cast<UnsignedInt>(s_allied.assaultProbes.size()));
@@ -7723,7 +7782,7 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 		fflush(stdout);
 	}
 	if (surviving[0] == 0 || surviving[1] == 0)
-	{ FailSkirmishAITest("allied_assault_retained_members_no_survivor"); RequestSkirmishAITestStop(); return; }
+	{ PrintAlliedAssaultFailure(frame, "allied_assault_retained_members_no_survivor"); FailSkirmishAITest("allied_assault_retained_members_no_survivor"); RequestSkirmishAITestStop(); return; }
 	for (Int participant = 0; participant < 2; ++participant)
 		if (s_allied.assaultMoved[participant])
 		{
@@ -7731,7 +7790,7 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 			Player *player = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[participant]);
 			if (!IsSkirmishAIRecoveryCombatUnit(member, player) || !member->getTeam() ||
 				member->getTeam()->getID() != s_allied.assaultMovedTeams[participant])
-			{ FailSkirmishAITest("allied_assault_qualified_member_lost"); RequestSkirmishAITestStop(); return; }
+			{ PrintAlliedAssaultFailure(frame, "allied_assault_qualified_member_lost"); FailSkirmishAITest("allied_assault_qualified_member_lost"); RequestSkirmishAITestStop(); return; }
 		}
 	if (s_allied.assaultMoved[0] && s_allied.assaultMoved[1] && s_allied.sawFortifyDecline)
 		ObserveAlliedLaunchedReturnFire(frame);
