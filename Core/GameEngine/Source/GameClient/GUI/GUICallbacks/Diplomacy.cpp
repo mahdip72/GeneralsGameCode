@@ -207,14 +207,18 @@ static void updateMoneyControls()
 {
 	const Bool visible = canShowMoneyControls() && winInGame && !winInGame->winIsHidden();
 	Player *donor = ThePlayerList ? ThePlayerList->getLocalPlayer() : nullptr;
-	UnsignedInt maxAmount = donor ? donor->getMoney()->countMoney() : 0;
+	const UnsignedInt availableCash = donor ? donor->getMoney()->countMoney() : 0;
+	UnsignedInt maxAmount = availableCash;
 	if (maxAmount > AlliedMoneyTransfer::MAX_HUMAN_AMOUNT)
 		maxAmount = AlliedMoneyTransfer::MAX_HUMAN_AMOUNT;
 	maxAmount -= maxAmount % AlliedMoneyTransfer::HUMAN_AMOUNT_STEP;
-	if (selectedMoneyAmount > static_cast<Int>(maxAmount))
-		selectedMoneyAmount = static_cast<Int>(maxAmount);
-	if (selectedMoneyAmount < AlliedMoneyTransfer::MIN_HUMAN_AMOUNT)
-		selectedMoneyAmount = AlliedMoneyTransfer::MIN_HUMAN_AMOUNT;
+	if (maxAmount >= AlliedMoneyTransfer::MIN_HUMAN_AMOUNT)
+	{
+		if (selectedMoneyAmount > static_cast<Int>(maxAmount))
+			selectedMoneyAmount = static_cast<Int>(maxAmount);
+		if (selectedMoneyAmount < AlliedMoneyTransfer::MIN_HUMAN_AMOUNT)
+			selectedMoneyAmount = AlliedMoneyTransfer::MIN_HUMAN_AMOUNT;
+	}
 	GameWindow *controls[] = {moneyAmountLabel, moneyAmountSlider, moneyAmountLess, moneyAmountMore};
 	for (Int control = 0; control < 4; ++control)
 		if (controls[control])
@@ -230,7 +234,8 @@ static void updateMoneyControls()
 		GadgetSliderGetMinMax(moneyAmountSlider, &oldMin, &oldMax);
 		if (oldMax != sliderMax)
 			TheWindowManager->winSendSystemMsg(moneyAmountSlider, GSM_SET_MIN_MAX, 1, sliderMax);
-		GadgetSliderSetPosition(moneyAmountSlider, selectedMoneyAmount / AlliedMoneyTransfer::HUMAN_AMOUNT_STEP);
+		GadgetSliderSetPosition(moneyAmountSlider, maxAmount >= AlliedMoneyTransfer::MIN_HUMAN_AMOUNT ?
+			selectedMoneyAmount / AlliedMoneyTransfer::HUMAN_AMOUNT_STEP : 1);
 		moneyAmountSlider->winEnable(donorEnabled && maxAmount > 100);
 	}
 	if (moneyAmountLess)
@@ -240,7 +245,10 @@ static void updateMoneyControls()
 	if (moneyAmountLabel)
 	{
 		UnicodeString label;
-		label.format(L"Give $%d (max $%u)", selectedMoneyAmount, maxAmount);
+		if (maxAmount < AlliedMoneyTransfer::MIN_HUMAN_AMOUNT)
+			label.format(L"Need at least $100 (cash $%u)", availableCash);
+		else
+			label.format(L"Give $%d (max $%u)", selectedMoneyAmount, maxAmount);
 		GadgetStaticTextSetText(moneyAmountLabel, label);
 	}
 	for (Int row = 0; row < MAX_SLOTS; ++row)
