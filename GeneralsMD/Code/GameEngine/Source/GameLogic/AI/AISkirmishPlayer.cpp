@@ -8425,13 +8425,13 @@ void AISkirmishPlayer::resumeAlliedStrategy()
 	if (!fortifying && (!m_alliedResumeAttackSafe || recentAttack)) {
 		// An abort does not promote an attack. Keep the safe home command until
 		// another actual strategy evaluation establishes normal ownership.
-		commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0);
+		commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0, true);
 		return;
 	}
 	m_alliedStrategyResumePending = false;
 	// NONE forces one normal strategy impulse even when mode/target stayed
 	// unchanged while the shared hold suppressed its original transition.
-	applyStrategyMode(SKIRMISH_STRATEGY_NONE, m_strategyState.currentMode, INVALID_ID);
+	applyStrategyMode(SKIRMISH_STRATEGY_NONE, m_strategyState.currentMode, INVALID_ID, true);
 }
 
 Player *AISkirmishPlayer::getPinnedAlliedEnemy() const
@@ -8715,10 +8715,10 @@ void AISkirmishPlayer::updateAlliedAssignments()
 			m_strategyState.strategicTargetID = m_alliedTargetID;
 			m_strategyState.strategicTargetObserved = true;
 			m_strategyState.strategicTargetLastSeenFrame = now;
-			commandOffensiveTeams(SKIRMISH_STRATEGY_ASSAULT, target);
+			commandOffensiveTeams(SKIRMISH_STRATEGY_ASSAULT, target, true);
 		} else if (!m_alliedAssaultLaunched && IsSkirmishStrategyFrameReached(now, m_alliedNextHoldFrame)) {
 			m_alliedNextHoldFrame = now + 2 * LOGICFRAMES_PER_SECOND;
-			commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0);
+			commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0, true);
 		}
 	}
 	if (m_alliedSupportRecipientIndex >= 0) {
@@ -10997,12 +10997,13 @@ static Bool IsSkirmishTacticalRetreatPointSafe(
 }
 
 void AISkirmishPlayer::commandOffensiveTeams(
-	SkirmishStrategyMode mode, Object *target)
+	SkirmishStrategyMode mode, Object *target, Bool preserveTunnelTransit)
 {
 	if (!TheAI || !m_player)
 		return;
-	const Bool alliedHoldCommands = isAlliedAssaultHolding() ||
-		(usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending);
+	// Allied release/resumption may already have cleared their hold flags.
+	const Bool protectTransit = usesAlliedCoordinationBehavior() &&
+		(preserveTunnelTransit || isAlliedAssaultHolding() || m_alliedStrategyResumePending);
 	std::vector<Team *> teams;
 	Player::PlayerTeamList::const_iterator prototype;
 	for (prototype = m_player->getPlayerTeams()->begin();
@@ -11013,7 +11014,7 @@ void AISkirmishPlayer::commandOffensiveTeams(
 			Team *candidate = teamInstance.cur();
 			if (IsSkirmishStrategyOffensiveTeam(candidate, m_player) &&
 				!isAlliedSupportTeam(candidate->getID()) &&
-				(!alliedHoldCommands || !isActiveTacticalTunnelTeam(candidate->getID())) &&
+				(!protectTransit || !isActiveTacticalTunnelTeam(candidate->getID())) &&
 				candidate->hasAnyObjects()) {
 				SkirmishStrategyGroupRecipientContext context;
 				context.player = m_player;
@@ -11075,7 +11076,7 @@ void AISkirmishPlayer::commandOffensiveTeams(
 
 void AISkirmishPlayer::applyStrategyMode(
 	SkirmishStrategyMode previousMode, SkirmishStrategyMode currentMode,
-	ObjectID previousTargetID)
+	ObjectID previousTargetID, Bool preserveTunnelTransit)
 {
 	if (isAlliedAssaultHolding() && currentMode != SKIRMISH_STRATEGY_FORTIFY) return;
 	if (usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending &&
@@ -11118,7 +11119,7 @@ void AISkirmishPlayer::applyStrategyMode(
 		target = nullptr;
 	if (currentMode == SKIRMISH_STRATEGY_ASSAULT && !target)
 		ClearSkirmishStrategyTargetObservation(&m_strategyState);
-	commandOffensiveTeams(currentMode, target);
+	commandOffensiveTeams(currentMode, target, preserveTunnelTransit);
 }
 
 Bool AISkirmishPlayer::updateStrategy()

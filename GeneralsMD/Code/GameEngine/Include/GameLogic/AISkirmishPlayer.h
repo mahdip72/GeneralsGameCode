@@ -269,8 +269,10 @@ protected:
 	void collectStrategyMetrics( SkirmishStrategyMetrics *metrics,
 		ObjectID *strategicTargetID );
 	void applyStrategyMode( SkirmishStrategyMode previousMode,
-		SkirmishStrategyMode currentMode, ObjectID previousTargetID );
-	void commandOffensiveTeams( SkirmishStrategyMode mode, Object *target );
+		SkirmishStrategyMode currentMode, ObjectID previousTargetID,
+		Bool preserveTunnelTransit = false );
+	void commandOffensiveTeams( SkirmishStrategyMode mode, Object *target,
+		Bool preserveTunnelTransit = false );
 	void updateTacticalTeams();
 	struct TacticalTeamState;
 	Bool tryTunnelBypass(Team *team, Object *target,
