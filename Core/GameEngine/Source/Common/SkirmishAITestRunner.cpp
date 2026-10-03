@@ -4251,18 +4251,18 @@ Bool StartSkirmishAITestRunner()
 #if defined(_WIN64)
 	if (s_reviewedMapRequest.requested) reportedMapName = s_reviewedMapIdentity.logicalKey;
 #endif
-	if (s_allied.active)
-	{
-		printf("SKIRMISH_AI_ALLIED_FIXTURE_START seed=%d case=%s map=\"%s\"\n",
-			plan.seed, s_alliedCaseNames[s_allied.fixtureCase], reportedMapName);
-	}
-	else if (s_recovery.active)
+	if (s_recovery.active)
 	{
 		printf("SKIRMISH_AI_RECOVERY_START seed=%d case=%s faction=%s template=%s map=\"%s\" "
 			"expected_mode=zero_hour_skirmish expected_subject_slot=1\n",
 			plan.seed, GetSkirmishAIRecoveryFixtureCaseName(s_recovery.fixtureCase),
 			GetSkirmishAIRecoveryFactionName(s_recovery.faction),
 			GetSkirmishAIRecoveryFactionTemplateName(s_recovery.faction), reportedMapName);
+	}
+	else if (s_allied.active)
+	{
+		printf("SKIRMISH_AI_ALLIED_FIXTURE_START seed=%d case=%s map=\"%s\"\n",
+			plan.seed, s_alliedCaseNames[s_allied.fixtureCase], reportedMapName);
 	}
 	else if (IsSkirmishAITest4v2(s_runner.scenario))
 	{
