@@ -455,6 +455,7 @@ enum {
 	MAX_SKIRMISH_STRATEGY_TARGET_CANDIDATES = 4,
 	MAX_SKIRMISH_STRATEGY_GROUND_PROBES_PER_TARGET = 4,
 	MAX_SKIRMISH_STRATEGY_QUICK_PATH_QUERIES = 16,
+	MAX_SKIRMISH_ALLIED_ASSAULT_TEAMS = 16,
 	MAX_SKIRMISH_AI_TACTICAL_QUICK_PATH_QUERIES_PER_UPDATE = 16,
 	MAX_SKIRMISH_AI_TACTICAL_RETREAT_PATH_QUERIES_PER_TEAM = 10
 };
@@ -4834,13 +4835,13 @@ void AISkirmishPlayer::processBaseBuilding()
 			? TheGameLogic->findObjectByID(m_tunnelBuildTargetID) : nullptr;
 		Object *blocker = m_tunnelBuildBlockerID != INVALID_ID
 			? TheGameLogic->findObjectByID(m_tunnelBuildBlockerID) : nullptr;
+		Player *tunnelEnemy = 0;
 		const Bool invalidPendingPlan =
 			!pendingInfoFound || !tunnelPlan ||
-			m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
-			m_strategyState.strategicTargetID != m_tunnelBuildTargetID ||
+			!resolveTunnelBuildTargetOwner(m_tunnelBuildTargetID, &tunnelEnemy) ||
 			!IsSkirmishAIStrategyTunnelTargetUsable(
-				target, m_player, m_currentEnemy) ||
-			!blocker || blocker->getControllingPlayer() != m_currentEnemy ||
+				target, m_player, tunnelEnemy) ||
+			!blocker || blocker->getControllingPlayer() != tunnelEnemy ||
 			!blocker->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
 			blocker->isEffectivelyDead() || blocker->isDestroyed() ||
 			blocker->testStatus(OBJECT_STATUS_SOLD) ||
@@ -5017,9 +5018,9 @@ void AISkirmishPlayer::processBaseBuilding()
 				continue;
 			const Bool pendingTunnelBuild =
 				isPendingTunnelBuildInfo(info, curPlan);
+			Player *tunnelEnemy = m_currentEnemy;
 			if (pendingTunnelBuild &&
-				(m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
-				 m_strategyState.strategicTargetID != m_tunnelBuildTargetID)) {
+				!resolveTunnelBuildTargetOwner(m_tunnelBuildTargetID, &tunnelEnemy)) {
 				abandonTunnelBuildPlan(TheGameLogic->getFrame(), TRUE);
 				continue;
 			}
@@ -5054,7 +5055,7 @@ void AISkirmishPlayer::processBaseBuilding()
 				? TheGameLogic->findObjectByID(m_tunnelBuildTargetID) : nullptr;
 			if (forwardTunnelBuild
 				? !IsSkirmishAIForwardTunnelLocationSafe(m_player,
-					m_currentEnemy, info->getLocation(), curPlan,
+					tunnelEnemy, info->getLocation(), curPlan,
 					forwardBlocker, forwardTarget)
 				: !isLocationSafe(info->getLocation(), curPlan)) {
 				continue;
@@ -5915,6 +5916,7 @@ Bool AISkirmishPlayer::selectTeamToReinforce( Int minPriority )
 				Team *team = teamIt.cur();
 				if (team && team->hasAnyUnits() &&
 					!isAlliedSupportTeam(team->getID()) &&
+					!isAlliedAssaultTeam(team->getID()) &&
 					HasSkirmishAIReinforcementDeficit(team))
 					candidates.push_back(team);
 			}
@@ -6622,9 +6624,7 @@ static Bool ShouldUseCounterBasedSkirmishAIPlanning()
 #if defined(_WIN64)
 Bool AISkirmishPlayer::isEnemyPlanningDue() const
 {
-	// A live shared plan owns enemy identity. Avoid staging a different native
-	// result and then changing it after its reference receipt was committed.
-	if (getPinnedAlliedEnemy()) return false;
+	// Shared target ownership is per admitted team; native planning keeps the ordinary enemy.
 	Bool currentEnemyInvalid = m_currentEnemy &&
 		(m_player->getRelationship(m_currentEnemy->getDefaultTeam()) != ENEMIES ||
 		 !(usesProductionBehavior()
@@ -7454,6 +7454,10 @@ void AISkirmishPlayer::resetAlliedCoordination()
 	m_alliedAssaultActive = false;
 	m_alliedAssaultLaunched = false;
 	m_alliedStrategyResumePending = false;
+	m_alliedAssaultTeamIDs.clear();
+	m_alliedCapturedTeamIDs.clear();
+	m_alliedCapturedForceValue = 0;
+	m_alliedCapturedForceConfidence = 0;
 	m_alliedHoldAdmissionValid = false;
 	m_alliedHoldAdmissionFrame = 0;
 	m_alliedHomeDamageValid = false;
@@ -7686,6 +7690,7 @@ void AISkirmishPlayer::notifyAlliedDamage(Object *object, const DamageInfo *dama
 	}
 	Team *team = object->getTeam();
 	if ((isAlliedAssaultHolding() || m_alliedStrategyResumePending) && team &&
+		isAlliedAssaultTeam(team->getID()) &&
 		!isAlliedSupportTeam(team->getID()) && !isAlliedCommandProtectedTeam(team->getID()) &&
 		IsSkirmishStrategyOffensiveTeam(team, m_player) &&
 		IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team, true)) {
@@ -7698,7 +7703,8 @@ void AISkirmishPlayer::notifyAlliedDamage(Object *object, const DamageInfo *dama
 }
 
 void AISkirmishPlayer::collectStrategyMetrics(
-	SkirmishStrategyMetrics *metrics, ObjectID *strategicTargetID, Int *alliedSafetyThreat)
+	SkirmishStrategyMetrics *metrics, ObjectID *strategicTargetID, Int *alliedSafetyThreat,
+	ObjectID *alliedTargetID)
 {
 	metrics->economyHealth = 0;
 	metrics->baseIntegrity = 0;
@@ -7741,6 +7747,13 @@ void AISkirmishPlayer::collectStrategyMetrics(
 		TheGameLogic->getFrame() / tunnelProbeInterval;
 	std::vector<SkirmishStrategyCapabilityCandidate> groundAttackers;
 	std::vector<SkirmishStrategyCapabilityCandidate> airAttackers;
+	std::vector<SkirmishStrategyCapabilityCandidate> alliedGroundAttackers;
+	std::vector<SkirmishStrategyCapabilityCandidate> alliedAirAttackers;
+	if (alliedTargetID) {
+		*alliedTargetID = INVALID_ID;
+		m_alliedCapturedForceValue = 0;
+		m_alliedCapturedForceConfidence = 0;
+	}
 	std::vector<Team *> tunnelCandidateTeams;
 	std::vector<Object *> visibleDefenseBlockers;
 	TunnelTracker *activeTransitTracker = targetFallbackEnabled && m_player
@@ -7875,6 +7888,17 @@ void AISkirmishPlayer::collectStrategyMetrics(
 				}
 				if (!object->isContained() &&
 					IsSkirmishStrategyOffensiveRecipient(object, m_player)) {
+					if (alliedTargetID && std::binary_search(m_alliedCapturedTeamIDs.begin(),
+						m_alliedCapturedTeamIDs.end(), object->getTeam()->getID()) &&
+						!isAlliedSupportTeam(object->getTeam()->getID()) &&
+						!isAlliedCommandProtectedTeam(object->getTeam()->getID())) {
+						m_alliedCapturedForceValue = AddSkirmishStrategyValue(
+							m_alliedCapturedForceValue, value);
+						if (object->isKindOf(KINDOF_AIRCRAFT))
+							AppendSkirmishStrategyCapabilityCandidate(&alliedAirAttackers, object, value);
+						else
+							AppendSkirmishStrategyCapabilityCandidate(&alliedGroundAttackers, object, value);
+					}
 					if (object->isKindOf(KINDOF_AIRCRAFT))
 						AppendSkirmishStrategyCapabilityCandidate(
 							&airAttackers, object, value);
@@ -8184,6 +8208,26 @@ void AISkirmishPlayer::collectStrategyMetrics(
 	metrics->hasStrategicTarget = preserveHiddenTarget || routeAvailable;
 	if (routeAvailable)
 		*strategicTargetID = selectedTarget->getID();
+	if (alliedTargetID && m_alliedCapturedForceValue > 0) {
+		// Reuse the visible target candidates from this traversal, with only the
+		// captured staging force and four additional quick probes per evaluation.
+		SortSkirmishStrategyCapabilityCandidates(&alliedGroundAttackers);
+		SortSkirmishStrategyCapabilityCandidates(&alliedAirAttackers);
+		Int alliedQueries = MAX_SKIRMISH_STRATEGY_QUICK_PATH_QUERIES - 4;
+		for (Int i = 0; i < targetCandidateCount; ++i) {
+			Object *candidate = targetCandidates[i].object;
+			if (HasSkirmishStrategyTargetCapability(candidate, alliedAirAttackers,
+				alliedGroundAttackers, &alliedQueries, true)) {
+				*alliedTargetID = candidate->getID();
+				break;
+			}
+		}
+		const Int alliedForceConfidence = enemyCombatValue > 0 ? ClampSkirmishStrategyPercent(
+			(Int)((__int64)m_alliedCapturedForceValue * 100 /
+				((__int64)m_alliedCapturedForceValue + enemyCombatValue))) : 75;
+		m_alliedCapturedForceConfidence = (70 * alliedForceConfidence +
+			30 * (*alliedTargetID != INVALID_ID ? 100 : 20)) / 100;
+	}
 }
 
 static Bool HasSkirmishAlliedSupplySource(Player *player,
@@ -8431,8 +8475,10 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 		HasSkirmishAlliedRecoveryRoute(player, facts->missingIncome, facts->missingProduction);
 	if (owner) {
 		ObjectID targetID = INVALID_ID;
+		ObjectID alliedTargetID = INVALID_ID;
+		owner->captureAlliedStagingTeams();
 		owner->collectStrategyMetrics(&owner->m_alliedCapturedStrategyMetrics, &targetID,
-			&owner->m_alliedCapturedSafetyThreat);
+			&owner->m_alliedCapturedSafetyThreat, &alliedTargetID);
 		owner->m_alliedCapturedStrategyAvailable = true;
 		owner->m_alliedCapturedStrategyFrame = now;
 		owner->m_alliedCapturedStrategyTargetID = targetID;
@@ -8440,12 +8486,13 @@ void AISkirmishPlayer::captureAlliedPlayerFacts(Player *player,
 		facts->mode = owner->m_strategyState.currentMode;
 		facts->economyHealth = metrics.economyHealth;
 		facts->baseIntegrity = metrics.baseIntegrity;
-		facts->armyReadiness = metrics.armyReadiness;
+		facts->armyReadiness = GetSkirmishStrategyValuePercent(owner->m_alliedCapturedForceValue, wealthy);
 		facts->immediateThreat = owner->m_alliedCapturedSafetyThreat;
 		facts->targetEnemyIndex = owner->m_currentEnemy ? owner->m_currentEnemy->getPlayerIndex() : -1;
-		facts->targetObjectID = targetID;
-		facts->targetScore = 70 * metrics.enemyOpportunity + 30 * metrics.attackConfidence;
-		facts->hasReadyForce = metrics.availableCombatValue > 0 && metrics.armyReadiness >= 60;
+		facts->targetObjectID = alliedTargetID;
+		facts->targetScore = 70 * metrics.enemyOpportunity + 30 * owner->m_alliedCapturedForceConfidence;
+		facts->hasReadyForce = !owner->m_alliedStrategyResumePending &&
+			owner->m_alliedCapturedForceValue > 0 && facts->armyReadiness >= 60;
 		owner->refreshStrategyProductionReserve();
 		facts->protectedReserve = owner->m_strategyProductionReserveCost;
 		const Int recovery = owner->getActiveRecoveryReserveCost();
@@ -8518,6 +8565,7 @@ AISkirmishPlayer::getAlliedCoordinationDiagnostics() const
 	d.targetID = m_alliedTargetID;
 	d.assaultFrame = m_alliedAssaultFrame;
 	d.assaultExpiryFrame = m_alliedAssaultExpiryFrame;
+	d.assaultTeamCount = (Int)m_alliedAssaultTeamIDs.size();
 	d.supportRecipientIndex = m_alliedSupportRecipientIndex;
 	d.supportTeamCount = (Int)m_alliedSupportTeamIDs.size();
 	d.supportReturning = m_alliedSupportReturning;
@@ -8532,6 +8580,168 @@ UnsignedInt AISkirmishPlayer::getAlliedSupportTeamID(Int index) const
 {
 	return index >= 0 && (size_t)index < m_alliedSupportTeamIDs.size() ?
 		m_alliedSupportTeamIDs[index] : 0;
+}
+
+UnsignedInt AISkirmishPlayer::getAlliedAssaultTeamID(Int index) const
+{
+	return index >= 0 && (size_t)index < m_alliedAssaultTeamIDs.size() ?
+		m_alliedAssaultTeamIDs[index] : 0;
+}
+
+Bool AISkirmishPlayer::isAlliedAssaultTeam(UnsignedInt teamID) const
+{
+	return usesAlliedCoordinationBehavior() && std::binary_search(
+		m_alliedAssaultTeamIDs.begin(), m_alliedAssaultTeamIDs.end(), teamID);
+}
+
+Bool AISkirmishPlayer::isAlliedAssaultMember(const Object *object) const
+{
+	Team *team = object ? object->getTeam() : 0;
+	return usesAlliedCoordinationBehavior() && IsSkirmishStrategyOffensiveTeam(team, m_player) &&
+		isAlliedAssaultTeam(team->getID()) &&
+		(IsSkirmishStrategyPotentialOffensiveRecipient(const_cast<Object *>(object), m_player, team) ||
+		 IsSkirmishAIStrategyTunnelTransitMember(const_cast<Object *>(object), m_player, team, true));
+}
+
+Bool AISkirmishPlayer::isAlliedStagingTeamAvailable(Team *team)
+{
+	if (!m_baseCenterSet || !IsSkirmishStrategyOffensiveTeam(team, m_player) ||
+		isAlliedSupportTeam(team->getID()) || isAlliedCommandProtectedTeam(team->getID())) return false;
+	// A produced reinforcement can join before its ready-queue activation.
+	for (DLINK_ITERATOR<TeamInQueue> queued = iterate_TeamBuildQueue();
+		!queued.done(); queued.advance())
+		if (queued.cur()->m_reinforcement && queued.cur()->m_team == team) return false;
+	for (DLINK_ITERATOR<TeamInQueue> ready = iterate_TeamReadyQueue();
+		!ready.done(); ready.advance())
+		if (ready.cur()->m_reinforcement && ready.cur()->m_team == team) return false;
+	const Real radius = getAlliedSafetyHomeRadius();
+	Bool any = false;
+	for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+		!member.done(); member.advance()) {
+		Object *object = member.cur();
+		// Incidental builders/noncombat members retain ordinary ownership.
+		if (!IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team)) continue;
+		const Real dx = object->getPosition()->x - m_baseCenter.x;
+		const Real dy = object->getPosition()->y - m_baseCenter.y;
+		if (GetSkirmishStrategyHealthPercent(object) < 60 ||
+			dx * dx + dy * dy > radius * radius || object->getAIUpdateInterface()->isAttacking() ||
+			HasSkirmishAlliedHostileDamage(object, m_player, TheGameLogic->getFrame())) return false;
+		any = true;
+	}
+	return any;
+}
+
+Bool AISkirmishPlayer::hasAlliedAssaultForce() const
+{
+	for (size_t i = 0; i < m_alliedAssaultTeamIDs.size(); ++i) {
+		Team *team = FindSkirmishAlliedTeam(m_player, m_alliedAssaultTeamIDs[i]);
+		if (!IsSkirmishStrategyOffensiveTeam(team, m_player)) continue;
+		for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+			!member.done(); member.advance())
+			if (IsSkirmishStrategyPotentialOffensiveRecipient(member.cur(), m_player, team) ||
+				IsSkirmishAIStrategyTunnelTransitMember(member.cur(), m_player, team, true)) return true;
+	}
+	return false;
+}
+
+void AISkirmishPlayer::rebaseAlliedAssaultTeams()
+{
+	for (size_t i = 0; i < m_alliedAssaultTeamIDs.size(); ++i) {
+		const UnsignedInt id = m_alliedAssaultTeamIDs[i];
+		if (isAlliedCommandProtectedTeam(id)) continue;
+		std::map<UnsignedInt, TacticalTeamState>::iterator it = m_tacticalTeams.find(id);
+		if (it == m_tacticalTeams.end()) continue;
+		TacticalTeamState &state = it->second;
+		state.targetID = INVALID_ID;
+		state.targetHealth = 0.0f;
+		state.distanceToTargetSqr = 0.0f;
+		state.lastProgressFrame = TheGameLogic->getFrame();
+		state.blockedSinceFrame = 0;
+		state.approachAttempt = 0;
+		state.alternateProbeAfterID = INVALID_ID;
+		state.alternateAttackIssuedTargetID = INVALID_ID;
+		state.routeExhaustedTargetID = INVALID_ID;
+		state.routeExhaustedUntilFrame = 0;
+		state.tunnelWaitTargetID = INVALID_ID;
+		state.tunnelBuilderWaitUntilFrame = 0;
+		state.tunnelBuilderWindowsRemaining = 0;
+	}
+}
+
+void AISkirmishPlayer::getTeamStrategyContext(Team *team, SkirmishStrategyMode *mode,
+	Player **enemy, ObjectID *targetID) const
+{
+	*mode = m_strategyState.currentMode;
+	*enemy = m_currentEnemy;
+	*targetID = m_strategyState.strategicTargetID;
+	if (m_alliedAssaultActive && m_alliedAssaultLaunched && team && isAlliedAssaultTeam(team->getID())) {
+		*mode = SKIRMISH_STRATEGY_ASSAULT;
+		*enemy = getPinnedAlliedEnemy();
+		*targetID = m_alliedTargetID;
+	}
+}
+
+Bool AISkirmishPlayer::resolveTunnelBuildTargetOwner(ObjectID targetID, Player **enemy) const
+{
+	*enemy = 0;
+	if (usesAlliedCoordinationBehavior() && m_alliedAssaultActive && m_alliedAssaultLaunched &&
+		m_strategyState.currentMode != SKIRMISH_STRATEGY_FORTIFY &&
+		m_alliedTargetID == targetID && hasAlliedAssaultForce()) {
+		Object *target = TheGameLogic ? TheGameLogic->findObjectByID(targetID) : 0;
+		Player *sharedEnemy = getPinnedAlliedEnemy();
+		if (target && sharedEnemy && target->getControllingPlayer() == sharedEnemy) {
+			*enemy = sharedEnemy;
+			return true;
+		}
+	}
+	// Keep the ordinary mode/ID gate exact, including legacy replay behavior.
+	// Its existing callers separately validate target, intel and enemy ownership.
+	if (m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+		m_strategyState.strategicTargetID == targetID) {
+		*enemy = m_currentEnemy;
+		return true;
+	}
+	return false;
+}
+
+void AISkirmishPlayer::captureAlliedStagingTeams()
+{
+	m_alliedCapturedTeamIDs.clear();
+	if (m_alliedAssaultActive || m_alliedStrategyResumePending) {
+		m_alliedCapturedTeamIDs = m_alliedAssaultTeamIDs;
+		return;
+	}
+	for (Player::PlayerTeamList::const_iterator prototype = m_player->getPlayerTeams()->begin();
+		prototype != m_player->getPlayerTeams()->end(); ++prototype) {
+		for (DLINK_ITERATOR<Team> instance = (*prototype)->iterate_TeamInstanceList();
+			!instance.done(); instance.advance()) {
+			Team *team = instance.cur();
+			if (!isAlliedStagingTeamAvailable(team)) continue;
+			std::vector<UnsignedInt>::iterator position = std::lower_bound(
+				m_alliedCapturedTeamIDs.begin(), m_alliedCapturedTeamIDs.end(), team->getID());
+			m_alliedCapturedTeamIDs.insert(position, team->getID());
+			if (m_alliedCapturedTeamIDs.size() > MAX_SKIRMISH_ALLIED_ASSAULT_TEAMS)
+				m_alliedCapturedTeamIDs.pop_back();
+		}
+	}
+}
+
+void AISkirmishPlayer::xferAlliedAssaultTeams(Xfer *xfer)
+{
+	UnsignedInt count = (UnsignedInt)m_alliedAssaultTeamIDs.size();
+	xfer->xferUnsignedInt(&count);
+	if (xfer->getXferMode() == XFER_LOAD) m_alliedAssaultTeamIDs.clear();
+	for (UnsignedInt i = 0; i < count; ++i) {
+		UnsignedInt id = xfer->getXferMode() == XFER_LOAD ? 0 : m_alliedAssaultTeamIDs[i];
+		xfer->xferUnsignedInt(&id);
+		if (xfer->getXferMode() == XFER_LOAD && i < MAX_SKIRMISH_ALLIED_ASSAULT_TEAMS && id)
+			m_alliedAssaultTeamIDs.push_back(id);
+	}
+	if (xfer->getXferMode() == XFER_LOAD) {
+		std::sort(m_alliedAssaultTeamIDs.begin(), m_alliedAssaultTeamIDs.end());
+		m_alliedAssaultTeamIDs.erase(std::unique(m_alliedAssaultTeamIDs.begin(),
+			m_alliedAssaultTeamIDs.end()), m_alliedAssaultTeamIDs.end());
+	}
 }
 
 void AISkirmishPlayer::xferAlliedCoordination(Xfer *xfer)
@@ -8614,12 +8824,13 @@ Bool AISkirmishPlayer::shouldHoldAlliedScriptCommand(const Object *object) const
 	const UnsignedInt teamID = object->getTeam()->getID();
 	// Support retains command ownership until its returning roster actually reaches home.
 	return !isAlliedCommandProtectedTeam(teamID) &&
-		(isAlliedSupportTeam(teamID) || isAlliedAssaultHolding() || m_alliedStrategyResumePending);
+		(isAlliedSupportTeam(teamID) || (isAlliedAssaultTeam(teamID) &&
+		 (m_alliedAssaultActive || m_alliedStrategyResumePending)));
 }
 
 Bool AISkirmishPlayer::isAlliedAssaultHoldingTeam(UnsignedInt teamID) const
 {
-	if (!isAlliedAssaultHolding() || !m_player || isAlliedSupportTeam(teamID) ||
+	if (!isAlliedAssaultHolding() || !m_player || !isAlliedAssaultTeam(teamID) || isAlliedSupportTeam(teamID) ||
 		isAlliedCommandProtectedTeam(teamID)) return false;
 	Team *team = FindSkirmishAlliedTeam(m_player, teamID);
 	if (!IsSkirmishStrategyOffensiveTeam(team, m_player) || !team->hasAnyObjects()) return false;
@@ -8633,7 +8844,7 @@ Bool AISkirmishPlayer::isAlliedAssaultHoldingTeam(UnsignedInt teamID) const
 
 void AISkirmishPlayer::clearAlliedAssault()
 {
-	if (m_alliedAssaultActive && !m_alliedAssaultLaunched)
+	if (m_alliedAssaultActive)
 		m_alliedStrategyResumePending = true;
 	m_alliedAssaultActive = false;
 	m_alliedAssaultLaunched = false;
@@ -8673,15 +8884,22 @@ void AISkirmishPlayer::resumeAlliedStrategy()
 		m_alliedRecentHomeDamage || m_alliedRecentHeldDamage)) {
 		// An abort does not promote an attack. Keep the safe home command until
 		// another actual strategy evaluation establishes normal ownership.
-		commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0, true);
+		commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0, true, true);
 		return;
 	}
+	Object *target = m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT ?
+		TheGameLogic->findObjectByID(m_strategyState.strategicTargetID) : 0;
+	if (target && (!m_currentEnemy || target->getControllingPlayer() != m_currentEnemy ||
+		!IsSkirmishStrategyIntelEligible(target, m_player) || !IsSkirmishStrategyStaticTarget(target) ||
+		target->isEffectivelyDead() || target->isDestroyed() || target->testStatus(OBJECT_STATUS_SOLD))) target = 0;
+	// Reissue ordinary ownership only to the retained roster, before releasing it.
+	rebaseAlliedAssaultTeams();
+	// Only historical whole-owner saves can have pending ownership without a roster.
+	commandOffensiveTeams(m_strategyState.currentMode, target, true, !m_alliedAssaultTeamIDs.empty());
 	m_alliedStrategyResumePending = false;
 	m_alliedHoldAdmissionValid = false;
 	m_alliedHoldAdmissionFrame = 0;
-	// NONE forces one normal strategy impulse even when mode/target stayed
-	// unchanged while the shared hold suppressed its original transition.
-	applyStrategyMode(SKIRMISH_STRATEGY_NONE, m_strategyState.currentMode, INVALID_ID, true);
+	m_alliedAssaultTeamIDs.clear();
 }
 
 Player *AISkirmishPlayer::getPinnedAlliedEnemy() const
@@ -8690,9 +8908,12 @@ Player *AISkirmishPlayer::getPinnedAlliedEnemy() const
 		IsSkirmishStrategyFrameReached(TheGameLogic->getFrame(), m_alliedAssaultExpiryFrame))
 		return 0;
 	Player *enemy = FindSkirmishAlliedPlayer(m_alliedEnemyIndex);
+	Object *target = enemy ? TheGameLogic->findObjectByID(m_alliedTargetID) : 0;
 	return enemy && enemy->getDefaultTeam() && enemy->isPlayerActive() &&
 		!enemy->isPlayerDead() && m_player->getRelationship(enemy->getDefaultTeam()) == ENEMIES &&
-		enemy->hasOffensiveTargetableObjects() ? enemy : 0;
+		target && target->getControllingPlayer() == enemy && IsSkirmishStrategyStaticTarget(target) &&
+		!target->isEffectivelyDead() && !target->isDestroyed() &&
+		!target->testStatus(OBJECT_STATUS_SOLD) ? enemy : 0;
 }
 
 Bool AISkirmishPlayer::resolveAlliedAssaultTarget(Object **target) const
@@ -8701,9 +8922,44 @@ Bool AISkirmishPlayer::resolveAlliedAssaultTarget(Object **target) const
 	Player *enemy = getPinnedAlliedEnemy();
 	Object *object = enemy && TheGameLogic ? TheGameLogic->findObjectByID(m_alliedTargetID) : 0;
 	if (!object || object->getControllingPlayer() != enemy ||
-		!IsSkirmishStrategyIntelEligible(object, m_player) ||
 		!IsSkirmishStrategyStaticTarget(object) || object->isEffectivelyDead() ||
 		object->isDestroyed() || object->testStatus(OBJECT_STATUS_SOLD)) return false;
+	if (!IsSkirmishStrategyIntelEligible(object, m_player)) {
+		const ObjectShroudStatus shroud = object->getShroudedStatus(m_player->getPlayerIndex());
+		if (shroud == OBJECTSHROUD_CLEAR || shroud == OBJECTSHROUD_PARTIAL_CLEAR ||
+			!IsSkirmishAIIntelEligible(object->isKindOf(KINDOF_STRUCTURE), true, false,
+				object->testStatus(OBJECT_STATUS_STEALTHED), object->testStatus(OBJECT_STATUS_DETECTED),
+				object->testStatus(OBJECT_STATUS_MASKED))) return false;
+		// Boarding can remove the cohort's only vision. Retain this already
+		// launched objective only while an actual admitted passenger is in transit
+		// and its own committed observation remains fresh. No new attack uses this grace.
+		Bool retainedTransit = false;
+		TunnelTracker *tracker = m_player->getTunnelSystem();
+		for (size_t i = 0; m_alliedAssaultLaunched && tracker &&
+			i < m_alliedAssaultTeamIDs.size() && !retainedTransit; ++i) {
+			const UnsignedInt id = m_alliedAssaultTeamIDs[i];
+			std::map<UnsignedInt, TacticalTeamState>::const_iterator it = m_tacticalTeams.find(id);
+			if (it == m_tacticalTeams.end()) continue;
+			const TacticalTeamState &state = it->second;
+			if (state.tunnelTransitPhase == SKIRMISH_AI_TUNNEL_TRANSIT_NONE ||
+				state.tunnelTransitPhase == SKIRMISH_AI_TUNNEL_TRANSIT_FALLBACK_EXIT ||
+				state.tunnelTargetID != m_alliedTargetID || state.tunnelStrategicTargetID != m_alliedTargetID ||
+				!IsSkirmishStrategyTargetObservationAvailable(TRUE, TheGameLogic->getFrame(),
+					state.tunnelCommittedTargetLastSeenFrame)) continue;
+			Team *team = FindSkirmishAlliedTeam(m_player, id);
+			if (!IsSkirmishStrategyOffensiveTeam(team, m_player)) continue;
+			for (Int member = 0; member < state.tunnelMemberCount &&
+				member < MAX_SKIRMISH_AI_TUNNEL_MEMBERS; ++member) {
+				Object *passenger = TheGameLogic->findObjectByID(state.tunnelMemberIDs[member]);
+				if (IsSkirmishAIStrategyTunnelTransitMember(passenger, m_player, team, true) &&
+					passenger->isContained() && tracker->isInContainer(passenger)) {
+					retainedTransit = true;
+					break;
+				}
+			}
+		}
+		if (!retainedTransit) return false;
+	}
 	*target = object;
 	return true;
 }
@@ -8746,6 +9002,7 @@ void AISkirmishPlayer::commitAlliedCoordination(
 			!resolveAlliedAssaultTarget(&target)) clearAlliedAssault();
 		else return; // A plan's announced release frame is immutable.
 	}
+	if (m_alliedStrategyResumePending) return;
 	if (m_strategyState.alliedCoordinationCooldownActive &&
 		!IsSkirmishStrategyFrameReached(now, m_strategyState.nextAlliedCoordinationFrame)) return;
 	const Int leader = decision.assaultLeaderIndices[index];
@@ -8762,41 +9019,55 @@ void AISkirmishPlayer::commitAlliedCoordination(
 		!IsSkirmishStrategyStaticTarget(target) || target->isEffectivelyDead() || target->isDestroyed() ||
 		target->testStatus(OBJECT_STATUS_SOLD))
 		return;
-	// Each participant proves its own usable approach. Their routes may differ.
+	// Admission uses the same immutable capture as readiness/target selection.
+	// Recheck ownership and availability after support admission changed the live roster.
+	if (m_alliedCapturedStrategyFrame != now || m_alliedCapturedTeamIDs.empty()) return;
 	std::vector<SkirmishStrategyCapabilityCandidate> ground;
 	std::vector<SkirmishStrategyCapabilityCandidate> air;
-	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject()) {
-		if (!IsSkirmishStrategyOffensiveRecipient(object, m_player) ||
-			isAlliedSupportTeam(object->getTeam()->getID())) continue;
-		std::map<UnsignedInt, TacticalTeamState>::const_iterator state =
-			m_tacticalTeams.find(object->getTeam()->getID());
-		if (state != m_tacticalTeams.end() &&
-			(state->second.retreating || state->second.woundedReserve ||
-			 state->second.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE)) continue;
-		if (object->isKindOf(KINDOF_AIRCRAFT)) AppendSkirmishStrategyCapabilityCandidate(&air, object, 1);
-		else AppendSkirmishStrategyCapabilityCandidate(&ground, object, 1);
+	Int forceValue = 0;
+	for (size_t i = 0; i < m_alliedCapturedTeamIDs.size(); ++i) {
+		Team *team = FindSkirmishAlliedTeam(m_player, m_alliedCapturedTeamIDs[i]);
+		if (!isAlliedStagingTeamAvailable(team)) return;
+		for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+			!member.done(); member.advance()) {
+			Object *object = member.cur();
+			if (!IsSkirmishStrategyPotentialOffensiveRecipient(object, m_player, team)) continue;
+			const Int cost = object->getTemplate()->calcCostToBuild(m_player);
+			const Int value = cost > 0 ? (Int)((__int64)cost *
+				GetSkirmishStrategyHealthPercent(object) / 100) : 0;
+			forceValue = AddSkirmishStrategyValue(forceValue, value);
+			if (object->isKindOf(KINDOF_AIRCRAFT)) AppendSkirmishStrategyCapabilityCandidate(&air, object, value);
+			else AppendSkirmishStrategyCapabilityCandidate(&ground, object, value);
+		}
 	}
+	const Int poor = TheAI->getAiData()->m_resourcesPoor > 0 ? TheAI->getAiData()->m_resourcesPoor : 2500;
+	const Int wealthy = TheAI->getAiData()->m_resourcesWealthy > poor ?
+		TheAI->getAiData()->m_resourcesWealthy :
+		(Int)((__int64)poor * 4 > 2147483647 ? 2147483647 : (__int64)poor * 4);
+	if (forceValue <= 0 || GetSkirmishStrategyValuePercent(forceValue, wealthy) < 60) return;
 	SortSkirmishStrategyCapabilityCandidates(&ground);
 	SortSkirmishStrategyCapabilityCandidates(&air);
 	Int queries = 0;
 	if (!HasSkirmishStrategyTargetCapability(target, air, ground, &queries, true)) return;
+	UnsignedInt releaseFrame = now + 20 * LOGICFRAMES_PER_SECOND;
+	if (leader != index && leaderPlayer && leaderPlayer->isSkirmishAIPlayer()) {
+		AISkirmishPlayer *leaderAI = static_cast<AISkirmishPlayer *>(leaderPlayer->getAIPlayerForPlanning());
+		if (!leaderAI || !leaderAI->m_alliedAssaultActive || leaderAI->m_alliedAssaultLaunched ||
+			leaderAI->m_alliedTargetID != target->getID() ||
+			leaderAI->m_alliedEnemyIndex != enemyIndex ||
+			IsSkirmishStrategyFrameReached(now, leaderAI->m_alliedAssaultFrame)) {
+			return;
+		}
+		releaseFrame = leaderAI->m_alliedAssaultFrame;
+	}
+	m_alliedAssaultTeamIDs = m_alliedCapturedTeamIDs;
+	rebaseAlliedAssaultTeams();
 	m_alliedAssaultActive = true;
 	m_alliedAssaultLaunched = false;
 	m_alliedLeaderIndex = leader;
 	m_alliedEnemyIndex = enemyIndex;
 	m_alliedTargetID = target->getID();
-	m_alliedAssaultFrame = now + 20 * LOGICFRAMES_PER_SECOND;
-	if (leader != index && leaderPlayer && leaderPlayer->isSkirmishAIPlayer()) {
-		AISkirmishPlayer *leaderAI = static_cast<AISkirmishPlayer *>(leaderPlayer->getAIPlayerForPlanning());
-		if (!leaderAI || !leaderAI->m_alliedAssaultActive || leaderAI->m_alliedAssaultLaunched ||
-			leaderAI->m_alliedTargetID != m_alliedTargetID ||
-			leaderAI->m_alliedEnemyIndex != m_alliedEnemyIndex ||
-			IsSkirmishStrategyFrameReached(now, leaderAI->m_alliedAssaultFrame)) {
-			clearAlliedAssault();
-			return;
-		}
-		m_alliedAssaultFrame = leaderAI->m_alliedAssaultFrame;
-	}
+	m_alliedAssaultFrame = releaseFrame;
 	m_alliedAssaultExpiryFrame = m_alliedAssaultFrame + 90 * LOGICFRAMES_PER_SECOND;
 	m_alliedStrategyResumePending = false;
 	// Discard any earlier hold/pending event before accepting this admission.
@@ -8809,9 +9080,6 @@ void AISkirmishPlayer::commitAlliedCoordination(
 	m_alliedNextHoldFrame = now;
 	m_strategyState.alliedCoordinationCooldownActive = true;
 	m_strategyState.nextAlliedCoordinationFrame = m_alliedAssaultExpiryFrame;
-	m_currentEnemy = enemy;
-	m_currentEnemyPlayerIndex = enemyIndex;
-	m_frameToCheckEnemy = now + 5 * LOGICFRAMES_PER_SECOND;
 }
 
 void AISkirmishPlayer::recallAlliedSupport()
@@ -8849,7 +9117,8 @@ void AISkirmishPlayer::dispatchAlliedSupport(Int recipientIndex, Int budget)
 		for (DLINK_ITERATOR<Team> instance = (*prototype)->iterate_TeamInstanceList();
 			!instance.done(); instance.advance()) {
 			Team *team = instance.cur();
-			if (IsSkirmishStrategyOffensiveTeam(team, m_player)) teams.push_back(team);
+			if (IsSkirmishStrategyOffensiveTeam(team, m_player) &&
+				!isAlliedAssaultTeam(team->getID())) teams.push_back(team);
 		}
 	}
 	std::sort(teams.begin(), teams.end(), IsSkirmishAITacticalTeamBefore);
@@ -8960,7 +9229,7 @@ void AISkirmishPlayer::updateAlliedAssignments()
 				leaderAI->m_alliedTargetID == m_alliedTargetID &&
 				leaderAI->m_alliedAssaultFrame == m_alliedAssaultFrame;
 		}
-		if (!own || !own->alive || own->immediateThreat >= 60 ||
+		if (!hasAlliedAssaultForce() || !own || !own->alive || own->immediateThreat >= 60 ||
 			m_alliedRecentHomeDamage || (!m_alliedAssaultLaunched && m_alliedRecentHeldDamage) ||
 			(!m_alliedAssaultLaunched && !m_alliedHoldAdmissionValid) ||
 			m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY ||
@@ -8972,18 +9241,11 @@ void AISkirmishPlayer::updateAlliedAssignments()
 		} else if (!m_alliedAssaultLaunched && IsSkirmishStrategyFrameReached(now, m_alliedAssaultFrame)) {
 			m_alliedAssaultLaunched = true;
 			m_alliedStrategyResumePending = false;
-			m_strategyState.currentMode = SKIRMISH_STRATEGY_ASSAULT;
-			m_strategyState.pendingMode = SKIRMISH_STRATEGY_NONE;
-			m_strategyState.pendingSinceFrame = 0;
-			m_strategyState.modeEntryFrame = now;
-			m_strategyState.assaultEntryCombatValue = own->combatValue;
-			m_strategyState.strategicTargetID = m_alliedTargetID;
-			m_strategyState.strategicTargetObserved = true;
-			m_strategyState.strategicTargetLastSeenFrame = now;
-			commandOffensiveTeams(SKIRMISH_STRATEGY_ASSAULT, target, true);
+			rebaseAlliedAssaultTeams();
+			commandOffensiveTeams(SKIRMISH_STRATEGY_ASSAULT, target, true, true);
 		} else if (!m_alliedAssaultLaunched && IsSkirmishStrategyFrameReached(now, m_alliedNextHoldFrame)) {
 			m_alliedNextHoldFrame = now + 2 * LOGICFRAMES_PER_SECOND;
-			commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0, true);
+			commandOffensiveTeams(SKIRMISH_STRATEGY_FORTIFY, 0, true, true);
 		}
 	}
 	if (m_alliedSupportRecipientIndex >= 0) {
@@ -9558,6 +9820,8 @@ void AISkirmishPlayer::updateTacticalTeams()
 {
 	const Bool alliedOffensiveHold = isAlliedAssaultHolding() ||
 		(usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending);
+	const Bool alliedLaunched = usesAlliedCoordinationBehavior() &&
+		m_alliedAssaultActive && m_alliedAssaultLaunched;
 	if (!ShouldUseCurrentSkirmishAITacticalBehavior() || !usesStrategyBehavior() ||
 		!m_player || !TheAI ||
 		!TheAI->pathfinder() || !m_baseCenterSet)
@@ -9598,8 +9862,9 @@ void AISkirmishPlayer::updateTacticalTeams()
 	std::vector<Object *> alternateTargets;
 	std::vector<Object *> corridorDefenses;
 	std::vector<Object *> retreatFacilities;
-	if (!alliedOffensiveHold && !teams.empty() &&
-		m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT) {
+	Player *sharedEnemy = alliedLaunched ? getPinnedAlliedEnemy() : 0;
+	if (!teams.empty() &&
+		(m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT || alliedLaunched)) {
 		for (Object *object = TheGameLogic->getFirstObject(); object;
 			object = object->getNextObject()) {
 			Player *owner = object->getControllingPlayer();
@@ -9629,7 +9894,7 @@ void AISkirmishPlayer::updateTacticalTeams()
 				visibleCombatEnemies.push_back(object);
 			if (combat || armedStructure)
 				retreatHazards.push_back(object);
-			if (owner == m_currentEnemy &&
+			if ((owner == m_currentEnemy || (sharedEnemy && owner == sharedEnemy)) &&
 				!object->testStatus(OBJECT_STATUS_SOLD)) {
 				if (IsSkirmishStrategyStaticTarget(object))
 					alternateTargets.push_back(object);
@@ -9672,7 +9937,11 @@ void AISkirmishPlayer::updateTacticalTeams()
 			continue;
 		}
 		// Keep committed transit advancement/cleanup above the allied reassignment gate.
-		if (alliedOffensiveHold) continue;
+		if (alliedOffensiveHold && isAlliedAssaultTeam(team->getID())) continue;
+		SkirmishStrategyMode teamMode;
+		ObjectID teamTargetID;
+		Player *teamEnemy;
+		getTeamStrategyContext(team, &teamMode, &teamEnemy, &teamTargetID);
 		if (evaluatedTeams >=
 			MAX_SKIRMISH_AI_TACTICAL_TEAM_EVALUATIONS_PER_UPDATE)
 			continue;
@@ -9721,7 +9990,7 @@ void AISkirmishPlayer::updateTacticalTeams()
 		}
 		// Balanced and Fortify hand control back to the native team scripts.
 		// A wounded team must not remain in the tactical regroup loop forever.
-		if (m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT) {
+		if (teamMode != SKIRMISH_STRATEGY_ASSAULT) {
 			state.retreating = false;
 			state.woundedReserve = false;
 			state.alternateAttackIssuedTargetID = INVALID_ID;
@@ -9752,7 +10021,7 @@ void AISkirmishPlayer::updateTacticalTeams()
 			continue;
 		}
 		if (state.retreating &&
-			state.routeExhaustedTargetID == m_strategyState.strategicTargetID &&
+			state.routeExhaustedTargetID == teamTargetID &&
 			state.routeExhaustedTargetID != INVALID_ID &&
 			!IsSkirmishStrategyFrameReached(now, state.routeExhaustedUntilFrame)) {
 			state.regroupUntilFrame = now + 8 * LOGICFRAMES_PER_SECOND;
@@ -9766,15 +10035,15 @@ void AISkirmishPlayer::updateTacticalTeams()
 		Object *target = state.targetID != INVALID_ID
 			? TheGameLogic->findObjectByID(state.targetID) : nullptr;
 		if (target && (!IsSkirmishStrategyIntelEligible(target, m_player) ||
-			target->getControllingPlayer() != m_currentEnemy ||
+			target->getControllingPlayer() != teamEnemy ||
 			!IsSkirmishStrategyStaticTarget(target) ||
 			target->isEffectivelyDead() || target->isDestroyed() ||
 			target->testStatus(OBJECT_STATUS_SOLD)))
 			target = nullptr;
-		if (!target && m_strategyState.strategicTargetID != INVALID_ID) {
-			target = TheGameLogic->findObjectByID(m_strategyState.strategicTargetID);
+		if (!target && teamTargetID != INVALID_ID) {
+			target = TheGameLogic->findObjectByID(teamTargetID);
 			if (target && (!IsSkirmishStrategyIntelEligible(target, m_player) ||
-				target->getControllingPlayer() != m_currentEnemy ||
+				target->getControllingPlayer() != teamEnemy ||
 				!IsSkirmishStrategyStaticTarget(target) ||
 				target->isEffectivelyDead() || target->isDestroyed() ||
 				target->testStatus(OBJECT_STATUS_SOLD)))
@@ -9825,7 +10094,7 @@ void AISkirmishPlayer::updateTacticalTeams()
 			}
 		}
 		Bool stalled = false;
-		if (target && m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT) {
+		if (target && teamMode == SKIRMISH_STRATEGY_ASSAULT) {
 			const Real dx = target->getPosition()->x - representative->getPosition()->x;
 			const Real dy = target->getPosition()->y - representative->getPosition()->y;
 			const Real distance = dx * dx + dy * dy;
@@ -9879,7 +10148,7 @@ void AISkirmishPlayer::updateTacticalTeams()
 		const Bool retreat = IsSkirmishStrategyFrameReached(now, state.nextRetreatFrame) &&
 			(averageHealth < 35 || (threat && threatCapableCount == 0) || outmatched);
 		Bool alternateReady = false;
-		if (target && target->getID() != m_strategyState.strategicTargetID &&
+		if (target && target->getID() != teamTargetID &&
 			targetCapableCount > 0) {
 			const Real dx = target->getPosition()->x - representative->getPosition()->x;
 			const Real dy = target->getPosition()->y - representative->getPosition()->y;
@@ -9932,10 +10201,10 @@ void AISkirmishPlayer::updateTacticalTeams()
 				continue;
 		}
 		if (reengage && !retreat && !stalled) {
-			if (target && m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT)
+			if (target && teamMode == SKIRMISH_STRATEGY_ASSAULT)
 				group->groupAttackMoveToPosition(target->getPosition(),
 					NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
-			else if (m_strategyState.currentMode == SKIRMISH_STRATEGY_BALANCED)
+			else if (teamMode == SKIRMISH_STRATEGY_BALANCED)
 				group->groupIdle(CMD_FROM_AI);
 			continue;
 		}
@@ -9992,7 +10261,7 @@ void AISkirmishPlayer::updateTacticalTeams()
 			for (size_t candidateIndex = 0;
 				candidateIndex < alternateTargets.size(); ++candidateIndex) {
 				Object *candidate = alternateTargets[candidateIndex];
-				if (candidate == target || candidate->getControllingPlayer() != m_currentEnemy ||
+				if (candidate == target || candidate->getControllingPlayer() != teamEnemy ||
 					(state.alternateProbeAfterID != INVALID_ID &&
 					 candidate->getID() <= state.alternateProbeAfterID) ||
 					(representative->getAbleToAttackSpecificObject(ATTACK_NEW_TARGET,
@@ -10075,6 +10344,7 @@ void AISkirmishPlayer::updateTacticalTeams()
 				for (size_t candidateIndex = 0;
 					candidateIndex < corridorDefenses.size(); ++candidateIndex) {
 					Object *candidate = corridorDefenses[candidateIndex];
+					if (candidate->getControllingPlayer() != teamEnemy) continue;
 					if (!SkirmishAITunnelRoute::IsCorridorBlocker(
 							representative->getPosition()->x,
 							representative->getPosition()->y,
@@ -10142,7 +10412,7 @@ void AISkirmishPlayer::updateTacticalTeams()
 			if (pathProbeDeferred)
 				continue;
 			if (!moreCandidates && target &&
-				target->getID() == m_strategyState.strategicTargetID) {
+				target->getID() == teamTargetID) {
 				state.routeExhaustedTargetID = target->getID();
 				state.routeExhaustedUntilFrame = now +
 					60 * LOGICFRAMES_PER_SECOND;
@@ -10271,15 +10541,19 @@ Bool AISkirmishPlayer::tryTunnelBypass(
 	Int *aggregatePathQueryCount)
 {
 	Int tunnelAttemptPathQueryCount = 0;
+	SkirmishStrategyMode teamMode;
+	Player *teamEnemy;
+	ObjectID teamTargetID;
+	getTeamStrategyContext(team, &teamMode, &teamEnemy, &teamTargetID);
 	if (!team || !target || !blockingDefense || !group || !representative ||
 		!aggregatePathQueryCount ||
 		!m_player || !TheGameLogic || !TheAI || !TheAI->pathfinder() ||
 		!IsSkirmishAISupportedGLASide(m_player->getSide()) || hasAircraft ||
 		memberCount <= 0 || memberCount > MAX_SKIRMISH_AI_TUNNEL_MEMBERS ||
 		state.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE ||
-		m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
-		!IsSkirmishAIStrategyTunnelTargetUsable(target, m_player, m_currentEnemy) ||
-		blockingDefense->getControllingPlayer() != m_currentEnemy ||
+		teamMode != SKIRMISH_STRATEGY_ASSAULT ||
+		!IsSkirmishAIStrategyTunnelTargetUsable(target, m_player, teamEnemy) ||
+		blockingDefense->getControllingPlayer() != teamEnemy ||
 		!blockingDefense->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
 		blockingDefense->isEffectivelyDead() || blockingDefense->isDestroyed() ||
 		blockingDefense->testStatus(OBJECT_STATUS_SOLD) ||
@@ -10849,7 +11123,7 @@ Bool AISkirmishPlayer::tryTunnelBypass(
 	state.tunnelTargetID = target->getID();
 	state.tunnelCommittedTargetLastSeenFrame = now;
 	state.tunnelWaitTargetID = target->getID();
-	state.tunnelStrategicTargetID = m_strategyState.strategicTargetID;
+	state.tunnelStrategicTargetID = teamTargetID;
 	state.targetID = target->getID();
 	state.lastProgressFrame = now;
 	state.blockedSinceFrame = 0;
@@ -10913,6 +11187,11 @@ void AISkirmishPlayer::updateTunnelTransit(
 	if (!team || !TheGameLogic ||
 		state.tunnelTransitPhase == SKIRMISH_AI_TUNNEL_TRANSIT_NONE)
 		return;
+	SkirmishStrategyMode teamMode;
+	Player *teamEnemy;
+	ObjectID teamTargetID;
+	getTeamStrategyContext(team, &teamMode, &teamEnemy, &teamTargetID);
+	const Bool alliedTransit = m_alliedAssaultActive && m_alliedAssaultLaunched && isAlliedAssaultTeam(team->getID());
 
 	std::vector<Object *> members;
 	Bool memberSetStable = state.tunnelMemberCount > 0;
@@ -11003,9 +11282,9 @@ void AISkirmishPlayer::updateTunnelTransit(
 	Object *target = state.tunnelTargetID != INVALID_ID
 		? TheGameLogic->findObjectByID(state.tunnelTargetID) : nullptr;
 	const Bool targetUnchanged =
-		m_strategyState.strategicTargetID == state.tunnelStrategicTargetID;
+		teamTargetID == state.tunnelStrategicTargetID;
 	const Bool targetVisibleUsable = IsSkirmishAIStrategyTunnelTargetUsable(
-		target, m_player, m_currentEnemy);
+		target, m_player, teamEnemy);
 	// Boarding can remove the team's only vision of its already committed
 	// objective. Let it finish the planned transit while that observation is
 	// fresh, but never use a hidden target for a new attack order.
@@ -11015,8 +11294,8 @@ void AISkirmishPlayer::updateTunnelTransit(
 	const Bool targetHiddenByFog = target && m_player &&
 		targetShroud != OBJECTSHROUD_CLEAR &&
 		targetShroud != OBJECTSHROUD_PARTIAL_CLEAR;
-	const Bool targetLiveEnemyStatic = target && m_player && m_currentEnemy &&
-		target->getControllingPlayer() == m_currentEnemy &&
+	const Bool targetLiveEnemyStatic = target && m_player && teamEnemy &&
+		target->getControllingPlayer() == teamEnemy &&
 		IsSkirmishStrategyStaticTarget(target) &&
 		!target->isEffectivelyDead() && !target->isDestroyed() &&
 		!target->testStatus(OBJECT_STATUS_SOLD);
@@ -11028,19 +11307,19 @@ void AISkirmishPlayer::updateTunnelTransit(
 	const Bool targetGraceUsable = targetUnchanged &&
 		targetHiddenByFog && targetLiveEnemyStatic &&
 		targetWouldBeIntelEligible &&
-		(state.tunnelTargetID == state.tunnelStrategicTargetID
+		(state.tunnelTargetID == state.tunnelStrategicTargetID && !alliedTransit
 			? IsSkirmishStrategyTargetObservationAvailable(
 				m_strategyState.strategicTargetObserved, now,
 				m_strategyState.strategicTargetLastSeenFrame)
 			: IsSkirmishStrategyTargetObservationAvailable(TRUE, now,
 				state.tunnelCommittedTargetLastSeenFrame));
-	const Bool targetUsable = m_strategyState.currentMode ==
+	const Bool targetUsable = teamMode ==
 		SKIRMISH_STRATEGY_ASSAULT && targetUnchanged &&
 		(targetVisibleUsable || targetGraceUsable);
-	Object *currentTarget = m_strategyState.strategicTargetID != INVALID_ID
-		? TheGameLogic->findObjectByID(m_strategyState.strategicTargetID) : nullptr;
+	Object *currentTarget = teamTargetID != INVALID_ID
+		? TheGameLogic->findObjectByID(teamTargetID) : nullptr;
 	if (!IsSkirmishAIStrategyTunnelTargetUsable(
-			currentTarget, m_player, m_currentEnemy))
+			currentTarget, m_player, teamEnemy))
 		currentTarget = nullptr;
 
 	Object *entry = state.tunnelEntryID != INVALID_ID
@@ -11176,14 +11455,14 @@ void AISkirmishPlayer::updateTunnelTransit(
 		state.routeExhaustedUntilFrame = 0;
 	}
 
-	if (m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+	if (teamMode == SKIRMISH_STRATEGY_ASSAULT &&
 		!currentTarget && targetVisibleUsable && targetUsable)
 		currentTarget = target;
 	if (groupObject) {
-		if (m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT && currentTarget)
+		if (teamMode == SKIRMISH_STRATEGY_ASSAULT && currentTarget)
 			groupObject->groupAttackMoveToPosition(currentTarget->getPosition(),
 				NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
-		else if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+		else if (teamMode == SKIRMISH_STRATEGY_FORTIFY &&
 			m_baseCenterSet)
 			groupObject->groupGuardPosition(&m_baseCenter,
 				GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
@@ -11196,11 +11475,11 @@ void AISkirmishPlayer::updateTunnelTransit(
 			AIUpdateInterface *ai = members[memberIndex]->getAIUpdateInterface();
 			if (!ai)
 				continue;
-			if (m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT &&
+			if (teamMode == SKIRMISH_STRATEGY_ASSAULT &&
 				currentTarget)
 				ai->aiAttackMoveToPosition(currentTarget->getPosition(),
 					NO_MAX_SHOTS_LIMIT, CMD_FROM_AI);
-			else if (m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY &&
+			else if (teamMode == SKIRMISH_STRATEGY_FORTIFY &&
 				m_baseCenterSet)
 				ai->aiGuardPosition(&m_baseCenter,
 					GUARDMODE_GUARD_WITHOUT_PURSUIT, CMD_FROM_AI);
@@ -11262,14 +11541,14 @@ static Bool IsSkirmishTacticalRetreatPointSafe(
 }
 
 void AISkirmishPlayer::commandOffensiveTeams(
-	SkirmishStrategyMode mode, Object *target, Bool preserveTunnelTransit)
+	SkirmishStrategyMode mode, Object *target, Bool preserveTunnelTransit, Bool alliedRosterOnly)
 {
 	if (!TheAI || !m_player)
 		return;
 	// Allied release/resumption may already have cleared their hold flags.
 	// Preserve tactical retreat, wounded reserve and transit ownership on those impulses.
 	const Bool protectTacticalOrders = usesAlliedCoordinationBehavior() &&
-		(preserveTunnelTransit || isAlliedAssaultHolding() || m_alliedStrategyResumePending);
+		(preserveTunnelTransit || alliedRosterOnly);
 	std::vector<Team *> teams;
 	Player::PlayerTeamList::const_iterator prototype;
 	for (prototype = m_player->getPlayerTeams()->begin();
@@ -11280,6 +11559,8 @@ void AISkirmishPlayer::commandOffensiveTeams(
 			Team *candidate = teamInstance.cur();
 			if (IsSkirmishStrategyOffensiveTeam(candidate, m_player) &&
 				!isAlliedSupportTeam(candidate->getID()) &&
+				(alliedRosterOnly ? isAlliedAssaultTeam(candidate->getID()) :
+				 !isAlliedAssaultTeam(candidate->getID())) &&
 				(!protectTacticalOrders || !isAlliedCommandProtectedTeam(candidate->getID())) &&
 				candidate->hasAnyObjects()) {
 				SkirmishStrategyGroupRecipientContext context;
@@ -11344,9 +11625,6 @@ void AISkirmishPlayer::applyStrategyMode(
 	SkirmishStrategyMode previousMode, SkirmishStrategyMode currentMode,
 	ObjectID previousTargetID, Bool preserveTunnelTransit)
 {
-	if (isAlliedAssaultHolding() && currentMode != SKIRMISH_STRATEGY_FORTIFY) return;
-	if (usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending &&
-		currentMode != SKIRMISH_STRATEGY_FORTIFY) return;
 	// Strategy commands are transition impulses.  Native team scripts retain
 	// ownership on later frames; stable modes must not keep overwriting them.
 	if (previousMode == currentMode &&
@@ -11359,6 +11637,7 @@ void AISkirmishPlayer::applyStrategyMode(
 		const UnsignedInt now = TheGameLogic->getFrame();
 		for (std::map<UnsignedInt, TacticalTeamState>::iterator it =
 				m_tacticalTeams.begin(); it != m_tacticalTeams.end(); ++it) {
+			if (isAlliedAssaultTeam(it->first)) continue;
 			TacticalTeamState &state = it->second;
 			if (state.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE)
 				continue;
@@ -11411,13 +11690,6 @@ Bool AISkirmishPlayer::updateStrategy()
 		m_alliedResumeSafetyFrame = currentFrame;
 		m_alliedResumeAttackSafe = alliedSafetyThreat < 60 && metrics.baseIntegrity >= 65;
 	}
-	if (usesAlliedCoordinationBehavior() && m_alliedAssaultActive && m_alliedAssaultLaunched) {
-		Object *sharedTarget = 0;
-		if (resolveAlliedAssaultTarget(&sharedTarget)) {
-			targetID = sharedTarget->getID();
-			metrics.hasStrategicTarget = true;
-		}
-	}
 	const Bool tunnelBuildPendingForTarget = targetID != INVALID_ID &&
 		m_tunnelBuildTargetID == targetID &&
 		(m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
@@ -11436,7 +11708,7 @@ Bool AISkirmishPlayer::updateStrategy()
 			for (DLINK_ITERATOR<Team> instance = (*prototype)->iterate_TeamInstanceList();
 				!instance.done(); instance.advance()) {
 				Team *team = instance.cur();
-				if (!IsSkirmishStrategyOffensiveTeam(team, m_player))
+				if (!IsSkirmishStrategyOffensiveTeam(team, m_player) || isAlliedAssaultTeam(team->getID()))
 					continue;
 				std::map<UnsignedInt, TacticalTeamState>::iterator it =
 					m_tacticalTeams.find(team->getID());
@@ -11501,10 +11773,10 @@ Bool AISkirmishPlayer::updateStrategy()
 		ClearSkirmishStrategyTargetObservation(&decision.nextState);
 	}
 	m_strategyState = decision.nextState;
+	Player *tunnelEnemy = 0;
 	if ((m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_HOME_QUEUED ||
 		 m_tunnelBuildPhase == SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED) &&
-		(m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
-		 m_strategyState.strategicTargetID != m_tunnelBuildTargetID))
+		!resolveTunnelBuildTargetOwner(m_tunnelBuildTargetID, &tunnelEnemy))
 		abandonTunnelBuildPlan(currentFrame, TRUE);
 	if (previousMode != SKIRMISH_STRATEGY_FORTIFY &&
 		m_strategyState.currentMode == SKIRMISH_STRATEGY_FORTIFY)
@@ -11827,12 +12099,6 @@ void AISkirmishPlayer::acquireEnemyLegacy()
 */
 void AISkirmishPlayer::acquireEnemy()
 {
-	Player *pinnedEnemy = getPinnedAlliedEnemy();
-	if (pinnedEnemy) {
-		m_currentEnemy = pinnedEnemy;
-		m_currentEnemyPlayerIndex = pinnedEnemy->getPlayerIndex();
-		return;
-	}
 	const Bool productionBehavior = usesProductionBehavior();
 	std::vector<SkirmishEnemyCandidate> candidates;
 	Int maximumKnownAssetValue = 0;
@@ -13035,10 +13301,8 @@ Bool AISkirmishPlayer::canActivateReadyTeam( const TeamInQueue *team ) const
 {
 	// Keep even pre-existing queued joins from changing an admitted or returning support roster.
 	if (team && team->m_reinforcement && team->m_team &&
-		isAlliedSupportTeam(team->m_team->getID())) return false;
-	if (team && (isAlliedAssaultHolding() ||
-		(usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending)) && !team->m_reinforcement &&
-		IsSkirmishStrategyOffensiveTeamType(team->m_team, m_player)) return false;
+		(isAlliedSupportTeam(team->m_team->getID()) ||
+		 isAlliedAssaultTeam(team->m_team->getID()))) return false;
 	if (!team || !usesStrategyBehavior() ||
 		m_strategyState.currentMode != SKIRMISH_STRATEGY_FORTIFY)
 		return true;
@@ -13455,11 +13719,10 @@ Bool AISkirmishPlayer::validatePendingTunnelBuild(
 		? TheGameLogic->findObjectByID(m_tunnelBuildTargetID) : nullptr;
 	Object *blocker = m_tunnelBuildBlockerID != INVALID_ID
 		? TheGameLogic->findObjectByID(m_tunnelBuildBlockerID) : nullptr;
-	if (!IsSkirmishAIStrategyTunnelTargetUsable(
-			target, m_player, m_currentEnemy) ||
-		m_strategyState.currentMode != SKIRMISH_STRATEGY_ASSAULT ||
-		m_strategyState.strategicTargetID != m_tunnelBuildTargetID ||
-		!blocker || blocker->getControllingPlayer() != m_currentEnemy ||
+	Player *tunnelEnemy = 0;
+	if (!resolveTunnelBuildTargetOwner(m_tunnelBuildTargetID, &tunnelEnemy) ||
+		!IsSkirmishAIStrategyTunnelTargetUsable(target, m_player, tunnelEnemy) ||
+		!blocker || blocker->getControllingPlayer() != tunnelEnemy ||
 		!blocker->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
 		blocker->isEffectivelyDead() || blocker->isDestroyed() ||
 		blocker->testStatus(OBJECT_STATUS_SOLD) ||
@@ -13510,7 +13773,7 @@ Bool AISkirmishPlayer::validatePendingTunnelBuild(
 	Object *forwardBlocker = m_tunnelBuildPhase ==
 		SKIRMISH_AI_TUNNEL_BUILD_FORWARD_QUEUED ? blocker : nullptr;
 	if ((forwardBlocker
-		? !IsSkirmishAIForwardTunnelLocationSafe(m_player, m_currentEnemy,
+		? !IsSkirmishAIForwardTunnelLocationSafe(m_player, tunnelEnemy,
 			&buildPosition, plan, forwardBlocker, target)
 		: !isLocationSafe(&buildPosition, plan)) ||
 		TheBuildAssistant->isLocationLegalToBuild(
@@ -13595,6 +13858,10 @@ Bool AISkirmishPlayer::tryQueueTunnelEndpoint(
 	Int *attemptPathQueryCount, Int *aggregatePathQueryCount,
 	TacticalTeamState &state, Bool *deferred)
 {
+	SkirmishStrategyMode teamMode;
+	Player *teamEnemy;
+	ObjectID teamTargetID;
+	getTeamStrategyContext(team, &teamMode, &teamEnemy, &teamTargetID);
 	if (deferred) *deferred = FALSE;
 	const Int retryPhase = homeEndpoint
 		? SKIRMISH_AI_TUNNEL_BUILD_HOME_RETRY_AVAILABLE
@@ -13626,9 +13893,9 @@ Bool AISkirmishPlayer::tryQueueTunnelEndpoint(
 		(m_tunnelBuildPhase != SKIRMISH_AI_TUNNEL_BUILD_NONE && !retryAvailable) ||
 		(homeEndpoint && m_tunnelHomeAttempted && !retryAvailable) ||
 		!IsSkirmishAIStrategyTunnelTargetUsable(
-			target, m_player, m_currentEnemy) ||
-		m_strategyState.strategicTargetID != target->getID() ||
-		blockingDefense->getControllingPlayer() != m_currentEnemy ||
+			target, m_player, teamEnemy) ||
+		teamMode != SKIRMISH_STRATEGY_ASSAULT || teamTargetID != target->getID() ||
+		blockingDefense->getControllingPlayer() != teamEnemy ||
 		!blockingDefense->isKindOf(KINDOF_FS_BASE_DEFENSE) ||
 		blockingDefense->isEffectivelyDead() || blockingDefense->isDestroyed() ||
 		blockingDefense->testStatus(OBJECT_STATUS_SOLD) ||
@@ -14002,7 +14269,7 @@ Bool AISkirmishPlayer::tryQueueTunnelEndpoint(
 		if (homeEndpoint
 			? !isLocationSafe(&buildPosition, plan)
 			: !IsSkirmishAIForwardTunnelLocationSafe(m_player,
-				m_currentEnemy, &buildPosition, plan,
+				teamEnemy, &buildPosition, plan,
 				blockingDefense, target))
 			continue;
 		Bool groupRoute = true;
@@ -14655,6 +14922,7 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 		xfer->xferUnsignedInt(&m_alliedHomeDamageFrame);
 		xfer->xferBool(&m_alliedHeldDamageValid);
 		xfer->xferUnsignedInt(&m_alliedHeldDamageFrame);
+		xferAlliedAssaultTeams(xfer);
 	}
 }
 
@@ -14683,13 +14951,14 @@ void AISkirmishPlayer::crc( Xfer *xfer )
 	 * 19: Exhausted forward targets and committed alternate-target observation
 	 * 20: Allied assault, support ownership, and received-money relay guard
 	 * 21: Pending return to ordinary strategy after an allied hold abort
-	 * 22: Per-owner allied hold admission cutoff and hostile damage event latches */
+	 * 22: Per-owner allied hold admission cutoff and hostile damage event latches
+	 * 23: Canonical staged assault team roster */
 // ------------------------------------------------------------------------------------------------
 void AISkirmishPlayer::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 22;
+	XferVersion currentVersion = 23;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
 
@@ -15043,7 +15312,27 @@ void AISkirmishPlayer::xfer( Xfer *xfer )
 		if (m_alliedAssaultActive && !m_alliedAssaultLaunched)
 			clearAlliedAssault();
 	}
+	if (version >= 23)
+		xferAlliedAssaultTeams(xfer);
+	else if (xfer->getXferMode() == XFER_LOAD) {
+		m_alliedAssaultTeamIDs.clear();
+		if (usesAlliedCoordinationBehavior() && (m_alliedAssaultActive || m_alliedStrategyResumePending)) {
+			// An older whole-owner hold has no defensible staged roster. Cancel it
+			// and force one ordinary resumption after fresh safety qualification.
+			clearAlliedAssault();
+			m_alliedStrategyResumePending = true;
+			m_alliedHoldAdmissionValid = false;
+			m_alliedHoldAdmissionFrame = 0;
+			if (m_strategyState.currentMode < SKIRMISH_STRATEGY_BALANCED ||
+				m_strategyState.currentMode > SKIRMISH_STRATEGY_ASSAULT)
+				m_strategyState.currentMode = SKIRMISH_STRATEGY_FORTIFY;
+			m_strategyState.nextEvaluationFrame = TheGameLogic ? TheGameLogic->getFrame() : 0;
+		}
+	}
 	if (xfer->getXferMode() == XFER_LOAD) {
+		m_alliedCapturedTeamIDs.clear();
+		m_alliedCapturedForceValue = 0;
+		m_alliedCapturedForceConfidence = 0;
 		m_alliedResumeAttackSafe = false;
 		m_alliedResumeSafetyFrame = 0;
 		invalidateAlliedSafetyCache();
@@ -15077,6 +15366,7 @@ void AISkirmishPlayer::loadPostProcess()
 		Object *target = TheGameLogic && m_alliedTargetID != INVALID_ID ?
 			TheGameLogic->findObjectByID(m_alliedTargetID) : 0;
 		if (m_alliedAssaultActive && (!enemy || !enemy->getDefaultTeam() ||
+			!hasAlliedAssaultForce() ||
 			m_player->getRelationship(enemy->getDefaultTeam()) != ENEMIES ||
 			(m_alliedLeaderIndex != m_player->getPlayerIndex() &&
 			 !IsSkirmishMutualLiveAlly(m_player, leader)) || !target ||

@@ -2533,9 +2533,10 @@ Object *Team::tryToRecruit(const ThingTemplate *tTemplate, const Coord3D *teamHo
 		}
 		if (obj->getControllingPlayer() != myPlayer)
 			continue;
-		// All queue/recruit callers preserve the actual assigned or returning support roster.
+		// All queue/recruit callers preserve actual support and staged combat recipients.
 		// The owner query is disabled for legacy epochs and leaves other recruitment unchanged.
-		if (skirmishOwner && skirmishOwner->isAlliedSupportMember(obj))
+		if (skirmishOwner && (skirmishOwner->isAlliedSupportMember(obj) ||
+			skirmishOwner->isAlliedAssaultMember(obj)))
 			continue;
 		Team *team = obj->getTeam();
 		Bool isDefaultTeam = false;

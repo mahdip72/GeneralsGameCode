@@ -111,6 +111,7 @@ public:	// AIPlayer interface methods.
 		ObjectID targetID;
 		UnsignedInt assaultFrame;
 		UnsignedInt assaultExpiryFrame;
+		Int assaultTeamCount;
 		Int supportRecipientIndex;
 		Int supportTeamCount;
 		Bool supportReturning;
@@ -121,6 +122,9 @@ public:	// AIPlayer interface methods.
 	};
 	AlliedCoordinationDiagnostics getAlliedCoordinationDiagnostics() const;
 	UnsignedInt getAlliedSupportTeamID(Int index) const;
+	UnsignedInt getAlliedAssaultTeamID(Int index) const;
+	Bool isAlliedAssaultTeam(UnsignedInt teamID) const;
+	Bool isAlliedAssaultMember(const Object *object) const;
 	Real getAlliedSupportHomeRadius() const { return m_baseRadius + 150.0f; }
 	Real getAlliedSafetyHomeRadius() const { return (m_baseRadius > 0.0f ? m_baseRadius : 0.0f) + 500.0f; }
 	SkirmishStrategyMode getAlliedCurrentStrategyMode() const { return m_strategyState.currentMode; }
@@ -278,12 +282,13 @@ protected:
 	void refreshStrategyProductionState();
 	Bool updateStrategy();
 	void collectStrategyMetrics( SkirmishStrategyMetrics *metrics,
-		ObjectID *strategicTargetID, Int *alliedSafetyThreat = 0 );
+		ObjectID *strategicTargetID, Int *alliedSafetyThreat = 0,
+		ObjectID *alliedTargetID = 0 );
 	void applyStrategyMode( SkirmishStrategyMode previousMode,
 		SkirmishStrategyMode currentMode, ObjectID previousTargetID,
 		Bool preserveTunnelTransit = false );
 	void commandOffensiveTeams( SkirmishStrategyMode mode, Object *target,
-		Bool preserveTunnelTransit = false );
+		Bool preserveTunnelTransit = false, Bool alliedRosterOnly = false );
 	void updateTacticalTeams();
 	struct TacticalTeamState;
 	Bool tryTunnelBypass(Team *team, Object *target,
@@ -309,6 +314,14 @@ protected:
 	void queryAlliedDamageSafety();
 	void invalidateAlliedSafetyCache();
 	void xferAlliedCoordination(Xfer *xfer);
+	void xferAlliedAssaultTeams(Xfer *xfer);
+	Bool isAlliedStagingTeamAvailable(Team *team);
+	void captureAlliedStagingTeams();
+	Bool hasAlliedAssaultForce() const;
+	void rebaseAlliedAssaultTeams();
+	void getTeamStrategyContext(Team *team, SkirmishStrategyMode *mode,
+		Player **enemy, ObjectID *targetID) const;
+	Bool resolveTunnelBuildTargetOwner(ObjectID targetID, Player **enemy) const;
 	const ThingTemplate *findTunnelContainBuildTemplate() const;
 	Bool isTunnelBuildBuilderAvailable(Object *builder) const;
 	Bool validatePendingTunnelBuild(BuildListInfo *info,
@@ -505,6 +518,12 @@ protected:
 	Bool m_alliedSupportReturning;
 	UnsignedInt m_alliedNextSupportFrame;
 	std::vector<UnsignedInt> m_alliedSupportTeamIDs;
+	// The admitted roster retains command ownership until ordinary resumption.
+	std::vector<UnsignedInt> m_alliedAssaultTeamIDs;
+	// Rebuilt only in the central evaluation capture; never read after a load.
+	std::vector<UnsignedInt> m_alliedCapturedTeamIDs;
+	Int m_alliedCapturedForceValue;
+	Int m_alliedCapturedForceConfidence;
 	// Only consumed during the same owner frame as the immutable roster capture.
 	Bool m_alliedCapturedStrategyAvailable;
 	UnsignedInt m_alliedCapturedStrategyFrame;
