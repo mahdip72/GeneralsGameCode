@@ -286,6 +286,7 @@ protected:
 	void recallAlliedSupport();
 	void dispatchAlliedSupport(Int recipientIndex, Int budget);
 	Bool isAlliedSupportTeam(UnsignedInt teamID) const;
+	Bool isActiveTacticalTunnelTeam(UnsignedInt teamID) const;
 	Bool isAlliedAssaultHolding() const;
 	Bool resolveAlliedAssaultTarget(Object **target) const;
 	Player *getPinnedAlliedEnemy() const;

@@ -8378,9 +8378,17 @@ Bool AISkirmishPlayer::isAlliedAssaultHolding() const
 		!m_alliedAssaultLaunched;
 }
 
+Bool AISkirmishPlayer::isActiveTacticalTunnelTeam(UnsignedInt teamID) const
+{
+	std::map<UnsignedInt, TacticalTeamState>::const_iterator state = m_tacticalTeams.find(teamID);
+	return state != m_tacticalTeams.end() &&
+		state->second.tunnelTransitPhase != SKIRMISH_AI_TUNNEL_TRANSIT_NONE;
+}
+
 Bool AISkirmishPlayer::isAlliedAssaultHoldingTeam(UnsignedInt teamID) const
 {
-	if (!isAlliedAssaultHolding() || !m_player || isAlliedSupportTeam(teamID)) return false;
+	if (!isAlliedAssaultHolding() || !m_player || isAlliedSupportTeam(teamID) ||
+		isActiveTacticalTunnelTeam(teamID)) return false;
 	Team *team = FindSkirmishAlliedTeam(m_player, teamID);
 	if (!IsSkirmishStrategyOffensiveTeam(team, m_player) || !team->hasAnyObjects()) return false;
 	SkirmishStrategyGroupRecipientContext context;
@@ -9283,8 +9291,8 @@ enum {
 
 void AISkirmishPlayer::updateTacticalTeams()
 {
-	if (isAlliedAssaultHolding() ||
-		(usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending)) return;
+	const Bool alliedOffensiveHold = isAlliedAssaultHolding() ||
+		(usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending);
 	if (!ShouldUseCurrentSkirmishAITacticalBehavior() || !usesStrategyBehavior() ||
 		!m_player || !TheAI ||
 		!TheAI->pathfinder() || !m_baseCenterSet)
@@ -9325,7 +9333,7 @@ void AISkirmishPlayer::updateTacticalTeams()
 	std::vector<Object *> alternateTargets;
 	std::vector<Object *> corridorDefenses;
 	std::vector<Object *> retreatFacilities;
-	if (!teams.empty() &&
+	if (!alliedOffensiveHold && !teams.empty() &&
 		m_strategyState.currentMode == SKIRMISH_STRATEGY_ASSAULT) {
 		for (Object *object = TheGameLogic->getFirstObject(); object;
 			object = object->getNextObject()) {
@@ -9398,6 +9406,8 @@ void AISkirmishPlayer::updateTacticalTeams()
 			}
 			continue;
 		}
+		// Keep committed transit advancement/cleanup above the allied reassignment gate.
+		if (alliedOffensiveHold) continue;
 		if (evaluatedTeams >=
 			MAX_SKIRMISH_AI_TACTICAL_TEAM_EVALUATIONS_PER_UPDATE)
 			continue;
@@ -10991,6 +11001,8 @@ void AISkirmishPlayer::commandOffensiveTeams(
 {
 	if (!TheAI || !m_player)
 		return;
+	const Bool alliedHoldCommands = isAlliedAssaultHolding() ||
+		(usesAlliedCoordinationBehavior() && m_alliedStrategyResumePending);
 	std::vector<Team *> teams;
 	Player::PlayerTeamList::const_iterator prototype;
 	for (prototype = m_player->getPlayerTeams()->begin();
@@ -11001,6 +11013,7 @@ void AISkirmishPlayer::commandOffensiveTeams(
 			Team *candidate = teamInstance.cur();
 			if (IsSkirmishStrategyOffensiveTeam(candidate, m_player) &&
 				!isAlliedSupportTeam(candidate->getID()) &&
+				(!alliedHoldCommands || !isActiveTacticalTunnelTeam(candidate->getID())) &&
 				candidate->hasAnyObjects()) {
 				SkirmishStrategyGroupRecipientContext context;
 				context.player = m_player;
