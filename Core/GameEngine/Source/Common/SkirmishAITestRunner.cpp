@@ -26,6 +26,7 @@
 #include "Common/ThingTemplate.h"
 #if RTS_ZEROHOUR
 #include "GameLogic/AI.h"
+#include "GameLogic/AISkirmishPlayer.h"
 #endif
 #include "GameLogic/AIPathfind.h"
 #include "GameClient/MapUtil.h"
@@ -64,12 +65,48 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 #if defined(_WIN32)
 #include <io.h>
 #endif
 
 namespace
 {
+const char *const s_alliedCaseNames[] = {
+	"transfer_command", "coordination_live", "save_load", "support_lifecycle", "aid_lifecycle"
+};
+Int s_alliedRequestedCase = -1;
+struct AlliedFixtureState
+{
+	Bool active;
+	Int fixtureCase;
+	UnsignedInt startFrame;
+	UnsignedInt checks;
+	Bool saveLoaded;
+	Bool sawFortifyDecline;
+	Bool sawCoordination;
+	UnsignedInt nextEvaluation;
+	Int supportDonorSlot;
+	Int supportRecipientIndex;
+	Bool aidFaultApplied;
+	Bool sawFirstStarvationEvaluation;
+	Bool sawAid;
+	Int aidDonorSlot;
+	Int aidRecipientSlot;
+	UnsignedInt aidCooldownUntil;
+	UnsignedInt aidEvaluation;
+	UnsignedInt firstStarvationFrame;
+	Bool sawSupportReturning;
+	AlliedFixtureState() : active(FALSE), fixtureCase(-1), startFrame(0),
+		checks(0), saveLoaded(FALSE), sawFortifyDecline(FALSE),
+		sawCoordination(FALSE), nextEvaluation(0), supportDonorSlot(-1),
+		supportRecipientIndex(-1), aidFaultApplied(FALSE),
+		sawFirstStarvationEvaluation(FALSE), sawAid(FALSE), aidDonorSlot(-1),
+		aidRecipientSlot(-1), aidCooldownUntil(0), aidEvaluation(0),
+		firstStarvationFrame(0), sawSupportReturning(FALSE) {}
+};
+AlliedFixtureState s_allied;
+void UpdateSkirmishAIAlliedFixture();
 #if defined(_WIN64)
 rts::ai_fixture::MapRequest s_reviewedMapRequest;
 rts::fixture::ResolvedMapIdentity s_reviewedMapIdentity;
@@ -3478,7 +3515,7 @@ Bool IsExpectedSkirmishAIRecoveryLoadedState(
 	if (IsExpectedSkirmishAITestLoadedState(
 			plan, expectedMapCRC, expectedMapSize, loadedState))
 		return TRUE;
-	if (!s_recovery.saveLoadIssued || !loadedState || plan.mapName == nullptr ||
+	if ((!s_recovery.saveLoadIssued && !s_allied.saveLoaded) || !loadedState || plan.mapName == nullptr ||
 		loadedState->gameInfoMapName == nullptr || loadedState->globalMapName == nullptr ||
 		loadedState->terrainMapName == nullptr || loadedState->mapCRC != expectedMapCRC ||
 		loadedState->mapSize != expectedMapSize || loadedState->seed != plan.seed)
@@ -3506,6 +3543,21 @@ static Bool TryParseSkirmishAIRecoveryNamedValue(
 		}
 	}
 	return FALSE;
+}
+
+Bool TryParseSkirmishAIAlliedFixtureCase(const char *text, Int *fixtureCase)
+{
+	return TryParseSkirmishAIRecoveryNamedValue(text, fixtureCase,
+		s_alliedCaseNames, ARRAY_SIZE(s_alliedCaseNames));
+}
+
+Bool ConfigureSkirmishAIAlliedFixture(Int fixtureCase)
+{
+	if (s_alliedRequestedCase >= 0 || fixtureCase < 0 ||
+		fixtureCase >= SKIRMISH_AI_ALLIED_FIXTURE_CASE_COUNT)
+		return FALSE;
+	s_alliedRequestedCase = fixtureCase;
+	return TRUE;
 }
 
 Bool TryParseSkirmishAIRecoveryFixtureCase(const char *text, Int *fixtureCase)
@@ -3830,6 +3882,11 @@ Bool IsSkirmishAITestProgressStalled(UnsignedInt elapsedMilliseconds)
 void ArmSkirmishAITestRunner(Int seed, SkirmishAITestScenario scenario)
 {
 	s_recovery.reset();
+	s_allied = AlliedFixtureState();
+	s_allied.active = s_alliedRequestedCase >= 0;
+	s_allied.fixtureCase = s_alliedRequestedCase;
+	if (s_allied.active && s_allied.fixtureCase == SKIRMISH_AI_ALLIED_TRANSFER_COMMAND)
+		scenario = SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7;
 	if (scenario != SKIRMISH_AI_TEST_SCENARIO_4V2 &&
 		scenario != SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7 &&
 		!IsSkirmishAITestHardAI2v6(scenario))
@@ -4066,20 +4123,20 @@ Bool StartSkirmishAITestRunner()
 	// The practical controller lane is intentionally interactive.  Automated
 	// lanes remain headless and continue to be the replay-gate scenarios.
 	TheWritableGlobalData->m_headless =
-		IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) ? FALSE : TRUE;
+		!s_allied.active && IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) ? FALSE : TRUE;
 	TheWritableGlobalData->m_shellMapOn = FALSE;
-	if (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
+	if (s_allied.active || !IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
 		TheWritableGlobalData->m_useFpsLimit = FALSE;
 	// Automated lanes keep logical and local retaliation modes disabled so the
 	// recorder does not capture an irrelevant frame-zero preference
 	// synchronization command.
-	if (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
+	if (s_allied.active || !IsSkirmishAITestPracticalControllerScenario(s_runner.scenario))
 		TheWritableGlobalData->m_clientRetaliationModeEnabled = FALSE;
 	TheRecorder->setArchiveEnabled(FALSE);
 	InitRandom(static_cast<UnsignedInt>(plan.seed));
 
 #if defined(_WIN64)
-	if (!s_recovery.active &&
+	if (!s_recovery.active && !s_allied.active &&
 		!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) &&
 		!s_performanceReceiptAttempted)
 	{
@@ -4112,7 +4169,12 @@ Bool StartSkirmishAITestRunner()
 #if defined(_WIN64)
 	if (s_reviewedMapRequest.requested) reportedMapName = s_reviewedMapIdentity.logicalKey;
 #endif
-	if (s_recovery.active)
+	if (s_allied.active)
+	{
+		printf("SKIRMISH_AI_ALLIED_FIXTURE_START seed=%d case=%s map=\"%s\"\n",
+			plan.seed, s_alliedCaseNames[s_allied.fixtureCase], reportedMapName);
+	}
+	else if (s_recovery.active)
 	{
 		printf("SKIRMISH_AI_RECOVERY_START seed=%d case=%s faction=%s template=%s map=\"%s\" "
 			"expected_mode=zero_hour_skirmish expected_subject_slot=1\n",
@@ -4221,7 +4283,7 @@ void UpdateSkirmishAITestRunner()
 		gameInfoMap.str(), globalMap.str(), terrainMap.str(),
 		TheGameInfo->getMapCRC(), TheGameInfo->getMapSize(), TheGameInfo->getSeed()
 	};
-	if (!(s_recovery.active ?
+	if (!(s_recovery.active || s_allied.saveLoaded ?
 		IsExpectedSkirmishAIRecoveryLoadedState(expectedPlan, s_runner.expectedMapCRC,
 			s_runner.expectedMapSize, &loadedState) :
 		IsExpectedSkirmishAITestLoadedState(expectedPlan, s_runner.expectedMapCRC,
@@ -4251,6 +4313,12 @@ void UpdateSkirmishAITestRunner()
 #endif
 	}
 
+	if (s_allied.active)
+	{
+		TheWritableGlobalData->m_useFpsLimit = FALSE;
+		UpdateSkirmishAIAlliedFixture();
+		return;
+	}
 	if (s_recovery.active)
 	{
 		TheWritableGlobalData->m_useFpsLimit = FALSE;
@@ -6598,6 +6666,450 @@ void UpdateSkirmishAIRecoveryFixture()
 }
 
 
+namespace
+{
+#if RTS_ZEROHOUR
+Bool CheckAlliedTransferCommand(Player *donor, Player *recipient, Int amount,
+	Bool accepted, Int argumentShape = 0)
+{
+	const UnsignedInt frame = TheGameLogic->getFrame();
+	const UnsignedInt donorBefore = donor->getMoney()->countMoney();
+	const UnsignedInt recipientBefore = recipient->getMoney()->countMoney();
+	AIPlayer *recipientAI = recipient->getAIPlayerForPlanning();
+	AISkirmishPlayer *skirmishAI = recipientAI && recipientAI->isSkirmishAI()
+		? static_cast<AISkirmishPlayer *>(recipientAI) : nullptr;
+	const UnsignedInt receiptBefore = skirmishAI ?
+		skirmishAI->getAlliedCoordinationDiagnostics().mayDonateFrame : 0;
+	CommandList commands;
+	GameMessage *message = NEW GameMessage(GameMessage::MSG_TRANSFER_MONEY_TO_ALLY);
+	message->friend_setPlayerIndex(donor->getPlayerIndex());
+	if (argumentShape == 1)
+		message->appendRealArgument(static_cast<Real>(recipient->getPlayerIndex()));
+	else
+		message->appendIntegerArgument(recipient->getPlayerIndex());
+	if (argumentShape == 2)
+		message->appendRealArgument(static_cast<Real>(amount));
+	else if (argumentShape != 3)
+		message->appendIntegerArgument(amount);
+	if (argumentShape == 4)
+		message->appendIntegerArgument(0);
+	commands.appendMessage(message);
+	TheGameLogic->processCommandList(&commands);
+	const UnsignedInt delta = accepted ? static_cast<UnsignedInt>(amount) : 0;
+	const Bool receiptValid = !skirmishAI || (accepted ?
+		(skirmishAI->getAlliedCoordinationDiagnostics().receiptCooldownActive &&
+		 skirmishAI->getAlliedCoordinationDiagnostics().mayDonateFrame ==
+		 frame + 120 * LOGICFRAMES_PER_SECOND) :
+		 skirmishAI->getAlliedCoordinationDiagnostics().mayDonateFrame == receiptBefore);
+	const Bool valid = receiptValid && TheGameLogic->getFrame() == frame &&
+		donor->getMoney()->countMoney() == donorBefore - delta &&
+		recipient->getMoney()->countMoney() == recipientBefore + delta;
+	printf("SKIRMISH_AI_ALLIED_TRANSFER_ASSERT frame=%u donor=%d recipient=%d "
+		"amount=%d shape=%d accepted=%d donor_before=%u donor_after=%u "
+		"recipient_before=%u recipient_after=%u valid=%d\n", frame,
+		donor->getPlayerIndex(), recipient->getPlayerIndex(), amount, argumentShape,
+		accepted, donorBefore, donor->getMoney()->countMoney(), recipientBefore,
+		recipient->getMoney()->countMoney(), valid);
+	fflush(stdout);
+	if (valid) ++s_allied.checks;
+	return valid;
+}
+
+Bool RunAlliedTransferCommands()
+{
+	Player *donor = ThePlayerList->getPlayerFromSlotIndex(0);
+	Player *recipient = ThePlayerList->getPlayerFromSlotIndex(1);
+	Player *enemy = ThePlayerList->getPlayerFromSlotIndex(4);
+	Player *inactive = ThePlayerList->getPlayerFromSlotIndex(2);
+	if (!donor || !recipient || !enemy || !inactive ||
+		donor->getPlayerType() != PLAYER_HUMAN || !donor->isPlayerActive() ||
+		!recipient->isPlayerActive()) return FALSE;
+	SetSkirmishAIRecoveryCash(donor, 50000);
+	SetSkirmishAIRecoveryCash(recipient, 1000);
+	if (!CheckAlliedTransferCommand(donor, recipient, 1800, TRUE) ||
+		!CheckAlliedTransferCommand(donor, recipient, 100, TRUE) ||
+		!CheckAlliedTransferCommand(donor, recipient, 10000, TRUE) ||
+		!CheckAlliedTransferCommand(donor, donor, 100, FALSE) ||
+		!CheckAlliedTransferCommand(donor, enemy, 100, FALSE) ||
+		!CheckAlliedTransferCommand(donor, recipient, -100, FALSE) ||
+		!CheckAlliedTransferCommand(donor, recipient, 0, FALSE) ||
+		!CheckAlliedTransferCommand(donor, recipient, 50, FALSE) ||
+		!CheckAlliedTransferCommand(donor, recipient, 150, FALSE) ||
+		!CheckAlliedTransferCommand(donor, recipient, 10100, FALSE)) return FALSE;
+	for (Int shape = 1; shape <= 4; ++shape)
+		if (!CheckAlliedTransferCommand(donor, recipient, 100, FALSE, shape)) return FALSE;
+	SetSkirmishAIRecoveryCash(recipient, UINT_MAX - 50);
+	if (!CheckAlliedTransferCommand(donor, recipient, 100, FALSE)) return FALSE;
+	SetSkirmishAIRecoveryCash(recipient, 1000);
+	SetSkirmishAIRecoveryCash(donor, 50);
+	if (!CheckAlliedTransferCommand(donor, recipient, 100, FALSE)) return FALSE;
+	SetSkirmishAIRecoveryCash(donor, 20000);
+	inactive->killPlayer();
+	if (inactive->isPlayerActive() ||
+		!CheckAlliedTransferCommand(donor, inactive, 100, FALSE)) return FALSE;
+	return TRUE;
+}
+
+AISkirmishPlayer *GetAlliedFixtureAI(Int slot)
+{
+	Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
+	AIPlayer *ai = player ? player->getAIPlayerForPlanning() : nullptr;
+	return ai && ai->isSkirmishAI() ? static_cast<AISkirmishPlayer *>(ai) : nullptr;
+}
+
+Bool SameAlliedDiagnostics(const AISkirmishPlayer::AlliedCoordinationDiagnostics &a,
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics &b)
+{
+	return a.assaultActive == b.assaultActive && a.assaultLaunched == b.assaultLaunched &&
+		a.leaderIndex == b.leaderIndex && a.enemyIndex == b.enemyIndex &&
+		a.targetID == b.targetID && a.assaultFrame == b.assaultFrame &&
+		a.assaultExpiryFrame == b.assaultExpiryFrame &&
+		a.supportRecipientIndex == b.supportRecipientIndex &&
+		a.supportTeamCount == b.supportTeamCount && a.supportReturning == b.supportReturning &&
+		a.donationCooldownActive == b.donationCooldownActive &&
+		a.nextDonationFrame == b.nextDonationFrame &&
+		a.receiptCooldownActive == b.receiptCooldownActive && a.mayDonateFrame == b.mayDonateFrame;
+}
+
+Bool RoundTripAlliedFixture()
+{
+	if (!TheAI || !TheGameState) return FALSE;
+	AISkirmishPlayer::AlliedCoordinationDiagnostics before[7];
+	Int playerIndices[7];
+	Int starvation[7];
+	UnsignedInt relief[7];
+	std::vector<UnsignedInt> supportIDs[7];
+	const UnsignedInt frame = TheGameLogic->getFrame();
+	const Bool evaluated = TheAI->hasAlliedEvaluation();
+	const UnsignedInt nextEvaluation = TheAI->getNextAlliedEvaluationFrame();
+	for (Int slot = 1; slot <= 7; ++slot)
+	{
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(slot);
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
+		if (!ai || !player) return FALSE;
+		before[slot - 1] = ai->getAlliedCoordinationDiagnostics();
+		playerIndices[slot - 1] = player->getPlayerIndex();
+		starvation[slot - 1] = TheAI->getAlliedStarvationStreak(playerIndices[slot - 1]);
+		relief[slot - 1] = TheAI->getAlliedRecipientReliefUntil(playerIndices[slot - 1]);
+		for (Int team = 0; team < before[slot - 1].supportTeamCount; ++team)
+			supportIDs[slot - 1].push_back(ai->getAlliedSupportTeamID(team));
+	}
+	AsciiString filename;
+	filename.format("SkirmishAIAllied_%s.sav", s_runner.runNonce);
+	UnicodeString description;
+	description.set(L"Stage 5 allied coordination fixture");
+	const SaveResult saved = TheGameState->saveGame(filename, description, SAVE_FILE_TYPE_NORMAL);
+	if (saved.saveCode != SC_OK || saved.filename.isEmpty()) return FALSE;
+	AvailableGameInfo gameInfo;
+	gameInfo.filename = saved.filename;
+	gameInfo.next = nullptr;
+	gameInfo.prev = nullptr;
+	gameInfo.saveGameInfo = *TheGameState->getSaveGameInfo();
+	gameInfo.saveGameInfo.saveFileType = SAVE_FILE_TYPE_NORMAL;
+	if (TheGameState->loadGame(gameInfo) != SC_OK) return FALSE;
+	s_allied.saveLoaded = TRUE;
+	// No borrowed Player/AI/Object pointers survive loadGame. Reacquire each
+	// slot and validate the serialized ID-bearing state and central cadence.
+	if (!TheAI || !ThePlayerList || TheGameLogic->getFrame() != frame ||
+		TheAI->hasAlliedEvaluation() != evaluated ||
+		TheAI->getNextAlliedEvaluationFrame() != nextEvaluation) return FALSE;
+	for (Int slot = 1; slot <= 7; ++slot)
+	{
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(slot);
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
+		if (!ai || !player || player->getPlayerIndex() != playerIndices[slot - 1] ||
+			!SameAlliedDiagnostics(before[slot - 1], ai->getAlliedCoordinationDiagnostics()) ||
+			TheAI->getAlliedStarvationStreak(playerIndices[slot - 1]) != starvation[slot - 1] ||
+			TheAI->getAlliedRecipientReliefUntil(playerIndices[slot - 1]) != relief[slot - 1]) return FALSE;
+		for (Int team = 0; team < before[slot - 1].supportTeamCount; ++team)
+			if (ai->getAlliedSupportTeamID(team) != supportIDs[slot - 1][team]) return FALSE;
+		if (before[slot - 1].assaultActive &&
+			!TheGameLogic->findObjectByID(before[slot - 1].targetID)) return FALSE;
+	}
+	++s_allied.checks;
+	printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_ASSERT frame=%u file=%s "
+		"player_slots=7 central_cadence=preserved commitments=preserved support_ids=preserved\n",
+		frame, saved.filename.str());
+	fflush(stdout);
+	return TRUE;
+}
+
+void ObserveAlliedCoordination(UnsignedInt frame)
+{
+	if (!TheAI || !TheAI->hasAlliedEvaluation()) return;
+	const UnsignedInt nextEvaluation = TheAI->getNextAlliedEvaluationFrame();
+	if (s_allied.nextEvaluation == nextEvaluation) return;
+	s_allied.nextEvaluation = nextEvaluation;
+	for (Int slot = 1; slot <= 7; ++slot)
+	{
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(slot);
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
+		if (!ai || !player) continue;
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics a = ai->getAlliedCoordinationDiagnostics();
+		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(player->getPlayerIndex());
+		if (facts && facts->valid && facts->alive && facts->mode == SKIRMISH_STRATEGY_FORTIFY)
+		{
+			if (a.assaultActive)
+			{
+				FailSkirmishAITest("allied_fortify_joined_assault");
+				RequestSkirmishAITestStop();
+				return;
+			}
+			s_allied.sawFortifyDecline = TRUE;
+		}
+		if (!a.assaultActive || a.assaultLaunched || a.assaultFrame <= frame) continue;
+		for (Int peer = slot + 1; peer <= 7; ++peer)
+		{
+			AISkirmishPlayer *other = GetAlliedFixtureAI(peer);
+			if (!other) continue;
+			const AISkirmishPlayer::AlliedCoordinationDiagnostics b = other->getAlliedCoordinationDiagnostics();
+			if (b.assaultActive && !b.assaultLaunched && a.leaderIndex == b.leaderIndex &&
+				a.enemyIndex == b.enemyIndex && a.targetID == b.targetID &&
+				a.targetID != INVALID_ID && a.assaultFrame == b.assaultFrame &&
+				a.assaultExpiryFrame == b.assaultExpiryFrame && a.assaultExpiryFrame > a.assaultFrame)
+			{
+				if (!TheGameLogic->findObjectByID(a.targetID)) continue;
+				s_allied.sawCoordination = TRUE;
+				++s_allied.checks;
+				printf("SKIRMISH_AI_ALLIED_COORDINATION_ASSERT frame=%u slots=%d,%d "
+					"leader=%d enemy=%d target=%u release=%u expiry=%u fortify_decline=%d\n",
+					frame, slot, peer, a.leaderIndex, a.enemyIndex, a.targetID,
+					a.assaultFrame, a.assaultExpiryFrame, s_allied.sawFortifyDecline);
+				fflush(stdout);
+				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
+					s_allied.sawAid && !s_allied.saveLoaded)
+				{
+					if (!RoundTripAlliedFixture()) FailSkirmishAITest("allied_save_load_assertion");
+					s_runner.endFrame = frame;
+					RequestSkirmishAITestStop();
+					return;
+				}
+			}
+		}
+	}
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_COORDINATION_LIVE &&
+		s_allied.sawCoordination && s_allied.sawFortifyDecline)
+	{
+		++s_allied.checks;
+		s_runner.endFrame = frame;
+		RequestSkirmishAITestStop();
+	}
+}
+
+void ObserveAlliedSupport(UnsignedInt frame)
+{
+	if (s_allied.supportDonorSlot >= 0)
+	{
+		AISkirmishPlayer *donor = GetAlliedFixtureAI(s_allied.supportDonorSlot);
+		if (!donor) { FailSkirmishAITest("allied_support_donor_lost"); RequestSkirmishAITestStop(); return; }
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = donor->getAlliedCoordinationDiagnostics();
+		if (state.supportRecipientIndex < 0 && state.supportReturning && state.supportTeamCount > 0)
+			s_allied.sawSupportReturning = TRUE;
+		if (state.supportTeamCount == 0 && state.supportRecipientIndex < 0)
+		{
+			++s_allied.checks;
+			printf("SKIRMISH_AI_ALLIED_SUPPORT_RECALL_ASSERT frame=%u donor_slot=%d "
+				"recipient=%d support_registry=empty returning_observed=%d\n", frame,
+				s_allied.supportDonorSlot, s_allied.supportRecipientIndex, s_allied.sawSupportReturning);
+			fflush(stdout);
+			s_runner.endFrame = frame;
+			RequestSkirmishAITestStop();
+		}
+		return;
+	}
+	for (Int slot = 1; slot <= 7; ++slot)
+	{
+		AISkirmishPlayer *donor = GetAlliedFixtureAI(slot);
+		if (!donor) continue;
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = donor->getAlliedCoordinationDiagnostics();
+		if (state.supportTeamCount <= 0 || state.supportRecipientIndex < 0) continue;
+		Player *recipient = ThePlayerList->getNthPlayer(state.supportRecipientIndex);
+		if (!recipient || !recipient->isPlayerActive()) continue;
+		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(
+			ThePlayerList->getPlayerFromSlotIndex(slot)->getPlayerIndex());
+		if (!facts || !facts->valid || facts->immediateThreat >= 50 ||
+			facts->supportAvailableValue <= 0) continue;
+		for (Int team = 0; team < state.supportTeamCount; ++team)
+			if (donor->getAlliedSupportTeamID(team) == 0)
+			{ FailSkirmishAITest("allied_support_missing_team_id"); RequestSkirmishAITestStop(); return; }
+		s_allied.supportDonorSlot = slot;
+		s_allied.supportRecipientIndex = state.supportRecipientIndex;
+		++s_allied.checks;
+		printf("SKIRMISH_AI_ALLIED_SUPPORT_DISPATCH_ASSERT frame=%u donor_slot=%d "
+			"recipient=%d support_teams=%d first_team=%u surplus_value=%d\n", frame,
+			slot, state.supportRecipientIndex, state.supportTeamCount,
+			donor->getAlliedSupportTeamID(0), facts->supportAvailableValue);
+		fflush(stdout);
+		// Fault a real dispatched recipient. The ordinary AI update owns recall.
+		recipient->killPlayer();
+		if (recipient->isPlayerActive())
+		{ FailSkirmishAITest("allied_support_fault_not_inactive"); RequestSkirmishAITestStop(); }
+		return;
+	}
+}
+
+void ObserveAlliedAid(UnsignedInt frame)
+{
+	if (!TheAI || !TheAI->hasAlliedEvaluation()) return;
+	if (!s_allied.aidFaultApplied)
+	{
+		for (Int donorSlot = 1; donorSlot <= 4; ++donorSlot)
+		{
+			Player *donor = ThePlayerList->getPlayerFromSlotIndex(donorSlot);
+			const SkirmishAIAlliedPlayerFacts *healthy = donor ?
+				TheAI->getAlliedPlayerFacts(donor->getPlayerIndex()) : nullptr;
+			if (!healthy || !healthy->valid || !healthy->alive || !healthy->isAI ||
+				healthy->economyHealth < 75 || healthy->baseIntegrity < 80 ||
+				healthy->immediateThreat > 40 || healthy->donationBlocked) continue;
+			for (Int recipientSlot = 1; recipientSlot <= 4; ++recipientSlot)
+			{
+				if (recipientSlot == donorSlot) continue;
+				Player *recipient = ThePlayerList->getPlayerFromSlotIndex(recipientSlot);
+				if (!recipient || !recipient->isPlayerActive() ||
+					donor->getRelationship(recipient->getDefaultTeam()) != ALLIES ||
+					recipient->getRelationship(donor->getDefaultTeam()) != ALLIES) continue;
+				AISkirmishPlayer *recipientAI = GetAlliedFixtureAI(recipientSlot);
+				if (!recipientAI || recipientAI->getAlliedCoordinationDiagnostics().receiptCooldownActive ||
+					recipientAI->getAlliedCoordinationDiagnostics().donationCooldownActive ||
+					TheAI->getAlliedRecipientReliefUntil(recipient->getPlayerIndex()) != 0) continue;
+				Object *builder = nullptr;
+				for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
+					if (IsLiveSkirmishAIRecoveryObject(object) && object->getControllingPlayer() == recipient &&
+						object->isKindOf(KINDOF_DOZER)) { builder = object; break; }
+				if (!builder) continue;
+				const ObjectID builderID = builder->getID();
+				for (Object *object = TheGameLogic->getFirstObject(); object; )
+				{
+					Object *next = object->getNextObject();
+					if (object != builder && object->getControllingPlayer() == recipient &&
+						IsLiveSkirmishAIRecoveryObject(object)) DestroySkirmishAIRecoveryObject(object);
+					object = next;
+				}
+				for (BuildListInfo *info = recipient->getBuildList(); info; info = info->getNext())
+					info->setNumRebuilds(0);
+				SetSkirmishAIRecoveryCash(recipient, 10);
+				SetSkirmishAIRecoveryCash(donor, 100000);
+				s_allied.aidDonorSlot = donorSlot;
+				s_allied.aidRecipientSlot = recipientSlot;
+				s_allied.aidFaultApplied = TRUE;
+				s_allied.aidEvaluation = TheAI->getNextAlliedEvaluationFrame();
+				printf("SKIRMISH_AI_ALLIED_AID_FAULT frame=%u donor_slot=%d recipient_slot=%d "
+					"builder=%u recipient_cash=10 donor_cash=100000 captured_economy=%d captured_base=%d\n",
+					frame, donorSlot, recipientSlot, builderID, healthy->economyHealth, healthy->baseIntegrity);
+				fflush(stdout);
+				return;
+			}
+		}
+		return;
+	}
+	AISkirmishPlayer *donorAI = GetAlliedFixtureAI(s_allied.aidDonorSlot);
+	AISkirmishPlayer *recipientAI = GetAlliedFixtureAI(s_allied.aidRecipientSlot);
+	Player *recipient = ThePlayerList->getPlayerFromSlotIndex(s_allied.aidRecipientSlot);
+	if (!donorAI || !recipientAI || !recipient || !recipient->isPlayerActive())
+	{ FailSkirmishAITest("allied_aid_participant_lost"); RequestSkirmishAITestStop(); return; }
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics donor = donorAI->getAlliedCoordinationDiagnostics();
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics received = recipientAI->getAlliedCoordinationDiagnostics();
+	const Int recipientIndex = recipient->getPlayerIndex();
+	const UnsignedInt nextEvaluation = TheAI->getNextAlliedEvaluationFrame();
+	if (!s_allied.sawAid && nextEvaluation != s_allied.aidEvaluation)
+	{
+		s_allied.aidEvaluation = nextEvaluation;
+		const Int streak = TheAI->getAlliedStarvationStreak(recipientIndex);
+		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(recipientIndex);
+		if (streak == 1 && facts && facts->missingIncome && facts->missingProduction &&
+			facts->recoverable && facts->economyHealth <= 25)
+		{
+			s_allied.sawFirstStarvationEvaluation = TRUE;
+			s_allied.firstStarvationFrame = frame;
+			++s_allied.checks;
+		}
+		if (received.receiptCooldownActive && donor.donationCooldownActive)
+		{
+			// Successful aid consumes the central starvation episode and resets
+			// its streak. The prior observed starving batch establishes evaluation
+			// one; this distinct five-second batch establishes evaluation two.
+			if (!s_allied.sawFirstStarvationEvaluation || streak != 0 || !facts ||
+				!facts->missingIncome || !facts->missingProduction || !facts->recoverable ||
+				facts->economyHealth > 25 ||
+				frame - s_allied.firstStarvationFrame < 5 * LOGICFRAMES_PER_SECOND - 1 ||
+				donor.nextDonationFrame != received.mayDonateFrame ||
+				TheAI->getAlliedRecipientReliefUntil(recipientIndex) != received.mayDonateFrame ||
+				received.mayDonateFrame <= frame ||
+				received.mayDonateFrame - frame < 120 * LOGICFRAMES_PER_SECOND - 1 ||
+				received.mayDonateFrame - frame > 120 * LOGICFRAMES_PER_SECOND)
+			{ FailSkirmishAITest("allied_aid_cooldown_or_two_evaluation_assertion"); RequestSkirmishAITestStop(); return; }
+			s_allied.sawAid = TRUE;
+			s_allied.aidCooldownUntil = received.mayDonateFrame;
+			++s_allied.checks;
+			printf("SKIRMISH_AI_ALLIED_AID_ASSERT frame=%u donor_slot=%d recipient_slot=%d "
+				"starvation_evaluations=2 consumed_streak=0 cooldown_until=%u donor_recipient_relief_equal=1\n",
+				frame, s_allied.aidDonorSlot, s_allied.aidRecipientSlot, received.mayDonateFrame);
+			fflush(stdout);
+		}
+	}
+	if (s_allied.sawAid && frame < s_allied.aidCooldownUntil)
+	{
+		if (donor.nextDonationFrame != s_allied.aidCooldownUntil ||
+			received.mayDonateFrame != s_allied.aidCooldownUntil ||
+			received.donationCooldownActive || !received.receiptCooldownActive)
+		{ FailSkirmishAITest("allied_aid_cooldown_or_relay_changed"); RequestSkirmishAITestStop(); return; }
+	}
+	if (s_allied.sawAid && frame >= s_allied.aidCooldownUntil &&
+		s_allied.fixtureCase == SKIRMISH_AI_ALLIED_AID_LIFECYCLE)
+	{
+		++s_allied.checks;
+		printf("SKIRMISH_AI_ALLIED_AID_NO_RELAY_ASSERT frame=%u through_frame=%u\n",
+			frame, s_allied.aidCooldownUntil - 1);
+		fflush(stdout);
+		s_runner.endFrame = frame;
+		RequestSkirmishAITestStop();
+	}
+}
+#endif
+
+void UpdateSkirmishAIAlliedFixture()
+{
+	const UnsignedInt frame = TheGameLogic->getFrame();
+	if (frame < 2) return;
+	if (s_allied.startFrame == 0) s_allied.startFrame = frame;
+	if (s_runner.lastObservedFrame != frame)
+	{
+		s_runner.lastObservedFrame = frame;
+		s_runner.stalledStartMilliseconds = GetTickCount();
+	}
+	else if (IsSkirmishAITestProgressStalled(
+		ElapsedMilliseconds(s_runner.stalledStartMilliseconds, GetTickCount())))
+	{
+		FailSkirmishAITest("allied_fixture_frame_stalled");
+		RequestSkirmishAITestStop();
+		return;
+	}
+#if RTS_ZEROHOUR
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_TRANSFER_COMMAND)
+	{
+		if (!RunAlliedTransferCommands()) FailSkirmishAITest("allied_transfer_assertion");
+		s_runner.endFrame = frame;
+		RequestSkirmishAITestStop();
+		return;
+	}
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_AID_LIFECYCLE ||
+		s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD) ObserveAlliedAid(frame);
+	if (s_runner.ending) return;
+	ObserveAlliedCoordination(frame);
+	if (s_runner.ending) return;
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SUPPORT_LIFECYCLE)
+		ObserveAlliedSupport(frame);
+	if (s_runner.ending) return;
+#endif
+	if (frame - s_allied.startFrame > 18000 ||
+		ElapsedMilliseconds(s_runner.startupStartMilliseconds, GetTickCount()) > 600000)
+	{
+		FailSkirmishAITest("allied_fixture_assertions_timeout");
+		RequestSkirmishAITestStop();
+	}
+}
+}
+
 Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 {
 	if (!s_runner.armed)
@@ -6607,6 +7119,24 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 	if (!s_runner.finished && !s_runner.failed)
 		FailSkirmishAITest("incomplete");
 
+	if (s_allied.active)
+	{
+		if (strcmp(s_executableHashObserved, "unavailable") == 0)
+			FailSkirmishAITest("allied_executable_hash_unavailable");
+		else if (strcmp(s_executableHashInput, "unavailable") != 0 &&
+			_stricmp(s_executableHashInput, s_executableHashObserved) != 0)
+			FailSkirmishAITest("allied_executable_hash_mismatch");
+		printf("%s seed=%d case=%s checks=%u end_frame=%u reason=%s "
+			"map_crc=%08X map_size=%u executable_sha256=%s "
+			"fresh_match_gate=not_run replay_gate=not_run\n",
+			s_runner.failed ? "SKIRMISH_AI_ALLIED_FIXTURE_FAIL" :
+				"SKIRMISH_AI_ALLIED_FIXTURE_COMPLETE",
+			s_runner.seed, s_alliedCaseNames[s_allied.fixtureCase], s_allied.checks,
+			s_runner.endFrame, s_runner.failureReason ? s_runner.failureReason : "none",
+			s_runner.loadedMapCRC, s_runner.loadedMapSize, s_executableHashObserved);
+		fflush(stdout);
+		return s_runner.failed ? 1 : 0;
+	}
 	if (s_recovery.active)
 	{
 		if (s_runner.failed)
