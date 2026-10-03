@@ -8658,7 +8658,7 @@ void AISkirmishPlayer::queryAlliedDamageSafety()
 	m_alliedRecentHeldDamage = m_alliedHoldAdmissionValid &&
 		(isAlliedAssaultHolding() || m_alliedStrategyResumePending) &&
 		IsSkirmishAlliedDamageRecent(m_alliedHeldDamageValid, m_alliedHeldDamageFrame, now) &&
-		IsSkirmishStrategyFrameReached(m_alliedHeldDamageFrame, m_alliedHoldAdmissionFrame + 1);
+		IsSkirmishStrategyFrameReached(m_alliedHeldDamageFrame, m_alliedHoldAdmissionFrame);
 }
 
 void AISkirmishPlayer::resumeAlliedStrategy()
@@ -8799,9 +8799,10 @@ void AISkirmishPlayer::commitAlliedCoordination(
 	}
 	m_alliedAssaultExpiryFrame = m_alliedAssaultFrame + 90 * LOGICFRAMES_PER_SECOND;
 	m_alliedStrategyResumePending = false;
-	// This owner's accepted hold may start after the leader's announcement.
-	// Frame-resolution body metadata cannot order earlier/later hits within
-	// this frame; only strict subsequent-frame outside-home damage is proof.
+	// Discard any earlier hold/pending event before accepting this admission.
+	// New damage callbacks prove hold ownership even in this same frame.
+	m_alliedHeldDamageValid = false;
+	m_alliedHeldDamageFrame = 0;
 	m_alliedHoldAdmissionValid = true;
 	m_alliedHoldAdmissionFrame = now;
 	m_alliedDamageSafetyValid = false;
