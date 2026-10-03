@@ -7821,6 +7821,63 @@ void ObserveAlliedAid(UnsignedInt frame)
 		RequestSkirmishAITestStop();
 	}
 }
+
+void PrintAlliedFixtureTimeoutDiagnostics(UnsignedInt frame)
+{
+	// Read the existing owner state and last immutable batch. Do not capture a
+	// new decision, refresh metrics, or change any assertion at the deadline.
+	printf("SKIRMISH_AI_ALLIED_TIMEOUT_STATE frame=%u start_frame=%u elapsed_frames=%u case=%s checks=%u "
+		"game_mode=%d replay=%d recorder_epoch=%d central_evaluated=%d central_next=%u observer_next=%u "
+		"coordination_seen=%d fortify_decline=%d retained=%d probes=%u withdrawal_fault=%d withdrawal_canceled=%d "
+		"withdrawal_complete=%d launched=%d retained_slots=%d,%d leader=%d target=%u release=%u expiry=%u "
+		"aid_fault=%d aid_seen=%d cancellation_issued=%d cancellation_saved=%d support_fault=%d support_returning=%d\n",
+		frame, s_allied.startFrame, frame - s_allied.startFrame, s_alliedCaseNames[s_allied.fixtureCase], s_allied.checks,
+		static_cast<Int>(TheGameLogic->getGameMode()), TheGameLogic->isInReplayGame(),
+		TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() : -1,
+		TheAI ? TheAI->hasAlliedEvaluation() : FALSE, TheAI ? TheAI->getNextAlliedEvaluationFrame() : 0,
+		s_allied.nextEvaluation, s_allied.sawCoordination, s_allied.sawFortifyDecline, s_allied.assaultRetained,
+		static_cast<UnsignedInt>(s_allied.assaultProbes.size()), s_allied.withdrawalFaultIssued, s_allied.withdrawalCanceled,
+		s_allied.withdrawalComplete, s_allied.assaultLaunched, s_allied.assaultSlots[0], s_allied.assaultSlots[1],
+		s_allied.assaultLeader, s_allied.assaultTarget, s_allied.assaultRelease, s_allied.assaultExpiry,
+		s_allied.aidFaultApplied, s_allied.sawAid, s_allied.cancellationIssued, s_allied.cancellationSaved,
+		s_allied.supportFaultIssued, s_allied.sawSupportReturning);
+	if (!ThePlayerList) { fflush(stdout); return; }
+	for (Int slot = 0; slot < SKIRMISH_AI_TEST_SLOT_COUNT; ++slot)
+	{
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
+		if (!player)
+		{ printf("SKIRMISH_AI_ALLIED_TIMEOUT_PLAYER slot=%d present=0\n", slot); continue; }
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(slot);
+		const SkirmishAIAlliedPlayerFacts *facts = TheAI ? TheAI->getAlliedPlayerFacts(player->getPlayerIndex()) : nullptr;
+		printf("SKIRMISH_AI_ALLIED_TIMEOUT_PLAYER slot=%d present=1 index=%d type=%d active=%d skirmish_ai=%d "
+			"money_present=%d actual_cash=%u attacked_frame=%u cached_facts=%d\n", slot, player->getPlayerIndex(),
+			static_cast<Int>(player->getPlayerType()), player->isPlayerActive(), ai != nullptr,
+			player->getMoney() != nullptr, player->getMoney() ? player->getMoney()->countMoney() : 0,
+			player->getAttackedFrame(), facts != nullptr);
+		if (facts)
+			printf("SKIRMISH_AI_ALLIED_TIMEOUT_FACTS slot=%d index=%d valid=%d alive=%d is_ai=%d mode=%d "
+				"economy=%d base=%d army=%d threat=%d ready_force=%d missing_income=%d missing_production=%d recoverable=%d "
+				"cash=%d starvation_cash_limit=%d protected_reserve=%d combat=%d local_combat=%d local_enemy=%d surplus=%d "
+				"allied_mask=%08X enemy_mask=%08X target_enemy=%d target=%u target_score=%d donation_blocked=%d aid_blocked=%d\n",
+				slot, facts->playerIndex, facts->valid, facts->alive, facts->isAI, static_cast<Int>(facts->mode),
+				facts->economyHealth, facts->baseIntegrity, facts->armyReadiness, facts->immediateThreat, facts->hasReadyForce,
+				facts->missingIncome, facts->missingProduction, facts->recoverable, facts->cash, facts->starvationCashLimit,
+				facts->protectedReserve, facts->combatValue, facts->localCombatValue, facts->localEnemyValue,
+				facts->supportAvailableValue, facts->alliedMask, facts->enemyMask, facts->targetEnemyIndex,
+				facts->targetObjectID, facts->targetScore, facts->donationBlocked, facts->aidBlocked);
+		if (!ai) continue;
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
+		printf("SKIRMISH_AI_ALLIED_TIMEOUT_ASSAULT slot=%d current_mode=%d strategic_target=%u "
+			"active=%d launched=%d resume_pending=%d leader=%d enemy=%d target=%u release=%u expiry=%u "
+			"support_recipient=%d support_teams=%d support_returning=%d donation_cooldown=%d next_donation=%u "
+			"receipt_cooldown=%d may_donate=%u\n", slot, static_cast<Int>(ai->getAlliedCurrentStrategyMode()),
+			ai->getAlliedCurrentStrategicTargetID(), state.assaultActive, state.assaultLaunched, state.strategyResumePending,
+			state.leaderIndex, state.enemyIndex, state.targetID, state.assaultFrame, state.assaultExpiryFrame,
+			state.supportRecipientIndex, state.supportTeamCount, state.supportReturning,
+			state.donationCooldownActive, state.nextDonationFrame, state.receiptCooldownActive, state.mayDonateFrame);
+	}
+	fflush(stdout);
+}
 #endif
 
 void UpdateSkirmishAIAlliedFixture()
@@ -7845,6 +7902,7 @@ void UpdateSkirmishAIAlliedFixture()
 	if (frame - s_allied.startFrame > 18000 ||
 		ElapsedMilliseconds(s_runner.startupStartMilliseconds, GetTickCount()) > 600000)
 	{
+		PrintAlliedFixtureTimeoutDiagnostics(frame);
 		FailSkirmishAITest("allied_fixture_assertions_timeout");
 		RequestSkirmishAITestStop();
 		return;
