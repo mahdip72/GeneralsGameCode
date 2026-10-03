@@ -80,6 +80,7 @@ Int s_alliedRequestedCase = -1;
 struct AlliedMovementProbe
 {
 	ObjectID objectID;
+	UnsignedInt teamID;
 	Int participant;
 	Coord3D position;
 };
@@ -117,6 +118,8 @@ struct AlliedFixtureState
 	UnsignedInt assaultExpiry;
 	Coord3D assaultTargetPosition;
 	Bool assaultMoved[2];
+	ObjectID assaultMovedMembers[2];
+	UnsignedInt assaultMovedTeams[2];
 	std::vector<AlliedMovementProbe> assaultProbes;
 	UnsignedInt supportTeamID;
 	ObjectID supportMemberID;
@@ -151,6 +154,8 @@ struct AlliedFixtureState
 	{
 		assaultSlots[0] = assaultSlots[1] = -1;
 		assaultMoved[0] = assaultMoved[1] = FALSE;
+		assaultMovedMembers[0] = assaultMovedMembers[1] = INVALID_ID;
+		assaultMovedTeams[0] = assaultMovedTeams[1] = 0;
 		for (Int participant = 0; participant < 2; ++participant)
 		{
 			cancellationSlots[participant] = -1;
@@ -6981,6 +6986,46 @@ void BeginAlliedCancellation(Int firstSlot, Int secondSlot, ObjectID targetID,
 	fflush(stdout);
 }
 
+Bool RetainHeldAlliedAssaultProbes(Int firstSlot, Int secondSlot)
+{
+	const Int slots[2] = { firstSlot, secondSlot };
+	Int captured[2] = { 0, 0 };
+	std::vector<AlliedMovementProbe> probes;
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(slots[participant]);
+		AISkirmishPlayer *skirmish = GetAlliedFixtureAI(slots[participant]);
+		Coord3D home;
+		if (!player || !skirmish || !skirmish->getBaseCenter(&home)) return FALSE;
+		for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
+		{
+			if (captured[participant] >= 64 || !IsSkirmishAIRecoveryCombatUnit(object, player) ||
+				!object->getTeam() || !skirmish->isAlliedAssaultHoldingTeam(object->getTeam()->getID())) continue;
+			AIUpdateInterface *ai = object->getAIUpdateInterface();
+			const Coord3D *guard = ai ? ai->getGuardLocation() : nullptr;
+			if (!ai || !guard || ai->getLastCommandSource() != CMD_FROM_AI ||
+				ai->getGuardTargetType() != GUARDTARGET_LOCATION) continue;
+			const Real dx = guard->x - home.x;
+			const Real dy = guard->y - home.y;
+			if (dx * dx + dy * dy > 50.0f * 50.0f) continue;
+			AlliedMovementProbe probe;
+			probe.objectID = object->getID();
+			probe.teamID = object->getTeam()->getID();
+			probe.participant = participant;
+			probe.position = *object->getPosition();
+			probes.push_back(probe);
+			++captured[participant];
+		}
+	}
+	if (captured[0] == 0 || captured[1] == 0) return FALSE;
+	s_allied.assaultProbes.swap(probes);
+	printf("SKIRMISH_AI_ALLIED_HELD_PROBES_ASSERT frame=%u slots=%d,%d members=%d,%d "
+		"offensive_hold_predicate=1 ai_home_guard=1\n", TheGameLogic->getFrame(),
+		firstSlot, secondSlot, captured[0], captured[1]);
+	fflush(stdout);
+	return TRUE;
+}
+
 void ObserveAlliedCoordination(UnsignedInt frame)
 {
 	if (!TheAI || !TheAI->hasAlliedEvaluation()) return;
@@ -7019,7 +7064,7 @@ void ObserveAlliedCoordination(UnsignedInt frame)
 				s_allied.sawCoordination = TRUE;
 				s_allied.coordinatedReleaseFrame = a.assaultFrame;
 				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_COORDINATION_LIVE &&
-					!s_allied.assaultRetained)
+					!s_allied.assaultRetained && RetainHeldAlliedAssaultProbes(slot, peer))
 				{
 					s_allied.assaultRetained = TRUE;
 					s_allied.assaultSlots[0] = slot;
@@ -7180,21 +7225,21 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 		{ FailSkirmishAITest("allied_assault_launch_target_lost"); RequestSkirmishAITestStop(); return; }
 		s_allied.assaultLaunched = TRUE;
 		s_allied.assaultTargetPosition = *target->getPosition();
-		for (Int participant = 0; participant < 2; ++participant)
+		Int surviving[2] = { 0, 0 };
+		for (size_t index = 0; index < s_allied.assaultProbes.size(); ++index)
 		{
-			Player *player = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[participant]);
-			Int captured = 0;
-			for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
-				if (captured < 64 && IsSkirmishAIRecoveryCombatUnit(object, player))
-				{
-					AlliedMovementProbe probe;
-					probe.objectID = object->getID();
-					probe.participant = participant;
-					probe.position = *object->getPosition();
-					s_allied.assaultProbes.push_back(probe);
-					++captured;
-				}
+			AlliedMovementProbe &probe = s_allied.assaultProbes[index];
+			Object *object = TheGameLogic->findObjectByID(probe.objectID);
+			Player *player = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[probe.participant]);
+			if (!IsSkirmishAIRecoveryCombatUnit(object, player) || !object->getTeam() ||
+				object->getTeam()->getID() != probe.teamID) continue;
+			// Retain the pre-release identities, but measure forward movement
+			// from the release boundary so earlier home-guard travel cannot pass.
+			probe.position = *object->getPosition();
+			++surviving[probe.participant];
 		}
+		if (surviving[0] == 0 || surviving[1] == 0)
+		{ FailSkirmishAITest("allied_assault_held_members_lost_before_release"); RequestSkirmishAITestStop(); return; }
 		printf("SKIRMISH_AI_ALLIED_LAUNCH_ASSERT frame=%u release=%u slots=%d,%d target=%u probes=%u\n",
 			frame, s_allied.assaultRelease, s_allied.assaultSlots[0], s_allied.assaultSlots[1],
 			s_allied.assaultTarget, static_cast<UnsignedInt>(s_allied.assaultProbes.size()));
@@ -7202,13 +7247,16 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 		++s_allied.checks;
 		return;
 	}
+	Int surviving[2] = { 0, 0 };
 	for (size_t index = 0; index < s_allied.assaultProbes.size(); ++index)
 	{
 		const AlliedMovementProbe &probe = s_allied.assaultProbes[index];
-		if (s_allied.assaultMoved[probe.participant]) continue;
 		Object *object = TheGameLogic->findObjectByID(probe.objectID);
 		Player *player = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[probe.participant]);
-		if (!IsSkirmishAIRecoveryCombatUnit(object, player)) continue;
+		if (!IsSkirmishAIRecoveryCombatUnit(object, player) || !object->getTeam() ||
+			object->getTeam()->getID() != probe.teamID) continue;
+		++surviving[probe.participant];
+		if (s_allied.assaultMoved[probe.participant]) continue;
 		AIUpdateInterface *ai = object->getAIUpdateInterface();
 		const Coord3D *goal = ai ? ai->getGoalPosition() : nullptr;
 		// Formation destinations may be offset from the common target point.
@@ -7220,12 +7268,25 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 			AlliedFixtureDistanceSquared(*object->getPosition(), s_allied.assaultTargetPosition) >=
 			AlliedFixtureDistanceSquared(probe.position, s_allied.assaultTargetPosition)) continue;
 		s_allied.assaultMoved[probe.participant] = TRUE;
+		s_allied.assaultMovedMembers[probe.participant] = probe.objectID;
+		s_allied.assaultMovedTeams[probe.participant] = probe.teamID;
 		++s_allied.checks;
-		printf("SKIRMISH_AI_ALLIED_MOVEMENT_ASSERT frame=%u slot=%d object=%u "
+		printf("SKIRMISH_AI_ALLIED_MOVEMENT_ASSERT frame=%u slot=%d object=%u team=%u "
 			"release=%u ai_attack_move=1 forward_displacement_min=25\n", frame,
-			s_allied.assaultSlots[probe.participant], probe.objectID, s_allied.assaultRelease);
+			s_allied.assaultSlots[probe.participant], probe.objectID, probe.teamID, s_allied.assaultRelease);
 		fflush(stdout);
 	}
+	if (surviving[0] == 0 || surviving[1] == 0)
+	{ FailSkirmishAITest("allied_assault_retained_members_no_survivor"); RequestSkirmishAITestStop(); return; }
+	for (Int participant = 0; participant < 2; ++participant)
+		if (s_allied.assaultMoved[participant])
+		{
+			Object *member = TheGameLogic->findObjectByID(s_allied.assaultMovedMembers[participant]);
+			Player *player = ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[participant]);
+			if (!IsSkirmishAIRecoveryCombatUnit(member, player) || !member->getTeam() ||
+				member->getTeam()->getID() != s_allied.assaultMovedTeams[participant])
+			{ FailSkirmishAITest("allied_assault_qualified_member_lost"); RequestSkirmishAITestStop(); return; }
+		}
 	if (s_allied.assaultMoved[0] && s_allied.assaultMoved[1] && s_allied.sawFortifyDecline)
 	{
 		s_runner.endFrame = frame;
