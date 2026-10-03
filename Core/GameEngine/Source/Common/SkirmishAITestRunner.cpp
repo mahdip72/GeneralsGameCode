@@ -97,13 +97,17 @@ struct AlliedFixtureState
 	UnsignedInt aidEvaluation;
 	UnsignedInt firstStarvationFrame;
 	Bool sawSupportReturning;
+	UnsignedInt coordinatedReleaseFrame;
+	UnsignedInt postLoadEvaluation;
+	Int postLoadBlockedEvaluations;
 	AlliedFixtureState() : active(FALSE), fixtureCase(-1), startFrame(0),
 		checks(0), saveLoaded(FALSE), sawFortifyDecline(FALSE),
 		sawCoordination(FALSE), nextEvaluation(0), supportDonorSlot(-1),
 		supportRecipientIndex(-1), aidFaultApplied(FALSE),
 		sawFirstStarvationEvaluation(FALSE), sawAid(FALSE), aidDonorSlot(-1),
 		aidRecipientSlot(-1), aidCooldownUntil(0), aidEvaluation(0),
-		firstStarvationFrame(0), sawSupportReturning(FALSE) {}
+		firstStarvationFrame(0), sawSupportReturning(FALSE),
+		coordinatedReleaseFrame(0), postLoadEvaluation(0), postLoadBlockedEvaluations(0) {}
 };
 AlliedFixtureState s_allied;
 void UpdateSkirmishAIAlliedFixture();
@@ -6788,6 +6792,11 @@ Bool SameAlliedDiagnostics(const AISkirmishPlayer::AlliedCoordinationDiagnostics
 Bool RoundTripAlliedFixture()
 {
 	if (!TheAI || !TheGameState) return FALSE;
+	// Leave enough protected time for two ordinary five-second evaluations
+	// after load. A nonzero expired timestamp is not cooldown evidence.
+	if (!s_allied.sawAid || s_allied.aidCooldownUntil <= TheGameLogic->getFrame() ||
+		s_allied.aidCooldownUntil - TheGameLogic->getFrame() < 20 * LOGICFRAMES_PER_SECOND)
+		return FALSE;
 	AISkirmishPlayer::AlliedCoordinationDiagnostics before[7];
 	Int playerIndices[7];
 	Int starvation[7];
@@ -6841,9 +6850,12 @@ Bool RoundTripAlliedFixture()
 			!TheGameLogic->findObjectByID(before[slot - 1].targetID)) return FALSE;
 	}
 	++s_allied.checks;
+	s_allied.postLoadEvaluation = TheAI->getNextAlliedEvaluationFrame();
+	s_allied.postLoadBlockedEvaluations = 0;
 	printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_ASSERT frame=%u file=%s "
-		"player_slots=7 central_cadence=preserved commitments=preserved support_ids=preserved\n",
-		frame, saved.filename.str());
+		"player_slots=7 central_cadence=preserved commitments=preserved support_ids=preserved "
+		"cooldown_until=%u remaining_frames=%u post_load_protection=pending\n",
+		frame, saved.filename.str(), s_allied.aidCooldownUntil, s_allied.aidCooldownUntil - frame);
 	fflush(stdout);
 	return TRUE;
 }
@@ -6884,6 +6896,7 @@ void ObserveAlliedCoordination(UnsignedInt frame)
 			{
 				if (!TheGameLogic->findObjectByID(a.targetID)) continue;
 				s_allied.sawCoordination = TRUE;
+				s_allied.coordinatedReleaseFrame = a.assaultFrame;
 				++s_allied.checks;
 				printf("SKIRMISH_AI_ALLIED_COORDINATION_ASSERT frame=%u slots=%d,%d "
 					"leader=%d enemy=%d target=%u release=%u expiry=%u fortify_decline=%d\n",
@@ -6891,11 +6904,14 @@ void ObserveAlliedCoordination(UnsignedInt frame)
 					a.assaultFrame, a.assaultExpiryFrame, s_allied.sawFortifyDecline);
 				fflush(stdout);
 				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
-					s_allied.sawAid && !s_allied.saveLoaded)
+					s_allied.sawAid && !s_allied.saveLoaded && s_allied.aidCooldownUntil > frame &&
+					s_allied.aidCooldownUntil - frame >= 20 * LOGICFRAMES_PER_SECOND)
 				{
-					if (!RoundTripAlliedFixture()) FailSkirmishAITest("allied_save_load_assertion");
-					s_runner.endFrame = frame;
-					RequestSkirmishAITestStop();
+					if (!RoundTripAlliedFixture())
+					{
+						FailSkirmishAITest("allied_save_load_assertion");
+						RequestSkirmishAITestStop();
+					}
 					return;
 				}
 			}
@@ -6967,6 +6983,11 @@ void ObserveAlliedAid(UnsignedInt frame)
 	if (!TheAI || !TheAI->hasAlliedEvaluation()) return;
 	if (!s_allied.aidFaultApplied)
 	{
+		// In the save/load case establish a real future commitment first, then
+		// apply the recovery fault while that cohort still has time to assemble.
+		if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
+			(s_allied.coordinatedReleaseFrame <= frame ||
+			 s_allied.coordinatedReleaseFrame - frame < 10 * LOGICFRAMES_PER_SECOND)) return;
 		for (Int donorSlot = 1; donorSlot <= 4; ++donorSlot)
 		{
 			Player *donor = ThePlayerList->getPlayerFromSlotIndex(donorSlot);
@@ -7067,6 +7088,35 @@ void ObserveAlliedAid(UnsignedInt frame)
 			received.mayDonateFrame != s_allied.aidCooldownUntil ||
 			received.donationCooldownActive || !received.receiptCooldownActive)
 		{ FailSkirmishAITest("allied_aid_cooldown_or_relay_changed"); RequestSkirmishAITestStop(); return; }
+	}
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD && s_allied.saveLoaded)
+	{
+		if (frame >= s_allied.aidCooldownUntil)
+		{ FailSkirmishAITest("allied_save_load_protection_expired"); RequestSkirmishAITestStop(); return; }
+		if (nextEvaluation != s_allied.postLoadEvaluation)
+		{
+			s_allied.postLoadEvaluation = nextEvaluation;
+			Player *donorPlayer = ThePlayerList->getPlayerFromSlotIndex(s_allied.aidDonorSlot);
+			const SkirmishAIAlliedPlayerFacts *donorFacts = donorPlayer ?
+				TheAI->getAlliedPlayerFacts(donorPlayer->getPlayerIndex()) : nullptr;
+			const SkirmishAIAlliedPlayerFacts *recipientFacts = TheAI->getAlliedPlayerFacts(recipientIndex);
+			if (!donorFacts || !recipientFacts || !donorFacts->valid || !recipientFacts->valid ||
+				!donorFacts->donationBlocked || !recipientFacts->donationBlocked || !recipientFacts->aidBlocked ||
+				TheAI->getAlliedRecipientReliefUntil(recipientIndex) != s_allied.aidCooldownUntil)
+			{ FailSkirmishAITest("allied_save_load_protection_not_enforced"); RequestSkirmishAITestStop(); return; }
+			++s_allied.postLoadBlockedEvaluations;
+			++s_allied.checks;
+			printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_PROTECTION_ASSERT frame=%u evaluation=%d "
+				"cooldown_until=%u donor_blocked=1 recipient_aid_blocked=1 relay_blocked=1\n",
+				frame, s_allied.postLoadBlockedEvaluations, s_allied.aidCooldownUntil);
+			fflush(stdout);
+			if (s_allied.postLoadBlockedEvaluations >= 2)
+			{
+				s_runner.endFrame = frame;
+				RequestSkirmishAITestStop();
+				return;
+			}
+		}
 	}
 	if (s_allied.sawAid && frame >= s_allied.aidCooldownUntil &&
 		s_allied.fixtureCase == SKIRMISH_AI_ALLIED_AID_LIFECYCLE)
