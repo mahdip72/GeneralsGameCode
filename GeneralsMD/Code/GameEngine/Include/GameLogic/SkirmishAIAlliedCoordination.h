@@ -22,6 +22,21 @@
 
 const Int SKIRMISH_AI_ALLIED_MAX_PLAYERS = 16;
 
+// Retain only the identity of an already launched static goal. This does not
+// grant current intel for new attack, route, or construction commands.
+inline Bool ShouldRetainSkirmishAIAlliedStaticGoal(
+	Bool active, Bool launched, Bool staticTarget, Bool liveEnemyOwnedTarget,
+	Bool hiddenByFog, Bool intelEligibleWhenVisible, UnsignedInt now,
+	UnsignedInt releaseFrame, UnsignedInt expiryFrame)
+{
+	return active && launched && staticTarget && liveEnemyOwnedTarget &&
+		hiddenByFog && intelEligibleWhenVisible &&
+		// Reject a corrupt or expanded deadline instead of extending memory.
+		expiryFrame - releaseFrame == 90 * LOGICFRAMES_PER_SECOND &&
+		IsSkirmishStrategyFrameReached(now, releaseFrame) &&
+		!IsSkirmishStrategyFrameReached(now, expiryFrame);
+}
+
 struct SkirmishAIAlliedPlayerFacts
 {
 	Bool valid;

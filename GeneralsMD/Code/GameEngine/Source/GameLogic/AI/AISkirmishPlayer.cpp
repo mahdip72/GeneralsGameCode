@@ -9031,39 +9031,18 @@ Bool AISkirmishPlayer::resolveAlliedAssaultTarget(Object **target) const
 		object->isDestroyed() || object->testStatus(OBJECT_STATUS_SOLD)) return false;
 	if (!IsSkirmishStrategyIntelEligible(object, m_player)) {
 		const ObjectShroudStatus shroud = object->getShroudedStatus(m_player->getPlayerIndex());
-		if (shroud == OBJECTSHROUD_CLEAR || shroud == OBJECTSHROUD_PARTIAL_CLEAR ||
-			!IsSkirmishAIIntelEligible(object->isKindOf(KINDOF_STRUCTURE), true, false,
+		const Bool hiddenByFog = shroud != OBJECTSHROUD_CLEAR && shroud != OBJECTSHROUD_PARTIAL_CLEAR;
+		const Bool intelEligibleWhenVisible =
+			IsSkirmishAIIntelEligible(object->isKindOf(KINDOF_STRUCTURE), true, false,
 				object->testStatus(OBJECT_STATUS_STEALTHED), object->testStatus(OBJECT_STATUS_DETECTED),
-				object->testStatus(OBJECT_STATUS_MASKED))) return false;
-		// Boarding can remove the cohort's only vision. Retain this already
-		// launched objective only while an actual admitted passenger is in transit
-		// and its own committed observation remains fresh. No new attack uses this grace.
-		Bool retainedTransit = false;
-		TunnelTracker *tracker = m_player->getTunnelSystem();
-		for (size_t i = 0; m_alliedAssaultLaunched && tracker &&
-			i < m_alliedAssaultTeamIDs.size() && !retainedTransit; ++i) {
-			const UnsignedInt id = m_alliedAssaultTeamIDs[i];
-			std::map<UnsignedInt, TacticalTeamState>::const_iterator it = m_tacticalTeams.find(id);
-			if (it == m_tacticalTeams.end()) continue;
-			const TacticalTeamState &state = it->second;
-			if (state.tunnelTransitPhase == SKIRMISH_AI_TUNNEL_TRANSIT_NONE ||
-				state.tunnelTransitPhase == SKIRMISH_AI_TUNNEL_TRANSIT_FALLBACK_EXIT ||
-				state.tunnelTargetID != m_alliedTargetID || state.tunnelStrategicTargetID != m_alliedTargetID ||
-				!IsSkirmishStrategyTargetObservationAvailable(TRUE, TheGameLogic->getFrame(),
-					state.tunnelCommittedTargetLastSeenFrame)) continue;
-			Team *team = FindSkirmishAlliedTeam(m_player, id);
-			if (!IsSkirmishStrategyOffensiveTeam(team, m_player)) continue;
-			for (Int member = 0; member < state.tunnelMemberCount &&
-				member < MAX_SKIRMISH_AI_TUNNEL_MEMBERS; ++member) {
-				Object *passenger = TheGameLogic->findObjectByID(state.tunnelMemberIDs[member]);
-				if (IsSkirmishAIStrategyTunnelTransitMember(passenger, m_player, team, true) &&
-					passenger->isContained() && tracker->isInContainer(passenger)) {
-					retainedTransit = true;
-					break;
-				}
-			}
-		}
-		if (!retainedTransit) return false;
+				object->testStatus(OBJECT_STATUS_MASKED));
+		// Both callers only validate the existing tuple. Keep launched orders
+		// through fog until its saved expiry; prelaunch release still needs intel.
+		// Tactical target selection and tunnel commands retain their own intel gates.
+		if (!ShouldRetainSkirmishAIAlliedStaticGoal(m_alliedAssaultActive,
+			m_alliedAssaultLaunched, IsSkirmishStrategyStaticTarget(object),
+			object->getControllingPlayer() == enemy, hiddenByFog, intelEligibleWhenVisible,
+			TheGameLogic->getFrame(), m_alliedAssaultFrame, m_alliedAssaultExpiryFrame)) return false;
 	}
 	*target = object;
 	return true;

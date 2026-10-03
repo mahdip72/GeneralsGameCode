@@ -26,6 +26,48 @@ int s_failures = 0;
 		} \
 	} while (0)
 
+static void TestLaunchedStaticGoalMemory()
+{
+	const UnsignedInt release = 19650U;
+	const UnsignedInt expiry = release + 90 * LOGICFRAMES_PER_SECOND;
+	// Actual failure: the admitted static goal becomes fogged after launch.
+	STAGE5_CHECK(ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, 20750U, release, expiry));
+	// Neither fresh/prelaunch plans nor hidden dynamic targets gain admission.
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, 20750U, release, expiry));
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, FALSE, TRUE, TRUE, TRUE, TRUE, release, release, expiry));
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, FALSE, TRUE, TRUE, TRUE, 20750U, release, expiry));
+	// Death, sale, or changed/invalid enemy ownership still invalidates the goal.
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, FALSE, TRUE, TRUE, 20750U, release, expiry));
+	// A visible intel rejection, stealth or masking is not ordinary fog loss.
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, FALSE, TRUE, 20750U, release, expiry));
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, TRUE, FALSE, 20750U, release, expiry));
+	STAGE5_CHECK(ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, expiry - 1U, release, expiry));
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, expiry, release, expiry));
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, release - 1U, release, expiry));
+	// A saved tuple crossing frame wrap has the same bounded release/expiry.
+	const UnsignedInt wrappedRelease = 0xfffffff0U;
+	const UnsignedInt wrappedExpiry = wrappedRelease + 90 * LOGICFRAMES_PER_SECOND;
+	STAGE5_CHECK(ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, 0U, wrappedRelease, wrappedExpiry));
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, wrappedExpiry, wrappedRelease, wrappedExpiry));
+	// Corrupt/expanded and half-range-ambiguous deadlines fail closed.
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, release, release, expiry + 1U));
+	STAGE5_CHECK(!ShouldRetainSkirmishAIAlliedStaticGoal(
+		TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, release, release, release + 0x80000000U));
+}
+
 static void InitializeFacts(SkirmishAIAlliedPlayerFacts facts[16])
 {
 	memset(facts, 0, sizeof(SkirmishAIAlliedPlayerFacts) * 16);
@@ -473,6 +515,7 @@ static void TestSupportSelectionAndMoneyRules()
 int RunStage5AlliedCoordinationTests()
 {
 	s_failures = 0;
+	TestLaunchedStaticGoalMemory();
 	TestPlayerZeroAndStarvationLifecycle();
 	TestHumanStarvationCashBoundary();
 	TestDonationBoundariesAndDeterministicPair();
