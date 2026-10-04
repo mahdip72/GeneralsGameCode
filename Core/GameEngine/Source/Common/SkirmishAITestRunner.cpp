@@ -45,6 +45,7 @@
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/Module/DozerAIUpdate.h"
 #include "GameLogic/Module/HackInternetAIUpdate.h"
+#include "GameLogic/Module/LifetimeUpdate.h"
 #include "GameLogic/Module/ProductionUpdate.h"
 #include "GameLogic/Module/RebuildHoleBehavior.h"
 #include "GameLogic/PartitionManager.h"
@@ -125,6 +126,16 @@ struct AlliedFixtureState
 	UnsignedInt aidSightSetupFrame;
 	UnsignedInt aidSightProvenFrame;
 	UnsignedInt aidSightMissingTraces;
+	UnsignedInt aidSightRejectedTraces;
+	ObjectID aidSightLastRejectedID;
+	UnsignedInt aidSightHealthTraces;
+	Real aidSightLastHealth;
+	UnsignedInt aidSightLastDamageFrame;
+	UnsignedInt aidIsolationFrames;
+	UnsignedInt aidIsolationEvents;
+	UnsignedInt aidIsolationDisableCount;
+	UnsignedInt aidIsolationProjectileCount;
+	UnsignedInt aidIsolationMineCount;
 	UnsignedInt aidCooldownUntil;
 	UnsignedInt aidEvaluation;
 	UnsignedInt firstStarvationFrame;
@@ -206,6 +217,9 @@ struct AlliedFixtureState
 		aidNaturalTargetID(INVALID_ID), aidNaturalLeaderIndex(-1), aidNaturalEnemyIndex(-1),
 		aidNaturalReleaseFrame(0), aidNaturalExpiryFrame(0), aidSightProviderID(INVALID_ID),
 		aidSightSetupFrame(0), aidSightProvenFrame(0), aidSightMissingTraces(0),
+		aidSightRejectedTraces(0), aidSightLastRejectedID(INVALID_ID), aidSightHealthTraces(0),
+		aidSightLastHealth(-1.0f), aidSightLastDamageFrame(0), aidIsolationFrames(0), aidIsolationEvents(0),
+		aidIsolationDisableCount(0), aidIsolationProjectileCount(0), aidIsolationMineCount(0),
 		aidCooldownUntil(0), aidEvaluation(0),
 		firstStarvationFrame(0), sawSupportReturning(FALSE),
 		coordinatedReleaseFrame(0), postLoadEvaluation(0), postLoadBlockedEvaluations(0),
@@ -10238,7 +10252,7 @@ Bool IsAlliedAidNaturalTargetVisible(Object *target)
 	return TRUE;
 }
 
-Bool IsAlliedAidSightProvider(Object *object, Player *recipient, Object *target)
+Bool IsAlliedAidSightCandidate(Object *object, Player *recipient, Object *target)
 {
 	AIPlayer *playerAI = recipient ? recipient->getAIPlayerForPlanning() : nullptr;
 	AISkirmishPlayer *ownerAI = playerAI && playerAI->isSkirmishAI() ? static_cast<AISkirmishPlayer *>(playerAI) : nullptr;
@@ -10258,6 +10272,140 @@ Bool IsAlliedAidSightProvider(Object *object, Player *recipient, Object *target)
 	}
 	const Real range = object->getShroudClearingRange();
 	return range > 0.0f && AlliedFixtureDistanceSquared(*object->getPosition(), *target->getPosition()) < range * range;
+}
+
+SlavedUpdateInterface *GetAlliedAidSightSlave(Object *object)
+{
+	BehaviorModule **modules = object ? object->getBehaviorModules() : nullptr;
+	if (modules)
+		for (BehaviorModule **module = modules; *module; ++module)
+			if ((*module)->getSlavedUpdateInterface()) return (*module)->getSlavedUpdateInterface();
+	return nullptr;
+}
+
+LifetimeUpdate *GetAlliedAidSightLifetime(Object *object)
+{
+	return object ? static_cast<LifetimeUpdate *>(object->findUpdateModule(NAMEKEY("LifetimeUpdate"))) : nullptr;
+}
+
+Bool IsAlliedAidSightIndependent(Object *object)
+{
+	if (!object || object->isKindOf(KINDOF_DRONE) || object->isKindOf(KINDOF_MOB_NEXUS) ||
+		GetAlliedAidSightSlave(object) || GetAlliedAidSightLifetime(object)) return FALSE;
+	Object *producer = TheGameLogic->findObjectByID(object->getProducerID());
+	// Ordinary factory-produced units remain eligible. Spawn children can be
+	// destroyed by their producer's removal, regardless of their own idle state.
+	return !producer || !producer->getSpawnBehaviorInterface();
+}
+
+Bool IsAlliedAidSightHealthy(Object *object)
+{
+	BodyModuleInterface *body = object ? object->getBodyModule() : nullptr;
+	return body && body->getMaxHealth() > 0.0f && body->getMaxHealth() <= FLT_MAX &&
+		body->getHealth() == body->getMaxHealth();
+}
+
+Bool IsAlliedAidSightProvider(Object *object, Player *recipient, Object *target)
+{
+	return IsAlliedAidSightCandidate(object, recipient, target) && IsAlliedAidSightIndependent(object);
+}
+
+void TraceAlliedAidSightProvider(const char *phase, UnsignedInt frame, Object *object)
+{
+	BodyModuleInterface *body = object ? object->getBodyModule() : nullptr;
+	const DamageInfo *damage = body ? body->getLastDamageInfo() : nullptr;
+	Object *producer = object ? TheGameLogic->findObjectByID(object->getProducerID()) : nullptr;
+	SlavedUpdateInterface *slave = GetAlliedAidSightSlave(object);
+	LifetimeUpdate *lifetime = GetAlliedAidSightLifetime(object);
+	printf("SKIRMISH_AI_ALLIED_AID_SIGHT_OBJECT phase=%s frame=%u provider=%u found=%d template=%s "
+		"destroyed=%d dead=%d health=%g max_health=%g producer=%u producer_live=%d producer_spawns=%d "
+		"drone=%d mob_nexus=%d slaved_module=%d slaver=%u lifetime_module=%d lifetime_die_frame=%u "
+		"last_damage_frame=%u damage_record_source=%u damage_record_mask=%08X damage_record_type=%d "
+		"damage_record_amount=%g\n", phase, frame, object ? object->getID() : s_allied.aidSightProviderID,
+		object != nullptr, object ? object->getTemplate()->getName().str() : "missing",
+		object && object->isDestroyed(), object && object->isEffectivelyDead(),
+		body ? body->getHealth() : -1.0f, body ? body->getMaxHealth() : -1.0f,
+		object ? object->getProducerID() : INVALID_ID, IsLiveSkirmishAIRecoveryObject(producer),
+		producer && producer->getSpawnBehaviorInterface() != nullptr, object && object->isKindOf(KINDOF_DRONE),
+		object && object->isKindOf(KINDOF_MOB_NEXUS), slave != nullptr, slave ? slave->getSlaverID() : INVALID_ID, lifetime != nullptr,
+		lifetime ? lifetime->getDieFrame() : 0, body ? body->getLastDamageTimestamp() : 0,
+		damage ? damage->in.m_sourceID : INVALID_ID, damage ? damage->in.m_sourcePlayerMask : 0,
+		damage ? static_cast<Int>(damage->in.m_damageType) : -1, damage ? damage->in.m_amount : 0.0f);
+	fflush(stdout);
+}
+
+Bool MaintainAlliedAidIsolation(UnsignedInt frame, Player *recipient, Object *target)
+{
+	if (s_allied.fixtureCase != SKIRMISH_AI_ALLIED_SAVE_LOAD || !recipient || !target) return FALSE;
+	Player *protectedOwners[3] = {
+		ThePlayerList->getPlayerFromSlotIndex(s_allied.aidNaturalSlots[0]),
+		ThePlayerList->getPlayerFromSlotIndex(s_allied.aidNaturalSlots[1]), recipient
+	};
+	for (Int participant = 0; participant < 3; ++participant)
+		if (!protectedOwners[participant] || !protectedOwners[participant]->isPlayerActive()) return FALSE;
+	Player *enemy = FindAlliedFixturePlayer(s_allied.aidNaturalEnemyIndex);
+	if (!enemy || target->getControllingPlayer() != enemy || !IsLiveSkirmishAIRecoveryObject(target) ||
+		enemy->getPlayerType() != PLAYER_COMPUTER || !enemy->isPlayerActive() ||
+		!enemy->getAIPlayerForPlanning()) return FALSE;
+	UnsignedInt actors = 0, newlyDisabled = 0, projectiles = 0, mines = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object; )
+	{
+		Object *next = object->getNextObject();
+		Player *owner = object->getControllingPlayer();
+		Bool hostile = FALSE;
+		if (IsLiveSkirmishAIRecoveryObject(object) && owner && object->getTeam() &&
+			owner->getPlayerType() == PLAYER_COMPUTER && owner->isPlayerActive() &&
+			owner != protectedOwners[0] && owner != protectedOwners[1] && owner != recipient)
+			for (Int participant = 0; participant < 3; ++participant)
+				if (protectedOwners[participant]->getRelationship(object->getTeam()) == ENEMIES) hostile = TRUE;
+		if (hostile)
+		{
+			// As in the support positive fixture, Physics processes all disabled
+			// masks. Remove only true-hostile ordnance through deferred destruction.
+			if (!object->isKindOf(KINDOF_STRUCTURE) && !object->isKindOf(KINDOF_MP_COUNT_FOR_VICTORY) &&
+				(object->isKindOf(KINDOF_PROJECTILE) || object->isKindOf(KINDOF_MINE)))
+			{
+				if (object->isKindOf(KINDOF_PROJECTILE)) ++projectiles;
+				else ++mines;
+				TheGameLogic->destroyObject(object);
+			}
+			else
+			{
+				AIUpdateInterface *ai = object->getAIUpdateInterface();
+				if (ai)
+				{
+					ai->setAttitude(ATTITUDE_NORMAL);
+					ai->aiIdle(CMD_FROM_AI);
+					ai->setLocomotorGoalNone();
+					ai->setAttitude(ATTITUDE_SLEEP);
+				}
+				if (!object->isDisabledByType(DISABLED_SCRIPT_DISABLED))
+				{ object->setDisabled(DISABLED_SCRIPT_DISABLED); ++newlyDisabled; }
+				if (!object->isDisabledByType(DISABLED_SCRIPT_DISABLED)) return FALSE;
+				++actors;
+			}
+		}
+		object = next;
+	}
+	++s_allied.aidIsolationFrames;
+	s_allied.aidIsolationDisableCount += newlyDisabled;
+	s_allied.aidIsolationProjectileCount += projectiles;
+	s_allied.aidIsolationMineCount += mines;
+	if (!IsLiveSkirmishAIRecoveryObject(target) || target->getControllingPlayer() != enemy ||
+		!target->isDisabledByType(DISABLED_SCRIPT_DISABLED) || !enemy->isPlayerActive() ||
+		enemy->getPlayerType() != PLAYER_COMPUTER || !enemy->getAIPlayerForPlanning()) return FALSE;
+	if ((s_allied.aidIsolationFrames == 1 || newlyDisabled || projectiles || mines) && s_allied.aidIsolationEvents < 16)
+	{
+		++s_allied.aidIsolationEvents;
+		printf("SKIRMISH_AI_ALLIED_AID_ISOLATION frame=%u after_natural_visible_tuple=1 actors_disabled=%u "
+			"new_disables=%u hostile_projectiles_removed=%u hostile_mines_removed=%u target=%u target_live=1 "
+			"enemy=%d enemy_cpu_active_ai_retained=1 natural_slots=%d,%d recipient=%d "
+			"health_intel_fact_overrides=0\n", frame, actors, newlyDisabled, projectiles, mines,
+			target->getID(), enemy->getPlayerIndex(), s_allied.aidNaturalSlots[0], s_allied.aidNaturalSlots[1],
+			recipient->getPlayerIndex());
+		fflush(stdout);
+	}
+	return TRUE;
 }
 
 Bool ControlAlliedAidSightProvider(Object *object)
@@ -10290,12 +10438,28 @@ void ObserveAlliedAid(UnsignedInt frame)
 		Player *recipient = ThePlayerList->getPlayerFromSlotIndex(s_allied.aidRecipientSlot);
 		if (!IsAlliedAidSightProvider(provider, recipient, target))
 		{
+			TraceAlliedAidSightProvider("lost", frame, provider);
 			printf("SKIRMISH_AI_ALLIED_AID_SIGHT_FAILURE frame=%u provider=%u provider_live=%d target=%u target_live=%d "
-				"both_participants_visible=%d\n", frame, s_allied.aidSightProviderID,
-				IsLiveSkirmishAIRecoveryObject(provider), s_allied.aidNaturalTargetID,
-				IsLiveSkirmishAIRecoveryObject(target), IsAlliedAidNaturalTargetVisible(target));
+				"both_participants_visible=%d last_observed_health=%g last_observed_damage_frame=%u "
+				"isolation_frames=%u new_disables_total=%u hostile_projectiles_total=%u hostile_mines_total=%u\n",
+				frame, s_allied.aidSightProviderID, IsLiveSkirmishAIRecoveryObject(provider), s_allied.aidNaturalTargetID,
+				IsLiveSkirmishAIRecoveryObject(target), IsAlliedAidNaturalTargetVisible(target),
+				s_allied.aidSightLastHealth, s_allied.aidSightLastDamageFrame, s_allied.aidIsolationFrames,
+				s_allied.aidIsolationDisableCount, s_allied.aidIsolationProjectileCount, s_allied.aidIsolationMineCount);
+			fflush(stdout);
 			FailSkirmishAITest("allied_save_load_genuine_sight_lost"); RequestSkirmishAITestStop(); return;
 		}
+		BodyModuleInterface *body = provider->getBodyModule();
+		if (body && (body->getHealth() != s_allied.aidSightLastHealth ||
+			body->getLastDamageTimestamp() != s_allied.aidSightLastDamageFrame))
+		{
+			if (s_allied.aidSightHealthTraces < 8)
+			{ ++s_allied.aidSightHealthTraces; TraceAlliedAidSightProvider("health_change", frame, provider); }
+			s_allied.aidSightLastHealth = body->getHealth();
+			s_allied.aidSightLastDamageFrame = body->getLastDamageTimestamp();
+		}
+		if (!MaintainAlliedAidIsolation(frame, recipient, target))
+		{ FailSkirmishAITest("allied_save_load_hostile_actor_control_unproven"); RequestSkirmishAITestStop(); return; }
 		if (!ControlAlliedAidSightProvider(provider) || !IsAlliedAidNaturalTargetVisible(target))
 		{ FailSkirmishAITest("allied_save_load_genuine_sight_lost"); RequestSkirmishAITestStop(); return; }
 		// Publication advances the world clock after the ordinary spatial pass,
@@ -10376,8 +10540,20 @@ void ObserveAlliedAid(UnsignedInt frame)
 					// Select only an existing recipient unit with real current sight.
 					// Keeping it changes neither income nor combat production counts.
 					for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
-						if (IsAlliedAidSightProvider(object, recipient, sightTarget) &&
-							(!sightProvider || object->getID() < sightProvider->getID())) sightProvider = object;
+					{
+						if (!IsAlliedAidSightCandidate(object, recipient, sightTarget)) continue;
+						if (!IsAlliedAidSightIndependent(object) || !IsAlliedAidSightHealthy(object))
+						{
+							if (s_allied.aidSightRejectedTraces < 8 && object->getID() != s_allied.aidSightLastRejectedID)
+							{
+								++s_allied.aidSightRejectedTraces;
+								s_allied.aidSightLastRejectedID = object->getID();
+								TraceAlliedAidSightProvider("rejected_dependent_or_damaged", frame, object);
+							}
+							continue;
+						}
+						if (!sightProvider || object->getID() < sightProvider->getID()) sightProvider = object;
+					}
 					if (!sightProvider)
 					{
 						if (s_allied.aidSightMissingTraces < 16)
@@ -10391,6 +10567,9 @@ void ObserveAlliedAid(UnsignedInt frame)
 						continue;
 					}
 					if (!IsAlliedAidNaturalCohortCurrent(frame, TRUE)) return;
+					TraceAlliedAidSightProvider("selected_before_fault", frame, sightProvider);
+					if (!MaintainAlliedAidIsolation(frame, recipient, sightTarget))
+					{ FailSkirmishAITest("allied_save_load_hostile_actor_control_unproven"); RequestSkirmishAITestStop(); return; }
 					if (!ControlAlliedAidSightProvider(sightProvider))
 					{ FailSkirmishAITest("allied_save_load_genuine_sight_control_changed"); RequestSkirmishAITestStop(); return; }
 				}
@@ -10440,6 +10619,8 @@ void ObserveAlliedAid(UnsignedInt frame)
 				{
 					s_allied.aidSightProviderID = sightProvider->getID();
 					s_allied.aidSightSetupFrame = frame;
+					s_allied.aidSightLastHealth = sightProvider->getBodyModule()->getHealth();
+					s_allied.aidSightLastDamageFrame = sightProvider->getBodyModule()->getLastDamageTimestamp();
 					// Refresh the live object's normal owner/position/range sight;
 					// no intel, shroud status or vision radius is assigned by the fixture.
 					sightProvider->handlePartitionCellMaintenance();
