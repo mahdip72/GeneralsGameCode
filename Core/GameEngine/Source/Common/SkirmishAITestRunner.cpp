@@ -168,7 +168,7 @@ struct AlliedFixtureState
 	Bool supportFaultIssued;
 	Bool supportAssignedScriptChecked;
 	Bool supportReturningScriptChecked;
-	UnsignedInt supportTransferHoldWitnesses;
+	UnsignedInt teamTransferHoldWitnesses;
 	Bool cancellationIssued;
 	Bool cancellationSaved;
 	Bool postLoadProtectionVerified;
@@ -200,7 +200,7 @@ struct AlliedFixtureState
 		supportNeedSourceWitnessID(INVALID_ID), supportNeedEnemyIndex(-1),
 		supportNextNeedImpactFrame(0), supportNeedImpactCount(0), supportFaultIssued(FALSE),
 		supportAssignedScriptChecked(FALSE), supportReturningScriptChecked(FALSE),
-		supportTransferHoldWitnesses(0),
+		teamTransferHoldWitnesses(0),
 		cancellationIssued(FALSE), cancellationSaved(FALSE), postLoadProtectionVerified(FALSE),
 		cancellationTarget(INVALID_ID), cancellationRelease(0)
 	{
@@ -3702,15 +3702,30 @@ void ObserveSkirmishAIAlliedTeamTransferHeld(UnsignedInt sourceTeamID,
 	UnsignedInt destinationTeamID, const char *operation)
 {
 #if RTS_ZEROHOUR && defined(_WIN64)
-	if (!s_allied.active || s_allied.fixtureCase != SKIRMISH_AI_ALLIED_SUPPORT_LIFECYCLE ||
-		s_allied.supportDonorSlot < 0 || sourceTeamID != s_allied.supportTeamID)
-		return;
-	++s_allied.supportTransferHoldWitnesses;
-	if (s_allied.supportTransferHoldWitnesses <= 16) {
-		printf("SKIRMISH_AI_ALLIED_SUPPORT_TRANSFER_HOLD frame=%u operation=%s "
+	if (!s_allied.active) return;
+	Bool trackedSource = s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SUPPORT_LIFECYCLE &&
+		s_allied.supportDonorSlot >= 0 && sourceTeamID == s_allied.supportTeamID;
+	ObjectID trackedMember = s_allied.supportMemberID;
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_COORDINATION_LIVE && s_allied.assaultRetained) {
+		for (size_t index = 0; index < s_allied.assaultProbes.size(); ++index) {
+			if (s_allied.assaultProbes[index].teamID != sourceTeamID) continue;
+			Object *member = TheGameLogic->findObjectByID(s_allied.assaultProbes[index].objectID);
+			if (!member || member->isDestroyed() || member->isEffectivelyDead() ||
+				!member->getTeam() || member->getTeam()->getID() != sourceTeamID) continue;
+			trackedSource = TRUE;
+			trackedMember = s_allied.assaultProbes[index].objectID;
+			break;
+		}
+	}
+	if (!trackedSource) return;
+	++s_allied.teamTransferHoldWitnesses;
+	if (s_allied.teamTransferHoldWitnesses <= 16) {
+		printf("%s frame=%u operation=%s "
 			"source_team=%u destination_team=%u tracked_member=%u witness=%u\n",
+			s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SUPPORT_LIFECYCLE ?
+				"SKIRMISH_AI_ALLIED_SUPPORT_TRANSFER_HOLD" : "SKIRMISH_AI_ALLIED_ASSAULT_TRANSFER_HOLD",
 			TheGameLogic->getFrame(), operation, sourceTeamID, destinationTeamID,
-			s_allied.supportMemberID, s_allied.supportTransferHoldWitnesses);
+			trackedMember, s_allied.teamTransferHoldWitnesses);
 		fflush(stdout);
 	}
 #else
@@ -8244,6 +8259,14 @@ Bool CaptureAlliedFixtureAssaultRoster(AISkirmishPlayer *ai, std::vector<Unsigne
 	return TRUE;
 }
 
+void CaptureAlliedFixtureTeamMembers(Team *team, std::vector<ObjectID> *ids)
+{
+	ids->clear();
+	for (DLINK_ITERATOR<Object> member = team->iterate_TeamMemberList();
+		!member.done(); member.advance())
+		ids->push_back(member.cur()->getID());
+}
+
 Bool AlliedFixtureAssaultRosterContains(const std::vector<UnsignedInt> &ids, UnsignedInt teamID)
 {
 	for (size_t index = 0; index < ids.size(); ++index) if (ids[index] == teamID) return TRUE;
@@ -8957,20 +8980,56 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 				AlliedFixtureDistanceSquared(*guard, home) > 50.0f * 50.0f)
 			{ FailSkirmishAITest("allied_script_probe_not_currently_home_held"); RequestSkirmishAITestStop(); return; }
 			const Coord3D guardBefore = *guard;
+			const ObjectID memberBefore = members[participant]->getID();
 			const UnsignedInt teamBefore = members[participant]->getTeam()->getID();
 			const Int stateBefore = unitAI->getCurrentStateID();
-			for (Int command = 0; command < 2; ++command)
+			const Real healthBefore = members[participant]->getBodyModule()->getHealth();
+			const Bool recruitableBefore = unitAI->isRecruitable();
+			const AISkirmishPlayer::AlliedCoordinationDiagnostics assignmentBefore = ownerAI->getAlliedCoordinationDiagnostics();
+			std::vector<ObjectID> membersBefore;
+			CaptureAlliedFixtureTeamMembers(members[participant]->getTeam(), &membersBefore);
+			std::vector<UnsignedInt> rosterBefore;
+			if (!CaptureAlliedFixtureAssaultRoster(ownerAI, &rosterBefore))
+			{ FailSkirmishAITest("allied_script_probe_roster_unavailable"); RequestSkirmishAITestStop(); return; }
+			for (Int command = 0; command < 3; ++command)
 			{
+				const UnsignedInt transferWitnessesBefore = s_allied.teamTransferHoldWitnesses;
 				if (command == 0)
 					unitAI->aiAttackMoveToPosition(target->getPosition(), NO_MAX_SHOTS_LIMIT, CMD_FROM_SCRIPT);
-				else
+				else if (command == 1)
 					unitAI->aiMoveToPosition(target->getPosition(), CMD_FROM_SCRIPT);
+				else {
+					if (!TheScriptActions || !TheScriptEngine)
+					{ FailSkirmishAITest("allied_script_alias_probe_unavailable"); RequestSkirmishAITestStop(); return; }
+					ScriptAction *action = newInstance(ScriptAction)(ScriptAction::TEAM_MERGE_INTO_TEAM);
+					action->setNextAction(nullptr);
+					action->getParameter(0)->setString(THIS_TEAM);
+					action->getParameter(1)->setString(THIS_TEAM);
+					TheScriptEngine->friend_executeAction(action, members[participant]->getTeam());
+					deleteInstance(action);
+				}
+				// A broken self-merge destroys objects. Resolve the original ID before
+				// reading its AI so the regression reports loss without stale pointers.
+				members[participant] = TheGameLogic->findObjectByID(memberBefore);
+				if (!IsSkirmishAIRecoveryCombatUnit(members[participant], players[participant]) ||
+					!members[participant]->getBodyModule() || members[participant]->getBodyModule()->getHealth() != healthBefore ||
+					!members[participant]->getTeam() || members[participant]->getTeam()->getID() != teamBefore ||
+					!members[participant]->getAIUpdateInterface())
+				{ FailSkirmishAITest("allied_script_probe_survivor_lost"); RequestSkirmishAITestStop(); return; }
+				unitAI = members[participant]->getAIUpdateInterface();
 				guard = unitAI->getGuardLocation();
+				std::vector<ObjectID> membersAfter;
+				CaptureAlliedFixtureTeamMembers(members[participant]->getTeam(), &membersAfter);
+				std::vector<UnsignedInt> rosterAfter;
 				const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ownerAI->getAlliedCoordinationDiagnostics();
 				if (!members[participant]->getTeam() || members[participant]->getTeam()->getID() != teamBefore ||
 					members[participant]->getControllingPlayer() != players[participant] ||
 					!guard || unitAI->getLastCommandSource() != CMD_FROM_AI ||
 					unitAI->getCurrentStateID() != stateBefore || unitAI->getGuardTargetType() != GUARDTARGET_LOCATION ||
+					unitAI->isRecruitable() != recruitableBefore || membersAfter != membersBefore ||
+					(command == 2 && s_allied.teamTransferHoldWitnesses != transferWitnessesBefore + 1) ||
+					!CaptureAlliedFixtureAssaultRoster(ownerAI, &rosterAfter) || rosterAfter != rosterBefore ||
+					!SameAlliedDiagnostics(assignmentBefore, state) ||
 					AlliedFixtureDistanceSquared(*guard, guardBefore) > 1.0f ||
 					!ownerAI->shouldHoldAlliedScriptCommand(members[participant]) ||
 					!state.assaultActive || state.assaultLaunched || state.targetID != s_allied.assaultTarget ||
@@ -8978,10 +9037,11 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 				{ FailSkirmishAITest("allied_script_command_replaced_held_order"); RequestSkirmishAITestStop(); return; }
 				++s_allied.checks;
 				printf("SKIRMISH_AI_ALLIED_SCRIPT_HOLD_ASSERT frame=%u release=%u slot=%d member=%u team=%u "
-					"command=%s source=script guard_unchanged=1 owner_source=ai launched=0\n",
+					"command=%s source=script guard_unchanged=1 owner_source=ai launched=0 "
+					"survivor_alive=1 health_unchanged=1 team_members_unchanged=1 roster_unchanged=1 assignment_unchanged=1\n",
 					frame, s_allied.assaultRelease, s_allied.assaultSlots[participant],
 					members[participant]->getID(), members[participant]->getTeam()->getID(),
-					command == 0 ? "attack_move" : "move");
+					command == 0 ? "attack_move" : (command == 1 ? "move" : "merge_self_alias"));
 				fflush(stdout);
 			}
 		}
@@ -9527,16 +9587,23 @@ Bool CheckAlliedSupportScriptHold(AISkirmishPlayer *ownerAI, Player *owner, Obje
 	AIUpdateInterface *unitAI = member->getAIUpdateInterface();
 	const Coord3D *guard = unitAI ? unitAI->getGuardLocation() : nullptr;
 	if (!ownerAI->isAlliedSupportMember(member) || !ownerAI->shouldHoldAlliedScriptCommand(member) ||
-		!unitAI || !guard || unitAI->getLastCommandSource() != CMD_FROM_AI ||
+		!member->getBodyModule() || !unitAI || !guard || unitAI->getLastCommandSource() != CMD_FROM_AI ||
 		unitAI->getGuardTargetType() != GUARDTARGET_LOCATION)
 	{ FailSkirmishAITest("allied_support_script_probe_not_owned_guard"); RequestSkirmishAITestStop(); return FALSE; }
 	const Coord3D guardBefore = *guard;
+	const ObjectID memberBefore = member->getID();
+	const Real healthBefore = member->getBodyModule()->getHealth();
 	const Int stateBefore = unitAI->getCurrentStateID();
 	const Bool recruitableBefore = unitAI->isRecruitable();
 	const AISkirmishPlayer::AlliedCoordinationDiagnostics assignmentBefore = ownerAI->getAlliedCoordinationDiagnostics();
-	for (Int command = 0; command < 4; ++command)
+	std::vector<ObjectID> membersBefore;
+	CaptureAlliedFixtureTeamMembers(member->getTeam(), &membersBefore);
+	std::vector<UnsignedInt> rosterBefore;
+	for (Int index = 0; index < assignmentBefore.supportTeamCount; ++index)
+		rosterBefore.push_back(ownerAI->getAlliedSupportTeamID(index));
+	for (Int command = 0; command < 5; ++command)
 	{
-		const UnsignedInt transferWitnessesBefore = s_allied.supportTransferHoldWitnesses;
+		const UnsignedInt transferWitnessesBefore = s_allied.teamTransferHoldWitnesses;
 		if (command == 0) unitAI->aiAttackMoveToPosition(&scriptGoal, NO_MAX_SHOTS_LIMIT, CMD_FROM_SCRIPT);
 		else if (command == 1) unitAI->aiMoveToPosition(&scriptGoal, CMD_FROM_SCRIPT);
 		else {
@@ -9544,33 +9611,50 @@ Bool CheckAlliedSupportScriptHold(AISkirmishPlayer *ownerAI, Player *owner, Obje
 			{ FailSkirmishAITest("allied_support_transfer_probe_unavailable"); RequestSkirmishAITestStop(); return FALSE; }
 			// Execute the real script dispatcher against this exact team instance.
 			// An unguarded merge/disband moves the survivor and destroys its source.
-			ScriptAction *action = newInstance(ScriptAction)(command == 2 ?
+			ScriptAction *action = newInstance(ScriptAction)(command != 3 ?
 				ScriptAction::TEAM_MERGE_INTO_TEAM : ScriptAction::TEAM_STOP_AND_DISBAND);
 			action->setNextAction(nullptr);
 			action->getParameter(0)->setString(THIS_TEAM);
-			if (command == 2)
+			if (command == 4)
+				action->getParameter(1)->setString(THIS_TEAM);
+			else if (command == 2)
 				action->getParameter(1)->setString(owner->getDefaultTeam()->getName());
 			TheScriptEngine->friend_executeAction(action, member->getTeam());
 			deleteInstance(action);
 		}
+		member = TheGameLogic->findObjectByID(memberBefore);
+		if (!IsSkirmishAIRecoveryCombatUnit(member, owner) || !member->getBodyModule() ||
+			member->getBodyModule()->getHealth() != healthBefore || !member->getTeam() ||
+			member->getTeam()->getID() != s_allied.supportTeamID || !member->getAIUpdateInterface())
+		{ FailSkirmishAITest("allied_support_script_probe_survivor_lost"); RequestSkirmishAITestStop(); return FALSE; }
+		unitAI = member->getAIUpdateInterface();
 		guard = unitAI->getGuardLocation();
+		std::vector<ObjectID> membersAfter;
+		CaptureAlliedFixtureTeamMembers(member->getTeam(), &membersAfter);
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics assignmentAfter = ownerAI->getAlliedCoordinationDiagnostics();
+		std::vector<UnsignedInt> rosterAfter;
+		for (Int index = 0; index < assignmentAfter.supportTeamCount; ++index)
+			rosterAfter.push_back(ownerAI->getAlliedSupportTeamID(index));
 		if (!IsSkirmishAIRecoveryCombatUnit(member, owner) || !member->getTeam() ||
 			member->getID() != s_allied.supportMemberID || member->getTeam()->getID() != s_allied.supportTeamID ||
 			!guard || unitAI->getLastCommandSource() != CMD_FROM_AI || unitAI->getCurrentStateID() != stateBefore ||
 			unitAI->isRecruitable() != recruitableBefore ||
-			(command >= 2 && s_allied.supportTransferHoldWitnesses != transferWitnessesBefore + 1) ||
+			membersAfter != membersBefore || rosterAfter != rosterBefore ||
+			(command >= 2 && s_allied.teamTransferHoldWitnesses != transferWitnessesBefore + 1) ||
 			unitAI->getGuardTargetType() != GUARDTARGET_LOCATION ||
 			AlliedFixtureDistanceSquared(*guard, guardBefore) > 1.0f ||
 			!ownerAI->isAlliedSupportMember(member) || !ownerAI->shouldHoldAlliedScriptCommand(member) ||
-			!SameAlliedDiagnostics(assignmentBefore, ownerAI->getAlliedCoordinationDiagnostics()))
+			!SameAlliedDiagnostics(assignmentBefore, assignmentAfter))
 		{ FailSkirmishAITest("allied_support_script_command_replaced_owned_guard"); RequestSkirmishAITestStop(); return FALSE; }
 		++s_allied.checks;
 		printf("SKIRMISH_AI_ALLIED_SUPPORT_SCRIPT_HOLD_ASSERT frame=%u phase=%s member=%u team=%u "
 			"command=%s source=script guard_unchanged=1 owner_source=ai assignment_unchanged=1 "
-			"recruitable_unchanged=1 destination_team=%u transfer_witnesses=%u\n",
+			"recruitable_unchanged=1 survivor_alive=1 health_unchanged=1 team_members_unchanged=1 "
+			"roster_unchanged=1 destination_team=%u transfer_witnesses=%u\n",
 			frame, phase, member->getID(), member->getTeam()->getID(),
-			command == 0 ? "attack_move" : (command == 1 ? "move" : (command == 2 ? "merge" : "disband")),
-			owner->getDefaultTeam()->getID(), s_allied.supportTransferHoldWitnesses);
+			command == 0 ? "attack_move" : (command == 1 ? "move" :
+				(command == 2 ? "merge" : (command == 3 ? "disband" : "merge_self_alias"))),
+			command == 4 ? member->getTeam()->getID() : owner->getDefaultTeam()->getID(), s_allied.teamTransferHoldWitnesses);
 		fflush(stdout);
 	}
 	return TRUE;
