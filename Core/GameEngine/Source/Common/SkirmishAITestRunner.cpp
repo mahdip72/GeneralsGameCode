@@ -165,6 +165,11 @@ struct AlliedFixtureState
 	Int supportNeedEnemyIndex;
 	UnsignedInt supportNextNeedImpactFrame;
 	UnsignedInt supportNeedImpactCount;
+	UnsignedInt supportIsolationFrames;
+	UnsignedInt supportIsolationDisableCount;
+	UnsignedInt supportIsolationProjectileCount;
+	UnsignedInt supportIsolationMineCount;
+	UnsignedInt supportIsolationEvents;
 	Bool supportFaultIssued;
 	Bool supportAssignedScriptChecked;
 	Bool supportReturningScriptChecked;
@@ -198,7 +203,9 @@ struct AlliedFixtureState
 		assaultTarget(INVALID_ID), assaultRelease(0), assaultExpiry(0),
 		supportTeamID(0), supportMemberID(INVALID_ID), supportNeedVictimID(INVALID_ID),
 		supportNeedSourceWitnessID(INVALID_ID), supportNeedEnemyIndex(-1),
-		supportNextNeedImpactFrame(0), supportNeedImpactCount(0), supportFaultIssued(FALSE),
+		supportNextNeedImpactFrame(0), supportNeedImpactCount(0), supportIsolationFrames(0),
+		supportIsolationDisableCount(0), supportIsolationProjectileCount(0), supportIsolationMineCount(0),
+		supportIsolationEvents(0), supportFaultIssued(FALSE),
 		supportAssignedScriptChecked(FALSE), supportReturningScriptChecked(FALSE),
 		teamTransferHoldWitnesses(0),
 		cancellationIssued(FALSE), cancellationSaved(FALSE), postLoadProtectionVerified(FALSE),
@@ -9746,6 +9753,83 @@ Bool FindAlliedSupportNeedWitnesses(Player *recipient, Object **victim, Object *
 	return *victim && *source;
 }
 
+Bool MaintainAlliedSupportIsolation(UnsignedInt frame)
+{
+	// This opt-in positive fixture starts controlling actors only after a real
+	// natural support admission. Never edit donor health, home damage or facts.
+	Player *donor = ThePlayerList->getPlayerFromSlotIndex(s_allied.supportDonorSlot);
+	Player *recipient = FindAlliedFixturePlayer(s_allied.supportRecipientIndex);
+	if (!donor || !recipient) return FALSE;
+	UnsignedInt actors = 0, newlyDisabled = 0, projectiles = 0, mines = 0;
+	for (Object *object = TheGameLogic->getFirstObject(); object; )
+	{
+		Object *next = object->getNextObject();
+		Player *owner = object->getControllingPlayer();
+		if (IsLiveSkirmishAIRecoveryObject(object) && owner && owner != donor && owner != recipient &&
+			owner->getPlayerType() == PLAYER_COMPUTER && owner->isPlayerActive() && object->getTeam() &&
+			(donor->getRelationship(object->getTeam()) == ENEMIES ||
+			 recipient->getRelationship(object->getTeam()) == ENEMIES))
+		{
+			// Physics processes every disabled mask: stop in-flight hostile ordnance
+			// through the ordinary destruction API, never any building or ally.
+			if (!object->isKindOf(KINDOF_STRUCTURE) &&
+				(object->isKindOf(KINDOF_PROJECTILE) || object->isKindOf(KINDOF_MINE)))
+			{
+				if (object->isKindOf(KINDOF_PROJECTILE)) ++projectiles;
+				else ++mines;
+				TheGameLogic->destroyObject(object);
+			}
+			else
+			{
+				AIUpdateInterface *ai = object->getAIUpdateInterface();
+				if (ai)
+				{
+					// Sleeping actors ignore idle commands. Apply idle before sleep;
+					// the AI source also bypasses the script-command hold legitimately.
+					ai->setAttitude(ATTITUDE_NORMAL);
+					ai->aiIdle(CMD_FROM_AI);
+					ai->setLocomotorGoalNone();
+					ai->setAttitude(ATTITUDE_SLEEP);
+				}
+				if (!object->isDisabledByType(DISABLED_SCRIPT_DISABLED))
+				{
+					object->setDisabled(DISABLED_SCRIPT_DISABLED);
+					++newlyDisabled;
+				}
+				if (!object->isDisabledByType(DISABLED_SCRIPT_DISABLED)) return FALSE;
+				++actors;
+			}
+		}
+		object = next;
+	}
+	++s_allied.supportIsolationFrames;
+	s_allied.supportIsolationDisableCount += newlyDisabled;
+	s_allied.supportIsolationProjectileCount += projectiles;
+	s_allied.supportIsolationMineCount += mines;
+	Object *source = TheGameLogic->findObjectByID(s_allied.supportNeedSourceWitnessID);
+	Player *enemy = FindAlliedFixturePlayer(s_allied.supportNeedEnemyIndex);
+	if (s_allied.supportIsolationFrames == 1 &&
+		(!IsSkirmishAIRecoveryCombatUnit(source, enemy) ||
+		 !source->isDisabledByType(DISABLED_SCRIPT_DISABLED) || !enemy ||
+		 enemy->getPlayerType() != PLAYER_COMPUTER || !enemy->isPlayerActive() ||
+		 !enemy->getAIPlayerForPlanning())) return FALSE;
+	if ((s_allied.supportIsolationFrames == 1 || newlyDisabled || projectiles || mines) &&
+		s_allied.supportIsolationEvents < 16)
+	{
+		++s_allied.supportIsolationEvents;
+		printf("SKIRMISH_AI_ALLIED_SUPPORT_ISOLATION frame=%u after_natural_admission=1 "
+			"actors_disabled=%u new_disables=%u hostile_projectiles_removed=%u hostile_mines_removed=%u "
+			"initial_source_witness=%u witness_alive=%d witness_script_disabled=%d enemy=%d enemy_active=%d "
+			"enemy_cpu=%d enemy_ai_retained=%d donor_home_damage_untouched=1\n", frame, actors,
+			newlyDisabled, projectiles, mines, s_allied.supportNeedSourceWitnessID,
+			IsSkirmishAIRecoveryCombatUnit(source, enemy), source && source->isDisabledByType(DISABLED_SCRIPT_DISABLED),
+			s_allied.supportNeedEnemyIndex, enemy && enemy->isPlayerActive(),
+			enemy && enemy->getPlayerType() == PLAYER_COMPUTER, enemy && enemy->getAIPlayerForPlanning() != nullptr);
+		fflush(stdout);
+	}
+	return TRUE;
+}
+
 Bool ReportAlliedSupportNeedFailure(const char *phase, UnsignedInt frame)
 {
 	Player *recipient = FindAlliedFixturePlayer(s_allied.supportRecipientIndex);
@@ -9836,11 +9920,12 @@ Bool SustainAlliedSupportNeed(UnsignedInt frame)
 	++s_allied.supportNeedImpactCount;
 	s_allied.supportNextNeedImpactFrame = frame + 5 * LOGICFRAMES_PER_SECOND;
 	printf("SKIRMISH_AI_ALLIED_SUPPORT_NEED_IMPACT_ASSERT frame=%u recipient=%d victim_cc=%u "
-		"initial_source_witness=%u witness_alive=%d enemy=%d source_mask=%u pulse=%u "
+		"initial_source_witness=%u witness_alive=%d witness_script_disabled=%d enemy=%d source_mask=%u pulse=%u "
 		"health_before=%g health_after=%g health_healed=%g damage_clipped=%g healing_clipped=%g "
 		"home_damage_frame=%u next_impact=%u sustained_need=real_hostile_home_latch\n", frame,
 		s_allied.supportRecipientIndex, victim->getID(), s_allied.supportNeedSourceWitnessID,
-		IsSkirmishAIRecoveryCombatUnit(source, enemy), enemy->getPlayerIndex(), sourceMask,
+		IsSkirmishAIRecoveryCombatUnit(source, enemy), source && source->isDisabledByType(DISABLED_SCRIPT_DISABLED),
+		enemy->getPlayerIndex(), sourceMask,
 		s_allied.supportNeedImpactCount, before, after, victim->getBodyModule()->getHealth(),
 		damage.out.m_actualDamageClipped, healing.out.m_actualDamageClipped,
 		healed.homeDamageFrame, s_allied.supportNextNeedImpactFrame);
@@ -9852,6 +9937,10 @@ void ObserveAlliedSupport(UnsignedInt frame)
 {
 	if (s_allied.supportDonorSlot >= 0)
 	{
+		if (!MaintainAlliedSupportIsolation(frame))
+		{
+			FailSkirmishAITest("allied_support_actor_isolation_unproven"); RequestSkirmishAITestStop(); return;
+		}
 		AISkirmishPlayer *donorAI = GetAlliedFixtureAI(s_allied.supportDonorSlot);
 		Player *donor = ThePlayerList->getPlayerFromSlotIndex(s_allied.supportDonorSlot);
 		Object *member = TheGameLogic->findObjectByID(s_allied.supportMemberID);
@@ -9961,6 +10050,11 @@ void ObserveAlliedSupport(UnsignedInt frame)
 				frame, s_allied.supportDonorSlot, s_allied.supportRecipientIndex,
 				s_allied.supportTeamID, s_allied.supportMemberID, homeRadius);
 			fflush(stdout);
+			printf("SKIRMISH_AI_ALLIED_SUPPORT_ISOLATION_SUMMARY frame=%u controlled_frames=%u "
+				"disable_events=%u hostile_projectiles_removed=%u hostile_mines_removed=%u\n", frame,
+				s_allied.supportIsolationFrames, s_allied.supportIsolationDisableCount,
+				s_allied.supportIsolationProjectileCount, s_allied.supportIsolationMineCount);
+			fflush(stdout);
 			s_runner.endFrame = frame;
 			RequestSkirmishAITestStop();
 		}
@@ -10015,6 +10109,10 @@ void ObserveAlliedSupport(UnsignedInt frame)
 		s_allied.supportNeedVictimID = needVictim->getID();
 		s_allied.supportNeedSourceWitnessID = needSource->getID();
 		s_allied.supportNeedEnemyIndex = needSource->getControllingPlayer()->getPlayerIndex();
+		if (!MaintainAlliedSupportIsolation(frame))
+		{
+			FailSkirmishAITest("allied_support_actor_isolation_unproven"); RequestSkirmishAITestStop(); return;
+		}
 		if (!SustainAlliedSupportNeed(frame))
 		{
 			PrintAlliedSupportFailure("controlled_need_admission", frame, donor,
