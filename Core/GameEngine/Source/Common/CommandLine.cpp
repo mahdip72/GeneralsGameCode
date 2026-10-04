@@ -596,6 +596,34 @@ Int parseRunSkirmishAITestForStartup(char *args[], int num)
 }
 
 #if RTS_ZEROHOUR
+static void parseSkirmishAIAlliedArguments(char *args[], int num, Int *seed, Int *fixtureCase)
+{
+#if !defined(_WIN64)
+	printf("SKIRMISH_AI_ALLIED_FIXTURE_FAIL seed=0 reason=native_x64_only\n");
+	fflush(stdout);
+	exit(2);
+#endif
+	if (num < 3 || !TryParseSkirmishAITestSeed(args[1], seed) ||
+		!TryParseSkirmishAIAlliedFixtureCase(args[2], fixtureCase))
+	{
+		printf("SKIRMISH_AI_ALLIED_FIXTURE_FAIL seed=0 reason=invalid_arguments\n");
+		fflush(stdout);
+		exit(2);
+	}
+}
+
+Int parseRunSkirmishAIAlliedTestForStartup(char *args[], int num)
+{
+	Int seed = 0, fixtureCase = 0;
+	parseSkirmishAIAlliedArguments(args, num, &seed, &fixtureCase);
+	parseHeadless(args, num);
+	TheWritableGlobalData->m_shellMapOn = FALSE;
+	TheWritableGlobalData->m_useFpsLimit = FALSE;
+	rts::ClientInstance::setMultiInstance(TRUE);
+	rts::ClientInstance::skipPrimaryInstance();
+	return 3;
+}
+
 static void parseSkirmishAIRecoveryFixtureArguments(
 	char *args[], int num, Int *seed, Int *fixtureCase, Int *faction)
 {
@@ -727,6 +755,31 @@ Int parseRunSkirmishAITest4v2(char *args[], int num)
 // Whole-command validation checks the four typed values in both passes.
 Int parseSkirmishAITestReviewedMap(char *[], int) { return 5; }
 #if RTS_ZEROHOUR
+Int parseRunSkirmishAIAlliedTest(char *args[], int num)
+{
+	Int seed = 0, fixtureCase = 0;
+	parseSkirmishAIAlliedArguments(args, num, &seed, &fixtureCase);
+	// Reserve the existing fresh-run request so all other runner modes reject
+	// a mixed invocation regardless of argument order. EngineInit still arms
+	// through the ordinary deferred startup contract.
+	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request() ||
+		TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest() ||
+#if defined(_WIN64)
+		TheGlobalData->m_commandLineData.hasSkirmishAITestHardAI2v6Request() ||
+#endif
+		IsSkirmishAILegacySaveTestRequested() || !TheGlobalData->m_simulateReplays.empty() ||
+		!ConfigureSkirmishAIAlliedFixture(fixtureCase) ||
+		!TheWritableGlobalData->m_commandLineData.requestSkirmishAITest(seed))
+	{
+		printf("SKIRMISH_AI_ALLIED_FIXTURE_FAIL seed=%d reason=conflicting_option\n", seed);
+		fflush(stdout);
+		exit(2);
+	}
+	return 3;
+}
+
 Int parseRunSkirmishAIRecoveryTest(char *args[], int num)
 {
 	if (TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
@@ -1740,6 +1793,7 @@ static CommandLineParam paramsForStartup[] =
 	// Explicit full-engine Stage 1 recovery fixture; one case/faction per process.
 #if RTS_ZEROHOUR
 	{ "-runSkirmishAIRecoveryTest", parseRunSkirmishAIRecoveryTestForStartup },
+	{ "-runSkirmishAIAlliedTest", parseRunSkirmishAIAlliedTestForStartup },
 	{ "-runRenderedBattleDiagnostic", parseRunRenderedBattleDiagnosticForStartup },
 	{ "-runRenderedBattleBenchmark", parseRunRenderedBattleDiagnosticForStartup },
 	// Explicit snapshot-only legacy-save probe; the argument is a leaf .sav name.
@@ -1782,6 +1836,7 @@ static CommandLineParam paramsForEngineInit[] =
 #endif
 #if RTS_ZEROHOUR
 	{ "-runSkirmishAIRecoveryTest", parseRunSkirmishAIRecoveryTest },
+	{ "-runSkirmishAIAlliedTest", parseRunSkirmishAIAlliedTest },
 	{ "-runRenderedBattleDiagnostic", parseRunRenderedBattleDiagnostic },
 	{ "-runRenderedBattleBenchmark", parseRunRenderedBattleDiagnostic },
 	{ "-runSkirmishAILegacySaveTest", parseRunSkirmishAILegacySaveTest },
@@ -2017,6 +2072,31 @@ static void parseCommandLine(const CommandLineParam* params, int numParams)
 		token = nextParam(nullptr, "\" ");
 	}
 	int argc = argv.size();
+#if RTS_ZEROHOUR
+	// Validate mode conflicts before either parser pass can mutate startup
+	// state or dispatch a fixture handler. Argument order cannot hide a replay.
+	Int alliedRequests = 0;
+	Bool alliedConflict = FALSE;
+	for (Int option = 1; option < argc; ++option)
+	{
+		if (_stricmp(argv[option], "-runSkirmishAIAlliedTest") == 0)
+			++alliedRequests;
+		else if (_strnicmp(argv[option], "-runSkirmishAI", 14) == 0 ||
+			_stricmp(argv[option], "-replay") == 0 ||
+			_stricmp(argv[option], "-loadsave") == 0 ||
+			_stricmp(argv[option], "-runStage5PerformanceFixture") == 0 ||
+			_stricmp(argv[option], "-skirmishAITestReviewedMap") == 0 ||
+			_stricmp(argv[option], "-runRenderedBattleDiagnostic") == 0 ||
+			_stricmp(argv[option], "-runRenderedBattleBenchmark") == 0)
+			alliedConflict = TRUE;
+	}
+	if (alliedRequests > 1 || (alliedRequests != 0 && alliedConflict))
+	{
+		printf("SKIRMISH_AI_ALLIED_FIXTURE_FAIL seed=0 reason=conflicting_option\n");
+		fflush(stdout);
+		exit(2);
+	}
+#endif
 	const char *renderedBattleError = nullptr;
 	Bool renderedBattleSupported = FALSE;
 #if RTS_ZEROHOUR

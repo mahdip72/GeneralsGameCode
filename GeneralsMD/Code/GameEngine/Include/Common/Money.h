@@ -78,7 +78,9 @@ public:
 
 	/// returns the actual amount withdrawn, which may be less than you want. (sorry, can't go into debt...)
 	UnsignedInt withdraw(UnsignedInt amountToWithdraw, Bool playSound = TRUE);
-	void deposit(UnsignedInt amountToDeposit, Bool playSound = TRUE, Bool trackIncome = TRUE);
+	/// Allied gifts disable both harvested-income and academy-income accounting.
+	void deposit(UnsignedInt amountToDeposit, Bool playSound = TRUE, Bool trackIncome = TRUE,
+		Bool trackAcademyIncome = TRUE);
 
 	void setStartingCash(UnsignedInt amount);
 	void updateIncomeBucket();

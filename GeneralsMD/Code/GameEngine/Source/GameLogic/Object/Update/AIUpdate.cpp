@@ -54,6 +54,7 @@
 #include "GameClient/InGameUI.h"  // useful for printing quick debug strings when we need to
 
 #include "GameLogic/AI.h"
+#include "GameLogic/AISkirmishPlayer.h"
 #include "GameLogic/AIPathfind.h"
 #include "GameLogic/Locomotor.h"
 #include "GameLogic/Module/AIUpdate.h"
@@ -2667,6 +2668,53 @@ void AIUpdateInterface::joinTeam()
 }
 
 //-------------------------------------------------------------------------------------------------
+Bool AIUpdateInterface::isAlliedScriptCommandHeld(const AICommandParms* parms) const
+{
+	if (parms->m_cmdSource != CMD_FROM_SCRIPT)
+		return false;
+	switch (parms->m_cmd)
+	{
+		case AICMD_MOVE_TO_POSITION:
+		case AICMD_MOVE_TO_POSITION_EVEN_IF_SLEEPING:
+		case AICMD_MOVE_TO_OBJECT:
+		case AICMD_TIGHTEN_TO_POSITION:
+		case AICMD_FOLLOW_WAYPOINT_PATH:
+		case AICMD_FOLLOW_WAYPOINT_PATH_AS_TEAM:
+		case AICMD_FOLLOW_WAYPOINT_PATH_EXACT:
+		case AICMD_FOLLOW_WAYPOINT_PATH_AS_TEAM_EXACT:
+		case AICMD_FOLLOW_PATH:
+		case AICMD_FOLLOW_PATH_APPEND:
+		case AICMD_GUARD_POSITION:
+		case AICMD_GUARD_OBJECT:
+		case AICMD_GUARD_AREA:
+		case AICMD_WANDER:
+		case AICMD_WANDER_IN_PLACE:
+		case AICMD_ATTACK_OBJECT:
+		case AICMD_FORCE_ATTACK_OBJECT:
+		case AICMD_ATTACK_TEAM:
+		case AICMD_ATTACK_POSITION:
+		case AICMD_ATTACKMOVE_TO_POSITION:
+		case AICMD_ATTACKFOLLOW_WAYPOINT_PATH:
+		case AICMD_ATTACKFOLLOW_WAYPOINT_PATH_AS_TEAM:
+		case AICMD_HUNT:
+		case AICMD_ATTACK_AREA:
+			break;
+		default:
+			return false;
+	}
+	const Object *object = getObject();
+	const Player *owner = object ? object->getControllingPlayer() : nullptr;
+	AIPlayer *aiPlayer = owner ? owner->getAIPlayerForPlanning() : nullptr;
+	// Check the actual recipient, not its whole team. The read-only predicate
+	// preserves legacy epochs, mixed-team builders and protected/support units.
+	// Generic script moves and guards can march this offensive recipient into
+	// combat early. Retaliation, repair and transit commands still pass.
+	return owner && owner->getPlayerType() == PLAYER_COMPUTER && aiPlayer &&
+		aiPlayer->isSkirmishAI() && static_cast<const AISkirmishPlayer *>(aiPlayer)->
+			shouldHoldAlliedScriptCommand(object);
+}
+
+//-------------------------------------------------------------------------------------------------
 Bool AIUpdateInterface::isAllowedToRespondToAiCommands(const AICommandParms* parms) const
 {
 	// the dead don't listen very well
@@ -2692,6 +2740,8 @@ Bool AIUpdateInterface::isAllowedToRespondToAiCommands(const AICommandParms* par
   // ALLOWING ONLY THE SPECTREUPDATE TO COMMAND IT VIA CMD_FROM_AI
   // AUTHOR, LORENZEN... 5/15/03
 
+	if (isAlliedScriptCommandHeld(parms))
+		return FALSE;
 
 	return TRUE;
 }

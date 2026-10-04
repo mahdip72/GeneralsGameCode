@@ -38,9 +38,11 @@
 #include "Lib/DeterministicAIPlanning.h"
 #endif
 #include "GameLogic/SkirmishAIStrategy.h"
+#include "GameLogic/SkirmishAIAlliedCoordination.h"
 #include "GameLogic/SkirmishAITunnelRoute.h"
 
 class BuildListInfo;
+class DamageInfo;
 class SpecialPowerTemplate;
 class ThingTemplate;
 enum ProductionID CPP_11(: Int);
@@ -86,6 +88,51 @@ public:	// AIPlayer interface methods.
 
 	virtual Bool isSkirmishAI() override {return true;}
 	Bool usesCriticalRecoveryBehavior() const;
+	Bool usesAlliedCoordinationBehavior() const;
+	static void captureAlliedPlayerFacts(Player *player,
+		SkirmishAIAlliedPlayerFacts *facts);
+	void commitAlliedCoordination(const SkirmishAIAlliedDecision &decision,
+		UnsignedInt now);
+	Bool donateToAlly(Int recipientIndex, Int amount);
+	void notifyReceivedAlliedMoney(UnsignedInt currentFrame);
+	void notifyAlliedDamage(Object *object, const DamageInfo *damage);
+	struct AlliedCoordinationDiagnostics {
+		Bool assaultActive;
+		Bool assaultLaunched;
+		Bool strategyResumePending;
+		Bool holdAdmissionValid;
+		UnsignedInt holdAdmissionFrame;
+		Bool homeDamageValid;
+		UnsignedInt homeDamageFrame;
+		Bool heldDamageValid;
+		UnsignedInt heldDamageFrame;
+		Int leaderIndex;
+		Int enemyIndex;
+		ObjectID targetID;
+		UnsignedInt assaultFrame;
+		UnsignedInt assaultExpiryFrame;
+		Int assaultTeamCount;
+		Int supportRecipientIndex;
+		Int supportTeamCount;
+		Bool supportReturning;
+		Bool donationCooldownActive;
+		UnsignedInt nextDonationFrame;
+		Bool receiptCooldownActive;
+		UnsignedInt mayDonateFrame;
+	};
+	AlliedCoordinationDiagnostics getAlliedCoordinationDiagnostics() const;
+	UnsignedInt getAlliedSupportTeamID(Int index) const;
+	UnsignedInt getAlliedAssaultTeamID(Int index) const;
+	Bool isAlliedAssaultTeam(UnsignedInt teamID) const;
+	Bool isAlliedAssaultMember(const Object *object) const;
+	Real getAlliedSupportHomeRadius() const { return m_baseRadius + 150.0f; }
+	Real getAlliedSafetyHomeRadius() const { return (m_baseRadius > 0.0f ? m_baseRadius : 0.0f) + 500.0f; }
+	SkirmishStrategyMode getAlliedCurrentStrategyMode() const { return m_strategyState.currentMode; }
+	ObjectID getAlliedCurrentStrategicTargetID() const { return m_strategyState.strategicTargetID; }
+	Bool isAlliedAssaultHoldingTeam(UnsignedInt teamID) const;
+	Bool shouldHoldAlliedScriptCommand(const Object *object) const;
+	Bool isAlliedSupportMember(const Object *object) const;
+	Bool shouldHoldAlliedTeamTransfer(Team *source, Team *destination) const;
 	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing,
 		Bool isUpgrade, Bool refreshProductionReserve);
 
@@ -236,10 +283,13 @@ protected:
 	void refreshStrategyProductionState();
 	Bool updateStrategy();
 	void collectStrategyMetrics( SkirmishStrategyMetrics *metrics,
-		ObjectID *strategicTargetID );
+		ObjectID *strategicTargetID, Int *alliedSafetyThreat = 0,
+		ObjectID *alliedTargetID = 0 );
 	void applyStrategyMode( SkirmishStrategyMode previousMode,
-		SkirmishStrategyMode currentMode, ObjectID previousTargetID );
-	void commandOffensiveTeams( SkirmishStrategyMode mode, Object *target );
+		SkirmishStrategyMode currentMode, ObjectID previousTargetID,
+		Bool preserveTunnelTransit = false );
+	void commandOffensiveTeams( SkirmishStrategyMode mode, Object *target,
+		Bool preserveTunnelTransit = false, Bool alliedRosterOnly = false );
 	void updateTacticalTeams();
 	struct TacticalTeamState;
 	Bool tryTunnelBypass(Team *team, Object *target,
@@ -250,6 +300,29 @@ protected:
 	void updateTunnelTransit(Team *team, TacticalTeamState &state,
 		UnsignedInt now);
 	void updateDefensePatrol();
+	void resetAlliedCoordination();
+	void updateAlliedAssignments();
+	void recallAlliedSupport();
+	void dispatchAlliedSupport(Int recipientIndex, Int budget);
+	Bool isAlliedSupportTeam(UnsignedInt teamID) const;
+	Bool isActiveTacticalTunnelTeam(UnsignedInt teamID) const;
+	Bool isAlliedCommandProtectedTeam(UnsignedInt teamID) const;
+	Bool isAlliedAssaultHolding() const;
+	Bool resolveAlliedAssaultTarget(Object **target) const;
+	Player *getPinnedAlliedEnemy() const;
+	void clearAlliedAssault();
+	void resumeAlliedStrategy();
+	void queryAlliedDamageSafety();
+	void invalidateAlliedSafetyCache();
+	void xferAlliedCoordination(Xfer *xfer);
+	void xferAlliedAssaultTeams(Xfer *xfer);
+	Bool isAlliedStagingTeamAvailable(Team *team);
+	void captureAlliedStagingTeams();
+	Bool hasAlliedAssaultForce() const;
+	void rebaseAlliedAssaultTeams();
+	void getTeamStrategyContext(Team *team, SkirmishStrategyMode *mode,
+		Player **enemy, ObjectID *targetID) const;
+	Bool resolveTunnelBuildTargetOwner(ObjectID targetID, Player **enemy) const;
 	const ThingTemplate *findTunnelContainBuildTemplate() const;
 	Bool isTunnelBuildBuilderAvailable(Object *builder) const;
 	Bool validatePendingTunnelBuild(BuildListInfo *info,
@@ -423,6 +496,45 @@ protected:
 	UnsignedInt m_frameToCheckEnemy;
 	Player			*m_currentEnemy;
 	Int m_currentEnemyPlayerIndex;
+	Bool m_alliedAssaultActive;
+	Bool m_alliedAssaultLaunched;
+	Bool m_alliedStrategyResumePending;
+	Bool m_alliedHoldAdmissionValid;
+	UnsignedInt m_alliedHoldAdmissionFrame;
+	Bool m_alliedHomeDamageValid;
+	UnsignedInt m_alliedHomeDamageFrame;
+	Bool m_alliedHeldDamageValid;
+	UnsignedInt m_alliedHeldDamageFrame;
+	Bool m_alliedResumeAttackSafe;
+	UnsignedInt m_alliedResumeSafetyFrame;
+	Int m_alliedLeaderIndex;
+	Int m_alliedEnemyIndex;
+	ObjectID m_alliedTargetID;
+	UnsignedInt m_alliedAssaultFrame;
+	UnsignedInt m_alliedAssaultExpiryFrame;
+	UnsignedInt m_alliedNextHoldFrame;
+	Bool m_alliedReceiptCooldownActive;
+	UnsignedInt m_alliedMayDonateFrame;
+	Int m_alliedSupportRecipientIndex;
+	Bool m_alliedSupportReturning;
+	UnsignedInt m_alliedNextSupportFrame;
+	std::vector<UnsignedInt> m_alliedSupportTeamIDs;
+	// The admitted roster retains command ownership until ordinary resumption.
+	std::vector<UnsignedInt> m_alliedAssaultTeamIDs;
+	// Rebuilt only in the central evaluation capture; never read after a load.
+	std::vector<UnsignedInt> m_alliedCapturedTeamIDs;
+	Int m_alliedCapturedForceValue;
+	Int m_alliedCapturedForceConfidence;
+	// Only consumed during the same owner frame as the immutable roster capture.
+	Bool m_alliedCapturedStrategyAvailable;
+	UnsignedInt m_alliedCapturedStrategyFrame;
+	SkirmishStrategyMetrics m_alliedCapturedStrategyMetrics;
+	ObjectID m_alliedCapturedStrategyTargetID;
+	Int m_alliedCapturedSafetyThreat;
+	Bool m_alliedDamageSafetyValid;
+	UnsignedInt m_alliedDamageSafetyFrame;
+	Bool m_alliedRecentHomeDamage;
+	Bool m_alliedRecentHeldDamage;
 	SkirmishStrategyState m_strategyState;
 	Bool m_strategyTargetFallbackPending;
 	ObjectID m_strategyTargetFallbackAfterID;

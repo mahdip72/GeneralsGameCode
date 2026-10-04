@@ -164,9 +164,13 @@ public:
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE ||
 		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
-		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG ||
+		m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG; }
 	Bool replayUsesSkirmishAICounterRng() const {
-		return m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG; }
+		return m_skirmishAIReplayEpoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG ||
+			m_skirmishAIReplayEpoch ==
+				SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG; }
 	Int getPathfindQueueReplayEpoch() const { return m_pathfindQueueReplayEpoch; }
 	Bool replayUsesPathfindQueueCapacity() const { return m_pathfindQueueReplayEpoch == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT; }
 	void initControls();															///< Show or Hide the Replay controls

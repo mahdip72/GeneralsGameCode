@@ -43,6 +43,7 @@
 #include "GameClient/Drawable.h"
 
 #include "GameLogic/SidesList.h"
+#include "GameLogic/AISkirmishPlayer.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/Module/BodyModule.h"
 #include "GameLogic/Module/ContainModule.h"
@@ -2516,6 +2517,9 @@ static Bool isInBuildVariations(const ThingTemplate* ttWithVariations, const Thi
 Object *Team::tryToRecruit(const ThingTemplate *tTemplate, const Coord3D *teamHome, Real maxDist)
 {
 	Player *myPlayer = getControllingPlayer();
+	AIPlayer *ownerAI = myPlayer ? myPlayer->getAIPlayerForPlanning() : 0;
+	AISkirmishPlayer *skirmishOwner = ownerAI && ownerAI->isSkirmishAI()
+		? static_cast<AISkirmishPlayer *>(ownerAI) : 0;
 	Object *obj=nullptr;
 	Real distSqr = maxDist*maxDist;
 	Object *recruit = nullptr;
@@ -2528,6 +2532,11 @@ Object *Team::tryToRecruit(const ThingTemplate *tTemplate, const Coord3D *teamHo
 				continue;
 		}
 		if (obj->getControllingPlayer() != myPlayer)
+			continue;
+		// All queue/recruit callers preserve actual support and staged combat recipients.
+		// The owner query is disabled for legacy epochs and leaves other recruitment unchanged.
+		if (skirmishOwner && (skirmishOwner->isAlliedSupportMember(obj) ||
+			skirmishOwner->isAlliedAssaultMember(obj)))
 			continue;
 		Team *team = obj->getTeam();
 		Bool isDefaultTeam = false;

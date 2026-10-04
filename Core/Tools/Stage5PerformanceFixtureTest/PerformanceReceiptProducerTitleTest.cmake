@@ -244,6 +244,20 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     rts_producer_test_replace_once(_start "${_start}"
         "\tif (!s_recovery.active &&\n\t\t!IsRenderedSkirmishScenario(s_runner.scenario) &&"
         "\tif (!IsRenderedSkirmishScenario(s_runner.scenario) &&")
+    # Fresh receipt titles omit the live allied controller, just as they
+    # omit recovery. Keep each source boundary exact; do not stub its state.
+    rts_producer_test_replace_once(_start "${_start}"
+        "!s_allied.active && IsRenderedSkirmishScenario(s_runner.scenario) ? FALSE : TRUE;"
+        "IsRenderedSkirmishScenario(s_runner.scenario) ? FALSE : TRUE;")
+    rts_producer_test_replace_once(_start "${_start}"
+        "\tif (s_allied.active || !IsRenderedSkirmishScenario(s_runner.scenario))\n\t\tTheWritableGlobalData->m_useFpsLimit = FALSE;"
+        "\tif (!IsRenderedSkirmishScenario(s_runner.scenario))\n\t\tTheWritableGlobalData->m_useFpsLimit = FALSE;")
+    rts_producer_test_replace_once(_start "${_start}"
+        "\tif (s_allied.active || !IsRenderedSkirmishScenario(s_runner.scenario))\n\t\tTheWritableGlobalData->m_clientRetaliationModeEnabled = FALSE;"
+        "\tif (!IsRenderedSkirmishScenario(s_runner.scenario))\n\t\tTheWritableGlobalData->m_clientRetaliationModeEnabled = FALSE;")
+    rts_producer_test_replace_once(_start "${_start}"
+        "\t\t!s_allied.active && !s_performanceReceiptAttempted)"
+        "\t\t!s_performanceReceiptAttempted)")
     rts_producer_test_omit_span(_start "${_start}"
         "\tif (s_recovery.active)\n\t{\n\t\tprintf(\"SKIRMISH_AI_RECOVERY_START"
         "\telse if (IsSkirmishAITest4v2(s_runner.scenario))")
@@ -259,6 +273,11 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     rts_producer_test_extract(_terminal_prefix "${_runner_text}"
         "Int FinalizeSkirmishAITestRunner(Int engineExitCode)"
         "\tif (s_recovery.active)\n\t{\n\t\tif (s_runner.failed)")
+    # Preserve the recovery terminal boundary assertion above, then omit the
+    # preceding allied terminal arm from the same fresh-only title prefix.
+    rts_producer_test_extract(_terminal_prefix "${_terminal_prefix}"
+        "Int FinalizeSkirmishAITestRunner(Int engineExitCode)"
+        "\tif (s_allied.active)\n\t{\n\t\tif (strcmp(s_executableHashObserved, \"unavailable\") == 0)")
     rts_producer_test_extract(_terminal_suffix "${_runner_text}\nRTS_FRESH_PRODUCER_FIXTURE_EOF"
         "\tAsciiString replayName = s_runner.replayFileName;"
         "RTS_FRESH_PRODUCER_FIXTURE_EOF")
@@ -269,6 +288,10 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     string(FIND "${_runner_state}${_start}${_finalizers}" "s_recovery" _recovery_leak)
     if(NOT _recovery_leak EQUAL -1)
         message(FATAL_ERROR "Fresh receipt fixture unexpectedly depends on Stage 1 recovery state")
+    endif()
+    string(FIND "${_runner_state}${_start}${_finalizers}" "s_allied" _allied_leak)
+    if(NOT _allied_leak EQUAL -1)
+        message(FATAL_ERROR "Fresh receipt fixture unexpectedly depends on allied controller state")
     endif()
     rts_producer_test_extract(_engine_destructor "${_engine_text}"
         "GameEngine::~GameEngine()"

@@ -32,6 +32,7 @@
 #include "GameLogic/SkirmishAIStrategy.h"
 #include "GameLogic/SkirmishAITunnelRoute.h"
 #include "GameLogic/SkirmishAILiveness.h"
+#include "Stage5AlliedCoordinationTests.h"
 #if defined(_WIN64)
 #include "GameLogic/ImmutableSpatialQueryRuntime.h"
 #include "Lib/CollisionCandidateKernel.h"
@@ -2958,27 +2959,27 @@ static void TestSkirmishAIReplayEpoch()
 
 	// Live games always use the current and recovery paths. Replays retain the
 	// behavior selected by their recording epoch; an unknown epoch is legacy.
-	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+	const Int replayEpochs[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
 	const Bool expectedReplayCurrentBehavior[] =
-		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	const Bool expectedReplayRecoveryBehavior[] =
-		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	const Bool expectedRecoveryCRCFields[] =
-		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	const Bool expectedCancellationOwnership[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	const Bool expectedUnownedQueueFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	const Bool expectedBoundedFailover[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	const Bool expectedResourceWorkerPreservation[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	const Bool expectedStrategyBehavior[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	const Bool expectedProductionBehavior[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	const Bool expectedTacticalBehavior[] =
-		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, FALSE };
+		{ FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, TRUE, TRUE, TRUE, TRUE, TRUE, TRUE };
 	for (Int i = 0; i < (Int)ARRAY_SIZE(replayEpochs); ++i)
 	{
 		CHECK(ShouldUseSkirmishAICurrentBehavior(FALSE, replayEpochs[i]));
@@ -3008,9 +3009,20 @@ static void TestSkirmishAIReplayEpoch()
 		CHECK(ShouldUseSkirmishAICounterRng(FALSE, replayEpochs[i]));
 		CHECK(ShouldUseSkirmishAIAdaptiveGlobalRng(TRUE, replayEpochs[i]) ==
 			(replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
-				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG));
+				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG ||
+				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG ||
+				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG));
+		CHECK(ShouldUseSkirmishAIAlliedCoordinationBehavior(FALSE, replayEpochs[i]));
+		CHECK(ShouldIncludeSkirmishAIAlliedCoordinationCRCFields(FALSE, replayEpochs[i]));
+		CHECK(ShouldUseSkirmishAIAlliedCoordinationBehavior(TRUE, replayEpochs[i]) ==
+			(replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG ||
+			 replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG));
+		CHECK(ShouldIncludeSkirmishAIAlliedCoordinationCRCFields(TRUE, replayEpochs[i]) ==
+			(replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG ||
+			 replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG));
 		CHECK(ShouldUseSkirmishAICounterRng(TRUE, replayEpochs[i]) ==
-			(replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG));
+			(replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG ||
+				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG));
 		CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, replayEpochs[i])
 			== expectedReplayCurrentBehavior[i]);
 		CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, replayEpochs[i])
@@ -3046,7 +3058,9 @@ static void TestSkirmishAIReplayEpoch()
 		CHECK(ShouldUseSkirmishAIInfrastructureBehavior(TRUE, replayEpochs[i])
 			== (replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_INFRASTRUCTURE ||
 				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG ||
-				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG));
+				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG ||
+				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG ||
+				replayEpochs[i] == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG));
 	}
 
 	UnicodeString livenessOnly = unmarked;
@@ -3066,35 +3080,40 @@ static void TestSkirmishAIReplayEpoch()
 
 	UnicodeString currentEpoch = unmarked;
 	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
-	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=14]") == 0);
-	CHECK(GetSkirmishAIReplayEpoch(currentEpoch) == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG);
+	CHECK(GetSkirmishAIReplayEpoch(currentEpoch) == GetSkirmishAIReplayRecordingEpoch());
 	CHECK(ReplayVersionUsesSkirmishAILivenessRecovery(currentEpoch));
-	CHECK(ShouldUseSkirmishAICurrentBehavior(true, SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG));
-	CHECK(ShouldUseSkirmishAICounterRng(true, SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG));
+	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayRecordingEpoch()));
+	CHECK(ShouldUseSkirmishAICounterRng(TRUE, GetSkirmishAIReplayRecordingEpoch()) ==
+		BuildSupportsSkirmishAICounterRngPlanning());
+	UnicodeString repeatedCurrentEpoch = currentEpoch;
 	MarkReplayVersionForSkirmishAICurrentEpoch(currentEpoch);
-	CHECK(currentEpoch.compare(L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=14]") == 0);
+	CHECK(currentEpoch == repeatedCurrentEpoch);
 
 	UnicodeString recordingWithoutCounterPlanning = unmarked;
 	MarkReplayVersionForSkirmishAIRecordingCapability(
 		recordingWithoutCounterPlanning, FALSE);
 	CHECK(GetSkirmishAIReplayEpoch(recordingWithoutCounterPlanning) ==
-		SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG);
+		SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG);
 	UnicodeString recordingWithCounterPlanning = unmarked;
 	MarkReplayVersionForSkirmishAIRecordingCapability(
 		recordingWithCounterPlanning, TRUE);
 	CHECK(GetSkirmishAIReplayEpoch(recordingWithCounterPlanning) ==
-		SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG);
+		SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG);
 
 	UnicodeString architectureRecordingEpoch = unmarked;
 	MarkReplayVersionForSkirmishAIRecordingEpoch(architectureRecordingEpoch);
 #if defined(_WIN64)
 	CHECK(BuildSupportsSkirmishAICounterRngPlanning());
 	CHECK(GetSkirmishAIReplayEpoch(architectureRecordingEpoch) ==
-		SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG);
+		SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG);
+	CHECK(GetSkirmishAIReplayRecordingEpoch() ==
+		SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG);
 #else
 	CHECK(!BuildSupportsSkirmishAICounterRngPlanning());
 	CHECK(GetSkirmishAIReplayEpoch(architectureRecordingEpoch) ==
-		SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG);
+		SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG);
+	CHECK(GetSkirmishAIReplayRecordingEpoch() ==
+		SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG);
 #endif
 	CHECK(GetSkirmishAIReplayRecordingEpoch() ==
 		GetSkirmishAIReplayEpoch(architectureRecordingEpoch));
@@ -3109,8 +3128,8 @@ static void TestSkirmishAIReplayEpoch()
 		CHECK(GetPathfindQueueReplayEpoch(recordingHeader) ==
 			PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
 		CHECK(GetSkirmishAIReplayEpoch(recordingHeader) ==
-			(supportsCounterRng ? SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG :
-				SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG));
+			(supportsCounterRng ? SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG :
+				SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG));
 	}
 	for (Int epoch = SKIRMISH_AI_REPLAY_EPOCH_CURRENT;
 		epoch <= SKIRMISH_AI_REPLAY_EPOCH_LATEST; ++epoch)
@@ -3120,6 +3139,12 @@ static void TestSkirmishAIReplayEpoch()
 		MarkReplayVersionForSkirmishAIPlaybackCompatibilityEpoch(
 			compatibleHeader, epoch);
 		CHECK(GetSkirmishAIReplayEpoch(compatibleHeader) == epoch);
+		CHECK(ShouldUseSkirmishAIAlliedCoordinationBehavior(TRUE, epoch) ==
+			(epoch == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG ||
+			 epoch == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG));
+		CHECK(ShouldIncludeSkirmishAIAlliedCoordinationCRCFields(TRUE, epoch) ==
+			(epoch == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG ||
+			 epoch == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG));
 		CHECK(ShouldUseSkirmishAITacticalBehavior(TRUE, epoch) ==
 			(epoch >= SKIRMISH_AI_REPLAY_EPOCH_TACTICAL_ADAPTATION));
 		CHECK(ShouldUseSkirmishAIInfrastructureBehavior(TRUE, epoch) ==
@@ -3129,7 +3154,8 @@ static void TestSkirmishAIReplayEpoch()
 		CHECK(ShouldUseSkirmishAIAdaptiveGlobalRng(TRUE, epoch) ==
 			(epoch >= SKIRMISH_AI_REPLAY_EPOCH_ADAPTIVE_GLOBAL_RNG));
 		CHECK(ShouldUseSkirmishAICounterRng(TRUE, epoch) ==
-			(epoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG));
+			(epoch == SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG ||
+			epoch == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG));
 		UnicodeString repeatedHeader = compatibleHeader;
 		MarkReplayVersionForSkirmishAIPlaybackCompatibilityEpoch(
 			repeatedHeader, epoch);
@@ -3400,7 +3426,20 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString unrelatedSuffix = L"Aug 14 2026 21:00:00 [SkirmishAILiveness=2]";
 	CHECK(GetSkirmishAIReplayEpoch(unrelatedSuffix) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	CHECK(!ReplayVersionUsesSkirmishAILivenessRecovery(unrelatedSuffix));
-	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=15]";
+	UnicodeString alliedGlobal = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=15]";
+	CHECK(GetSkirmishAIReplayEpoch(alliedGlobal) == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_GLOBAL_RNG);
+	UnicodeString alliedCounter = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=16]";
+	CHECK(GetSkirmishAIReplayEpoch(alliedCounter) == SKIRMISH_AI_REPLAY_EPOCH_ALLIED_COORDINATION_COUNTER_RNG);
+	UnicodeString mixedAlliedMarkers =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=15] [SkirmishAIEpoch=16]";
+	CHECK(GetSkirmishAIReplayEpoch(mixedAlliedMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString duplicateAlliedGlobal =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=15] [SkirmishAIEpoch=15]";
+	CHECK(GetSkirmishAIReplayEpoch(duplicateAlliedGlobal) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString duplicateAlliedCounter =
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=16] [SkirmishAIEpoch=16]";
+	CHECK(GetSkirmishAIReplayEpoch(duplicateAlliedCounter) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
+	UnicodeString futureEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=17]";
 	CHECK(GetSkirmishAIReplayEpoch(futureEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedEpoch = L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=x]";
 	CHECK(GetSkirmishAIReplayEpoch(malformedEpoch) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
@@ -3432,7 +3471,7 @@ static void TestSkirmishAIReplayEpoch()
 		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=3] [SkirmishAIEpoch=3]";
 	CHECK(GetSkirmishAIReplayEpoch(duplicateMarkers) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString unknownThenCurrent =
-		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=15] [SkirmishAIEpoch=14]";
+		L"Aug 14 2026 21:00:00 [SkirmishAIEpoch=17] [SkirmishAIEpoch=14]";
 	CHECK(GetSkirmishAIReplayEpoch(unknownThenCurrent) == SKIRMISH_AI_REPLAY_EPOCH_LEGACY);
 	UnicodeString malformedThenLiveness =
 		L"Aug 14 2026 21:00:00 [SkirmishAILiveness=x] [SkirmishAILiveness=1]";
@@ -3440,7 +3479,7 @@ static void TestSkirmishAIReplayEpoch()
 	UnicodeString unknownWriterInput = futureEpoch;
 	MarkReplayVersionForSkirmishAICurrentEpoch(unknownWriterInput);
 	CHECK(unknownWriterInput.compare(futureEpoch) == 0);
-	CHECK(!ShouldUseSkirmishAICurrentBehavior(true, 15));
+	CHECK(!ShouldUseSkirmishAICurrentBehavior(TRUE, 17));
 	CHECK(ShouldUseSkirmishAICounterRng(false, SKIRMISH_AI_REPLAY_EPOCH_LEGACY));
 	UnicodeString compatibilityMalformed = malformedRecoveryEpoch;
 	MarkReplayVersionForSkirmishAICurrentCompatibilityEpoch(compatibilityMalformed);
@@ -3507,15 +3546,15 @@ static void TestPathfindQueueReplayEpoch()
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
 	CHECK(GetPathfindQueueReplayEpoch(combined) == PATHFIND_QUEUE_REPLAY_EPOCH_CURRENT);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=14]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(combined) == GetSkirmishAIReplayRecordingEpoch());
 	CHECK(GetSkirmishAIReplayEpoch(combined) ==
-		SKIRMISH_AI_REPLAY_EPOCH_COUNTER_RNG);
+		GetSkirmishAIReplayRecordingEpoch());
 	CHECK(ShouldUseSkirmishAICurrentBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAIRecoveryBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	CHECK(ShouldUseSkirmishAITacticalBehavior(TRUE, GetSkirmishAIReplayEpoch(combined)));
 	MarkReplayVersionForPathfindQueueCurrentEpoch(combined);
 	MarkReplayVersionForSkirmishAICurrentEpoch(combined);
-	CHECK(combined.compare(L"Aug 14 2026 21:00:00 [PathfindQueueEpoch=1] [SkirmishAIEpoch=14]") == 0);
+	CHECK(GetSkirmishAIReplayEpoch(combined) == GetSkirmishAIReplayRecordingEpoch());
 
 	UnicodeString pathAdaptiveGlobalRng = unmarked;
 	MarkReplayVersionForPathfindQueueCurrentEpoch(pathAdaptiveGlobalRng);
@@ -6767,6 +6806,7 @@ static void TestSkirmishAITestRunnerContractContinuation()
 
 #if defined(_WIN64)
 int RunHeadlessMetricStartupTitleTests();
+int RunHeadlessSimulationStartupTitleTests(const char *simulation, const char *pipeline);
 int RunPerformanceReceiptOwnerBridgeTitleTests();
 int RunPerformanceReceiptProducerTitleTests();
 int RunPerformanceReceiptFreshProducerTitleTests();
@@ -6812,6 +6852,8 @@ int main(int argc, char **argv)
 	}
 	if (argc == 2 && strcmp(argv[1], "--headless-metric-startup") == 0)
 		return RunHeadlessMetricStartupTitleTests();
+	if (argc == 4 && strcmp(argv[1], "--headless-simulation-startup") == 0)
+		return RunHeadlessSimulationStartupTitleTests(argv[2], argv[3]);
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-owner-bridge") == 0)
 		return RunPerformanceReceiptOwnerBridgeTitleTests();
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-producer") == 0)
@@ -6970,6 +7012,12 @@ int main(int argc, char **argv)
 		shutdownMemoryManager();
 		return 0;
 	}
+	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-stage5") == 0)
+	{
+		const int result = RunStage5AlliedCoordinationTests();
+		shutdownMemoryManager();
+		return result;
+	}
 	if (argc == 2 && strcmp(argv[1], "--skirmish-ai-stage4") == 0)
 	{
 		TestSkirmishAIReplayEpoch();
@@ -7006,6 +7054,7 @@ int main(int argc, char **argv)
 	TestSkirmishAIStage3Policies();
 	TestSkirmishAIStage4DefensePolicies();
 	TestSkirmishAITunnelRoutePolicies();
+	s_failures += RunStage5AlliedCoordinationTests();
 	TestSkirmishAITargetingPolicies();
 	TestSkirmishAIFeedbackPolicies();
 	TestSkirmishAILegacySaveCandidateSelection();

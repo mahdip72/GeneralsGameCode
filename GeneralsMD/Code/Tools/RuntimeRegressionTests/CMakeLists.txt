@@ -14,6 +14,7 @@ add_executable(z_runtime_regression_tests)
 
 target_sources(z_runtime_regression_tests PRIVATE
     RuntimeRegressionTests.cpp
+    Stage5AlliedCoordinationTests.cpp
     $<TARGET_OBJECTS:z_xcrc>
 )
 
@@ -50,6 +51,9 @@ set_tests_properties(z_skirmish_ai_stage3_tests PROPERTIES TIMEOUT 30)
 
 add_test(NAME z_skirmish_ai_stage4_tests COMMAND z_runtime_regression_tests --skirmish-ai-stage4)
 set_tests_properties(z_skirmish_ai_stage4_tests PROPERTIES TIMEOUT 30)
+
+add_test(NAME z_skirmish_ai_stage5_tests COMMAND z_runtime_regression_tests --skirmish-ai-stage5)
+set_tests_properties(z_skirmish_ai_stage5_tests PROPERTIES TIMEOUT 30)
 
 add_test(NAME z_skirmish_ai_runner_contract_tests COMMAND z_runtime_regression_tests --skirmish-ai-runner-contract)
 set_tests_properties(z_skirmish_ai_runner_contract_tests PROPERTIES TIMEOUT 30)
@@ -293,6 +297,7 @@ if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND WIN32 AND NOT IS_VS6_BUILD
 		z_skirmish_ai_strategy_tests
 		z_skirmish_ai_stage3_tests
 		z_skirmish_ai_stage4_tests
+		z_skirmish_ai_stage5_tests
 		z_skirmish_ai_runner_contract_tests
 		z_skirmish_ai_legacy_save_selection_tests
 		z_native_logical_audio_tests

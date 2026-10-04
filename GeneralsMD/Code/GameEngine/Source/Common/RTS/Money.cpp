@@ -79,7 +79,8 @@ UnsignedInt Money::withdraw(UnsignedInt amountToWithdraw, Bool playSound)
 }
 
 // ------------------------------------------------------------------------------------------------
-void Money::deposit(UnsignedInt amountToDeposit, Bool playSound, Bool trackIncome)
+void Money::deposit(UnsignedInt amountToDeposit, Bool playSound, Bool trackIncome,
+	Bool trackAcademyIncome)
 {
 	if (amountToDeposit == 0)
 		return;
@@ -97,7 +98,7 @@ void Money::deposit(UnsignedInt amountToDeposit, Bool playSound, Bool trackIncom
 
 	m_money += amountToDeposit;
 
-	if( amountToDeposit > 0 )
+	if( trackAcademyIncome )
 	{
 		Player *player = ThePlayerList->getNthPlayer( m_playerIndex );
 		if( player )

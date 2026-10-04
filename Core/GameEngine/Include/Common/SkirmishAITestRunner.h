@@ -318,6 +318,24 @@ void SetSkirmishAITestFinalDigest(UnsignedInt digest);
 void ArmSkirmishAITestRunner(Int seed,
 	SkirmishAITestScenario scenario = SKIRMISH_AI_TEST_SCENARIO_4V3);
 void ArmSkirmishAIRecoveryFixtureRunner(Int seed, Int fixtureCase, Int faction);
+// Opt-in native x64 Zero Hour full-engine allied fixtures; never a
+// fresh-match/replay acceptance lane.
+enum SkirmishAIAlliedFixtureCase
+{
+	SKIRMISH_AI_ALLIED_TRANSFER_COMMAND,
+	SKIRMISH_AI_ALLIED_COORDINATION_LIVE,
+	SKIRMISH_AI_ALLIED_SAVE_LOAD,
+	SKIRMISH_AI_ALLIED_SUPPORT_LIFECYCLE,
+	SKIRMISH_AI_ALLIED_AID_LIFECYCLE,
+	SKIRMISH_AI_ALLIED_FIXTURE_CASE_COUNT
+};
+Bool TryParseSkirmishAIAlliedFixtureCase(const char *text, Int *fixtureCase);
+Bool ConfigureSkirmishAIAlliedFixture(Int fixtureCase);
+// Read-only opt-in for live allied-fixture diagnostics, false in other lanes.
+Bool IsSkirmishAIAlliedFixtureActive();
+// Opt-in bounded witness for direct roster transfers held by the actual engine.
+void ObserveSkirmishAIAlliedTeamTransferHeld(UnsignedInt sourceTeamID,
+	UnsignedInt destinationTeamID, const char *operation);
 Bool IsSkirmishAITestRunnerArmed();
 Bool StartSkirmishAITestRunner();
 void UpdateSkirmishAITestRunner();

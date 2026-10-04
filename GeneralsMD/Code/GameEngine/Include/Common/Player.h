@@ -235,6 +235,8 @@ public:
 	/// return the Player's Money sub-object
 	Money *getMoney() { return &m_money; }
 	const Money *getMoney() const { return &m_money; }
+	/// Transfer the exact amount to an active mutual ally on the logic owner thread.
+	Bool transferMoneyToAlly(Int recipientPlayerIndex, Int amount);
 
 	UnsignedInt getSupplyBoxValue();///< Many things can affect the value of a crate, but at heart it is a GlobalData ratio.
 
@@ -454,10 +456,8 @@ public:
 
 	/// Is this player a skirmish ai player?
 	Bool isSkirmishAIPlayer();
-#if defined(_WIN64)
-	/// Stage 5 owner-side orchestration only; workers never receive this pointer.
+	/// Owner-side AI orchestration only; workers never receive this pointer.
 	AIPlayer *getAIPlayerForPlanning() const { return m_ai; }
-#endif
 	/// Preserve critical reconstruction money at the actual purchase boundary.
 	Bool canSpendForSkirmishAIRecovery(Int cost, const ThingTemplate *thing,
 		Bool isUpgrade, Bool refreshProductionReserve = FALSE) const;

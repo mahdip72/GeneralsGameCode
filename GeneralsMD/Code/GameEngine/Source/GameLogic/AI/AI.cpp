@@ -318,6 +318,7 @@ AI::AI()
 	m_aiData = NEW TAiData;
 	m_pathfinder = NEW Pathfinder;
 	m_nextFormationID = NO_FORMATION_ID;
+	resetAlliedCoordination();
 }
 
 /**
@@ -333,6 +334,7 @@ void AI::init()
  */
 void AI::reset()
 {
+	resetAlliedCoordination();
 	m_pathfinder->reset();
 	while (m_aiData && m_aiData->m_next) {
 		TAiData *cur = m_aiData;
@@ -882,7 +884,14 @@ void AI::update()
 #if defined(_WIN64)
 	// A failed capture/validation simply leaves the existing per-player serial
 	// acquisition path in charge during PlayerList::UPDATE.
-	if (RunSkirmishEnemyPlanningBatch())
+	const Bool enemyPlanningReady = RunSkirmishEnemyPlanningBatch();
+#endif
+	// All titles other than Zero Hour compile their own AI.cpp. This boundary
+	// is owner-only on both Win32 and native and publishes a complete roster
+	// before any Player update or production snapshot can spend donated cash.
+	updateAlliedCoordination();
+#if defined(_WIN64)
+	if (enemyPlanningReady)
 		RunSkirmishProductionPlanningBatch();
 #endif
 
@@ -895,6 +904,167 @@ void AI::update()
 		rts::RecordAIPlanningOwnerCommit(false);
 #endif
 
+}
+
+void AI::resetAlliedCoordination()
+{
+	m_alliedEvaluationScheduled = false;
+	m_nextAlliedEvaluationFrame = 0;
+	for (Int i = 0; i < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++i) {
+		m_alliedStarvationStreaks[i] = 0;
+		m_alliedRecipientCooldownActive[i] = false;
+		m_alliedRecipientReliefUntil[i] = 0;
+		memset(&m_alliedPlayerFacts[i], 0, sizeof(m_alliedPlayerFacts[i]));
+		m_alliedPlayerFacts[i].playerIndex = i;
+		m_alliedPlayerFacts[i].targetEnemyIndex = -1;
+		m_alliedPlayerFacts[i].targetObjectID = INVALID_ID;
+	}
+}
+
+const SkirmishAIAlliedPlayerFacts *AI::getAlliedPlayerFacts(Int playerIndex) const
+{
+	return playerIndex >= 0 && playerIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS &&
+		m_alliedPlayerFacts[playerIndex].valid
+		? &m_alliedPlayerFacts[playerIndex] : 0;
+}
+
+void AI::updateAlliedCoordination()
+{
+	if (!TheGameLogic || !ThePlayerList ||
+		!ShouldUseSkirmishAIAlliedCoordinationBehavior(
+			TheGameLogic->isInReplayGame(), TheRecorder ?
+			TheRecorder->getSkirmishAIReplayEpoch() : SKIRMISH_AI_REPLAY_EPOCH_LEGACY))
+		return;
+	const Int mode = TheGameLogic->isInReplayGame() && TheRecorder ?
+		TheRecorder->getGameMode() : TheGameLogic->getGameMode();
+	if (mode != GAME_SKIRMISH && mode != GAME_LAN && mode != GAME_INTERNET)
+		return;
+	const UnsignedInt now = TheGameLogic->getFrame();
+	if (m_alliedEvaluationScheduled &&
+		!IsSkirmishStrategyFrameReached(now, m_nextAlliedEvaluationFrame))
+		return;
+	SkirmishAIAlliedPlayerFacts captured[SKIRMISH_AI_ALLIED_MAX_PLAYERS];
+	AISkirmishPlayer *owners[SKIRMISH_AI_ALLIED_MAX_PLAYERS];
+	memset(captured, 0, sizeof(captured));
+	memset(owners, 0, sizeof(owners));
+	// Empty roster slots still need unique identities: the policy rejects
+	// duplicate indices before testing validity, including absent players.
+	for (Int slot = 0; slot < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++slot) {
+		captured[slot].playerIndex = slot;
+		captured[slot].targetEnemyIndex = -1;
+		captured[slot].targetObjectID = INVALID_ID;
+	}
+	// Actual player indices, never pointer order, name, or a local UI player.
+	for (Int i = 0; i < ThePlayerList->getPlayerCount(); ++i) {
+		Player *player = ThePlayerList->getNthPlayer(i);
+		const Int index = player ? player->getPlayerIndex() : -1;
+		if (index < 0 || index >= SKIRMISH_AI_ALLIED_MAX_PLAYERS)
+			continue;
+		if (player->isSkirmishAIPlayer()) {
+			owners[index] = static_cast<AISkirmishPlayer *>(player->getAIPlayerForPlanning());
+			// Win32's serial enemy path must resolve before the roster is frozen.
+			// Native normally already committed the complete enemy batch above.
+			if (owners[index] && owners[index]->usesAlliedCoordinationBehavior())
+				owners[index]->getAiEnemy();
+		}
+	}
+	for (Int source = 0; source < ThePlayerList->getPlayerCount(); ++source) {
+		Player *player = ThePlayerList->getNthPlayer(source);
+		const Int index = player ? player->getPlayerIndex() : -1;
+		if (index >= 0 && index < SKIRMISH_AI_ALLIED_MAX_PLAYERS) {
+			AISkirmishPlayer::captureAlliedPlayerFacts(player, &captured[index]);
+			captured[index].aidBlocked = m_alliedRecipientCooldownActive[index] &&
+				!IsSkirmishStrategyFrameReached(now, m_alliedRecipientReliefUntil[index]);
+		}
+	}
+	SkirmishAIAlliedDecision decision;
+	EvaluateSkirmishAIAlliedCoordination(captured, SKIRMISH_AI_ALLIED_MAX_PLAYERS,
+		m_alliedStarvationStreaks, &decision);
+	for (Int index = 0; index < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++index) {
+		m_alliedPlayerFacts[index] = captured[index];
+		m_alliedStarvationStreaks[index] = decision.starvationStreaks[index];
+	}
+	m_alliedEvaluationScheduled = true;
+	m_nextAlliedEvaluationFrame = now + 5 * LOGICFRAMES_PER_SECOND;
+	// The immutable decision is complete before any assignment or cash writes.
+	for (Int owner = 0; owner < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++owner)
+		if (owners[owner] && owners[owner]->usesAlliedCoordinationBehavior())
+			owners[owner]->commitAlliedCoordination(decision, now);
+	if (decision.donorIndex >= 0 &&
+		decision.donorIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS &&
+		decision.recipientIndex >= 0 &&
+		decision.recipientIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS &&
+		owners[decision.donorIndex] && decision.donationAmount >= 500 &&
+		owners[decision.donorIndex]->donateToAlly(
+			decision.recipientIndex, decision.donationAmount)) {
+		// Recipient protection prevents another donor replacing the same relief
+		// on the next evaluation while its cash score catches up.
+		m_alliedStarvationStreaks[decision.recipientIndex] = 0;
+		m_alliedRecipientCooldownActive[decision.recipientIndex] = true;
+		m_alliedRecipientReliefUntil[decision.recipientIndex] =
+			now + 120 * LOGICFRAMES_PER_SECOND;
+	}
+}
+
+void AI::xferAlliedCoordination(Xfer *xfer)
+{
+	xfer->xferBool(&m_alliedEvaluationScheduled);
+	xfer->xferUnsignedInt(&m_nextAlliedEvaluationFrame);
+	for (Int i = 0; i < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++i) {
+		xfer->xferInt(&m_alliedStarvationStreaks[i]);
+		xfer->xferBool(&m_alliedRecipientCooldownActive[i]);
+		xfer->xferUnsignedInt(&m_alliedRecipientReliefUntil[i]);
+		SkirmishAIAlliedPlayerFacts &f = m_alliedPlayerFacts[i];
+		xfer->xferBool(&f.valid);
+		xfer->xferBool(&f.alive);
+		xfer->xferBool(&f.isAI);
+		xfer->xferBool(&f.missingIncome);
+		xfer->xferBool(&f.missingProduction);
+		xfer->xferBool(&f.recoverable);
+		xfer->xferBool(&f.hasReadyForce);
+		xfer->xferBool(&f.donationBlocked);
+		xfer->xferBool(&f.aidBlocked);
+		xfer->xferInt(&f.playerIndex);
+		xfer->xferInt(&f.economyHealth);
+		xfer->xferInt(&f.baseIntegrity);
+		xfer->xferInt(&f.armyReadiness);
+		xfer->xferInt(&f.immediateThreat);
+		xfer->xferInt(&f.distress);
+		xfer->xferInt(&f.cash);
+		xfer->xferInt(&f.protectedReserve);
+		xfer->xferInt(&f.combatValue);
+		xfer->xferInt(&f.localCombatValue);
+		xfer->xferInt(&f.localEnemyValue);
+		xfer->xferInt(&f.supportAvailableValue);
+		xfer->xferInt(&f.targetEnemyIndex);
+		xfer->xferInt(&f.targetScore);
+		xfer->xferObjectID(&f.targetObjectID);
+		xfer->xferUnsignedInt(&f.alliedMask);
+		Int mode = (Int)f.mode;
+		xfer->xferInt(&mode);
+		if (xfer->getXferMode() == XFER_LOAD) {
+			f.mode = (SkirmishStrategyMode)mode;
+			if (m_alliedStarvationStreaks[i] < 0 ||
+				m_alliedStarvationStreaks[i] > 2)
+				m_alliedStarvationStreaks[i] = 0;
+			if (f.playerIndex != i)
+				f.valid = false;
+		}
+	}
+}
+
+void AI::xferAlliedFactExtensions(Xfer *xfer)
+{
+	// Keep the complete version-2 block unchanged and append version-3 facts.
+	for (Int i = 0; i < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++i) {
+		SkirmishAIAlliedPlayerFacts &facts = m_alliedPlayerFacts[i];
+		xfer->xferInt(&facts.starvationCashLimit);
+		xfer->xferUnsignedInt(&facts.enemyMask);
+		if (xfer->getXferMode() == XFER_LOAD) {
+			if (facts.starvationCashLimit < 0) facts.starvationCashLimit = 0;
+			facts.enemyMask &= 0x0000ffffU;
+		}
+	}
 }
 
 /**
@@ -1564,7 +1734,13 @@ void AI::crc( Xfer *xfer )
 			xfer->xferSnapshot( (*groupIt) );
 		}
 	}
-
+	if (ShouldIncludeSkirmishAIAlliedCoordinationCRCFields(
+			TheGameLogic && TheGameLogic->isInReplayGame(),
+			TheRecorder ? TheRecorder->getSkirmishAIReplayEpoch() :
+				SKIRMISH_AI_REPLAY_EPOCH_LEGACY)) {
+		xferAlliedCoordination(xfer);
+		xferAlliedFactExtensions(xfer);
+	}
 }
 
 //-----------------------------------------------------------------------------
@@ -1572,10 +1748,23 @@ void AI::xfer( Xfer *xfer )
 {
 
 	// version
-	XferVersion currentVersion = 1;
+	XferVersion currentVersion = 3;
 	XferVersion version = currentVersion;
 	xfer->xferVersion( &version, currentVersion );
-
+	if (version >= 2)
+		xferAlliedCoordination(xfer);
+	else if (xfer->getXferMode() == XFER_LOAD)
+		resetAlliedCoordination();
+	if (version >= 3)
+		xferAlliedFactExtensions(xfer);
+	else if (xfer->getXferMode() == XFER_LOAD) {
+		// Old snapshots have no proof of low cash or hostile relationships.
+		// Fail closed until the next owner-thread roster capture.
+		for (Int i = 0; i < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++i) {
+			m_alliedPlayerFacts[i].starvationCashLimit = 0;
+			m_alliedPlayerFacts[i].enemyMask = 0;
+		}
+	}
 }
 
 //-----------------------------------------------------------------------------
