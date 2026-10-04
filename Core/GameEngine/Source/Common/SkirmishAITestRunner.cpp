@@ -114,6 +114,10 @@ struct AlliedFixtureState
 	Int aidRecipientSlot;
 	ObjectID aidBuilderID;
 	ObjectID aidVictoryBuildingID;
+	Int aidNaturalSlots[2];
+	ObjectID aidNaturalTargetID;
+	ObjectID aidSightProviderID;
+	UnsignedInt aidSightMissingTraces;
 	UnsignedInt aidCooldownUntil;
 	UnsignedInt aidEvaluation;
 	UnsignedInt firstStarvationFrame;
@@ -192,6 +196,7 @@ struct AlliedFixtureState
 		supportRecipientIndex(-1), aidFaultApplied(FALSE),
 		sawFirstStarvationEvaluation(FALSE), sawAid(FALSE), aidDonorSlot(-1),
 		aidRecipientSlot(-1), aidBuilderID(INVALID_ID), aidVictoryBuildingID(INVALID_ID),
+		aidNaturalTargetID(INVALID_ID), aidSightProviderID(INVALID_ID), aidSightMissingTraces(0),
 		aidCooldownUntil(0), aidEvaluation(0),
 		firstStarvationFrame(0), sawSupportReturning(FALSE),
 		coordinatedReleaseFrame(0), postLoadEvaluation(0), postLoadBlockedEvaluations(0),
@@ -215,6 +220,7 @@ struct AlliedFixtureState
 		withdrawalMembers[0] = withdrawalMembers[1] = INVALID_ID;
 		withdrawalTeams[0] = withdrawalTeams[1] = 0;
 		assaultSlots[0] = assaultSlots[1] = -1;
+		aidNaturalSlots[0] = aidNaturalSlots[1] = -1;
 		positiveAbortMembers[0] = positiveAbortMembers[1] = INVALID_ID;
 		positiveAbortTeams[0] = positiveAbortTeams[1] = 0;
 		positiveAbortOrdinary[0] = positiveAbortOrdinary[1] = FALSE;
@@ -8696,6 +8702,12 @@ void ObserveAlliedCoordination(UnsignedInt frame)
 				if (!TheGameLogic->findObjectByID(a.targetID)) continue;
 				s_allied.sawCoordination = TRUE;
 				s_allied.coordinatedReleaseFrame = a.assaultFrame;
+				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD && !s_allied.aidFaultApplied)
+				{
+					s_allied.aidNaturalSlots[0] = slot;
+					s_allied.aidNaturalSlots[1] = peer;
+					s_allied.aidNaturalTargetID = a.targetID;
+				}
 				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_COORDINATION_LIVE &&
 					!s_allied.assaultRetained &&
 					(s_allied.withdrawalComplete || (a.assaultFrame > frame + 3 &&
@@ -10150,9 +10162,79 @@ void ObserveAlliedSupport(UnsignedInt frame)
 	}
 }
 
+Bool IsAlliedAidNaturalTargetVisible(Object *target)
+{
+	if (!IsLiveSkirmishAIRecoveryObject(target)) return FALSE;
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		if (s_allied.aidNaturalSlots[participant] < 1 || s_allied.aidNaturalSlots[participant] > 7) return FALSE;
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(s_allied.aidNaturalSlots[participant]);
+		if (!player || !player->isPlayerActive()) return FALSE;
+		const ObjectShroudStatus shroud = target->getShroudedStatus(player->getPlayerIndex());
+		if (shroud != OBJECTSHROUD_CLEAR && shroud != OBJECTSHROUD_PARTIAL_CLEAR) return FALSE;
+	}
+	return TRUE;
+}
+
+Bool IsAlliedAidSightProvider(Object *object, Player *recipient, Object *target)
+{
+	AIPlayer *playerAI = recipient ? recipient->getAIPlayerForPlanning() : nullptr;
+	AISkirmishPlayer *ownerAI = playerAI && playerAI->isSkirmishAI() ? static_cast<AISkirmishPlayer *>(playerAI) : nullptr;
+	if (!IsLiveSkirmishAIRecoveryObject(object) || object->getControllingPlayer() != recipient ||
+		object->isContained() || object->isKindOf(KINDOF_STRUCTURE) || object->isKindOf(KINDOF_DOZER) ||
+		object->isKindOf(KINDOF_HARVESTER) || object->isKindOf(KINDOF_MONEY_HACKER) ||
+		object->isKindOf(KINDOF_PROJECTILE) || object->isKindOf(KINDOF_MINE) ||
+		object->testStatus(OBJECT_STATUS_SOLD) || object->isDisabledByType(DISABLED_UNMANNED) ||
+		!object->getAIUpdateInterface() || !ownerAI || ownerAI->isAlliedAssaultMember(object) ||
+		ownerAI->isAlliedSupportMember(object) || !IsAlliedAidNaturalTargetVisible(target)) return FALSE;
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(s_allied.aidNaturalSlots[participant]);
+		// Match Object::look's real allied looking mask, with mutual live allies.
+		if (recipient->getRelationship(player->getDefaultTeam()) != ALLIES ||
+			player->getRelationship(recipient->getDefaultTeam()) != ALLIES) return FALSE;
+	}
+	const Real range = object->getShroudClearingRange();
+	return range > 0.0f && AlliedFixtureDistanceSquared(*object->getPosition(), *target->getPosition()) < range * range;
+}
+
+Bool ControlAlliedAidSightProvider(Object *object)
+{
+	Player *owner = object->getControllingPlayer();
+	const Coord3D position = *object->getPosition();
+	const Real range = object->getShroudClearingRange();
+	AIUpdateInterface *ai = object->getAIUpdateInterface();
+	ai->setAttitude(ATTITUDE_NORMAL);
+	ai->aiIdle(CMD_FROM_AI);
+	ai->setLocomotorGoalNone();
+	ai->setAttitude(ATTITUDE_SLEEP);
+	object->setDisabled(DISABLED_SCRIPT_DISABLED);
+	return IsLiveSkirmishAIRecoveryObject(object) && object->getControllingPlayer() == owner &&
+		object->getPosition()->x == position.x && object->getPosition()->y == position.y &&
+		object->getPosition()->z == position.z && object->getShroudClearingRange() == range &&
+		object->isDisabledByType(DISABLED_SCRIPT_DISABLED);
+}
+
 void ObserveAlliedAid(UnsignedInt frame)
 {
 	if (!TheAI || !TheAI->hasAlliedEvaluation()) return;
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
+		s_allied.aidSightProviderID != INVALID_ID && !s_allied.cancellationIssued)
+	{
+		Object *provider = TheGameLogic->findObjectByID(s_allied.aidSightProviderID);
+		Object *target = TheGameLogic->findObjectByID(s_allied.aidNaturalTargetID);
+		Player *recipient = ThePlayerList->getPlayerFromSlotIndex(s_allied.aidRecipientSlot);
+		if (!IsAlliedAidSightProvider(provider, recipient, target))
+		{
+			printf("SKIRMISH_AI_ALLIED_AID_SIGHT_FAILURE frame=%u provider=%u provider_live=%d target=%u target_live=%d "
+				"both_participants_visible=%d\n", frame, s_allied.aidSightProviderID,
+				IsLiveSkirmishAIRecoveryObject(provider), s_allied.aidNaturalTargetID,
+				IsLiveSkirmishAIRecoveryObject(target), IsAlliedAidNaturalTargetVisible(target));
+			FailSkirmishAITest("allied_save_load_genuine_sight_lost"); RequestSkirmishAITestStop(); return;
+		}
+		if (!ControlAlliedAidSightProvider(provider) || !IsAlliedAidNaturalTargetVisible(target))
+		{ FailSkirmishAITest("allied_save_load_genuine_sight_lost"); RequestSkirmishAITestStop(); return; }
+	}
 	if (!s_allied.aidFaultApplied)
 	{
 		// In the save/load case establish a real future commitment first, then
@@ -10171,6 +10253,8 @@ void ObserveAlliedAid(UnsignedInt frame)
 			for (Int recipientSlot = 1; recipientSlot <= 4; ++recipientSlot)
 			{
 				if (recipientSlot == donorSlot) continue;
+				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
+					(recipientSlot == s_allied.aidNaturalSlots[0] || recipientSlot == s_allied.aidNaturalSlots[1])) continue;
 				Player *recipient = ThePlayerList->getPlayerFromSlotIndex(recipientSlot);
 				if (!recipient || !recipient->isPlayerActive() ||
 					donor->getRelationship(recipient->getDefaultTeam()) != ALLIES ||
@@ -10205,6 +10289,31 @@ void ObserveAlliedAid(UnsignedInt frame)
 						(!victoryBuilding || object->getID() < victoryBuilding->getID())) victoryBuilding = object;
 				}
 				if (!builder || !victoryBuilding) continue;
+				Object *sightProvider = nullptr;
+				Object *sightTarget = nullptr;
+				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD)
+				{
+					sightTarget = TheGameLogic->findObjectByID(s_allied.aidNaturalTargetID);
+					// Select only an existing recipient unit with real current sight.
+					// Keeping it changes neither income nor combat production counts.
+					for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
+						if (IsAlliedAidSightProvider(object, recipient, sightTarget) &&
+							(!sightProvider || object->getID() < sightProvider->getID())) sightProvider = object;
+					if (!sightProvider)
+					{
+						if (s_allied.aidSightMissingTraces < 16)
+						{
+							++s_allied.aidSightMissingTraces;
+							printf("SKIRMISH_AI_ALLIED_AID_SIGHT_UNAVAILABLE frame=%u recipient_slot=%d target=%u "
+								"both_participants_visible=%d\n", frame, recipientSlot, s_allied.aidNaturalTargetID,
+								IsAlliedAidNaturalTargetVisible(sightTarget));
+							fflush(stdout);
+						}
+						continue;
+					}
+					if (!ControlAlliedAidSightProvider(sightProvider))
+					{ FailSkirmishAITest("allied_save_load_genuine_sight_control_changed"); RequestSkirmishAITestStop(); return; }
+				}
 				const Int victoryConditions = TheVictoryConditions ?
 					TheVictoryConditions->getVictoryConditions() : -1;
 				if (victoryConditions != VICTORY_NOBUILDINGS)
@@ -10220,7 +10329,7 @@ void ObserveAlliedAid(UnsignedInt frame)
 				for (Object *object = TheGameLogic->getFirstObject(); object; )
 				{
 					Object *next = object->getNextObject();
-					if (object != builder && object != victoryBuilding && object->getControllingPlayer() == recipient &&
+					if (object != builder && object != victoryBuilding && object != sightProvider && object->getControllingPlayer() == recipient &&
 						IsLiveSkirmishAIRecoveryObject(object)) DestroySkirmishAIRecoveryObject(object);
 					object = next;
 				}
@@ -10245,6 +10354,26 @@ void ObserveAlliedAid(UnsignedInt frame)
 				SetSkirmishAIRecoveryCash(donor, 100000);
 				s_allied.aidDonorSlot = donorSlot;
 				s_allied.aidRecipientSlot = recipientSlot;
+				if (sightProvider)
+				{
+					s_allied.aidSightProviderID = sightProvider->getID();
+					// Refresh the live object's normal owner/position/range sight;
+					// no intel, shroud status or vision radius is assigned by the fixture.
+					sightProvider->handlePartitionCellMaintenance();
+					ThePartitionManager->update();
+					if (!IsAlliedAidSightProvider(sightProvider, recipient, sightTarget))
+					{ FailSkirmishAITest("allied_save_load_genuine_sight_lost"); RequestSkirmishAITestStop(); return; }
+					printf("SKIRMISH_AI_ALLIED_AID_SIGHT_RETAINED frame=%u provider=%u owner=%d target=%u "
+						"position=%g,%g range=%g health=%g natural_slots=%d,%d shrouds=%d,%d both_participants_visible=1 "
+						"owner_position_range_unchanged=1 assault_support_member=0 script_disabled=1\n", frame,
+						sightProvider->getID(), recipient->getPlayerIndex(), sightTarget->getID(),
+						sightProvider->getPosition()->x, sightProvider->getPosition()->y, sightProvider->getShroudClearingRange(),
+						sightProvider->getBodyModule() ? sightProvider->getBodyModule()->getHealth() : -1.0f,
+						s_allied.aidNaturalSlots[0], s_allied.aidNaturalSlots[1],
+						static_cast<Int>(sightTarget->getShroudedStatus(ThePlayerList->getPlayerFromSlotIndex(s_allied.aidNaturalSlots[0])->getPlayerIndex())),
+						static_cast<Int>(sightTarget->getShroudedStatus(ThePlayerList->getPlayerFromSlotIndex(s_allied.aidNaturalSlots[1])->getPlayerIndex())));
+					fflush(stdout);
+				}
 				s_allied.aidBuilderID = builderID;
 				s_allied.aidVictoryBuildingID = victoryBuilding->getID();
 				s_allied.aidFaultApplied = TRUE;
@@ -10321,6 +10450,16 @@ void ObserveAlliedAid(UnsignedInt frame)
 				"starvation_evaluations=2 consumed_streak=0 cooldown_until=%u donor_recipient_relief_equal=1\n",
 				frame, s_allied.aidDonorSlot, s_allied.aidRecipientSlot, received.mayDonateFrame);
 			fflush(stdout);
+			if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD)
+			{
+				Object *target = TheGameLogic->findObjectByID(s_allied.aidNaturalTargetID);
+				printf("SKIRMISH_AI_ALLIED_AID_SIGHT_PAID_ASSERT frame=%u provider=%u target=%u "
+					"both_participants_visible=%d paid_batch_economy=%d recoverable=%d "
+					"missing_income=%d missing_production=%d\n", frame,
+					s_allied.aidSightProviderID, s_allied.aidNaturalTargetID, IsAlliedAidNaturalTargetVisible(target),
+					facts->economyHealth, facts->recoverable, facts->missingIncome, facts->missingProduction);
+				fflush(stdout);
+			}
 		}
 	}
 	if (s_allied.sawAid && frame < s_allied.aidCooldownUntil)
