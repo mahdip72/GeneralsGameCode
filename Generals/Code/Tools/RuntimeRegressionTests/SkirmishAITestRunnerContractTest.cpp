@@ -1498,9 +1498,6 @@ static void TestSkirmishAITestHardAI2v6Contract()
 
 #if defined(_WIN64)
 int RunHeadlessMetricStartupTitleTests();
-#if RTS_ZEROHOUR
-int RunHeadlessSimulationStartupTitleTests(const char *simulation, const char *pipeline);
-#endif
 int RunPerformanceReceiptOwnerBridgeTitleTests();
 int RunPerformanceReceiptProducerTitleTests();
 int RunPerformanceReceiptFreshProducerTitleTests();
@@ -2130,10 +2127,6 @@ int main(int argc, char **argv)
 	}
 	if (argc == 2 && strcmp(argv[1], "--headless-metric-startup") == 0)
 		return RunHeadlessMetricStartupTitleTests();
-#if RTS_ZEROHOUR
-	if (argc == 4 && strcmp(argv[1], "--headless-simulation-startup") == 0)
-		return RunHeadlessSimulationStartupTitleTests(argv[2], argv[3]);
-#endif
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-owner-bridge") == 0)
 		return RunPerformanceReceiptOwnerBridgeTitleTests();
 	if (argc == 2 && strcmp(argv[1], "--performance-receipt-producer") == 0)
