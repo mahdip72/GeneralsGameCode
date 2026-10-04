@@ -9904,6 +9904,20 @@ Bool SustainAlliedSupportNeed(UnsignedInt frame)
 	healing.in.m_sourceID = INVALID_ID;
 	healing.in.m_damageType = DAMAGE_HEALING;
 	healing.in.m_amount = 1.0f;
+	// Healing goes through the current armor coefficient; UNRESISTABLE does
+	// not. Restore the measured loss with a real armor-adjusted healing event.
+	const Real healingScale = victim->getBodyModule()->estimateDamage(healing.in);
+	const Real healingMaxHealth = victim->getBodyModule()->getMaxHealth();
+	if (!(healingScale > 0.0f) || healingScale > FLT_MAX ||
+		!(healingMaxHealth >= before) || healingMaxHealth > FLT_MAX)
+		return ReportAlliedSupportNeedFailure("healing_coefficient", frame);
+	// A precision-sized margin prevents a division/multiply round trip from
+	// leaving one float step missing. The body still clips at real max health.
+	const Real healingMargin = FLT_EPSILON * before;
+	healing.in.m_amount = (before - after + healingMargin) / healingScale;
+	if (!(healing.in.m_amount > 0.0f) || healing.in.m_amount > FLT_MAX ||
+		healing.in.m_amount > healingMaxHealth)
+		return ReportAlliedSupportNeedFailure("healing_request", frame);
 	victim->attemptDamage(&healing);
 	victim = TheGameLogic->findObjectByID(s_allied.supportNeedVictimID);
 	source = TheGameLogic->findObjectByID(s_allied.supportNeedSourceWitnessID);
@@ -9913,8 +9927,11 @@ Bool SustainAlliedSupportNeed(UnsignedInt frame)
 		healing.out.m_actualDamageClipped >= 0 || !recipient->isPlayerActive() ||
 		!healed.homeDamageValid || healed.homeDamageFrame != frame)
 	{
-		printf("SKIRMISH_AI_ALLIED_SUPPORT_NEED_HEAL health_before=%g clipped=%g home_valid=%d home_frame=%u\n",
-			before, healing.out.m_actualDamageClipped, healed.homeDamageValid, healed.homeDamageFrame);
+		printf("SKIRMISH_AI_ALLIED_SUPPORT_NEED_HEAL health_before=%g clipped=%g "
+			"healing_scale=%g healing_requested=%g healing_margin=%g victim_max_health=%g home_valid=%d home_frame=%u\n",
+			before, healing.out.m_actualDamageClipped, healingScale, healing.in.m_amount, healingMargin,
+			victim && victim->getBodyModule() ? victim->getBodyModule()->getMaxHealth() : -1.0f,
+			healed.homeDamageValid, healed.homeDamageFrame);
 		return ReportAlliedSupportNeedFailure("healed_latch", frame);
 	}
 	++s_allied.supportNeedImpactCount;
@@ -9922,12 +9939,14 @@ Bool SustainAlliedSupportNeed(UnsignedInt frame)
 	printf("SKIRMISH_AI_ALLIED_SUPPORT_NEED_IMPACT_ASSERT frame=%u recipient=%d victim_cc=%u "
 		"initial_source_witness=%u witness_alive=%d witness_script_disabled=%d enemy=%d source_mask=%u pulse=%u "
 		"health_before=%g health_after=%g health_healed=%g damage_clipped=%g healing_clipped=%g "
+		"healing_scale=%g healing_requested=%g healing_margin=%g victim_max_health=%g "
 		"home_damage_frame=%u next_impact=%u sustained_need=real_hostile_home_latch\n", frame,
 		s_allied.supportRecipientIndex, victim->getID(), s_allied.supportNeedSourceWitnessID,
 		IsSkirmishAIRecoveryCombatUnit(source, enemy), source && source->isDisabledByType(DISABLED_SCRIPT_DISABLED),
 		enemy->getPlayerIndex(), sourceMask,
 		s_allied.supportNeedImpactCount, before, after, victim->getBodyModule()->getHealth(),
 		damage.out.m_actualDamageClipped, healing.out.m_actualDamageClipped,
+		healingScale, healing.in.m_amount, healingMargin, victim->getBodyModule()->getMaxHealth(),
 		healed.homeDamageFrame, s_allied.supportNextNeedImpactFrame);
 	fflush(stdout);
 	return TRUE;
