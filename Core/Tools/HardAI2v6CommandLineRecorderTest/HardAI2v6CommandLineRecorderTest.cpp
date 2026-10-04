@@ -425,6 +425,7 @@ static void TestRenderedBattleActualDispatch()
 		"rendered startup does not enter the headless instance path");
 	Check(RunPass(FALSE, &exitCode), "actual rendered init dispatch succeeds");
 	Check(s_globalData.m_commandLineData.hasRenderedBattleDiagnosticRequest() &&
+		!s_globalData.m_commandLineData.isRenderedBattleBenchmark() &&
 		s_globalData.m_commandLineData.getRenderedBattleDiagnosticSeed() == 1729,
 		"actual rendered handler retains the exact positive seed");
 	Check(RunPass(TRUE, &exitCode), "repeated rendered startup is inert");
@@ -479,6 +480,64 @@ static void TestRenderedBattleActualDispatch()
 				Check(!s_globalData.m_commandLineData.hasRenderedBattleDiagnosticRequest(),
 					"mixed modes never arm rendered request");
 #endif
+			}
+}
+
+static void TestRenderedBattleBenchmarkActualDispatch()
+{
+	Int exitCode = 0;
+	Reset("game -win -nologo -workerPolicy auto -runRenderedBattleBenchmark 1729");
+#if RTS_ZEROHOUR
+	Check(RunPass(TRUE, &exitCode), "actual dense benchmark startup dispatch succeeds");
+	Check(!s_globalData.m_commandLineData.hasRenderedBattleDiagnosticRequest(),
+		"benchmark startup does not prematurely arm the request");
+	Check(s_globalData.m_useFpsLimit && s_globalData.m_framesPerSecondLimit == 30,
+		"benchmark parsing preserves global pacing preferences");
+	Check(RunPass(FALSE, &exitCode), "actual dense benchmark init dispatch succeeds");
+	Check(s_globalData.m_commandLineData.isRenderedBattleBenchmark() &&
+		s_globalData.m_commandLineData.getRenderedBattleDiagnosticSeed() == 1729,
+		"shared production parser retains distinct benchmark intent and seed");
+	RunActualGameMainArmingBranch();
+	Check(s_scenario.armCalls == 1 && s_scenario.armedSeed == 1729 &&
+		s_scenario.armedScenario == static_cast<Int>(SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK),
+		"actual GameMain arms the distinct dense benchmark scenario");
+#else
+	Check(!RunPass(TRUE, &exitCode) && exitCode == 2,
+		"Generals rejects dense benchmark before startup effects");
+	Reset("game -runRenderedBattleBenchmark 1729");
+	Check(!RunPass(FALSE, &exitCode) && exitCode == 2,
+		"Generals rejects dense benchmark in actual init dispatch");
+#endif
+	const char *invalid[] = {
+		"game -runRenderedBattleBenchmark", "game -runRenderedBattleBenchmark 0",
+		"game -runRenderedBattleBenchmark -1", "game -runRenderedBattleBenchmark bogus",
+		"game -runRenderedBattleBenchmark 1729 -runRenderedBattleBenchmark 1730",
+		"game -runRenderedBattleBenchmark 1729 -runRenderedBattleDiagnostic 1730",
+		"game -runRenderedBattleDiagnostic 1730 -runRenderedBattleBenchmark 1729" };
+	for (unsigned index = 0; index < ARRAY_SIZE(invalid); ++index)
+		for (unsigned pass = 0; pass < 2; ++pass)
+		{
+			Reset(invalid[index]);
+			Check(!RunPass(pass == 0, &exitCode) && exitCode == 2,
+				"invalid benchmark rejected by both actual dispatch passes");
+			Check(s_globalData.m_useFpsLimit && s_globalData.m_playIntro && !s_globalData.m_headless,
+				"invalid benchmark rejection precedes startup preference mutation");
+		}
+	const char *conflicts[] = { "-noFPSLimit", "-headless", "-replay old.rep",
+		"-runSkirmishAITestHardAI2v6 1733", "-runSkirmishAITestPractical1v7 1733" };
+	for (unsigned index = 0; index < ARRAY_SIZE(conflicts); ++index)
+		for (unsigned order = 0; order < 2; ++order)
+			for (unsigned pass = 0; pass < 2; ++pass)
+			{
+				std::string command = "game ";
+				command += order == 0 ? conflicts[index] : "-runRenderedBattleBenchmark 1729";
+				command += " ";
+				command += order == 0 ? "-runRenderedBattleBenchmark 1729" : conflicts[index];
+				Reset(command.c_str());
+				Check(!RunPass(pass == 0, &exitCode) && exitCode == 2,
+					"benchmark conflicts rejected in both orders and both actual passes");
+				Check(s_globalData.m_useFpsLimit && s_globalData.m_playIntro && s_scenario.armCalls == 0,
+					"benchmark conflict rejection leaves global defaults intact");
 			}
 }
 
@@ -706,6 +765,7 @@ int main()
 	TestHardAndExistingModesAreMutuallyExclusive();
 	TestExistingModesRemainInert();
 	TestRenderedBattleActualDispatch();
+	TestRenderedBattleBenchmarkActualDispatch();
 	TestZeroHourLegacySaveReplayGuards();
 	TestRecorderLocalIndexRoundTrip();
 	TestMalformedLocalIndexRemainsRejected();

@@ -10,6 +10,20 @@ namespace rts
 namespace render
 {
 
+// Opt in only when the caller fills every byte of the locked span. The legacy
+// lane keeps its original Lock_Buffer call and legal lock flags unchanged.
+template <class BufferClass>
+inline bool Lock_W3D_Buffer_For_Full_Overwrite(BufferClass *buffer,
+	size_t byte_offset, size_t byte_count, int flags, void **data)
+{
+#if defined(_WIN64)
+	return buffer->Lock_Buffer_For_Full_Overwrite(byte_offset, byte_count,
+		flags, data);
+#else
+	return buffer->Lock_Buffer(byte_offset, byte_count, flags, data);
+#endif
+}
+
 // Streaming shadow buffers force a discard by making the next append cursor
 // exceed the available range.  Keep the cursor policy shared between the
 // projected and volumetric shadow callers so a failed mutation always retries

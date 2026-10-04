@@ -34,6 +34,9 @@ enum Phase
 	RendererVolumeParticleUpdateArrays, RendererVolumeParticlePackSubmit,
 	RendererVolumeStaticDraw, RendererVolumeDynamicDraw,
 	RendererVolumeDynamicUpload, RendererVolumeDynamicCommands,
+	ClientDrawableSweep, RendererWW3DSync, RendererW3DViewUpdate,
+	RendererShroudSourceSync,
+	RendererSceneCustomizedRender, RendererSceneFlush,
 	PhaseCount
 };
 
@@ -422,7 +425,10 @@ private:
 			"renderer_volume_particle", "renderer_volume_particle_transform",
 			"renderer_volume_particle_update_arrays", "renderer_volume_particle_pack_submit",
 			"renderer_volume_static_draw", "renderer_volume_dynamic_draw",
-			"renderer_volume_dynamic_upload", "renderer_volume_dynamic_commands"
+			"renderer_volume_dynamic_upload", "renderer_volume_dynamic_commands",
+			"client_drawable_sweep", "renderer_ww3d_sync", "renderer_w3d_view_update",
+			"renderer_shroud_source_sync", "renderer_scene_customized_render",
+			"renderer_scene_flush"
 		};
 		static_assert(sizeof(names) / sizeof(names[0]) == PhaseCount,
 			"Every diagnostic phase must retain its CSV name");

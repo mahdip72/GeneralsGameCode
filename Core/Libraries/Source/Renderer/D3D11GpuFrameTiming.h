@@ -44,6 +44,7 @@ struct GpuTimingRecord
 	bool readback, presentCalled;
 	long presentResult;
 	double cpuPresentMs, totalMs, sceneMs, resolveMs, gammaMs;
+	uint64_t presentStartQpc, presentEndQpc, cpuQpcFrequency;
 };
 
 struct GpuTimingDeviceInfo
@@ -137,6 +138,7 @@ public:
 		row.status = GpuTimingOpen; row.readback = false; row.presentCalled = false;
 		row.presentResult = 0;
 		row.cpuPresentMs = row.totalMs = row.sceneMs = row.resolveMs = row.gammaMs = -1.0;
+		row.presentStartQpc = row.presentEndQpc = row.cpuQpcFrequency = 0;
 		m_driver.begin(slot.disjoint);
 		stamp(0);
 	}
@@ -163,16 +165,29 @@ public:
 	uint64_t cpuPresentStart()
 	{
 		if (!m_enabled || m_presentRecord < 0) return 0;
-		m_records[m_presentRecord].presentCalled = true;
-		return m_driver.clock();
+		return cpuPresentStart(m_driver.clock());
+	}
+	uint64_t cpuPresentStart(uint64_t start)
+	{
+		if (!m_enabled || m_presentRecord < 0) return 0;
+		GpuTimingRecord& row = m_records[m_presentRecord];
+		row.presentCalled = true;
+		row.presentStartQpc = start;
+		return row.presentStartQpc;
 	}
 	void cpuPresentEnd(uint64_t start, long result)
 	{
 		if (!m_enabled || m_presentRecord < 0) return;
-		GpuTimingRecord& row = m_records[m_presentRecord];
-		row.presentResult = result;
 		const uint64_t stop = m_driver.clock();
 		const uint64_t frequency = m_driver.cpuFrequency();
+		cpuPresentEnd(start, result, stop, frequency);
+	}
+	void cpuPresentEnd(uint64_t start, long result, uint64_t stop, uint64_t frequency)
+	{
+		if (!m_enabled || m_presentRecord < 0) return;
+		GpuTimingRecord& row = m_records[m_presentRecord];
+		row.presentResult = result;
+		row.presentEndQpc = stop; row.cpuQpcFrequency = frequency;
 		if (start != 0 && stop >= start && frequency != 0)
 			row.cpuPresentMs = static_cast<double>(stop - start) * 1000.0 / frequency;
 		if (result < 0) failPresentation(result);
@@ -426,10 +441,10 @@ inline const char *GpuTimingStatusName(GpuTimingStatus status)
 	}
 }
 
-enum { GpuTimingCsvColumns = 26 };
+enum { GpuTimingCsvColumns = 29 };
 inline const char *GpuTimingCsvHeader()
 {
-	return "row_type,device_epoch,local_frame_ordinal,status,width,height,samples,gamma,brightness,contrast,gamma_limit,gamma_applied,resolve_applied,swap_interval,present_flags,present_called,present_hresult,cpu_present_ms,readback_contaminated,gpu_total_ms,gpu_scene_ms,gpu_resolve_ms,gpu_gamma_ms,gpu_elapsed_not_busy,owner_begin_tick_ms,count\n";
+	return "row_type,device_epoch,local_frame_ordinal,status,width,height,samples,gamma,brightness,contrast,gamma_limit,gamma_applied,resolve_applied,swap_interval,present_flags,present_called,present_hresult,cpu_present_ms,readback_contaminated,gpu_total_ms,gpu_scene_ms,gpu_resolve_ms,gpu_gamma_ms,gpu_elapsed_not_busy,owner_begin_tick_ms,present_start_qpc,present_end_qpc,cpu_qpc_frequency,count\n";
 }
 
 // All operations are invoked only by normal shutdown. A failed staging file
@@ -461,13 +476,14 @@ public:
 	bool header() { return fprintf(m_file, "%s", GpuTimingCsvHeader()) >= 0; }
 	bool frame(const GpuTimingRecord& row)
 	{
-		return _fprintf_l(m_file, "frame,%llu,%llu,%s,%u,%u,%u,%.9g,%.9g,%.9g,%u,%u,%u,%u,%u,%u,%ld,%.9f,%u,%.9f,%.9f,%.9f,%.9f,1,%u,\n", m_locale,
+		return _fprintf_l(m_file, "frame,%llu,%llu,%s,%u,%u,%u,%.9g,%.9g,%.9g,%u,%u,%u,%u,%u,%u,%ld,%.9f,%u,%.9f,%.9f,%.9f,%.9f,1,%u,%llu,%llu,%llu,\n", m_locale,
 			static_cast<unsigned long long>(row.epoch), static_cast<unsigned long long>(row.ordinal), GpuTimingStatusName(row.status),
 			row.info.width, row.info.height, row.info.samples, row.info.gamma, row.info.brightness, row.info.contrast,
 			row.info.gammaLimit ? 1U : 0U, row.info.gammaApplied ? 1U : 0U, row.info.samples > 1 ? 1U : 0U,
 			row.info.swapInterval, row.info.presentFlags, row.presentCalled ? 1U : 0U, row.presentResult, row.cpuPresentMs,
 			row.readback ? 1U : 0U, row.totalMs, row.sceneMs, row.resolveMs, row.gammaMs,
-			static_cast<unsigned int>(row.ownerBeginTickMs)) >= 0;
+			static_cast<unsigned int>(row.ownerBeginTickMs), static_cast<unsigned long long>(row.presentStartQpc),
+			static_cast<unsigned long long>(row.presentEndQpc), static_cast<unsigned long long>(row.cpuQpcFrequency)) >= 0;
 	}
 	bool summary(const char *name, uint64_t count, uint64_t epoch = 0)
 	{
@@ -567,7 +583,10 @@ public:
 	void afterResolve() { m_capture.afterResolve(); }
 	void beforePresent() { m_capture.beforePresent(); }
 	uint64_t cpuPresentStart() { return m_capture.cpuPresentStart(); }
+	uint64_t cpuPresentStart(uint64_t start) { return m_capture.cpuPresentStart(start); }
 	void cpuPresentEnd(uint64_t start, HRESULT result) { m_capture.cpuPresentEnd(start, result); }
+	void cpuPresentEnd(uint64_t start, HRESULT result, uint64_t stop, uint64_t frequency)
+	{ m_capture.cpuPresentEnd(start, result, stop, frequency); }
 	void failPresentation(HRESULT result) { m_capture.failPresentation(result); }
 	void markReadback() { m_capture.markReadback(); }
 	void cancel(GpuTimingStatus reason) { m_capture.cancel(reason); }

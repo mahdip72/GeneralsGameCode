@@ -977,7 +977,8 @@ Int parseRunRenderedBattleDiagnostic(char *args[], int num)
 {
 	Int seed = 0;
 	parseSkirmishAITestSeedArgument(args, num, &seed);
-	if (!TheWritableGlobalData->m_commandLineData.requestRenderedBattleDiagnostic(seed))
+	if (!TheWritableGlobalData->m_commandLineData.requestRenderedBattleDiagnostic(seed,
+		stricmp(args[0], "-runRenderedBattleBenchmark") == 0))
 	{
 		printf("RENDERED_BATTLE_DIAGNOSTIC_FAIL reason=duplicate_option\n");
 		fflush(stdout);
@@ -1740,6 +1741,7 @@ static CommandLineParam paramsForStartup[] =
 #if RTS_ZEROHOUR
 	{ "-runSkirmishAIRecoveryTest", parseRunSkirmishAIRecoveryTestForStartup },
 	{ "-runRenderedBattleDiagnostic", parseRunRenderedBattleDiagnosticForStartup },
+	{ "-runRenderedBattleBenchmark", parseRunRenderedBattleDiagnosticForStartup },
 	// Explicit snapshot-only legacy-save probe; the argument is a leaf .sav name.
 	{ "-runSkirmishAILegacySaveTest", parseRunSkirmishAILegacySaveTestForStartup },
 #endif
@@ -1781,6 +1783,7 @@ static CommandLineParam paramsForEngineInit[] =
 #if RTS_ZEROHOUR
 	{ "-runSkirmishAIRecoveryTest", parseRunSkirmishAIRecoveryTest },
 	{ "-runRenderedBattleDiagnostic", parseRunRenderedBattleDiagnostic },
+	{ "-runRenderedBattleBenchmark", parseRunRenderedBattleDiagnostic },
 	{ "-runSkirmishAILegacySaveTest", parseRunSkirmishAILegacySaveTest },
 #endif
 	{ "-nologo", parseNoLogo }, // TheSuperHackers @tweak Is now available in Release builds.

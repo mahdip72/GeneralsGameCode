@@ -161,6 +161,15 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         COMMAND core_d3d11_gpu_frame_timing_tests)
     set_tests_properties(core_d3d11_gpu_frame_timing_tests PROPERTIES TIMEOUT 30)
 
+    # Actual-Present clocks remain independent of GPU query sampling.
+    add_executable(core_native_present_frame_timing_tests
+        PresentFrameTimingTest.cpp)
+    set_target_properties(core_native_present_frame_timing_tests PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME core_native_present_frame_timing_tests
+        COMMAND core_native_present_frame_timing_tests)
+    set_tests_properties(core_native_present_frame_timing_tests PROPERTIES TIMEOUT 30)
+
     # Execute the production sampler lifetime methods and their real gather/
     # bind callsites against a recording device. Missing or duplicate markers
     # fail configuration; the generated proof records exact normalized bodies.
@@ -270,6 +279,62 @@ set_tests_properties(core_w3d_video_buffer_format_selection_tests PROPERTIES
 # quaternion math. All three interpolation entrypoints in both titles must
 # remain connected to that selector; this supplements, not replaces, execution.
 if(WIN32)
+    # Execute each title's actual orientation invalidation block, including
+    # the normalized CNC3 and near-light branches, with production WWMath.
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ShadowOrientationSourceProof.txt" "")
+    foreach(shadow_title Generals GeneralsMD)
+        set(shadow_source "${CMAKE_SOURCE_DIR}/${shadow_title}/Code/GameEngineDevice/Source/W3DDevice/GameClient/Shadow/W3DVolumetricShadow.cpp")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${shadow_source}")
+        file(READ "${shadow_source}" shadow_contents)
+        string(REPLACE "\r\n" "\n" shadow_contents "${shadow_contents}")
+        if(shadow_title STREQUAL "GeneralsMD")
+            set(shadow_marker "#ifdef CNC3 //(gth) numerical error requires")
+        else()
+            set(shadow_marker "#ifdef ASSUME_NEAR_LIGHTSOURCE")
+        endif()
+        string(FIND "${shadow_contents}" "${shadow_marker}" shadow_start)
+        if(shadow_start LESS 0)
+            message(FATAL_ERROR "Shadow orientation start missing: ${shadow_title}")
+        endif()
+        string(SUBSTRING "${shadow_contents}" ${shadow_start} -1 shadow_body)
+        string(LENGTH "${shadow_marker}" shadow_marker_length)
+        string(SUBSTRING "${shadow_body}" ${shadow_marker_length} -1 shadow_remainder)
+        string(FIND "${shadow_remainder}" "${shadow_marker}" shadow_duplicate)
+        if(NOT shadow_duplicate LESS 0)
+            message(FATAL_ERROR "Shadow orientation start duplicated: ${shadow_title}")
+        endif()
+        string(FIND "${shadow_body}" "\n\t// get the light" shadow_end)
+        if(shadow_end LESS 0)
+            message(FATAL_ERROR "Shadow orientation end missing: ${shadow_title}")
+        endif()
+        string(SUBSTRING "${shadow_body}" 0 ${shadow_end} shadow_body)
+        string(REGEX MATCH "const Real cosAngleToCare = [^\n]+" shadow_threshold "${shadow_contents}")
+        if(shadow_threshold STREQUAL "")
+            message(FATAL_ERROR "Shadow threshold missing: ${shadow_title}")
+        endif()
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${shadow_title}ShadowOrientation.inc" "${shadow_body}\n")
+        file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${shadow_title}ShadowThreshold.inc" "${shadow_threshold}\n")
+        file(SHA256 "${shadow_source}" shadow_source_hash)
+        string(SHA256 shadow_body_hash "${shadow_body}")
+        file(APPEND "${CMAKE_CURRENT_BINARY_DIR}/ShadowOrientationSourceProof.txt"
+            "${shadow_title}_source_sha256=${shadow_source_hash}\n${shadow_title}_orientation_sha256=${shadow_body_hash}\n")
+    endforeach()
+    add_executable(core_shadow_orientation_cache_tests ShadowOrientationCacheTest.cpp)
+    target_include_directories(core_shadow_orientation_cache_tests PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Source/WWVegas
+        ${CMAKE_SOURCE_DIR}/Core/Libraries/Include
+        ${CMAKE_SOURCE_DIR}/Dependencies/Utility)
+    target_link_libraries(core_shadow_orientation_cache_tests PRIVATE
+        core_wwmath core_wwstub core_wwdebug core_wwlib winmm)
+    if(IS_VS6_BUILD)
+        target_link_libraries(core_shadow_orientation_cache_tests PRIVATE stlport)
+    endif()
+    set_target_properties(core_shadow_orientation_cache_tests PROPERTIES
+        CXX_STANDARD 98 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    add_test(NAME core_shadow_orientation_cache_tests COMMAND core_shadow_orientation_cache_tests)
+    set_tests_properties(core_shadow_orientation_cache_tests PROPERTIES TIMEOUT 30)
+
     file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/RawAnimationFrameSourceProof.txt" "")
     foreach(raw_title Generals GeneralsMD)
         set(raw_source "${CMAKE_SOURCE_DIR}/${raw_title}/Code/Libraries/Source/WWVegas/WW3D2/hrawanim.cpp")

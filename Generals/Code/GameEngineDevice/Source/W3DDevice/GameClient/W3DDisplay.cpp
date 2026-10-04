@@ -43,6 +43,7 @@ static void drawFramerateBar();
 #include <time.h>
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
+#include "Lib/FrameTimingDiagnostics.h"
 #include "Common/FramePacer.h"
 #include "Common/GameThreadOwnership.h"
 #include "Common/ThingFactory.h"
@@ -2015,7 +2016,10 @@ AGAIN:
 	WW3D::Update_Logic_Frame_Time(TheFramePacer->getLogicTimeStepMilliseconds());
 
 	// TheSuperHackers @info This binds the WW3D update to the logic update.
-	WW3D::Sync(TheGameLogic->hasUpdated());
+	{
+		rts::frame_timing::Scope ww3dSyncTiming(rts::frame_timing::RendererWW3DSync);
+		WW3D::Sync(TheGameLogic->hasUpdated());
+	}
 
 	static Int now;
 	now=timeGetTime();
@@ -2043,7 +2047,10 @@ AGAIN:
 		{	//Checking if we have the device before updating views because the heightmap crashes otherwise while
 			//trying to refresh the visible terrain geometry.
 //			if(TheGlobalData->m_loadScreenRender != TRUE)
+			{
+				rts::frame_timing::Scope viewUpdateTiming(rts::frame_timing::RendererW3DViewUpdate);
 				updateViews();
+			}
 
 			if (TheWaterRenderObj && TheGlobalData->m_waterType == 2)
 				renderTargetTexturesReady = TheWaterRenderObj->updateRenderTargetTextures(primaryW3DView->get3DCamera());	//do a render into each texture

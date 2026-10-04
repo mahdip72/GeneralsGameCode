@@ -119,7 +119,7 @@ void disabled(const std::string& directory)
 		rts::frame_timing::Capture capture;
 		capture.beginSession("headless");
 		capture.beginFrame(0);
-		const rts::frame_timing::Phase rendererPhases[] = {
+		const rts::frame_timing::Phase instrumentedPhases[] = {
 			rts::frame_timing::RendererConstantPack,
 			rts::frame_timing::RendererConstantUpload,
 			rts::frame_timing::RendererBufferUpload,
@@ -142,7 +142,13 @@ void disabled(const std::string& directory)
 			rts::frame_timing::RendererParticleSubmit,
 			rts::frame_timing::RendererProjectedSceneMeshDrain,
 			rts::frame_timing::RendererTextureOwnerDrain,
-			rts::frame_timing::RendererTextureCopyPublication
+			rts::frame_timing::RendererTextureCopyPublication,
+			rts::frame_timing::ClientDrawableSweep,
+			rts::frame_timing::RendererWW3DSync,
+			rts::frame_timing::RendererW3DViewUpdate,
+			rts::frame_timing::RendererShroudSourceSync,
+			rts::frame_timing::RendererSceneCustomizedRender,
+			rts::frame_timing::RendererSceneFlush
 		};
 		const rts::frame_timing::Phase audioPhases[] = {
 			rts::frame_timing::AudioAssetResolve, rts::frame_timing::AudioVirtualRead,
@@ -152,14 +158,17 @@ void disabled(const std::string& directory)
 			rts::frame_timing::AudioSampleFallback
 		};
 		const unsigned int threadCallsBeforeScopes = diagnosticThreadIdCalls;
-		for (std::size_t phase = 0; phase < sizeof(rendererPhases) / sizeof(rendererPhases[0]); ++phase)
+		rts::frame_timing::BindCapture captureBinding(capture);
+		for (std::size_t phase = 0; phase < sizeof(instrumentedPhases) / sizeof(instrumentedPhases[0]); ++phase)
 		{
-			rts::frame_timing::Scope timing(capture, rendererPhases[phase]);
+			rts::frame_timing::Scope timing(capture, instrumentedPhases[phase]);
 			timing.finish();
 			timing.finish();
+			rts::frame_timing::Scope productionTiming(instrumentedPhases[phase]);
+			productionTiming.finish();
+			productionTiming.finish();
 		}
 		capture.add(rts::frame_timing::Logic, 100);
-		rts::frame_timing::BindCapture captureBinding(capture);
 		for (std::size_t phase = 0; phase < sizeof(audioPhases) / sizeof(audioPhases[0]); ++phase)
 		{
 			rts::frame_timing::Scope timing(capture, audioPhases[phase]);
@@ -405,7 +414,7 @@ void enabled(const std::string& directory, __int64 frequency)
 		for (int module = 0; module < 3; ++module)
 			capture.add(rts::frame_timing::WaterTrackModuleRender,
 				frequency / 2000);
-		const rts::frame_timing::Phase rendererPhases[] = {
+		const rts::frame_timing::Phase instrumentedPhases[] = {
 			rts::frame_timing::RendererConstantPack,
 			rts::frame_timing::RendererConstantUpload,
 			rts::frame_timing::RendererBufferUpload,
@@ -428,13 +437,19 @@ void enabled(const std::string& directory, __int64 frequency)
 			rts::frame_timing::RendererParticleSubmit,
 			rts::frame_timing::RendererProjectedSceneMeshDrain,
 			rts::frame_timing::RendererTextureOwnerDrain,
-			rts::frame_timing::RendererTextureCopyPublication
+			rts::frame_timing::RendererTextureCopyPublication,
+			rts::frame_timing::ClientDrawableSweep,
+			rts::frame_timing::RendererWW3DSync,
+			rts::frame_timing::RendererW3DViewUpdate,
+			rts::frame_timing::RendererShroudSourceSync,
+			rts::frame_timing::RendererSceneCustomizedRender,
+			rts::frame_timing::RendererSceneFlush
 		};
-		for (std::size_t phase = 0; phase < sizeof(rendererPhases) / sizeof(rendererPhases[0]); ++phase)
+		for (std::size_t phase = 0; phase < sizeof(instrumentedPhases) / sizeof(instrumentedPhases[0]); ++phase)
 		{
 			unsigned int finishedAt = 0;
 			{
-				rts::frame_timing::Scope timing(capture, rendererPhases[phase]);
+				rts::frame_timing::Scope timing(capture, instrumentedPhases[phase]);
 				timing.finish();
 				finishedAt = diagnosticClockCalls;
 				timing.finish();
@@ -444,8 +459,8 @@ void enabled(const std::string& directory, __int64 frequency)
 		}
 		capture.endFrame(1000); // Forces the headless periodic bucket without sleeping.
 		std::vector<Row> data = rows(directory);
-		check(data.size() == 38, "periodic flush writes existing phases and all twenty-three renderer phases before session ends");
-		if (data.size() == 38)
+		check(data.size() == 44, "periodic flush writes existing phases and all twenty-nine renderer/client phases before session ends");
+		if (data.size() == 44)
 		{
 			const Row& logic = data[1];
 			check(strcmp(logic.phase, "logic") == 0 && logic.samples == 20, "logic sample count");
@@ -469,7 +484,7 @@ void enabled(const std::string& directory, __int64 frequency)
 				data[13].samples == 1, "water track texture bind phase and sample count");
 			check(strcmp(data[14].phase, "water_track_module_render") == 0 &&
 				data[14].samples == 3, "water track module count and phase name");
-			const char *rendererNames[] = {
+			const char *instrumentedNames[] = {
 				"renderer_constant_pack", "renderer_constant_upload", "renderer_buffer_upload",
 				"renderer_draw_validation", "renderer_draw_submit", "renderer_buffer_shadow",
 				"renderer_scene_lights", "renderer_projected_shadows", "renderer_volume_shadows",
@@ -478,11 +493,13 @@ void enabled(const std::string& directory, __int64 frequency)
 				"renderer_projected_terrain", "renderer_projected_decal", "renderer_projected_flush",
 				"renderer_particle_prepare", "renderer_particle_submit",
 				"renderer_projected_scene_mesh_drain", "renderer_texture_owner_drain",
-				"renderer_texture_copy_publication"
+				"renderer_texture_copy_publication", "client_drawable_sweep",
+				"renderer_ww3d_sync", "renderer_w3d_view_update", "renderer_shroud_source_sync",
+				"renderer_scene_customized_render", "renderer_scene_flush"
 			};
-			for (std::size_t phase = 0; phase < sizeof(rendererNames) / sizeof(rendererNames[0]); ++phase)
-				check(strcmp(data[phase + 15].phase, rendererNames[phase]) == 0 &&
-					data[phase + 15].samples == 1, "renderer phase names and finished scopes emit exactly one sample");
+			for (std::size_t phase = 0; phase < sizeof(instrumentedNames) / sizeof(instrumentedNames[0]); ++phase)
+				check(strcmp(data[phase + 15].phase, instrumentedNames[phase]) == 0 &&
+					data[phase + 15].samples == 1, "instrumented phase names and finished scopes emit exactly one sample");
 		}
 		capture.beginFrame(1000);
 		capture.endFrame(1005);
@@ -490,7 +507,7 @@ void enabled(const std::string& directory, __int64 frequency)
 		capture.endFrame(0); // Game teardown can reset GameLogic before EndFrame.
 		capture.endSession();
 		data = rows(directory);
-		check(data.size() == 39 && data.back().frames == 5 &&
+		check(data.size() == 45 && data.back().frames == 5 &&
 			data.back().first == 1000 && data.back().last == 1005,
 			"session end preserves the final pre-reset frame range");
 		capture.beginSession("interactive");
@@ -499,7 +516,7 @@ void enabled(const std::string& directory, __int64 frequency)
 		// Destructor must retain this final partial bucket without endSession.
 	}
 	const std::vector<Row> data = rows(directory);
-	check(data.size() == 40 && data.back().session == 2 && data.back().frames == 1 &&
+	check(data.size() == 46 && data.back().session == 2 && data.back().frames == 1 &&
 		strcmp(data.back().mode, "interactive") == 0, "destructor/session reset retains only new frame counts");
 }
 

@@ -1684,6 +1684,276 @@ static void TestRenderedBattleDiagnosticContract()
 {
 	TestRenderedBattleDiagnosticSearch();
 	TestRenderedBattleDiagnosticLocalPlacement();
+
+	// Dense benchmark uses the same original 32 mixed units plus 32 infantry.
+	// Pure bounds/geometry tests do not qualify live terrain or actual FPS.
+	const char *benchmarkArgs[] = { "game", "-win", "-runRenderedBattleBenchmark", "1729" };
+	const char *benchmarkReason = nullptr;
+	CHECK(ValidateRenderedBattleDiagnosticArguments(4, benchmarkArgs, TRUE, &benchmarkReason));
+	CHECK(!ValidateRenderedBattleDiagnosticArguments(4, benchmarkArgs, FALSE, &benchmarkReason));
+	CHECK(strcmp(benchmarkReason, "unsupported_title") == 0);
+	const char *benchmarkInvalid[] = { "game", "-runRenderedBattleBenchmark", "0" };
+	CHECK(!ValidateRenderedBattleDiagnosticArguments(3, benchmarkInvalid, TRUE, &benchmarkReason));
+	const char *benchmarkMixed[] = { "game", "-runRenderedBattleBenchmark", "1729",
+		"-runRenderedBattleDiagnostic", "1730" };
+	CHECK(!ValidateRenderedBattleDiagnosticArguments(5, benchmarkMixed, TRUE, &benchmarkReason));
+	CHECK(strcmp(benchmarkReason, "duplicate_option") == 0);
+	const char *benchmarkConflicts[] = { "-noFPSLimit", "-headless", "-replay", "-noshaders", "-particleEdit" };
+	for (UnsignedInt index = 0; index < ARRAY_SIZE(benchmarkConflicts); ++index)
+	{
+		const char *before[] = { "game", benchmarkConflicts[index], "-runRenderedBattleBenchmark", "1729" };
+		const char *after[] = { "game", "-runRenderedBattleBenchmark", "1729", benchmarkConflicts[index] };
+		CHECK(!ValidateRenderedBattleDiagnosticArguments(4, before, TRUE, &benchmarkReason));
+		CHECK(!ValidateRenderedBattleDiagnosticArguments(4, after, TRUE, &benchmarkReason));
+	}
+	SkirmishAITestPlan benchmarkPlan;
+	BuildSkirmishAITestPlan(1729, SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK, &benchmarkPlan);
+	CHECK(strcmp(benchmarkPlan.mapName, "Maps\\Fortress Avalanche\\Fortress Avalanche.map") == 0);
+	for (Int slot = 0; slot < 8; ++slot)
+	{
+		CHECK(benchmarkPlan.slots[slot].teamNumber == (slot < 4 ? 0 : 1));
+		for (Int unit = 0; unit < 64; ++unit)
+		{
+			Coord3D dense, mirrored;
+			CHECK(GetRenderedBattleDiagnosticOffset(slot, unit, &dense, TRUE));
+			CHECK(GetRenderedBattleDiagnosticOffset((slot + 4) % 8, unit, &mirrored, TRUE));
+			CHECK(dense.x == -mirrored.x && dense.y == mirrored.y);
+			CHECK(dense.x >= -459.0f && dense.x <= 459.0f && dense.y >= -390.0f && dense.y <= 416.0f);
+			if (unit < 32)
+			{
+				Coord3D original;
+				CHECK(GetRenderedBattleDiagnosticOffset(slot, unit, &original));
+				CHECK(original.x == (slot < 4 ? -1.0f : 1.0f) * (95.0f + (unit % 8) * 44.0f));
+				CHECK(original.y == ((slot % 4) - 1.5f) * 200.0f + (unit / 8 - 1.5f) * 44.0f);
+				CHECK(strcmp(GetRenderedBattleDiagnosticObjectName(slot, unit),
+					GetRenderedBattleDiagnosticObjectName(slot, unit, TRUE)) == 0);
+			}
+			else CHECK(strcmp(GetRenderedBattleDiagnosticObjectName(slot, unit, TRUE),
+				GetRenderedBattleDiagnosticObjectName(slot, 2 + unit % 2)) == 0);
+			// Exhaust every nominal pair with conservative raw21 vehicle and
+			// raw10 infantry radii, including all adjacent player-band pairs.
+			const Real radius = unit < 32 && unit % 4 < 2 ? 21.0f : 10.0f;
+			for (Int earlierSlot = 0; earlierSlot <= slot; ++earlierSlot)
+				for (Int earlierUnit = 0; earlierUnit < 64; ++earlierUnit)
+				{
+					if (earlierSlot == slot && earlierUnit >= unit) break;
+					Coord3D earlier;
+					CHECK(GetRenderedBattleDiagnosticOffset(earlierSlot, earlierUnit, &earlier, TRUE));
+					const Real earlierRadius = earlierUnit < 32 && earlierUnit % 4 < 2 ? 21.0f : 10.0f;
+					CHECK(AreRenderedBattleDiagnosticPositionsSeparated(dense, radius, earlier, earlierRadius));
+				}
+		}
+	}
+	Coord3D unchanged = { 1.0f, 2.0f, 3.0f };
+	CHECK(GetRenderedBattleDiagnosticObjectName(0, 64, TRUE) == nullptr);
+	CHECK(!GetRenderedBattleDiagnosticOffset(0, 64, &unchanged, TRUE));
+	CHECK(unchanged.x == 1.0f && unchanged.y == 2.0f && unchanged.z == 3.0f);
+	CHECK(ValidateRenderedBattleBenchmarkNominalGeometry(21.0f, 10.0f));
+	CHECK(!ValidateRenderedBattleBenchmarkNominalGeometry(21.001f, 10.0f));
+	CHECK(!ValidateRenderedBattleBenchmarkNominalGeometry(21.0f, 21.001f));
+	CHECK(!ValidateRenderedBattleBenchmarkNominalGeometry(21.0f, 13.0f)); // mixed34->37 exceeds sqrt1352
+	CHECK(!ValidateRenderedBattleBenchmarkNominalGeometry(0.0f, 10.0f));
+	CHECK(!ValidateRenderedBattleBenchmarkNominalGeometry(21.0f, 0.0f));
+
+	// Reproduce the observed candidate55 trap: the extra infantry's only
+	// live-valid trial conflicts with the earlier vehicle nominal position.
+	// MRV reserves that infantry first and revises the unconstrained vehicle.
+	Coord3D domainPositions[512 * 9] = {};
+	Real domainRadii[512] = {};
+	UnsignedInt domainMasks[512] = {};
+	Int chosen[512], repeated[512];
+	for (Int index = 0; index < 512; ++index) chosen[index] = repeated[index] = -7;
+	domainPositions[0].x = 2580.5f; domainPositions[0].y = 434.0f;
+	domainPositions[1].x = 2602.5f; domainPositions[1].y = 456.0f;
+	domainPositions[9 + 8].x = 2576.5f; domainPositions[9 + 8].y = 430.0f;
+	domainRadii[0] = 15.811f; domainRadii[1] = 10.0f;
+	domainMasks[0] = 3u; domainMasks[1] = 1u << 8;
+	CHECK(!AreRenderedBattleDiagnosticPositionsSeparated(domainPositions[0], domainRadii[0],
+		domainPositions[17], domainRadii[1]));
+	RenderedBattleBenchmarkPlacementStats placementStats, repeatedStats;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
+	CHECK(chosen[0] == 1 && chosen[1] == 8 && chosen[2] == -7 && placementStats.maxAssigned == 2);
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, repeated, &repeatedStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
+	CHECK(repeated[0] == chosen[0] && repeated[1] == chosen[1]);
+	CHECK(memcmp(&placementStats, &repeatedStats, sizeof(placementStats)) == 0);
+	CHECK(domainMasks[0] == 3u && domainMasks[1] == (1u << 8)); // caller domains immutable
+
+	// A two-choice tie needs actual backtracking, not just constrained-first
+	// reordering: choosing A0 forces B1, which removes both C positions.
+	memset(domainPositions, 0, sizeof(domainPositions));
+	domainPositions[1].x = 100.0f; domainPositions[10].x = 200.0f;
+	domainPositions[18].x = 200.0f; domainPositions[19].x = 201.0f;
+	for (Int index = 0; index < 3; ++index) { domainRadii[index] = 1.0f; domainMasks[index] = 3u; }
+	CHECK(SolveRenderedBattleBenchmarkPlacement(3, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
+	CHECK(chosen[0] == 1 && chosen[1] == 0 && chosen[2] == 0 && placementStats.backtracks > 0);
+
+	for (Int index = 0; index < 512; ++index) chosen[index] = -7;
+	domainMasks[0] = domainMasks[1] = 1u; // coincident singletons: proven unsatisfiable
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_UNSATISFIABLE);
+	CHECK(placementStats.emptyDomains == 0 && placementStats.pairComparisons > 0);
+	CHECK(chosen[0] == -7 && chosen[1] == -7);
+	domainMasks[0] = 0;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		0, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_EMPTY_DOMAIN);
+	CHECK(placementStats.emptyDomains == 1 && placementStats.operations == 0);
+	domainMasks[1] = 0;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		0, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_EMPTY_DOMAIN);
+	CHECK(placementStats.emptyDomains == 2 && chosen[0] == -7 && chosen[1] == -7);
+	domainMasks[0] = domainMasks[1] = 1u;
+	for (Int budget = 0; budget < 5; ++budget)
+	{
+		CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+			budget, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED);
+		CHECK(placementStats.operations == budget && chosen[0] == -7 && chosen[1] == -7);
+	}
+	CHECK(SolveRenderedBattleBenchmarkPlacement(513, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_INVALID);
+	domainMasks[0] = 512u;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_INVALID);
+	domainMasks[0] = 1u; domainRadii[0] = 21.001f;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_INVALID);
+	CHECK(chosen[0] == -7 && chosen[1] == -7);
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, nullptr, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_INVALID);
+
+	// All 512 actual canonical indices, with the conservative nominal gate.
+	// A solver may plan in any order but must return the original roster order.
+	for (Int index = 0; index < 512; ++index)
+	{
+		const Int slot = index / 64, unit = index % 64;
+		domainRadii[index] = unit < 32 && unit % 4 < 2 ? 21.0f : 10.0f;
+		domainMasks[index] = 1u;
+		CHECK(GetRenderedBattleDiagnosticOffset(slot, unit, &domainPositions[index * 9], TRUE));
+	}
+	CHECK(SolveRenderedBattleBenchmarkPlacement(512, domainPositions, domainRadii, domainMasks,
+		RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
+	CHECK(placementStats.maxAssigned == 512 && placementStats.assignments == 512 &&
+		placementStats.pairComparisons == 130816 &&
+		placementStats.operations < RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS);
+	for (Int index = 0; index < 512; ++index)
+	{
+		CHECK(chosen[index] == 0);
+		for (Int earlier = 0; earlier < index; ++earlier)
+			CHECK(AreRenderedBattleDiagnosticPositionsSeparated(domainPositions[index * 9 + chosen[index]], domainRadii[index],
+				domainPositions[earlier * 9 + chosen[earlier]], domainRadii[earlier]));
+	}
+
+	// Full nine-position domains also retain every safe nominal position.
+	for (Int index = 0; index < 512; ++index)
+	{
+		domainMasks[index] = 511u;
+		for (Int trial = 0; trial < 9; ++trial)
+		{
+			Coord3D local;
+			CHECK(GetRenderedBattleDiagnosticOffset(index / 64, index % 64, &domainPositions[index * 9 + trial], TRUE));
+			CHECK(GetRenderedBattleDiagnosticLocalOffset(index / 64, trial, &local));
+			domainPositions[index * 9 + trial].x += local.x;
+			domainPositions[index * 9 + trial].y += local.y;
+		}
+	}
+	CHECK(SolveRenderedBattleBenchmarkPlacement(512, domainPositions, domainRadii, domainMasks,
+		RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
+	CHECK(placementStats.maxAssigned == 512 && placementStats.operations <= RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS);
+	for (Int index = 0; index < 512; ++index) CHECK(chosen[index] == 0);
+	const Int completedOperations = placementStats.operations;
+	for (Int index = 0; index < 512; ++index) chosen[index] = -7;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(512, domainPositions, domainRadii, domainMasks,
+		completedOperations - 1, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED);
+	CHECK(placementStats.operations == completedOperations - 1);
+	for (Int index = 0; index < 512; ++index) CHECK(chosen[index] == -7);
+
+	CHECK(RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS == 16000000 &&
+		RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS == 4000000);
+
+	CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, 1006.0f, 920.0f, TRUE) == 130);
+	CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, 1005.0f, 920.0f, TRUE) == 49);
+	CHECK(GetRenderedBattleDiagnosticSearchCount(0.0f, 0.0f, 1006.0f, 919.0f, TRUE) == 49);
+	Coord3D exact;
+	CHECK(GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 1006.0f, 920.0f, 129, &exact, TRUE));
+	CHECK(exact.x == 503.0f && exact.y == 460.0f);
+	for (Int grid = 0; grid < 81; ++grid)
+	{
+		Coord3D fit;
+		CHECK(GetRenderedBattleDiagnosticSearchCenter(0.0f, 0.0f, 1006.0f, 920.0f, 49 + grid, &fit, TRUE));
+		CHECK(fit.x == 503.0f && fit.y == 460.0f);
+		for (Int slot = 0; slot < 8; ++slot)
+			for (Int unit = 0; unit < 64; ++unit)
+				for (Int trial = 0; trial < 9; ++trial)
+				{
+					Coord3D nominal, local;
+					CHECK(GetRenderedBattleDiagnosticOffset(slot, unit, &nominal, TRUE));
+					CHECK(GetRenderedBattleDiagnosticLocalOffset(slot, trial, &local));
+					const Real x = fit.x + nominal.x + local.x, y = fit.y + nominal.y + local.y;
+					CHECK(x - 22.0f >= 0.0f && x + 22.0f <= 1006.0f);
+					CHECK(y - 22.0f >= 0.0f && y + 22.0f <= 920.0f);
+				}
+	}
+	Int denseCandidates[8] = { 0 }, densePrefixes[8] = { 0 }, denseCount = 0;
+	CHECK(RememberRenderedBattleDiagnosticArena(0, 511, denseCandidates, densePrefixes, &denseCount, TRUE));
+	CHECK(!RememberRenderedBattleDiagnosticArena(1, 512, denseCandidates, densePrefixes, &denseCount, TRUE));
+	CHECK(denseCount == 1 && densePrefixes[0] == 511);
+
+	// The placement permutation reserves every original unit before extras,
+	// while retaining canonical slot64 storage and exact original slot32 order.
+	Bool denseSeen[512] = { FALSE };
+	for (Int rank = 0; rank < 512; ++rank)
+	{
+		Int slot = -1, unit = -1;
+		CHECK(GetRenderedBattleDiagnosticPlacementUnit(rank, TRUE, &slot, &unit));
+		CHECK(slot >= 0 && slot < 8 && unit >= 0 && unit < 64);
+		const Int canonical = slot * 64 + unit;
+		CHECK(!denseSeen[canonical]);
+		denseSeen[canonical] = TRUE;
+		if (rank < 256)
+		{
+			CHECK(slot == rank / 32 && unit == rank % 32);
+			Int legacySlot = -1, legacyUnit = -1;
+			CHECK(GetRenderedBattleDiagnosticPlacementUnit(rank, FALSE, &legacySlot, &legacyUnit));
+			CHECK(legacySlot == slot && legacyUnit == unit);
+		}
+		else CHECK(unit >= 32);
+	}
+	for (Int canonical = 0; canonical < 512; ++canonical) CHECK(denseSeen[canonical]);
+	Int unchangedSlot = 9, unchangedUnit = 99;
+	CHECK(!GetRenderedBattleDiagnosticPlacementUnit(-1, TRUE, &unchangedSlot, &unchangedUnit));
+	CHECK(!GetRenderedBattleDiagnosticPlacementUnit(512, TRUE, &unchangedSlot, &unchangedUnit));
+	CHECK(!GetRenderedBattleDiagnosticPlacementUnit(256, FALSE, &unchangedSlot, &unchangedUnit));
+	CHECK(!GetRenderedBattleDiagnosticPlacementUnit(0, TRUE, nullptr, &unchangedUnit));
+	CHECK(!GetRenderedBattleDiagnosticPlacementUnit(0, TRUE, &unchangedSlot, nullptr));
+	CHECK(unchangedSlot == 9 && unchangedUnit == 99);
+	// Failed live v1 collided at canonical index472 (slot7 unit24), then
+	// slot7 unit25. Both now reserve positions before the first extra infantry.
+	Int orderedSlot = -1, orderedUnit = -1;
+	CHECK(GetRenderedBattleDiagnosticPlacementUnit(248, TRUE, &orderedSlot, &orderedUnit));
+	CHECK(orderedSlot == 7 && orderedUnit == 24 && orderedSlot * 64 + orderedUnit == 472);
+	CHECK(GetRenderedBattleDiagnosticPlacementUnit(249, TRUE, &orderedSlot, &orderedUnit));
+	CHECK(orderedSlot == 7 && orderedUnit == 25);
+	CHECK(GetRenderedBattleDiagnosticPlacementUnit(256, TRUE, &orderedSlot, &orderedUnit));
+	CHECK(orderedSlot == 0 && orderedUnit == 32);
+	// Production fast-mode guard covers all engine compile-policy combinations.
+	for (Int fast = 0; fast < 2; ++fast)
+		for (Int replay = 0; replay < 2; ++replay)
+		{
+			CHECK(IsRenderedBattleBenchmarkFastModeActive(fast != 0, replay != 0, TRUE) == (fast != 0));
+			CHECK(IsRenderedBattleBenchmarkFastModeActive(fast != 0, replay != 0, FALSE) == (fast != 0 && replay != 0));
+		}
+
+#if RTS_ZEROHOUR
+	CommandLineData denseCommand;
+	CHECK(!denseCommand.isRenderedBattleBenchmark());
+	CHECK(denseCommand.requestRenderedBattleDiagnostic(1729, TRUE));
+	CHECK(denseCommand.isRenderedBattleBenchmark() && denseCommand.hasRenderedBattleDiagnosticRequest());
+	CHECK(!denseCommand.requestRenderedBattleDiagnostic(1730));
+	CHECK(denseCommand.isRenderedBattleBenchmark() && denseCommand.getRenderedBattleDiagnosticSeed() == 1729);
+#endif
+
 	char report[8] = "";
 	UnsignedInt used = 0;
 	CHECK(AppendRenderedBattleDiagnosticReportRecord(report, sizeof(report), &used, "abc\n", 4));

@@ -50,7 +50,8 @@ differences with separation less than 2^31 ms; do not interpret raw subtraction
 across wrap as a large delay. Skipped samples have no tick row, so skip counters
 also describe missing wall coverage. See [Microsoft GetTickCount documentation](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount).
 
-The CSV has 26 columns. owner_begin_tick_ms follows gpu_elapsed_not_busy;
+The CSV has 29 columns. owner_begin_tick_ms follows gpu_elapsed_not_busy;
+present_start_qpc, present_end_qpc, and cpu_qpc_frequency follow that tick;
 count is always last. Frame rows leave count empty. Summary rows use status
 for the numeric field name and count for its value, leaving frame columns empty.
 Epoch zero identifies collector-wide counters. Positive device_epoch identifies
@@ -63,6 +64,29 @@ settings. device_debug_layer reflects the device's actual creation flags.
 Require adapter_identity_valid=1 before interpreting hardware versus software;
 a missing identity never proves hardware rendering. Keep GPU-enabled captures
 separate from Main/Owner/Off telemetry modes unless independently matched.
+
+The three Present clock fields retain the existing CPU clock readings around
+DXGI Present and the frequency already used for cpu_present_ms. They add no
+clock calls. New retained/unpresented records start with zero fields; a failed clock or
+frequency read remains zero, not a valid fast timing. Require present_called=1,
+both ticks positive, end >= start, and cpu_qpc_frequency > 0 before interpreting
+that interval. Equal positive ticks are a valid zero-duration interval.
+cpu_present_ms remains -1 when the clock interval cannot be calculated.
+Retained ticks survive GPU query loss and a failed Present result; validate
+presentation success independently of timing availability.
+
+For a qualified visible-window workload, present_called=1 and present_hresult=0
+count retained S_OK native Present calls, even when GPU query status is not
+complete. These are submitted presentations, not scanned-out/displayed frames.
+With matching positive frequencies, consecutive valid present_end_qpc values
+give exact CPU-side Present-completion cadence; present_start_qpc values give
+call-start cadence. Use 1000 * tick_difference / cpu_qpc_frequency for
+milliseconds. Windowed combat throughput is the count of qualifying completion
+ticks in an externally delimited QPC interval divided by its wall seconds.
+Reject nonmonotonic ticks, failed/occluded calls, and invalid windows rather than
+presenting them as normal visible throughput. QPC permits wall-time alignment
+to a pipeline trace using the same clock, but provides no exact threaded-sequence
+or GPU-ordinal association.
 
 Frame rows retain actual scene sample count, width/height, gamma, brightness,
 contrast, gamma limit setting, whether gamma processing ran, swap interval,
@@ -105,6 +129,11 @@ failure increments allocation_failures and leaves later frames
 skipped_unavailable. A query read failure increments readiness_failures,
 drops pending rows, and disables collection until a subsequent resize/device
 attachment recreates the query pool. These failures never become render errors.
+Skipped begins have no Present clock row even when the game subsequently calls
+Present. A published CSV with nonzero skipped_full, skipped_cap, or
+skipped_unavailable cannot prove complete Present totals. Preserve those counts
+and capture-window coverage alongside throughput; the precise clock fields do
+not repair missing records.
 
 An ordinary cancellation ends its disjoint query and keeps the slot pending
 until its result is ready; in-flight query objects are not immediately reused.
@@ -135,6 +164,9 @@ rows, unsampled ring-full frames, fixed capacity, readiness deferral and polling
 disjoint/invalid data, allocation/readiness failures, cancellation, resize,
 device epochs, shutdown loss, and failed presentation followed immediately by
 every query-loss lifecycle. It also tests owner-tick retention/wrap arithmetic,
+Present clock retention without extra calls, exact start/end cadence, missing
+and backward clocks versus valid equal ticks, skipped-frame clock absence,
+29-column schema order with count last,
 device-identity retention/failure/cap, and the production exporter decisions via
 a recording output seam that injects open/header/frame/summary/stream/flush/
 close/publication failures. This is not a duplicate exporter algorithm.

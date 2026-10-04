@@ -77,7 +77,7 @@ extern const FrustumClass *shadowCameraFrustum;	//defined in W3DShadow.
 // when the change in angle from the object to the light source
 // (represented in degrees in the first number below)
 // is large enough the shadow info will be reconstructed
-const Real cosAngleToCare = cos ((0.2 * PI) / 180.0);	//1.5 degree difference
+const Real cosAngleToCare = cos ((0.2 * PI) / 180.0);	//0.2 degree difference
 #define MAX_SILHOUETTE_EDGES	1024	//maximum number of shadov volume sides or edges in silhoutte
 #define	SHADOW_EXTRUSION_BUFFER	0.1f		//amount to extend shadow volume beyond what's required to hit ground.
 #define AIRBORNE_UNIT_GROUND_DELTA 2.0f
@@ -1431,7 +1431,7 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowVertsInBuf,
 		SHADOW_VERTEX_SIZE, numVerts))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
-		if (!shadowVertexBufferOwner->Lock_Buffer(0,
+		if (!rts::render::Lock_W3D_Buffer_For_Full_Overwrite(shadowVertexBufferOwner, 0,
 			numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvVertices)))
 		{
@@ -1442,7 +1442,7 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 		nShadowStartBatchVertex=0;
 	}
 	else
-	{	if (!shadowVertexBufferOwner->Lock_Buffer(
+	{	if (!rts::render::Lock_W3D_Buffer_For_Full_Overwrite(shadowVertexBufferOwner,
 			static_cast<size_t>(nShadowVertsInBuf) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			static_cast<size_t>(numVerts) * sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvVertices)))
@@ -1483,7 +1483,7 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowIndicesInBuf,
 		SHADOW_INDEX_SIZE, numIndex))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
-		if (!shadowIndexBufferOwner->Lock_Buffer(0,
+		if (!rts::render::Lock_W3D_Buffer_For_Full_Overwrite(shadowIndexBufferOwner, 0,
 			static_cast<size_t>(numIndex) * sizeof(short),
 			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvIndices)))
 		{
@@ -1494,7 +1494,7 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 		nShadowStartBatchIndex=0;
 	}
 	else
-	{	if (!shadowIndexBufferOwner->Lock_Buffer(
+	{	if (!rts::render::Lock_W3D_Buffer_For_Full_Overwrite(shadowIndexBufferOwner,
 			static_cast<size_t>(nShadowIndicesInBuf) * sizeof(short),
 			static_cast<size_t>(numIndex) * sizeof(short),
 			NATIVE_BUFFER_LOCK_NO_OVERWRITE, reinterpret_cast<void **>(&pvIndices)))
@@ -2050,7 +2050,8 @@ void W3DVolumetricShadow::updateMeshVolume(Int meshIndex, Int lightIndex, const 
 	Vector3 vb = (Vector3 &)objectToWorld[0];
 	va.Normalize();
 	vb.Normalize();
-	Real cosAngle = WWMath::Fabs(Vector3::Dot_Product(va,vb));
+	// Opposite axes change the light-relative extrusion, even for symmetric meshes.
+	Real cosAngle = Vector3::Dot_Product(va,vb);
 
 	if (cosAngle >= cosAngleToCare)
 	{
@@ -2059,7 +2060,7 @@ void W3DVolumetricShadow::updateMeshVolume(Int meshIndex, Int lightIndex, const 
 		vb = (Vector3 &)objectToWorld[1];
 		va.Normalize();
 		vb.Normalize();
-		cosAngle = WWMath::Fabs(Vector3::Dot_Product(va,vb));
+		cosAngle = Vector3::Dot_Product(va,vb);
 
 		if (cosAngle >= cosAngleToCare)
 		{
@@ -2067,7 +2068,7 @@ void W3DVolumetricShadow::updateMeshVolume(Int meshIndex, Int lightIndex, const 
 			vb = (Vector3 &)objectToWorld[2];
 			va.Normalize();
 			vb.Normalize();
-			cosAngle = WWMath::Fabs(Vector3::Dot_Product(va,vb));
+			cosAngle = Vector3::Dot_Product(va,vb);
 			if (cosAngle < cosAngleToCare)
 				isMeshRotating=true;
 		}
@@ -2086,12 +2087,13 @@ void W3DVolumetricShadow::updateMeshVolume(Int meshIndex, Int lightIndex, const 
 #else
 	//When dealing with infinite light sources, we can assume that the shadow doesn't
 	//change much based on object position.  Only the orientation to light matters.
-	Real cosAngle = fabs (Vector3::Dot_Product((Vector3 &)(prevXForm->operator [](0)),(Vector3 &)(objectToWorld.operator [](0))));
+	// Opposite axes change the light-relative extrusion, even for symmetric meshes.
+	Real cosAngle = Vector3::Dot_Product((Vector3 &)(prevXForm->operator [](0)),(Vector3 &)(objectToWorld.operator [](0)));
 	if (cosAngle >= cosAngleToCare)
-	{	cosAngle = fabs (Vector3::Dot_Product((Vector3 &)(prevXForm->operator [](1)),(Vector3 &)(objectToWorld.operator [](1))));
+	{	cosAngle = Vector3::Dot_Product((Vector3 &)(prevXForm->operator [](1)),(Vector3 &)(objectToWorld.operator [](1)));
 		if (cosAngle >= cosAngleToCare)
 		{
-			cosAngle = fabs (Vector3::Dot_Product((Vector3 &)(prevXForm->operator [](2)),(Vector3 &)(objectToWorld.operator [](2))));
+			cosAngle = Vector3::Dot_Product((Vector3 &)(prevXForm->operator [](2)),(Vector3 &)(objectToWorld.operator [](2)));
 			if (cosAngle < cosAngleToCare)
 				isMeshRotating=true;
 		}

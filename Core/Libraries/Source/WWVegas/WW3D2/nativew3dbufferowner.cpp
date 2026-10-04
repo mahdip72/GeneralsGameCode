@@ -308,6 +308,18 @@ RenderResult NativeW3DBufferOwner::RecreateForDiscard()
 RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 	size_t byteCount, RenderBufferUpdateMode mode, void **data)
 {
+	return LockImpl(destinationOffset, byteCount, mode, data, false);
+}
+
+RenderResult NativeW3DBufferOwner::LockForFullOverwrite(size_t destinationOffset,
+	size_t byteCount, RenderBufferUpdateMode mode, void **data)
+{
+	return LockImpl(destinationOffset, byteCount, mode, data, true);
+}
+
+RenderResult NativeW3DBufferOwner::LockImpl(size_t destinationOffset,
+	size_t byteCount, RenderBufferUpdateMode mode, void **data, bool fullOverwrite)
+{
 	NativeGameRenderOwnerScope ownerScope;
 	if (data == 0)
 	{
@@ -370,16 +382,19 @@ RenderResult NativeW3DBufferOwner::Lock(size_t destinationOffset,
 		// authoritative shadow before a write has been accepted.
 		memset(m_authoritative, 0, m_authoritativeBytes);
 	}
-	if (mode != RENDER_BUFFER_UPDATE_DISCARD && m_authoritative != 0 &&
-		m_authoritativeBytes == m_descriptor.byteCount)
+	if (!fullOverwrite)
 	{
-		// This complete authoritative copy initializes the requested range;
-		// clearing it first only writes the same staging bytes twice.
-		memcpy(m_staging, m_authoritative + destinationOffset, byteCount);
-	}
-	else
-	{
-		memset(m_staging, 0, byteCount);
+		if (mode != RENDER_BUFFER_UPDATE_DISCARD && m_authoritative != 0 &&
+			m_authoritativeBytes == m_descriptor.byteCount)
+		{
+			// This complete authoritative copy initializes the requested range;
+			// clearing it first only writes the same staging bytes twice.
+			memcpy(m_staging, m_authoritative + destinationOffset, byteCount);
+		}
+		else
+		{
+			memset(m_staging, 0, byteCount);
+		}
 	}
 	m_lockOffset = destinationOffset;
 	m_lockBytes = byteCount;

@@ -35,6 +35,7 @@
 #include "Common/ActionManager.h"
 #include "Common/GameEngine.h"
 #include "Common/GameThreadOwnership.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "Common/GameState.h"
 #include "Common/GameUtility.h"
 #include "Common/GlobalData.h"
@@ -542,6 +543,9 @@ void GameClient::update()
 			delete m_intro;
 			m_intro = nullptr;
 
+			if (IsSkirmishAITestRunnerArmed() && !TheGlobalData->m_headless)
+				TheWritableGlobalData->m_breakTheMovie = FALSE;
+
 			if (!IsSkirmishAITestRunnerArmed()
 #if RTS_ZEROHOUR
 				&& !IsSkirmishAILegacySaveTestActive()
@@ -654,6 +658,7 @@ void GameClient::update()
 
 
 		// call the update for all client drawables
+		rts::frame_timing::Scope drawableSweepTiming(rts::frame_timing::ClientDrawableSweep);
 		Drawable* draw = firstDrawable();
 		while (draw)
 		{	// update() could free the Drawable, so go ahead and grab 'next'

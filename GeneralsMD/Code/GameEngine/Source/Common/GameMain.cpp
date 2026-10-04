@@ -141,6 +141,8 @@ Int GameMain()
 		if (TheGlobalData->m_commandLineData.hasRenderedBattleDiagnosticRequest())
 			ArmSkirmishAITestRunner(
 				TheGlobalData->m_commandLineData.getRenderedBattleDiagnosticSeed(),
+				TheGlobalData->m_commandLineData.isRenderedBattleBenchmark() ?
+				SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK :
 				SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC);
 		else if (TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest())
 			ArmSkirmishAIRecoveryFixtureRunner(

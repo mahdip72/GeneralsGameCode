@@ -22,13 +22,15 @@ struct RecordingState
 {
 	RecordingState() : creates(0), releases(0), begins(0), ends(0), reads(0), clocks(0), failCreate(0), tickCalls(0), ownerTickMs(0xfffffff0U),
 		failRead(false), ready(true), disjoint(false),
-		frequency(1000), timestamp(100), cpuTick(100), unsafeUse(false), metadataCalls(0), metadataValid(true) {}
+		frequency(1000), timestamp(100), cpuTick(100), cpuStep(50), cpuFrequencyValue(1000), failClockCall(0), cpuFrequencies(0),
+		unsafeUse(false), metadataCalls(0), metadataValid(true) {}
 	~RecordingState() { for (size_t index = 0; index < queries.size(); ++index) delete queries[index]; }
 	unsigned int creates, releases, begins, ends, reads, clocks, failCreate;
 	unsigned int tickCalls;
 	uint32_t ownerTickMs;
 	bool failRead, ready, disjoint;
-	uint64_t frequency, timestamp, cpuTick;
+	uint64_t frequency, timestamp, cpuTick, cpuStep, cpuFrequencyValue;
+	unsigned int failClockCall, cpuFrequencies;
 	bool unsafeUse;
 	unsigned int metadataCalls;
 	bool metadataValid;
@@ -74,8 +76,8 @@ struct RecordingDriver
 		value = query->value;
 		return state->failRead ? GpuTimingReadFailed : (state->ready ? GpuTimingReady : GpuTimingNotReady);
 	}
-	uint64_t clock() { ++state->clocks; state->cpuTick += 50; return state->cpuTick; }
-	uint64_t cpuFrequency() { return 1000; }
+	uint64_t clock() { ++state->clocks; state->cpuTick += state->cpuStep; return state->clocks == state->failClockCall ? 0 : state->cpuTick; }
+	uint64_t cpuFrequency() { ++state->cpuFrequencies; return state->cpuFrequencyValue; }
 	uint32_t ownerTick() { ++state->tickCalls; return state->ownerTickMs; }
 	GpuTimingDeviceInfo deviceInfo()
 	{
@@ -109,7 +111,7 @@ int DisabledAndIntervals()
 	Capture capture;
 	capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture);
 	capture.markReadback(); capture.poll(); capture.resize(); capture.release(GpuTimingShutdownPending);
-	int result = Check(state.creates == 0 && state.reads == 0 && state.ends == 0 && state.clocks == 0 && state.tickCalls == 0 && state.metadataCalls == 0 && capture.recordCount() == 0,
+	int result = Check(state.creates == 0 && state.reads == 0 && state.ends == 0 && state.clocks == 0 && state.cpuFrequencies == 0 && state.tickCalls == 0 && state.metadataCalls == 0 && capture.recordCount() == 0,
 		"disabled allocates no queries and calls no GPU or clocks");
 	capture.enable(); capture.attach(RecordingDriver(&state));
 	result |= Check(state.creates == Capture::SlotCount * (Capture::StampCount + 1), "fixed query pool allocated once");
@@ -124,11 +126,48 @@ int DisabledAndIntervals()
 	result |= Check(fabs(row.totalMs - 300.0) < 0.001 && fabs(row.sceneMs - 100.0) < 0.001 &&
 		fabs(row.resolveMs - 100.0) < 0.001 && fabs(row.gammaMs - 100.0) < 0.001 && fabs(row.cpuPresentMs - 50.0) < 0.001,
 		"four timestamps partition GPU elapsed work with separate CPU Present");
+	result |= Check(row.presentStartQpc == 150 && row.presentEndQpc == 200 && row.cpuQpcFrequency == 1000 &&
+		state.clocks == 2 && state.cpuFrequencies == 1,
+		"Present retains existing clock ticks and frequency without additional calls");
 	const unsigned int clocks = state.clocks;
 	capture.beforePresent(); capture.cpuPresentEnd(capture.cpuPresentStart(), -1);
 	result |= Check(state.clocks == clocks && row.status == GpuTimingComplete,
 		"Present without sampled begin cannot mutate the previous row");
 	return result | Check(!state.unsafeUse, "queries read only when ended and live");
+}
+int PresentClockValidation()
+{
+	int result = 0;
+	for (unsigned int invalid = 0; invalid < 5; ++invalid)
+	{
+		RecordingState state;
+		if (invalid < 2) state.failClockCall = invalid + 1;
+		if (invalid == 2) state.cpuFrequencyValue = 0;
+		if (invalid == 4) state.cpuStep = 0;
+		Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+		capture.begin(Info());
+		result |= Check(capture.record(0).presentStartQpc == 0 && capture.record(0).presentEndQpc == 0 &&
+			capture.record(0).cpuQpcFrequency == 0, "unpresented record starts with missing clock fields");
+		capture.beforeResolve(Info()); capture.afterResolve(); capture.beforePresent();
+		const uint64_t start = capture.cpuPresentStart();
+		if (invalid == 3) state.cpuTick = 1;
+		capture.cpuPresentEnd(start, 0);
+		const GpuTimingRecord& row = capture.record(0);
+		result |= Check(row.presentCalled && row.presentStartQpc == start && row.presentEndQpc == (invalid == 1 ? 0 : state.cpuTick) &&
+			row.cpuQpcFrequency == state.cpuFrequencyValue && state.clocks == 2 && state.cpuFrequencies == 1,
+			"missing or backward clocks retain raw evidence without extra sampling");
+		result |= Check(row.cpuPresentMs == (invalid == 4 ? 0.0 : -1.0),
+			"valid equal ticks are zero duration; invalid clock evidence is not a fast sample");
+	}
+	RecordingState state;
+	Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+	capture.begin(Info()); Present(capture); capture.poll();
+	capture.begin(Info()); Present(capture); capture.poll();
+	result |= Check(capture.record(1).presentStartQpc - capture.record(0).presentStartQpc == 100 &&
+		capture.record(1).presentEndQpc - capture.record(0).presentEndQpc == 100 &&
+		state.clocks == 4 && state.cpuFrequencies == 2,
+		"successive retained Presents expose exact start and end cadence");
+	return result;
 }
 int ReadbackBoundaryAssociation()
 {
@@ -177,12 +216,15 @@ int FullRingAndBudget()
 		capture.begin(Info()); Present(capture);
 		result |= Check(state.reads - reads <= Capture::PollBudget, "begin observes fixed read budget");
 	}
-	const unsigned int creates = state.creates, ends = state.ends;
+	const unsigned int creates = state.creates, ends = state.ends, clocks = state.clocks, frequencies = state.cpuFrequencies;
 	capture.begin(Info()); Present(capture);
 	result |= Check(capture.recordCount() == Capture::SlotCount && capture.counters().skippedFull == 1 &&
 		capture.counters().pending == Capture::SlotCount && state.creates == creates && state.ends == ends,
 		"full ring skips without allocation, query reuse or wait");
 	result |= Check(state.tickCalls == Capture::SlotCount, "ring-full skips do not query owner tick");
+	result |= Check(state.clocks == clocks && state.cpuFrequencies == frequencies &&
+		capture.counters().framesBegun > capture.recordCount(),
+		"unsampled ring-full Present has no clock row and cannot prove complete Present totals");
 	for (unsigned int index = 0; index < state.queries.size(); ++index)
 		result |= Check(state.queries[index]->ends == 1, "not-ready queries never reissued");
 	state.ready = true;
@@ -289,6 +331,8 @@ int FailedPresentThenLoss()
 		result |= Check(capture.record(0).status == GpuTimingPresentFailed && capture.record(0).presentResult == -1 &&
 			capture.record(0).totalMs == -1.0 && capture.counters().complete == 0 && capture.counters().pending == 0,
 			"known Present failure survives immediate unresolved-query loss");
+		result |= Check(capture.record(0).presentStartQpc == 150 && capture.record(0).presentEndQpc == 200 &&
+			capture.record(0).cpuQpcFrequency == 1000, "Present clock evidence survives unresolved-query loss");
 		const GpuTimingCounters& counts = capture.counters();
 		result |= Check((loss != 0 || counts.resizeDropped == 1) && (loss != 1 || counts.deviceDropped == 1) &&
 			(loss != 2 || counts.shutdownPending == 1) && (loss != 3 || (counts.readinessFailures == 1 && counts.invalid == 1)),
@@ -300,11 +344,13 @@ struct RecordingOutput
 {
 	enum Failure { None, Open, Header, Frame, Summary, Stream, Flush, Close, Publish };
 	explicit RecordingOutput(Failure failure) : failure(failure), closeCalls(0), publishCalls(0), frameCalls(0),
-		pending(false), finalFile(false), footer(false), rowStatus(GpuTimingOpen), rowTick(0), metadataRows(0), identityEpoch(0), identityValid(0) {}
+		pending(false), finalFile(false), footer(false), rowStatus(GpuTimingOpen), rowTick(0), rowStart(0), rowEnd(0), rowFrequency(0),
+		metadataRows(0), identityEpoch(0), identityValid(0) {}
 	bool open() { pending = failure != Open; return failure != Open; }
 	bool header() { return failure != Header; }
 	bool frame(const GpuTimingRecord& row)
-	{ ++frameCalls; rowStatus = row.status; rowTick = row.ownerBeginTickMs; return failure != Frame; }
+	{ ++frameCalls; rowStatus = row.status; rowTick = row.ownerBeginTickMs;
+		rowStart = row.presentStartQpc; rowEnd = row.presentEndQpc; rowFrequency = row.cpuQpcFrequency; return failure != Frame; }
 	bool summary(const char *name, uint64_t value, uint64_t epoch = 0)
 	{
 		if (failure == Summary) return false;
@@ -327,6 +373,7 @@ struct RecordingOutput
 	bool pending, finalFile, footer;
 	GpuTimingStatus rowStatus;
 	uint32_t rowTick;
+	uint64_t rowStart, rowEnd, rowFrequency;
 	unsigned int metadataRows;
 	uint64_t identityEpoch, identityValid;
 };
@@ -336,8 +383,9 @@ int CheckedExport()
 	const char *header = GpuTimingCsvHeader();
 	unsigned int columns = 1;
 	for (const char *cursor = header; *cursor != 0; ++cursor) if (*cursor == ',') ++columns;
-	result |= Check(columns == GpuTimingCsvColumns && strstr(header, ",owner_begin_tick_ms,count\n") != 0,
-		"production header includes owner tick with count as final column");
+	result |= Check(columns == 29 && columns == GpuTimingCsvColumns &&
+		strstr(header, ",owner_begin_tick_ms,present_start_qpc,present_end_qpc,cpu_qpc_frequency,count\n") != 0,
+		"production 29-column header appends precise Present clocks before final count");
 	for (unsigned int failure = RecordingOutput::None; failure <= RecordingOutput::Publish; ++failure)
 	{
 		RecordingState state;
@@ -354,6 +402,7 @@ int CheckedExport()
 		if (failure == RecordingOutput::None)
 			result |= Check(output.finalFile && !output.pending && output.footer && output.frameCalls == 1 &&
 				output.rowStatus == GpuTimingUnpresented && output.rowTick == 0xfffffff0U &&
+				output.rowStart == 0 && output.rowEnd == 0 && output.rowFrequency == 0 &&
 				output.metadataRows == 8 && output.identityEpoch == 1 && output.identityValid == 1,
 				"export retains cancelled sample status and original owner tick");
 		else
@@ -363,6 +412,12 @@ int CheckedExport()
 			result |= Check(output.footer && output.pending && !output.finalFile,
 				"footer alone does not publish a close- or rename-failed pending export");
 	}
+	RecordingState state;
+	Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
+	capture.begin(Info()); Present(capture); capture.poll(); capture.release(GpuTimingShutdownPending);
+	RecordingOutput output(RecordingOutput::None);
+	result |= Check(ExportGpuTimingCapture(capture, output) && output.rowStart == 150 && output.rowEnd == 200 &&
+		output.rowFrequency == 1000, "production exporter passes precise Present clock evidence unchanged");
 	return result;
 }
 int DeviceIdentityBounds()
@@ -391,19 +446,20 @@ int RecordCap()
 	RecordingState state;
 	Capture capture; capture.enable(); capture.attach(RecordingDriver(&state));
 	for (unsigned int index = 0; index < Capture::RecordCapacity; ++index) { capture.begin(Info()); Present(capture); }
-	const unsigned int creates = state.creates;
+	const unsigned int creates = state.creates, clocks = state.clocks, frequencies = state.cpuFrequencies;
 	capture.begin(Info()); Present(capture);
 	const unsigned int ends = state.ends;
 	capture.begin(Info()); Present(capture);
 	return Check(capture.recordCount() == Capture::RecordCapacity && capture.counters().skippedCap == 2 &&
 		capture.counters().framesBegun == Capture::RecordCapacity + 2 && capture.counters().complete == Capture::RecordCapacity &&
-		state.creates == creates && state.ends == ends && state.tickCalls == Capture::RecordCapacity && !state.unsafeUse,
+		state.creates == creates && state.ends == ends && state.clocks == clocks && state.cpuFrequencies == frequencies &&
+		state.tickCalls == Capture::RecordCapacity && !state.unsafeUse,
 		"record cap retains old evidence and accounts for every dropped frame");
 }
 }
 int main()
 {
-	int result = DisabledAndIntervals(); result |= ReadbackBoundaryAssociation();
+	int result = DisabledAndIntervals(); result |= PresentClockValidation(); result |= ReadbackBoundaryAssociation();
 	result |= FullRingAndBudget(); result |= CancelAndLifecycle();
 	result |= InvalidAndFailure(); result |= RecordCap();
 	result |= FailedPresentThenLoss(); result |= CheckedExport(); result |= DeviceIdentityBounds();

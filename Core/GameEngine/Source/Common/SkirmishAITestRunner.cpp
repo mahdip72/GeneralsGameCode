@@ -11,6 +11,7 @@
 #include "PreRTS.h"
 
 #include "Common/GameEngine.h"
+#include "Common/FramePacer.h"
 #include "Common/GlobalData.h"
 #include "Common/BuildAssistant.h"
 #include "Common/GameState.h"
@@ -60,7 +61,6 @@
 #include "Lib/PhysicsIntegrationKernel.h"
 #include <memory>
 #include <new>
-#include <vector>
 #endif
 
 #include <errno.h>
@@ -71,6 +71,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 #if defined(_WIN32)
 #include <io.h>
 #endif
@@ -2295,6 +2296,8 @@ const char *SkirmishAITestScenarioName(SkirmishAITestScenario scenario)
 		return "practical-1v7";
 	if (scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC)
 		return "rendered-battle-diagnostic";
+	if (scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK)
+		return "rendered-battle-benchmark";
 	if (IsSkirmishAITestHardAI2v6(scenario))
 		return "hard-ai-2v6";
 	return "4v3";
@@ -3668,7 +3671,8 @@ Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv
 	if (reason) *reason = nullptr;
 	Int requests = 0;
 	for (Int i = 1; argv && i < argc; ++i)
-		if (argv[i] && stricmp(argv[i], "-runRenderedBattleDiagnostic") == 0)
+		if (argv[i] && (stricmp(argv[i], "-runRenderedBattleDiagnostic") == 0 ||
+			stricmp(argv[i], "-runRenderedBattleBenchmark") == 0))
 			++requests;
 	if (requests == 0) return TRUE;
 	const char *error = !supported ? "unsupported_title" :
@@ -3676,7 +3680,8 @@ Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv
 	for (Int i = 1; !error && i < argc; ++i)
 	{
 		if (!argv[i]) { error = "invalid_arguments"; break; }
-		if (stricmp(argv[i], "-runRenderedBattleDiagnostic") == 0)
+		if (stricmp(argv[i], "-runRenderedBattleDiagnostic") == 0 ||
+			stricmp(argv[i], "-runRenderedBattleBenchmark") == 0)
 		{
 			Int seed = 0;
 			if (i + 1 >= argc || !TryParseSkirmishAITestSeed(argv[i + 1], &seed))
@@ -3707,7 +3712,7 @@ const char *GetRenderedBattleDiagnosticFactionName(Int slot)
 	return slot >= 0 && slot < SKIRMISH_AI_TEST_SLOT_COUNT ? names[slot % 4] : nullptr;
 }
 
-const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit)
+const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit, Bool benchmark)
 {
 	static const char *names[3][4] = {
 		{ "AmericaTankCrusader", "AmericaVehicleHumvee", "AmericaInfantryRanger", "AmericaInfantryMissileDefender" },
@@ -3715,14 +3720,29 @@ const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit)
 		{ "GLATankScorpion", "GLAVehicleTechnical", "GLAInfantryRebel", "GLAInfantryTunnelDefender" }
 	};
 	if (slot < 0 || slot >= SKIRMISH_AI_TEST_SLOT_COUNT ||
-		unit < 0 || unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER) return nullptr;
+		unit < 0 || unit >= (benchmark ? RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER :
+		RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER)) return nullptr;
 	const Int faction = slot % 4 == 3 ? 0 : slot % 4;
-	return names[faction][unit % 4];
+	return names[faction][unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER ?
+		2 + unit % 2 : unit % 4];
 }
 
-Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset)
+Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset, Bool benchmark)
 {
-	if (!offset || !GetRenderedBattleDiagnosticObjectName(slot, unit)) return FALSE;
+	if (!offset || !GetRenderedBattleDiagnosticObjectName(slot, unit, benchmark)) return FALSE;
+	if (benchmark)
+	{
+		// 52 spacing admits raw21 vehicles / raw10 infantry with +3 clearance.
+		// Diagonal26 infantry shifts need208 player bands to retain that gap.
+		const Bool extra = unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+		const Int withinGroup = unit % RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+		offset->x = (slot < 4 ? -1.0f : 1.0f) * (95.0f +
+			(withinGroup % 8) * RENDERED_BATTLE_BENCHMARK_GRID_STEP - (extra ? 26.0f : 0.0f));
+		offset->y = ((slot % 4) - 1.5f) * RENDERED_BATTLE_BENCHMARK_BAND_STEP +
+			(withinGroup / 8 - 1.5f) * RENDERED_BATTLE_BENCHMARK_GRID_STEP + (extra ? 26.0f : 0.0f);
+		offset->z = 0.0f;
+		return TRUE;
+	}
 	// Two mirrored fronts, 44-unit spacing, four non-overlapping player bands.
 	offset->x = (slot < 4 ? -1.0f : 1.0f) * (95.0f + (unit % 8) * 44.0f);
 	offset->y = ((slot % 4) - 1.5f) * 200.0f + (unit / 8 - 1.5f) * 44.0f;
@@ -3730,7 +3750,24 @@ Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset)
 	return TRUE;
 }
 
-Int GetRenderedBattleDiagnosticSearchCount(Real loX, Real loY, Real hiX, Real hiY)
+Bool GetRenderedBattleDiagnosticPlacementUnit(Int rank, Bool benchmark, Int *slot, Int *unit)
+{
+	const Int originalUnits = SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+	const Int totalUnits = benchmark ? SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER : originalUnits;
+	if (!slot || !unit || rank < 0 || rank >= totalUnits) return FALSE;
+	const Int extra = rank >= originalUnits ? RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER : 0;
+	const Int withinGroup = rank >= originalUnits ? rank - originalUnits : rank;
+	*slot = withinGroup / RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+	*unit = withinGroup % RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER + extra;
+	return TRUE;
+}
+
+Bool IsRenderedBattleBenchmarkFastModeActive(Bool fastMode, Bool replayGame, Bool debugCheatsAllowed)
+{
+	return fastMode && (debugCheatsAllowed || replayGame);
+}
+
+Int GetRenderedBattleDiagnosticSearchCount(Real loX, Real loY, Real hiX, Real hiY, Bool benchmark)
 {
 	// Comparison form rejects both infinities and NaNs without a title/compiler
 	// specific finite-value API. These helpers are used only by the diagnostic.
@@ -3738,16 +3775,16 @@ Int GetRenderedBattleDiagnosticSearchCount(Real loX, Real loY, Real hiX, Real hi
 		hiX >= -FLT_MAX && hiX <= FLT_MAX && hiY >= -FLT_MAX && hiY <= FLT_MAX &&
 		loX <= hiX && loY <= hiY)) return 0;
 	// Full nine-offset envelope, including the maximum tested footprint.
-	if (static_cast<double>(hiX) - loX < 894.0 ||
-		static_cast<double>(hiY) - loY < 820.0) return 49;
+	if (static_cast<double>(hiX) - loX < (benchmark ? 2.0 * RENDERED_BATTLE_BENCHMARK_INSET_X : 894.0) ||
+		static_cast<double>(hiY) - loY < (benchmark ? 2.0 * RENDERED_BATTLE_BENCHMARK_INSET_Y : 820.0)) return 49;
 	return 49 + 9 * 9;
 }
 
 Bool GetRenderedBattleDiagnosticSearchCenter(Real loX, Real loY, Real hiX, Real hiY,
-	Int candidate, Coord3D *center)
+	Int candidate, Coord3D *center, Bool benchmark)
 {
 	if (!center || candidate < 0 ||
-		candidate >= GetRenderedBattleDiagnosticSearchCount(loX, loY, hiX, hiY)) return FALSE;
+		candidate >= GetRenderedBattleDiagnosticSearchCount(loX, loY, hiX, hiY, benchmark)) return FALSE;
 	Coord3D result;
 	if (candidate < 49)
 	{
@@ -3760,10 +3797,12 @@ Bool GetRenderedBattleDiagnosticSearchCenter(Real loX, Real loY, Real hiX, Real 
 		const Int grid = candidate - 49;
 		// Fixed denominator 8, never a reciprocal of a possibly zero map span.
 		// Exact-fit extents deliberately retain all 81 (coincident) grid entries.
-		result.x = static_cast<Real>(static_cast<double>(loX) + 447.0 +
-			(static_cast<double>(hiX) - loX - 894.0) * (grid % 9) / 8.0);
-		result.y = static_cast<Real>(static_cast<double>(loY) + 410.0 +
-			(static_cast<double>(hiY) - loY - 820.0) * (grid / 9) / 8.0);
+		const double insetX = benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_X : 447.0;
+		result.x = static_cast<Real>(static_cast<double>(loX) + insetX +
+			(static_cast<double>(hiX) - loX - 2.0 * insetX) * (grid % 9) / 8.0);
+		const double insetY = benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_Y : 410.0;
+		result.y = static_cast<Real>(static_cast<double>(loY) + insetY +
+			(static_cast<double>(hiY) - loY - 2.0 * insetY) * (grid / 9) / 8.0);
 	}
 	if (!(result.x >= -FLT_MAX && result.x <= FLT_MAX &&
 		result.y >= -FLT_MAX && result.y <= FLT_MAX)) return FALSE;
@@ -3804,13 +3843,132 @@ Bool AreRenderedBattleDiagnosticPositionsSeparated(const Coord3D &a, Real radius
 	return dx * dx + dy * dy >= separation * separation;
 }
 
+Bool ValidateRenderedBattleBenchmarkNominalGeometry(Real vehicleRadius, Real infantryRadius)
+{
+	if (!(vehicleRadius > 0.0f && vehicleRadius <= 21.0f &&
+		infantryRadius > 0.0f && infantryRadius <= 21.0f)) return FALSE;
+	Coord3D positions[SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
+	Real radii[SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
+	for (Int index = 0; index < SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER; ++index)
+	{
+		const Int slot = index / RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER;
+		const Int unit = index % RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER;
+		if (!GetRenderedBattleDiagnosticOffset(slot, unit, &positions[index], TRUE)) return FALSE;
+		radii[index] = unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER && unit % 4 < 2 ? vehicleRadius : infantryRadius;
+		if (fabs(positions[index].x) > RENDERED_BATTLE_BENCHMARK_FORMATION_X ||
+			fabs(positions[index].y) > RENDERED_BATTLE_BENCHMARK_FORMATION_Y) return FALSE;
+		for (Int previous = 0; previous < index; ++previous)
+			if (!AreRenderedBattleDiagnosticPositionsSeparated(positions[index], radii[index],
+				positions[previous], radii[previous])) return FALSE;
+	}
+	return TRUE;
+}
+
+RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
+	Int unitCount, const Coord3D *domains, const Real *radii, const UnsignedInt *domainMasks,
+	Int operationBudget, Int *choices, RenderedBattleBenchmarkPlacementStats *stats)
+{
+	if (!stats) return RB_BENCHMARK_PLACEMENT_INVALID;
+	memset(stats, 0, sizeof(*stats));
+	if (unitCount <= 0 || unitCount > 8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER ||
+		!domains || !radii || !domainMasks || !choices || operationBudget < 0)
+		return RB_BENCHMARK_PLACEMENT_INVALID;
+	const Int trials = RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT;
+	for (Int unit = 0; unit < unitCount; ++unit)
+	{
+		if (!(radii[unit] > 0.0f && radii[unit] <= 21.0f) || (domainMasks[unit] & ~511u))
+			return RB_BENCHMARK_PLACEMENT_INVALID;
+		if (!domainMasks[unit]) ++stats->emptyDomains;
+		for (Int trial = 0; trial < trials; ++trial)
+			if (domainMasks[unit] & (1u << trial))
+			{
+				const Coord3D &p = domains[unit * trials + trial];
+				if (!(p.x >= -FLT_MAX && p.x <= FLT_MAX && p.y >= -FLT_MAX && p.y <= FLT_MAX &&
+					p.z >= -FLT_MAX && p.z <= FLT_MAX)) return RB_BENCHMARK_PLACEMENT_INVALID;
+			}
+	}
+	if (stats->emptyDomains) return RB_BENCHMARK_PLACEMENT_EMPTY_DOMAIN;
+	try
+	{
+		// Heap snapshots avoid recursion and a large owner-thread stack.
+		// A parent mask retains tried values removed; child pruning is discarded
+		// on backtrack. No choice reaches the caller before all units are solved.
+		std::vector<UnsignedInt> masks((unitCount + 1) * unitCount);
+		Int selected[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
+		Int picked[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
+		for (Int unit = 0; unit < unitCount; ++unit)
+		{
+			masks[unit] = domainMasks[unit]; selected[unit] = picked[unit] = -1;
+		}
+		Int depth = 0;
+		while (depth >= 0)
+		{
+			if (depth == unitCount)
+			{
+				for (Int unit = 0; unit < unitCount; ++unit) choices[unit] = picked[unit];
+				return RB_BENCHMARK_PLACEMENT_SOLVED;
+			}
+			UnsignedInt *current = &masks[depth * unitCount];
+			if (selected[depth] < 0)
+			{
+				Int least = trials + 1;
+				for (Int unit = 0; unit < unitCount; ++unit)
+				{
+					if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+					++stats->operations;
+					if (picked[unit] >= 0) continue;
+					Int count = 0;
+					for (Int trial = 0; trial < trials; ++trial) if (current[unit] & (1u << trial)) ++count;
+					if (count < least) { least = count; selected[depth] = unit; }
+				}
+			}
+			const Int unit = selected[depth];
+			Int trial = 0;
+			while (trial < trials && !(current[unit] & (1u << trial))) ++trial;
+			if (trial == trials)
+			{
+				selected[depth] = -1;
+				if (!depth) return RB_BENCHMARK_PLACEMENT_UNSATISFIABLE;
+				--depth; picked[selected[depth]] = -1; ++stats->backtracks;
+				continue;
+			}
+			if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+			++stats->operations; ++stats->assignments;
+			current[unit] &= ~(1u << trial); picked[unit] = trial;
+			if (depth + 1 > stats->maxAssigned) stats->maxAssigned = depth + 1;
+			UnsignedInt *next = &masks[(depth + 1) * unitCount];
+			Bool viable = TRUE;
+			for (Int other = 0; other < unitCount; ++other)
+			{
+				if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+				++stats->operations; next[other] = current[other];
+				if (picked[other] >= 0) continue;
+				for (Int value = 0; value < trials; ++value)
+					if (next[other] & (1u << value))
+					{
+						if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+						++stats->operations; ++stats->pairComparisons;
+						if (!AreRenderedBattleDiagnosticPositionsSeparated(domains[unit * trials + trial], radii[unit],
+							domains[other * trials + value], radii[other])) next[other] &= ~(1u << value);
+					}
+				if (!next[other]) { viable = FALSE; break; }
+			}
+			if (viable) { ++depth; if (depth < unitCount) selected[depth] = -1; }
+			else { picked[unit] = -1; ++stats->backtracks; }
+		}
+	}
+	catch (...) { return RB_BENCHMARK_PLACEMENT_INVALID; }
+	return RB_BENCHMARK_PLACEMENT_UNSATISFIABLE;
+}
+
 Bool RememberRenderedBattleDiagnosticArena(Int candidate, Int validUnits,
-	Int *candidates, Int *validPrefixes, Int *count)
+	Int *candidates, Int *validPrefixes, Int *count, Bool benchmark)
 {
 	if (!candidates || !validPrefixes || !count || *count < 0 ||
 		*count > RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP || candidate < 0 ||
 		candidate >= 130 || validUnits < 0 ||
-		validUnits >= SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER)
+		validUnits >= SKIRMISH_AI_TEST_SLOT_COUNT * (benchmark ?
+		RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER : RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER))
 		return FALSE;
 	Int index;
 	for (index = 0; index < *count; ++index)
@@ -3846,7 +4004,35 @@ namespace
 {
 Bool IsRenderedBattleDiagnostic(SkirmishAITestScenario scenario)
 {
-	return scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC;
+	return scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC ||
+		scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK;
+}
+Bool IsRenderedBattleBenchmark()
+{
+	return s_runner.scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK;
+}
+Int RenderedBattleUnitsPerPlayer()
+{
+	return IsRenderedBattleBenchmark() ? RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER :
+		RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+}
+Int RenderedBattleUnitType(Int unit)
+{
+	return unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER ? 2 + unit % 2 : unit % 4;
+}
+Real RenderedBattleBandStep()
+{
+	return IsRenderedBattleBenchmark() ? RENDERED_BATTLE_BENCHMARK_BAND_STEP : 200.0f;
+}
+Int RenderedBattleMaxFrames()
+{
+	return IsRenderedBattleBenchmark() ? RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES +
+		RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES : RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES;
+}
+UnsignedInt RenderedBattleMaxMilliseconds()
+{
+	return IsRenderedBattleBenchmark() ? RENDERED_BATTLE_BENCHMARK_MAX_MILLISECONDS :
+		RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS;
 }
 Bool IsRenderedSkirmishScenario(SkirmishAITestScenario scenario)
 {
@@ -3856,7 +4042,10 @@ struct RenderedBattleDiagnosticState
 {
 	Bool staged;
 	Coord3D center;
-	ObjectID ids[SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER];
+	ObjectID ids[SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
+	Bool measurementStarted;
+	LARGE_INTEGER qpcFrequency;
+	Int measuredAttackSamples, measuredLossSamples, measurementStartAlive;
 	UnsignedInt startFrame, startTick, nextSummaryFrame;
 	Int created, samplesWithAttacks, samplesWithLoss;
 	const char *completionReason, *setupFailure;
@@ -3879,6 +4068,9 @@ struct RenderedBattleDiagnosticState
 		// incomplete pending report or replace an existing published artifact.
 		closeReportFile();
 		staged = FALSE; created = 0; startFrame = startTick = nextSummaryFrame = 0;
+		measurementStarted = FALSE;
+		qpcFrequency.QuadPart = 0;
+		measuredAttackSamples = measuredLossSamples = measurementStartAlive = 0;
 		samplesWithAttacks = samplesWithLoss = 0; completionReason = "incomplete";
 		setupFailure = "runtime_state_unavailable";
 		center.x = center.y = center.z = 0.0f;
@@ -4001,7 +4193,8 @@ enum RenderedBattlePreflightRejection
 	RB_PREFLIGHT_ACCEPTED = 0, RB_PREFLIGHT_BOUNDS, RB_PREFLIGHT_MISSING_CELL,
 	RB_PREFLIGHT_SURFACE, RB_PREFLIGHT_FOOTPRINT_HEIGHT, RB_PREFLIGHT_OCCUPIED,
 	RB_PREFLIGHT_CENTER_HEIGHT, RB_PREFLIGHT_GROUND_PATH, RB_PREFLIGHT_ATTACK_GOAL_PATH,
-	RB_PREFLIGHT_PLANNED_PAIR, RB_PREFLIGHT_REASON_COUNT
+	RB_PREFLIGHT_PLANNED_PAIR, RB_PREFLIGHT_EMPTY_DOMAIN, RB_PREFLIGHT_UNSATISFIABLE,
+	RB_PREFLIGHT_SEARCH_BUDGET, RB_PREFLIGHT_PLANNER_INVALID, RB_PREFLIGHT_REASON_COUNT
 };
 
 struct RenderedBattlePreflightFailure
@@ -4023,7 +4216,8 @@ struct RenderedBattlePreflightFailure
 const char *RenderedBattlePreflightReasonName(Int reason)
 {
 	static const char *names[] = { "accepted", "bounds", "missing_cell", "surface",
-		"footprint_height", "occupied", "center_height", "ground_path", "attack_goal_path", "planned_pair" };
+		"footprint_height", "occupied", "center_height", "ground_path", "attack_goal_path", "planned_pair",
+		"empty_domain", "unsatisfiable", "search_budget_exhausted", "planner_invalid" };
 	return reason >= 0 && reason < RB_PREFLIGHT_REASON_COUNT ? names[reason] : "unknown";
 }
 
@@ -4127,7 +4321,7 @@ Bool PreflightRenderedBattleUnitPosition(const Coord3D &p, Real radius,
 	}
 	target = center;
 	target.x += slot < 4 ? 95.0f : -95.0f;
-	target.y += ((slot % 4) - 1.5f) * 200.0f;
+	target.y += ((slot % 4) - 1.5f) * RenderedBattleBandStep();
 	target.z = TheTerrainLogic->getGroundHeight(target.x, target.y);
 	failure->target = target;
 	if (!pathfinder->isGroundPathPassable(FALSE, p, LAYER_GROUND, target, 4))
@@ -4140,6 +4334,14 @@ Bool PreflightRenderedBattleUnitPosition(const Coord3D &p, Real radius,
 
 Bool StageRenderedBattleDiagnostic()
 {
+	const Bool benchmark = IsRenderedBattleBenchmark();
+	const Int unitsPerPlayer = RenderedBattleUnitsPerPlayer();
+	if (benchmark && (!TheFramePacer || !TheGlobalData->m_windowed ||
+		TheGlobalData->m_xResolution != 1920 || TheGlobalData->m_yResolution != 1080))
+	{
+		s_renderedBattle.setupFailure = "benchmark_requires_1920x1080_windowed";
+		return FALSE;
+	}
 	if (!TheThingFactory || !TheTerrainLogic || !TheTacticalView || !ThePartitionManager ||
 		!TheAI || !TheAI->pathfinder() || !ThePlayerList->getLocalPlayer()) return FALSE;
 	Pathfinder *pathfinder = TheAI->pathfinder();
@@ -4148,6 +4350,7 @@ Bool StageRenderedBattleDiagnostic()
 		ThePlayerList->getLocalPlayer() != ThePlayerList->getPlayerFromSlotIndex(0)) return FALSE;
 	const ThingTemplate *templates[8][4];
 	Real radii[8][4];
+	Real maxVehicleRadius = 0.0f, maxInfantryRadius = 0.0f;
 	Player *players[8];
 	s_renderedBattle.setupFailure = "player_or_faction_invalid";
 	for (Int slot = 0; slot < 8; ++slot)
@@ -4171,24 +4374,41 @@ Bool StageRenderedBattleDiagnostic()
 				 !templates[slot][type]->isKindOf(KINDOF_INFANTRY))) return FALSE;
 			radii[slot][type] = templates[slot][type]->getTemplateGeometryInfo().getBoundingCircleRadius();
 			if (!(radii[slot][type] > 0.0f && radii[slot][type] <= 21.0f)) return FALSE;
+			if (type < 2) maxVehicleRadius = max(maxVehicleRadius, radii[slot][type]);
+			else maxInfantryRadius = max(maxInfantryRadius, radii[slot][type]);
 		}
 	}
+	if (benchmark && !ValidateRenderedBattleBenchmarkNominalGeometry(maxVehicleRadius, maxInfantryRadius))
+	{
+		s_renderedBattle.setupFailure = "benchmark_nominal_geometry_not_separated";
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_GEOMETRY_FAIL vehicle_radius=%.3f infantry_radius=%.3f\n",
+			maxVehicleRadius, maxInfantryRadius);
+		return FALSE;
+	}
+	if (benchmark)
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS vehicle_radius=%.3f infantry_radius=%.3f "
+			"nominal_units=512 nominal_pairs=130816 grid_step=52 band_step=208 formation_x=459 formation_y=416\n",
+			maxVehicleRadius, maxInfantryRadius);
 	Region3D extent; TheTerrainLogic->getExtent(&extent);
 	s_renderedBattle.setupFailure = "formation_terrain_or_occupancy_invalid";
-	Coord3D positions[8 * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER];
+	Coord3D positions[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
+	Int positionIndices[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
 	Bool found = FALSE;
 	Int rejected[RB_PREFLIGHT_REASON_COUNT] = {0}, trialRejected[RB_PREFLIGHT_REASON_COUNT] = {0};
 	Int examined = 0, nominalExamined = 0, localExamined = 0, selected = -1, selectedPhase = -1;
 	Int maxValidUnits = 0, exampleCount = 0, unitTrials = 0, localUnitTrials = 0;
 	Int acceptedUnitTrials = 0, selectedAdoptedOffsets = 0, pairComparisons = 0;
+	Int solverOperations = 0, solverPairs = 0, solverAssignments = 0, solverBacktracks = 0;
+	Int domainEmptyUnits = 0, solverArenas = 0;
+	char solverDetails[1024] = {0}; Int solverDetailBytes = 0;
 	Int retained[RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP];
 	Int retainedPrefixes[RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP], retainedCount = 0;
 	RenderedBattlePreflightFailure examples[2], furthest;
 	const Int searchCount = GetRenderedBattleDiagnosticSearchCount(
-		extent.lo.x, extent.lo.y, extent.hi.x, extent.hi.y);
-	// Nominal fixed order first, then at most eight ranked failed arenas. Each
-	// unit uses at most nine deterministic trials, with no backtracking or RNG.
-	// No object is created until all 256 positions pass every live gate.
+		extent.lo.x, extent.lo.y, extent.hi.x, extent.hi.y, benchmark);
+	// Nominal fixed order first, then at most eight ranked failed arenas. Legacy
+	// keeps greedy local9; dense mode caches live domains and solves pair gates.
+	// No object is created until the complete requested roster passes every gate.
 	for (Int phase = 0; phase < 2 && !found; ++phase)
 		for (Int ordinal = 0; ordinal < (phase ? retainedCount : searchCount) && !found; ++ordinal)
 		{
@@ -4197,7 +4417,7 @@ Bool StageRenderedBattleDiagnostic()
 			failure.candidate = candidate; failure.phase = phase;
 			Coord3D center;
 			if (!GetRenderedBattleDiagnosticSearchCenter(extent.lo.x, extent.lo.y,
-				extent.hi.x, extent.hi.y, candidate, &center)) break;
+				extent.hi.x, extent.hi.y, candidate, &center, benchmark)) break;
 			++examined;
 			if (phase) ++localExamined; else ++nominalExamined;
 			center.z = TheTerrainLogic->getGroundHeight(center.x, center.y);
@@ -4205,55 +4425,155 @@ Bool StageRenderedBattleDiagnostic()
 			const Bool centerAccepted = PreflightRenderedBattlePosition(center, 20.0f, extent, pathfinder, &failure);
 			Bool arenaAccepted = centerAccepted;
 			Int validUnits = 0, adoptedOffsets = 0;
-			for (Int slot = 0; slot < 8 && arenaAccepted; ++slot)
-				for (Int unit = 0; unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER && arenaAccepted; ++unit)
+			if (benchmark && phase && arenaAccepted)
+			{
+				RenderedBattleBenchmarkPlacementStats stats;
+				memset(&stats, 0, sizeof(stats));
+				RenderedBattleBenchmarkPlacementResult result = RB_BENCHMARK_PLACEMENT_INVALID;
+				Int firstEmpty = -1, firstEmptyGate = RB_PREFLIGHT_ACCEPTED;
+				try
 				{
-					Bool unitAccepted = FALSE;
-					for (Int trial = 0; trial < (phase ? RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT : 1) && !unitAccepted; ++trial)
+					const Int total = 8 * unitsPerPlayer;
+					std::vector<Coord3D> domains(total * RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT);
+					UnsignedInt masks[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER] = {0};
+					Real domainRadii[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
+					Int choices[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
+					RenderedBattlePreflightFailure firstEmptyFailure;
+					// Each unary query is evaluated exactly once per unit/trial/arena.
+					// Pair pruning cannot relax terrain, footprint, occupancy or routes.
+					for (Int index = 0; index < total; ++index)
 					{
-						// Fresh metadata per trial: no stale blocker, delta, cell or target.
-						RenderedBattlePreflightFailure attempt;
-						attempt.candidate = candidate; attempt.phase = phase; attempt.trial = trial;
-						attempt.slot = slot; attempt.unit = unit; attempt.validUnits = validUnits;
-						attempt.center = center;
-						Coord3D p, local;
-						++unitTrials; if (phase) ++localUnitTrials;
-						if (!GetRenderedBattleDiagnosticOffset(slot, unit, &p) ||
-							!GetRenderedBattleDiagnosticLocalOffset(slot, trial, &local))
-							attempt.reason = RB_PREFLIGHT_BOUNDS;
-						else
+						const Int slot = index / unitsPerPlayer, unit = index % unitsPerPlayer;
+						domainRadii[index] = radii[slot][RenderedBattleUnitType(unit)];
+						for (Int trial = 0; trial < RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT; ++trial)
 						{
-							p.x += center.x + local.x; p.y += center.y + local.y;
-							p.z = TheTerrainLogic->getGroundHeight(p.x, p.y);
-							const Real radius = radii[slot][unit % 4];
-							unitAccepted = PreflightRenderedBattleUnitPosition(p, radius, center, slot,
-								extent, pathfinder, &attempt);
-							// World occupancy cannot see the not-yet-created roster.
-							// Add symmetric clearance against all accepted positions.
-							for (Int previous = 0; previous < validUnits && unitAccepted; ++previous)
+							RenderedBattlePreflightFailure attempt;
+							attempt.candidate = candidate; attempt.phase = phase; attempt.trial = trial;
+							attempt.slot = slot; attempt.unit = unit; attempt.center = center;
+							Coord3D p, local;
+							++unitTrials; ++localUnitTrials;
+							Bool admitted = GetRenderedBattleDiagnosticOffset(slot, unit, &p, TRUE) &&
+								GetRenderedBattleDiagnosticLocalOffset(slot, trial, &local);
+							if (admitted)
 							{
-								++pairComparisons;
-								const Real previousRadius = radii[previous / RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER][previous % 4];
-								if (!AreRenderedBattleDiagnosticPositionsSeparated(p, radius, positions[previous], previousRadius))
-								{
-									unitAccepted = FALSE; attempt.reason = RB_PREFLIGHT_PLANNED_PAIR;
-									attempt.plannedIndex = previous; attempt.query = p;
-									attempt.cellType = attempt.cellFlags = -1;
-									attempt.blockerPosition = positions[previous]; attempt.blockerRadius = previousRadius;
-								}
+								p.x += center.x + local.x; p.y += center.y + local.y;
+								p.z = TheTerrainLogic->getGroundHeight(p.x, p.y);
+								admitted = PreflightRenderedBattleUnitPosition(p, domainRadii[index], center,
+									slot, extent, pathfinder, &attempt);
+							}
+							else attempt.reason = RB_PREFLIGHT_BOUNDS;
+							if (admitted)
+							{
+								domains[index * RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT + trial] = p;
+								masks[index] |= 1u << trial; ++acceptedUnitTrials;
+							}
+							else ++trialRejected[attempt.reason];
+							failure = attempt;
+						}
+						if (!masks[index] && firstEmpty < 0)
+						{
+							firstEmpty = index; firstEmptyFailure = failure; firstEmptyGate = failure.reason;
+						}
+					}
+					Int budget = RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS - solverOperations;
+					if (budget > RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS)
+						budget = RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS;
+					result = SolveRenderedBattleBenchmarkPlacement(total, &domains[0], domainRadii,
+						masks, budget, choices, &stats);
+					validUnits = stats.maxAssigned;
+					if (result == RB_BENCHMARK_PLACEMENT_SOLVED)
+						for (Int index = 0; index < total; ++index)
+						{
+							positions[index] = domains[index * RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT + choices[index]];
+							if (choices[index]) ++adoptedOffsets;
+						}
+					else if (firstEmpty >= 0) failure = firstEmptyFailure;
+					else
+					{
+						// A combinatorial/budget failure is not a single unary rejection.
+						failure = RenderedBattlePreflightFailure();
+						failure.candidate = candidate; failure.phase = phase; failure.center = center;
+					}
+				}
+				catch (...) { result = RB_BENCHMARK_PLACEMENT_INVALID; }
+				++solverArenas; domainEmptyUnits += stats.emptyDomains;
+				solverOperations += stats.operations; solverPairs += stats.pairComparisons;
+				solverAssignments += stats.assignments; solverBacktracks += stats.backtracks;
+				arenaAccepted = result == RB_BENCHMARK_PLACEMENT_SOLVED;
+				failure.validUnits = validUnits;
+				failure.reason = arenaAccepted ? RB_PREFLIGHT_ACCEPTED :
+					(result == RB_BENCHMARK_PLACEMENT_EMPTY_DOMAIN ? RB_PREFLIGHT_EMPTY_DOMAIN :
+					(result == RB_BENCHMARK_PLACEMENT_UNSATISFIABLE ? RB_PREFLIGHT_UNSATISFIABLE :
+					(result == RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED ? RB_PREFLIGHT_SEARCH_BUDGET : RB_PREFLIGHT_PLANNER_INVALID)));
+				const Int bytes = _snprintf(solverDetails + solverDetailBytes, sizeof(solverDetails) - solverDetailBytes,
+					"%s%d:%s:empty%d:first%d:last_gate%s:max%d:ops%d", solverDetailBytes ? "," : "", candidate,
+					arenaAccepted ? "solved" : RenderedBattlePreflightReasonName(failure.reason),
+					stats.emptyDomains, firstEmpty, RenderedBattlePreflightReasonName(firstEmptyGate),
+					stats.maxAssigned, stats.operations);
+				if (bytes < 0 || bytes >= static_cast<Int>(sizeof(solverDetails)) - solverDetailBytes)
+				{
+					s_renderedBattle.reportFailed = TRUE; return FALSE;
+				}
+				solverDetailBytes += bytes;
+			}
+			else
+			// Reserve all original units before choosing extra infantry offsets.
+			// Positions/creation remain indexed by canonical slot64 roster index;
+			// the accepted-prefix array holds only the separate planning order.
+			for (Int rank = 0; rank < 8 * unitsPerPlayer && arenaAccepted; ++rank)
+			{
+				Int slot = 0, unit = 0;
+				if (!GetRenderedBattleDiagnosticPlacementUnit(rank, benchmark, &slot, &unit))
+					return FALSE;
+				const Int positionIndex = slot * unitsPerPlayer + unit;
+				Bool unitAccepted = FALSE;
+				for (Int trial = 0; trial < (phase ? RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT : 1) && !unitAccepted; ++trial)
+				{
+					// Fresh metadata per trial: no stale blocker, delta, cell or target.
+					RenderedBattlePreflightFailure attempt;
+					attempt.candidate = candidate; attempt.phase = phase; attempt.trial = trial;
+					attempt.slot = slot; attempt.unit = unit; attempt.validUnits = validUnits;
+					attempt.center = center;
+					Coord3D p, local;
+					++unitTrials; if (phase) ++localUnitTrials;
+					if (!GetRenderedBattleDiagnosticOffset(slot, unit, &p, benchmark) ||
+						!GetRenderedBattleDiagnosticLocalOffset(slot, trial, &local))
+						attempt.reason = RB_PREFLIGHT_BOUNDS;
+					else
+					{
+						p.x += center.x + local.x; p.y += center.y + local.y;
+						p.z = TheTerrainLogic->getGroundHeight(p.x, p.y);
+						const Real radius = radii[slot][RenderedBattleUnitType(unit)];
+						unitAccepted = PreflightRenderedBattleUnitPosition(p, radius, center, slot,
+							extent, pathfinder, &attempt);
+						// World occupancy cannot see the not-yet-created roster.
+						// Add symmetric clearance against all accepted positions.
+						for (Int previous = 0; previous < validUnits && unitAccepted; ++previous)
+						{
+							++pairComparisons;
+							const Int previousIndex = positionIndices[previous];
+							const Real previousRadius = radii[previousIndex / unitsPerPlayer][RenderedBattleUnitType(previousIndex % unitsPerPlayer)];
+							if (!AreRenderedBattleDiagnosticPositionsSeparated(p, radius, positions[previousIndex], previousRadius))
+							{
+								unitAccepted = FALSE; attempt.reason = RB_PREFLIGHT_PLANNED_PAIR;
+								attempt.plannedIndex = previousIndex; attempt.query = p;
+								attempt.cellType = attempt.cellFlags = -1;
+								attempt.blockerPosition = positions[previousIndex]; attempt.blockerRadius = previousRadius;
 							}
 						}
-						if (unitAccepted)
-						{
-							positions[validUnits++] = p; ++acceptedUnitTrials;
-							attempt.validUnits = validUnits;
-							if (trial) ++adoptedOffsets;
-						}
-						else ++trialRejected[attempt.reason];
-						failure = attempt;
 					}
-					arenaAccepted = unitAccepted;
+					if (unitAccepted)
+					{
+						positions[positionIndex] = p;
+						positionIndices[validUnits++] = positionIndex; ++acceptedUnitTrials;
+						attempt.validUnits = validUnits;
+						if (trial) ++adoptedOffsets;
+					}
+					else ++trialRejected[attempt.reason];
+					failure = attempt;
 				}
+				arenaAccepted = unitAccepted;
+			}
 			if (validUnits > maxValidUnits) maxValidUnits = validUnits;
 			found = arenaAccepted;
 			if (found)
@@ -4265,9 +4585,11 @@ Bool StageRenderedBattleDiagnostic()
 			{
 				++rejected[failure.reason];
 				if (!phase && centerAccepted &&
-					center.x - 447.0f >= extent.lo.x && center.x + 447.0f <= extent.hi.x &&
-					center.y - 410.0f >= extent.lo.y && center.y + 410.0f <= extent.hi.y)
-					RememberRenderedBattleDiagnosticArena(candidate, validUnits, retained, retainedPrefixes, &retainedCount);
+					center.x - (benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_X : 447.0f) >= extent.lo.x &&
+					center.x + (benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_X : 447.0f) <= extent.hi.x &&
+					center.y - (benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_Y : 410.0f) >= extent.lo.y &&
+					center.y + (benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_Y : 410.0f) <= extent.hi.y)
+					RememberRenderedBattleDiagnosticArena(candidate, validUnits, retained, retainedPrefixes, &retainedCount, benchmark);
 				if (exampleCount == 0 || (exampleCount == 1 && failure.reason != examples[0].reason))
 					examples[exampleCount++] = failure;
 				if (furthest.candidate < 0 || failure.validUnits > furthest.validUnits) furthest = failure;
@@ -4276,25 +4598,28 @@ Bool StageRenderedBattleDiagnostic()
 	// Two aggregates and at most three examples remain within the 32-record cap.
 	// Arena counts are terminal gates; trial counts include rejected local trials.
 	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY examined=%d selected=%d "
-		"search_schema=legacy49_then_extent9x9_local9_v2 placement_schema=2 selected_phase=%s "
+		"search_schema=%s placement_schema=%d selected_phase=%s "
 		"search_capacity=%d base_search_capacity=%d nominal_examined=%d local_examined=%d "
-		"legacy_candidates=49 grid_candidates=%d grid_columns=9 grid_rows=9 grid_inset_x=447 grid_inset_y=410 "
+		"legacy_candidates=49 grid_candidates=%d grid_columns=9 grid_rows=9 grid_inset_x=%d grid_inset_y=%d "
 		"local_step=22 local_trials=9 local_arena_cap=8 retained_arenas=%d "
 		"max_valid_units=%d bounds=%d missing_cell=%d surface=%d footprint_height=%d occupied=%d "
 		"center_height=%d ground_path=%d attack_goal_path=%d planned_pair=%d "
 		"extent_lo=(%.3f,%.3f,%.3f) extent_hi=(%.3f,%.3f,%.3f) "
 		"grid_hi=(%d,%d) cell_size=10 candidate_step=240 candidate_span=720 "
-		"formation_x=403 formation_y=366 footprint_margin_max=22 height_limit=8 path_diameter_cells=4 "
+		"formation_x=%d formation_y=%d footprint_margin_max=22 height_limit=8 path_diameter_cells=4 "
 		"frame=%u in_game=%d loading=%d loaded_identity_valid=%d map_crc=%08X map_size=%u\n",
-		examined, selected, selectedPhase < 0 ? "none" : (selectedPhase ? "local9" : "nominal"),
+		examined, selected, benchmark ? "dense512_grid52_band208_cached_local9_mrv_v6" : "legacy49_then_extent9x9_local9_v2",
+		benchmark ? 6 : 2, selectedPhase < 0 ? "none" : (selectedPhase ? "local9" : "nominal"),
 		searchCount + RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP, searchCount, nominalExamined, localExamined,
-		searchCount > 49 ? searchCount - 49 : 0, retainedCount,
+		searchCount > 49 ? searchCount - 49 : 0, benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_X : 447,
+		benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_Y : 410, retainedCount,
 		maxValidUnits, rejected[RB_PREFLIGHT_BOUNDS], rejected[RB_PREFLIGHT_MISSING_CELL],
 		rejected[RB_PREFLIGHT_SURFACE], rejected[RB_PREFLIGHT_FOOTPRINT_HEIGHT], rejected[RB_PREFLIGHT_OCCUPIED],
 		rejected[RB_PREFLIGHT_CENTER_HEIGHT], rejected[RB_PREFLIGHT_GROUND_PATH],
 		rejected[RB_PREFLIGHT_ATTACK_GOAL_PATH], rejected[RB_PREFLIGHT_PLANNED_PAIR],
 		extent.lo.x, extent.lo.y, extent.lo.z, extent.hi.x, extent.hi.y, extent.hi.z,
-		pathfinder->getExtent()->x, pathfinder->getExtent()->y, TheGameLogic->getFrame(),
+		pathfinder->getExtent()->x, pathfinder->getExtent()->y, benchmark ? RENDERED_BATTLE_BENCHMARK_FORMATION_X : 403,
+		benchmark ? RENDERED_BATTLE_BENCHMARK_FORMATION_Y : 366, TheGameLogic->getFrame(),
 		TheGameLogic->isInGame() ? 1 : 0, TheGameLogic->isLoadingMap() ? 1 : 0,
 		s_runner.loadedStateValidated ? 1 : 0, s_runner.loadedMapCRC, s_runner.loadedMapSize);
 	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_PLACEMENT_SUMMARY "
@@ -4307,6 +4632,22 @@ Bool StageRenderedBattleDiagnostic()
 		trialRejected[RB_PREFLIGHT_OCCUPIED], trialRejected[RB_PREFLIGHT_CENTER_HEIGHT],
 		trialRejected[RB_PREFLIGHT_GROUND_PATH], trialRejected[RB_PREFLIGHT_ATTACK_GOAL_PATH],
 		trialRejected[RB_PREFLIGHT_PLANNED_PAIR]);
+	if (benchmark)
+	{
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PLANNER_SUMMARY arenas=%d "
+			"empty_domain_arenas=%d empty_domain_units=%d unsatisfiable_arenas=%d budget_exhausted_arenas=%d invalid_arenas=%d "
+			"operations=%d arena_operation_cap=%d total_operation_cap=%d pair_comparisons=%d assignments=%d backtracks=%d "
+			"domain_trials_per_arena=4608 cached_trial_acceptance=unary_only choices=canonical_roster_index details=%s\n",
+			solverArenas, rejected[RB_PREFLIGHT_EMPTY_DOMAIN], domainEmptyUnits,
+			rejected[RB_PREFLIGHT_UNSATISFIABLE], rejected[RB_PREFLIGHT_SEARCH_BUDGET], rejected[RB_PREFLIGHT_PLANNER_INVALID],
+			solverOperations, RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS,
+			RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS, solverPairs, solverAssignments, solverBacktracks,
+			solverDetailBytes ? solverDetails : "none");
+		if (!found && solverArenas)
+			s_renderedBattle.setupFailure = rejected[RB_PREFLIGHT_PLANNER_INVALID] ? "benchmark_planner_invalid" :
+				(rejected[RB_PREFLIGHT_SEARCH_BUDGET] ? "benchmark_placement_search_budget_exhausted" :
+				(rejected[RB_PREFLIGHT_UNSATISFIABLE] ? "benchmark_placement_unsatisfiable" : "benchmark_live_position_domain_empty"));
+	}
 	for (Int example = 0; example < exampleCount; ++example)
 		RecordRenderedBattlePreflightFailure(examples[example], example ? "different_reason" : "first");
 	if (furthest.candidate >= 0 &&
@@ -4318,11 +4659,11 @@ Bool StageRenderedBattleDiagnostic()
 	try
 	{
 		for (Int slot = 0; slot < 8; ++slot)
-			for (Int unit = 0; unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER; ++unit)
+			for (Int unit = 0; unit < unitsPerPlayer; ++unit)
 			{
-				Object *object = TheThingFactory->newObject(templates[slot][unit % 4], players[slot]->getDefaultTeam());
+				Object *object = TheThingFactory->newObject(templates[slot][RenderedBattleUnitType(unit)], players[slot]->getDefaultTeam());
 				s_renderedBattle.ids[s_renderedBattle.created++] = object->getID();
-				MoveSkirmishAIRecoveryObject(object, &positions[slot * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER + unit]);
+				MoveSkirmishAIRecoveryObject(object, &positions[slot * unitsPerPlayer + unit]);
 				object->setOrientation(slot < 4 ? 0.0f : 3.14159265358979323846f);
 				const Real objectRadius = object->getGeometryInfo().getBoundingCircleRadius();
 				if (!object->getAIUpdateInterface() || !object->getBodyModule() ||
@@ -4336,10 +4677,10 @@ Bool StageRenderedBattleDiagnostic()
 		for (Int index = 0; index < s_renderedBattle.created; ++index)
 		{
 			Object *object = TheGameLogic->findObjectByID(s_renderedBattle.ids[index]);
-			const Int slot = index / RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+			const Int slot = index / unitsPerPlayer;
 			Coord3D target = s_renderedBattle.center;
 			target.x += slot < 4 ? 95.0f : -95.0f;
-			target.y += ((slot % 4) - 1.5f) * 200.0f;
+			target.y += ((slot % 4) - 1.5f) * RenderedBattleBandStep();
 			target.z = TheTerrainLogic->getGroundHeight(target.x, target.y);
 			object->getAIUpdateInterface()->aiAttackMoveToPosition(&target, NO_MAX_SHOTS_LIMIT, CMD_FROM_SCRIPT);
 			AIUpdateInterface *ai = object->getAIUpdateInterface();
@@ -4350,19 +4691,25 @@ Bool StageRenderedBattleDiagnostic()
 	catch (...) { return FALSE; }
 	for (Int slot = 0; slot < 8; ++slot)
 	{
-		char roster[1024];
-		Int bytes = _snprintf(roster, sizeof(roster),
+		char roster[1536];
+		Int bytes = benchmark ? _snprintf(roster, sizeof(roster),
+			"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d "
+			"templates=%s:8,%s:8,%s:24,%s:24 ids=",
+			slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1, unitsPerPlayer,
+			templates[slot][0]->getName().str(), templates[slot][1]->getName().str(),
+			templates[slot][2]->getName().str(), templates[slot][3]->getName().str()) :
+			_snprintf(roster, sizeof(roster),
 			"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d ids=",
 			slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1,
-			RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER);
-		for (Int unit = 0; unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER; ++unit)
+			unitsPerPlayer);
+		for (Int unit = 0; unit < unitsPerPlayer; ++unit)
 		{
 			if (bytes < 0 || bytes >= static_cast<Int>(sizeof(roster)))
 			{
 				s_renderedBattle.reportFailed = TRUE; return FALSE;
 			}
 			const Int appended = _snprintf(roster + bytes, sizeof(roster) - bytes, "%s%u", unit ? "," : "",
-				static_cast<UnsignedInt>(s_renderedBattle.ids[slot * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER + unit]));
+				static_cast<UnsignedInt>(s_renderedBattle.ids[slot * unitsPerPlayer + unit]));
 			if (appended < 0 || appended >= static_cast<Int>(sizeof(roster)) - bytes)
 			{
 				s_renderedBattle.reportFailed = TRUE; return FALSE;
@@ -4385,6 +4732,26 @@ Bool StageRenderedBattleDiagnostic()
 	TheTacticalView->setZoomToDefault(); TheTacticalView->lookAt(&s_renderedBattle.center);
 	s_renderedBattle.startFrame = TheGameLogic->getFrame();
 	s_renderedBattle.startTick = GetTickCount();
+	if (benchmark)
+	{
+		// Existing engine clock separates logic updates from rendering. This
+		// fixture removes only render waiting, retaining normal 30-tick logic.
+		TheFramePacer->setLogicTimeScaleFps(LOGICFRAMES_PER_SECOND);
+		TheFramePacer->enableLogicTimeScale(TRUE);
+		LARGE_INTEGER qpc;
+		if (!QueryPerformanceFrequency(&s_renderedBattle.qpcFrequency) ||
+			s_renderedBattle.qpcFrequency.QuadPart <= 0 || !QueryPerformanceCounter(&qpc))
+		{
+			s_renderedBattle.setupFailure = "benchmark_clock_unavailable";
+			return FALSE;
+		}
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin frame=%u tick=%u "
+			"qpc=%I64d qpc_frequency=%I64d warmup_frames=%d measure_frames=%d "
+			"logic_target_hz=30 render_pacing=uncapped resolution=1920x1080 windowed=1 fps_source=present_trace\n",
+			s_renderedBattle.startFrame, s_renderedBattle.startTick, qpc.QuadPart,
+			s_renderedBattle.qpcFrequency.QuadPart, RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES,
+			RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES);
+	}
 	s_renderedBattle.nextSummaryFrame = s_renderedBattle.startFrame;
 	s_renderedBattle.staged = TRUE;
 	s_runner.lastObservedFrame = s_renderedBattle.startFrame;
@@ -4395,14 +4762,25 @@ Bool StageRenderedBattleDiagnostic()
 		"frame_cap=%d wall_cap_ms=%d map_crc=%08X map_size=%u\n",
 		s_runner.seed, s_renderedBattle.startFrame, s_renderedBattle.startTick,
 		s_renderedBattle.created, s_renderedBattle.center.x, s_renderedBattle.center.y,
-		s_renderedBattle.center.z, RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES,
-		RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS, s_runner.loadedMapCRC, s_runner.loadedMapSize);
+		s_renderedBattle.center.z, RenderedBattleMaxFrames(),
+		RenderedBattleMaxMilliseconds(), s_runner.loadedMapCRC, s_runner.loadedMapSize);
 	fflush(stdout);
 	return TRUE;
 }
 
 void UpdateRenderedBattleDiagnostic()
 {
+	const Bool benchmark = IsRenderedBattleBenchmark();
+#if defined(_ALLOW_DEBUG_CHEATS_IN_RELEASE)
+	const Bool debugCheatsAllowed = TRUE;
+#else
+	const Bool debugCheatsAllowed = FALSE;
+#endif
+	if (benchmark && IsRenderedBattleBenchmarkFastModeActive(TheGlobalData->m_TiVOFastMode,
+		TheGameLogic->isInReplayGame(), debugCheatsAllowed))
+	{
+		FailSkirmishAITest("benchmark_tivo_fast_mode_active"); RequestSkirmishAITestStop(); return;
+	}
 	if (TheGlobalData->m_headless || !TheGlobalData->m_useFpsLimit)
 	{
 		FailSkirmishAITest("rendered_mode_or_pacing_changed"); RequestSkirmishAITestStop(); return;
@@ -4412,8 +4790,18 @@ void UpdateRenderedBattleDiagnostic()
 		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_SETUP_FAIL created=%d\n", s_renderedBattle.created);
 		FailSkirmishAITest(s_renderedBattle.setupFailure); RequestSkirmishAITestStop(); return;
 	}
+	if (benchmark && (!TheFramePacer->isLogicTimeScaleEnabled() ||
+		TheFramePacer->getLogicTimeScaleFps() != LOGICFRAMES_PER_SECOND ||
+		TheFramePacer->isTimeFrozen() || TheFramePacer->isGameHalted() ||
+		TheTacticalView->getTimeMultiplier() != 1 || TheGameLogic->isGamePaused()))
+	{
+		FailSkirmishAITest("benchmark_logic_pacing_changed"); RequestSkirmishAITestStop(); return;
+	}
 	const UnsignedInt frame = TheGameLogic->getFrame(), tick = GetTickCount();
 	const UnsignedInt elapsed = ElapsedMilliseconds(s_renderedBattle.startTick, tick);
+	const UnsignedInt frames = frame - s_renderedBattle.startFrame;
+	const Bool measurementBeginning = benchmark && !s_renderedBattle.measurementStarted &&
+		frames >= RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES;
 	if (frame == s_runner.lastObservedFrame)
 	{
 		if (IsSkirmishAITestProgressStalled(ElapsedMilliseconds(s_runner.stalledStartMilliseconds, tick)))
@@ -4427,39 +4815,79 @@ void UpdateRenderedBattleDiagnostic()
 	TheTacticalView->lookAt(&s_renderedBattle.center);
 	// Sparse bounded summaries; no full roster walk on ordinary diagnostic frames.
 	if (frame < s_renderedBattle.nextSummaryFrame &&
-		frame - s_renderedBattle.startFrame < RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES &&
-		elapsed < RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS) return;
+		frames < static_cast<UnsignedInt>(RenderedBattleMaxFrames()) &&
+		elapsed < RenderedBattleMaxMilliseconds() && !measurementBeginning) return;
 	Int alive[2] = {0, 0}, attacking = 0;
 	Real health[2] = {0.0f, 0.0f}, positionSum[2] = {0.0f, 0.0f};
 	for (Int index = 0; index < s_renderedBattle.created; ++index)
 	{
 		Object *object = TheGameLogic->findObjectByID(s_renderedBattle.ids[index]);
 		if (!IsLiveSkirmishAIRecoveryObject(object)) continue;
-		const Int team = index / (4 * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER);
+		const Int team = index / (4 * RenderedBattleUnitsPerPlayer());
 		++alive[team]; health[team] += object->getBodyModule()->getHealth();
 		positionSum[team] += object->getPosition()->x + object->getPosition()->y;
 		if (object->getAIUpdateInterface()->isAttacking()) ++attacking;
 	}
+	if (measurementBeginning)
+	{
+		LARGE_INTEGER qpc;
+		if (!QueryPerformanceCounter(&qpc))
+		{
+			FailSkirmishAITest("benchmark_clock_unavailable"); RequestSkirmishAITestStop(); return;
+		}
+		s_renderedBattle.measurementStarted = TRUE;
+		s_renderedBattle.measurementStartAlive = alive[0] + alive[1];
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin frame=%u tick=%u "
+			"qpc=%I64d qpc_frequency=%I64d alive0=%d alive1=%d attacking=%d\n",
+			frame, tick, qpc.QuadPart, s_renderedBattle.qpcFrequency.QuadPart, alive[0], alive[1], attacking);
+	}
 	// Always retain the fresh terminal sample, including a wall cap between
 	// sparse sample boundaries. The bounded report remains below 32 records.
 	if (frame >= s_renderedBattle.nextSummaryFrame ||
-		frame - s_renderedBattle.startFrame >= RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES ||
-		elapsed >= RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS)
+		frames >= static_cast<UnsignedInt>(RenderedBattleMaxFrames()) ||
+		elapsed >= RenderedBattleMaxMilliseconds() || measurementBeginning)
 	{
 		if (attacking > 0) ++s_renderedBattle.samplesWithAttacks;
 		if (alive[0] + alive[1] < s_renderedBattle.created) ++s_renderedBattle.samplesWithLoss;
+		if (s_renderedBattle.measurementStarted)
+		{
+			if (attacking > 0) ++s_renderedBattle.measuredAttackSamples;
+			if (alive[0] + alive[1] < s_renderedBattle.measurementStartAlive)
+				++s_renderedBattle.measuredLossSamples;
+		}
 		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_SAMPLE frame=%u tick=%u elapsed_ms=%u "
 			"alive0=%d alive1=%d health0=%.3f health1=%.3f position_sum0=%.3f position_sum1=%.3f "
 			"attacking=%d camera=combat\n", frame, tick, elapsed, alive[0], alive[1],
 			health[0], health[1], positionSum[0], positionSum[1], attacking);
 		fflush(stdout); s_renderedBattle.nextSummaryFrame = frame + 150;
 	}
-	if (frame - s_renderedBattle.startFrame >= RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES ||
-		elapsed >= RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS)
+	if (frames >= static_cast<UnsignedInt>(RenderedBattleMaxFrames()) ||
+		elapsed >= RenderedBattleMaxMilliseconds())
 	{
-		s_renderedBattle.completionReason = elapsed >= RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS ?
+		s_renderedBattle.completionReason = elapsed >= RenderedBattleMaxMilliseconds() ?
 			"wall_cap" : "frame_cap";
 		s_runner.endFrame = frame;
+		if (benchmark)
+		{
+			LARGE_INTEGER qpc;
+			const Bool clockValid = QueryPerformanceCounter(&qpc) != FALSE;
+			const Bool complete = s_renderedBattle.measurementStarted &&
+				frames >= static_cast<UnsignedInt>(RenderedBattleMaxFrames());
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop frame=%u tick=%u "
+				"qpc=%I64d qpc_frequency=%I64d complete=%d warmup_frames=%d requested_measure_frames=%d "
+				"actual_measure_frames=%u measured_attack_samples=%d measured_loss_samples=%d "
+				"alive0=%d alive1=%d attacking=%d fps_source=present_trace\n",
+				frame, tick, clockValid ? qpc.QuadPart : 0, s_renderedBattle.qpcFrequency.QuadPart,
+				complete ? 1 : 0, RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES,
+				RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES,
+				frames > RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES ? frames - RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES : 0,
+				s_renderedBattle.measuredAttackSamples, s_renderedBattle.measuredLossSamples,
+				alive[0], alive[1], attacking);
+			if (!clockValid) FailSkirmishAITest("benchmark_clock_unavailable");
+			else if (!complete) FailSkirmishAITest("benchmark_measurement_incomplete");
+			else if (!s_renderedBattle.measuredAttackSamples)
+				FailSkirmishAITest("benchmark_measured_combat_not_observed");
+		}
 		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_STOP reason=%s frame=%u tick=%u alive0=%d alive1=%d\n",
 			s_renderedBattle.completionReason, frame, tick, alive[0], alive[1]);
 		RequestSkirmishAITestStop();
@@ -4502,6 +4930,8 @@ Bool ShouldBypassFramePacingForSkirmishAITest(Bool runnerArmed)
 {
 	if (!runnerArmed)
 		return FALSE;
+	if (s_runner.armed && IsRenderedBattleBenchmark())
+		return TRUE;
 	// Automated headless gates run without pacing. The practical controller
 	// lane keeps normal presentation/input cadence so it remains playable.
 	return !s_runner.armed ||
@@ -4970,8 +5400,8 @@ Bool StartSkirmishAITestRunner()
 	else if (IsRenderedBattleDiagnostic(s_runner.scenario))
 	{
 		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_START seed=%d map=\"%s\" expected_players=8 "
-			"expected_ai=7 expected_teams=4v4 pacing=normal replay_acceptance=not_applicable\n",
-			plan.seed, reportedMapName);
+			"expected_ai=7 expected_teams=4v4 pacing=%s replay_acceptance=not_applicable\n",
+			plan.seed, reportedMapName, IsRenderedBattleBenchmark() ? "render_uncapped_logic30" : "normal");
 	}
 	else if (IsSkirmishAITest4v2(s_runner.scenario))
 	{

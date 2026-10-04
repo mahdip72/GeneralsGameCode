@@ -8,6 +8,7 @@
 
 #include "D3D11ResultTranslation.h"
 #include "D3D11GpuFrameTiming.h"
+#include "PresentFrameTiming.h"
 #include "IndexedDrawValidationCache.h"
 #include "LegacyFixedFunctionPS.h"
 #include "LegacyFixedFunctionVS.h"
@@ -835,6 +836,7 @@ public:
 		}
 		m_initialized = true;
 		m_gpuTiming.attach(m_device, m_context);
+		m_presentTiming.attachDevice();
 		return RENDER_RESULT_OK;
 	}
 
@@ -847,6 +849,7 @@ public:
 		m_gpuTiming.release(detail::GpuTimingShutdownPending);
 		shutdownInternal();
 		m_gpuTiming.writeOnShutdown();
+		m_presentTiming.writeOnShutdown();
 	}
 
 	virtual IRenderContext *immediateContext()
@@ -1625,6 +1628,7 @@ public:
 		markTextureBindingsEmpty();
 		m_viewportBound = defaultRenderTarget() != 0;
 		m_gpuTiming.attach(m_device, m_context);
+		m_presentTiming.attachDevice();
 		return RENDER_RESULT_OK;
 	}
 
@@ -1837,10 +1841,11 @@ public:
 			}
 		}
 		m_gpuTiming.beforePresent();
-		const uint64_t cpuPresentStart = m_gpuTiming.cpuPresentStart();
+		const uint64_t cpuPresentStart = detail::BeginPresentTiming(m_gpuTiming, m_presentTiming);
 		const HRESULT presentResult = m_swapChain->Present(
 			m_swapInterval, 0);
-		m_gpuTiming.cpuPresentEnd(cpuPresentStart, presentResult);
+		detail::EndPresentTiming(m_gpuTiming, m_presentTiming, cpuPresentStart, presentResult,
+			m_swapInterval, 0, m_width, m_height);
 		if (FAILED(presentResult))
 		{
 			return TranslateResult(presentResult);
@@ -1949,6 +1954,7 @@ public:
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		if (m_gpuTiming.enabled()) m_gpuTiming.begin(gpuTimingFrameInfo(false));
+		m_presentTiming.beginFrame();
 		bindDefaultRenderTargets();
 		bindDefaultViewport(m_width, m_height);
 		bool needsTextureReset = !m_textureBindingsValid;
@@ -6221,6 +6227,7 @@ private:
 	}
 
 	detail::D3D11GpuFrameTiming m_gpuTiming;
+	detail::D3D11PresentFrameTiming m_presentTiming;
 	ID3D11Device *m_device;
 	ID3D11DeviceContext *m_context;
 	D3D_FEATURE_LEVEL m_featureLevel;

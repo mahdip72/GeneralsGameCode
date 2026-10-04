@@ -22,6 +22,14 @@ struct NativeW3DBufferOwnerTestAccess
 	{
 		return owner.m_stagingCapacity;
 	}
+	static unsigned char *StagingData(NativeW3DBufferOwner &owner)
+	{
+		return owner.m_staging;
+	}
+	static const unsigned char *AuthoritativeData(const NativeW3DBufferOwner &owner)
+	{
+		return owner.m_authoritative;
+	}
 };
 }
 }
@@ -634,6 +642,196 @@ int RunDynamicBufferPoolWrapContract(FakeRenderDevice &device)
 	return result;
 }
 
+int RunFullOverwriteLockContract(FakeRenderDevice &device,
+	NativeW3DResources &resources)
+{
+	int result = 0;
+	const unsigned int liveBefore = device.LiveCount();
+	for (unsigned int binding = RENDER_BUFFER_VERTEX;
+		binding <= RENDER_BUFFER_INDEX; ++binding)
+	{
+		BufferDescriptor descriptor;
+		descriptor.byteCount = 16;
+		descriptor.stride = binding == RENDER_BUFFER_VERTEX ? 4 : 2;
+		descriptor.binding = binding;
+		descriptor.usage = RENDER_USAGE_DYNAMIC;
+		NativeW3DBufferOwner owner;
+		void *bytes = nullptr;
+		unsigned char zero[16] = {};
+		result |= Check(owner.Create(descriptor) == RENDER_RESULT_OK &&
+			owner.LockForFullOverwrite(0, 4, RENDER_BUFFER_UPDATE_DISCARD,
+				&bytes) == RENDER_RESULT_OK && bytes != nullptr &&
+			std::memcmp(NativeW3DBufferOwnerTestAccess::AuthoritativeData(owner),
+				zero, sizeof(zero)) == 0,
+			"full-overwrite first discard admits its exact vertex/index prefix");
+		Fill(bytes, 4, 0x09);
+		GpuHandle handle;
+		NativeW3DBufferDescription description;
+		result |= Check(owner.Unlock() == RENDER_RESULT_OK &&
+			(binding == RENDER_BUFFER_VERTEX ?
+				owner.AcquireVertexRange(4, 0, 0, 1, &handle) :
+				owner.AcquireIndexRange(RENDER_FORMAT_R16_UINT, 0, 0, 2, &handle)) ==
+				RENDER_RESULT_OK &&
+			resources.DescribeBuffer(handle, &description) == RENDER_RESULT_OK &&
+			description.authority == NATIVE_W3D_CONTENT_INVALID,
+			"full-overwrite partial discard retains exact-range-only authority");
+		GpuHandle rejected(1, 1);
+		result |= Check((binding == RENDER_BUFFER_VERTEX ?
+			owner.AcquireVertexRange(4, 0, 1, 1, &rejected) :
+			owner.AcquireIndexRange(RENDER_FORMAT_R16_UINT, 0, 2, 1, &rejected)) ==
+				RENDER_RESULT_INVALID_ARGUMENT && !rejected.isValid(),
+			"full-overwrite first discard cannot authorize untouched bytes");
+
+		result |= Check(owner.LockForFullOverwrite(0, 0,
+			RENDER_BUFFER_UPDATE_PRESERVE, &bytes) == RENDER_RESULT_OK,
+			"zero-count full-overwrite lock spans the remaining buffer");
+		Fill(bytes, 16, 0x11);
+		unsigned char expected[16];
+		std::memset(expected, 0x11, sizeof(expected));
+		result |= Check(owner.Unlock() == RENDER_RESULT_OK &&
+			device.LastBytes() == sizeof(expected) &&
+			device.BufferEquals(handle, expected, sizeof(expected)) &&
+			resources.DescribeBuffer(handle, &description) == RENDER_RESULT_OK &&
+			description.authority == NATIVE_W3D_CONTENT_CPU,
+			"full-overwrite publishes every final byte and restores full CPU authority");
+		result |= Check(owner.Lock(4, 4, RENDER_BUFFER_UPDATE_NO_OVERWRITE,
+			&bytes) == RENDER_RESULT_OK && bytes != nullptr &&
+			std::memcmp(bytes, expected + 4, 4) == 0,
+			"default no-overwrite still prefills from authoritative bytes");
+		Fill(bytes, 4, 0x22);
+		std::memset(expected + 4, 0x22, 4);
+		result |= Check(owner.Unlock() == RENDER_RESULT_OK,
+			"default seeded lock publishes before opt-in staging reuse");
+
+		unsigned char poison[16];
+		std::memset(poison, 0xB7, sizeof(poison));
+		unsigned char *staging = NativeW3DBufferOwnerTestAccess::StagingData(owner);
+		if (staging == nullptr ||
+			NativeW3DBufferOwnerTestAccess::StagingCapacity(owner) != sizeof(poison))
+		{
+			result |= Check(false, "full-overwrite fixture requires retained staging");
+			(void)owner.Reset();
+			continue;
+		}
+		Fill(staging, sizeof(poison), 0xB7);
+		result |= Check(owner.LockForFullOverwrite(8, 4,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE, &bytes) == RENDER_RESULT_OK &&
+			bytes == staging && std::memcmp(staging, poison, sizeof(poison)) == 0 &&
+			std::memcmp(NativeW3DBufferOwnerTestAccess::AuthoritativeData(owner),
+				expected, sizeof(expected)) == 0,
+			"opt-in full-overwrite skips prefill without mutating authoritative storage");
+		void *nested = reinterpret_cast<void *>(1);
+		result |= Check(owner.LockForFullOverwrite(0, 4,
+			RENDER_BUFFER_UPDATE_PRESERVE, &nested) == RENDER_RESULT_INVALID_ARGUMENT &&
+			nested == nullptr && owner.IsLocked(),
+			"full-overwrite nested lock rejects without changing the active span");
+		Fill(bytes, 4, 0x33);
+		std::memset(expected + 8, 0x33, 4);
+		result |= Check(std::memcmp(staging + 4, poison + 4, 12) == 0 &&
+			owner.Unlock() == RENDER_RESULT_OK && device.LastOffset() == 8 &&
+			device.LastBytes() == 4 &&
+			device.LastMode() == RENDER_BUFFER_UPDATE_NO_OVERWRITE &&
+			device.BufferEquals(handle, expected, sizeof(expected)) &&
+			std::memcmp(NativeW3DBufferOwnerTestAccess::AuthoritativeData(owner),
+				expected, sizeof(expected)) == 0,
+			"full-overwrite exposes/publishes only its span and preserves outside storage");
+		result |= Check(owner.Lock(8, 4, RENDER_BUFFER_UPDATE_PRESERVE,
+			&bytes) == RENDER_RESULT_OK && bytes != nullptr &&
+			std::memcmp(bytes, expected + 8, 4) == 0,
+			"default preserve remains seeded after full-overwrite publication");
+		Fill(bytes, 4, 0x33);
+		result |= Check(owner.Unlock() == RENDER_RESULT_OK,
+			"default preserve retains its original unlock path");
+
+		void *rejectedBytes = reinterpret_cast<void *>(1);
+		result |= Check(owner.LockForFullOverwrite(17, 1,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE, &rejectedBytes) ==
+				RENDER_RESULT_INVALID_ARGUMENT && rejectedBytes == nullptr &&
+			owner.LockForFullOverwrite(15, 2, RENDER_BUFFER_UPDATE_NO_OVERWRITE,
+				&rejectedBytes) == RENDER_RESULT_INVALID_ARGUMENT &&
+			owner.LockForFullOverwrite(static_cast<size_t>(-1), 1,
+				RENDER_BUFFER_UPDATE_NO_OVERWRITE, &rejectedBytes) ==
+				RENDER_RESULT_INVALID_ARGUMENT &&
+			owner.LockForFullOverwrite(16, 0, RENDER_BUFFER_UPDATE_PRESERVE,
+				&rejectedBytes) == RENDER_RESULT_INVALID_ARGUMENT &&
+			owner.LockForFullOverwrite(4, 4, RENDER_BUFFER_UPDATE_DISCARD,
+				&rejectedBytes) == RENDER_RESULT_INVALID_ARGUMENT &&
+			owner.LockForFullOverwrite(0, 4, static_cast<RenderBufferUpdateMode>(3),
+				&rejectedBytes) == RENDER_RESULT_INVALID_ARGUMENT &&
+			owner.LockForFullOverwrite(0, 4, RENDER_BUFFER_UPDATE_PRESERVE,
+				nullptr) == RENDER_RESULT_INVALID_ARGUMENT &&
+			!owner.IsLocked() && std::memcmp(
+				NativeW3DBufferOwnerTestAccess::AuthoritativeData(owner),
+				expected, sizeof(expected)) == 0,
+			"full-overwrite preserves null/mode/range/overflow/discard admission");
+		Fill(staging, sizeof(poison), 0xB7);
+		result |= Check(owner.LockForFullOverwrite(0, 4,
+			RENDER_BUFFER_UPDATE_DISCARD, &bytes) == RENDER_RESULT_OK &&
+			std::memcmp(staging, poison, sizeof(poison)) == 0 &&
+			std::memcmp(NativeW3DBufferOwnerTestAccess::AuthoritativeData(owner),
+				zero, sizeof(zero)) == 0,
+			"full-overwrite discard skips staging clear but clears whole authoritative image");
+		Fill(bytes, 4, 0x44);
+		result |= Check(owner.Unlock() == RENDER_RESULT_OK &&
+			(binding == RENDER_BUFFER_VERTEX ?
+				owner.AcquireVertexRange(4, 0, 1, 1, &rejected) :
+				owner.AcquireIndexRange(RENDER_FORMAT_R16_UINT, 0, 2, 1, &rejected)) ==
+				RENDER_RESULT_INVALID_ARGUMENT && !rejected.isValid(),
+			"full-overwrite repeated discard revokes the previously initialized tail");
+		result |= Check(owner.Lock(8, 4, RENDER_BUFFER_UPDATE_NO_OVERWRITE,
+			&bytes) == RENDER_RESULT_OK && bytes != nullptr &&
+			std::memcmp(bytes, zero, 4) == 0,
+			"default tail prefill observes full-overwrite discard authority clearing");
+		Fill(bytes, 4, 0);
+		result |= Check(owner.Unlock() == RENDER_RESULT_OK,
+			"default tail lock remains publishable after opt-in discard");
+
+		device.FailUpdate(true);
+		result |= Check(owner.LockForFullOverwrite(4, 4,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE, &bytes) == RENDER_RESULT_OK,
+			"full-overwrite obtains a bounded failure-injection span");
+		Fill(bytes, 4, 0x55);
+		result |= Check(owner.Unlock() == RENDER_RESULT_FAILED &&
+			owner.HasFailedMutation() && !owner.IsLocked() &&
+			(binding == RENDER_BUFFER_VERTEX ? owner.AcquireVertexBinding(&rejected) :
+				owner.AcquireIndexBinding(&rejected)) == RENDER_RESULT_FAILED &&
+			!rejected.isValid() &&
+			owner.LockForFullOverwrite(4, 4, RENDER_BUFFER_UPDATE_NO_OVERWRITE,
+				&rejectedBytes) == RENDER_RESULT_FAILED && rejectedBytes == nullptr &&
+			owner.LockForFullOverwrite(0, 16, RENDER_BUFFER_UPDATE_PRESERVE,
+				&rejectedBytes) == RENDER_RESULT_FAILED && rejectedBytes == nullptr,
+			"full-overwrite publication failure revokes binding and forbids stale retry");
+		device.FailUpdate(false);
+		device.FailCreate(true);
+		result |= Check(owner.LockForFullOverwrite(0, 16,
+			RENDER_BUFFER_UPDATE_DISCARD, &rejectedBytes) == RENDER_RESULT_FAILED &&
+			rejectedBytes == nullptr && resources.IsValid(handle),
+			"full-overwrite failed recreation retains the retryable old generation");
+		device.FailCreate(false);
+		result |= Check(owner.LockForFullOverwrite(0, 0,
+			RENDER_BUFFER_UPDATE_DISCARD, &bytes) == RENDER_RESULT_OK &&
+			std::memcmp(NativeW3DBufferOwnerTestAccess::AuthoritativeData(owner),
+				zero, sizeof(zero)) == 0,
+			"full-overwrite retry recreates through offset-zero discard with clean authority");
+		Fill(bytes, 16, 0x66);
+		std::memset(expected, 0x66, sizeof(expected));
+		GpuHandle recovered;
+		result |= Check(owner.Unlock() == RENDER_RESULT_OK &&
+			(binding == RENDER_BUFFER_VERTEX ? owner.AcquireVertexBinding(&recovered) :
+				owner.AcquireIndexBinding(&recovered)) == RENDER_RESULT_OK &&
+			recovered != handle && !resources.IsValid(handle) &&
+			device.BufferEquals(recovered, expected, sizeof(expected)) &&
+			resources.DescribeBuffer(recovered, &description) == RENDER_RESULT_OK &&
+			description.authority == NATIVE_W3D_CONTENT_CPU &&
+			!owner.HasFailedMutation() && owner.Reset() == RENDER_RESULT_OK &&
+			NativeW3DBufferOwnerTestAccess::StagingCapacity(owner) == 0,
+			"full-overwrite recovery publishes all bytes on a new generation and reset frees staging");
+	}
+	result |= Check(device.LiveCount() == liveBefore,
+		"full-overwrite vertex/index fixtures retain no backend allocation");
+	return result;
+}
+
 }
 
 int main(int argc, char **argv)
@@ -654,6 +852,11 @@ int main(int argc, char **argv)
 	result |= Check(unbound.Create(staticDescriptor) ==
 		RENDER_RESULT_INVALID_ARGUMENT,
 		"an unbound native buffer owner fails closed");
+	void *unboundFullWrite = reinterpret_cast<void *>(1);
+	result |= Check(unbound.LockForFullOverwrite(0, 16,
+		RENDER_BUFFER_UPDATE_PRESERVE, &unboundFullWrite) ==
+			RENDER_RESULT_INVALID_ARGUMENT && unboundFullWrite == nullptr,
+		"an unbound full-overwrite lock rejects and clears its output");
 	DX8IndexBufferClass *unboundIndex = NEW_REF(DX8IndexBufferClass,(3));
 	DX8VertexBufferClass *unboundVertex = NEW_REF(DX8VertexBufferClass,(
 		DX8_FVF_XYZ, 3));
@@ -699,6 +902,7 @@ int main(int argc, char **argv)
 		BindNativeW3DBufferResources(&differentResources) ==
 			RENDER_RESULT_INVALID_ARGUMENT,
 		"the native buffer boundary borrows exactly one resource registry");
+	result |= RunFullOverwriteLockContract(device, resources);
 	SortingIndexBufferClass *sortingAppendBuffer =
 		NEW_REF(SortingIndexBufferClass,(static_cast<unsigned short>(65535U)));
 	result |= Check(sortingAppendBuffer != nullptr &&
@@ -853,6 +1057,24 @@ int main(int argc, char **argv)
 	result |= Check(nativeIndex->Unlock_Buffer() &&
 		nativeVertex->Unlock_Buffer(),
 		"native compatibility-shaped unlocks publish through the owner");
+	lockedIndexBytes = reinterpret_cast<void *>(1);
+	lockedVertexBytes = reinterpret_cast<void *>(1);
+	result |= Check(!nativeIndex->Lock_Buffer_For_Full_Overwrite(0,
+		sizeof(indexBytes), NATIVE_BUFFER_LOCK_READ_ONLY, &lockedIndexBytes) &&
+		lockedIndexBytes == nullptr &&
+		!nativeVertex->Lock_Buffer_For_Full_Overwrite(0, sizeof(vertexBytes),
+			NATIVE_BUFFER_LOCK_DISCARD | NATIVE_BUFFER_LOCK_NO_OVERWRITE,
+			&lockedVertexBytes) && lockedVertexBytes == nullptr,
+		"full-overwrite native wrappers keep existing legal-flag decoding");
+	result |= Check(Lock_W3D_Buffer_For_Full_Overwrite(nativeIndex, 0,
+		sizeof(indexBytes), 0, &lockedIndexBytes) && lockedIndexBytes != nullptr &&
+		Lock_W3D_Buffer_For_Full_Overwrite(nativeVertex, 0, sizeof(vertexBytes),
+			0, &lockedVertexBytes) && lockedVertexBytes != nullptr,
+		"full-overwrite native compatibility dispatch admits complete vertex/index fills");
+	Fill(lockedIndexBytes, sizeof(indexBytes), 0);
+	Fill(lockedVertexBytes, sizeof(vertexBytes), 0);
+	result |= Check(nativeIndex->Unlock_Buffer() && nativeVertex->Unlock_Buffer(),
+		"full-overwrite native wrappers retain original unlock publication");
 	nativeIndex->Release_Ref();
 	nativeVertex->Release_Ref();
 	result |= Check(device.LiveCount() == 0,
@@ -935,6 +1157,12 @@ int main(int argc, char **argv)
 		staticBuffer.Lock(0, 16, RENDER_BUFFER_UPDATE_NO_OVERWRITE,
 			&bytes) == RENDER_RESULT_INVALID_ARGUMENT && bytes == nullptr,
 		"static buffers reject dynamic discard and no-overwrite modes");
+	result |= Check(staticBuffer.LockForFullOverwrite(0, 16,
+		RENDER_BUFFER_UPDATE_DISCARD, &bytes) == RENDER_RESULT_INVALID_ARGUMENT &&
+		bytes == nullptr && staticBuffer.LockForFullOverwrite(0, 16,
+			RENDER_BUFFER_UPDATE_NO_OVERWRITE, &bytes) ==
+			RENDER_RESULT_INVALID_ARGUMENT && bytes == nullptr,
+		"full-overwrite static locks retain dynamic-mode rejection");
 
 	BufferDescriptor dynamicDescriptor = staticDescriptor;
 	dynamicDescriptor.binding = RENDER_BUFFER_INDEX;
@@ -1364,7 +1592,10 @@ int main(int argc, char **argv)
 		BindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK &&
 		staleBindingBuffer.AcquireVertexRange(4, 0, 0, 4,
 			&rejectedHandle) == RENDER_RESULT_FAILED &&
-		!rejectedHandle.isValid() && staleBindingBuffer.Reset() == RENDER_RESULT_OK &&
+		!rejectedHandle.isValid() &&
+		staleBindingBuffer.LockForFullOverwrite(0, 16,
+			RENDER_BUFFER_UPDATE_PRESERVE, &bytes) == RENDER_RESULT_INVALID_ARGUMENT &&
+		bytes == nullptr && staleBindingBuffer.Reset() == RENDER_RESULT_OK &&
 		!resources.IsValid(staleBindingHandle) &&
 		UnbindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK,
 		"only the borrowed registry can unbind the native buffer boundary");

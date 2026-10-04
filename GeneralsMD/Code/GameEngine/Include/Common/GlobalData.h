@@ -71,6 +71,7 @@ public:
 		, m_skirmishAITestPractical1v7Seed(0)
 		, m_hasRenderedBattleDiagnosticRequest(false)
 		, m_renderedBattleDiagnosticSeed(0)
+		, m_renderedBattleBenchmark(false)
 		#if defined(_WIN64)
 		, m_hasSkirmishAITestHardAI2v6Request(false)
 		, m_skirmishAITestHardAI2v6Seed(0)
@@ -188,7 +189,8 @@ public:
 	// Test-only rendered combat, never an ordinary AI/replay acceptance lane.
 	Bool hasRenderedBattleDiagnosticRequest() const { return m_hasRenderedBattleDiagnosticRequest; }
 	Int getRenderedBattleDiagnosticSeed() const { return m_renderedBattleDiagnosticSeed; }
-	Bool requestRenderedBattleDiagnostic(Int seed)
+	Bool isRenderedBattleBenchmark() const { return m_renderedBattleBenchmark; }
+	Bool requestRenderedBattleDiagnostic(Int seed, Bool benchmark = false)
 	{
 		if (seed <= 0 || m_hasRenderedBattleDiagnosticRequest ||
 			m_hasSkirmishAITestRequest || m_hasSkirmishAITest4v2Request ||
@@ -200,6 +202,7 @@ public:
 			return false;
 		m_hasRenderedBattleDiagnosticRequest = true;
 		m_renderedBattleDiagnosticSeed = seed;
+		m_renderedBattleBenchmark = benchmark;
 		return true;
 	}
 
@@ -214,6 +217,7 @@ private:
 	Int m_skirmishAITestPractical1v7Seed;
 	Bool m_hasRenderedBattleDiagnosticRequest;
 	Int m_renderedBattleDiagnosticSeed;
+	Bool m_renderedBattleBenchmark;
 #if defined(_WIN64)
 	Bool m_hasSkirmishAITestHardAI2v6Request;
 	Int m_skirmishAITestHardAI2v6Seed;

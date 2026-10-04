@@ -155,6 +155,8 @@ public:
 		unsigned char **data, unsigned long flags);
 	long Unlock();
 #if defined(_WIN64)
+	bool Lock_Buffer_For_Full_Overwrite(size_t byte_offset, size_t byte_count,
+		int flags, void **data);
 	bool Acquire_Native_Index_Buffer(
 		rts::render::GpuHandle *validated) const;
 	bool Acquire_Native_Index_Buffer(unsigned int offset,
