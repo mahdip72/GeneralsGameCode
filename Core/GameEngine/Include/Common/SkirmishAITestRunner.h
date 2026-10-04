@@ -333,6 +333,9 @@ Bool TryParseSkirmishAIAlliedFixtureCase(const char *text, Int *fixtureCase);
 Bool ConfigureSkirmishAIAlliedFixture(Int fixtureCase);
 // Read-only opt-in for live allied-fixture diagnostics, false in other lanes.
 Bool IsSkirmishAIAlliedFixtureActive();
+// Opt-in bounded witness for direct roster transfers held by the actual engine.
+void ObserveSkirmishAIAlliedTeamTransferHeld(UnsignedInt sourceTeamID,
+	UnsignedInt destinationTeamID, const char *operation);
 Bool IsSkirmishAITestRunnerArmed();
 Bool StartSkirmishAITestRunner();
 void UpdateSkirmishAITestRunner();

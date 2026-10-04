@@ -29,6 +29,9 @@
 #if RTS_ZEROHOUR
 #include "GameLogic/AI.h"
 #include "GameLogic/AISkirmishPlayer.h"
+#include "GameLogic/ScriptActions.h"
+#include "GameLogic/ScriptEngine.h"
+#include "GameLogic/Scripts.h"
 #endif
 #include "GameLogic/AIPathfind.h"
 #include "GameClient/MapUtil.h"
@@ -165,6 +168,7 @@ struct AlliedFixtureState
 	Bool supportFaultIssued;
 	Bool supportAssignedScriptChecked;
 	Bool supportReturningScriptChecked;
+	UnsignedInt supportTransferHoldWitnesses;
 	Bool cancellationIssued;
 	Bool cancellationSaved;
 	Bool postLoadProtectionVerified;
@@ -196,6 +200,7 @@ struct AlliedFixtureState
 		supportNeedSourceWitnessID(INVALID_ID), supportNeedEnemyIndex(-1),
 		supportNextNeedImpactFrame(0), supportNeedImpactCount(0), supportFaultIssued(FALSE),
 		supportAssignedScriptChecked(FALSE), supportReturningScriptChecked(FALSE),
+		supportTransferHoldWitnesses(0),
 		cancellationIssued(FALSE), cancellationSaved(FALSE), postLoadProtectionVerified(FALSE),
 		cancellationTarget(INVALID_ID), cancellationRelease(0)
 	{
@@ -3690,6 +3695,28 @@ Bool IsSkirmishAIAlliedFixtureActive()
 	return s_allied.active;
 #else
 	return FALSE;
+#endif
+}
+
+void ObserveSkirmishAIAlliedTeamTransferHeld(UnsignedInt sourceTeamID,
+	UnsignedInt destinationTeamID, const char *operation)
+{
+#if RTS_ZEROHOUR && defined(_WIN64)
+	if (!s_allied.active || s_allied.fixtureCase != SKIRMISH_AI_ALLIED_SUPPORT_LIFECYCLE ||
+		s_allied.supportDonorSlot < 0 || sourceTeamID != s_allied.supportTeamID)
+		return;
+	++s_allied.supportTransferHoldWitnesses;
+	if (s_allied.supportTransferHoldWitnesses <= 16) {
+		printf("SKIRMISH_AI_ALLIED_SUPPORT_TRANSFER_HOLD frame=%u operation=%s "
+			"source_team=%u destination_team=%u tracked_member=%u witness=%u\n",
+			TheGameLogic->getFrame(), operation, sourceTeamID, destinationTeamID,
+			s_allied.supportMemberID, s_allied.supportTransferHoldWitnesses);
+		fflush(stdout);
+	}
+#else
+	(void)sourceTeamID;
+	(void)destinationTeamID;
+	(void)operation;
 #endif
 }
 
@@ -9505,15 +9532,33 @@ Bool CheckAlliedSupportScriptHold(AISkirmishPlayer *ownerAI, Player *owner, Obje
 	{ FailSkirmishAITest("allied_support_script_probe_not_owned_guard"); RequestSkirmishAITestStop(); return FALSE; }
 	const Coord3D guardBefore = *guard;
 	const Int stateBefore = unitAI->getCurrentStateID();
+	const Bool recruitableBefore = unitAI->isRecruitable();
 	const AISkirmishPlayer::AlliedCoordinationDiagnostics assignmentBefore = ownerAI->getAlliedCoordinationDiagnostics();
-	for (Int command = 0; command < 2; ++command)
+	for (Int command = 0; command < 4; ++command)
 	{
+		const UnsignedInt transferWitnessesBefore = s_allied.supportTransferHoldWitnesses;
 		if (command == 0) unitAI->aiAttackMoveToPosition(&scriptGoal, NO_MAX_SHOTS_LIMIT, CMD_FROM_SCRIPT);
-		else unitAI->aiMoveToPosition(&scriptGoal, CMD_FROM_SCRIPT);
+		else if (command == 1) unitAI->aiMoveToPosition(&scriptGoal, CMD_FROM_SCRIPT);
+		else {
+			if (!TheScriptActions || !TheScriptEngine || !owner->getDefaultTeam())
+			{ FailSkirmishAITest("allied_support_transfer_probe_unavailable"); RequestSkirmishAITestStop(); return FALSE; }
+			// Execute the real script dispatcher against this exact team instance.
+			// An unguarded merge/disband moves the survivor and destroys its source.
+			ScriptAction *action = newInstance(ScriptAction)(command == 2 ?
+				ScriptAction::TEAM_MERGE_INTO_TEAM : ScriptAction::TEAM_STOP_AND_DISBAND);
+			action->setNextAction(nullptr);
+			action->getParameter(0)->setString(THIS_TEAM);
+			if (command == 2)
+				action->getParameter(1)->setString(owner->getDefaultTeam()->getName());
+			TheScriptEngine->friend_executeAction(action, member->getTeam());
+			deleteInstance(action);
+		}
 		guard = unitAI->getGuardLocation();
 		if (!IsSkirmishAIRecoveryCombatUnit(member, owner) || !member->getTeam() ||
 			member->getID() != s_allied.supportMemberID || member->getTeam()->getID() != s_allied.supportTeamID ||
 			!guard || unitAI->getLastCommandSource() != CMD_FROM_AI || unitAI->getCurrentStateID() != stateBefore ||
+			unitAI->isRecruitable() != recruitableBefore ||
+			(command >= 2 && s_allied.supportTransferHoldWitnesses != transferWitnessesBefore + 1) ||
 			unitAI->getGuardTargetType() != GUARDTARGET_LOCATION ||
 			AlliedFixtureDistanceSquared(*guard, guardBefore) > 1.0f ||
 			!ownerAI->isAlliedSupportMember(member) || !ownerAI->shouldHoldAlliedScriptCommand(member) ||
@@ -9521,8 +9566,11 @@ Bool CheckAlliedSupportScriptHold(AISkirmishPlayer *ownerAI, Player *owner, Obje
 		{ FailSkirmishAITest("allied_support_script_command_replaced_owned_guard"); RequestSkirmishAITestStop(); return FALSE; }
 		++s_allied.checks;
 		printf("SKIRMISH_AI_ALLIED_SUPPORT_SCRIPT_HOLD_ASSERT frame=%u phase=%s member=%u team=%u "
-			"command=%s source=script guard_unchanged=1 owner_source=ai assignment_unchanged=1\n",
-			frame, phase, member->getID(), member->getTeam()->getID(), command == 0 ? "attack_move" : "move");
+			"command=%s source=script guard_unchanged=1 owner_source=ai assignment_unchanged=1 "
+			"recruitable_unchanged=1 destination_team=%u transfer_witnesses=%u\n",
+			frame, phase, member->getID(), member->getTeam()->getID(),
+			command == 0 ? "attack_move" : (command == 1 ? "move" : (command == 2 ? "merge" : "disband")),
+			owner->getDefaultTeam()->getID(), s_allied.supportTransferHoldWitnesses);
 		fflush(stdout);
 	}
 	return TRUE;

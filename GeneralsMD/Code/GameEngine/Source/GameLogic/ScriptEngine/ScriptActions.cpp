@@ -42,6 +42,9 @@
 #include "Common/PlayerTemplate.h"
 #include "Common/Radar.h"									// For TheRadar
 #include "Common/Recorder.h"
+#if defined(_WIN64)
+#include "Common/SkirmishAITestRunner.h"
+#endif
 #include "Common/SpecialPower.h"
 #include "Common/ThingFactory.h"
 #include "Common/ThingTemplate.h"
@@ -194,6 +197,21 @@ static void updateTeamAndPlayerStuff( Object *obj, void *userData )
 		else
 			draw->setIndicatorColor(obj->getIndicatorColor());
 	}
+}
+
+static Bool HoldAlliedScriptTeamTransfer(Team *source, Team *destination, const char *operation)
+{
+	Player *owner = source ? source->getControllingPlayer() : nullptr;
+	AIPlayer *ownerAI = owner ? owner->getAIPlayerForPlanning() : nullptr;
+	if (!ownerAI || !ownerAI->isSkirmishAI() ||
+		!static_cast<AISkirmishPlayer *>(ownerAI)->shouldHoldAlliedTeamTransfer(source, destination))
+		return false;
+#if defined(_WIN64)
+	ObserveSkirmishAIAlliedTeamTransferHeld(source->getID(), destination->getID(), operation);
+#else
+	(void)operation;
+#endif
+	return true;
 }
 //-------------------------------------------------------------------------------------------------
 //-------------------------------------------------------------------------------------------------
@@ -3336,6 +3354,8 @@ void ScriptActions::doMergeTeamIntoTeam(const AsciiString& teamSrcName, const As
 	if (!teamSrc || !teamDest) {
 		return;
 	}
+	if (HoldAlliedScriptTeamTransfer(teamSrc, teamDest, "script_merge"))
+		return;
 
 //	Bool done = FALSE;
 
@@ -4840,6 +4860,10 @@ void ScriptActions::doTeamStop(const AsciiString& teamName, Bool shouldDisband)
 	if (!theTeam) {
 		return;
 	}
+	// Disband must be held before idle orders or recruitability metadata change.
+	if (shouldDisband && HoldAlliedScriptTeamTransfer(theTeam,
+		theTeam->getControllingPlayer()->getDefaultTeam(), "script_disband"))
+		return;
 
 	AIGroupPtr theGroup = TheAI->createGroup();
 	if (!theGroup) {

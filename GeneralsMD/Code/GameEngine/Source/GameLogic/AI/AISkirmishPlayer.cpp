@@ -8799,6 +8799,26 @@ Bool AISkirmishPlayer::isAlliedSupportMember(const Object *object) const
 		isAlliedSupportTeam(object->getTeam()->getID());
 }
 
+Bool AISkirmishPlayer::shouldHoldAlliedTeamTransfer(Team *source, Team *destination) const
+{
+	if (!usesAlliedCoordinationBehavior() || !m_player ||
+		m_player->getPlayerType() != PLAYER_COMPUTER || !source || !destination ||
+		source == destination || source->getControllingPlayer() != m_player ||
+		destination->getControllingPlayer() != m_player ||
+		(!isAlliedSupportTeam(source->getID()) && !isAlliedAssaultTeam(source->getID())))
+		return false;
+	// A merge/disband deletes its source after moving members, so defer the whole
+	// operation while it owns actual combat recipients. Roster identity does
+	// not depend on activation while a queued team is being retired.
+	for (DLINK_ITERATOR<Object> member = source->iterate_TeamMemberList();
+		!member.done(); member.advance()) {
+		if (IsSkirmishStrategyPotentialOffensiveRecipient(member.cur(), m_player, source) ||
+			IsSkirmishAIStrategyTunnelTransitMember(member.cur(), m_player, source, true))
+			return true;
+	}
+	return false;
+}
+
 Bool AISkirmishPlayer::isAlliedAssaultHolding() const
 {
 	return usesAlliedCoordinationBehavior() && m_alliedAssaultActive &&

@@ -50,6 +50,7 @@
 #include "GameLogic/GameLogic.h"
 #include "GameLogic/Object.h"
 #include "GameLogic/AIPlayer.h"
+#include "GameLogic/AISkirmishPlayer.h"
 #include "GameLogic/SidesList.h"
 #include "GameLogic/AI.h"
 #include "GameLogic/AIPathfind.h"
@@ -68,6 +69,7 @@
 #include "GameLogic/Module/SupplyWarehouseDockUpdate.h"
 #include "GameLogic/PartitionManager.h"
 #if defined(_WIN64)
+#include "Common/SkirmishAITestRunner.h"
 #include "Lib/DeterministicAIPlanning.h"
 #include <new>
 #endif
@@ -4678,6 +4680,17 @@ Bool TeamInQueue::areBuildsComplete()
 void TeamInQueue::disband()
 {
 	Team *newTeam = m_team->getPrototype()->getControllingPlayer()->getDefaultTeam();
+	Player *owner = m_team->getControllingPlayer();
+	AIPlayer *ownerAI = owner ? owner->getAIPlayerForPlanning() : nullptr;
+	if (ownerAI && ownerAI->isSkirmishAI() &&
+		static_cast<AISkirmishPlayer *>(ownerAI)->shouldHoldAlliedTeamTransfer(m_team, newTeam)) {
+#if defined(_WIN64)
+		ObserveSkirmishAIAlliedTeamTransferHeld(m_team->getID(), newTeam->getID(), "queued_disband");
+#endif
+		// The caller retires only this queue entry. Its destructor keeps the
+		// retained team active without script feedback and never deletes it.
+		return;
+	}
 	AsciiString teamName = m_team->getPrototype()->getName();
 	teamName.concat(" - team disbanded, build time expired.");
 	TheScriptEngine->AppendDebugMessage(teamName, false);

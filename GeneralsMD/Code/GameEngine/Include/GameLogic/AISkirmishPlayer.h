@@ -132,6 +132,7 @@ public:	// AIPlayer interface methods.
 	Bool isAlliedAssaultHoldingTeam(UnsignedInt teamID) const;
 	Bool shouldHoldAlliedScriptCommand(const Object *object) const;
 	Bool isAlliedSupportMember(const Object *object) const;
+	Bool shouldHoldAlliedTeamTransfer(Team *source, Team *destination) const;
 	Bool canSpendForCriticalRecovery(Int cost, const ThingTemplate *thing,
 		Bool isUpgrade, Bool refreshProductionReserve);
 
