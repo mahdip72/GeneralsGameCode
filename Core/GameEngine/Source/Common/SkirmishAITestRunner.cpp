@@ -109,6 +109,8 @@ struct AlliedFixtureState
 	Bool sawAid;
 	Int aidDonorSlot;
 	Int aidRecipientSlot;
+	ObjectID aidBuilderID;
+	ObjectID aidVictoryBuildingID;
 	UnsignedInt aidCooldownUntil;
 	UnsignedInt aidEvaluation;
 	UnsignedInt firstStarvationFrame;
@@ -175,7 +177,8 @@ struct AlliedFixtureState
 		sawCoordination(FALSE), nextEvaluation(0), supportDonorSlot(-1),
 		supportRecipientIndex(-1), aidFaultApplied(FALSE),
 		sawFirstStarvationEvaluation(FALSE), sawAid(FALSE), aidDonorSlot(-1),
-		aidRecipientSlot(-1), aidCooldownUntil(0), aidEvaluation(0),
+		aidRecipientSlot(-1), aidBuilderID(INVALID_ID), aidVictoryBuildingID(INVALID_ID),
+		aidCooldownUntil(0), aidEvaluation(0),
 		firstStarvationFrame(0), sawSupportReturning(FALSE),
 		coordinatedReleaseFrame(0), postLoadEvaluation(0), postLoadBlockedEvaluations(0),
 		withdrawalFaultIssued(FALSE), withdrawalCanceled(FALSE), withdrawalComplete(FALSE),
@@ -9525,17 +9528,64 @@ void ObserveAlliedAid(UnsignedInt frame)
 					recipientAI->getAlliedCoordinationDiagnostics().donationCooldownActive ||
 					TheAI->getAlliedRecipientReliefUntil(recipient->getPlayerIndex()) != 0) continue;
 				Object *builder = nullptr;
+				Object *victoryBuilding = nullptr;
 				for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
-					if (IsLiveSkirmishAIRecoveryObject(object) && object->getControllingPlayer() == recipient &&
-						object->isKindOf(KINDOF_DOZER)) { builder = object; break; }
-				if (!builder) continue;
+				{
+					if (!IsLiveSkirmishAIRecoveryObject(object) || object->getControllingPlayer() != recipient ||
+						object->isContained() || object->testStatus(OBJECT_STATUS_SOLD) ||
+						object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+						object->testStatus(OBJECT_STATUS_RECONSTRUCTING)) continue;
+					AIUpdateInterface *unitAI = object->getAIUpdateInterface();
+					if (object->isKindOf(KINDOF_DOZER) && unitAI && unitAI->getDozerAIInterface() &&
+						!object->isDisabledByType(DISABLED_UNMANNED) &&
+						(!builder || object->getID() < builder->getID())) builder = object;
+					// Stock victory requires a real surviving building. A command center
+					// also exists in the initial CC/dozer-only state, but contributes no
+					// income or combat production to the authoritative allied capture.
+					if (object->isKindOf(KINDOF_COMMANDCENTER) && object->isKindOf(KINDOF_STRUCTURE) &&
+						object->isKindOf(KINDOF_MP_COUNT_FOR_VICTORY) &&
+						!object->isKindOf(KINDOF_FS_SUPPLY_CENTER) &&
+						!object->isKindOf(KINDOF_FS_SUPPLY_DROPZONE) &&
+						!object->isKindOf(KINDOF_FS_BLACK_MARKET) &&
+						!object->isKindOf(KINDOF_FS_BARRACKS) &&
+						!object->isKindOf(KINDOF_FS_WARFACTORY) &&
+						!object->isKindOf(KINDOF_FS_AIRFIELD) &&
+						(!victoryBuilding || object->getID() < victoryBuilding->getID())) victoryBuilding = object;
+				}
+				if (!builder || !victoryBuilding) continue;
+				const Int victoryConditions = TheVictoryConditions ?
+					TheVictoryConditions->getVictoryConditions() : -1;
+				if (victoryConditions != VICTORY_NOBUILDINGS)
+				{
+					printf("SKIRMISH_AI_ALLIED_AID_SETUP_DIAGNOSTIC frame=%u victory_conditions=%d expected=%d\n",
+						frame, victoryConditions, VICTORY_NOBUILDINGS);
+					fflush(stdout);
+					FailSkirmishAITest("allied_aid_unexpected_victory_conditions");
+					RequestSkirmishAITestStop();
+					return;
+				}
 				const ObjectID builderID = builder->getID();
 				for (Object *object = TheGameLogic->getFirstObject(); object; )
 				{
 					Object *next = object->getNextObject();
-					if (object != builder && object->getControllingPlayer() == recipient &&
+					if (object != builder && object != victoryBuilding && object->getControllingPlayer() == recipient &&
 						IsLiveSkirmishAIRecoveryObject(object)) DestroySkirmishAIRecoveryObject(object);
 					object = next;
+				}
+				KindOfMaskType victoryMask;
+				victoryMask.set(KINDOF_MP_COUNT_FOR_VICTORY);
+				if (!recipient->isPlayerActive() || !IsLiveSkirmishAIRecoveryObject(builder) ||
+					!IsLiveSkirmishAIRecoveryObject(victoryBuilding) || !recipient->hasAnyBuildings(victoryMask))
+				{
+					printf("SKIRMISH_AI_ALLIED_AID_SETUP_DIAGNOSTIC frame=%u recipient_active=%d builder=%u "
+						"builder_live=%d victory_building=%u victory_building_live=%d victory_counted_building=%d\n",
+						frame, recipient->isPlayerActive(), builderID, IsLiveSkirmishAIRecoveryObject(builder),
+						victoryBuilding->getID(), IsLiveSkirmishAIRecoveryObject(victoryBuilding),
+						recipient->hasAnyBuildings(victoryMask));
+					fflush(stdout);
+					FailSkirmishAITest("allied_aid_survival_setup_invalid");
+					RequestSkirmishAITestStop();
+					return;
 				}
 				for (BuildListInfo *info = recipient->getBuildList(); info; info = info->getNext())
 					info->setNumRebuilds(0);
@@ -9543,11 +9593,15 @@ void ObserveAlliedAid(UnsignedInt frame)
 				SetSkirmishAIRecoveryCash(donor, 100000);
 				s_allied.aidDonorSlot = donorSlot;
 				s_allied.aidRecipientSlot = recipientSlot;
+				s_allied.aidBuilderID = builderID;
+				s_allied.aidVictoryBuildingID = victoryBuilding->getID();
 				s_allied.aidFaultApplied = TRUE;
 				s_allied.aidEvaluation = TheAI->getNextAlliedEvaluationFrame();
 				printf("SKIRMISH_AI_ALLIED_AID_FAULT frame=%u donor_slot=%d recipient_slot=%d "
-					"builder=%u recipient_cash=10 donor_cash=100000 captured_economy=%d captured_base=%d\n",
-					frame, donorSlot, recipientSlot, builderID, healthy->economyHealth, healthy->baseIntegrity);
+					"builder=%u recipient_cash=10 donor_cash=100000 captured_economy=%d captured_base=%d "
+					"victory_conditions=%d victory_building=%u victory_template=%s\n",
+					frame, donorSlot, recipientSlot, builderID, healthy->economyHealth, healthy->baseIntegrity,
+					victoryConditions, victoryBuilding->getID(), victoryBuilding->getTemplate()->getName().str());
 				fflush(stdout);
 				return;
 			}
@@ -9556,9 +9610,27 @@ void ObserveAlliedAid(UnsignedInt frame)
 	}
 	AISkirmishPlayer *donorAI = GetAlliedFixtureAI(s_allied.aidDonorSlot);
 	AISkirmishPlayer *recipientAI = GetAlliedFixtureAI(s_allied.aidRecipientSlot);
+	Player *liveDonor = ThePlayerList->getPlayerFromSlotIndex(s_allied.aidDonorSlot);
 	Player *recipient = ThePlayerList->getPlayerFromSlotIndex(s_allied.aidRecipientSlot);
-	if (!donorAI || !recipientAI || !recipient || !recipient->isPlayerActive())
-	{ FailSkirmishAITest("allied_aid_participant_lost"); RequestSkirmishAITestStop(); return; }
+	if (!donorAI || !recipientAI || !liveDonor || !liveDonor->isPlayerActive() ||
+		!recipient || !recipient->isPlayerActive())
+	{
+		Object *builder = TheGameLogic->findObjectByID(s_allied.aidBuilderID);
+		Object *victoryBuilding = TheGameLogic->findObjectByID(s_allied.aidVictoryBuildingID);
+		printf("SKIRMISH_AI_ALLIED_AID_PARTICIPANT_DIAGNOSTIC frame=%u donor_slot=%d donor_present=%d "
+			"donor_active=%d donor_ai=%d recipient_slot=%d recipient_present=%d recipient_active=%d recipient_ai=%d "
+			"victory_conditions=%d builder=%u builder_live=%d builder_owner=%d victory_building=%u "
+			"victory_building_live=%d victory_building_owner=%d\n", frame, s_allied.aidDonorSlot,
+			liveDonor != nullptr, liveDonor && liveDonor->isPlayerActive(), donorAI != nullptr,
+			s_allied.aidRecipientSlot, recipient != nullptr, recipient && recipient->isPlayerActive(), recipientAI != nullptr,
+			TheVictoryConditions ? TheVictoryConditions->getVictoryConditions() : -1, s_allied.aidBuilderID,
+			IsLiveSkirmishAIRecoveryObject(builder), builder && builder->getControllingPlayer() ?
+				builder->getControllingPlayer()->getPlayerIndex() : -1, s_allied.aidVictoryBuildingID,
+			IsLiveSkirmishAIRecoveryObject(victoryBuilding), victoryBuilding && victoryBuilding->getControllingPlayer() ?
+				victoryBuilding->getControllingPlayer()->getPlayerIndex() : -1);
+		fflush(stdout);
+		FailSkirmishAITest("allied_aid_participant_lost"); RequestSkirmishAITestStop(); return;
+	}
 	const AISkirmishPlayer::AlliedCoordinationDiagnostics donor = donorAI->getAlliedCoordinationDiagnostics();
 	const AISkirmishPlayer::AlliedCoordinationDiagnostics received = recipientAI->getAlliedCoordinationDiagnostics();
 	const Int recipientIndex = recipient->getPlayerIndex();
