@@ -157,6 +157,11 @@ struct AlliedFixtureState
 	ObjectID supportMemberID;
 	Coord3D supportInitialPosition;
 	Coord3D supportAwayPosition;
+	ObjectID supportNeedVictimID;
+	ObjectID supportNeedSourceWitnessID;
+	Int supportNeedEnemyIndex;
+	UnsignedInt supportNextNeedImpactFrame;
+	UnsignedInt supportNeedImpactCount;
 	Bool supportFaultIssued;
 	Bool supportAssignedScriptChecked;
 	Bool supportReturningScriptChecked;
@@ -187,7 +192,9 @@ struct AlliedFixtureState
 		returnFireEvaluation(0), returnFireMember(INVALID_ID), returnFireSource(INVALID_ID),
 		returnFireTeam(0), returnFireParticipant(-1), assaultLeader(-1), assaultEnemy(-1),
 		assaultTarget(INVALID_ID), assaultRelease(0), assaultExpiry(0),
-		supportTeamID(0), supportMemberID(INVALID_ID), supportFaultIssued(FALSE),
+		supportTeamID(0), supportMemberID(INVALID_ID), supportNeedVictimID(INVALID_ID),
+		supportNeedSourceWitnessID(INVALID_ID), supportNeedEnemyIndex(-1),
+		supportNextNeedImpactFrame(0), supportNeedImpactCount(0), supportFaultIssued(FALSE),
 		supportAssignedScriptChecked(FALSE), supportReturningScriptChecked(FALSE),
 		cancellationIssued(FALSE), cancellationSaved(FALSE), postLoadProtectionVerified(FALSE),
 		cancellationTarget(INVALID_ID), cancellationRelease(0)
@@ -9584,6 +9591,131 @@ void PrintAlliedSupportFailure(const char *phase, UnsignedInt frame,
 	fflush(stdout);
 }
 
+Bool FindAlliedSupportNeedWitnesses(Player *recipient, Object **victim, Object **source)
+{
+	*victim = nullptr;
+	*source = nullptr;
+	AIPlayer *recipientAI = recipient->getAIPlayerForPlanning();
+	if (!recipientAI || !recipientAI->isSkirmishAI()) return FALSE;
+	for (Object *object = TheGameLogic->getFirstObject(); object; object = object->getNextObject())
+	{
+		if (IsLiveSkirmishAIRecoveryObject(object) && object->getControllingPlayer() == recipient &&
+			object->isKindOf(KINDOF_COMMANDCENTER) && !object->isContained() &&
+			!object->testStatus(OBJECT_STATUS_SOLD) && !object->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) &&
+			!object->testStatus(OBJECT_STATUS_RECONSTRUCTING) && object->getBodyModule() &&
+			object->getBodyModule()->getHealth() > 1.0f &&
+			(!*victim || object->getID() < (*victim)->getID())) *victim = object;
+		Player *enemy = object->getControllingPlayer();
+		if (enemy && enemy->isPlayerActive() && object->getTeam() &&
+			recipient->getRelationship(object->getTeam()) == ENEMIES &&
+			IsSkirmishAIRecoveryCombatUnit(object, enemy) &&
+			(!*source || object->getID() < (*source)->getID())) *source = object;
+	}
+	return *victim && *source;
+}
+
+Bool ReportAlliedSupportNeedFailure(const char *phase, UnsignedInt frame)
+{
+	Player *recipient = FindAlliedFixturePlayer(s_allied.supportRecipientIndex);
+	Player *enemy = FindAlliedFixturePlayer(s_allied.supportNeedEnemyIndex);
+	Object *victim = TheGameLogic->findObjectByID(s_allied.supportNeedVictimID);
+	Object *source = TheGameLogic->findObjectByID(s_allied.supportNeedSourceWitnessID);
+	printf("SKIRMISH_AI_ALLIED_SUPPORT_NEED_FAILURE phase=%s frame=%u recipient=%d recipient_active=%d "
+		"enemy=%d enemy_active=%d source_mask=%u relationship=%d victim=%u victim_found=%d victim_owner=%d "
+		"victim_cc=%d victim_dead=%d victim_sold=%d victim_construction=%d victim_reconstruction=%d "
+		"victim_health=%g initial_source=%u witness_alive=%d pulse=%u\n", phase, frame,
+		s_allied.supportRecipientIndex, recipient && recipient->isPlayerActive(), s_allied.supportNeedEnemyIndex,
+		enemy && enemy->isPlayerActive(), enemy ? enemy->getPlayerMask() : 0,
+		recipient && enemy && enemy->getDefaultTeam() ? static_cast<Int>(recipient->getRelationship(enemy->getDefaultTeam())) : -1,
+		s_allied.supportNeedVictimID, victim != nullptr,
+		victim && victim->getControllingPlayer() ? victim->getControllingPlayer()->getPlayerIndex() : -1,
+		victim && victim->isKindOf(KINDOF_COMMANDCENTER), victim && victim->isEffectivelyDead(),
+		victim && victim->testStatus(OBJECT_STATUS_SOLD), victim && victim->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION),
+		victim && victim->testStatus(OBJECT_STATUS_RECONSTRUCTING),
+		victim && victim->getBodyModule() ? victim->getBodyModule()->getHealth() : -1.0f,
+		s_allied.supportNeedSourceWitnessID, IsSkirmishAIRecoveryCombatUnit(source, enemy), s_allied.supportNeedImpactCount);
+	fflush(stdout);
+	return FALSE;
+}
+
+Bool SustainAlliedSupportNeed(UnsignedInt frame)
+{
+	if (s_allied.supportFaultIssued || frame < s_allied.supportNextNeedImpactFrame) return TRUE;
+	Player *recipient = FindAlliedFixturePlayer(s_allied.supportRecipientIndex);
+	Player *enemy = FindAlliedFixturePlayer(s_allied.supportNeedEnemyIndex);
+	Object *victim = TheGameLogic->findObjectByID(s_allied.supportNeedVictimID);
+	Object *source = TheGameLogic->findObjectByID(s_allied.supportNeedSourceWitnessID);
+	AIPlayer *recipientAI = recipient ? recipient->getAIPlayerForPlanning() : nullptr;
+	const UnsignedInt sourceMask = enemy ? enemy->getPlayerMask() : 0;
+	if (!recipient || !recipient->isPlayerActive() || !recipientAI || !recipientAI->isSkirmishAI() ||
+		!enemy || !enemy->isPlayerActive() || !enemy->getDefaultTeam() ||
+		recipient->getRelationship(enemy->getDefaultTeam()) != ENEMIES ||
+		!sourceMask || (sourceMask & (sourceMask - 1)) != 0 ||
+		!IsLiveSkirmishAIRecoveryObject(victim) || victim->getControllingPlayer() != recipient ||
+		!victim->isKindOf(KINDOF_COMMANDCENTER) || victim->isContained() ||
+		victim->testStatus(OBJECT_STATUS_SOLD) || victim->testStatus(OBJECT_STATUS_UNDER_CONSTRUCTION) ||
+		victim->testStatus(OBJECT_STATUS_RECONSTRUCTING) || !victim->getBodyModule() ||
+		victim->getBodyModule()->getHealth() <= 1.0f ||
+		(s_allied.supportNeedImpactCount == 0 &&
+		 (!IsSkirmishAIRecoveryCombatUnit(source, enemy) || !source->getTeam() ||
+		  recipient->getRelationship(source->getTeam()) != ENEMIES)))
+		return ReportAlliedSupportNeedFailure("preconditions", frame);
+	AISkirmishPlayer *needAI = static_cast<AISkirmishPlayer *>(recipientAI);
+	const Real before = victim->getBodyModule()->getHealth();
+	// Keep the natural admitted need above the ongoing 40-point recall cut.
+	// Real hostile home hits leave a ten-second latch even after real healing.
+	// The exact active enemy mask remains authoritative if the initial witness dies.
+	DamageInfo damage;
+	damage.in.m_sourceID = INVALID_ID;
+	damage.in.m_sourcePlayerMask = sourceMask;
+	damage.in.m_damageType = DAMAGE_UNRESISTABLE;
+	damage.in.m_amount = 1.0f;
+	victim->attemptDamage(&damage);
+	victim = TheGameLogic->findObjectByID(s_allied.supportNeedVictimID);
+	if (!IsLiveSkirmishAIRecoveryObject(victim) || !victim->getBodyModule())
+		return ReportAlliedSupportNeedFailure("hit_survivor", frame);
+	const Real after = victim->getBodyModule()->getHealth();
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics hit = needAI->getAlliedCoordinationDiagnostics();
+	if (after <= 0 || after >= before || damage.out.m_actualDamageClipped <= 0 ||
+		!hit.homeDamageValid || hit.homeDamageFrame != frame)
+	{
+		printf("SKIRMISH_AI_ALLIED_SUPPORT_NEED_DAMAGE health_before=%g health_after=%g clipped=%g "
+			"home_valid=%d home_frame=%u\n", before, after, damage.out.m_actualDamageClipped,
+			hit.homeDamageValid, hit.homeDamageFrame);
+		return ReportAlliedSupportNeedFailure("hit_latch", frame);
+	}
+	DamageInfo healing;
+	healing.in.m_sourceID = INVALID_ID;
+	healing.in.m_damageType = DAMAGE_HEALING;
+	healing.in.m_amount = 1.0f;
+	victim->attemptDamage(&healing);
+	victim = TheGameLogic->findObjectByID(s_allied.supportNeedVictimID);
+	source = TheGameLogic->findObjectByID(s_allied.supportNeedSourceWitnessID);
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics healed = needAI->getAlliedCoordinationDiagnostics();
+	if (!IsLiveSkirmishAIRecoveryObject(victim) || victim->getControllingPlayer() != recipient ||
+		!victim->getBodyModule() || victim->getBodyModule()->getHealth() < before ||
+		healing.out.m_actualDamageClipped >= 0 || !recipient->isPlayerActive() ||
+		!healed.homeDamageValid || healed.homeDamageFrame != frame)
+	{
+		printf("SKIRMISH_AI_ALLIED_SUPPORT_NEED_HEAL health_before=%g clipped=%g home_valid=%d home_frame=%u\n",
+			before, healing.out.m_actualDamageClipped, healed.homeDamageValid, healed.homeDamageFrame);
+		return ReportAlliedSupportNeedFailure("healed_latch", frame);
+	}
+	++s_allied.supportNeedImpactCount;
+	s_allied.supportNextNeedImpactFrame = frame + 5 * LOGICFRAMES_PER_SECOND;
+	printf("SKIRMISH_AI_ALLIED_SUPPORT_NEED_IMPACT_ASSERT frame=%u recipient=%d victim_cc=%u "
+		"initial_source_witness=%u witness_alive=%d enemy=%d source_mask=%u pulse=%u "
+		"health_before=%g health_after=%g health_healed=%g damage_clipped=%g healing_clipped=%g "
+		"home_damage_frame=%u next_impact=%u sustained_need=real_hostile_home_latch\n", frame,
+		s_allied.supportRecipientIndex, victim->getID(), s_allied.supportNeedSourceWitnessID,
+		IsSkirmishAIRecoveryCombatUnit(source, enemy), enemy->getPlayerIndex(), sourceMask,
+		s_allied.supportNeedImpactCount, before, after, victim->getBodyModule()->getHealth(),
+		damage.out.m_actualDamageClipped, healing.out.m_actualDamageClipped,
+		healed.homeDamageFrame, s_allied.supportNextNeedImpactFrame);
+	fflush(stdout);
+	return TRUE;
+}
+
 void ObserveAlliedSupport(UnsignedInt frame)
 {
 	if (s_allied.supportDonorSlot >= 0)
@@ -9618,6 +9750,11 @@ void ObserveAlliedSupport(UnsignedInt frame)
 					retainedTeam, state.supportRecipientIndex == s_allied.supportRecipientIndex);
 				PrintAlliedSupportFailure("before_departure", frame, donorAI, donor, member);
 				FailSkirmishAITest("allied_support_withdrawn_before_departure"); RequestSkirmishAITestStop(); return;
+			}
+			if (!SustainAlliedSupportNeed(frame))
+			{
+				PrintAlliedSupportFailure("controlled_need", frame, donorAI, donor, member);
+				FailSkirmishAITest("allied_support_real_sustained_need_unproven"); RequestSkirmishAITestStop(); return;
 			}
 			AIUpdateInterface *ai = member->getAIUpdateInterface();
 			const Coord3D *guard = ai ? ai->getGuardLocation() : nullptr;
@@ -9705,6 +9842,8 @@ void ObserveAlliedSupport(UnsignedInt frame)
 		if (state.supportTeamCount <= 0 || state.supportRecipientIndex < 0) continue;
 		Player *recipient = FindAlliedFixturePlayer(state.supportRecipientIndex);
 		if (!recipient || !recipient->isPlayerActive()) continue;
+		const SkirmishAIAlliedPlayerFacts *naturalNeed = TheAI->getAlliedPlayerFacts(state.supportRecipientIndex);
+		if (!naturalNeed || !naturalNeed->valid || !naturalNeed->alive || naturalNeed->distress < 70) continue;
 		const SkirmishAIAlliedPlayerFacts *facts = TheAI->getAlliedPlayerFacts(
 			ThePlayerList->getPlayerFromSlotIndex(slot)->getPlayerIndex());
 		if (!facts || !facts->valid || facts->immediateThreat >= 50 ||
@@ -9733,16 +9872,30 @@ void ObserveAlliedSupport(UnsignedInt frame)
 				{ trackedMember = object; trackedTeam = teamID; break; }
 		}
 		if (!trackedMember || state.supportReturning) continue;
+		Object *needVictim = nullptr;
+		Object *needSource = nullptr;
+		if (!FindAlliedSupportNeedWitnesses(recipient, &needVictim, &needSource)) continue;
 		s_allied.supportDonorSlot = slot;
 		s_allied.supportRecipientIndex = state.supportRecipientIndex;
 		s_allied.supportTeamID = trackedTeam;
 		s_allied.supportMemberID = trackedMember->getID();
 		s_allied.supportInitialPosition = *trackedMember->getPosition();
+		s_allied.supportNeedVictimID = needVictim->getID();
+		s_allied.supportNeedSourceWitnessID = needSource->getID();
+		s_allied.supportNeedEnemyIndex = needSource->getControllingPlayer()->getPlayerIndex();
+		if (!SustainAlliedSupportNeed(frame))
+		{
+			PrintAlliedSupportFailure("controlled_need_admission", frame, donor,
+				ThePlayerList->getPlayerFromSlotIndex(slot), trackedMember);
+			FailSkirmishAITest("allied_support_real_sustained_need_unproven"); RequestSkirmishAITestStop(); return;
+		}
 		++s_allied.checks;
 		printf("SKIRMISH_AI_ALLIED_SUPPORT_DISPATCH_ASSERT frame=%u donor_slot=%d "
-			"recipient=%d support_teams=%d tracked_team=%u tracked_member=%u surplus_value=%d departure=pending\n", frame,
+			"recipient=%d support_teams=%d tracked_team=%u tracked_member=%u surplus_value=%d "
+			"natural_distress=%d controlled_victim_cc=%u departure=pending\n", frame,
 			slot, state.supportRecipientIndex, state.supportTeamCount,
-			trackedTeam, trackedMember->getID(), facts->supportAvailableValue);
+			trackedTeam, trackedMember->getID(), facts->supportAvailableValue,
+			naturalNeed->distress, s_allied.supportNeedVictimID);
 		fflush(stdout);
 		return;
 	}
