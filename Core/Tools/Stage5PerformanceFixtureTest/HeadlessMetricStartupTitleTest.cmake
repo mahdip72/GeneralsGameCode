@@ -41,10 +41,19 @@ function(rts_add_headless_metric_startup_test target title test_name)
         foreach(_mode parallel shadow serial)
             add_test(NAME zh_headless_simulation_startup_${_mode}_tests
                 COMMAND ${target} --headless-simulation-startup ${_mode} parallel)
-            set_tests_properties(zh_headless_simulation_startup_${_mode}_tests PROPERTIES TIMEOUT 30)
+            if(_mode STREQUAL "serial")
+                set(_workers 0)
+            else()
+                set(_workers 2)
+            endif()
+            set_tests_properties(zh_headless_simulation_startup_${_mode}_tests PROPERTIES
+                TIMEOUT 30
+                PASS_REGULAR_EXPRESSION "HEADLESS_SIMULATION_STARTUP_TEST_PASS simulation=${_mode} pipeline=parallel workers=${_workers}")
         endforeach()
         add_test(NAME zh_headless_simulation_startup_serial_pipeline_tests
             COMMAND ${target} --headless-simulation-startup parallel serial)
-        set_tests_properties(zh_headless_simulation_startup_serial_pipeline_tests PROPERTIES TIMEOUT 30)
+        set_tests_properties(zh_headless_simulation_startup_serial_pipeline_tests PROPERTIES
+            TIMEOUT 30
+            PASS_REGULAR_EXPRESSION "HEADLESS_SIMULATION_STARTUP_TEST_PASS simulation=parallel pipeline=serial workers=2")
     endif()
 endfunction()

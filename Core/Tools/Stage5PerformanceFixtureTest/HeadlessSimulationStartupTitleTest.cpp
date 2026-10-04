@@ -89,6 +89,8 @@ int RunHeadlessSimulationStartupTitleTests(const char *simulation, const char *p
 	Check(resources.metrics().ownershipFailures == 0 && !jobs.isRunning(),
 		"real I/O owner and workers shut down without ownership failures");
 	if (failures) return 1;
-	printf("Headless simulation startup title tests passed.\n");
+	printf("HEADLESS_SIMULATION_STARTUP_TEST_PASS simulation=%s pipeline=%s workers=%u\n",
+		headlessSimulationModeName(rts::GetSimulationExecutionMode()),
+		headlessPipelineModeName(rts::GetPipelineExecutionMode()), s_headlessSimulationWorkerCount);
 	return 0;
 }
