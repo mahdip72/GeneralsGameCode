@@ -2219,6 +2219,35 @@ int TestThreadedAdjacentBufferPublication()
 		resources.AcquireVertexBufferRange(buffer, 4, 0, 0, 4,
 			&validated) == RENDER_RESULT_OK && validated == buffer,
 		"second completion publishes only its own dependent extension");
+	// The committed ranges are [0,16) and [20,28). A queued short DISCARD
+	// replaces both, while PRESERVE must still retain the new prefix.
+	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words, 4, 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(buffer, words + 2, 4, 8,
+			RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK &&
+		resources.AcquireVertexBufferRange(buffer, 4, 0, 5, 1,
+			&validated) == RENDER_RESULT_OK && validated == buffer &&
+		context->endFrame() == RENDER_RESULT_OK &&
+		SubmitThreadedRenderFrame(device, false) == RENDER_RESULT_OK,
+		"queued DISCARD and PRESERVE do not replace committed ranges before publication");
+	ThreadedRenderFrameCompletion discarded;
+	result |= Check(DrainThreadedRenderDevice(device) == RENDER_RESULT_OK &&
+		PollThreadedRenderCompletion(device, &discarded) &&
+		resources.PublishThreadedCompletion(discarded.sequence, false) == RENDER_RESULT_OK &&
+		resources.AcquireVertexBufferRange(buffer, 4, 0, 0, 1,
+			&validated) == RENDER_RESULT_OK && validated == buffer &&
+		resources.AcquireVertexBufferRange(buffer, 4, 0, 2, 1,
+			&validated) == RENDER_RESULT_OK && validated == buffer,
+		"completion publishes the short DISCARD prefix and later PRESERVE range");
+	validated = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(buffer, 4, 0, 1, 1,
+			&validated) == RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid(),
+		"DISCARD followed by PRESERVE leaves the intervening hole uninitialized");
+	validated = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(buffer, 4, 0, 5, 1,
+			&validated) == RENDER_RESULT_INVALID_ARGUMENT && !validated.isValid(),
+		"short DISCARD rejects the previously committed separated tail");
 	const long failureCall = ReadCount(&control.updateCalls) + 1;
 	InterlockedExchange(&control.failUpdateOnCall, failureCall);
 	result |= Check(context->beginFrame() == RENDER_RESULT_OK &&
@@ -3227,13 +3256,18 @@ int main(int argc, char **argv)
 		bufferDescription.authority == NATIVE_W3D_CONTENT_INVALID,
 		"a partial preserve write does not grant whole-buffer CPU authority");
 	result |= Check(resources.UpdateBuffer(partiallyInitialized,
-		originalBytes + 1, sizeof(originalBytes) - sizeof(originalBytes[0]),
-		sizeof(originalBytes[0]), RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
+		originalBytes + 3, sizeof(originalBytes[3]),
+		3 * sizeof(originalBytes[0]), RENDER_BUFFER_UPDATE_NO_OVERWRITE) ==
 		RENDER_RESULT_OK &&
 		resources.DescribeBuffer(partiallyInitialized, &bufferDescription) ==
 		RENDER_RESULT_OK &&
 		bufferDescription.authority == NATIVE_W3D_CONTENT_INVALID,
 		"disjoint partial ranges remain range-valid without granting whole-buffer authority");
+	GpuHandle fragmentedRange;
+	result |= Check(resources.AcquireVertexBufferRange(partiallyInitialized,
+		sizeof(unsigned int), 0, 3, 1, &fragmentedRange) == RENDER_RESULT_OK &&
+		fragmentedRange == partiallyInitialized,
+		"separated initialized tail is valid before short DISCARD");
 	result |= Check(resources.UpdateBuffer(partiallyInitialized, latestBytes,
 		sizeof(latestBytes[0]), 0, RENDER_BUFFER_UPDATE_DISCARD) ==
 		RENDER_RESULT_OK &&
@@ -3246,6 +3280,11 @@ int main(int argc, char **argv)
 		sizeof(unsigned int), 0, 0, 1, &validatedRange) == RENDER_RESULT_OK &&
 		validatedRange == partiallyInitialized,
 		"partial DISCARD publishes its exact initialized vertex range");
+	validatedRange = buffer;
+	result |= Check(resources.AcquireVertexBufferRange(partiallyInitialized,
+		sizeof(unsigned int), 0, 3, 1, &validatedRange) ==
+		RENDER_RESULT_INVALID_ARGUMENT && !validatedRange.isValid(),
+		"synchronous short DISCARD rejects its formerly initialized separated tail");
 	validatedRange = buffer;
 	result |= Check(resources.AcquireVertexBufferRange(partiallyInitialized,
 		sizeof(unsigned int), 0, 1, 1, &validatedRange) ==

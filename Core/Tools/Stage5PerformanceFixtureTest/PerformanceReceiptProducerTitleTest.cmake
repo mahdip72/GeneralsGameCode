@@ -227,12 +227,23 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     rts_producer_test_extract(_start "${_runner_text}"
         "Bool StartSkirmishAITestRunner()"
         "void UpdateSkirmishAITestRunner()")
+    # Keep the exact rendered-scenario predicate used by receipt admission.
+    # Only the orthogonal diagnostic's live-world/report branches are omitted.
+    rts_producer_test_extract(_rendered_predicates "${_runner_text}"
+        "Bool IsRenderedBattleDiagnostic("
+        "struct RenderedBattleDiagnosticState")
+    rts_producer_test_omit_span(_start "${_start}"
+        "// BEGIN RENDERED_BATTLE_DIAGNOSTIC_PROFILE_PREFLIGHT"
+        "// END RENDERED_BATTLE_DIAGNOSTIC_PROFILE_PREFLIGHT")
+    rts_producer_test_omit_span(_start "${_start}"
+        "// BEGIN RENDERED_BATTLE_DIAGNOSTIC_WORLD_PREFLIGHT"
+        "// END RENDERED_BATTLE_DIAGNOSTIC_WORLD_PREFLIGHT")
     rts_producer_test_omit_span(_start "${_start}"
         "\tif (s_recovery.active)\n\t{\n#if !RTS_ZEROHOUR"
         "#if defined(_WIN64)\n\tif (s_reviewedMapRequest.requested)\n\t{\n\t\tif (!IsSkirmishAITest4v2")
     rts_producer_test_replace_once(_start "${_start}"
-        "\tif (!s_recovery.active &&\n\t\t!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) &&"
-        "\tif (!IsSkirmishAITestPracticalControllerScenario(s_runner.scenario) &&")
+        "\tif (!s_recovery.active &&\n\t\t!IsRenderedSkirmishScenario(s_runner.scenario) &&"
+        "\tif (!IsRenderedSkirmishScenario(s_runner.scenario) &&")
     rts_producer_test_omit_span(_start "${_start}"
         "\tif (s_recovery.active)\n\t{\n\t\tprintf(\"SKIRMISH_AI_RECOVERY_START"
         "\telse if (IsSkirmishAITest4v2(s_runner.scenario))")
@@ -251,6 +262,9 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     rts_producer_test_extract(_terminal_suffix "${_runner_text}\nRTS_FRESH_PRODUCER_FIXTURE_EOF"
         "\tAsciiString replayName = s_runner.replayFileName;"
         "RTS_FRESH_PRODUCER_FIXTURE_EOF")
+    rts_producer_test_omit_span(_terminal_prefix "${_terminal_prefix}"
+        "// BEGIN RENDERED_BATTLE_DIAGNOSTIC_FINALIZER"
+        "// END RENDERED_BATTLE_DIAGNOSTIC_FINALIZER")
     set(_finalizers "${_receipt_finalizers}\n${_terminal_prefix}\n${_terminal_suffix}")
     string(FIND "${_runner_state}${_start}${_finalizers}" "s_recovery" _recovery_leak)
     if(NOT _recovery_leak EQUAL -1)
@@ -281,7 +295,7 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     file(GENERATE OUTPUT "${_out}/FreshProducerRunnerState.inc" CONTENT "${_runner_state}")
     file(GENERATE OUTPUT "${_out}/FreshProducerCaptureState.inc"
         CONTENT "${_slice_capture}\n${_runtime_capture}")
-    file(GENERATE OUTPUT "${_out}/FreshProducerStart.inc" CONTENT "${_start}")
+    file(GENERATE OUTPUT "${_out}/FreshProducerStart.inc" CONTENT "${_rendered_predicates}\n${_start}")
     file(GENERATE OUTPUT "${_out}/FreshProducerFailure.inc" CONTENT "${_fail}")
     file(GENERATE OUTPUT "${_out}/FreshProducerGameMainStart.inc" CONTENT "${_main_start}")
     file(GENERATE OUTPUT "${_out}/FreshProducerFinalizers.inc" CONTENT "${_finalizers}")

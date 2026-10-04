@@ -55,6 +55,7 @@
 #include "GameLogic/Module/AIUpdate.h"
 #include "GameLogic/Module/PhysicsUpdate.h"
 #include "W3DDevice/GameClient/Module/W3DModelDraw.h"
+#include "W3DDevice/GameClient/Module/WeaponFireRecoil.h"
 #include "W3DDevice/GameClient/W3DAssetManager.h"
 #include "W3DDevice/GameClient/W3DDisplay.h"
 #include "W3DDevice/GameClient/W3DScene.h"
@@ -2509,6 +2510,9 @@ void W3DModelDraw::handleClientRecoil()
 
 		const ModelConditionInfo::WeaponBarrelInfoVec& barrels = m_curState->m_weaponBarrelInfoVec[wslot];
 		WeaponRecoilInfoVec& recoils = m_weaponRecoilInfoVec[wslot];
+		// Other instances can populate the shared table before this instance
+		// ever fires. Establish the invariant before assertion or any iteration.
+		rts::weapon_fire_recoil::SynchronizeCount(recoils, barrels.size());
 		Int count = barrels.size();
 		Int recoilCount = recoils.size();
 		DEBUG_ASSERTCRASH(count == recoilCount, ("Barrel count != recoil count!"));
@@ -3691,26 +3695,24 @@ Int W3DModelDraw::getBarrelCount(WeaponSlotType wslot) const
 //-------------------------------------------------------------------------------------------------
 Bool W3DModelDraw::handleWeaponFireFX(WeaponSlotType wslot, Int specificBarrelToUse, const FXList* fxl, Real weaponSpeed, const Coord3D* victimPos, Real damageRadius)
 {
+	if (!rts::weapon_fire_recoil::IsWeaponSlotValid(wslot, WEAPONSLOT_COUNT)) return false;
 	DEBUG_ASSERTCRASH(specificBarrelToUse >= 0, ("specificBarrelToUse should now always be explicit"));
 
 	if (!m_curState || !(m_curState->m_validStuff & ModelConditionInfo::BARRELS_VALID))
 		return false;
 
 	const ModelConditionInfo::WeaponBarrelInfoVec& wbvec = m_curState->m_weaponBarrelInfoVec[wslot];
-	if (wbvec.empty())
+	if (!rts::weapon_fire_recoil::NormalizeBarrelIndex(specificBarrelToUse, wbvec.size(), &specificBarrelToUse))
 	{
-		// don't do this... some other module of our drawable may have handled it.
-		// just return false and let the caller sort it out.
-		// FXList::doFXPos(fxl, getDrawable()->getPosition(), getDrawable()->getTransformMatrix(), weaponSpeed, victimPos);
+		// Another draw module may handle an empty barrel table.
 		return false;
 	}
 
 	Bool handled = false;
 
-	if (specificBarrelToUse < 0 || specificBarrelToUse > wbvec.size())
-		specificBarrelToUse = 0;
-
-	const ModelConditionInfo::WeaponBarrelInfo& info = wbvec[specificBarrelToUse];
+	// FX callbacks can change model state or lazily populate shared tables.
+	// Keep the firing metadata owned, never a vector element reference.
+	const ModelConditionInfo::WeaponBarrelInfo info = wbvec[specificBarrelToUse];
 
 	if (fxl)
 	{
@@ -3751,14 +3753,29 @@ Bool W3DModelDraw::handleWeaponFireFX(WeaponSlotType wslot, Int specificBarrelTo
 		}
 	}
 
-	if (info.m_recoilBone || info.m_muzzleFlashBone)
+	// Reacquire the current table after FX dispatch; never carry recoil references
+	// across callbacks. A changed state without barrels has no recoil to apply.
+	if (!m_curState || !(m_curState->m_validStuff & ModelConditionInfo::BARRELS_VALID)) return handled;
+	const ModelConditionInfo::WeaponBarrelInfoVec& currentBarrels = m_curState->m_weaponBarrelInfoVec[wslot];
+	if (!rts::weapon_fire_recoil::NormalizeBarrelIndex(specificBarrelToUse, currentBarrels.size(), &specificBarrelToUse))
+		return handled;
+	const ModelConditionInfo::WeaponBarrelInfo currentInfo = currentBarrels[specificBarrelToUse];
+	WeaponRecoilInfoVec& recoils = m_weaponRecoilInfoVec[wslot];
+	// Initialize the whole flagged slot even when the selected barrel is FX-only;
+	// a different barrel in the same slot may require client recoil iteration.
+	if (m_curState->m_hasRecoilBonesOrMuzzleFlashes[wslot] ||
+		currentInfo.m_recoilBone || currentInfo.m_muzzleFlashBone)
 	{
-		//DEBUG_LOG(("START muzzleflash %08lx for Draw %08lx state %s at frame %d",info.m_muzzleFlashBone,this,m_curState->m_description.str(),TheGameLogic->getFrame()));
-		WeaponRecoilInfo& recoil = m_weaponRecoilInfoVec[wslot][specificBarrelToUse];
+		if (!rts::weapon_fire_recoil::PrepareForFire(wslot, WEAPONSLOT_COUNT,
+			currentBarrels.size(), specificBarrelToUse, &recoils, &specificBarrelToUse)) return handled;
+	}
+	if (currentInfo.m_recoilBone || currentInfo.m_muzzleFlashBone)
+	{
+		WeaponRecoilInfo& recoil = recoils[specificBarrelToUse];
 		recoil.m_state = WeaponRecoilInfo::RECOIL_START;
 		recoil.m_recoilRate = getW3DModelDrawModuleData()->m_initialRecoil;
-		if (info.m_muzzleFlashBone != 0)
-			info.setMuzzleFlashHidden(m_renderObject, false);
+		if (currentInfo.m_muzzleFlashBone != 0)
+			currentInfo.setMuzzleFlashHidden(m_renderObject, false);
 	}
 
 	return handled;

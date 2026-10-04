@@ -83,6 +83,7 @@ Int GameMain()
 		TheGlobalData->m_commandLineData.hasSkirmishAITestRequest() ||
 		TheGlobalData->m_commandLineData.hasSkirmishAITest4v2Request() ||
 		TheGlobalData->m_commandLineData.hasSkirmishAITestPractical1v7Request() ||
+		TheGlobalData->m_commandLineData.hasRenderedBattleDiagnosticRequest() ||
 		TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest()
 #if defined(_WIN64)
 		|| TheGlobalData->m_commandLineData.hasSkirmishAITestHardAI2v6Request()
@@ -137,7 +138,13 @@ Int GameMain()
 #endif
 	if (!net3ValidationRequested && !lockstepV2ValidationRequested)
 	{
-		if (TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest())
+		if (TheGlobalData->m_commandLineData.hasRenderedBattleDiagnosticRequest())
+			ArmSkirmishAITestRunner(
+				TheGlobalData->m_commandLineData.getRenderedBattleDiagnosticSeed(),
+				TheGlobalData->m_commandLineData.isRenderedBattleBenchmark() ?
+				SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK :
+				SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC);
+		else if (TheGlobalData->m_commandLineData.hasSkirmishAIRecoveryTestRequest())
 			ArmSkirmishAIRecoveryFixtureRunner(
 				TheGlobalData->m_commandLineData.getSkirmishAIRecoveryTestSeed(),
 				TheGlobalData->m_commandLineData.getSkirmishAIRecoveryFixtureCase(),

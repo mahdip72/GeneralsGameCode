@@ -64,6 +64,33 @@ struct Fixture
 	IRenderContext *context;
 };
 
+struct WindowedFixture : Fixture
+{
+	WindowedFixture() : window(CreateWindowExW(0, L"STATIC", L"", WS_OVERLAPPED,
+		0, 0, 64, 64, 0, 0, GetModuleHandleW(0), 0)) {}
+	~WindowedFixture()
+	{
+		// Release the swap chain before its hidden HWND. The base destructor
+		// then sees a null device and leaves the window lifetime independent.
+		delete device;
+		device = 0;
+		if (window) DestroyWindow(window);
+	}
+	bool Initialize()
+	{
+		RenderDeviceParameters parameters;
+		parameters.backend = RENDER_BACKEND_D3D11;
+		parameters.window = window;
+		parameters.width = parameters.height = 64;
+		parameters.enableVsync = false;
+		if (!window || !device || device->initialize(parameters) != RENDER_RESULT_OK)
+			return false;
+		context = device->immediateContext();
+		return context != 0;
+	}
+	HWND window;
+};
+
 double Milliseconds(const LARGE_INTEGER &begin, const LARGE_INTEGER &end,
 	const LARGE_INTEGER &frequency)
 {
@@ -284,6 +311,93 @@ int SummaryCacheContract()
 	return result;
 }
 
+int DiscardThenPreserveMatchesFullUpload(Fixture &fixture)
+{
+	struct Vertex { float x, y, z; unsigned int color; };
+	const Vertex triangle[3] = {
+		{ -0.75f, -0.75f, 0.5f, 0xff00ff00U },
+		{ 0.0f, 0.75f, 0.5f, 0xff00ff00U },
+		{ 0.75f, -0.75f, 0.5f, 0xff00ff00U }
+	};
+	Vertex stale[6];
+	Vertex initial[3];
+	memcpy(initial, triangle, sizeof(initial));
+	initial[1].color = 0xff0000ffU;
+	for (unsigned int index = 0; index < 6; ++index)
+	{ stale[index] = triangle[index % 3]; stale[index].color = 0xffff0000U; }
+	unsigned short indices[6] = { 0, 1, 2, 3, 4, 5 };
+	GpuHandle vb, reference, ib;
+	int result = Check(fixture.Buffer(RENDER_BUFFER_VERTEX, stale, sizeof(stale), &vb) &&
+		fixture.Buffer(RENDER_BUFFER_VERTEX, triangle, sizeof(triangle), &reference) &&
+		fixture.Buffer(RENDER_BUFFER_INDEX, indices, sizeof(indices), &ib),
+		"DISCARD parity real buffers create with stale prefix and tail");
+	if (result) return result;
+	// Full DISCARD first, then shorten the initialized prefix. The old tail
+	// remains inaccessible even though the allocated buffer is still larger.
+	result |= Check(fixture.device->updateBufferResource(vb, stale, sizeof(stale), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		fixture.device->updateBufferResource(vb, initial, sizeof(initial), 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		fixture.Begin(vb, ib, RENDER_FORMAT_R16_UINT) &&
+		fixture.context->drawIndexed(3, 3, 0) == RENDER_RESULT_INVALID_ARGUMENT &&
+		fixture.context->endFrame() == RENDER_RESULT_OK,
+		"partial DISCARD revokes stale vertex-tail initialization");
+	// A partial PRESERVE must republish the retained CPU prefix as well as the
+	// changed bytes. It cannot accidentally revive the uninitialized tail.
+	result |= Check(fixture.device->updateBufferResource(vb, &triangle[1], sizeof(Vertex),
+		sizeof(Vertex), RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK &&
+		fixture.device->updateBufferResource(vb, triangle, sizeof(Vertex), sizeof(Vertex),
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_INVALID_ARGUMENT,
+		"PRESERVE follows DISCARD and nonzero DISCARD offset is rejected");
+	std::vector<unsigned char> pixels[2];
+	RenderBackBufferInfo info;
+	result |= Check(fixture.device->getBackBufferInfo(&info) == RENDER_RESULT_OK &&
+		info.width == 64 && info.height == 64 && info.format == RENDER_FORMAT_B8G8R8A8_UNORM,
+		"DISCARD parity real 64x64 swap-chain backbuffer info");
+	if (result) return result;
+	GpuHandle buffers[2] = { reference, vb };
+	for (unsigned int image = 0; image < 2; ++image)
+	{
+		pixels[image].resize(static_cast<size_t>(info.width) * info.height * 4);
+		RenderFormat format = RENDER_FORMAT_UNKNOWN;
+		result |= Check(fixture.Begin(buffers[image], ib, RENDER_FORMAT_R16_UINT) &&
+			fixture.context->clear(RenderFloat4(0, 0, 0, 1), 1, 0) == RENDER_RESULT_OK &&
+			fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK &&
+			fixture.context->endFrame() == RENDER_RESULT_OK &&
+			fixture.device->captureBackBuffer(&pixels[image][0], pixels[image].size(), info.width * 4,
+				&format) == RENDER_RESULT_OK && format == info.format,
+			"real backend draws and captures reference or DISCARD/PRESERVE image");
+	}
+	result |= Check(pixels[0] == pixels[1], "DISCARD/PRESERVE GPU pixels equal full-upload reference");
+	bool colored = false;
+	for (size_t pixel = 0; pixel + 3 < pixels[0].size(); pixel += 4)
+		colored = colored || pixels[0][pixel] != 0 || pixels[0][pixel + 1] != 0 || pixels[0][pixel + 2] != 0;
+	result |= Check(colored, "reference parity compares a rendered triangle, not two clear images");
+	result |= Check(fixture.device->updateBufferResource(ib, indices, 3 * sizeof(indices[0]), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		fixture.Begin(vb, ib, RENDER_FORMAT_R16_UINT) &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 3, 0) == RENDER_RESULT_INVALID_ARGUMENT &&
+		fixture.context->endFrame() == RENDER_RESULT_OK &&
+		fixture.device->recoverDevice() == RENDER_RESULT_OK,
+		"partial index DISCARD retains prefix and reset completes");
+	result |= Check(fixture.context->beginFrame() == RENDER_RESULT_OK &&
+		fixture.context->setVertexBuffer(vb, sizeof(Vertex), 0) == RENDER_RESULT_INVALID_ARGUMENT &&
+		fixture.context->setIndexBuffer(ib, RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_INVALID_ARGUMENT &&
+		fixture.context->endFrame() == RENDER_RESULT_OK,
+		"reset cannot restore mutable DISCARD mirror as initialized GPU contents");
+	result |= Check(fixture.device->updateBufferResource(vb, triangle, sizeof(triangle), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		fixture.device->updateBufferResource(ib, indices, 3 * sizeof(indices[0]), 0,
+			RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK &&
+		fixture.Begin(vb, ib, RENDER_FORMAT_R16_UINT) &&
+		fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK &&
+		fixture.context->drawIndexed(3, 3, 0) == RENDER_RESULT_INVALID_ARGUMENT &&
+		fixture.context->endFrame() == RENDER_RESULT_OK,
+		"post-reset DISCARD republishes only current initialized prefixes");
+	return result;
+}
+
 int VertexUpdatesRetainOnlyRawSummary(Fixture &fixture)
 {
 	unsigned char vertices[8 * 16] = { 0 };
@@ -359,6 +473,12 @@ int main(int argc, char **argv)
 	if (argc == 2 && strcmp(argv[1], "--vertex-update-performance") == 0)
 		return VertexUpdatePerformance(fixture);
 	result |= SummaryCacheContract();
+	{
+		WindowedFixture pixelFixture;
+		result |= Check(pixelFixture.Initialize(), "DISCARD parity windowed real backend initializes");
+		if (result) return result;
+		result |= DiscardThenPreserveMatchesFullUpload(pixelFixture);
+	}
 	result |= VertexUpdatesRetainOnlyRawSummary(fixture);
 	unsigned char vertices[4 * 16] = { 0 };
 	unsigned short indices[6] = { 4, 0, 1, 2, 3, 0 };

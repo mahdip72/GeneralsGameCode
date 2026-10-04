@@ -415,6 +415,18 @@ bool DX8VertexBufferClass::Unlock_Buffer()
 	return changed;
 }
 
+bool DX8VertexBufferClass::Lock_Buffer_For_Full_Overwrite(size_t byteOffset,
+	size_t byteCount, int flags, void **data)
+{
+	if (data == nullptr)
+		return false;
+	*data = nullptr;
+	rts::render::RenderBufferUpdateMode mode;
+	return NativeBuffer != nullptr && Get_Native_Buffer_Update_Mode(flags, &mode) &&
+		NativeBuffer->LockForFullOverwrite(byteOffset, byteCount, mode, data) ==
+			rts::render::RENDER_RESULT_OK;
+}
+
 long DX8VertexBufferClass::Lock(unsigned int byteOffset,
 	unsigned int byteCount, unsigned char **data, unsigned long flags)
 {
@@ -1357,6 +1369,18 @@ bool DX8IndexBufferClass::Unlock_Buffer()
 	if (changed)
 		Mark_Changed();
 	return changed;
+}
+
+bool DX8IndexBufferClass::Lock_Buffer_For_Full_Overwrite(size_t byteOffset,
+	size_t byteCount, int flags, void **data)
+{
+	if (data == nullptr)
+		return false;
+	*data = nullptr;
+	rts::render::RenderBufferUpdateMode mode;
+	return native_buffer != nullptr && Get_Native_Buffer_Update_Mode(flags, &mode) &&
+		native_buffer->LockForFullOverwrite(byteOffset, byteCount, mode, data) ==
+			rts::render::RENDER_RESULT_OK;
 }
 
 long DX8IndexBufferClass::Lock(unsigned int byteOffset,

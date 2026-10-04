@@ -13,7 +13,9 @@
 #include "Renderer/RenderTexturePublication.h"
 
 #include <atomic>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 
 // Native surfaces publish their retained CPU image during Unlock. There is no
 // compatibility cache to invalidate after that transaction; republishing here
@@ -112,7 +114,13 @@ void SetGameRenderClientNativeOwner(IGameRenderClientNativeOwner *owner)
 NativeGameRenderOwnerScope::NativeGameRenderOwnerScope() :
 	m_owner(0), m_locked(false)
 {
-	g_native_owner_mutex.lock();
+	// One recursive gate level belongs to all live same-thread command pins,
+	// not to the first scope object (which may be destroyed before the others).
+	// A pre-existing lifecycle scope retains its own separate gate level.
+	if (g_native_owner_pin_depth == (std::numeric_limits<unsigned int>::max)())
+		throw std::overflow_error("native render owner pin depth overflow");
+	if (g_native_owner_pin_depth == 0)
+		g_native_owner_mutex.lock();
 	m_owner = g_native_owner_atomic.load(std::memory_order_acquire);
 	++g_native_owner_pin_depth;
 	m_locked = true;
@@ -124,7 +132,9 @@ NativeGameRenderOwnerScope::~NativeGameRenderOwnerScope()
 	{
 		m_locked = false;
 		--g_native_owner_pin_depth;
-		g_native_owner_mutex.unlock();
+		// m_locked denotes active participation, not an individual mutex level.
+		if (g_native_owner_pin_depth == 0)
+			g_native_owner_mutex.unlock();
 	}
 }
 

@@ -6,6 +6,8 @@
 #endif
 #include <windows.h>
 #endif
+#include "Lib/FrameTimingDiagnostics.h"
+#include "RenderPipelineStallTrace.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -44,6 +46,7 @@ struct Fixture
 		gateEvent(-1), gateEntered(false), gateReleased(false),
 		wrongThread(false), failCreate(false), failDraw(false), failEnd(false),
 		failPresent(false), failCapture(false), failInitialize(false), failUpdate(false),
+		failTopology(false),
 		createFailureResult(RENDER_RESULT_OUT_OF_MEMORY), updateFailureResult(RENDER_RESULT_DEVICE_REMOVED),
 		factoryCalls(0), draws(0), presents(0), infos(0),
 		textureFilterCapabilityCalls(0), reportedMaxAnisotropy(16),
@@ -63,13 +66,16 @@ struct Fixture
 	std::atomic<bool> busyEntered, busyRelease;
 	int gateEvent;
 	bool gateEntered, gateReleased, wrongThread;
-	bool failCreate, failDraw, failEnd, failPresent, failCapture, failInitialize, failUpdate;
+	bool failCreate, failDraw, failEnd, failPresent, failCapture, failInitialize,
+		failUpdate, failTopology;
 	RenderResult createFailureResult, updateFailureResult;
 	unsigned int factoryCalls, draws, presents, infos, textureFilterCapabilityCalls;
 	unsigned int reportedMaxAnisotropy, destroys;
 	unsigned int failEndFrames;
 	float stateValue;
 	unsigned int layoutStride, layoutOffset;
+	LegacyLogicalState layoutState;
+	LegacyVertexLayout layoutValue;
 	unsigned int swapIntervalSetCalls, swapIntervalGetCalls;
 	unsigned int gammaSetCalls, gammaGetCalls;
 	unsigned int faultConfigCalls, resourceStatisticsCalls;
@@ -83,6 +89,7 @@ struct Fixture
 	bool reentrantRejected;
 	std::vector<int> events;
 	std::vector<unsigned char> bufferBytes, updateBytes, textureBytes, refreshBytes;
+	std::vector<RenderPrimitiveTopology> topologies;
 	std::vector<GpuHandle> createdHandles, destroyedHandles;
 
 	void event(int event)
@@ -317,6 +324,7 @@ public:
 	RenderResult setLegacyStateForLayout(const LegacyLogicalState &state, const LegacyVertexLayout &layout, unsigned int) override
 	{
 		f.event(LAYOUT); f.stateValue = state.constants.world.values[0];
+		f.layoutState = state; f.layoutValue = layout;
 		f.layoutStride = layout.stride; f.layoutOffset = layout.elements[0].byteOffset; return RENDER_RESULT_OK;
 	}
 	RenderResult setVertexBuffer(GpuHandle handle, unsigned int, unsigned int) override
@@ -325,10 +333,24 @@ public:
 	{ f.event(INDEX); CHECK(!handle.isValid() || handles.isLive(handle)); return RENDER_RESULT_OK; }
 	RenderResult setTexture(unsigned int, GpuHandle handle) override
 	{ f.event(BIND_TEXTURE); CHECK(!handle.isValid() || handles.isLive(handle)); return RENDER_RESULT_OK; }
-	RenderResult setPrimitiveTopology(RenderPrimitiveTopology) override
-	{ f.event(TOPOLOGY); return RENDER_RESULT_OK; }
+	RenderResult setPrimitiveTopology(RenderPrimitiveTopology topology) override
+	{
+		f.event(TOPOLOGY);
+		f.topologies.push_back(topology);
+		switch (topology)
+		{
+		case RENDER_PRIMITIVE_TRIANGLE_LIST:
+		case RENDER_PRIMITIVE_TRIANGLE_STRIP:
+		case RENDER_PRIMITIVE_LINE_LIST:
+		case RENDER_PRIMITIVE_LINE_STRIP:
+			return f.failTopology ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
+		default:
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+	}
 	RenderResult draw(unsigned int, unsigned int) override
 	{
+		rts::frame_timing::Scope timing(rts::frame_timing::RendererDrawSubmit);
 		f.event(DRAW); CHECK(open); ++f.draws;
 		if (f.busyDraw)
 		{
@@ -386,6 +408,430 @@ void EmptyFrame(IRenderDevice *device, bool visible = true)
 	CHECK(SubmitThreadedRenderFrame(device, visible) == RENDER_RESULT_OK);
 }
 
+#if defined(_WIN64)
+typedef rts::render::detail::RenderPipelineStallTrace PipelineTrace;
+
+struct PipelineTraceEnvironment
+{
+	PipelineTraceEnvironment()
+	{
+		for (unsigned int i = 0; i < 4; ++i)
+		{
+			wchar_t value[MAX_PATH];
+			const DWORD length = GetEnvironmentVariableW(names[i], value, MAX_PATH);
+			CHECK(length < MAX_PATH);
+			previous[i] = length ? value : L"";
+			CHECK(SetEnvironmentVariableW(names[i], nullptr));
+		}
+	}
+	~PipelineTraceEnvironment()
+	{
+		for (unsigned int i = 0; i < 4; ++i)
+			SetEnvironmentVariableW(names[i], previous[i].empty() ? nullptr : previous[i].c_str());
+	}
+	const wchar_t *names[4] = { L"RTS_RENDER_PIPELINE_TRACE_DIR", L"RTS_FRAME_TIMING_DIR",
+		L"RTS_RENDER_OWNER_TIMING_DIR", L"RTS_GPU_FRAME_TIMING_DIR" };
+	std::wstring previous[4];
+};
+
+std::wstring PipelineTestDirectory(const wchar_t *suffix)
+{
+	wchar_t relative[128], absolute[MAX_PATH], temporary[MAX_PATH];
+	const DWORD temporaryLength = GetTempPathW(MAX_PATH, temporary);
+	CHECK(temporaryLength && temporaryLength < MAX_PATH);
+	CHECK(swprintf_s(relative, L"ThreadedPipelineTrace-%lu-%llu-%ls",
+		GetCurrentProcessId(), GetTickCount64(), suffix) >= 0);
+	const std::wstring ownedLeaf = std::wstring(temporary) + relative;
+	const DWORD length = GetFullPathNameW(ownedLeaf.c_str(), MAX_PATH, absolute, nullptr);
+	CHECK(length && length < MAX_PATH && CreateDirectoryW(absolute, nullptr));
+	return absolute;
+}
+
+std::vector<std::wstring> PipelineOutputs(const std::wstring &directory)
+{
+	std::vector<std::wstring> outputs;
+	WIN32_FIND_DATAW entry;
+	HANDLE search = FindFirstFileW((directory + L"\\pipeline-stall-*").c_str(), &entry);
+	if (search != INVALID_HANDLE_VALUE)
+	{
+		do { CHECK(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY); outputs.push_back(directory + L"\\" + entry.cFileName); }
+		while (FindNextFileW(search, &entry));
+		CHECK(GetLastError() == ERROR_NO_MORE_FILES); FindClose(search);
+	}
+	return outputs;
+}
+
+struct PipelineRow
+{
+	std::string stream, event;
+	unsigned long long ordinal, sequence, packet;
+	long long tick;
+	unsigned int thread, queued, free, pending, detail;
+};
+
+std::vector<PipelineRow> ReadPipelineRows(const std::wstring &directory)
+{
+	FILE *file = _wfopen((directory + L"\\events.csv").c_str(), L"rt"); CHECK(file);
+	char line[512]; CHECK(fgets(line, sizeof(line), file));
+	CHECK(strcmp(line, "stream,ordinal,event,qpc,thread_id,sequence,packet_id,queue_count,free_count,pending_count,detail\n") == 0);
+	std::vector<PipelineRow> rows;
+	while (fgets(line, sizeof(line), file))
+	{
+		PipelineRow row; char stream[16], event[32];
+		CHECK(sscanf(line, "%15[^,],%llu,%31[^,],%lld,%u,%llu,%llu,%u,%u,%u,%u",
+			stream, &row.ordinal, event, &row.tick, &row.thread, &row.sequence, &row.packet,
+			&row.queued, &row.free, &row.pending, &row.detail) == 11);
+		row.stream = stream; row.event = event; rows.push_back(row);
+	}
+	CHECK(ferror(file) == 0 && fclose(file) == 0);
+	return rows;
+}
+
+void RemovePipelineOutput(const std::wstring &directory)
+{
+	CHECK(DeleteFileW((directory + L"\\events.csv").c_str()));
+	CHECK(DeleteFileW((directory + L"\\summary.csv").c_str()));
+	CHECK(RemoveDirectoryW(directory.c_str()));
+}
+
+void PipelineTraceOffCapOwnershipAndExport()
+{
+	PipelineTraceEnvironment environment;
+	std::thread absentOwner;
+	PipelineTrace off;
+	CHECK(!off.enabled() && off.status() == PipelineTrace::Off);
+	off.record(PipelineTrace::Producer, PipelineTrace::Publish, 1, 1);
+	CHECK(off.count(PipelineTrace::Producer) == 0 && !off.exportAfterJoin(absentOwner));
+	CHECK(SetEnvironmentVariableW(environment.names[0], L"relative-directory"));
+	PipelineTrace relative; CHECK(!relative.enabled() && relative.status() == PipelineTrace::InvalidConfiguration);
+	const std::wstring directory = PipelineTestDirectory(L"ring");
+	CHECK(SetEnvironmentVariableW(environment.names[0], directory.c_str()));
+	CHECK(SetEnvironmentVariableW(environment.names[1], directory.c_str()));
+	PipelineTrace collision; CHECK(!collision.enabled());
+	auto rejectOverlap = [&](const std::wstring &traceDirectory, const std::wstring &timingDirectory)
+	{
+		CHECK(SetEnvironmentVariableW(environment.names[0], traceDirectory.c_str()));
+		CHECK(SetEnvironmentVariableW(environment.names[1], timingDirectory.c_str()));
+		PipelineTrace rejected;
+		CHECK(!rejected.enabled() && rejected.status() == PipelineTrace::InvalidConfiguration &&
+			!rejected.exportAfterJoin(absentOwner) && rejected.outputDirectory()[0] == L'\0');
+	};
+	if (directory.size() > 3 && directory[1] == L':' && directory[2] == L'\\')
+	{
+		const std::wstring driveRoot = directory.substr(0, 3);
+		rejectOverlap(driveRoot, directory);
+		rejectOverlap(directory, driveRoot);
+	}
+	const std::wstring nested = directory + L"\\nested", sibling = directory + L"\\nested-extra";
+	CHECK(CreateDirectoryW(nested.c_str(), nullptr) && CreateDirectoryW(sibling.c_str(), nullptr));
+	rejectOverlap(directory, nested);
+	rejectOverlap(nested, directory);
+	{
+		CHECK(SetEnvironmentVariableW(environment.names[0], nested.c_str()));
+		CHECK(SetEnvironmentVariableW(environment.names[1], sibling.c_str()));
+		PipelineTrace siblings; CHECK(siblings.enabled() && siblings.status() == PipelineTrace::Configured);
+		CHECK(PipelineOutputs(nested).empty() && PipelineOutputs(sibling).empty());
+	}
+	CHECK(RemoveDirectoryW(nested.c_str()) && RemoveDirectoryW(sibling.c_str()));
+	CHECK(SetEnvironmentVariableW(environment.names[0], directory.c_str()));
+	CHECK(SetEnvironmentVariableW(environment.names[1], nullptr));
+	PipelineTrace trace; CHECK(trace.enabled());
+	for (unsigned int i = 0; i < PipelineTrace::Capacity + 17U; ++i)
+		trace.record(PipelineTrace::Producer, PipelineTrace::Publish, 0, i + 1, 1, 2, 1);
+	CHECK(trace.count(PipelineTrace::Producer) == PipelineTrace::Capacity &&
+		trace.overwritten(PipelineTrace::Producer) == 17);
+	std::atomic<bool> ready(false), release(false);
+	std::thread owner([&]
+	{
+		trace.bindOwner();
+		trace.record(PipelineTrace::Owner, PipelineTrace::ExecuteBegin, 0, 9);
+		trace.record(PipelineTrace::Producer, PipelineTrace::Publish, 9, 9); // Rejected, never touches the producer ring.
+		ready.store(true);
+		while (!release.load()) std::this_thread::yield();
+		trace.record(PipelineTrace::Owner, PipelineTrace::ExecuteEnd, 0, 9);
+	});
+	while (!ready.load()) std::this_thread::yield();
+	CHECK(!trace.exportAfterJoin(owner) && PipelineOutputs(directory).empty());
+	release.store(true); owner.join();
+	trace.record(PipelineTrace::Owner, PipelineTrace::PoolReturn, 0, 9); // Wrong owner after join.
+	CHECK(trace.rejectedThread(PipelineTrace::Producer) == 1 && trace.rejectedThread(PipelineTrace::Owner) == 1);
+	CHECK(trace.exportAfterJoin(owner) && trace.status() == PipelineTrace::ExportSucceeded);
+	CHECK(!trace.exportAfterJoin(owner)); // Never overwrites/reexports a finished capture.
+	const auto rows = ReadPipelineRows(trace.outputDirectory());
+	CHECK(rows.size() == PipelineTrace::Capacity + 2U && rows.front().ordinal == 18 &&
+		rows[PipelineTrace::Capacity - 1].ordinal == PipelineTrace::Capacity + 17U);
+	for (size_t i = 1; i < PipelineTrace::Capacity; ++i)
+		CHECK(rows[i].tick >= rows[i - 1].tick && rows[i].thread == GetCurrentThreadId());
+	CHECK(rows.back().tick >= rows[rows.size() - 2].tick && rows.back().thread != GetCurrentThreadId());
+	FILE *summary = _wfopen((std::wstring(trace.outputDirectory()) + L"\\summary.csv").c_str(), L"rt"); CHECK(summary);
+	char summaryLine[512]; CHECK(fgets(summaryLine, sizeof(summaryLine), summary));
+	CHECK(strcmp(summaryLine, "stream,capacity,retained,overwritten,rejected_thread,clock_failures,qpc_frequency,thread_id,serial_policy\n") == 0);
+	for (unsigned int stream = 0; stream < 2; ++stream)
+	{
+		char name[16]; unsigned int capacity = 0, retained = 0, rejected = 0, failures = 0, thread = 0, serial = 0;
+		unsigned long long overwritten = 0; long long frequency = 0;
+		CHECK(fgets(summaryLine, sizeof(summaryLine), summary));
+		CHECK(sscanf(summaryLine, "%15[^,],%u,%u,%llu,%u,%u,%lld,%u,%u", name, &capacity,
+			&retained, &overwritten, &rejected, &failures, &frequency, &thread, &serial) == 9);
+		CHECK(strcmp(name, stream == 0 ? "producer" : "owner") == 0 && capacity == PipelineTrace::Capacity &&
+			retained == (stream == 0 ? PipelineTrace::Capacity : 2U) && overwritten == (stream == 0 ? 17U : 0U) &&
+			rejected == 1 && failures == 0 && frequency > 0 && thread != 0 && serial == 0);
+	}
+	CHECK(!fgets(summaryLine, sizeof(summaryLine), summary) && fclose(summary) == 0);
+	RemovePipelineOutput(trace.outputDirectory()); CHECK(RemoveDirectoryW(directory.c_str()));
+	const std::wstring missing = PipelineTestDirectory(L"removed");
+	CHECK(SetEnvironmentVariableW(environment.names[0], missing.c_str()));
+	PipelineTrace failed; CHECK(failed.enabled());
+	CHECK(RemoveDirectoryW(missing.c_str()));
+	CHECK(!failed.exportAfterJoin(absentOwner) && failed.status() == PipelineTrace::ExportFailed);
+	CHECK(GetFileAttributesW(missing.c_str()) == INVALID_FILE_ATTRIBUTES); // Export does not recreate parents.
+}
+
+struct PipelineExportFailureIO : PipelineTrace::ExportFileIO
+{
+	enum Failure { AfterCreate, EventsOpen, EventsWrite, EventsFlush, EventsClose,
+		SummaryOpen, SummaryWrite, SummaryFlush, SummaryClose, Publish, None };
+	explicit PipelineExportFailureIO(Failure failure) : failure(failure) {}
+	bool created() noexcept { return failure != AfterCreate; }
+	FILE *open(const wchar_t *path) noexcept
+	{
+		++opens;
+		if ((opens == 1 && failure == EventsOpen) || (opens == 2 && failure == SummaryOpen)) return nullptr;
+		return ExportFileIO::open(path);
+	}
+	bool written(bool ok) noexcept
+	{
+		++writes;
+		return ok && !((writes == 1 && failure == EventsWrite) || (writes == 2 && failure == SummaryWrite));
+	}
+	bool flush(FILE *file) noexcept
+	{
+		++flushes;
+		const bool ok = ExportFileIO::flush(file);
+		return ok && !((flushes == 1 && failure == EventsFlush) || (flushes == 2 && failure == SummaryFlush));
+	}
+	bool close(FILE *file) noexcept
+	{
+		++closes;
+		const bool ok = ExportFileIO::close(file); // Actually close even when simulating a close error.
+		return ok && !((closes == 1 && failure == EventsClose) || (closes == 2 && failure == SummaryClose));
+	}
+	bool publish(const wchar_t *pending, const wchar_t *final) noexcept
+	{
+		++publishes;
+		if (failure == Publish)
+		{
+			// Race a preexisting destination against the actual no-overwrite publication.
+			CHECK(CreateDirectoryW(final, nullptr));
+			const bool ok = ExportFileIO::publish(pending, final);
+			CHECK(!ok && GetFileAttributesW(final) != INVALID_FILE_ATTRIBUTES);
+			CHECK(RemoveDirectoryW(final));
+			return ok;
+		}
+		return ExportFileIO::publish(pending, final);
+	}
+	Failure failure;
+	unsigned int opens = 0, writes = 0, flushes = 0, closes = 0, publishes = 0;
+};
+
+void PipelineTraceStagesFailedExports()
+{
+	PipelineTraceEnvironment environment;
+	std::thread absentOwner;
+	for (unsigned int failure = PipelineExportFailureIO::AfterCreate; failure <= PipelineExportFailureIO::None; ++failure)
+	{
+		wchar_t suffix[32]; CHECK(swprintf_s(suffix, L"export-%u", failure) >= 0);
+		const std::wstring directory = PipelineTestDirectory(suffix);
+		CHECK(SetEnvironmentVariableW(environment.names[0], directory.c_str()));
+		PipelineTrace trace; CHECK(trace.enabled());
+		trace.record(PipelineTrace::Producer, PipelineTrace::Publish, 0, 7, 1, 2, 1);
+		PipelineExportFailureIO io(static_cast<PipelineExportFailureIO::Failure>(failure));
+		const bool success = failure == PipelineExportFailureIO::None;
+		CHECK(trace.exportAfterJoin(absentOwner, io) == success);
+		CHECK(trace.status() == (success ? PipelineTrace::ExportSucceeded : PipelineTrace::ExportFailed));
+		CHECK(!trace.exportAfterJoin(absentOwner, io));
+		const std::wstring output = trace.outputDirectory();
+		CHECK(output.size() > 8 && (output.substr(output.size() - 8) == L".pending") == !success);
+		const auto outputs = PipelineOutputs(directory);
+		CHECK(outputs.size() == 1 && outputs[0] == output);
+		CHECK(GetFileAttributesW(output.c_str()) & FILE_ATTRIBUTE_DIRECTORY);
+		if (!success)
+			CHECK(GetFileAttributesW(output.substr(0, output.size() - 8).c_str()) == INVALID_FILE_ATTRIBUTES);
+		CHECK(io.closes == io.flushes && io.closes == io.writes);
+		CHECK(io.publishes == (failure >= PipelineExportFailureIO::Publish ? 1U : 0U));
+		if (success)
+		{
+			CHECK(io.opens == 2 && io.closes == 2);
+			const auto rows = ReadPipelineRows(output);
+			CHECK(rows.size() == 1 && rows[0].sequence == 0 && rows[0].packet == 7 && rows[0].queued == 1);
+			RemovePipelineOutput(output);
+		}
+		else
+		{
+			// Only the two exact owned artifact names may exist in a failed staging directory.
+			for (const wchar_t *name : { L"events.csv", L"summary.csv" })
+			{
+				const std::wstring path = output + L"\\" + name;
+				if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) CHECK(DeleteFileW(path.c_str()));
+			}
+			CHECK(RemoveDirectoryW(output.c_str()));
+		}
+		CHECK(RemoveDirectoryW(directory.c_str()));
+	}
+}
+
+void PipelineTraceFollowsProductionWaitsAndShutdown()
+{
+	PipelineTraceEnvironment environment;
+	LARGE_INTEGER frequency; CHECK(QueryPerformanceFrequency(&frequency));
+	for (unsigned int mode = 0; mode < 4; ++mode)
+	{
+		const bool enabled = mode != 0, serial = mode >= 2, exportFailure = mode == 3;
+		const std::wstring parent = PipelineTestDirectory(serial ? L"serial" : enabled ? L"enabled" : L"off");
+		const std::wstring directory = parent + L"\\trace", timing = parent + L"\\timing";
+		CHECK(CreateDirectoryW(directory.c_str(), nullptr) && CreateDirectoryW(timing.c_str(), nullptr));
+		CHECK(SetEnvironmentVariableW(environment.names[0], enabled ? directory.c_str() : nullptr));
+		CHECK(SetEnvironmentVariableW(environment.names[2], timing.c_str()));
+		Fixture fixture;
+		ThreadedRenderOptions options; options.maxFramesInFlight = 2; options.maxPacketCommands = 2; options.serial = serial;
+		auto device = Device(fixture, options);
+		BufferDescriptor descriptor; descriptor.byteCount = 4; descriptor.usage = RENDER_USAGE_DEFAULT;
+		unsigned int bytes = 7; GpuHandle buffer;
+		CHECK(device->createBuffer(descriptor, &bytes, sizeof(bytes), &buffer) == RENDER_RESULT_OK);
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK); // Sequence-zero resource packet.
+		if (serial)
+		{
+			EmptyFrame(device.get()); CHECK(Complete(device.get()).presented);
+		}
+		else
+		{
+			ReleaseGate release(fixture); fixture.gateEvent = BEGIN;
+			EmptyFrame(device.get()); fixture.waitForGate(); EmptyFrame(device.get());
+			std::thread unblock([&]
+			{
+				ThreadedRenderMetrics metrics;
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+				do { CHECK(GetThreadedRenderMetrics(device.get(), &metrics)); std::this_thread::yield(); }
+				while (!metrics.backpressureWaits && std::chrono::steady_clock::now() < deadline);
+				std::this_thread::sleep_for(std::chrono::milliseconds(10)); fixture.release();
+			});
+			const RenderResult begun = device->immediateContext()->beginFrame(); unblock.join();
+			CHECK(begun == RENDER_RESULT_OK && CancelThreadedRenderFrame(device.get()) == RENDER_RESULT_OK);
+			CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_FAILED);
+		}
+		CHECK(PipelineOutputs(directory).empty()); // No trace file/directory creation during any render/wait.
+		if (exportFailure) CHECK(RemoveDirectoryW(directory.c_str()));
+		device->shutdown(); CHECK(!fixture.wrongThread && fixture.presents == (serial ? 1U : 2U));
+		const auto outputs = PipelineOutputs(directory);
+		CHECK(outputs.size() == (enabled && !exportFailure ? 1U : 0U));
+		if (enabled && !exportFailure)
+		{
+			const auto rows = ReadPipelineRows(outputs[0]);
+			bool zero = false, reply = false, telemetry = false, returned = false, waited = false;
+			long long waitBegin = 0; uint64_t telemetryPacket = 0;
+			for (const auto &row : rows)
+			{
+				CHECK(row.tick > 0);
+				CHECK((row.stream == "producer") == (row.thread == GetCurrentThreadId()));
+				if (row.event == "dequeue") { zero |= row.sequence == 0 && row.packet != 0; CHECK(row.pending <= 2); }
+				if (row.event == "reply_wait_begin") reply = true;
+				if (row.event == "acquire_wait_begin") { waitBegin = row.tick; CHECK(row.free == 0); }
+				if (row.event == "acquire_wait_end") { CHECK(waitBegin && row.tick - waitBegin >= frequency.QuadPart / 200); waited = true; }
+				if (row.event == "serial_wait_end") waited = true;
+				if (row.event == "telemetry_begin") telemetryPacket = row.packet;
+				if (row.event == "telemetry_end") { CHECK(row.packet == telemetryPacket); telemetry = true; }
+				if (row.event == "pool_return") { CHECK(row.free > 0 && row.pending <= 2); returned = true; }
+			}
+			CHECK(zero && reply && telemetry && returned && waited);
+			RemovePipelineOutput(outputs[0]);
+		}
+		// Existing owner timing remains in its own namespace and retains its CSV schema.
+		WIN32_FIND_DATAW entry;
+		HANDLE search = FindFirstFileW((timing + L"\\render-owner-timing-*.csv").c_str(), &entry);
+		CHECK(search != INVALID_HANDLE_VALUE);
+		const std::wstring timingFile = timing + L"\\" + entry.cFileName;
+		CHECK(!FindNextFileW(search, &entry)); FindClose(search);
+		FILE *ownerFile = _wfopen(timingFile.c_str(), L"rt"); CHECK(ownerFile);
+		char header[512]; CHECK(fgets(header, sizeof(header), ownerFile));
+		CHECK(strcmp(header, "session,mode,sequence_begin,sequence_end,executed_packets,wall_ms,phase,samples,total_ms,avg_ms,p95_upper_ms,p99_upper_ms,max_ms,over_33ms,over_100ms\n") == 0);
+		CHECK(fclose(ownerFile) == 0);
+		CHECK(DeleteFileW(timingFile.c_str()));
+		CHECK(RemoveDirectoryW(timing.c_str()) && (exportFailure || RemoveDirectoryW(directory.c_str())) && RemoveDirectoryW(parent.c_str()));
+	}
+}
+
+void RenderOwnerDiagnosticsFollowActualPacketExecution()
+{
+	CHECK(SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", NULL));
+	char relative[96], absolute[MAX_PATH];
+	_snprintf(relative, sizeof(relative), "ThreadedRenderTiming-%lu-%lu", GetCurrentProcessId(), GetTickCount());
+	const DWORD length = GetFullPathNameA(relative, sizeof(absolute), absolute, NULL);
+	CHECK(length && length < sizeof(absolute) && CreateDirectoryA(absolute, NULL));
+	for (unsigned int enabled = 0; enabled != 2; ++enabled)
+	{
+		const std::string directory = std::string(absolute) + (enabled ? "\\enabled" : "\\disabled");
+		CHECK(CreateDirectoryA(directory.c_str(), NULL));
+		CHECK(SetEnvironmentVariableA("RTS_RENDER_OWNER_TIMING_DIR", enabled ? directory.c_str() : NULL));
+		Fixture fixture;
+		ThreadedRenderOptions options; options.maxPacketCommands = 2;
+		auto device = Device(fixture, options);
+		IRenderContext *context = device->immediateContext();
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		for (unsigned int draw = 0; draw != 6; ++draw)
+			CHECK(context->draw(3, 0) == RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), true) == RENDER_RESULT_OK);
+		CHECK(Complete(device.get()).presented);
+		fixture.failDraw = true;
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		for (unsigned int draw = 0; draw != 3; ++draw)
+			CHECK(context->draw(3, 0) == RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(Complete(device.get(), RENDER_RESULT_FAILED).outcome.hasCommandFailure());
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(CancelThreadedRenderFrame(device.get(), RENDER_RESULT_FAILED) == RENDER_RESULT_OK);
+		CHECK(Complete(device.get(), RENDER_RESULT_FAILED).outcome.hasCommandFailure());
+		ThreadedRenderMetrics metrics;
+		CHECK(GetThreadedRenderMetrics(device.get(), &metrics) && metrics.completedFrames == 3);
+		device->shutdown();
+		CHECK(!fixture.wrongThread && fixture.draws == 7);
+		WIN32_FIND_DATAA entry;
+		HANDLE search = FindFirstFileA((directory + "\\frame-timing-*.csv").c_str(), &entry);
+		CHECK(search == INVALID_HANDLE_VALUE); // Main receipt namespace remains untouched.
+		search = FindFirstFileA((directory + "\\render-owner-timing-*.csv").c_str(), &entry);
+		if (!enabled)
+			CHECK(search == INVALID_HANDLE_VALUE);
+		else
+		{
+			CHECK(search != INVALID_HANDLE_VALUE);
+			const std::string path = directory + "\\" + entry.cFileName;
+			CHECK(!FindNextFileA(search, &entry)); FindClose(search);
+			FILE *file = fopen(path.c_str(), "rb"); CHECK(file != NULL);
+			char line[1024]; CHECK(fgets(line, sizeof(line), file));
+			CHECK(strstr(line, "session,mode,sequence_begin,sequence_end,executed_packets,") == line);
+			unsigned int rows = 0;
+			while (fgets(line, sizeof(line), file))
+			{
+				unsigned int session = 0, samples = 0;
+				unsigned __int64 first = 0, last = 0, packets = 0;
+				char mode[32], phase[32]; double wall = 0;
+				CHECK(sscanf(line, "%u,%31[^,],%llu,%llu,%llu,%lf,%31[^,],%u",
+					&session, mode, &first, &last, &packets, &wall, phase, &samples) == 8);
+				CHECK(strcmp(mode, "render_owner") == 0 && first == 1 && last == 3 && packets > metrics.completedFrames);
+				if (strcmp(phase, "execution_packet") == 0) CHECK(samples == packets);
+				else CHECK(strcmp(phase, "renderer_draw_submit") == 0 && samples == fixture.draws);
+				++rows;
+			}
+			CHECK(rows == 2); fclose(file); CHECK(DeleteFileA(path.c_str()));
+		}
+		CHECK(RemoveDirectoryA(directory.c_str()));
+	}
+	CHECK(SetEnvironmentVariableA("RTS_RENDER_OWNER_TIMING_DIR", NULL));
+	CHECK(RemoveDirectoryA(absolute));
+}
+#endif
+
 void ProducerTextureBindingCachePreservesOrderedInvalidation()
 {
 	Fixture f;
@@ -438,6 +884,164 @@ void ProducerTextureBindingCachePreservesOrderedInvalidation()
 	CHECK(device->destroyResource(second));
 	CHECK(context->setTexture(1, second) == RENDER_RESULT_INVALID_ARGUMENT);
 	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+}
+
+void ProducerTopologyCachePreservesAdmissionAndFailure()
+{
+	// RenderPrimitiveTopology has no fixed underlying type and values 0..3.
+	// An out-of-range enum cannot be passed portably through this public API;
+	// invalid raw encodings are verified by production owner-switch source review.
+	for (unsigned int serial = 0; serial != 2; ++serial)
+	{
+		Fixture f;
+		ThreadedRenderOptions options;
+		options.serial = serial != 0;
+		options.maxPacketCommands = 2;
+		auto device = Device(f, options);
+		IRenderContext *context = device->immediateContext();
+
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_INVALID_ARGUMENT);
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK);
+		CHECK(context->draw(3, 0) == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK);
+
+		RenderResult offOwner = RENDER_RESULT_OK;
+		std::thread rejectedProducer([&]
+		{
+			offOwner = context->setPrimitiveTopology(
+				RENDER_PRIMITIVE_TRIANGLE_LIST);
+		});
+		rejectedProducer.join();
+		CHECK(offOwner == RENDER_RESULT_INVALID_ARGUMENT);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) ==
+			RENDER_RESULT_OK);
+
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_LIST) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_LIST) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get()).presented);
+		CHECK(f.topologies.size() == 4 &&
+			f.topologies[0] == RENDER_PRIMITIVE_TRIANGLE_LIST &&
+			f.topologies[1] == RENDER_PRIMITIVE_TRIANGLE_STRIP &&
+			f.topologies[2] == RENDER_PRIMITIVE_LINE_LIST &&
+			f.topologies[3] == RENDER_PRIMITIVE_LINE_STRIP);
+
+		// A new logical frame must enqueue its first topology even when it
+		// matches the last value from the preceding frame.
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get()).presented);
+		CHECK(f.topologies.size() == 5 &&
+			f.topologies[4] == RENDER_PRIMITIVE_LINE_STRIP);
+
+		// A control fence breaks producer knowledge even though the owner keeps
+		// the same frame and topology open across the control.
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setRenderTargets(GpuHandle(), GpuHandle()) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get()).presented);
+		CHECK(f.topologies.size() == 8 &&
+			f.topologies[5] == RENDER_PRIMITIVE_LINE_STRIP &&
+			f.topologies[6] == RENDER_PRIMITIVE_LINE_STRIP &&
+			f.topologies[7] == RENDER_PRIMITIVE_LINE_STRIP);
+
+		// An ended-frame call cannot use the last producer value as a hit. Its
+		// synchronous rejection remains attached to the submitted frame.
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_LIST) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_LIST) ==
+			RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_LIST) ==
+			RENDER_RESULT_INVALID_ARGUMENT);
+		const RenderResult endedSubmit = SubmitThreadedRenderFrame(
+			device.get(), false);
+		CHECK(endedSubmit == (options.serial ? RENDER_RESULT_INVALID_ARGUMENT :
+			RENDER_RESULT_OK));
+		CHECK(Complete(device.get(), RENDER_RESULT_INVALID_ARGUMENT).result ==
+			RENDER_RESULT_INVALID_ARGUMENT);
+		CHECK(f.topologies.size() == 8);
+
+		// An out-of-frame attempt also rejects; the next frame starts clean.
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_LIST) ==
+			RENDER_RESULT_INVALID_ARGUMENT);
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_LIST) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_LIST) ==
+			RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get()).presented);
+		CHECK(f.topologies.size() == 9 &&
+			f.topologies[8] == RENDER_PRIMITIVE_LINE_LIST);
+
+		// A backend-side failure remains observable after a repeated setter, and
+		// a later frame can submit and complete the same topology successfully.
+		f.failTopology = true;
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		const RenderResult failedSubmit = SubmitThreadedRenderFrame(
+			device.get(), false);
+		CHECK(failedSubmit == (options.serial ? RENDER_RESULT_FAILED :
+			RENDER_RESULT_OK));
+		CHECK(Complete(device.get(), RENDER_RESULT_FAILED).result ==
+			RENDER_RESULT_FAILED);
+		CHECK(f.topologies.size() == 10 &&
+			f.topologies[9] == RENDER_PRIMITIVE_LINE_STRIP);
+
+		f.failTopology = false;
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->setPrimitiveTopology(RENDER_PRIMITIVE_LINE_STRIP) ==
+			RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get()).presented);
+		CHECK(f.topologies.size() == 11 &&
+			f.topologies[10] == RENDER_PRIMITIVE_LINE_STRIP);
+	}
 }
 
 void SwapIntervalOwnerTransport()
@@ -667,6 +1271,15 @@ void OwnershipAndDeepCopy()
 	LegacyLogicalState state; state.constants.world.values[0] = 9;
 	CHECK(context->setLegacyState(state, RENDER_VERTEX_POSITION3_COLOR, 0) == RENDER_RESULT_OK);
 	LegacyVertexLayout layout; layout.stride = 24; layout.elementCount = 1; layout.elements[0].byteOffset = 12;
+	const unsigned int lastStage = LEGACY_TEXTURE_STAGE_COUNT - 1;
+	const unsigned int lastVertexConstant = LEGACY_VERTEX_CONSTANT_COUNT - 1;
+	const unsigned int lastPixelConstant = LEGACY_PIXEL_CONSTANT_COUNT - 1;
+	state.pipeline.textureStages[lastStage].projectedCoordinates = true;
+	state.pipeline.textureStages[lastStage].bumpEnvironmentLuminanceOffset = 17;
+	state.constants.textureTransforms[lastStage].values[15] = 23;
+	state.constants.vertexShaderConstants[lastVertexConstant] = RenderFloat4(29, 31, 37, 41);
+	state.constants.pixelShaderConstants[lastPixelConstant] = RenderFloat4(43, 47, 53, 59);
+	const LegacyLogicalState expectedLayoutState = state;
 	CHECK(context->setLegacyStateForLayout(state, layout, 0) == RENDER_RESULT_OK);
 	CHECK(context->setVertexBuffer(vertex, sizeof(unsigned int), 0) == RENDER_RESULT_OK);
 	CHECK(context->setIndexBuffer(index, RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK);
@@ -683,6 +1296,11 @@ void OwnershipAndDeepCopy()
 	std::memset(bytes, 99, sizeof(bytes)); std::memset(top, 99, sizeof(top)); std::memset(mip, 99, sizeof(mip));
 	std::memset(subresources, 0, sizeof(subresources));
 	state.constants.world.values[0] = 99; layout.stride = 99; layout.elements[0].byteOffset = 99;
+	state.pipeline.textureStages[lastStage].projectedCoordinates = false;
+	state.pipeline.textureStages[lastStage].bumpEnvironmentLuminanceOffset = 99;
+	state.constants.textureTransforms[lastStage].values[15] = 99;
+	state.constants.vertexShaderConstants[lastVertexConstant] = RenderFloat4(99, 99, 99, 99);
+	state.constants.pixelShaderConstants[lastPixelConstant] = RenderFloat4(99, 99, 99, 99);
 	f.release();
 	const ThreadedRenderFrameCompletion completion = Complete(device.get());
 	CHECK(completion.presented && completion.outcome.wasPresented() && completion.outcome.frameEnded());
@@ -692,6 +1310,14 @@ void OwnershipAndDeepCopy()
 	CHECK(f.textureBytes.size() == 20 && f.textureBytes.front() == 33 && f.textureBytes.back() == 44);
 	CHECK(f.refreshBytes.size() == 20 && f.refreshBytes.front() == 55 && f.refreshBytes.back() == 66);
 	CHECK(f.stateValue == 9 && f.layoutStride == 24 && f.layoutOffset == 12);
+	CHECK(f.layoutValue.elementCount == 1 &&
+		f.layoutState.pipeline.textureStages[lastStage].projectedCoordinates &&
+		f.layoutState.pipeline.textureStages[lastStage].bumpEnvironmentLuminanceOffset == 17 &&
+		f.layoutState.constants.textureTransforms[lastStage].values[15] == 23);
+	CHECK(std::memcmp(&f.layoutState.constants.vertexShaderConstants[lastVertexConstant],
+		&expectedLayoutState.constants.vertexShaderConstants[lastVertexConstant], sizeof(RenderFloat4)) == 0);
+	CHECK(std::memcmp(&f.layoutState.constants.pixelShaderConstants[lastPixelConstant],
+		&expectedLayoutState.constants.pixelShaderConstants[lastPixelConstant], sizeof(RenderFloat4)) == 0);
 	CHECK(f.targets.hasColor && !f.targets.useBackBufferColor && !f.targets.hasDepth && !f.targets.useBackBufferDepth);
 	unsigned int count = 0;
 	CHECK(device->getDebugValidationErrorCount(&count) == RENDER_RESULT_OK && count == 7);
@@ -890,6 +1516,55 @@ void FailurePublicationAndRecovery()
 	f.failPresent = false;
 	CHECK(device->recoverDevice() == RENDER_RESULT_OK && device->isOperational());
 	EmptyFrame(device.get()); CHECK(Complete(device.get()).presented);
+}
+
+void FragmentedBufferDiscardReplacesRanges()
+{
+	Fixture f;
+	auto device = Device(f);
+	IRenderContext *context = device->immediateContext();
+	unsigned int words[4] = { 11, 13, 17, 19 };
+	BufferDescriptor descriptor;
+	descriptor.byteCount = sizeof(words);
+	descriptor.stride = sizeof(words[0]);
+	descriptor.usage = RENDER_USAGE_DYNAMIC;
+	descriptor.binding = RENDER_BUFFER_VERTEX;
+	GpuHandle buffer;
+	CHECK(device->createBuffer(descriptor, 0, 0, &buffer) == RENDER_RESULT_OK);
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, words, sizeof(words[0]), 0,
+		RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, words + 3, sizeof(words[3]), 3 * sizeof(words[0]),
+		RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(buffer, sizeof(words[0]), 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 3) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get()).presented && f.draws == 2);
+	// DISCARD replaces two separated initialized ranges with only its prefix.
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, words, sizeof(words[0]), 0,
+		RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(buffer, sizeof(words[0]), 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 3) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get(), RENDER_RESULT_FAILED).resourceFailure && f.draws == 3);
+	// A subsequent PRESERVE adds its range without reviving the old tail or hole.
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(buffer, words + 2, sizeof(words[2]), 2 * sizeof(words[0]),
+		RENDER_BUFFER_UPDATE_PRESERVE) == RENDER_RESULT_OK);
+	CHECK(context->setVertexBuffer(buffer, sizeof(words[0]), 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 0) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 2) == RENDER_RESULT_OK);
+	CHECK(context->draw(1, 1) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(device->present() == RENDER_RESULT_OK);
+	CHECK(Complete(device.get(), RENDER_RESULT_FAILED).resourceFailure && f.draws == 5);
+	CHECK(device->destroyResource(buffer));
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
 }
 
 void BufferUpdateFailureRecoveryRestoresBinding()
@@ -1417,6 +2092,83 @@ void BenchmarkCompletionPolling()
 		std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / calls, sink);
 }
 
+struct OperationalStateObserver
+{
+	OperationalStateObserver(IRenderDevice *device, bool expected) :
+		started(false), stop(false), matched(false), reader([this, device, expected]
+		{
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+			while (!stop.load(std::memory_order_acquire))
+			{
+				const bool operational = device->isOperational();
+				started.store(true, std::memory_order_release);
+				if (operational == expected)
+				{
+					matched.store(true, std::memory_order_release);
+					return;
+				}
+				if (std::chrono::steady_clock::now() >= deadline) return;
+				std::this_thread::yield();
+			}
+		}) {}
+	~OperationalStateObserver()
+	{
+		stop.store(true, std::memory_order_release);
+		if (reader.joinable()) reader.join();
+	}
+	void waitForFirstQuery()
+	{
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (!started.load(std::memory_order_acquire))
+		{
+			CHECK(std::chrono::steady_clock::now() < deadline);
+			std::this_thread::yield();
+		}
+	}
+	void wait()
+	{
+		reader.join();
+		CHECK(matched.load(std::memory_order_acquire));
+	}
+	std::atomic<bool> started, stop, matched;
+	std::thread reader;
+};
+
+void ConcurrentOperationalPublicationAndLifecycle()
+{
+	Fixture f;
+	auto device = Device(f);
+	CHECK(device->isOperational());
+	{
+		ReleaseGate release(f);
+		f.gateEvent = PRESENT; f.failPresent = true;
+		EmptyFrame(device.get()); f.waitForGate();
+		// This gate holds backend execution, not the queue mutex. A concurrent
+		// reader observes the last owner publication until the failed Present ends.
+		OperationalStateObserver active(device.get(), true);
+		active.wait();
+		OperationalStateObserver removed(device.get(), false);
+		removed.waitForFirstQuery();
+		f.release();
+		removed.wait(); // Observe asynchronous removal before draining completion.
+		const ThreadedRenderFrameCompletion completion =
+			Complete(device.get(), RENDER_RESULT_DEVICE_REMOVED);
+		CHECK(!completion.operational && !completion.outcome.isOperational());
+	}
+	f.failPresent = false;
+	OperationalStateObserver recovered(device.get(), true);
+	recovered.waitForFirstQuery();
+	CHECK(device->recoverDevice() == RENDER_RESULT_OK);
+	recovered.wait();
+	EmptyFrame(device.get());
+	CHECK(Complete(device.get()).operational);
+	OperationalStateObserver stopped(device.get(), false);
+	stopped.waitForFirstQuery();
+	device->shutdown();
+	stopped.wait();
+	CHECK(!device->isOperational());
+}
+
 void ShutdownWithQueuedFrames()
 {
 	Fixture f;
@@ -1447,12 +2199,17 @@ void SerialAndInitializationFailure()
 	Fixture rejected;
 	std::unique_ptr<IRenderDevice> second(CreateThreadedRenderDevice(Factory, &rejected));
 	RenderDeviceParameters parameters; parameters.backend = RENDER_BACKEND_D3D11;
+	CHECK(!second->isOperational());
 	CHECK(second->initialize(parameters) == RENDER_RESULT_FAILED); // one render owner
+	CHECK(!second->isOperational());
 	second.reset(); CHECK(rejected.factoryCalls == 0);
 	device.reset();
 	Fixture failed; failed.failInitialize = true;
 	std::unique_ptr<IRenderDevice> bad(CreateThreadedRenderDevice(Factory, &failed));
+	CHECK(!bad->isOperational());
 	CHECK(bad->initialize(parameters) == RENDER_RESULT_FAILED);
+	CHECK(!bad->isOperational());
+	bad->shutdown(); CHECK(!bad->isOperational());
 	bad.reset(); CHECK(failed.destroys == 1 && !failed.wrongThread);
 }
 
@@ -1510,13 +2267,28 @@ int main(int argc, char **argv)
 	try
 	{
 		CHECK(rts::JobSystem::instance().registerCurrentThread(rts::JOB_OWNER_GAME));
+#if defined(_WIN64)
+		if (argc == 2 && std::strcmp(argv[1], "--pipeline-stall-trace") == 0)
+		{
+			PipelineTraceOffCapOwnershipAndExport();
+			PipelineTraceStagesFailedExports();
+			PipelineTraceFollowsProductionWaitsAndShutdown();
+			CHECK(rts::JobSystem::instance().unregisterCurrentThread(rts::JOB_OWNER_GAME));
+			std::puts("Production pipeline stall trace contracts passed");
+			return 0;
+		}
+#endif
 		if (argc == 2 && std::strcmp(argv[1], "--benchmark-completion-poll") == 0)
 		{
 			BenchmarkCompletionPolling();
 			CHECK(rts::JobSystem::instance().unregisterCurrentThread(rts::JOB_OWNER_GAME));
 			return 0;
 		}
+#if defined(_WIN64)
+		RenderOwnerDiagnosticsFollowActualPacketExecution();
+#endif
 		ProducerTextureBindingCachePreservesOrderedInvalidation();
+		ProducerTopologyCachePreservesAdmissionAndFailure();
 		SwapIntervalOwnerTransport();
 		GammaOwnerTransport();
 		TextureFilterCapabilitiesArePublishedFromOwner();
@@ -1526,6 +2298,7 @@ int main(int argc, char **argv)
 		GenerationsAndResourceFailure();
 		ProducerFailureTraceIsOptInAndRateLimited();
 		FailurePublicationAndRecovery();
+		FragmentedBufferDiscardReplacesRanges();
 		BufferUpdateFailureRecoveryRestoresBinding();
 		BufferMutationFailureIsIsolated();
 		SuccessfulCpuUploadSurvivesUnrelatedFrameFailure();
@@ -1540,6 +2313,7 @@ int main(int argc, char **argv)
 		EmptyCompletionPollingPreservesOutputAndAuthority();
 		CompletionMailboxWrapAndRecoveryRetention();
 		ConcurrentCompletionPollingPreservesFifo();
+		ConcurrentOperationalPublicationAndLifecycle();
 		ShutdownWithQueuedFrames();
 		SerialAndInitializationFailure();
 #ifdef _WIN32

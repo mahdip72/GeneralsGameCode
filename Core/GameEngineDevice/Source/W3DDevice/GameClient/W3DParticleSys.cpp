@@ -27,6 +27,7 @@
 // Author: Michael S. Booth, November 2001
 
 #include "Common/GlobalData.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "GameClient/Color.h"
 #include "W3DDevice/GameClient/W3DParticleSys.h"
 #include "W3DDevice/GameClient/W3DAssetManager.h"
@@ -123,6 +124,7 @@ void DoParticles( RenderInfoClass &rinfo )
 
 void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 {
+	rts::frame_timing::Scope particleTiming(rts::frame_timing::RendererParticles);
 
 	if (m_readyToRender == false)
 		return;
@@ -228,6 +230,7 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 
 
 		// Capture on the owner. Workers never see a Particle or shared W3D array.
+		rts::frame_timing::Scope preparationTiming(rts::frame_timing::RendererParticlePrepare);
 		Bool prepared = FALSE;
 		const unsigned particleCount = sys->getParticleCount();
 		if (rts::UseParallelPipelines() && particleCount >= 256 &&
@@ -321,6 +324,8 @@ void W3DParticleSystemManager::doParticles(RenderInfoClass &rinfo)
 		if ( count == 0 )
 			continue;	//this system has no particles to render
 
+		preparationTiming.finish();
+		rts::frame_timing::Scope submissionTiming(rts::frame_timing::RendererParticleSubmit);
 		TextureClass *texture = W3DDisplay::m_assetManager->Get_Texture( sys->getParticleTypeName().str() );
 
 		if ( m_streakLine && sys->isUsingStreak() && (count >= 2) )

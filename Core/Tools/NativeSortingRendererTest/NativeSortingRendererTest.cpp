@@ -9,7 +9,10 @@
 #include "Lib/JobSystem.h"
 
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
+#include <new>
+#include <type_traits>
 #include <vector>
 
 bool NativeSortingRendererTestRetireAllComplete();
@@ -80,6 +83,7 @@ struct CapturedBatch
 	std::vector<unsigned int> indexCounts;
 	std::vector<unsigned int> startIndices;
 	std::vector<unsigned int> vertexOffsets;
+	std::vector<unsigned int> vertexCounts;
 	std::vector<unsigned int> vertexStrides;
 	std::vector<unsigned short> indices;
 	std::vector<unsigned char> vertices;
@@ -117,6 +121,7 @@ public:
 			batch.indexCounts.push_back(draws[index].packet.indexCount);
 			batch.startIndices.push_back(draws[index].packet.startIndex);
 			batch.vertexOffsets.push_back(draws[index].packet.vertexOffset);
+			batch.vertexCounts.push_back(draws[index].packet.vertexCount);
 			batch.vertexStrides.push_back(draws[index].packet.vertexStride);
 		}
 		const unsigned char *sourceVertices =
@@ -183,6 +188,7 @@ bool CaptureAcceptedDrawStream(const RecordingSink &sink,
 			batch.states.size() != batch.indexCounts.size() ||
 			batch.states.size() != batch.startIndices.size() ||
 			batch.states.size() != batch.vertexOffsets.size() ||
+			batch.states.size() != batch.vertexCounts.size() ||
 			batch.states.size() != batch.vertexStrides.size())
 			return false;
 
@@ -192,8 +198,11 @@ bool CaptureAcceptedDrawStream(const RecordingSink &sink,
 			const unsigned int startIndex = batch.startIndices[drawIndex];
 			const unsigned int indexCount = batch.indexCounts[drawIndex];
 			const unsigned int vertexOffset = batch.vertexOffsets[drawIndex];
+			const unsigned int vertexCount = batch.vertexCounts[drawIndex];
 			const unsigned int stride = batch.vertexStrides[drawIndex];
-			if (stride == 0 || startIndex > batch.indices.size() ||
+			if (stride == 0 || vertexOffset > batch.vertices.size() ||
+				vertexCount > (batch.vertices.size() - vertexOffset) / stride ||
+				startIndex > batch.indices.size() ||
 				indexCount > batch.indices.size() - startIndex)
 				return false;
 
@@ -203,6 +212,8 @@ bool CaptureAcceptedDrawStream(const RecordingSink &sink,
 			{
 				const unsigned short vertexIndex =
 					batch.indices[startIndex + index];
+				if (vertexIndex >= vertexCount)
+					return false;
 				const size_t vertexByteOffset = static_cast<size_t>(vertexOffset) +
 					static_cast<size_t>(vertexIndex) * stride;
 				if (vertexByteOffset > batch.vertices.size() ||
@@ -220,6 +231,27 @@ bool CaptureAcceptedDrawStream(const RecordingSink &sink,
 	return true;
 }
 
+void TestCapturedDrawRejectsIndexOutsideDeclaredVertexRange()
+{
+	RecordingSink sink;
+	CapturedBatch batch;
+	batch.states.push_back(1);
+	batch.indexCounts.push_back(3);
+	batch.startIndices.push_back(0);
+	batch.vertexOffsets.push_back(0);
+	batch.vertexCounts.push_back(2);
+	batch.vertexStrides.push_back(sizeof(TestVertex));
+	batch.indices.push_back(0);
+	batch.indices.push_back(1);
+	batch.indices.push_back(2);
+	batch.vertices.resize(3 * sizeof(TestVertex));
+	batch.acceptedDrawCount = 1;
+	sink.batches.push_back(batch);
+
+	std::vector<CapturedDraw> draws;
+	CHECK(!CaptureAcceptedDrawStream(sink, draws));
+}
+
 bool SameAcceptedDrawStream(const std::vector<CapturedDraw> &left,
 	const std::vector<CapturedDraw> &right)
 {
@@ -228,8 +260,22 @@ bool SameAcceptedDrawStream(const std::vector<CapturedDraw> &left,
 	for (size_t index = 0; index < left.size(); ++index)
 	{
 		if (left[index].state != right[index].state ||
-			left[index].indices != right[index].indices ||
 			left[index].referencedVertices != right[index].referencedVertices)
+			return false;
+	}
+	return true;
+}
+
+// Different local index encodings are equivalent when they resolve to the
+// same ordered corner bytes in the packed batch.
+bool SameAcceptedTriangleVertexStream(const std::vector<CapturedDraw> &left,
+	const std::vector<CapturedDraw> &right)
+{
+	if (left.size() != right.size())
+		return false;
+	for (size_t index = 0; index < left.size(); ++index)
+	{
+		if (left[index].referencedVertices != right[index].referencedVertices)
 			return false;
 	}
 	return true;
@@ -242,6 +288,7 @@ bool SameCapturedBatchBytes(const CapturedBatch &left,
 		left.indexCounts == right.indexCounts &&
 		left.startIndices == right.startIndices &&
 		left.vertexOffsets == right.vertexOffsets &&
+		left.vertexCounts == right.vertexCounts &&
 		left.vertexStrides == right.vertexStrides &&
 		left.indices == right.indices && left.vertices == right.vertices &&
 		left.acceptedDrawCount == right.acceptedDrawCount;
@@ -1234,6 +1281,599 @@ void TestCapturedPassFailureAndTail()
 	CHECK(sink.calls == 2 && sink.viewports[0].width == 256 && sink.viewports[1].width == 128);
 }
 
+void QueueArbitraryTriangle(NativeSortingRenderer &renderer,
+	const LegacyLogicalState &state, const NativeDrawPacket &packet,
+	float depth, unsigned int colorBase, const NativeSortedPass *pass = 0)
+{
+	TestVertex vertices[3] = {};
+	for (unsigned int corner = 0; corner < 3; ++corner)
+	{
+		vertices[corner].x = static_cast<float>(colorBase + corner);
+		vertices[corner].y = static_cast<float>(colorBase + corner + 3);
+		vertices[corner].z = depth;
+		vertices[corner].color = colorBase + corner;
+	}
+	const unsigned short indices[] = {0, 1, 2};
+	CHECK(renderer.Queue(state, packet, vertices, sizeof(vertices), indices,
+		sizeof(indices), 0, pass) == RENDER_RESULT_OK);
+}
+
+unsigned int RecordedDrawCount(const RecordingSink &sink)
+{
+	unsigned int count = 0;
+	for (size_t batch = 0; batch < sink.batches.size(); ++batch)
+		count += static_cast<unsigned int>(sink.batches[batch].states.size());
+	return count;
+}
+
+void CheckKeyDifferenceKeepsSeparateDraws(
+	const LegacyLogicalState &firstState, const NativeDrawPacket &firstPacket,
+	const LegacyLogicalState &secondState, const NativeDrawPacket &secondPacket,
+	const NativeSortedPass *firstPass = 0,
+	const NativeSortedPass *secondPass = 0)
+{
+	NativeSortingRenderer renderer;
+	QueueArbitraryTriangle(renderer, firstState, firstPacket, 8.0f,
+		0x11000000U, firstPass);
+	QueueArbitraryTriangle(renderer, secondState, secondPacket, 4.0f,
+		0x22000000U, secondPass);
+	PassRecordingSink sink;
+	sink.requireHomogeneous = true;
+	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
+	CHECK(renderer.Empty());
+	CHECK(RecordedDrawCount(sink) == 2);
+}
+
+void PoisonLegacyLightStatePadding(LegacyLogicalState *state,
+	unsigned char poison)
+{
+	const size_t paddingStart = offsetof(LegacyLightState, enabled) + sizeof(bool);
+	const size_t paddingEnd = offsetof(LegacyLightState, type);
+	if (paddingEnd > paddingStart)
+	{
+		unsigned char *lightBytes = reinterpret_cast<unsigned char *>(
+			&state->constants.lights[0]);
+		memset(lightBytes + paddingStart, poison, paddingEnd - paddingStart);
+	}
+}
+
+void TestAdjacentSameStateSourcesCoalesceWithoutChangingTriangles()
+{
+	const unsigned int count = 257;
+	const unsigned short indices[] = {0, 1, 2};
+	LegacyLogicalState commonState;
+	commonState.pipeline.shaderBits = 4242;
+	const NativeDrawPacket packet = MakePacket(3, 3);
+
+	NativeSortingRenderer reference;
+	for (unsigned int source = 0; source < count; ++source)
+	{
+		LegacyLogicalState state = commonState;
+		state.pipeline.shaderBits += source;
+		TestVertex vertices[3] = {};
+		for (unsigned int corner = 0; corner < 3; ++corner)
+		{
+			vertices[corner].x = static_cast<float>(source * 3 + corner);
+			vertices[corner].y = static_cast<float>(source + corner);
+			vertices[corner].z = static_cast<float>(count - source);
+			vertices[corner].color = 0x10000000U + source * 3 + corner;
+		}
+		CHECK(reference.Queue(state, packet, vertices, sizeof(vertices), indices,
+			sizeof(indices), 0) == RENDER_RESULT_OK);
+	}
+	RecordingSink referenceSink;
+	CHECK(reference.Flush(referenceSink) == RENDER_RESULT_OK);
+	CHECK(RecordedDrawCount(referenceSink) == count);
+
+	NativeSortingRenderer coalesced;
+	CHECK(offsetof(LegacyLightState, type) >
+		offsetof(LegacyLightState, enabled) + sizeof(bool));
+	unsigned char firstStateBytes[sizeof(LegacyLogicalState)];
+	for (unsigned int source = 0; source < count; ++source)
+	{
+		TestVertex vertices[3] = {};
+		for (unsigned int corner = 0; corner < 3; ++corner)
+		{
+			vertices[corner].x = static_cast<float>(source * 3 + corner);
+			vertices[corner].y = static_cast<float>(source + corner);
+			vertices[corner].z = static_cast<float>(count - source);
+			vertices[corner].color = 0x10000000U + source * 3 + corner;
+		}
+		std::aligned_storage<sizeof(LegacyLogicalState)>::type stateStorage;
+		const unsigned char poison = source % 2 == 0 ? 0xa5 : 0x5a;
+		memset(&stateStorage, poison, sizeof(stateStorage));
+		LegacyLogicalState *state = new (&stateStorage) LegacyLogicalState();
+		state->pipeline.shaderBits = commonState.pipeline.shaderBits;
+		PoisonLegacyLightStatePadding(state, poison);
+		if (source == 0)
+			memcpy(firstStateBytes, state, sizeof(*state));
+		else if (source == 1)
+			CHECK(memcmp(firstStateBytes, state, sizeof(*state)) != 0);
+		CHECK(coalesced.Queue(*state, packet, vertices, sizeof(vertices),
+			indices, sizeof(indices), 0) == RENDER_RESULT_OK);
+		state->~LegacyLogicalState();
+	}
+	RecordingSink coalescedSink;
+	CHECK(coalesced.Flush(coalescedSink) == RENDER_RESULT_OK);
+	CHECK(RecordedDrawCount(coalescedSink) == 1);
+	CHECK(coalescedSink.batches.size() == 1);
+	if (coalescedSink.batches.size() == 1)
+	{
+		const CapturedBatch &batch = coalescedSink.batches[0];
+		CHECK(batch.indexCounts.size() == 1 && batch.indexCounts[0] == count * 3);
+		CHECK(batch.vertexOffsets.size() == 1 && batch.vertexOffsets[0] == 0);
+		CHECK(batch.vertexCounts.size() == 1 && batch.vertexCounts[0] == count * 3);
+		CHECK(batch.indices.size() == count * 3);
+		CHECK(batch.vertices.size() == count * 3 * sizeof(TestVertex));
+	}
+	std::vector<CapturedDraw> expected, actual;
+	CHECK(CaptureAcceptedTriangleStream(referenceSink, expected));
+	CHECK(CaptureAcceptedTriangleStream(coalescedSink, actual));
+	CHECK(expected.size() == count && actual.size() == count);
+	CHECK(SameAcceptedTriangleVertexStream(expected, actual));
+}
+
+void TestAdjacentSameStateCoalescingKeyBoundaries()
+{
+	LegacyLogicalState state;
+	state.pipeline.shaderBits = 90;
+	NativeDrawPacket packet = MakePacket(3, 3);
+
+	LegacyLogicalState shaderChange = state;
+	shaderChange.pipeline.shaderBits++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, shaderChange, packet);
+
+	LegacyLogicalState blendChange = state;
+	blendChange.pipeline.blend.blendEnable =
+		!blendChange.pipeline.blend.blendEnable;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, blendChange, packet);
+	LegacyLogicalState depthChange = state;
+	depthChange.pipeline.depthStencil.depthWrite =
+		!depthChange.pipeline.depthStencil.depthWrite;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, depthChange, packet);
+	LegacyLogicalState textureStageChange = state;
+	textureStageChange.pipeline.textureStages[0].colorOperation =
+		RENDER_TEXTURE_OP_SELECT_ARGUMENT_1;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, textureStageChange,
+		packet);
+
+	LegacyLogicalState constantsChange = state;
+	constantsChange.constants.world.values[14] = 2.0f;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, constantsChange, packet);
+	LegacyLogicalState shaderConstantsChange = state;
+	shaderConstantsChange.constants.pixelShaderConstants[0].x = 0.5f;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet,
+		shaderConstantsChange, packet);
+	LegacyLogicalState lightEnabledChange = state;
+	lightEnabledChange.constants.lights[0].enabled = true;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, lightEnabledChange,
+		packet);
+	LegacyLogicalState lightTypeChange = state;
+	lightTypeChange.constants.lights[0].type = RENDER_LIGHT_POINT;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, lightTypeChange,
+		packet);
+	LegacyLogicalState positiveZeroState = state;
+	positiveZeroState.constants.world.values[1] = 0.0f;
+	LegacyLogicalState negativeZeroState = positiveZeroState;
+	negativeZeroState.constants.world.values[1] = -0.0f;
+	CheckKeyDifferenceKeepsSeparateDraws(positiveZeroState, packet,
+		negativeZeroState, packet);
+
+	LegacyLogicalState stateTextureMaskChange = state;
+	stateTextureMaskChange.texturePresenceMask = 1;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, stateTextureMaskChange,
+		packet);
+
+	LegacyLogicalState texturedState = state;
+	texturedState.texturePresenceMask = 1;
+	NativeDrawPacket firstTexture = packet;
+	NativeDrawPacket secondTexture = packet;
+	firstTexture.texturePresenceMask = secondTexture.texturePresenceMask = 1;
+	firstTexture.textures[0] = GpuHandle(17, 3);
+	secondTexture.textures[0] = GpuHandle(18, 3);
+	CheckKeyDifferenceKeepsSeparateDraws(texturedState, firstTexture,
+		texturedState, secondTexture);
+	NativeDrawPacket textureGenerationChange = firstTexture;
+	textureGenerationChange.textures[0] = GpuHandle(17, 4);
+	CheckKeyDifferenceKeepsSeparateDraws(texturedState, firstTexture,
+		texturedState, textureGenerationChange);
+	LegacyLogicalState lastStageState = state;
+	lastStageState.texturePresenceMask = 1U << (LEGACY_TEXTURE_STAGE_COUNT - 1);
+	NativeDrawPacket firstLastStage = packet;
+	NativeDrawPacket secondLastStage = packet;
+	firstLastStage.texturePresenceMask = secondLastStage.texturePresenceMask =
+		1U << (LEGACY_TEXTURE_STAGE_COUNT - 1);
+	firstLastStage.textures[LEGACY_TEXTURE_STAGE_COUNT - 1] = GpuHandle(20, 4);
+	secondLastStage.textures[LEGACY_TEXTURE_STAGE_COUNT - 1] = GpuHandle(21, 4);
+	CheckKeyDifferenceKeepsSeparateDraws(lastStageState, firstLastStage,
+		lastStageState, secondLastStage);
+
+	NativeDrawPacket packetMaskChange = firstTexture;
+	packetMaskChange.texturePresenceMask = 3;
+	packetMaskChange.textures[1] = GpuHandle(19, 4);
+	CheckKeyDifferenceKeepsSeparateDraws(texturedState, firstTexture,
+		texturedState, packetMaskChange);
+
+	NativeDrawPacket elementCountChange = packet;
+	elementCountChange.vertexLayout.elementCount = 1;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state,
+		elementCountChange);
+
+	NativeDrawPacket elementOffsetChange = packet;
+	elementOffsetChange.vertexLayout.elements[1].byteOffset = sizeof(float) * 2;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state,
+		elementOffsetChange);
+	NativeDrawPacket preTransformedChange = packet;
+	preTransformedChange.vertexLayout.preTransformed = true;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state,
+		preTransformedChange);
+	NativeDrawPacket semanticChange = packet;
+	semanticChange.vertexLayout.elements[1].semantic =
+		RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, semanticChange);
+	NativeDrawPacket semanticIndexChange = packet;
+	semanticIndexChange.vertexLayout.elements[1].semanticIndex = 1;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state,
+		semanticIndexChange);
+	NativeDrawPacket elementFormatChange = packet;
+	elementFormatChange.vertexLayout.elements[0].format =
+		RENDER_VERTEX_DATA_FLOAT4;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state,
+		elementFormatChange);
+
+	NativeDrawPacket vertexFormatChange = packet;
+	vertexFormatChange.vertexFormat = RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state,
+		vertexFormatChange);
+
+	NativeSortedPass pass;
+	pass.captured = true;
+	pass.identity = 5;
+	pass.viewport = RenderViewport(0, 0, 640, 480, 0.0f, 1.0f);
+	NativeSortedPass captureChange;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &captureChange);
+	NativeSortedPass identityChange = pass;
+	identityChange.identity++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &identityChange);
+
+	NativeSortedPass targetChange = pass;
+	targetChange.target.useBackBufferColor =
+		!targetChange.target.useBackBufferColor;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &targetChange);
+	NativeSortedPass backBufferDepthChange = pass;
+	backBufferDepthChange.target.useBackBufferDepth =
+		!backBufferDepthChange.target.useBackBufferDepth;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &backBufferDepthChange);
+	NativeSortedPass hasColorChange = pass;
+	hasColorChange.target.hasColor = !hasColorChange.target.hasColor;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &hasColorChange);
+	NativeSortedPass hasDepthChange = pass;
+	hasDepthChange.target.hasDepth = !hasDepthChange.target.hasDepth;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &hasDepthChange);
+	NativeSortedPass colorResourceChange = pass;
+	colorResourceChange.target.color.resource = GpuHandle(22, 1);
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &colorResourceChange);
+	NativeSortedPass colorGenerationChange = pass;
+	colorGenerationChange.target.color.resource = GpuHandle(0, 1);
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &colorGenerationChange);
+	NativeSortedPass colorMipChange = pass;
+	colorMipChange.target.color.mip++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &colorMipChange);
+	NativeSortedPass colorSliceChange = pass;
+	colorSliceChange.target.color.arraySlice++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &colorSliceChange);
+	NativeSortedPass depthResourceChange = pass;
+	depthResourceChange.target.depth.resource = GpuHandle(23, 2);
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &depthResourceChange);
+	NativeSortedPass depthMipChange = pass;
+	depthMipChange.target.depth.mip++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &depthMipChange);
+	NativeSortedPass depthSliceChange = pass;
+	depthSliceChange.target.depth.arraySlice++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &depthSliceChange);
+	NativeSortedPass viewportXChange = pass;
+	viewportXChange.viewport.x++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &viewportXChange);
+	NativeSortedPass viewportYChange = pass;
+	viewportYChange.viewport.y++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &viewportYChange);
+	NativeSortedPass viewportHeightChange = pass;
+	viewportHeightChange.viewport.height++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &viewportHeightChange);
+	NativeSortedPass viewportMinimumDepthChange = pass;
+	viewportMinimumDepthChange.viewport.minimumDepth = 0.25f;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &viewportMinimumDepthChange);
+	NativeSortedPass viewportMaximumDepthChange = pass;
+	viewportMaximumDepthChange.viewport.maximumDepth = 0.75f;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &viewportMaximumDepthChange);
+
+	NativeSortedPass viewportChange = pass;
+	viewportChange.viewport.width++;
+	CheckKeyDifferenceKeepsSeparateDraws(state, packet, state, packet,
+		&pass, &viewportChange);
+}
+
+void TestAdjacentSameStateStrideDifferenceDoesNotCoalesce()
+{
+	const unsigned short indices[] = {0, 1, 2};
+	LegacyLogicalState state;
+	state.pipeline.shaderBits = 123;
+	TestVertex narrow[3] = {};
+	TestVertexWide wide[3] = {};
+	for (unsigned int corner = 0; corner < 3; ++corner)
+	{
+		narrow[corner].x = static_cast<float>(corner);
+		narrow[corner].z = 8.0f;
+		wide[corner].x = static_cast<float>(corner + 10);
+		wide[corner].z = 4.0f;
+	}
+	NativeDrawPacket narrowPacket = MakePacket(3, 3);
+	NativeDrawPacket widePacket = MakePacket(3, 3);
+	widePacket.vertexStride = sizeof(TestVertexWide);
+	widePacket.vertexFormat = RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1;
+	widePacket.vertexLayout.stride = sizeof(TestVertexWide);
+	widePacket.vertexLayout.elementCount = 3;
+	widePacket.vertexLayout.elements[2].semantic =
+		RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE;
+	widePacket.vertexLayout.elements[2].format = RENDER_VERTEX_DATA_FLOAT2;
+	widePacket.vertexLayout.elements[2].byteOffset = sizeof(TestVertex);
+
+	NativeSortingRenderer renderer;
+	CHECK(renderer.Queue(state, narrowPacket, narrow, sizeof(narrow), indices,
+		sizeof(indices), 0) == RENDER_RESULT_OK);
+	CHECK(renderer.Queue(state, widePacket, wide, sizeof(wide), indices,
+		sizeof(indices), 0) == RENDER_RESULT_OK);
+	RecordingSink sink;
+	sink.requireHomogeneous = true;
+	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
+	CHECK(renderer.Empty());
+	CHECK(RecordedDrawCount(sink) == 2);
+}
+
+void TestUnsupportedGeometryStillFailsQueueValidation()
+{
+	LegacyLogicalState state;
+	const NativeDrawPacket packet = MakePacket(3, 3);
+	TestVertex vertices[3] = {};
+	const unsigned short indices[] = {0, 1, 2};
+	NativeSortingRenderer renderer;
+	CHECK(renderer.Queue(state, packet, vertices, sizeof(vertices), indices,
+		sizeof(indices), 0) == RENDER_RESULT_OK);
+	NativeDrawPacket wrongIndexFormat = packet;
+	wrongIndexFormat.indexFormat = RENDER_FORMAT_R32_UINT;
+	CHECK(renderer.Queue(state, wrongIndexFormat, vertices, sizeof(vertices),
+		indices, sizeof(indices), 0) == RENDER_RESULT_INVALID_ARGUMENT);
+	NativeDrawPacket wrongTopology = packet;
+	wrongTopology.topology = RENDER_PRIMITIVE_LINE_LIST;
+	CHECK(renderer.Queue(state, wrongTopology, vertices, sizeof(vertices),
+		indices, sizeof(indices), 0) == RENDER_RESULT_INVALID_ARGUMENT);
+	RecordingSink sink;
+	CHECK(renderer.Flush(sink) == RENDER_RESULT_OK);
+	CHECK(RecordedDrawCount(sink) == 1);
+}
+
+void QueuePartialMergedDrawAcknowledgementCase(
+	NativeSortingRenderer &renderer, const LegacyLogicalState &sharedState,
+	const LegacyLogicalState &otherState, const NativeDrawPacket &packet,
+	bool mergedRunFirst)
+{
+	if (mergedRunFirst)
+	{
+		// Queue the other state first, but sort the shared run ahead of it.
+		QueueArbitraryTriangle(renderer, otherState, packet, 10.0f,
+			0x33000000U);
+		QueueArbitraryTriangle(renderer, sharedState, packet, 7.0f,
+			0x22000000U);
+		QueueArbitraryTriangle(renderer, sharedState, packet, 9.0f,
+			0x11000000U);
+		return;
+	}
+
+	// Preserve the previously observed standalone-first, merged-retry order.
+	QueueArbitraryTriangle(renderer, sharedState, packet, 9.0f,
+		0x11000000U);
+	QueueArbitraryTriangle(renderer, sharedState, packet, 7.0f,
+		0x22000000U);
+	QueueArbitraryTriangle(renderer, otherState, packet, 5.0f,
+		0x33000000U);
+}
+
+unsigned int AcceptedTriangleCount(const CapturedBatch &batch)
+{
+	size_t acceptedIndexCount = 0;
+	for (unsigned int draw = 0; draw < batch.acceptedDrawCount &&
+		draw < batch.indexCounts.size(); ++draw)
+		acceptedIndexCount += batch.indexCounts[draw];
+	return static_cast<unsigned int>(acceptedIndexCount / 3);
+}
+
+void CheckPartialMergedDrawAcknowledgementCase(bool mergedRunFirst)
+{
+	const NativeDrawPacket packet = MakePacket(3, 3);
+	LegacyLogicalState sharedState;
+	sharedState.pipeline.shaderBits = 700;
+	LegacyLogicalState otherState = sharedState;
+	otherState.pipeline.shaderBits = 800;
+	const unsigned int firstState = mergedRunFirst ?
+		sharedState.pipeline.shaderBits : otherState.pipeline.shaderBits;
+	const unsigned int tailState = mergedRunFirst ?
+		otherState.pipeline.shaderBits : sharedState.pipeline.shaderBits;
+	const unsigned int firstIndexCount = mergedRunFirst ? 6 : 3;
+	const unsigned int tailIndexCount = mergedRunFirst ? 3 : 6;
+	const unsigned int firstAcceptedTriangles = mergedRunFirst ? 2 : 1;
+
+	NativeSortingRenderer baseline;
+	QueuePartialMergedDrawAcknowledgementCase(baseline, sharedState,
+		otherState, packet, mergedRunFirst);
+	RecordingSink baselineSink;
+	CHECK(baseline.Flush(baselineSink) == RENDER_RESULT_OK);
+	CHECK(baseline.Empty());
+	CHECK(baselineSink.calls == 1 && baselineSink.batches.size() == 1);
+	CHECK(RecordedDrawCount(baselineSink) == 2);
+	if (baselineSink.batches.size() == 1)
+	{
+		const CapturedBatch &batch = baselineSink.batches[0];
+		CHECK(batch.states.size() == 2 && batch.indexCounts.size() == 2);
+		if (batch.states.size() == 2 && batch.indexCounts.size() == 2)
+		{
+			CHECK(batch.states[0] == firstState && batch.states[1] == tailState);
+			CHECK(batch.indexCounts[0] == firstIndexCount &&
+				batch.indexCounts[1] == tailIndexCount);
+		}
+		CHECK(batch.acceptedDrawCount == 2);
+		CHECK(AcceptedTriangleCount(batch) == 3);
+	}
+
+	NativeSortingRenderer retry;
+	QueuePartialMergedDrawAcknowledgementCase(retry, sharedState,
+		otherState, packet, mergedRunFirst);
+	RecordingSink retrySink;
+	retrySink.failCall = 1;
+	retrySink.acceptedOnFailure = 1;
+	CHECK(retry.Flush(retrySink) == RENDER_RESULT_FAILED);
+	CHECK(!retry.Empty());
+	CHECK(retrySink.calls == 1 && retrySink.batches.size() == 1);
+	if (retrySink.batches.size() == 1)
+	{
+		const CapturedBatch &batch = retrySink.batches[0];
+		CHECK(batch.states.size() == 2 && batch.indexCounts.size() == 2);
+		if (batch.states.size() == 2 && batch.indexCounts.size() == 2)
+		{
+			CHECK(batch.states[0] == firstState && batch.states[1] == tailState);
+			CHECK(batch.indexCounts[0] == firstIndexCount &&
+				batch.indexCounts[1] == tailIndexCount);
+		}
+		CHECK(batch.acceptedDrawCount == 1);
+		CHECK(AcceptedTriangleCount(batch) == firstAcceptedTriangles);
+	}
+
+	retrySink.failCall = 0;
+	CHECK(retry.Flush(retrySink) == RENDER_RESULT_OK);
+	CHECK(retry.Empty());
+	CHECK(retrySink.calls == 2 && retrySink.batches.size() == 2);
+	if (retrySink.batches.size() == 2)
+	{
+		const CapturedBatch &batch = retrySink.batches[1];
+		CHECK(batch.states.size() == 1 && batch.indexCounts.size() == 1);
+		if (batch.states.size() == 1 && batch.indexCounts.size() == 1)
+		{
+			CHECK(batch.states[0] == tailState);
+			CHECK(batch.indexCounts[0] == tailIndexCount);
+		}
+		CHECK(batch.acceptedDrawCount == 1);
+		CHECK(AcceptedTriangleCount(batch) == tailIndexCount / 3);
+	}
+
+	std::vector<CapturedDraw> expected, actual;
+	CHECK(CaptureAcceptedTriangleStream(baselineSink, expected));
+	CHECK(CaptureAcceptedTriangleStream(retrySink, actual));
+	CHECK(expected.size() == 3 && actual.size() == 3);
+	CHECK(SameAcceptedDrawStream(expected, actual));
+}
+
+void TestPartialMergedDrawAcknowledgementAcrossSources()
+{
+	CheckPartialMergedDrawAcknowledgementCase(true);
+	CheckPartialMergedDrawAcknowledgementCase(false);
+}
+
+void TestCoalescedRunsResetAcrossR16ChunksAndRetry()
+{
+	const unsigned int trianglesPerSource = 10923;
+	const unsigned short triangleIndices[] = {0, 1, 2};
+	const std::vector<unsigned short> indices(trianglesPerSource * 3,
+		triangleIndices[0]);
+	std::vector<unsigned short> sourceIndices = indices;
+	for (size_t triangle = 0; triangle < trianglesPerSource; ++triangle)
+	{
+		sourceIndices[triangle * 3 + 1] = triangleIndices[1];
+		sourceIndices[triangle * 3 + 2] = triangleIndices[2];
+	}
+	TestVertex firstVertices[3] = {};
+	TestVertex secondVertices[3] = {};
+	for (unsigned int corner = 0; corner < 3; ++corner)
+	{
+		firstVertices[corner].x = static_cast<float>(corner);
+		firstVertices[corner].z = 8.0f;
+		firstVertices[corner].color = 0x11000000U + corner;
+		secondVertices[corner].x = static_cast<float>(corner + 10);
+		secondVertices[corner].z = 7.0f;
+		secondVertices[corner].color = 0x22000000U + corner;
+	}
+	const NativeDrawPacket packet = MakePacket(3,
+		static_cast<unsigned int>(sourceIndices.size()));
+	LegacyLogicalState state;
+	state.pipeline.shaderBits = 99;
+
+	NativeSortingRenderer baseline;
+	CHECK(baseline.Queue(state, packet, firstVertices, sizeof(firstVertices),
+		sourceIndices.data(), sourceIndices.size() * sizeof(unsigned short),
+		0) == RENDER_RESULT_OK);
+	CHECK(baseline.Queue(state, packet, secondVertices, sizeof(secondVertices),
+		sourceIndices.data(), sourceIndices.size() * sizeof(unsigned short),
+		0) == RENDER_RESULT_OK);
+	RecordingSink baselineSink;
+	CHECK(baseline.Flush(baselineSink) == RENDER_RESULT_OK);
+	CHECK(baselineSink.calls == 2 && RecordedDrawCount(baselineSink) == 2);
+	if (baselineSink.batches.size() == 2)
+	{
+		CHECK(baselineSink.batches[0].states.size() == 1);
+		CHECK(baselineSink.batches[0].indexCounts[0] == 65535);
+		CHECK(baselineSink.batches[0].vertexOffsets[0] == 0);
+		CHECK(baselineSink.batches[0].vertexCounts[0] == 6);
+		CHECK(baselineSink.batches[1].states.size() == 1);
+		CHECK(baselineSink.batches[1].indexCounts[0] == 3);
+	}
+
+	NativeSortingRenderer retry;
+	CHECK(retry.Queue(state, packet, firstVertices, sizeof(firstVertices),
+		sourceIndices.data(), sourceIndices.size() * sizeof(unsigned short),
+		0) == RENDER_RESULT_OK);
+	CHECK(retry.Queue(state, packet, secondVertices, sizeof(secondVertices),
+		sourceIndices.data(), sourceIndices.size() * sizeof(unsigned short),
+		0) == RENDER_RESULT_OK);
+	RecordingSink retrySink;
+	retrySink.failCall = 2;
+	retrySink.acceptedOnFailure = 0;
+	CHECK(retry.Flush(retrySink) == RENDER_RESULT_FAILED);
+	CHECK(!retry.Empty());
+	CHECK(NativeSortingRendererTestLastOffsetResets() == 2);
+	CHECK(retrySink.batches.size() == 2 &&
+		retrySink.batches[0].acceptedDrawCount == 1 &&
+		retrySink.batches[1].acceptedDrawCount == 0);
+
+	retrySink.failCall = 0;
+	CHECK(retry.Flush(retrySink) == RENDER_RESULT_OK);
+	CHECK(retry.Empty());
+	CHECK(retrySink.batches.size() == 3 &&
+		retrySink.batches[2].states.size() == 1 &&
+		retrySink.batches[2].indexCounts[0] == 3);
+	std::vector<CapturedDraw> expected, actual;
+	CHECK(CaptureAcceptedTriangleStream(baselineSink, expected));
+	CHECK(CaptureAcceptedTriangleStream(retrySink, actual));
+	CHECK(expected.size() == trianglesPerSource * 2);
+	CHECK(expected.size() == actual.size());
+	CHECK(SameAcceptedTriangleVertexStream(expected, actual));
+}
+
 void TestLinearOffsetWorkspaceAlternatingLayouts()
 {
 	NativeSortingRenderer renderer;
@@ -1282,6 +1922,13 @@ int main()
 	TestIndexChunkCohortQueueExtension();
 	TestCapturedPassFailureAndTail();
 	TestDeferredOutputIntervalAndRetry();
+	TestCapturedDrawRejectsIndexOutsideDeclaredVertexRange();
+	TestAdjacentSameStateSourcesCoalesceWithoutChangingTriangles();
+	TestAdjacentSameStateCoalescingKeyBoundaries();
+	TestAdjacentSameStateStrideDifferenceDoesNotCoalesce();
+	TestUnsupportedGeometryStillFailsQueueValidation();
+	TestPartialMergedDrawAcknowledgementAcrossSources();
+	TestCoalescedRunsResetAcrossR16ChunksAndRetry();
 	TestLinearOffsetWorkspaceAlternatingLayouts();
 	CHECK(NativeSortingRendererTestRetireAllComplete());
 	CHECK(NativeSortingRendererTestRetireMixedPending());
