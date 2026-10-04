@@ -181,6 +181,7 @@ void startHeadlessSimulationJobsAfterUnsafeInitialization()
 	rts::ResetImmutableSpatialRuntimeMetrics();
 #endif
 
+#if !defined(_WIN64)
 	if (rts::GetPipelineExecutionMode() != rts::PIPELINE_EXECUTION_SERIAL &&
 		!rts::SetPipelineExecutionMode(rts::PIPELINE_EXECUTION_SERIAL))
 	{
@@ -191,6 +192,10 @@ void startHeadlessSimulationJobsAfterUnsafeInitialization()
 		fflush(stdout);
 		return;
 	}
+#endif
+	// Native resource owners can already have frozen the startup-selected
+	// pipeline mode. Keep that policy while starting simulation workers at
+	// this safe boundary; simulation and service pipelines are separate modes.
 	rts::LockPipelineExecutionMode();
 
 #if defined(_MSC_VER) && _MSC_VER < 1300
@@ -227,10 +232,11 @@ void startHeadlessSimulationJobsAfterUnsafeInitialization()
 	rts::LockSimulationExecutionMode();
 	s_headlessSimulationJobSystemStarted = TRUE;
 	s_headlessSimulationWorkerCount = jobs.workerCount();
-	printf("SIMULATION_JOB_SYSTEM_START requested_mode=%s effective_mode=%s requested_pipeline=%s effective_pipeline=serial workers=%u\n",
+	printf("SIMULATION_JOB_SYSTEM_START requested_mode=%s effective_mode=%s requested_pipeline=%s effective_pipeline=%s workers=%u\n",
 		headlessSimulationModeName(s_requestedHeadlessSimulationMode),
 		headlessSimulationModeName(rts::GetSimulationExecutionMode()),
 		headlessPipelineModeName(s_requestedHeadlessPipelineMode),
+		headlessPipelineModeName(rts::GetPipelineExecutionMode()),
 		s_headlessSimulationWorkerCount);
 	fflush(stdout);
 #endif
@@ -245,11 +251,12 @@ void printHeadlessSimulationJobMetrics(const rts::JobSystemMetrics &metrics,
 		headlessSimulationModeName(s_requestedHeadlessSimulationMode),
 		headlessPipelineModeName(s_requestedHeadlessPipelineMode));
 #else
-	printf("SIMULATION_JOB_METRICS requested_mode=%s effective_mode=%s requested_pipeline=%s effective_pipeline=serial scheduler_started=%u workers=%u submitted=%llu executed=%llu steals=%llu owner_help=%llu waits=%llu worker_wait_rejections=%llu failures=%llu cancelled=%llu fallback=%llu queue_latency_ns=%llu max_queue_latency_ns=%llu sleeps=%llu wakes=%llu affinity_failures=%llu queue_high_water=%u peak_active_workers=%u available_cpus=%u reserved_owner_cpus=%u selected_worker_cpus=%u\n",
+	printf("SIMULATION_JOB_METRICS requested_mode=%s effective_mode=%s requested_pipeline=%s effective_pipeline=%s scheduler_started=%u workers=%u submitted=%llu executed=%llu steals=%llu owner_help=%llu waits=%llu worker_wait_rejections=%llu failures=%llu cancelled=%llu fallback=%llu queue_latency_ns=%llu max_queue_latency_ns=%llu sleeps=%llu wakes=%llu affinity_failures=%llu queue_high_water=%u peak_active_workers=%u available_cpus=%u reserved_owner_cpus=%u selected_worker_cpus=%u\n",
 		headlessSimulationModeName(s_requestedHeadlessSimulationMode),
 		s_headlessSimulationJobSystemStarted ?
 			headlessSimulationModeName(rts::GetSimulationExecutionMode()) : "serial",
 		headlessPipelineModeName(s_requestedHeadlessPipelineMode),
+		headlessPipelineModeName(rts::GetPipelineExecutionMode()),
 		s_headlessSimulationJobSystemStarted ? 1u : 0u,
 		s_headlessSimulationWorkerCount,
 		static_cast<unsigned long long>(metrics.submittedJobCount),
