@@ -10298,10 +10298,11 @@ void ObserveAlliedAid(UnsignedInt frame)
 		}
 		if (!ControlAlliedAidSightProvider(provider) || !IsAlliedAidNaturalTargetVisible(target))
 		{ FailSkirmishAITest("allied_save_load_genuine_sight_lost"); RequestSkirmishAITestStop(); return; }
-		// Read back after ordinary spatial updates and the normal deferred
-		// removal horizon. Do not run another collision pass or flush sight.
+		// Publication advances the world clock after the ordinary spatial pass,
+		// so its completed frame is frame - 1. Require that pass strictly past
+		// the deferred removal expiry, without adding to the unsigned duration.
 		if (frame > s_allied.aidSightSetupFrame &&
-			frame - s_allied.aidSightSetupFrame > TheGlobalData->m_unlookPersistDuration)
+			frame - s_allied.aidSightSetupFrame - 1 > TheGlobalData->m_unlookPersistDuration)
 		{
 			if (s_allied.aidSightProvenFrame == 0)
 			{
