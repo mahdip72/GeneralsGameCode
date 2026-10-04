@@ -152,6 +152,11 @@ struct AlliedFixtureState
 	Bool assaultRetained;
 	Bool assaultLaunched;
 	UnsignedInt assaultLastIntactFrame;
+	UnsignedInt assaultIsolationFrames;
+	UnsignedInt assaultIsolationEvents;
+	UnsignedInt assaultIsolationDisableCount;
+	UnsignedInt assaultIsolationProjectileCount;
+	UnsignedInt assaultIsolationMineCount;
 	Bool positiveAbortActive;
 	Bool positiveAbortCanceled;
 	UnsignedInt positiveAbortFrame;
@@ -224,7 +229,9 @@ struct AlliedFixtureState
 		firstStarvationFrame(0), sawSupportReturning(FALSE),
 		coordinatedReleaseFrame(0), postLoadEvaluation(0), postLoadBlockedEvaluations(0),
 		withdrawalFaultIssued(FALSE), withdrawalCanceled(FALSE), withdrawalComplete(FALSE),
-		assaultRetained(FALSE), assaultLaunched(FALSE), assaultLastIntactFrame(0), positiveAbortActive(FALSE),
+		assaultRetained(FALSE), assaultLaunched(FALSE), assaultLastIntactFrame(0),
+		assaultIsolationFrames(0), assaultIsolationEvents(0), assaultIsolationDisableCount(0),
+		assaultIsolationProjectileCount(0), assaultIsolationMineCount(0), positiveAbortActive(FALSE),
 		positiveAbortCanceled(FALSE), positiveAbortFrame(0), positiveAbortCount(0), returnFireIssued(FALSE), returnFireFrame(0),
 		returnFireEvaluation(0), returnFireMember(INVALID_ID), returnFireSource(INVALID_ID),
 		returnFireTeam(0), returnFireParticipant(-1), assaultLeader(-1), assaultEnemy(-1),
@@ -9576,6 +9583,8 @@ void ObserveAlliedPositiveLeaderAbort(UnsignedInt frame)
 	s_allied.returnFireParticipant = -1;
 }
 
+Bool MaintainAlliedCoordinationIsolation(UnsignedInt frame);
+
 void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 {
 	if (!s_allied.assaultRetained) return;
@@ -9602,6 +9611,9 @@ void ObserveAlliedAssaultLaunch(UnsignedInt frame)
 		bothLaunched = bothLaunched && state.assaultLaunched;
 	}
 	s_allied.assaultLastIntactFrame = frame;
+	if (!MaintainAlliedCoordinationIsolation(frame))
+	{ PrintAlliedAssaultFailure(frame, "allied_assault_positive_isolation_unproven");
+	  FailSkirmishAITest("allied_assault_positive_isolation_unproven"); RequestSkirmishAITestStop(); return; }
 	if (frame < s_allied.assaultRelease || !bothLaunched) return;
 	if (!s_allied.assaultLaunched)
 	{
@@ -10403,6 +10415,90 @@ Bool MaintainAlliedAidIsolation(UnsignedInt frame, Player *recipient, Object *ta
 			"health_intel_fact_overrides=0\n", frame, actors, newlyDisabled, projectiles, mines,
 			target->getID(), enemy->getPlayerIndex(), s_allied.aidNaturalSlots[0], s_allied.aidNaturalSlots[1],
 			recipient->getPlayerIndex());
+		fflush(stdout);
+	}
+	return TRUE;
+}
+
+Bool MaintainAlliedCoordinationIsolation(UnsignedInt frame)
+{
+	// The caller has already verified both owners' exact live admitted tuple.
+	// Start only after the original negative withdrawal/resumption proof.
+	if (s_allied.fixtureCase != SKIRMISH_AI_ALLIED_COORDINATION_LIVE || !s_allied.withdrawalComplete ||
+		!s_allied.assaultRetained || s_allied.positiveAbortActive) return FALSE;
+	Object *target = TheGameLogic->findObjectByID(s_allied.assaultTarget);
+	if (!target) return FALSE;
+	Player *protectedOwners[2] = {
+		ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[0]),
+		ThePlayerList->getPlayerFromSlotIndex(s_allied.assaultSlots[1])
+	};
+	for (Int participant = 0; participant < 2; ++participant)
+		if (!protectedOwners[participant] || !protectedOwners[participant]->isPlayerActive()) return FALSE;
+	Player *enemy = FindAlliedFixturePlayer(s_allied.assaultEnemy);
+	if (!enemy || target->getControllingPlayer() != enemy || !IsLiveSkirmishAIRecoveryObject(target) ||
+		enemy->getPlayerType() != PLAYER_COMPUTER || !enemy->isPlayerActive() ||
+		!enemy->getAIPlayerForPlanning()) return FALSE;
+	UnsignedInt actors = 0, newlyDisabled = 0, projectiles = 0, mines = 0;
+	Object *witness = nullptr;
+	for (Object *object = TheGameLogic->getFirstObject(); object; )
+	{
+		Object *next = object->getNextObject();
+		Player *owner = object->getControllingPlayer();
+		Bool hostile = FALSE;
+		if (IsLiveSkirmishAIRecoveryObject(object) && owner && object->getTeam() &&
+			owner->getPlayerType() == PLAYER_COMPUTER && owner->isPlayerActive() &&
+			owner != protectedOwners[0] && owner != protectedOwners[1])
+			for (Int participant = 0; participant < 2; ++participant)
+				if (protectedOwners[participant]->getRelationship(object->getTeam()) == ENEMIES) hostile = TRUE;
+		if (hostile)
+		{
+			// As in the support positive fixture, Physics processes all disabled
+			// masks. Remove only true-hostile ordnance through deferred destruction.
+			if (!object->isKindOf(KINDOF_STRUCTURE) && !object->isKindOf(KINDOF_MP_COUNT_FOR_VICTORY) &&
+				(object->isKindOf(KINDOF_PROJECTILE) || object->isKindOf(KINDOF_MINE)))
+			{
+				if (object->isKindOf(KINDOF_PROJECTILE)) ++projectiles;
+				else ++mines;
+				TheGameLogic->destroyObject(object);
+			}
+			else
+			{
+				AIUpdateInterface *ai = object->getAIUpdateInterface();
+				if (ai)
+				{
+					ai->setAttitude(ATTITUDE_NORMAL);
+					ai->aiIdle(CMD_FROM_AI);
+					ai->setLocomotorGoalNone();
+					ai->setAttitude(ATTITUDE_SLEEP);
+				}
+				if (!object->isDisabledByType(DISABLED_SCRIPT_DISABLED))
+				{ object->setDisabled(DISABLED_SCRIPT_DISABLED); ++newlyDisabled; }
+				if (!object->isDisabledByType(DISABLED_SCRIPT_DISABLED)) return FALSE;
+				++actors;
+				if (!witness && IsSkirmishAIRecoveryCombatUnit(object, owner)) witness = object;
+			}
+		}
+		object = next;
+	}
+	++s_allied.assaultIsolationFrames;
+	s_allied.assaultIsolationDisableCount += newlyDisabled;
+	s_allied.assaultIsolationProjectileCount += projectiles;
+	s_allied.assaultIsolationMineCount += mines;
+	if (!IsLiveSkirmishAIRecoveryObject(witness) || !witness->isDisabledByType(DISABLED_SCRIPT_DISABLED) ||
+		!IsLiveSkirmishAIRecoveryObject(target) || target->getControllingPlayer() != enemy ||
+		!target->isDisabledByType(DISABLED_SCRIPT_DISABLED) || !enemy->isPlayerActive() ||
+		enemy->getPlayerType() != PLAYER_COMPUTER || !enemy->getAIPlayerForPlanning()) return FALSE;
+	if ((s_allied.assaultIsolationFrames == 1 || newlyDisabled || projectiles || mines) && s_allied.assaultIsolationEvents < 16)
+	{
+		++s_allied.assaultIsolationEvents;
+		printf("SKIRMISH_AI_ALLIED_ASSAULT_ISOLATION frame=%u after_negative_withdrawal=1 same_natural_tuple=1 "
+			"slots=%d,%d release=%u expiry=%u target=%u target_live=1 enemy=%d enemy_cpu_active_ai_retained=1 "
+			"actors_disabled=%u new_disables=%u hostile_projectiles_removed=%u hostile_mines_removed=%u "
+			"living_combat_witness=%u witness_script_disabled=1 target_shrouds=%d,%d health_intel_fact_overrides=0\n",
+			frame, s_allied.assaultSlots[0], s_allied.assaultSlots[1], s_allied.assaultRelease, s_allied.assaultExpiry,
+			target->getID(), enemy->getPlayerIndex(), actors, newlyDisabled, projectiles, mines, witness->getID(),
+			static_cast<Int>(target->getShroudedStatus(protectedOwners[0]->getPlayerIndex())),
+			static_cast<Int>(target->getShroudedStatus(protectedOwners[1]->getPlayerIndex())));
 		fflush(stdout);
 	}
 	return TRUE;
