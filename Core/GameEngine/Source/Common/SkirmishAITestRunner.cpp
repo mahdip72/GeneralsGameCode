@@ -8224,14 +8224,91 @@ void PrintAlliedFixtureAssaultRoster(const char *record, UnsignedInt frame, Int 
 	printf("\n");
 }
 
+// Failure-only diagnostics: never advance or repair the live fixture state.
+Bool AlliedFixtureRoundTripFailure(const char *phase, Int slot)
+{
+	printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_FAILURE phase=%s frame=%u slot=%d\n",
+		phase, TheGameLogic ? TheGameLogic->getFrame() : 0, slot);
+	fflush(stdout);
+	return FALSE;
+}
+
+void PrintAlliedFixtureDiagnosticDifferences(Int slot, Int owner,
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics &before,
+	const AISkirmishPlayer::AlliedCoordinationDiagnostics &after)
+{
+#define ALLIED_SAVE_LOAD_DIFFERENCE(field, format) \
+	if (before.field != after.field) \
+		printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_DIFFERENCE slot=%d owner=%d field=" #field \
+			" before=" format " after=" format "\n", slot, owner, before.field, after.field)
+	ALLIED_SAVE_LOAD_DIFFERENCE(assaultActive, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(assaultLaunched, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(strategyResumePending, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(assaultTeamCount, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(holdAdmissionValid, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(holdAdmissionFrame, "%u");
+	ALLIED_SAVE_LOAD_DIFFERENCE(homeDamageValid, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(homeDamageFrame, "%u");
+	ALLIED_SAVE_LOAD_DIFFERENCE(heldDamageValid, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(heldDamageFrame, "%u");
+	ALLIED_SAVE_LOAD_DIFFERENCE(leaderIndex, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(enemyIndex, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(targetID, "%u");
+	ALLIED_SAVE_LOAD_DIFFERENCE(assaultFrame, "%u");
+	ALLIED_SAVE_LOAD_DIFFERENCE(assaultExpiryFrame, "%u");
+	ALLIED_SAVE_LOAD_DIFFERENCE(supportRecipientIndex, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(supportTeamCount, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(supportReturning, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(donationCooldownActive, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(nextDonationFrame, "%u");
+	ALLIED_SAVE_LOAD_DIFFERENCE(receiptCooldownActive, "%d");
+	ALLIED_SAVE_LOAD_DIFFERENCE(mayDonateFrame, "%u");
+#undef ALLIED_SAVE_LOAD_DIFFERENCE
+}
+
+void PrintAlliedFixtureLiveAssaultRoster(Int slot, AISkirmishPlayer *ai)
+{
+	const Int count = ai->getAlliedCoordinationDiagnostics().assaultTeamCount;
+	printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_LIVE_ROSTER slot=%d count=%d team_ids=", slot, count);
+	for (Int index = 0; index < count && index < 16; ++index)
+	{
+		const UnsignedInt id = ai->getAlliedAssaultTeamID(index);
+		printf("%s%u:%d", index == 0 ? "" : ",", id, ai->isAlliedAssaultTeam(id));
+	}
+	printf("\n");
+}
+
+void PrintAlliedFixtureSupportRosters(Int slot, AISkirmishPlayer *ai,
+	const std::vector<UnsignedInt> &before)
+{
+	printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_SUPPORT_BEFORE slot=%d count=%u team_ids=",
+		slot, static_cast<UnsignedInt>(before.size()));
+	for (size_t index = 0; index < before.size(); ++index)
+		printf("%s%u", index == 0 ? "" : ",", before[index]);
+	const Int count = ai->getAlliedCoordinationDiagnostics().supportTeamCount;
+	printf("\nSKIRMISH_AI_ALLIED_SAVE_LOAD_SUPPORT_AFTER slot=%d count=%d team_ids=", slot, count);
+	for (Int index = 0; index < count && index < 4; ++index)
+		printf("%s%u", index == 0 ? "" : ",", ai->getAlliedSupportTeamID(index));
+	printf("\n");
+}
+
 Bool RoundTripAlliedFixture()
 {
-	if (!TheAI || !TheGameState) return FALSE;
+	if (!TheAI || !TheGameState)
+	{
+		printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_CONTEXT ai=%d game_state=%d\n", TheAI != nullptr, TheGameState != nullptr);
+		return AlliedFixtureRoundTripFailure("pre_context", 0);
+	}
 	// Leave enough protected time for two ordinary five-second evaluations
 	// after load. A nonzero expired timestamp is not cooldown evidence.
 	if (!s_allied.sawAid || s_allied.aidCooldownUntil <= TheGameLogic->getFrame() ||
 		s_allied.aidCooldownUntil - TheGameLogic->getFrame() < 20 * LOGICFRAMES_PER_SECOND)
-		return FALSE;
+	{
+		printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_AID saw_aid=%d cooldown_until=%u frame=%u minimum_remaining=%u\n",
+			s_allied.sawAid, s_allied.aidCooldownUntil, TheGameLogic ? TheGameLogic->getFrame() : 0,
+			static_cast<UnsignedInt>(20 * LOGICFRAMES_PER_SECOND));
+		return AlliedFixtureRoundTripFailure("pre_aid_protection", 0);
+	}
 	AISkirmishPlayer::AlliedCoordinationDiagnostics before[7];
 	Int playerIndices[7];
 	Int starvation[7];
@@ -8245,9 +8322,17 @@ Bool RoundTripAlliedFixture()
 	{
 		AISkirmishPlayer *ai = GetAlliedFixtureAI(slot);
 		Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
-		if (!ai || !player) return FALSE;
+		if (!ai || !player)
+		{
+			printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_OWNER slot=%d ai=%d player=%d\n", slot, ai != nullptr, player != nullptr);
+			return AlliedFixtureRoundTripFailure("pre_owner", slot);
+		}
 		before[slot - 1] = ai->getAlliedCoordinationDiagnostics();
-		if (!CaptureAlliedFixtureAssaultRoster(ai, &assaultIDs[slot - 1])) return FALSE;
+		if (!CaptureAlliedFixtureAssaultRoster(ai, &assaultIDs[slot - 1]))
+		{
+			PrintAlliedFixtureLiveAssaultRoster(slot, ai);
+			return AlliedFixtureRoundTripFailure("pre_assault_roster", slot);
+		}
 		playerIndices[slot - 1] = player->getPlayerIndex();
 		starvation[slot - 1] = TheAI->getAlliedStarvationStreak(playerIndices[slot - 1]);
 		relief[slot - 1] = TheAI->getAlliedRecipientReliefUntil(playerIndices[slot - 1]);
@@ -8256,7 +8341,16 @@ Bool RoundTripAlliedFixture()
 	}
 	if (!s_allied.cancellationIssued ||
 		(!before[s_allied.cancellationSlots[0] - 1].strategyResumePending &&
-		 !before[s_allied.cancellationSlots[1] - 1].strategyResumePending)) return FALSE;
+		 !before[s_allied.cancellationSlots[1] - 1].strategyResumePending))
+	{
+		printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_PENDING cancellation_issued=%d slots=%d,%d\n",
+			s_allied.cancellationIssued, s_allied.cancellationSlots[0], s_allied.cancellationSlots[1]);
+		if (s_allied.cancellationIssued)
+			printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_PENDING before=%d,%d\n",
+				before[s_allied.cancellationSlots[0] - 1].strategyResumePending,
+				before[s_allied.cancellationSlots[1] - 1].strategyResumePending);
+		return AlliedFixtureRoundTripFailure("pre_pending", 0);
+	}
 	for (Int participant = 0; participant < 2; ++participant)
 	{
 		const AISkirmishPlayer::AlliedCoordinationDiagnostics &state =
@@ -8266,27 +8360,55 @@ Bool RoundTripAlliedFixture()
 		if (state.strategyResumePending &&
 			(!state.holdAdmissionValid || state.holdAdmissionFrame > frame || state.assaultTeamCount <= 0 ||
 			 !AlliedFixtureAssaultRosterContains(assaultIDs[s_allied.cancellationSlots[participant] - 1],
-				s_allied.cancellationTeams[participant]))) return FALSE;
+				s_allied.cancellationTeams[participant])))
+		{
+			const Int slot = s_allied.cancellationSlots[participant];
+			printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_PENDING_ROSTER slot=%d pending=%d admission_valid=%d "
+				"admission_frame=%u frame=%u count=%d retained_team=%u retained_member=%d\n",
+				slot, state.strategyResumePending, state.holdAdmissionValid, state.holdAdmissionFrame,
+				frame, state.assaultTeamCount, s_allied.cancellationTeams[participant],
+				AlliedFixtureAssaultRosterContains(assaultIDs[slot - 1], s_allied.cancellationTeams[participant]));
+			PrintAlliedFixtureAssaultRoster("SKIRMISH_AI_ALLIED_SAVE_LOAD_BEFORE_ROSTER", frame, slot, assaultIDs[slot - 1]);
+			return AlliedFixtureRoundTripFailure("pre_pending_roster", slot);
+		}
 	}
 	AsciiString filename;
 	filename.format("SkirmishAIAllied_%s.sav", s_runner.runNonce);
 	UnicodeString description;
 	description.set(L"Stage 5 allied coordination fixture");
 	const SaveResult saved = TheGameState->saveGame(filename, description, SAVE_FILE_TYPE_NORMAL);
-	if (saved.saveCode != SC_OK || saved.filename.isEmpty()) return FALSE;
+	if (saved.saveCode != SC_OK || saved.filename.isEmpty())
+	{
+		printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_SAVE code=%d filename_empty=%d file=%s\n",
+			saved.saveCode, saved.filename.isEmpty(), saved.filename.str());
+		return AlliedFixtureRoundTripFailure("save_game", 0);
+	}
 	AvailableGameInfo gameInfo;
 	gameInfo.filename = saved.filename;
 	gameInfo.next = nullptr;
 	gameInfo.prev = nullptr;
 	gameInfo.saveGameInfo = *TheGameState->getSaveGameInfo();
 	gameInfo.saveGameInfo.saveFileType = SAVE_FILE_TYPE_NORMAL;
-	if (TheGameState->loadGame(gameInfo) != SC_OK) return FALSE;
+	const SaveCode loaded = TheGameState->loadGame(gameInfo);
+	if (loaded != SC_OK)
+	{
+		printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_LOAD code=%d file=%s\n", loaded, saved.filename.str());
+		return AlliedFixtureRoundTripFailure("load_game", 0);
+	}
 	s_allied.saveLoaded = TRUE;
 	// No borrowed Player/AI/Object pointers survive loadGame. Reacquire each
 	// slot and validate the serialized ID-bearing state and central cadence.
 	if (!TheAI || !ThePlayerList || TheGameLogic->getFrame() != frame ||
 		TheAI->hasAlliedEvaluation() != evaluated ||
-		TheAI->getNextAlliedEvaluationFrame() != nextEvaluation) return FALSE;
+		TheAI->getNextAlliedEvaluationFrame() != nextEvaluation)
+	{
+		printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_CENTRAL ai=%d player_list=%d frame_before=%u frame_after=%u "
+			"evaluated_before=%d evaluated_after=%d next_before=%u next_after=%u\n",
+			TheAI != nullptr, ThePlayerList != nullptr, frame, TheGameLogic ? TheGameLogic->getFrame() : 0, evaluated,
+			TheAI ? TheAI->hasAlliedEvaluation() : FALSE, nextEvaluation,
+			TheAI ? TheAI->getNextAlliedEvaluationFrame() : 0);
+		return AlliedFixtureRoundTripFailure("post_central", 0);
+	}
 	for (Int slot = 1; slot <= 7; ++slot)
 	{
 		AISkirmishPlayer *ai = GetAlliedFixtureAI(slot);
@@ -8294,22 +8416,60 @@ Bool RoundTripAlliedFixture()
 		if (!ai || !player || player->getPlayerIndex() != playerIndices[slot - 1] ||
 			!SameAlliedDiagnostics(before[slot - 1], ai->getAlliedCoordinationDiagnostics()) ||
 			TheAI->getAlliedStarvationStreak(playerIndices[slot - 1]) != starvation[slot - 1] ||
-			TheAI->getAlliedRecipientReliefUntil(playerIndices[slot - 1]) != relief[slot - 1]) return FALSE;
+			TheAI->getAlliedRecipientReliefUntil(playerIndices[slot - 1]) != relief[slot - 1])
+		{
+			printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_OWNER slot=%d ai=%d player=%d owner_before=%d owner_after=%d "
+				"starvation_before=%d starvation_after=%d relief_before=%u relief_after=%u\n",
+				slot, ai != nullptr, player != nullptr, playerIndices[slot - 1], player ? player->getPlayerIndex() : -1,
+				starvation[slot - 1], TheAI->getAlliedStarvationStreak(playerIndices[slot - 1]),
+				relief[slot - 1], TheAI->getAlliedRecipientReliefUntil(playerIndices[slot - 1]));
+			if (ai)
+			{
+				PrintAlliedFixtureDiagnosticDifferences(slot, playerIndices[slot - 1], before[slot - 1], ai->getAlliedCoordinationDiagnostics());
+				PrintAlliedFixtureLiveAssaultRoster(slot, ai);
+				PrintAlliedFixtureSupportRosters(slot, ai, supportIDs[slot - 1]);
+			}
+			PrintAlliedFixtureAssaultRoster("SKIRMISH_AI_ALLIED_SAVE_LOAD_BEFORE_ROSTER", frame, slot, assaultIDs[slot - 1]);
+			return AlliedFixtureRoundTripFailure("post_owner_state", slot);
+		}
 		for (Int team = 0; team < before[slot - 1].supportTeamCount; ++team)
-			if (ai->getAlliedSupportTeamID(team) != supportIDs[slot - 1][team]) return FALSE;
+			if (ai->getAlliedSupportTeamID(team) != supportIDs[slot - 1][team])
+			{
+				printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_SUPPORT slot=%d owner=%d index=%d before=%u after=%u\n",
+					slot, playerIndices[slot - 1], team, supportIDs[slot - 1][team], ai->getAlliedSupportTeamID(team));
+				PrintAlliedFixtureSupportRosters(slot, ai, supportIDs[slot - 1]);
+				return AlliedFixtureRoundTripFailure("post_support_roster", slot);
+			}
 		std::vector<UnsignedInt> reboundAssaultIDs;
-		if (!CaptureAlliedFixtureAssaultRoster(ai, &reboundAssaultIDs) || reboundAssaultIDs != assaultIDs[slot - 1]) return FALSE;
+		if (!CaptureAlliedFixtureAssaultRoster(ai, &reboundAssaultIDs) || reboundAssaultIDs != assaultIDs[slot - 1])
+		{
+			PrintAlliedFixtureAssaultRoster("SKIRMISH_AI_ALLIED_SAVE_LOAD_BEFORE_ROSTER", frame, slot, assaultIDs[slot - 1]);
+			PrintAlliedFixtureAssaultRoster("SKIRMISH_AI_ALLIED_SAVE_LOAD_AFTER_ROSTER", frame, slot, reboundAssaultIDs);
+			PrintAlliedFixtureLiveAssaultRoster(slot, ai);
+			return AlliedFixtureRoundTripFailure("post_assault_roster", slot);
+		}
 		if (before[slot - 1].assaultActive &&
-			!TheGameLogic->findObjectByID(before[slot - 1].targetID)) return FALSE;
+			!TheGameLogic->findObjectByID(before[slot - 1].targetID))
+		{
+			printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_TARGET slot=%d owner=%d active_before=%d target=%u found=0\n",
+				slot, playerIndices[slot - 1], before[slot - 1].assaultActive, before[slot - 1].targetID);
+			return AlliedFixtureRoundTripFailure("post_target", slot);
+		}
 	}
 	for (Int participant = 0; participant < 2; ++participant)
 	{
 		AISkirmishPlayer *rebound = GetAlliedFixtureAI(s_allied.cancellationSlots[participant]);
-		if (!rebound) return FALSE;
+		if (!rebound) return AlliedFixtureRoundTripFailure("post_pending_owner", s_allied.cancellationSlots[participant]);
 		s_allied.cancellationPendingAfterLoad[participant] =
 			rebound->getAlliedCoordinationDiagnostics().strategyResumePending;
 		if (s_allied.cancellationPendingAfterLoad[participant] !=
-			s_allied.cancellationPendingAtSave[participant]) return FALSE;
+			s_allied.cancellationPendingAtSave[participant])
+		{
+			printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_PENDING slot=%d before=%d after=%d\n",
+				s_allied.cancellationSlots[participant], s_allied.cancellationPendingAtSave[participant],
+				s_allied.cancellationPendingAfterLoad[participant]);
+			return AlliedFixtureRoundTripFailure("post_pending", s_allied.cancellationSlots[participant]);
+		}
 	}
 	++s_allied.checks;
 	for (Int slot = 1; slot <= 7; ++slot)
