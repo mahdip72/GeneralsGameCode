@@ -116,7 +116,14 @@ struct AlliedFixtureState
 	ObjectID aidVictoryBuildingID;
 	Int aidNaturalSlots[2];
 	ObjectID aidNaturalTargetID;
+	Int aidNaturalLeaderIndex;
+	Int aidNaturalEnemyIndex;
+	UnsignedInt aidNaturalReleaseFrame;
+	UnsignedInt aidNaturalExpiryFrame;
+	UnsignedInt aidNaturalAdmissionFrames[2];
 	ObjectID aidSightProviderID;
+	UnsignedInt aidSightSetupFrame;
+	UnsignedInt aidSightProvenFrame;
 	UnsignedInt aidSightMissingTraces;
 	UnsignedInt aidCooldownUntil;
 	UnsignedInt aidEvaluation;
@@ -196,7 +203,9 @@ struct AlliedFixtureState
 		supportRecipientIndex(-1), aidFaultApplied(FALSE),
 		sawFirstStarvationEvaluation(FALSE), sawAid(FALSE), aidDonorSlot(-1),
 		aidRecipientSlot(-1), aidBuilderID(INVALID_ID), aidVictoryBuildingID(INVALID_ID),
-		aidNaturalTargetID(INVALID_ID), aidSightProviderID(INVALID_ID), aidSightMissingTraces(0),
+		aidNaturalTargetID(INVALID_ID), aidNaturalLeaderIndex(-1), aidNaturalEnemyIndex(-1),
+		aidNaturalReleaseFrame(0), aidNaturalExpiryFrame(0), aidSightProviderID(INVALID_ID),
+		aidSightSetupFrame(0), aidSightProvenFrame(0), aidSightMissingTraces(0),
 		aidCooldownUntil(0), aidEvaluation(0),
 		firstStarvationFrame(0), sawSupportReturning(FALSE),
 		coordinatedReleaseFrame(0), postLoadEvaluation(0), postLoadBlockedEvaluations(0),
@@ -221,6 +230,7 @@ struct AlliedFixtureState
 		withdrawalTeams[0] = withdrawalTeams[1] = 0;
 		assaultSlots[0] = assaultSlots[1] = -1;
 		aidNaturalSlots[0] = aidNaturalSlots[1] = -1;
+		aidNaturalAdmissionFrames[0] = aidNaturalAdmissionFrames[1] = 0;
 		positiveAbortMembers[0] = positiveAbortMembers[1] = INVALID_ID;
 		positiveAbortTeams[0] = positiveAbortTeams[1] = 0;
 		positiveAbortOrdinary[0] = positiveAbortOrdinary[1] = FALSE;
@@ -8369,6 +8379,13 @@ Bool RoundTripAlliedFixture()
 		printf("SKIRMISH_AI_ALLIED_SAVE_LOAD_CONTEXT ai=%d game_state=%d\n", TheAI != nullptr, TheGameState != nullptr);
 		return AlliedFixtureRoundTripFailure("pre_context", 0);
 	}
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
+		(s_allied.aidSightProviderID == INVALID_ID || s_allied.aidSightProvenFrame == 0 ||
+		 !s_allied.cancellationIssued || s_allied.cancellationTarget != s_allied.aidNaturalTargetID ||
+		 s_allied.cancellationRelease != s_allied.aidNaturalReleaseFrame ||
+		 s_allied.cancellationSlots[0] != s_allied.aidNaturalSlots[0] ||
+		 s_allied.cancellationSlots[1] != s_allied.aidNaturalSlots[1]))
+		return AlliedFixtureRoundTripFailure("pre_sight_binding", 0);
 	// Leave enough protected time for two ordinary five-second evaluations
 	// after load. A nonzero expired timestamp is not cooldown evidence.
 	if (!s_allied.sawAid || s_allied.aidCooldownUntil <= TheGameLogic->getFrame() ||
@@ -8429,6 +8446,8 @@ Bool RoundTripAlliedFixture()
 			state.strategyResumePending;
 		if (state.strategyResumePending &&
 			(!state.holdAdmissionValid || state.holdAdmissionFrame > frame || state.assaultTeamCount <= 0 ||
+			 (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
+			  state.holdAdmissionFrame != s_allied.aidNaturalAdmissionFrames[participant]) ||
 			 !AlliedFixtureAssaultRosterContains(assaultIDs[s_allied.cancellationSlots[participant] - 1],
 				s_allied.cancellationTeams[participant])))
 		{
@@ -8564,10 +8583,44 @@ Bool RoundTripAlliedFixture()
 	return TRUE;
 }
 
+Bool IsAlliedAidNaturalCohortCurrent(UnsignedInt frame, Bool setupWindow)
+{
+	if (s_allied.aidNaturalReleaseFrame <= frame ||
+		s_allied.aidNaturalExpiryFrame <= s_allied.aidNaturalReleaseFrame ||
+		(setupWindow && s_allied.aidNaturalReleaseFrame - frame < 10 * LOGICFRAMES_PER_SECOND)) return FALSE;
+	for (Int participant = 0; participant < 2; ++participant)
+	{
+		const Int slot = s_allied.aidNaturalSlots[participant];
+		if (slot < 1 || slot > 7) return FALSE;
+		Player *player = ThePlayerList->getPlayerFromSlotIndex(slot);
+		AISkirmishPlayer *ai = GetAlliedFixtureAI(slot);
+		if (!player || !player->isPlayerActive() || !ai) return FALSE;
+		const AISkirmishPlayer::AlliedCoordinationDiagnostics state = ai->getAlliedCoordinationDiagnostics();
+		if (!state.assaultActive || state.assaultLaunched ||
+			state.leaderIndex != s_allied.aidNaturalLeaderIndex || state.enemyIndex != s_allied.aidNaturalEnemyIndex ||
+			state.targetID != s_allied.aidNaturalTargetID || state.assaultFrame != s_allied.aidNaturalReleaseFrame ||
+			state.assaultExpiryFrame != s_allied.aidNaturalExpiryFrame || !state.holdAdmissionValid ||
+			state.holdAdmissionFrame != s_allied.aidNaturalAdmissionFrames[participant] ||
+			state.holdAdmissionFrame > frame || state.assaultTeamCount <= 0) return FALSE;
+	}
+	return TRUE;
+}
+
+Bool IsAlliedAidSightProvider(Object *object, Player *recipient, Object *target);
+
 void BeginAlliedCancellation(Int firstSlot, Int secondSlot, ObjectID targetID,
 	UnsignedInt releaseFrame, UnsignedInt frame)
 {
 	if (s_allied.cancellationIssued || releaseFrame <= frame) return;
+	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
+		(firstSlot != s_allied.aidNaturalSlots[0] || secondSlot != s_allied.aidNaturalSlots[1] ||
+		 targetID != s_allied.aidNaturalTargetID || releaseFrame != s_allied.aidNaturalReleaseFrame ||
+		 s_allied.aidSightProvenFrame != frame || !IsAlliedAidNaturalCohortCurrent(frame, FALSE) ||
+		 !IsAlliedAidSightProvider(TheGameLogic->findObjectByID(s_allied.aidSightProviderID),
+			ThePlayerList->getPlayerFromSlotIndex(s_allied.aidRecipientSlot), TheGameLogic->findObjectByID(targetID))))
+	{
+		FailSkirmishAITest("allied_save_load_cancellation_sight_binding"); RequestSkirmishAITestStop(); return;
+	}
 	const Int slots[2] = { firstSlot, secondSlot };
 	Object *held[2] = { nullptr, nullptr };
 	std::vector<UnsignedInt> rosters[2];
@@ -8707,6 +8760,12 @@ void ObserveAlliedCoordination(UnsignedInt frame)
 					s_allied.aidNaturalSlots[0] = slot;
 					s_allied.aidNaturalSlots[1] = peer;
 					s_allied.aidNaturalTargetID = a.targetID;
+					s_allied.aidNaturalLeaderIndex = a.leaderIndex;
+					s_allied.aidNaturalEnemyIndex = a.enemyIndex;
+					s_allied.aidNaturalReleaseFrame = a.assaultFrame;
+					s_allied.aidNaturalExpiryFrame = a.assaultExpiryFrame;
+					s_allied.aidNaturalAdmissionFrames[0] = a.holdAdmissionFrame;
+					s_allied.aidNaturalAdmissionFrames[1] = b.holdAdmissionFrame;
 				}
 				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_COORDINATION_LIVE &&
 					!s_allied.assaultRetained &&
@@ -8737,6 +8796,9 @@ void ObserveAlliedCoordination(UnsignedInt frame)
 				fflush(stdout);
 				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
 					s_allied.sawAid && !s_allied.saveLoaded &&
+					slot == s_allied.aidNaturalSlots[0] && peer == s_allied.aidNaturalSlots[1] &&
+					a.targetID == s_allied.aidNaturalTargetID && a.assaultFrame == s_allied.aidNaturalReleaseFrame &&
+					s_allied.aidSightProvenFrame == frame &&
 					slot != s_allied.aidRecipientSlot && peer != s_allied.aidRecipientSlot &&
 					s_allied.aidCooldownUntil > frame &&
 					s_allied.aidCooldownUntil - frame >= 20 * LOGICFRAMES_PER_SECOND)
@@ -10221,6 +10283,8 @@ void ObserveAlliedAid(UnsignedInt frame)
 	if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
 		s_allied.aidSightProviderID != INVALID_ID && !s_allied.cancellationIssued)
 	{
+		if (!IsAlliedAidNaturalCohortCurrent(frame, FALSE))
+		{ FailSkirmishAITest("allied_save_load_retained_cohort_changed"); RequestSkirmishAITestStop(); return; }
 		Object *provider = TheGameLogic->findObjectByID(s_allied.aidSightProviderID);
 		Object *target = TheGameLogic->findObjectByID(s_allied.aidNaturalTargetID);
 		Player *recipient = ThePlayerList->getPlayerFromSlotIndex(s_allied.aidRecipientSlot);
@@ -10234,14 +10298,28 @@ void ObserveAlliedAid(UnsignedInt frame)
 		}
 		if (!ControlAlliedAidSightProvider(provider) || !IsAlliedAidNaturalTargetVisible(target))
 		{ FailSkirmishAITest("allied_save_load_genuine_sight_lost"); RequestSkirmishAITestStop(); return; }
+		// Read back after ordinary spatial updates and the normal deferred
+		// removal horizon. Do not run another collision pass or flush sight.
+		if (frame > s_allied.aidSightSetupFrame &&
+			frame - s_allied.aidSightSetupFrame > TheGlobalData->m_unlookPersistDuration)
+		{
+			if (s_allied.aidSightProvenFrame == 0)
+			{
+				printf("SKIRMISH_AI_ALLIED_AID_SIGHT_OBSERVED frame=%u setup=%u unlook_duration=%u "
+					"provider=%u target=%u both_participants_visible=1 same_natural_tuple=1 normal_spatial_update=1\n",
+					frame, s_allied.aidSightSetupFrame, TheGlobalData->m_unlookPersistDuration,
+					s_allied.aidSightProviderID, s_allied.aidNaturalTargetID);
+				fflush(stdout);
+			}
+			s_allied.aidSightProvenFrame = frame;
+		}
 	}
 	if (!s_allied.aidFaultApplied)
 	{
 		// In the save/load case establish a real future commitment first, then
 		// apply the recovery fault while that cohort still has time to assemble.
 		if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
-			(s_allied.coordinatedReleaseFrame <= frame ||
-			 s_allied.coordinatedReleaseFrame - frame < 10 * LOGICFRAMES_PER_SECOND)) return;
+			!IsAlliedAidNaturalCohortCurrent(frame, TRUE)) return;
 		for (Int donorSlot = 1; donorSlot <= 4; ++donorSlot)
 		{
 			Player *donor = ThePlayerList->getPlayerFromSlotIndex(donorSlot);
@@ -10311,6 +10389,7 @@ void ObserveAlliedAid(UnsignedInt frame)
 						}
 						continue;
 					}
+					if (!IsAlliedAidNaturalCohortCurrent(frame, TRUE)) return;
 					if (!ControlAlliedAidSightProvider(sightProvider))
 					{ FailSkirmishAITest("allied_save_load_genuine_sight_control_changed"); RequestSkirmishAITestStop(); return; }
 				}
@@ -10325,6 +10404,8 @@ void ObserveAlliedAid(UnsignedInt frame)
 					RequestSkirmishAITestStop();
 					return;
 				}
+				if (s_allied.fixtureCase == SKIRMISH_AI_ALLIED_SAVE_LOAD &&
+					!IsAlliedAidNaturalCohortCurrent(frame, TRUE)) return;
 				const ObjectID builderID = builder->getID();
 				for (Object *object = TheGameLogic->getFirstObject(); object; )
 				{
@@ -10357,21 +10438,18 @@ void ObserveAlliedAid(UnsignedInt frame)
 				if (sightProvider)
 				{
 					s_allied.aidSightProviderID = sightProvider->getID();
+					s_allied.aidSightSetupFrame = frame;
 					// Refresh the live object's normal owner/position/range sight;
 					// no intel, shroud status or vision radius is assigned by the fixture.
 					sightProvider->handlePartitionCellMaintenance();
-					ThePartitionManager->update();
-					if (!IsAlliedAidSightProvider(sightProvider, recipient, sightTarget))
-					{ FailSkirmishAITest("allied_save_load_genuine_sight_lost"); RequestSkirmishAITestStop(); return; }
 					printf("SKIRMISH_AI_ALLIED_AID_SIGHT_RETAINED frame=%u provider=%u owner=%d target=%u "
-						"position=%g,%g range=%g health=%g natural_slots=%d,%d shrouds=%d,%d both_participants_visible=1 "
+						"position=%g,%g range=%g health=%g natural_slots=%d,%d before_control_both_visible=1 "
+						"post_fault_readback=pending_normal_spatial_update "
 						"owner_position_range_unchanged=1 assault_support_member=0 script_disabled=1\n", frame,
 						sightProvider->getID(), recipient->getPlayerIndex(), sightTarget->getID(),
 						sightProvider->getPosition()->x, sightProvider->getPosition()->y, sightProvider->getShroudClearingRange(),
 						sightProvider->getBodyModule() ? sightProvider->getBodyModule()->getHealth() : -1.0f,
-						s_allied.aidNaturalSlots[0], s_allied.aidNaturalSlots[1],
-						static_cast<Int>(sightTarget->getShroudedStatus(ThePlayerList->getPlayerFromSlotIndex(s_allied.aidNaturalSlots[0])->getPlayerIndex())),
-						static_cast<Int>(sightTarget->getShroudedStatus(ThePlayerList->getPlayerFromSlotIndex(s_allied.aidNaturalSlots[1])->getPlayerIndex())));
+						s_allied.aidNaturalSlots[0], s_allied.aidNaturalSlots[1]);
 					fflush(stdout);
 				}
 				s_allied.aidBuilderID = builderID;
