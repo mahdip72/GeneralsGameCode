@@ -9003,8 +9003,8 @@ void ObserveAlliedLeaderWithdrawal(UnsignedInt frame)
 					{ FailSkirmishAITest("allied_script_alias_probe_unavailable"); RequestSkirmishAITestStop(); return; }
 					ScriptAction *action = newInstance(ScriptAction)(ScriptAction::TEAM_MERGE_INTO_TEAM);
 					action->setNextAction(nullptr);
-					action->getParameter(0)->setString(THIS_TEAM);
-					action->getParameter(1)->setString(THIS_TEAM);
+					action->getParameter(0)->friend_setString(THIS_TEAM);
+					action->getParameter(1)->friend_setString(THIS_TEAM);
 					TheScriptEngine->friend_executeAction(action, members[participant]->getTeam());
 					deleteInstance(action);
 				}
@@ -9614,11 +9614,11 @@ Bool CheckAlliedSupportScriptHold(AISkirmishPlayer *ownerAI, Player *owner, Obje
 			ScriptAction *action = newInstance(ScriptAction)(command != 3 ?
 				ScriptAction::TEAM_MERGE_INTO_TEAM : ScriptAction::TEAM_STOP_AND_DISBAND);
 			action->setNextAction(nullptr);
-			action->getParameter(0)->setString(THIS_TEAM);
+			action->getParameter(0)->friend_setString(THIS_TEAM);
 			if (command == 4)
-				action->getParameter(1)->setString(THIS_TEAM);
+				action->getParameter(1)->friend_setString(THIS_TEAM);
 			else if (command == 2)
-				action->getParameter(1)->setString(owner->getDefaultTeam()->getName());
+				action->getParameter(1)->friend_setString(owner->getDefaultTeam()->getName());
 			TheScriptEngine->friend_executeAction(action, member->getTeam());
 			deleteInstance(action);
 		}
