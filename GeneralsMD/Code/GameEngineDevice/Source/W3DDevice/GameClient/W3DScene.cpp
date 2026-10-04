@@ -36,6 +36,7 @@
 
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "Lib/BaseType.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "Common/GameUtility.h"
 #include "Common/GlobalData.h"
 #include "Common/PerfTimer.h"
@@ -924,6 +925,7 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 	if (!drawableHidden)
 	{
 		//standard scene lights
+		rts::frame_timing::Scope lightTiming(rts::frame_timing::RendererSceneLights);
 		RefRenderObjListIterator it2(&LightList);
 		for (it2.First(); !it2.Is_Done(); it2.Next())
 		{
@@ -954,6 +956,7 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
     }
 
 		lightEnv.Pre_Render_Update(rinfo.Camera.Get_Transform());
+		lightTiming.finish();
 		rinfo.light_environment = &lightEnv;
 
 		if (drawInfo)
@@ -1003,6 +1006,7 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 /**Draw everything that was submitted from this scene*/
 void RTS3DScene::Flush(RenderInfoClass & rinfo)
 {
+	rts::frame_timing::Scope sceneFlushTiming(rts::frame_timing::RendererSceneFlush);
 	// TheSuperHackers @bugfix Now always prepares shadows to guarantee correct state before doing any
 	// shadow draw calls. Originally just drawing shadows for trees would not properly prepare shadows.
 	{
@@ -1286,6 +1290,8 @@ void RTS3DScene::Render(RenderInfoClass & rinfo)
 //=============================================================================
 void RTS3DScene::Customized_Render( RenderInfoClass &rinfo )
 {
+	rts::frame_timing::Scope customizedRenderTiming(
+		rts::frame_timing::RendererSceneCustomizedRender);
 #ifdef DIRTY_CONDITION_FLAGS
 	StDrawableDirtyStuffLocker lockDirtyStuff;
 #endif

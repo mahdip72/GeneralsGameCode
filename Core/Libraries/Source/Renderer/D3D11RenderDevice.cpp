@@ -1,4 +1,5 @@
 #include "Renderer/RendererDevice.h"
+#include "Lib/FrameTimingDiagnostics.h"
 
 #include <windows.h>
 #include <d3d11.h>
@@ -6,6 +7,8 @@
 #include <dxgi1_2.h>
 
 #include "D3D11ResultTranslation.h"
+#include "D3D11GpuFrameTiming.h"
+#include "PresentFrameTiming.h"
 #include "IndexedDrawValidationCache.h"
 #include "LegacyFixedFunctionPS.h"
 #include "LegacyFixedFunctionVS.h"
@@ -832,6 +835,8 @@ public:
 			return TranslateResult(result);
 		}
 		m_initialized = true;
+		m_gpuTiming.attach(m_device, m_context);
+		m_presentTiming.attachDevice();
 		return RENDER_RESULT_OK;
 	}
 
@@ -841,7 +846,10 @@ public:
 		{
 			return;
 		}
+		m_gpuTiming.release(detail::GpuTimingShutdownPending);
 		shutdownInternal();
+		m_gpuTiming.writeOnShutdown();
+		m_presentTiming.writeOnShutdown();
 	}
 
 	virtual IRenderContext *immediateContext()
@@ -1531,6 +1539,7 @@ public:
 		}
 		m_parameters.width = m_width;
 		m_parameters.height = m_height;
+		m_gpuTiming.release(detail::GpuTimingDeviceReleased);
 		m_indexedDrawValidation.clear();
 		m_indexRangeSummaries.clear();
 		m_activeRenderTarget = 0;
@@ -1618,6 +1627,8 @@ public:
 		m_renderTargetsBound = defaultRenderTarget() != 0;
 		markTextureBindingsEmpty();
 		m_viewportBound = defaultRenderTarget() != 0;
+		m_gpuTiming.attach(m_device, m_context);
+		m_presentTiming.attachDevice();
 		return RENDER_RESULT_OK;
 	}
 
@@ -1636,6 +1647,7 @@ public:
 			// resize until a non-zero client area is reported.
 			return RENDER_RESULT_OK;
 		}
+		m_gpuTiming.resize();
 		if (m_swapChain != 0)
 		{
 			const unsigned int previousWidth = m_width;
@@ -1797,33 +1809,50 @@ public:
 
 	virtual RenderResult present()
 	{
+		rts::frame_timing::Scope presentTiming(rts::frame_timing::RendererPresent);
 		if (!isOwner() || m_frameOpen)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		if (m_swapChain == 0)
 		{
+			m_gpuTiming.cancel(detail::GpuTimingUnpresented);
 			// Headless passes have no Present call to surface asynchronous device
 			// removal.  Query the device at this lifecycle boundary instead of
 			// silently reporting success after a lost GPU.
 			return TranslateResult(m_device->GetDeviceRemovedReason());
 		}
+		const bool gammaApplied = !isPresentationIdentity() && isDefaultBackBufferTarget();
+		if (m_gpuTiming.enabled()) m_gpuTiming.beforeResolve(gpuTimingFrameInfo(gammaApplied));
 		const RenderResult resolveResult = resolveBackBuffer();
 		if (resolveResult != RENDER_RESULT_OK)
+		{
+			m_gpuTiming.cancel(detail::GpuTimingPresentFailed);
 			return resolveResult;
-		if (!isPresentationIdentity() && isDefaultBackBufferTarget())
+		}
+		m_gpuTiming.afterResolve();
+		if (gammaApplied)
 		{
 			const RenderResult transformResult = applyPresentationGamma();
 			if (transformResult != RENDER_RESULT_OK)
+			{
+				m_gpuTiming.cancel(detail::GpuTimingPresentFailed);
 				return transformResult;
+			}
 		}
+		m_gpuTiming.beforePresent();
+		const uint64_t cpuPresentStart = detail::BeginPresentTiming(m_gpuTiming, m_presentTiming);
 		const HRESULT presentResult = m_swapChain->Present(
 			m_swapInterval, 0);
+		detail::EndPresentTiming(m_gpuTiming, m_presentTiming, cpuPresentStart, presentResult,
+			m_swapInterval, 0, m_width, m_height);
 		if (FAILED(presentResult))
 		{
 			return TranslateResult(presentResult);
 		}
-		return TranslateResult(m_device->GetDeviceRemovedReason());
+		const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+		if (FAILED(deviceResult)) m_gpuTiming.failPresentation(deviceResult);
+		return TranslateResult(deviceResult);
 	}
 
 	virtual RenderResult setSwapInterval(unsigned int interval)
@@ -1924,6 +1953,8 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		if (m_gpuTiming.enabled()) m_gpuTiming.begin(gpuTimingFrameInfo(false));
+		m_presentTiming.beginFrame();
 		bindDefaultRenderTargets();
 		bindDefaultViewport(m_width, m_height);
 		bool needsTextureReset = !m_textureBindingsValid;
@@ -1962,6 +1993,7 @@ public:
 		const void *data, size_t byteCount, size_t destinationOffset,
 		RenderBufferUpdateMode mode)
 	{
+		rts::frame_timing::Scope uploadTiming(rts::frame_timing::RendererBufferUpload);
 		if (!isOwner() || data == 0 || byteCount == 0 ||
 			!m_handles->isLive(buffer))
 		{
@@ -2056,9 +2088,10 @@ public:
 			m_context->Unmap(slot.resource, 0);
 			if (maintainImage)
 			{
+				rts::frame_timing::Scope shadowTiming(rts::frame_timing::RendererBufferShadow);
 				if (mode == RENDER_BUFFER_UPDATE_DISCARD)
 				{
-					std::fill(slot.bufferImage.begin(), slot.bufferImage.end(), 0);
+					std::fill(slot.bufferImage.begin() + byteCount, slot.bufferImage.end(), 0);
 				}
 				memcpy(&slot.bufferImage[destinationOffset], data, byteCount);
 			}
@@ -2079,6 +2112,7 @@ public:
 		m_context->UpdateSubresource(slot.resource, 0, &destination, data, 0, 0);
 		if (maintainImage)
 		{
+			rts::frame_timing::Scope shadowTiming(rts::frame_timing::RendererBufferShadow);
 			memcpy(&slot.bufferImage[destinationOffset], data, byteCount);
 		}
 		ApplyBufferRangeUpdate(&slot.initializedBufferRanges,
@@ -3064,6 +3098,7 @@ public:
 
 	virtual RenderResult draw(unsigned int vertexCount, unsigned int startVertex)
 	{
+		rts::frame_timing::Scope validationTiming(rts::frame_timing::RendererDrawValidation);
 		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
 			!m_vertexBufferBound || !m_handles->isLive(m_boundVertexBuffer))
 		{
@@ -3090,6 +3125,8 @@ public:
 		{
 			return transformResult;
 		}
+		validationTiming.finish();
+		rts::frame_timing::Scope submissionTiming(rts::frame_timing::RendererDrawSubmit);
 		m_context->Draw(vertexCount, startVertex);
 		return RENDER_RESULT_OK;
 	}
@@ -3097,6 +3134,7 @@ public:
 	virtual RenderResult drawIndexed(unsigned int indexCount,
 		unsigned int startIndex, int baseVertex)
 	{
+		rts::frame_timing::Scope validationTiming(rts::frame_timing::RendererDrawValidation);
 		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
 			!m_vertexBufferBound || !m_indexBufferBound ||
 			!m_handles->isLive(m_boundVertexBuffer) ||
@@ -3243,6 +3281,8 @@ public:
 		{
 			return transformResult;
 		}
+		validationTiming.finish();
+		rts::frame_timing::Scope submissionTiming(rts::frame_timing::RendererDrawSubmit);
 		m_context->DrawIndexed(indexCount, startIndex, baseVertex);
 		return RENDER_RESULT_OK;
 	}
@@ -3274,6 +3314,7 @@ public:
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		m_gpuTiming.markReadback();
 		const RenderResult resolveResult = resolveBackBuffer();
 		if (resolveResult != RENDER_RESULT_OK)
 			return resolveResult;
@@ -3578,6 +3619,16 @@ private:
 		m_viewportMaximumDepth = viewport.MaxDepth;
 		m_viewportBound = true;
 		m_transformConstantsChanged = true;
+	}
+
+	detail::GpuTimingFrameInfo gpuTimingFrameInfo(bool gammaApplied) const
+	{
+		detail::GpuTimingFrameInfo info;
+		info.width = m_width; info.height = m_height; info.samples = m_multisampleCount;
+		info.gamma = m_gamma; info.brightness = m_brightness; info.contrast = m_contrast;
+		info.gammaLimit = m_gammaUseLimit; info.gammaApplied = gammaApplied;
+		info.swapInterval = m_swapInterval; info.presentFlags = 0;
+		return info;
 	}
 
 	RenderResult resolveBackBuffer()
@@ -4380,6 +4431,7 @@ private:
 		unsigned int vertexLayoutFlags, unsigned int texturePresenceMask,
 		unsigned int cubeTextureMask)
 	{
+		rts::frame_timing::Scope packingTiming(rts::frame_timing::RendererConstantPack);
 		LegacyTransformConstants shaderConstants;
 		RenderMatrix4 worldViewMatrix;
 		MultiplyMatrices(state.constants.world.values, state.constants.view.values,
@@ -4644,6 +4696,8 @@ private:
 			m_transformConstantsChanged = false;
 			return S_OK;
 		}
+		packingTiming.finish();
+		rts::frame_timing::Scope uploadTiming(rts::frame_timing::RendererConstantUpload);
 		ID3D11Buffer *constantBuffer =
 			m_transformConstants[m_transformConstantCursor];
 		m_transformConstantCursor = (m_transformConstantCursor + 1) %
@@ -5933,6 +5987,7 @@ private:
 
 	void shutdownInternal()
 	{
+		m_gpuTiming.release(detail::GpuTimingDeviceReleased);
 		m_frameOpen = false;
 		m_pipelineBound = false;
 		m_vertexBufferBound = false;
@@ -6171,6 +6226,8 @@ private:
 		}
 	}
 
+	detail::D3D11GpuFrameTiming m_gpuTiming;
+	detail::D3D11PresentFrameTiming m_presentTiming;
 	ID3D11Device *m_device;
 	ID3D11DeviceContext *m_context;
 	D3D_FEATURE_LEVEL m_featureLevel;

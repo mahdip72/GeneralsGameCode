@@ -29,6 +29,7 @@
 
 #include <mmsystem.h>
 
+#include "Lib/FrameTimingDiagnostics.h"
 #include "Lib/BaseType.h"
 #include "WW3D2/camera.h"
 #include "WWLib/simplevec.h"
@@ -278,6 +279,7 @@ Bool W3DShroud::syncSourceTexture()
 {
 	if (!m_srcTextureDirty || !m_pSrcTexture || !m_srcTextureData)
 		return TRUE;
+	rts::frame_timing::Scope sourceSyncTiming(rts::frame_timing::RendererShroudSourceSync);
 
 	Int destinationPitch = 0;
 	Byte *destination = static_cast<Byte *>(m_pSrcTexture->Lock(

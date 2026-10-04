@@ -51,7 +51,11 @@ enum SkirmishAITestScenario
 		SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7,
 	// Eight occupied hard-AI slots: two allied against six. The local player
 	// is the engine-created replay observer, not a GameInfo slot.
-	SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6
+	SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6,
+	// Explicit test-only rendered combat diagnostic; not AI/replay acceptance.
+	SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC,
+	// Bounded development benchmark, with uncapped rendering and normal logic time.
+	SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK
 };
 
 // CLI: -runSkirmishAIRecoveryTest <positive-seed> <case> <FactionTemplate>.
@@ -101,6 +105,88 @@ enum SkirmishAITestProgress
 	SKIRMISH_AI_TEST_COMPLETE,
 	SKIRMISH_AI_TEST_TIMED_OUT
 };
+
+enum
+{
+	RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER = 32,
+	RENDERED_BATTLE_DIAGNOSTIC_MAX_FRAMES = 1800,
+	RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS = 120000,
+	RENDERED_BATTLE_DIAGNOSTIC_PLACEMENT_SCHEMA_VERSION = 2,
+	RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT = 9,
+	RENDERED_BATTLE_DIAGNOSTIC_LOCAL_STEP = 22,
+	RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP = 8
+};
+enum
+{
+	RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER = 64,
+	RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES = 150,
+	RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES = 450,
+	RENDERED_BATTLE_BENCHMARK_MAX_MILLISECONDS = 45000,
+	RENDERED_BATTLE_BENCHMARK_GRID_STEP = 52,
+	RENDERED_BATTLE_BENCHMARK_BAND_STEP = 208,
+	RENDERED_BATTLE_BENCHMARK_FORMATION_X = 459,
+	RENDERED_BATTLE_BENCHMARK_FORMATION_Y = 416,
+	RENDERED_BATTLE_BENCHMARK_INSET_X = 503,
+	RENDERED_BATTLE_BENCHMARK_INSET_Y = 460,
+	RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS = 4000000,
+	RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS = 16000000
+};
+// Pure admission/roster helpers used by the production diagnostic and fixture.
+// Ordinary command lines are accepted unchanged when the new flag is absent.
+Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv,
+	Bool supported, const char **reason);
+const char *GetRenderedBattleDiagnosticFactionName(Int slot);
+const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit, Bool benchmark = FALSE);
+Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset, Bool benchmark = FALSE);
+// Planning order is independent of canonical slot/roster storage: in dense
+// mode all original 256 units precede every added infantry position.
+// Invalid ranks/output pointers preserve supplied outputs.
+Bool GetRenderedBattleDiagnosticPlacementUnit(Int rank, Bool benchmark, Int *slot, Int *unit);
+// Mirrors the existing engine fast-mode admission, including debug-cheat builds.
+Bool IsRenderedBattleBenchmarkFastModeActive(Bool fastMode, Bool replayGame, Bool debugCheatsAllowed);
+// Qualify all 512 nominal pairs once before any live arena search. Conservative
+// class maxima must satisfy the same uninflated-radius +3 clearance gate.
+Bool ValidateRenderedBattleBenchmarkNominalGeometry(Real vehicleRadius, Real infantryRadius);
+enum RenderedBattleBenchmarkPlacementResult
+{
+	RB_BENCHMARK_PLACEMENT_SOLVED, RB_BENCHMARK_PLACEMENT_EMPTY_DOMAIN,
+	RB_BENCHMARK_PLACEMENT_UNSATISFIABLE, RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED,
+	RB_BENCHMARK_PLACEMENT_INVALID
+};
+struct RenderedBattleBenchmarkPlacementStats
+{
+	Int operations, pairComparisons, assignments, backtracks, maxAssigned, emptyDomains;
+};
+// Pure dense-only planner: canonical unit-major nine-position domains already
+// passed every live unary gate. MRV ties and position trials use ascending
+// canonical indices. Forward checking/backtracking never queries the world.
+// At most 512 units. Budget counts each MRV/copy scan, assignment and pair gate;
+// fixed nine-bit scans and bounded input validation are separate. On failure
+// choices remain untouched; stats describe the bounded attempt, not acceptance.
+RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
+	Int unitCount, const Coord3D *domains, const Real *radii, const UnsignedInt *domainMasks,
+	Int operationBudget, Int *choices, RenderedBattleBenchmarkPlacementStats *stats);
+// Version 2: original 49 centers first, then a row-major 9x9 grid inset by
+// 403/366 formation + 22 local movement + 22 footprint = 447/410.
+// Dense-only 52-grid/208-player bands have envelope459/416, insets503/460.
+// Invalid extents have no candidates; too-small extents
+// retain only the original search. Failure leaves the supplied center intact.
+Int GetRenderedBattleDiagnosticSearchCount(Real loX, Real loY, Real hiX, Real hiY, Bool benchmark = FALSE);
+Bool GetRenderedBattleDiagnosticSearchCenter(Real loX, Real loY, Real hiX, Real hiY,
+	Int candidate, Coord3D *center, Bool benchmark = FALSE);
+// Fixed local stencil, mirrored in X by battle side; no RNG or world queries.
+Bool GetRenderedBattleDiagnosticLocalOffset(Int slot, Int trial, Coord3D *offset);
+// Geometry radii are the uninflated template radii. Same total clearance as
+// the world occupancy gate: current+1, previous, then 2 additional units.
+Bool AreRenderedBattleDiagnosticPositionsSeparated(const Coord3D &a, Real radiusA,
+	const Coord3D &b, Real radiusB);
+// Retain at most eight arenas by descending valid prefix, ascending index.
+// Arrays have LOCAL_ARENA_CAP entries; rejected inserts preserve them/count.
+Bool RememberRenderedBattleDiagnosticArena(Int candidate, Int validUnits,
+	Int *candidates, Int *validPrefixes, Int *count, Bool benchmark = FALSE);
+// Bounded append: failure preserves the prior bytes and length.
+Bool AppendRenderedBattleDiagnosticReportRecord(char *buffer, UnsignedInt capacity,
+	UnsignedInt *used, const char *record, UnsignedInt recordBytes);
 
 struct SkirmishAITestSlotPlan
 {

@@ -274,10 +274,15 @@ function Test-PointParticleVertexContract {
 
     $text = Remove-CppComments $PointGroupImplementationText
     $render = Get-FunctionBody $text 'void PointGroupClass::Render(RenderInfoClass &rinfo)'
+    $packVertices = Get-FunctionBody $text `
+        'void PointGroupClass::Pack_Vertex_Chunk(unsigned char *vertices,'
+    $packBillboards = Get-FunctionBody $text `
+        'bool PointGroupClass::Pack_Billboard_Quad_Chunk(unsigned char *vertices,'
     $renderVolume = Get-FunctionBody $text 'void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int depth )'
-    if ($null -eq $render -or $null -eq $renderVolume) { return $false }
+    if ($null -eq $render -or $null -eq $packVertices -or
+        $null -eq $packBillboards -or $null -eq $renderVolume) { return $false }
 
-    foreach ($body in @($render, $renderVolume)) {
+    foreach ($body in @($packVertices, $packBillboards, $renderVolume)) {
         $location = $body.IndexOf('Get_Location_Offset()', [StringComparison]::Ordinal)
         $normal = $body.IndexOf('Get_Normal_Offset()', [StringComparison]::Ordinal)
         $texture0 = $body.IndexOf('Get_Tex_Offset(0)', [StringComparison]::Ordinal)
@@ -293,6 +298,30 @@ function Test-PointParticleVertexContract {
                 (Get-BraceDepthAt $body $texture1)) {
             return $false
         }
+    }
+
+    $billboardCall = $render.IndexOf('Pack_Billboard_Quad_Chunk(',
+        [StringComparison]::Ordinal)
+    $fusedBillboards = if ($billboardCall -ge 0) {
+        $render.LastIndexOf('if (fused_billboards)', $billboardCall,
+            [StringComparison]::Ordinal)
+    } else { -1 }
+    $billboardElse = if ($billboardCall -ge 0) {
+        $render.IndexOf('} else {', $billboardCall, [StringComparison]::Ordinal)
+    } else { -1 }
+    $vertexCall = $render.IndexOf('Pack_Vertex_Chunk(',
+        [StringComparison]::Ordinal)
+    if ($fusedBillboards -lt 0 -or $billboardCall -lt 0 -or
+        $billboardElse -lt 0 -or $vertexCall -lt 0 -or
+        $fusedBillboards -gt $billboardCall -or
+        $billboardCall -gt $billboardElse -or $billboardElse -gt $vertexCall -or
+        [regex]::Matches($render, '\bPack_Billboard_Quad_Chunk\s*\(').Count -ne 1 -or
+        [regex]::Matches($render, '\bPack_Vertex_Chunk\s*\(').Count -ne 1 -or
+        (Get-BraceDepthAt $render $billboardCall) -ne
+            ((Get-BraceDepthAt $render $fusedBillboards) + 1) -or
+        (Get-BraceDepthAt $render $vertexCall) -ne
+            ((Get-BraceDepthAt $render $fusedBillboards) + 1)) {
+        return $false
     }
     return $true
 }
@@ -379,13 +408,51 @@ bool D3D11LegacyBridge::Prepare_Legacy_Device_Reset()
 }
 '@
     $validPointGroup = @'
-void PointGroupClass::Render(RenderInfoClass &rinfo)
+void PointGroupClass::Pack_Vertex_Chunk(unsigned char *vertices,
+    const FVFInfoClass &fvfinfo, Vector4 *diffuse, int first_vertex,
+    int vertex_count) const
 {
     for (;;) {
         Write(Get_Location_Offset());
         Write(Get_Normal_Offset());
+        Write(Get_Diffuse_Offset());
         Write(Get_Tex_Offset(0));
         Write(Get_Tex_Offset(1));
+    }
+}
+bool PointGroupClass::Pack_Billboard_Quad_Chunk(unsigned char *vertices,
+    const FVFInfoClass &fvfinfo, const Matrix4x4 &view, int first_vertex,
+    int vertex_count) const
+{
+    for (;;) {
+        for (;;) {
+            WriteBillboard(Get_Location_Offset());
+            WriteBillboard(Get_Normal_Offset());
+            WriteBillboard(Get_Diffuse_Offset());
+            WriteBillboard(Get_Tex_Offset(0));
+            WriteBillboard(Get_Tex_Offset(1));
+        }
+    }
+    return true;
+}
+void PointGroupClass::Render(RenderInfoClass &rinfo)
+{
+    if (fused_billboards) {
+        vnum = 0;
+        pnum = 0;
+    } else {
+        Prepare_Vertex_Arrays();
+    }
+    while (vnum) {
+        {
+            if (fused_billboards) {
+                if (!Pack_Billboard_Quad_Chunk(vb)) {
+                    break;
+                }
+            } else {
+                Pack_Vertex_Chunk(vb);
+            }
+        }
     }
 }
 void PointGroupClass::RenderVolumeParticle(RenderInfoClass &rinfo, unsigned int depth )
@@ -563,7 +630,31 @@ void Publish_Render_Texture_Stage(unsigned int stage,
         '        Write(Get_Normal_Offset());'.Length)
     if ($firstNormal -lt 0 -or
         (Test-PointParticleVertexContract $missingRenderNormal)) {
-        throw 'Point Render without a normal initialization was accepted.'
+        throw 'Generic point vertex packing without a normal initialization was accepted.'
+    }
+    $secondFusedSelector = $validPointGroup.LastIndexOf(
+        'if (fused_billboards)', [StringComparison]::Ordinal)
+    if ($secondFusedSelector -lt 0) {
+        throw 'Packing-selector negative-test anchor was not found.'
+    }
+    $wrongPackingSelector = $validPointGroup.Remove($secondFusedSelector,
+        'if (fused_billboards)'.Length).Insert($secondFusedSelector,
+        'if (other_billboards)')
+    if ($wrongPackingSelector -eq $validPointGroup -or
+        (Test-PointParticleVertexContract $wrongPackingSelector)) {
+        throw 'Packing calls disconnected from the fused-billboard selector were accepted.'
+    }
+    $missingBillboardCall = $validPointGroup.Replace(
+        'if (!Pack_Billboard_Quad_Chunk(vb)) {', 'if (false) {')
+    if ($missingBillboardCall -eq $validPointGroup -or
+        (Test-PointParticleVertexContract $missingBillboardCall)) {
+        throw 'Render without its billboard packing call was accepted.'
+    }
+    $missingBillboardTexture1 = $validPointGroup.Replace(
+        'WriteBillboard(Get_Tex_Offset(1));', '')
+    if ($missingBillboardTexture1 -eq $validPointGroup -or
+        (Test-PointParticleVertexContract $missingBillboardTexture1)) {
+        throw 'Billboard packing without a second UV initialization was accepted.'
     }
     $lastTexture1 = $validPointGroup.LastIndexOf('        Write(Get_Tex_Offset(1));',
         [StringComparison]::Ordinal)

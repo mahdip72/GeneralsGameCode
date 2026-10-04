@@ -32,6 +32,10 @@ public:
 	RenderResult Reset();
 	RenderResult Lock(size_t destinationOffset, size_t byteCount,
 		RenderBufferUpdateMode mode, void **data);
+	// The caller must overwrite every byte in the admitted span before Unlock.
+	// Only staging prefill is omitted; DISCARD authority invalidation remains.
+	RenderResult LockForFullOverwrite(size_t destinationOffset, size_t byteCount,
+		RenderBufferUpdateMode mode, void **data);
 	RenderResult Unlock();
 	RenderResult AcquireVertexRange(unsigned int stride, unsigned int offset,
 		unsigned int startVertex, unsigned int vertexCount,
@@ -55,6 +59,8 @@ private:
 	NativeW3DBufferOwner &operator=(const NativeW3DBufferOwner &);
 
 	RenderResult RecreateForDiscard();
+	RenderResult LockImpl(size_t destinationOffset, size_t byteCount,
+		RenderBufferUpdateMode mode, void **data, bool fullOverwrite);
 	NativeW3DResources *ActiveResources() const;
 	void ObserveAuthorityFailure(NativeW3DResources *resources) const;
 	void FinishLock();

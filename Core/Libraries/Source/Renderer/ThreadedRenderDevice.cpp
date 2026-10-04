@@ -7,6 +7,8 @@
 #endif
 #include <windows.h>
 #endif
+#include "Lib/FrameTimingDiagnostics.h"
+#include "RenderPipelineStallTrace.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -40,6 +42,7 @@ ThreadedRenderMetrics::ThreadedRenderMetrics() : submittedFrames(0),
 
 namespace
 {
+typedef detail::RenderPipelineStallTrace StallTrace;
 typedef std::chrono::steady_clock Clock;
 uint64_t Nanoseconds(Clock::duration duration)
 {
@@ -63,6 +66,20 @@ RenderResult FirstFailure(RenderResult first, RenderResult next)
 {
 	if (next == RENDER_RESULT_DEVICE_REMOVED) return next;
 	return first == RENDER_RESULT_OK ? next : first;
+}
+
+bool IsKnownPrimitiveTopology(RenderPrimitiveTopology topology)
+{
+	switch (topology)
+	{
+	case RENDER_PRIMITIVE_TRIANGLE_LIST:
+	case RENDER_PRIMITIVE_TRIANGLE_STRIP:
+	case RENDER_PRIMITIVE_LINE_LIST:
+	case RENDER_PRIMITIVE_LINE_STRIP:
+		return true;
+	default:
+		return false;
+	}
 }
 
 uint64_t PackHandle(GpuHandle handle)
@@ -243,7 +260,7 @@ struct Reply
 
 struct Packet
 {
-	Packet() { reset(); }
+	Packet() : traceId(0) { reset(); }
 	void reset()
 	{
 		commands.clear(); bytes.clear(); sequence = 0; closeFrame = false;
@@ -253,6 +270,7 @@ struct Packet
 	std::vector<Command> commands;
 	std::vector<unsigned char> bytes;
 	uint64_t sequence;
+	uint64_t traceId;
 	bool closeFrame, finalFrame, present;
 	RenderResult failure;
 	Control control;
@@ -296,9 +314,12 @@ public:
 		m_initialResult(RENDER_RESULT_FAILED), m_infoResult(RENDER_RESULT_FAILED),
 		m_textureFilterCapabilitiesResult(RENDER_RESULT_FAILED),
 		m_current(0), m_queueRead(0), m_queueCount(0), m_pending(0),
+		m_tracePacketId(0),
 		m_completionRead(0), m_completionCount(0), m_reservedCompletions(0),
 		m_completionReadyCount(0),
 		m_completedSequence(0), m_completedResult(RENDER_RESULT_OK),
+		m_cachedTopology(RENDER_PRIMITIVE_TRIANGLE_LIST),
+		m_cachedTopologyKnown(false),
 		m_recording(false), m_ended(false), m_nextSequence(1), m_sequence(0),
 		m_lastSequence(0), m_producerFailure(RENDER_RESULT_OK),
 		m_failureStreakObserved(false),
@@ -309,6 +330,7 @@ public:
 		m_ownerIndexBuffer(), m_ownerVertexStride(0), m_ownerVertexOffset(0),
 		m_ownerIndexSize(0), m_ownerIndexOffset(0)
 	{
+		m_trace.setSerial(options.serial);
 		m_handles.reset(new GpuHandleAllocator(options.resourceCapacity));
 		if (m_handles->capacity() != options.resourceCapacity) throw std::bad_alloc();
 		m_producerResources.resize(options.resourceCapacity);
@@ -327,8 +349,7 @@ public:
 	RenderBackend backend() const override { return RENDER_BACKEND_D3D11; }
 	bool isOperational() const override
 	{
-		std::lock_guard<std::mutex> lock(m_mutex);
-		return m_operational;
+		return m_operational.load(std::memory_order_acquire);
 	}
 	RenderResult initialize(const RenderDeviceParameters &parameters) override;
 	void shutdown() override;
@@ -424,6 +445,7 @@ private:
 		// returned to the caller directly.  Only failures while a frame is being
 		// recorded belong in that frame's packet; accepted asynchronous resource
 		// commands still report owner-side failures from execute().
+		if (producer()) invalidateProducerTopologyCache();
 		if (producer() && m_recording)
 		{
 			const bool firstFailure = m_producerFailure == RENDER_RESULT_OK;
@@ -468,6 +490,7 @@ private:
 			++stage)
 			m_cachedTextureKnown[stage] = false;
 	}
+	void invalidateProducerTopologyCache() { m_cachedTopologyKnown = false; }
 	RenderResult textureCommand(Operation, GpuHandle, const TextureDescriptor &,
 		const TextureSubresourceData *, unsigned int);
 	RenderResult bufferUpdateCommand(GpuHandle, const void *, size_t, size_t,
@@ -494,7 +517,8 @@ private:
 	void *m_factoryContext;
 	ThreadedRenderOptions m_options;
 	std::thread::id m_producer;
-	bool m_waiting, m_initialized, m_started, m_stopping, m_operational;
+	bool m_waiting, m_initialized, m_started, m_stopping;
+	std::atomic<bool> m_operational;
 	bool m_ownerExecuting;
 	RenderResult m_initialResult, m_infoResult,
 		m_textureFilterCapabilitiesResult;
@@ -502,11 +526,13 @@ private:
 	RenderTextureFilterCapabilities m_textureFilterCapabilities;
 	mutable std::mutex m_mutex;
 	std::condition_variable m_changed;
+	StallTrace m_trace;
 	std::thread m_thread;
 	std::vector<std::unique_ptr<Packet> > m_packets;
 	std::vector<Packet *> m_free, m_queue;
 	Packet *m_current;
 	size_t m_queueRead, m_queueCount, m_pending;
+	uint64_t m_tracePacketId;
 	enum { COMPLETION_CAPACITY = 64 };
 	ThreadedRenderFrameCompletion m_completions[COMPLETION_CAPACITY];
 	size_t m_completionRead, m_completionCount, m_reservedCompletions;
@@ -520,10 +546,12 @@ private:
 	std::vector<ProducerResource> m_producerResources;
 	std::vector<OwnerResource> m_ownerResources;
 	RenderTargetBinding m_targets;
-	// Producer-only mirror of the ordered texture command stream. A frame or
-	// operation that can alter owner SRV bindings always makes it unknown.
+	// Producer-only mirrors of ordered texture/topology command streams. A frame
+	// or operation that can alter owner state makes the corresponding value unknown.
 	GpuHandle m_cachedTextures[LEGACY_TEXTURE_STAGE_COUNT];
 	bool m_cachedTextureKnown[LEGACY_TEXTURE_STAGE_COUNT];
+	RenderPrimitiveTopology m_cachedTopology;
+	bool m_cachedTopologyKnown;
 	bool m_recording, m_ended;
 	uint64_t m_nextSequence, m_sequence, m_lastSequence;
 	RenderResult m_producerFailure;
@@ -561,11 +589,18 @@ bool ThreadedRenderDevice::acquire()
 	if (m_free.empty())
 	{
 		++m_metrics.backpressureWaits;
+		m_trace.record(StallTrace::Producer, StallTrace::AcquireWaitBegin,
+			m_recording ? m_sequence : 0, 0, static_cast<unsigned int>(m_queueCount),
+			static_cast<unsigned int>(m_free.size()), static_cast<unsigned int>(m_pending));
 		wait(lock, [this] { return !m_free.empty(); });
+		m_trace.record(StallTrace::Producer, StallTrace::AcquireWaitEnd,
+			m_recording ? m_sequence : 0, 0, static_cast<unsigned int>(m_queueCount),
+			static_cast<unsigned int>(m_free.size()), static_cast<unsigned int>(m_pending));
 	}
 	m_current = m_free.back();
 	m_free.pop_back();
 	m_current->sequence = m_recording ? m_sequence : 0;
+	if (m_trace.enabled()) m_current->traceId = ++m_tracePacketId;
 	return true;
 }
 
@@ -616,6 +651,7 @@ size_t ThreadedRenderDevice::copyPayload(const void *data, size_t bytes)
 RenderResult ThreadedRenderDevice::append(Command command, const void *payload,
 	size_t bytes, bool requireFrame)
 {
+	rts::frame_timing::Scope enqueueTiming(rts::frame_timing::RendererCommandEnqueue);
 	if (!usable() || (requireFrame && (!m_recording || m_ended)))
 		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
 			static_cast<uint64_t>(command.operation), bytes,
@@ -625,8 +661,9 @@ RenderResult ThreadedRenderDevice::append(Command command, const void *payload,
 		m_options.maxPacketBytes, m_current == 0 ? 0U : m_current->bytes.size());
 	command.payloadOffset = copyPayload(payload, bytes);
 	m_current->commands.push_back(command);
-	// Only these operations preserve the owner's current SRV bindings. All
-	// target, texture mutation, copy, and lifecycle commands fail closed.
+	// The whitelist preserves producer texture knowledge (OP_TEXTURE updates its
+	// stage) and primitive topology. Other state, resource, and lifecycle effects
+	// fail closed.
 	switch (command.operation)
 	{
 	case OP_TEXTURE:
@@ -643,6 +680,7 @@ RenderResult ThreadedRenderDevice::append(Command command, const void *payload,
 		break;
 	default:
 		invalidateProducerTextureCache();
+		invalidateProducerTopologyCache();
 		break;
 	}
 	return RENDER_RESULT_OK;
@@ -665,6 +703,7 @@ RenderResult ThreadedRenderDevice::beginFrame()
 	}
 	m_recording = true;
 	m_ended = false;
+	invalidateProducerTopologyCache();
 	m_targets = RenderTargetBinding();
 	m_sequence = m_nextSequence++;
 	acquire();
@@ -690,6 +729,7 @@ RenderResult ThreadedRenderDevice::endFrame()
 			usable() ? 1U : 0U, m_recording ? 1U : 0U, m_ended ? 1U : 0U,
 			m_sequence);
 	m_ended = true;
+	invalidateProducerTopologyCache();
 	acquire();
 	m_current->closeFrame = true;
 	if (m_producerFailure == RENDER_RESULT_OK)
@@ -701,7 +741,10 @@ RenderResult ThreadedRenderDevice::flush(Control control,
 	const std::shared_ptr<Reply> &reply, bool finalFrame, bool visible)
 {
 	if (control != CONTROL_NONE || finalFrame || visible)
+	{
 		invalidateProducerTextureCache();
+		invalidateProducerTopologyCache();
+	}
 	acquire();
 	m_current->control = control;
 	m_current->reply = reply;
@@ -710,6 +753,8 @@ RenderResult ThreadedRenderDevice::flush(Control control,
 	m_current->failure = m_producerFailure;
 	m_current->sequence = m_recording ? m_sequence : 0;
 	std::unique_lock<std::mutex> lock(m_mutex);
+	const uint64_t tracePacket = m_trace.enabled() ? m_current->traceId : 0;
+	const uint64_t traceSequence = m_current->sequence;
 	m_metrics.peakPacketBytes = (std::max)(m_metrics.peakPacketBytes,
 		m_current->bytes.size() + m_current->commands.size() * sizeof(Command));
 	m_queue[(m_queueRead + m_queueCount) % m_queue.size()] = m_current;
@@ -727,10 +772,19 @@ RenderResult ThreadedRenderDevice::flush(Control control,
 		m_producerFailure = RENDER_RESULT_OK;
 	}
 	m_current = 0;
+	m_trace.record(StallTrace::Producer, StallTrace::Publish, traceSequence, tracePacket,
+		static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+		static_cast<unsigned int>(m_pending), static_cast<unsigned int>(control));
 	m_changed.notify_all();
 	if (reply)
 	{
+		m_trace.record(StallTrace::Producer, StallTrace::ReplyWaitBegin, traceSequence, tracePacket,
+			static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+			static_cast<unsigned int>(m_pending), static_cast<unsigned int>(control));
 		wait(lock, [&reply] { return reply->done; });
+		m_trace.record(StallTrace::Producer, StallTrace::ReplyWaitEnd, traceSequence, tracePacket,
+			static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+			static_cast<unsigned int>(m_pending), static_cast<unsigned int>(control));
 		return reply->result;
 	}
 	return RENDER_RESULT_OK;
@@ -745,7 +799,13 @@ RenderResult ThreadedRenderDevice::submitFrame(bool visible)
 	// Serial reference/cancellation has no heap-allocated reply. In particular,
 	// shutdown cannot lose an accepted frame when allocation is exhausted.
 	std::unique_lock<std::mutex> lock(m_mutex);
+	m_trace.record(StallTrace::Producer, StallTrace::SerialWaitBegin, sequence, 0,
+		static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+		static_cast<unsigned int>(m_pending));
 	wait(lock, [this, sequence] { return m_completedSequence >= sequence; });
+	m_trace.record(StallTrace::Producer, StallTrace::SerialWaitEnd, sequence, 0,
+		static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+		static_cast<unsigned int>(m_pending));
 	return m_completedResult;
 }
 
@@ -980,6 +1040,7 @@ void ThreadedRenderDevice::shutdown()
 		wait(lock, [this] { return !m_started; });
 	}
 	m_thread.join();
+	m_trace.exportAfterJoin(m_thread);
 	m_initialized = false;
 }
 
@@ -1269,7 +1330,7 @@ RenderResult ThreadedRenderDevice::setLegacyStateForLayout(const LegacyLogicalSt
 		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
 			layout.elementCount, LegacyVertexLayout::MAX_ELEMENT_COUNT, mask,
 			m_sequence);
-	LayoutState payload; payload.state = state; payload.layout = layout;
+	LayoutState payload = { state, layout };
 	Command command(OP_LEGACY_LAYOUT); command.integers[0] = mask;
 	return append(command, &payload, sizeof(payload));
 }
@@ -1318,7 +1379,26 @@ RenderResult ThreadedRenderDevice::setTexture(unsigned int stage, GpuHandle hand
 }
 RenderResult ThreadedRenderDevice::setPrimitiveTopology(RenderPrimitiveTopology topology)
 {
-	Command command(OP_TOPOLOGY); command.integers[0] = topology; return append(command);
+	if (!usable() || !m_recording || m_ended)
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__,
+			static_cast<uint64_t>(topology), m_recording ? 1U : 0U,
+			m_ended ? 1U : 0U, m_sequence);
+	const bool knownTopology = IsKnownPrimitiveTopology(topology);
+	if (knownTopology && m_producerFailure == RENDER_RESULT_OK &&
+		m_cachedTopologyKnown && m_cachedTopology == topology)
+		return RENDER_RESULT_OK;
+
+	Command command(OP_TOPOLOGY);
+	command.integers[0] = topology;
+	const RenderResult result = append(command);
+	if (result == RENDER_RESULT_OK && knownTopology)
+	{
+		m_cachedTopology = topology;
+		m_cachedTopologyKnown = true;
+	}
+	else if (!knownTopology || result != RENDER_RESULT_OK)
+		invalidateProducerTopologyCache();
+	return result;
 }
 RenderResult ThreadedRenderDevice::draw(unsigned int count, unsigned int first)
 {
@@ -1512,7 +1592,8 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		std::vector<InitializedRange> nextRanges;
 		try
 		{
-			nextRanges = slot.initializedBytes;
+			if (static_cast<RenderBufferUpdateMode>(u[0]) != RENDER_BUFFER_UPDATE_DISCARD)
+				nextRanges = slot.initializedBytes;
 			RecordInitializedRange(nextRanges, command.destinationOffset,
 				command.dataBytes,
 				static_cast<RenderBufferUpdateMode>(u[0]) == RENDER_BUFFER_UPDATE_DISCARD);
@@ -1695,7 +1776,7 @@ void ThreadedRenderDevice::publishMetadata(RenderResult result, bool refreshInfo
 		operational = false;
 	}
 	std::lock_guard<std::mutex> lock(m_mutex);
-	m_operational = operational;
+	m_operational.store(operational, std::memory_order_release);
 	if (refreshInfo || !operational)
 	{
 		m_infoResult = infoResult;
@@ -1953,13 +2034,14 @@ void ThreadedRenderDevice::execute(Packet &packet)
 	if (packet.finalFrame)
 	{
 		m_ownerOutcome.markSubmitted();
-		m_ownerOutcome.setOperational(m_operational);
+		m_ownerOutcome.setOperational(m_operational.load(std::memory_order_acquire));
 		ThreadedRenderFrameCompletion &completion = m_completions[
 			(m_completionRead + m_completionCount) % COMPLETION_CAPACITY];
 		completion.sequence = packet.sequence; completion.result = frameResult;
 		completion.outcome = m_ownerOutcome;
 		completion.resourceFailure = m_ownerResourceFailure;
-		completion.presented = presented; completion.operational = m_operational;
+		completion.presented = presented;
+		completion.operational = m_operational.load(std::memory_order_acquire);
 		++m_completionCount; --m_reservedCompletions;
 		m_completedSequence = packet.sequence; m_completedResult = frameResult;
 		++m_metrics.completedFrames;
@@ -1978,6 +2060,7 @@ void ThreadedRenderDevice::execute(Packet &packet)
 
 void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 {
+	m_trace.bindOwner();
 	RenderResult initial = RENDER_RESULT_FAILED;
 	const bool registered = rts::JobSystem::instance().registerCurrentThread(rts::JOB_OWNER_RENDER);
 	try
@@ -1997,30 +2080,79 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_initialResult = initial; m_started = true;
-		if (initial != RENDER_RESULT_OK) m_operational = false;
+		if (initial != RENDER_RESULT_OK) m_operational.store(false, std::memory_order_release);
 		m_changed.notify_all();
 	}
+#if defined(_WIN64)
+	rts::frame_timing::Capture ownerCapture(rts::frame_timing::Capture::RenderOwnerStream);
+	ownerCapture.beginSession("render_owner");
+	const bool ownerCaptureEnabled = ownerCapture.isEnabled();
+	// Keep owner-side scopes off the game-thread capture even when owner
+	// telemetry is disabled. One binding covers the loop, not each packet.
+	rts::frame_timing::BindCapture ownerBinding(ownerCapture);
+#endif
 	for (;;)
 	{
 		Packet *packet = 0;
 		{
 			std::unique_lock<std::mutex> lock(m_mutex);
+			m_trace.record(StallTrace::Owner, StallTrace::OwnerWaitBegin, 0, 0,
+				static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+				static_cast<unsigned int>(m_pending));
 			m_changed.wait(lock, [this] { return m_queueCount || m_stopping; });
+			m_trace.record(StallTrace::Owner, StallTrace::OwnerWaitEnd, 0, 0,
+				static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+				static_cast<unsigned int>(m_pending));
 			if (!m_queueCount && m_stopping) break;
 			packet = m_queue[m_queueRead];
 			m_queueRead = (m_queueRead + 1) % m_queue.size(); --m_queueCount;
 			m_ownerExecuting = true;
+			m_trace.record(StallTrace::Owner, StallTrace::Dequeue, packet->sequence, packet->traceId,
+				static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+				static_cast<unsigned int>(m_pending), static_cast<unsigned int>(packet->control));
 		}
 		const Clock::time_point start = Clock::now();
-		execute(*packet);
+		m_trace.record(StallTrace::Owner, StallTrace::ExecuteBegin, packet->sequence, packet->traceId);
+#if defined(_WIN64)
+		if (ownerCaptureEnabled && packet->sequence != 0)
+		{
+			rts::frame_timing::ExecutionPacket timing(ownerCapture, packet->sequence);
+			execute(*packet);
+			m_trace.record(StallTrace::Owner, StallTrace::ExecuteEnd, packet->sequence, packet->traceId);
+			m_trace.record(StallTrace::Owner, StallTrace::TelemetryBegin, packet->sequence, packet->traceId);
+		}
+		else
+#endif
+		{
+			execute(*packet);
+			m_trace.record(StallTrace::Owner, StallTrace::ExecuteEnd, packet->sequence, packet->traceId);
+		}
+#if defined(_WIN64)
+		if (ownerCaptureEnabled && packet->sequence != 0)
+			m_trace.record(StallTrace::Owner, StallTrace::TelemetryEnd, packet->sequence, packet->traceId);
+#endif
+		m_trace.record(StallTrace::Owner, StallTrace::PoolLockBegin, packet->sequence, packet->traceId);
 		std::lock_guard<std::mutex> lock(m_mutex);
+		m_trace.record(StallTrace::Owner, StallTrace::PoolLockEnd, packet->sequence, packet->traceId,
+			static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+			static_cast<unsigned int>(m_pending));
 		m_metrics.ownerExecutionNanoseconds += Nanoseconds(Clock::now() - start);
+		const uint64_t traceSequence = packet->sequence, tracePacket = packet->traceId;
+		m_trace.record(StallTrace::Owner, StallTrace::ResetBegin, traceSequence, tracePacket,
+			static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+			static_cast<unsigned int>(m_pending));
 		packet->reset();
 		m_free.push_back(packet); --m_pending;
 		m_ownerExecuting = false;
 		m_metrics.pendingPackets = static_cast<unsigned int>(m_pending);
+		m_trace.record(StallTrace::Owner, StallTrace::PoolReturn, traceSequence, tracePacket,
+			static_cast<unsigned int>(m_queueCount), static_cast<unsigned int>(m_free.size()),
+			static_cast<unsigned int>(m_pending));
 		m_changed.notify_all();
 	}
+#if defined(_WIN64)
+	ownerCapture.endSession();
+#endif
 	if (m_backend)
 	{
 		if (m_ownerFrameOpen && m_context) m_context->endFrame();
@@ -2030,7 +2162,7 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 	}
 	if (registered) rts::JobSystem::instance().unregisterCurrentThread(rts::JOB_OWNER_RENDER);
 	std::lock_guard<std::mutex> lock(m_mutex);
-	m_operational = false; m_started = false;
+	m_operational.store(false, std::memory_order_release); m_started = false;
 	m_infoResult = RENDER_RESULT_FAILED;
 	m_changed.notify_all();
 }

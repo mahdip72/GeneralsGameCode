@@ -19,6 +19,11 @@ set_target_properties(core_native_w3d2_tests PROPERTIES
 add_test(NAME core_native_w3d2_tests COMMAND core_native_w3d2_tests)
 set_tests_properties(core_native_w3d2_tests PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 
+add_test(NAME core_native_w3d2_pinned_completion_poll
+    COMMAND core_native_w3d2_tests --pinned-completion-poll)
+set_tests_properties(core_native_w3d2_pinned_completion_poll PROPERTIES
+    TIMEOUT 30 SKIP_RETURN_CODE 77 LABELS "renderer;native;completion;recovery")
+
 add_test(NAME core_native_w3d2_open_recovery_serial
     COMMAND core_native_w3d2_tests --explicit-open-recovery-serial)
 add_test(NAME core_native_w3d2_open_recovery_parallel
