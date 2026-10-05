@@ -1,6 +1,7 @@
 #include "Renderer/NativeW3DRenderer.h"
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/NativeW3DRenderState.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include "Renderer/ThreadedRenderDevice.h"
 #include "Lib/PipelineExecutionPolicy.h"
@@ -455,6 +456,38 @@ RenderResult NativeW3DRenderer::SubmitInternal(
 	// textured compatibility enum and would bind POSITION3_NORMAL_COLOR_TEX1 to
 	// this four-float stream.  All other packets retain the declaration-aware
 	// compatibility path.
+	#if defined(RTS_RENDERER_HAS_D3D11)
+	if (packet.indexed && IsThreadedRenderDevice(m_state->Device()))
+	{
+		ThreadedIndexedDraw draw(state);
+		PopulateLegacyLayout(packet.vertexLayout, draw.layout);
+		draw.vertexFormat = packet.vertexFormat;
+		draw.useVertexFormat = packet.texturePresenceMask == 0 &&
+			packet.vertexFormat == RENDER_VERTEX_POSITION3_COLOR &&
+			IsCompactPositionColorLayout(packet.vertexLayout, packet.vertexStride);
+		draw.texturePresenceMask = packet.texturePresenceMask;
+		draw.vertexBuffer = packet.vertexBuffer; draw.vertexStride = packet.vertexStride;
+		draw.vertexOffset = packet.vertexOffset;
+		draw.indexBuffer = packet.indexBuffer; draw.indexFormat = packet.indexFormat;
+		draw.indexOffset = packet.indexOffset; draw.topology = packet.topology;
+		draw.bindIndexBuffer = sortedBatchBindingCache == 0 ||
+			!sortedBatchBindingCache->IsIndexBufferKnown(packet.indexBuffer,
+				packet.indexFormat, packet.indexOffset);
+		draw.indexCount = packet.indexCount; draw.startIndex = packet.startIndex;
+		draw.baseVertex = packet.baseVertex;
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+			draw.textures[stage] = packet.textures[stage];
+		const RenderResult admitted = SubmitThreadedIndexedDraw(m_state->Device(), draw);
+		if (admitted == RENDER_RESULT_OK)
+		{
+			if (textureBindingCache != 0) textureBindingCache->Acknowledge(packet.textures);
+			if (sortedBatchBindingCache != 0)
+				sortedBatchBindingCache->Acknowledge(packet.topology, packet.indexBuffer,
+					packet.indexFormat, packet.indexOffset);
+		}
+		return admitted;
+	}
+	#endif
 	RenderResult result = RENDER_RESULT_OK;
 	if (packet.texturePresenceMask == 0 &&
 		packet.vertexFormat == RENDER_VERTEX_POSITION3_COLOR &&
@@ -793,9 +826,11 @@ RenderResult NativeW3DRenderer::SetGamma(float gamma, float brightness,
 
 bool NativeW3DRenderer::IsInitialized() const
 {
-	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
-	return m_state != 0 && m_state->IsOperational() && device != 0 &&
-		device->isOperational();
+	rts::frame_timing::SampledScope readinessTiming(rts::frame_timing::RendererReadinessCheckSampled64);
+	// IsOperational proves owner affinity and attached pointers together. No
+	// callback or wait intervenes before the live backend readiness observation.
+	return m_state != 0 && m_state->IsOperational() &&
+		m_state->m_device->isOperational();
 }
 
 bool NativeW3DRenderer::IsFrameOpen() const
@@ -844,9 +879,9 @@ IRenderDevice *NativeW3DRenderer::BorrowThreadedCompletionDevice() const
 
 bool NativeW3DRenderer::IsBackendOperational() const
 {
-	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
-	return m_state != 0 && m_state->IsOperational() && device != 0 &&
-		device->isOperational();
+	rts::frame_timing::SampledScope readinessTiming(rts::frame_timing::RendererReadinessCheckSampled64);
+	return m_state != 0 && m_state->IsOperational() &&
+		m_state->m_device->isOperational();
 }
 
 bool NativeW3DRenderer::CanRecoverDevice() const

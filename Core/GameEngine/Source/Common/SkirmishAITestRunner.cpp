@@ -56,6 +56,7 @@
 #include "Lib/SimulationExecutionPolicy.h"
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 #include "Lib/ValidationProfileRoot.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
 #if defined(_WIN64)
 #include "Common/FileSystem.h"
 #include "Common/Stage5MapResolution.h"
@@ -4290,6 +4291,8 @@ Int RenderedBattleMaxFrames()
 }
 UnsignedInt RenderedBattleMaxMilliseconds()
 {
+	if (IsRenderedBattleBenchmark() && rts::rendered_battle::ProcessTestOptions().visualCaptureOnly)
+		return 120000;
 	return IsRenderedBattleBenchmark() ? RENDERED_BATTLE_BENCHMARK_MAX_MILLISECONDS :
 		RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS;
 }
@@ -4362,9 +4365,15 @@ Bool PrepareRenderedBattleDiagnosticReportPath()
 {
 	if (s_renderedBattle.reportFile != INVALID_HANDLE_VALUE) return FALSE;
 	char isolated[MAX_PATH], resolved[MAX_PATH];
-	if (!TheGlobalData ||
-		rts::validation::ReadProcessLocalProfileRoot(isolated, sizeof(isolated)) !=
-			rts::validation::PROCESS_LOCAL_PROFILE_ROOT_VALID) return FALSE;
+	if (!TheGlobalData) return FALSE;
+	const rts::rendered_battle::TestOptions &testOptions = rts::rendered_battle::ProcessTestOptions();
+	if (testOptions.backgroundStartup || testOptions.visualCaptureOnly || testOptions.visualSamples)
+	{
+		strcpy(isolated, testOptions.profileRoot);
+		if (!rts::rendered_battle::IsNonReparseDirectoryTree(isolated)) return FALSE;
+	}
+	else if (rts::validation::ReadProcessLocalProfileRoot(isolated, sizeof(isolated)) !=
+		rts::validation::PROCESS_LOCAL_PROFILE_ROOT_VALID) return FALSE;
 	const char *actual = TheGlobalData->getPath_UserData().str();
 	const DWORD length = GetFullPathNameA(actual, sizeof(resolved), resolved, nullptr);
 	if (!length || length >= sizeof(resolved)) return FALSE;
@@ -4594,6 +4603,12 @@ Bool PreflightRenderedBattleUnitPosition(const Coord3D &p, Real radius,
 Bool StageRenderedBattleDiagnostic()
 {
 	const Bool benchmark = IsRenderedBattleBenchmark();
+	if (benchmark && rts::rendered_battle::ProcessTestOptions().backgroundStartup)
+		RecordRenderedBattleDiagnostic("%s\n", rts::rendered_battle::BackgroundStartupMarker());
+	if (benchmark && rts::rendered_battle::ProcessTestOptions().visualCaptureOnly)
+		RecordRenderedBattleDiagnostic("%s\n", rts::rendered_battle::VisualCaptureOnlyMarker());
+	if (benchmark && rts::rendered_battle::ProcessTestOptions().visualSamples)
+		RecordRenderedBattleDiagnostic("%s\n", rts::rendered_battle::VisualSamplesMarker());
 	const Int unitsPerPlayer = RenderedBattleUnitsPerPlayer();
 	if (benchmark && (!TheFramePacer || !TheGlobalData->m_windowed ||
 		TheGlobalData->m_xResolution != 1920 || TheGlobalData->m_yResolution != 1080))
@@ -5013,6 +5028,8 @@ Bool StageRenderedBattleDiagnostic()
 	}
 	s_renderedBattle.nextSummaryFrame = s_renderedBattle.startFrame;
 	s_renderedBattle.staged = TRUE;
+	if (benchmark && rts::rendered_battle::ProcessTestOptions().visualSamples)
+		rts::rendered_battle::ProcessVisualSampleState().battleStaged = true;
 	s_runner.lastObservedFrame = s_renderedBattle.startFrame;
 	s_runner.stalledStartMilliseconds = s_renderedBattle.startTick;
 	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_STAGED seed=%d frame=%u tick=%u created=%d "
@@ -5054,7 +5071,30 @@ void UpdateRenderedBattleDiagnostic()
 		TheFramePacer->isTimeFrozen() || TheFramePacer->isGameHalted() ||
 		TheTacticalView->getTimeMultiplier() != 1 || TheGameLogic->isGamePaused()))
 	{
-		FailSkirmishAITest("benchmark_logic_pacing_changed"); RequestSkirmishAITestStop(); return;
+		FailSkirmishAITest("benchmark_logic_pacing_changed");
+		LARGE_INTEGER pacingFailureQpc;
+		pacingFailureQpc.QuadPart = 0;
+		const Bool pacingFailureQpcValid = QueryPerformanceCounter(&pacingFailureQpc) != FALSE;
+		const UnsignedInt pacingFailureTick = GetTickCount();
+		const UnsignedInt pacingFailureFrame = TheGameLogic->getFrame();
+		const Bool logicScaleEnabled = TheFramePacer->isLogicTimeScaleEnabled();
+		const Int logicScaleFps = TheFramePacer->getLogicTimeScaleFps();
+		const Bool timeFrozen = TheFramePacer->isTimeFrozen();
+		const Bool gameHalted = TheFramePacer->isGameHalted();
+		const Int tacticalTimeMultiplier = TheTacticalView->getTimeMultiplier();
+		const Bool gamePaused = TheGameLogic->isGamePaused();
+		RecordRenderedBattleDiagnostic(
+			"RENDERED_BATTLE_PACING_FAILURE_SNAPSHOT qpc_valid=%d qpc=%I64d qpc_frequency=%I64d "
+			"tick=%u frame=%u start_frame=%u start_tick=%u last_observed_frame=%u stalled_start_tick=%u "
+			"logic_scale_enabled=%d logic_scale_fps=%d time_frozen=%d game_halted=%d "
+			"tactical_time_multiplier=%d game_paused=%d\n",
+			pacingFailureQpcValid ? 1 : 0, pacingFailureQpc.QuadPart,
+			s_renderedBattle.qpcFrequency.QuadPart, pacingFailureTick, pacingFailureFrame,
+			s_renderedBattle.startFrame, s_renderedBattle.startTick, s_runner.lastObservedFrame,
+			s_runner.stalledStartMilliseconds, logicScaleEnabled ? 1 : 0, logicScaleFps,
+			timeFrozen ? 1 : 0, gameHalted ? 1 : 0, tacticalTimeMultiplier, gamePaused ? 1 : 0);
+		RequestSkirmishAITestStop();
+		return;
 	}
 	const UnsignedInt frame = TheGameLogic->getFrame(), tick = GetTickCount();
 	const UnsignedInt elapsed = ElapsedMilliseconds(s_renderedBattle.startTick, tick);
@@ -10994,6 +11034,9 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 	// BEGIN RENDERED_BATTLE_DIAGNOSTIC_FINALIZER
 	if (IsRenderedBattleDiagnostic(s_runner.scenario))
 	{
+		if (rts::rendered_battle::ProcessTestOptions().visualSamples &&
+			!rts::rendered_battle::VisualSamplesComplete(rts::rendered_battle::ProcessVisualSampleState(), 20))
+			FailSkirmishAITest("visual_samples_incomplete");
 		if (s_renderedBattle.reportFailed)
 			FailSkirmishAITest("diagnostic_report_overflow");
 		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_%s seed=%d reason=%s created=%d end_frame=%u "

@@ -581,6 +581,18 @@ bool NativeW3DOwnerQueue::IsOwnerThread() const
 	return m_impl->ownerBound && SameQueueThread(m_impl->owner, currentThread);
 }
 
+bool NativeW3DOwnerQueue::IsOwnerAccepting() const
+{
+	if (m_impl == 0 || !m_impl->lock.IsInitialized())
+	{
+		return false;
+	}
+	const QueueThreadId currentThread = CurrentQueueThreadId();
+	ScopedQueueLock lock(m_impl->lock);
+	return m_impl->ownerBound && SameQueueThread(m_impl->owner, currentThread) &&
+		m_impl->accepting;
+}
+
 bool NativeW3DOwnerQueue::IsBound() const
 {
 	if (m_impl == 0 || !m_impl->lock.IsInitialized())

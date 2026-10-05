@@ -82,6 +82,16 @@ public:
 		}
 	}
 
+	// The compact threaded record has admitted every slot as one transaction.
+	void Acknowledge(const GpuHandle *textures)
+	{
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+		{
+			m_textures[stage] = textures[stage];
+			m_isKnown[stage] = true;
+		}
+	}
+
 	template <class RenderContext>
 	RenderResult Bind(RenderContext *context, const GpuHandle *textures)
 	{
@@ -128,6 +138,19 @@ public:
 		m_indexBuffer = GpuHandle();
 		m_indexFormat = RENDER_FORMAT_UNKNOWN;
 		m_indexOffset = 0;
+	}
+
+	bool IsIndexBufferKnown(GpuHandle buffer, RenderFormat format, unsigned int offset) const
+	{
+		return m_indexBufferKnown && m_indexBuffer == buffer &&
+			m_indexFormat == format && m_indexOffset == offset;
+	}
+	void Acknowledge(RenderPrimitiveTopology topology, GpuHandle buffer,
+		RenderFormat format, unsigned int offset)
+	{
+		m_topologyKnown = true; m_topology = topology;
+		m_indexBufferKnown = true; m_indexBuffer = buffer;
+		m_indexFormat = format; m_indexOffset = offset;
 	}
 
 	template <class RenderContext>

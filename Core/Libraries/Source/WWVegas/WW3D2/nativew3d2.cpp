@@ -829,6 +829,8 @@ bool NativeW3D2::CanRebuildResources() const
 
 rts::render::RenderResult NativeW3D2::ServiceThreadedCompletions()
 {
+	rts::frame_timing::SampledScope serviceThreadedCompletionsTiming(
+		rts::frame_timing::RendererNativeServiceThreadedCompletionsSampled64);
 	using namespace rts::render;
 	RenderResult result = RENDER_RESULT_OK;
 	if (IsNativeGameRenderOwnerPinnedByCurrentThread() &&
@@ -1431,6 +1433,8 @@ rts::render::RenderResult NativeW3D2::RestoreSortedContext()
 rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	const rts::render::GameRenderCommand &command)
 {
+	rts::frame_timing::SampledScope executeGameRenderCommandTiming(
+		rts::frame_timing::RendererNativeExecuteCommandSampled64);
 	using namespace rts::render;
 	GameRenderCommandFailureScope failureCommandScope(&command);
 	if ((command.type == GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE ||
@@ -1488,6 +1492,8 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		return RENDER_RESULT_FAILED;
 	}
 
+	rts::frame_timing::SampledScope nativeCommandBodyTiming(
+		rts::frame_timing::RendererNativeCommandBodySampled64);
 	switch (command.type)
 	{
 	case GAME_RENDER_COMMAND_SET_TEXTURE:
@@ -1651,16 +1657,15 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				if (!IsFiniteGameFloat(projection.values[index]))
 					goto invalid_command;
 			}
-			LegacyLogicalState logical;
-			if (!GetTrackedLegacyLogicalState(&logical))
-				logical = LegacyLogicalState();
+			int depthBias = 0;
+			(void)GetTrackedLegacyDepthBias(&depthBias);
 			if (!SupportsZBias() && command.float0 != command.float1)
 			{
 				const float depthRange = command.float1 - command.float0;
 				if (depthRange == 0.0f || !IsFiniteGameFloat(depthRange))
 					goto invalid_command;
 				const float bias = static_cast<float>(
-					logical.pipeline.rasterizer.depthBias) * (1.0f / 16.0f) /
+					depthBias) * (1.0f / 16.0f) /
 					depthRange;
 				if (!IsFiniteGameFloat(bias))
 					goto invalid_command;

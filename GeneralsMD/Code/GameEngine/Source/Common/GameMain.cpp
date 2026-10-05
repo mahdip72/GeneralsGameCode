@@ -34,6 +34,8 @@
 #include "Common/GlobalData.h"
 #include "Common/ReplaySimulation.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
+#include "Renderer/RenderGameClient.h"
 #include "GameNetwork/InstalledNet3Validation.h"
 #if defined(_WIN64)
 #include "Common/Stage5PerformanceFixtureRunner.h"
@@ -43,6 +45,8 @@
 #include "Common/SkirmishAILegacySaveTest.h"
 #endif
 
+// Existing renderer shutdown hook drains diagnostic screenshot CPU jobs.
+void W3D_ShutdownScreenshotTasks();
 
 /**
  * This is the entry point for the game system.
@@ -188,6 +192,18 @@ Int GameMain()
 	{
 		// run it
 		TheGameEngine->execute();
+	}
+	if (rts::rendered_battle::ProcessTestOptions().visualSamples)
+	{
+		// Sync polls owner completions; it is not a GPU fence. Any request still
+		// pending after submitted PNG jobs drain makes this diagnostic fail.
+		if (rts::render::SyncGameRenderer(false) != rts::render::RENDER_RESULT_OK)
+		{
+			++rts::rendered_battle::ProcessVisualSampleState().failed;
+			rts::rendered_battle::ProcessVisualSampleState().complete = false;
+		}
+		W3D_ShutdownScreenshotTasks();
+		if (!rts::rendered_battle::FinalizeVisualSamples()) exitcode = 1;
 	}
 	if (IsSkirmishAITestRunnerArmed())
 		exitcode = FinalizeSkirmishAITestRunner(exitcode);

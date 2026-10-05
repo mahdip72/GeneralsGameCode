@@ -39,6 +39,35 @@ ThreadedRenderMetrics::ThreadedRenderMetrics() : submittedFrames(0),
 	completedFrames(0), failedFrames(0), producerOverlapFrames(0),
 	backpressureWaits(0), producerWaitNanoseconds(0), ownerExecutionNanoseconds(0),
 	rejectedPackets(0), pendingPackets(0), peakPendingPackets(0), peakPacketBytes(0) {}
+namespace
+{
+void InitializeThreadedIndexedDrawDefaults(ThreadedIndexedDraw &draw)
+{
+	draw.vertexFormat = RENDER_VERTEX_POSITION3_COLOR;
+	draw.useVertexFormat = false;
+	draw.texturePresenceMask = 0;
+	draw.vertexStride = 0;
+	draw.vertexOffset = 0;
+	draw.indexOffset = 0;
+	draw.indexFormat = RENDER_FORMAT_R16_UINT;
+	draw.topology = RENDER_PRIMITIVE_TRIANGLE_LIST;
+	draw.bindIndexBuffer = true;
+	draw.indexCount = 0;
+	draw.startIndex = 0;
+	draw.baseVertex = 0;
+}
+}
+
+ThreadedIndexedDraw::ThreadedIndexedDraw()
+{
+	InitializeThreadedIndexedDrawDefaults(*this);
+}
+
+ThreadedIndexedDraw::ThreadedIndexedDraw(
+	const LegacyLogicalState &initialState) : state(initialState)
+{
+	InitializeThreadedIndexedDrawDefaults(*this);
+}
 
 namespace
 {
@@ -158,8 +187,35 @@ enum Operation
 	OP_BEGIN, OP_CREATE_BUFFER, OP_CREATE_TEXTURE, OP_REFRESH_TEXTURE,
 	OP_DESTROY, OP_UPDATE_BUFFER, OP_CLEAR, OP_TARGETS, OP_VIEWPORT,
 	OP_LEGACY_STATE, OP_LEGACY_LAYOUT, OP_VERTEX_BUFFER, OP_INDEX_BUFFER,
-	OP_TEXTURE, OP_TOPOLOGY, OP_DRAW, OP_DRAW_INDEXED, OP_COPY_COLOR
+	OP_TEXTURE, OP_TOPOLOGY, OP_DRAW, OP_DRAW_INDEXED, OP_COPY_COLOR,
+	OP_INDEXED_DRAW_RECORD
 };
+const char *OwnerOperationName(Operation operation)
+{
+	switch (operation)
+	{
+	case OP_BEGIN: return "begin";
+	case OP_CREATE_BUFFER: return "create-buffer";
+	case OP_CREATE_TEXTURE: return "create-texture";
+	case OP_REFRESH_TEXTURE: return "refresh-texture";
+	case OP_DESTROY: return "destroy";
+	case OP_UPDATE_BUFFER: return "update-buffer";
+	case OP_CLEAR: return "clear";
+	case OP_TARGETS: return "targets";
+	case OP_VIEWPORT: return "viewport";
+	case OP_LEGACY_STATE: return "state";
+	case OP_LEGACY_LAYOUT: return "layout";
+	case OP_VERTEX_BUFFER: return "vertex-buffer";
+	case OP_INDEX_BUFFER: return "index-buffer";
+	case OP_TEXTURE: return "texture";
+	case OP_TOPOLOGY: return "topology";
+	case OP_DRAW: return "draw";
+	case OP_DRAW_INDEXED: return "draw-indexed";
+	case OP_COPY_COLOR: return "copy-color";
+	case OP_INDEXED_DRAW_RECORD: return "indexed-record";
+	default: return "unknown";
+	}
+}
 enum Control { CONTROL_NONE, CONTROL_FENCE, CONTROL_CAPTURE,
 	CONTROL_RESIZE, CONTROL_RECOVER, CONTROL_DEBUG_COUNT, CONTROL_REPORT,
 	CONTROL_ROLLBACK_RESOURCE, CONTROL_SET_SWAP_INTERVAL,
@@ -325,6 +381,7 @@ public:
 		m_failureStreakObserved(false),
 		m_backend(0), m_context(0), m_ownerFrameOpen(false), m_ownerFrameActive(false), m_ownerDeviceRemoved(false),
 		m_ownerResourceFailure(false), m_outsideResourceFailure(false), m_ownerSequence(0),
+		m_ownerFailureTraceAttempted(false),
 		m_ownerFrameResult(RENDER_RESULT_OK), m_outsideFailure(RENDER_RESULT_OK),
 		m_drainFailure(RENDER_RESULT_OK), m_ownerVertexBuffer(),
 		m_ownerIndexBuffer(), m_ownerVertexStride(0), m_ownerVertexOffset(0),
@@ -432,6 +489,7 @@ public:
 		return producer() && m_recording ? m_sequence : 0;
 	}
 	bool metrics(ThreadedRenderMetrics *) const;
+	RenderResult indexedDraw(const ThreadedIndexedDraw &);
 
 private:
 	bool producer() const { return std::this_thread::get_id() == m_producer && !m_waiting; }
@@ -501,6 +559,8 @@ private:
 	void run(RenderDeviceParameters);
 	void execute(Packet &);
 	RenderResult executeCommand(const Packet &, const Command &);
+	void traceOwnerFailure(const Packet &, RenderResult, const char *,
+		Operation, const Command *);
 	GpuHandle resolve(GpuHandle handle) const;
 	OwnerResource *ownerResource(GpuHandle handle);
 	void writeTarget(GpuHandle handle, bool establishesContents);
@@ -562,6 +622,7 @@ private:
 	bool m_ownerFrameOpen, m_ownerFrameActive, m_ownerDeviceRemoved;
 	bool m_ownerResourceFailure, m_outsideResourceFailure;
 	uint64_t m_ownerSequence;
+	bool m_ownerFailureTraceAttempted;
 	GpuHandle m_ownerColorTarget, m_ownerDepthTarget;
 	GpuHandle m_ownerVertexBuffer, m_ownerIndexBuffer;
 	unsigned int m_ownerVertexStride, m_ownerVertexOffset;
@@ -677,6 +738,7 @@ RenderResult ThreadedRenderDevice::append(Command command, const void *payload,
 	case OP_TOPOLOGY:
 	case OP_DRAW:
 	case OP_DRAW_INDEXED:
+	case OP_INDEXED_DRAW_RECORD:
 		break;
 	default:
 		invalidateProducerTextureCache();
@@ -1410,6 +1472,61 @@ RenderResult ThreadedRenderDevice::drawIndexed(unsigned int count, unsigned int 
 	command.signedValue = base; return append(command);
 }
 
+RenderResult ThreadedRenderDevice::indexedDraw(const ThreadedIndexedDraw &draw)
+{
+	if (!usable() || !m_recording || m_ended ||
+		!valid(draw.vertexBuffer, false) || !valid(draw.indexBuffer, false) ||
+		!draw.vertexStride || !draw.indexCount ||
+		draw.layout.stride != draw.vertexStride ||
+		(draw.useVertexFormat &&
+			(draw.vertexFormat != RENDER_VERTEX_POSITION3_COLOR ||
+			 draw.vertexStride != 16 || draw.texturePresenceMask != 0)) ||
+		draw.layout.elementCount > LegacyVertexLayout::MAX_ELEMENT_COUNT ||
+		(draw.texturePresenceMask & ~((1U << LEGACY_TEXTURE_STAGE_COUNT) - 1U)) ||
+		!IsKnownPrimitiveTopology(draw.topology))
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
+	const unsigned int indexSize = draw.indexFormat == RENDER_FORMAT_R16_UINT ? 2U :
+		(draw.indexFormat == RENDER_FORMAT_R32_UINT ? 4U : 0U);
+	const size_t indexBytes = m_producerResources[draw.indexBuffer.index()].buffer.byteCount;
+	const size_t vertexBytes = m_producerResources[draw.vertexBuffer.index()].buffer.byteCount;
+	if (!(m_producerResources[draw.vertexBuffer.index()].buffer.binding & RENDER_BUFFER_VERTEX) ||
+		!(m_producerResources[draw.indexBuffer.index()].buffer.binding & RENDER_BUFFER_INDEX) ||
+		!indexSize || draw.indexOffset % indexSize ||
+		draw.indexOffset > indexBytes ||
+		draw.startIndex > (indexBytes - draw.indexOffset) / indexSize ||
+		draw.indexCount > (indexBytes - draw.indexOffset) / indexSize - draw.startIndex ||
+		draw.vertexOffset > vertexBytes || draw.vertexStride > vertexBytes - draw.vertexOffset)
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
+	Command command(OP_INDEXED_DRAW_RECORD);
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		const GpuHandle texture = draw.textures[stage];
+		if (!valid(texture, true, true) ||
+			texture.isValid() != ((draw.texturePresenceMask & (1U << stage)) != 0))
+			return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, stage);
+		const bool aliasesTarget = texture.isValid() &&
+			((m_targets.hasColor && !m_targets.useBackBufferColor && m_targets.color.resource == texture) ||
+			 (m_targets.hasDepth && !m_targets.useBackBufferDepth && m_targets.depth.resource == texture));
+		if (aliasesTarget || m_producerFailure != RENDER_RESULT_OK ||
+			!m_cachedTextureKnown[stage] || m_cachedTextures[stage] != texture)
+			command.integers[0] |= 1U << stage;
+	}
+	command.integers[1] = m_producerFailure != RENDER_RESULT_OK ||
+		!m_cachedTopologyKnown || m_cachedTopology != draw.topology;
+	const RenderResult result = append(command, &draw, sizeof(draw));
+	if (result == RENDER_RESULT_OK)
+	{
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+		{
+			m_cachedTextures[stage] = draw.textures[stage];
+			m_cachedTextureKnown[stage] = true;
+		}
+		m_cachedTopology = draw.topology;
+		m_cachedTopologyKnown = true;
+	}
+	return result;
+}
+
 RenderResult ThreadedRenderDevice::captureBackBuffer(void *destination, size_t bytes,
 	size_t rowPitch, RenderFormat *format)
 {
@@ -1475,6 +1592,55 @@ void ThreadedRenderDevice::writeTarget(GpuHandle handle, bool establishesContent
 	slot->writtenSequence = m_ownerSequence;
 }
 
+void ThreadedRenderDevice::traceOwnerFailure(const Packet &packet,
+	RenderResult result, const char *stage, Operation parent, const Command *leaf)
+{
+	// Owner-only, one attempt per device session. Called only on a cold failure;
+	// successful rendering does not inspect configuration, clocks or files.
+	if (m_ownerFailureTraceAttempted) return;
+	m_ownerFailureTraceAttempted = true;
+	const char *path = std::getenv("RTS_RENDER_FAILURE_TRACE");
+	if (path == 0 || path[0] == '\0') return;
+	char output[4096], pending[4096], record[2048];
+	const int outputLength = std::snprintf(output, sizeof(output), "%s.owner", path);
+	const int pendingLength = std::snprintf(pending, sizeof(pending), "%s.owner.pending", path);
+	if (outputLength < 0 || static_cast<size_t>(outputLength) >= sizeof(output) ||
+		pendingLength < 0 || static_cast<size_t>(pendingLength) >= sizeof(pending)) return;
+	unsigned long long qpc = 0;
+#ifdef _WIN32
+	LARGE_INTEGER timestamp;
+	if (QueryPerformanceCounter(&timestamp)) qpc = static_cast<unsigned long long>(timestamp.QuadPart);
+#endif
+	const int length = std::snprintf(record, sizeof(record),
+		"renderer_failure source=owner diagnostic=cold-optin-not-performance qpc=%llu packet=%llu frame=%llu parent=%s stage=%s result=%d prior=%d active=%u open=%u prior_resource_failure=%u handle_valid=%u handle_index=%u handle_generation=%u arg0=%u arg1=%u arg2=%u arg3=%u signed=%d bytes=%llu offset=%llu\nexport_status=complete\n",
+		qpc, static_cast<unsigned long long>(packet.sequence),
+		static_cast<unsigned long long>(m_ownerSequence), OwnerOperationName(parent), stage,
+		static_cast<int>(result), static_cast<int>(m_ownerFrameActive ? m_ownerFrameResult : m_outsideFailure),
+		m_ownerFrameActive ? 1U : 0U, m_ownerFrameOpen ? 1U : 0U,
+		(m_ownerFrameActive ? m_ownerResourceFailure : m_outsideResourceFailure) ? 1U : 0U,
+		leaf != 0 && leaf->handle.isValid() ? 1U : 0U,
+		leaf == 0 ? 0U : leaf->handle.index(), leaf == 0 ? 0U : leaf->handle.generation(),
+		leaf == 0 ? 0U : leaf->integers[0], leaf == 0 ? 0U : leaf->integers[1],
+		leaf == 0 ? 0U : leaf->integers[2], leaf == 0 ? 0U : leaf->integers[3],
+		leaf == 0 ? 0 : leaf->signedValue,
+		static_cast<unsigned long long>(leaf == 0 ? 0 : leaf->dataBytes),
+		static_cast<unsigned long long>(leaf == 0 ? 0 : leaf->destinationOffset));
+	if (length < 0 || static_cast<size_t>(length) >= sizeof(record)) return;
+	std::FILE *file = std::fopen(pending, "wb");
+	if (file == 0) return;
+	bool complete = std::fwrite(record, 1, static_cast<size_t>(length), file) == static_cast<size_t>(length);
+	if (std::fflush(file) != 0) complete = false;
+	if (std::fclose(file) != 0) complete = false;
+	// A pending file is never evidence of a complete export, even if its footer
+	// reached disk before a flush/close error. The sidecar has one owner writer.
+	if (!complete) return;
+#ifdef _WIN32
+	(void)MoveFileExA(pending, output, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+#else
+	(void)std::rename(pending, output);
+#endif
+}
+
 RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Command &command)
 {
 	const GpuHandle handle = resolve(command.handle);
@@ -1489,6 +1655,67 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		!m_ownerResources[command.handle.index()].contentValid) return RENDER_RESULT_FAILED;
 	switch (command.operation)
 	{
+	case OP_INDEXED_DRAW_RECORD:
+	{
+		const ThreadedIndexedDraw draw = read<ThreadedIndexedDraw>(packet, command.payloadOffset);
+		RenderResult result = BackendCall([&] {
+			return draw.useVertexFormat ?
+				m_context->setLegacyState(draw.state, draw.vertexFormat, draw.texturePresenceMask) :
+				m_context->setLegacyStateForLayout(draw.state, draw.layout, draw.texturePresenceMask);
+		});
+		if (result != RENDER_RESULT_OK)
+		{
+			traceOwnerFailure(packet, result, draw.useVertexFormat ? "state" : "layout", command.operation, &command);
+			return result;
+		}
+		// Expand only on the owner, reusing the ordinary handle, initialized-byte
+		// and target-write checks. Stop at the first failed component exactly as
+		// the separate command stream does, including resource classification.
+		auto component = [&](const Command &part) {
+			const RenderResult value = BackendCall([&] { return executeCommand(packet, part); });
+			if (value != RENDER_RESULT_OK && part.handle.isValid()) m_ownerResourceFailure = true;
+			if (value != RENDER_RESULT_OK)
+				traceOwnerFailure(packet, value, OwnerOperationName(part.operation), command.operation, &part);
+			return value;
+		};
+		Command vertex(OP_VERTEX_BUFFER); vertex.handle = draw.vertexBuffer;
+		vertex.integers[0] = draw.vertexStride; vertex.integers[1] = draw.vertexOffset;
+		result = component(vertex);
+		if (result != RENDER_RESULT_OK) return result;
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+		{
+			if (!(u[0] & (1U << stage))) continue;
+			Command texture(OP_TEXTURE); texture.handle = draw.textures[stage]; texture.integers[0] = stage;
+			result = component(texture);
+			if (result != RENDER_RESULT_OK) return result;
+		}
+		if (u[1])
+		{
+			Command topology(OP_TOPOLOGY); topology.integers[0] = draw.topology;
+			result = component(topology);
+			if (result != RENDER_RESULT_OK) return result;
+		}
+		if (draw.bindIndexBuffer)
+		{
+			Command index(OP_INDEX_BUFFER); index.handle = draw.indexBuffer;
+			index.integers[0] = draw.indexFormat; index.integers[1] = draw.indexOffset;
+			result = component(index);
+			if (result != RENDER_RESULT_OK) return result;
+		}
+		else if (m_ownerIndexBuffer != draw.indexBuffer ||
+			m_ownerIndexOffset != draw.indexOffset ||
+			m_ownerIndexSize != (draw.indexFormat == RENDER_FORMAT_R16_UINT ? 2U : 4U))
+		{
+			m_ownerResourceFailure = true;
+			Command index(OP_INDEX_BUFFER); index.handle = draw.indexBuffer;
+			index.integers[0] = draw.indexFormat; index.integers[1] = draw.indexOffset;
+			traceOwnerFailure(packet, RENDER_RESULT_INVALID_ARGUMENT, "index-reuse-validation", command.operation, &index);
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		Command indexed(OP_DRAW_INDEXED); indexed.integers[0] = draw.indexCount;
+		indexed.integers[1] = draw.startIndex; indexed.signedValue = draw.baseVertex;
+		return component(indexed);
+	}
 	case OP_BEGIN:
 		m_ownerFrameResult = m_outsideFailure; m_outsideFailure = RENDER_RESULT_OK;
 		m_ownerFrameResult = FirstFailure(m_ownerFrameResult, packet.failure);
@@ -1817,6 +2044,8 @@ void ThreadedRenderDevice::execute(Packet &packet)
 		try { result = executeCommand(packet, command); }
 		catch (const std::bad_alloc &) { result = RENDER_RESULT_OUT_OF_MEMORY; }
 		catch (...) { result = RENDER_RESULT_FAILED; }
+		if (result != RENDER_RESULT_OK)
+			traceOwnerFailure(packet, result, OwnerOperationName(command.operation), command.operation, &command);
 		packetResult = FirstFailure(packetResult, result);
 		if ((command.operation >= OP_CREATE_BUFFER &&
 			command.operation <= OP_UPDATE_BUFFER) ||
@@ -1837,6 +2066,8 @@ void ThreadedRenderDevice::execute(Packet &packet)
 	if (packet.closeFrame && m_ownerFrameOpen)
 	{
 		const RenderResult result = BackendCall([&] { return m_context->endFrame(); });
+		if (result != RENDER_RESULT_OK)
+			traceOwnerFailure(packet, result, "end-frame", OP_BEGIN, 0);
 		m_ownerFrameOpen = false;
 		m_ownerOutcome.recordEndFrame(result);
 		m_ownerOutcome.markFrameEnded();
@@ -2004,6 +2235,8 @@ void ThreadedRenderDevice::execute(Packet &packet)
 	if (packet.finalFrame && packet.present && frameResult == RENDER_RESULT_OK)
 	{
 		frameResult = BackendCall([&] { return m_backend->present(); });
+		if (frameResult != RENDER_RESULT_OK)
+			traceOwnerFailure(packet, frameResult, "present", OP_BEGIN, 0);
 		m_ownerOutcome.recordPresentation(frameResult);
 		presented = frameResult == RENDER_RESULT_OK;
 		if (presented) m_ownerOutcome.markPresented();
@@ -2183,6 +2416,11 @@ IRenderDevice *CreateThreadedD3D11RenderDevice(const ThreadedRenderOptions &opti
 { return CreateThreadedRenderDevice(MakeD3D11, 0, options); }
 bool IsThreadedRenderDevice(const IRenderDevice *device)
 { return dynamic_cast<const ThreadedRenderDevice *>(device) != 0; }
+RenderResult SubmitThreadedIndexedDraw(IRenderDevice *device, const ThreadedIndexedDraw &draw)
+{
+	ThreadedRenderDevice *threaded = dynamic_cast<ThreadedRenderDevice *>(device);
+	return threaded ? threaded->indexedDraw(draw) : RENDER_RESULT_UNSUPPORTED;
+}
 RenderResult SubmitThreadedRenderFrame(IRenderDevice *device, bool presentFrame)
 {
 	ThreadedRenderDevice *threaded = dynamic_cast<ThreadedRenderDevice *>(device);

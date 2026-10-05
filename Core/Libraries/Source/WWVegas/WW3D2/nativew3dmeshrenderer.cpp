@@ -1474,53 +1474,62 @@ void DX8SkinFVFCategoryContainer::Render()
 
 				VertexFormatXYZNDUV2* verts=dest_verts+vertex_offset;
 
-				mesh->Get_Deformed_Vertices(loc,norm);
-
-				for (int v=0;v<mesh_vertex_count;++v) {
-					verts[v].x=(*loc)[0];
-					verts[v].y=(*loc)[1];
-					verts[v].z=(*loc)[2];
-					verts[v].nx=(*norm)[0];
-					verts[v].ny=(*norm)[1];
-					verts[v].nz=(*norm)[2];
-					if (diffuse) {
-						verts[v].diffuse=*diffuse++;
-					}
-					else {
-						verts[v].diffuse=0;
-					}
-					if (uv0) {
-						verts[v].u1=(*uv0)[0];
-						verts[v].v1=(*uv0)[1];
-						uv0++;
-					}
-					else {
-						verts[v].u1=0.0f;
-						verts[v].v1=0.0f;
-					}
-					if (uv1) {
-						verts[v].u2=(*uv1)[0];
-						verts[v].v2=(*uv1)[1];
-						uv1++;
-					}
-					else {
-						verts[v].u2=0.0f;
-						verts[v].v2=0.0f;
-					}
-
-					loc++;
-					norm++;
+				{
+					rts::frame_timing::Scope skinDeformationTiming(rts::frame_timing::RendererSkinDeformation);
+					mesh->Get_Deformed_Vertices(loc,norm);
 				}
 
+				{
+					rts::frame_timing::Scope skinPackingTiming(rts::frame_timing::RendererSkinPacking);
+					for (int v=0;v<mesh_vertex_count;++v) {
+						verts[v].x=(*loc)[0];
+						verts[v].y=(*loc)[1];
+						verts[v].z=(*loc)[2];
+						verts[v].nx=(*norm)[0];
+						verts[v].ny=(*norm)[1];
+						verts[v].nz=(*norm)[2];
+						if (diffuse) {
+							verts[v].diffuse=*diffuse++;
+						}
+						else {
+							verts[v].diffuse=0;
+						}
+						if (uv0) {
+							verts[v].u1=(*uv0)[0];
+							verts[v].v1=(*uv0)[1];
+							uv0++;
+						}
+						else {
+							verts[v].u1=0.0f;
+							verts[v].v1=0.0f;
+						}
+						if (uv1) {
+							verts[v].u2=(*uv1)[0];
+							verts[v].v2=(*uv1)[1];
+							uv1++;
+						}
+						else {
+							verts[v].u2=0.0f;
+							verts[v].v2=0.0f;
+						}
+
+						loc++;
+						norm++;
+					}
+
+				}
 				mesh->Set_Base_Vertex_Offset(vertex_offset);
 				vertex_offset+=mesh_vertex_count;
 				renderedVertexCount += mesh_vertex_count;
 
 				mesh = mesh->Peek_Next_Visible_Skin();
 			}
-			if (!l.Commit()) {
-				dynamic_buffer_failed = true;
-				break;
+			{
+				rts::frame_timing::Scope skinCommitTiming(rts::frame_timing::RendererSkinCommit);
+				if (!l.Commit()) {
+					dynamic_buffer_failed = true;
+					break;
+				}
 			}
 		}
 
@@ -1533,17 +1542,20 @@ void DX8SkinFVFCategoryContainer::Render()
 		rts::render::SetGameIndexBuffer(index_buffer, 0);
 
 		//Flush the meshes which fit in the vertex buffer, applying all texture variations
-		for (unsigned pass=0;pass<passes;++pass) {
-			SNAPSHOT_SAY(("Pass: %d",pass));
+		{
+			rts::frame_timing::Scope skinDrawCategoriesTiming(rts::frame_timing::RendererSkinDrawCategories);
+			for (unsigned pass=0;pass<passes;++pass) {
+				SNAPSHOT_SAY(("Pass: %d",pass));
 
-			TextureCategoryListIterator it(&visible_texture_category_list[pass]);
-			while (!it.Is_Done()) {
-				it.Peek_Obj()->Render();
-				it.Next();
+				TextureCategoryListIterator it(&visible_texture_category_list[pass]);
+				while (!it.Is_Done()) {
+					it.Peek_Obj()->Render();
+					it.Next();
+				}
 			}
-		}
 
-		Render_Procedural_Material_Passes();
+			Render_Procedural_Material_Passes();
+		}
 	}
 
 	//remove all the rendered data from queues
@@ -2347,20 +2359,29 @@ void DX8MeshRendererClass::Flush()
 	** bulk of the meshes have already been drawn (there would be extra overhead involved
 	** in solving this for skins)
 	*/
-	for (i=0;i<texture_category_container_lists_rigid.Count();++i) {
-		Render_FVF_Category_Container_List(*texture_category_container_lists_rigid[i]);
+	{
+		rts::frame_timing::Scope rigidFVFRenderTiming(rts::frame_timing::RendererRigidFVFRender);
+		for (i=0;i<texture_category_container_lists_rigid.Count();++i) {
+			Render_FVF_Category_Container_List(*texture_category_container_lists_rigid[i]);
+		}
 	}
 
 	Render_FVF_Category_Container_List(*texture_category_container_list_skin);
 
-	Render_Decal_Meshes();
+	{
+		rts::frame_timing::Scope decalRenderTiming(rts::frame_timing::RendererDecalRender);
+		Render_Decal_Meshes();
+	}
 
 	/*
 	** Render the translucent procedural material passes that were applied to meshes that
 	** had their base passes disabled.
 	*/
-	for (i=0;i<texture_category_container_lists_rigid.Count();++i) {
-		Render_FVF_Category_Container_List_Delayed_Passes(*texture_category_container_lists_rigid[i]);
+	{
+		rts::frame_timing::Scope delayedPassRenderTiming(rts::frame_timing::RendererDelayedPassRender);
+		for (i=0;i<texture_category_container_lists_rigid.Count();++i) {
+			Render_FVF_Category_Container_List_Delayed_Passes(*texture_category_container_lists_rigid[i]);
+		}
 	}
 
 	rts::render::SetGameVertexBuffer(static_cast<const VertexBufferClass *>(nullptr));

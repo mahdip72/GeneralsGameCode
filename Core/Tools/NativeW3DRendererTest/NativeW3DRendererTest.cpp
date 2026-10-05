@@ -1,5 +1,6 @@
 #include "Renderer/NativeW3DRenderer.h"
 #include "Renderer/NativeW3DResources.h"
+#include "Renderer/NativeW3DRenderState.h"
 #include "Renderer/RenderTexturePublication.h"
 
 #include <cstdio>
@@ -8,6 +9,37 @@
 #if defined(_WIN32)
 #include <windows.h>
 #endif
+
+namespace rts { namespace render {
+// Exercise the existing internal lifecycle seam with the production renderer,
+// state and queue. This grants no extra access to runtime callers.
+class NativeW3DRecoveryTestAccess
+{
+public:
+	static RenderResult Attach(NativeW3DRenderer &renderer,
+		NativeW3DRenderState *state, IRenderDevice *device)
+	{
+		const RenderResult attached = state->AttachBackend(device,
+			device->immediateContext());
+		return attached == RENDER_RESULT_OK ?
+			renderer.AttachBorrowedState(state) : attached;
+	}
+	static bool BackendOperational(const NativeW3DRenderer &renderer)
+	{
+		return renderer.IsBackendOperational();
+	}
+	static IRenderDevice *Device(const NativeW3DRenderState &state)
+	{
+		return state.Device();
+	}
+	static RenderResult Detach(NativeW3DRenderer &renderer,
+		NativeW3DRenderState *state)
+	{
+		const RenderResult detached = renderer.DetachBorrowedState();
+		return detached == RENDER_RESULT_OK ? state->DetachBackend() : detached;
+	}
+};
+} }
 
 namespace
 {
@@ -253,6 +285,41 @@ public:
 	std::vector<SortedBatchCommand> commands;
 };
 
+int TestCompactRecordBindingAcknowledgements()
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3DTextureBindingCache textures;
+	TextureStageTraceContext textureTrace;
+	GpuHandle slots[LEGACY_TEXTURE_STAGE_COUNT];
+	slots[0] = GpuHandle(8, 2);
+	textures.Acknowledge(slots);
+	result |= Check(textures.Bind(&textureTrace, slots) == RENDER_RESULT_OK &&
+		textureTrace.commands.empty(), "admitted compact draw acknowledges every texture slot");
+	textures.Reset();
+	result |= Check(textures.Bind(&textureTrace, slots) == RENDER_RESULT_OK &&
+		textureTrace.commands.size() == LEGACY_TEXTURE_STAGE_COUNT,
+		"reset forgets compact texture acknowledgements");
+	NativeW3DSortedBatchBindingCache sorted;
+	SortedBatchTraceContext sortedTrace;
+	GpuHandle index(12, 3);
+	result |= Check(!sorted.IsIndexBufferKnown(index, RENDER_FORMAT_R16_UINT, 0),
+		"fresh batch requires the compact index binding");
+	sorted.Acknowledge(RENDER_PRIMITIVE_TRIANGLE_LIST, index, RENDER_FORMAT_R16_UINT, 0);
+	result |= Check(sorted.IsIndexBufferKnown(index, RENDER_FORMAT_R16_UINT, 0) &&
+		!sorted.IsIndexBufferKnown(GpuHandle(12, 4), RENDER_FORMAT_R16_UINT, 0) &&
+		!sorted.IsIndexBufferKnown(index, RENDER_FORMAT_R32_UINT, 0) &&
+		!sorted.IsIndexBufferKnown(index, RENDER_FORMAT_R16_UINT, 2),
+		"compact acknowledgement retains the complete generation and index tuple");
+	result |= Check(sorted.BindTopology(&sortedTrace, RENDER_PRIMITIVE_TRIANGLE_LIST) == RENDER_RESULT_OK &&
+		sorted.BindIndexBuffer(&sortedTrace, index, RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK &&
+		sortedTrace.commands.empty(), "fallback submissions reuse acknowledged compact bindings");
+	sorted.Reset();
+	result |= Check(!sorted.IsIndexBufferKnown(index, RENDER_FORMAT_R16_UINT, 0),
+		"batch reset forgets the compact index acknowledgement");
+	return result;
+}
+
 int TestSortedBatchBindingCacheCommandTrace()
 {
 	using namespace rts::render;
@@ -332,6 +399,98 @@ int TestSortedBatchBindingCacheCommandTrace()
 }
 
 #if defined(_WIN32) && defined(RTS_RENDERER_HAS_D3D11)
+void CountReadinessCleanup(void *context)
+{
+	++*static_cast<unsigned int *>(context);
+}
+
+struct ForeignReadinessRequest
+{
+	rts::render::NativeW3DRenderer *renderer;
+	rts::render::NativeW3DRenderState *state;
+	rts::render::NativeW3DOwnerToken *token;
+	bool initialized;
+	bool backendOperational;
+	rts::render::RenderResult enqueued;
+};
+
+DWORD WINAPI ProbeAndEnqueueReadinessCleanup(void *parameter)
+{
+	ForeignReadinessRequest *request = static_cast<ForeignReadinessRequest *>(parameter);
+	request->initialized = request->renderer->IsInitialized();
+	request->backendOperational =
+		rts::render::NativeW3DRecoveryTestAccess::BackendOperational(*request->renderer);
+	request->enqueued = request->state->EnqueueCleanup(
+		CountReadinessCleanup, request->token);
+	return 0;
+}
+
+// Called after the existing native device fixture has finished its draws. It
+// owns shutdown of that device and tests readiness against its real transition.
+int TestRendererReadinessLifecycle(rts::render::IRenderDevice *device)
+{
+	using namespace rts::render;
+	int result = 0;
+	NativeW3DRenderer renderer;
+	NativeW3DRenderState *state = NativeW3DRenderState::Create(2);
+	if (state == 0) return Check(false, "readiness fixture creates its production state");
+	const RenderResult bound = state->BindOwner();
+	const RenderResult attached = bound == RENDER_RESULT_OK ?
+		NativeW3DRecoveryTestAccess::Attach(renderer, state, device) : bound;
+	result |= Check(attached == RENDER_RESULT_OK,
+		"readiness fixture attaches the initialized device to the real renderer");
+	if (attached != RENDER_RESULT_OK)
+	{
+		state->BeginShutdown();
+		NativeW3DRecoveryTestAccess::Detach(renderer, state);
+		state->Release();
+		return result;
+	}
+	result |= Check(renderer.IsInitialized() &&
+		NativeW3DRecoveryTestAccess::BackendOperational(renderer),
+		"attached owner observes live backend readiness");
+	unsigned int callbacks = 0;
+	NativeW3DOwnerToken *token = NativeW3DOwnerToken::Create(&callbacks, 0);
+	result |= Check(token != 0, "readiness fixture creates an opaque cleanup token");
+	if (token != 0)
+	{
+		ForeignReadinessRequest request = { &renderer, state, token, true, true,
+			RENDER_RESULT_FAILED };
+		HANDLE worker = CreateThread(0, 0, ProbeAndEnqueueReadinessCleanup, &request, 0, 0);
+		result |= Check(worker != 0, "readiness fixture starts its joined foreign producer");
+		if (worker != 0)
+		{
+			WaitForSingleObject(worker, INFINITE);
+			CloseHandle(worker);
+			result |= Check(!request.initialized && !request.backendOperational &&
+				request.enqueued == RENDER_RESULT_OK && state->PendingCleanup() == 1,
+				"foreign readiness is rejected while foreign cleanup is accepted");
+			result |= Check(renderer.IsInitialized() &&
+				NativeW3DRecoveryTestAccess::BackendOperational(renderer) && callbacks == 0,
+				"owner readiness neither hides nor executes pending foreign cleanup");
+		}
+		token->Release();
+	}
+	device->shutdown();
+	result |= Check(!renderer.IsInitialized() &&
+		!NativeW3DRecoveryTestAccess::BackendOperational(renderer) && state->IsOwnerThread(),
+		"backend unavailability is observed live without losing cleanup ownership");
+	result |= Check(state->BeginShutdown() == RENDER_RESULT_OK &&
+		!renderer.IsInitialized() && !NativeW3DRecoveryTestAccess::BackendOperational(renderer) &&
+		NativeW3DRecoveryTestAccess::Device(*state) == device,
+		"closed owner rejects readiness but retains attached device access for cleanup");
+	const unsigned int pending = state->PendingCleanup();
+	unsigned int drained = 0;
+	result |= Check(state->DrainCleanup(0, &drained) == RENDER_RESULT_OK &&
+		drained == pending && callbacks == pending && state->PendingCleanup() == 0,
+		"closed owner drains exactly the accepted foreign cleanup");
+	result |= Check(NativeW3DRecoveryTestAccess::Detach(renderer, state) == RENDER_RESULT_OK &&
+		!renderer.IsInitialized() && !NativeW3DRecoveryTestAccess::BackendOperational(renderer),
+		"terminal detachment leaves no stale renderer readiness");
+	state->Release();
+	return result;
+}
+
 const wchar_t *kD3D11InputLayoutTestWindowClass =
 	L"GeneralsGameCodeD3D11InputLayoutTestWindow";
 
@@ -511,6 +670,7 @@ int TestD3D11TexturedInputLayoutSafety()
 		result |= Check(device->destroyResource(weightedBuffer),
 			"weighted input fixture releases its buffer");
 	}
+	result |= TestRendererReadinessLifecycle(device);
 	device->shutdown();
 	delete device;
 	DestroyWindow(window);
@@ -526,6 +686,7 @@ int main()
 	result |= TestTexturePublicationOperationalContract();
 	result |= TestTextureBindingCacheCommandTrace();
 	result |= TestSortedBatchBindingCacheCommandTrace();
+	result |= TestCompactRecordBindingAcknowledgements();
 #if defined(_WIN32) && defined(RTS_RENDERER_HAS_D3D11)
 	result |= TestD3D11TexturedInputLayoutSafety();
 #endif

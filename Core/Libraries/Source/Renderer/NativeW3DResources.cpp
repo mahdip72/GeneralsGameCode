@@ -1,5 +1,6 @@
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/NativeW3DRenderState.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include <Utility/interlocked_adapter.h>
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include "Renderer/ThreadedRenderDevice.h"
@@ -2832,6 +2833,8 @@ const NativeW3DResources::Slot *NativeW3DResources::Find(
 		return &m_impl->slots[hint.slot];
 	}
 #endif
+	rts::frame_timing::Scope lookupScanTiming(
+		rts::frame_timing::RendererResourceLookupScan);
 	for (size_t index = 0; index < m_impl->slots.size(); ++index)
 	{
 		if (m_impl->slots[index].handle == handle)

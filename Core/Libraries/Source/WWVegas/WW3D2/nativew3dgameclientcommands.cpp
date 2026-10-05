@@ -10,6 +10,7 @@
 */
 
 #include "Utility/CppMacros.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include "Renderer/LegacyColorPacking.h"
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/RenderGameClientNative.h"
@@ -62,6 +63,8 @@ void InitializeCommand(GameRenderCommand *command,
 RenderResult SubmitCommand(IGameRenderClientNativeOwner *owner,
 	const GameRenderCommand &command)
 {
+	rts::frame_timing::SampledScope submitCommandTiming(
+		rts::frame_timing::RendererNativeSubmitCommandSampled64);
 	if (!IsOperationalOwner(owner))
 	{
 		if (owner != 0)

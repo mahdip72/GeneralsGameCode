@@ -46,6 +46,21 @@ if(WIN32)
             COMMAND core_validation_profile_root_tests)
         set_tests_properties(core_validation_profile_root_tests PROPERTIES
             RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
+
+        add_executable(core_rendered_battle_benchmark_options_tests
+            "${CMAKE_CURRENT_SOURCE_DIR}/../ValidationProfileRootTest/RenderedBattleBenchmarkOptionsTest.cpp")
+        target_include_directories(core_rendered_battle_benchmark_options_tests PRIVATE
+            "${CMAKE_SOURCE_DIR}/Core/Libraries/Include")
+        set_target_properties(core_rendered_battle_benchmark_options_tests PROPERTIES
+            CXX_STANDARD 98 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+        set(_rendered_battle_options_test_profile
+            "${_stage5_validation_test_scratch_root}/rendered-battle-options-profile")
+        file(MAKE_DIRECTORY "${_rendered_battle_options_test_profile}")
+        add_test(NAME core_rendered_battle_benchmark_options_tests
+            COMMAND core_rendered_battle_benchmark_options_tests
+                "${_rendered_battle_options_test_profile}")
+        set_tests_properties(core_rendered_battle_benchmark_options_tests PROPERTIES
+            RUN_SERIAL TRUE PROCESSORS 1 TIMEOUT 60)
     endif()
     add_test(NAME core_stage5_validation_profile_root_contract_tests
         COMMAND powershell -NoProfile -ExecutionPolicy Bypass

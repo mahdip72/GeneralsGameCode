@@ -1,6 +1,7 @@
 #include "Utility/CppMacros.h"
 #include "Renderer/RendererDevice.h"
 #include "Renderer/RenderTexturePublication.h"
+#include "../../Libraries/Source/Renderer/TransformConstantArenaPolicy.h"
 #include "W3DDevice/GameClient/W3DVideoBuffer.h"
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include "../../Libraries/Source/Renderer/D3D11ResultTranslation.h"
@@ -1435,9 +1436,14 @@ int testLegacyResetSeedAndAmbientUpdate()
 	int result = 0;
 	rts::render::LegacyPipelineState pipeline;
 	rts::render::LegacyLogicalState logical;
+	int depthBias = 73;
 	rts::render::ResetTrackedLegacyState();
 	result |= check(!rts::render::GetTrackedLegacyPipelineState(&pipeline),
 		"legacy reset invalidates the tracked pipeline before reseeding");
+	result |= check(!rts::render::GetTrackedLegacyDepthBias(&depthBias) &&
+		depthBias == 73 && !rts::render::GetTrackedLegacyDepthBias(0) &&
+		!rts::render::HasTrackedLegacyPipelineState(),
+		"invalid scalar depth-bias queries preserve output and tracker validity");
 	rts::render::SeedTrackedLegacyPipelineState();
 	result |= check(rts::render::GetTrackedLegacyPipelineState(&pipeline) &&
 		pipeline.depthStencil.depthEnable && pipeline.depthStencil.depthWrite &&
@@ -1445,6 +1451,26 @@ int testLegacyResetSeedAndAmbientUpdate()
 			rts::render::RENDER_COMPARE_LESS_EQUAL &&
 		pipeline.rasterizer.fillMode == rts::render::RENDER_FILL_SOLID,
 		"explicit neutral pipeline seed restores valid deterministic defaults");
+	depthBias = 73;
+	result |= check(rts::render::GetTrackedLegacyDepthBias(&depthBias) &&
+		depthBias == 0,
+		"scalar depth-bias query reads the seeded default without changing it");
+	pipeline.rasterizer.depthBias = -7;
+	pipeline.textureFactor = 0x12345678U;
+	rts::render::TrackLegacyPipelineState(pipeline);
+	depthBias = 73;
+	result |= check(rts::render::GetTrackedLegacyDepthBias(&depthBias) &&
+		depthBias == -7 &&
+		rts::render::GetTrackedLegacyPipelineState(&pipeline) &&
+		pipeline.rasterizer.depthBias == -7 &&
+		pipeline.textureFactor == 0x12345678U,
+		"scalar depth-bias query preserves negative value and unrelated state");
+	pipeline.rasterizer.depthBias = 5;
+	rts::render::TrackLegacyPipelineState(pipeline);
+	depthBias = 73;
+	result |= check(rts::render::GetTrackedLegacyDepthBias(&depthBias) &&
+		depthBias == 5,
+		"scalar depth-bias query reads a valid positive value");
 	const rts::render::RenderFloat4 rawAmbient =
 		rts::render::DecodeLegacyAmbientColor(0x80402010U);
 	result |= check(rawAmbient.x == (64.0f / 255.0f) &&
@@ -7400,8 +7426,53 @@ int RunLegacyShaderAssetContractTests();
 #endif
 #endif
 
+static int testTransformConstantArenaPolicy()
+{
+	using rts::render::detail::TransformConstantArenaPolicy;
+	typedef TransformConstantArenaPolicy Policy;
+	int result = 0;
+	for (unsigned int flags = 0; flags < 8; ++flags)
+		result |= check(Policy::Supported((flags & 1) != 0, (flags & 2) != 0,
+			(flags & 4) != 0) == (flags == 7), "arena requires all three capabilities");
+	unsigned char payload[Policy::PAYLOAD_BYTES];
+	unsigned char bytes[Policy::SLICE_BYTES + 2];
+	memset(payload, 0x5a, sizeof(payload));
+	memset(bytes, 0xa5, sizeof(bytes));
+	Policy::WriteSlice(bytes + 1, payload);
+	result |= check(memcmp(bytes + 1, payload, sizeof(payload)) == 0 &&
+		bytes[0] == 0xa5 && bytes[sizeof(bytes) - 1] == 0xa5,
+		"arena preserves exact payload and adjacent bytes");
+	for (unsigned int byte = Policy::PAYLOAD_BYTES; byte < Policy::SLICE_BYTES; ++byte)
+		result |= check(bytes[byte + 1] == 0, "arena zeros every tail-padding byte");
+	Policy policy;
+	Policy::Range pending = policy.reserve();
+	result |= check(pending.discard && policy.reserve().slot == pending.slot,
+		"failed upload without commit leaves DISCARD reservation unchanged");
+	Policy::Range invalid = pending;
+	++invalid.firstConstant;
+	result |= check(!policy.commit(invalid) && policy.reserve().slot == 0,
+		"invalid publication cannot advance arena");
+	for (unsigned int upload = 0; upload < 1000; ++upload)
+	{
+		pending = policy.reserve();
+		result |= check(pending.slot == upload % 21 &&
+			pending.discard == (upload % 21 == 0) &&
+			pending.firstConstant % 16 == 0 && pending.constantCount == 192 &&
+			pending.byteOffset + Policy::SLICE_BYTES <= Policy::PAGE_BYTES &&
+			pending.firstConstant + pending.constantCount <= 4096,
+			"arena append and wrap stay aligned and fully inside fixed page");
+		result |= check(policy.commit(pending), "successful range publication commits");
+	}
+	policy.reset();
+	result |= check(policy.reserve().slot == 0 && policy.reserve().discard,
+		"frame/device reset forces DISCARD before any reuse");
+	return result;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc == 2 && strcmp(argv[1], "--constant-arena-policy") == 0)
+		return testTransformConstantArenaPolicy();
 	if (argc == 2 && strcmp(argv[1],
 		"--w3d-video-buffer-format-selection") == 0)
 	{
@@ -7414,6 +7485,7 @@ int main(int argc, char **argv)
 	}
 
 	int result = 0;
+	result |= testTransformConstantArenaPolicy();
 #if !defined(RTS_RENDERER_NATIVE_CONTRACT_ONLY)
 	result |= TestLegacyResetResources();
 	result |= TestLegacyAsyncFramePolicy();

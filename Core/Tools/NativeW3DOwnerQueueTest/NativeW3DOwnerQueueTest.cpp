@@ -55,12 +55,14 @@ struct WrongOwnerDrain
 	rts::render::RenderResult bindResult;
 	rts::render::RenderResult result;
 	unsigned int drained;
+	bool ownerAccepting;
 };
 
 DWORD WINAPI DrainFromWrongOwner(void *parameter)
 {
 	WrongOwnerDrain *test = static_cast<WrongOwnerDrain *>(parameter);
 	test->bindResult = test->queue->BindOwner();
+	test->ownerAccepting = test->queue->IsOwnerAccepting();
 	test->drained = 0;
 	test->result = test->queue->Drain(0, &test->drained);
 	return 0;
@@ -85,6 +87,8 @@ int main()
 		"owner queue preserves its fixed capacity");
 	result |= Check(!queue.IsBound() && !queue.IsOwnerThread(),
 		"owner queue starts without an owner");
+	result |= Check(!queue.IsOwnerAccepting(),
+		"unbound queue has no owner admission");
 	result |= Check(queue.Enqueue(Increment, 0) ==
 		rts::render::RENDER_RESULT_INVALID_ARGUMENT,
 		"owner queue rejects a missing opaque token");
@@ -109,12 +113,15 @@ int main()
 		"owner queue rejects commands beyond capacity");
 	result |= Check(queue.Size() == 2,
 		"owner queue reports the number of pending commands");
+	result |= Check(queue.IsOwnerAccepting(),
+		"pending cleanup does not close owner admission");
 
 	WrongOwnerDrain wrongOwner;
 	wrongOwner.queue = &queue;
 	wrongOwner.bindResult = rts::render::RENDER_RESULT_OK;
 	wrongOwner.result = rts::render::RENDER_RESULT_OK;
 	wrongOwner.drained = 0;
+	wrongOwner.ownerAccepting = true;
 	HANDLE thread = CreateThread(0, 0, DrainFromWrongOwner, &wrongOwner, 0, 0);
 	result |= Check(thread != 0,
 		"wrong-owner test thread starts");
@@ -130,6 +137,8 @@ int main()
 			"wrong owner cannot drain the queue");
 		result |= Check(wrongOwner.drained == 0,
 			"wrong-owner rejection leaves commands pending");
+		result |= Check(!wrongOwner.ownerAccepting,
+			"foreign thread cannot acquire owner admission with pending cleanup");
 	}
 
 	unsigned int drained = 0;
@@ -152,6 +161,18 @@ int main()
 	result |= Check(queue.Drain(0, &drained) == rts::render::RENDER_RESULT_OK &&
 		drained == 1 && stats.callbackCount == 3 && stats.releaseCount == 0,
 		"reused owner queue drains a later command");
+	result |= Check(queue.Enqueue(Increment, token) ==
+		rts::render::RENDER_RESULT_OK,
+		"owner queue retains a separate command for the close boundary");
+	result |= Check(queue.Close() == rts::render::RENDER_RESULT_OK &&
+		queue.IsOwnerThread() && !queue.IsOwnerAccepting() && queue.Size() == 1,
+		"close preserves cleanup ownership and pending work while rejecting admission");
+	result |= Check(queue.Enqueue(Increment, token) ==
+		rts::render::RENDER_RESULT_INVALID_ARGUMENT,
+		"closed queue rejects new work without discarding accepted cleanup");
+	result |= Check(queue.Drain(0, &drained) == rts::render::RENDER_RESULT_OK &&
+		drained == 1 && stats.callbackCount == 4 && stats.releaseCount == 0,
+		"closed owner queue drains its previously accepted command");
 
 	// The caller may release its reference immediately after enqueue.  The
 	// queue's reference keeps the opaque context alive until execution.

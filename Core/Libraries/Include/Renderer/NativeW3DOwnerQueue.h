@@ -107,6 +107,9 @@ public:
 	RenderResult Drain(unsigned int maxCommands, unsigned int *drained);
 
 	bool IsOwnerThread() const;
+	// One authoritative owner/admission check. Pending cleanup remains drainable
+	// independently of this result, including after the owner closes admission.
+	bool IsOwnerAccepting() const;
 	bool IsBound() const;
 	bool IsAccepting() const;
 	unsigned int Capacity() const;
