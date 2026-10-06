@@ -919,6 +919,20 @@ Bool HashSkirmishAITestHandle(void *opaqueHandle,
 	HANDLE handle = static_cast<HANDLE>(opaqueHandle);
 	if (handle == INVALID_HANDLE_VALUE || handle == nullptr)
 		return FALSE;
+#if defined(_MSC_VER) && _MSC_VER <= 1200
+	typedef BOOL (WINAPI *SetFilePointerExFunction)(HANDLE, LARGE_INTEGER,
+		PLARGE_INTEGER, DWORD);
+	typedef BOOL (WINAPI *GetFileSizeExFunction)(HANDLE, PLARGE_INTEGER);
+	HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+	SetFilePointerExFunction SetFilePointerEx = kernel32 ?
+		reinterpret_cast<SetFilePointerExFunction>(
+			GetProcAddress(kernel32, "SetFilePointerEx")) : nullptr;
+	GetFileSizeExFunction GetFileSizeEx = kernel32 ?
+		reinterpret_cast<GetFileSizeExFunction>(
+			GetProcAddress(kernel32, "GetFileSizeEx")) : nullptr;
+	if (!SetFilePointerEx || !GetFileSizeEx)
+		return FALSE;
+#endif
 	LARGE_INTEGER origin = { 0 };
 	LARGE_INTEGER position = { 0 };
 	LARGE_INTEGER extent = { 0 };
