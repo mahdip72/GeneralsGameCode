@@ -1849,7 +1849,11 @@ void DX8TextureCategoryClass::Render()
 {
 	// A category/pass is an encounter-order boundary, before its material or
 	// mapper callbacks can mutate the logical state used by a saved prefix.
-	if (rts::render::FlushGameRigidDraws() != rts::render::RENDER_RESULT_OK) return;
+	if (rts::render::FlushGameRigidDraws() != rts::render::RENDER_RESULT_OK)
+	{
+		Clear_Render_List();
+		return;
+	}
 	#ifdef WWDEBUG
 	if (!WW3D::Expose_Prelit()) {
 	#endif
@@ -1928,7 +1932,11 @@ void DX8TextureCategoryClass::Render()
 			;
 		if (!rigidTask || mesh->Get_Base_Vertex_Offset() == VERTEX_BUFFER_OVERFLOW)
 		{
-			if (rts::render::FlushGameRigidDraws() != rts::render::RENDER_RESULT_OK) return;
+			if (rts::render::FlushGameRigidDraws() != rts::render::RENDER_RESULT_OK)
+			{
+				Clear_Render_List();
+				return;
+			}
 		}
 
 		if (mesh->Get_Base_Vertex_Offset() == VERTEX_BUFFER_OVERFLOW)	//check if this mesh is valid
@@ -2152,7 +2160,11 @@ void DX8TextureCategoryClass::Render()
 		prt = next_prt;
 	}
 
-	(void)rts::render::FlushGameRigidDraws();
+	if (rts::render::FlushGameRigidDraws() != rts::render::RENDER_RESULT_OK)
+	{
+		Clear_Render_List();
+		return;
+	}
 	if (!renderTasksRemaining)
 	{
 		WWASSERT(!render_task_head);
