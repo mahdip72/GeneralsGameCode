@@ -1,4 +1,34 @@
 #include "Renderer/ThreadedRenderDevice.h"
+#if defined(RTS_RENDERER_HAS_D3D11)
+#include "Renderer/NativeW3DRenderer.h"
+#include "Renderer/NativeW3DResources.h"
+#include "Renderer/NativeW3DRenderState.h"
+namespace rts { namespace render {
+// Reuse the established test-only friend, without exposing device injection in
+// the production facade. Sorted product submission calls this same method.
+class NativeW3DRecoveryTestAccess
+{
+public:
+	static RenderResult Attach(NativeW3DRenderer &renderer, IRenderDevice *device)
+	{
+		NativeW3DRenderState *state = NativeW3DRenderState::Create();
+		if (!state) return RENDER_RESULT_OUT_OF_MEMORY;
+		RenderResult result = state->BindOwner();
+		if (result == RENDER_RESULT_OK) result = state->AttachBackend(device, device->immediateContext());
+		if (result == RENDER_RESULT_OK) result = renderer.AttachBorrowedState(state);
+		state->Release();
+		return result;
+	}
+	static RenderResult SortedSubmit(NativeW3DRenderer &renderer,
+		const NativeW3DResources &resources, const LegacyLogicalState &state,
+		const NativeDrawPacket &packet, NativeW3DTextureBindingCache &textures,
+		NativeW3DSortedBatchBindingCache &bindings)
+	{
+		return renderer.SubmitInternal(resources, state, packet, true, &textures, &bindings);
+	}
+};
+} }
+#endif
 #include "Lib/JobSystem.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -40,9 +70,24 @@ enum Event
 	GAMMA_SET, GAMMA_GET, FAULT_CONFIG, RESOURCE_STATS, SHUTDOWN, DELETED
 };
 
+struct IndexedExecution
+{
+	IndexedExecution() : stride(0), vertexOffset(0), indexOffset(0), count(0), first(0),
+		format(RENDER_FORMAT_UNKNOWN), base(0) {}
+	LegacyLogicalState state;
+	LegacyVertexLayout layout;
+	GpuHandle vertex, index;
+	unsigned int stride, vertexOffset, indexOffset, count, first;
+	RenderFormat format;
+	int base;
+};
+struct TextureBindingExecution { unsigned int stage; GpuHandle texture; };
+
 struct Fixture
 {
 	Fixture() : busyDraw(false), busyEntered(false), busyRelease(false),
+		failEvent(-1), failEventOccurrence(1), failEventSeen(0),
+		returnedFailureEvent(-1), returnedFailureSeen(0), returnedFailureOccurrence(2),
 		gateEvent(-1), gateEntered(false), gateReleased(false),
 		wrongThread(false), failCreate(false), failDraw(false), failEnd(false),
 		failPresent(false), failCapture(false), failInitialize(false), failUpdate(false),
@@ -63,6 +108,16 @@ struct Fixture
 	std::thread::id owner;
 	// CPU-only benchmark context, inactive in ordinary contract tests.
 	bool busyDraw;
+	int failEvent;
+	unsigned int failEventOccurrence, failEventSeen;
+	int returnedFailureEvent;
+	unsigned int returnedFailureSeen, returnedFailureOccurrence;
+	IndexedExecution currentIndexed;
+	std::vector<IndexedExecution> indexedExecutions;
+	std::vector<LegacyLogicalState> submittedLayoutStates;
+	std::vector<LegacyVertexLayout> submittedLayouts;
+	std::vector<unsigned int> submittedLayoutMasks;
+	std::vector<TextureBindingExecution> textureBindings;
 	std::atomic<bool> busyEntered, busyRelease;
 	int gateEvent;
 	bool gateEntered, gateReleased, wrongThread;
@@ -97,11 +152,18 @@ struct Fixture
 		std::unique_lock<std::mutex> lock(mutex);
 		wrongThread = wrongThread || owner != std::this_thread::get_id();
 		events.push_back(event);
+		if (event == failEvent && ++failEventSeen == failEventOccurrence)
+			throw std::runtime_error("injected indexed-record component failure");
 		if (event == gateEvent && !gateEntered)
 		{
 			gateEntered = true; changed.notify_all();
 			CHECK(changed.wait_for(lock, std::chrono::seconds(5), [this] { return gateReleased; }));
 		}
+	}
+	RenderResult returnedFailure(int event)
+	{
+		return event == returnedFailureEvent && ++returnedFailureSeen == returnedFailureOccurrence ?
+			RENDER_RESULT_UNSUPPORTED : RENDER_RESULT_OK;
 	}
 	void waitForGate()
 	{
@@ -321,18 +383,25 @@ public:
 	{ f.event(VIEWPORT); CHECK(open); return RENDER_RESULT_OK; }
 	RenderResult setLegacyState(const LegacyLogicalState &state, LegacyVertexFormat, unsigned int) override
 	{ f.event(STATE); f.stateValue = state.constants.world.values[0]; return RENDER_RESULT_OK; }
-	RenderResult setLegacyStateForLayout(const LegacyLogicalState &state, const LegacyVertexLayout &layout, unsigned int) override
+	RenderResult setLegacyStateForLayout(const LegacyLogicalState &state, const LegacyVertexLayout &layout, unsigned int mask) override
 	{
 		f.event(LAYOUT); f.stateValue = state.constants.world.values[0];
 		f.layoutState = state; f.layoutValue = layout;
+		f.submittedLayoutStates.push_back(state); f.submittedLayouts.push_back(layout);
+		f.submittedLayoutMasks.push_back(mask);
 		f.layoutStride = layout.stride; f.layoutOffset = layout.elements[0].byteOffset; return RENDER_RESULT_OK;
 	}
-	RenderResult setVertexBuffer(GpuHandle handle, unsigned int, unsigned int) override
-	{ f.event(VERTEX); CHECK(!handle.isValid() || handles.isLive(handle)); return RENDER_RESULT_OK; }
-	RenderResult setIndexBuffer(GpuHandle handle, RenderFormat, unsigned int) override
-	{ f.event(INDEX); CHECK(!handle.isValid() || handles.isLive(handle)); return RENDER_RESULT_OK; }
-	RenderResult setTexture(unsigned int, GpuHandle handle) override
-	{ f.event(BIND_TEXTURE); CHECK(!handle.isValid() || handles.isLive(handle)); return RENDER_RESULT_OK; }
+	RenderResult setVertexBuffer(GpuHandle handle, unsigned int stride, unsigned int offset) override
+	{ f.event(VERTEX); CHECK(!handle.isValid() || handles.isLive(handle));
+		f.currentIndexed.vertex = handle; f.currentIndexed.stride = stride; f.currentIndexed.vertexOffset = offset;
+		return f.returnedFailure(VERTEX); }
+	RenderResult setIndexBuffer(GpuHandle handle, RenderFormat format, unsigned int offset) override
+	{ f.event(INDEX); CHECK(!handle.isValid() || handles.isLive(handle));
+		f.currentIndexed.index = handle; f.currentIndexed.format = format; f.currentIndexed.indexOffset = offset;
+		return RENDER_RESULT_OK; }
+	RenderResult setTexture(unsigned int stage, GpuHandle handle) override
+	{ f.event(BIND_TEXTURE); CHECK(!handle.isValid() || handles.isLive(handle));
+		f.textureBindings.push_back({stage, handle}); return RENDER_RESULT_OK; }
 	RenderResult setPrimitiveTopology(RenderPrimitiveTopology topology) override
 	{
 		f.event(TOPOLOGY);
@@ -360,8 +429,12 @@ public:
 		}
 		return f.failDraw ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
 	}
-	RenderResult drawIndexed(unsigned int, unsigned int, int) override
-	{ f.event(DRAW_INDEXED); CHECK(open); return RENDER_RESULT_OK; }
+	RenderResult drawIndexed(unsigned int count, unsigned int first, int base) override
+	{ f.event(DRAW_INDEXED); CHECK(open);
+		f.currentIndexed.state = f.layoutState; f.currentIndexed.layout = f.layoutValue;
+		f.currentIndexed.count = count; f.currentIndexed.first = first; f.currentIndexed.base = base;
+		f.indexedExecutions.push_back(f.currentIndexed);
+		return f.returnedFailure(DRAW_INDEXED); }
 	RenderResult endFrame() override
 	{
 		f.event(END); CHECK(open); open = false;
@@ -1044,6 +1117,345 @@ void ProducerTopologyCachePreservesAdmissionAndFailure()
 	}
 }
 
+ThreadedIndexedDraw IndexedRecord(IRenderDevice *device, RenderUsage usage = RENDER_USAGE_IMMUTABLE)
+{
+	ThreadedIndexedDraw draw;
+	const float vertices[12] = {};
+	const unsigned short indices[3] = {0, 1, 2};
+	BufferDescriptor vertex; vertex.byteCount = sizeof(vertices); vertex.binding = RENDER_BUFFER_VERTEX;
+	vertex.usage = usage;
+	BufferDescriptor index; index.byteCount = sizeof(indices); index.binding = RENDER_BUFFER_INDEX;
+	CHECK(device->createBuffer(vertex, vertices, sizeof(vertices), &draw.vertexBuffer) == RENDER_RESULT_OK);
+	CHECK(device->createBuffer(index, indices, sizeof(indices), &draw.indexBuffer) == RENDER_RESULT_OK);
+	draw.vertexStride = 16; draw.layout.stride = 16; draw.layout.elementCount = 2;
+	draw.layout.elements[0].byteOffset = 0; draw.layout.elements[1].byteOffset = 12;
+	draw.indexCount = 3;
+	draw.state.constants.world.values[0] = 23.0f;
+	return draw;
+}
+
+void CompactIndexedDrawSuccessAndBoundaries()
+{
+	for (unsigned int serial = 0; serial != 2; ++serial)
+	{
+		Fixture f; ThreadedRenderOptions options; options.serial = serial != 0;
+		options.maxPacketBytes = sizeof(ThreadedIndexedDraw); options.maxPacketCommands = 1;
+		auto device = Device(f, options); auto draw = IndexedRecord(device.get());
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_INVALID_ARGUMENT);
+		f.events.clear();
+		auto context = device->immediateContext();
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		// A second record must split at both bounds without splitting a draw.
+		draw.bindIndexBuffer = false;
+		CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), true) == RENDER_RESULT_OK);
+		CHECK(Complete(device.get()).presented && !f.wrongThread);
+		std::vector<int> expected = { BEGIN, LAYOUT, VERTEX };
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage) expected.push_back(BIND_TEXTURE);
+		expected.insert(expected.end(), { TOPOLOGY, INDEX, DRAW_INDEXED, LAYOUT, VERTEX, DRAW_INDEXED, END, PRESENT });
+		CHECK(f.events == expected);
+		CHECK(f.stateValue == 23.0f && f.layoutStride == 16 && f.layoutOffset == 0);
+		// Controls invalidate the producer's texture and topology knowledge.
+		f.events.clear(); draw.bindIndexBuffer = true;
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get()).presented);
+		CHECK(std::count(f.events.begin(), f.events.end(), BIND_TEXTURE) == 2 * LEGACY_TEXTURE_STAGE_COUNT);
+		CHECK(std::count(f.events.begin(), f.events.end(), TOPOLOGY) == 2);
+	}
+	// Hold the owner at begin so mutation after admission cannot race execution.
+	Fixture f; auto device = Device(f); auto draw = IndexedRecord(device.get());
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+	ReleaseGate release(f); f.gateEvent = BEGIN;
+	auto context = device->immediateContext();
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	draw.state.constants.world.values[0] = 99.0f; draw.layout.stride = 99;
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	f.waitForGate(); f.release();
+	CHECK(!Complete(device.get()).presented && f.stateValue == 23.0f && f.layoutStride == 16);
+}
+
+void CompactIndexedDrawComponentFailuresAndRecovery()
+{
+	for (unsigned int serial = 0; serial != 2; ++serial)
+	for (unsigned int failure = 0; failure < 6 + LEGACY_TEXTURE_STAGE_COUNT; ++failure)
+	{
+		Fixture f; ThreadedRenderOptions options; options.serial = serial != 0;
+		options.maxPacketCommands = 1;
+		auto device = Device(f, options); auto draw = IndexedRecord(device.get());
+		TextureDescriptor texture; texture.width = texture.height = 1;
+		texture.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+		unsigned int pixel = 0; TextureSubresourceData data;
+		data.data = &pixel; data.rowPitch = data.slicePitch = sizeof(pixel);
+		GpuHandle tex;
+		CHECK(device->createTexture(texture, &data, 1, &tex) == RENDER_RESULT_OK);
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+		{ draw.textures[stage] = tex; draw.texturePresenceMask |= 1U << stage; }
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		std::vector<int> components = { STATE, LAYOUT, VERTEX };
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage) components.push_back(BIND_TEXTURE);
+		components.insert(components.end(), { TOPOLOGY, INDEX, DRAW_INDEXED });
+		const int failed = components[failure];
+		draw.useVertexFormat = failed == STATE;
+		if (draw.useVertexFormat)
+		{
+			draw.texturePresenceMask = 0;
+			for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+				draw.textures[stage] = GpuHandle();
+		}
+		f.failEvent = failed;
+		if (failed == BIND_TEXTURE) f.failEventOccurrence = failure - 2;
+		f.events.clear(); auto context = device->immediateContext();
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), true) == (options.serial ? RENDER_RESULT_FAILED : RENDER_RESULT_OK));
+		const auto completion = Complete(device.get(), RENDER_RESULT_FAILED);
+		CHECK(completion.outcome.hasCommandFailure() && !completion.presented && !f.wrongThread);
+		CHECK(completion.resourceFailure == (failed == VERTEX || failed == INDEX || failed == BIND_TEXTURE));
+		std::vector<int> expected = { BEGIN, draw.useVertexFormat ? STATE : LAYOUT };
+		if (failed != STATE && failed != LAYOUT)
+		{
+			expected.push_back(VERTEX);
+			if (failed != VERTEX)
+			{
+				for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+				{ expected.push_back(BIND_TEXTURE); if (failed == BIND_TEXTURE && stage + 1 == f.failEventOccurrence) break; }
+				if (failed != BIND_TEXTURE)
+				{ expected.push_back(TOPOLOGY); if (failed != TOPOLOGY) { expected.push_back(INDEX); if (failed != INDEX) expected.push_back(DRAW_INDEXED); } }
+			}
+		}
+		expected.push_back(END);
+		CHECK(f.events == expected);
+		f.failEvent = -1; f.events.clear();
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), true) == RENDER_RESULT_OK);
+		CHECK(Complete(device.get()).presented);
+		CHECK(std::count(f.events.begin(), f.events.end(), DRAW_INDEXED) == 1);
+	}
+}
+
+void CompactIndexedDrawAdmissionAndResourceFailure()
+{
+	Fixture f; auto device = Device(f); auto draw = IndexedRecord(device.get(), RENDER_USAGE_DYNAMIC);
+	TextureDescriptor maskDescriptor; maskDescriptor.width = maskDescriptor.height = 1;
+	maskDescriptor.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+	unsigned int maskPixel = 0; TextureSubresourceData maskData;
+	maskData.data = &maskPixel; maskData.rowPitch = maskData.slicePitch = sizeof(maskPixel);
+	GpuHandle maskTexture;
+	CHECK(device->createTexture(maskDescriptor, &maskData, 1, &maskTexture) == RENDER_RESULT_OK);
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedDraw(0, draw) == RENDER_RESULT_UNSUPPORTED);
+	auto context = device->immediateContext();
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	RenderResult other = RENDER_RESULT_OK;
+	std::thread wrongProducer([&] { other = SubmitThreadedIndexedDraw(device.get(), draw); });
+	wrongProducer.join(); CHECK(other == RENDER_RESULT_INVALID_ARGUMENT);
+	CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	CHECK(!Complete(device.get()).presented);
+	for (unsigned int bad = 0; bad < 10; ++bad)
+	{
+		auto invalid = draw;
+		if (bad == 0) invalid.vertexBuffer = GpuHandle(draw.vertexBuffer.index(), draw.vertexBuffer.generation() + 1);
+		if (bad == 1) invalid.indexBuffer = GpuHandle();
+		if (bad == 2) invalid.indexCount = 4;
+		if (bad == 3) invalid.texturePresenceMask = 1;
+		if (bad == 4) invalid.vertexOffset = 48;
+		if (bad == 6) invalid.layout.stride = invalid.vertexStride + 4;
+		if (bad == 7) { invalid.useVertexFormat = true; invalid.vertexStride = invalid.layout.stride = 12; }
+		if (bad == 8) { invalid.useVertexFormat = true; invalid.vertexFormat = RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1; }
+		if (bad == 9) { invalid.useVertexFormat = true; invalid.texturePresenceMask = 1; invalid.textures[0] = maskTexture; }
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		if (bad == 5) CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), invalid) == RENDER_RESULT_INVALID_ARGUMENT);
+		CHECK(CancelThreadedRenderFrame(device.get(), RENDER_RESULT_INVALID_ARGUMENT) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get(), RENDER_RESULT_INVALID_ARGUMENT).presented);
+	}
+	// An accepted upload can fail after admission; the record must report the
+	// unavailable dependency and suppress every component of the draw.
+	f.failUpdate = true; f.updateFailureResult = RENDER_RESULT_FAILED;
+	const float bytes[12] = {};
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(draw.vertexBuffer, bytes, sizeof(bytes), 0) == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	CHECK(Complete(device.get(), RENDER_RESULT_FAILED).resourceFailure);
+	f.failUpdate = false;
+	CHECK(device->recoverDevice() == RENDER_RESULT_OK);
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(draw.vertexBuffer, bytes, sizeof(bytes), 0) == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), true) == RENDER_RESULT_OK);
+	CHECK(Complete(device.get()).presented);
+
+	// A compact record is indivisible. Reject it if the configured owned-byte
+	// budget cannot fit it, even though all its resources fit separate packets.
+	device.reset();
+	Fixture smallFixture; ThreadedRenderOptions options;
+	options.maxPacketBytes = sizeof(ThreadedIndexedDraw) - 1;
+	auto limited = Device(smallFixture, options); auto tooLarge = IndexedRecord(limited.get());
+	CHECK(DrainThreadedRenderDevice(limited.get()) == RENDER_RESULT_OK);
+	CHECK(limited->immediateContext()->beginFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedDraw(limited.get(), tooLarge) == RENDER_RESULT_OUT_OF_MEMORY);
+	CHECK(CancelThreadedRenderFrame(limited.get(), RENDER_RESULT_OUT_OF_MEMORY) == RENDER_RESULT_OK);
+	CHECK(!Complete(limited.get(), RENDER_RESULT_OUT_OF_MEMORY).presented);
+}
+
+#if defined(RTS_RENDERER_HAS_D3D11)
+void CheckNativeSortedMapping(const LegacyLogicalState &actual, const LegacyLogicalState &expected,
+	const LegacyVertexLayout &layout, const NativeDrawPacket &packet)
+{
+	CHECK(actual.pipeline.shaderBits == expected.pipeline.shaderBits);
+	CHECK(actual.pipeline.depthStencil.stencilReference == expected.pipeline.depthStencil.stencilReference);
+	CHECK(actual.pipeline.textureFactor == expected.pipeline.textureFactor);
+	CHECK(actual.constants.world.values[12] == expected.constants.world.values[12]);
+	CHECK(actual.constants.view.values[13] == expected.constants.view.values[13]);
+	CHECK(actual.constants.projection.values[14] == expected.constants.projection.values[14]);
+	CHECK(actual.constants.vertexShaderConstants[7].x == expected.constants.vertexShaderConstants[7].x);
+	CHECK(actual.constants.pixelShaderConstants[3].w == expected.constants.pixelShaderConstants[3].w);
+	CHECK(actual.texturePresenceMask == expected.texturePresenceMask);
+	CHECK(layout.stride == packet.vertexLayout.stride && layout.elementCount == packet.vertexLayout.elementCount);
+	CHECK(layout.preTransformed == packet.vertexLayout.preTransformed);
+	for (unsigned int element = 0; element < layout.elementCount; ++element)
+	{
+		CHECK(layout.elements[element].semantic == packet.vertexLayout.elements[element].semantic);
+		CHECK(layout.elements[element].semanticIndex == packet.vertexLayout.elements[element].semanticIndex);
+		CHECK(layout.elements[element].format == packet.vertexLayout.elements[element].format);
+		CHECK(layout.elements[element].byteOffset == packet.vertexLayout.elements[element].byteOffset);
+	}
+}
+
+void NativeSortedCompactIntegrationAndPartialFailure()
+{
+	for (unsigned int serial = 0; serial < 2; ++serial)
+	for (unsigned int resourceFailure = 0; resourceFailure < 2; ++resourceFailure)
+	{
+		Fixture f; ThreadedRenderOptions options; options.serial = serial != 0;
+		options.maxPacketCommands = 2;
+		auto device = Device(f, options);
+		NativeW3DRenderer renderer;
+		CHECK(NativeW3DRecoveryTestAccess::Attach(renderer, device.get()) == RENDER_RESULT_OK);
+		NativeW3DResources resources;
+		CHECK(resources.Bind(&renderer) == RENDER_RESULT_OK);
+		NativeDrawPacket first;
+		unsigned char vertexBytes[16 + 7 * 24] = {};
+		unsigned short indexBytes[10] = {9, 9, 2, 3, 4, 3, 4, 5, 9, 9};
+		BufferDescriptor vertex; vertex.byteCount = sizeof(vertexBytes); vertex.stride = 24;
+		vertex.binding = RENDER_BUFFER_VERTEX; vertex.usage = RENDER_USAGE_IMMUTABLE;
+		BufferDescriptor index; index.byteCount = sizeof(indexBytes); index.binding = RENDER_BUFFER_INDEX;
+		CHECK(resources.CreateBuffer(vertex, vertexBytes, sizeof(vertexBytes), &first.vertexBuffer) == RENDER_RESULT_OK);
+		CHECK(resources.CreateBuffer(index, indexBytes, sizeof(indexBytes), &first.indexBuffer) == RENDER_RESULT_OK);
+		TextureDescriptor texture; texture.width = texture.height = 1; texture.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+		unsigned int pixel = 0xffffffff; TextureSubresourceData texData;
+		texData.data = &pixel; texData.rowPitch = texData.slicePitch = sizeof(pixel);
+		CHECK(resources.CreateTexture(texture, &texData, 1, &first.textures[0]) == RENDER_RESULT_OK);
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		CHECK(f.createdHandles.size() == 3);
+		first.indexed = true; first.vertexStride = 24; first.vertexOffset = 16;
+		first.indexFormat = RENDER_FORMAT_R16_UINT; first.indexOffset = 2;
+		first.vertexFormat = RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1;
+		first.vertexLayout.stride = 24; first.vertexLayout.elementCount = 3;
+		first.vertexLayout.elements[0].semantic = RENDER_VERTEX_SEMANTIC_POSITION;
+		first.vertexLayout.elements[0].format = RENDER_VERTEX_DATA_FLOAT3;
+		first.vertexLayout.elements[0].byteOffset = 0;
+		first.vertexLayout.elements[1].semantic = RENDER_VERTEX_SEMANTIC_DIFFUSE;
+		first.vertexLayout.elements[1].format = RENDER_VERTEX_DATA_COLOR_BGRA8;
+		first.vertexLayout.elements[1].byteOffset = 12;
+		first.vertexLayout.elements[2].semantic = RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE;
+		first.vertexLayout.elements[2].semanticIndex = 2;
+		first.vertexLayout.elements[2].format = RENDER_VERTEX_DATA_FLOAT2;
+		first.vertexLayout.elements[2].byteOffset = 16;
+		first.topology = RENDER_PRIMITIVE_LINE_STRIP; first.texturePresenceMask = 1;
+		first.vertexCount = 3; first.minimumVertexIndex = 2; first.baseVertex = -1;
+		first.startVertex = 99; first.indexCount = 3; first.startIndex = 1;
+		NativeDrawPacket second = first;
+		second.minimumVertexIndex = 3; second.baseVertex = 1; second.startIndex = 4;
+		LegacyLogicalState firstState;
+		firstState.pipeline.shaderBits = 0x12345678;
+		firstState.pipeline.depthStencil.stencilReference = 17;
+		firstState.pipeline.textureFactor = 0xabcdef01;
+		firstState.constants.world.values[12] = 11;
+		firstState.constants.view.values[13] = 13;
+		firstState.constants.projection.values[14] = 19;
+		firstState.constants.vertexShaderConstants[7].x = 23;
+		firstState.constants.pixelShaderConstants[3].w = 29;
+		firstState.texturePresenceMask = 1;
+		LegacyLogicalState secondState = firstState;
+		secondState.pipeline.shaderBits = 0x87654321;
+		secondState.constants.world.values[12] = 31;
+		secondState.constants.pixelShaderConstants[3].w = 37;
+		f.events.clear(); f.returnedFailureEvent = resourceFailure ? VERTEX : DRAW_INDEXED;
+		CHECK(renderer.BeginFrame() == RENDER_RESULT_OK);
+		NativeW3DTextureBindingCache textures; NativeW3DSortedBatchBindingCache bindings;
+		CHECK(NativeW3DRecoveryTestAccess::SortedSubmit(renderer, resources, firstState, first, textures, bindings) == RENDER_RESULT_OK);
+		CHECK(bindings.IsIndexBufferKnown(first.indexBuffer, first.indexFormat, first.indexOffset));
+		CHECK(NativeW3DRecoveryTestAccess::SortedSubmit(renderer, resources, secondState, second, textures, bindings) == RENDER_RESULT_OK);
+		// A later admitted draw must be suppressed after the second returned error.
+		CHECK(NativeW3DRecoveryTestAccess::SortedSubmit(renderer, resources, firstState, first, textures, bindings) == RENDER_RESULT_OK);
+		CHECK(renderer.EndFrame(true) == (serial ? RENDER_RESULT_UNSUPPORTED : RENDER_RESULT_OK));
+		const auto completion = Complete(device.get(), RENDER_RESULT_UNSUPPORTED);
+		CHECK(completion.outcome.hasCommandFailure() && !completion.presented);
+		CHECK(completion.resourceFailure == (resourceFailure != 0) && !f.wrongThread);
+		CHECK(resources.PublishThreadedCompletion(completion.sequence, completion.resourceFailure) == RENDER_RESULT_OK);
+		std::vector<int> expected = { BEGIN, LAYOUT, VERTEX };
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage) expected.push_back(BIND_TEXTURE);
+		expected.insert(expected.end(), { TOPOLOGY, INDEX, DRAW_INDEXED, LAYOUT, VERTEX });
+		if (!resourceFailure) expected.push_back(DRAW_INDEXED);
+		expected.push_back(END);
+		CHECK(f.events == expected);
+		CHECK(f.submittedLayoutStates.size() == 2 && f.submittedLayouts.size() == 2);
+		CheckNativeSortedMapping(f.submittedLayoutStates[0], firstState, f.submittedLayouts[0], first);
+		CheckNativeSortedMapping(f.submittedLayoutStates[1], secondState, f.submittedLayouts[1], second);
+		CHECK(f.submittedLayoutMasks.size() == 2 && f.submittedLayoutMasks[0] == 1 && f.submittedLayoutMasks[1] == 1);
+		CHECK(f.indexedExecutions.size() == (resourceFailure ? 1U : 2U));
+		for (unsigned int draw = 0; draw < f.indexedExecutions.size(); ++draw)
+		{
+			const auto &execution = f.indexedExecutions[draw]; const auto &source = draw ? second : first;
+			CHECK(execution.vertex == f.createdHandles[0] && execution.index == f.createdHandles[1]);
+			CHECK(execution.stride == source.vertexStride && execution.vertexOffset == source.vertexOffset);
+			CHECK(execution.format == source.indexFormat && execution.indexOffset == source.indexOffset);
+			CHECK(execution.count == source.indexCount && execution.first == source.startIndex && execution.base == source.baseVertex);
+		}
+		CHECK(f.topologies.size() == 1 && f.topologies[0] == first.topology);
+		CHECK(f.textureBindings.size() == LEGACY_TEXTURE_STAGE_COUNT);
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+		{
+			CHECK(f.textureBindings[stage].stage == stage);
+			CHECK(f.textureBindings[stage].texture == (stage == 0 ? f.createdHandles[2] : GpuHandle()));
+		}
+		f.returnedFailureEvent = -1;
+		CHECK(device->recoverDevice() == RENDER_RESULT_OK);
+		f.events.clear(); f.indexedExecutions.clear(); f.submittedLayouts.clear(); f.submittedLayoutStates.clear();
+		textures.Reset(); bindings.Reset();
+		CHECK(renderer.BeginFrame() == RENDER_RESULT_OK);
+		CHECK(NativeW3DRecoveryTestAccess::SortedSubmit(renderer, resources, firstState, first, textures, bindings) == RENDER_RESULT_OK);
+		CHECK(NativeW3DRecoveryTestAccess::SortedSubmit(renderer, resources, secondState, second, textures, bindings) == RENDER_RESULT_OK);
+		CHECK(renderer.EndFrame(true) == RENDER_RESULT_OK);
+		const auto recovered = Complete(device.get()); CHECK(recovered.presented && !recovered.resourceFailure);
+		CHECK(resources.PublishThreadedCompletion(recovered.sequence, false) == RENDER_RESULT_OK);
+		CHECK(f.indexedExecutions.size() == 2 && std::count(f.events.begin(), f.events.end(), INDEX) == 1);
+		CHECK(resources.Shutdown() == RENDER_RESULT_OK);
+		CHECK(renderer.Shutdown() == RENDER_RESULT_OK);
+	}
+}
+#endif
+
 void SwapIntervalOwnerTransport()
 {
 	Fixture f;
@@ -1486,6 +1898,115 @@ void ProducerFailureTraceIsOptInAndRateLimited()
 	CHECK(contents.find("arg3=1") != std::string::npos);
 	CHECK(contents.find("frame=1") != std::string::npos);
 	CHECK(contents.find("frame=4") != std::string::npos);
+#endif
+}
+
+void OwnerFailureTraceCapturesActualOrigin()
+{
+#ifdef _WIN32
+	struct TraceEnvironment
+	{
+		TraceEnvironment() : previous(std::getenv("RTS_RENDER_FAILURE_TRACE") == 0 ? "" :
+			std::getenv("RTS_RENDER_FAILURE_TRACE"))
+		{
+			char directory[MAX_PATH], path[MAX_PATH];
+			const DWORD length = GetTempPathA(MAX_PATH, directory);
+			CHECK(length != 0 && length < MAX_PATH);
+			CHECK(GetTempFileNameA(directory, "rof", 0, path) != 0);
+			base = path; output = base + ".owner"; pending = output + ".pending";
+			CHECK(_putenv_s("RTS_RENDER_FAILURE_TRACE", base.c_str()) == 0);
+		}
+		~TraceEnvironment()
+		{
+			_putenv_s("RTS_RENDER_FAILURE_TRACE", previous.c_str());
+			DeleteFileA(base.c_str()); DeleteFileA(output.c_str()); DeleteFileA(pending.c_str());
+		}
+		std::string read() const
+		{
+			std::ifstream file(output, std::ios::binary);
+			return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+		}
+		std::string previous, base, output, pending;
+	};
+	for (unsigned int serial = 0; serial != 2; ++serial)
+	for (unsigned int mode = 0; mode != 11; ++mode)
+	{
+		TraceEnvironment trace;
+		if (mode == 0) CHECK(_putenv_s("RTS_RENDER_FAILURE_TRACE", "") == 0);
+		Fixture f; ThreadedRenderOptions options; options.serial = serial != 0;
+		auto device = Device(f, options);
+		const char *stage = "draw";
+		RenderResult expected = RENDER_RESULT_FAILED;
+		if (mode == 10)
+		{
+			f.failCreate = true; f.createFailureResult = RENDER_RESULT_FAILED;
+			BufferDescriptor descriptor; descriptor.byteCount = 12; descriptor.stride = 4;
+			descriptor.binding = RENDER_BUFFER_VERTEX; descriptor.usage = RENDER_USAGE_DYNAMIC;
+			GpuHandle handle;
+			CHECK(device->createBuffer(descriptor, 0, 0, &handle) == RENDER_RESULT_OK);
+			CHECK(DrainThreadedRenderDevice(device.get()) == expected);
+			stage = "create-buffer";
+		}
+		else if (mode == 8 || mode == 9)
+		{
+			f.failEnd = mode == 8; f.failPresent = mode == 9;
+			stage = mode == 8 ? "end-frame" : "present";
+			if (mode == 9) expected = RENDER_RESULT_DEVICE_REMOVED;
+			auto context = device->immediateContext();
+			CHECK(context->beginFrame() == RENDER_RESULT_OK);
+			CHECK(context->endFrame() == RENDER_RESULT_OK);
+			CHECK(SubmitThreadedRenderFrame(device.get(), true) == (options.serial ? expected : RENDER_RESULT_OK));
+			CHECK(!Complete(device.get(), expected).presented);
+		}
+		else if (mode == 0)
+		{
+			f.failDraw = true;
+			auto context = device->immediateContext();
+			CHECK(context->beginFrame() == RENDER_RESULT_OK);
+			CHECK(context->draw(3, 0) == RENDER_RESULT_OK);
+			CHECK(context->endFrame() == RENDER_RESULT_OK);
+			CHECK(SubmitThreadedRenderFrame(device.get(), true) == (options.serial ? expected : RENDER_RESULT_OK));
+			CHECK(!Complete(device.get(), expected).presented);
+		}
+		else
+		{
+			auto draw = IndexedRecord(device.get());
+			CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+			const int failures[] = { STATE, LAYOUT, VERTEX, BIND_TEXTURE, TOPOLOGY, INDEX, DRAW_INDEXED };
+			const char *stages[] = { "state", "layout", "vertex-buffer", "texture", "topology", "index-buffer", "draw-indexed" };
+			// Modes 1..7 exercise exceptions at real owner compact substeps.
+			f.failEvent = failures[mode - 1]; stage = stages[mode - 1];
+			draw.useVertexFormat = mode == 1;
+			auto context = device->immediateContext();
+			CHECK(context->beginFrame() == RENDER_RESULT_OK);
+			CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+			CHECK(SubmitThreadedIndexedDraw(device.get(), draw) == RENDER_RESULT_OK);
+			CHECK(context->endFrame() == RENDER_RESULT_OK);
+			CHECK(SubmitThreadedRenderFrame(device.get(), true) == (options.serial ? expected : RENDER_RESULT_OK));
+			CHECK(!Complete(device.get(), expected).presented);
+		}
+		const std::string contents = trace.read();
+		if (mode == 0) CHECK(contents.empty());
+		else
+		{
+			CHECK(contents.find("source=owner") != std::string::npos);
+			CHECK(contents.find(std::string("stage=") + stage + " ") != std::string::npos);
+			CHECK(contents.find("export_status=complete\n") != std::string::npos);
+			CHECK(contents.find("source=owner", contents.find("source=owner") + 1) == std::string::npos);
+			CHECK(GetFileAttributesA(trace.pending.c_str()) == INVALID_FILE_ATTRIBUTES);
+			if (mode >= 1 && mode <= 7)
+			{
+				// A later failure in a different frame must retain the first origin.
+				f.failEvent = -1; f.failEnd = true;
+				auto context = device->immediateContext();
+				CHECK(context->beginFrame() == RENDER_RESULT_OK);
+				CHECK(context->endFrame() == RENDER_RESULT_OK);
+				CHECK(SubmitThreadedRenderFrame(device.get(), true) == (options.serial ? expected : RENDER_RESULT_OK));
+				CHECK(!Complete(device.get(), expected).presented);
+				CHECK(trace.read() == contents);
+			}
+		}
+	}
 #endif
 }
 
@@ -2267,6 +2788,15 @@ int main(int argc, char **argv)
 	try
 	{
 		CHECK(rts::JobSystem::instance().registerCurrentThread(rts::JOB_OWNER_GAME));
+#ifdef _WIN32
+		if (argc == 2 && std::strcmp(argv[1], "--owner-failure-trace") == 0)
+		{
+			OwnerFailureTraceCapturesActualOrigin();
+			CHECK(rts::JobSystem::instance().unregisterCurrentThread(rts::JOB_OWNER_GAME));
+			std::puts("Owner failure-origin trace contracts passed");
+			return 0;
+		}
+#endif
 #if defined(_WIN64)
 		if (argc == 2 && std::strcmp(argv[1], "--pipeline-stall-trace") == 0)
 		{
@@ -2289,6 +2819,12 @@ int main(int argc, char **argv)
 #endif
 		ProducerTextureBindingCachePreservesOrderedInvalidation();
 		ProducerTopologyCachePreservesAdmissionAndFailure();
+		CompactIndexedDrawSuccessAndBoundaries();
+		CompactIndexedDrawComponentFailuresAndRecovery();
+		CompactIndexedDrawAdmissionAndResourceFailure();
+#if defined(RTS_RENDERER_HAS_D3D11)
+		NativeSortedCompactIntegrationAndPartialFailure();
+#endif
 		SwapIntervalOwnerTransport();
 		GammaOwnerTransport();
 		TextureFilterCapabilitiesArePublishedFromOwner();
@@ -2297,6 +2833,7 @@ int main(int argc, char **argv)
 		SynchronousProducerRejectionsDoNotPoisonNextFrame();
 		GenerationsAndResourceFailure();
 		ProducerFailureTraceIsOptInAndRateLimited();
+		OwnerFailureTraceCapturesActualOrigin();
 		FailurePublicationAndRecovery();
 		FragmentedBufferDiscardReplacesRanges();
 		BufferUpdateFailureRecoveryRestoresBinding();

@@ -222,14 +222,14 @@ inline void EvaluateSkirmishAIAlliedCoordination(
 	if (decision == 0)
 		return;
 
-	for (Int playerIndex = 0; playerIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++playerIndex)
+	for (Int decisionIndex = 0; decisionIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++decisionIndex)
 	{
-		decision->starvationStreaks[playerIndex] = 0;
-		decision->assaultLeaderIndices[playerIndex] = -1;
-		decision->assaultEnemyIndices[playerIndex] = -1;
-		decision->supportRecipientIndices[playerIndex] = -1;
-		decision->supportBudgets[playerIndex] = 0;
-		decision->assaultTargetIDs[playerIndex] = INVALID_ID;
+		decision->starvationStreaks[decisionIndex] = 0;
+		decision->assaultLeaderIndices[decisionIndex] = -1;
+		decision->assaultEnemyIndices[decisionIndex] = -1;
+		decision->supportRecipientIndices[decisionIndex] = -1;
+		decision->supportBudgets[decisionIndex] = 0;
+		decision->assaultTargetIDs[decisionIndex] = INVALID_ID;
 	}
 	decision->donorIndex = -1;
 	decision->recipientIndex = -1;
@@ -241,10 +241,10 @@ inline void EvaluateSkirmishAIAlliedCoordination(
 
 	const SkirmishAIAlliedPlayerFacts *players[16];
 	Bool duplicatePlayer[16];
-	for (Int playerIndex = 0; playerIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++playerIndex)
+	for (Int tableIndex = 0; tableIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++tableIndex)
 	{
-		players[playerIndex] = 0;
-		duplicatePlayer[playerIndex] = FALSE;
+		players[tableIndex] = 0;
+		duplicatePlayer[tableIndex] = FALSE;
 	}
 
 	// Reject every duplicate index so a reordered snapshot cannot change the policy.
@@ -263,20 +263,20 @@ inline void EvaluateSkirmishAIAlliedCoordination(
 			players[playerIndex] = &facts[factIndex];
 	}
 
-	for (Int playerIndex = 0; playerIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++playerIndex)
+	for (Int streakIndex = 0; streakIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++streakIndex)
 	{
-		if (duplicatePlayer[playerIndex])
-			players[playerIndex] = 0;
+		if (duplicatePlayer[streakIndex])
+			players[streakIndex] = 0;
 
-		const SkirmishAIAlliedPlayerFacts *fact = players[playerIndex];
+		const SkirmishAIAlliedPlayerFacts *fact = players[streakIndex];
 		if (!IsLivePlayer(fact))
 			continue;
 
 		if (IsStarving(fact))
 		{
 			const Int previous = previousStarvationStreaks
-				? ClampStarvationStreak(previousStarvationStreaks[playerIndex]) : 0;
-			decision->starvationStreaks[playerIndex] = previous < 2 ? previous + 1 : 2;
+				? ClampStarvationStreak(previousStarvationStreaks[streakIndex]) : 0;
+			decision->starvationStreaks[streakIndex] = previous < 2 ? previous + 1 : 2;
 		}
 	}
 
@@ -331,8 +331,8 @@ inline void EvaluateSkirmishAIAlliedCoordination(
 	// Each lowest unassigned eligible AI leads a cohort of direct mutual allies.
 	// Cohorts are non-overlapping and never follow transitive alliance edges.
 	Bool assigned[16];
-	for (Int playerIndex = 0; playerIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++playerIndex)
-		assigned[playerIndex] = FALSE;
+	for (Int assignedIndex = 0; assignedIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++assignedIndex)
+		assigned[assignedIndex] = FALSE;
 
 	for (Int leaderIndex = 0; leaderIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++leaderIndex)
 	{
@@ -341,19 +341,19 @@ inline void EvaluateSkirmishAIAlliedCoordination(
 
 		Bool cohort[16];
 		Int cohortCount = 1;
-		for (Int memberIndex = 0; memberIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++memberIndex)
-			cohort[memberIndex] = FALSE;
+		for (Int cohortIndex = 0; cohortIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++cohortIndex)
+			cohort[cohortIndex] = FALSE;
 		cohort[leaderIndex] = TRUE;
 		assigned[leaderIndex] = TRUE;
 
-		for (Int memberIndex = leaderIndex + 1;
-			memberIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++memberIndex)
+		for (Int candidateIndex = leaderIndex + 1;
+			candidateIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS; ++candidateIndex)
 		{
-			if (!assigned[memberIndex] && IsAssaultEligible(players, memberIndex) &&
-				AreMutuallyAllied(players, leaderIndex, memberIndex))
+			if (!assigned[candidateIndex] && IsAssaultEligible(players, candidateIndex) &&
+				AreMutuallyAllied(players, leaderIndex, candidateIndex))
 			{
-				cohort[memberIndex] = TRUE;
-				assigned[memberIndex] = TRUE;
+				cohort[candidateIndex] = TRUE;
+				assigned[candidateIndex] = TRUE;
 				++cohortCount;
 			}
 		}
@@ -363,13 +363,13 @@ inline void EvaluateSkirmishAIAlliedCoordination(
 		Int bestEnemyIndex = -1;
 		Int bestTargetScore = 0;
 		ObjectID bestTargetID = INVALID_ID;
-		for (Int memberIndex = 0; memberIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS;
-			++memberIndex)
+		for (Int targetIndex = 0; targetIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS;
+			++targetIndex)
 		{
-			if (!cohort[memberIndex])
+			if (!cohort[targetIndex])
 				continue;
 
-			const SkirmishAIAlliedPlayerFacts *member = players[memberIndex];
+			const SkirmishAIAlliedPlayerFacts *member = players[targetIndex];
 			const Int enemyIndex = member->targetEnemyIndex;
 			const ObjectID targetID = member->targetObjectID;
 			if (targetID == INVALID_ID ||
@@ -390,28 +390,28 @@ inline void EvaluateSkirmishAIAlliedCoordination(
 			continue;
 
 		Int participantCount = 0;
-		for (Int memberIndex = 0; memberIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS;
-			++memberIndex)
+		for (Int participantIndex = 0; participantIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS;
+			++participantIndex)
 		{
-			if (cohort[memberIndex] &&
-				AreMutuallyAllied(players, leaderIndex, memberIndex) &&
-				IsHostileTo(players, memberIndex, bestEnemyIndex))
+			if (cohort[participantIndex] &&
+				AreMutuallyAllied(players, leaderIndex, participantIndex) &&
+				IsHostileTo(players, participantIndex, bestEnemyIndex))
 				++participantCount;
 		}
 		if (participantCount < 2)
 			continue;
 
-		for (Int memberIndex = 0; memberIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS;
-			++memberIndex)
+		for (Int assaultIndex = 0; assaultIndex < SKIRMISH_AI_ALLIED_MAX_PLAYERS;
+			++assaultIndex)
 		{
-			if (!cohort[memberIndex] ||
-				!AreMutuallyAllied(players, leaderIndex, memberIndex) ||
-				!IsHostileTo(players, memberIndex, bestEnemyIndex))
+			if (!cohort[assaultIndex] ||
+				!AreMutuallyAllied(players, leaderIndex, assaultIndex) ||
+				!IsHostileTo(players, assaultIndex, bestEnemyIndex))
 				continue;
 
-			decision->assaultLeaderIndices[memberIndex] = leaderIndex;
-			decision->assaultEnemyIndices[memberIndex] = bestEnemyIndex;
-			decision->assaultTargetIDs[memberIndex] = bestTargetID;
+			decision->assaultLeaderIndices[assaultIndex] = leaderIndex;
+			decision->assaultEnemyIndices[assaultIndex] = bestEnemyIndex;
+			decision->assaultTargetIDs[assaultIndex] = bestTargetID;
 		}
 	}
 

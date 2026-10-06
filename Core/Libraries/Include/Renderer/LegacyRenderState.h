@@ -472,6 +472,9 @@ void TrackLegacyPipelineState(const LegacyPipelineState &state);
 // Query validity without copying or seeding the tracked pipeline.
 bool HasTrackedLegacyPipelineState();
 bool GetTrackedLegacyPipelineState(LegacyPipelineState *state);
+// Read only the tracked rasterizer depth bias without copying pipeline state.
+// A false result leaves the caller's output unchanged.
+bool GetTrackedLegacyDepthBias(int *depthBias);
 bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values);
 bool GetTrackedLegacyTransform(LegacyTransformSlot slot,
 	RenderMatrix4 *transform);

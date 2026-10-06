@@ -59,6 +59,29 @@ IRenderDevice *CreateThreadedD3D11RenderDevice(
 	const ThreadedRenderOptions &options = ThreadedRenderOptions());
 bool IsThreadedRenderDevice(const IRenderDevice *device);
 
+// Native-only value record. The wrapper owns a copy before returning. Exact
+// indexed vertex ranges remain the NativeW3DResources caller's responsibility.
+struct ThreadedIndexedDraw
+{
+	ThreadedIndexedDraw();
+	explicit ThreadedIndexedDraw(const LegacyLogicalState &initialState);
+	LegacyLogicalState state;
+	LegacyVertexLayout layout;
+	LegacyVertexFormat vertexFormat;
+	bool useVertexFormat; // Only the untextured 16-byte position/color declaration.
+	unsigned int texturePresenceMask;
+	GpuHandle vertexBuffer, indexBuffer;
+	unsigned int vertexStride, vertexOffset, indexOffset;
+	RenderFormat indexFormat;
+	GpuHandle textures[LEGACY_TEXTURE_STAGE_COUNT];
+	RenderPrimitiveTopology topology;
+	bool bindIndexBuffer; // False only for an acknowledged local sorted batch.
+	unsigned int indexCount, startIndex;
+	int baseVertex;
+};
+RenderResult SubmitThreadedIndexedDraw(IRenderDevice *device,
+	const ThreadedIndexedDraw &draw);
+
 // endFrame records teardown; present seals a visible packet. Non-visible
 // render-to-texture frames MUST be sealed explicitly with presentFrame=false.
 // A successful enqueue is NOT execution success. Poll every accepted frame's

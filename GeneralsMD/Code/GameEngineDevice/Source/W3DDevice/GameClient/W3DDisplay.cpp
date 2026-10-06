@@ -118,6 +118,7 @@ static void drawFramerateBar();
 #include "WW3D2/rddesc.h"
 #include "WWLib/TARGA.h"
 #include "Renderer/RenderGameClient.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
 #include "Renderer/RenderSubmissionPolicy.h"
 
 #include "GameLogic/ScriptEngine.h"		// For TheScriptEngine - jkmcd
@@ -2274,6 +2275,35 @@ AGAIN:
 					m_profilerFrameCapture->Capture(getWidth(), getHeight());
 				}
 #endif
+				// Diagnostic samples use the ordinary GAME-thread PNG request path.
+				// Uninstrumented frames do no extra clocks, environment reads, or IO.
+				if (rts::rendered_battle::ProcessTestOptions().visualSamples &&
+					TheGameClient && TheGameClient->getFrame() != 0 &&
+					rts::render::IsNativeGameRendererActive())
+				{
+					RECT client;
+					rts::rendered_battle::VisualSampleState &samples =
+						rts::rendered_battle::ProcessVisualSampleState();
+					if (!samples.complete && !samples.captureDisabled && !samples.pendingSample && ApplicationHWnd &&
+						GetClientRect(ApplicationHWnd, &client) && client.right - client.left == 1920 && client.bottom - client.top == 1080)
+					{
+						const bool wasReady = samples.ready;
+						const bool due = rts::rendered_battle::VisualSampleDue(samples, GetTickCount(),
+							rts::rendered_battle::ProcessTestOptions().benchmarkRequested);
+						if (!wasReady && samples.ready && !rts::rendered_battle::WriteVisualSampleReady(samples.readyTick, TheGameClient->getFrame()))
+						{
+							if (due) rts::rendered_battle::VisualSampleTerminal(samples, samples.currentSample, false,
+								rts::rendered_battle::ProcessTestOptions().benchmarkRequested ? 20 : 40);
+							else ++samples.failed;
+							samples.captureDisabled = true;
+						}
+						if (due && !samples.captureDisabled)
+						{
+							takeScreenShot(SCREENSHOT_PNG, DEFAULT_JPEG_QUALITY);
+							samples.currentSample = 0;
+						}
+					}
+				}
 				// render is all done!
 				const bool captureArmed = rendererCaptureFrameGate.arm(
 					rts::render::IsNativeGameRendererActive());

@@ -29,6 +29,14 @@ public:
 	{
 		return state->Device() == 0 && state->Context() == 0;
 	}
+	static bool IsOperational(const NativeW3DRenderState *state)
+	{
+		return state->IsOperational();
+	}
+	static RenderResult DetachSentinelBackend(NativeW3DRenderState *state)
+	{
+		return state->DetachBackend();
+	}
 };
 }
 }
@@ -89,14 +97,21 @@ struct WrongOwnerRequest
 {
 	rts::render::NativeW3DRenderState *state;
 	rts::render::RenderResult drainResult;
+	rts::render::NativeW3DOwnerToken *producerToken;
+	rts::render::RenderResult enqueueResult;
 	unsigned int drained;
+	bool operational;
 };
 
 DWORD WINAPI DrainFromWrongOwner(void *parameter)
 {
 	WrongOwnerRequest *request = static_cast<WrongOwnerRequest *>(parameter);
 	request->drained = 0;
+	request->operational =
+		rts::render::NativeW3DRecoveryTestAccess::IsOperational(request->state);
 	request->drainResult = request->state->DrainCleanup(0, &request->drained);
+	request->enqueueResult = request->state->EnqueueCleanup(RunCommand,
+		request->producerToken);
 	return 0;
 }
 }
@@ -114,6 +129,10 @@ int main()
 	result |= Check(state->BindOwner() == rts::render::RENDER_RESULT_OK &&
 		state->IsOwnerThread() && state->IsAcceptingCleanup(),
 		"render state binds one cleanup owner before accepting producer work");
+	result |= Check(rts::render::NativeW3DRecoveryTestAccess::AttachSentinelBackend(state) ==
+		rts::render::RENDER_RESULT_OK &&
+		rts::render::NativeW3DRecoveryTestAccess::IsOperational(state),
+		"attached state admits its owner without dereferencing the opaque backend");
 
 	ReleaseStats stats;
 	rts::render::NativeW3DOwnerToken *token =
@@ -127,10 +146,17 @@ int main()
 		token->Release();
 	}
 
+	ReleaseStats producerStats;
+	rts::render::NativeW3DOwnerToken *producerToken =
+		rts::render::NativeW3DOwnerToken::Create(&producerStats, ReleaseCommand);
+	result |= Check(producerToken != 0, "foreign CPU producer receives a retained cleanup token");
 	WrongOwnerRequest wrongOwner;
 	wrongOwner.state = state;
 	wrongOwner.drainResult = rts::render::RENDER_RESULT_OK;
 	wrongOwner.drained = 0;
+	wrongOwner.operational = true;
+	wrongOwner.producerToken = producerToken;
+	wrongOwner.enqueueResult = rts::render::RENDER_RESULT_FAILED;
 	HANDLE thread = CreateThread(0, 0, DrainFromWrongOwner, &wrongOwner, 0, 0);
 	result |= Check(thread != 0, "wrong-owner cleanup request starts");
 	if (thread != 0)
@@ -138,17 +164,35 @@ int main()
 		WaitForSingleObject(thread, INFINITE);
 		CloseHandle(thread);
 		result |= Check(wrongOwner.drainResult == rts::render::RENDER_RESULT_INVALID_ARGUMENT &&
-			wrongOwner.drained == 0,
+			wrongOwner.drained == 0 && !wrongOwner.operational,
 			"only the state owner may drain backend cleanup");
+		result |= Check(wrongOwner.enqueueResult == rts::render::RENDER_RESULT_OK &&
+			state->IsAcceptingCleanup() &&
+			rts::render::NativeW3DRecoveryTestAccess::IsOperational(state) &&
+			state->PendingCleanup() == 2 && producerStats.commandCount == 0 &&
+			producerStats.releaseCount == 0,
+			"joined foreign producer leaves retained cleanup pending while owner admission stays open");
+	}
+	if (producerToken != 0)
+	{
+		producerToken->Release();
+		result |= Check(producerStats.releaseCount == 0,
+			"accepted foreign cleanup retains its token after the producer reference is released");
 	}
 
 	unsigned int drained = 0;
 	result |= Check(state->BeginShutdown() == rts::render::RENDER_RESULT_OK &&
-		!state->IsAcceptingCleanup(),
+		!state->IsAcceptingCleanup() &&
+		!rts::render::NativeW3DRecoveryTestAccess::IsOperational(state) &&
+		!rts::render::NativeW3DRecoveryTestAccess::IsBackendDetached(state),
 		"shutdown closes cleanup admission before backend destruction");
 	result |= Check(state->DrainCleanup(0, &drained) == rts::render::RENDER_RESULT_OK &&
-		drained == 1 && stats.commandCount == 1 && stats.releaseCount == 1,
+		drained == 2 && stats.commandCount == 1 && stats.releaseCount == 1 &&
+		producerStats.commandCount == 1 && producerStats.releaseCount == 1,
 		"owner drains accepted cleanup after shutdown admission closes");
+	result |= Check(state->DrainCleanup(0, &drained) == rts::render::RENDER_RESULT_OK &&
+		drained == 0 && producerStats.commandCount == 1 && producerStats.releaseCount == 1,
+		"foreign cleanup executes and releases exactly once on the owner");
 	rts::render::NativeW3DOwnerToken *lateToken =
 		rts::render::NativeW3DOwnerToken::Create(&stats, ReleaseCommand);
 	result |= Check(lateToken != 0, "late cleanup payload can be allocated");
@@ -159,6 +203,11 @@ int main()
 			"a closed state rejects late cleanup without touching backend lifetime");
 		lateToken->Release();
 	}
+	result |= Check(rts::render::NativeW3DRecoveryTestAccess::DetachSentinelBackend(state) ==
+		rts::render::RENDER_RESULT_OK &&
+		rts::render::NativeW3DRecoveryTestAccess::IsBackendDetached(state) &&
+		!rts::render::NativeW3DRecoveryTestAccess::IsOperational(state),
+		"closed state detaches its backend after accepted cleanup has drained");
 	state->Release();
 
 	rts::render::NativeW3DRenderState *recoveryState =

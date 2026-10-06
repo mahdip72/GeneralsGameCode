@@ -56,6 +56,7 @@
 #include "Lib/SimulationExecutionPolicy.h"
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 #include "Lib/ValidationProfileRoot.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
 #if defined(_WIN64)
 #include "Common/FileSystem.h"
 #include "Common/Stage5MapResolution.h"
@@ -673,7 +674,7 @@ Bool s_finalDigestAvailable = FALSE;
 UnsignedInt s_runnerNonceCounter = 0;
 
 void CaptureSkirmishAITestSliceMetrics();
-Bool IsHexDigit(char value);
+Bool IsSkirmishAITestHexDigit(char value);
 
 SkirmishAIRecoveryFixtureState s_recovery;
 
@@ -873,7 +874,7 @@ Bool IsHexString(const char *value, size_t length)
 		return FALSE;
 	for (size_t index = 0; index < length; ++index)
 	{
-		if (!IsHexDigit(value[index]))
+		if (!IsSkirmishAITestHexDigit(value[index]))
 			return FALSE;
 	}
 	return TRUE;
@@ -918,9 +919,23 @@ Bool HashSkirmishAITestHandle(void *opaqueHandle,
 	HANDLE handle = static_cast<HANDLE>(opaqueHandle);
 	if (handle == INVALID_HANDLE_VALUE || handle == nullptr)
 		return FALSE;
-	LARGE_INTEGER origin = {};
-	LARGE_INTEGER position = {};
-	LARGE_INTEGER extent = {};
+#if defined(_MSC_VER) && _MSC_VER <= 1200
+	typedef BOOL (WINAPI *SetFilePointerExFunction)(HANDLE, LARGE_INTEGER,
+		PLARGE_INTEGER, DWORD);
+	typedef BOOL (WINAPI *GetFileSizeExFunction)(HANDLE, PLARGE_INTEGER);
+	HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+	SetFilePointerExFunction SetFilePointerEx = kernel32 ?
+		reinterpret_cast<SetFilePointerExFunction>(
+			GetProcAddress(kernel32, "SetFilePointerEx")) : nullptr;
+	GetFileSizeExFunction GetFileSizeEx = kernel32 ?
+		reinterpret_cast<GetFileSizeExFunction>(
+			GetProcAddress(kernel32, "GetFileSizeEx")) : nullptr;
+	if (!SetFilePointerEx || !GetFileSizeEx)
+		return FALSE;
+#endif
+	LARGE_INTEGER origin = { 0 };
+	LARGE_INTEGER position = { 0 };
+	LARGE_INTEGER extent = { 0 };
 	if (!SetFilePointerEx(handle, origin, &position, FILE_CURRENT) ||
 		!GetFileSizeEx(handle, &extent) || extent.QuadPart < 0 ||
 		extent.QuadPart > static_cast<LONGLONG>(SKIRMISH_AI_TEST_MAX_REPLAY_BYTES) ||
@@ -929,7 +944,7 @@ Bool HashSkirmishAITestHandle(void *opaqueHandle,
 	SkirmishAITestSha256 sha256;
 	unsigned char bytes[32768];
 	Bool success = TRUE;
-	unsigned long long remaining = static_cast<unsigned long long>(extent.QuadPart);
+	ULONGLONG remaining = static_cast<ULONGLONG>(extent.QuadPart);
 	while (remaining != 0)
 	{
 		const DWORD requested = static_cast<DWORD>(remaining < sizeof(bytes) ?
@@ -949,7 +964,7 @@ Bool HashSkirmishAITestHandle(void *opaqueHandle,
 	// the digest; the replay owner performs this again at checked closure.
 	unsigned char extra = 0;
 	DWORD extraCount = 0;
-	LARGE_INTEGER closedExtent = {};
+	LARGE_INTEGER closedExtent = { 0 };
 	if (success && (!ReadFile(handle, &extra, 1, &extraCount, nullptr) ||
 		extraCount != 0 || !GetFileSizeEx(handle, &closedExtent) ||
 		closedExtent.QuadPart != extent.QuadPart))
@@ -1288,7 +1303,7 @@ Bool CaptureSkirmishAITestExecutableHash(
 #endif
 }
 
-Bool IsHexDigit(char value)
+Bool IsSkirmishAITestHexDigit(char value)
 {
 	return (value >= '0' && value <= '9') ||
 		(value >= 'a' && value <= 'f') ||
@@ -3936,16 +3951,16 @@ Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv
 	if (requests == 0) return TRUE;
 	const char *error = !supported ? "unsupported_title" :
 		(requests != 1 ? "duplicate_option" : nullptr);
-	for (Int i = 1; !error && i < argc; ++i)
+	for (Int argumentIndex = 1; !error && argumentIndex < argc; ++argumentIndex)
 	{
-		if (!argv[i]) { error = "invalid_arguments"; break; }
-		if (stricmp(argv[i], "-runRenderedBattleDiagnostic") == 0 ||
-			stricmp(argv[i], "-runRenderedBattleBenchmark") == 0)
+		if (!argv[argumentIndex]) { error = "invalid_arguments"; break; }
+		if (stricmp(argv[argumentIndex], "-runRenderedBattleDiagnostic") == 0 ||
+			stricmp(argv[argumentIndex], "-runRenderedBattleBenchmark") == 0)
 		{
 			Int seed = 0;
-			if (i + 1 >= argc || !TryParseSkirmishAITestSeed(argv[i + 1], &seed))
+			if (argumentIndex + 1 >= argc || !TryParseSkirmishAITestSeed(argv[argumentIndex + 1], &seed))
 				error = "invalid_seed";
-			else ++i;
+			else ++argumentIndex;
 			continue;
 		}
 		const char *conflicts[] = {
@@ -3958,7 +3973,7 @@ Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv
 			"-benchmark", "-map", "-mod", "-noshaders", "-particleEdit"
 		};
 		for (UnsignedInt j = 0; j < ARRAY_SIZE(conflicts); ++j)
-			if (stricmp(argv[i], conflicts[j]) == 0)
+			if (stricmp(argv[argumentIndex], conflicts[j]) == 0)
 				error = "conflicting_option";
 	}
 	if (reason) *reason = error;
@@ -4290,6 +4305,8 @@ Int RenderedBattleMaxFrames()
 }
 UnsignedInt RenderedBattleMaxMilliseconds()
 {
+	if (IsRenderedBattleBenchmark() && rts::rendered_battle::ProcessTestOptions().visualCaptureOnly)
+		return 120000;
 	return IsRenderedBattleBenchmark() ? RENDERED_BATTLE_BENCHMARK_MAX_MILLISECONDS :
 		RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS;
 }
@@ -4362,9 +4379,15 @@ Bool PrepareRenderedBattleDiagnosticReportPath()
 {
 	if (s_renderedBattle.reportFile != INVALID_HANDLE_VALUE) return FALSE;
 	char isolated[MAX_PATH], resolved[MAX_PATH];
-	if (!TheGlobalData ||
-		rts::validation::ReadProcessLocalProfileRoot(isolated, sizeof(isolated)) !=
-			rts::validation::PROCESS_LOCAL_PROFILE_ROOT_VALID) return FALSE;
+	if (!TheGlobalData) return FALSE;
+	const rts::rendered_battle::TestOptions &testOptions = rts::rendered_battle::ProcessTestOptions();
+	if (testOptions.backgroundStartup || testOptions.visualCaptureOnly || testOptions.visualSamples)
+	{
+		strcpy(isolated, testOptions.profileRoot);
+		if (!rts::rendered_battle::IsNonReparseDirectoryTree(isolated)) return FALSE;
+	}
+	else if (rts::validation::ReadProcessLocalProfileRoot(isolated, sizeof(isolated)) !=
+		rts::validation::PROCESS_LOCAL_PROFILE_ROOT_VALID) return FALSE;
 	const char *actual = TheGlobalData->getPath_UserData().str();
 	const DWORD length = GetFullPathNameA(actual, sizeof(resolved), resolved, nullptr);
 	if (!length || length >= sizeof(resolved)) return FALSE;
@@ -4372,7 +4395,8 @@ Bool PrepareRenderedBattleDiagnosticReportPath()
 	DWORD actualLength = length;
 	while (actualLength > 3 && resolved[actualLength - 1] == '\\') resolved[--actualLength] = '\0';
 	DWORD isolatedLength = strlen(isolated);
-	for (DWORD i = 0; i < isolatedLength; ++i) if (isolated[i] == '/') isolated[i] = '\\';
+	for (DWORD isolatedIndex = 0; isolatedIndex < isolatedLength; ++isolatedIndex)
+		if (isolated[isolatedIndex] == '/') isolated[isolatedIndex] = '\\';
 	while (isolatedLength > 3 && isolated[isolatedLength - 1] == '\\') isolated[--isolatedLength] = '\0';
 	if (_stricmp(resolved, isolated) != 0) return FALSE;
 	const Int written = _snprintf(s_renderedBattle.reportPath, sizeof(s_renderedBattle.reportPath),
@@ -4594,6 +4618,12 @@ Bool PreflightRenderedBattleUnitPosition(const Coord3D &p, Real radius,
 Bool StageRenderedBattleDiagnostic()
 {
 	const Bool benchmark = IsRenderedBattleBenchmark();
+	if (benchmark && rts::rendered_battle::ProcessTestOptions().backgroundStartup)
+		RecordRenderedBattleDiagnostic("%s\n", rts::rendered_battle::BackgroundStartupMarker());
+	if (benchmark && rts::rendered_battle::ProcessTestOptions().visualCaptureOnly)
+		RecordRenderedBattleDiagnostic("%s\n", rts::rendered_battle::VisualCaptureOnlyMarker());
+	if (benchmark && rts::rendered_battle::ProcessTestOptions().visualSamples)
+		RecordRenderedBattleDiagnostic("%s\n", rts::rendered_battle::VisualSamplesMarker());
 	const Int unitsPerPlayer = RenderedBattleUnitsPerPlayer();
 	if (benchmark && (!TheFramePacer || !TheGlobalData->m_windowed ||
 		TheGlobalData->m_xResolution != 1920 || TheGlobalData->m_yResolution != 1080))
@@ -4948,18 +4978,18 @@ Bool StageRenderedBattleDiagnostic()
 		}
 	}
 	catch (...) { return FALSE; }
-	for (Int slot = 0; slot < 8; ++slot)
+	for (Int reportSlot = 0; reportSlot < 8; ++reportSlot)
 	{
 		char roster[1536];
 		Int bytes = benchmark ? _snprintf(roster, sizeof(roster),
 			"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d "
 			"templates=%s:8,%s:8,%s:24,%s:24 ids=",
-			slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1, unitsPerPlayer,
-			templates[slot][0]->getName().str(), templates[slot][1]->getName().str(),
-			templates[slot][2]->getName().str(), templates[slot][3]->getName().str()) :
+		reportSlot, GetRenderedBattleDiagnosticFactionName(reportSlot), reportSlot < 4 ? 0 : 1, unitsPerPlayer,
+		templates[reportSlot][0]->getName().str(), templates[reportSlot][1]->getName().str(),
+		templates[reportSlot][2]->getName().str(), templates[reportSlot][3]->getName().str()) :
 			_snprintf(roster, sizeof(roster),
 			"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d ids=",
-			slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1,
+			reportSlot, GetRenderedBattleDiagnosticFactionName(reportSlot), reportSlot < 4 ? 0 : 1,
 			unitsPerPlayer);
 		for (Int unit = 0; unit < unitsPerPlayer; ++unit)
 		{
@@ -4968,7 +4998,7 @@ Bool StageRenderedBattleDiagnostic()
 				s_renderedBattle.reportFailed = TRUE; return FALSE;
 			}
 			const Int appended = _snprintf(roster + bytes, sizeof(roster) - bytes, "%s%u", unit ? "," : "",
-				static_cast<UnsignedInt>(s_renderedBattle.ids[slot * unitsPerPlayer + unit]));
+				static_cast<UnsignedInt>(s_renderedBattle.ids[reportSlot * unitsPerPlayer + unit]));
 			if (appended < 0 || appended >= static_cast<Int>(sizeof(roster)) - bytes)
 			{
 				s_renderedBattle.reportFailed = TRUE; return FALSE;
@@ -5013,6 +5043,8 @@ Bool StageRenderedBattleDiagnostic()
 	}
 	s_renderedBattle.nextSummaryFrame = s_renderedBattle.startFrame;
 	s_renderedBattle.staged = TRUE;
+	if (benchmark && rts::rendered_battle::ProcessTestOptions().visualSamples)
+		rts::rendered_battle::ProcessVisualSampleState().battleStaged = true;
 	s_runner.lastObservedFrame = s_renderedBattle.startFrame;
 	s_runner.stalledStartMilliseconds = s_renderedBattle.startTick;
 	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_STAGED seed=%d frame=%u tick=%u created=%d "
@@ -5054,7 +5086,30 @@ void UpdateRenderedBattleDiagnostic()
 		TheFramePacer->isTimeFrozen() || TheFramePacer->isGameHalted() ||
 		TheTacticalView->getTimeMultiplier() != 1 || TheGameLogic->isGamePaused()))
 	{
-		FailSkirmishAITest("benchmark_logic_pacing_changed"); RequestSkirmishAITestStop(); return;
+		FailSkirmishAITest("benchmark_logic_pacing_changed");
+		LARGE_INTEGER pacingFailureQpc;
+		pacingFailureQpc.QuadPart = 0;
+		const Bool pacingFailureQpcValid = QueryPerformanceCounter(&pacingFailureQpc) != FALSE;
+		const UnsignedInt pacingFailureTick = GetTickCount();
+		const UnsignedInt pacingFailureFrame = TheGameLogic->getFrame();
+		const Bool logicScaleEnabled = TheFramePacer->isLogicTimeScaleEnabled();
+		const Int logicScaleFps = TheFramePacer->getLogicTimeScaleFps();
+		const Bool timeFrozen = TheFramePacer->isTimeFrozen();
+		const Bool gameHalted = TheFramePacer->isGameHalted();
+		const Int tacticalTimeMultiplier = TheTacticalView->getTimeMultiplier();
+		const Bool gamePaused = TheGameLogic->isGamePaused();
+		RecordRenderedBattleDiagnostic(
+			"RENDERED_BATTLE_PACING_FAILURE_SNAPSHOT qpc_valid=%d qpc=%I64d qpc_frequency=%I64d "
+			"tick=%u frame=%u start_frame=%u start_tick=%u last_observed_frame=%u stalled_start_tick=%u "
+			"logic_scale_enabled=%d logic_scale_fps=%d time_frozen=%d game_halted=%d "
+			"tactical_time_multiplier=%d game_paused=%d\n",
+			pacingFailureQpcValid ? 1 : 0, pacingFailureQpc.QuadPart,
+			s_renderedBattle.qpcFrequency.QuadPart, pacingFailureTick, pacingFailureFrame,
+			s_renderedBattle.startFrame, s_renderedBattle.startTick, s_runner.lastObservedFrame,
+			s_runner.stalledStartMilliseconds, logicScaleEnabled ? 1 : 0, logicScaleFps,
+			timeFrozen ? 1 : 0, gameHalted ? 1 : 0, tacticalTimeMultiplier, gamePaused ? 1 : 0);
+		RequestSkirmishAITestStop();
+		return;
 	}
 	const UnsignedInt frame = TheGameLogic->getFrame(), tick = GetTickCount();
 	const UnsignedInt elapsed = ElapsedMilliseconds(s_renderedBattle.startTick, tick);
@@ -5160,7 +5215,7 @@ Bool SetSkirmishAITestExecutableHashInput(const char *sha256)
 		return FALSE;
 	for (Int index = 0; index < 64; ++index)
 	{
-		if (!IsHexDigit(sha256[index]))
+		if (!IsSkirmishAITestHexDigit(sha256[index]))
 			return FALSE;
 	}
 	strlcpy(s_executableHashInput, sha256, ARRAY_SIZE(s_executableHashInput));
@@ -10994,6 +11049,9 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 	// BEGIN RENDERED_BATTLE_DIAGNOSTIC_FINALIZER
 	if (IsRenderedBattleDiagnostic(s_runner.scenario))
 	{
+		if (rts::rendered_battle::ProcessTestOptions().visualSamples &&
+			!rts::rendered_battle::VisualSamplesComplete(rts::rendered_battle::ProcessVisualSampleState(), 20))
+			FailSkirmishAITest("visual_samples_incomplete");
 		if (s_renderedBattle.reportFailed)
 			FailSkirmishAITest("diagnostic_report_overflow");
 		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_%s seed=%d reason=%s created=%d end_frame=%u "

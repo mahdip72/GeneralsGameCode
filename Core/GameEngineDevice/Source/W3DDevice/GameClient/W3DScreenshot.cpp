@@ -20,6 +20,8 @@
 #include <Utility/interlocked_adapter.h>
 #include "W3DDevice/GameClient/W3DScreenshotCodec.h"
 #include "Common/GlobalData.h"
+#include "GameClient/GameClient.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
 #include "GameClient/GameText.h"
 #include "GameClient/InGameUI.h"
 #include "Lib/JobSystem.h"
@@ -54,8 +56,54 @@ struct ScreenshotWrittenMessage
 {
 	ScreenshotWrittenMessage* next;
 	char leafname[_MAX_FNAME];
+	unsigned diagnosticSample, diagnosticWidth, diagnosticHeight, diagnosticFrame;
+	bool diagnosticSuccess;
+	const char *diagnosticReason;
+	char diagnosticPath[_MAX_PATH];
 };
 static MPSCIntrusiveQueue<ScreenshotWrittenMessage> s_screenshotWrittenQueue;
+
+static bool recordVisualScreenshotEvent(const char *event, unsigned sample,
+	unsigned width, unsigned height, const char *path, int queueResult, const char *reason = "none", unsigned frame = 0)
+{
+	SYSTEMTIME utc;
+	LARGE_INTEGER qpc, frequency;
+	GetSystemTime(&utc);
+	qpc.QuadPart = 0; frequency.QuadPart = 0;
+	const bool clockValid = QueryPerformanceCounter(&qpc) != FALSE && QueryPerformanceFrequency(&frequency) != FALSE;
+	char record[1024];
+	_snprintf(record, sizeof(record),
+		"RENDER_VISUAL_SAMPLE_%s sample=%u utc=%04u-%02u-%02uT%02u:%02u:%02u.%03uZ "
+		"qpc=%I64d qpc_frequency=%I64d frame=%u width=%u height=%u queue_result=%d clock_valid=%d reason=%s path=\"%s\"\n",
+		event, sample, utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond,
+		utc.wMilliseconds, qpc.QuadPart, frequency.QuadPart,
+		frame, width, height, queueResult, clockValid ? 1 : 0, reason, path);
+	record[sizeof(record) - 1] = '\0';
+	return rts::rendered_battle::WriteVisualSampleRecord(record) && clockValid;
+}
+
+// Owner/worker callbacks transfer existing metadata to the GAME-thread queue;
+// they never mutate process sample counters or read game/profile globals.
+static void publishDiagnosticFailure(ScreenshotWrittenMessage *&completion, const char *reason)
+{
+	if (completion && completion->diagnosticSample)
+	{
+		completion->diagnosticSuccess = false;
+		completion->diagnosticReason = reason;
+		s_screenshotWrittenQueue.Push(completion);
+		completion = 0;
+	}
+}
+
+static void failVisualScreenshotSynchronously(const char *reason)
+{
+	if (!rts::rendered_battle::ProcessTestOptions().visualSamples) return;
+	rts::rendered_battle::VisualSampleState &state = rts::rendered_battle::ProcessVisualSampleState();
+	recordVisualScreenshotEvent("FAILED", state.currentSample, 0, 0, "none", -1, reason,
+		TheGameClient ? TheGameClient->getFrame() : 0);
+	rts::rendered_battle::VisualSampleTerminal(state, state.currentSample, false,
+		rts::rendered_battle::ProcessTestOptions().benchmarkRequested ? 20 : 40);
+}
 
 static void deleteScreenshotWrittenMessages(ScreenshotWrittenMessage* message)
 {
@@ -80,6 +128,36 @@ static unsigned char* allocateScreenshotBuffer(size_t size)
 	{
 		return 0;
 	}
+}
+
+struct DiagnosticPngOutput
+{
+	HANDLE file;
+	bool failed;
+	DiagnosticPngOutput() : file(INVALID_HANDLE_VALUE), failed(false) {}
+	~DiagnosticPngOutput() { if (file != INVALID_HANDLE_VALUE) CloseHandle(file); }
+};
+static void writeDiagnosticPngBytes(void *context, void *bytes, int size)
+{
+	DiagnosticPngOutput *output = static_cast<DiagnosticPngOutput *>(context);
+	DWORD written = 0;
+	if (size < 0 || !WriteFile(output->file, bytes, static_cast<DWORD>(size), &written, NULL) ||
+		written != static_cast<DWORD>(size)) output->failed = true;
+}
+static bool writeDiagnosticPng(const char *directory, const char *path,
+	unsigned width, unsigned height, const unsigned char *image)
+{
+	if (!rts::rendered_battle::IsNonReparseDirectoryTree(directory)) return false;
+	DiagnosticPngOutput output;
+	output.file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (output.file == INVALID_HANDLE_VALUE) return false;
+	output.failed = false;
+	const bool encoded = stbi_write_png_to_func(writeDiagnosticPngBytes, &output,
+		static_cast<int>(width), static_cast<int>(height), 3, image, static_cast<int>(width * 3)) != 0;
+	const bool flushed = FlushFileBuffers(output.file) != FALSE;
+	const bool closed = CloseHandle(output.file) != FALSE;
+	output.file = INVALID_HANDLE_VALUE;
+	return encoded && !output.failed && flushed && closed;
 }
 
 class ScreenshotBatch
@@ -160,8 +238,10 @@ public:
 				catch (...)
 				{
 					DEBUG_LOG(("Failed to encode screenshot %s", m_outputPath));
+					publishDiagnosticFailure(m_completion, "encode_exception");
 				}
 			}
+			else publishDiagnosticFailure(m_completion, "conversion_failed");
 			delete this;
 		}
 	}
@@ -184,7 +264,7 @@ private:
 
 		{
 			PROFILER_SECTION_NAME("Screenshot.Encode");
-			CreateDirectory(m_outputDirectory, 0);
+			if (!m_completion->diagnosticSample) CreateDirectory(m_outputDirectory, 0);
 
 			switch (m_format)
 			{
@@ -193,20 +273,26 @@ private:
 						3, m_image, m_quality);
 					break;
 				case SCREENSHOT_PNG:
-					success = stbi_write_png(m_outputPath, (int)m_source.width, (int)m_source.height,
-						3, m_image, (int)(m_source.width * 3));
+					if (m_completion->diagnosticSample)
+						success = writeDiagnosticPng(m_outputDirectory, m_outputPath, m_source.width, m_source.height, m_image);
+					else
+						success = stbi_write_png(m_outputPath, (int)m_source.width, (int)m_source.height,
+							3, m_image, (int)(m_source.width * 3));
 					break;
 			}
 		}
 
 		if (success)
 		{
+			m_completion->diagnosticSuccess = true;
+			m_completion->diagnosticReason = "none";
 			s_screenshotWrittenQueue.Push(m_completion);
 			m_completion = 0;
 		}
 		else
 		{
 			DEBUG_LOG(("Failed to write screenshot %s", m_outputPath));
+			publishDiagnosticFailure(m_completion, "png_write_failed");
 		}
 	}
 	unsigned char* m_pixelData;
@@ -443,6 +529,7 @@ static void completeD3D11CompressedScreenshot(void *consumer,
 			&requiredBytes) || pixelBytes < requiredBytes)
 	{
 		DEBUG_LOG(("D3D11 compressed screenshot completion had invalid pixels"));
+		publishDiagnosticFailure(capture->completion, "invalid_readback");
 		delete[] capture->pixelData;
 		delete[] capture->image;
 		delete capture->completion;
@@ -472,6 +559,7 @@ static void completeD3D11CompressedScreenshot(void *consumer,
 	{
 		DEBUG_LOG(("Dropped D3D11 screenshot %s because its batch could not be allocated",
 			capture->leafname));
+		publishDiagnosticFailure(capture->completion, "batch_allocation_failed");
 		delete[] capture->pixelData;
 		delete[] capture->image;
 		delete capture->completion;
@@ -494,6 +582,7 @@ static void cancelD3D11CompressedScreenshot(void *consumer,
 	{
 		DEBUG_LOG(("D3D11 compressed screenshot capture cancelled: %d",
 			static_cast<int>(reason)));
+		publishDiagnosticFailure(capture->completion, "capture_cancelled");
 		delete[] capture->pixelData;
 		delete[] capture->image;
 		delete capture->completion;
@@ -504,7 +593,7 @@ static void cancelD3D11CompressedScreenshot(void *consumer,
 void W3D_UpdateScreenshotMessages()
 {
 	ScreenshotWrittenMessage* message = s_screenshotWrittenQueue.Flush();
-	if (TheInGameUI == 0)
+	if (TheInGameUI == 0 && !rts::rendered_battle::ProcessTestOptions().visualSamples)
 	{
 		deleteScreenshotWrittenMessages(message);
 		return;
@@ -512,9 +601,21 @@ void W3D_UpdateScreenshotMessages()
 
 	while (message != 0)
 	{
-		UnicodeString ufileName;
-		ufileName.translate(message->leafname);
-		TheInGameUI->message(TheGameText->fetch("GUI:ScreenCapture"), ufileName.str());
+		if (message->diagnosticSample)
+		{
+			const bool receipted = recordVisualScreenshotEvent(message->diagnosticSuccess ? "WRITTEN" : "FAILED",
+				message->diagnosticSample, message->diagnosticWidth, message->diagnosticHeight,
+				message->diagnosticPath, message->diagnosticSuccess ? 0 : -1, message->diagnosticReason, message->diagnosticFrame);
+			rts::rendered_battle::VisualSampleTerminal(rts::rendered_battle::ProcessVisualSampleState(),
+				message->diagnosticSample, message->diagnosticSuccess && receipted,
+				rts::rendered_battle::ProcessTestOptions().benchmarkRequested ? 20 : 40);
+		}
+		else if (TheInGameUI)
+		{
+			UnicodeString ufileName;
+			ufileName.translate(message->leafname);
+			TheInGameUI->message(TheGameText->fetch("GUI:ScreenCapture"), ufileName.str());
+		}
 		ScreenshotWrittenMessage* next = message->next;
 		delete message;
 		message = next;
@@ -524,17 +625,31 @@ void W3D_UpdateScreenshotMessages()
 void W3D_ShutdownScreenshotTasks()
 {
 	s_screenshotTaskService.shutdown();
-	deleteScreenshotWrittenMessages(s_screenshotWrittenQueue.Flush());
+	if (rts::rendered_battle::ProcessTestOptions().visualSamples)
+		W3D_UpdateScreenshotMessages();
+	else
+		deleteScreenshotWrittenMessages(s_screenshotWrittenQueue.Flush());
 }
 
 void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 {
+	if (rts::rendered_battle::ProcessTestOptions().visualSamples)
+	{
+		rts::rendered_battle::VisualSampleState &samples = rts::rendered_battle::ProcessVisualSampleState();
+		if (samples.captureDisabled) return;
+		if (!TheGlobalData || !rts::rendered_battle::VisualSampleProfileMatches(TheGlobalData->getPath_UserData().str()))
+		{
+			failVisualScreenshotSynchronously("effective_profile_mismatch");
+			return;
+		}
+	}
 	static constexpr const char* const ScreenshotFormatExtensions[] = { "jpg", "png" };
 	static_assert(ARRAY_SIZE(ScreenshotFormatExtensions) == SCREENSHOT_FORMAT_COUNT, "Incorrect array size");
 
 	if ((unsigned)format >= ARRAY_SIZE(ScreenshotFormatExtensions))
 	{
 		DEBUG_LOG(("Screenshot format %d is invalid", (int)format));
+		failVisualScreenshotSynchronously("request_failed");
 		return;
 	}
 
@@ -552,14 +667,27 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 	char outputPath[_MAX_PATH];
 	strlcpy(outputDirectory, TheGlobalData->getPath_UserData().str(), ARRAY_SIZE(outputDirectory));
 	strlcat(outputDirectory, "Screenshots\\", ARRAY_SIZE(outputDirectory));
+	if (rts::rendered_battle::ProcessTestOptions().visualSamples)
+	{
+		if ((!CreateDirectoryA(outputDirectory, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) ||
+			!rts::rendered_battle::IsNonReparseDirectoryTree(outputDirectory))
+		{
+			failVisualScreenshotSynchronously("unsafe_screenshot_directory");
+			return;
+		}
+		if (rts::rendered_battle::ProcessVisualSampleState().currentSample)
+			sprintf(leafname, "sshot_visual_pid%lu_sample%03u.png", GetCurrentProcessId(),
+				rts::rendered_battle::ProcessVisualSampleState().currentSample);
+	}
 	strlcpy(outputPath, outputDirectory, ARRAY_SIZE(outputPath));
 	strlcat(outputPath, leafname, ARRAY_SIZE(outputPath));
 
 	{
-		if (!reserveD3D11ScreenshotName(outputDirectory, leafname, leafname,
+		if (!rts::rendered_battle::ProcessTestOptions().visualSamples && !reserveD3D11ScreenshotName(outputDirectory, leafname, leafname,
 			ARRAY_SIZE(leafname), outputPath, ARRAY_SIZE(outputPath)))
 		{
 			DEBUG_LOG(("D3D11 screenshot name reservation failed"));
+			failVisualScreenshotSynchronously("request_failed");
 			return;
 		}
 		rts::render::RenderBackBufferInfo backBufferInfo;
@@ -583,12 +711,19 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 		{
 			DEBUG_LOG(("D3D11 screenshot dimensions %u x %u are invalid", width,
 				height));
+			failVisualScreenshotSynchronously("request_failed");
 			return;
 		}
 		if (pitchSize > UINT_MAX)
 		{
 			DEBUG_LOG(("D3D11 screenshot pitch is too large: %u x %u", width,
 				height));
+			failVisualScreenshotSynchronously("request_failed");
+			return;
+		}
+		if (rts::rendered_battle::ProcessTestOptions().visualSamples && (width != 1920 || height != 1080))
+		{
+			failVisualScreenshotSynchronously("backbuffer_dimensions");
 			return;
 		}
 
@@ -611,6 +746,7 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 			delete[] pixelData;
 			delete[] image;
 			delete completion;
+			failVisualScreenshotSynchronously("request_failed");
 			return;
 		}
 
@@ -628,9 +764,19 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 			delete[] pixelData;
 			delete[] image;
 			delete completion;
+			failVisualScreenshotSynchronously("request_failed");
 			return;
 		}
 		capture->pixelData = pixelData;
+		completion->diagnosticSample = rts::rendered_battle::ProcessTestOptions().visualSamples ?
+			rts::rendered_battle::ProcessVisualSampleState().currentSample : 0;
+		completion->diagnosticSuccess = false;
+		completion->diagnosticReason = "pending";
+		completion->diagnosticWidth = width;
+		completion->diagnosticHeight = height;
+		completion->diagnosticFrame = TheGameClient ? TheGameClient->getFrame() : 0;
+		if (completion->diagnosticSample)
+			strlcpy(completion->diagnosticPath, outputPath, ARRAY_SIZE(completion->diagnosticPath));
 		capture->image = image;
 		capture->completion = completion;
 		capture->width = width;
@@ -649,8 +795,13 @@ void W3D_TakeCompressedScreenshot(ScreenshotFormat format, Int jpegQuality)
 		descriptor.completed = completeD3D11CompressedScreenshot;
 		descriptor.cancelled = cancelD3D11CompressedScreenshot;
 		rts::render::RenderCaptureHandle handle;
+		const unsigned diagnosticSample = completion->diagnosticSample;
+		const unsigned diagnosticFrame = completion->diagnosticFrame;
 		const rts::render::RenderResult queueResult =
 			rts::render::QueueGameBackBufferCapture(descriptor, &handle);
+		if (diagnosticSample && !recordVisualScreenshotEvent("REQUEST", diagnosticSample, width, height,
+			outputPath, static_cast<int>(queueResult), "none", diagnosticFrame))
+			failVisualScreenshotSynchronously("request_receipt_failed");
 		if (queueResult != rts::render::RENDER_RESULT_OK)
 		{
 			DEBUG_LOG(("D3D11 screenshot queue rejected %s: result=%d",

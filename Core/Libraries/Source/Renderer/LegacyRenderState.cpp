@@ -589,6 +589,16 @@ bool GetTrackedLegacyPipelineState(LegacyPipelineState *state)
 	return true;
 }
 
+bool GetTrackedLegacyDepthBias(int *depthBias)
+{
+	if (depthBias == 0 || !g_trackedPipelineStateValid)
+	{
+		return false;
+	}
+	*depthBias = g_trackedLogicalState.pipeline.rasterizer.depthBias;
+	return true;
+}
+
 bool TrackLegacyTransform(LegacyTransformSlot slot, const float *values)
 {
 	if (values == 0 || slot < LEGACY_TRANSFORM_WORLD ||

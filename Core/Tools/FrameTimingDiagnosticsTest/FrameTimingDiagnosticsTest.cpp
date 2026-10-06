@@ -102,10 +102,22 @@ void removeCase(const std::string& directory)
 
 void inactiveSingleton(const std::string& directory)
 {
-	// A valid opt-in directory alone must not make a display gate construct
-	// the singleton or open its output before the game-owned session begins.
+	// A valid opt-in directory alone must not let an unbound sampled scope or
+	// display gate construct the singleton before the game-owned session begins.
 	SetEnvironmentVariableA("RTS_FRAME_TIMING_DIR", directory.c_str());
 	const unsigned int before = diagnosticClockCalls;
+	const unsigned int threadIdsBefore = diagnosticThreadIdCalls;
+	{
+		rts::frame_timing::SampledScope coldScope(
+			rts::frame_timing::RendererReadinessCheckSampled64);
+		coldScope.finish();
+	}
+	check(diagnosticClockCalls == before,
+		"cold unbound sampled scope does not query the performance counter");
+	check(diagnosticThreadIdCalls == threadIdsBefore,
+		"cold unbound sampled scope does not probe capture ownership");
+	check(files(directory).empty(),
+		"cold unbound sampled scope does not construct the capture or create a CSV");
 	check(!rts::frame_timing::IsActive(), "uninitialized singleton remains inactive");
 	check(diagnosticClockCalls == before, "inactive singleton gate does not query the clock");
 	check(files(directory).empty(), "inactive singleton gate does not create a CSV file");

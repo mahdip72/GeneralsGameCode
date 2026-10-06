@@ -75,7 +75,7 @@ inline bool IsProcessLocalProfileRootPathValid(const char *path, DWORD length)
 	}
 
 	const DWORD attributes = GetFileAttributesA(path);
-	return attributes != INVALID_FILE_ATTRIBUTES &&
+	return attributes != static_cast<DWORD>(-1) &&
 		(attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 &&
 		(attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0;
 }

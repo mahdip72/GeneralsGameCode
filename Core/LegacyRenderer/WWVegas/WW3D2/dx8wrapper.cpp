@@ -51,6 +51,7 @@
 #endif
 
 #include "dx8wrapper.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/RenderTexturePublication.h"
 #include "dx8webbrowser.h"
@@ -1618,7 +1619,8 @@ bool DX8Wrapper::Resize_And_Position_Window(bool use_restored_width,
 			MoveRectIntoOtherRect(rectClient, mi.rcMonitor, &left, &top);
 
 			if (!::SetWindowPos(_Hwnd, nullptr, left, top, width, height,
-				SWP_NOZORDER) && _UseD3D11Backend)
+				SWP_NOZORDER | (rts::rendered_battle::ProcessTestOptions().backgroundStartup ?
+					SWP_NOACTIVATE : 0)) && _UseD3D11Backend)
 			{
 				return d3d11_windowed_restore_pending ?
 					Abort_D3D11_Windowed_Transition(d3d11_rollback_monitor) : false;

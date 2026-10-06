@@ -149,6 +149,9 @@ add_test(NAME core_renderer_contract_tests
     COMMAND core_renderer_contract_tests
 )
 set_tests_properties(core_renderer_contract_tests PROPERTIES TIMEOUT 30)
+add_test(NAME core_transform_constant_arena_policy_tests
+    COMMAND core_renderer_contract_tests --constant-arena-policy)
+set_tests_properties(core_transform_constant_arena_policy_tests PROPERTIES TIMEOUT 30)
 
 if(WIN32 AND NOT IS_VS6_BUILD)
 
@@ -223,6 +226,32 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         "\t\tif (hasTextures && (forcePipeline || !m_pipelineHasTextures ||"
         "\n\t\tm_boundBlendDescriptor =")
 
+    if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8 AND MSVC_CXX_ARCHITECTURE_ID STREQUAL "x64")
+        # Run the actual constant publication/reset methods against a recording
+        # context, including failed Map and the whole-block equality shortcut.
+        d3d11_sampler_fragment(D3D11NormalConstants
+            "struct LegacyTransformConstants" "\nstruct PresentationColorConstants")
+        d3d11_sampler_fragment(D3D11NormalMultiply
+            "void MultiplyMatrices(" "\nbool IsSeaWaveVertexLayout(")
+        d3d11_sampler_fragment(D3D11NormalPublication
+            "\tHRESULT updateTransformConstants(" "\n\tvoid releaseNativeSlot(")
+        d3d11_sampler_fragment(D3D11NormalBeginFrame
+            "\tvirtual RenderResult beginFrame()" "\n\tvirtual RenderResult updateBuffer(")
+        d3d11_sampler_fragment(D3D11NormalInvalidation
+            "\tvoid invalidatePipelineBindings()" "\n\tvoid markTextureBindingsEmpty()")
+        add_executable(core_d3d11_normal_matrix_cache_tests
+            D3D11NormalMatrixCacheContractTest.cpp)
+        target_include_directories(core_d3d11_normal_matrix_cache_tests PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}"
+            "${CMAKE_SOURCE_DIR}/Core/Libraries/Source/Renderer")
+        target_link_libraries(core_d3d11_normal_matrix_cache_tests PRIVATE core_renderer)
+        set_target_properties(core_d3d11_normal_matrix_cache_tests PROPERTIES
+            CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+        add_test(NAME core_d3d11_normal_matrix_cache_tests
+            COMMAND core_d3d11_normal_matrix_cache_tests)
+        set_tests_properties(core_d3d11_normal_matrix_cache_tests PROPERTIES TIMEOUT 30)
+    endif()
+
     # Supplement real-backend pixel/lifecycle coverage with the exact buffer
     # update method against a recording Map double, exposing private mirror
     # bytes and failed-map boundaries without a new production debug API.
@@ -266,6 +295,9 @@ if(WIN32 AND NOT IS_VS6_BUILD)
     add_test(NAME core_d3d11_index_validation_tests
         COMMAND core_d3d11_index_validation_tests)
     set_tests_properties(core_d3d11_index_validation_tests PROPERTIES TIMEOUT 30)
+    add_test(NAME core_d3d11_constant_arena_tests
+        COMMAND core_d3d11_index_validation_tests --constant-arena)
+    set_tests_properties(core_d3d11_constant_arena_tests PROPERTIES TIMEOUT 30)
 endif()
 
 add_test(NAME core_w3d_video_buffer_format_selection_tests
@@ -384,3 +416,5 @@ if(WIN32)
     add_test(NAME core_raw_animation_frame_tests COMMAND core_raw_animation_frame_tests)
     set_tests_properties(core_raw_animation_frame_tests PROPERTIES TIMEOUT 30)
 endif()
+
+include(${CMAKE_CURRENT_LIST_DIR}/ShadowSecondPassUploadReuseTest.cmake)

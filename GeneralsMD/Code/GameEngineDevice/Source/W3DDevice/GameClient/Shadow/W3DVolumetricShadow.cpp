@@ -50,6 +50,7 @@
 #include "WW3D2/meshmdl.h"
 #include "Lib/BaseType.h"
 #include "Lib/FrameTimingDiagnostics.h"
+#include "Lib/ShadowStreamReuseDiagnostics.h"
 #include "W3DDevice/GameClient/HeightMap.h"
 #include "Common/GlobalData.h"
 #include "Common/DrawModule.h"
@@ -59,6 +60,7 @@
 #include "GameLogic/TerrainLogic.h"
 #include "GameClient/Drawable.h"
 #include "Renderer/RenderGameClient.h"
+#include "Renderer/ShadowSecondPassUploadReusePolicy.h"
 #ifdef USE_WWSHADE
 #include "wwshade/shdmesh.h"
 #include "wwshade/shdsubmesh.h"
@@ -111,17 +113,162 @@ struct SHADOW_STATIC_VOLUME_VERTEX	//vertex structure submitted to the renderer
 
 DX8VertexBufferClass *shadowVertexBufferOwner=nullptr;
 DX8IndexBufferClass *shadowIndexBufferOwner=nullptr;
-int nShadowVertsInBuf=0;	//model vetices in vertex buffer
+DX8VertexBufferClass *shadowVertexPageBuffers[rts::render::ShadowStreamPageMaximumCount]={0,0,0,0};
+DX8IndexBufferClass *shadowIndexPageBuffers[rts::render::ShadowStreamPageMaximumCount]={0,0,0,0};
+rts::render::ShadowStreamPageState shadowVertexPageStates[rts::render::ShadowStreamPageMaximumCount];
+rts::render::ShadowStreamPageState shadowIndexPageStates[rts::render::ShadowStreamPageMaximumCount];
+unsigned int shadowStreamPageCount=1;
+int shadowVertexActivePage=-1;
+int shadowIndexActivePage=-1;
+unsigned int shadowPageUseSequence=0;
+int nShadowVertsInBuf=0;	//cursor mirror for the currently selected vertex page
 int nShadowStartBatchVertex=0;
-int nShadowIndicesInBuf=0;	//model vetices in vertex buffer
+int nShadowIndicesInBuf=0;	//cursor mirror for the currently selected index page
 int nShadowStartBatchIndex=0;
 int SHADOW_VERTEX_SIZE=4096;
 int SHADOW_INDEX_SIZE=8192;
 
+static unsigned int shadowUploadRenderEpoch=0;
+#if defined(_WIN64)
+static bool shadowSecondPassFrozen=false;
+#endif
+static void AdvanceShadowDiscardGeneration(unsigned int *generation)
+{
+	rts::render::AdvanceShadowStreamPageGeneration(generation);
+}
+
+static void BeginShadowUploadReuseRender()
+{
+	AdvanceShadowDiscardGeneration(&shadowUploadRenderEpoch);
+	shadowVertexActivePage=-1;
+	shadowIndexActivePage=-1;
+	shadowPageUseSequence=0;
+#if defined(_WIN64)
+	shadowSecondPassFrozen=false;
+#endif
+}
+
+#if defined(_WIN64)
+static bool ShadowReuseSwitch(const char *name)
+{
+	char value[2];
+	return GetEnvironmentVariableA(name, value, sizeof(value)) != 1 || value[0] != '0';
+}
+static rts::render::ShadowStreamReuseRow *shadowReuseStats=0;
+#if !defined(SV_DEBUG_BOUNDS) && !defined(SV_DEBUG)
+static const bool shadowReuseEnabled=ShadowReuseSwitch("RTS_SHADOW_UPLOAD_REUSE");
+#else
+static const bool shadowReuseEnabled=false;
+#endif
+static const bool shadowArenaEnabled=ShadowReuseSwitch("RTS_SHADOW_UPLOAD_ARENA");
+static const bool shadowMultiPageEnabled=ShadowReuseSwitch("RTS_SHADOW_MULTIPAGE_ARENA");
+
+static void InitializeShadowUploadReuseQuery(
+	rts::render::ShadowSecondPassUploadReuseQuery *query,
+	const void *task,
+	const void *geometry,
+	const Matrix3D *transform,
+	unsigned int geometryRevision,
+	unsigned int vertexCount,
+	unsigned int indexCount,
+	const rts::render::ShadowStreamPageState *vertexPage,
+	const rts::render::ShadowStreamPageState *indexPage)
+{
+	query->task=task;
+	query->geometry=geometry;
+	for (unsigned int row=0; row<3; ++row)
+		for (unsigned int column=0; column<4; ++column)
+			query->transform[row*4+column]=(*transform)[row][column];
+	query->geometryRevision=geometryRevision;
+	query->secondPassFrozen=shadowSecondPassFrozen;
+	query->vertexBuffer=vertexPage != 0 ? vertexPage->owner : 0;
+	query->indexBuffer=indexPage != 0 ? indexPage->owner : 0;
+	query->renderEpoch=shadowUploadRenderEpoch;
+	query->vertexDiscardGeneration=vertexPage != 0 ? vertexPage->discardGeneration : 0;
+	query->indexDiscardGeneration=indexPage != 0 ? indexPage->discardGeneration : 0;
+	query->vertexCount=vertexCount;
+	query->indexCount=indexCount;
+	query->vertexCapacity=static_cast<unsigned int>(SHADOW_VERTEX_SIZE);
+	query->indexCapacity=static_cast<unsigned int>(SHADOW_INDEX_SIZE);
+	query->vertexCursor=vertexPage != 0 && vertexPage->usedThisEpoch &&
+		vertexPage->renderEpoch==shadowUploadRenderEpoch ? vertexPage->cursor : 0;
+	query->indexCursor=indexPage != 0 && indexPage->usedThisEpoch &&
+		indexPage->renderEpoch==shadowUploadRenderEpoch ? indexPage->cursor : 0;
+}
+
+#endif
+
+static unsigned int NextShadowPageUseSequence()
+{
+	++shadowPageUseSequence;
+	if (shadowPageUseSequence == 0)
+		++shadowPageUseSequence;
+	return shadowPageUseSequence;
+}
+
+static int FindShadowVertexPage(const void *owner)
+{
+	if (owner == 0)
+		return -1;
+	for (unsigned int i=0; i<shadowStreamPageCount; ++i)
+		if (shadowVertexPageStates[i].owner==owner && shadowVertexPageBuffers[i]==owner)
+			return static_cast<int>(i);
+	return -1;
+}
+
+static int FindShadowIndexPage(const void *owner)
+{
+	if (owner == 0)
+		return -1;
+	for (unsigned int i=0; i<shadowStreamPageCount; ++i)
+		if (shadowIndexPageStates[i].owner==owner && shadowIndexPageBuffers[i]==owner)
+			return static_cast<int>(i);
+	return -1;
+}
+
+static bool ShadowStreamPagePoolReady()
+{
+	if (shadowStreamPageCount==0 ||
+		shadowStreamPageCount>rts::render::ShadowStreamPageMaximumCount)
+		return false;
+	for (unsigned int i=0; i<shadowStreamPageCount; ++i)
+		if (shadowVertexPageBuffers[i]==0 || shadowIndexPageBuffers[i]==0 ||
+			shadowVertexPageStates[i].owner!=shadowVertexPageBuffers[i] ||
+			shadowIndexPageStates[i].owner!=shadowIndexPageBuffers[i])
+			return false;
+	return true;
+}
+
+static void ReleaseShadowStreamPageBuffers()
+{
+	for (unsigned int i=0; i<rts::render::ShadowStreamPageMaximumCount; ++i)
+	{
+		REF_PTR_RELEASE(shadowIndexPageBuffers[i]);
+		REF_PTR_RELEASE(shadowVertexPageBuffers[i]);
+		rts::render::ReleaseShadowStreamPageState(&shadowIndexPageStates[i]);
+		rts::render::ReleaseShadowStreamPageState(&shadowVertexPageStates[i]);
+	}
+	shadowStreamPageCount=0;
+	shadowVertexActivePage=-1;
+	shadowIndexActivePage=-1;
+	shadowVertexBufferOwner=0;
+	shadowIndexBufferOwner=0;
+}
+
 static void ResetVolumetricStreamAfterUploadFailure()
 {
+#if defined(_WIN64)
+	if (shadowReuseStats) ++shadowReuseStats->failures;
+#endif
 	rts::render::Invalidate_Native_W3D_Stream_Cursors(nShadowVertsInBuf,
 		nShadowIndicesInBuf, nShadowStartBatchVertex, nShadowStartBatchIndex);
+	shadowVertexActivePage=-1;
+	shadowIndexActivePage=-1;
+	for (unsigned int i=0; i<rts::render::ShadowStreamPageMaximumCount; ++i)
+	{
+		rts::render::InvalidateShadowStreamPageState(&shadowVertexPageStates[i]);
+		rts::render::InvalidateShadowStreamPageState(&shadowIndexPageStates[i]);
+	}
 }
 
 //Rough bounding box around visible portion of the terrain
@@ -1307,9 +1454,13 @@ void W3DVolumetricShadow::getRenderCost(RenderCost & rc) const
 #endif
 
 /************************************ New Buffered Rendering Code ************************/
-void W3DVolumetricShadow::RenderVolume(Int meshIndex, Int lightIndex)
+void W3DVolumetricShadow::RenderVolume(W3DVolumetricShadowRenderTask *task, Bool secondPass)
 {
 	rts::frame_timing::Scope submissionTiming(rts::frame_timing::RendererVolumeSubmit);
+	if (task == 0)
+		return;
+	Int meshIndex=task->m_meshIndex;
+	Int lightIndex=task->m_lightIndex;
 	HLodClass *hlod=(HLodClass *)m_robj;
 	MeshClass *mesh=nullptr;
 
@@ -1326,7 +1477,7 @@ void W3DVolumetricShadow::RenderVolume(Int meshIndex, Int lightIndex)
 			RenderMeshVolumeBounds(meshIndex,lightIndex, &mesh->Get_Transform());
 #endif
 			if (m_shadowVolume[0][ meshIndex ]->GetFlags() & SHADOW_DYNAMIC)
-				RenderDynamicMeshVolume(meshIndex,lightIndex,&mesh->Get_Transform());
+				RenderDynamicMeshVolume(task,meshIndex,lightIndex,&mesh->Get_Transform(),secondPass);
 			else
 				RenderMeshVolume(meshIndex,lightIndex,&mesh->Get_Transform());
 	}
@@ -1339,7 +1490,7 @@ void W3DVolumetricShadow::RenderMeshVolume(Int meshIndex, Int lightIndex, const 
 
 	if (!rts::render::IsGameRendererInitialized() ||
 		!rts::render::IsGameRenderTargetOperational() ||
-		shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr)
+		!ShadowStreamPagePoolReady())
 		return;
 
 	geometry = m_shadowVolume[lightIndex][ meshIndex ];
@@ -1393,7 +1544,7 @@ void W3DVolumetricShadow::RenderMeshVolume(Int meshIndex, Int lightIndex, const 
 
 }
 
-void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex, const Matrix3D *meshXform)
+void W3DVolumetricShadow::RenderDynamicMeshVolume(W3DVolumetricShadowRenderTask *task, Int meshIndex, Int lightIndex, const Matrix3D *meshXform, Bool secondPass)
 {
 	Geometry *geometry;
 	Int numVerts, numPolys, numIndex;
@@ -1402,7 +1553,7 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 
 	if (!rts::render::IsGameRendererInitialized() ||
 		!rts::render::IsGameRenderTargetOperational() ||
-		shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr)
+		!ShadowStreamPagePoolReady())
 		return;
 
 
@@ -1423,14 +1574,115 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 	if( numVerts == 0 || numPolys == 0 )
 		return;
 
+	rts::frame_timing::Scope dynamicDrawTiming(rts::frame_timing::RendererVolumeDynamicDraw);
+	Bool reusedUpload=FALSE;
+int vertexPageIndex=-1;
+int indexPageIndex=-1;
+const unsigned int pageUseSequence=NextShadowPageUseSequence();
+rts::render::ShadowStreamPageReservation vertexReservation;
+rts::render::ShadowStreamPageReservation indexReservation;
+#if defined(_WIN64)
+	rts::render::ShadowSecondPassUploadReuseQuery reuseQuery;
+	const rts::render::ShadowStreamPageState *reuseVertexPage=0;
+	const rts::render::ShadowStreamPageState *reuseIndexPage=0;
+	if (secondPass && task != 0)
+	{
+		vertexPageIndex=FindShadowVertexPage(task->m_secondPassUploadReuse.vertexBuffer);
+		indexPageIndex=FindShadowIndexPage(task->m_secondPassUploadReuse.indexBuffer);
+		if (vertexPageIndex >= 0) reuseVertexPage=&shadowVertexPageStates[vertexPageIndex];
+		if (indexPageIndex >= 0) reuseIndexPage=&shadowIndexPageStates[indexPageIndex];
+	}
+	InitializeShadowUploadReuseQuery(&reuseQuery, task, geometry, meshXform,
+		task != 0 ? task->m_geometryRevision : 0,
+		static_cast<unsigned int>(numVerts), static_cast<unsigned int>(numIndex),
+		reuseVertexPage, reuseIndexPage);
+	rts::render::ShadowUploadReuseMissReason reuseReason=rts::render::ShadowReuseMissingProof;
+	if (secondPass && task != 0)
+		reuseReason=rts::render::ShadowSecondPassUploadReuseReason(task->m_secondPassUploadReuse, reuseQuery);
+#if !defined(SV_DEBUG_BOUNDS) && !defined(SV_DEBUG)
+	if (shadowReuseEnabled && secondPass && task != 0)
+		reusedUpload=reuseReason==rts::render::ShadowReuseHit;
+#endif
+	if (shadowReuseStats)
+	{
+		rts::render::ShadowStreamReuseRow &stats=*shadowReuseStats;
+		if (!secondPass) { ++stats.firstTasks; stats.firstVertices+=numVerts; stats.firstIndices+=numIndex; }
+		else
+		{
+			++stats.secondTasks;
+			if (reuseReason==rts::render::ShadowReuseHit) ++stats.eligible;
+			if (reusedUpload) { ++stats.hits; stats.reusedBytes+=numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX)+numIndex*sizeof(short); }
+			else
+			{
+				++stats.misses;
+				if (!shadowReuseEnabled) ++stats.missDisabled;
+				else switch (reuseReason)
+				{
+				case rts::render::ShadowReuseGeometryChanged: ++stats.missGeometry; break;
+				case rts::render::ShadowReuseTransformChanged: ++stats.missTransform; break;
+				case rts::render::ShadowReuseVertexDiscarded: ++stats.missVertexGeneration; break;
+				case rts::render::ShadowReuseIndexDiscarded: ++stats.missIndexGeneration; break;
+				case rts::render::ShadowReuseRangeInvalid: ++stats.missRange; break;
+				default: ++stats.missProof; break;
+				}
+			}
+		}
+		if (numVerts>SHADOW_VERTEX_SIZE || numIndex>SHADOW_INDEX_SIZE) ++stats.oversized;
+	}
+#endif
+	unsigned int drawVertexStart=0;
+	unsigned int drawIndexStart=0;
+	if (reusedUpload)
+	{
+#if defined(_WIN64)
+		drawVertexStart=task->m_secondPassUploadReuse.vertexStart;
+		drawIndexStart=task->m_secondPassUploadReuse.indexStart;
+		shadowVertexBufferOwner=shadowVertexPageBuffers[vertexPageIndex];
+		shadowIndexBufferOwner=shadowIndexPageBuffers[indexPageIndex];
+		shadowVertexActivePage=vertexPageIndex;
+		shadowIndexActivePage=indexPageIndex;
+		rts::render::MarkShadowStreamPageUsed(&shadowVertexPageStates[vertexPageIndex],
+			shadowUploadRenderEpoch,pageUseSequence);
+		rts::render::MarkShadowStreamPageUsed(&shadowIndexPageStates[indexPageIndex],
+			shadowUploadRenderEpoch,pageUseSequence);
+#endif
+	}
+	else
+	{
 
 	// Admission is not draw success: failed lock/unlock paths remain measured.
-	rts::frame_timing::Scope dynamicDrawTiming(rts::frame_timing::RendererVolumeDynamicDraw);
 	rts::frame_timing::Scope dynamicUploadTiming(rts::frame_timing::RendererVolumeDynamicUpload);
+	if (!rts::render::ReserveShadowStreamPageAppend(shadowVertexPageStates,
+		shadowStreamPageCount,shadowVertexActivePage,shadowUploadRenderEpoch,
+		static_cast<unsigned int>(SHADOW_VERTEX_SIZE),static_cast<unsigned int>(numVerts),
+		pageUseSequence,&vertexReservation) ||
+		!rts::render::ReserveShadowStreamPageAppend(shadowIndexPageStates,
+			shadowStreamPageCount,shadowIndexActivePage,shadowUploadRenderEpoch,
+			static_cast<unsigned int>(SHADOW_INDEX_SIZE),static_cast<unsigned int>(numIndex),
+			pageUseSequence,&indexReservation))
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
+	vertexPageIndex=static_cast<int>(vertexReservation.pageIndex);
+	indexPageIndex=static_cast<int>(indexReservation.pageIndex);
+	shadowVertexActivePage=vertexPageIndex;
+	shadowIndexActivePage=indexPageIndex;
+	shadowVertexBufferOwner=shadowVertexPageBuffers[vertexPageIndex];
+	shadowIndexBufferOwner=shadowIndexPageBuffers[indexPageIndex];
+	nShadowVertsInBuf=vertexReservation.discard ? SHADOW_VERTEX_SIZE :
+		static_cast<int>(shadowVertexPageStates[vertexPageIndex].cursor);
+	nShadowIndicesInBuf=indexReservation.discard ? SHADOW_INDEX_SIZE :
+		static_cast<int>(shadowIndexPageStates[indexPageIndex].cursor);
+	nShadowStartBatchVertex=static_cast<int>(vertexReservation.start);
+	nShadowStartBatchIndex=static_cast<int>(indexReservation.start);
 
 	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowVertsInBuf,
 		SHADOW_VERTEX_SIZE, numVerts))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
+#if defined(_WIN64)
+		if (shadowReuseStats) { if (secondPass) ++shadowReuseStats->secondVertexDiscards; else ++shadowReuseStats->firstVertexDiscards; }
+#endif
 		if (!rts::render::Lock_W3D_Buffer_For_Full_Overwrite(shadowVertexBufferOwner, 0,
 			numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX),
 			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvVertices)))
@@ -1479,10 +1731,21 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 		ResetVolumetricStreamAfterUploadFailure();
 		return;
 	}
+	if (!rts::render::CommitShadowStreamPageAppend(shadowVertexPageStates,
+		shadowStreamPageCount,static_cast<unsigned int>(SHADOW_VERTEX_SIZE),vertexReservation))
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
+	nShadowVertsInBuf=static_cast<int>(shadowVertexPageStates[vertexPageIndex].cursor);
+	nShadowStartBatchVertex=static_cast<int>(vertexReservation.start);
 
 	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowIndicesInBuf,
 		SHADOW_INDEX_SIZE, numIndex))	//check if room for model verts
 	{	//flush the buffer by drawing the contents and re-locking again
+#if defined(_WIN64)
+		if (shadowReuseStats) { if (secondPass) ++shadowReuseStats->secondIndexDiscards; else ++shadowReuseStats->firstIndexDiscards; }
+#endif
 		if (!rts::render::Lock_W3D_Buffer_For_Full_Overwrite(shadowIndexBufferOwner, 0,
 			static_cast<size_t>(numIndex) * sizeof(short),
 			NATIVE_BUFFER_LOCK_DISCARD, reinterpret_cast<void **>(&pvIndices)))
@@ -1519,27 +1782,58 @@ void W3DVolumetricShadow::RenderDynamicMeshVolume(Int meshIndex, Int lightIndex,
 		ResetVolumetricStreamAfterUploadFailure();
 		return;
 	}
+	if (!rts::render::CommitShadowStreamPageAppend(shadowIndexPageStates,
+		shadowStreamPageCount,static_cast<unsigned int>(SHADOW_INDEX_SIZE),indexReservation))
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
+	nShadowIndicesInBuf=static_cast<int>(shadowIndexPageStates[indexPageIndex].cursor);
+	nShadowStartBatchIndex=static_cast<int>(indexReservation.start);
 
 	dynamicUploadTiming.finish();
+#if defined(_WIN64)
+	if (shadowReuseStats)
+	{
+		const unsigned int bytes=numVerts*sizeof(SHADOW_DYNAMIC_VOLUME_VERTEX)+numIndex*sizeof(short);
+		if (secondPass) { ++shadowReuseStats->secondUploads; shadowReuseStats->secondBytes+=bytes; }
+		else { ++shadowReuseStats->firstUploads; shadowReuseStats->firstBytes+=bytes; }
+	}
+#endif
+	drawVertexStart=static_cast<unsigned int>(nShadowStartBatchVertex);
+	drawIndexStart=static_cast<unsigned int>(nShadowStartBatchIndex);
+	#if defined(_WIN64) && !defined(SV_DEBUG_BOUNDS) && !defined(SV_DEBUG)
+	if (!secondPass && task != 0)
+	{
+		InitializeShadowUploadReuseQuery(&reuseQuery, task, geometry, meshXform,
+			task->m_geometryRevision, static_cast<unsigned int>(numVerts),
+			static_cast<unsigned int>(numIndex), &shadowVertexPageStates[vertexPageIndex],
+			&shadowIndexPageStates[indexPageIndex]);
+		rts::render::RecordShadowSecondPassUpload(&task->m_secondPassUploadReuse,
+			reuseQuery, drawVertexStart, drawIndexStart);
+	}
+	#endif
+	}
 	rts::frame_timing::Scope dynamicCommandsTiming(rts::frame_timing::RendererVolumeDynamicCommands);
 
 	rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
-		static_cast<unsigned short>(nShadowStartBatchVertex));
+		static_cast<unsigned short>(drawVertexStart));
 	rts::render::SetGameTransform(rts::render::GAME_TRANSFORM_WORLD, *meshXform);
 	lastActiveVertexBuffer = shadowVertexBufferOwner;
 	rts::render::SetGameVertexBuffer(shadowVertexBufferOwner);
 	rts::render::SetGameVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
 	Debug_Statistics::Record_DX8_Polys_And_Vertices(numPolys, numVerts,
 		ShaderClass::_PresetOpaqueShader);
-	rts::render::DrawGameTriangles(static_cast<unsigned short>(nShadowStartBatchIndex),
+	rts::render::DrawGameTriangles(static_cast<unsigned short>(drawIndexStart),
 		static_cast<unsigned short>(numPolys), 0,
 		static_cast<unsigned short>(numVerts));
-
-	nShadowVertsInBuf += numVerts;
+	// The projected-shadow renderer shares these legacy globals and runs before
+	// the next volumetric pass, so publish this concrete page's append tail.
+	nShadowVertsInBuf=static_cast<int>(shadowVertexPageStates[vertexPageIndex].cursor);
+	nShadowIndicesInBuf=static_cast<int>(shadowIndexPageStates[indexPageIndex].cursor);
 	nShadowStartBatchVertex=nShadowVertsInBuf;
-
-	nShadowIndicesInBuf += numIndex;
 	nShadowStartBatchIndex=nShadowIndicesInBuf;
+
 }
 
 /** Debug function to draw bounding boxes around shadow volumes */
@@ -1549,6 +1843,10 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 	Int numVerts, numPolys, numIndex;
 	SHADOW_DYNAMIC_VOLUME_VERTEX* pvVertices;
 	UnsignedShort *pvIndices;
+	int vertexPageIndex, indexPageIndex;
+	unsigned int pageUseSequence;
+	rts::render::ShadowStreamPageReservation vertexReservation;
+	rts::render::ShadowStreamPageReservation indexReservation;
 	// Vertex Positions as a function of the box extents
 	static Vector3						_BoxVerts[8] =
 	{
@@ -1583,7 +1881,8 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 
 	if (!rts::render::IsGameRendererInitialized() ||
 		!rts::render::IsGameRenderTargetOperational() ||
-		!rts::render::GameRendererSupportsStencil())
+		!rts::render::GameRendererSupportsStencil() ||
+		!ShadowStreamPagePoolReady())
 		return;	//need a live renderer with a stencil attachment.
 
 	Vector3 meshPosition;
@@ -1619,6 +1918,31 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 	if( numVerts == 0 || numPolys == 0 )
 		return;
 
+	pageUseSequence=NextShadowPageUseSequence();
+	if (!rts::render::ReserveShadowStreamPageAppend(shadowVertexPageStates,
+		shadowStreamPageCount,shadowVertexActivePage,shadowUploadRenderEpoch,
+		static_cast<unsigned int>(SHADOW_VERTEX_SIZE),static_cast<unsigned int>(numVerts),
+		pageUseSequence,&vertexReservation) ||
+		!rts::render::ReserveShadowStreamPageAppend(shadowIndexPageStates,
+			shadowStreamPageCount,shadowIndexActivePage,shadowUploadRenderEpoch,
+			static_cast<unsigned int>(SHADOW_INDEX_SIZE),static_cast<unsigned int>(numIndex),
+			pageUseSequence,&indexReservation))
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
+	vertexPageIndex=static_cast<int>(vertexReservation.pageIndex);
+	indexPageIndex=static_cast<int>(indexReservation.pageIndex);
+	shadowVertexActivePage=vertexPageIndex;
+	shadowIndexActivePage=indexPageIndex;
+	shadowVertexBufferOwner=shadowVertexPageBuffers[vertexPageIndex];
+	shadowIndexBufferOwner=shadowIndexPageBuffers[indexPageIndex];
+	nShadowVertsInBuf=vertexReservation.discard ? SHADOW_VERTEX_SIZE :
+		static_cast<int>(shadowVertexPageStates[vertexPageIndex].cursor);
+	nShadowIndicesInBuf=indexReservation.discard ? SHADOW_INDEX_SIZE :
+		static_cast<int>(shadowIndexPageStates[indexPageIndex].cursor);
+	nShadowStartBatchVertex=static_cast<int>(vertexReservation.start);
+	nShadowStartBatchIndex=static_cast<int>(indexReservation.start);
 
 	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowVertsInBuf,
 		SHADOW_VERTEX_SIZE, numVerts))	//check if room for model verts
@@ -1668,6 +1992,14 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 		ResetVolumetricStreamAfterUploadFailure();
 		return;
 	}
+	if (!rts::render::CommitShadowStreamPageAppend(shadowVertexPageStates,
+		shadowStreamPageCount,static_cast<unsigned int>(SHADOW_VERTEX_SIZE),vertexReservation))
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
+	nShadowVertsInBuf=static_cast<int>(shadowVertexPageStates[vertexPageIndex].cursor);
+	nShadowStartBatchVertex=static_cast<int>(vertexReservation.start);
 
 	if (rts::render::Native_W3D_Stream_Needs_Discard(nShadowIndicesInBuf,
 		SHADOW_INDEX_SIZE, numIndex))	//check if room for model verts
@@ -1715,9 +2047,17 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 		ResetVolumetricStreamAfterUploadFailure();
 		return;
 	}
+	if (!rts::render::CommitShadowStreamPageAppend(shadowIndexPageStates,
+		shadowStreamPageCount,static_cast<unsigned int>(SHADOW_INDEX_SIZE),indexReservation))
+	{
+		ResetVolumetricStreamAfterUploadFailure();
+		return;
+	}
+	nShadowIndicesInBuf=static_cast<int>(shadowIndexPageStates[indexPageIndex].cursor);
+	nShadowStartBatchIndex=static_cast<int>(indexReservation.start);
 
 	rts::render::SetGameIndexBuffer(shadowIndexBufferOwner,
-		static_cast<unsigned short>(nShadowStartBatchVertex));
+		static_cast<unsigned short>(vertexReservation.start));
 
 	// The box vertices are already in world space, so use the identity transform.
 	Matrix4x4 mWorld(1);
@@ -1725,14 +2065,12 @@ void W3DVolumetricShadow::RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, 
 	lastActiveVertexBuffer = shadowVertexBufferOwner;
 	rts::render::SetGameVertexBuffer(shadowVertexBufferOwner);
 	rts::render::SetGameVertexShader(SHADOW_DYNAMIC_VOLUME_FVF);
-	rts::render::DrawGameTriangles(static_cast<unsigned short>(nShadowStartBatchIndex),
+	rts::render::DrawGameTriangles(static_cast<unsigned short>(indexReservation.start),
 		static_cast<unsigned short>(numPolys), 0,
 		static_cast<unsigned short>(numVerts));
-
-	nShadowVertsInBuf += numVerts;
+	nShadowVertsInBuf=static_cast<int>(shadowVertexPageStates[vertexPageIndex].cursor);
+	nShadowIndicesInBuf=static_cast<int>(shadowIndexPageStates[indexPageIndex].cursor);
 	nShadowStartBatchVertex=nShadowVertsInBuf;
-
-	nShadowIndicesInBuf += numIndex;
 	nShadowStartBatchIndex=nShadowIndicesInBuf;
 }
 
@@ -2006,6 +2344,9 @@ void W3DVolumetricShadow::updateVolumes(Real zoffset)
 						}
 						else
 						{
+#if defined(_WIN64)
+							m_shadowVolumeRenderTask[i][j].m_secondPassUploadReuse.invalidate();
+#endif
 							TheW3DVolumetricShadowManager->addDynamicShadowTask(&m_shadowVolumeRenderTask[i][j]);
 						}
 					}
@@ -2019,6 +2360,13 @@ void W3DVolumetricShadow::updateVolumes(Real zoffset)
 to reduce fill rate usage.*/
 void W3DVolumetricShadow::updateMeshVolume(Int meshIndex, Int lightIndex, const Matrix3D *meshXform, const AABoxClass &meshBox, float floorZ )
 {
+#if defined(_WIN64)
+	// Pose/light/geometry mutations cannot authorize an earlier upload.
+	AdvanceShadowDiscardGeneration(&m_shadowVolumeRenderTask[lightIndex][meshIndex].m_geometryRevision);
+	m_shadowVolumeRenderTask[lightIndex][meshIndex].m_secondPassUploadReuse.invalidate();
+	shadowSecondPassFrozen=false;
+#endif
+
 	Vector3 lightPosObject;
 	Matrix4x4 worldToObject;
 	Vector3 objectCenter;
@@ -3233,6 +3581,13 @@ Bool W3DVolumetricShadow::allocateShadowVolume( Int volumeIndex, Int meshIndex )
 
 	}
 
+#if defined(_WIN64)
+	// Pose/light/geometry mutations cannot authorize an earlier upload.
+	AdvanceShadowDiscardGeneration(&m_shadowVolumeRenderTask[volumeIndex][meshIndex].m_geometryRevision);
+	m_shadowVolumeRenderTask[volumeIndex][meshIndex].m_secondPassUploadReuse.invalidate();
+	shadowSecondPassFrozen=false;
+#endif
+
 	if ((shadowVolume = m_shadowVolume[ volumeIndex ][meshIndex]) == nullptr)
 	{
 		// poolify
@@ -3352,6 +3707,13 @@ void W3DVolumetricShadow::resetShadowVolume( Int volumeIndex, Int meshIndex )
 		return;
 
 	}
+
+#if defined(_WIN64)
+	// Pose/light/geometry mutations cannot authorize an earlier upload.
+	AdvanceShadowDiscardGeneration(&m_shadowVolumeRenderTask[volumeIndex][meshIndex].m_geometryRevision);
+	m_shadowVolumeRenderTask[volumeIndex][meshIndex].m_secondPassUploadReuse.invalidate();
+	shadowSecondPassFrozen=false;
+#endif
 
 	geometry = m_shadowVolume[ volumeIndex ][meshIndex];
 
@@ -3551,13 +3913,16 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 		if (!rts::render::IsGameRendererInitialized() ||
 			!rts::render::IsGameRenderTargetOperational() ||
 			!rts::render::GameRendererSupportsStencil() ||
-			shadowVertexBufferOwner == nullptr || shadowIndexBufferOwner == nullptr)
+			!ShadowStreamPagePoolReady())
 			return;	//need a live renderer with a stencil attachment.
 
 		//Some drivers require a fresh dynamic VB each frame, so force a
 		//discard by overflowing the dynamic-stream counters.
- 		nShadowIndicesInBuf = 0xffff;
- 		nShadowVertsInBuf = 0xffff;
+		BeginShadowUploadReuseRender();
+#if defined(_WIN64)
+		rts::render::ShadowStreamReuseDiagnosticsFrame shadowReuseCapture(shadowReuseStats,
+			shadowUploadRenderEpoch, SHADOW_VERTEX_SIZE, SHADOW_INDEX_SIZE, shadowReuseEnabled);
+#endif
 
 		//Set the neutral renderer to the shadow-volume baseline.
 		VertexMaterialClass *vmat=VertexMaterialClass::Get_Preset(VertexMaterialClass::PRELIT_DIFFUSE);
@@ -3687,7 +4052,7 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 				{	//update() added a dynamic shadow
 					//dynamic shadow columns don't need to wait in queue since they
 					//all use the same vertex buffer.  Flush them ASAP.
-					shadow->RenderVolume(shadowDynamicTask->m_meshIndex,shadowDynamicTask->m_lightIndex);
+					shadow->RenderVolume(shadowDynamicTask,FALSE);
 					//move to next dynamic task
 					shadowDynamicTask=(W3DVolumetricShadowRenderTask *)shadowDynamicTask->m_nextTask;
 					numRenderedShadows++;
@@ -3706,12 +4071,16 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 			nextTask=(W3DVolumetricShadowRenderTask *)nextVb->m_renderTaskList;
 			while (nextTask)
 			{
-				nextTask->m_parentShadow->RenderVolume(nextTask->m_meshIndex,nextTask->m_lightIndex);
+				nextTask->m_parentShadow->RenderVolume(nextTask,FALSE);
 				nextTask=(W3DVolumetricShadowRenderTask *)nextTask->m_nextTask;
 				numRenderedShadows++;
 			}
 		}
 
+		// Owner-thread geometry updates are complete until both global passes finish.
+#if defined(_WIN64)
+		shadowSecondPassFrozen=true;
+#endif
 		// change the stencil op to decrement
 		rts::render::SetGameRenderState(
 				rts::render::GAME_RENDER_STATE_STENCIL_PASS_OPERATION,
@@ -3731,7 +4100,7 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 			nextTask=(W3DVolumetricShadowRenderTask *)nextVb->m_renderTaskList;
 			while (nextTask)
 			{
-				nextTask->m_parentShadow->RenderVolume(nextTask->m_meshIndex,nextTask->m_lightIndex);
+				nextTask->m_parentShadow->RenderVolume(nextTask,TRUE);
 				nextTask=(W3DVolumetricShadowRenderTask *)nextTask->m_nextTask;
 			}
 		}
@@ -3742,10 +4111,13 @@ void W3DVolumetricShadowManager::renderShadows( Bool forceStencilFill )
 		while (shadowDynamicTask)
 		{	//dynamic shadow columns don't need to wait in queue since they
 			//all use the same vertex buffer.  Flush them ASAP.
-			shadowDynamicTask->m_parentShadow->RenderVolume(shadowDynamicTask->m_meshIndex,shadowDynamicTask->m_lightIndex);
+			shadowDynamicTask->m_parentShadow->RenderVolume(shadowDynamicTask,TRUE);
 			shadowDynamicTask=(W3DVolumetricShadowRenderTask *)shadowDynamicTask->m_nextTask;
 		}
 
+#if defined(_WIN64)
+		shadowSecondPassFrozen=false;
+#endif
 		//Reset all render tasks for next frame.
 		for (nextVb=TheW3DBufferManager->getNextVertexBuffer(nullptr,W3DBufferManager::VBM_FVF_XYZ);nextVb != nullptr; nextVb=TheW3DBufferManager->getNextVertexBuffer(nextVb,W3DBufferManager::VBM_FVF_XYZ))
 		{
@@ -3896,8 +4268,12 @@ W3DVolumetricShadowManager::~W3DVolumetricShadowManager()
 /** Releases all render assets before a reset. */
 void W3DVolumetricShadowManager::ReleaseResources()
 {
-	REF_PTR_RELEASE(shadowIndexBufferOwner);
-	REF_PTR_RELEASE(shadowVertexBufferOwner);
+	AdvanceShadowDiscardGeneration(&shadowUploadRenderEpoch);
+	rts::render::Invalidate_Native_W3D_Stream_Cursors(nShadowVertsInBuf, nShadowIndicesInBuf, nShadowStartBatchVertex, nShadowStartBatchIndex);
+#if defined(_WIN64)
+	shadowSecondPassFrozen=false;
+#endif
+	ReleaseShadowStreamPageBuffers();
 	lastActiveVertexBuffer=nullptr;
 	if (TheW3DBufferManager)
 	{	TheW3DBufferManager->ReleaseResources();
@@ -3914,27 +4290,44 @@ Bool W3DVolumetricShadowManager::ReAcquireResources()
 		!rts::render::IsGameRenderTargetOperational())
 		return FALSE;
 
-	shadowIndexBufferOwner=NEW_REF(DX8IndexBufferClass,
-		(static_cast<unsigned short>(SHADOW_INDEX_SIZE),
-		DX8IndexBufferClass::USAGE_DYNAMIC));
-	if (shadowIndexBufferOwner == nullptr ||
-		!shadowIndexBufferOwner->Is_Valid())
+	SHADOW_VERTEX_SIZE=4096;
+	SHADOW_INDEX_SIZE=8192;
+	shadowStreamPageCount=1;
+#if defined(_WIN64)
+	if (shadowArenaEnabled) { SHADOW_VERTEX_SIZE=16384; SHADOW_INDEX_SIZE=49152; }
+#if !defined(SV_DEBUG_BOUNDS) && !defined(SV_DEBUG)
+	// RTS_SHADOW_MULTIPAGE_ARENA=0 opts out to one page while retaining the
+	// selected arena capacity; RTS_SHADOW_UPLOAD_ARENA=0 selects legacy sizes.
+	if (shadowArenaEnabled && shadowMultiPageEnabled)
+		shadowStreamPageCount=rts::render::ShadowStreamPageMaximumCount;
+#endif
+#endif
+	// Creation failures retain the ordinary renderer resource-failure latch.
+	// The fixed pool is allocated before rendering; do not retry at a smaller size.
+	for (unsigned int i=0; i<shadowStreamPageCount; ++i)
 	{
-		REF_PTR_RELEASE(shadowIndexBufferOwner);
-		return FALSE;
-	}
+		shadowIndexPageBuffers[i]=NEW_REF(DX8IndexBufferClass,
+			(static_cast<unsigned short>(SHADOW_INDEX_SIZE), DX8IndexBufferClass::USAGE_DYNAMIC));
+		if (shadowIndexPageBuffers[i] == nullptr || !shadowIndexPageBuffers[i]->Is_Valid())
+		{
+			ReleaseShadowStreamPageBuffers();
+			return FALSE;
+		}
+		rts::render::InitializeShadowStreamPageState(&shadowIndexPageStates[i],
+			shadowIndexPageBuffers[i]);
 
-	shadowVertexBufferOwner=NEW_REF(DX8VertexBufferClass,
-		(SHADOW_DYNAMIC_VOLUME_FVF,
-		static_cast<unsigned short>(SHADOW_VERTEX_SIZE),
-		DX8VertexBufferClass::USAGE_DYNAMIC));
-	if (shadowVertexBufferOwner == nullptr ||
-		!shadowVertexBufferOwner->Is_Valid())
-	{
-		REF_PTR_RELEASE(shadowVertexBufferOwner);
-		REF_PTR_RELEASE(shadowIndexBufferOwner);
-		return FALSE;
+		shadowVertexPageBuffers[i]=NEW_REF(DX8VertexBufferClass,
+			(SHADOW_DYNAMIC_VOLUME_FVF, static_cast<unsigned short>(SHADOW_VERTEX_SIZE), DX8VertexBufferClass::USAGE_DYNAMIC));
+		if (shadowVertexPageBuffers[i] == nullptr || !shadowVertexPageBuffers[i]->Is_Valid())
+		{
+			ReleaseShadowStreamPageBuffers();
+			return FALSE;
+		}
+		rts::render::InitializeShadowStreamPageState(&shadowVertexPageStates[i],
+			shadowVertexPageBuffers[i]);
 	}
+	shadowIndexBufferOwner=shadowIndexPageBuffers[0];
+	shadowVertexBufferOwner=shadowVertexPageBuffers[0];
 
 	if (TheW3DBufferManager)
 		if (!TheW3DBufferManager->ReAcquireResources())

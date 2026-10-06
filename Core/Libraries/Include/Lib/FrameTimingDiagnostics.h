@@ -37,6 +37,14 @@ enum Phase
 	ClientDrawableSweep, RendererWW3DSync, RendererW3DViewUpdate,
 	RendererShroudSourceSync,
 	RendererSceneCustomizedRender, RendererSceneFlush,
+	RendererScenePrimaryOpaqueMeshFlush, RendererSceneOccludedFlush,
+	RendererSceneStaticSortLists, RendererSceneTranslucentObjects,
+	RendererRigidFVFRender, RendererDecalRender, RendererDelayedPassRender,
+	RendererSkinDeformation, RendererSkinPacking, RendererSkinCommit,
+	RendererSkinDrawCategories, RendererResourceLookupScan, RendererReadinessCheckSampled64,
+	RendererNativeSubmitCommandSampled64, RendererNativeExecuteCommandSampled64,
+	RendererNativeServiceThreadedCompletionsSampled64,
+	RendererNativeCommandBodySampled64,
 	PhaseCount
 };
 
@@ -305,6 +313,7 @@ public:
 	}
 
 private:
+	friend class SampledScope;
 	static std::atomic<Capture*>& instanceSlot()
 	{
 		static std::atomic<Capture*> capture(NULL);
@@ -428,7 +437,15 @@ private:
 			"renderer_volume_dynamic_upload", "renderer_volume_dynamic_commands",
 			"client_drawable_sweep", "renderer_ww3d_sync", "renderer_w3d_view_update",
 			"renderer_shroud_source_sync", "renderer_scene_customized_render",
-			"renderer_scene_flush"
+			"renderer_scene_flush",
+			"renderer_scene_primary_opaque_mesh_flush", "renderer_scene_occluded_flush",
+			"renderer_scene_static_sort_lists", "renderer_scene_translucent_objects",
+			"renderer_rigid_fvf_render", "renderer_decal_render", "renderer_delayed_pass_render",
+			"renderer_skin_deformation", "renderer_skin_packing", "renderer_skin_commit",
+			"renderer_skin_draw_categories", "renderer_resource_lookup_scan", "renderer_readiness_check_sampled64",
+			"renderer_native_submit_command_sampled64", "renderer_native_execute_command_sampled64",
+			"renderer_native_service_threaded_completions_sampled64",
+			"renderer_native_command_body_sampled64"
 		};
 		static_assert(sizeof(names) / sizeof(names[0]) == PhaseCount,
 			"Every diagnostic phase must retain its CSV name");
@@ -548,6 +565,46 @@ private:
 	Scope& operator=(const Scope&);
 };
 
+class SampledScope
+{
+public:
+	explicit SampledScope(Phase phase) : m_capture(selectedCapture()), m_phase(phase), m_start(0)
+	{
+		if (m_capture == NULL || !m_capture->isActive() || phase < 0 || phase >= PhaseCount)
+			return;
+		unsigned int& eligibleCalls = sampleCounts()[phase];
+		const unsigned int sequence = eligibleCalls++;
+		if ((sequence & 63U) == 0U)
+			m_start = Capture::clock();
+	}
+	~SampledScope() { finish(); }
+	void finish()
+	{
+		if (!m_start)
+			return;
+		const __int64 start = m_start;
+		m_start = 0;
+		if (m_capture != NULL && m_capture->isActive())
+			m_capture->add(m_phase, Capture::clock() - start);
+	}
+private:
+	static Capture* selectedCapture()
+	{
+		Capture *capture = BoundCaptureSlot();
+		return capture ? capture : Capture::instanceSlot().load(std::memory_order_acquire);
+	}
+	static unsigned int* sampleCounts()
+	{
+		static thread_local unsigned int counts[PhaseCount] = { 0 };
+		return counts;
+	}
+	Capture *m_capture;
+	Phase m_phase;
+	__int64 m_start;
+	SampledScope(const SampledScope&);
+	SampledScope& operator=(const SampledScope&);
+};
+
 class Session
 {
 public:
@@ -566,6 +623,7 @@ inline bool IsActive() { return Capture::isInstanceActive(); }
 #else
 namespace rts { namespace frame_timing {
 class Scope { public: explicit Scope(Phase) {} void finish() {} };
+class SampledScope { public: explicit SampledScope(Phase) {} void finish() {} };
 class Session { public: explicit Session(const char*) {} };
 inline void BeginFrame(unsigned int) {}
 inline void EndFrame(unsigned int) {}

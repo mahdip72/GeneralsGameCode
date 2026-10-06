@@ -269,7 +269,7 @@ bool NativeW3DRenderState::IsBackendTerminal() const
 
 bool NativeW3DRenderState::IsOperational() const
 {
-	return IsOwnerThread() && IsAcceptingCleanup() && m_device != 0 &&
+	return m_cleanup.IsOwnerAccepting() && m_device != 0 &&
 		m_context != 0;
 }
 

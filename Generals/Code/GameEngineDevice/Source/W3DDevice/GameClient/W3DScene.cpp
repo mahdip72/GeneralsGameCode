@@ -980,11 +980,13 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 	}
 
 	{
+		rts::frame_timing::Scope primaryOpaqueMeshFlushTiming(rts::frame_timing::RendererScenePrimaryOpaqueMeshFlush);
 		rts::render::FlushGameRenderMeshes();	//draw all non-translucent objects.
 	}
 
 	//draw all non-translucent objects which were separated because they are hidden and need custom rendering.
 	{
+		rts::frame_timing::Scope occludedFlushTiming(rts::frame_timing::RendererSceneOccludedFlush);
 #ifdef USE_NON_STENCIL_OCCLUSION
 		flushOccludedObjects(rinfo);
 #else
@@ -1004,11 +1006,13 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 	}
 
 	{
+		rts::frame_timing::Scope staticSortListsTiming(rts::frame_timing::RendererSceneStaticSortLists);
 		WW3D::Render_And_Clear_Static_Sort_Lists(rinfo);	//draws things like water
 	}
 
 	if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 	{
+		rts::frame_timing::Scope translucentObjectsTiming(rts::frame_timing::RendererSceneTranslucentObjects);
 		flushTranslucentObjects(rinfo);	//draw all translucent meshes which don't need per-polygon sorting.
 	}
 

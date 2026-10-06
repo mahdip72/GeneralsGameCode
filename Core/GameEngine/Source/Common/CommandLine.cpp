@@ -47,6 +47,7 @@
 #include "Lib/JobSystem.h"
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/SimulationExecutionPolicy.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/RendererDevice.h"
 #include "WWLib/trim.h"
@@ -2108,6 +2109,38 @@ static void parseCommandLine(const CommandLineParam* params, int numParams)
 		printf("RENDERED_BATTLE_DIAGNOSTIC_FAIL reason=%s\n", renderedBattleError);
 		fflush(stdout);
 		exit(2);
+	}
+	if (params == paramsForStartup)
+	{
+		const char *testOptionsError = NULL;
+		if (!rts::rendered_battle::ConfigureTestOptions(argc, argv.empty() ? NULL : &argv[0],
+			renderedBattleSupported != FALSE, &testOptionsError, sizeof(void *) == 8))
+		{
+			printf("RENDERED_BATTLE_TEST_OPTIONS_FAIL reason=%s\n", testOptionsError);
+			fflush(stdout);
+			exit(2);
+		}
+		if (rts::rendered_battle::ProcessTestOptions().visualSamples)
+		{
+			printf("%s\n", rts::rendered_battle::VisualSamplesMarker());
+			fflush(stdout);
+			if (!rts::rendered_battle::WriteVisualSampleRecord("RENDER_VISUAL_CAPTURE_SAMPLES_ONLY numerical_eligible=0\n"))
+			{
+				printf("RENDER_VISUAL_CAPTURE_SAMPLES_FAIL reason=receipt_unavailable\n");
+				fflush(stdout);
+				exit(2);
+			}
+		}
+		if (rts::rendered_battle::ProcessTestOptions().backgroundStartup)
+		{
+			printf("%s\n", rts::rendered_battle::BackgroundStartupMarker());
+			fflush(stdout);
+		}
+		if (rts::rendered_battle::ProcessTestOptions().visualCaptureOnly)
+		{
+			printf("%s\n", rts::rendered_battle::VisualCaptureOnlyMarker());
+			fflush(stdout);
+		}
 	}
 	rts::ai_fixture::MapRequest reviewedMapRequest;
 	const char *reviewedMapError = 0;

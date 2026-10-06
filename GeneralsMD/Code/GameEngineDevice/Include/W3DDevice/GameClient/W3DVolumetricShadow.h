@@ -27,6 +27,9 @@
 #include "WWMath/matrix4.h"
 #include "W3DDevice/GameClient/W3DBufferManager.h"
 #include "GameClient/Shadow.h"
+#if defined(_WIN64)
+#include "Renderer/ShadowSecondPassUploadReusePolicy.h"
+#endif
 
 ///@todo Make the 100 below a 'better' number. Was 32, increased because of overcomplex models.
 #define MAX_SHADOW_CASTER_MESHES	160	//number of meshes allowed in animated hierarchy (must be <256 since index is a byte).
@@ -40,6 +43,11 @@ class Drawable;	//forward reference
 
 struct W3DVolumetricShadowRenderTask : public W3DBufferManager::W3DRenderTask
 {
+#if defined(_WIN64)
+	rts::render::ShadowSecondPassUploadReuseRecord m_secondPassUploadReuse;
+	unsigned int m_geometryRevision;
+	W3DVolumetricShadowRenderTask() : m_geometryRevision(1) {}
+#endif
 	W3DVolumetricShadow	*m_parentShadow;		///<main casting object to which this volume belongs.
 	UnsignedByte		m_meshIndex;		///<mesh index of volume within parent to render.
 	UnsignedByte		m_lightIndex;		///<light index of volume within parent to render.
@@ -124,11 +132,11 @@ class W3DVolumetricShadow	: public Shadow
 		void updateMeshVolume(Int meshIndex, Int lightIndex, const Matrix3D *meshXform, const AABoxClass &meshBox, float floorZ);///<update shadow volume of this mesh.
 
 		// rendering interface
-		void RenderVolume(Int meshIndex, Int lightIndex);	///<renders a specific volume from the model hierarchy
+		void RenderVolume(W3DVolumetricShadowRenderTask *task, Bool secondPass);	///<renders a specific volume from the model hierarchy
 		///render single mesh which could belong to a larger hierarchy (optimized for static meshes).
 		void RenderMeshVolume(Int meshIndex, Int lightIndex, const Matrix3D *meshXform);
 		///render single mesh which could belong to a larger hierarchy (optimized for animated meshes).
-		void RenderDynamicMeshVolume(Int meshIndex, Int lightIndex, const Matrix3D *meshXform);
+		void RenderDynamicMeshVolume(W3DVolumetricShadowRenderTask *task, Int meshIndex, Int lightIndex, const Matrix3D *meshXform, Bool secondPass);
 		void RenderMeshVolumeBounds(Int meshIndex, Int lightIndex, const Matrix3D *meshXform);	///<render bounding volume around shadow volume - for debug use.
 
 		void setLightPosHistory(Int lightIndex, Int meshIndex, Vector3 &pos) {m_lightPosHistory[lightIndex][meshIndex]=pos;}	///<updates the last position of light

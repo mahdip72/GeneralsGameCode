@@ -68,6 +68,7 @@
 #include "BuildVersion.h"
 #include "GeneratedVersion.h"
 #include "Renderer/RendererDevice.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
 #include "resource.h"
 
 #ifdef RTS_ENABLE_CRASHDUMP
@@ -750,6 +751,8 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 {
 	DWORD windowStyle;
 	DWORD windowExStyle = 0;
+	const Bool backgroundStartup = rts::rendered_battle::ProcessTestOptions().backgroundStartup;
+	if (backgroundStartup && !runWindowed) return false;
 	Int startWidth = DEFAULT_DISPLAY_WIDTH,
 			startHeight = DEFAULT_DISPLAY_HEIGHT;
 	Int windowX = 0;
@@ -759,6 +762,11 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 			rts::render::RENDER_BACKEND_D3D11;
 	const Bool createWindowedBootstrap = runWindowed || d3d11Fullscreen;
 
+	if (backgroundStartup)
+	{
+		startWidth = 1920;
+		startHeight = 1080;
+	}
 	// register the window class
 
   WNDCLASS wndClass = { CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS, WndProc, 0, 0, hInstance,
@@ -769,7 +777,10 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
   RegisterClass( &wndClass );
 
    // Create our main window
-	windowStyle =  WS_POPUP|WS_VISIBLE;
+	windowStyle = WS_POPUP | (backgroundStartup ? 0 : WS_VISIBLE);
+	if (backgroundStartup)
+		// WS_EX_NOACTIVATE is absent from some legacy SDK headers.
+		windowExStyle |= 0x08000000L;
 	if (createWindowedBootstrap)
 		windowStyle |= WS_MINIMIZEBOX | WS_SYSMENU | WS_DLGFRAME | WS_CAPTION;
 	else
@@ -783,8 +794,11 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 	if (createWindowedBootstrap) {
 		AdjustWindowRectEx(&rect, windowStyle, FALSE, windowExStyle);
 		// Makes the normal debug 800x600 window center in the screen.
-		startWidth = DEFAULT_DISPLAY_WIDTH;
-		startHeight= DEFAULT_DISPLAY_HEIGHT;
+		if (!backgroundStartup)
+		{
+			startWidth = DEFAULT_DISPLAY_WIDTH;
+			startHeight = DEFAULT_DISPLAY_HEIGHT;
+		}
 		windowX = (GetSystemMetrics(SM_CXSCREEN) / 2) - (startWidth / 2);
 		windowY = (GetSystemMetrics(SM_CYSCREEN) / 2) - (startHeight / 2);
 	}
@@ -823,7 +837,13 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 														nullptr );
 
 
-	if (!createWindowedBootstrap)
+	if (backgroundStartup)
+	{
+		if (!hWnd) { gInitializing = false; return false; }
+		SetWindowPos(hWnd, NULL, 0, 0, 0, 0,
+			SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+	}
+	else if (!createWindowedBootstrap)
 	{	SetWindowPos(hWnd, HWND_TOPMOST, rect.left, rect.top,
 				rect.right - rect.left, rect.bottom - rect.top,
 				SWP_FRAMECHANGED | SWP_SHOWWINDOW);
@@ -831,10 +851,12 @@ static Bool initializeAppWindows( HINSTANCE hInstance, Int nCmdShow, Bool runWin
 	else
 		SetWindowPos(hWnd, HWND_TOP, 0, 0, 0, 0,SWP_NOSIZE |SWP_NOMOVE);
 
-	SetFocus(hWnd);
-
-	SetForegroundWindow(hWnd);
-	ShowWindow( hWnd, nCmdShow );
+	if (!backgroundStartup)
+	{
+		SetFocus(hWnd);
+		SetForegroundWindow(hWnd);
+		ShowWindow(hWnd, nCmdShow);
+	}
 	UpdateWindow( hWnd );
 
 	// save our application window handle for future use
@@ -987,7 +1009,7 @@ Int APIENTRY WinMain( HINSTANCE hInstance, HINSTANCE hPrevInstance,
 		if (!rts::ClientInstance::initialize())
 		{
 			HWND ccwindow = FindWindow(rts::ClientInstance::getFirstInstanceName(), nullptr);
-			if (ccwindow)
+			if (ccwindow && !rts::rendered_battle::ProcessTestOptions().backgroundStartup)
 			{
 				SetForegroundWindow(ccwindow);
 				ShowWindow(ccwindow, SW_RESTORE);

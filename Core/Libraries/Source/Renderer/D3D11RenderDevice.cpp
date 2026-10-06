@@ -1,8 +1,10 @@
 #include "Renderer/RendererDevice.h"
+#include "Renderer/NormalMatrixSubgroupCache.h"
 #include "Lib/FrameTimingDiagnostics.h"
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3d11sdklayers.h>
 #include <dxgi1_2.h>
 
@@ -10,6 +12,7 @@
 #include "D3D11GpuFrameTiming.h"
 #include "PresentFrameTiming.h"
 #include "IndexedDrawValidationCache.h"
+#include "TransformConstantArenaPolicy.h"
 #include "LegacyFixedFunctionPS.h"
 #include "LegacyFixedFunctionVS.h"
 #include "LegacyWaterFlatPS.h"
@@ -602,6 +605,18 @@ struct PresentationColorConstants
 	float limit;
 };
 
+// Match the unchanged HLSL b0 layout, including padded float3x3 rows.
+typedef char TransformConstantArenaLayoutProof[
+	(sizeof(float) == 4 && sizeof(unsigned int) == 4 &&
+	 sizeof(LegacyTransformConstants) == detail::TransformConstantArenaPolicy::PAYLOAD_BYTES &&
+	 offsetof(LegacyTransformConstants, vertexShaderConstants) == 2016 &&
+	 offsetof(LegacyTransformConstants, pixelShaderConstants) == 2560 &&
+	 offsetof(LegacyTransformConstants, view) == 2688 &&
+	 offsetof(LegacyTransformConstants, worldNormalMatrix) == 2752 &&
+	 offsetof(LegacyTransformConstants, worldViewNormalMatrix) == 2800 &&
+	 offsetof(LegacyTransformConstants, clipPlanes) == 2848 &&
+	 offsetof(LegacyTransformConstants, fogStateParameters) == 2960) ? 1 : -1];
+
 void MultiplyMatrices(const float *left, const float *right, float *product)
 {
 	for (unsigned int row = 0; row < 4; ++row)
@@ -692,7 +707,7 @@ bool CanDisableLegacyPixelShader(const LegacyPipelineState &pipeline)
 class D3D11RenderDevice : public IRenderDevice, public IRenderContext
 {
 public:
-	D3D11RenderDevice() : m_device(0), m_context(0),
+	D3D11RenderDevice() : m_device(0), m_context(0), m_context1(0),
 		m_featureLevel(D3D_FEATURE_LEVEL_9_1), m_debugLayer(0),
 		m_debugLayerActive(false), m_swapChain(0),
 		m_renderTarget(0), m_renderTargetResource(0),
@@ -702,6 +717,7 @@ public:
 		m_multisampleDepthTexture(0), m_multisampleDepthStencil(0),
 		m_activeRenderTarget(0), m_activeDepthStencil(0),
 		m_activeColorResource(0), m_activeDepthResource(0),
+		m_transformArena(0),
 		m_vertexShader(0), m_pixelShader(0), m_positionColorLayout(0),
 		m_texturedVertexShader(0), m_texturedPixelShader(0),
 		m_texturedUnweightedVertexShader(0),
@@ -756,11 +772,20 @@ public:
 		memset(m_cachedLegacyPipeline, 0, sizeof(m_cachedLegacyPipeline));
 		memset(m_boundTextures, 0, sizeof(m_boundTextures));
 		memset(&m_lastTransformConstants, 0, sizeof(m_lastTransformConstants));
+#if defined(_MSC_VER) && defined(_M_X64)
+		m_worldNormalCache.invalidate();
+		m_worldViewNormalCache.invalidate();
+#endif
 	}
 
 	virtual ~D3D11RenderDevice()
 	{
 		shutdown();
+	}
+
+	bool transformConstantArenaEnabled() const
+	{
+		return isOperational() && m_context1 != 0 && m_transformArena != 0;
 	}
 
 	virtual RenderBackend backend() const
@@ -1969,7 +1994,13 @@ public:
 		}
 		m_pipelineStateValid = false;
 		m_transformConstantsValid = false;
+		// A frame reset must discard, never NO_OVERWRITE an earlier live slice.
+		m_transformArenaPolicy.reset();
 		m_pipelineBound = false;
+#if defined(_MSC_VER) && defined(_M_X64)
+		m_worldNormalCache.invalidate();
+		m_worldViewNormalCache.invalidate();
+#endif
 		m_vertexBufferBound = false;
 		m_indexBufferBound = false;
 		m_topologyBound = false;
@@ -3720,6 +3751,9 @@ private:
 		ID3D11Buffer *emptyConstantBuffer = 0;
 		m_context->VSSetConstantBuffers(0, 1, &emptyConstantBuffer);
 		m_context->PSSetConstantBuffers(0, 1, &emptyConstantBuffer);
+		// Presentation overwrote b0; identical bytes must rebind a fresh range.
+		m_transformConstantsValid = false;
+		m_transformConstantsChanged = true;
 		m_context->VSSetShader(0, 0, 0);
 		m_context->PSSetShader(0, 0, 0);
 		m_context->IASetInputLayout(0);
@@ -3911,6 +3945,10 @@ private:
 		m_cachedLegacyPipelineValid = false;
 		m_transformConstantsValid = false;
 		m_transformConstantsChanged = true;
+#if defined(_MSC_VER) && defined(_M_X64)
+		m_worldNormalCache.invalidate();
+		m_worldViewNormalCache.invalidate();
+#endif
 	}
 
 	void invalidateResourceBindings()
@@ -4256,6 +4294,25 @@ private:
 			}
 		}
 		m_transformConstantCursor = 0;
+		m_transformArenaPolicy.reset();
+		if (m_context1 != 0)
+		{
+			D3D11_BUFFER_DESC arenaDescriptor = constantDescriptor;
+			arenaDescriptor.ByteWidth = detail::TransformConstantArenaPolicy::PAGE_BYTES;
+			const HRESULT arenaResult = m_device->CreateBuffer(&arenaDescriptor, 0,
+				&m_transformArena);
+			if (FAILED(arenaResult))
+			{
+				if (m_transformArena != 0)
+				{
+					m_transformArena->Release();
+					m_transformArena = 0;
+				}
+				const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+				if (FAILED(deviceResult)) return deviceResult;
+				// Optional healthy-device allocation failure retains the original ring.
+			}
+		}
 		result = m_device->CreateVertexShader(g_LegacyFixedFunctionVS,
 			sizeof(g_LegacyFixedFunctionVS), 0, &m_vertexShader);
 		if (FAILED(result))
@@ -4446,10 +4503,20 @@ private:
 		// Invert once while publishing the logical state.  The vertex shader only
 		// multiplies by these matrices; it must not perform a cofactor/determinant
 		// calculation for every vertex.
+#if defined(_MSC_VER) && defined(_M_X64)
+		detail::NormalMatrixSubgroupCache::Entry pendingWorldNormal;
+		detail::NormalMatrixSubgroupCache::Entry pendingWorldViewNormal;
+		const unsigned int normalControls = detail::ReadNormalMatrixCacheControls();
+		m_worldNormalCache.stage(state.constants.world,
+			shaderConstants.worldNormalMatrix, pendingWorldNormal, normalControls);
+		m_worldViewNormalCache.stage(worldViewMatrix,
+			shaderConstants.worldViewNormalMatrix, pendingWorldViewNormal, normalControls);
+#else
 		BuildLegacyInverseTransposeNormalMatrix(state.constants.world,
 			shaderConstants.worldNormalMatrix);
 		BuildLegacyInverseTransposeNormalMatrix(worldViewMatrix,
 			shaderConstants.worldViewNormalMatrix);
+#endif
 		// The legacy shader has three distinct fog equations.  The scale-fragment
 		// variant deliberately sets the fixed-function fog color to black so that
 		// the visibility factor multiplies the fragment instead of blending it
@@ -4694,33 +4761,73 @@ private:
 			&shaderConstants, sizeof(shaderConstants)) == 0)
 		{
 			m_transformConstantsChanged = false;
+#if defined(_MSC_VER) && defined(_M_X64)
+			m_worldNormalCache.commit(pendingWorldNormal);
+			m_worldViewNormalCache.commit(pendingWorldViewNormal);
+#endif
 			return S_OK;
 		}
 		packingTiming.finish();
 		rts::frame_timing::Scope uploadTiming(rts::frame_timing::RendererConstantUpload);
-		ID3D11Buffer *constantBuffer =
+		const bool arena = m_transformArena != 0 && m_context1 != 0;
+		const detail::TransformConstantArenaPolicy::Range range =
+			m_transformArenaPolicy.reserve();
+		ID3D11Buffer *constantBuffer = arena ? m_transformArena :
 			m_transformConstants[m_transformConstantCursor];
-		m_transformConstantCursor = (m_transformConstantCursor + 1) %
-			TRANSFORM_CONSTANT_BUFFER_COUNT;
+		if (!arena)
+			m_transformConstantCursor = (m_transformConstantCursor + 1) %
+				TRANSFORM_CONSTANT_BUFFER_COUNT;
 		D3D11_MAPPED_SUBRESOURCE mapped;
 		const HRESULT result = m_context->Map(constantBuffer, 0,
-			D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+			arena && !range.discard ? D3D11_MAP_WRITE_NO_OVERWRITE :
+				D3D11_MAP_WRITE_DISCARD, 0, &mapped);
 		if (FAILED(result))
 		{
+			m_transformConstantsValid = false;
+			m_transformConstantsChanged = true;
 			return result;
 		}
 		if (mapped.pData == 0)
 		{
 			m_context->Unmap(constantBuffer, 0);
+			m_transformConstantsValid = false;
+			m_transformConstantsChanged = true;
 			return E_FAIL;
 		}
-		memcpy(mapped.pData, &shaderConstants, sizeof(shaderConstants));
+		if (arena)
+			detail::TransformConstantArenaPolicy::WriteSlice(
+				static_cast<unsigned char *>(mapped.pData) + range.byteOffset,
+				&shaderConstants);
+		else
+			memcpy(mapped.pData, &shaderConstants, sizeof(shaderConstants));
 		m_context->Unmap(constantBuffer, 0);
+		if (arena)
+		{
+			m_context1->VSSetConstantBuffers1(0, 1, &constantBuffer,
+				&range.firstConstant, &range.constantCount);
+			m_context1->PSSetConstantBuffers1(0, 1, &constantBuffer,
+				&range.firstConstant, &range.constantCount);
+			if (!m_transformArenaPolicy.commit(range))
+			{
+				// The published slice cannot be reused with NO_OVERWRITE on retry.
+				m_transformArenaPolicy.reset();
+				m_transformConstantsValid = false;
+				m_transformConstantsChanged = true;
+				return E_FAIL;
+			}
+		}
+		else
+		{
+			m_context->VSSetConstantBuffers(0, 1, &constantBuffer);
+			m_context->PSSetConstantBuffers(0, 1, &constantBuffer);
+		}
 		m_lastTransformConstants = shaderConstants;
 		m_transformConstantsValid = true;
 		m_transformConstantsChanged = true;
-		m_context->VSSetConstantBuffers(0, 1, &constantBuffer);
-		m_context->PSSetConstantBuffers(0, 1, &constantBuffer);
+#if defined(_MSC_VER) && defined(_M_X64)
+		m_worldNormalCache.commit(pendingWorldNormal);
+		m_worldViewNormalCache.commit(pendingWorldViewNormal);
+#endif
 		return S_OK;
 	}
 
@@ -5924,6 +6031,21 @@ private:
 		if (SUCCEEDED(result))
 		{
 			m_featureLevel = obtainedLevel;
+			D3D11_FEATURE_DATA_D3D11_OPTIONS options;
+			memset(&options, 0, sizeof(options));
+			ID3D11DeviceContext1 *context1 = 0;
+			const bool hasContext1 = SUCCEEDED(m_context->QueryInterface(
+				__uuidof(ID3D11DeviceContext1), reinterpret_cast<void **>(&context1)));
+			const bool hasOptions = SUCCEEDED(m_device->CheckFeatureSupport(
+				D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options)));
+			if (detail::TransformConstantArenaPolicy::Supported(hasContext1 && context1 != 0,
+				hasOptions && options.ConstantBufferOffsetting != FALSE,
+				hasOptions && options.MapNoOverwriteOnDynamicConstantBuffer != FALSE))
+				m_context1 = context1;
+			else if (context1 != 0)
+				context1->Release();
+			const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+			if (FAILED(deviceResult)) return deviceResult;
 			m_debugLayerActive = false;
 			if ((flags & D3D11_CREATE_DEVICE_DEBUG) != 0)
 			{
@@ -6058,6 +6180,13 @@ private:
 
 	void releasePipelineResources()
 	{
+		if (m_transformArena != 0)
+		{
+			m_transformArena->Release();
+			m_transformArena = 0;
+		}
+		m_transformArenaPolicy.reset();
+		m_transformConstantsValid = false;
 		if (m_presentationSampler != 0)
 		{
 			m_presentationSampler->Release();
@@ -6201,6 +6330,11 @@ private:
 
 	void releaseImmediateContext()
 	{
+		if (m_context1 != 0)
+		{
+			m_context1->Release();
+			m_context1 = 0;
+		}
 		if (m_context != 0)
 		{
 			m_context->Release();
@@ -6230,6 +6364,7 @@ private:
 	detail::D3D11PresentFrameTiming m_presentTiming;
 	ID3D11Device *m_device;
 	ID3D11DeviceContext *m_context;
+	ID3D11DeviceContext1 *m_context1;
 	D3D_FEATURE_LEVEL m_featureLevel;
 	ID3D11Debug *m_debugLayer;
 	bool m_debugLayerActive;
@@ -6249,6 +6384,8 @@ private:
 	ID3D11Resource *m_activeColorResource;
 	ID3D11Resource *m_activeDepthResource;
 	ID3D11Buffer *m_transformConstants[TRANSFORM_CONSTANT_BUFFER_COUNT];
+	ID3D11Buffer *m_transformArena;
+	detail::TransformConstantArenaPolicy m_transformArenaPolicy;
 	ID3D11VertexShader *m_vertexShader;
 	ID3D11PixelShader *m_pixelShader;
 	ID3D11InputLayout *m_positionColorLayout;
@@ -6329,6 +6466,10 @@ private:
 	unsigned int m_cachedLegacyVertexLayoutFlags;
 	ID3D11InputLayout *m_cachedLegacyInputLayout;
 	LegacyTransformConstants m_lastTransformConstants;
+#if defined(_MSC_VER) && defined(_M_X64)
+	detail::NormalMatrixSubgroupCache m_worldNormalCache;
+	detail::NormalMatrixSubgroupCache m_worldViewNormalCache;
+#endif
 	bool m_transformConstantsValid;
 	bool m_transformConstantsChanged;
 	bool m_hasInputLayoutOverride;
@@ -6361,6 +6502,13 @@ IRenderDevice *CreateD3D11RenderDevice()
 	{
 		return 0;
 	}
+}
+
+bool detail::D3D11TransformConstantArenaEnabled(IRenderDevice *device)
+{
+	// Internal coverage query; callers supply the actual backend factory result.
+	return device != 0 && device->backend() == RENDER_BACKEND_D3D11 &&
+		static_cast<D3D11RenderDevice *>(device)->transformConstantArenaEnabled();
 }
 }
 }

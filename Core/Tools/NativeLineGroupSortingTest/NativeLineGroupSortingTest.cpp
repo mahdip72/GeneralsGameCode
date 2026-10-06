@@ -4,6 +4,7 @@
 #include "nativew3dsorting.h"
 #include "Renderer/LegacyColorPacking.h"
 #include "Lib/JobSystem.h"
+#include "Lib/FrameTimingDiagnostics.h"
 #include <assert.h>
 #include <cmath>
 #include <cstdio>

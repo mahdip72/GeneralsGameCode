@@ -6,6 +6,7 @@
 #if defined(RTS_RENDERER_HAS_D3D11)
 #include <windows.h>
 #include "../../Libraries/Source/Renderer/IndexedDrawValidationCache.h"
+#include "../../Libraries/Source/Renderer/TransformConstantArenaPolicy.h"
 
 namespace
 {
@@ -90,6 +91,101 @@ struct WindowedFixture : Fixture
 	}
 	HWND window;
 };
+
+int ConstantArenaParity(WindowedFixture &fixture)
+{
+	struct Vertex { float x, y, z; unsigned int color; };
+	const Vertex triangle[3] = {
+		{ -.75f, -.75f, .5f, 0xffffffffU },
+		{ 0, .75f, .5f, 0xffffffffU },
+		{ .75f, -.75f, .5f, 0xffffffffU }
+	};
+	const unsigned short indices[3] = { 0, 1, 2 };
+	GpuHandle vb, ib;
+	int result = Check(fixture.Buffer(RENDER_BUFFER_VERTEX, triangle, sizeof(triangle),
+		&vb, RENDER_USAGE_IMMUTABLE) && fixture.Buffer(RENDER_BUFFER_INDEX,
+		indices, sizeof(indices), &ib, RENDER_USAGE_IMMUTABLE),
+		"constant arena immutable parity buffers create");
+	if (result) return result;
+	std::vector<unsigned char> reference(64 * 64 * 4), pixels(reference.size());
+	for (unsigned int image = 0; image < 5; ++image)
+	{
+		if (image == 2)
+			result |= Check(fixture.device->setGamma(1.1f, 0, 1, false, false) == RENDER_RESULT_OK &&
+				fixture.device->present() == RENDER_RESULT_OK &&
+				fixture.device->setGamma(1, 0, 1, false, false) == RENDER_RESULT_OK,
+				"constant arena presentation b0 transition restores ordinary drawing");
+		if (image == 3)
+		{
+			result |= Check(fixture.device->recoverDevice() == RENDER_RESULT_OK,
+				"constant arena device recovery recreates constants and immutable buffers");
+			fixture.context = fixture.device->immediateContext();
+		}
+		if (image == 4)
+			result |= Check(fixture.device->resize(80, 80) == RENDER_RESULT_OK &&
+				fixture.device->resize(64, 64) == RENDER_RESULT_OK,
+				"constant arena resize revokes stale pipeline bindings");
+		if (result || fixture.context == 0) return result | 1;
+		printf("CONSTANT_ARENA_GPU image=%u admitted=%u reference=%s\n", image,
+			detail::D3D11TransformConstantArenaEnabled(fixture.device) ? 1U : 0U,
+			image == 0 ? "one-draw-per-DISCARD-frame" : "42-draw-two-page-frame");
+		for (unsigned int draw = 0; draw < 42; ++draw)
+		{
+			// Reference uses the identical shader and constants but one DISCARD
+			// per frame. The batch submits two pages with one mid-frame wrap.
+			if (image == 0 || draw == 0)
+			{
+				result |= Check(fixture.context->beginFrame() == RENDER_RESULT_OK &&
+					fixture.context->setVertexBuffer(vb, sizeof(Vertex), 0) == RENDER_RESULT_OK &&
+					fixture.context->setIndexBuffer(ib, RENDER_FORMAT_R16_UINT, 0) == RENDER_RESULT_OK &&
+					fixture.context->setPrimitiveTopology(RENDER_PRIMITIVE_TRIANGLE_LIST) == RENDER_RESULT_OK,
+					"constant arena parity frame and buffer bindings begin");
+				if (draw == 0)
+					result |= Check(fixture.context->clear(RenderFloat4(0, 0, 0, 1), 1, 0) ==
+						RENDER_RESULT_OK, "constant arena parity clears once per image");
+			}
+			LegacyLogicalState state;
+			state.pipeline.rasterizer.cullMode = RENDER_CULL_NONE;
+			state.pipeline.alphaTestEnable = (draw & 1) != 0;
+			state.pipeline.alphaFunction = RENDER_COMPARE_ALWAYS;
+			state.pipeline.fogMode = RENDER_FOG_LINEAR;
+			state.constants.world.values[0] = state.constants.world.values[5] = .125f;
+			state.constants.world.values[12] = -.75f + .25f * (draw % 6);
+			state.constants.world.values[13] = -.75f + .25f * (draw / 6);
+			state.constants.fog.enabled = true;
+			state.constants.fog.start = -1; state.constants.fog.end = 0;
+			state.constants.fog.color = (draw & 1) ? RenderFloat4(1, 0, 0, 1) :
+				RenderFloat4(0, 1, 0, 1);
+			result |= Check(fixture.context->setLegacyState(state, RENDER_VERTEX_POSITION3_COLOR, 0) ==
+				RENDER_RESULT_OK && fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK &&
+				fixture.context->setLegacyState(state, RENDER_VERTEX_POSITION3_COLOR, 0) == RENDER_RESULT_OK &&
+				fixture.context->drawIndexed(3, 0, 0) == RENDER_RESULT_OK,
+				"constant arena changing VS/PS constants and shader variants retain equal-state binding");
+			if (image == 0 || draw == 41)
+				result |= Check(fixture.context->endFrame() == RENDER_RESULT_OK,
+					"constant arena parity frame ends");
+			if (result) return result;
+		}
+		RenderFormat format = RENDER_FORMAT_UNKNOWN;
+		result |= Check(fixture.device->captureBackBuffer(&pixels[0], pixels.size(), 64 * 4,
+			&format) == RENDER_RESULT_OK && format == RENDER_FORMAT_B8G8R8A8_UNORM,
+			"constant arena real backend image captures");
+		if (image == 0) reference = pixels;
+		else result |= Check(pixels == reference,
+			"constant arena wrap/recovery/resize pixels equal isolated DISCARD reference");
+	}
+	bool red = false, green = false;
+	for (size_t pixel = 0; pixel < reference.size(); pixel += 4)
+	{
+		red = red || (reference[pixel + 2] > 240 && reference[pixel + 1] < 16);
+		green = green || (reference[pixel + 1] > 240 && reference[pixel + 2] < 16);
+	}
+	result |= Check(red && green, "constant arena parity contains distinct PS colors, not clear pixels");
+	// Unsupported options exercise the unchanged fallback here; admitted=0
+	// must never be reported as GPU arena coverage. Map/device-removal failure
+	// injection is not supplied by this fixture.
+	return result;
+}
 
 double Milliseconds(const LARGE_INTEGER &begin, const LARGE_INTEGER &end,
 	const LARGE_INTEGER &frequency)
@@ -466,6 +562,12 @@ int main(int argc, char **argv)
 #if defined(RTS_RENDERER_HAS_D3D11)
 	const bool performance = argc == 2 && strcmp(argv[1], "--performance") == 0;
 	using namespace rts::render;
+	if (argc == 2 && strcmp(argv[1], "--constant-arena") == 0)
+	{
+		WindowedFixture arenaFixture;
+		const int result = Check(arenaFixture.Initialize(), "constant arena real backend initializes");
+		return result ? result : ConstantArenaParity(arenaFixture);
+	}
 	Fixture fixture;
 	int result = Check(fixture.Initialize(), "indexed validation real backend initializes");
 	if (result) return result;

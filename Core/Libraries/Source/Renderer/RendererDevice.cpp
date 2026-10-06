@@ -81,7 +81,32 @@ unsigned long Current_Render_Thread_Id()
 unsigned int Next_Gpu_Handle_Generation()
 {
 #ifdef _WIN32
-	static volatile LONG lastGeneration = 0;
+#if defined(_MSC_VER) && _MSC_VER <= 1200
+	// VC6's Win32 SDK declares only the PVOID* compare-exchange overload.
+	// These bounded values stay opaque and are never dereferenced.
+	typedef char Vc6Win32PointerWidthRequired[
+		(sizeof(PVOID) == 4 && sizeof(LONG) == 4 && sizeof(ULONG) == 4) ? 1 : -1];
+	static PVOID lastGeneration = 0;
+	const PVOID initialValue = InterlockedCompareExchange(&lastGeneration, 0, 0);
+	LONG current = initialValue == 0 ? 0 :
+		static_cast<LONG>(reinterpret_cast<ULONG>(initialValue));
+	while (current < LONG_MAX)
+	{
+		const LONG next = current + 1;
+		const PVOID expected = current == 0 ? 0 :
+			reinterpret_cast<PVOID>(static_cast<ULONG>(current));
+		const PVOID observedValue = InterlockedCompareExchange(&lastGeneration,
+			reinterpret_cast<PVOID>(static_cast<ULONG>(next)), expected);
+		const LONG observed = observedValue == 0 ? 0 :
+			static_cast<LONG>(reinterpret_cast<ULONG>(observedValue));
+		if (observed == current)
+		{
+			return static_cast<unsigned int>(next);
+		}
+		current = observed;
+	}
+#else
+	static LONG lastGeneration = 0;
 	LONG current = InterlockedCompareExchange(&lastGeneration, 0, 0);
 	while (current < LONG_MAX)
 	{
@@ -94,6 +119,7 @@ unsigned int Next_Gpu_Handle_Generation()
 		}
 		current = observed;
 	}
+#endif
 #else
 	static std::atomic<unsigned int> lastGeneration(0);
 	unsigned int current = lastGeneration.load();
