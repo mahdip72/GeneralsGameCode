@@ -18,12 +18,19 @@
 bool NativeSortingRendererTestRetireAllComplete();
 bool NativeSortingRendererTestRetireMixedPending();
 unsigned int NativeSortingRendererTestLastFlushScratchAllocationCount();
-void NativeSortingRendererTestUseSingleDescriptorReference(bool enabled);
+void NativeSortingRendererTestUseFormerPreparationReference(bool enabled);
 unsigned int NativeSortingRendererTestLastParallelBatches();
 unsigned int NativeSortingRendererTestLastFlushPreparedGrowthCount();
 unsigned long long NativeSortingRendererTestLastFlushWorkspaceCapacityBytes();
 unsigned long long NativeSortingRendererTestLastOffsetInitializations();
 unsigned long long NativeSortingRendererTestLastOffsetResets();
+void NativeSortingRendererTestPrimeWorkspaceTrimOnNextFlush();
+unsigned long long NativeSortingRendererTestLastPreTrimCapacityBytes();
+unsigned long long NativeSortingRendererTestLastIndependentPreTrimCapacityBytes();
+unsigned long long NativeSortingRendererTestLastPreTrimDescriptorBytes();
+unsigned long long NativeSortingRendererTestLastPreTrimNodeMapBytes();
+unsigned long long NativeSortingRendererTestLastPostTrimDescriptorBytes();
+unsigned long long NativeSortingRendererTestLastPostTrimNodeMapBytes();
 
 namespace
 {
@@ -908,6 +915,68 @@ void TestFlushWorkspaceReusePreservesRepeatedBatchBytes()
 			reuseSink.batches[1]));
 	}
 	CHECK(reuseRenderer.Empty());
+}
+
+void CheckPrimedWorkspaceActuallyTrimmed()
+{
+	const unsigned long long budget = 24ULL * 1024ULL * 1024ULL;
+	CHECK(NativeSortingRendererTestLastPreTrimCapacityBytes() > budget);
+	// This inventory sums all actual vector capacities independently of the
+	// product accounting helper. Both new metadata allocations must be counted.
+	CHECK(NativeSortingRendererTestLastPreTrimCapacityBytes() ==
+		NativeSortingRendererTestLastIndependentPreTrimCapacityBytes());
+	CHECK(NativeSortingRendererTestLastPreTrimDescriptorBytes() > 0);
+	CHECK(NativeSortingRendererTestLastPreTrimNodeMapBytes() > 0);
+	CHECK(NativeSortingRendererTestLastFlushWorkspaceCapacityBytes() <= budget);
+	// The primed byte arena alone exceeds budget. Product trim must release
+	// these earlier metadata capacities before the arena can satisfy the cap.
+	CHECK(NativeSortingRendererTestLastPostTrimDescriptorBytes() == 0);
+	CHECK(NativeSortingRendererTestLastPostTrimNodeMapBytes() == 0);
+}
+
+void TestActualWorkspaceTrimPreservesNormalAndPartialRetryBytes()
+{
+	NativeSortingRenderer referenceRenderer, primedRenderer;
+	RecordingSink referenceSink, primedSink;
+	QueueMixedSizeScratchReuseFixture(referenceRenderer);
+	QueueMixedSizeScratchReuseFixture(primedRenderer);
+	CHECK(referenceRenderer.Flush(referenceSink) == RENDER_RESULT_OK);
+	NativeSortingRendererTestPrimeWorkspaceTrimOnNextFlush();
+	CHECK(primedRenderer.Flush(primedSink) == RENDER_RESULT_OK);
+	CHECK(referenceRenderer.Empty() && primedRenderer.Empty());
+	CheckPrimedWorkspaceActuallyTrimmed();
+	CHECK(referenceSink.batches.size() == 1 && primedSink.batches.size() == 1);
+	if (referenceSink.batches.size() == 1 && primedSink.batches.size() == 1)
+		CHECK(SameCapturedBatchBytes(referenceSink.batches[0], primedSink.batches[0]));
+
+	NativeSortingRenderer referenceRetryRenderer, primedRetryRenderer;
+	RecordingSink referenceRetrySink, primedRetrySink;
+	QueueMixedSizeScratchReuseFixture(referenceRetryRenderer);
+	QueueMixedSizeScratchReuseFixture(primedRetryRenderer);
+	referenceRetrySink.failCall = primedRetrySink.failCall = 1;
+	referenceRetrySink.acceptedOnFailure = primedRetrySink.acceptedOnFailure = 3;
+	CHECK(referenceRetryRenderer.Flush(referenceRetrySink) == RENDER_RESULT_FAILED);
+	NativeSortingRendererTestPrimeWorkspaceTrimOnNextFlush();
+	CHECK(primedRetryRenderer.Flush(primedRetrySink) == RENDER_RESULT_FAILED);
+	CHECK(!referenceRetryRenderer.Empty() && !primedRetryRenderer.Empty());
+	CheckPrimedWorkspaceActuallyTrimmed();
+	CHECK(primedRetrySink.batches.size() == 1 &&
+		primedRetrySink.batches[0].acceptedDrawCount == 3);
+	referenceRetrySink.failCall = primedRetrySink.failCall = 0;
+	CHECK(referenceRetryRenderer.Flush(referenceRetrySink) == RENDER_RESULT_OK);
+	NativeSortingRendererTestPrimeWorkspaceTrimOnNextFlush();
+	CHECK(primedRetryRenderer.Flush(primedRetrySink) == RENDER_RESULT_OK);
+	CHECK(referenceRetryRenderer.Empty() && primedRetryRenderer.Empty());
+	CheckPrimedWorkspaceActuallyTrimmed();
+	CHECK(referenceRetrySink.batches.size() == primedRetrySink.batches.size());
+	for (size_t i = 0; i < referenceRetrySink.batches.size() &&
+		i < primedRetrySink.batches.size(); ++i)
+		CHECK(SameCapturedBatchBytes(referenceRetrySink.batches[i], primedRetrySink.batches[i]));
+	std::vector<CapturedDraw> expected, actual;
+	CHECK(CaptureAcceptedDrawStream(referenceSink, expected));
+	CHECK(CaptureAcceptedDrawStream(primedRetrySink, actual));
+	CheckMixedSizeScratchReuseStream(actual);
+	CHECK(SameAcceptedDrawStream(expected, actual));
 }
 
 void TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput()
@@ -2036,41 +2105,43 @@ void CheckPreparationContractSinks(const PreparationContractSink &reference,
 	}
 }
 
-void TestBoundedPreparationBatchesMatchSerialDescriptorStream()
+void TestBoundedPreparationBatchesMatchFormerPreparationStream()
 {
-	// Descriptor ceiling, aggregate polygon ceiling, oversized single source.
+	// The independent parent implementation bypasses new aggregate slicing,
+	// descriptor mapping and sourceTriangle reconstruction. Compare its exact
+	// captures at descriptor/polygon ceilings and an oversized single source.
 	const unsigned int sources[] = {4350, 600, 3};
 	const unsigned int counts[] = {1, 128, 3};
 	for (unsigned int fixture = 0; fixture < 3; ++fixture)
 	{
 		PreparationContractSink reference, batched, referenceRetry, batchedRetry;
-		NativeSortingRenderer serialRenderer, batchRenderer, serialRetryRenderer, batchRetryRenderer;
-		QueuePreparationBatchFixture(serialRenderer, sources[fixture], counts[fixture], fixture == 2);
+		NativeSortingRenderer referenceRenderer, batchRenderer, referenceRetryRenderer, batchRetryRenderer;
+		QueuePreparationBatchFixture(referenceRenderer, sources[fixture], counts[fixture], fixture == 2);
 		QueuePreparationBatchFixture(batchRenderer, sources[fixture], counts[fixture], fixture == 2);
-		NativeSortingRendererTestUseSingleDescriptorReference(true);
-		CHECK(serialRenderer.Flush(reference) == RENDER_RESULT_OK);
-		CHECK(serialRenderer.Empty());
-		NativeSortingRendererTestUseSingleDescriptorReference(false);
+		NativeSortingRendererTestUseFormerPreparationReference(true);
+		CHECK(referenceRenderer.Flush(reference) == RENDER_RESULT_OK);
+		CHECK(referenceRenderer.Empty());
+		NativeSortingRendererTestUseFormerPreparationReference(false);
 		CHECK(batchRenderer.Flush(batched) == RENDER_RESULT_OK);
 		CHECK(batchRenderer.Empty());
 		CHECK(NativeSortingRendererTestLastParallelBatches() > 0);
 		CHECK(NativeSortingRendererTestLastFlushWorkspaceCapacityBytes() <= 24ULL * 1024ULL * 1024ULL);
 		CheckPreparationContractSinks(reference, batched);
-		QueuePreparationBatchFixture(serialRetryRenderer, sources[fixture], counts[fixture], fixture == 2);
+		QueuePreparationBatchFixture(referenceRetryRenderer, sources[fixture], counts[fixture], fixture == 2);
 		QueuePreparationBatchFixture(batchRetryRenderer, sources[fixture], counts[fixture], fixture == 2);
 		referenceRetry.failCall = batchedRetry.failCall = 1;
 		referenceRetry.acceptedOnFailure = batchedRetry.acceptedOnFailure = 1;
-		NativeSortingRendererTestUseSingleDescriptorReference(true);
-		CHECK(serialRetryRenderer.Flush(referenceRetry) == RENDER_RESULT_FAILED);
-		NativeSortingRendererTestUseSingleDescriptorReference(false);
+		NativeSortingRendererTestUseFormerPreparationReference(true);
+		CHECK(referenceRetryRenderer.Flush(referenceRetry) == RENDER_RESULT_FAILED);
+		NativeSortingRendererTestUseFormerPreparationReference(false);
 		CHECK(batchRetryRenderer.Flush(batchedRetry) == RENDER_RESULT_FAILED);
-		CHECK(!serialRetryRenderer.Empty() && !batchRetryRenderer.Empty());
+		CHECK(!referenceRetryRenderer.Empty() && !batchRetryRenderer.Empty());
 		referenceRetry.failCall = batchedRetry.failCall = 0;
-		NativeSortingRendererTestUseSingleDescriptorReference(true);
-		CHECK(serialRetryRenderer.Flush(referenceRetry) == RENDER_RESULT_OK);
-		NativeSortingRendererTestUseSingleDescriptorReference(false);
+		NativeSortingRendererTestUseFormerPreparationReference(true);
+		CHECK(referenceRetryRenderer.Flush(referenceRetry) == RENDER_RESULT_OK);
+		NativeSortingRendererTestUseFormerPreparationReference(false);
 		CHECK(batchRetryRenderer.Flush(batchedRetry) == RENDER_RESULT_OK);
-		CHECK(serialRetryRenderer.Empty() && batchRetryRenderer.Empty());
+		CHECK(referenceRetryRenderer.Empty() && batchRetryRenderer.Empty());
 		CheckPreparationContractSinks(referenceRetry, batchedRetry);
 		std::vector<CapturedDraw> expected, actual;
 		CHECK(CaptureAcceptedTriangleStream(reference, expected));
@@ -2084,7 +2155,7 @@ int main()
 	// Keep this focused test within the project validation budget even when the
 	// host exposes more logical processors.
 	rts::JobSystem::setStartupWorkerCount(6);
-	TestBoundedPreparationBatchesMatchSerialDescriptorStream();
+	TestBoundedPreparationBatchesMatchFormerPreparationStream();
 	TestNodeOrderingAndFlushBoundary();
 	TestStableNodeOrderingPreservesEqualDepthAndSplice();
 	TestPerTriangleDepthOrder();
@@ -2094,6 +2165,7 @@ int main()
 	TestPartialDrawFailureRetryMatchesOneShotOutput();
 	TestFlushLocalScratchReuseMixedSizesAndRetry();
 	TestFlushWorkspaceReusePreservesRepeatedBatchBytes();
+	TestActualWorkspaceTrimPreservesNormalAndPartialRetryBytes();
 	TestStableNodeOrderingPartialAckRetryMatchesOneShotOutput();
 	TestCanonicalTieRetryAndQueueExtension();
 	TestMixedLayoutCohortAndClear();
