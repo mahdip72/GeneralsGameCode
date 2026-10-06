@@ -187,13 +187,13 @@ inline bool IsNonReparseDirectoryTree(const char *path)
 	if (!length || length >= sizeof(resolved) || resolved[1] != ':') return false;
 	for (DWORD i = 0; i < length; ++i) if (resolved[i] == '/') resolved[i] = '\\';
 	while (length > 3 && resolved[length - 1] == '\\') resolved[--length] = '\0';
-	for (DWORD i = 3; i <= length; ++i)
+	for (DWORD componentIndex = 3; componentIndex <= length; ++componentIndex)
 	{
-		if (i != length && resolved[i] != '\\') continue;
-		const char saved = resolved[i]; resolved[i] = '\0';
+		if (componentIndex != length && resolved[componentIndex] != '\\') continue;
+		const char saved = resolved[componentIndex]; resolved[componentIndex] = '\0';
 		const DWORD attributes = GetFileAttributesA(resolved);
-		resolved[i] = saved;
-		if (attributes == INVALID_FILE_ATTRIBUTES || !(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
+		resolved[componentIndex] = saved;
+		if (attributes == static_cast<DWORD>(-1) || !(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
 			(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
 	}
 	return true;
@@ -402,7 +402,7 @@ inline bool WriteVisualSampleRecord(const char *record)
 	strcpy(path, options.profileRoot);
 	strcat(path, "RenderVisualSamples.txt");
 	const DWORD attributes = GetFileAttributesA(path);
-	if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+	if (attributes != static_cast<DWORD>(-1) && (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
 	FILE *file = fopen(path, "a");
 	if (!file) return false;
 	const bool written = fputs(record, file) >= 0;

@@ -2,13 +2,8 @@ name: GenCI
 
 permissions:
   contents: read
-  pull-requests: write
 
 on:
-  push:
-    branches:
-      - main
-  pull_request:
   workflow_dispatch:
     inputs:
       stage5_fixture_manifest:
@@ -131,17 +126,15 @@ jobs:
               - 'Core/**'
               - 'Dependencies/**'
             stage5:
-              - '.github/workflows/**'
-              - 'CMakeLists.txt'
-              - 'CMakePresets.json'
-              - 'cmake/**'
-              - 'vcpkg.json'
-              - 'vcpkg-lock.json'
-              - 'triplets/**'
-              - 'Core/**'
-              - 'Dependencies/**'
-              - 'Generals/**'
-              - 'GeneralsMD/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/build-toolchain.yml'
+              - '.github/workflows/check-replays.yml'
+              - '.github/workflows/*Stage5*'
+              - 'Core/Tools/DeterministicSimulationValidation/**'
+              - 'Core/Tools/Stage5*/**'
+              - 'Core/Libraries/Source/RuntimeEpoch/**'
+              - 'Generals/Code/GameEngine/Source/GameLogic/**'
+              - 'GeneralsMD/Code/GameEngine/Source/GameLogic/**'
 
       - name: Changes Summary
         run: |
@@ -291,7 +284,7 @@ jobs:
 
   build-generalsmd-x64:
     name: Build GeneralsMD x64
-    needs: [detect-changes, build-generals-x64]
+    needs: detect-changes
     if: ${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' || needs.detect-changes.outputs.stage5 == 'true' }}
     uses: ./.github/workflows/build-toolchain.yml
     with:
@@ -1210,7 +1203,11 @@ jobs:
 
   stage5-replaycheck-generalsmd-x64:
     name: Stage 5 Installed Runtime Replay Matrix GeneralsMD x64
-    needs: [detect-changes, build-generalsmd-x64, stage5-execution-cohort]
+    # Match the existing reusable replay workflow's declared token scopes.
+    permissions:
+      contents: read
+      pull-requests: write
+    needs: [detect-changes, build-generals-x64, build-generalsmd-x64, stage5-execution-cohort]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&
           inputs.stage5_fixture_manifest != '' &&
@@ -1231,6 +1228,9 @@ jobs:
 
   stage5-replaycheck-generals-x64:
     name: Stage 5 Installed Runtime Replay Matrix Generals x64
+    permissions:
+      contents: read
+      pull-requests: write
     needs: [detect-changes, build-generals-x64, build-generalsmd-x64, stage5-execution-cohort]
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&

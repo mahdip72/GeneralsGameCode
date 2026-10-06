@@ -3919,6 +3919,11 @@ $check = Get-Stage5WorkflowFile $root '.github/workflows/check-replays.yml'
 $buildToolchain = Get-Stage5WorkflowFile $root `
     '.github/workflows/build-toolchain.yml'
 $weekly = Get-Stage5WorkflowFile $root '.github/workflows/weekly-release.yml'
+$ciTrigger = Get-Stage5IndentedBlock $ci 'on:' 0
+Assert-Stage5WorkflowContains $ciTrigger '(?m)^ {2}workflow_dispatch:\s*$' `
+    'Extended qualification manual trigger'
+Assert-Stage5WorkflowNotContains $ciTrigger '(?m)^ {2}(push|pull_request|pull_request_target|schedule):' `
+    'Extended qualification must remain deliberately manual'
 $validationVolumeHelper = Get-Stage5WorkflowFile $root `
     '.github/workflows/Stage5ValidationVolume.ps1'
 Assert-Stage5ValidationVolumeHelper $validationVolumeHelper `
@@ -3970,9 +3975,19 @@ Assert-Stage5WorkflowContains $ci `
     'stage5:\s*\$\{\{\s*steps\.filter\.outputs\.stage5\s*\}\}' `
     'CI change detector output'
 $stage5Filter = Get-Stage5IndentedBlock $ci 'stage5:' 12
-Assert-Stage5WorkflowLiteral $stage5Filter ".github/workflows/**" 'CI Stage 5 path filter'
-Assert-Stage5WorkflowLiteral $stage5Filter 'Core/**' 'CI Stage 5 path filter'
-Assert-Stage5WorkflowLiteral $stage5Filter 'Generals/**' 'CI Stage 5 path filter'
+foreach ($qualificationPath in @(
+    '.github/workflows/ci.yml',
+    '.github/workflows/build-toolchain.yml',
+    '.github/workflows/check-replays.yml',
+    '.github/workflows/*Stage5*',
+    'Core/Tools/DeterministicSimulationValidation/**',
+    'Core/Tools/Stage5*/**',
+    'Core/Libraries/Source/RuntimeEpoch/**',
+    'Generals/Code/GameEngine/Source/GameLogic/**',
+    'GeneralsMD/Code/GameEngine/Source/GameLogic/**')) {
+    Assert-Stage5WorkflowLiteral $stage5Filter $qualificationPath `
+        'CI manual Stage 5 qualification path filter'
+}
 
 $workflowContractJob = Get-Stage5IndentedBlock $ci 'stage5-workflow-contract:' 2
 Assert-Stage5WorkflowContractInvocation $ci `
@@ -4090,8 +4105,8 @@ Assert-Stage5ProductArtifactIsolation $buildToolchain `
     'reusable native product build workflow'
 Assert-Stage5ValidationVolumeBinding $buildToolchain `
     'Provision Stage 5 validation scratch' `
-    'Clean Stage 5 validation scratch volume' '${{ inputs.extras }}' `
-    '${{ always() && inputs.extras }}' `
+    'Clean Stage 5 validation scratch volume' '${{ inputs.extras && inputs.validation_scratch }}' `
+    '${{ always() && inputs.extras && inputs.validation_scratch }}' `
     '__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__-__STAGE5_GITHUB_EXPRESSION__' `
     @('Upload ${{ inputs.game }} ${{ inputs.preset }}${{ inputs.tools && ''+t'' || '''' }}${{ inputs.extras && ''+e'' || '''' }} Artifact') `
     $null 'reusable native product build workflow'
@@ -4105,10 +4120,14 @@ $generalsX64Build = Get-Stage5IndentedBlock $ci 'build-generals-x64:' 2
 Assert-Stage5WorkflowContains $generalsX64Build 'outputs\.stage5\s*==\s*.true.' `
     'Generals x64 build Stage 5 prerequisite'
 $generalsMdX64Build = Get-Stage5IndentedBlock $ci 'build-generalsmd-x64:' 2
+Assert-Stage5WorkflowLiteral $generalsMdX64Build 'needs: detect-changes' `
+    'Independent Zero Hour native build dependency'
+Assert-Stage5WorkflowNotContains $generalsMdX64Build 'needs:.*build-generals-x64' `
+    'Independent Zero Hour native build must not wait for Generals'
 Assert-Stage5WorkflowContains $generalsMdX64Build 'outputs\.stage5\s*==\s*.true.' `
     'GeneralsMD x64 build Stage 5 prerequisite'
 $zeroHourStage5Job = Get-Stage5IndentedBlock $ci 'stage5-replaycheck-generalsmd-x64:' 2
-Assert-Stage5WorkflowLiteral $zeroHourStage5Job 'needs: [detect-changes, build-generalsmd-x64, stage5-execution-cohort]' `
+Assert-Stage5WorkflowLiteral $zeroHourStage5Job 'needs: [detect-changes, build-generals-x64, build-generalsmd-x64, stage5-execution-cohort]' `
     'Zero Hour Stage 5 build dependency'
 $zeroHourCondition = Get-Stage5IndentedBlock $zeroHourStage5Job 'if: >-' 4
 Assert-Stage5ExactFoldedJobCondition $zeroHourCondition `

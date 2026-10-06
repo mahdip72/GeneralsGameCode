@@ -22,7 +22,10 @@
 #include "Lib/ObjectStatusTimerKernel.h"
 #include "Lib/PhysicsIntegrationKernel.h"
 #include "Lib/PipelineExecutionPolicy.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
 #include "Lib/SimulationExecutionPolicy.h"
+#include "Renderer/RenderGameClient.h"
+#include "W3DDevice/GameClient/W3DScreenshot.h"
 #include <windows.h>
 #include <limits.h>
 #include <memory>

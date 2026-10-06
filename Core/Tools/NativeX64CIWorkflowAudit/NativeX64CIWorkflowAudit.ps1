@@ -72,7 +72,8 @@ function Assert-StepOrder {
 function Test-NativeX64CIWorkflow {
     param(
         [string]$CIWorkflow,
-        [string]$BuildWorkflow
+        [string]$BuildWorkflow,
+        [string]$PRWorkflow = $script:PRWorkflow
     )
 
     foreach ($contract in @(
@@ -87,8 +88,8 @@ function Test-NativeX64CIWorkflow {
             "$($contract.Name) does not select the dependency-complete native x64 preset"
         Assert-Contains $body '(?m)^      extras: true\r?$' `
             "$($contract.Name) does not enable the native test graph"
-        Assert-Contains $body '(?m)^    needs: (?:detect-changes|\[detect-changes, build-generals-x64\])\r?$' `
-            "$($contract.Name) does not depend on change detection"
+        Assert-Contains $body '(?m)^    needs: detect-changes\r?$' `
+            "$($contract.Name) must depend only on change detection"
         Assert-Contains $body '(?m)^    uses: \./\.github/workflows/build-toolchain\.yml\r?$' `
             "$($contract.Name) does not invoke the reusable build workflow"
         Assert-Contains $body `
@@ -96,13 +97,8 @@ function Test-NativeX64CIWorkflow {
             "$($contract.Name) can skip its title changes"
         Assert-Contains $body "needs\.detect-changes\.outputs\.shared == 'true'" `
             "$($contract.Name) can skip shared changes"
-        if ($contract.Game -eq 'Generals') {
-            Assert-Contains $body "needs\.detect-changes\.outputs\.generalsmd == 'true'" `
-                'the x64 cache producer can be skipped for a Zero Hour-only change'
-        } else {
-            Assert-Contains $body '(?m)^    needs: \[detect-changes, build-generals-x64\]\r?$' `
-                'Zero Hour x64 can race the dependency-cache producer'
-        }
+        # The binary cache is an optimization, not an artifact dependency.
+        # Both titles now independently build their dependency-complete preset.
     }
 
     $focusedBody = Get-JobBody -Workflow $CIWorkflow -JobName 'build-native-x64-focused-runtime'
@@ -119,7 +115,12 @@ function Test-NativeX64CIWorkflow {
     Assert-Contains $focusedBody '(?m)^      focused_test_regex: ' `
         'focused native x64 checks do not declare a focused CTest selection'
 
-    Assert-Contains $CIWorkflow '(?m)^  pull_request:\r?$' `
+    Assert-Contains $CIWorkflow '(?m)^  workflow_dispatch:\r?$' `
+        'extended qualification has no deliberate manual trigger'
+    if ($CIWorkflow -match '(?m)^  (pull_request|push|schedule):') {
+        throw 'Native x64 CI workflow audit failed: extended qualification is automatic'
+    }
+    Assert-Contains $PRWorkflow '(?m)^  pull_request:\r?$' `
         'stacked pull requests are excluded from CI'
     Assert-Contains $CIWorkflow "(?m)^              - 'vcpkg\.json'\r?$" `
         'vcpkg manifest changes bypass native CI'
@@ -128,7 +129,7 @@ function Test-NativeX64CIWorkflow {
     Assert-Contains $CIWorkflow "(?m)^              - 'triplets/\*\*'\r?$" `
         'vcpkg triplet changes bypass native CI'
     $pullRequestBlock = [Regex]::Match(
-        $CIWorkflow,
+        $PRWorkflow,
         '(?ms)^  pull_request:\r?\n(?<body>(?: {4}.*\r?\n)*)'
     )
     if ($pullRequestBlock.Groups['body'].Value -match '(?m)^    branches(?:-ignore)?:') {
@@ -145,7 +146,7 @@ function Test-NativeX64CIWorkflow {
         "inputs\.game == 'Generals' && inputs\.preset == 'x64-generals-vcpkg-product'" `
         'no active native x64 job can save the vcpkg binary cache'
     Assert-Contains $BuildWorkflow `
-        "timeout-minutes: \$\{\{ startsWith\(inputs\.preset, 'x64'\) && inputs\.product && inputs\.extras && 240 \|\| startsWith\(inputs\.preset, 'x64'\) && 90 \|\| 30 \}\}" `
+        "timeout-minutes: \$\{\{ startsWith\(inputs\.preset, 'x64'\) && inputs\.product && inputs\.extras && inputs\.package && 240 \|\| startsWith\(inputs\.preset, 'x64'\) && 90 \|\| 30 \}\}" `
         'native x64 product extras builds receive the bounded extended timeout'
     Assert-Contains $BuildWorkflow `
         '\$buildProduct = ''\$\{\{ inputs\.product \}\}'' -eq ''true''' `
@@ -178,7 +179,7 @@ function Test-NativeX64CIWorkflow {
 
     $installStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Install native runtime'
     Assert-Contains $installStep `
-        "if: \$\{\{ inputs\.product && startsWith\(inputs\.preset, 'x64'\) \}\}" `
+        "if: \$\{\{ inputs\.product && inputs\.package && startsWith\(inputs\.preset, 'x64'\) \}\}" `
         'the installed-runtime step is not limited to native x64 product builds'
     Assert-Contains $installStep 'cmake --install ' `
         'the native CI artifact is not produced through CMake install rules'
@@ -189,7 +190,7 @@ function Test-NativeX64CIWorkflow {
         -EarlierStepNamePrefix 'Install native runtime' `
         -LaterStepNamePrefix 'Run installed native contract tests'
     Assert-Contains $runtimeContractStep `
-        '(?m)^        if: \$\{\{ inputs\.product && inputs\.extras && startsWith\(inputs\.preset, ''x64''\) \}\}\r?$' `
+        '(?m)^        if: \$\{\{ inputs\.product && inputs\.package && inputs\.extras && startsWith\(inputs\.preset, ''x64''\) \}\}\r?$' `
         'the installed contract gate is not enabled for both native title extras lanes'
     Assert-Contains $runtimeContractStep `
         "\$titleDirectory = '\$\{\{ inputs\.game == 'Generals' && 'Generals' \|\| 'ZeroHour' \}\}'" `
@@ -231,7 +232,7 @@ function Test-NativeX64CIWorkflow {
 
     $artifactStep = Get-StepBody -Workflow $BuildWorkflow -StepNamePrefix 'Collect '
     Assert-Contains $artifactStep `
-        '(?m)^        if: \$\{\{ inputs\.product \}\}\r?$' `
+        '(?m)^        if: \$\{\{ inputs\.product && inputs\.package \}\}\r?$' `
         'the artifact collector is not limited to product builds'
     Assert-Contains $artifactStep '\$installedRuntime' `
         'the native x64 artifact is collected from build outputs instead of the installed runtime'
@@ -388,9 +389,10 @@ function Test-NativeX64CMakeContract {
 }
 
 if ($SelfTest) {
+    $script:PRWorkflow = "on:`n  pull_request:`n"
     $goodCI = @'
 on:
-  pull_request:
+  workflow_dispatch:
 jobs:
               - 'vcpkg.json'
               - 'vcpkg-lock.json'
@@ -404,7 +406,7 @@ jobs:
       preset: "x64-generals-vcpkg-product"
       extras: true
   build-generalsmd-x64:
-    needs: [detect-changes, build-generals-x64]
+    needs: detect-changes
     if: needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true'
     uses: ./.github/workflows/build-toolchain.yml
     with:
@@ -429,7 +431,7 @@ jobs:
     $goodBuild = @'
 if: startsWith(inputs.preset, 'win32') || startsWith(inputs.preset, 'x64')
 arch: ${{ startsWith(inputs.preset, 'x64') && 'x64' || 'x86' }}
-timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && inputs.product && inputs.extras && 240 || startsWith(inputs.preset, 'x64') && 90 || 30 }}
+timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && inputs.product && inputs.extras && inputs.package && 240 || startsWith(inputs.preset, 'x64') && 90 || 30 }}
 key: cmake-deps-${{ hashFiles('cmake/patches/*.patch') }}
 if: inputs.game == 'Generals' && inputs.preset == 'x64-generals-vcpkg-product'
 $buildProduct = '${{ inputs.product }}' -eq 'true'
@@ -457,11 +459,11 @@ if ($buildProduct -and '${{ inputs.preset }}' -notlike 'x64*') {
           }
           exit $ctestExitCode
       - name: Install native runtime for game
-        if: ${{ inputs.product && startsWith(inputs.preset, 'x64') }}
+        if: ${{ inputs.product && inputs.package && startsWith(inputs.preset, 'x64') }}
         run: |
           cmake --install build
       - name: Run installed native contract tests
-        if: ${{ inputs.product && inputs.extras && startsWith(inputs.preset, 'x64') }}
+        if: ${{ inputs.product && inputs.package && inputs.extras && startsWith(inputs.preset, 'x64') }}
         run: |
           $titleDirectory = '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}'
           $testName = '${{ inputs.game == 'Generals' && 'g_skirmish_ai_runner_contract_tests.exe' || 'z_runtime_regression_tests.exe' }}'
@@ -486,7 +488,7 @@ if ($buildProduct -and '${{ inputs.preset }}' -notlike 'x64*') {
           }
           exit $testExitCode
       - name: Collect game Artifact
-        if: ${{ inputs.product }}
+        if: ${{ inputs.product && inputs.package }}
         run: |
           $installedRuntime = 'installed'
           Copy-Item -Path (Join-Path $installedRuntime '*') -Destination artifacts
@@ -528,6 +530,19 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
 '@
 
     Test-NativeX64CIWorkflow -CIWorkflow $goodCI -BuildWorkflow $goodBuild
+    foreach ($invalidExtendedCI in @(
+        ($goodCI -replace '    needs: detect-changes', '    needs: [detect-changes, build-generals-x64]'),
+        ($goodCI -replace "  workflow_dispatch:\r?\n", "  workflow_dispatch:`n  pull_request:`n"))) {
+        $caughtInvalidExtendedCI = $false
+        try {
+            Test-NativeX64CIWorkflow -CIWorkflow $invalidExtendedCI -BuildWorkflow $goodBuild
+        } catch {
+            $caughtInvalidExtendedCI = $true
+        }
+        if (-not $caughtInvalidExtendedCI) {
+            throw 'Native x64 CI workflow audit self-test accepted automatic qualification or coupled title builds'
+        }
+    }
     Test-NativeX64CMakeContract `
         -Presets $goodPresets `
         -CoreToolsCMake $goodCoreToolsCMake `
@@ -605,7 +620,8 @@ $arguments += "-DFFMPEG_RUNTIME_DIR=$FFmpegRuntimeDir"
     $caughtBranchFilter = $false
     try {
         Test-NativeX64CIWorkflow `
-            -CIWorkflow ($goodCI -replace "  pull_request:\r?\n", "  pull_request:`n    branches:`n      - main`n") `
+            -CIWorkflow $goodCI `
+            -PRWorkflow "on:`n  pull_request:`n    branches:`n      - main`n" `
             -BuildWorkflow $goodBuild
     } catch {
         $caughtBranchFilter = $true
@@ -909,6 +925,7 @@ if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
 }
 
 $ciPath = Join-Path $SourceRoot '.github/workflows/ci.yml'
+$script:PRWorkflow = Get-Content -Raw -LiteralPath (Join-Path $SourceRoot '.github/workflows/pr-ci.yml')
 $buildPath = Join-Path $SourceRoot '.github/workflows/build-toolchain.yml'
 $presetsPath = Join-Path $SourceRoot 'CMakePresets.json'
 $coreToolsCMakePath = Join-Path $SourceRoot 'Core/Tools/CMakeLists.txt'

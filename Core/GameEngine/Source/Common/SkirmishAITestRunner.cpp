@@ -677,7 +677,7 @@ Bool s_finalDigestAvailable = FALSE;
 UnsignedInt s_runnerNonceCounter = 0;
 
 void CaptureSkirmishAITestSliceMetrics();
-Bool IsHexDigit(char value);
+Bool IsSkirmishAITestHexDigit(char value);
 
 SkirmishAIRecoveryFixtureState s_recovery;
 
@@ -877,7 +877,7 @@ Bool IsHexString(const char *value, size_t length)
 		return FALSE;
 	for (size_t index = 0; index < length; ++index)
 	{
-		if (!IsHexDigit(value[index]))
+		if (!IsSkirmishAITestHexDigit(value[index]))
 			return FALSE;
 	}
 	return TRUE;
@@ -922,9 +922,23 @@ Bool HashSkirmishAITestHandle(void *opaqueHandle,
 	HANDLE handle = static_cast<HANDLE>(opaqueHandle);
 	if (handle == INVALID_HANDLE_VALUE || handle == nullptr)
 		return FALSE;
-	LARGE_INTEGER origin = {};
-	LARGE_INTEGER position = {};
-	LARGE_INTEGER extent = {};
+#if defined(_MSC_VER) && _MSC_VER <= 1200
+	typedef BOOL (WINAPI *SetFilePointerExFunction)(HANDLE, LARGE_INTEGER,
+		PLARGE_INTEGER, DWORD);
+	typedef BOOL (WINAPI *GetFileSizeExFunction)(HANDLE, PLARGE_INTEGER);
+	HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+	SetFilePointerExFunction SetFilePointerEx = kernel32 ?
+		reinterpret_cast<SetFilePointerExFunction>(
+			GetProcAddress(kernel32, "SetFilePointerEx")) : nullptr;
+	GetFileSizeExFunction GetFileSizeEx = kernel32 ?
+		reinterpret_cast<GetFileSizeExFunction>(
+			GetProcAddress(kernel32, "GetFileSizeEx")) : nullptr;
+	if (!SetFilePointerEx || !GetFileSizeEx)
+		return FALSE;
+#endif
+	LARGE_INTEGER origin = { 0 };
+	LARGE_INTEGER position = { 0 };
+	LARGE_INTEGER extent = { 0 };
 	if (!SetFilePointerEx(handle, origin, &position, FILE_CURRENT) ||
 		!GetFileSizeEx(handle, &extent) || extent.QuadPart < 0 ||
 		extent.QuadPart > static_cast<LONGLONG>(SKIRMISH_AI_TEST_MAX_REPLAY_BYTES) ||
@@ -933,7 +947,7 @@ Bool HashSkirmishAITestHandle(void *opaqueHandle,
 	SkirmishAITestSha256 sha256;
 	unsigned char bytes[32768];
 	Bool success = TRUE;
-	unsigned long long remaining = static_cast<unsigned long long>(extent.QuadPart);
+	ULONGLONG remaining = static_cast<ULONGLONG>(extent.QuadPart);
 	while (remaining != 0)
 	{
 		const DWORD requested = static_cast<DWORD>(remaining < sizeof(bytes) ?
@@ -953,7 +967,7 @@ Bool HashSkirmishAITestHandle(void *opaqueHandle,
 	// the digest; the replay owner performs this again at checked closure.
 	unsigned char extra = 0;
 	DWORD extraCount = 0;
-	LARGE_INTEGER closedExtent = {};
+	LARGE_INTEGER closedExtent = { 0 };
 	if (success && (!ReadFile(handle, &extra, 1, &extraCount, nullptr) ||
 		extraCount != 0 || !GetFileSizeEx(handle, &closedExtent) ||
 		closedExtent.QuadPart != extent.QuadPart))
@@ -1292,7 +1306,7 @@ Bool CaptureSkirmishAITestExecutableHash(
 #endif
 }
 
-Bool IsHexDigit(char value)
+Bool IsSkirmishAITestHexDigit(char value)
 {
 	return (value >= '0' && value <= '9') ||
 		(value >= 'a' && value <= 'f') ||
@@ -3940,16 +3954,16 @@ Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv
 	if (requests == 0) return TRUE;
 	const char *error = !supported ? "unsupported_title" :
 		(requests != 1 ? "duplicate_option" : nullptr);
-	for (Int i = 1; !error && i < argc; ++i)
+	for (Int argumentIndex = 1; !error && argumentIndex < argc; ++argumentIndex)
 	{
-		if (!argv[i]) { error = "invalid_arguments"; break; }
-		if (stricmp(argv[i], "-runRenderedBattleDiagnostic") == 0 ||
-			stricmp(argv[i], "-runRenderedBattleBenchmark") == 0)
+		if (!argv[argumentIndex]) { error = "invalid_arguments"; break; }
+		if (stricmp(argv[argumentIndex], "-runRenderedBattleDiagnostic") == 0 ||
+			stricmp(argv[argumentIndex], "-runRenderedBattleBenchmark") == 0)
 		{
 			Int seed = 0;
-			if (i + 1 >= argc || !TryParseSkirmishAITestSeed(argv[i + 1], &seed))
+			if (argumentIndex + 1 >= argc || !TryParseSkirmishAITestSeed(argv[argumentIndex + 1], &seed))
 				error = "invalid_seed";
-			else ++i;
+			else ++argumentIndex;
 			continue;
 		}
 		const char *conflicts[] = {
@@ -3962,7 +3976,7 @@ Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv
 			"-benchmark", "-map", "-mod", "-noshaders", "-particleEdit"
 		};
 		for (UnsignedInt j = 0; j < ARRAY_SIZE(conflicts); ++j)
-			if (stricmp(argv[i], conflicts[j]) == 0)
+			if (stricmp(argv[argumentIndex], conflicts[j]) == 0)
 				error = "conflicting_option";
 	}
 	if (reason) *reason = error;
@@ -4453,7 +4467,8 @@ Bool PrepareRenderedBattleDiagnosticReportPath()
 	DWORD actualLength = length;
 	while (actualLength > 3 && resolved[actualLength - 1] == '\\') resolved[--actualLength] = '\0';
 	DWORD isolatedLength = strlen(isolated);
-	for (DWORD i = 0; i < isolatedLength; ++i) if (isolated[i] == '/') isolated[i] = '\\';
+	for (DWORD isolatedIndex = 0; isolatedIndex < isolatedLength; ++isolatedIndex)
+		if (isolated[isolatedIndex] == '/') isolated[isolatedIndex] = '\\';
 	while (isolatedLength > 3 && isolated[isolatedLength - 1] == '\\') isolated[--isolatedLength] = '\0';
 	if (_stricmp(resolved, isolated) != 0) return FALSE;
 	const Int written = _snprintf(s_renderedBattle.reportPath, sizeof(s_renderedBattle.reportPath),
@@ -5069,7 +5084,7 @@ Bool StageRenderedBattleDiagnostic()
 		}
 	}
 	catch (...) { return FALSE; }
-	for (Int slot = 0; slot < 8; ++slot)
+	for (Int reportSlot = 0; reportSlot < 8; ++reportSlot)
 	{
 		char roster[1536];
 		Int bytes;
@@ -5091,24 +5106,24 @@ Bool StageRenderedBattleDiagnostic()
 				"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d "
 				"templates=%s:%u,%s:%u,%s:%u,%s:%u profile_id=%s roster_contract=%s "
 				"unit_type_sequence=%s ids=",
-				slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1, unitsPerPlayer,
-				templates[slot][0]->getName().str(), benchmarkContract.templateCounts[0],
-				templates[slot][1]->getName().str(), benchmarkContract.templateCounts[1],
-				templates[slot][2]->getName().str(), benchmarkContract.templateCounts[2],
-				templates[slot][3]->getName().str(), benchmarkContract.templateCounts[3],
+				reportSlot, GetRenderedBattleDiagnosticFactionName(reportSlot), reportSlot < 4 ? 0 : 1, unitsPerPlayer,
+				templates[reportSlot][0]->getName().str(), benchmarkContract.templateCounts[0],
+				templates[reportSlot][1]->getName().str(), benchmarkContract.templateCounts[1],
+				templates[reportSlot][2]->getName().str(), benchmarkContract.templateCounts[2],
+				templates[reportSlot][3]->getName().str(), benchmarkContract.templateCounts[3],
 				benchmarkContract.profileId, benchmarkContract.rosterContract, unitTypeSequence);
 		}
 		else if (benchmark)
 			bytes = _snprintf(roster, sizeof(roster),
 				"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d "
 				"templates=%s:8,%s:8,%s:24,%s:24 ids=",
-				slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1, unitsPerPlayer,
-				templates[slot][0]->getName().str(), templates[slot][1]->getName().str(),
-				templates[slot][2]->getName().str(), templates[slot][3]->getName().str());
+				reportSlot, GetRenderedBattleDiagnosticFactionName(reportSlot), reportSlot < 4 ? 0 : 1, unitsPerPlayer,
+				templates[reportSlot][0]->getName().str(), templates[reportSlot][1]->getName().str(),
+				templates[reportSlot][2]->getName().str(), templates[reportSlot][3]->getName().str());
 		else
 			bytes = _snprintf(roster, sizeof(roster),
 			"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d ids=",
-			slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1,
+			reportSlot, GetRenderedBattleDiagnosticFactionName(reportSlot), reportSlot < 4 ? 0 : 1,
 			unitsPerPlayer);
 		for (Int unit = 0; unit < unitsPerPlayer; ++unit)
 		{
@@ -5117,7 +5132,7 @@ Bool StageRenderedBattleDiagnostic()
 				s_renderedBattle.reportFailed = TRUE; return FALSE;
 			}
 			const Int appended = _snprintf(roster + bytes, sizeof(roster) - bytes, "%s%u", unit ? "," : "",
-				static_cast<UnsignedInt>(s_renderedBattle.ids[slot * unitsPerPlayer + unit]));
+				static_cast<UnsignedInt>(s_renderedBattle.ids[reportSlot * unitsPerPlayer + unit]));
 			if (appended < 0 || appended >= static_cast<Int>(sizeof(roster)) - bytes)
 			{
 				s_renderedBattle.reportFailed = TRUE; return FALSE;
@@ -5398,7 +5413,7 @@ Bool SetSkirmishAITestExecutableHashInput(const char *sha256)
 		return FALSE;
 	for (Int index = 0; index < 64; ++index)
 	{
-		if (!IsHexDigit(sha256[index]))
+		if (!IsSkirmishAITestHexDigit(sha256[index]))
 			return FALSE;
 	}
 	strlcpy(s_executableHashInput, sha256, ARRAY_SIZE(s_executableHashInput));

@@ -1,0 +1,114 @@
+name: PR CI
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      generals: ${{ steps.filter.outputs.generals }}
+      zerohour: ${{ steps.filter.outputs.zerohour }}
+      shared: ${{ steps.filter.outputs.shared }}
+      rendering_tools: ${{ steps.filter.outputs.rendering_tools }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          token: ''
+          filters: |
+            generals:
+              - 'Generals/**'
+            zerohour:
+              - 'GeneralsMD/**'
+            shared:
+              - 'Core/**'
+              - 'Dependencies/**'
+              - 'resources/**'
+              - 'cmake/**'
+              - 'triplets/**'
+              - 'CMakeLists.txt'
+              - 'CMakePresets.json'
+              - 'vcpkg.json'
+              - 'vcpkg-lock.json'
+              - '.github/workflows/**'
+            rendering_tools:
+              - 'tools/rendering-benchmark/**'
+              - '.github/workflows/pr-ci.yml'
+              - '.github/workflows/PRWorkflowPolicy*.py'
+
+  workflow-policy:
+    name: CI workflow policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: python3 -m pip install PyYAML==6.0.2
+      - run: python3 .github/workflows/PRWorkflowPolicy.py
+      - run: python3 -m unittest discover -s .github/workflows -p PRWorkflowPolicyTests.py
+
+  native-generals:
+    name: Generals x64 Release smoke
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    uses: ./.github/workflows/build-toolchain.yml
+    with:
+      game: "Generals"
+      preset: "x64-generals-vcpkg-product"
+      tools: false
+      extras: true
+      product: true
+      package: false
+      validation_scratch: false
+      focused_targets: "g_generals,core_threaded_render_device_tests,core_threaded_render_device_native_tests,core_native_w3d_owner_queue_tests,core_native_w3d_render_state_tests,core_task_runtime_tests,core_chunkio_value_read_tests,core_replay_field_reader_tests,core_crc_runtime_tests,g_skirmish_ai_runner_contract_tests"
+      focused_test_regex: '^(core_threaded_render_device_tests|core_threaded_render_device_native_tests|core_threaded_render_pipeline_stall_trace_tests|core_native_w3d_owner_queue_tests|core_native_w3d_render_state_tests|core_task_runtime_tests|core_chunkio_value_read_tests|core_replay_field_reader_tests|core_deterministic_crc_runtime_adapter_tests|g_skirmish_ai_runner_contract_tests|g_xfer_crc_snapshot_tests|g_texture_load_queue_contract_tests|g_skirmish_ai_replay_epoch_tests)$'
+
+  native-zerohour:
+    name: GeneralsMD x64 Release smoke
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.zerohour == 'true' || needs.detect-changes.outputs.shared == 'true' }}
+    uses: ./.github/workflows/build-toolchain.yml
+    with:
+      game: "GeneralsMD"
+      preset: "x64-zerohour-vcpkg-product"
+      tools: false
+      extras: true
+      product: true
+      package: false
+      validation_scratch: false
+      focused_targets: "z_generals,core_threaded_render_device_tests,core_threaded_render_device_native_tests,core_native_w3d_owner_queue_tests,core_native_w3d_render_state_tests,core_task_runtime_tests,core_chunkio_value_read_tests,core_replay_field_reader_tests,core_crc_runtime_tests,z_runtime_regression_tests"
+      focused_test_regex: '^(core_threaded_render_device_tests|core_threaded_render_device_native_tests|core_threaded_render_pipeline_stall_trace_tests|core_native_w3d_owner_queue_tests|core_native_w3d_render_state_tests|core_task_runtime_tests|core_chunkio_value_read_tests|core_replay_field_reader_tests|core_deterministic_crc_runtime_adapter_tests|z_skirmish_ai_runner_contract_tests|z_xfer_crc_snapshot_tests|z_texture_load_queue_contract_tests|z_skirmish_ai_replay_epoch_tests)$'
+
+  rendering-tools:
+    name: Rendering benchmark tooling
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.rendering_tools == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - run: python3 -m unittest discover -s tools/rendering-benchmark -p 'test_*.py'
+
+  pr-readiness:
+    name: PR readiness
+    needs: [detect-changes, workflow-policy, native-generals, native-zerohour, rendering-tools]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Require every applicable lane to succeed
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 .github/workflows/PRWorkflowPolicy.py --readiness

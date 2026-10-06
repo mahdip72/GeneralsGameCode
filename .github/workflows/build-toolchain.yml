@@ -2,7 +2,6 @@ name: Build Toolchain
 
 permissions:
   contents: read
-  pull-requests: write
 
 on:
   workflow_call:
@@ -30,6 +29,16 @@ on:
         default: true
         type: boolean
         description: "Build the selected game product; disable for focused shared-runtime checks"
+      package:
+        required: false
+        default: true
+        type: boolean
+        description: "Install and upload the selected product runtime"
+      validation_scratch:
+        required: false
+        default: true
+        type: boolean
+        description: "Provision scratch for extended simulation and path validation"
       focused_targets:
         required: false
         default: ""
@@ -45,7 +54,7 @@ jobs:
   build:
     name: ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }}
     runs-on: windows-2022
-    timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && inputs.product && inputs.extras && 240 || startsWith(inputs.preset, 'x64') && 90 || 30 }}
+    timeout-minutes: ${{ startsWith(inputs.preset, 'x64') && inputs.product && inputs.extras && inputs.package && 240 || startsWith(inputs.preset, 'x64') && 90 || 30 }}
 
     env:
       VCPKG_FILE_CACHE: ${{ github.workspace }}\vcpkg-bincache
@@ -175,7 +184,7 @@ jobs:
           "VCPKG_INSTALL_OPTIONS=--x-abi-tools-use-exact-versions" >> $env:GITHUB_ENV
 
       - name: Provision Stage 5 validation scratch
-        if: ${{ inputs.extras }}
+        if: ${{ inputs.extras && inputs.validation_scratch }}
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
@@ -259,15 +268,17 @@ jobs:
         if: inputs.extras
         shell: pwsh
         run: |
-          $scratchRoot = $env:RTS_STAGE5_VALIDATION_SCRATCH_ROOT
-          if ([string]::IsNullOrWhiteSpace($scratchRoot) -or
-              -not $scratchRoot.StartsWith('H:\', [StringComparison]::OrdinalIgnoreCase) -or
-              -not (Test-Path -LiteralPath $scratchRoot -PathType Container)) {
-            throw "Stage 5 validation scratch root is not an existing H: directory: $scratchRoot"
-          }
-          $scratchItem = Get-Item -LiteralPath $scratchRoot -Force
-          if (($scratchItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            throw "Stage 5 validation scratch root is a reparse point: $scratchRoot"
+          if ('${{ inputs.validation_scratch }}' -eq 'true') {
+            $scratchRoot = $env:RTS_STAGE5_VALIDATION_SCRATCH_ROOT
+            if ([string]::IsNullOrWhiteSpace($scratchRoot) -or
+                -not $scratchRoot.StartsWith('H:\', [StringComparison]::OrdinalIgnoreCase) -or
+                -not (Test-Path -LiteralPath $scratchRoot -PathType Container)) {
+              throw "Stage 5 validation scratch root is not an existing H: directory: $scratchRoot"
+            }
+            $scratchItem = Get-Item -LiteralPath $scratchRoot -Force
+            if (($scratchItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "Stage 5 validation scratch root is a reparse point: $scratchRoot"
+            }
           }
           $arguments = @('--test-dir', "build\${{ inputs.preset }}", '--output-on-failure', '--no-tests=error')
           if (-not [string]::IsNullOrWhiteSpace('${{ inputs.focused_test_regex }}')) {
@@ -300,7 +311,7 @@ jobs:
           exit $ctestExitCode
 
       - name: Install native runtime for ${{ inputs.game }} with ${{ inputs.preset }}
-        if: ${{ inputs.product && startsWith(inputs.preset, 'x64') }}
+        if: ${{ inputs.product && inputs.package && startsWith(inputs.preset, 'x64') }}
         shell: pwsh
         run: |
           $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
@@ -318,7 +329,7 @@ jobs:
           }
 
       - name: Run installed native contract tests
-        if: ${{ inputs.product && inputs.extras && startsWith(inputs.preset, 'x64') }}
+        if: ${{ inputs.product && inputs.package && inputs.extras && startsWith(inputs.preset, 'x64') }}
         shell: pwsh
         run: |
           $titleDirectory = '${{ inputs.game == 'Generals' && 'Generals' || 'ZeroHour' }}'
@@ -357,7 +368,7 @@ jobs:
           key: vcpkg-bincache-v3-${{ runner.os }}-baseline${{ steps.vcpkg_key.outputs.baseline }}-${{ steps.vcpkg_key.outputs.triplet }}-manifest${{ hashFiles('vcpkg.json', 'vcpkg-lock.json') }}-${{ hashFiles('triplets/*.cmake') }}
 
       - name: Collect ${{ inputs.game }} ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Artifact
-        if: ${{ inputs.product }}
+        if: ${{ inputs.product && inputs.package }}
         shell: pwsh
         run: |
           $buildDir = "build\${{ inputs.preset }}"
@@ -371,7 +382,7 @@ jobs:
           Copy-Item -Path (Join-Path $installedRuntime '*') -Destination $artifactsDir -Recurse -Force -Verbose
 
       - name: Upload ${{ inputs.game }} ${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }} Artifact
-        if: ${{ inputs.product }}
+        if: ${{ inputs.product && inputs.package }}
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: ${{ inputs.game }}-${{ inputs.preset }}${{ inputs.tools && '+t' || '' }}${{ inputs.extras && '+e' || '' }}
@@ -380,7 +391,7 @@ jobs:
           if-no-files-found: error
 
       - name: Clean Stage 5 validation scratch volume
-        if: ${{ always() && inputs.extras }}
+        if: ${{ always() && inputs.extras && inputs.validation_scratch }}
         shell: pwsh
         run: |
           & "$env:GITHUB_WORKSPACE/.github/workflows/Stage5ValidationVolume.ps1" `
