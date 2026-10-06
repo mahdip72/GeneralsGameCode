@@ -28,6 +28,12 @@
 #include <string>
 #include <vector>
 
+#include "Lib/RenderedBattleBenchmarkOptions.h"
+
+// The real benchmark header includes Windows.h; keep the fixture's Bool constants.
+#undef TRUE
+#undef FALSE
+
 typedef bool Bool;
 typedef int Int;
 typedef unsigned int UnsignedInt;
@@ -158,6 +164,7 @@ static Bool ParseCommandLine(Int, const char *const *, Bool, Request *request,
 }
 
 namespace ai_fixture = ::rts::ai_fixture;
+namespace rendered_battle = ::rts::rendered_battle;
 
 class JobSystem
 {
@@ -759,6 +766,24 @@ static void TestMalformedLocalIndexRemainsRejected()
 
 int main()
 {
+	// Exercise ordinary parser behavior even when the parent process opts into
+	// rendered-battle test modes. These removals affect only this test process.
+	const char *testOptIns[] = {
+		"RTS_RENDERED_BATTLE_BACKGROUND_STARTUP",
+		"RTS_RENDERED_BATTLE_VISUAL_CAPTURE",
+		"RTS_RENDER_VISUAL_CAPTURE_SAMPLES"
+	};
+	for (unsigned i = 0; i < ARRAY_SIZE(testOptIns); ++i)
+	{
+		SetEnvironmentVariableA(testOptIns[i], NULL);
+		bool enabled = false;
+		if (!::rts::rendered_battle::ReadTestOptIn(testOptIns[i], &enabled) || enabled)
+		{
+			fprintf(stderr, "FAIL: could not clear process-local test opt-in %s\n", testOptIns[i]);
+			return 1;
+		}
+	}
+
 	using namespace hard_ai_2v6_fixture;
 	TestHardFlagCapturesExactlyOnce();
 	TestInvalidHardSeedsAreFatal();
