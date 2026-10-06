@@ -1832,9 +1832,24 @@ static void TestRenderedBattleMechanizedRefinement()
 			else ++rejected;
 		}
 	CHECK(accepted > 0 && rejected > 0 && accepted + rejected == 10400);
+	// Independent inclusive-edge witnesses; a strict inset comparison must fail.
+	Coord3D boundary;
+	CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 49, 48, &boundary));
+	CHECK(boundary.x == 587 && boundary.y == 566);
+	CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 49, 40, &boundary));
+	CHECK(boundary.x == 597 && boundary.y == 556);
+	CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 129, 31, &boundary));
+	CHECK(boundary.x == 3593 && boundary.y == 3564);
+	CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 129, 39, &boundary));
+	CHECK(boundary.x == 3583 && boundary.y == 3574);
 	struct GuardedCenter { Int before; Coord3D value; Int after; } guarded;
 	guarded.before = 123; guarded.after = 456;
 	guarded.value.x = 901; guarded.value.y = 902; guarded.value.z = 903;
+	// One10-unit step outside each corresponding inset edge is rejected intact.
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 49, 39, &guarded.value));
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 49, 31, &guarded.value));
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 129, 40, &guarded.value));
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 129, 48, &guarded.value));
 	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, -1, &guarded.value));
 	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, 80, &guarded.value));
 	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 130, 0, &guarded.value));
