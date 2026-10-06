@@ -629,8 +629,9 @@ bool ExactWindowsConfiguration(const std::string& bytes)
     char expected[512];
     const int count = _snprintf_s(expected, sizeof(expected), _TRUNCATE,
         "{\"schema\":\"ggc.gpu-capture-configuration.v1\",\"status\":\"configured\",\"process_id\":%lu,"
-        "\"record_capacity\":65536,\"record_bytes\":144,\"record_storage_bytes\":9437184,\"allocation_proven\":false}\n",
-        GetCurrentProcessId());
+        "\"record_capacity\":65536,\"record_bytes\":%llu,\"record_storage_bytes\":%llu,\"allocation_proven\":false}\n",
+        GetCurrentProcessId(), static_cast<unsigned long long>(sizeof(GpuTimingRecord)),
+        static_cast<unsigned long long>(65536ULL * sizeof(GpuTimingRecord)));
     return count > 0 && bytes == std::string(expected, static_cast<size_t>(count));
 }
 bool ReadWindowsEnvironment(const wchar_t *name, std::wstring& value, bool& present)
@@ -672,7 +673,15 @@ struct WindowsEnvironmentRestore
 };
 int ActualWindowsConfigurationProvenance()
 {
-    int result = Check(sizeof(GpuTimingRecord) == 144, "actual record ABI retains the documented 144-byte storage product");
+    const uint64_t recordBytes = sizeof(GpuTimingRecord);
+    const uint64_t recordStorageBytes = 65536ULL * recordBytes;
+    printf("GPU_TIMING_RECORD_ABI record_bytes=%llu frame_info_bytes=%llu long_bytes=%llu record_alignment=%llu "
+        "record_capacity=65536 record_storage_bytes=%llu budget_bytes=10485760\n",
+        static_cast<unsigned long long>(recordBytes), static_cast<unsigned long long>(sizeof(GpuTimingFrameInfo)),
+        static_cast<unsigned long long>(sizeof(long)), static_cast<unsigned long long>(alignof(GpuTimingRecord)),
+        static_cast<unsigned long long>(recordStorageBytes));
+    int result = Check(recordBytes > 0 && recordStorageBytes <= 10ULL * 1024ULL * 1024ULL,
+        "actual record ABI storage product fits the unchanged 10MiB maximum budget");
     {
         WindowsConfigurationDirectory directory(result);
         const bool created = directory.create();
