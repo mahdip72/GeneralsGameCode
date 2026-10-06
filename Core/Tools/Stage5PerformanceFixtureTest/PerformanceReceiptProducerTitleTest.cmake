@@ -304,6 +304,12 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     rts_producer_test_extract(_main_cleanup "${_main_text}"
         "\tif (IsSkirmishAITestRunnerArmed())"
         "\treturn exitcode;")
+    # Animated-menu capture is an orthogonal diagnostic, outside this
+    # receipt-owner lifetime shim. Keep its exact product hooks unchanged.
+    if(title STREQUAL "GeneralsMD")
+        rts_producer_test_replace_once(_main_cleanup "${_main_cleanup}"
+            "\texitcode = rts::animated_menu::Finalize(exitcode);\n\n" "")
+    endif()
     # Zero Hour's promoted owner-thread scope closes here; the Generals title
     # has the earlier unwrapped shape. The shim is intentionally scope-free.
     string(FIND "${_main_cleanup}"
@@ -316,6 +322,14 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     rts_producer_test_extract(_main_start "${_main_text}"
         "\tconst Bool canRun = !validationOptionsConflict && !net3ValidationRequested &&"
         "\tif (IsSkirmishAITestRunnerArmed())")
+    if(title STREQUAL "GeneralsMD")
+        rts_producer_test_replace_once(_main_start "${_main_start}"
+            "\t\trts::animated_menu::Start() &&\n" "")
+    endif()
+    string(FIND "${_main_start}${_main_cleanup}" "rts::animated_menu::" _animated_menu_leak)
+    if(NOT _animated_menu_leak EQUAL -1)
+        message(FATAL_ERROR "Fresh receipt fixture unexpectedly depends on animated-menu capture")
+    endif()
 
     set(_out "${CMAKE_CURRENT_BINARY_DIR}/performance-receipt-fresh-producer")
     file(MAKE_DIRECTORY "${_out}")
