@@ -229,6 +229,11 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
         "void UpdateSkirmishAITestRunner()")
     # Keep the exact rendered-scenario predicate used by receipt admission.
     # Only the orthogonal diagnostic's live-world/report branches are omitted.
+    # The predicates below call the real named-profile helpers. Extract their
+    # definitions too, rather than substituting fixture-only profile behavior.
+    rts_producer_test_extract(_rendered_profile_helpers "${_runner_text}"
+        "static Int GetRenderedBattleBenchmarkProfileUnitsPerPlayer()"
+        "const char *GetRenderedBattleDiagnosticObjectName(")
     rts_producer_test_extract(_rendered_predicates "${_runner_text}"
         "Bool IsRenderedBattleDiagnostic("
         "struct RenderedBattleDiagnosticState")
@@ -318,7 +323,7 @@ function(rts_add_performance_receipt_fresh_producer_test target title test_name)
     file(GENERATE OUTPUT "${_out}/FreshProducerRunnerState.inc" CONTENT "${_runner_state}")
     file(GENERATE OUTPUT "${_out}/FreshProducerCaptureState.inc"
         CONTENT "${_slice_capture}\n${_runtime_capture}")
-    file(GENERATE OUTPUT "${_out}/FreshProducerStart.inc" CONTENT "${_rendered_predicates}\n${_start}")
+    file(GENERATE OUTPUT "${_out}/FreshProducerStart.inc" CONTENT "${_rendered_profile_helpers}\n${_rendered_predicates}\n${_start}")
     file(GENERATE OUTPUT "${_out}/FreshProducerFailure.inc" CONTENT "${_fail}")
     file(GENERATE OUTPUT "${_out}/FreshProducerGameMainStart.inc" CONTENT "${_main_start}")
     file(GENERATE OUTPUT "${_out}/FreshProducerFinalizers.inc" CONTENT "${_finalizers}")
