@@ -126,3 +126,14 @@ Strict START seed and native per-faction roster checks add two further regressio
 
 
 The six named R2 profile acceptance and falsification tests and the optional rigid-draw metrics receipt checks bring the current static analyzer test-method count to 126. Root owns execution of the suite; no test pass is recorded for these changed files. The 118-test result above is historical and applies only to its recorded hashes.
+
+Named profile placement retains all 130 bounded, center-valid, inset-safe arena
+candidates. The legacy/default fixture keeps its eight-arena shortlist. Every
+terrain, occupancy, route and pair-separation gate still applies before spawning.
+The `mechanized_512` profile uses grid spacing 64, diagonal offset 32 and player
+bands 256 to preserve vehicle clearance. Other profiles keep their existing
+layout. Mechanized512 uses a local reveal radius of 850 to cover its larger
+formation; the other profiles retain 700. Both roles use the same pinned profile
+geometry, reveal and complete roster.
+Planner diagnostics retain the first eight arena details and the terminal detail,
+with an explicit omitted-detail count and full aggregate operation counts.

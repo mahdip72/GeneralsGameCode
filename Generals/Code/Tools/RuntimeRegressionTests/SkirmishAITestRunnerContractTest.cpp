@@ -1735,9 +1735,56 @@ static void TestRenderedBattleProfileObjectNames()
 	ProcessTestOptions() = savedOptions;
 }
 
+static void TestRenderedBattleNamedGeometryAndArenaRetention()
+{
+	using namespace rts::rendered_battle;
+	const TestOptions saved = ProcessTestOptions();
+	const BenchmarkProfile profiles[] = { BENCHMARK_PROFILE_COMBINED_ARMS_256,
+		BENCHMARK_PROFILE_COMBINED_ARMS_512, BENCHMARK_PROFILE_MECHANIZED_256,
+		BENCHMARK_PROFILE_MECHANIZED_512, BENCHMARK_PROFILE_INFANTRY_LINE_256,
+		BENCHMARK_PROFILE_INFANTRY_LINE_512 };
+	for (UnsignedInt i = 0; i < ARRAY_SIZE(profiles); ++i)
+	{
+		ProcessTestOptions().benchmarkProfile = profiles[i];
+		const RenderedBattleBenchmarkGeometry g = GetRenderedBattleBenchmarkGeometry();
+		const Bool mech = profiles[i] == BENCHMARK_PROFILE_MECHANIZED_512;
+		CHECK(g.gridStep == (mech ? 64 : 52) && g.extraOffset == (mech ? 32 : 26));
+		CHECK(g.bandStep == (mech ? 256 : 208));
+		CHECK(g.formationX == (mech ? 543 : 459) && g.formationY == (mech ? 512 : 416));
+		CHECK(g.insetX == g.formationX + 44 && g.insetY == g.formationY + 44);
+		CHECK(g.revealRadius == (mech ? 850 : 700));
+		// Conservatively cover even the full local-offset/footprint envelope.
+		CHECK(static_cast<double>(g.insetX) * g.insetX +
+			static_cast<double>(g.insetY) * g.insetY <=
+			static_cast<double>(g.revealRadius) * g.revealRadius);
+		// The production validator checks every pair with the largest admitted
+		// vehicle radius, not a reduced value selected from one live report.
+		CHECK(ValidateRenderedBattleBenchmarkNominalGeometry(21.0f, 10.0f));
+		CHECK(GetRenderedBattleDiagnosticSearchCount(0, 0, 2.0f * g.insetX, 2.0f * g.insetY, TRUE) == 130);
+		Coord3D center;
+		CHECK(GetRenderedBattleDiagnosticSearchCenter(0, 0, 2.0f * g.insetX, 2.0f * g.insetY, 49, &center, TRUE));
+		CHECK(center.x == g.insetX && center.y == g.insetY);
+		CHECK(GetRenderedBattleDiagnosticSearchCount(0, 0, 2.0f * g.insetX - 1, 2.0f * g.insetY, TRUE) == 49);
+	}
+	ProcessTestOptions().benchmarkProfile = BENCHMARK_PROFILE_LEGACY_512;
+	CHECK(GetRenderedBattleBenchmarkGeometry().revealRadius == 700);
+	ProcessTestOptions() = saved;
+	Int candidates[131], prefixes[131], count = 0;
+	candidates[130] = prefixes[130] = -999;
+	for (Int c = 129; c >= 0; --c)
+		CHECK(RememberRenderedBattleDiagnosticArena(c, c == 55 ? 0 : 100,
+			candidates, prefixes, &count, TRUE, 130));
+	CHECK(count == 130 && candidates[129] == 55 && prefixes[129] == 0);
+	CHECK(candidates[130] == -999 && prefixes[130] == -999);
+	CHECK(!RememberRenderedBattleDiagnosticArena(55, 0, candidates, prefixes, &count, TRUE, 130));
+	CHECK(!RememberRenderedBattleDiagnosticArena(0, 0, candidates, prefixes, &count, TRUE, 0));
+	CHECK(!RememberRenderedBattleDiagnosticArena(0, 0, candidates, prefixes, &count, TRUE, 131));
+}
+
 static void TestRenderedBattleDiagnosticContract()
 {
 	TestRenderedBattleProfileObjectNames();
+	TestRenderedBattleNamedGeometryAndArenaRetention();
 	TestRenderedBattleDiagnosticSearch();
 	TestRenderedBattleDiagnosticLocalPlacement();
 

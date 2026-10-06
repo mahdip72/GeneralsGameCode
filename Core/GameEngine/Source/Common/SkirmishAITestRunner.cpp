@@ -3989,6 +3989,20 @@ const char *GetRenderedBattleDiagnosticFactionName(Int slot)
 	return slot >= 0 && slot < SKIRMISH_AI_TEST_SLOT_COUNT ? names[slot % 4] : nullptr;
 }
 
+RenderedBattleBenchmarkGeometry GetRenderedBattleBenchmarkGeometry()
+{
+	RenderedBattleBenchmarkGeometry geometry = { 52, 26, 208, 459, 416, 503, 460, 700 };
+	if (rts::rendered_battle::ProcessTestOptions().benchmarkProfile ==
+		rts::rendered_battle::BENCHMARK_PROFILE_MECHANIZED_512)
+	{
+		// Two vehicle lattices require diagonal clearance for admitted radius21.
+		geometry.gridStep = 64; geometry.extraOffset = 32; geometry.bandStep = 256;
+		geometry.formationX = 543; geometry.formationY = 512;
+		geometry.insetX = 587; geometry.insetY = 556; geometry.revealRadius = 850;
+	}
+	return geometry;
+}
+
 static Int GetRenderedBattleBenchmarkProfileUnitsPerPlayer()
 {
 	const rts::rendered_battle::TestOptions &options = rts::rendered_battle::ProcessTestOptions();
@@ -4035,14 +4049,14 @@ Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset, Bool
 		unit >= unitsPerPlayer) return FALSE;
 	if (benchmark)
 	{
-		// 52 spacing admits raw21 vehicles / raw10 infantry with +3 clearance.
-		// Diagonal26 infantry shifts need208 player bands to retain that gap.
+		// Preserve the legacy layout except mechanized512, whose extra vehicles
+		// require grid64/diagonal32/bands256 to retain radius21 +3 clearance.
 		const Bool extra = unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
 		const Int withinGroup = unit % RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
 		offset->x = (slot < 4 ? -1.0f : 1.0f) * (95.0f +
-			(withinGroup % 8) * RENDERED_BATTLE_BENCHMARK_GRID_STEP - (extra ? 26.0f : 0.0f));
-		offset->y = ((slot % 4) - 1.5f) * RENDERED_BATTLE_BENCHMARK_BAND_STEP +
-			(withinGroup / 8 - 1.5f) * RENDERED_BATTLE_BENCHMARK_GRID_STEP + (extra ? 26.0f : 0.0f);
+			(withinGroup % 8) * GetRenderedBattleBenchmarkGeometry().gridStep - (extra ? static_cast<Real>(GetRenderedBattleBenchmarkGeometry().extraOffset) : 0.0f));
+		offset->y = ((slot % 4) - 1.5f) * GetRenderedBattleBenchmarkGeometry().bandStep +
+			(withinGroup / 8 - 1.5f) * GetRenderedBattleBenchmarkGeometry().gridStep + (extra ? static_cast<Real>(GetRenderedBattleBenchmarkGeometry().extraOffset) : 0.0f);
 		offset->z = 0.0f;
 		return TRUE;
 	}
@@ -4090,8 +4104,8 @@ Int GetRenderedBattleDiagnosticSearchCount(Real loX, Real loY, Real hiX, Real hi
 		hiX >= -FLT_MAX && hiX <= FLT_MAX && hiY >= -FLT_MAX && hiY <= FLT_MAX &&
 		loX <= hiX && loY <= hiY)) return 0;
 	// Full nine-offset envelope, including the maximum tested footprint.
-	if (static_cast<double>(hiX) - loX < (benchmark ? 2.0 * RENDERED_BATTLE_BENCHMARK_INSET_X : 894.0) ||
-		static_cast<double>(hiY) - loY < (benchmark ? 2.0 * RENDERED_BATTLE_BENCHMARK_INSET_Y : 820.0)) return 49;
+	if (static_cast<double>(hiX) - loX < (benchmark ? 2.0 * GetRenderedBattleBenchmarkGeometry().insetX : 894.0) ||
+		static_cast<double>(hiY) - loY < (benchmark ? 2.0 * GetRenderedBattleBenchmarkGeometry().insetY : 820.0)) return 49;
 	return 49 + 9 * 9;
 }
 
@@ -4112,10 +4126,10 @@ Bool GetRenderedBattleDiagnosticSearchCenter(Real loX, Real loY, Real hiX, Real 
 		const Int grid = candidate - 49;
 		// Fixed denominator 8, never a reciprocal of a possibly zero map span.
 		// Exact-fit extents deliberately retain all 81 (coincident) grid entries.
-		const double insetX = benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_X : 447.0;
+		const double insetX = benchmark ? GetRenderedBattleBenchmarkGeometry().insetX : 447.0;
 		result.x = static_cast<Real>(static_cast<double>(loX) + insetX +
 			(static_cast<double>(hiX) - loX - 2.0 * insetX) * (grid % 9) / 8.0);
-		const double insetY = benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_Y : 410.0;
+		const double insetY = benchmark ? GetRenderedBattleBenchmarkGeometry().insetY : 410.0;
 		result.y = static_cast<Real>(static_cast<double>(loY) + insetY +
 			(static_cast<double>(hiY) - loY - 2.0 * insetY) * (grid / 9) / 8.0);
 	}
@@ -4176,8 +4190,8 @@ Bool ValidateRenderedBattleBenchmarkNominalGeometry(const Real templateRadii[SKI
 		if (!(radius > 0.0f && radius <= 21.0f)) return FALSE;
 		if (!GetRenderedBattleDiagnosticOffset(slot, unit, &positions[index], TRUE)) return FALSE;
 		radii[index] = radius;
-		if (fabs(positions[index].x) > RENDERED_BATTLE_BENCHMARK_FORMATION_X ||
-			fabs(positions[index].y) > RENDERED_BATTLE_BENCHMARK_FORMATION_Y) return FALSE;
+		if (fabs(positions[index].x) > GetRenderedBattleBenchmarkGeometry().formationX ||
+			fabs(positions[index].y) > GetRenderedBattleBenchmarkGeometry().formationY) return FALSE;
 		for (Int previous = 0; previous < index; ++previous)
 			if (!AreRenderedBattleDiagnosticPositionsSeparated(positions[index], radii[index],
 				positions[previous], radii[previous])) return FALSE;
@@ -4300,10 +4314,11 @@ RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
 }
 
 Bool RememberRenderedBattleDiagnosticArena(Int candidate, Int validUnits,
-	Int *candidates, Int *validPrefixes, Int *count, Bool benchmark)
+	Int *candidates, Int *validPrefixes, Int *count, Bool benchmark, Int arenaCapacity)
 {
-	if (!candidates || !validPrefixes || !count || *count < 0 ||
-		*count > RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP || candidate < 0 ||
+	if (arenaCapacity < 1 || arenaCapacity > RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP ||
+		!candidates || !validPrefixes || !count || *count < 0 ||
+		*count > arenaCapacity || candidate < 0 ||
 		candidate >= 130 || validUnits < 0 ||
 		validUnits >= SKIRMISH_AI_TEST_SLOT_COUNT * (benchmark ?
 		RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER : RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER))
@@ -4315,16 +4330,16 @@ Bool RememberRenderedBattleDiagnosticArena(Int candidate, Int validUnits,
 	while (insertion < *count && (validPrefixes[insertion] > validUnits ||
 		(validPrefixes[insertion] == validUnits && candidates[insertion] < candidate)))
 		++insertion;
-	if (insertion >= RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP) return FALSE;
-	const Int last = *count < RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP ?
-		*count : RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP - 1;
+	if (insertion >= arenaCapacity) return FALSE;
+	const Int last = *count < arenaCapacity ?
+		*count : arenaCapacity - 1;
 	for (index = last; index > insertion; --index)
 	{
 		candidates[index] = candidates[index - 1];
 		validPrefixes[index] = validPrefixes[index - 1];
 	}
 	candidates[insertion] = candidate; validPrefixes[insertion] = validUnits;
-	if (*count < RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP) ++*count;
+	if (*count < arenaCapacity) ++*count;
 	return TRUE;
 }
 
@@ -4361,7 +4376,7 @@ Int RenderedBattleUnitType(Int unit)
 }
 Real RenderedBattleBandStep()
 {
-	return IsRenderedBattleBenchmark() ? RENDERED_BATTLE_BENCHMARK_BAND_STEP : 200.0f;
+	return IsRenderedBattleBenchmark() ? GetRenderedBattleBenchmarkGeometry().bandStep : 200.0f;
 }
 Int RenderedBattleMaxFrames()
 {
@@ -4783,9 +4798,11 @@ Bool StageRenderedBattleDiagnostic()
 		{
 			const Int nominalUnits = 8 * unitsPerPlayer;
 			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS vehicle_radius=%.3f infantry_radius=%.3f "
-				"nominal_units=%d nominal_pairs=%d grid_step=52 band_step=208 formation_x=459 formation_y=416 "
+				"nominal_units=%d nominal_pairs=%d grid_step=%d band_step=%d formation_x=%d formation_y=%d "
 				"profile_id=%s roster_contract=%s\n",
 				maxVehicleRadius, maxInfantryRadius, nominalUnits, nominalUnits * (nominalUnits - 1) / 2,
+				GetRenderedBattleBenchmarkGeometry().gridStep, GetRenderedBattleBenchmarkGeometry().bandStep,
+				GetRenderedBattleBenchmarkGeometry().formationX, GetRenderedBattleBenchmarkGeometry().formationY,
 				benchmarkContract.profileId, benchmarkContract.rosterContract);
 		}
 		else
@@ -4804,13 +4821,17 @@ Bool StageRenderedBattleDiagnostic()
 	Int acceptedUnitTrials = 0, selectedAdoptedOffsets = 0, pairComparisons = 0;
 	Int solverOperations = 0, solverPairs = 0, solverAssignments = 0, solverBacktracks = 0;
 	Int domainEmptyUnits = 0, solverArenas = 0;
-	char solverDetails[1024] = {0}; Int solverDetailBytes = 0;
-	Int retained[RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP];
-	Int retainedPrefixes[RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP], retainedCount = 0;
+	char solverDetails[1024] = {0}, solverLastDetail[128] = {0};
+	Int solverDetailBytes = 0, solverDetailRecords = 0, solverDetailOmitted = 0;
+	const Int localArenaCapacity = namedBenchmarkProfile ?
+		RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP : RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP;
+	Int retained[RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP];
+	Int retainedPrefixes[RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP], retainedCount = 0;
 	RenderedBattlePreflightFailure examples[2], furthest;
 	const Int searchCount = GetRenderedBattleDiagnosticSearchCount(
 		extent.lo.x, extent.lo.y, extent.hi.x, extent.hi.y, benchmark);
-	// Nominal fixed order first, then at most eight ranked failed arenas. Legacy
+	// Nominal fixed order first, then ranked failed arenas. Named profiles retain
+	// every center-valid, inset-safe candidate rather than an eight-arena beam. Legacy
 	// keeps greedy local9; dense mode caches live domains and solves pair gates.
 	// No object is created until the complete requested roster passes every gate.
 	for (Int phase = 0; phase < 2 && !found; ++phase)
@@ -4909,16 +4930,27 @@ Bool StageRenderedBattleDiagnostic()
 					(result == RB_BENCHMARK_PLACEMENT_EMPTY_DOMAIN ? RB_PREFLIGHT_EMPTY_DOMAIN :
 					(result == RB_BENCHMARK_PLACEMENT_UNSATISFIABLE ? RB_PREFLIGHT_UNSATISFIABLE :
 					(result == RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED ? RB_PREFLIGHT_SEARCH_BUDGET : RB_PREFLIGHT_PLANNER_INVALID)));
-				const Int bytes = _snprintf(solverDetails + solverDetailBytes, sizeof(solverDetails) - solverDetailBytes,
-					"%s%d:%s:empty%d:first%d:last_gate%s:max%d:ops%d", solverDetailBytes ? "," : "", candidate,
+				const Int bytes = _snprintf(solverLastDetail, sizeof(solverLastDetail),
+					"%d:%s:empty%d:first%d:last_gate%s:max%d:ops%d", candidate,
 					arenaAccepted ? "solved" : RenderedBattlePreflightReasonName(failure.reason),
 					stats.emptyDomains, firstEmpty, RenderedBattlePreflightReasonName(firstEmptyGate),
 					stats.maxAssigned, stats.operations);
-				if (bytes < 0 || bytes >= static_cast<Int>(sizeof(solverDetails)) - solverDetailBytes)
+				if (bytes < 0 || bytes >= static_cast<Int>(sizeof(solverLastDetail)))
 				{
 					s_renderedBattle.reportFailed = TRUE; return FALSE;
 				}
-				solverDetailBytes += bytes;
+				if (solverDetailRecords < 8)
+				{
+					const Int extraBytes = bytes + (solverDetailBytes ? 1 : 0);
+					if (extraBytes >= static_cast<Int>(sizeof(solverDetails)) - solverDetailBytes)
+					{
+						s_renderedBattle.reportFailed = TRUE; return FALSE;
+					}
+					if (solverDetailBytes) solverDetails[solverDetailBytes++] = ',';
+					memcpy(solverDetails + solverDetailBytes, solverLastDetail, bytes + 1);
+					solverDetailBytes += bytes; ++solverDetailRecords;
+				}
+				else ++solverDetailOmitted;
 			}
 			else
 			// Reserve all original units before choosing extra infantry offsets.
@@ -4989,11 +5021,11 @@ Bool StageRenderedBattleDiagnostic()
 			{
 				++rejected[failure.reason];
 				if (!phase && centerAccepted &&
-					center.x - (benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_X : 447.0f) >= extent.lo.x &&
-					center.x + (benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_X : 447.0f) <= extent.hi.x &&
-					center.y - (benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_Y : 410.0f) >= extent.lo.y &&
-					center.y + (benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_Y : 410.0f) <= extent.hi.y)
-					RememberRenderedBattleDiagnosticArena(candidate, validUnits, retained, retainedPrefixes, &retainedCount, benchmark);
+					center.x - (benchmark ? GetRenderedBattleBenchmarkGeometry().insetX : 447.0f) >= extent.lo.x &&
+					center.x + (benchmark ? GetRenderedBattleBenchmarkGeometry().insetX : 447.0f) <= extent.hi.x &&
+					center.y - (benchmark ? GetRenderedBattleBenchmarkGeometry().insetY : 410.0f) >= extent.lo.y &&
+					center.y + (benchmark ? GetRenderedBattleBenchmarkGeometry().insetY : 410.0f) <= extent.hi.y)
+					RememberRenderedBattleDiagnosticArena(candidate, validUnits, retained, retainedPrefixes, &retainedCount, benchmark, localArenaCapacity);
 				if (exampleCount == 0 || (exampleCount == 1 && failure.reason != examples[0].reason))
 					examples[exampleCount++] = failure;
 				if (furthest.candidate < 0 || failure.validUnits > furthest.validUnits) furthest = failure;
@@ -5005,25 +5037,26 @@ Bool StageRenderedBattleDiagnostic()
 		"search_schema=%s placement_schema=%d selected_phase=%s "
 		"search_capacity=%d base_search_capacity=%d nominal_examined=%d local_examined=%d "
 		"legacy_candidates=49 grid_candidates=%d grid_columns=9 grid_rows=9 grid_inset_x=%d grid_inset_y=%d "
-		"local_step=22 local_trials=9 local_arena_cap=8 retained_arenas=%d "
+		"local_step=22 local_trials=9 local_arena_cap=%d retained_arenas=%d "
 		"max_valid_units=%d bounds=%d missing_cell=%d surface=%d footprint_height=%d occupied=%d "
 		"center_height=%d ground_path=%d attack_goal_path=%d planned_pair=%d "
 		"extent_lo=(%.3f,%.3f,%.3f) extent_hi=(%.3f,%.3f,%.3f) "
 		"grid_hi=(%d,%d) cell_size=10 candidate_step=240 candidate_span=720 "
 		"formation_x=%d formation_y=%d footprint_margin_max=22 height_limit=8 path_diameter_cells=4 "
 		"frame=%u in_game=%d loading=%d loaded_identity_valid=%d map_crc=%08X map_size=%u\n",
-		examined, selected, benchmark ? "dense512_grid52_band208_cached_local9_mrv_v6" : "legacy49_then_extent9x9_local9_v2",
+		examined, selected, benchmark ? (namedBenchmarkProfile ? "named_profile_geometry_cached_local9_mrv_v6" :
+			"dense512_grid52_band208_cached_local9_mrv_v6") : "legacy49_then_extent9x9_local9_v2",
 		benchmark ? 6 : 2, selectedPhase < 0 ? "none" : (selectedPhase ? "local9" : "nominal"),
-		searchCount + RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP, searchCount, nominalExamined, localExamined,
-		searchCount > 49 ? searchCount - 49 : 0, benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_X : 447,
-		benchmark ? RENDERED_BATTLE_BENCHMARK_INSET_Y : 410, retainedCount,
+		searchCount + localArenaCapacity, searchCount, nominalExamined, localExamined,
+		searchCount > 49 ? searchCount - 49 : 0, benchmark ? GetRenderedBattleBenchmarkGeometry().insetX : 447,
+		benchmark ? GetRenderedBattleBenchmarkGeometry().insetY : 410, localArenaCapacity, retainedCount,
 		maxValidUnits, rejected[RB_PREFLIGHT_BOUNDS], rejected[RB_PREFLIGHT_MISSING_CELL],
 		rejected[RB_PREFLIGHT_SURFACE], rejected[RB_PREFLIGHT_FOOTPRINT_HEIGHT], rejected[RB_PREFLIGHT_OCCUPIED],
 		rejected[RB_PREFLIGHT_CENTER_HEIGHT], rejected[RB_PREFLIGHT_GROUND_PATH],
 		rejected[RB_PREFLIGHT_ATTACK_GOAL_PATH], rejected[RB_PREFLIGHT_PLANNED_PAIR],
 		extent.lo.x, extent.lo.y, extent.lo.z, extent.hi.x, extent.hi.y, extent.hi.z,
-		pathfinder->getExtent()->x, pathfinder->getExtent()->y, benchmark ? RENDERED_BATTLE_BENCHMARK_FORMATION_X : 403,
-		benchmark ? RENDERED_BATTLE_BENCHMARK_FORMATION_Y : 366, TheGameLogic->getFrame(),
+		pathfinder->getExtent()->x, pathfinder->getExtent()->y, benchmark ? GetRenderedBattleBenchmarkGeometry().formationX : 403,
+		benchmark ? GetRenderedBattleBenchmarkGeometry().formationY : 366, TheGameLogic->getFrame(),
 		TheGameLogic->isInGame() ? 1 : 0, TheGameLogic->isLoadingMap() ? 1 : 0,
 		s_runner.loadedStateValidated ? 1 : 0, s_runner.loadedMapCRC, s_runner.loadedMapSize);
 	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_PLACEMENT_SUMMARY "
@@ -5042,14 +5075,15 @@ Bool StageRenderedBattleDiagnostic()
 			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PLANNER_SUMMARY arenas=%d "
 				"empty_domain_arenas=%d empty_domain_units=%d unsatisfiable_arenas=%d budget_exhausted_arenas=%d invalid_arenas=%d "
 				"operations=%d arena_operation_cap=%d total_operation_cap=%d pair_comparisons=%d assignments=%d backtracks=%d "
-				"domain_trials_per_arena=%d cached_trial_acceptance=unary_only choices=canonical_roster_index details=%s "
+				"domain_trials_per_arena=%d cached_trial_acceptance=unary_only choices=canonical_roster_index details=%s detail_records=%d detail_omitted=%d terminal_detail=%s "
 				"profile_id=%s roster_contract=%s\n",
 				solverArenas, rejected[RB_PREFLIGHT_EMPTY_DOMAIN], domainEmptyUnits,
 				rejected[RB_PREFLIGHT_UNSATISFIABLE], rejected[RB_PREFLIGHT_SEARCH_BUDGET], rejected[RB_PREFLIGHT_PLANNER_INVALID],
 				solverOperations, RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS,
 				RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS, solverPairs, solverAssignments, solverBacktracks,
 				8 * unitsPerPlayer * RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT,
-				solverDetailBytes ? solverDetails : "none", benchmarkContract.profileId, benchmarkContract.rosterContract);
+				solverDetailBytes ? solverDetails : "none", solverDetailRecords, solverDetailOmitted,
+				solverLastDetail[0] ? solverLastDetail : "none", benchmarkContract.profileId, benchmarkContract.rosterContract);
 		else
 			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PLANNER_SUMMARY arenas=%d "
 				"empty_domain_arenas=%d empty_domain_units=%d unsatisfiable_arenas=%d budget_exhausted_arenas=%d invalid_arenas=%d "
@@ -5170,8 +5204,9 @@ Bool StageRenderedBattleDiagnostic()
 		if (s_renderedBattle.reportFailed) return FALSE;
 	}
 	// Diagnostic-only local reveal; normal object sight and enemy targeting remain unchanged.
+	const Int localRevealRadius = benchmark ? GetRenderedBattleBenchmarkGeometry().revealRadius : 700;
 	ThePartitionManager->doShroudReveal(s_renderedBattle.center.x, s_renderedBattle.center.y,
-		700.0f, 1 << ThePlayerList->getLocalPlayer()->getPlayerIndex());
+		static_cast<Real>(localRevealRadius), 1 << ThePlayerList->getLocalPlayer()->getPlayerIndex());
 	TheTacticalView->setAngleToDefault(); TheTacticalView->setPitchToDefault();
 	TheTacticalView->stopDoingScriptedCamera(); TheTacticalView->setCameraLock(INVALID_ID);
 	TheTacticalView->setZoomToDefault(); TheTacticalView->lookAt(&s_renderedBattle.center);
@@ -5224,11 +5259,11 @@ Bool StageRenderedBattleDiagnostic()
 	s_runner.stalledStartMilliseconds = s_renderedBattle.startTick;
 	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_STAGED seed=%d frame=%u tick=%u created=%d "
 		"camera=(%.1f,%.1f,%.1f) yaw=default pitch=default zoom=1 scripted_camera=stopped "
-		"camera_lock=none local_reveal_radius=700 "
+		"camera_lock=none local_reveal_radius=%d "
 		"frame_cap=%d wall_cap_ms=%d map_crc=%08X map_size=%u\n",
 		s_runner.seed, s_renderedBattle.startFrame, s_renderedBattle.startTick,
 		s_renderedBattle.created, s_renderedBattle.center.x, s_renderedBattle.center.y,
-		s_renderedBattle.center.z, RenderedBattleMaxFrames(),
+		s_renderedBattle.center.z, localRevealRadius, RenderedBattleMaxFrames(),
 		RenderedBattleMaxMilliseconds(), s_runner.loadedMapCRC, s_runner.loadedMapSize);
 	fflush(stdout);
 	return TRUE;
