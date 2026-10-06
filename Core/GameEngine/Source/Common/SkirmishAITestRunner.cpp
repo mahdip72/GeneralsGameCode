@@ -4022,8 +4022,9 @@ const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit, Bool bench
 	if (slot < 0 || slot >= SKIRMISH_AI_TEST_SLOT_COUNT ||
 		unit < 0 || unit >= unitsPerPlayer) return nullptr;
 	const Int faction = slot % 4 == 3 ? 0 : slot % 4;
-	return names[faction][unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER ?
-		2 + unit % 2 : unit % 4];
+	const Int type = benchmark ? GetRenderedBattleBenchmarkProfileUnitType(unit) : unit % 4;
+	if (type < 0 || type >= 4) return nullptr;
+	return names[faction][type];
 }
 
 Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset, Bool benchmark)
