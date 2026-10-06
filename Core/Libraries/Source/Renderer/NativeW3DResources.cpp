@@ -1016,9 +1016,9 @@ RenderResult NativeW3DResources::PublishThreadedCompletion(
 			slot.submissionBackendEpoch = slot.backendEpoch;
 		}
 	}
-	for (size_t slotIndex = 0; slotIndex < m_impl->slots.size(); ++slotIndex)
+	for (size_t textureSlotIndex = 0; textureSlotIndex < m_impl->slots.size(); ++textureSlotIndex)
 	{
-		Slot &slot = m_impl->slots[slotIndex];
+		Slot &slot = m_impl->slots[textureSlotIndex];
 		if (!slot.handle.isValid() || slot.kind != 2 || slot.retired ||
 			slot.pendingTexturePublications.empty())
 		{
