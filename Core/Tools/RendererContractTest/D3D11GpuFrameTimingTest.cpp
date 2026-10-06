@@ -3,6 +3,16 @@
 #include <vector>
 #include <math.h>
 
+// Replace only the standard nothrow array allocation in this test executable,
+// so the real collector's record-allocation failure can be proved deterministically.
+static bool failRecordArrayAllocation = false;
+void *operator new[](size_t bytes, const std::nothrow_t&) noexcept
+{
+    if (failRecordArrayAllocation) return 0;
+    try { return ::operator new[](bytes); } catch (...) { return 0; }
+}
+void operator delete[](void *memory, const std::nothrow_t&) noexcept
+{ ::operator delete[](memory); }
 namespace
 {
 using namespace rts::render::detail;
@@ -456,12 +466,131 @@ int RecordCap()
 		state.tickCalls == Capture::RecordCapacity && !state.unsafeUse,
 		"record cap retains old evidence and accounts for every dropped frame");
 }
+int RecordCapacityConfiguration()
+{
+    int result = Check(Capture::SlotCount == 8 && Capture::PollBudget == 16 && Capture::RecordCapacity == 8192 &&
+        Capture::MaximumRecordCapacity == 65536 && sizeof(GpuTimingRecord) * Capture::MaximumRecordCapacity <= 10U * 1024U * 1024U,
+        "record budget remains bounded below 10MiB with unchanged query ring and polling budget");
+    unsigned int capacity = 0;
+    result |= Check(ParseGpuTimingRecordCapacity(0, &capacity) && capacity == 8192,
+        "absent request uses historical default");
+    const wchar_t *valid[] = {L"8192", L"9000", L"65536"};
+    const unsigned int expected[] = {8192, 9000, 65536};
+    for (unsigned int i = 0; i < 3; ++i)
+        result |= Check(ParseGpuTimingRecordCapacity(valid[i], &capacity) && capacity == expected[i], "strict decimal bounded capacity accepted");
+    const wchar_t *invalid[] = {L"", L"0", L"8191", L"65537", L"4294967296", L"9999999999999999999999999",
+        L"+65536", L"-8192", L" 65536", L"65536 ", L"65536x", L"8.192", L"0x2000"};
+    for (unsigned int i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
+    {
+        capacity = 123;
+        result |= Check(!ParseGpuTimingRecordCapacity(invalid[i], &capacity) && capacity == 123,
+            "invalid requested capacity is rejected without a partial/default output");
+    }
+    result |= Check(!ParseGpuTimingRecordCapacity(L"8192", 0), "capacity parser rejects null output");
+    const unsigned int rejected[] = {0, 8191, 65537, 0xffffffffU};
+    for (unsigned int i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i)
+    {
+        RecordingState state; Capture capture;
+        result |= Check(!capture.enable(rejected[i]) && !capture.enabled() && capture.recordCapacity() == 8192,
+            "invalid collector request leaves capture disabled and default capacity unchanged");
+        capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture); capture.poll();
+        result |= Check(state.creates == 0 && state.metadataCalls == 0 && state.reads == 0 && capture.recordCount() == 0 &&
+            capture.counters().allocationFailures == 0, "configuration rejection never fabricates allocation failure or GPU work");
+    }
+    RecordingState state; Capture capture;
+    result |= Check(capture.enable(65536) && capture.recordCapacity() == 65536 && state.creates == 0,
+        "expanded enable selects capacity before attachment without allocation");
+    result |= Check(!capture.enable(8192) && capture.recordCapacity() == 65536,
+        "enabled configuration cannot be changed even before first attachment");
+    capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture); capture.poll();
+    const unsigned int creates = state.creates, releases = state.releases;
+    result |= Check(!capture.enable(9000) && capture.recordCapacity() == 65536 && capture.recordCount() == 1 &&
+        state.creates == creates && state.releases == releases, "active configuration rejection performs no reallocation or query change");
+    capture.attach(RecordingDriver(&state));
+    result |= Check(capture.recordCapacity() == 65536 && capture.recordCount() == 1 && state.creates == creates * 2 &&
+        state.releases == creates && capture.deviceCount() == 2, "reattach preserves record budget and old rows while replacing only query pool");
+    capture.reset();
+    result |= Check(!capture.enabled() && capture.recordCapacity() == 8192 && capture.recordCount() == 0 &&
+        capture.deviceCount() == 0 && capture.counters().allocationFailures == 0, "reset restores independent historical default");
+    result |= Check(capture.enable() && capture.recordCapacity() == 8192, "default enable remains source compatible after reset");
+    capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture); capture.poll();
+    return result | Check(capture.recordCount() == 1 && capture.record(0).epoch == 1 && !state.unsafeUse,
+        "reset/default reattach starts fresh capture without stale query use");
 }
+int ExpandedRecordCapAndAllocationFailure()
+{
+    int result = 0;
+    {
+        RecordingState state; Capture capture;
+        result |= Check(capture.enable(Capture::MaximumRecordCapacity), "maximum opt-in capacity accepted");
+        capture.attach(RecordingDriver(&state));
+        for (unsigned int index = 0; index < Capture::MaximumRecordCapacity; ++index)
+        {
+            const unsigned int reads = state.reads;
+            capture.begin(Info()); Present(capture);
+            result |= Check(state.reads - reads <= Capture::PollBudget, "expanded capture keeps bounded read budget per begin");
+        }
+        const unsigned int creates = state.creates, clocks = state.clocks;
+        capture.begin(Info()); Present(capture); capture.poll();
+        result |= Check(capture.recordCount() == Capture::MaximumRecordCapacity && capture.recordCount() > Capture::RecordCapacity &&
+            capture.counters().complete == Capture::MaximumRecordCapacity && capture.counters().skippedCap == 1 &&
+            capture.counters().framesBegun == Capture::MaximumRecordCapacity + 1 && capture.counters().pending == 0 &&
+            capture.record(0).ordinal == 1 && capture.record(Capture::MaximumRecordCapacity - 1).ordinal == Capture::MaximumRecordCapacity &&
+            state.creates == Capture::SlotCount * (Capture::StampCount + 1) && state.creates == creates && state.clocks == clocks &&
+            state.tickCalls == Capture::MaximumRecordCapacity && !state.unsafeUse,
+            "65536-row capture retains both endpoints and reports cap drops with no query growth or skipped Present clock");
+    }
+    {
+        RecordingState state; Capture capture; capture.enable(65536);
+        failRecordArrayAllocation = true;
+        capture.attach(RecordingDriver(&state));
+        failRecordArrayAllocation = false;
+        capture.begin(Info()); Present(capture); capture.poll();
+        result |= Check(capture.enabled() && capture.recordCapacity() == 65536 && capture.recordCount() == 0 &&
+            capture.counters().allocationFailures == 1 && capture.counters().skippedUnavailable == 1 && state.creates == 0,
+            "real record new[] failure remains explicit allocation failure with no query allocation or fabricated row");
+        capture.attach(RecordingDriver(&state)); capture.begin(Info()); Present(capture); capture.poll();
+        result |= Check(capture.recordCount() == 1 && capture.counters().complete == 1 && capture.counters().allocationFailures == 1 &&
+            capture.recordCapacity() == 65536 && state.creates == Capture::SlotCount * (Capture::StampCount + 1) && !state.unsafeUse,
+            "later attachment can allocate requested budget but cannot erase earlier allocation failure provenance");
+    }
+    return result;
+}struct RecordingConfigurationOutput
+{
+    enum Failure { None, Open, Write, Flush, Close };
+    explicit RecordingConfigurationOutput(Failure fail) : fail(fail), opens(0), writes(0), flushes(0), closes(0), pid(0), capacity(0), bytes(0) {}
+    bool open(unsigned long value) { ++opens; pid = value; return fail != Open; }
+    bool write(unsigned long value, unsigned int records, uint64_t recordBytes)
+    { ++writes; pid = value; capacity = records; bytes = recordBytes; return fail != Write; }
+    bool flush() { ++flushes; return fail != Flush; }
+    bool close() { ++closes; return fail != Close; }
+    Failure fail; unsigned int opens, writes, flushes, closes;
+    unsigned long pid; unsigned int capacity; uint64_t bytes;
+};
+int CheckedConfigurationProvenance()
+{
+    int result = 0;
+    Capture capture; capture.enable(65536);
+    for (unsigned int failure = RecordingConfigurationOutput::None; failure <= RecordingConfigurationOutput::Close; ++failure)
+    {
+        RecordingConfigurationOutput output(static_cast<RecordingConfigurationOutput::Failure>(failure));
+        const bool ok = WriteGpuTimingConfiguration(output, 4321UL, capture.recordCapacity(), sizeof(GpuTimingRecord));
+        result |= Check(ok == (failure == RecordingConfigurationOutput::None) && output.opens == 1 && output.closes == 1 &&
+            output.writes == (failure == RecordingConfigurationOutput::Open ? 0U : 1U) &&
+            output.flushes == (failure == RecordingConfigurationOutput::Open || failure == RecordingConfigurationOutput::Write ? 0U : 1U),
+            "once-activation provenance checks open/write/flush/close and cannot succeed on a failed stage");
+        if (failure != RecordingConfigurationOutput::Open)
+            result |= Check(output.pid == 4321UL && output.capacity == capture.recordCapacity() && output.bytes == sizeof(GpuTimingRecord),
+                "sidecar receives actual collector budget, process identity and record ABI size");
+    }
+    return result;
+}}
 int main()
 {
 	int result = DisabledAndIntervals(); result |= PresentClockValidation(); result |= ReadbackBoundaryAssociation();
 	result |= FullRingAndBudget(); result |= CancelAndLifecycle();
 	result |= InvalidAndFailure(); result |= RecordCap();
+	result |= RecordCapacityConfiguration(); result |= ExpandedRecordCapAndAllocationFailure(); result |= CheckedConfigurationProvenance();
 	result |= FailedPresentThenLoss(); result |= CheckedExport(); result |= DeviceIdentityBounds();
 	if (!result) puts("GPU timing collector contracts passed (recording driver, no GPU)");
 	return result;

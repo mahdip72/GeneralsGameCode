@@ -68,15 +68,42 @@ struct GpuTimingCounters
 		deviceMetadataFailures, deviceMetadataDropped;
 };
 
+inline bool ParseGpuTimingRecordCapacity(const wchar_t *text, unsigned int *capacity)
+{
+	if (capacity == 0) return false;
+	if (text == 0) { *capacity = 8192; return true; }
+	if (*text == 0) return false;
+	unsigned int value = 0;
+	for (const wchar_t *cursor = text; *cursor != 0; ++cursor)
+	{
+		if (*cursor < L'0' || *cursor > L'9') return false;
+		const unsigned int digit = static_cast<unsigned int>(*cursor - L'0');
+		if (value > (65536U - digit) / 10U) return false;
+		value = value * 10U + digit;
+	}
+	if (value < 8192U || value > 65536U) return false;
+	*capacity = value;
+	return true;
+}
+
 template<class Driver> class GpuTimingCapture
 {
 public:
-	enum { SlotCount = 8, StampCount = 4, PollBudget = 16, RecordCapacity = 8192, DeviceCapacity = 64 };
+	enum { SlotCount = 8, StampCount = 4, PollBudget = 16, RecordCapacity = 8192, MaximumRecordCapacity = 65536, DeviceCapacity = 64 };
 	typedef typename Driver::Query Query;
-	GpuTimingCapture() : m_enabled(false), m_available(false), m_records(0),
+	GpuTimingCapture() : m_enabled(false), m_available(false), m_records(0), m_recordCapacity(RecordCapacity),
 		m_deviceCount(0), m_epoch(0), m_ordinal(0), m_current(-1), m_frameRecord(-1), m_presentRecord(-1), m_pollCursor(0) {}
 	~GpuTimingCapture() { release(GpuTimingShutdownPending); delete[] m_records; }
-	void enable() { m_enabled = true; }
+	// Configuration is immutable until reset; device replacement reuses storage.
+	bool enable(unsigned int capacity = RecordCapacity)
+	{
+		if (m_enabled || m_epoch != 0 || m_records != 0 ||
+			capacity < RecordCapacity || capacity > MaximumRecordCapacity) return false;
+		m_recordCapacity = capacity;
+		m_enabled = true;
+		return true;
+	}
+	unsigned int recordCapacity() const { return m_recordCapacity; }
 	bool enabled() const { return m_enabled; }
 	const GpuTimingCounters& counters() const { return m_counts; }
 	const GpuTimingRecord& record(unsigned int index) const { return m_records[index]; }
@@ -102,7 +129,7 @@ public:
 		m_frameRecord = -1;
 		if (m_records == 0)
 		{
-			m_records = new (std::nothrow) GpuTimingRecord[RecordCapacity];
+			m_records = new (std::nothrow) GpuTimingRecord[m_recordCapacity];
 			if (m_records == 0) { ++m_counts.allocationFailures; return; }
 		}
 		allocateQueries();
@@ -118,7 +145,7 @@ public:
 		m_frameRecord = -1;
 		m_presentRecord = -1;
 		if (!m_available) { ++m_counts.skippedUnavailable; return; }
-		if (m_counts.records == RecordCapacity) { ++m_counts.skippedCap; return; }
+		if (m_counts.records == m_recordCapacity) { ++m_counts.skippedCap; return; }
 		unsigned int index = 0;
 		while (index < SlotCount && m_slots[index].pending) ++index;
 		if (index == SlotCount) { ++m_counts.skippedFull; return; }
@@ -259,7 +286,7 @@ public:
 		release(GpuTimingShutdownPending);
 		delete[] m_records; m_records = 0;
 		m_counts = GpuTimingCounters(); m_driver = Driver();
-		m_enabled = false; m_epoch = m_ordinal = 0; m_pollCursor = m_deviceCount = 0;
+		m_enabled = false; m_recordCapacity = RecordCapacity; m_epoch = m_ordinal = 0; m_pollCursor = m_deviceCount = 0;
 	}
 
 	void poll()
@@ -349,6 +376,7 @@ private:
 	GpuTimingCapture& operator=(const GpuTimingCapture&);
 	bool m_enabled, m_available;
 	GpuTimingRecord *m_records;
+	unsigned int m_recordCapacity;
 	GpuTimingCounters m_counts;
 	Driver m_driver;
 	Slot m_slots[SlotCount];
@@ -558,6 +586,54 @@ template<class Driver, class Output> bool ExportGpuTimingCapture(GpuTimingCaptur
 	return ok;
 }
 
+// Once-per-activation provenance: configured storage budget, not allocation or
+// GPU execution proof. Never written from the timed frame path.
+class D3D11GpuTimingConfigurationOutput
+{
+public:
+	explicit D3D11GpuTimingConfigurationOutput(const wchar_t *directory)
+		: m_directory(directory), m_file(INVALID_HANDLE_VALUE) {}
+	~D3D11GpuTimingConfigurationOutput() { close(); }
+	bool open(unsigned long processId)
+	{
+		wchar_t path[MAX_PATH];
+		if (_snwprintf_s(path, _countof(path), _TRUNCATE,
+			L"%ls\\gpu-capture-configuration-%lu.json", m_directory, processId) < 0) return false;
+		m_file = CreateFileW(path, GENERIC_WRITE, 0, 0, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0);
+		return m_file != INVALID_HANDLE_VALUE;
+	}
+	bool write(unsigned long processId, unsigned int capacity, uint64_t recordBytes)
+	{
+		char text[512];
+		const int count = _snprintf_s(text, sizeof(text), _TRUNCATE,
+			"{\"schema\":\"ggc.gpu-capture-configuration.v1\",\"status\":\"configured\",\"process_id\":%lu,"
+			"\"record_capacity\":%u,\"record_bytes\":%llu,\"record_storage_bytes\":%llu,\"allocation_proven\":false}\n",
+			processId, capacity, static_cast<unsigned long long>(recordBytes),
+			static_cast<unsigned long long>(capacity) * recordBytes);
+		if (count <= 0 || m_file == INVALID_HANDLE_VALUE) return false;
+		DWORD written = 0;
+		return WriteFile(m_file, text, static_cast<DWORD>(count), &written, 0) != FALSE && written == static_cast<DWORD>(count);
+	}
+	bool flush() { return m_file != INVALID_HANDLE_VALUE && FlushFileBuffers(m_file) != FALSE; }
+	bool close()
+	{
+		if (m_file == INVALID_HANDLE_VALUE) return true;
+		const HANDLE file = m_file; m_file = INVALID_HANDLE_VALUE;
+		return CloseHandle(file) != FALSE;
+	}
+private:
+	const wchar_t *m_directory;
+	HANDLE m_file;
+};
+template<class Output> bool WriteGpuTimingConfiguration(Output& output,
+	unsigned long processId, unsigned int capacity, uint64_t recordBytes)
+{
+	bool ok = output.open(processId);
+	if (ok) ok = output.write(processId, capacity, recordBytes);
+	if (ok) ok = output.flush();
+	const bool closed = output.close();
+	return ok && closed;
+}
 class D3D11GpuFrameTiming
 {
 public:
@@ -573,7 +649,32 @@ public:
 			const DWORD attributes = GetFileAttributesW(m_directory);
 			if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
 			{ m_directory[0] = 0; return; }
-			m_capture.enable();
+			wchar_t capacityText[16] = {};
+			SetLastError(ERROR_SUCCESS);
+			const DWORD capacityLength = GetEnvironmentVariableW(
+				L"RTS_GPU_FRAME_TIMING_MAX_RECORDS", capacityText, _countof(capacityText));
+			const DWORD capacityError = GetLastError();
+			unsigned int capacity = GpuTimingCapture<D3D11GpuTimingDriver>::RecordCapacity;
+			const bool absent = capacityLength == 0 && capacityError == ERROR_ENVVAR_NOT_FOUND;
+			if ((!absent && (capacityLength == 0 || capacityLength >= _countof(capacityText) ||
+				!ParseGpuTimingRecordCapacity(capacityText, &capacity))) || !m_capture.enable(capacity))
+			{
+				fprintf(stderr, "GPU_FRAME_TIMING_CONFIGURATION status=invalid_capacity process_id=%lu\n", GetCurrentProcessId());
+				m_directory[0] = 0;
+				return;
+			}
+			static_assert(sizeof(GpuTimingRecord) * GpuTimingCapture<D3D11GpuTimingDriver>::MaximumRecordCapacity <= 10U * 1024U * 1024U,
+				"GPU capture record storage must remain below 10MiB");
+			D3D11GpuTimingConfigurationOutput configuration(m_directory);
+			if (!WriteGpuTimingConfiguration(configuration, GetCurrentProcessId(),
+				m_capture.recordCapacity(), sizeof(GpuTimingRecord)))
+			{
+				m_capture.reset();
+				m_capture.noteIoFailure();
+				m_directory[0] = 0;
+				fputs("GPU_FRAME_TIMING_CONFIGURATION status=io_failure\n", stderr);
+				return;
+			}
 		}
 		m_capture.attach(D3D11GpuTimingDriver(device, context));
 	}
