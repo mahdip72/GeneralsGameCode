@@ -313,6 +313,38 @@ class VisualCaptureTests(unittest.TestCase):
                 self.assertEqual(fixture["profile_contract"]["total_units"], expected["units_per_player"] * 8)
                 self.assertEqual(fixture["profile_contract"]["unit_type_sequence"], sequence)
                 self.assertEqual(len(fixture["roster"]), 8)
+                self.assertEqual(fixture["profile_contract"]["phase_contract"], r1.R2_PHASE_CONTRACT)
+                self.assertEqual(fixture["phase"], {"qpc_frequency": 1000, "begin": 10000,
+                    "stop": 14000, "seconds": 4.0, "warmup_frames": 150, "measured_frames": 450})
+
+    def reject_named_phase_field(self, phase, field, value, message):
+        self.lines = self.profile_fixture("combined_arms_256")
+        index = next(i for i, line in enumerate(self.lines)
+                     if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=" + phase + " "))
+        fields = self.lines[index].split()
+        self.assertEqual(sum(token.startswith(field + "=") for token in fields), 1)
+        self.lines[index] = " ".join(field + "=" + value if token.startswith(field + "=") else token
+                                     for token in fields)
+        self.write()  # Preserve the actual fixed marker count and completed footer.
+        with self.assertRaisesRegex(r1.Reject, message):
+            r1.diagnostic(self.path, self.ready)
+
+    def test_named_profile_contradictory_logic_target_is_rejected(self):
+        self.reject_named_phase_field("warmup_begin", "logic_target_hz", "600", "R2 warmup logic target")
+
+    def test_named_profile_contradictory_requested_measure_frames_are_rejected(self):
+        self.reject_named_phase_field("measurement_stop", "requested_measure_frames", "99", "R2 stop requested measure frames")
+
+    def test_named_profile_contradictory_stop_warmup_frames_are_rejected(self):
+        self.reject_named_phase_field("measurement_stop", "warmup_frames", "99", "R2 stop warmup frames")
+
+    def test_named_profile_contradictory_stop_fps_source_is_rejected(self):
+        self.reject_named_phase_field("measurement_stop", "fps_source", "logic_update", "R2 stop FPS source")
+
+    def test_named_profile_warmup_qpc_requires_positive_canonical_order(self):
+        for value in ("999999", "14000", "10000", "0", "-1", "01000", "1000.5", "+1000"):
+            with self.subTest(value=value):
+                self.reject_named_phase_field("warmup_begin", "qpc", value, "R2 warmup QPC")
 
     def test_optional_rigid_draw_metrics_are_separate_from_workload_and_fps_evidence(self):
         self.lines = self.profile_fixture("combined_arms_256")

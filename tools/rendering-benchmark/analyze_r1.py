@@ -464,6 +464,14 @@ def diagnostic(path, ready):
             req(marker.get("profile_id")==profile["profile_id"] and
                 marker.get("phase_contract")==profile["phase_contract"],
                 "R2 phase marker identity mismatch")
+        req(num(warm.get("logic_target_hz"),"R2 warmup logic target")==30,
+            "R2 warmup logic target differs from the fixed 30Hz phase contract")
+        req(num(ms.get("warmup_frames"),"R2 stop warmup_frames")==150,
+            "R2 stop warmup frames differ from the fixed phase contract")
+        req(num(ms.get("requested_measure_frames"),"R2 stop requested_measure_frames")==450,
+            "R2 stop requested measure frames differ from the fixed phase contract")
+        req(ms.get("fps_source")=="present_trace",
+            "R2 stop FPS source differs from the fixed Present-trace contract")
         for marker in rosters:
             keys=[key for key,_ in KV.findall(marker["_line"])]
             req(len(keys)==len(set(keys)) and set(keys)==
@@ -501,6 +509,9 @@ def diagnostic(path, ready):
     freq=num(warm.get("qpc_frequency"),"warmup frequency"); qb=num(mb.get("qpc"),"measurement begin QPC"); qe=num(ms.get("qpc"),"measurement stop QPC")
     f0=num(warm.get("frame"),"warmup frame"); fb=num(mb.get("frame"),"measurement begin frame"); fe=num(ms.get("frame"),"measurement stop frame")
     req(freq>0 and qb>0 and qe>qb and num(mb.get("qpc_frequency"),"begin frequency")==freq and num(ms.get("qpc_frequency"),"stop frequency")==freq,"phase QPC clocks invalid")
+    if profile:
+        qw=num(warm.get("qpc"),"R2 warmup QPC")
+        req(qw>0 and qw<qb,"R2 warmup QPC must be positive and precede measurement begin")
     req(fb-f0==150 and fe-fb==450 and num(staged.get("frame"),"staged frame")==f0,"frame markers do not delimit exact 150+450 workload")
     cam=staged.get("camera"); req(cam and staged.get("yaw")=="default" and staged.get("pitch")=="default" and staged.get("zoom")=="1" and staged.get("scripted_camera")=="stopped" and staged.get("camera_lock")=="none","fixed combat camera identity invalid")
     state={k:num(mb.get(k),"begin."+k) for k in ("alive0","alive1","attacking")}
