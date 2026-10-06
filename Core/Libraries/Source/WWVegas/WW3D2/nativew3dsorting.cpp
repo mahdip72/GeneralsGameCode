@@ -99,6 +99,8 @@ struct DrawRun
 
 struct FlushWorkspace
 {
+	std::vector<rts::SortingTriangleDescriptor> preparationDescriptors;
+	std::vector<size_t> preparationNodes;
 	std::vector<rts::SortingTriangleOutput> prepared;
 	std::vector<SortedNode> nodes;
 	std::vector<size_t> positiveNodes;
@@ -114,6 +116,8 @@ struct FlushWorkspace
 
 	void Clear()
 	{
+		preparationDescriptors.clear();
+		preparationNodes.clear();
 		prepared.clear();
 		nodes.clear();
 		positiveNodes.clear();
@@ -130,7 +134,9 @@ struct FlushWorkspace
 
 	unsigned long long RetainedCapacityBytes() const
 	{
-		return VectorCapacityBytes(prepared) + VectorCapacityBytes(nodes) +
+		return VectorCapacityBytes(preparationDescriptors) +
+			VectorCapacityBytes(preparationNodes) +
+			VectorCapacityBytes(prepared) + VectorCapacityBytes(nodes) +
 			VectorCapacityBytes(positiveNodes) +
 			VectorCapacityBytes(unsortedNodes) +
 			VectorCapacityBytes(nodeOrder) + VectorCapacityBytes(triangles) +
@@ -148,6 +154,8 @@ struct FlushWorkspace
 		ReleaseCapacity(draws, retainedBytes);
 		ReleaseCapacity(triangles, retainedBytes);
 		ReleaseCapacity(prepared, retainedBytes);
+		ReleaseCapacity(preparationDescriptors, retainedBytes);
+		ReleaseCapacity(preparationNodes, retainedBytes);
 		ReleaseCapacity(chunkVertices, retainedBytes);
 		ReleaseCapacity(chunkIndices, retainedBytes);
 		ReleaseCapacity(runs, retainedBytes);
@@ -200,6 +208,8 @@ unsigned int g_nativeSortingLastFlushPreparedGrowthCount = 0;
 unsigned long long g_nativeSortingLastFlushWorkspaceCapacityBytes = 0;
 unsigned long long g_nativeSortingLastOffsetInitializations = 0;
 unsigned long long g_nativeSortingLastOffsetResets = 0;
+bool g_nativeSortingSingleDescriptorReference = false;
+unsigned int g_nativeSortingLastParallelBatches = 0;
 #endif
 
 class FlushWorkspaceScope
@@ -314,6 +324,7 @@ bool ValidateSubmission(const NativeDrawPacket &packet,
 	return true;
 }
 
+#if defined(RTS_NATIVE_SORTING_TESTS)
 bool HasPendingTriangles(const SortedSubmission &submission)
 {
 	for (size_t index = 0; index < submission.submittedTriangles.size(); ++index)
@@ -324,7 +335,6 @@ bool HasPendingTriangles(const SortedSubmission &submission)
 	return false;
 }
 
-#if defined(RTS_NATIVE_SORTING_TESTS)
 // Retained for the existing retirement-helper assertions. Product retirement
 // now removes only a whole completed cohort so tie-sort input stays intact.
 struct CompletedSubmissionPredicate
@@ -373,53 +383,80 @@ bool ValidateSourceIndices(const SortedSubmission &submission)
 	return true;
 }
 
-template <bool IncludeAcknowledged>
-RenderResult AppendPreparedTriangles(const SortedSubmission &submission,
-	size_t submissionIndex, const float *matrix,
-	rts::SortingTriangleScratchLease &scratch,
-	std::vector<rts::SortingTriangleOutput> &prepared,
-	std::vector<SortedTriangle> &triangles)
+// The descriptor and triangle ceilings bound each synchronous preparation call,
+// independent of cohort size. Source bytes and transforms stay owner-owned and
+// immutable until the kernel has fenced; output and scratch are separate arenas.
+RenderResult AppendPreparedTriangleBatches(
+	const std::vector<SortedSubmission> &submissions,
+	FlushWorkspace &workspace, rts::SortingTriangleScratchLease &scratch)
 {
-	if (!ValidateSourceIndices(submission))
-		return RENDER_RESULT_INVALID_ARGUMENT;
-
-	const unsigned int triangleCount =
-		submission.packet.indexCount / 3U;
-	const unsigned int minimum = submission.packet.minimumVertexIndex;
-	const unsigned int stride = submission.packet.vertexStride;
-	const bool commonZ = matrix[0 * 4 + 2] == 0.0f &&
-		matrix[1 * 4 + 2] == 0.0f && matrix[3 * 4 + 2] == 0.0f &&
-		matrix[2 * 4 + 2] == 1.0f;
-
+	std::vector<rts::SortingTriangleDescriptor> &descriptors =
+		workspace.preparationDescriptors;
+	std::vector<size_t> &preparationNodes = workspace.preparationNodes;
+	std::vector<rts::SortingTriangleOutput> &prepared = workspace.prepared;
 	rts::SortingTriangleOptions options;
 	options.parallel = true;
-	for (unsigned int batchStart = 0; batchStart < triangleCount; )
+	unsigned int descriptorLimit = rts::SORTING_TRIANGLE_MAX_DESCRIPTORS;
+#if defined(RTS_NATIVE_SORTING_TESTS)
+	if (g_nativeSortingSingleDescriptorReference)
 	{
-		const unsigned int batchCount = std::min(
-			MAX_SORTING_TRIANGLES_PER_KERNEL_CALL, triangleCount - batchStart);
-		if (batchCount == 0)
-			break;
-		if (!scratch.prepare(1, batchCount, options.maximumScratchBytes))
+		descriptorLimit = 1;
+		options.parallel = false;
+	}
+#endif
+	size_t order = 0;
+	unsigned int sourceStart = 0;
+	while (order < workspace.nodeOrder.size())
+	{
+		descriptors.clear();
+		preparationNodes.clear();
+		unsigned int batchCount = 0;
+		while (order < workspace.nodeOrder.size() &&
+			descriptors.size() < descriptorLimit &&
+			batchCount < MAX_SORTING_TRIANGLES_PER_KERNEL_CALL)
+		{
+			const size_t nodeIndex = workspace.nodeOrder[order];
+			const SortedNode &node = workspace.nodes[nodeIndex];
+			const SortedSubmission &submission = submissions[node.submissionIndex];
+			if (sourceStart == 0 && !ValidateSourceIndices(submission))
+				return RENDER_RESULT_INVALID_ARGUMENT;
+			const unsigned int triangleCount = submission.packet.indexCount / 3U;
+			const unsigned int count = std::min(triangleCount - sourceStart,
+				MAX_SORTING_TRIANGLES_PER_KERNEL_CALL - batchCount);
+			rts::SortingTriangleDescriptor descriptor;
+			descriptor.vertices = submission.vertices.data();
+			descriptor.vertexStrideBytes = submission.packet.vertexStride;
+			descriptor.indices = submission.indices.data() +
+				static_cast<size_t>(sourceStart) * 3;
+			descriptor.minVertexIndex = static_cast<unsigned short>(
+				submission.packet.minimumVertexIndex);
+			descriptor.vertexCount = static_cast<unsigned short>(
+				submission.packet.vertexCount);
+			descriptor.polygonCount = static_cast<unsigned short>(count);
+			descriptor.vertexOffset = 0;
+			descriptor.outputOffset = batchCount;
+			// The kernel's output identity is ushort, so use the bounded batch
+			// ordinal rather than the potentially unbounded cohort node index.
+			descriptor.nodeIndex = static_cast<unsigned int>(descriptors.size());
+			descriptor.zX = node.worldView[0 * 4 + 2];
+			descriptor.zY = node.worldView[1 * 4 + 2];
+			descriptor.zZ = node.worldView[2 * 4 + 2];
+			descriptor.zTranslation = node.worldView[3 * 4 + 2];
+			descriptor.commonZ = descriptor.zX == 0.0f && descriptor.zY == 0.0f &&
+				descriptor.zTranslation == 0.0f && descriptor.zZ == 1.0f ? 1U : 0U;
+			descriptors.push_back(descriptor);
+			preparationNodes.push_back(nodeIndex);
+			batchCount += count;
+			sourceStart += count;
+			if (sourceStart == triangleCount)
+			{
+				++order;
+				sourceStart = 0;
+			}
+		}
+		const unsigned int descriptorCount = static_cast<unsigned int>(descriptors.size());
+		if (!scratch.prepare(descriptorCount, batchCount, options.maximumScratchBytes))
 			return RENDER_RESULT_OUT_OF_MEMORY;
-
-		rts::SortingTriangleDescriptor descriptor;
-		descriptor.vertices = submission.vertices.data();
-		descriptor.vertexStrideBytes = stride;
-		descriptor.indices = submission.indices.data() +
-			static_cast<size_t>(batchStart) * 3;
-		descriptor.minVertexIndex = static_cast<unsigned short>(minimum);
-		descriptor.vertexCount = static_cast<unsigned short>(
-			submission.packet.vertexCount);
-		descriptor.polygonCount = static_cast<unsigned short>(batchCount);
-		descriptor.vertexOffset = 0;
-		descriptor.outputOffset = 0;
-		descriptor.nodeIndex = 0;
-		descriptor.zX = matrix[0 * 4 + 2];
-		descriptor.zY = matrix[1 * 4 + 2];
-		descriptor.zZ = matrix[2 * 4 + 2];
-		descriptor.zTranslation = matrix[3 * 4 + 2];
-		descriptor.commonZ = commonZ ? 1U : 0U;
-
 		if (prepared.size() < batchCount)
 		{
 			const bool growsCapacity = prepared.capacity() < batchCount;
@@ -431,42 +468,49 @@ RenderResult AppendPreparedTriangles(const SortedSubmission &submission,
 		}
 		rts::SortingTriangleMetrics metrics;
 		rts::SortingTriangleResult result = rts::PrepareSortingTriangles(
-			&descriptor, 1, batchCount, prepared.data(), scratch.outputs(),
-			options, &metrics);
+			descriptors.data(), descriptorCount, batchCount, prepared.data(),
+			scratch.outputs(), options, &metrics);
+#if defined(RTS_NATIVE_SORTING_TESTS)
+		if (result == rts::SORTING_TRIANGLE_PARALLEL)
+			++g_nativeSortingLastParallelBatches;
+#endif
 		if (result == rts::SORTING_TRIANGLE_SERIAL_FALLBACK)
 		{
-			// The parallel call has fenced all accepted jobs before returning.
-			// Reuse the same owner-thread scratch storage for the reference loop.
+			// All accepted worker jobs have drained before this result. Keep
+			// descriptors/source/output alive and rerun the identical serial kernel.
+			const bool parallel = options.parallel;
 			options.parallel = false;
-			result = rts::PrepareSortingTriangles(&descriptor, 1, batchCount,
-				prepared.data(), scratch.outputs(), options, &metrics);
-			options.parallel = true;
+			result = rts::PrepareSortingTriangles(descriptors.data(), descriptorCount,
+				batchCount, prepared.data(), scratch.outputs(), options, &metrics);
+			options.parallel = parallel;
 		}
 		if (!rts::SortingTriangleCompleted(result))
-		return result == rts::SORTING_TRIANGLE_INVALID_INPUT ?
-			RENDER_RESULT_INVALID_ARGUMENT : RENDER_RESULT_FAILED;
-
-		for (unsigned int local = 0; local < batchCount; ++local)
+			return result == rts::SORTING_TRIANGLE_INVALID_INPUT ?
+				RENDER_RESULT_INVALID_ARGUMENT : RENDER_RESULT_FAILED;
+		for (unsigned int descriptorIndex = 0; descriptorIndex < descriptorCount;
+			++descriptorIndex)
 		{
-			const unsigned int sourceTriangle = batchStart + local;
-			if (!IncludeAcknowledged &&
-				submission.submittedTriangles[sourceTriangle])
-				continue;
-			if (!IsFiniteFloat(prepared[local].z))
-				return RENDER_RESULT_INVALID_ARGUMENT;
-			SortedTriangle triangle;
-			triangle.submissionIndex = submissionIndex;
-			triangle.sourceTriangle = sourceTriangle;
-			triangle.i = static_cast<unsigned short>(
-				prepared[local].tri.i);
-			triangle.j = static_cast<unsigned short>(
-				prepared[local].tri.j);
-			triangle.k = static_cast<unsigned short>(
-				prepared[local].tri.k);
-			triangle.depth = prepared[local].z;
-			triangles.push_back(triangle);
+			const rts::SortingTriangleDescriptor &descriptor = descriptors[descriptorIndex];
+			const size_t submissionIndex = workspace.nodes[
+				preparationNodes[descriptorIndex]].submissionIndex;
+			const SortedSubmission &submission = submissions[submissionIndex];
+			const unsigned int firstTriangle = static_cast<unsigned int>(
+				(descriptor.indices - submission.indices.data()) / 3);
+			for (unsigned int local = 0; local < descriptor.polygonCount; ++local)
+			{
+				const rts::SortingTriangleOutput &output = prepared[descriptor.outputOffset + local];
+				if (!IsFiniteFloat(output.z))
+					return RENDER_RESULT_INVALID_ARGUMENT;
+				SortedTriangle triangle;
+				triangle.submissionIndex = submissionIndex;
+				triangle.sourceTriangle = firstTriangle + local;
+				triangle.i = output.tri.i;
+				triangle.j = output.tri.j;
+				triangle.k = output.tri.k;
+				triangle.depth = output.z;
+				workspace.triangles.push_back(triangle);
+			}
 		}
-		batchStart += batchCount;
 	}
 	return RENDER_RESULT_OK;
 }
@@ -1040,6 +1084,7 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink,
 	g_nativeSortingLastFlushPreparedGrowthCount = 0;
 	g_nativeSortingLastOffsetInitializations = 0;
 	g_nativeSortingLastOffsetResets = 0;
+	g_nativeSortingLastParallelBatches = 0;
 #endif
 	if (m_impl == 0 || m_impl->submissions.empty())
 		return RENDER_RESULT_OK;
@@ -1073,8 +1118,6 @@ nextCohort:
 		// SortingTriangleScratchLease is synchronously fenced by each kernel
 		// call, so one workspace safely serves every sorted node and Flush.
 		rts::SortingTriangleScratchLease scratch;
-		std::vector<rts::SortingTriangleOutput> &prepared =
-			m_impl->workspace.prepared;
 		std::vector<SortedNode> &nodes = m_impl->workspace.nodes;
 		std::vector<size_t> &positiveNodes = m_impl->workspace.positiveNodes;
 		std::vector<size_t> &unsortedNodes = m_impl->workspace.unsortedNodes;
@@ -1082,8 +1125,6 @@ nextCohort:
 		for (size_t index = cohortStart; index < cohortStart + cohortSize; ++index)
 		{
 			const SortedSubmission &submission = m_impl->submissions[index];
-			if (!retryingAcknowledgedCohort && !HasPendingTriangles(submission))
-				continue;
 			SortedNode node;
 			node.submissionIndex = index;
 			node.hasSphere = submission.hasSphere;
@@ -1131,24 +1172,16 @@ nextCohort:
 			positiveNodes.end());
 
 		std::vector<SortedTriangle> &triangles = m_impl->workspace.triangles;
-		for (size_t order = 0; order < nodeOrder.size(); ++order)
-		{
-			const SortedNode &node = nodes[nodeOrder[order]];
-			const size_t submissionIndex = node.submissionIndex;
-			const SortedSubmission &submission = m_impl->submissions[
-				submissionIndex];
-			const RenderResult prepareResult = retryingAcknowledgedCohort ?
-				AppendPreparedTriangles<true>(submission, submissionIndex,
-					node.worldView, scratch, prepared, triangles) :
-				AppendPreparedTriangles<false>(submission, submissionIndex,
-					node.worldView, scratch, prepared, triangles);
+		// Queue initializes all acknowledgements to zero; only an accepted
+		// draw can set them, and it also fixes the acknowledged retry cohort.
+		// Prepare the full cohort in both cases to retain legacy equal-depth ties.
+		const RenderResult prepareResult = AppendPreparedTriangleBatches(
+			m_impl->submissions, m_impl->workspace, scratch);
 #if defined(RTS_NATIVE_SORTING_TESTS)
-			g_nativeSortingLastFlushScratchAllocationCount =
-				scratch.allocationCount();
+		g_nativeSortingLastFlushScratchAllocationCount = scratch.allocationCount();
 #endif
-			if (prepareResult != RENDER_RESULT_OK)
-				return prepareResult;
-		}
+		if (prepareResult != RENDER_RESULT_OK)
+			return prepareResult;
 		if (!triangles.empty())
 			Sort(triangles.data(), triangles.data() + triangles.size());
 		if (retryingAcknowledgedCohort)
@@ -1420,6 +1453,16 @@ bool NativeSortingRenderer::Empty() const
 }
 
 #if defined(RTS_NATIVE_SORTING_TESTS)
+void NativeSortingRendererTestUseSingleDescriptorReference(bool enabled)
+{
+	g_nativeSortingSingleDescriptorReference = enabled;
+}
+
+unsigned int NativeSortingRendererTestLastParallelBatches()
+{
+	return g_nativeSortingLastParallelBatches;
+}
+
 unsigned long long NativeSortingRendererTestLastOffsetInitializations()
 {
 	return g_nativeSortingLastOffsetInitializations;
