@@ -4372,6 +4372,10 @@ UnsignedInt RenderedBattleMaxMilliseconds()
 {
 	if (IsRenderedBattleBenchmark() && rts::rendered_battle::ProcessTestOptions().visualCaptureOnly)
 		return 120000;
+	// Named profiles retain the fixed simulation workload on slower machines.
+	if (IsRenderedBattleBenchmark() && rts::rendered_battle::IsExplicitBenchmarkProfile(
+		rts::rendered_battle::ProcessTestOptions().benchmarkProfile))
+		return 180000;
 	return IsRenderedBattleBenchmark() ? RENDERED_BATTLE_BENCHMARK_MAX_MILLISECONDS :
 		RENDERED_BATTLE_DIAGNOSTIC_MAX_MILLISECONDS;
 }
