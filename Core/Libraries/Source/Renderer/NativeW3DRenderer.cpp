@@ -1,4 +1,5 @@
 #include "Renderer/NativeW3DRenderer.h"
+#include "Renderer/RigidInstancingPolicy.h"
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/NativeW3DRenderState.h"
 #include "Lib/FrameTimingDiagnostics.h"
@@ -370,6 +371,171 @@ RenderResult NativeW3DRenderer::SubmitExternal(
 	const NativeDrawPacket &packet)
 {
 	return SubmitInternal(resources, state, packet, false, 0, 0);
+}
+
+bool NativeW3DRenderer::SupportsRigidInstancing() const
+{
+	IRenderDevice *device = m_state == 0 ? 0 : m_state->Device();
+	return device != 0 && IsOwnerThread() && device->isOperational() &&
+		device->supportsRigidInstancing();
+}
+
+RenderResult NativeW3DRenderer::SubmitInstanced(
+	const NativeW3DResources &resources, const LegacyLogicalState &state,
+	const NativeDrawPacket &packet, const RenderMatrix4 *worlds,
+	unsigned int instanceCount)
+{
+	return SubmitInstancedInternal(resources, state, packet, worlds,
+		instanceCount, true);
+}
+
+RenderResult NativeW3DRenderer::SubmitInstancedExternal(
+	const NativeW3DResources &resources, const LegacyLogicalState &state,
+	const NativeDrawPacket &packet, const RenderMatrix4 *worlds,
+	unsigned int instanceCount)
+{
+	return SubmitInstancedInternal(resources, state, packet, worlds,
+		instanceCount, false);
+}
+
+RenderResult NativeW3DRenderer::SubmitInstancedInternal(
+	const NativeW3DResources &resources, const LegacyLogicalState &state,
+	const NativeDrawPacket &packet, const RenderMatrix4 *worlds,
+	unsigned int instanceCount, bool requireFacadeFrame)
+{
+	if (worlds == 0 || instanceCount < 2 ||
+		instanceCount > RENDER_RIGID_INSTANCE_MAX || !packet.indexed)
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	IRenderContext *context = m_state == 0 ? 0 : m_state->Context();
+	if (context == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (requireFacadeFrame && !m_frameOpen)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (!IsOwnerThread())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (!resources.IsBoundTo(this))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (!packet.vertexBuffer.isValid())
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (packet.vertexStride == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (packet.vertexLayout.stride != packet.vertexStride)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (packet.vertexCount == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (packet.vertexLayout.elementCount >
+		RenderVertexLayout::MAX_ELEMENT_COUNT)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	unsigned int declaredVertexStart = 0;
+	if (!ComputeDeclaredVertexStart(packet, &declaredVertexStart))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (packet.vertexCount > UINT_MAX - declaredVertexStart)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (!resources.IsVertexRangeValidForSubmission(packet.vertexBuffer,
+		packet.vertexStride, packet.vertexOffset, declaredVertexStart,
+		packet.vertexCount))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if (packet.indexed && !resources.IsIndexRangeValidForSubmission(
+		packet.indexBuffer, packet.indexFormat, packet.indexOffset,
+		packet.startIndex, packet.indexCount))
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	if ((packet.texturePresenceMask & ~((1U << LEGACY_TEXTURE_STAGE_COUNT) - 1U)) != 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+	{
+		const bool expected = (packet.texturePresenceMask & (1U << stage)) != 0;
+		const bool supplied = packet.textures[stage].isValid();
+		if (expected != supplied || !resources.IsTextureValidOrEmpty(packet.textures[stage]))
+		{
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+	}
+	for (unsigned int i = 0; i < instanceCount; ++i)
+		if (!RigidInstancingWorldValid(worlds[i]))
+			return RENDER_RESULT_INVALID_ARGUMENT;
+	// These are the only clean fallback returns. No state, uploads or queued
+	// commands have been accepted before this complete preparation succeeds.
+	if (!SupportsRigidInstancing() || !RigidInstancingDrawEligible(packet, state))
+		return RENDER_RESULT_UNSUPPORTED;
+
+#if defined(RTS_RENDERER_HAS_D3D11)
+	if (IsThreadedRenderDevice(m_state->Device()))
+	{
+		ThreadedIndexedInstancedDraw draw(state);
+		PopulateLegacyLayout(packet.vertexLayout, draw.shared.layout);
+		draw.shared.vertexFormat = packet.vertexFormat;
+		draw.shared.useVertexFormat = false;
+		draw.shared.texturePresenceMask = packet.texturePresenceMask;
+		draw.shared.vertexBuffer = packet.vertexBuffer;
+		draw.shared.vertexStride = packet.vertexStride;
+		draw.shared.vertexOffset = packet.vertexOffset;
+		draw.shared.indexBuffer = packet.indexBuffer;
+		draw.shared.indexFormat = packet.indexFormat;
+		draw.shared.indexOffset = packet.indexOffset;
+		draw.shared.topology = packet.topology;
+		draw.shared.bindIndexBuffer = true;
+		draw.shared.indexCount = packet.indexCount;
+		draw.shared.startIndex = packet.startIndex;
+		draw.shared.baseVertex = packet.baseVertex;
+		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+			draw.shared.textures[stage] = packet.textures[stage];
+		draw.instanceCount = instanceCount;
+		for (unsigned int i = 0; i < instanceCount; ++i)
+			draw.worlds[i] = worlds[i];
+		const RenderResult admitted = SubmitThreadedIndexedInstancedDraw(
+			m_state->Device(), draw);
+		// A backend/wrapper capability inconsistency is terminal here. Never
+		// expose UNSUPPORTED after entering admission as permission to replay.
+		return admitted == RENDER_RESULT_UNSUPPORTED ? RENDER_RESULT_FAILED : admitted;
+	}
+#endif
+	LegacyVertexLayout layout;
+	PopulateLegacyLayout(packet.vertexLayout, layout);
+	RenderResult result = context->setLegacyStateForLayout(state, layout,
+		packet.texturePresenceMask);
+	if (result == RENDER_RESULT_OK)
+		result = context->setVertexBuffer(packet.vertexBuffer,
+			packet.vertexStride, packet.vertexOffset);
+	for (unsigned int stage = 0; result == RENDER_RESULT_OK &&
+		stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
+		result = context->setTexture(stage, packet.textures[stage]);
+	if (result == RENDER_RESULT_OK)
+		result = context->setPrimitiveTopology(packet.topology);
+	if (result == RENDER_RESULT_OK)
+		result = context->setIndexBuffer(packet.indexBuffer, packet.indexFormat,
+			packet.indexOffset);
+	if (result == RENDER_RESULT_OK)
+		result = context->drawIndexedInstanced(packet.indexCount,
+			packet.startIndex, packet.baseVertex, worlds, instanceCount);
+	return result == RENDER_RESULT_UNSUPPORTED ? RENDER_RESULT_FAILED : result;
 }
 
 RenderResult NativeW3DRenderer::SubmitInternal(

@@ -81,7 +81,7 @@ unsigned long Current_Render_Thread_Id()
 unsigned int Next_Gpu_Handle_Generation()
 {
 #ifdef _WIN32
-	static volatile LONG lastGeneration = 0;
+	static LONG lastGeneration = 0;
 	LONG current = InterlockedCompareExchange(&lastGeneration, 0, 0);
 	while (current < LONG_MAX)
 	{

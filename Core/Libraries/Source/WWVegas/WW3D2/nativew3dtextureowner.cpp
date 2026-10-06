@@ -149,6 +149,11 @@ NativeW3DTextureHandle NativeW3DTextureCandidate::Handle() const
 
 void NativeW3DTextureCandidate::Abandon()
 {
+	// Flush latches the draw failure and relinquishes its unsubmitted prefix.
+	// Retirement is mandatory even on that failure: its existing synchronous
+	// owner command follows accepted draws, or the ticket transfers allocation-
+	// free to the cleanup queue. Never orphan the last token from a destructor.
+	(void)FlushGameRigidDraws();
 	if (!m_owned)
 	{
 		Clear();
@@ -189,6 +194,8 @@ RenderResult NativeW3DTextureOwner::CreateCandidate(
 	unsigned int subresourceCount,
 	NativeW3DTextureCandidate *candidate) const
 {
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	if (candidate == 0 || candidate->IsValid())
 	{
@@ -275,6 +282,8 @@ RenderResult NativeW3DTextureOwner::PublishCandidate(
 	NativeW3DTextureCandidate *candidate,
 	unsigned int expectedPublicationGeneration)
 {
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	if (candidate == 0 || !candidate->IsValid())
 	{
@@ -455,12 +464,14 @@ RenderResult NativeW3DTextureOwner::AcquireOutputSurface(
 RenderResult NativeW3DTextureOwner::PublishOutputWrite(
 	NativeW3DSurfaceHandle surface, NativeW3DGpuContentLease *gpuLease) const
 {
+	if (gpuLease != 0) *gpuLease = NativeW3DGpuContentLease();
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	if (gpuLease == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	*gpuLease = NativeW3DGpuContentLease();
 	NativeW3DResources *resources = ActiveResources();
 	if (resources == 0 || !m_handle.isValid() || !surface.isValid() ||
 		surface.texture.resource != m_handle.resource ||
@@ -474,12 +485,14 @@ RenderResult NativeW3DTextureOwner::PublishOutputWrite(
 RenderResult NativeW3DTextureOwner::CopyActiveColorTarget(
 	NativeW3DGpuContentLease *gpuLease) const
 {
+	if (gpuLease != 0) *gpuLease = NativeW3DGpuContentLease();
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	if (gpuLease == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	*gpuLease = NativeW3DGpuContentLease();
 	NativeW3DResources *resources = ActiveResources();
 	if (resources == 0 || !m_handle.isValid())
 	{
@@ -518,6 +531,8 @@ RenderResult NativeW3DTextureOwner::RefreshCpuContent(
 	const TextureSubresourceData *subresources,
 	unsigned int subresourceCount) const
 {
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	NativeW3DResources *resources = ActiveResources();
 	if (resources == 0 || !m_handle.isValid() ||
@@ -568,6 +583,8 @@ RenderResult NativeW3DTextureOwner::DescribeContentStamp(
 
 RenderResult NativeW3DTextureOwner::Reset()
 {
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	if (!m_handle.isValid())
 	{
@@ -609,6 +626,9 @@ NativeW3DResources *NativeW3DTextureOwner::ActiveResources() const
 
 void NativeW3DTextureOwner::AbandonPublication()
 {
+	// Preserve the failed draw latch, but transfer mandatory retirement through
+	// the existing ordered ticket path before this facade can disappear.
+	(void)FlushGameRigidDraws();
 	if (!m_handle.isValid())
 	{
 		return;

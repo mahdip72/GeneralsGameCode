@@ -35,6 +35,21 @@ namespace rts
 namespace render
 {
 
+class GameRigidDrawHintScope
+{
+public:
+	GameRigidDrawHintScope(bool enabled, const void *geometry, const void *category)
+		: m_enabled(enabled)
+	{
+		if (m_enabled) (void)BeginGameRigidDrawScope(geometry, category);
+	}
+	~GameRigidDrawHintScope() { if (m_enabled) EndGameRigidDrawScope(); }
+private:
+	GameRigidDrawHintScope(const GameRigidDrawHintScope &);
+	GameRigidDrawHintScope &operator=(const GameRigidDrawHintScope &);
+	bool m_enabled;
+};
+
 // Backend-neutral copy of the legacy object-space sort volume.  Keeping this
 // POD in the public seam avoids making the renderer depend on WWMath's
 // SphereClass while retaining the center/radius values used by deferred

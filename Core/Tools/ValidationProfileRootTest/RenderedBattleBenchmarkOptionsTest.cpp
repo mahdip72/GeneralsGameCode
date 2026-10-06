@@ -155,10 +155,87 @@ int main(int argc, char **argv)
 	SetEnvironmentVariableA("RTS_RENDERED_BATTLE_BACKGROUND_STARTUP", NULL);
 	SetEnvironmentVariableA("RTS_RENDERED_BATTLE_VISUAL_CAPTURE", NULL);
 	SetEnvironmentVariableA("RTS_RENDER_VISUAL_CAPTURE_SAMPLES", NULL);
+	SetEnvironmentVariableA("RTS_RENDERED_BATTLE_PROFILE", NULL);
 	SetEnvironmentVariableA("RTS_STAGE5_VALIDATION_PROFILE_ROOT", NULL);
+	const char *ordinary[] = { "test", "-win" };
+	SetEnvironmentVariableA("RTS_RENDERED_BATTLE_PROFILE", "unknown_profile");
+	CHECK(rts::rendered_battle::ConfigureTestOptions(2, ordinary, true, &error));
+	CHECK(!rts::rendered_battle::ProcessTestOptions().benchmarkRequested);
+	CHECK(rts::rendered_battle::ProcessTestOptions().benchmarkProfile ==
+		rts::rendered_battle::BENCHMARK_PROFILE_LEGACY_512);
+	SetEnvironmentVariableA("RTS_RENDERED_BATTLE_PROFILE", NULL);
 	CHECK(rts::rendered_battle::ConfigureTestOptions(1, request, false, &error));
 	CHECK(!rts::rendered_battle::ProcessTestOptions().backgroundStartup);
 	CHECK(!rts::rendered_battle::ProcessTestOptions().visualCaptureOnly);
+	const char *benchmarkOnly[] = { "test", "-runRenderedBattleBenchmark", "637808953" };
+	CHECK(rts::rendered_battle::ConfigureTestOptions(3, benchmarkOnly, true, &error));
+	CHECK(!rts::rendered_battle::ProcessTestOptions().benchmarkRequested);
+	CHECK(rts::rendered_battle::ProcessTestOptions().benchmarkProfile ==
+		rts::rendered_battle::BENCHMARK_PROFILE_LEGACY_512);
+	const char *profileNames[] = { "combined_arms_256", "combined_arms_512", "mechanized_256",
+		"mechanized_512", "infantry_line_256", "infantry_line_512" };
+	const char *rosterContracts[] = {
+		"ggc.r2.rendered-battle.roster.combined-arms-256.v1",
+		"ggc.r2.rendered-battle.roster.combined-arms-512.v1",
+		"ggc.r2.rendered-battle.roster.mechanized-256.v1",
+		"ggc.r2.rendered-battle.roster.mechanized-512.v1",
+		"ggc.r2.rendered-battle.roster.infantry-line-256.v1",
+		"ggc.r2.rendered-battle.roster.infantry-line-512.v1" };
+	const unsigned int expectedCounts[6][4] = {
+		{ 4, 4, 12, 12 }, { 8, 8, 24, 24 }, { 16, 16, 0, 0 },
+		{ 32, 32, 0, 0 }, { 0, 0, 16, 16 }, { 0, 0, 32, 32 } };
+	const char *expectedTypeSequences[6] = {
+		"00001111222222222222333333333333",
+		"0123012301230123012301230123012323232323232323232323232323232323",
+		"00000000000000001111111111111111",
+		"0000000000000000000000000000000011111111111111111111111111111111",
+		"22222222222222223333333333333333",
+		"2222222222222222222222222222222233333333333333333333333333333333" };
+	const rts::rendered_battle::BenchmarkProfile profiles[] = {
+		rts::rendered_battle::BENCHMARK_PROFILE_COMBINED_ARMS_256,
+		rts::rendered_battle::BENCHMARK_PROFILE_COMBINED_ARMS_512,
+		rts::rendered_battle::BENCHMARK_PROFILE_MECHANIZED_256,
+		rts::rendered_battle::BENCHMARK_PROFILE_MECHANIZED_512,
+		rts::rendered_battle::BENCHMARK_PROFILE_INFANTRY_LINE_256,
+		rts::rendered_battle::BENCHMARK_PROFILE_INFANTRY_LINE_512 };
+	for (unsigned int profileIndex = 0; profileIndex < sizeof(profiles) / sizeof(profiles[0]); ++profileIndex)
+	{
+		SetEnvironmentVariableA("RTS_RENDERED_BATTLE_PROFILE", profileNames[profileIndex]);
+		CHECK(rts::rendered_battle::ConfigureTestOptions(3, benchmarkOnly, true, &error));
+		CHECK(rts::rendered_battle::ProcessTestOptions().benchmarkProfile == profiles[profileIndex]);
+		rts::rendered_battle::BenchmarkProfileContract contract;
+		CHECK(rts::rendered_battle::GetBenchmarkProfileContract(profiles[profileIndex], &contract));
+		CHECK(strcmp(contract.profileId, profileNames[profileIndex]) == 0);
+		CHECK(strcmp(contract.rosterContract, rosterContracts[profileIndex]) == 0);
+		CHECK(contract.unitsPerPlayer == (profileIndex % 2 ? 64u : 32u));
+		for (unsigned int type = 0; type < 4; ++type)
+			CHECK(contract.templateCounts[type] == expectedCounts[profileIndex][type]);
+		CHECK(contract.templateCounts[0] + contract.templateCounts[1] +
+			contract.templateCounts[2] + contract.templateCounts[3] == contract.unitsPerPlayer);
+		CHECK(strlen(expectedTypeSequences[profileIndex]) == contract.unitsPerPlayer);
+		unsigned int selectedCounts[4] = { 0, 0, 0, 0 };
+		for (unsigned int unit = 0; unit < contract.unitsPerPlayer; ++unit)
+		{
+			const int selectedType = rts::rendered_battle::GetBenchmarkProfileUnitType(
+				profiles[profileIndex], unit);
+			CHECK(selectedType >= 0 && selectedType < 4);
+			if (selectedType >= 0 && selectedType < 4)
+			{
+				CHECK(selectedType == expectedTypeSequences[profileIndex][unit] - '0');
+				++selectedCounts[selectedType];
+			}
+		}
+		for (unsigned int type = 0; type < 4; ++type)
+			CHECK(selectedCounts[type] == expectedCounts[profileIndex][type]);
+		CHECK(rts::rendered_battle::GetBenchmarkProfileUnitType(
+			profiles[profileIndex], contract.unitsPerPlayer) == -1);
+		CHECK(strcmp(contract.phaseContract,
+			"ggc.r2.rendered-battle.phase.normal30hz-150-450-1080p.v1") == 0);
+	}
+	SetEnvironmentVariableA("RTS_RENDERED_BATTLE_PROFILE", "unknown_profile");
+	CHECK(!rts::rendered_battle::ConfigureTestOptions(3, benchmarkOnly, true, &error));
+	CHECK(error && strcmp(error, "invalid_rendered_battle_profile") == 0);
+	SetEnvironmentVariableA("RTS_RENDERED_BATTLE_PROFILE", NULL);
 	// Default policy ignores a profile override unless a test opt-in requests it.
 	SetEnvironmentVariableA("RTS_STAGE5_VALIDATION_PROFILE_ROOT", "relative-profile");
 	CHECK(rts::rendered_battle::ConfigureTestOptions(1, request, false, &error));

@@ -32,6 +32,31 @@
 
 #if defined(_WIN64)
 
+namespace rts { namespace render {
+
+RenderResult GetGameRigidDrawMetrics(GameRigidDrawMetrics *metrics)
+{
+	NativeGameRenderOwnerScope scope;
+	return scope.Get() != 0 ? scope.Get()->GetGameRigidDrawMetrics(metrics) :
+		RENDER_RESULT_UNSUPPORTED;
+}
+
+RenderResult BeginGameRigidDrawScope(const void *geometry, const void *category)
+{
+	NativeGameRenderOwnerScope scope;
+	IGameRenderClientNativeOwner *owner = scope.Get();
+	return owner != 0 ? owner->BeginGameRigidDrawScope(geometry, category) :
+		RENDER_RESULT_UNSUPPORTED;
+}
+
+void EndGameRigidDrawScope()
+{
+	NativeGameRenderOwnerScope scope;
+	if (scope.Get() != 0) scope.Get()->EndGameRigidDrawScope();
+}
+
+} }
+
 namespace
 {
 

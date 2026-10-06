@@ -57,6 +57,9 @@
 #include "Lib/SimulationPhaseGraphOwnerAdapter.h"
 #include "Lib/ValidationProfileRoot.h"
 #include "Lib/RenderedBattleBenchmarkOptions.h"
+#if defined(RTS_RENDERER_RIGID_INSTANCING_METRICS)
+#include "Renderer/RenderGameClientNative.h"
+#endif
 #if defined(_WIN64)
 #include "Common/FileSystem.h"
 #include "Common/Stage5MapResolution.h"
@@ -3972,6 +3975,27 @@ const char *GetRenderedBattleDiagnosticFactionName(Int slot)
 	return slot >= 0 && slot < SKIRMISH_AI_TEST_SLOT_COUNT ? names[slot % 4] : nullptr;
 }
 
+static Int GetRenderedBattleBenchmarkProfileUnitsPerPlayer()
+{
+	const rts::rendered_battle::TestOptions &options = rts::rendered_battle::ProcessTestOptions();
+	if (rts::rendered_battle::IsExplicitBenchmarkProfile(options.benchmarkProfile))
+	{
+		rts::rendered_battle::BenchmarkProfileContract contract;
+		if (rts::rendered_battle::GetBenchmarkProfileContract(options.benchmarkProfile, &contract))
+			return static_cast<Int>(contract.unitsPerPlayer);
+	}
+	return RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER;
+}
+
+static Int GetRenderedBattleBenchmarkProfileUnitType(Int unit)
+{
+	const rts::rendered_battle::TestOptions &options = rts::rendered_battle::ProcessTestOptions();
+	if (rts::rendered_battle::IsExplicitBenchmarkProfile(options.benchmarkProfile))
+		return unit < 0 ? -1 : rts::rendered_battle::GetBenchmarkProfileUnitType(
+			options.benchmarkProfile, static_cast<unsigned int>(unit));
+	return unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER ? 2 + unit % 2 : unit % 4;
+}
+
 const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit, Bool benchmark)
 {
 	static const char *names[3][4] = {
@@ -3979,9 +4003,10 @@ const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit, Bool bench
 		{ "ChinaTankBattleMaster", "ChinaTankGattling", "ChinaInfantryRedguard", "ChinaInfantryTankHunter" },
 		{ "GLATankScorpion", "GLAVehicleTechnical", "GLAInfantryRebel", "GLAInfantryTunnelDefender" }
 	};
+	const Int unitsPerPlayer = benchmark ? GetRenderedBattleBenchmarkProfileUnitsPerPlayer() :
+		RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
 	if (slot < 0 || slot >= SKIRMISH_AI_TEST_SLOT_COUNT ||
-		unit < 0 || unit >= (benchmark ? RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER :
-		RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER)) return nullptr;
+		unit < 0 || unit >= unitsPerPlayer) return nullptr;
 	const Int faction = slot % 4 == 3 ? 0 : slot % 4;
 	return names[faction][unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER ?
 		2 + unit % 2 : unit % 4];
@@ -3989,7 +4014,10 @@ const char *GetRenderedBattleDiagnosticObjectName(Int slot, Int unit, Bool bench
 
 Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset, Bool benchmark)
 {
-	if (!offset || !GetRenderedBattleDiagnosticObjectName(slot, unit, benchmark)) return FALSE;
+	const Int unitsPerPlayer = benchmark ? GetRenderedBattleBenchmarkProfileUnitsPerPlayer() :
+		RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+	if (!offset || slot < 0 || slot >= SKIRMISH_AI_TEST_SLOT_COUNT || unit < 0 ||
+		unit >= unitsPerPlayer) return FALSE;
 	if (benchmark)
 	{
 		// 52 spacing admits raw21 vehicles / raw10 infantry with +3 clearance.
@@ -4013,8 +4041,20 @@ Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset, Bool
 Bool GetRenderedBattleDiagnosticPlacementUnit(Int rank, Bool benchmark, Int *slot, Int *unit)
 {
 	const Int originalUnits = SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
-	const Int totalUnits = benchmark ? SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER : originalUnits;
+	const Int unitsPerPlayer = benchmark ? GetRenderedBattleBenchmarkProfileUnitsPerPlayer() :
+		RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+	const Int totalUnits = SKIRMISH_AI_TEST_SLOT_COUNT * unitsPerPlayer;
 	if (!slot || !unit || rank < 0 || rank >= totalUnits) return FALSE;
+	if (benchmark && rts::rendered_battle::IsExplicitBenchmarkProfile(
+		rts::rendered_battle::ProcessTestOptions().benchmarkProfile))
+	{
+		const Int wave = rank / originalUnits;
+		const Int withinWave = rank % originalUnits;
+		*slot = withinWave / RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+		*unit = withinWave % RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER +
+			wave * RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
+		return TRUE;
+	}
 	const Int extra = rank >= originalUnits ? RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER : 0;
 	const Int withinGroup = rank >= originalUnits ? rank - originalUnits : rank;
 	*slot = withinGroup / RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
@@ -4103,18 +4143,24 @@ Bool AreRenderedBattleDiagnosticPositionsSeparated(const Coord3D &a, Real radius
 	return dx * dx + dy * dy >= separation * separation;
 }
 
-Bool ValidateRenderedBattleBenchmarkNominalGeometry(Real vehicleRadius, Real infantryRadius)
+Bool ValidateRenderedBattleBenchmarkNominalGeometry(const Real templateRadii[SKIRMISH_AI_TEST_SLOT_COUNT][4])
 {
-	if (!(vehicleRadius > 0.0f && vehicleRadius <= 21.0f &&
-		infantryRadius > 0.0f && infantryRadius <= 21.0f)) return FALSE;
+	if (!templateRadii) return FALSE;
+	const Int unitsPerPlayer = GetRenderedBattleBenchmarkProfileUnitsPerPlayer();
+	if (unitsPerPlayer <= 0 || unitsPerPlayer > RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER) return FALSE;
+	const Int nominalUnits = SKIRMISH_AI_TEST_SLOT_COUNT * unitsPerPlayer;
 	Coord3D positions[SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
 	Real radii[SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
-	for (Int index = 0; index < SKIRMISH_AI_TEST_SLOT_COUNT * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER; ++index)
+	for (Int index = 0; index < nominalUnits; ++index)
 	{
-		const Int slot = index / RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER;
-		const Int unit = index % RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER;
+		const Int slot = index / unitsPerPlayer;
+		const Int unit = index % unitsPerPlayer;
+		const Int type = GetRenderedBattleBenchmarkProfileUnitType(unit);
+		if (type < 0 || type >= 4) return FALSE;
+		const Real radius = templateRadii[slot][type];
+		if (!(radius > 0.0f && radius <= 21.0f)) return FALSE;
 		if (!GetRenderedBattleDiagnosticOffset(slot, unit, &positions[index], TRUE)) return FALSE;
-		radii[index] = unit < RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER && unit % 4 < 2 ? vehicleRadius : infantryRadius;
+		radii[index] = radius;
 		if (fabs(positions[index].x) > RENDERED_BATTLE_BENCHMARK_FORMATION_X ||
 			fabs(positions[index].y) > RENDERED_BATTLE_BENCHMARK_FORMATION_Y) return FALSE;
 		for (Int previous = 0; previous < index; ++previous)
@@ -4273,12 +4319,13 @@ Bool IsRenderedBattleBenchmark()
 }
 Int RenderedBattleUnitsPerPlayer()
 {
-	return IsRenderedBattleBenchmark() ? RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER :
+	return IsRenderedBattleBenchmark() ? GetRenderedBattleBenchmarkProfileUnitsPerPlayer() :
 		RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
 }
 Int RenderedBattleUnitType(Int unit)
 {
-	return unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER ? 2 + unit % 2 : unit % 4;
+	return IsRenderedBattleBenchmark() ? GetRenderedBattleBenchmarkProfileUnitType(unit) :
+		(unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER ? 2 + unit % 2 : unit % 4);
 }
 Real RenderedBattleBandStep()
 {
@@ -4360,6 +4407,31 @@ void RecordRenderedBattleDiagnostic(const char *format, ...)
 	++s_renderedBattle.reportRecords;
 	printf("%s", line);
 }
+
+#if defined(RTS_RENDERER_RIGID_INSTANCING_METRICS)
+Bool FormatRenderedBattleRigidDrawMetrics(char *fields, size_t capacity,
+	UnsignedInt logicFrame)
+{
+	if (!fields || capacity == 0) return FALSE;
+	rts::render::GameRigidDrawMetrics metrics;
+	const rts::render::RenderResult result = rts::render::GetGameRigidDrawMetrics(&metrics);
+	const Int bytes = _snprintf(fields, capacity,
+		" rigid_metrics_schema=ggc.r2.rendered-battle-rigid-draw-metrics.v1 "
+		"rigid_metrics_status=%d rigid_logic_frame=%u rigid_captured_draws=%I64u "
+		"rigid_instanced_batches=%I64u rigid_instanced_instances=%I64u "
+		"rigid_singleton_ordinary=%I64u rigid_unsupported_fallbacks=%I64u "
+		"rigid_ordinary_fallback_draws=%I64u rigid_rejected_draws=%I64u",
+		static_cast<Int>(result), logicFrame, metrics.capturedDraws, metrics.instancedBatches,
+		metrics.instancedInstances, metrics.singletonOrdinary, metrics.unsupportedFallbacks,
+		metrics.ordinaryFallbackDraws, metrics.rejectedDraws);
+	if (bytes < 0 || static_cast<size_t>(bytes) >= capacity)
+	{
+		fields[0] = '\0';
+		return FALSE;
+	}
+	return TRUE;
+}
+#endif
 
 Bool PrepareRenderedBattleDiagnosticReportPath()
 {
@@ -4603,6 +4675,15 @@ Bool PreflightRenderedBattleUnitPosition(const Coord3D &p, Real radius,
 Bool StageRenderedBattleDiagnostic()
 {
 	const Bool benchmark = IsRenderedBattleBenchmark();
+	const Bool namedBenchmarkProfile = benchmark && rts::rendered_battle::IsExplicitBenchmarkProfile(
+		rts::rendered_battle::ProcessTestOptions().benchmarkProfile);
+	rts::rendered_battle::BenchmarkProfileContract benchmarkContract;
+	if (namedBenchmarkProfile && !rts::rendered_battle::GetBenchmarkProfileContract(
+		rts::rendered_battle::ProcessTestOptions().benchmarkProfile, &benchmarkContract))
+	{
+		s_renderedBattle.setupFailure = "benchmark_profile_contract_invalid";
+		return FALSE;
+	}
 	if (benchmark && rts::rendered_battle::ProcessTestOptions().backgroundStartup)
 		RecordRenderedBattleDiagnostic("%s\n", rts::rendered_battle::BackgroundStartupMarker());
 	if (benchmark && rts::rendered_battle::ProcessTestOptions().visualCaptureOnly)
@@ -4652,7 +4733,7 @@ Bool StageRenderedBattleDiagnostic()
 			else maxInfantryRadius = max(maxInfantryRadius, radii[slot][type]);
 		}
 	}
-	if (benchmark && !ValidateRenderedBattleBenchmarkNominalGeometry(maxVehicleRadius, maxInfantryRadius))
+	if (benchmark && !ValidateRenderedBattleBenchmarkNominalGeometry(radii))
 	{
 		s_renderedBattle.setupFailure = "benchmark_nominal_geometry_not_separated";
 		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_GEOMETRY_FAIL vehicle_radius=%.3f infantry_radius=%.3f\n",
@@ -4660,9 +4741,21 @@ Bool StageRenderedBattleDiagnostic()
 		return FALSE;
 	}
 	if (benchmark)
-		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS vehicle_radius=%.3f infantry_radius=%.3f "
-			"nominal_units=512 nominal_pairs=130816 grid_step=52 band_step=208 formation_x=459 formation_y=416\n",
-			maxVehicleRadius, maxInfantryRadius);
+	{
+		if (namedBenchmarkProfile)
+		{
+			const Int nominalUnits = 8 * unitsPerPlayer;
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS vehicle_radius=%.3f infantry_radius=%.3f "
+				"nominal_units=%d nominal_pairs=%d grid_step=52 band_step=208 formation_x=459 formation_y=416 "
+				"profile_id=%s roster_contract=%s\n",
+				maxVehicleRadius, maxInfantryRadius, nominalUnits, nominalUnits * (nominalUnits - 1) / 2,
+				benchmarkContract.profileId, benchmarkContract.rosterContract);
+		}
+		else
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS vehicle_radius=%.3f infantry_radius=%.3f "
+				"nominal_units=512 nominal_pairs=130816 grid_step=52 band_step=208 formation_x=459 formation_y=416\n",
+				maxVehicleRadius, maxInfantryRadius);
+	}
 	Region3D extent; TheTerrainLogic->getExtent(&extent);
 	s_renderedBattle.setupFailure = "formation_terrain_or_occupancy_invalid";
 	Coord3D positions[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
@@ -4908,15 +5001,28 @@ Bool StageRenderedBattleDiagnostic()
 		trialRejected[RB_PREFLIGHT_PLANNED_PAIR]);
 	if (benchmark)
 	{
-		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PLANNER_SUMMARY arenas=%d "
-			"empty_domain_arenas=%d empty_domain_units=%d unsatisfiable_arenas=%d budget_exhausted_arenas=%d invalid_arenas=%d "
-			"operations=%d arena_operation_cap=%d total_operation_cap=%d pair_comparisons=%d assignments=%d backtracks=%d "
-			"domain_trials_per_arena=4608 cached_trial_acceptance=unary_only choices=canonical_roster_index details=%s\n",
-			solverArenas, rejected[RB_PREFLIGHT_EMPTY_DOMAIN], domainEmptyUnits,
-			rejected[RB_PREFLIGHT_UNSATISFIABLE], rejected[RB_PREFLIGHT_SEARCH_BUDGET], rejected[RB_PREFLIGHT_PLANNER_INVALID],
-			solverOperations, RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS,
-			RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS, solverPairs, solverAssignments, solverBacktracks,
-			solverDetailBytes ? solverDetails : "none");
+		if (namedBenchmarkProfile)
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PLANNER_SUMMARY arenas=%d "
+				"empty_domain_arenas=%d empty_domain_units=%d unsatisfiable_arenas=%d budget_exhausted_arenas=%d invalid_arenas=%d "
+				"operations=%d arena_operation_cap=%d total_operation_cap=%d pair_comparisons=%d assignments=%d backtracks=%d "
+				"domain_trials_per_arena=%d cached_trial_acceptance=unary_only choices=canonical_roster_index details=%s "
+				"profile_id=%s roster_contract=%s\n",
+				solverArenas, rejected[RB_PREFLIGHT_EMPTY_DOMAIN], domainEmptyUnits,
+				rejected[RB_PREFLIGHT_UNSATISFIABLE], rejected[RB_PREFLIGHT_SEARCH_BUDGET], rejected[RB_PREFLIGHT_PLANNER_INVALID],
+				solverOperations, RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS,
+				RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS, solverPairs, solverAssignments, solverBacktracks,
+				8 * unitsPerPlayer * RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT,
+				solverDetailBytes ? solverDetails : "none", benchmarkContract.profileId, benchmarkContract.rosterContract);
+		else
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PLANNER_SUMMARY arenas=%d "
+				"empty_domain_arenas=%d empty_domain_units=%d unsatisfiable_arenas=%d budget_exhausted_arenas=%d invalid_arenas=%d "
+				"operations=%d arena_operation_cap=%d total_operation_cap=%d pair_comparisons=%d assignments=%d backtracks=%d "
+				"domain_trials_per_arena=4608 cached_trial_acceptance=unary_only choices=canonical_roster_index details=%s\n",
+				solverArenas, rejected[RB_PREFLIGHT_EMPTY_DOMAIN], domainEmptyUnits,
+				rejected[RB_PREFLIGHT_UNSATISFIABLE], rejected[RB_PREFLIGHT_SEARCH_BUDGET], rejected[RB_PREFLIGHT_PLANNER_INVALID],
+				solverOperations, RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS,
+				RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS, solverPairs, solverAssignments, solverBacktracks,
+				solverDetailBytes ? solverDetails : "none");
 		if (!found && solverArenas)
 			s_renderedBattle.setupFailure = rejected[RB_PREFLIGHT_PLANNER_INVALID] ? "benchmark_planner_invalid" :
 				(rejected[RB_PREFLIGHT_SEARCH_BUDGET] ? "benchmark_placement_search_budget_exhausted" :
@@ -4966,13 +5072,41 @@ Bool StageRenderedBattleDiagnostic()
 	for (Int slot = 0; slot < 8; ++slot)
 	{
 		char roster[1536];
-		Int bytes = benchmark ? _snprintf(roster, sizeof(roster),
-			"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d "
-			"templates=%s:8,%s:8,%s:24,%s:24 ids=",
-			slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1, unitsPerPlayer,
-			templates[slot][0]->getName().str(), templates[slot][1]->getName().str(),
-			templates[slot][2]->getName().str(), templates[slot][3]->getName().str()) :
-			_snprintf(roster, sizeof(roster),
+		Int bytes;
+		if (benchmark && namedBenchmarkProfile)
+		{
+			char unitTypeSequence[RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER + 1];
+			for (Int unit = 0; unit < unitsPerPlayer; ++unit)
+			{
+				const Int type = RenderedBattleUnitType(unit);
+				if (type < 0 || type > 3)
+				{
+					s_renderedBattle.setupFailure = "benchmark_profile_template_sequence_invalid";
+					return FALSE;
+				}
+				unitTypeSequence[unit] = "0123"[type];
+			}
+			unitTypeSequence[unitsPerPlayer] = '\0';
+			bytes = _snprintf(roster, sizeof(roster),
+				"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d "
+				"templates=%s:%u,%s:%u,%s:%u,%s:%u profile_id=%s roster_contract=%s "
+				"unit_type_sequence=%s ids=",
+				slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1, unitsPerPlayer,
+				templates[slot][0]->getName().str(), benchmarkContract.templateCounts[0],
+				templates[slot][1]->getName().str(), benchmarkContract.templateCounts[1],
+				templates[slot][2]->getName().str(), benchmarkContract.templateCounts[2],
+				templates[slot][3]->getName().str(), benchmarkContract.templateCounts[3],
+				benchmarkContract.profileId, benchmarkContract.rosterContract, unitTypeSequence);
+		}
+		else if (benchmark)
+			bytes = _snprintf(roster, sizeof(roster),
+				"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d "
+				"templates=%s:8,%s:8,%s:24,%s:24 ids=",
+				slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1, unitsPerPlayer,
+				templates[slot][0]->getName().str(), templates[slot][1]->getName().str(),
+				templates[slot][2]->getName().str(), templates[slot][3]->getName().str());
+		else
+			bytes = _snprintf(roster, sizeof(roster),
 			"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot=%d faction=%s team=%d count=%d ids=",
 			slot, GetRenderedBattleDiagnosticFactionName(slot), slot < 4 ? 0 : 1,
 			unitsPerPlayer);
@@ -5019,12 +5153,31 @@ Bool StageRenderedBattleDiagnostic()
 			s_renderedBattle.setupFailure = "benchmark_clock_unavailable";
 			return FALSE;
 		}
-		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin frame=%u tick=%u "
-			"qpc=%I64d qpc_frequency=%I64d warmup_frames=%d measure_frames=%d "
-			"logic_target_hz=30 render_pacing=uncapped resolution=1920x1080 windowed=1 fps_source=present_trace\n",
-			s_renderedBattle.startFrame, s_renderedBattle.startTick, qpc.QuadPart,
-			s_renderedBattle.qpcFrequency.QuadPart, RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES,
-			RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES);
+		char rigidMetricsFields[512] = "";
+#if defined(RTS_RENDERER_RIGID_INSTANCING_METRICS)
+		if (namedBenchmarkProfile && !FormatRenderedBattleRigidDrawMetrics(
+			rigidMetricsFields, sizeof(rigidMetricsFields), s_renderedBattle.startFrame))
+		{
+			s_renderedBattle.setupFailure = "benchmark_rigid_metrics_format_failed";
+			return FALSE;
+		}
+#endif
+		if (namedBenchmarkProfile)
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin frame=%u tick=%u "
+				"qpc=%I64d qpc_frequency=%I64d warmup_frames=%d measure_frames=%d "
+				"logic_target_hz=30 render_pacing=uncapped resolution=1920x1080 windowed=1 fps_source=present_trace "
+				"profile_id=%s phase_contract=%s%s\n",
+				s_renderedBattle.startFrame, s_renderedBattle.startTick, qpc.QuadPart,
+				s_renderedBattle.qpcFrequency.QuadPart, RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES,
+				RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES, benchmarkContract.profileId,
+				benchmarkContract.phaseContract, rigidMetricsFields);
+		else
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin frame=%u tick=%u "
+				"qpc=%I64d qpc_frequency=%I64d warmup_frames=%d measure_frames=%d "
+				"logic_target_hz=30 render_pacing=uncapped resolution=1920x1080 windowed=1 fps_source=present_trace%s\n",
+				s_renderedBattle.startFrame, s_renderedBattle.startTick, qpc.QuadPart,
+				s_renderedBattle.qpcFrequency.QuadPart, RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES,
+				RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES, rigidMetricsFields);
 	}
 	s_renderedBattle.nextSummaryFrame = s_renderedBattle.startFrame;
 	s_renderedBattle.staged = TRUE;
@@ -5136,9 +5289,24 @@ void UpdateRenderedBattleDiagnostic()
 		}
 		s_renderedBattle.measurementStarted = TRUE;
 		s_renderedBattle.measurementStartAlive = alive[0] + alive[1];
-		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin frame=%u tick=%u "
-			"qpc=%I64d qpc_frequency=%I64d alive0=%d alive1=%d attacking=%d\n",
-			frame, tick, qpc.QuadPart, s_renderedBattle.qpcFrequency.QuadPart, alive[0], alive[1], attacking);
+		if (rts::rendered_battle::IsExplicitBenchmarkProfile(
+			rts::rendered_battle::ProcessTestOptions().benchmarkProfile))
+		{
+			rts::rendered_battle::BenchmarkProfileContract contract;
+			if (!rts::rendered_battle::GetBenchmarkProfileContract(
+				rts::rendered_battle::ProcessTestOptions().benchmarkProfile, &contract))
+			{
+				FailSkirmishAITest("benchmark_profile_contract_invalid"); RequestSkirmishAITestStop(); return;
+			}
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin frame=%u tick=%u "
+				"qpc=%I64d qpc_frequency=%I64d alive0=%d alive1=%d attacking=%d profile_id=%s phase_contract=%s\n",
+				frame, tick, qpc.QuadPart, s_renderedBattle.qpcFrequency.QuadPart, alive[0], alive[1], attacking,
+				contract.profileId, contract.phaseContract);
+		}
+		else
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin frame=%u tick=%u "
+				"qpc=%I64d qpc_frequency=%I64d alive0=%d alive1=%d attacking=%d\n",
+				frame, tick, qpc.QuadPart, s_renderedBattle.qpcFrequency.QuadPart, alive[0], alive[1], attacking);
 	}
 	// Always retain the fresh terminal sample, including a wall cap between
 	// sparse sample boundaries. The bounded report remains below 32 records.
@@ -5172,16 +5340,46 @@ void UpdateRenderedBattleDiagnostic()
 			const Bool clockValid = QueryPerformanceCounter(&qpc) != FALSE;
 			const Bool complete = s_renderedBattle.measurementStarted &&
 				frames >= static_cast<UnsignedInt>(RenderedBattleMaxFrames());
-			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop frame=%u tick=%u "
-				"qpc=%I64d qpc_frequency=%I64d complete=%d warmup_frames=%d requested_measure_frames=%d "
-				"actual_measure_frames=%u measured_attack_samples=%d measured_loss_samples=%d "
-				"alive0=%d alive1=%d attacking=%d fps_source=present_trace\n",
-				frame, tick, clockValid ? qpc.QuadPart : 0, s_renderedBattle.qpcFrequency.QuadPart,
-				complete ? 1 : 0, RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES,
-				RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES,
-				frames > RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES ? frames - RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES : 0,
-				s_renderedBattle.measuredAttackSamples, s_renderedBattle.measuredLossSamples,
-				alive[0], alive[1], attacking);
+			const Bool namedBenchmarkProfile = rts::rendered_battle::IsExplicitBenchmarkProfile(
+				rts::rendered_battle::ProcessTestOptions().benchmarkProfile);
+			char rigidMetricsFields[512] = "";
+#if defined(RTS_RENDERER_RIGID_INSTANCING_METRICS)
+			if (namedBenchmarkProfile)
+				FormatRenderedBattleRigidDrawMetrics(rigidMetricsFields,
+					sizeof(rigidMetricsFields), frame);
+#endif
+			if (namedBenchmarkProfile)
+			{
+				rts::rendered_battle::BenchmarkProfileContract contract;
+				if (!rts::rendered_battle::GetBenchmarkProfileContract(
+					rts::rendered_battle::ProcessTestOptions().benchmarkProfile, &contract))
+				{
+					FailSkirmishAITest("benchmark_profile_contract_invalid");
+					RequestSkirmishAITestStop(); return;
+				}
+				RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop frame=%u tick=%u "
+					"qpc=%I64d qpc_frequency=%I64d complete=%d warmup_frames=%d requested_measure_frames=%d "
+					"actual_measure_frames=%u measured_attack_samples=%d measured_loss_samples=%d "
+					"alive0=%d alive1=%d attacking=%d fps_source=present_trace profile_id=%s phase_contract=%s%s\n",
+					frame, tick, clockValid ? qpc.QuadPart : 0, s_renderedBattle.qpcFrequency.QuadPart,
+					complete ? 1 : 0, RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES,
+					RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES,
+					frames > RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES ? frames - RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES : 0,
+					s_renderedBattle.measuredAttackSamples, s_renderedBattle.measuredLossSamples,
+					alive[0], alive[1], attacking, contract.profileId, contract.phaseContract,
+					rigidMetricsFields);
+			}
+			else
+				RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop frame=%u tick=%u "
+					"qpc=%I64d qpc_frequency=%I64d complete=%d warmup_frames=%d requested_measure_frames=%d "
+					"actual_measure_frames=%u measured_attack_samples=%d measured_loss_samples=%d "
+					"alive0=%d alive1=%d attacking=%d fps_source=present_trace%s\n",
+					frame, tick, clockValid ? qpc.QuadPart : 0, s_renderedBattle.qpcFrequency.QuadPart,
+					complete ? 1 : 0, RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES,
+					RENDERED_BATTLE_BENCHMARK_MEASURE_FRAMES,
+					frames > RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES ? frames - RENDERED_BATTLE_BENCHMARK_WARMUP_FRAMES : 0,
+					s_renderedBattle.measuredAttackSamples, s_renderedBattle.measuredLossSamples,
+					alive[0], alive[1], attacking, rigidMetricsFields);
 			if (!clockValid) FailSkirmishAITest("benchmark_clock_unavailable");
 			else if (!complete) FailSkirmishAITest("benchmark_measurement_incomplete");
 			else if (!s_renderedBattle.measuredAttackSamples)
@@ -5506,6 +5704,21 @@ Bool StartSkirmishAITestRunner()
 			"executable_sha256_observed=%s executable_sha256_supplied=%s source_sha256_supplied=%s\n",
 			s_runner.seed, s_executableHashObserved, s_executableHashInput,
 			s_renderedBattle.suppliedSourceHash[0] ? s_renderedBattle.suppliedSourceHash : "not_supplied");
+		if (IsRenderedBattleBenchmark() && rts::rendered_battle::IsExplicitBenchmarkProfile(
+			rts::rendered_battle::ProcessTestOptions().benchmarkProfile))
+		{
+			rts::rendered_battle::BenchmarkProfileContract contract;
+			if (!rts::rendered_battle::GetBenchmarkProfileContract(
+				rts::rendered_battle::ProcessTestOptions().benchmarkProfile, &contract))
+			{
+				FailSkirmishAITest("benchmark_profile_contract_invalid");
+				return FALSE;
+			}
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_PROFILE schema=%s id=%s "
+				"roster_contract=%s phase_contract=%s units_per_player=%u total_units=%u\n",
+				rts::rendered_battle::BenchmarkProfileSchema(), contract.profileId, contract.rosterContract,
+				contract.phaseContract, contract.unitsPerPlayer, 8 * contract.unitsPerPlayer);
+		}
 	}
 	// END RENDERED_BATTLE_DIAGNOSTIC_PROFILE_PREFLIGHT
 #if defined(_WIN64)

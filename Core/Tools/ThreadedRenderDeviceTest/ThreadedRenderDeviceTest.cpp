@@ -67,7 +67,8 @@ enum Event
 	DESTROY_RESOURCE, UPDATE, CLEAR, TARGETS, VIEWPORT, STATE, LAYOUT,
 	VERTEX, INDEX, BIND_TEXTURE, TOPOLOGY, DRAW, DRAW_INDEXED, END, PRESENT,
 	CAPTURE, INFO, FILTER_CAPS, RESIZE, RECOVER, DEBUG_COUNT, REPORT, SWAP_SET, SWAP_GET,
-	GAMMA_SET, GAMMA_GET, FAULT_CONFIG, RESOURCE_STATS, SHUTDOWN, DELETED
+	GAMMA_SET, GAMMA_GET, FAULT_CONFIG, RESOURCE_STATS, SHUTDOWN, DELETED,
+	INSTANCING_CAPS, DRAW_INDEXED_INSTANCED
 };
 
 struct IndexedExecution
@@ -89,7 +90,9 @@ struct Fixture
 		failEvent(-1), failEventOccurrence(1), failEventSeen(0),
 		returnedFailureEvent(-1), returnedFailureSeen(0), returnedFailureOccurrence(2),
 		gateEvent(-1), gateEntered(false), gateReleased(false),
-		wrongThread(false), failCreate(false), failDraw(false), failEnd(false),
+		wrongThread(false), rigidInstancing(true), instancingCapabilityCalls(0),
+		recoverResult(RENDER_RESULT_OK), resizeResult(RENDER_RESULT_OK), resizeReplacesDevice(false),
+		failCreate(false), failDraw(false), failEnd(false),
 		failPresent(false), failCapture(false), failInitialize(false), failUpdate(false),
 		failTopology(false),
 		createFailureResult(RENDER_RESULT_OUT_OF_MEMORY), updateFailureResult(RENDER_RESULT_DEVICE_REMOVED),
@@ -121,6 +124,12 @@ struct Fixture
 	std::atomic<bool> busyEntered, busyRelease;
 	int gateEvent;
 	bool gateEntered, gateReleased, wrongThread;
+	bool rigidInstancing;
+	unsigned int instancingCapabilityCalls;
+	RenderResult recoverResult, resizeResult;
+	bool resizeReplacesDevice;
+	std::vector<std::vector<RenderMatrix4> > instancedWorlds;
+	std::vector<IndexedExecution> instancedExecutions;
 	bool failCreate, failDraw, failEnd, failPresent, failCapture, failInitialize,
 		failUpdate, failTopology;
 	RenderResult createFailureResult, updateFailureResult;
@@ -215,6 +224,8 @@ public:
 	~FakeBackend() override { f.event(DELETED); ++f.destroys; }
 	RenderBackend backend() const override { return RENDER_BACKEND_D3D11; }
 	bool isOperational() const override { return operational; }
+	bool supportsRigidInstancing() const override
+	{ f.event(INSTANCING_CAPS); ++f.instancingCapabilityCalls; return f.rigidInstancing; }
 	RenderResult initialize(const RenderDeviceParameters &parameters) override
 	{ f.event(INITIALIZED); f.sendWindowMessage(); swapInterval = parameters.enableVsync ? 1 : 0; operational = !f.failInitialize; return operational ? RENDER_RESULT_OK : RENDER_RESULT_FAILED; }
 	void shutdown() override { f.event(SHUTDOWN); f.sendWindowMessage(); operational = false; }
@@ -256,12 +267,22 @@ public:
 	{ f.event(COPY); CHECK(open && handles.isLive(handle)); return RENDER_RESULT_OK; }
 	bool destroyResource(GpuHandle handle) override
 	{ f.event(DESTROY_RESOURCE); f.destroyedHandles.push_back(handle); return handles.release(handle); }
-	RenderResult recoverDevice() override { f.event(RECOVER); operational = true; return RENDER_RESULT_OK; }
+	RenderResult recoverDevice() override
+	{ f.event(RECOVER); operational = f.recoverResult == RENDER_RESULT_OK; return f.recoverResult; }
 	RenderResult resize(unsigned int width, unsigned int height) override
 	{
 		f.event(RESIZE); f.sendWindowMessage(); CHECK(!open);
 		if (width && height) { info.width = width; info.height = height; }
 		return RENDER_RESULT_OK;
+	}
+	RenderResult resizeWithRecovery(unsigned int width, unsigned int height, bool *recovered) override
+	{
+		CHECK(recovered != 0); *recovered = false;
+		const RenderResult result = resize(width, height);
+		if (f.resizeResult != RENDER_RESULT_OK) return f.resizeResult;
+		*recovered = f.resizeReplacesDevice;
+		if (*recovered) operational = true;
+		return result;
 	}
 	RenderResult present() override
 	{
@@ -435,6 +456,16 @@ public:
 		f.currentIndexed.count = count; f.currentIndexed.first = first; f.currentIndexed.base = base;
 		f.indexedExecutions.push_back(f.currentIndexed);
 		return f.returnedFailure(DRAW_INDEXED); }
+	RenderResult drawIndexedInstanced(unsigned int count, unsigned int first,
+		int base, const RenderMatrix4 *worlds, unsigned int instanceCount) override
+	{
+		f.event(DRAW_INDEXED_INSTANCED); CHECK(open && worlds && instanceCount);
+		f.currentIndexed.state = f.layoutState; f.currentIndexed.layout = f.layoutValue;
+		f.currentIndexed.count = count; f.currentIndexed.first = first; f.currentIndexed.base = base;
+		f.instancedExecutions.push_back(f.currentIndexed);
+		f.instancedWorlds.emplace_back(worlds, worlds + instanceCount);
+		return f.returnedFailure(DRAW_INDEXED_INSTANCED);
+	}
 	RenderResult endFrame() override
 	{
 		f.event(END); CHECK(open); open = false;
@@ -464,15 +495,34 @@ std::unique_ptr<IRenderDevice> Device(Fixture &fixture, const ThreadedRenderOpti
 	CHECK(device->initialize(parameters) == RENDER_RESULT_OK);
 	return device;
 }
-ThreadedRenderFrameCompletion Complete(IRenderDevice *device, RenderResult expected = RENDER_RESULT_OK)
+ThreadedRenderFrameCompletion CompleteAt(const char *source, unsigned int line,
+	IRenderDevice *device, RenderResult expected = RENDER_RESULT_OK)
 {
-	CHECK(DrainThreadedRenderDevice(device) == expected);
+	const RenderResult actual = DrainThreadedRenderDevice(device);
+	if (actual != expected)
+	{
+		ThreadedRenderFrameCompletion failedCompletion;
+		const bool completed = PollThreadedRenderCompletion(device, &failedCompletion);
+		std::fprintf(stderr,
+			"DRAIN_DIAGNOSTIC caller=%s:%u expected=%d actual=%d last_sequence=%llu current_sequence=%llu completion_available=%u completion_sequence=%llu completion_result=%d resource_failure=%u presented=%u operational=%u\n",
+			source, line, static_cast<int>(expected), static_cast<int>(actual),
+			static_cast<unsigned long long>(LastThreadedRenderFrameSequence(device)),
+			static_cast<unsigned long long>(CurrentThreadedRenderFrameSequence(device)),
+			completed ? 1U : 0U,
+			static_cast<unsigned long long>(failedCompletion.sequence),
+			static_cast<int>(failedCompletion.result),
+			failedCompletion.resourceFailure ? 1U : 0U,
+			failedCompletion.presented ? 1U : 0U,
+			failedCompletion.operational ? 1U : 0U);
+	}
+	CHECK(actual == expected);
 	ThreadedRenderFrameCompletion completion;
 	CHECK(PollThreadedRenderCompletion(device, &completion));
 	CHECK(completion.result == expected);
 	CHECK(!PollThreadedRenderCompletion(device, &completion));
 	return completion;
 }
+#define Complete(...) CompleteAt(__FILE__, __LINE__, __VA_ARGS__)
 void EmptyFrame(IRenderDevice *device, bool visible = true)
 {
 	IRenderContext *context = device->immediateContext();
@@ -1117,7 +1167,8 @@ void ProducerTopologyCachePreservesAdmissionAndFailure()
 	}
 }
 
-ThreadedIndexedDraw IndexedRecord(IRenderDevice *device, RenderUsage usage = RENDER_USAGE_IMMUTABLE)
+ThreadedIndexedDraw IndexedRecord(IRenderDevice *device, RenderUsage usage = RENDER_USAGE_IMMUTABLE,
+	RenderUsage indexUsage = RENDER_USAGE_IMMUTABLE)
 {
 	ThreadedIndexedDraw draw;
 	const float vertices[12] = {};
@@ -1125,6 +1176,7 @@ ThreadedIndexedDraw IndexedRecord(IRenderDevice *device, RenderUsage usage = REN
 	BufferDescriptor vertex; vertex.byteCount = sizeof(vertices); vertex.binding = RENDER_BUFFER_VERTEX;
 	vertex.usage = usage;
 	BufferDescriptor index; index.byteCount = sizeof(indices); index.binding = RENDER_BUFFER_INDEX;
+	index.usage = indexUsage;
 	CHECK(device->createBuffer(vertex, vertices, sizeof(vertices), &draw.vertexBuffer) == RENDER_RESULT_OK);
 	CHECK(device->createBuffer(index, indices, sizeof(indices), &draw.indexBuffer) == RENDER_RESULT_OK);
 	draw.vertexStride = 16; draw.layout.stride = 16; draw.layout.elementCount = 2;
@@ -1132,6 +1184,286 @@ ThreadedIndexedDraw IndexedRecord(IRenderDevice *device, RenderUsage usage = REN
 	draw.indexCount = 3;
 	draw.state.constants.world.values[0] = 23.0f;
 	return draw;
+}
+
+ThreadedIndexedInstancedDraw InstancedRecord(IRenderDevice *device,
+	RenderUsage usage = RENDER_USAGE_IMMUTABLE)
+{
+	ThreadedIndexedInstancedDraw draw;
+	// Instanced DISCARD coverage explicitly needs both buffers mutable.
+	draw.shared = IndexedRecord(device, usage, usage);
+	draw.instanceCount = 2;
+	draw.worlds[0].values[0] = 31.0f;
+	draw.worlds[1].values[0] = 47.0f;
+	return draw;
+}
+
+void OwnedInstancedDrawPoisonAndFifo()
+{
+	for (unsigned int serial = 0; serial != 2; ++serial)
+	{
+		Fixture f; ThreadedRenderOptions options; options.serial = serial != 0;
+		options.maxPacketBytes = sizeof(ThreadedIndexedInstancedDraw);
+		options.maxPacketCommands = 1;
+		auto device = Device(f, options); auto draw = InstancedRecord(device.get(), RENDER_USAGE_DYNAMIC);
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		CHECK(device->supportsRigidInstancing() && device->supportsRigidInstancing());
+		CHECK(f.instancingCapabilityCalls == 1 && !f.wrongThread);
+		const auto shared = draw.shared;
+		f.events.clear(); auto context = device->immediateContext();
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		const float bytes[12] = {};
+		CHECK(context->updateBuffer(shared.vertexBuffer, bytes, sizeof(bytes), 0) == RENDER_RESULT_OK);
+		draw.worlds[0].values[0] = 61.0f;
+		CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), shared) == RENDER_RESULT_OK);
+		CHECK(device->destroyResource(shared.vertexBuffer));
+		CHECK(device->destroyResource(shared.indexBuffer));
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get()).presented && !f.wrongThread);
+		CHECK(f.instancedExecutions.size() == 2 && f.indexedExecutions.size() == 1);
+		CHECK(f.instancedWorlds[0][0].values[0] == 31.0f && f.instancedWorlds[1][0].values[0] == 61.0f);
+		const auto first = std::find(f.events.begin(), f.events.end(), DRAW_INDEXED_INSTANCED);
+		const auto update = std::find(f.events.begin(), f.events.end(), UPDATE);
+		const auto second = std::find(first + 1, f.events.end(), DRAW_INDEXED_INSTANCED);
+		const auto ordinary = std::find(f.events.begin(), f.events.end(), DRAW_INDEXED);
+		const auto destroy = std::find(f.events.begin(), f.events.end(), DESTROY_RESOURCE);
+		CHECK(first < update && update < second && second < ordinary && ordinary < destroy);
+	}
+	// Delay owner execution until all caller storage has been overwritten.
+	Fixture f; auto device = Device(f); auto draw = InstancedRecord(device.get());
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+	ReleaseGate release(f); f.gateEvent = BEGIN; f.events.clear();
+	auto context = device->immediateContext();
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	// The raw context seam owns its matrix payload too.
+	CHECK(context->drawIndexedInstanced(3, 0, 0, draw.worlds, draw.instanceCount) == RENDER_RESULT_OK);
+	draw.shared.state.constants.world.values[0] = 99.0f;
+	draw.shared.layout.stride = 99; draw.instanceCount = 0;
+	for (unsigned int i = 0; i < RENDER_RIGID_INSTANCE_MAX; ++i) draw.worlds[i].values[0] = 99.0f;
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	f.waitForGate(); f.release();
+	CHECK(!Complete(device.get()).presented && !f.wrongThread);
+	CHECK(f.instancedExecutions.size() == 2 && f.indexedExecutions.empty());
+	CHECK(f.instancedExecutions[0].state.constants.world.values[0] == 23.0f);
+	CHECK(f.instancedExecutions[0].layout.stride == 16);
+	for (unsigned int i = 0; i != 2; ++i)
+		CHECK(f.instancedWorlds[i].size() == 2 && f.instancedWorlds[i][0].values[0] == 31.0f &&
+			f.instancedWorlds[i][1].values[0] == 47.0f);
+}
+
+void InstancingCapabilityReplacementBoundaries()
+{
+	Fixture f; auto device = Device(f);
+	CHECK(device->supportsRigidInstancing() && f.instancingCapabilityCalls == 1);
+	f.rigidInstancing = false;
+	CHECK(device->recoverDevice() == RENDER_RESULT_OK);
+	CHECK(!device->supportsRigidInstancing() && f.instancingCapabilityCalls == 2);
+	// Ordinary resize preserves the current generation and performs no query.
+	bool recovered = true;
+	f.rigidInstancing = true;
+	CHECK(device->resizeWithRecovery(8, 8, &recovered) == RENDER_RESULT_OK && !recovered);
+	CHECK(!device->supportsRigidInstancing() && f.instancingCapabilityCalls == 2);
+	f.resizeReplacesDevice = true;
+	CHECK(device->resizeWithRecovery(8, 8, &recovered) == RENDER_RESULT_OK && recovered);
+	CHECK(device->supportsRigidInstancing() && f.instancingCapabilityCalls == 3);
+	f.rigidInstancing = false;
+	CHECK(device->resizeWithRecovery(8, 8, &recovered) == RENDER_RESULT_OK && recovered);
+	CHECK(!device->supportsRigidInstancing() && f.instancingCapabilityCalls == 4);
+	f.rigidInstancing = true;
+	CHECK(device->recoverDevice() == RENDER_RESULT_OK);
+	CHECK(device->supportsRigidInstancing() && f.instancingCapabilityCalls == 5);
+	f.recoverResult = RENDER_RESULT_FAILED;
+	CHECK(device->recoverDevice() == RENDER_RESULT_FAILED);
+	CHECK(!device->supportsRigidInstancing() && f.instancingCapabilityCalls == 5);
+	f.recoverResult = RENDER_RESULT_OK;
+	CHECK(device->recoverDevice() == RENDER_RESULT_OK);
+	CHECK(device->supportsRigidInstancing() && f.instancingCapabilityCalls == 6);
+	f.resizeResult = RENDER_RESULT_DEVICE_REMOVED;
+	CHECK(device->resizeWithRecovery(8, 8, &recovered) == RENDER_RESULT_DEVICE_REMOVED);
+	CHECK(!device->supportsRigidInstancing() && f.instancingCapabilityCalls == 6);
+	f.resizeResult = RENDER_RESULT_OK;
+	CHECK(device->recoverDevice() == RENDER_RESULT_OK);
+	CHECK(device->supportsRigidInstancing() && f.instancingCapabilityCalls == 7);
+	// Asynchronous device removal also disables capture before recovery.
+	f.failPresent = true;
+	EmptyFrame(device.get());
+	CHECK(!Complete(device.get(), RENDER_RESULT_DEVICE_REMOVED).operational);
+	CHECK(!device->supportsRigidInstancing() && f.instancingCapabilityCalls == 7);
+	f.failPresent = false; f.rigidInstancing = false;
+	CHECK(device->recoverDevice() == RENDER_RESULT_OK);
+	CHECK(!device->supportsRigidInstancing() && f.instancingCapabilityCalls == 8 && !f.wrongThread);
+}
+
+void OwnedInstancedDrawComponentFailures()
+{
+	const int components[] = { LAYOUT, VERTEX, BIND_TEXTURE, TOPOLOGY, INDEX, DRAW_INDEXED_INSTANCED };
+	for (unsigned int serial = 0; serial != 2; ++serial)
+	for (unsigned int component = 0; component < sizeof(components) / sizeof(components[0]); ++component)
+	{
+		Fixture f; ThreadedRenderOptions options; options.serial = serial != 0;
+		options.maxPacketCommands = 1;
+		auto device = Device(f, options); auto draw = InstancedRecord(device.get());
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		f.failEvent = components[component]; f.events.clear();
+		auto context = device->immediateContext();
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(device->destroyResource(draw.shared.vertexBuffer));
+		CHECK(device->destroyResource(draw.shared.indexBuffer));
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), true) == (options.serial ? RENDER_RESULT_FAILED : RENDER_RESULT_OK));
+		const auto completion = Complete(device.get(), RENDER_RESULT_FAILED);
+		CHECK(completion.outcome.hasCommandFailure() && !completion.presented && !f.wrongThread);
+		CHECK(completion.resourceFailure == (components[component] == VERTEX || components[component] == INDEX));
+		CHECK(std::count(f.events.begin(), f.events.end(), DRAW_INDEXED) == 0);
+		CHECK(std::count(f.events.begin(), f.events.end(), DRAW_INDEXED_INSTANCED) == (components[component] == DRAW_INDEXED_INSTANCED ? 1 : 0));
+		CHECK(std::count(f.events.begin(), f.events.end(), DESTROY_RESOURCE) == 2);
+		CHECK(std::count(f.events.begin(), f.events.end(), END) == 1);
+		CHECK(std::count(f.events.begin(), f.events.end(), PRESENT) == 0);
+	}
+}
+
+void OwnedInstancedSingletonRejectedBeforeAdmission()
+{
+	for (unsigned int direct = 0; direct != 2; ++direct)
+	{
+		Fixture f; auto device = Device(f); auto draw = InstancedRecord(device.get());
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		draw.instanceCount = 1;
+		ThreadedRenderMetrics before, rejected, canceled;
+		CHECK(GetThreadedRenderMetrics(device.get(), &before));
+		const uint64_t lastSequence = LastThreadedRenderFrameSequence(device.get());
+		auto context = device->immediateContext();
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		const RenderResult result = direct ?
+			context->drawIndexedInstanced(3, 0, 0, draw.worlds, draw.instanceCount) :
+			SubmitThreadedIndexedInstancedDraw(device.get(), draw);
+		CHECK(result == RENDER_RESULT_INVALID_ARGUMENT);
+		CHECK(GetThreadedRenderMetrics(device.get(), &rejected));
+		CHECK(rejected.submittedFrames == before.submittedFrames &&
+			rejected.completedFrames == before.completedFrames && rejected.failedFrames == before.failedFrames);
+		CHECK(LastThreadedRenderFrameSequence(device.get()) == lastSequence);
+		ThreadedRenderFrameCompletion completion;
+		CHECK(!PollThreadedRenderCompletion(device.get(), &completion));
+		CHECK(f.instancedExecutions.empty() && f.indexedExecutions.empty());
+		// Invalid arguments keep the existing recording failure latch. Only this
+		// explicit cancellation emits a completion, never a failed admitted draw.
+		CHECK(CancelThreadedRenderFrame(device.get(), RENDER_RESULT_INVALID_ARGUMENT) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get(), RENDER_RESULT_INVALID_ARGUMENT).presented);
+		CHECK(GetThreadedRenderMetrics(device.get(), &canceled));
+		CHECK(canceled.submittedFrames == before.submittedFrames + 1 &&
+			canceled.completedFrames == before.completedFrames + 1 && canceled.failedFrames == before.failedFrames + 1);
+		CHECK(f.instancedExecutions.empty() && f.indexedExecutions.empty());
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), draw.shared) == RENDER_RESULT_OK);
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get()).presented);
+		CHECK(f.instancedExecutions.empty() && f.indexedExecutions.size() == 1 && !f.wrongThread);
+	}
+}
+
+void OwnedInstancedDrawAdmissionAndFailure()
+{
+	Fixture f; auto device = Device(f); auto draw = InstancedRecord(device.get(), RENDER_USAGE_DYNAMIC);
+	CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedInstancedDraw(0, draw) == RENDER_RESULT_UNSUPPORTED);
+	auto context = device->immediateContext();
+	for (unsigned int bad = 0; bad < 7; ++bad)
+	{
+		auto invalid = draw;
+		if (bad == 0) invalid.instanceCount = 0;
+		if (bad == 1) invalid.instanceCount = RENDER_RIGID_INSTANCE_MAX + 1;
+		if (bad == 2) invalid.shared.vertexBuffer = GpuHandle(draw.shared.vertexBuffer.index(), draw.shared.vertexBuffer.generation() + 1);
+		if (bad == 3) invalid.shared.indexCount = 4;
+		if (bad == 4) invalid.shared.bindIndexBuffer = false;
+		if (bad == 5) invalid.shared.layout.stride = 20;
+		if (bad == 6) invalid.shared.texturePresenceMask = 1;
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), invalid) == RENDER_RESULT_INVALID_ARGUMENT);
+		CHECK(CancelThreadedRenderFrame(device.get(), RENDER_RESULT_INVALID_ARGUMENT) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get(), RENDER_RESULT_INVALID_ARGUMENT).presented);
+	}
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	RenderResult other = RENDER_RESULT_OK;
+	std::thread wrongProducer([&] { other = SubmitThreadedIndexedInstancedDraw(device.get(), draw); });
+	wrongProducer.join(); CHECK(other == RENDER_RESULT_INVALID_ARGUMENT);
+	draw.instanceCount = RENDER_RIGID_INSTANCE_MAX;
+	CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	CHECK(!Complete(device.get()).presented && f.instancedWorlds.back().size() == RENDER_RIGID_INSTANCE_MAX);
+	// Failure of an accepted instanced call suppresses subsequent draws; there
+	// is no ordinary replay, even when the backend reports unsupported.
+	f.events.clear(); f.returnedFailureEvent = DRAW_INDEXED_INSTANCED;
+	f.returnedFailureOccurrence = 1;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), true) == RENDER_RESULT_OK);
+	const auto failure = Complete(device.get(), RENDER_RESULT_UNSUPPORTED);
+	CHECK(failure.outcome.hasCommandFailure() && !failure.presented && !failure.resourceFailure);
+	CHECK(std::count(f.events.begin(), f.events.end(), DRAW_INDEXED_INSTANCED) == 1);
+	CHECK(std::count(f.events.begin(), f.events.end(), DRAW_INDEXED) == 0);
+	// Resource uploads accepted before the batch retain failure classification;
+	// no draw is replayed after their failure.
+	f.returnedFailureEvent = -1; f.failUpdate = true; f.updateFailureResult = RENDER_RESULT_FAILED;
+	f.events.clear(); const float failedBytes[12] = {};
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(draw.shared.vertexBuffer, failedBytes, sizeof(failedBytes), 0) == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	CHECK(Complete(device.get(), RENDER_RESULT_FAILED).resourceFailure);
+	CHECK(std::count(f.events.begin(), f.events.end(), DRAW_INDEXED_INSTANCED) == 0);
+	CHECK(std::count(f.events.begin(), f.events.end(), DRAW_INDEXED) == 0);
+	f.failUpdate = false;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(draw.shared.vertexBuffer, failedBytes, sizeof(failedBytes), 0) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	CHECK(!Complete(device.get()).presented);
+	// A partial DISCARD leaves the requested index range unavailable on owner.
+	f.events.clear();
+	const unsigned short index = 0;
+	CHECK(context->beginFrame() == RENDER_RESULT_OK);
+	CHECK(context->updateBuffer(draw.shared.indexBuffer, &index, sizeof(index), 0, RENDER_BUFFER_UPDATE_DISCARD) == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+	CHECK(context->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+	CHECK(Complete(device.get(), RENDER_RESULT_FAILED).resourceFailure);
+	CHECK(std::count(f.events.begin(), f.events.end(), DRAW_INDEXED_INSTANCED) == 0);
+	CHECK(std::count(f.events.begin(), f.events.end(), DRAW_INDEXED) == 0);
+	device.reset();
+	Fixture unsupported; unsupported.rigidInstancing = false;
+	auto uninstanced = Device(unsupported); auto unsupportedDraw = InstancedRecord(uninstanced.get());
+	CHECK(DrainThreadedRenderDevice(uninstanced.get()) == RENDER_RESULT_OK);
+	CHECK(!uninstanced->supportsRigidInstancing() && unsupported.instancingCapabilityCalls == 1);
+	CHECK(uninstanced->immediateContext()->beginFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedInstancedDraw(uninstanced.get(), unsupportedDraw) == RENDER_RESULT_UNSUPPORTED);
+	CHECK(SubmitThreadedIndexedDraw(uninstanced.get(), unsupportedDraw.shared) == RENDER_RESULT_OK);
+	CHECK(uninstanced->immediateContext()->endFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedRenderFrame(uninstanced.get(), false) == RENDER_RESULT_OK);
+	CHECK(!Complete(uninstanced.get()).presented && unsupported.instancedExecutions.empty());
+	CHECK(unsupported.indexedExecutions.size() == 1);
+	// The render-owner role permits one live threaded device at a time.
+	uninstanced.reset();
+	CHECK(unsupported.destroys == 1);
+	Fixture packetBudgetFixture; ThreadedRenderOptions options;
+	options.maxPacketBytes = sizeof(ThreadedIndexedInstancedDraw) - 1;
+	auto limited = Device(packetBudgetFixture, options); auto oversized = InstancedRecord(limited.get());
+	CHECK(DrainThreadedRenderDevice(limited.get()) == RENDER_RESULT_OK);
+	CHECK(limited->immediateContext()->beginFrame() == RENDER_RESULT_OK);
+	CHECK(SubmitThreadedIndexedInstancedDraw(limited.get(), oversized) == RENDER_RESULT_OUT_OF_MEMORY);
+	CHECK(CancelThreadedRenderFrame(limited.get(), RENDER_RESULT_OUT_OF_MEMORY) == RENDER_RESULT_OK);
+	CHECK(!Complete(limited.get(), RENDER_RESULT_OUT_OF_MEMORY).presented);
 }
 
 void CompactIndexedDrawSuccessAndBoundaries()
@@ -2819,6 +3151,11 @@ int main(int argc, char **argv)
 #endif
 		ProducerTextureBindingCachePreservesOrderedInvalidation();
 		ProducerTopologyCachePreservesAdmissionAndFailure();
+		OwnedInstancedDrawPoisonAndFifo();
+		OwnedInstancedDrawAdmissionAndFailure();
+		OwnedInstancedSingletonRejectedBeforeAdmission();
+		OwnedInstancedDrawComponentFailures();
+		InstancingCapabilityReplacementBoundaries();
 		CompactIndexedDrawSuccessAndBoundaries();
 		CompactIndexedDrawComponentFailuresAndRecovery();
 		CompactIndexedDrawAdmissionAndResourceFailure();

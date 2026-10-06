@@ -1,5 +1,6 @@
 #include "Renderer/RendererDevice.h"
 #include "Renderer/NormalMatrixSubgroupCache.h"
+#include "Renderer/RigidInstancingPolicy.h"
 #include "Lib/FrameTimingDiagnostics.h"
 
 #include <windows.h>
@@ -32,6 +33,7 @@
 #include "LegacyTexturedPS.h"
 #include "LegacyTexturedVS.h"
 #include "LegacyTexturedUnweightedVS.h"
+#include "LegacyRigidInstancedVS.h"
 #include "PresentationColorTransformPS.h"
 #include "PresentationColorTransformVS.h"
 
@@ -720,7 +722,7 @@ public:
 		m_transformArena(0),
 		m_vertexShader(0), m_pixelShader(0), m_positionColorLayout(0),
 		m_texturedVertexShader(0), m_texturedPixelShader(0),
-		m_texturedUnweightedVertexShader(0),
+		m_texturedUnweightedVertexShader(0), m_instancedVertexShader(0), m_instanceBuffer(0), m_instancedInputLayout(0), m_instancedInputLayout32(0),
 		m_texturedFixed1PixelShader(0), m_texturedFixed2PixelShader(0),
 		m_waterFlatPixelShader(0), m_waterRiverPixelShader(0),
 		m_seaWaveVertexShader(0), m_seaWavePixelShader(0),
@@ -3162,8 +3164,7 @@ public:
 		return RENDER_RESULT_OK;
 	}
 
-	virtual RenderResult drawIndexed(unsigned int indexCount,
-		unsigned int startIndex, int baseVertex)
+	RenderResult validateIndexedDraw(unsigned int indexCount, unsigned int startIndex, int baseVertex)
 	{
 		rts::frame_timing::Scope validationTiming(rts::frame_timing::RendererDrawValidation);
 		if (!isOwner() || !m_frameOpen || !m_pipelineBound || !m_topologyBound ||
@@ -3307,15 +3308,93 @@ public:
 			}
 			m_indexedDrawValidation.store(validationKey);
 		}
-		const RenderResult transformResult = refreshTransformConstantsForDraw();
-		if (transformResult != RENDER_RESULT_OK)
-		{
-			return transformResult;
-		}
-		validationTiming.finish();
+		return RENDER_RESULT_OK;
+	}
+
+	virtual RenderResult drawIndexed(unsigned int indexCount, unsigned int startIndex, int baseVertex)
+	{
+		RenderResult result = validateIndexedDraw(indexCount, startIndex, baseVertex);
+		if (result != RENDER_RESULT_OK) return result;
+		result = refreshTransformConstantsForDraw();
+		if (result != RENDER_RESULT_OK) return result;
 		rts::frame_timing::Scope submissionTiming(rts::frame_timing::RendererDrawSubmit);
 		m_context->DrawIndexed(indexCount, startIndex, baseVertex);
 		return RENDER_RESULT_OK;
+	}
+
+	virtual bool supportsRigidInstancing() const
+	{
+		return m_initialized && m_instancedVertexShader && m_instanceBuffer && m_instancedInputLayout && m_instancedInputLayout32;
+	}
+
+	virtual RenderResult drawIndexedInstanced(unsigned int indexCount,
+		unsigned int startIndex, int baseVertex, const RenderMatrix4 *worlds,
+		unsigned int instanceCount)
+	{
+		if (!isOwner() || !m_frameOpen || !worlds || instanceCount < 2 ||
+			instanceCount > RENDER_RIGID_INSTANCE_MAX) return RENDER_RESULT_INVALID_ARGUMENT;
+		if (!supportsRigidInstancing()) return RENDER_RESULT_UNSUPPORTED;
+		if (!m_cachedLegacyStateValid || m_boundTopology != RENDER_PRIMITIVE_TRIANGLE_LIST ||
+			(m_boundVertexStride != 36 && m_boundVertexStride != 32)) return RENDER_RESULT_UNSUPPORTED;
+		LegacyLogicalState state;
+		memcpy(&state, m_cachedLegacyState, sizeof(state));
+		if (state.pipeline.vertexProgram != RENDER_LEGACY_VERTEX_FIXED_FUNCTION ||
+			state.pipeline.pixelProgram != RENDER_LEGACY_PIXEL_FIXED_FUNCTION ||
+			state.pipeline.alphaTestEnable || state.pipeline.blend.blendEnable ||
+			state.pipeline.nPatchEnable) return RENDER_RESULT_UNSUPPORTED;
+		bool rigidLayout = false;
+		const LegacyVertexLayout canonical = rigidVertexLayout(m_boundVertexStride == 36);
+		for (unsigned int i = 0; i < m_inputLayouts.size(); ++i)
+			if (m_inputLayouts[i].layout == m_boundInputLayout)
+				rigidLayout = EqualVertexLayouts(m_inputLayouts[i].descriptor, canonical);
+		if (!rigidLayout) return RENDER_RESULT_UNSUPPORTED;
+		ID3D11InputLayout *layout = m_boundVertexStride == 36 ? m_instancedInputLayout : m_instancedInputLayout32;
+		RenderResult result = validateIndexedDraw(indexCount, startIndex, baseVertex);
+		if (result != RENDER_RESULT_OK) return result;
+		// These records retain the exact CPU multiply and padded normal builder.
+		struct InstanceRecord { float wvp[16], wv[16], world[16], normal[12], viewNormal[12]; };
+		static_assert(sizeof(InstanceRecord) == 288, "rigid instance upload ABI");
+		InstanceRecord records[RENDER_RIGID_INSTANCE_MAX];
+		for (unsigned int i = 0; i < instanceCount; ++i)
+		{
+			if (!RigidInstancingWorldValid(worlds[i], records[i].normal)) return RENDER_RESULT_INVALID_ARGUMENT;
+			RenderMatrix4 worldView;
+			MultiplyMatrices(worlds[i].values, state.constants.view.values, worldView.values);
+			memcpy(records[i].wv, worldView.values, sizeof(records[i].wv));
+			MultiplyMatrices(worldView.values, state.constants.projection.values, records[i].wvp);
+			memcpy(records[i].world, worlds[i].values, sizeof(records[i].world));
+			BuildLegacyInverseTransposeNormalMatrix(worldView, records[i].viewNormal);
+		}
+		result = refreshTransformConstantsForDraw();
+		if (result != RENDER_RESULT_OK)
+			return result == RENDER_RESULT_UNSUPPORTED ? RENDER_RESULT_FAILED : result;
+		D3D11_MAPPED_SUBRESOURCE mapped = {};
+		const HRESULT upload = m_context->Map(m_instanceBuffer, 0,
+			D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+		if (FAILED(upload))
+		{
+			result = TranslateResult(upload);
+			return result == RENDER_RESULT_UNSUPPORTED ? RENDER_RESULT_FAILED : result;
+		}
+		if (mapped.pData == 0)
+		{
+			m_context->Unmap(m_instanceBuffer, 0);
+			return RENDER_RESULT_FAILED;
+		}
+		memcpy(mapped.pData, records, instanceCount * sizeof(InstanceRecord));
+		m_context->Unmap(m_instanceBuffer, 0);
+		UINT stride = sizeof(InstanceRecord), offset = 0;
+		m_context->IASetVertexBuffers(1, 1, &m_instanceBuffer, &stride, &offset);
+		m_context->IASetInputLayout(layout);
+		m_context->VSSetShader(m_instancedVertexShader, 0, 0);
+		m_context->DrawIndexedInstanced(indexCount, instanceCount, startIndex, baseVertex, 0);
+		// Restore physical bindings while keeping ordinary cache publication valid.
+		m_context->VSSetShader(m_boundVertexShader, 0, 0);
+		m_context->IASetInputLayout(m_boundInputLayout);
+		ID3D11Buffer *nullBuffer = 0; stride = offset = 0;
+		m_context->IASetVertexBuffers(1, 1, &nullBuffer, &stride, &offset);
+		result = TranslateResult(m_device->GetDeviceRemovedReason());
+		return result == RENDER_RESULT_UNSUPPORTED ? RENDER_RESULT_FAILED : result;
 	}
 
 	virtual RenderResult endFrame()
@@ -4358,6 +4437,31 @@ private:
 	{
 		return result;
 	}
+		result = m_device->CreateVertexShader(g_LegacyRigidInstancedVS,
+			sizeof(g_LegacyRigidInstancedVS), 0, &m_instancedVertexShader);
+		if (SUCCEEDED(result))
+		{
+			D3D11_BUFFER_DESC instanceDescriptor = {};
+			instanceDescriptor.ByteWidth = 288 * RENDER_RIGID_INSTANCE_MAX;
+			instanceDescriptor.Usage = D3D11_USAGE_DYNAMIC;
+			instanceDescriptor.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+			instanceDescriptor.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+			result = m_device->CreateBuffer(&instanceDescriptor, 0, &m_instanceBuffer);
+		}
+		if (SUCCEEDED(result)) result = createRigidInstancedInputLayout(true, &m_instancedInputLayout);
+		if (SUCCEEDED(result)) result = createRigidInstancedInputLayout(false, &m_instancedInputLayout32);
+		if (FAILED(result))
+		{
+			// Instancing is optional on a healthy device. Release the partial
+			// capability without disabling the established ordinary pipeline.
+			if (m_instancedInputLayout32) { m_instancedInputLayout32->Release(); m_instancedInputLayout32 = 0; }
+			if (m_instancedInputLayout) { m_instancedInputLayout->Release(); m_instancedInputLayout = 0; }
+			if (m_instanceBuffer) { m_instanceBuffer->Release(); m_instanceBuffer = 0; }
+			if (m_instancedVertexShader) { m_instancedVertexShader->Release(); m_instancedVertexShader = 0; }
+			const HRESULT deviceResult = m_device->GetDeviceRemovedReason();
+			if (FAILED(deviceResult)) return deviceResult;
+			if (TranslateResult(result) == RENDER_RESULT_DEVICE_REMOVED) return result;
+		}
 	result = m_device->CreatePixelShader(g_LegacyTexturedFixed1PS,
 		sizeof(g_LegacyTexturedFixed1PS), 0, &m_texturedFixed1PixelShader);
 	if (FAILED(result))
@@ -5589,46 +5693,36 @@ private:
 		return S_OK;
 	}
 
-	HRESULT findOrCreateInputLayout(const LegacyVertexLayout &descriptor,
-		ID3D11InputLayout **layout, unsigned int *layoutFlags)
+	static LegacyVertexLayout rigidVertexLayout(bool hasDiffuse = true)
 	{
-		if (layout == 0 || layoutFlags == 0 || descriptor.stride == 0 ||
-			descriptor.elementCount == 0 ||
-			descriptor.elementCount > LegacyVertexLayout::MAX_ELEMENT_COUNT)
+		LegacyVertexLayout descriptor;
+		descriptor.stride = 36; descriptor.elementCount = 4;
+		const LegacyVertexSemantic semantics[] = { RENDER_VERTEX_SEMANTIC_POSITION,
+			RENDER_VERTEX_SEMANTIC_NORMAL, RENDER_VERTEX_SEMANTIC_DIFFUSE,
+			RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE };
+		const LegacyVertexDataFormat formats[] = { RENDER_VERTEX_DATA_FLOAT3,
+			RENDER_VERTEX_DATA_FLOAT3, RENDER_VERTEX_DATA_COLOR_BGRA8, RENDER_VERTEX_DATA_FLOAT2 };
+		const unsigned int offsets[] = { 0, 12, 24, 28 };
+		for (unsigned int i = 0; i < 4; ++i)
 		{
-			return E_INVALIDARG;
+			descriptor.elements[i].semantic = semantics[i];
+			descriptor.elements[i].format = formats[i];
+			descriptor.elements[i].byteOffset = offsets[i];
 		}
-		// The cache is ordered by insertion, not recent use. The last matching
-		// index avoids a linear scan for repeated layouts, but always rechecks
-		// the complete descriptor before using the current native entry.
-		if (m_lastInputLayoutIndex < m_inputLayouts.size() &&
-			EqualVertexLayouts(m_inputLayouts[m_lastInputLayoutIndex].descriptor,
-				descriptor))
+		if (!hasDiffuse)
 		{
-			InputLayoutEntry &entry = m_inputLayouts[m_lastInputLayoutIndex];
-			entry.lastUsedSerial = nextStateUseSerial();
-			*layout = entry.layout;
-			*layoutFlags = entry.layoutFlags;
-			return S_OK;
+			descriptor.stride = 32; descriptor.elementCount = 3;
+			descriptor.elements[2] = descriptor.elements[3];
+			descriptor.elements[2].byteOffset = 24;
+			descriptor.elements[3] = LegacyVertexElement();
 		}
-		for (unsigned int cached = 0; cached < m_inputLayouts.size(); ++cached)
-		{
-			if (EqualVertexLayouts(m_inputLayouts[cached].descriptor, descriptor))
-			{
-				m_inputLayouts[cached].lastUsedSerial = nextStateUseSerial();
-				m_lastInputLayoutIndex = cached;
-				*layout = m_inputLayouts[cached].layout;
-				*layoutFlags = m_inputLayouts[cached].layoutFlags;
-				return S_OK;
-			}
-		}
-		if (!evictInputLayout())
-		{
-			return E_OUTOFMEMORY;
-		}
+		return descriptor;
+	}
+
+	static HRESULT buildNativeInputElements(const LegacyVertexLayout &descriptor,
+		D3D11_INPUT_ELEMENT_DESC *nativeElements, unsigned int &nativeElementCount)
+	{
 		const bool weightedVertexInput = HasBlendVertexSemantics(descriptor);
-		D3D11_INPUT_ELEMENT_DESC nativeElements[
-			LegacyVertexLayout::MAX_ELEMENT_COUNT + LEGACY_TEXTURE_STAGE_COUNT + 6];
 		bool hasPosition = false;
 		bool hasNormal = false;
 		bool hasDiffuse = false;
@@ -5749,7 +5843,7 @@ private:
 		{
 			return E_INVALIDARG;
 		}
-		unsigned int nativeElementCount = descriptor.elementCount;
+		nativeElementCount = descriptor.elementCount;
 		if (!hasNormal)
 		{
 			if (!FitsVertexStride(descriptor, positionOffset, 3U * sizeof(float)))
@@ -5871,6 +5965,71 @@ private:
 				element.InstanceDataStepRate = 0;
 			}
 		}
+		return S_OK;
+	}
+
+	HRESULT createRigidInstancedInputLayout(bool hasDiffuse, ID3D11InputLayout **layout)
+	{
+		D3D11_INPUT_ELEMENT_DESC elements[
+			LegacyVertexLayout::MAX_ELEMENT_COUNT + LEGACY_TEXTURE_STAGE_COUNT + 24];
+		unsigned int count = 0;
+		const HRESULT result = buildNativeInputElements(rigidVertexLayout(hasDiffuse), elements, count);
+		if (FAILED(result)) return result;
+		for (unsigned int row = 0; row < 18; ++row)
+		{
+			D3D11_INPUT_ELEMENT_DESC &e = elements[count + row];
+			e.SemanticName = "INSTANCE"; e.SemanticIndex = row;
+			e.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+			e.InputSlot = 1; e.AlignedByteOffset = row * 16;
+			e.InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA; e.InstanceDataStepRate = 1;
+		}
+		return m_device->CreateInputLayout(elements, count + 18,
+			g_LegacyRigidInstancedVS, sizeof(g_LegacyRigidInstancedVS), layout);
+	}
+
+	HRESULT findOrCreateInputLayout(const LegacyVertexLayout &descriptor,
+		ID3D11InputLayout **layout, unsigned int *layoutFlags)
+	{
+		if (layout == 0 || layoutFlags == 0 || descriptor.stride == 0 ||
+			descriptor.elementCount == 0 ||
+			descriptor.elementCount > LegacyVertexLayout::MAX_ELEMENT_COUNT)
+		{
+			return E_INVALIDARG;
+		}
+		// The cache is ordered by insertion, not recent use. The last matching
+		// index avoids a linear scan for repeated layouts, but always rechecks
+		// the complete descriptor before using the current native entry.
+		if (m_lastInputLayoutIndex < m_inputLayouts.size() &&
+			EqualVertexLayouts(m_inputLayouts[m_lastInputLayoutIndex].descriptor,
+				descriptor))
+		{
+			InputLayoutEntry &entry = m_inputLayouts[m_lastInputLayoutIndex];
+			entry.lastUsedSerial = nextStateUseSerial();
+			*layout = entry.layout;
+			*layoutFlags = entry.layoutFlags;
+			return S_OK;
+		}
+		for (unsigned int cached = 0; cached < m_inputLayouts.size(); ++cached)
+		{
+			if (EqualVertexLayouts(m_inputLayouts[cached].descriptor, descriptor))
+			{
+				m_inputLayouts[cached].lastUsedSerial = nextStateUseSerial();
+				m_lastInputLayoutIndex = cached;
+				*layout = m_inputLayouts[cached].layout;
+				*layoutFlags = m_inputLayouts[cached].layoutFlags;
+				return S_OK;
+			}
+		}
+		if (!evictInputLayout())
+		{
+			return E_OUTOFMEMORY;
+		}
+		const bool weightedVertexInput = HasBlendVertexSemantics(descriptor);
+		D3D11_INPUT_ELEMENT_DESC nativeElements[
+			LegacyVertexLayout::MAX_ELEMENT_COUNT + LEGACY_TEXTURE_STAGE_COUNT + 24];
+		unsigned int nativeElementCount = 0;
+		const HRESULT elementsResult = buildNativeInputElements(descriptor, nativeElements, nativeElementCount);
+		if (FAILED(elementsResult)) return elementsResult;
 		InputLayoutEntry entry;
 		entry.descriptor = descriptor;
 		entry.layout = 0;
@@ -6272,6 +6431,10 @@ private:
 			m_texturedVertexShader->Release();
 			m_texturedVertexShader = 0;
 		}
+		if (m_instancedInputLayout32) { m_instancedInputLayout32->Release(); m_instancedInputLayout32 = 0; }
+		if (m_instancedInputLayout) { m_instancedInputLayout->Release(); m_instancedInputLayout = 0; }
+		if (m_instanceBuffer) { m_instanceBuffer->Release(); m_instanceBuffer = 0; }
+		if (m_instancedVertexShader) { m_instancedVertexShader->Release(); m_instancedVertexShader = 0; }
 		if (m_texturedUnweightedVertexShader != 0)
 		{
 			m_texturedUnweightedVertexShader->Release();
@@ -6391,6 +6554,10 @@ private:
 	ID3D11InputLayout *m_positionColorLayout;
 	ID3D11VertexShader *m_texturedVertexShader;
 	ID3D11VertexShader *m_texturedUnweightedVertexShader;
+	ID3D11VertexShader *m_instancedVertexShader;
+	ID3D11Buffer *m_instanceBuffer;
+	ID3D11InputLayout *m_instancedInputLayout;
+	ID3D11InputLayout *m_instancedInputLayout32;
 	ID3D11PixelShader *m_texturedPixelShader;
 	ID3D11PixelShader *m_texturedFixed1PixelShader;
 	ID3D11PixelShader *m_texturedFixed2PixelShader;
