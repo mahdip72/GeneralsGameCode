@@ -1,7 +1,7 @@
 # R1 rendering validation: V16-02
 
 **Code base:** `e9bc8ac999cdea97e043118a107c9a4846897408`
-**Validation state:** source and native gates passed; the V16 numeric comparison is data-comparable and clears its frozen descriptive thresholds. Stage acceptance remains `false` / `not_evaluated`. This record does not claim a bug-free renderer or accepted release.
+**Validation state:** source and native gates passed; the V16 numeric comparison is data-comparable and clears its frozen descriptive thresholds. The user accepted Stage 1 after fullscreen play on 2026-10-05. This record does not claim a bug-free renderer or completion of the deferred qualifications listed below.
 
 ## Implementation and source evidence
 
@@ -40,11 +40,19 @@ The median run FPS increased from 15.0028 to 16.7559, a descriptive 11.69%; the 
 
 No candidate run had a gap over 500 ms. Baseline numeric-05 retained one 1,607.9989-ms gap; it was not removed. With only three runs per group, these are descriptive summaries, not a significance claim. V15 and failed V15 cohorts were not pooled into this comparison.
 
-The first comparison invocation omitted required multipage proof inputs and remains rejected. Corrected comparison02 uses the six original prelaunch environment proofs. In the result, `data_comparable: true` means the evidence can be compared descriptively; it does not mean stage approval. The legacy `accepted` field is only an alias for data comparability. The comparison records `stage_accepted: false` and `stage_status: not_evaluated`; the frozen policy also sets manual acceptance to false.
+The first comparison invocation omitted required multipage proof inputs and remains rejected. Corrected comparison02 uses the six original prelaunch environment proofs. In the result, `data_comparable: true` means the evidence can be compared descriptively; it does not mean stage approval. The legacy `accepted` field is only an alias for data comparability. The original comparison records `stage_accepted: false` and `stage_status: not_evaluated`; the frozen policy also sets manual acceptance to false. These historical records remain unchanged. The later user acceptance is recorded separately below.
 
-## Remaining qualification
+## Fullscreen acceptance and compiler closeout
 
-Visual inspection is expressly waived for this publication record; no visual pass is claimed. Manual fullscreen testing, retail replay, full Generals title qualification, VC6 qualification, and external qualification remain pending. The change remains in a draft PR, and the candidate has not been promoted to the canonical installation.
+The user played the exact benchmarked normal Release executable at 3840x2160 fullscreen with normal intro videos and a copy of the established settings, maps, and saves. The executable retained SHA-256 `701B94298A3348B1D9E9C625466CEAB4E89254A9D52243A46D116255C96AA0C2`. The user reported smoother play and accepted Stage 1 on 2026-10-05, while noting that performance was still short of ideal. This is user gameplay acceptance, not an additional controlled FPS measurement.
+
+Three compiler compatibility repairs follow the benchmarked implementation. The generation counter remains accessed only through Interlocked operations, with a declaration accepted by the older Windows SDK. The second texture-slot loop uses a distinct variable name for VC6 scoping. The line-group sorting test includes its frame-timing declarations. These changes preserve runtime behavior by source inspection. A rebuilt executable has a different hash and is not substituted for the executable the user accepted.
+
+The compiler-closeout x64 Release build passed. All 22 selected native tests passed, including the sorting test and five admitted GPU constant-arena images. The original implementation review and benchmark evidence remain applicable, with the three compiler repairs reviewed separately.
+
+## Deferred qualification
+
+Automated visual inspection was waived. Retail replay, full Generals title/runtime qualification, and external qualification remain deferred. Native builds and local six-core testing do not establish retail replay compatibility or external 16-core qualification. The hosted installed replay matrices and external-core checks remain opt-in while their private data service or required runner is unavailable. Their skipped status is not a pass. The final playable package uses the exact user-accepted executable.
 
 ## Reproduction
 
