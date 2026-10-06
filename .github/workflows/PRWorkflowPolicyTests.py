@@ -125,7 +125,7 @@ class WorkflowMutationTests(unittest.TestCase):
                 settings = p['jobs'][lane]['with']
                 settings['focused_test_regex'] = settings['focused_test_regex'].replace('|core_task_runtime_tests', '')
                 settings['focused_targets'] = settings['focused_targets'].replace(',core_task_runtime_tests', '')
-            self.reject(remove_pair, 'exact required 13 smoke tests')
+            self.reject(remove_pair, 'exact required 17 smoke tests')
 
     def test_smoke_test_and_target_duplicates_are_rejected(self):
         for lane in ('native-generals', 'native-zerohour'):

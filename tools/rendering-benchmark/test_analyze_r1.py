@@ -355,6 +355,31 @@ class VisualCaptureTests(unittest.TestCase):
         self.assertFalse(unavailable["available"])
         self.assertIsNone(unavailable["warmup_plus_measurement_delta"])
 
+    def test_legacy_default_rejects_rigid_metrics_without_profile_marker(self):
+        self.lines = list(self.legacy_lines)
+        warm_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin "))
+        stop_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop "))
+        metric_fields = ("captured_draws", "instanced_batches", "instanced_instances",
+                         "singleton_ordinary", "unsupported_fallbacks",
+                         "ordinary_fallback_draws", "rejected_draws")
+
+        def metric_suffix(frame):
+            fields = ["rigid_metrics_schema=" + r1.RIGID_METRICS_SCHEMA,
+                      "rigid_metrics_status=0", "rigid_logic_frame=" + str(frame)]
+            fields.extend("rigid_" + name + "=0" for name in metric_fields)
+            return " " + " ".join(fields)
+
+        # This is a complete, correctly aligned pair on the legacy 512-unit
+        # diagnostic. It must fail only because that run has no named R2 profile.
+        self.lines[warm_index] += metric_suffix(1)
+        self.lines[stop_index] += metric_suffix(601)
+        self.write()
+        with self.assertRaisesRegex(r1.Reject,
+                                    "rigid-draw metrics require an explicit R2 profile"):
+            r1.diagnostic(self.path, self.ready)
+
     def test_rigid_draw_metrics_reject_partial_unknown_misaligned_and_nonmonotonic_receipts(self):
         base = self.profile_fixture("mechanized_256")
         warm_index = next(i for i, line in enumerate(base)

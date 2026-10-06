@@ -54,7 +54,11 @@ CORE_SMOKE_TESTS = frozenset((
     'core_threaded_render_device_native_tests',
     'core_threaded_render_pipeline_stall_trace_tests',
     'core_native_w3d_owner_queue_tests',
+    'core_native_w3d_renderer_tests',
     'core_native_w3d_render_state_tests',
+    'core_rigid_instancing_policy_tests',
+    'core_game_rigid_draw_batch_tests',
+    'core_native_mesh_task_lifetime_tests',
     'core_task_runtime_tests',
     'core_chunkio_value_read_tests',
     'core_replay_field_reader_tests',
@@ -64,7 +68,11 @@ CORE_SMOKE_TARGETS = frozenset((
     'core_threaded_render_device_tests',
     'core_threaded_render_device_native_tests',
     'core_native_w3d_owner_queue_tests',
+    'core_native_w3d_renderer_tests',
     'core_native_w3d_render_state_tests',
+    'core_rigid_instancing_policy_tests',
+    'core_game_rigid_draw_batch_tests',
+    'core_native_mesh_task_lifetime_tests',
     'core_task_runtime_tests',
     'core_chunkio_value_read_tests',
     'core_replay_field_reader_tests',
@@ -258,9 +266,9 @@ def validate_policy(pr, extended, root):
             require(command and command.group(1) in targets,
                     f'CTest executable is not selected for compilation: {name}')
         require(set(names) == required_smoke_tests(prefix),
-                f'{lane} must retain the exact required 13 smoke tests')
+                f'{lane} must retain the exact required 17 smoke tests')
         require(set(targets) == required_smoke_targets(prefix),
-                f'{lane} must retain the exact required 10 build targets')
+                f'{lane} must retain the exact required 14 build targets')
     policy = jobs['workflow-policy']
     require('if' not in policy and 'needs' not in policy, 'workflow policy must run unconditionally')
     policy_commands = (

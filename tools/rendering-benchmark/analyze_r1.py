@@ -485,6 +485,8 @@ def diagnostic(path, ready):
             req(not any(key in marker for key in ("profile_id","roster_contract","phase_contract")),
                 "profile identity fields appear without an R2 profile marker")
     render_admission_metrics=rendered_battle_rigid_metrics(warm,ms,mb)
+    req(profile is not None or render_admission_metrics is None,
+        "rigid-draw metrics require an explicit R2 profile")
     sig=[]; allids=[]
     factions=("FactionAmerica","FactionChina","FactionGLA","FactionAmerica")
     for slot,r in enumerate(sorted(rosters,key=lambda x:num(x.get("slot"),"roster slot"))):
