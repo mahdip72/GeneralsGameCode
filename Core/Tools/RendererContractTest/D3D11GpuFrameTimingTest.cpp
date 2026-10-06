@@ -2,6 +2,7 @@
 #include "../../Libraries/Source/Renderer/D3D11GpuFrameTiming.h"
 #include <vector>
 #include <math.h>
+#include <string>
 
 // Replace only the standard nothrow array allocation in this test executable,
 // so the real collector's record-allocation failure can be proved deterministically.
@@ -567,6 +568,173 @@ int ExpandedRecordCapAndAllocationFailure()
     Failure fail; unsigned int opens, writes, flushes, closes;
     unsigned long pid; unsigned int capacity; uint64_t bytes;
 };
+
+// Real Win32 filesystem/environment coverage; no D3D device or global capture.
+struct WindowsConfigurationDirectory
+{
+    explicit WindowsConfigurationDirectory(int& result) : result(result), owned(false)
+    { path[0] = sidecar[0] = 0; }
+    ~WindowsConfigurationDirectory()
+    {
+        if (!owned) return;
+        if (sidecar[0] && GetFileAttributesW(sidecar) != INVALID_FILE_ATTRIBUTES)
+            result |= Check(DeleteFileW(sidecar) != FALSE, "remove only this test's exact PID sidecar");
+        result |= Check(RemoveDirectoryW(path) != FALSE, "remove only this test's empty created directory");
+    }
+    bool create()
+    {
+        wchar_t current[MAX_PATH];
+        const DWORD length = GetCurrentDirectoryW(MAX_PATH, current);
+        if (!length || length >= MAX_PATH) return false;
+        static unsigned int sequence = 0;
+        for (unsigned int attempt = 0; attempt < 32; ++attempt)
+        {
+            if (_snwprintf_s(path, _countof(path), _TRUNCATE,
+                L"%ls\\gpu-configuration-test-%lu-%llu-%u", current, GetCurrentProcessId(),
+                static_cast<unsigned long long>(GetTickCount64()), ++sequence) < 0) return false;
+            if (CreateDirectoryW(path, 0)) { owned = true; break; }
+            if (GetLastError() != ERROR_ALREADY_EXISTS) return false;
+        }
+        if (!owned) return false;
+        return _snwprintf_s(sidecar, _countof(sidecar), _TRUNCATE,
+            L"%ls\\gpu-capture-configuration-%lu.json", path, GetCurrentProcessId()) >= 0;
+    }
+    int& result;
+    bool owned;
+    wchar_t path[MAX_PATH], sidecar[MAX_PATH];
+};
+struct WindowsConfigurationReadHandle
+{
+    WindowsConfigurationReadHandle(HANDLE file, int& result) : file(file), result(result) {}
+    ~WindowsConfigurationReadHandle()
+    { if (file != INVALID_HANDLE_VALUE) result |= Check(CloseHandle(file) != FALSE, "close actual sidecar read handle"); }
+    HANDLE file;
+    int& result;
+};
+bool ReadWindowsConfiguration(const wchar_t *path, std::string& bytes, int& result)
+{
+    WindowsConfigurationReadHandle input(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+        0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0), result);
+    if (input.file == INVALID_HANDLE_VALUE) return false;
+    char text[512]; DWORD count = 0;
+    if (!ReadFile(input.file, text, sizeof(text), &count, 0)) return false;
+    char extra = 0; DWORD extraCount = 1;
+    if (!ReadFile(input.file, &extra, 1, &extraCount, 0) || extraCount != 0) return false;
+    bytes.assign(text, count);
+    return true;
+}
+bool ExactWindowsConfiguration(const std::string& bytes)
+{
+    // Exact canonical JSON also rejects extra fields, duplicate keys and trailing bytes.
+    char expected[512];
+    const int count = _snprintf_s(expected, sizeof(expected), _TRUNCATE,
+        "{\"schema\":\"ggc.gpu-capture-configuration.v1\",\"status\":\"configured\",\"process_id\":%lu,"
+        "\"record_capacity\":65536,\"record_bytes\":144,\"record_storage_bytes\":9437184,\"allocation_proven\":false}\n",
+        GetCurrentProcessId());
+    return count > 0 && bytes == std::string(expected, static_cast<size_t>(count));
+}
+bool ReadWindowsEnvironment(const wchar_t *name, std::wstring& value, bool& present)
+{
+    SetLastError(ERROR_SUCCESS);
+    const DWORD required = GetEnvironmentVariableW(name, 0, 0);
+    if (required == 0)
+    {
+        const DWORD error = GetLastError();
+        if (error != ERROR_SUCCESS && error != ERROR_ENVVAR_NOT_FOUND) return false;
+        present = error != ERROR_ENVVAR_NOT_FOUND;
+        value.clear(); return true;
+    }
+    std::vector<wchar_t> buffer(required);
+    const DWORD copied = GetEnvironmentVariableW(name, &buffer[0], required);
+    if (copied != required - 1) return false;
+    present = true; value.assign(&buffer[0], copied); return true;
+}
+struct WindowsEnvironmentRestore
+{
+    WindowsEnvironmentRestore(const wchar_t *name, int& result)
+        : name(name), result(result), present(false), valid(ReadWindowsEnvironment(name, value, present))
+    { result |= Check(valid, "snapshot original process-local GPU timing environment"); }
+    ~WindowsEnvironmentRestore()
+    {
+        if (!valid) return;
+        result |= Check(SetEnvironmentVariableW(name, present ? value.c_str() : 0) != FALSE,
+            "restore original process-local GPU timing environment");
+        std::wstring observed; bool observedPresent = false;
+        result |= Check(ReadWindowsEnvironment(name, observed, observedPresent) &&
+            observedPresent == present && observed == value, "verify original environment was restored exactly");
+    }
+    bool set(const wchar_t *replacement)
+    { return valid && SetEnvironmentVariableW(name, replacement) != FALSE; }
+    const wchar_t *name;
+    int& result;
+    std::wstring value;
+    bool present, valid;
+};
+int ActualWindowsConfigurationProvenance()
+{
+    int result = Check(sizeof(GpuTimingRecord) == 144, "actual record ABI retains the documented 144-byte storage product");
+    {
+        WindowsConfigurationDirectory directory(result);
+        const bool created = directory.create();
+        result |= Check(created, "create a unique owned directory under the CTest working directory");
+        if (created)
+        {
+            D3D11GpuTimingConfigurationOutput output(directory.path);
+            result |= Check(WriteGpuTimingConfiguration(output, GetCurrentProcessId(), 65536, sizeof(GpuTimingRecord)),
+                "real Windows sidecar writer checks create/write/flush/close");
+            std::string original;
+            const bool read = ReadWindowsConfiguration(directory.sidecar, original, result);
+            result |= Check(read && ExactWindowsConfiguration(original),
+                "real PID sidecar has exact schema/status/cap/ABI/product/false-allocation JSON and complete EOF");
+            D3D11GpuTimingConfigurationOutput duplicate(directory.path);
+            result |= Check(!WriteGpuTimingConfiguration(duplicate, GetCurrentProcessId(), 8192, sizeof(GpuTimingRecord)),
+                "second actual writer refuses an existing same-PID sidecar through CREATE_NEW");
+            std::string unchanged;
+            result |= Check(ReadWindowsConfiguration(directory.sidecar, unchanged, result) && unchanged == original,
+                "refused same-PID write leaves every original sidecar byte unchanged");
+            wchar_t missing[MAX_PATH];
+            const bool fits = _snwprintf_s(missing, _countof(missing), _TRUNCATE, L"%ls\\missing", directory.path) >= 0;
+            result |= Check(fits, "bounded nonexistent child directory path");
+            if (fits)
+            {
+                D3D11GpuTimingConfigurationOutput nonexistent(missing);
+                result |= Check(!WriteGpuTimingConfiguration(nonexistent, GetCurrentProcessId(), 65536, sizeof(GpuTimingRecord)) &&
+                    GetFileAttributesW(missing) == INVALID_FILE_ATTRIBUTES,
+                    "real writer refuses a nonexistent directory without creating it");
+            }
+        }
+    }
+    for (unsigned int invalid = 0; invalid < 2; ++invalid)
+    {
+        WindowsConfigurationDirectory directory(result);
+        const bool created = directory.create();
+        result |= Check(created, "separate fresh directory for actual environment activation case");
+        WindowsEnvironmentRestore directoryEnvironment(L"RTS_GPU_FRAME_TIMING_DIR", result);
+        WindowsEnvironmentRestore capacityEnvironment(L"RTS_GPU_FRAME_TIMING_MAX_RECORDS", result);
+        if (created && directoryEnvironment.valid && capacityEnvironment.valid)
+        {
+            const bool set = directoryEnvironment.set(directory.path) && capacityEnvironment.set(invalid ? L"65537" : L"65536");
+            result |= Check(set, "set only scoped process-local GPU timing activation variables");
+            if (set)
+            {
+                D3D11GpuFrameTiming capture;
+                capture.attach(0, 0); // Real activation path; null driver cannot create GPU queries.
+                if (invalid)
+                    result |= Check(!capture.enabled() && GetFileAttributesW(directory.sidecar) == INVALID_FILE_ATTRIBUTES,
+                        "actual invalid-capacity activation stays disabled and produces no sidecar");
+                else
+                {
+                    std::string bytes;
+                    result |= Check(capture.enabled() && ReadWindowsConfiguration(directory.sidecar, bytes, result) &&
+                        ExactWindowsConfiguration(bytes), "actual valid-capacity activation publishes checked real Windows provenance");
+                }
+                // Do not call writeOnShutdown: it exports a separate CSV, outside this sidecar test.
+            }
+        }
+    }
+    return result; // All exact-file cleanup and environment RAII failures are counted before this return.
+}
+
 int CheckedConfigurationProvenance()
 {
     int result = 0;
@@ -590,7 +758,7 @@ int main()
 	int result = DisabledAndIntervals(); result |= PresentClockValidation(); result |= ReadbackBoundaryAssociation();
 	result |= FullRingAndBudget(); result |= CancelAndLifecycle();
 	result |= InvalidAndFailure(); result |= RecordCap();
-	result |= RecordCapacityConfiguration(); result |= ExpandedRecordCapAndAllocationFailure(); result |= CheckedConfigurationProvenance();
+	result |= RecordCapacityConfiguration(); result |= ExpandedRecordCapAndAllocationFailure(); result |= CheckedConfigurationProvenance(); result |= ActualWindowsConfigurationProvenance();
 	result |= FailedPresentThenLoss(); result |= CheckedExport(); result |= DeviceIdentityBounds();
 	if (!result) puts("GPU timing collector contracts passed (recording driver, no GPU)");
 	return result;
