@@ -4184,6 +4184,23 @@ Bool ValidateRenderedBattleBenchmarkNominalGeometry(const Real templateRadii[SKI
 	return TRUE;
 }
 
+Bool ValidateRenderedBattleBenchmarkNominalGeometry(Real vehicleRadius, Real infantryRadius)
+{
+	// Preserve the public two-radius contract. Types 0/1 are vehicles and
+	// types 2/3 are infantry in both legacy and named benchmark profiles.
+	if (!(vehicleRadius > 0.0f && vehicleRadius <= 21.0f &&
+		infantryRadius > 0.0f && infantryRadius <= 21.0f)) return FALSE;
+	Real templateRadii[SKIRMISH_AI_TEST_SLOT_COUNT][4];
+	for (Int radiusSlot = 0; radiusSlot < SKIRMISH_AI_TEST_SLOT_COUNT; ++radiusSlot)
+	{
+		templateRadii[radiusSlot][0] = vehicleRadius;
+		templateRadii[radiusSlot][1] = vehicleRadius;
+		templateRadii[radiusSlot][2] = infantryRadius;
+		templateRadii[radiusSlot][3] = infantryRadius;
+	}
+	return ValidateRenderedBattleBenchmarkNominalGeometry(templateRadii);
+}
+
 RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
 	Int unitCount, const Coord3D *domains, const Real *radii, const UnsignedInt *domainMasks,
 	Int operationBudget, Int *choices, RenderedBattleBenchmarkPlacementStats *stats)
