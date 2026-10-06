@@ -1,4 +1,5 @@
 #include "Lib/RenderedBattleBenchmarkOptions.h"
+#include "Lib/AnimatedMenuBenchmarkOptions.h"
 #include <stdio.h>
 #include <string.h>
 #include <winioctl.h>
@@ -152,6 +153,74 @@ int main(int argc, char **argv)
 	const char *error = NULL;
 	int failures = 0;
 #define CHECK(condition) do { if (!(condition)) { ++failures; printf("FAIL line=%d\n", __LINE__); } } while (0)
+	// The numerical menu lane uses its real process options helper. These
+	// admission checks do not simulate menu/runtime/Present behavior.
+	{
+		const char *menuError = NULL;
+		const char *noMenu[] = { "generalszh.exe", "-win", "-nologo" };
+		CHECK(!rts::animated_menu::ProcessOptions().requested);
+		CHECK(!rts::animated_menu::ProcessOptions().active);
+		CHECK(rts::animated_menu::Configure(3, noMenu, false, &menuError));
+		CHECK(!rts::animated_menu::ProcessOptions().requested &&
+			!rts::animated_menu::ProcessOptions().active);
+		// This is the controller's complete game argv, including executable.
+		const char *numericMenu[] = { "generalszh.exe", "-runAnimatedMenuBenchmark",
+			"-win", "-nologo", "-renderer", "d3d11", "-xres", "1920", "-yres", "1080" };
+		CHECK(rts::animated_menu::Configure(10, numericMenu, true, &menuError));
+		CHECK(rts::animated_menu::ProcessOptions().requested &&
+			!rts::animated_menu::ProcessOptions().active);
+		// Both parser passes must accept the same argv without arming pacing.
+		CHECK(rts::animated_menu::Configure(10, numericMenu, true, &menuError));
+		CHECK(rts::animated_menu::ProcessOptions().requested &&
+			!rts::animated_menu::ProcessOptions().active);
+		CHECK(rts::animated_menu::Configure(3, noMenu, true, &menuError));
+		CHECK(!rts::animated_menu::ProcessOptions().requested &&
+			!rts::animated_menu::ProcessOptions().active);
+		CHECK(!rts::animated_menu::Configure(10, numericMenu, false, &menuError));
+		CHECK(menuError && strcmp(menuError, "unsupported_title_or_architecture") == 0);
+		CHECK(!rts::animated_menu::ProcessOptions().requested &&
+			!rts::animated_menu::ProcessOptions().active);
+		const char *duplicateMenu[] = { "generalszh.exe", "-runAnimatedMenuBenchmark",
+			"-RUNANIMATEDMENUBENCHMARK" };
+		CHECK(!rts::animated_menu::Configure(3, duplicateMenu, true, &menuError));
+		CHECK(menuError && strcmp(menuError, "conflicting_option") == 0);
+		const char *menuConflicts[] = {
+			"-headless", "-replay", "-loadsave", "-file", "-map", "-shellmap",
+			"-noshellmap", "-noShellAnim", "-fps", "-noFPSLimit", "-mod", "-noshaders",
+			"-particleEdit", "-benchmark", "-buildmapcache", "-runRenderedBattleDiagnostic",
+			"-runRenderedBattleBenchmark", "-runSkirmishAITest", "-runSkirmishAIAlliedTest",
+			"-runStage5PerformanceFixture", "-renderVisualCaptureSamples", "-renderBenchmarkProfile",
+			"-skirmishAITestReviewedMap" };
+		for (unsigned int index = 0; index < sizeof(menuConflicts)/sizeof(menuConflicts[0]); ++index)
+		{
+			const char *conflictBefore[] = { "generalszh.exe", menuConflicts[index], "-runAnimatedMenuBenchmark" };
+			const char *conflictAfter[] = { "generalszh.exe", "-runAnimatedMenuBenchmark", menuConflicts[index] };
+			CHECK(!rts::animated_menu::Configure(3, conflictBefore, true, &menuError));
+			CHECK(menuError && strcmp(menuError, "conflicting_option") == 0);
+			CHECK(!rts::animated_menu::ProcessOptions().requested &&
+				!rts::animated_menu::ProcessOptions().active);
+			CHECK(!rts::animated_menu::Configure(3, conflictAfter, true, &menuError));
+			CHECK(!rts::animated_menu::ProcessOptions().requested &&
+				!rts::animated_menu::ProcessOptions().active);
+			// Conflict rejection belongs to the opt-in lane only.
+			const char *ordinaryOption[] = { "generalszh.exe", menuConflicts[index] };
+			CHECK(rts::animated_menu::Configure(2, ordinaryOption, false, &menuError));
+		}
+		// Case-insensitive recognition does not broaden activation to similar
+		// names or the existing visual animated-menu lane.
+		const char *caseMenu[] = { "generalszh.exe", "-RUNANIMATEDMENUBENCHMARK" };
+		CHECK(rts::animated_menu::Configure(2, caseMenu, true, &menuError));
+		CHECK(rts::animated_menu::ProcessOptions().requested &&
+			!rts::animated_menu::ProcessOptions().active);
+		const char *similarMenu[] = { "generalszh.exe", "-runAnimatedMenuBenchmarkExtra" };
+		CHECK(rts::animated_menu::Configure(2, similarMenu, true, &menuError));
+		CHECK(!rts::animated_menu::ProcessOptions().requested &&
+			!rts::animated_menu::ProcessOptions().active);
+		const char *visualMenu[] = { "generalszh.exe", "-renderVisualCaptureSamples", "-win" };
+		CHECK(rts::animated_menu::Configure(3, visualMenu, true, &menuError));
+		CHECK(!rts::animated_menu::ProcessOptions().requested &&
+			!rts::animated_menu::ProcessOptions().active);
+	}
 	SetEnvironmentVariableA("RTS_RENDERED_BATTLE_BACKGROUND_STARTUP", NULL);
 	SetEnvironmentVariableA("RTS_RENDERED_BATTLE_VISUAL_CAPTURE", NULL);
 	SetEnvironmentVariableA("RTS_RENDER_VISUAL_CAPTURE_SAMPLES", NULL);

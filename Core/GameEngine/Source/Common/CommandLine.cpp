@@ -48,6 +48,7 @@
 #include "Lib/PipelineExecutionPolicy.h"
 #include "Lib/SimulationExecutionPolicy.h"
 #include "Lib/RenderedBattleBenchmarkOptions.h"
+#include "Lib/AnimatedMenuBenchmarkOptions.h"
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/RendererDevice.h"
 #include "WWLib/trim.h"
@@ -1016,6 +1017,8 @@ Int parseRunSkirmishAITestPractical1v7ForStartup(char *args[], int num)
 }
 
 #if RTS_ZEROHOUR
+Int parseRunAnimatedMenuBenchmark(char *args[], int num) { return 1; }
+
 Int parseRunRenderedBattleDiagnosticForStartup(char *args[], int num)
 {
 	Int seed = 0;
@@ -1797,6 +1800,7 @@ static CommandLineParam paramsForStartup[] =
 	{ "-runSkirmishAIAlliedTest", parseRunSkirmishAIAlliedTestForStartup },
 	{ "-runRenderedBattleDiagnostic", parseRunRenderedBattleDiagnosticForStartup },
 	{ "-runRenderedBattleBenchmark", parseRunRenderedBattleDiagnosticForStartup },
+	{ "-runAnimatedMenuBenchmark", parseRunAnimatedMenuBenchmark },
 	// Explicit snapshot-only legacy-save probe; the argument is a leaf .sav name.
 	{ "-runSkirmishAILegacySaveTest", parseRunSkirmishAILegacySaveTestForStartup },
 #endif
@@ -1840,6 +1844,7 @@ static CommandLineParam paramsForEngineInit[] =
 	{ "-runSkirmishAIAlliedTest", parseRunSkirmishAIAlliedTest },
 	{ "-runRenderedBattleDiagnostic", parseRunRenderedBattleDiagnostic },
 	{ "-runRenderedBattleBenchmark", parseRunRenderedBattleDiagnostic },
+	{ "-runAnimatedMenuBenchmark", parseRunAnimatedMenuBenchmark },
 	{ "-runSkirmishAILegacySaveTest", parseRunSkirmishAILegacySaveTest },
 #endif
 	{ "-nologo", parseNoLogo }, // TheSuperHackers @tweak Is now available in Release builds.
@@ -2098,6 +2103,17 @@ static void parseCommandLine(const CommandLineParam* params, int numParams)
 		exit(2);
 	}
 #endif
+	const char *menuError = NULL;
+	bool menuSupported = false;
+#if RTS_ZEROHOUR && defined(_WIN64)
+	menuSupported = true;
+#endif
+	if (!rts::animated_menu::Configure(argc, argv.empty() ? NULL : &argv[0], menuSupported, &menuError))
+	{
+		printf("ANIMATED_MENU_BENCHMARK_FAIL reason=%s\n", menuError);
+		fflush(stdout);
+		exit(2);
+	}
 	const char *renderedBattleError = nullptr;
 	Bool renderedBattleSupported = FALSE;
 #if RTS_ZEROHOUR

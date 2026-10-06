@@ -29,6 +29,7 @@
 #include "PreRTS.h"	// This must go first in EVERY cpp file in the GameEngine
 
 #include "Common/FramePacer.h"
+#include "Common/AnimatedMenuBenchmark.h"
 #include "Common/GameEngine.h"
 #include "Common/GameThreadOwnership.h"
 #include "Common/GlobalData.h"
@@ -174,6 +175,7 @@ Int GameMain()
 	}
 	const Bool canRun = !validationOptionsConflict && !net3ValidationRequested &&
 		!lockstepV2ValidationRequested &&
+		rts::animated_menu::Start() &&
 		StartSkirmishAITestRunner()
 #if defined(_WIN64)
 		&& StartStage5PerformanceFixtureRunner()
@@ -213,6 +215,8 @@ Int GameMain()
 	ReleaseSkirmishAITestPerformanceReceiptOwner();
 #endif
 	}
+
+	exitcode = rts::animated_menu::Finalize(exitcode);
 
 	// since execute() returned, we are exiting the game
 	delete TheFramePacer;
