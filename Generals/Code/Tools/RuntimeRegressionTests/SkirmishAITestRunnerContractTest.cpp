@@ -1781,10 +1781,91 @@ static void TestRenderedBattleNamedGeometryAndArenaRetention()
 	CHECK(!RememberRenderedBattleDiagnosticArena(0, 0, candidates, prefixes, &count, TRUE, 131));
 }
 
+static void TestRenderedBattleMechanizedRefinement()
+{
+	using namespace rts::rendered_battle;
+	const TestOptions saved = ProcessTestOptions();
+	const BenchmarkProfile profiles[] = { BENCHMARK_PROFILE_LEGACY_512,
+		BENCHMARK_PROFILE_COMBINED_ARMS_256, BENCHMARK_PROFILE_COMBINED_ARMS_512,
+		BENCHMARK_PROFILE_MECHANIZED_256, BENCHMARK_PROFILE_MECHANIZED_512,
+		BENCHMARK_PROFILE_INFANTRY_LINE_256, BENCHMARK_PROFILE_INFANTRY_LINE_512 };
+	for (UnsignedInt i = 0; i < ARRAY_SIZE(profiles); ++i)
+	{
+		ProcessTestOptions().benchmarkProfile = profiles[i];
+		CHECK(IsRenderedBattleBenchmarkRefinementEligible(TRUE) == (profiles[i] == BENCHMARK_PROFILE_MECHANIZED_512));
+		CHECK(!IsRenderedBattleBenchmarkRefinementEligible(FALSE));
+	}
+	ProcessTestOptions().benchmarkProfile = BENCHMARK_PROFILE_MECHANIZED_512;
+	CHECK(RENDERED_BATTLE_BENCHMARK_REFINEMENT_CANDIDATE_CAP == 130 * 80);
+	Coord3D points[80], parent;
+	CHECK(GetRenderedBattleDiagnosticSearchCenter(0, 0, 10000, 10000, 24, &parent, TRUE));
+	for (Int offset = 0; offset < 80; ++offset)
+	{
+		CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, offset, &points[offset]));
+		const Int grid = offset < 40 ? offset : offset + 1;
+		CHECK(points[offset].x == parent.x + (grid % 9 - 4) * 10);
+		CHECK(points[offset].y == parent.y + (grid / 9 - 4) * 10);
+		CHECK(points[offset].x != parent.x || points[offset].y != parent.y);
+		Coord3D again;
+		CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, offset, &again));
+		CHECK(again.x == points[offset].x && again.y == points[offset].y && again.z == points[offset].z);
+		for (Int previous = 0; previous < offset; ++previous)
+			CHECK(points[previous].x != points[offset].x || points[previous].y != points[offset].y);
+	}
+	CHECK(points[0].x == 4960 && points[0].y == 4960);
+	CHECK(points[39].x == 4990 && points[39].y == 5000);
+	CHECK(points[40].x == 5010 && points[40].y == 5000);
+	CHECK(points[79].x == 5040 && points[79].y == 5040);
+	// Enumerate the complete prospective parent/offset universe and check every
+	// accepted center against the unchanged full formation/footprint envelope.
+	Int accepted = 0, rejected = 0;
+	for (Int parentIndex = 0; parentIndex < 130; ++parentIndex)
+		for (Int offset = 0; offset < 80; ++offset)
+		{
+			Coord3D center;
+			if (GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, parentIndex, offset, &center))
+			{
+				++accepted;
+				CHECK(center.x >= 587 && center.x <= 3593);
+				CHECK(center.y >= 556 && center.y <= 3574);
+			}
+			else ++rejected;
+		}
+	CHECK(accepted > 0 && rejected > 0 && accepted + rejected == 10400);
+	struct GuardedCenter { Int before; Coord3D value; Int after; } guarded;
+	guarded.before = 123; guarded.after = 456;
+	guarded.value.x = 901; guarded.value.y = 902; guarded.value.z = 903;
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, -1, &guarded.value));
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, 80, &guarded.value));
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 130, 0, &guarded.value));
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, 0, nullptr));
+	// Exact-fit envelope cannot admit a nonzero shift; outputs remain intact.
+	for (Int offset = 0; offset < 80; ++offset)
+		CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 1174, 1112, 49, offset, &guarded.value));
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(1, 0, 0, 10000, 24, 0, &guarded.value));
+	ProcessTestOptions().benchmarkProfile = BENCHMARK_PROFILE_MECHANIZED_256;
+	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, 0, &guarded.value));
+	CHECK(guarded.before == 123 && guarded.after == 456);
+	CHECK(guarded.value.x == 901 && guarded.value.y == 902 && guarded.value.z == 903);
+	const Int cap = RENDERED_BATTLE_BENCHMARK_REFINEMENT_UNARY_CAP;
+	CHECK(CanRenderedBattleBenchmarkRefinementQuery(0, 9));
+	CHECK(CanRenderedBattleBenchmarkRefinementQuery(cap - 9, 9));
+	CHECK(!CanRenderedBattleBenchmarkRefinementQuery(cap - 8, 9));
+	CHECK(CanRenderedBattleBenchmarkRefinementQuery(cap - 512, 512));
+	CHECK(!CanRenderedBattleBenchmarkRefinementQuery(cap - 511, 512));
+	CHECK(!CanRenderedBattleBenchmarkRefinementQuery(-1, 9));
+	CHECK(!CanRenderedBattleBenchmarkRefinementQuery(cap, 9));
+	CHECK(!CanRenderedBattleBenchmarkRefinementQuery(0, 0));
+	CHECK(!CanRenderedBattleBenchmarkRefinementQuery(0, -1));
+	CHECK(!CanRenderedBattleBenchmarkRefinementQuery(2147483647, 9));
+	ProcessTestOptions() = saved;
+}
+
 static void TestRenderedBattleDiagnosticContract()
 {
 	TestRenderedBattleProfileObjectNames();
 	TestRenderedBattleNamedGeometryAndArenaRetention();
+	TestRenderedBattleMechanizedRefinement();
 	TestRenderedBattleDiagnosticSearch();
 	TestRenderedBattleDiagnosticLocalPlacement();
 

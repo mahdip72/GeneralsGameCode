@@ -130,7 +130,10 @@ enum
 	RENDERED_BATTLE_BENCHMARK_INSET_Y = 460,
 	RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS = 4000000,
 	RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS = 16000000,
-	RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP = 130
+	RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP = 130,
+	RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS = 80,
+	RENDERED_BATTLE_BENCHMARK_REFINEMENT_CANDIDATE_CAP = 10400,
+	RENDERED_BATTLE_BENCHMARK_REFINEMENT_UNARY_CAP = 4000000
 };
 struct RenderedBattleBenchmarkGeometry
 {
@@ -181,6 +184,12 @@ RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
 Int GetRenderedBattleDiagnosticSearchCount(Real loX, Real loY, Real hiX, Real hiY, Bool benchmark = FALSE);
 Bool GetRenderedBattleDiagnosticSearchCenter(Real loX, Real loY, Real hiX, Real hiY,
 	Int candidate, Coord3D *center, Bool benchmark = FALSE);
+// Explicit mechanized512 only. Row-major 10-unit shifts in [-40,40], omitting
+// zero; reject outside the complete inset envelope, never clamp. No world queries.
+Bool IsRenderedBattleBenchmarkRefinementEligible(Bool benchmark);
+Bool CanRenderedBattleBenchmarkRefinementQuery(Int used, Int queries);
+Bool GetRenderedBattleBenchmarkRefinementCenter(Real loX, Real loY, Real hiX, Real hiY,
+	Int parentCandidate, Int offsetIndex, Coord3D *center);
 // Fixed local stencil, mirrored in X by battle side; no RNG or world queries.
 Bool GetRenderedBattleDiagnosticLocalOffset(Int slot, Int trial, Coord3D *offset);
 // Geometry radii are the uninflated template radii. Same total clearance as
