@@ -94,6 +94,7 @@ if(WIN32 AND NOT IS_VS6_BUILD)
     set(renderer_sea_wave_pixel_shader_header "${renderer_generated_dir}/LegacySeaWavePS.h")
     set(renderer_textured_vertex_shader_header "${renderer_generated_dir}/LegacyTexturedVS.h")
     set(renderer_textured_unweighted_vertex_shader_header "${renderer_generated_dir}/LegacyTexturedUnweightedVS.h")
+    set(renderer_instanced_vertex_shader_header "${renderer_generated_dir}/LegacyRigidInstancedVS.h")
     set(renderer_textured_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedPS.h")
     set(renderer_textured_fixed1_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedFixed1PS.h")
     set(renderer_textured_fixed2_pixel_shader_header "${renderer_generated_dir}/LegacyTexturedFixed2PS.h")
@@ -262,6 +263,17 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         VERBATIM
     )
 
+    add_custom_command(
+        OUTPUT "${renderer_instanced_vertex_shader_header}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${renderer_generated_dir}"
+        COMMAND "${RTS_FXC_EXECUTABLE}" /nologo /T vs_5_0 /E VSTextured
+            /D LEGACY_UNWEIGHTED_VERTEX_INPUT=1 /D LEGACY_RIGID_INSTANCED_INPUT=1
+            /Fh "${renderer_instanced_vertex_shader_header}"
+            /Vn g_LegacyRigidInstancedVS "${renderer_shader_source}"
+        DEPENDS "${renderer_shader_source}"
+        VERBATIM
+    )
+
     target_sources(core_renderer PRIVATE
         D3D11RenderDevice.cpp
         ThreadedRenderDevice.cpp
@@ -273,6 +285,7 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         "${renderer_sea_wave_pixel_shader_header}"
         "${renderer_textured_vertex_shader_header}"
         "${renderer_textured_unweighted_vertex_shader_header}"
+        "${renderer_instanced_vertex_shader_header}"
         "${renderer_textured_pixel_shader_header}"
         "${renderer_textured_fixed1_pixel_shader_header}"
         "${renderer_textured_fixed2_pixel_shader_header}"
@@ -293,6 +306,11 @@ if(WIN32 AND NOT IS_VS6_BUILD)
     target_compile_definitions(core_renderer PUBLIC
         RTS_RENDERER_HAS_D3D11=1
     )
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        # The game-owned metrics implementation exists only in the native x64 graph.
+        target_compile_definitions(core_renderer PUBLIC
+            RTS_RENDERER_RIGID_INSTANCING_METRICS=1)
+    endif()
     target_link_libraries(core_renderer PRIVATE
         core_task_runtime
         d3d11

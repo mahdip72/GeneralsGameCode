@@ -11,6 +11,39 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import analyze_r1 as r1
 
+EXPECTED_R2_PROFILE_ROSTERS = {
+    "combined_arms_256": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.combined-arms-256.v1",
+        "units_per_player": 32, "template_counts": (4, 4, 12, 12),
+        "unit_type_sequence": "00001111222222222222333333333333",
+    },
+    "combined_arms_512": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.combined-arms-512.v1",
+        "units_per_player": 64, "template_counts": (8, 8, 24, 24),
+        "unit_type_sequence": "0123012301230123012301230123012323232323232323232323232323232323",
+    },
+    "mechanized_256": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.mechanized-256.v1",
+        "units_per_player": 32, "template_counts": (16, 16, 0, 0),
+        "unit_type_sequence": "00000000000000001111111111111111",
+    },
+    "mechanized_512": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.mechanized-512.v1",
+        "units_per_player": 64, "template_counts": (32, 32, 0, 0),
+        "unit_type_sequence": "0000000000000000000000000000000011111111111111111111111111111111",
+    },
+    "infantry_line_256": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.infantry-line-256.v1",
+        "units_per_player": 32, "template_counts": (0, 0, 16, 16),
+        "unit_type_sequence": "22222222222222223333333333333333",
+    },
+    "infantry_line_512": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.infantry-line-512.v1",
+        "units_per_player": 64, "template_counts": (0, 0, 32, 32),
+        "unit_type_sequence": "2222222222222222222222222222222233333333333333333333333333333333",
+    },
+}
+
 
 def make_csv(path, ends, positive=(), export_delta=0, failed=()):
     rows = []
@@ -202,6 +235,38 @@ class VisualCaptureTests(unittest.TestCase):
         for frame in (151, 301, 451, 601):
             self.lines.append(f"RENDERED_BATTLE_DIAGNOSTIC_SAMPLE frame={frame} alive0=256 alive1=256 health0=100 health1=100 position_sum0=10 position_sum1=10 attacking=512 camera=combat")
         self.lines.append("RENDERED_BATTLE_DIAGNOSTIC_COMPLETE reason=frame_cap terminal_sample=fresh_cap_sample created=512 engine_exit_code=0 diagnostic_exit_code=0 executable_sha256=" + "a" * 64)
+        self.legacy_lines = list(self.lines)
+
+    def profile_fixture(self, profile_id):
+        expected = EXPECTED_R2_PROFILE_ROSTERS[profile_id]
+        per_player = expected["units_per_player"]
+        total = per_player * 8
+        template_counts = expected["template_counts"]
+        roster_contract = expected["roster_contract"]
+        phase_contract = r1.R2_PHASE_CONTRACT
+        alive = total // 2
+        lines = [self.legacy_lines[0],
+                 f"RENDERED_BATTLE_BENCHMARK_PROFILE schema={r1.R2_PROFILE_SCHEMA} id={profile_id} roster_contract={roster_contract} phase_contract={phase_contract} units_per_player={per_player} total_units={total}",
+                 self.legacy_lines[1],
+                 self.legacy_lines[2].replace("created=512", f"created={total}"),
+                 self.legacy_lines[3],
+                 f"RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS profile_id={profile_id} roster_contract={roster_contract}",
+                 f"RENDERED_BATTLE_BENCHMARK_PLANNER_SUMMARY profile_id={profile_id} roster_contract={roster_contract}",
+                 f"RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin frame=1 tick=10 qpc=1000 qpc_frequency=1000 warmup_frames=150 measure_frames=450 logic_target_hz=30 render_pacing=uncapped resolution=1920x1080 windowed=1 fps_source=present_trace profile_id={profile_id} phase_contract={phase_contract}",
+                 f"RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin frame=151 tick=20 qpc=10000 qpc_frequency=1000 alive0={alive} alive1={alive} attacking={total} profile_id={profile_id} phase_contract={phase_contract}",
+                 f"RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop frame=601 tick=30 qpc=14000 qpc_frequency=1000 complete=1 warmup_frames=150 requested_measure_frames=450 actual_measure_frames=450 measured_attack_samples=450 measured_loss_samples=0 alive0={alive} alive1={alive} attacking={total} fps_source=present_trace profile_id={profile_id} phase_contract={phase_contract}"]
+        factions = ("FactionAmerica", "FactionChina", "FactionGLA", "FactionAmerica")
+        for slot in range(8):
+            faction_index = 0 if slot % 4 == 3 else slot % 4
+            templates = ",".join(name + ":" + str(count) for name, count in
+                                  zip(r1.ROSTER_TEMPLATES[faction_index], template_counts))
+            ids = ",".join(str(value) for value in range(slot * per_player + 1,
+                                                          (slot + 1) * per_player + 1))
+            lines.append(f"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot={slot} faction={factions[slot % 4]} team={int(slot >= 4)} count={per_player} templates={templates} profile_id={profile_id} roster_contract={roster_contract} unit_type_sequence={expected['unit_type_sequence']} ids={ids}")
+        for frame in (151, 301, 451, 601):
+            lines.append(f"RENDERED_BATTLE_DIAGNOSTIC_SAMPLE frame={frame} alive0={alive} alive1={alive} health0=100 health1=100 position_sum0=10 position_sum1=10 attacking={total} camera=combat")
+        lines.append(f"RENDERED_BATTLE_DIAGNOSTIC_COMPLETE reason=frame_cap terminal_sample=fresh_cap_sample created={total} engine_exit_code=0 diagnostic_exit_code=0 executable_sha256=" + "a" * 64)
+        return lines
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -225,6 +290,226 @@ class VisualCaptureTests(unittest.TestCase):
         self.assertEqual(fixture["seed"], 637808953)
         self.assertEqual(fixture["phase"]["warmup_frames"], 150)
         self.assertEqual(fixture["phase"]["measured_frames"], 450)
+        self.assertIsNone(fixture["render_admission_metrics"])
+
+    def test_all_six_named_r2_profiles_accept_their_frozen_roster_and_phase_contracts(self):
+        self.assertEqual(set(EXPECTED_R2_PROFILE_ROSTERS), set(r1.R2_PROFILE_CONTRACTS))
+        for profile_id, expected in EXPECTED_R2_PROFILE_ROSTERS.items():
+            with self.subTest(profile=profile_id):
+                sequence = expected["unit_type_sequence"]
+                self.assertEqual(len(sequence), expected["units_per_player"])
+                self.assertEqual(tuple(sequence.count(str(kind)) for kind in range(4)),
+                                 expected["template_counts"])
+                contract = r1.R2_PROFILE_CONTRACTS[profile_id]
+                self.assertEqual(contract["units_per_player"], expected["units_per_player"])
+                self.assertEqual(contract["template_counts"], expected["template_counts"])
+                self.assertEqual(contract["unit_type_sequence"], sequence)
+                self.assertEqual(contract["roster_contract"], expected["roster_contract"])
+                self.lines = self.profile_fixture(profile_id)
+                self.write()
+                fixture = r1.diagnostic(self.path, self.ready)
+                self.assertEqual(fixture["profile_contract"]["profile_id"], profile_id)
+                self.assertEqual(fixture["profile_contract"]["roster_contract"], expected["roster_contract"])
+                self.assertEqual(fixture["profile_contract"]["total_units"], expected["units_per_player"] * 8)
+                self.assertEqual(fixture["profile_contract"]["unit_type_sequence"], sequence)
+                self.assertEqual(len(fixture["roster"]), 8)
+                self.assertEqual(fixture["profile_contract"]["phase_contract"], r1.R2_PHASE_CONTRACT)
+                self.assertEqual(fixture["phase"], {"qpc_frequency": 1000, "begin": 10000,
+                    "stop": 14000, "seconds": 4.0, "warmup_frames": 150, "measured_frames": 450})
+
+    def reject_named_phase_field(self, phase, field, value, message):
+        self.lines = self.profile_fixture("combined_arms_256")
+        index = next(i for i, line in enumerate(self.lines)
+                     if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=" + phase + " "))
+        fields = self.lines[index].split()
+        self.assertEqual(sum(token.startswith(field + "=") for token in fields), 1)
+        self.lines[index] = " ".join(field + "=" + value if token.startswith(field + "=") else token
+                                     for token in fields)
+        self.write()  # Preserve the actual fixed marker count and completed footer.
+        with self.assertRaisesRegex(r1.Reject, message):
+            r1.diagnostic(self.path, self.ready)
+
+    def test_named_profile_contradictory_logic_target_is_rejected(self):
+        self.reject_named_phase_field("warmup_begin", "logic_target_hz", "600", "R2 warmup logic target")
+
+    def test_named_profile_contradictory_requested_measure_frames_are_rejected(self):
+        self.reject_named_phase_field("measurement_stop", "requested_measure_frames", "99", "R2 stop requested measure frames")
+
+    def test_named_profile_contradictory_stop_warmup_frames_are_rejected(self):
+        self.reject_named_phase_field("measurement_stop", "warmup_frames", "99", "R2 stop warmup frames")
+
+    def test_named_profile_contradictory_stop_fps_source_is_rejected(self):
+        self.reject_named_phase_field("measurement_stop", "fps_source", "logic_update", "R2 stop FPS source")
+
+    def test_named_profile_warmup_qpc_requires_positive_canonical_order(self):
+        for value in ("999999", "14000", "10000", "0", "-1", "01000", "1000.5", "+1000"):
+            with self.subTest(value=value):
+                self.reject_named_phase_field("warmup_begin", "qpc", value, "R2 warmup QPC")
+
+    def test_optional_rigid_draw_metrics_are_separate_from_workload_and_fps_evidence(self):
+        self.lines = self.profile_fixture("combined_arms_256")
+        warm_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin "))
+        stop_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop "))
+        fields = ("captured_draws", "instanced_batches", "instanced_instances",
+                  "singleton_ordinary", "unsupported_fallbacks",
+                  "ordinary_fallback_draws", "rejected_draws")
+        warm_values = (100, 4, 96, 3, 2, 7, 0)
+        stop_values = (130, 7, 120, 5, 4, 11, 1)
+        def suffix(frame, values, status=0):
+            pairs = ["rigid_metrics_schema=" + r1.RIGID_METRICS_SCHEMA,
+                     "rigid_metrics_status=" + str(status), "rigid_logic_frame=" + str(frame)]
+            pairs.extend("rigid_" + key + "=" + str(value) for key, value in zip(fields, values))
+            return " " + " ".join(pairs)
+        self.lines[warm_index] += suffix(1, warm_values)
+        self.lines[stop_index] += suffix(601, stop_values)
+        self.write()
+        fixture = r1.diagnostic(self.path, self.ready)
+        receipt = fixture["render_admission_metrics"]
+        self.assertTrue(receipt["available"])
+        self.assertEqual(receipt["logic_frames"], {"warmup_begin": 1, "measurement_stop": 601})
+        self.assertEqual(receipt["counter_delta_scope"], {
+            "first_logic_frame": 1, "last_logic_frame": 601, "elapsed_logic_frames": 600,
+            "warmup_frames": 150, "measured_frames": 450})
+        self.assertEqual(receipt["warmup_plus_measurement_delta"], {
+            "captured_draws": 30, "instanced_batches": 3, "instanced_instances": 24,
+            "singleton_ordinary": 2, "unsupported_fallbacks": 2,
+            "ordinary_fallback_draws": 4, "rejected_draws": 1})
+        self.assertNotIn("render_admission_metrics", fixture["profile_contract"])
+        self.assertIn("admission and route-attempt", receipt["interpretation"])
+        self.assertIn("not GPU completion", receipt["interpretation"])
+
+        self.lines[warm_index] = self.lines[warm_index].replace("rigid_metrics_status=0", "rigid_metrics_status=2")
+        self.lines[stop_index] = self.lines[stop_index].replace("rigid_metrics_status=0", "rigid_metrics_status=2")
+        self.write()
+        unavailable = r1.diagnostic(self.path, self.ready)["render_admission_metrics"]
+        self.assertFalse(unavailable["available"])
+        self.assertIsNone(unavailable["warmup_plus_measurement_delta"])
+
+    def test_legacy_default_rejects_rigid_metrics_without_profile_marker(self):
+        self.lines = list(self.legacy_lines)
+        warm_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin "))
+        stop_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop "))
+        metric_fields = ("captured_draws", "instanced_batches", "instanced_instances",
+                         "singleton_ordinary", "unsupported_fallbacks",
+                         "ordinary_fallback_draws", "rejected_draws")
+
+        def metric_suffix(frame):
+            fields = ["rigid_metrics_schema=" + r1.RIGID_METRICS_SCHEMA,
+                      "rigid_metrics_status=0", "rigid_logic_frame=" + str(frame)]
+            fields.extend("rigid_" + name + "=0" for name in metric_fields)
+            return " " + " ".join(fields)
+
+        # This is a complete, correctly aligned pair on the legacy 512-unit
+        # diagnostic. It must fail only because that run has no named R2 profile.
+        self.lines[warm_index] += metric_suffix(1)
+        self.lines[stop_index] += metric_suffix(601)
+        self.write()
+        with self.assertRaisesRegex(r1.Reject,
+                                    "rigid-draw metrics require an explicit R2 profile"):
+            r1.diagnostic(self.path, self.ready)
+
+    def test_rigid_draw_metrics_reject_partial_unknown_misaligned_and_nonmonotonic_receipts(self):
+        base = self.profile_fixture("mechanized_256")
+        warm_index = next(i for i, line in enumerate(base)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin "))
+        stop_index = next(i for i, line in enumerate(base)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop "))
+        begin_index = next(i for i, line in enumerate(base)
+                           if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin "))
+        def with_metrics():
+            lines = list(base)
+            values = "rigid_metrics_schema=" + r1.RIGID_METRICS_SCHEMA + " rigid_metrics_status=0 rigid_logic_frame={frame} rigid_captured_draws={draws} " \
+                "rigid_instanced_batches=4 rigid_instanced_instances=80 rigid_singleton_ordinary=0 " \
+                "rigid_unsupported_fallbacks=0 rigid_ordinary_fallback_draws=0 rigid_rejected_draws=0"
+            lines[warm_index] += " " + values.format(frame=1, draws=10)
+            lines[stop_index] += " " + values.format(frame=601, draws=20)
+            return lines
+        mutations = (
+            ("missing stop snapshot", lambda lines: lines.__setitem__(stop_index, lines[stop_index].split(" rigid_metrics_schema=")[0])),
+            ("partial fields", lambda lines: lines.__setitem__(warm_index, lines[warm_index].replace(" rigid_rejected_draws=0", ""))),
+            ("duplicate field", lambda lines: lines.__setitem__(warm_index, lines[warm_index] + " rigid_captured_draws=10")),
+            ("unknown field", lambda lines: lines.__setitem__(stop_index, lines[stop_index] + " rigid_gpu_completions=2")),
+            ("unknown schema", lambda lines: lines.__setitem__(stop_index, lines[stop_index].replace(r1.RIGID_METRICS_SCHEMA, "ggc.r2.rendered-battle-rigid-draw-metrics.v2"))),
+            ("wrong logic frame", lambda lines: lines.__setitem__(warm_index, lines[warm_index].replace("rigid_logic_frame=1", "rigid_logic_frame=2"))),
+            ("negative counter", lambda lines: lines.__setitem__(stop_index, lines[stop_index].replace("rigid_rejected_draws=0", "rigid_rejected_draws=-1"))),
+            ("decreasing counter", lambda lines: lines.__setitem__(stop_index, lines[stop_index].replace("rigid_captured_draws=20", "rigid_captured_draws=9"))),
+            ("unknown status", lambda lines: lines.__setitem__(stop_index, lines[stop_index].replace("rigid_metrics_status=0", "rigid_metrics_status=9"))),
+            ("metrics on middle phase", lambda lines: lines.__setitem__(begin_index, lines[begin_index] + " rigid_metrics_status=0")),
+        )
+        for label, mutate in mutations:
+            with self.subTest(case=label):
+                self.lines = with_metrics()
+                mutate(self.lines)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_r2_profile_rejects_unknown_schema_density_and_partial_identity(self):
+        base = self.profile_fixture("combined_arms_256")
+        profile_index = next(i for i, line in enumerate(base)
+                             if line.startswith("RENDERED_BATTLE_BENCHMARK_PROFILE "))
+        mutations = (
+            lambda line: line.replace("id=combined_arms_256", "id=unknown_profile"),
+            lambda line: line.replace(r1.R2_PROFILE_SCHEMA, "ggc.r2.rendered-battle-profile.v2"),
+            lambda line: line.replace("total_units=256", "total_units=512"),
+            lambda line: line.replace(" phase_contract=" + r1.R2_PHASE_CONTRACT, ""),
+            lambda line: line + " unexpected=1",
+        )
+        for mutate in mutations:
+            with self.subTest(marker=mutate(base[profile_index])):
+                self.lines = list(base)
+                self.lines[profile_index] = mutate(self.lines[profile_index])
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_r2_roster_rejects_wrong_template_mix_or_unit_type_sequence(self):
+        base = self.profile_fixture("mechanized_256")
+        roster_index = next(i for i, line in enumerate(base)
+                            if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_ROSTER "))
+        for old, new in (("AmericaTankCrusader:16", "AmericaTankCrusader:15"),
+                         ("unit_type_sequence=" + r1.R2_PROFILE_CONTRACTS["mechanized_256"]["unit_type_sequence"],
+                          "unit_type_sequence=" + "1" * 16 + "0" * 16)):
+            with self.subTest(replacement=new):
+                self.lines = list(base)
+                self.lines[roster_index] = self.lines[roster_index].replace(old, new)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_r2_identity_must_repeat_on_each_roster_and_measured_phase(self):
+        base = self.profile_fixture("infantry_line_512")
+        roster_index = next(i for i, line in enumerate(base)
+                            if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_ROSTER "))
+        phase_index = next(i for i, line in enumerate(base)
+                           if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin "))
+        changes = (
+            (roster_index, "roster_contract=ggc.r2.rendered-battle.roster.infantry-line-512.v1",
+             "roster_contract=ggc.r2.rendered-battle.roster.infantry-line-256.v1"),
+            (roster_index, "profile_id=infantry_line_512", "profile_id=mechanized_512"),
+            (phase_index, "phase_contract=" + r1.R2_PHASE_CONTRACT,
+             "phase_contract=ggc.r2.rendered-battle.phase.other.v1"),
+            (phase_index, "profile_id=infantry_line_512", "profile_id=combined_arms_512"),
+        )
+        for index, old, new in changes:
+            with self.subTest(old=old):
+                self.lines = list(base)
+                self.lines[index] = self.lines[index].replace(old, new)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_stripped_r2_profile_marker_cannot_fall_back_to_legacy_512(self):
+        self.lines = self.profile_fixture("combined_arms_512")
+        self.lines = [line for line in self.lines
+                      if not line.startswith("RENDERED_BATTLE_BENCHMARK_PROFILE ")]
+        self.write()
+        with self.assertRaisesRegex(r1.Reject, "profile identity fields appear without"):
+            r1.diagnostic(self.path, self.ready)
 
     def test_diagnostic_requires_literal_seed_even_when_requests_match(self):
         original = self.lines[0]
@@ -432,6 +717,22 @@ class ComparisonTests(unittest.TestCase):
         self.assertFalse(result["stage_accepted"])
         self.assertEqual(result["stage_status"], "not_evaluated")
         self.assertGreater(result["mean_fps_delta"], 0)
+
+    def test_comparison_rejects_mixed_named_profile_and_legacy_default_identity(self):
+        reports = [comparison_run("baseline", 1), comparison_run("baseline", 2),
+                   comparison_run("candidate", 1), comparison_run("candidate", 2)]
+        profile = {"schema": r1.R2_PROFILE_SCHEMA, "profile_id": "combined_arms_512",
+                   "roster_contract": r1.R2_PROFILE_CONTRACTS["combined_arms_512"]["roster_contract"],
+                   "phase_contract": r1.R2_PHASE_CONTRACT, "units_per_player": 64,
+                   "total_units": 512, "template_counts": (8, 8, 24, 24),
+                   "unit_type_sequence": r1.R2_PROFILE_CONTRACTS["combined_arms_512"]["unit_type_sequence"]}
+        for report in reports[:3]:
+            report["workload_identity"]["profile_contract"] = profile
+        with patch.object(r1, "analyze", side_effect=reports):
+            result = r1.comparison(["b1", "b2"], ["c1", "c2"], 500, 500)
+        self.assertFalse(result["data_comparable"])
+        self.assertTrue(any("fixture profile_contract mismatch" in reason
+                            for rejection in result["rejections"] for reason in rejection["reasons"]))
 
     def test_comparison_rejects_different_captured_affinity(self):
         reports = [comparison_run("baseline", 1), comparison_run("baseline", 2),

@@ -18,6 +18,23 @@ ROSTER_TEMPLATES = (
     ("ChinaTankBattleMaster", "ChinaTankGattling", "ChinaInfantryRedguard", "ChinaInfantryTankHunter"),
     ("GLATankScorpion", "GLAVehicleTechnical", "GLAInfantryRebel", "GLAInfantryTunnelDefender"),
 )
+R2_PROFILE_SCHEMA = "ggc.r2.rendered-battle-profile.v1"
+R2_PHASE_CONTRACT = "ggc.r2.rendered-battle.phase.normal30hz-150-450-1080p.v1"
+RIGID_METRICS_SCHEMA = "ggc.r2.rendered-battle-rigid-draw-metrics.v1"
+RIGID_METRIC_FIELDS = {
+    "rigid_metrics_schema", "rigid_metrics_status", "rigid_logic_frame", "rigid_captured_draws",
+    "rigid_instanced_batches", "rigid_instanced_instances",
+    "rigid_singleton_ordinary", "rigid_unsupported_fallbacks",
+    "rigid_ordinary_fallback_draws", "rigid_rejected_draws",
+}
+R2_PROFILE_CONTRACTS = {
+    "combined_arms_256": {"roster_contract":"ggc.r2.rendered-battle.roster.combined-arms-256.v1", "units_per_player":32, "template_counts":(4,4,12,12), "unit_type_sequence":"00001111222222222222333333333333"},
+    "combined_arms_512": {"roster_contract":"ggc.r2.rendered-battle.roster.combined-arms-512.v1", "units_per_player":64, "template_counts":(8,8,24,24), "unit_type_sequence":"0123"*8+"23"*16},
+    "mechanized_256": {"roster_contract":"ggc.r2.rendered-battle.roster.mechanized-256.v1", "units_per_player":32, "template_counts":(16,16,0,0), "unit_type_sequence":"0"*16+"1"*16},
+    "mechanized_512": {"roster_contract":"ggc.r2.rendered-battle.roster.mechanized-512.v1", "units_per_player":64, "template_counts":(32,32,0,0), "unit_type_sequence":"0"*32+"1"*32},
+    "infantry_line_256": {"roster_contract":"ggc.r2.rendered-battle.roster.infantry-line-256.v1", "units_per_player":32, "template_counts":(0,0,16,16), "unit_type_sequence":"2"*16+"3"*16},
+    "infantry_line_512": {"roster_contract":"ggc.r2.rendered-battle.roster.infantry-line-512.v1", "units_per_player":64, "template_counts":(0,0,32,32), "unit_type_sequence":"2"*32+"3"*32},
+}
 
 class Reject(Exception): pass
 
@@ -128,6 +145,89 @@ def sparse_sample(r, frame):
     req(r.get("camera")=="combat","sample.camera must be combat")
     sample["camera"]="combat"
     return sample
+
+def rendered_battle_profile(marker):
+    expected_keys={"schema","id","roster_contract","phase_contract","units_per_player","total_units"}
+    pairs=KV.findall(marker["_line"])
+    keys=[key for key,_ in pairs]
+    req(len(keys)==len(set(keys)) and set(keys)==expected_keys,
+        "R2 profile identity fields are duplicate, missing, or unknown")
+    value=fields(marker["_line"])
+    req(value.get("schema")==R2_PROFILE_SCHEMA,"R2 profile schema mismatch")
+    profile_id=value.get("id")
+    contract=R2_PROFILE_CONTRACTS.get(profile_id)
+    req(contract is not None,"unknown R2 rendered-battle profile")
+    units_per_player=contract["units_per_player"]
+    total_units=8*units_per_player
+    req(value.get("roster_contract")==contract["roster_contract"],"R2 roster contract identity mismatch")
+    req(value.get("phase_contract")==R2_PHASE_CONTRACT,"R2 phase contract identity mismatch")
+    req(num(value.get("units_per_player"),"R2 units_per_player")==units_per_player and
+        num(value.get("total_units"),"R2 total_units")==total_units,
+        "R2 profile density identity mismatch")
+    return {"schema":R2_PROFILE_SCHEMA,"profile_id":profile_id,
+            "roster_contract":contract["roster_contract"],"phase_contract":R2_PHASE_CONTRACT,
+            "units_per_player":units_per_player,"total_units":total_units,
+            "template_counts":contract["template_counts"],
+            "unit_type_sequence":contract["unit_type_sequence"]}
+
+def rendered_battle_rigid_metrics(warm, stop, begin):
+    def marker_fields(marker):
+        pairs=KV.findall(marker["_line"])
+        keys=[key for key,_ in pairs]
+        req(len(keys)==len(set(keys)),"rigid-draw metrics marker contains duplicate fields")
+        rigid_keys={key for key in keys if key.startswith("rigid_")}
+        req(rigid_keys.issubset(RIGID_METRIC_FIELDS),"rigid-draw metrics marker contains unknown fields")
+        return rigid_keys
+    warm_fields=marker_fields(warm)
+    stop_fields=marker_fields(stop)
+    begin_fields=marker_fields(begin)
+    req(not begin_fields,"rigid-draw metrics are only valid at warmup start and phase end")
+    req(bool(warm_fields)==bool(stop_fields),"rigid-draw metrics receipt is missing one phase snapshot")
+    if not warm_fields:
+        return None
+    req(warm_fields==RIGID_METRIC_FIELDS and stop_fields==RIGID_METRIC_FIELDS,
+        "rigid-draw metrics snapshot is incomplete")
+    snapshots=[]
+    for marker,label in ((warm,"warmup_begin"),(stop,"measurement_stop")):
+        req(marker.get("rigid_metrics_schema")==RIGID_METRICS_SCHEMA,
+            label+" rigid metrics schema mismatch")
+        status=num(marker.get("rigid_metrics_status"),label+" rigid metrics status")
+        frame=num(marker.get("rigid_logic_frame"),label+" rigid metrics logic frame")
+        req(0<=status<=5,"rigid-draw metrics status is unknown")
+        req(frame==num(marker.get("frame"),label+" frame"),
+            "rigid-draw metrics logic frame differs from its phase marker")
+        counters={key:num(marker.get("rigid_"+key),label+" rigid "+key) for key in (
+            "captured_draws","instanced_batches","instanced_instances","singleton_ordinary",
+            "unsupported_fallbacks","ordinary_fallback_draws","rejected_draws")}
+        req(all(value>=0 for value in counters.values()),"rigid-draw metrics counters must be nonnegative")
+        snapshots.append({"status":status,"logic_frame":frame,"counters":counters})
+    available=all(snapshot["status"]==0 for snapshot in snapshots)
+    first_logic_frame=snapshots[0]["logic_frame"]
+    last_logic_frame=snapshots[1]["logic_frame"]
+    elapsed_logic_frames=last_logic_frame-first_logic_frame
+    req(elapsed_logic_frames==600,
+        "rigid-draw metrics snapshots must span all 150 warm-up and 450 measured logic frames")
+    delta=None
+    if available:
+        req(all(snapshots[1]["counters"][key]>=snapshots[0]["counters"][key]
+                for key in snapshots[0]["counters"]),
+            "cumulative rigid-draw metrics decreased between snapshots")
+        delta={key:snapshots[1]["counters"][key]-snapshots[0]["counters"][key]
+               for key in snapshots[0]["counters"]}
+    return {"schema":RIGID_METRICS_SCHEMA,
+            "available":available,
+            "status":{"warmup_begin":snapshots[0]["status"],
+                      "measurement_stop":snapshots[1]["status"]},
+            "logic_frames":{"warmup_begin":snapshots[0]["logic_frame"],
+                            "measurement_stop":snapshots[1]["logic_frame"]},
+            "counter_delta_scope":{"first_logic_frame":first_logic_frame,
+                                    "last_logic_frame":last_logic_frame,
+                                    "elapsed_logic_frames":elapsed_logic_frames,
+                                    "warmup_frames":150,"measured_frames":450},
+            "cumulative_counters":{"warmup_begin":snapshots[0]["counters"],
+                                    "measurement_stop":snapshots[1]["counters"]},
+            "warmup_plus_measurement_delta":delta,
+            "interpretation":"native render-path admission and route-attempt counters across the full 150-frame warm-up plus 450-frame measured span; not GPU completion or FPS qualification"}
 
 def shadow_experiment(ready, root):
     raw=ready.get("shadow_experiment")
@@ -317,6 +417,11 @@ def diagnostic(path, ready):
     rec=[]
     for line in lines:
         d=fields(line); d["_line"]=line; rec.append(d)
+    profile_lines=[line for line in lines if line.startswith("RENDERED_BATTLE_BENCHMARK_PROFILE")]
+    req(len(profile_lines)<=1 and (not profile_lines or
+        profile_lines[0].startswith("RENDERED_BATTLE_BENCHMARK_PROFILE ")),
+        "duplicate or malformed R2 profile identity marker")
+    profile=rendered_battle_profile(one(rec,"RENDERED_BATTLE_BENCHMARK_PROFILE ")) if profile_lines else None
     begin=one(rec,"RENDERED_BATTLE_DIAGNOSTIC_BEGIN "); start=one(rec,"RENDERED_BATTLE_DIAGNOSTIC_START "); staged=one(rec,"RENDERED_BATTLE_DIAGNOSTIC_STAGED ")
     seed=num(begin.get("seed"),"diagnostic seed")
     req(seed==637808953 and seed==requested_fixture_seed(ready),"diagnostic seed differs from the required requested fixture seed")
@@ -330,7 +435,10 @@ def diagnostic(path, ready):
     records=sum(x.startswith("RENDERED_BATTLE_") and not x.startswith("RENDERED_BATTLE_DIAGNOSTIC_REPORT_WRITE ") for x in lines)
     req(num(footer.get("records"),"footer.records")==records,"diagnostic record footer count mismatch")
     req(done.get("reason")=="frame_cap" and done.get("terminal_sample")=="fresh_cap_sample","fixture did not end at the normal frame cap")
-    req(num(done.get("created"),"created")==num(staged.get("created"),"staged.created")==512,"fixture did not create 512 units")
+    expected_units=profile["total_units"] if profile else 512
+    expected_units_per_player=profile["units_per_player"] if profile else 64
+    req(num(done.get("created"),"created")==num(staged.get("created"),"staged.created")==expected_units,
+        "fixture created-unit count differs from its profile")
     req(num(done.get("engine_exit_code"),"engine_exit_code")==num(done.get("diagnostic_exit_code"),"diagnostic_exit_code")==0,"diagnostic/game exit failed")
     req(start.get("expected_players")=="8" and start.get("expected_ai")=="7" and start.get("expected_teams")=="4v4" and start.get("pacing")=="render_uncapped_logic30","fixture player or pacing identity mismatch")
     req(warm.get("fps_source")=="present_trace" and warm.get("render_pacing")=="uncapped" and warm.get("resolution")=="1920x1080" and warm.get("windowed")=="1","unexpected benchmark mode")
@@ -340,19 +448,70 @@ def diagnostic(path, ready):
     req(begin.get("map")=="Fortress_Avalanche" and pre.get("map_crc") and pre.get("map_size"),"map identity missing")
     rosters=[r for r in rec if r["_line"].startswith("RENDERED_BATTLE_DIAGNOSTIC_ROSTER ")]
     req(len(rosters)==8,"expected eight roster lines")
+    if profile:
+        phase_keys={
+            "warmup_begin":{"phase","frame","tick","qpc","qpc_frequency","warmup_frames","measure_frames","logic_target_hz","render_pacing","resolution","windowed","fps_source","profile_id","phase_contract"},
+            "measurement_begin":{"phase","frame","tick","qpc","qpc_frequency","alive0","alive1","attacking","profile_id","phase_contract"},
+            "measurement_stop":{"phase","frame","tick","qpc","qpc_frequency","complete","warmup_frames","requested_measure_frames","actual_measure_frames","measured_attack_samples","measured_loss_samples","alive0","alive1","attacking","fps_source","profile_id","phase_contract"},
+        }
+        for phase_name,marker in (("warmup_begin",warm),("measurement_begin",mb),("measurement_stop",ms)):
+            keys=[key for key,_ in KV.findall(marker["_line"])]
+            expected=phase_keys[phase_name]
+            actual=set(keys)
+            allowed=(expected,expected|RIGID_METRIC_FIELDS) if phase_name in ("warmup_begin","measurement_stop") else (expected,)
+            req(len(keys)==len(set(keys)) and actual in allowed,
+                "R2 phase marker fields are duplicate, missing, or unknown")
+            req(marker.get("profile_id")==profile["profile_id"] and
+                marker.get("phase_contract")==profile["phase_contract"],
+                "R2 phase marker identity mismatch")
+        req(num(warm.get("logic_target_hz"),"R2 warmup logic target")==30,
+            "R2 warmup logic target differs from the fixed 30Hz phase contract")
+        req(num(ms.get("warmup_frames"),"R2 stop warmup_frames")==150,
+            "R2 stop warmup frames differ from the fixed phase contract")
+        req(num(ms.get("requested_measure_frames"),"R2 stop requested_measure_frames")==450,
+            "R2 stop requested measure frames differ from the fixed phase contract")
+        req(ms.get("fps_source")=="present_trace",
+            "R2 stop FPS source differs from the fixed Present-trace contract")
+        for marker in rosters:
+            keys=[key for key,_ in KV.findall(marker["_line"])]
+            req(len(keys)==len(set(keys)) and set(keys)==
+                {"slot","faction","team","count","templates","profile_id","roster_contract","unit_type_sequence","ids"},
+                "R2 roster marker fields are duplicate, missing, or unknown")
+            req(marker.get("profile_id")==profile["profile_id"] and
+                marker.get("roster_contract")==profile["roster_contract"],
+                "R2 roster marker identity mismatch")
+            req(marker.get("unit_type_sequence")==profile["unit_type_sequence"],
+                "R2 roster unit sequence differs from its immutable profile contract")
+        for prefix in ("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS ",
+            "RENDERED_BATTLE_BENCHMARK_PLANNER_SUMMARY "):
+            marker=one(rec,prefix)
+            req(marker.get("profile_id")==profile["profile_id"] and
+                marker.get("roster_contract")==profile["roster_contract"],
+                "R2 placement marker identity mismatch")
+    else:
+        for marker in rosters+[warm,mb,ms]:
+            req(not any(key in marker for key in ("profile_id","roster_contract","phase_contract")),
+                "profile identity fields appear without an R2 profile marker")
+    render_admission_metrics=rendered_battle_rigid_metrics(warm,ms,mb)
+    req(profile is not None or render_admission_metrics is None,
+        "rigid-draw metrics require an explicit R2 profile")
     sig=[]; allids=[]
     factions=("FactionAmerica","FactionChina","FactionGLA","FactionAmerica")
     for slot,r in enumerate(sorted(rosters,key=lambda x:num(x.get("slot"),"roster slot"))):
-        req(num(r.get("slot"),"roster slot")==slot and r.get("faction")==factions[slot%4] and num(r.get("team"),"team")==int(slot>=4) and num(r.get("count"),"count")==64,"roster slot differs from 512-unit fixture")
+        req(num(r.get("slot"),"roster slot")==slot and r.get("faction")==factions[slot%4] and num(r.get("team"),"team")==int(slot>=4) and num(r.get("count"),"count")==expected_units_per_player,"roster slot differs from the declared workload profile")
         ids=[num(x,"object ID") for x in r.get("ids","").split(",") if x]
-        req(len(ids)==64 and len(set(ids))==64,"roster object IDs incomplete or duplicated"); allids.extend(ids)
-        expected_templates=",".join(name+":"+str(count) for name,count in zip(ROSTER_TEMPLATES[0 if slot%4==3 else slot%4],(8,8,24,24)))
-        req(r.get("templates")==expected_templates,"roster template mix differs from fixed R1 fixture")
+        req(len(ids)==expected_units_per_player and len(set(ids))==expected_units_per_player,"roster object IDs incomplete or duplicated"); allids.extend(ids)
+        expected_counts=profile["template_counts"] if profile else (8,8,24,24)
+        expected_templates=",".join(name+":"+str(count) for name,count in zip(ROSTER_TEMPLATES[0 if slot%4==3 else slot%4],expected_counts))
+        req(r.get("templates")==expected_templates,"roster template mix differs from its immutable profile contract")
         sig.append({k:r.get(k) for k in ("slot","faction","team","count","templates")})
-    req(len(set(allids))==512,"roster does not contain 512 unique objects")
+    req(len(set(allids))==expected_units,"roster does not contain the declared number of unique objects")
     freq=num(warm.get("qpc_frequency"),"warmup frequency"); qb=num(mb.get("qpc"),"measurement begin QPC"); qe=num(ms.get("qpc"),"measurement stop QPC")
     f0=num(warm.get("frame"),"warmup frame"); fb=num(mb.get("frame"),"measurement begin frame"); fe=num(ms.get("frame"),"measurement stop frame")
     req(freq>0 and qb>0 and qe>qb and num(mb.get("qpc_frequency"),"begin frequency")==freq and num(ms.get("qpc_frequency"),"stop frequency")==freq,"phase QPC clocks invalid")
+    if profile:
+        qw=num(warm.get("qpc"),"R2 warmup QPC")
+        req(qw>0 and qw<qb,"R2 warmup QPC must be positive and precede measurement begin")
     req(fb-f0==150 and fe-fb==450 and num(staged.get("frame"),"staged frame")==f0,"frame markers do not delimit exact 150+450 workload")
     cam=staged.get("camera"); req(cam and staged.get("yaw")=="default" and staged.get("pitch")=="default" and staged.get("zoom")=="1" and staged.get("scripted_camera")=="stopped" and staged.get("camera_lock")=="none","fixed combat camera identity invalid")
     state={k:num(mb.get(k),"begin."+k) for k in ("alive0","alive1","attacking")}
@@ -365,7 +524,7 @@ def diagnostic(path, ready):
         req(len(found)==1,"missing/duplicate measured state sample at frame "+str(frame))
         sparse.append(sparse_sample(found[0],frame))
     state["sparse_samples"]=sparse
-    return {"seed":num(begin["seed"],"seed"),"map":start.get("map"),"map_crc":pre["map_crc"].upper(),"map_size":num(pre["map_size"],"map size"),"camera":cam,"roster":sig,"state":state,"phase":{"qpc_frequency":freq,"begin":qb,"stop":qe,"seconds":(qe-qb)/freq,"warmup_frames":150,"measured_frames":450}}
+    return {"seed":num(begin["seed"],"seed"),"map":start.get("map"),"map_crc":pre["map_crc"].upper(),"map_size":num(pre["map_size"],"map size"),"camera":cam,"roster":sig,"state":state,"profile_contract":({k:profile[k] for k in ("schema","profile_id","roster_contract","phase_contract","units_per_player","total_units","template_counts","unit_type_sequence")} if profile else None),"render_admission_metrics":render_admission_metrics,"phase":{"qpc_frequency":freq,"begin":qb,"stop":qe,"seconds":(qe-qb)/freq,"warmup_frames":150,"measured_frames":450}}
 
 def pct(xs,p):
     if not xs:return None
@@ -610,8 +769,8 @@ def analyze(directory, edge_ms=500.0, long_ms=500.0, multipage_proof=None):
     else:
         window,window_reasons=window_evidence(load(wp),ready,fixture["phase"]); reasons.extend(window_reasons)
     identity.update(game_pid=ready["game"]["pid"],game_started_utc=ready["game"]["started_utc"],window_mode=window["mode"] if window else None,present_swap_interval=fps["swap_interval"],measurement_run_identity=measurement_run_identity({"present":fps,"phase":fixture["phase"]}))
-    workload={k:fixture[k] for k in ("seed","map","map_crc","map_size","camera","roster","state")}; workload["phase_shape"]={"warmup_frames":150,"measured_frames":450}
-    return {"schema":"ggc.r1-present-analysis.v1","run_directory":str(root),"qualified":not reasons,"qualification_failures":reasons,"identity":identity,"experiment_settings":{"shadow":identity["shadow_experiment"]},"experiment_paths":{"shadow_diagnostics":identity["shadow_diagnostics_path"]},"workload_identity":workload,"phase":fixture["phase"],"present":fps,"window_observations":window,"effective_quality_evidence":quality,"notes":["FPS is successful native Present completion count divided by exact measurement QPC duration.","Present completion is not scanout evidence. `presentGpu` verifies effective 1920x1080 resolution, 8x MSAA resolve, and native hardware adapter identity from sampled frame records; it does not record effective anisotropic filtering or driver name/version.","GPU query records are a bounded subset; quality evidence is accepted when at least one successful measured-phase GPU row joins uniquely to Present. Timestamp-query coverage is reported separately and does not need to equal the Present row count.","Shadow upload/reuse options are recorded as experiment settings and are not effective-quality evidence.","`minimalPresent` and the existing `detailed` analysis remain effective-quality unmeasured. A `minimalPresent` comparison establishes data comparability for descriptive FPS only; stage status remains not_evaluated."]}
+    workload={k:fixture[k] for k in ("seed","map","map_crc","map_size","camera","roster","state","profile_contract")}; workload["phase_shape"]={"warmup_frames":150,"measured_frames":450}
+    return {"schema":"ggc.r1-present-analysis.v1","run_directory":str(root),"qualified":not reasons,"qualification_failures":reasons,"identity":identity,"experiment_settings":{"shadow":identity["shadow_experiment"]},"experiment_paths":{"shadow_diagnostics":identity["shadow_diagnostics_path"]},"workload_identity":workload,"phase":fixture["phase"],"present":fps,"render_admission_metrics":fixture["render_admission_metrics"],"window_observations":window,"effective_quality_evidence":quality,"notes":["FPS is successful native Present completion count divided by exact measurement QPC duration.","Present completion is not scanout evidence. `presentGpu` verifies effective 1920x1080 resolution, 8x MSAA resolve, and native hardware adapter identity from sampled frame records; it does not record effective anisotropic filtering or driver name/version.","GPU query records are a bounded subset; quality evidence is accepted when at least one successful measured-phase GPU row joins uniquely to Present. Timestamp-query coverage is reported separately and does not need to equal the Present row count.","Optional rigid-draw counters are reported as native render-path admission statistics; they are not GPU completion evidence and do not affect FPS qualification.","Shadow upload/reuse options are recorded as experiment settings and are not effective-quality evidence.","`minimalPresent` and the existing `detailed` analysis remain effective-quality unmeasured. A `minimalPresent` comparison establishes data comparability for descriptive FPS only; stage status remains not_evaluated."]}
 
 def comparison_result(data_comparable, **details):
     return {"schema":"ggc.r1-comparison.v1","data_comparable":data_comparable,"stage_accepted":False,"stage_status":"not_evaluated","accepted":data_comparable,"accepted_deprecated":True,"compatibility_note":"accepted is a deprecated alias for data_comparable; it never means stage approval.","comparison_note":"Comparability permits descriptive FPS summaries only; a positive delta is not a stage-approved performance gain.",**details}
@@ -705,7 +864,7 @@ def comparison(baseline,candidate,edge_ms,long_ms,multipage_proofs=None):
     if runs[0]["identity"].get("telemetry")=="presentGpu":
         for key in ("gpu_adapter_identity","effective_quality_contract"):
             same(runs,key,"presentGpu "+key)
-    for key in ("seed","map","map_crc","map_size","camera","roster","state"):
+    for key in ("seed","map","map_crc","map_size","camera","roster","state","profile_contract"):
         first=runs[0]["workload_identity"].get(key)
         for r in runs[1:]:
             if canon(r["workload_identity"].get(key))!=canon(first):reject.append({"run":r["run_directory"],"reasons":["fixture "+key+" mismatch"]})

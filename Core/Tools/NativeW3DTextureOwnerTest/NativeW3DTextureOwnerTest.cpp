@@ -2,6 +2,7 @@
 #include "nativew3dtextureowner.h"
 #include "Renderer/NativeW3DRenderer.h"
 #include "Renderer/NativeW3DRenderState.h"
+#include "Renderer/RenderGameClientNative.h"
 #include "nativew3dsorting.h"
 
 #include <atomic>
@@ -1697,11 +1698,119 @@ int TestDeferredTextureRetentionCpu()
 	return result;
 }
 
+int TestRigidFailureDestructorRetirement()
+{
+	using namespace rts::render;
+	class StickyFailureOwner : public IGameRenderClientNativeOwner
+	{
+	public:
+		explicit StickyFailureOwner(NativeW3DResources &resources) :
+			table(resources), sticky(false), failure(RENDER_RESULT_FAILED), liveAtBarrier(0),
+			leaseOutput(0), clearedOutputsAtBarrier(0), sourceQueries(0) {}
+		bool IsInitialized() const override { return true; }
+		bool IsOperational() const override { return true; }
+		GameRenderTargetKind ActiveRenderTargetKind() const override
+			{ return GAME_RENDER_TARGET_BACK_BUFFER; }
+		RenderResult FlushGameRigidDraws() override
+		{
+			if (!sticky) return RENDER_RESULT_OK;
+			if (table.IsValid(watched)) ++liveAtBarrier;
+			if (leaseOutput != 0 && !leaseOutput->isValid()) ++clearedOutputsAtBarrier;
+			return failure;
+		}
+		RenderResult GetGameActiveColorTargetInfo(RenderBackBufferInfo *, GpuHandle *) const override
+		{
+			++sourceQueries;
+			return RENDER_RESULT_FAILED;
+		}
+		NativeW3DResources &table;
+		GpuHandle watched;
+		bool sticky;
+		RenderResult failure;
+		unsigned int liveAtBarrier;
+		NativeW3DGpuContentLease *leaseOutput;
+		unsigned int clearedOutputsAtBarrier;
+		mutable unsigned int sourceQueries;
+	};
+	int result = 0;
+	for (unsigned int mode = 0; mode < 3; ++mode)
+	{
+		FakeRenderDevice device;
+		NativeW3DResourceHost host(8);
+		NativeW3DResources resources(16);
+		result |= Check(host.Attach(&device, device.immediateContext()) == RENDER_RESULT_OK &&
+			resources.BindHost(&host) == RENDER_RESULT_OK &&
+			BindNativeW3DTextureResources(&resources) == RENDER_RESULT_OK,
+			"sticky rigid failure texture fixture binds a real cleanup table");
+		StickyFailureOwner gameOwner(resources);
+		IGameRenderClientNativeOwner *previous = GetGameRenderClientNativeOwner();
+		SetGameRenderClientNativeOwner(&gameOwner);
+		unsigned char top[64] = {}, lower[16] = {};
+		TextureSubresourceData data[2];
+		MakeCpuData(top, lower, data);
+		const unsigned int destroyedBefore = device.DestroyCount();
+		{
+			NativeW3DTextureOwner owner;
+			NativeW3DTextureCandidate candidate;
+			result |= Check(owner.CreateCandidate(MakeCpuDescriptor(), data, 2,
+				&candidate) == RENDER_RESULT_OK, "sticky fixture creates a real owned candidate");
+			gameOwner.watched = candidate.Handle().resource;
+			if (mode != 0)
+				result |= Check(owner.PublishCandidate(&candidate, 0) == RENDER_RESULT_OK,
+					"sticky fixture transfers the actual ticket to a publication");
+			gameOwner.sticky = true;
+			NativeW3DGpuContentLease staleLease;
+			staleLease.resource = gameOwner.watched;
+			staleLease.attachmentGeneration = 1;
+			staleLease.backendEpoch = 1;
+			staleLease.authorityEpoch = 1;
+			result |= Check(staleLease.isValid(), "sticky lease-output fixture starts with a nonempty prior token");
+			NativeW3DGpuContentLease outputLease = staleLease;
+			gameOwner.leaseOutput = &outputLease;
+			result |= Check(owner.PublishOutputWrite(NativeW3DSurfaceHandle(), &outputLease) ==
+				RENDER_RESULT_FAILED && !outputLease.isValid(),
+				"failed rigid barrier clears the publication output lease before returning");
+			outputLease = staleLease;
+			result |= Check(owner.CopyActiveColorTarget(&outputLease) == RENDER_RESULT_FAILED &&
+				!outputLease.isValid() && gameOwner.clearedOutputsAtBarrier == 2 &&
+				gameOwner.sourceQueries == 0 && resources.IsValid(gameOwner.watched) &&
+				device.DestroyCount() == destroyedBefore && gameOwner.failure == RENDER_RESULT_FAILED,
+				"lease outputs are cleared before the barrier with no source query or resource mutation");
+			gameOwner.leaseOutput = 0;
+			if (mode == 2) device.FailDestroy(true);
+		} // Candidate and published owner destruct while the barrier stays failed.
+		result |= Check(gameOwner.liveAtBarrier != 0 &&
+			gameOwner.failure == RENDER_RESULT_FAILED &&
+			!resources.IsValid(gameOwner.watched),
+			"failed rigid barrier precedes mandatory retirement and retains its original failure");
+		result |= Check(device.DestroyCount() == destroyedBefore + (mode == 2 ? 0U : 1U),
+			"candidate/publication destructors retire once or transfer the failed exact slot");
+		SetGameRenderClientNativeOwner(previous);
+		result |= Check(UnbindNativeW3DTextureResources(&resources) == RENDER_RESULT_OK,
+			"sticky failure fixture unbinds publication without a stranded candidate");
+		if (mode == 2)
+		{
+			result |= Check(resources.Shutdown() == RENDER_RESULT_FAILED && device.LiveCount() == 1,
+				"rejected backend destruction remains reachable as a table-owned retired slot");
+			device.FailDestroy(false);
+		}
+		result |= Check(resources.Shutdown() == RENDER_RESULT_OK && device.LiveCount() == 0 &&
+			device.DestroyCount() == destroyedBefore + 1 &&
+			resources.BindHost(&host) == RENDER_RESULT_OK && resources.Shutdown() == RENDER_RESULT_OK &&
+			host.Detach() == RENDER_RESULT_OK,
+			"sticky failure destructors leave no orphan ticket blocking shutdown or rebind");
+	}
+	return result;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc == 2 && std::strcmp(argv[1], "--rigid-failure-retirement-cpu") == 0)
+		return TestRigidFailureDestructorRetirement();
 	if (argc == 2 && std::strcmp(argv[1], "--deferred-texture-retention-cpu") == 0)
 		return TestDeferredTextureRetentionCpu();
 	return TestNeutralTextureOwnership() |
+		TestRigidFailureDestructorRetirement() |
 		TestDeferredTextureRetentionCpu() |
 		TestNativeD3D11RetirementFault() |
 		TestLateRegistryTicketLifetime() |

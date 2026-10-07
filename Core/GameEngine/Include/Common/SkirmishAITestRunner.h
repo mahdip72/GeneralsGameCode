@@ -129,8 +129,18 @@ enum
 	RENDERED_BATTLE_BENCHMARK_INSET_X = 503,
 	RENDERED_BATTLE_BENCHMARK_INSET_Y = 460,
 	RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS = 4000000,
-	RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS = 16000000
+	RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS = 16000000,
+	RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP = 130,
+	RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS = 80,
+	RENDERED_BATTLE_BENCHMARK_REFINEMENT_CANDIDATE_CAP = 10400,
+	RENDERED_BATTLE_BENCHMARK_REFINEMENT_UNARY_CAP = 4000000
 };
+struct RenderedBattleBenchmarkGeometry
+{
+	Int gridStep, extraOffset, bandStep, formationX, formationY, insetX, insetY, revealRadius;
+};
+RenderedBattleBenchmarkGeometry GetRenderedBattleBenchmarkGeometry();
+
 // Pure admission/roster helpers used by the production diagnostic and fixture.
 // Ordinary command lines are accepted unchanged when the new flag is absent.
 Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv,
@@ -174,16 +184,24 @@ RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
 Int GetRenderedBattleDiagnosticSearchCount(Real loX, Real loY, Real hiX, Real hiY, Bool benchmark = FALSE);
 Bool GetRenderedBattleDiagnosticSearchCenter(Real loX, Real loY, Real hiX, Real hiY,
 	Int candidate, Coord3D *center, Bool benchmark = FALSE);
+// Explicit mechanized512 only. Row-major 10-unit shifts in [-40,40], omitting
+// zero; reject outside the complete inset envelope, never clamp. No world queries.
+Bool IsRenderedBattleBenchmarkRefinementEligible(Bool benchmark);
+Bool CanRenderedBattleBenchmarkRefinementQuery(Int used, Int queries);
+Bool GetRenderedBattleBenchmarkRefinementCenter(Real loX, Real loY, Real hiX, Real hiY,
+	Int parentCandidate, Int offsetIndex, Coord3D *center);
 // Fixed local stencil, mirrored in X by battle side; no RNG or world queries.
 Bool GetRenderedBattleDiagnosticLocalOffset(Int slot, Int trial, Coord3D *offset);
 // Geometry radii are the uninflated template radii. Same total clearance as
 // the world occupancy gate: current+1, previous, then 2 additional units.
 Bool AreRenderedBattleDiagnosticPositionsSeparated(const Coord3D &a, Real radiusA,
 	const Coord3D &b, Real radiusB);
-// Retain at most eight arenas by descending valid prefix, ascending index.
-// Arrays have LOCAL_ARENA_CAP entries; rejected inserts preserve them/count.
+// Retain arenas by descending valid prefix, ascending index.
+// Legacy/default capacity remains eight; named profiles retain all 130 candidates.
+// Arrays have arenaCapacity entries; rejected inserts preserve them/count.
 Bool RememberRenderedBattleDiagnosticArena(Int candidate, Int validUnits,
-	Int *candidates, Int *validPrefixes, Int *count, Bool benchmark = FALSE);
+	Int *candidates, Int *validPrefixes, Int *count, Bool benchmark = FALSE,
+	Int arenaCapacity = RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP);
 // Bounded append: failure preserves the prior bytes and length.
 Bool AppendRenderedBattleDiagnosticReportRecord(char *buffer, UnsignedInt capacity,
 	UnsignedInt *used, const char *record, UnsignedInt recordBytes);

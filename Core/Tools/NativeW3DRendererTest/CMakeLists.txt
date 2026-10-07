@@ -16,3 +16,12 @@ add_test(NAME core_native_w3d_renderer_tests
     COMMAND core_native_w3d_renderer_tests
 )
 set_tests_properties(core_native_w3d_renderer_tests PROPERTIES TIMEOUT 30)
+
+add_executable(core_rigid_instancing_policy_tests
+    RigidInstancingPolicyTest.cpp)
+target_link_libraries(core_rigid_instancing_policy_tests PRIVATE core_renderer)
+set_target_properties(core_rigid_instancing_policy_tests PROPERTIES
+    CXX_STANDARD 98 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+add_test(NAME core_rigid_instancing_policy_tests
+    COMMAND core_rigid_instancing_policy_tests)
+set_tests_properties(core_rigid_instancing_policy_tests PROPERTIES TIMEOUT 30)

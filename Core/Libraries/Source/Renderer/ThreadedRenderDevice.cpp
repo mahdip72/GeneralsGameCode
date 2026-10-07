@@ -69,6 +69,10 @@ ThreadedIndexedDraw::ThreadedIndexedDraw(
 	InitializeThreadedIndexedDrawDefaults(*this);
 }
 
+ThreadedIndexedInstancedDraw::ThreadedIndexedInstancedDraw() : instanceCount(0) {}
+ThreadedIndexedInstancedDraw::ThreadedIndexedInstancedDraw(
+	const LegacyLogicalState &initialState) : shared(initialState), instanceCount(0) {}
+
 namespace
 {
 typedef detail::RenderPipelineStallTrace StallTrace;
@@ -188,7 +192,7 @@ enum Operation
 	OP_DESTROY, OP_UPDATE_BUFFER, OP_CLEAR, OP_TARGETS, OP_VIEWPORT,
 	OP_LEGACY_STATE, OP_LEGACY_LAYOUT, OP_VERTEX_BUFFER, OP_INDEX_BUFFER,
 	OP_TEXTURE, OP_TOPOLOGY, OP_DRAW, OP_DRAW_INDEXED, OP_COPY_COLOR,
-	OP_INDEXED_DRAW_RECORD
+	OP_INDEXED_DRAW_RECORD, OP_DRAW_INDEXED_INSTANCED, OP_INDEXED_INSTANCED_DRAW_RECORD
 };
 const char *OwnerOperationName(Operation operation)
 {
@@ -213,6 +217,8 @@ const char *OwnerOperationName(Operation operation)
 	case OP_DRAW_INDEXED: return "draw-indexed";
 	case OP_COPY_COLOR: return "copy-color";
 	case OP_INDEXED_DRAW_RECORD: return "indexed-record";
+	case OP_DRAW_INDEXED_INSTANCED: return "draw-indexed-instanced";
+	case OP_INDEXED_INSTANCED_DRAW_RECORD: return "indexed-instanced-record";
 	default: return "unknown";
 	}
 }
@@ -365,7 +371,7 @@ public:
 		const ThreadedRenderOptions &options) : m_factory(factory),
 		m_factoryContext(factoryContext), m_options(options),
 		m_producer(std::this_thread::get_id()), m_waiting(false), m_initialized(false),
-		m_started(false), m_stopping(false), m_operational(false),
+		m_started(false), m_stopping(false), m_operational(false), m_supportsRigidInstancing(false),
 		m_ownerExecuting(false),
 		m_initialResult(RENDER_RESULT_FAILED), m_infoResult(RENDER_RESULT_FAILED),
 		m_textureFilterCapabilitiesResult(RENDER_RESULT_FAILED),
@@ -408,6 +414,8 @@ public:
 	{
 		return m_operational.load(std::memory_order_acquire);
 	}
+	bool supportsRigidInstancing() const override
+	{ return m_supportsRigidInstancing.load(std::memory_order_acquire); }
 	RenderResult initialize(const RenderDeviceParameters &parameters) override;
 	void shutdown() override;
 	IRenderContext *immediateContext() override { return producer() && m_initialized ? this : 0; }
@@ -477,6 +485,8 @@ public:
 	RenderResult setPrimitiveTopology(RenderPrimitiveTopology) override;
 	RenderResult draw(unsigned int, unsigned int) override;
 	RenderResult drawIndexed(unsigned int, unsigned int, int) override;
+	RenderResult drawIndexedInstanced(unsigned int, unsigned int, int,
+		const RenderMatrix4 *, unsigned int) override;
 	RenderResult submitFrame(bool);
 	RenderResult cancelFrame(RenderResult);
 	RenderResult drain();
@@ -490,8 +500,10 @@ public:
 	}
 	bool metrics(ThreadedRenderMetrics *) const;
 	RenderResult indexedDraw(const ThreadedIndexedDraw &);
+	RenderResult indexedInstancedDraw(const ThreadedIndexedInstancedDraw &);
 
 private:
+	RenderResult indexedDrawRecord(const ThreadedIndexedDraw &, Operation, const void *, size_t);
 	bool producer() const { return std::this_thread::get_id() == m_producer && !m_waiting; }
 	bool usable() const { return producer() && m_initialized; }
 	RenderResult fail(RenderResult result, const char *operation,
@@ -572,13 +584,14 @@ private:
 		return value;
 	}
 	void publishMetadata(RenderResult, bool refreshInfo = false);
+	RenderResult refreshRigidInstancingCapability();
 
 	ThreadedRenderBackendFactory m_factory;
 	void *m_factoryContext;
 	ThreadedRenderOptions m_options;
 	std::thread::id m_producer;
 	bool m_waiting, m_initialized, m_started, m_stopping;
-	std::atomic<bool> m_operational;
+	std::atomic<bool> m_operational, m_supportsRigidInstancing;
 	bool m_ownerExecuting;
 	RenderResult m_initialResult, m_infoResult,
 		m_textureFilterCapabilitiesResult;
@@ -739,6 +752,8 @@ RenderResult ThreadedRenderDevice::append(Command command, const void *payload,
 	case OP_DRAW:
 	case OP_DRAW_INDEXED:
 	case OP_INDEXED_DRAW_RECORD:
+	case OP_DRAW_INDEXED_INSTANCED:
+	case OP_INDEXED_INSTANCED_DRAW_RECORD:
 		break;
 	default:
 		invalidateProducerTextureCache();
@@ -1104,6 +1119,7 @@ void ThreadedRenderDevice::shutdown()
 	m_thread.join();
 	m_trace.exportAfterJoin(m_thread);
 	m_initialized = false;
+	m_supportsRigidInstancing.store(false, std::memory_order_release);
 }
 
 bool ThreadedRenderDevice::poll(ThreadedRenderFrameCompletion *completion)
@@ -1472,7 +1488,37 @@ RenderResult ThreadedRenderDevice::drawIndexed(unsigned int count, unsigned int 
 	command.signedValue = base; return append(command);
 }
 
+RenderResult ThreadedRenderDevice::drawIndexedInstanced(unsigned int count,
+	unsigned int first, int base, const RenderMatrix4 *worlds, unsigned int instanceCount)
+{
+	if (!usable() || !m_recording || m_ended || !worlds || instanceCount < 2 ||
+		instanceCount > RENDER_RIGID_INSTANCE_MAX || !count)
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
+	if (!supportsRigidInstancing()) return RENDER_RESULT_UNSUPPORTED;
+	ThreadedIndexedInstancedDraw owned;
+	owned.instanceCount = instanceCount;
+	for (unsigned int i = 0; i < instanceCount; ++i) owned.worlds[i] = worlds[i];
+	Command command(OP_DRAW_INDEXED_INSTANCED);
+	command.integers[0] = count; command.integers[1] = first; command.signedValue = base;
+	return append(command, &owned, sizeof(owned));
+}
+
+RenderResult ThreadedRenderDevice::indexedInstancedDraw(const ThreadedIndexedInstancedDraw &draw)
+{
+	if (!usable() || !m_recording || m_ended || draw.instanceCount < 2 ||
+		draw.instanceCount > RENDER_RIGID_INSTANCE_MAX || !draw.shared.bindIndexBuffer)
+		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
+	if (!supportsRigidInstancing()) return RENDER_RESULT_UNSUPPORTED;
+	return indexedDrawRecord(draw.shared, OP_INDEXED_INSTANCED_DRAW_RECORD, &draw, sizeof(draw));
+}
+
 RenderResult ThreadedRenderDevice::indexedDraw(const ThreadedIndexedDraw &draw)
+{
+	return indexedDrawRecord(draw, OP_INDEXED_DRAW_RECORD, &draw, sizeof(draw));
+}
+
+RenderResult ThreadedRenderDevice::indexedDrawRecord(const ThreadedIndexedDraw &draw,
+	Operation operation, const void *payload, size_t payloadBytes)
 {
 	if (!usable() || !m_recording || m_ended ||
 		!valid(draw.vertexBuffer, false) || !valid(draw.indexBuffer, false) ||
@@ -1497,7 +1543,7 @@ RenderResult ThreadedRenderDevice::indexedDraw(const ThreadedIndexedDraw &draw)
 		draw.indexCount > (indexBytes - draw.indexOffset) / indexSize - draw.startIndex ||
 		draw.vertexOffset > vertexBytes || draw.vertexStride > vertexBytes - draw.vertexOffset)
 		return fail(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
-	Command command(OP_INDEXED_DRAW_RECORD);
+	Command command(operation);
 	for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
 	{
 		const GpuHandle texture = draw.textures[stage];
@@ -1513,7 +1559,7 @@ RenderResult ThreadedRenderDevice::indexedDraw(const ThreadedIndexedDraw &draw)
 	}
 	command.integers[1] = m_producerFailure != RENDER_RESULT_OK ||
 		!m_cachedTopologyKnown || m_cachedTopology != draw.topology;
-	const RenderResult result = append(command, &draw, sizeof(draw));
+	const RenderResult result = append(command, payload, payloadBytes);
 	if (result == RENDER_RESULT_OK)
 	{
 		for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT; ++stage)
@@ -1656,8 +1702,21 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 	switch (command.operation)
 	{
 	case OP_INDEXED_DRAW_RECORD:
+	case OP_INDEXED_INSTANCED_DRAW_RECORD:
 	{
-		const ThreadedIndexedDraw draw = read<ThreadedIndexedDraw>(packet, command.payloadOffset);
+		const bool instanced = command.operation == OP_INDEXED_INSTANCED_DRAW_RECORD;
+		const size_t required = instanced ? sizeof(ThreadedIndexedInstancedDraw) : sizeof(ThreadedIndexedDraw);
+		if (command.payloadOffset > packet.bytes.size() || required > packet.bytes.size() - command.payloadOffset)
+			return RENDER_RESULT_INVALID_ARGUMENT;
+		ThreadedIndexedDraw draw;
+		if (instanced)
+		{
+			const ThreadedIndexedInstancedDraw owned = read<ThreadedIndexedInstancedDraw>(packet, command.payloadOffset);
+			if (owned.instanceCount < 2 || owned.instanceCount > RENDER_RIGID_INSTANCE_MAX || !owned.shared.bindIndexBuffer)
+				return RENDER_RESULT_INVALID_ARGUMENT;
+			draw = owned.shared;
+		}
+		else draw = read<ThreadedIndexedDraw>(packet, command.payloadOffset);
 		RenderResult result = BackendCall([&] {
 			return draw.useVertexFormat ?
 				m_context->setLegacyState(draw.state, draw.vertexFormat, draw.texturePresenceMask) :
@@ -1712,7 +1771,8 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 			traceOwnerFailure(packet, RENDER_RESULT_INVALID_ARGUMENT, "index-reuse-validation", command.operation, &index);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
-		Command indexed(OP_DRAW_INDEXED); indexed.integers[0] = draw.indexCount;
+		Command indexed(instanced ? OP_DRAW_INDEXED_INSTANCED : OP_DRAW_INDEXED);
+		indexed.payloadOffset = command.payloadOffset; indexed.integers[0] = draw.indexCount;
 		indexed.integers[1] = draw.startIndex; indexed.signedValue = draw.baseVertex;
 		return component(indexed);
 	}
@@ -1944,6 +2004,7 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		return m_context->draw(u[0], u[1]);
 	}
 	case OP_DRAW_INDEXED:
+	case OP_DRAW_INDEXED_INSTANCED:
 	{
 		OwnerResource *indices = ownerResource(m_ownerIndexBuffer);
 		OwnerResource *vertices = ownerResource(m_ownerVertexBuffer);
@@ -1965,6 +2026,18 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		// Exact indexed vertex bytes are validated by NativeW3DResources before
 		// enqueue; the owner has no CPU index payload and therefore cannot derive
 		// min/max indices without duplicating a byte shadow.
+		if (command.operation == OP_DRAW_INDEXED_INSTANCED)
+		{
+			if (command.payloadOffset > packet.bytes.size() ||
+				sizeof(ThreadedIndexedInstancedDraw) > packet.bytes.size() - command.payloadOffset)
+				return RENDER_RESULT_INVALID_ARGUMENT;
+			const ThreadedIndexedInstancedDraw owned = read<ThreadedIndexedInstancedDraw>(packet, command.payloadOffset);
+			if (owned.instanceCount < 2 || owned.instanceCount > RENDER_RIGID_INSTANCE_MAX)
+				return RENDER_RESULT_INVALID_ARGUMENT;
+			writeTarget(m_ownerColorTarget, false); writeTarget(m_ownerDepthTarget, false);
+			return m_context->drawIndexedInstanced(u[0], u[1], command.signedValue,
+				owned.worlds, owned.instanceCount);
+		}
 		writeTarget(m_ownerColorTarget, false); writeTarget(m_ownerDepthTarget, false);
 		return m_context->drawIndexed(u[0], u[1], command.signedValue);
 	}
@@ -1983,12 +2056,31 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 	return RENDER_RESULT_UNSUPPORTED;
 }
 
+RenderResult ThreadedRenderDevice::refreshRigidInstancingCapability()
+{
+	// Only the backend owner calls this, after initialization or replacement.
+	// Clear first so an exception cannot retain the old device's capability.
+	m_supportsRigidInstancing.store(false, std::memory_order_release);
+	bool supported = false;
+	const RenderResult result = BackendCall([&] {
+		supported = m_backend->supportsRigidInstancing();
+		return RENDER_RESULT_OK;
+	});
+	if (result == RENDER_RESULT_OK)
+		m_supportsRigidInstancing.store(supported, std::memory_order_release);
+	return result;
+}
+
 void ThreadedRenderDevice::publishMetadata(RenderResult result, bool refreshInfo)
 {
 	RenderBackBufferInfo info;
 	RenderTextureFilterCapabilities textureFilterCapabilities;
 	bool operational = false;
-	if (result == RENDER_RESULT_DEVICE_REMOVED) m_ownerDeviceRemoved = true;
+	if (result == RENDER_RESULT_DEVICE_REMOVED)
+	{
+		m_ownerDeviceRemoved = true;
+		m_supportsRigidInstancing.store(false, std::memory_order_release);
+	}
 	try { operational = m_backend && m_backend->isOperational() && !m_ownerDeviceRemoved; }
 	catch (...) {}
 	const RenderResult infoResult = operational && refreshInfo ?
@@ -2002,6 +2094,8 @@ void ThreadedRenderDevice::publishMetadata(RenderResult result, bool refreshInfo
 		m_ownerDeviceRemoved = true;
 		operational = false;
 	}
+	if (m_ownerDeviceRemoved)
+		m_supportsRigidInstancing.store(false, std::memory_order_release);
 	std::lock_guard<std::mutex> lock(m_mutex);
 	m_operational.store(operational, std::memory_order_release);
 	if (refreshInfo || !operational)
@@ -2115,11 +2209,17 @@ void ThreadedRenderDevice::execute(Packet &packet)
 				}
 			}
 			m_context = m_backend->immediateContext();
+			if (result == RENDER_RESULT_OK && packet.reply->recovered)
+				result = m_context ? refreshRigidInstancingCapability() : RENDER_RESULT_FAILED;
+			if (result != RENDER_RESULT_OK)
+				m_supportsRigidInstancing.store(false, std::memory_order_release);
 			break;
 		case CONTROL_RECOVER:
 			result = BackendCall([&] { return m_backend->recoverDevice(); });
 			m_context = m_backend->immediateContext();
 			if (result == RENDER_RESULT_OK && !m_context) result = RENDER_RESULT_FAILED;
+			if (result == RENDER_RESULT_OK) result = refreshRigidInstancingCapability();
+			else m_supportsRigidInstancing.store(false, std::memory_order_release);
 			if (result == RENDER_RESULT_OK)
 			{
 				m_ownerDeviceRemoved = false;
@@ -2306,6 +2406,7 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 		{
 			m_context = m_backend->immediateContext();
 			if (!m_context) initial = RENDER_RESULT_FAILED;
+			else initial = refreshRigidInstancingCapability();
 		}
 		publishMetadata(initial, true);
 	}
@@ -2313,7 +2414,11 @@ void ThreadedRenderDevice::run(RenderDeviceParameters parameters)
 	{
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_initialResult = initial; m_started = true;
-		if (initial != RENDER_RESULT_OK) m_operational.store(false, std::memory_order_release);
+		if (initial != RENDER_RESULT_OK)
+		{
+			m_operational.store(false, std::memory_order_release);
+			m_supportsRigidInstancing.store(false, std::memory_order_release);
+		}
 		m_changed.notify_all();
 	}
 #if defined(_WIN64)
@@ -2420,6 +2525,12 @@ RenderResult SubmitThreadedIndexedDraw(IRenderDevice *device, const ThreadedInde
 {
 	ThreadedRenderDevice *threaded = dynamic_cast<ThreadedRenderDevice *>(device);
 	return threaded ? threaded->indexedDraw(draw) : RENDER_RESULT_UNSUPPORTED;
+}
+RenderResult SubmitThreadedIndexedInstancedDraw(IRenderDevice *device,
+	const ThreadedIndexedInstancedDraw &draw)
+{
+	ThreadedRenderDevice *threaded = dynamic_cast<ThreadedRenderDevice *>(device);
+	return threaded ? threaded->indexedInstancedDraw(draw) : RENDER_RESULT_UNSUPPORTED;
 }
 RenderResult SubmitThreadedRenderFrame(IRenderDevice *device, bool presentFrame)
 {

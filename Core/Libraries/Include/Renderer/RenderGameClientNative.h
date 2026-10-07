@@ -12,8 +12,11 @@
 #define RTS_RENDERER_RENDERGAMECLIENTNATIVE_H
 
 #include "Renderer/RendererDevice.h"
+#include "Utility/stdint_adapter.h"
 
 #include <stddef.h>
+
+class NativeW3D2;
 
 namespace rts
 {
@@ -23,6 +26,28 @@ namespace render
 struct GameBoundingSphere;
 struct GameRenderCleanupHook;
 struct NativeDrawPacket;
+struct GameRigidDrawMetrics
+{
+	GameRigidDrawMetrics() : capturedDraws(0), instancedBatches(0),
+		instancedInstances(0), singletonOrdinary(0), unsupportedFallbacks(0),
+		ordinaryFallbackDraws(0), rejectedDraws(0) {}
+	uint64_t capturedDraws;
+	uint64_t instancedBatches;
+	uint64_t instancedInstances;
+	uint64_t singletonOrdinary;
+	uint64_t unsupportedFallbacks;
+	uint64_t ordinaryFallbackDraws;
+	uint64_t rejectedDraws;
+};
+
+// Native rigid capture is owner-thread local. Hints are synchronous identities
+// only; queued draws own values and never retain these caller pointers.
+RenderResult BeginGameRigidDrawScope(const void *geometry, const void *category);
+void EndGameRigidDrawScope();
+RenderResult GetGameRigidDrawMetrics(GameRigidDrawMetrics *metrics);
+inline RenderResult FlushGameRigidDraws();
+// Internal owner seam also covers direct calls which bypass the command facade.
+RenderResult FlushNativeGameRigidDraws(::NativeW3D2 &owner);
 
 struct GameTextureFilterCapabilities
 {
@@ -270,6 +295,12 @@ class IGameRenderClientNativeOwner
 {
 public:
 	virtual ~IGameRenderClientNativeOwner() {}
+	virtual RenderResult BeginGameRigidDrawScope(const void *, const void *)
+		{ return RENDER_RESULT_UNSUPPORTED; }
+	virtual void EndGameRigidDrawScope() {}
+	virtual RenderResult FlushGameRigidDraws() { return RENDER_RESULT_OK; }
+	virtual RenderResult GetGameRigidDrawMetrics(GameRigidDrawMetrics *) const
+		{ return RENDER_RESULT_UNSUPPORTED; }
 	virtual bool IsInitialized() const = 0;
 	virtual bool IsOperational() const = 0;
 	// Owner-thread resource callbacks may release logical objects while the
@@ -536,6 +567,13 @@ private:
 	IGameRenderClientNativeOwner *m_owner;
 	bool m_locked;
 };
+
+inline RenderResult FlushGameRigidDraws()
+{
+	NativeGameRenderOwnerScope scope;
+	return scope.Get() != 0 ? scope.Get()->FlushGameRigidDraws() :
+		RENDER_RESULT_OK;
+}
 
 // Lifecycle code holds this same gate across clear/publish and teardown.
 // Reentrant acquisition is rejected: callers must check IsAcquired before

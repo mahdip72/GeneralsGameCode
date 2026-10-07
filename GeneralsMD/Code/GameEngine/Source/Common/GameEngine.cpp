@@ -34,6 +34,7 @@
 #include "Common/CRCDebug.h"
 #include "Common/FramePacer.h"
 #include "Lib/FrameTimingDiagnostics.h"
+#include "Common/AnimatedMenuBenchmark.h"
 #include "Common/GameThreadOwnership.h"
 #include "Common/Radar.h"
 #include "Common/PlayerTemplate.h"
@@ -1398,6 +1399,7 @@ void GameEngine::execute()
 			}
 		}
 		rts::frame_timing::EndFrame(TheGameLogic->getFrame());
+		rts::animated_menu::ObserveCompletedFrame();
 #if defined(_WIN64)
 		ObserveSkirmishAITestCompletedFrame(previousFrame);
 #endif

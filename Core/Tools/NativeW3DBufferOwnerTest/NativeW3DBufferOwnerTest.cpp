@@ -4,6 +4,7 @@
 #include "dx8vertexbuffer.h"
 #include "WW3D2/NativeW3DMeshCapacity.h"
 #include "Renderer/NativeW3DRenderer.h"
+#include "Renderer/RenderGameClientNative.h"
 #include "nativew3dline.h"
 
 #include <cstdio>
@@ -834,8 +835,105 @@ int RunFullOverwriteLockContract(FakeRenderDevice &device,
 
 }
 
+int RunRigidFailureDestructorRetirement()
+{
+	using namespace rts::render;
+	class StickyFailureOwner : public IGameRenderClientNativeOwner
+	{
+	public:
+		explicit StickyFailureOwner(NativeW3DResources &resources) :
+			table(resources), sticky(false), failure(RENDER_RESULT_FAILED), liveAtBarrier(0),
+			lockOutput(0), clearedOutputsAtBarrier(0) {}
+		bool IsInitialized() const override { return true; }
+		bool IsOperational() const override { return true; }
+		GameRenderTargetKind ActiveRenderTargetKind() const override
+			{ return GAME_RENDER_TARGET_BACK_BUFFER; }
+		RenderResult FlushGameRigidDraws() override
+		{
+			if (!sticky) return RENDER_RESULT_OK;
+			if (table.IsValid(watched)) ++liveAtBarrier;
+			if (lockOutput != 0 && *lockOutput == 0) ++clearedOutputsAtBarrier;
+			return failure;
+		}
+		NativeW3DResources &table;
+		GpuHandle watched;
+		bool sticky;
+		RenderResult failure;
+		unsigned int liveAtBarrier;
+		void **lockOutput;
+		unsigned int clearedOutputsAtBarrier;
+	};
+	int result = 0;
+	for (unsigned int mode = 0; mode < 3; ++mode)
+	{
+		FakeRenderDevice device;
+		NativeW3DResourceHost host(8);
+		NativeW3DResources resources(16);
+		result |= Check(host.Attach(&device, device.immediateContext()) == RENDER_RESULT_OK &&
+			resources.BindHost(&host) == RENDER_RESULT_OK &&
+			BindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK,
+			"sticky buffer fixture binds a real ticket table");
+		StickyFailureOwner gameOwner(resources);
+		IGameRenderClientNativeOwner *previous = GetGameRenderClientNativeOwner();
+		SetGameRenderClientNativeOwner(&gameOwner);
+		BufferDescriptor descriptor;
+		descriptor.byteCount = 36;
+		descriptor.stride = 12;
+		descriptor.binding = RENDER_BUFFER_VERTEX;
+		descriptor.usage = RENDER_USAGE_DEFAULT;
+		const unsigned int destroyedBefore = device.DestroyCount();
+		{
+			NativeW3DBufferOwner buffer;
+			result |= Check(buffer.Create(descriptor) == RENDER_RESULT_OK &&
+				buffer.AcquireVertexBinding(&gameOwner.watched) == RENDER_RESULT_OK,
+				"sticky buffer fixture creates an actual cleanup ticket and captures its identity");
+			gameOwner.sticky = true;
+			const unsigned int updatesBefore = device.UpdateCount();
+			void *outputData = reinterpret_cast<void *>(1);
+			gameOwner.lockOutput = &outputData;
+			result |= Check(buffer.Lock(0, 36, RENDER_BUFFER_UPDATE_PRESERVE, &outputData) ==
+				RENDER_RESULT_FAILED && outputData == 0,
+				"failed rigid flush clears an ordinary lock's previous output pointer");
+			outputData = reinterpret_cast<void *>(1);
+			result |= Check(buffer.LockForFullOverwrite(0, 36, RENDER_BUFFER_UPDATE_PRESERVE,
+				&outputData) == RENDER_RESULT_FAILED && outputData == 0 &&
+				gameOwner.clearedOutputsAtBarrier == 2 && !buffer.IsLocked() &&
+				device.UpdateCount() == updatesBefore && resources.IsValid(gameOwner.watched) &&
+				gameOwner.failure == RENDER_RESULT_FAILED,
+				"both lock outputs clear before the failed barrier without acquiring or updating storage");
+			gameOwner.lockOutput = 0;
+			if (mode == 1)
+				result |= Check(buffer.Reset() == RENDER_RESULT_FAILED &&
+					!resources.IsValid(gameOwner.watched),
+					"explicit Reset preserves the original draw error after mandatory cleanup");
+			if (mode == 2) device.FailDestroy(true);
+		}
+		result |= Check(gameOwner.liveAtBarrier != 0 &&
+			gameOwner.failure == RENDER_RESULT_FAILED && !resources.IsValid(gameOwner.watched) &&
+			device.DestroyCount() == destroyedBefore + (mode == 2 ? 0U : 1U),
+			"sticky failure buffer destructor releases exactly once without clearing its draw error");
+		SetGameRenderClientNativeOwner(previous);
+		result |= Check(UnbindNativeW3DBufferResources(&resources) == RENDER_RESULT_OK,
+			"sticky buffer fixture unbinds its exact publication");
+		if (mode == 2)
+		{
+			result |= Check(resources.Shutdown() == RENDER_RESULT_FAILED && device.LiveCount() == 1,
+				"failed physical buffer retirement remains owned and reachable for shutdown retry");
+			device.FailDestroy(false);
+		}
+		result |= Check(resources.Shutdown() == RENDER_RESULT_OK && device.LiveCount() == 0 &&
+			device.DestroyCount() == destroyedBefore + 1 &&
+			resources.BindHost(&host) == RENDER_RESULT_OK && resources.Shutdown() == RENDER_RESULT_OK &&
+			host.Detach() == RENDER_RESULT_OK,
+			"buffer destructor leaves no orphan ticket blocking shutdown or replacement binding");
+	}
+	return result;
+}
+
 int main(int argc, char **argv)
 {
+	if (argc == 2 && std::strcmp(argv[1], "--rigid-failure-retirement-cpu") == 0)
+		return RunRigidFailureDestructorRetirement();
 	using namespace rts::render;
 	int result = 0;
 	const bool baselineSafeAppendMode = argc == 2 &&
@@ -1607,6 +1705,7 @@ int main(int argc, char **argv)
 		host.Detach() == RENDER_RESULT_OK && device.LiveCount() == 0,
 		"registry shutdown leaves no native buffer resource alive");
 	result |= RunNativeLine3DDestroyFailureContract();
+	result |= RunRigidFailureDestructorRetirement();
 
 	return result;
 }

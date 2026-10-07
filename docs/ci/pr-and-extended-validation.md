@@ -15,17 +15,23 @@ normal Release options, with debug, profile, Tracy and ASAN disabled by default.
 They retain the production FFmpeg and native runtime dependency closure. The
 routine workflow does not install or publish a playable package.
 
-The anchored CTest allowlist contains thirteen tests per selected title:
+The anchored CTest allowlist contains seventeen tests per selected title:
 
 | Contract | Tests | Build targets |
 | --- | --- | --- |
 | Threaded renderer | `core_threaded_render_device_tests`, `core_threaded_render_device_native_tests`, `core_threaded_render_pipeline_stall_trace_tests` | First two names |
+| Native renderer instancing admission | `core_native_w3d_renderer_tests` | Same name |
+| Rigid instancing policy | `core_rigid_instancing_policy_tests` | Same name |
+| Game rigid draw batching | `core_game_rigid_draw_batch_tests` | Same name |
+| Mesh task failure and recovery | `core_native_mesh_task_lifetime_tests` | Same name |
 | Renderer ownership and state | `core_native_w3d_owner_queue_tests`, `core_native_w3d_render_state_tests` | Same names |
 | Task runtime | `core_task_runtime_tests` | Same name |
 | Parser boundaries | `core_chunkio_value_read_tests`, `core_replay_field_reader_tests` | Same names |
 | Deterministic CRC adapter | `core_deterministic_crc_runtime_adapter_tests` | `core_crc_runtime_tests` |
 | Title runtime and determinism | `{g,z}_skirmish_ai_runner_contract_tests`, `{g,z}_xfer_crc_snapshot_tests`, `{g,z}_texture_load_queue_contract_tests`, `{g,z}_skirmish_ai_replay_epoch_tests` | `g_skirmish_ai_runner_contract_tests` or `z_runtime_regression_tests` |
 
+The hardware instancing-parity case `d3d11_instancing_parity` remains a local
+Tier 2 opt-in through `RTS_BUILD_D3D11_HARDWARE_TESTS`; it is excluded from PR CI.
 The pipeline trace case shares its executable with the threaded renderer test.
 Title cases share their title runtime harness. The game targets are `g_generals`
 and `z_generals`. Native renderer fixtures can use D3D11 WARP on hosted Windows

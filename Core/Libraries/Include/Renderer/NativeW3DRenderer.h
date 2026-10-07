@@ -242,6 +242,15 @@ public:
 	RenderResult SubmitExternal(const NativeW3DResources &resources,
 		const LegacyLogicalState &state,
 		const NativeDrawPacket &packet);
+	// UNSUPPORTED is returned only before any context/queue side effect.
+	// Once admitted, failure is terminal: never replay as ordinary draws.
+	bool SupportsRigidInstancing() const;
+	RenderResult SubmitInstanced(const NativeW3DResources &resources,
+		const LegacyLogicalState &state, const NativeDrawPacket &packet,
+		const RenderMatrix4 *worlds, unsigned int instanceCount);
+	RenderResult SubmitInstancedExternal(const NativeW3DResources &resources,
+		const LegacyLogicalState &state, const NativeDrawPacket &packet,
+		const RenderMatrix4 *worlds, unsigned int instanceCount);
 	RenderResult GetBackBufferInfo(RenderBackBufferInfo *info) const;
 	RenderResult EndFrame(bool present);
 	// Finalize an already-ended owner-thread frame.  Capture/readback must run
@@ -311,6 +320,10 @@ private:
 		bool requireFacadeFrame,
 		NativeW3DTextureBindingCache *textureBindingCache,
 		NativeW3DSortedBatchBindingCache *sortedBatchBindingCache);
+	RenderResult SubmitInstancedInternal(const NativeW3DResources &resources,
+		const LegacyLogicalState &state, const NativeDrawPacket &packet,
+		const RenderMatrix4 *worlds, unsigned int instanceCount,
+		bool requireFacadeFrame);
 	RenderResult AttachBorrowedState(NativeW3DRenderState *state);
 	RenderResult DetachBorrowedState();
 	// Destruction can be initiated by a worker, but the backend and its
