@@ -4917,7 +4917,10 @@ Bool StageRenderedBattleDiagnostic()
 					// Nominal placements allocate no domain buffer. Allocate once only
 					// after the first local arena passes its center gate, inside this catch.
 					if (refinementEligible && placementDomains.empty())
-						placementDomains.resize(total * RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT);
+					{
+						try { placementDomains.resize(total * RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT); }
+						catch (...) { s_renderedBattle.setupFailure = "benchmark_planner_invalid"; return FALSE; }
+					}
 					if (!refinementEligible) arenaDomains.resize(total * RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT);
 					std::vector<Coord3D> &domains = refinementEligible ? placementDomains : arenaDomains;
 					memset(&domains[0], 0, total * RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT * sizeof(Coord3D));
