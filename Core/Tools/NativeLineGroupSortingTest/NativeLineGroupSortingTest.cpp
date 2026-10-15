@@ -151,6 +151,8 @@ public:
     bool IsOperational()const override{return operational;}
     GameRenderTargetKind ActiveRenderTargetKind()const override{return GAME_RENDER_TARGET_BACK_BUFFER;}
     void RecordGameFailure(RenderResult r)override{lastFailure=r;++failureCount;}
+    // Extracted production cases pass diagnostic provenance without changing failure semantics.
+    void RecordGameFailure(RenderResult r,const char *,unsigned int){RecordGameFailure(r);}
     RenderResult ExecuteSortedCase(const GameRenderCommand &command);
     RenderResult QueueGameSortedTriangles(const LegacyLogicalState &state,const NativeDrawPacket &packet,
         const void *vertices,size_t vertexBytes,const void *indices,size_t indexBytes,const GameBoundingSphere *sphere)override {

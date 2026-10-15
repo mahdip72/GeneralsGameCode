@@ -11,6 +11,39 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import analyze_r1 as r1
 
+EXPECTED_R2_PROFILE_ROSTERS = {
+    "combined_arms_256": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.combined-arms-256.v1",
+        "units_per_player": 32, "template_counts": (4, 4, 12, 12),
+        "unit_type_sequence": "00001111222222222222333333333333",
+    },
+    "combined_arms_512": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.combined-arms-512.v1",
+        "units_per_player": 64, "template_counts": (8, 8, 24, 24),
+        "unit_type_sequence": "0123012301230123012301230123012323232323232323232323232323232323",
+    },
+    "mechanized_256": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.mechanized-256.v1",
+        "units_per_player": 32, "template_counts": (16, 16, 0, 0),
+        "unit_type_sequence": "00000000000000001111111111111111",
+    },
+    "mechanized_512": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.mechanized-512.v1",
+        "units_per_player": 64, "template_counts": (32, 32, 0, 0),
+        "unit_type_sequence": "0000000000000000000000000000000011111111111111111111111111111111",
+    },
+    "infantry_line_256": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.infantry-line-256.v1",
+        "units_per_player": 32, "template_counts": (0, 0, 16, 16),
+        "unit_type_sequence": "22222222222222223333333333333333",
+    },
+    "infantry_line_512": {
+        "roster_contract": "ggc.r2.rendered-battle.roster.infantry-line-512.v1",
+        "units_per_player": 64, "template_counts": (0, 0, 32, 32),
+        "unit_type_sequence": "2222222222222222222222222222222233333333333333333333333333333333",
+    },
+}
+
 
 def make_csv(path, ends, positive=(), export_delta=0, failed=()):
     rows = []
@@ -130,7 +163,8 @@ def comparison_run(role, number, mode="foreground", state=None, fps=15.0):
                      "window_mode": mode, "present_swap_interval": 0},
         "workload_identity": {"seed": 637808953, "map": "arena", "map_crc": "abc",
                               "map_size": 10, "camera": "(1,2,3)", "roster": [],
-                              "state": {"live": 512} if state is None else state},
+                              "state": {"live": 512} if state is None else state,
+                              "layout_contract": None},
         "phase": {"qpc_frequency": 1000, "begin": start_qpc + 10000,
                   "stop": start_qpc + 14000},
         "present": {"owner": {"owner_session": 3, "process_id": pid,
@@ -202,6 +236,64 @@ class VisualCaptureTests(unittest.TestCase):
         for frame in (151, 301, 451, 601):
             self.lines.append(f"RENDERED_BATTLE_DIAGNOSTIC_SAMPLE frame={frame} alive0=256 alive1=256 health0=100 health1=100 position_sum0=10 position_sum1=10 attacking=512 camera=combat")
         self.lines.append("RENDERED_BATTLE_DIAGNOSTIC_COMPLETE reason=frame_cap terminal_sample=fresh_cap_sample created=512 engine_exit_code=0 diagnostic_exit_code=0 executable_sha256=" + "a" * 64)
+        self.legacy_lines = list(self.lines)
+
+    def profile_fixture(self, profile_id):
+        expected = EXPECTED_R2_PROFILE_ROSTERS[profile_id]
+        per_player = expected["units_per_player"]
+        total = per_player * 8
+        template_counts = expected["template_counts"]
+        roster_contract = expected["roster_contract"]
+        phase_contract = r1.R2_PHASE_CONTRACT
+        alive = total // 2
+        lines = [self.legacy_lines[0],
+                 f"RENDERED_BATTLE_BENCHMARK_PROFILE schema={r1.R2_PROFILE_SCHEMA} id={profile_id} roster_contract={roster_contract} phase_contract={phase_contract} units_per_player={per_player} total_units={total}",
+                 self.legacy_lines[1],
+                 self.legacy_lines[2].replace("created=512", f"created={total}"),
+                 self.legacy_lines[3],
+                 f"RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS profile_id={profile_id} roster_contract={roster_contract}",
+                 f"RENDERED_BATTLE_BENCHMARK_PLANNER_SUMMARY profile_id={profile_id} roster_contract={roster_contract}",
+                 f"RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin frame=1 tick=10 qpc=1000 qpc_frequency=1000 warmup_frames=150 measure_frames=450 logic_target_hz=30 render_pacing=uncapped resolution=1920x1080 windowed=1 fps_source=present_trace profile_id={profile_id} phase_contract={phase_contract}",
+                 f"RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin frame=151 tick=20 qpc=10000 qpc_frequency=1000 alive0={alive} alive1={alive} attacking={total} profile_id={profile_id} phase_contract={phase_contract}",
+                 f"RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop frame=601 tick=30 qpc=14000 qpc_frequency=1000 complete=1 warmup_frames=150 requested_measure_frames=450 actual_measure_frames=450 measured_attack_samples=450 measured_loss_samples=0 alive0={alive} alive1={alive} attacking={total} fps_source=present_trace profile_id={profile_id} phase_contract={phase_contract}"]
+        if profile_id == "mechanized_512":
+            lines[0] = lines[0].replace("map=Fortress_Avalanche", "map=R2_Mechanized_Arena")
+            lines[2] = lines[2].replace(
+                "map=Fortress_Avalanche", r'map="Maps\R2 Mechanized Arena\R2 Mechanized Arena.map"')
+            layout = ("RENDERED_BATTLE_BENCHMARK_LAYOUT layout_schema=2 "
+                      "layout_contract=ggc.r2.rendered-battle.layout.mechanized-512.rect16x4.v2 "
+                      "workload_contract=ggc.r2.rendered-battle.workload.mechanized-512.rect16x4.r2-arena.v4 "
+                      "map_contract=ggc.r2.rendered-battle.map.mechanized-512.r2-arena.v1 "
+                      "profile_id=mechanized_512 placement_schema=9 columns=16 rows=4 grid_step=42 stagger=21 row_step=37 "
+                      "band_step=148 formation_x=746 formation_y=278 inset_x=790 inset_y=322 reveal_radius=850 "
+                      "goal_x_offsets=-95,95 goal_y_offsets=-222,-74,74,222 pair_clearance=3 footprint_padding=1 "
+                      "height_limit=8 path_diameter_cells=4")
+            lines.insert(2, layout)
+            preflight_index = next(i for i, line in enumerate(lines)
+                                   if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY "))
+            lines[preflight_index] = (
+                "RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY map_crc=B5AAEB44 map_size=3021429 "
+                "search_schema=mechanized512_rect16x4_refined10_mapwide100x104_local9_mrv_v9 "
+                "placement_schema=9 grid_inset_x=790 grid_inset_y=322 formation_x=746 "
+                "formation_y=278 height_limit=8 path_diameter_cells=4")
+            geometry_index = next(i for i, line in enumerate(lines)
+                                  if line.startswith("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS "))
+            lines[geometry_index] = (
+                "RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS vehicle_radius=22.000 infantry_radius=8.000 "
+                "nominal_units=512 nominal_pairs=130816 grid_step=42 band_step=148 formation_x=746 "
+                "formation_y=278 profile_id=mechanized_512 roster_contract=" + roster_contract)
+        factions = ("FactionAmerica", "FactionChina", "FactionGLA", "FactionAmerica")
+        for slot in range(8):
+            faction_index = 0 if slot % 4 == 3 else slot % 4
+            templates = ",".join(name + ":" + str(count) for name, count in
+                                  zip(r1.ROSTER_TEMPLATES[faction_index], template_counts))
+            ids = ",".join(str(value) for value in range(slot * per_player + 1,
+                                                          (slot + 1) * per_player + 1))
+            lines.append(f"RENDERED_BATTLE_DIAGNOSTIC_ROSTER slot={slot} faction={factions[slot % 4]} team={int(slot >= 4)} count={per_player} templates={templates} profile_id={profile_id} roster_contract={roster_contract} unit_type_sequence={expected['unit_type_sequence']} ids={ids}")
+        for frame in (151, 301, 451, 601):
+            lines.append(f"RENDERED_BATTLE_DIAGNOSTIC_SAMPLE frame={frame} alive0={alive} alive1={alive} health0=100 health1=100 position_sum0=10 position_sum1=10 attacking={total} camera=combat")
+        lines.append(f"RENDERED_BATTLE_DIAGNOSTIC_COMPLETE reason=frame_cap terminal_sample=fresh_cap_sample created={total} engine_exit_code=0 diagnostic_exit_code=0 executable_sha256=" + "a" * 64)
+        return lines
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -225,6 +317,595 @@ class VisualCaptureTests(unittest.TestCase):
         self.assertEqual(fixture["seed"], 637808953)
         self.assertEqual(fixture["phase"]["warmup_frames"], 150)
         self.assertEqual(fixture["phase"]["measured_frames"], 450)
+        self.assertIsNone(fixture["render_admission_metrics"])
+
+    def test_all_six_named_r2_profiles_accept_their_frozen_roster_and_phase_contracts(self):
+        self.assertEqual(set(EXPECTED_R2_PROFILE_ROSTERS), set(r1.R2_PROFILE_CONTRACTS))
+        for profile_id, expected in EXPECTED_R2_PROFILE_ROSTERS.items():
+            with self.subTest(profile=profile_id):
+                sequence = expected["unit_type_sequence"]
+                self.assertEqual(len(sequence), expected["units_per_player"])
+                self.assertEqual(tuple(sequence.count(str(kind)) for kind in range(4)),
+                                 expected["template_counts"])
+                contract = r1.R2_PROFILE_CONTRACTS[profile_id]
+                self.assertEqual(contract["units_per_player"], expected["units_per_player"])
+                self.assertEqual(contract["template_counts"], expected["template_counts"])
+                self.assertEqual(contract["unit_type_sequence"], sequence)
+                self.assertEqual(contract["roster_contract"], expected["roster_contract"])
+                self.lines = self.profile_fixture(profile_id)
+                self.write()
+                fixture = r1.diagnostic(self.path, self.ready)
+                self.assertEqual(fixture["profile_contract"]["profile_id"], profile_id)
+                self.assertEqual(fixture["profile_contract"]["roster_contract"], expected["roster_contract"])
+                self.assertEqual(fixture["profile_contract"]["total_units"], expected["units_per_player"] * 8)
+                self.assertEqual(fixture["profile_contract"]["unit_type_sequence"], sequence)
+                self.assertEqual(len(fixture["roster"]), 8)
+                self.assertEqual(fixture["profile_contract"]["phase_contract"], r1.R2_PHASE_CONTRACT)
+                self.assertEqual(fixture["phase"], {"qpc_frequency": 1000, "begin": 10000,
+                    "stop": 14000, "seconds": 4.0, "warmup_frames": 150, "measured_frames": 450})
+
+    def test_profile_map_matrix_selects_r2_arena_only_for_me512(self):
+        profile_cases = [(None, list(self.legacy_lines))]
+        profile_cases.extend((profile_id, self.profile_fixture(profile_id))
+                             for profile_id in EXPECTED_R2_PROFILE_ROSTERS)
+        for profile_id, base in profile_cases:
+            label = profile_id or "legacy_default"
+            expected_me512 = profile_id == "mechanized_512"
+            with self.subTest(profile=label):
+                self.lines = list(base)
+                self.write()
+                fixture = r1.diagnostic(self.path, self.ready)
+                begin = next(line for line in self.lines
+                             if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_BEGIN "))
+                start = next(line for line in self.lines
+                             if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_START "))
+                preflight = next(line for line in self.lines
+                                 if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY "))
+                begin_map = r1.fields(begin).get("map")
+                start_map = r1.fields(start).get("map")
+                preflight_fields = r1.fields(preflight)
+                if expected_me512:
+                    self.assertEqual(begin_map, "R2_Mechanized_Arena")
+                    self.assertEqual(start_map, r"Maps\R2 Mechanized Arena\R2 Mechanized Arena.map")
+                    self.assertEqual(preflight_fields["map_crc"], "B5AAEB44")
+                    self.assertEqual(preflight_fields["map_size"], "3021429")
+                    self.assertEqual(fixture["layout_contract"]["map_contract"],
+                                     "ggc.r2.rendered-battle.map.mechanized-512.r2-arena.v1")
+                    self.assertEqual(fixture["layout_contract"]["workload_contract"],
+                                     "ggc.r2.rendered-battle.workload.mechanized-512.rect16x4.r2-arena.v4")
+                else:
+                    self.assertEqual(begin_map, "Fortress_Avalanche")
+                    self.assertEqual(start_map, "Fortress_Avalanche")
+                    self.assertIsNone(fixture["layout_contract"])
+                    self.assertEqual(preflight_fields["map_crc"], "ABC")
+                    self.assertEqual(preflight_fields["map_size"], "10")
+
+                # A profile cannot be made to accept the other profile's map by
+                # changing BEGIN, START, and the selected map's CRC/size together.
+                self.lines = list(base)
+                begin_index = next(i for i, line in enumerate(self.lines)
+                                   if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_BEGIN "))
+                start_index = next(i for i, line in enumerate(self.lines)
+                                   if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_START "))
+                preflight_index = next(i for i, line in enumerate(self.lines)
+                                       if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY "))
+                if expected_me512:
+                    self.lines[begin_index] = self.lines[begin_index].replace(
+                        "map=R2_Mechanized_Arena", "map=Fortress_Avalanche", 1)
+                    self.lines[start_index] = self.lines[start_index].replace(
+                        r'map="Maps\R2 Mechanized Arena\R2 Mechanized Arena.map"',
+                        "map=Fortress_Avalanche", 1)
+                    self.lines[preflight_index] = self.lines[preflight_index].replace(
+                        "map_crc=B5AAEB44 map_size=3021429", "map_crc=ABC map_size=10", 1)
+                else:
+                    self.lines[begin_index] = self.lines[begin_index].replace(
+                        "map=Fortress_Avalanche", "map=R2_Mechanized_Arena", 1)
+                    self.lines[start_index] = self.lines[start_index].replace(
+                        "map=Fortress_Avalanche",
+                        r'map="Maps\R2 Mechanized Arena\R2 Mechanized Arena.map"', 1)
+                    self.lines[preflight_index] = self.lines[preflight_index].replace(
+                        "map_crc=ABC map_size=10", "map_crc=B5AAEB44 map_size=3021429", 1)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_me512_r2_arena_map_path_crc_size_and_quotes_fail_closed(self):
+        base = self.profile_fixture("mechanized_512")
+        start_index = next(i for i, line in enumerate(base)
+                           if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_START "))
+        begin_index = next(i for i, line in enumerate(base)
+                           if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_BEGIN "))
+        preflight_index = next(i for i, line in enumerate(base)
+                               if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY "))
+        path_token = r'map="Maps\R2 Mechanized Arena\R2 Mechanized Arena.map"'
+        valid_path_variants = (
+            path_token,
+            r'map="maps/r2 mechanized arena/r2 mechanized arena.map"',
+        )
+        for replacement in valid_path_variants:
+            with self.subTest(valid_path=replacement):
+                self.lines = list(base)
+                self.lines[start_index] = self.lines[start_index].replace(path_token, replacement, 1)
+                self.write()
+                fixture = r1.diagnostic(self.path, self.ready)
+                self.assertEqual(fixture["map"], r1.fields(self.lines[start_index])["map"])
+
+        mutations = (
+            ("BEGIN Fortress alias", begin_index, "map=R2_Mechanized_Arena", "map=Fortress_Avalanche"),
+            ("BEGIN wrong token case", begin_index, "map=R2_Mechanized_Arena", "map=r2_mechanized_arena"),
+            ("START token alias", start_index, path_token, "map=R2_Mechanized_Arena"),
+            ("START wrong leaf", start_index, path_token,
+             r'map="Maps\R2 Mechanized Arena\Fortress Avalanche.map"'),
+            ("START arbitrary absolute path", start_index, path_token,
+             r'map="C:\Maps\R2 Mechanized Arena\R2 Mechanized Arena.map"'),
+            ("START unmatched quote", start_index, path_token,
+             r'map="Maps\R2 Mechanized Arena\R2 Mechanized Arena.map'),
+            ("START duplicate map", start_index, path_token,
+             path_token + " map=R2_Mechanized_Arena"),
+        )
+        for label, line_index, old, new in mutations:
+            with self.subTest(case=label):
+                self.lines = list(base)
+                self.lines[line_index] = self.lines[line_index].replace(old, new, 1)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+        for label, old, new in (
+            ("wrong cache CRC", "map_crc=B5AAEB44", "map_crc=B5AAEB43"),
+            ("prefixed cache CRC", "map_crc=B5AAEB44", "map_crc=0xB5AAEB44"),
+            ("wrong map size", "map_size=3021429", "map_size=3021428"),
+            ("unmatched map CRC quote", "map_crc=B5AAEB44", 'map_crc="B5AAEB44x'),
+        ):
+            with self.subTest(case=label):
+                self.lines = list(base)
+                self.lines[preflight_index] = self.lines[preflight_index].replace(old, new, 1)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_me512_r2_arena_v4_fixture_emits_exact_declared_workload_identity(self):
+        self.lines = self.profile_fixture("mechanized_512")
+        self.write()
+        fixture = r1.diagnostic(self.path, self.ready)
+        self.assertEqual(fixture["profile_contract"]["units_per_player"], 64)
+        self.assertEqual(fixture["profile_contract"]["total_units"], 512)
+        self.assertEqual(fixture["profile_contract"]["unit_type_sequence"], "0" * 32 + "1" * 32)
+        self.assertEqual(len(fixture["roster"]), 8)
+        self.assertEqual(fixture["layout_contract"], {
+            "profile_id": "mechanized_512", "layout_schema": 2,
+            "layout_contract": "ggc.r2.rendered-battle.layout.mechanized-512.rect16x4.v2",
+            "workload_contract": "ggc.r2.rendered-battle.workload.mechanized-512.rect16x4.r2-arena.v4",
+            "map_contract": "ggc.r2.rendered-battle.map.mechanized-512.r2-arena.v1",
+            "map_asset_contract": {
+                "begin_token": "R2_Mechanized_Arena",
+                "start_path": r"Maps\R2 Mechanized Arena\R2 Mechanized Arena.map",
+                "map_cache_crc": "B5AAEB44",
+                "map_size_bytes": 3021429,
+                "payload_sha256_expected": "D2A2FD87763C92BECA4CB081BC6DF57EF5918CB63626452C70CBC8BE6DB8444A",
+                "archive_sha256_expected": "63474BA13A64E098B74EA4C509686E0353EC08D41C83AF01EC6559D2208DD528",
+                "evidence_scope": "expected fixture asset metadata; payload/archive hashes are not runtime-observed",
+            },
+            "placement_schema": 9,
+            "search_schema": "mechanized512_rect16x4_refined10_mapwide100x104_local9_mrv_v9",
+            "geometry": {"columns": 16, "rows": 4, "grid_step": 42, "stagger": 21,
+                         "row_step": 37, "band_step": 148, "formation_x": 746,
+                         "formation_y": 278, "inset_x": 790, "inset_y": 322,
+                         "reveal_radius": 850},
+            "goal_offsets": {"x": [-95, 95], "y": [-222, -74, 74, 222]},
+            "declared_constraints": {"pair_clearance": 3, "footprint_padding": 1,
+                                     "height_limit": 8, "path_diameter_cells": 4},
+            "evidence_scope": "producer_marker_declaration_only"})
+
+    def test_me512_r2_arena_v4_requires_one_new_marker_and_rejects_old_identities(self):
+        base = self.profile_fixture("mechanized_512")
+        marker_index = next(i for i, line in enumerate(base)
+                            if line.startswith("RENDERED_BATTLE_BENCHMARK_LAYOUT "))
+        old_version = base[marker_index].replace("layout_schema=2", "layout_schema=1")
+        old_version = old_version.replace(".rect16x4.v2", ".rect16x4.v1")
+        old_v8 = base[marker_index].replace("placement_schema=9", "placement_schema=8")
+        old_v8 = old_v8.replace("mrv_v9", "mrv_v8")
+        old_workload = base[marker_index].replace(
+            "workload.mechanized-512.rect16x4.r2-arena.v4",
+            "workload.mechanized-512.rect16x4.v2")
+        wrong_map_contract = base[marker_index].replace(
+            "map.mechanized-512.r2-arena.v1", "map.mechanized-512.other.v1")
+        missing_map_contract = base[marker_index].replace(
+            " map_contract=ggc.r2.rendered-battle.map.mechanized-512.r2-arena.v1", "")
+        cases = (
+            ("missing marker", lambda lines: lines.pop(marker_index)),
+            ("duplicate marker", lambda lines: lines.insert(marker_index + 1, lines[marker_index])),
+            ("old layout v1", lambda lines: lines.__setitem__(marker_index, old_version)),
+            ("old placement/search v8", lambda lines: lines.__setitem__(marker_index, old_v8)),
+            ("old workload identity", lambda lines: lines.__setitem__(marker_index, old_workload)),
+            ("wrong map contract", lambda lines: lines.__setitem__(marker_index, wrong_map_contract)),
+            ("missing map contract", lambda lines: lines.__setitem__(marker_index, missing_map_contract)),
+        )
+        for label, mutate in cases:
+            with self.subTest(case=label):
+                self.lines = list(base)
+                mutate(self.lines)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+
+    def test_me512_rejects_superseded_iron_dragon_identity(self):
+        base = self.profile_fixture("mechanized_512")
+        replacements = (
+            ("BEGIN token", "RENDERED_BATTLE_DIAGNOSTIC_BEGIN ",
+             "map=R2_Mechanized_Arena", "map=Iron_Dragon"),
+            ("START path", "RENDERED_BATTLE_DIAGNOSTIC_START ",
+             r'map="Maps\R2 Mechanized Arena\R2 Mechanized Arena.map"',
+             r'map="Maps\Iron Dragon\Iron Dragon.map"'),
+            ("layout map contract", "RENDERED_BATTLE_BENCHMARK_LAYOUT ",
+             "map.mechanized-512.r2-arena.v1",
+             "map.mechanized-512.iron-dragon.v1"),
+            ("layout workload contract", "RENDERED_BATTLE_BENCHMARK_LAYOUT ",
+             "workload.mechanized-512.rect16x4.r2-arena.v4",
+             "workload.mechanized-512.rect16x4.iron-dragon.v3"),
+            ("preflight CRC", "RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ",
+             "map_crc=B5AAEB44", "map_crc=6541B363"),
+            ("preflight size", "RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ",
+             "map_size=3021429", "map_size=306186"),
+        )
+        for label, prefix, old, new in replacements:
+            with self.subTest(stale_identity_component=label):
+                self.lines = list(base)
+                index = next(i for i, line in enumerate(self.lines)
+                             if line.startswith(prefix))
+                self.assertIn(old, self.lines[index])
+                self.lines[index] = self.lines[index].replace(old, new, 1)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+        # The exact previous Iron Dragon tuple is stale as a whole as well.
+        self.lines = list(base)
+        full_old_identity = (
+            ("RENDERED_BATTLE_DIAGNOSTIC_BEGIN ", "map=R2_Mechanized_Arena", "map=Iron_Dragon"),
+            ("RENDERED_BATTLE_DIAGNOSTIC_START ",
+             r'map="Maps\R2 Mechanized Arena\R2 Mechanized Arena.map"',
+             r'map="Maps\Iron Dragon\Iron Dragon.map"'),
+            ("RENDERED_BATTLE_BENCHMARK_LAYOUT ",
+             "workload.mechanized-512.rect16x4.r2-arena.v4",
+             "workload.mechanized-512.rect16x4.iron-dragon.v3"),
+            ("RENDERED_BATTLE_BENCHMARK_LAYOUT ",
+             "map.mechanized-512.r2-arena.v1",
+             "map.mechanized-512.iron-dragon.v1"),
+            ("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ",
+             "map_crc=B5AAEB44 map_size=3021429",
+             "map_crc=6541B363 map_size=306186"),
+        )
+        for prefix, old, new in full_old_identity:
+            index = next(i for i, line in enumerate(self.lines)
+                         if line.startswith(prefix))
+            self.assertIn(old, self.lines[index])
+            self.lines[index] = self.lines[index].replace(old, new, 1)
+        self.write()
+        with self.assertRaises(r1.Reject):
+            r1.diagnostic(self.path, self.ready)
+
+    def test_me512_compact_v2_rejects_wrong_dimensions_spacing_bands_and_goals(self):
+        base = self.profile_fixture("mechanized_512")
+        marker_index = next(i for i, line in enumerate(base)
+                            if line.startswith("RENDERED_BATTLE_BENCHMARK_LAYOUT "))
+        replacements = (
+            ("columns=16", "columns=15"), ("rows=4", "rows=5"),
+            ("row_step=37", "row_step=38"), ("band_step=148", "band_step=149"),
+            ("goal_x_offsets=-95,95", "goal_x_offsets=-96,95"),
+            ("goal_y_offsets=-222,-74,74,222", "goal_y_offsets=-222,-75,75,222"),
+        )
+        for old, new in replacements:
+            with self.subTest(field=old):
+                self.lines = list(base)
+                self.lines[marker_index] = self.lines[marker_index].replace(old, new)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_me512_compact_v2_rejects_geometry_and_preflight_marker_contradictions(self):
+        base = self.profile_fixture("mechanized_512")
+        changes = (
+            ("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS ", "grid_step=42", "grid_step=43"),
+            ("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS ", "formation_y=278", "formation_y=279"),
+            ("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ", "grid_inset_x=790", "grid_inset_x=791"),
+            ("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ", "placement_schema=9", "placement_schema=8"),
+            ("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ",
+             "mrv_v9", "mrv_v8"),
+        )
+        for prefix, old, new in changes:
+            with self.subTest(prefix=prefix, field=old):
+                self.lines = list(base)
+                index = next(i for i, line in enumerate(self.lines) if line.startswith(prefix))
+                self.lines[index] = self.lines[index].replace(old, new)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_me512_compact_v2_rejects_unconsumed_marker_tokens(self):
+        base = self.profile_fixture("mechanized_512")
+        cases = (
+            ("layout truncated row_step", "RENDERED_BATTLE_BENCHMARK_LAYOUT ", " row_step="),
+            ("layout truncated goals", "RENDERED_BATTLE_BENCHMARK_LAYOUT ", " goal_y_offsets="),
+            ("layout stray suffix", "RENDERED_BATTLE_BENCHMARK_LAYOUT ", " garbage"),
+            ("geometry truncated formation_y", "RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS ", " formation_y="),
+            ("preflight truncated placement_schema", "RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ",
+             " placement_schema="),
+        )
+        for label, prefix, suffix in cases:
+            with self.subTest(case=label):
+                self.lines = list(base)
+                index = next(i for i, line in enumerate(self.lines) if line.startswith(prefix))
+                self.lines[index] += suffix
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+        self.lines = list(base)
+        index = next(i for i, line in enumerate(self.lines)
+                     if line.startswith("RENDERED_BATTLE_BENCHMARK_LAYOUT "))
+        self.lines[index] = self.lines[index].replace(" row_step=37", " garbage row_step=37", 1)
+        self.write()
+        with self.assertRaises(r1.Reject):
+            r1.diagnostic(self.path, self.ready)
+
+    def test_me512_compact_v2_requires_whitespace_between_quoted_tokens(self):
+        self.lines = self.profile_fixture("mechanized_512")
+        index = next(i for i, line in enumerate(self.lines)
+                     if line.startswith("RENDERED_BATTLE_BENCHMARK_LAYOUT "))
+        self.lines[index] = self.lines[index].replace(
+            "layout_contract=ggc.r2.rendered-battle.layout.mechanized-512.rect16x4.v2 "
+            "workload_contract=",
+            'layout_contract="ggc.r2.rendered-battle.layout.mechanized-512.rect16x4.v2"workload_contract=',
+            1)
+        self.write()
+        with self.assertRaises(r1.Reject):
+            r1.diagnostic(self.path, self.ready)
+
+    def test_me512_strict_marker_paths_require_balanced_quotes(self):
+        base = self.profile_fixture("mechanized_512")
+        quoted = (
+            ("RENDERED_BATTLE_BENCHMARK_LAYOUT ", "path_diameter_cells=4",
+             'path_diameter_cells="4"'),
+            ("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS ", "grid_step=42",
+             'grid_step="42"'),
+            ("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ", "placement_schema=9",
+             'placement_schema="9"'),
+        )
+        self.lines = list(base)
+        for prefix, old, new in quoted:
+            index = next(i for i, line in enumerate(self.lines) if line.startswith(prefix))
+            self.lines[index] = self.lines[index].replace(old, new, 1)
+        self.write()
+        fixture = r1.diagnostic(self.path, self.ready)
+        self.assertEqual(fixture["layout_contract"]["placement_schema"], 9)
+
+        malformed = (
+            ("RENDERED_BATTLE_BENCHMARK_LAYOUT ", "path_diameter_cells=4",
+             'path_diameter_cells="4x', "path_diameter_cells", "4"),
+            ("RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS ", "grid_step=42",
+             'grid_step="42x', "grid_step", "42"),
+            ("RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ", "placement_schema=9",
+             'placement_schema="9x', "placement_schema", "9"),
+        )
+        for prefix, old, new, field, normalized in malformed:
+            with self.subTest(marker=prefix, field=field):
+                self.lines = list(base)
+                index = next(i for i, line in enumerate(self.lines) if line.startswith(prefix))
+                self.lines[index] = self.lines[index].replace(old, new, 1)
+                self.assertEqual(r1.fields(self.lines[index]).get(field), normalized)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_other_five_profiles_reject_a_me512_only_layout_marker(self):
+        marker = self.profile_fixture("mechanized_512")
+        layout = next(line for line in marker
+                      if line.startswith("RENDERED_BATTLE_BENCHMARK_LAYOUT "))
+        for profile_id in EXPECTED_R2_PROFILE_ROSTERS:
+            if profile_id == "mechanized_512":
+                continue
+            with self.subTest(profile=profile_id):
+                self.lines = self.profile_fixture(profile_id)
+                self.lines.insert(2, layout)
+                self.write()
+                with self.assertRaisesRegex(r1.Reject, "without the mechanized_512 profile"):
+                    r1.diagnostic(self.path, self.ready)
+
+    def reject_named_phase_field(self, phase, field, value, message):
+        self.lines = self.profile_fixture("combined_arms_256")
+        index = next(i for i, line in enumerate(self.lines)
+                     if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=" + phase + " "))
+        fields = self.lines[index].split()
+        self.assertEqual(sum(token.startswith(field + "=") for token in fields), 1)
+        self.lines[index] = " ".join(field + "=" + value if token.startswith(field + "=") else token
+                                     for token in fields)
+        self.write()  # Preserve the actual fixed marker count and completed footer.
+        with self.assertRaisesRegex(r1.Reject, message):
+            r1.diagnostic(self.path, self.ready)
+
+    def test_named_profile_contradictory_logic_target_is_rejected(self):
+        self.reject_named_phase_field("warmup_begin", "logic_target_hz", "600", "R2 warmup logic target")
+
+    def test_named_profile_contradictory_requested_measure_frames_are_rejected(self):
+        self.reject_named_phase_field("measurement_stop", "requested_measure_frames", "99", "R2 stop requested measure frames")
+
+    def test_named_profile_contradictory_stop_warmup_frames_are_rejected(self):
+        self.reject_named_phase_field("measurement_stop", "warmup_frames", "99", "R2 stop warmup frames")
+
+    def test_named_profile_contradictory_stop_fps_source_is_rejected(self):
+        self.reject_named_phase_field("measurement_stop", "fps_source", "logic_update", "R2 stop FPS source")
+
+    def test_named_profile_warmup_qpc_requires_positive_canonical_order(self):
+        for value in ("999999", "14000", "10000", "0", "-1", "01000", "1000.5", "+1000"):
+            with self.subTest(value=value):
+                self.reject_named_phase_field("warmup_begin", "qpc", value, "R2 warmup QPC")
+
+    def test_optional_rigid_draw_metrics_are_separate_from_workload_and_fps_evidence(self):
+        self.lines = self.profile_fixture("combined_arms_256")
+        warm_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin "))
+        stop_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop "))
+        fields = ("captured_draws", "instanced_batches", "instanced_instances",
+                  "singleton_ordinary", "unsupported_fallbacks",
+                  "ordinary_fallback_draws", "rejected_draws")
+        warm_values = (100, 4, 96, 3, 2, 7, 0)
+        stop_values = (130, 7, 120, 5, 4, 11, 1)
+        def suffix(frame, values, status=0):
+            pairs = ["rigid_metrics_schema=" + r1.RIGID_METRICS_SCHEMA,
+                     "rigid_metrics_status=" + str(status), "rigid_logic_frame=" + str(frame)]
+            pairs.extend("rigid_" + key + "=" + str(value) for key, value in zip(fields, values))
+            return " " + " ".join(pairs)
+        self.lines[warm_index] += suffix(1, warm_values)
+        self.lines[stop_index] += suffix(601, stop_values)
+        self.write()
+        fixture = r1.diagnostic(self.path, self.ready)
+        receipt = fixture["render_admission_metrics"]
+        self.assertTrue(receipt["available"])
+        self.assertEqual(receipt["logic_frames"], {"warmup_begin": 1, "measurement_stop": 601})
+        self.assertEqual(receipt["counter_delta_scope"], {
+            "first_logic_frame": 1, "last_logic_frame": 601, "elapsed_logic_frames": 600,
+            "warmup_frames": 150, "measured_frames": 450})
+        self.assertEqual(receipt["warmup_plus_measurement_delta"], {
+            "captured_draws": 30, "instanced_batches": 3, "instanced_instances": 24,
+            "singleton_ordinary": 2, "unsupported_fallbacks": 2,
+            "ordinary_fallback_draws": 4, "rejected_draws": 1})
+        self.assertNotIn("render_admission_metrics", fixture["profile_contract"])
+        self.assertIn("admission and route-attempt", receipt["interpretation"])
+        self.assertIn("not GPU completion", receipt["interpretation"])
+
+        self.lines[warm_index] = self.lines[warm_index].replace("rigid_metrics_status=0", "rigid_metrics_status=2")
+        self.lines[stop_index] = self.lines[stop_index].replace("rigid_metrics_status=0", "rigid_metrics_status=2")
+        self.write()
+        unavailable = r1.diagnostic(self.path, self.ready)["render_admission_metrics"]
+        self.assertFalse(unavailable["available"])
+        self.assertIsNone(unavailable["warmup_plus_measurement_delta"])
+
+    def test_legacy_default_rejects_rigid_metrics_without_profile_marker(self):
+        self.lines = list(self.legacy_lines)
+        warm_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin "))
+        stop_index = next(i for i, line in enumerate(self.lines)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop "))
+        metric_fields = ("captured_draws", "instanced_batches", "instanced_instances",
+                         "singleton_ordinary", "unsupported_fallbacks",
+                         "ordinary_fallback_draws", "rejected_draws")
+
+        def metric_suffix(frame):
+            fields = ["rigid_metrics_schema=" + r1.RIGID_METRICS_SCHEMA,
+                      "rigid_metrics_status=0", "rigid_logic_frame=" + str(frame)]
+            fields.extend("rigid_" + name + "=0" for name in metric_fields)
+            return " " + " ".join(fields)
+
+        # This is a complete, correctly aligned pair on the legacy 512-unit
+        # diagnostic. It must fail only because that run has no named R2 profile.
+        self.lines[warm_index] += metric_suffix(1)
+        self.lines[stop_index] += metric_suffix(601)
+        self.write()
+        with self.assertRaisesRegex(r1.Reject,
+                                    "rigid-draw metrics require an explicit R2 profile"):
+            r1.diagnostic(self.path, self.ready)
+
+    def test_rigid_draw_metrics_reject_partial_unknown_misaligned_and_nonmonotonic_receipts(self):
+        base = self.profile_fixture("mechanized_256")
+        warm_index = next(i for i, line in enumerate(base)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin "))
+        stop_index = next(i for i, line in enumerate(base)
+                          if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop "))
+        begin_index = next(i for i, line in enumerate(base)
+                           if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin "))
+        def with_metrics():
+            lines = list(base)
+            values = "rigid_metrics_schema=" + r1.RIGID_METRICS_SCHEMA + " rigid_metrics_status=0 rigid_logic_frame={frame} rigid_captured_draws={draws} " \
+                "rigid_instanced_batches=4 rigid_instanced_instances=80 rigid_singleton_ordinary=0 " \
+                "rigid_unsupported_fallbacks=0 rigid_ordinary_fallback_draws=0 rigid_rejected_draws=0"
+            lines[warm_index] += " " + values.format(frame=1, draws=10)
+            lines[stop_index] += " " + values.format(frame=601, draws=20)
+            return lines
+        mutations = (
+            ("missing stop snapshot", lambda lines: lines.__setitem__(stop_index, lines[stop_index].split(" rigid_metrics_schema=")[0])),
+            ("partial fields", lambda lines: lines.__setitem__(warm_index, lines[warm_index].replace(" rigid_rejected_draws=0", ""))),
+            ("duplicate field", lambda lines: lines.__setitem__(warm_index, lines[warm_index] + " rigid_captured_draws=10")),
+            ("unknown field", lambda lines: lines.__setitem__(stop_index, lines[stop_index] + " rigid_gpu_completions=2")),
+            ("unknown schema", lambda lines: lines.__setitem__(stop_index, lines[stop_index].replace(r1.RIGID_METRICS_SCHEMA, "ggc.r2.rendered-battle-rigid-draw-metrics.v2"))),
+            ("wrong logic frame", lambda lines: lines.__setitem__(warm_index, lines[warm_index].replace("rigid_logic_frame=1", "rigid_logic_frame=2"))),
+            ("negative counter", lambda lines: lines.__setitem__(stop_index, lines[stop_index].replace("rigid_rejected_draws=0", "rigid_rejected_draws=-1"))),
+            ("decreasing counter", lambda lines: lines.__setitem__(stop_index, lines[stop_index].replace("rigid_captured_draws=20", "rigid_captured_draws=9"))),
+            ("unknown status", lambda lines: lines.__setitem__(stop_index, lines[stop_index].replace("rigid_metrics_status=0", "rigid_metrics_status=9"))),
+            ("metrics on middle phase", lambda lines: lines.__setitem__(begin_index, lines[begin_index] + " rigid_metrics_status=0")),
+        )
+        for label, mutate in mutations:
+            with self.subTest(case=label):
+                self.lines = with_metrics()
+                mutate(self.lines)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_r2_profile_rejects_unknown_schema_density_and_partial_identity(self):
+        base = self.profile_fixture("combined_arms_256")
+        profile_index = next(i for i, line in enumerate(base)
+                             if line.startswith("RENDERED_BATTLE_BENCHMARK_PROFILE "))
+        mutations = (
+            lambda line: line.replace("id=combined_arms_256", "id=unknown_profile"),
+            lambda line: line.replace(r1.R2_PROFILE_SCHEMA, "ggc.r2.rendered-battle-profile.v2"),
+            lambda line: line.replace("total_units=256", "total_units=512"),
+            lambda line: line.replace(" phase_contract=" + r1.R2_PHASE_CONTRACT, ""),
+            lambda line: line + " unexpected=1",
+        )
+        for mutate in mutations:
+            with self.subTest(marker=mutate(base[profile_index])):
+                self.lines = list(base)
+                self.lines[profile_index] = mutate(self.lines[profile_index])
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_r2_roster_rejects_wrong_template_mix_or_unit_type_sequence(self):
+        base = self.profile_fixture("mechanized_256")
+        roster_index = next(i for i, line in enumerate(base)
+                            if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_ROSTER "))
+        for old, new in (("AmericaTankCrusader:16", "AmericaTankCrusader:15"),
+                         ("unit_type_sequence=" + r1.R2_PROFILE_CONTRACTS["mechanized_256"]["unit_type_sequence"],
+                          "unit_type_sequence=" + "1" * 16 + "0" * 16)):
+            with self.subTest(replacement=new):
+                self.lines = list(base)
+                self.lines[roster_index] = self.lines[roster_index].replace(old, new)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_r2_identity_must_repeat_on_each_roster_and_measured_phase(self):
+        base = self.profile_fixture("infantry_line_512")
+        roster_index = next(i for i, line in enumerate(base)
+                            if line.startswith("RENDERED_BATTLE_DIAGNOSTIC_ROSTER "))
+        phase_index = next(i for i, line in enumerate(base)
+                           if line.startswith("RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin "))
+        changes = (
+            (roster_index, "roster_contract=ggc.r2.rendered-battle.roster.infantry-line-512.v1",
+             "roster_contract=ggc.r2.rendered-battle.roster.infantry-line-256.v1"),
+            (roster_index, "profile_id=infantry_line_512", "profile_id=mechanized_512"),
+            (phase_index, "phase_contract=" + r1.R2_PHASE_CONTRACT,
+             "phase_contract=ggc.r2.rendered-battle.phase.other.v1"),
+            (phase_index, "profile_id=infantry_line_512", "profile_id=combined_arms_512"),
+        )
+        for index, old, new in changes:
+            with self.subTest(old=old):
+                self.lines = list(base)
+                self.lines[index] = self.lines[index].replace(old, new)
+                self.write()
+                with self.assertRaises(r1.Reject):
+                    r1.diagnostic(self.path, self.ready)
+
+    def test_stripped_r2_profile_marker_cannot_fall_back_to_legacy_512(self):
+        self.lines = self.profile_fixture("combined_arms_512")
+        self.lines = [line for line in self.lines
+                      if not line.startswith("RENDERED_BATTLE_BENCHMARK_PROFILE ")]
+        self.write()
+        with self.assertRaisesRegex(r1.Reject, "profile identity fields appear without"):
+            r1.diagnostic(self.path, self.ready)
 
     def test_diagnostic_requires_literal_seed_even_when_requests_match(self):
         original = self.lines[0]
@@ -270,7 +951,8 @@ class VisualCaptureTests(unittest.TestCase):
                          '"C:\\Maps\\Fortress Avalanche\\Fortress Avalanche.map"', ""):
             self.lines[1] = original.replace("map=Fortress_Avalanche", "map=" + map_name)
             self.write()
-            with self.assertRaisesRegex(r1.Reject, "START map differs"):
+            with self.assertRaisesRegex(r1.Reject,
+                                        "(?:START map differs|diagnostic START map identity)"):
                 r1.diagnostic(self.path, self.ready)
 
     def test_all_runs_with_same_wrong_seed_cannot_qualify_comparison(self):
@@ -432,6 +1114,92 @@ class ComparisonTests(unittest.TestCase):
         self.assertFalse(result["stage_accepted"])
         self.assertEqual(result["stage_status"], "not_evaluated")
         self.assertGreater(result["mean_fps_delta"], 0)
+
+    def test_comparison_rejects_mixed_named_profile_and_legacy_default_identity(self):
+        reports = [comparison_run("baseline", 1), comparison_run("baseline", 2),
+                   comparison_run("candidate", 1), comparison_run("candidate", 2)]
+        profile = {"schema": r1.R2_PROFILE_SCHEMA, "profile_id": "combined_arms_512",
+                   "roster_contract": r1.R2_PROFILE_CONTRACTS["combined_arms_512"]["roster_contract"],
+                   "phase_contract": r1.R2_PHASE_CONTRACT, "units_per_player": 64,
+                   "total_units": 512, "template_counts": (8, 8, 24, 24),
+                   "unit_type_sequence": r1.R2_PROFILE_CONTRACTS["combined_arms_512"]["unit_type_sequence"]}
+        for report in reports[:3]:
+            report["workload_identity"]["profile_contract"] = profile
+        with patch.object(r1, "analyze", side_effect=reports):
+            result = r1.comparison(["b1", "b2"], ["c1", "c2"], 500, 500)
+        self.assertFalse(result["data_comparable"])
+        self.assertTrue(any("fixture profile_contract mismatch" in reason
+                            for rejection in result["rejections"] for reason in rejection["reasons"]))
+
+    def test_comparison_requires_identical_versioned_me512_layout_across_both_roles(self):
+        profile = {"schema": r1.R2_PROFILE_SCHEMA, "profile_id": "mechanized_512",
+                   "roster_contract": r1.R2_PROFILE_CONTRACTS["mechanized_512"]["roster_contract"],
+                   "phase_contract": r1.R2_PHASE_CONTRACT, "units_per_player": 64,
+                   "total_units": 512, "template_counts": (32, 32, 0, 0),
+                   "unit_type_sequence": "0" * 32 + "1" * 32}
+        layout = {"layout_schema": 2,
+                  "layout_contract": "ggc.r2.rendered-battle.layout.mechanized-512.rect16x4.v2",
+                  "workload_contract": "ggc.r2.rendered-battle.workload.mechanized-512.rect16x4.r2-arena.v4",
+                  "map_contract": "ggc.r2.rendered-battle.map.mechanized-512.r2-arena.v1",
+                  "map_asset_contract": {
+                      "begin_token": "R2_Mechanized_Arena",
+                      "start_path": r"Maps\R2 Mechanized Arena\R2 Mechanized Arena.map",
+                      "map_cache_crc": "B5AAEB44",
+                      "map_size_bytes": 3021429,
+                      "payload_sha256_expected": "D2A2FD87763C92BECA4CB081BC6DF57EF5918CB63626452C70CBC8BE6DB8444A",
+                      "archive_sha256_expected": "63474BA13A64E098B74EA4C509686E0353EC08D41C83AF01EC6559D2208DD528",
+                      "evidence_scope": "expected fixture asset metadata; payload/archive hashes are not runtime-observed",
+                  },
+                  "geometry": {"columns": 16, "rows": 4, "grid_step": 42, "row_step": 37,
+                               "band_step": 148, "formation_x": 746, "formation_y": 278}}
+        reports = [comparison_run("baseline", 1), comparison_run("baseline", 2),
+                   comparison_run("candidate", 1), comparison_run("candidate", 2)]
+        for report in reports:
+            report["workload_identity"]["profile_contract"] = profile
+            report["workload_identity"]["layout_contract"] = layout
+        with patch.object(r1, "analyze", side_effect=reports):
+            result = r1.comparison(["b1", "b2"], ["c1", "c2"], 500, 500)
+        self.assertTrue(result["data_comparable"])
+
+        # Source31's ME512 fixture has no map-bound layout identity. It cannot pair with v3.
+        reports = [comparison_run("baseline", 1), comparison_run("baseline", 2),
+                   comparison_run("candidate", 1), comparison_run("candidate", 2)]
+        for report in reports:
+            report["workload_identity"]["profile_contract"] = profile
+        for report in reports[2:]:
+            report["workload_identity"]["layout_contract"] = layout
+        with patch.object(r1, "analyze", side_effect=reports):
+            result = r1.comparison(["b1", "b2"], ["c1", "c2"], 500, 500)
+        self.assertFalse(result["data_comparable"])
+        self.assertTrue(any("fixture layout_contract mismatch" in reason
+                            for rejection in result["rejections"] for reason in rejection["reasons"]))
+
+        reports = [comparison_run("baseline", 1), comparison_run("baseline", 2),
+                   comparison_run("candidate", 1), comparison_run("candidate", 2)]
+        for report in reports:
+            report["workload_identity"]["profile_contract"] = profile
+            report["workload_identity"]["layout_contract"] = layout
+        reports[-1]["workload_identity"]["layout_contract"] = {
+            **layout, "map_contract": "ggc.r2.rendered-battle.map.mechanized-512.other.v1"}
+        with patch.object(r1, "analyze", side_effect=reports):
+            result = r1.comparison(["b1", "b2"], ["c1", "c2"], 500, 500)
+        self.assertFalse(result["data_comparable"])
+        self.assertTrue(any("fixture layout_contract mismatch" in reason
+                            for rejection in result["rejections"] for reason in rejection["reasons"]))
+
+        # Even within v2, a changed geometry value is a different workload.
+        reports = [comparison_run("baseline", 1), comparison_run("baseline", 2),
+                   comparison_run("candidate", 1), comparison_run("candidate", 2)]
+        for report in reports:
+            report["workload_identity"]["profile_contract"] = profile
+            report["workload_identity"]["layout_contract"] = layout
+        reports[-1]["workload_identity"]["layout_contract"] = {
+            **layout, "geometry": {**layout["geometry"], "row_step": 38}}
+        with patch.object(r1, "analyze", side_effect=reports):
+            result = r1.comparison(["b1", "b2"], ["c1", "c2"], 500, 500)
+        self.assertFalse(result["data_comparable"])
+        self.assertTrue(any("fixture layout_contract mismatch" in reason
+                            for rejection in result["rejections"] for reason in rejection["reasons"]))
 
     def test_comparison_rejects_different_captured_affinity(self):
         reports = [comparison_run("baseline", 1), comparison_run("baseline", 2),
@@ -687,6 +1455,111 @@ class ControllerIntegerTests(unittest.TestCase):
         (self.root / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
         (self.root / "exit.json").write_text(json.dumps(exit_receipt), encoding="utf-8")
         return r1.controller(self.root)
+
+    def failure_trace_receipts(self):
+        ready = json.loads(json.dumps(self.ready))
+        receipt = json.loads(json.dumps(self.exit))
+        for capture in (ready, receipt):
+            capture.update(failure_trace_enabled=True, failure_trace_variable="RTS_RENDER_FAILURE_TRACE",
+                           failure_trace_path=str(self.root / "native-render-failure.txt"))
+        return ready, receipt
+
+    def test_recovered_present_still_rejects_native_failure_in_all_telemetry_modes(self):
+        present_path = self.root / "recovered-present.csv"
+        make_csv(present_path, range(10100, 14000, 100))
+        presented, reasons = r1.present(present_path,
+            {"qpc_frequency": 1000, "begin": 10000, "stop": 14000}, self.ready)
+        self.assertEqual(reasons, [])
+        self.assertEqual(presented["gaps_ms"]["stall_count"], 0)
+        trace = self.root / "native-render-failure.txt"
+        for telemetry in ("minimalPresent", "presentGpu", "detailed"):
+            with self.subTest(telemetry=telemetry):
+                ready, receipt = self.failure_trace_receipts()
+                for capture in (ready, receipt):
+                    capture["telemetry"] = telemetry
+                    if telemetry == "presentGpu":
+                        capture["controller_script_sha256"] = "d" * 64
+                        capture["shadow_experiment"] = ShadowExperimentTests.config()
+                        capture["telemetry_channels"] = {"present": True, "main": False,
+                                                         "owner": False, "gpu": True}
+                trace.write_bytes(b"")
+                evidence = self.run_controller(ready, receipt)[1]["native_render_failure_evidence"]
+                self.assertEqual(evidence["status"], "empty")
+                trace.write_text("result=1 INVALID_ARGUMENT recovered_after_failure=1\n", encoding="utf-8")
+                with self.assertRaisesRegex(r1.Reject, "nonempty native render failure trace"):
+                    r1.analyze(self.root)
+
+    def test_enabled_absent_and_empty_trace_are_honest_healthy_cases(self):
+        ready, receipt = self.failure_trace_receipts()
+        evidence = self.run_controller(ready, receipt)[1]["native_render_failure_evidence"]
+        self.assertEqual(evidence["status"], "absent")
+        self.assertIn("does not independently prove", evidence["limitation"])
+        (self.root / "native-render-failure.txt").write_bytes(b"")
+        evidence = self.run_controller(ready, receipt)[1]["native_render_failure_evidence"]
+        self.assertEqual(evidence["status"], "empty")
+        self.assertIn("does not independently prove", evidence["limitation"])
+
+    def test_disabled_or_unrecorded_legacy_trace_coverage_stays_unknown(self):
+        trace = self.root / "native-render-failure.txt"
+        for enabled in (None, False):
+            ready = json.loads(json.dumps(self.ready))
+            receipt = json.loads(json.dumps(self.exit))
+            if enabled is False:
+                ready["failure_trace_enabled"] = receipt["failure_trace_enabled"] = False
+                # Disabled arbitrary bindings are never followed; only the conventional local file is inspected.
+                unrelated = self.root / "unrelated-trace.txt"
+                unrelated.write_bytes(b"unrelated nonempty trace")
+                ready["failure_trace_path"] = receipt["failure_trace_path"] = str(unrelated)
+            trace.write_bytes(b"result=1 INVALID_ARGUMENT\n")
+            with self.assertRaisesRegex(r1.Reject, "nonempty native render failure trace"):
+                self.run_controller(ready, receipt)
+            trace.write_bytes(b"")
+            for absent in (False, True):
+                if absent:
+                    trace.unlink()
+                evidence = self.run_controller(ready, receipt)[1]["native_render_failure_evidence"]
+                self.assertEqual(evidence["status"], "coverage_unknown")
+                self.assertIs(evidence["enabled"], enabled)
+
+    def test_enabled_trace_path_must_be_exactly_inside_this_run(self):
+        for value in ("native-render-failure.txt", str(self.root.parent / "native-render-failure.txt"),
+                      str(self.root / "subdirectory" / "native-render-failure.txt"),
+                      str(self.root / ".." / "native-render-failure.txt")):
+            with self.subTest(path=value):
+                ready, receipt = self.failure_trace_receipts()
+                ready["failure_trace_path"] = receipt["failure_trace_path"] = value
+                with self.assertRaisesRegex(r1.Reject, "exact run-local"):
+                    self.run_controller(ready, receipt)
+
+    def test_enabled_unreadable_trace_is_rejected(self):
+        ready, receipt = self.failure_trace_receipts()
+        trace = self.root / "native-render-failure.txt"
+        trace.write_bytes(b"")
+        original_open = Path.open
+        def read_denied(path, *args, **kwargs):
+            if path == trace:
+                raise PermissionError("synthetic unreadable trace")
+            return original_open(path, *args, **kwargs)
+        with patch.object(Path, "open", read_denied):
+            with self.assertRaisesRegex(r1.Reject, "cannot read native render failure trace"):
+                self.run_controller(ready, receipt)
+
+    def test_enabled_nonordinary_and_oversized_traces_are_rejected(self):
+        ready, receipt = self.failure_trace_receipts()
+        trace = self.root / "native-render-failure.txt"
+        trace.mkdir()
+        with self.assertRaisesRegex(r1.Reject, "ordinary non-reparse"):
+            self.run_controller(ready, receipt)
+        trace.rmdir()
+        trace.write_bytes(b"x" * (1024 * 1024 + 1))
+        with self.assertRaisesRegex(r1.Reject, "1 MiB safety limit"):
+            self.run_controller(ready, receipt)
+
+    def test_trace_opt_in_cannot_be_removed_only_from_exit_receipt(self):
+        ready, receipt = self.failure_trace_receipts()
+        receipt["failure_trace_enabled"] = False
+        with self.assertRaisesRegex(r1.Reject, "ready/exit mismatch: failure_trace_enabled"):
+            self.run_controller(ready, receipt)
 
     def test_controller_rejects_fractional_exit_codes_and_pids(self):
         self.assertEqual(self.run_controller(self.ready, self.exit)[1]["game_sha256"],
@@ -1230,6 +2103,29 @@ class PresentParserTests(unittest.TestCase):
         make_csv(self.path, [10400, 10800, 10700, 11200])
         with self.assertRaisesRegex(r1.Reject, "nonmonotonic"):
             r1.present(self.path, self.phase, self.ready)
+
+    def test_overlapping_present_intervals_rejected_but_touching_intervals_are_allowed(self):
+        make_csv(self.path, [10401, 10402, 10403])
+        phase = {"qpc_frequency": 1000, "begin": 10400, "stop": 10404}
+        report, reasons = r1.present(self.path, phase, self.ready)
+        self.assertEqual(reasons, [])
+        self.assertEqual(report["completions"], 3)
+
+        with self.path.open(newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            rows = list(reader)
+        present_rows = [row for row in rows if row["row_type"] == "present"]
+        # Both sequences still increase, but the second interval begins before
+        # the first one ends: [10399, 10401], [10400, 10402].
+        present_rows[0]["present_start_qpc"] = "10399"
+        present_rows[1]["present_start_qpc"] = "10400"
+        with self.path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        with self.assertRaisesRegex(r1.Reject, "Present intervals overlap"):
+            r1.present(self.path, phase, self.ready)
 
     def test_repeated_long_gaps_qualify_as_failure(self):
         _, reasons = self.run_present([10400, 11400, 12400, 13600])

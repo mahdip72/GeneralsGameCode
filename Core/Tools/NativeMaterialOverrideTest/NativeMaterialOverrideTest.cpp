@@ -98,11 +98,14 @@ public:
 };
 class ShaderClass {
 public:
-    enum {SRCBLEND_SRC_ALPHA=1,SRCBLEND_ZERO=2,DSTBLEND_ONE_MINUS_SRC_ALPHA=3,DSTBLEND_ZERO=4,DSTBLEND_SRC_COLOR=5};
-    int source,dest; ShaderClass():source(0),dest(DSTBLEND_ZERO){}
+    // Values mirror both title ShaderClass contracts; the default is opaque ONE/ZERO.
+    enum {SRCBLEND_ZERO=0,SRCBLEND_ONE=1,SRCBLEND_SRC_ALPHA=2,DSTBLEND_ZERO=0,DSTBLEND_SRC_COLOR=2,DSTBLEND_ONE_MINUS_SRC_ALPHA=5,ALPHATEST_DISABLE=0,ALPHATEST_ENABLE=1};
+    int source,dest,alphaTest; ShaderClass():source(SRCBLEND_ONE),dest(DSTBLEND_ZERO),alphaTest(ALPHATEST_DISABLE){}
     void Set_Src_Blend_Func(int v){source=v;}
     void Set_Dst_Blend_Func(int v){dest=v;}
     int Get_Dst_Blend_Func()const{return dest;}
+    int Get_Src_Blend_Func()const{return source;}
+    int Get_Alpha_Test()const{return alphaTest;}
 };
 class RenderObjClass {
 public:
@@ -113,8 +116,9 @@ public:
 class MeshGeometryClass {public:enum {SORT=1};};
 class MeshModelClass : public MeshGeometryClass {
 public:
-    enum {ALIGNED=2,ORIENTED=4,SKIN=8};unsigned int flags;
-    MeshModelClass():flags(0){} unsigned int Get_Flag(unsigned int f)const{return flags&f;}
+    enum {ALIGNED=2,ORIENTED=4,SKIN=8};unsigned int flags,passCount;
+    MeshModelClass():flags(0),passCount(1){} unsigned int Get_Flag(unsigned int f)const{return flags&f;}
+    unsigned int Get_Pass_Count()const{return passCount;}
 };
 struct Sphere {};
 class MeshClass {
@@ -151,9 +155,23 @@ struct GameRenderCommand {GameRenderCommandType type;const void *input;size_t in
 class IGameRenderClientNativeOwner {
 public:
     bool operational,refuseCommand;unsigned int commands,failureCount;
+    unsigned int rigidFlushCalls=0,rigidFailCall=0,rigidBegins=0,rigidEnds=0;
+    bool rigidHint=false;const void *rigidGeometry=0,*rigidCategory=0;
     IGameRenderClientNativeOwner():operational(true),refuseCommand(false),commands(0),failureCount(0){}
+    RenderResult FlushGameRigidDraws(){
+        ++rigidFlushCalls;
+        if(rigidFailCall==rigidFlushCalls){RecordGameFailure(RENDER_RESULT_FAILED);return RENDER_RESULT_FAILED;}
+        return RENDER_RESULT_OK;
+    }
+    RenderResult BeginGameRigidDrawScope(const void *geometry,const void *category){
+        CHECK(!rigidHint && geometry!=0 && category!=0);++rigidBegins;
+        rigidHint=true;rigidGeometry=geometry;rigidCategory=category;return RENDER_RESULT_OK;
+    }
+    void EndGameRigidDrawScope(){CHECK(rigidHint);++rigidEnds;rigidHint=false;rigidGeometry=rigidCategory=0;}
     bool IsInitialized()const{return operational;} bool IsOperational()const{return operational;}
     void RecordGameFailure(RenderResult){++failureCount;}
+    // Extracted production cases pass diagnostic provenance without changing failure semantics.
+    void RecordGameFailure(RenderResult r,const char *,unsigned int){RecordGameFailure(r);}
     RenderResult ExecuteGameRenderCommand(const GameRenderCommand &);
 } owner;
 class NativeGameRenderOwnerScope {
@@ -161,6 +179,22 @@ public:
     NativeGameRenderOwnerScope(){++scopeDepth;++scopeAdmissions;}
     ~NativeGameRenderOwnerScope(){--scopeDepth;}
     IGameRenderClientNativeOwner *Get(){return &owner;}
+};
+// Instrument the category's owner barrier and synchronous hint contract. The
+// fixture never batches draws; the included product category decides eligibility.
+RenderResult FlushGameRigidDraws(){NativeGameRenderOwnerScope scope;return scope.Get()->FlushGameRigidDraws();}
+RenderResult BeginGameRigidDrawScope(const void *geometry,const void *category){return owner.BeginGameRigidDrawScope(geometry,category);}
+void EndGameRigidDrawScope(){owner.EndGameRigidDrawScope();}
+class GameRigidDrawHintScope {
+    bool enabled;
+public:
+    GameRigidDrawHintScope(bool value,const void *geometry,const void *category):enabled(value){
+        if(enabled)(void)BeginGameRigidDrawScope(geometry,category);
+    }
+    ~GameRigidDrawHintScope(){if(enabled)EndGameRigidDrawScope();}
+private:
+    GameRigidDrawHintScope(const GameRigidDrawHintScope &);
+    GameRigidDrawHintScope &operator=(const GameRigidDrawHintScope &);
 };
 void SetGameMaterial(const VertexMaterialClass *);
 void SetGameTexture(unsigned int,TextureClass *){}
@@ -189,11 +223,11 @@ void SetGameTransform(GameRenderTransformSlot slot,const Matrix4x4 &m){
 #include "mapper.inc"
 #include "material-facade.inc"
 
-struct CapturedDraw {rts::render::LegacyLogicalState state;bool sorted;};
+struct CapturedDraw {rts::render::LegacyLogicalState state;bool sorted,rigid;const void *geometry,*category;};
 std::vector<CapturedDraw> captured;
 class DX8PolygonRendererClass {
 public:
-    void Capture(bool sorted){CapturedDraw draw;CHECK(rts::render::GetTrackedLegacyLogicalState(&draw.state));draw.sorted=sorted;captured.push_back(draw);}
+    void Capture(bool sorted){CapturedDraw draw;CHECK(rts::render::GetTrackedLegacyLogicalState(&draw.state));draw.sorted=sorted;draw.rigid=rts::render::owner.rigidHint;draw.geometry=rts::render::owner.rigidGeometry;draw.category=rts::render::owner.rigidCategory;captured.push_back(draw);}
     void Render(unsigned int){Capture(false);}
     void Render_Sorted(unsigned int,const Sphere &){Capture(true);}
 };
@@ -286,11 +320,57 @@ void TestPendingAndDisabled(){
         category.Add(&renderer,&mesh);category.Render();CHECK(captured.empty());CHECK(category.render_task_head==0);DX8RendererDebugger::enabled=false;}
     CHECK(Near(material.Get_Opacity(),.8f));CHECK(scopeDepth==0);
 }
+void TestRigidCategoryContract(){
+    using namespace rts::render;
+    // Every exclusion is evaluated by the mechanically included category body.
+    for(unsigned int exclusion=0;exclusion<16;++exclusion){
+        captured.clear();ResetTrackedLegacyState();VertexMaterialClass material;
+        LinearOffsetTextureMapperClass mapper;MeshClass mesh;RenderObjClass::Material_Override data;
+        DX8PolygonRendererClass renderer;DX8TextureCategoryClass category(&material);
+        WW3D::sorting=true;
+        if(exclusion==1)material.Mapper[0]=&mapper;
+        if(exclusion==2)material.Mapper[1]=&mapper;
+        if(exclusion==3)mesh.model.passCount=2;
+        if(exclusion==4)category.pass=1;
+        if(exclusion==5)mesh.model.flags=MeshModelClass::SKIN;
+        if(exclusion==6)mesh.model.flags=MeshModelClass::ALIGNED;
+        if(exclusion==7)mesh.model.flags=MeshModelClass::ORIENTED;
+        if(exclusion==8)mesh.model.flags=MeshGeometryClass::SORT;
+        if(exclusion==9)mesh.scale=2;
+        if(exclusion==10)mesh.alpha=.5f;
+        if(exclusion==11)mesh.user=&data;
+        if(exclusion==12)category.shader.alphaTest=ShaderClass::ALPHATEST_ENABLE;
+        if(exclusion==13)category.shader.source=ShaderClass::SRCBLEND_SRC_ALPHA;
+        if(exclusion==14)category.shader.dest=ShaderClass::DSTBLEND_ONE_MINUS_SRC_ALPHA;
+        DX8RendererDebugger::enabled=exclusion==15;
+        const unsigned int begins=owner.rigidBegins,ends=owner.rigidEnds,flushes=owner.rigidFlushCalls;
+        category.Add(&renderer,&mesh);category.Render();
+        CHECK(captured.size()==1);CHECK(category.render_task_head==0);
+        const bool eligible=exclusion==0;
+        CHECK(owner.rigidBegins-begins==(eligible?1U:0U));CHECK(owner.rigidEnds-ends==(eligible?1U:0U));
+        CHECK(owner.rigidFlushCalls-flushes==(eligible?2U:3U));
+        if(captured.size()==1){CHECK(captured[0].rigid==eligible);
+            CHECK(captured[0].geometry==(eligible?static_cast<const void *>(&renderer):0));
+            CHECK(captured[0].category==(eligible?static_cast<const void *>(&category):0));}
+        CHECK(!owner.rigidHint && owner.rigidGeometry==0 && owner.rigidCategory==0 && scopeDepth==0);
+    }
+    DX8RendererDebugger::enabled=false;
+    // Start/end barrier failures must clear tasks and must not replay a callback.
+    for(unsigned int barrier=1;barrier<=2;++barrier){
+        captured.clear();ResetTrackedLegacyState();VertexMaterialClass material;MeshClass mesh;
+        DX8PolygonRendererClass renderer;DX8TextureCategoryClass category(&material);
+        const unsigned int failureCount=owner.failureCount;
+        owner.rigidFailCall=owner.rigidFlushCalls+barrier;
+        category.Add(&renderer,&mesh);category.Render();owner.rigidFailCall=0;
+        CHECK(captured.size()==barrier-1);CHECK(category.render_task_head==0 && category.clears==1);
+        CHECK(owner.failureCount==failureCount+1);CHECK(!owner.rigidHint && scopeDepth==0);
+    }
+}
 int main(){
     TestInstances(false,false,.25f,true);TestInstances(true,false,.4f,true);
     TestInstances(false,true,1,true);TestInstances(false,true,.5f,true);
     TestInstances(true,true,.6f,true);TestInstances(false,true,1,false);
-    TestNonLinearAndRefusal();TestPendingAndDisabled();
+    TestNonLinearAndRefusal();TestPendingAndDisabled();TestRigidCategoryContract();
     printf("failures=%u captured_owner_scopes=%u balanced=%u\n",failures,scopeAdmissions,scopeDepth);
     return failures?1:0;
 }

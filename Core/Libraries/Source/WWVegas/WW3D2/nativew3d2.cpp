@@ -4,9 +4,13 @@
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/ThreadedRenderDevice.h"
 #include "Renderer/LegacyAsyncFramePolicy.h"
+#include "Renderer/GameRigidDrawBatch.h"
 
 #include "Renderer/LegacyBridgeValidation.h"
 #include "Lib/FrameTimingDiagnostics.h"
+#include "nativesorteddiagnostics.h"
+
+namespace sorted_diag = rts::render::sorted_diagnostics;
 #include "dx8indexbuffer.h"
 #include "nativew3dbufferowner.h"
 #include "nativew3dtextureowner.h"
@@ -20,6 +24,53 @@
 
 namespace
 {
+
+class NativeRigidDrawSink : public rts::render::GameRigidDrawSink
+{
+public:
+	explicit NativeRigidDrawSink(NativeW3D2 &owner) : m_owner(owner) {}
+	virtual rts::render::RenderResult Ordinary(
+		const rts::render::LegacyLogicalState &state,
+		const rts::render::NativeDrawPacket &packet)
+	{
+		return m_owner.SubmitGameTriangles(state, packet);
+	}
+	virtual rts::render::RenderResult Instanced(
+		const rts::render::LegacyLogicalState &state,
+		const rts::render::NativeDrawPacket &packet,
+		const rts::render::RenderMatrix4 *worlds, unsigned int count)
+	{
+		if (!m_owner.IsOperational() || !m_owner.Renderer().IsFrameOpen())
+			return rts::render::RENDER_RESULT_FAILED;
+		return m_owner.Renderer().SubmitInstanced(m_owner.Resources(), state,
+			packet, worlds, count);
+	}
+private:
+	NativeW3D2 &m_owner; // Stack-only synchronous sink, never queued.
+};
+
+bool RigidCommandMayPrepareLogicalState(rts::render::GameRenderCommandType type)
+{
+	using namespace rts::render;
+	switch (type)
+	{
+	case GAME_RENDER_COMMAND_SET_TEXTURE:
+	case GAME_RENDER_COMMAND_SET_MATERIAL:
+	case GAME_RENDER_COMMAND_SET_LIGHT:
+	case GAME_RENDER_COMMAND_SET_TRANSFORM:
+	case GAME_RENDER_COMMAND_SET_TEXTURE_STAGE_STATE:
+	case GAME_RENDER_COMMAND_SET_TEXTURE_BUMP_ENVIRONMENT:
+	case GAME_RENDER_COMMAND_SET_VERTEX_BUFFER:
+	case GAME_RENDER_COMMAND_SET_INDEX_BUFFER:
+	case GAME_RENDER_COMMAND_SET_INDEX_BUFFER_OFFSET:
+	case GAME_RENDER_COMMAND_APPLY_RENDER_STATE_CHANGES:
+	case GAME_RENDER_COMMAND_SET_AMBIENT_COLOR:
+	case GAME_RENDER_COMMAND_DRAW_TRIANGLES:
+		return true;
+	default:
+		return false;
+	}
+}
 
 thread_local const rts::render::GameRenderCommand *g_failureCommand = 0;
 thread_local bool g_gameFailureStreakObserved = false;
@@ -66,15 +117,20 @@ uint64_t PackTraceHandle(const rts::render::GameRenderHandle &handle)
 
 void TraceGameFailure(rts::render::RenderResult result,
 	unsigned int displayIteration, uint64_t lastSubmittedSequence,
-	const rts::render::GameRenderCommand *command)
+	const rts::render::GameRenderCommand *command, const char *caller,
+	unsigned int site)
 {
 	const char *path = getenv("RTS_RENDER_FAILURE_TRACE");
 	if (path == 0 || path[0] == '\0') return;
+	LARGE_INTEGER qpc = {};
+	QueryPerformanceCounter(&qpc);
+	const sorted_diag::Origin *origin = sorted_diag::ActiveOrigin();
+	const bool hasOrigin = origin != 0 && origin->present;
 	FILE *trace = fopen(path, "ab");
 	if (trace != 0)
 	{
 		fprintf(trace,
-			"renderer_failure source=game display_iteration=%u last_submitted=%llu result=%d operation=game-command command=%u value0=%u value1=%u value2=%u value3=%u value4=%u value5=%u resource0=%llu resource1=%llu\r\n",
+			"renderer_failure source=game display_iteration=%u last_submitted=%llu result=%d operation=game-command command=%u value0=%u value1=%u value2=%u value3=%u value4=%u value5=%u resource0=%llu resource1=%llu command_present=%u caller=%.128s site=%u qpc=%llu sorted_origin_present=%u sorted_origin_result=%d sorted_origin_caller=%.128s sorted_origin_site=%u sorted_origin_reason=%.64s sorted_origin_qpc=%llu sorted_value0=%llu sorted_value1=%llu sorted_value2=%llu sorted_value3=%llu sorted_value4=%llu sorted_value5=%llu",
 			displayIteration,
 			static_cast<unsigned long long>(lastSubmittedSequence),
 			static_cast<int>(result),
@@ -88,7 +144,51 @@ void TraceGameFailure(rts::render::RenderResult result,
 			static_cast<unsigned long long>(command == 0 ? 0U :
 				PackTraceHandle(command->resource0)),
 			static_cast<unsigned long long>(command == 0 ? 0U :
-				PackTraceHandle(command->resource1)));
+				PackTraceHandle(command->resource1)),
+			command == 0 ? 0U : 1U,
+			caller == 0 ? "external-unknown" : caller, site,
+			static_cast<unsigned long long>(qpc.QuadPart),
+			hasOrigin ? 1U : 0U, hasOrigin ? static_cast<int>(origin->result) : 0,
+			hasOrigin && origin->caller != 0 ? origin->caller : "none",
+			hasOrigin ? origin->site : 0U,
+			hasOrigin && origin->reason != 0 ? origin->reason : "none",
+			static_cast<unsigned long long>(hasOrigin ? origin->qpc : 0),
+			static_cast<unsigned long long>(hasOrigin ? origin->values[0] : 0),
+			static_cast<unsigned long long>(hasOrigin ? origin->values[1] : 0),
+			static_cast<unsigned long long>(hasOrigin ? origin->values[2] : 0),
+			static_cast<unsigned long long>(hasOrigin ? origin->values[3] : 0),
+			static_cast<unsigned long long>(hasOrigin ? origin->values[4] : 0),
+			static_cast<unsigned long long>(hasOrigin ? origin->values[5] : 0));
+		fprintf(trace, " sorted_depth_present=%u", hasOrigin && origin->depth.present ? 1U : 0U);
+		if (hasOrigin && origin->depth.present)
+		{
+			const sorted_diag::DepthSnapshot &depth = origin->depth;
+#define RTS_DEPTH_FIELD(name) fprintf(trace, " sorted_depth_" #name "=%llu", static_cast<unsigned long long>(depth.name))
+			RTS_DEPTH_FIELD(bounds); RTS_DEPTH_FIELD(stride); RTS_DEPTH_FIELD(minimum);
+			RTS_DEPTH_FIELD(vertexCount); RTS_DEPTH_FIELD(vertexFormat); RTS_DEPTH_FIELD(layoutCount);
+			RTS_DEPTH_FIELD(vertexHandleIndex); RTS_DEPTH_FIELD(vertexHandleGeneration);
+			RTS_DEPTH_FIELD(indexHandleIndex); RTS_DEPTH_FIELD(indexHandleGeneration); RTS_DEPTH_FIELD(shaderBits);
+			RTS_DEPTH_FIELD(preTransformed); RTS_DEPTH_FIELD(commonZ); RTS_DEPTH_FIELD(kernelResult);
+			RTS_DEPTH_FIELD(batchCount); RTS_DEPTH_FIELD(descriptorCount); RTS_DEPTH_FIELD(submittedJobs);
+			RTS_DEPTH_FIELD(completedJobs); RTS_DEPTH_FIELD(workerThreadsUsed);
+			RTS_DEPTH_FIELD(scratchOutputCount); RTS_DEPTH_FIELD(scratchCapacityBytes);
+			RTS_DEPTH_FIELD(vertexAddress); RTS_DEPTH_FIELD(vertexBytes); RTS_DEPTH_FIELD(indexAddress);
+			RTS_DEPTH_FIELD(indexCount); RTS_DEPTH_FIELD(outputAddress); RTS_DEPTH_FIELD(outputCount);
+			RTS_DEPTH_FIELD(scratchAddress); RTS_DEPTH_FIELD(descriptorAddress);
+			RTS_DEPTH_FIELD(firstIndex); RTS_DEPTH_FIELD(outputSlot); RTS_DEPTH_FIELD(outputNode); RTS_DEPTH_FIELD(outputZ);
+#undef RTS_DEPTH_FIELD
+			for (unsigned int i = 0; i < 3; ++i)
+				fprintf(trace, " sorted_depth_sourceIndex%u=%u sorted_depth_relativeIndex%u=%u sorted_depth_outputIndex%u=%u",
+					i, depth.sourceIndices[i], i, depth.relativeIndices[i], i, depth.outputIndices[i]);
+			for (unsigned int i = 0; i < 9; ++i)
+				fprintf(trace, " sorted_depth_xyzBits%u=%u", i, depth.xyzBits[i]);
+			for (unsigned int i = 0; i < 4; ++i)
+				fprintf(trace, " sorted_depth_zBits%u=%u", i, depth.zBits[i]);
+			for (unsigned int i = 0; i < depth.layoutCount && i < 16; ++i)
+				fprintf(trace, " sorted_depth_layoutSemantic%u=%u sorted_depth_layoutIndex%u=%u sorted_depth_layoutFormat%u=%u sorted_depth_layoutOffset%u=%u",
+					i, depth.layoutSemantic[i], i, depth.layoutIndex[i], i, depth.layoutFormat[i], i, depth.layoutOffset[i]);
+		}
+		fprintf(trace, "\r\n");
 		fclose(trace);
 	}
 }
@@ -398,6 +498,35 @@ bool InvokeGameCleanupReAcquire(rts::render::GameRenderCleanupHook *hook)
 
 } // namespace
 
+namespace rts { namespace render {
+
+RenderResult FlushNativeGameRigidDraws(NativeW3D2 &owner)
+{
+	if (!owner.Resources().IsOwnerThread()) return RENDER_RESULT_OK;
+	if (owner.m_rigidDrawBatch.Count() != 0 &&
+		(!owner.IsOperational() || !owner.Renderer().IsFrameOpen()))
+	{
+		owner.m_rigidDrawBatch.Abandon();
+		owner.RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
+		return RENDER_RESULT_FAILED;
+	}
+	NativeRigidDrawSink sink(owner);
+	RenderResult result = RENDER_RESULT_FAILED;
+	try { result = owner.m_rigidDrawBatch.Flush(sink); }
+	catch (...) { result = RENDER_RESULT_FAILED; }
+	if (result != RENDER_RESULT_OK) owner.RecordGameFailure(result, __FUNCTION__, __LINE__);
+	if (!owner.m_rigidDrawBatch.Emitting())
+	{
+		// All physical mutations advance this conservative context boundary.
+		if (owner.m_rigidContextEpoch != ~static_cast<uint64_t>(0))
+			++owner.m_rigidContextEpoch;
+		else owner.EndGameRigidDrawScope();
+	}
+	return result;
+}
+
+} }
+
 
 NativeW3D2::NativeShaderEntry::NativeShaderEntry() : live(false),
 	vertexShader(false),
@@ -407,7 +536,62 @@ NativeW3D2::NativeShaderEntry::NativeShaderEntry() : live(false),
 {
 }
 
+rts::render::RenderResult NativeW3D2::BeginGameRigidDrawScope(
+	const void *geometry, const void *category)
+{
+	m_rigidHintEnabled = false;
+	if (!IsOperational() || !m_resources.IsOwnerThread() ||
+		!m_renderer.IsFrameOpen() || !m_renderer.SupportsRigidInstancing() ||
+		m_rigidContextEpoch == ~static_cast<uint64_t>(0))
+		return rts::render::RENDER_RESULT_UNSUPPORTED;
+	if (geometry == 0 || category == 0)
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	m_rigidGeometry = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(geometry));
+	m_rigidCategory = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(category));
+	m_rigidHintEnabled = true;
+	return rts::render::RENDER_RESULT_OK;
+}
+
+void NativeW3D2::EndGameRigidDrawScope()
+{
+	m_rigidHintEnabled = false;
+	m_rigidGeometry = 0;
+	m_rigidCategory = 0;
+}
+
+rts::render::RenderResult NativeW3D2::FlushGameRigidDraws()
+{
+	return rts::render::FlushNativeGameRigidDraws(*this);
+}
+
+rts::render::RenderResult NativeW3D2::GetGameRigidDrawMetrics(
+	rts::render::GameRigidDrawMetrics *metrics) const
+{
+	if (metrics == 0 || !m_resources.IsOwnerThread())
+		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	const rts::render::GameRigidDrawBatch::AdmissionDiagnostics &diagnostics =
+		m_rigidDrawBatch.Diagnostics();
+	// This seam is sampled at cohort warm/stop boundaries, never per draw.
+	printf("R2_RIGID_ADMISSION_DIAGNOSTIC identity=%llu range=%llu layout=%llu topology=%llu pipeline=%llu blend_alpha_npatch=%llu world=%llu stride32=%llu stride36=%llu stride_other=%llu accepted32=%llu accepted36=%llu\n",
+		static_cast<unsigned long long>(diagnostics.rejected[0]),
+		static_cast<unsigned long long>(diagnostics.rejected[1]),
+		static_cast<unsigned long long>(diagnostics.rejected[2]),
+		static_cast<unsigned long long>(diagnostics.rejected[3]),
+		static_cast<unsigned long long>(diagnostics.rejected[4]),
+		static_cast<unsigned long long>(diagnostics.rejected[5]),
+		static_cast<unsigned long long>(diagnostics.rejected[6]),
+		static_cast<unsigned long long>(diagnostics.declarations[0]),
+		static_cast<unsigned long long>(diagnostics.declarations[1]),
+		static_cast<unsigned long long>(diagnostics.declarations[2]),
+		static_cast<unsigned long long>(diagnostics.accepted[0]),
+		static_cast<unsigned long long>(diagnostics.accepted[1]));
+	*metrics = m_rigidDrawBatch.Metrics();
+	return rts::render::RENDER_RESULT_OK;
+}
+
 NativeW3D2::NativeW3D2() : m_resourceHost(256), m_resources(4096),
+	m_rigidDrawBatch(), m_rigidHintEnabled(false), m_rigidGeometry(0),
+	m_rigidCategory(0), m_rigidContextEpoch(1),
 	m_borrowedBackend(false), m_gameResourcesOperational(false),
 	m_line3DContext(&m_renderer, &m_resources),
 	m_activeRenderTargetKind(rts::render::GAME_RENDER_TARGET_UNKNOWN),
@@ -654,6 +838,9 @@ rts::render::RenderResult NativeW3D2::ReplaceBackendContext(
 	rts::render::NativeGameRenderOwnerLifecycleScope ownerLifecycleScope;
 	if (!ownerLifecycleScope.IsAcquired())
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	(void)rts::render::FlushNativeGameRigidDraws(*this);
+	m_rigidDrawBatch.Abandon();
+	EndGameRigidDrawScope();
 	const bool wasOwnerPublished = ownerLifecycleScope.Get() == this;
 	if (wasOwnerPublished)
 		ownerLifecycleScope.Publish(0);
@@ -693,6 +880,9 @@ rts::render::RenderResult NativeW3D2::ReplaceBackendContext(
 rts::render::RenderResult NativeW3D2::DrainResourceCleanup(
 	unsigned int maxCommands, unsigned int *drained)
 {
+	if (drained != 0) *drained = 0;
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	return !m_borrowedBackend ? rts::render::RENDER_RESULT_INVALID_ARGUMENT :
 		m_resourceHost.DrainCleanup(maxCommands, drained);
 }
@@ -799,12 +989,14 @@ rts::render::RenderResult NativeW3D2::FenceBufferPublications(void *owner)
 
 rts::render::RenderResult NativeW3D2::FenceThreadedRender()
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
 	if (!m_renderer.IsThreaded())
-		return rts::render::RENDER_RESULT_OK;
+		return rigidBarrier;
 	const rts::render::RenderResult drainResult = m_renderer.DrainThreaded();
 	const rts::render::RenderResult publicationResult =
 		PollThreadedCompletions();
-	return FirstNativeThreadedFailure(drainResult, publicationResult);
+	return FirstNativeThreadedFailure(rigidBarrier,
+		FirstNativeThreadedFailure(drainResult, publicationResult));
 }
 
 rts::render::RenderResult NativeW3D2::CancelOpenThreadedFrame(
@@ -950,6 +1142,9 @@ rts::render::RenderResult NativeW3D2::RecoverDevice()
 	rts::render::NativeGameRenderOwnerLifecycleScope lifecycleScope;
 	if (!lifecycleScope.IsAcquired())
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	(void)rts::render::FlushNativeGameRigidDraws(*this);
+	m_rigidDrawBatch.Abandon();
+	EndGameRigidDrawScope();
 	// A producer frame may still be open when an asynchronous completion reports
 	// removal. Seal it as a failed non-visible frame before the lifecycle fence;
 	// otherwise the threaded backend retains its reserved completion slot and a
@@ -1027,6 +1222,9 @@ rts::render::RenderResult NativeW3D2::RecoverOwnedDevice()
 	if (m_borrowedBackend || !m_resources.IsOwnerThread() ||
 		!m_renderer.CanRecoverDevice())
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	(void)rts::render::FlushNativeGameRigidDraws(*this);
+	m_rigidDrawBatch.Abandon();
+	EndGameRigidDrawScope();
 	// Sorted submissions copy logical handles from the old device epoch. A
 	// failed flush may retain them for a same-device retry, but recovery must
 	// retire them before title resources are released and reacquired.
@@ -1049,7 +1247,7 @@ rts::render::RenderResult NativeW3D2::RecoverOwnedDevice()
 	{
 		m_rebuildingResources = false;
 		m_gameCaptureRequest.clear();
-		RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
+		RecordGameFailure(rts::render::RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_FAILED;
 	}
 	const rts::render::RenderResult result = m_renderer.RecoverDevice();
@@ -1073,7 +1271,7 @@ rts::render::RenderResult NativeW3D2::RecoverOwnedDevice()
 				m_gameCaptureQueue.cancelCurrent(reacquireResult);
 				m_gameCaptureRequest.clear();
 			}
-			RecordGameFailure(reacquireResult);
+			RecordGameFailure(reacquireResult, __FUNCTION__, __LINE__);
 			return reacquireResult;
 		}
 	}
@@ -1094,7 +1292,7 @@ rts::render::RenderResult NativeW3D2::RecoverOwnedDevice()
 	}
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
-		RecordGameFailure(result);
+		RecordGameFailure(result, __FUNCTION__, __LINE__);
 	}
 	return result;
 }
@@ -1124,6 +1322,9 @@ rts::render::RenderResult NativeW3D2::Shutdown()
 	rts::render::NativeGameRenderOwnerLifecycleScope ownerLifecycleScope;
 	if (!ownerLifecycleScope.IsAcquired())
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+	(void)rts::render::FlushNativeGameRigidDraws(*this);
+	m_rigidDrawBatch.Abandon();
+	EndGameRigidDrawScope();
 	if (!m_borrowedBackend && m_renderer.IsThreaded())
 	{
 		// Owned threaded shutdown must close the producer packet and wait for the
@@ -1243,6 +1444,15 @@ rts::render::GameRenderTargetKind NativeW3D2::ActiveRenderTargetKind() const
 rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 	bool present)
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK)
+	{
+		if (capture && m_gameCaptureQueue.bindOwnerThread())
+			m_gameCaptureQueue.cancelCurrent(rigidBarrier);
+		m_gameCaptureRequest.clear();
+		const rts::render::RenderResult cancelled = CancelOpenThreadedFrame(rigidBarrier);
+		return FirstNativeThreadedFailure(rigidBarrier, cancelled);
+	}
 	using namespace rts::render;
 	if (!m_renderer.IsFrameOpen())
 	{
@@ -1251,7 +1461,7 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 			m_gameCaptureQueue.cancelCurrent(result);
 		if (capture)
 			m_gameCaptureRequest.clear();
-		RecordGameFailure(result);
+		RecordGameFailure(result, __FUNCTION__, __LINE__);
 		return result;
 	}
 
@@ -1271,7 +1481,7 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 		// FinalizeEndedFrame again here would submit an empty second packet (and
 		// can hide the original failure behind INVALID_ARGUMENT). Keep callback
 		// cancellation tied to the first failure and leave the facade in lockstep.
-		RecordGameFailure(endResult);
+		RecordGameFailure(endResult, __FUNCTION__, __LINE__);
 		if (capture && m_gameCaptureQueue.bindOwnerThread())
 			m_gameCaptureQueue.cancelCurrent(endResult);
 		if (capture)
@@ -1292,11 +1502,11 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 			// PrepareGameBackBufferCapture cancels the queue before returning a
 			// readback failure. Latch it at the aggregate boundary so the title
 			// adapter cannot mistake a failed capture for a visible frame.
-			RecordGameFailure(captureResult);
+			RecordGameFailure(captureResult, __FUNCTION__, __LINE__);
 			const RenderResult finalizeResult =
 				m_renderer.FinalizeEndedFrame(false);
 			if (finalizeResult != RENDER_RESULT_OK)
-				RecordGameFailure(finalizeResult);
+				RecordGameFailure(finalizeResult, __FUNCTION__, __LINE__);
 			return captureResult;
 		}
 	}
@@ -1312,7 +1522,7 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 	{
 		if (requestedCapture && m_gameCaptureQueue.bindOwnerThread())
 			m_gameCaptureQueue.cancelCurrent(finalizeResult);
-		RecordGameFailure(finalizeResult);
+		RecordGameFailure(finalizeResult, __FUNCTION__, __LINE__);
 		return finalizeResult;
 	}
 
@@ -1353,26 +1563,28 @@ rts::render::RenderResult NativeW3D2::FinishGameRenderFrame(bool capture,
 			completionResult : RENDER_RESULT_FAILED;
 		if (m_gameCaptureQueue.bindOwnerThread())
 			m_gameCaptureQueue.cancelCurrent(cancellation);
-		RecordGameFailure(cancellation);
+		RecordGameFailure(cancellation, __FUNCTION__, __LINE__);
 		return cancellation;
 	}
 
 	const RenderResult captureResult = CompleteGameBackBufferCaptures(
 		captureInfo, captureRowPitch, captureFormat, capturePixels);
 	if (captureResult != RENDER_RESULT_OK)
-		RecordGameFailure(captureResult);
+		RecordGameFailure(captureResult, __FUNCTION__, __LINE__);
 	return captureResult;
 }
 
 rts::render::RenderResult NativeW3D2::FinishGameTextureRenderFrame()
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
 	using namespace rts::render;
 	if (!m_renderer.IsFrameOpen())
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	const NativeW3DSubmissionSequence previous = m_renderer.LastThreadedSubmissionSequence();
 	const RenderResult sorted = FlushGameSortedTriangles();
 	const RenderResult ended = FinishGameRenderFrame(false, false);
-	RenderResult result = FirstNativeThreadedFailure(sorted, ended);
+	RenderResult result = FirstNativeThreadedFailure(rigidBarrier,
+		FirstNativeThreadedFailure(sorted, ended));
 	if (m_renderer.IsThreaded())
 	{
 		rts::frame_timing::Scope ownerDrainTiming(
@@ -1395,12 +1607,14 @@ rts::render::RenderResult NativeW3D2::FinishGameTextureRenderFrame()
 		}
 	}
 	if (result != RENDER_RESULT_OK)
-		RecordGameFailure(result);
+		RecordGameFailure(result, __FUNCTION__, __LINE__);
 	return result;
 }
 
 rts::render::RenderResult NativeW3D2::AdvanceSortedPassIdentity()
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	using namespace rts::render;
 	if (m_sortedPassIdentity == ~static_cast<NativeW3DSubmissionSequence>(0))
 	{
@@ -1415,6 +1629,8 @@ rts::render::RenderResult NativeW3D2::AdvanceSortedPassIdentity()
 
 rts::render::RenderResult NativeW3D2::RestoreSortedContext()
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	using namespace rts::render;
 	RenderResult target = RENDER_RESULT_FAILED;
 	RenderResult viewport = m_gameViewportValid ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
@@ -1447,6 +1663,18 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		*static_cast<NativeW3DGpuContentLease *>(command.output) =
 			NativeW3DGpuContentLease();
 	}
+	if (command.type == GAME_RENDER_COMMAND_BEGIN_RENDER &&
+		!m_renderer.IsFrameOpen() && m_rigidDrawBatch.Count() == 0)
+		m_rigidDrawBatch.Abandon();
+	if (!RigidCommandMayPrepareLogicalState(command.type) &&
+		command.type != GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE)
+	{
+		const RenderResult rigidResult = FlushNativeGameRigidDraws(*this);
+		if (rigidResult != RENDER_RESULT_OK &&
+			command.type != GAME_RENDER_COMMAND_END_RENDER &&
+			command.type != GAME_RENDER_COMMAND_END_TEXTURE_RENDER_PASS &&
+			command.type != GAME_RENDER_COMMAND_FLIP_RENDERER) return rigidResult;
+	}
 	// Completion publication is an owner-boundary operation. Service before the
 	// operational gate so an async removal can recover the owned device instead
 	// of being hidden by IsInitialized()/IsOperational() returning false.
@@ -1454,7 +1682,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	if (serviceResult != RENDER_RESULT_OK &&
 		!m_renderer.IsBackendOperational())
 	{
-		RecordGameFailure(serviceResult);
+		RecordGameFailure(serviceResult, __FUNCTION__, __LINE__);
 		return serviceResult;
 	}
 
@@ -1463,7 +1691,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		!IsWellFormedGameHandle(command.resource1) ||
 		!IsOperational() || !m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 
@@ -1476,7 +1704,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		// Device enumeration and adapter switching belong to the bootstrap
 		// owner.  NativeW3D2 borrows or owns one already-selected device and
 		// cannot truthfully fabricate an alternate device behind this command.
-		RecordGameFailure(RENDER_RESULT_UNSUPPORTED);
+		RecordGameFailure(RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 		return RENDER_RESULT_UNSUPPORTED;
 	}
 
@@ -1488,7 +1716,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		(command.type == GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE ||
 		 command.type == GAME_RENDER_COMMAND_ACQUIRE_COPIED_TEXTURE_CONTENT))
 	{
-		RecordGameFailure(RENDER_RESULT_FAILED);
+		RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 		return RENDER_RESULT_FAILED;
 	}
 
@@ -1499,18 +1727,18 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	case GAME_RENDER_COMMAND_SET_TEXTURE:
 		if (command.value0 >= LEGACY_TEXTURE_STAGE_COUNT)
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		if (resource0.isValid() && !m_resources.IsValid(resource0))
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		m_gameTextures[command.value0] = resource0;
 		if (!TrackLegacyTexturePresence(command.value0, resource0.isValid()))
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		return RENDER_RESULT_OK;
@@ -1519,7 +1747,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		if (command.input == 0 || command.inputBytes !=
 			sizeof(LegacyVertexMaterialState))
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		{
@@ -1536,7 +1764,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				!IsFiniteGameColor(material.material.emissive) ||
 				!IsFiniteGameFloat(material.material.specularPower))
 			{
-				RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+				RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 				return RENDER_RESULT_INVALID_ARGUMENT;
 			}
 			for (unsigned int stage = 0;
@@ -1545,7 +1773,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				if (material.textureCoordinateIndex[stage] >=
 					LEGACY_TEXTURE_STAGE_COUNT)
 				{
-					RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+					RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 					return RENDER_RESULT_INVALID_ARGUMENT;
 				}
 			}
@@ -1589,7 +1817,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	case GAME_RENDER_COMMAND_SET_LIGHT:
 		if (command.input == 0 || command.inputBytes != sizeof(LegacyLightState))
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		return SetGameLightState(command.value0,
@@ -1599,7 +1827,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		if (command.value0 >= LEGACY_TRANSFORM_COUNT || command.input == 0 ||
 			command.inputBytes != sizeof(RenderMatrix4))
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		{
@@ -1609,7 +1837,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			{
 				if (!IsFiniteGameFloat(transform.values[index]))
 				{
-					RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+					RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 					return RENDER_RESULT_INVALID_ARGUMENT;
 				}
 			}
@@ -1620,7 +1848,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				static_cast<LegacyTransformSlot>(command.value0),
 				static_cast<const RenderMatrix4 *>(command.input)->values))
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		return RENDER_RESULT_OK;
@@ -1629,7 +1857,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		if (command.value0 >= LEGACY_TRANSFORM_COUNT || command.output == 0 ||
 			command.outputBytes != sizeof(RenderMatrix4))
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		{
@@ -1637,7 +1865,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					static_cast<LegacyTransformSlot>(command.value0),
 					static_cast<RenderMatrix4 *>(command.output)))
 			{
-				RecordGameFailure(RENDER_RESULT_FAILED);
+				RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 				return RENDER_RESULT_FAILED;
 			}
 		}
@@ -1686,7 +1914,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		if (command.value0 >= LEGACY_TEXTURE_STAGE_COUNT || command.value1 >
 			static_cast<unsigned int>(GAME_TEXTURE_STAGE_MAX_MIP_LEVEL))
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		{
@@ -1820,7 +2048,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 						RENDER_RESULT_OK || command.value2 >
 						capabilities.maxAnisotropy)
 					{
-						RecordGameFailure(RENDER_RESULT_UNSUPPORTED);
+						RecordGameFailure(RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 						return RENDER_RESULT_UNSUPPORTED;
 					}
 				}
@@ -1847,7 +2075,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			!IsFiniteGameFloat(command.float2) ||
 			!IsFiniteGameFloat(command.float3))
 		{
-			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
 		{
@@ -1866,7 +2094,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	case GAME_RENDER_COMMAND_SET_VERTEX_BUFFER:
 		if (resource0.isValid() && command.value3 != 0U)
 		{
-			RecordGameFailure(RENDER_RESULT_UNSUPPORTED);
+			RecordGameFailure(RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 			return RENDER_RESULT_UNSUPPORTED;
 		}
 		if (!resource0.isValid())
@@ -1902,12 +2130,12 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				}
 				catch (const std::bad_alloc &)
 				{
-					RecordGameFailure(RENDER_RESULT_OUT_OF_MEMORY);
+					RecordGameFailure(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__);
 					return RENDER_RESULT_OUT_OF_MEMORY;
 				}
 				catch (...)
 				{
-					RecordGameFailure(RENDER_RESULT_FAILED);
+					RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 					return RENDER_RESULT_FAILED;
 				}
 				m_gameSortedVertexMinimum = command.value2;
@@ -1987,12 +2215,12 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				}
 				catch (const std::bad_alloc &)
 				{
-					RecordGameFailure(RENDER_RESULT_OUT_OF_MEMORY);
+					RecordGameFailure(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__);
 					return RENDER_RESULT_OUT_OF_MEMORY;
 				}
 				catch (...)
 				{
-					RecordGameFailure(RENDER_RESULT_FAILED);
+					RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 					return RENDER_RESULT_FAILED;
 				}
 				m_gameSortedIndexStart = command.value1;
@@ -2148,9 +2376,17 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			for (unsigned int stage = 0; stage < LEGACY_TEXTURE_STAGE_COUNT;
 				++stage)
 				packet.textures[stage] = m_gameTextures[stage];
-			const RenderResult result = SubmitGamePacket(state, packet);
+			NativeRigidDrawSink rigidSink(*this);
+			const GameRigidCaptureResult capture = m_rigidDrawBatch.Capture(
+				rigidSink, packet, state, m_rigidContextEpoch, m_rigidGeometry,
+				m_rigidCategory, m_rigidHintEnabled &&
+				m_renderer.SupportsRigidInstancing() && !m_sortedReplayActive &&
+				!m_sortedFlushFailed && !m_sortedContextRestoreFailed);
+			const RenderResult result = capture == GAME_RIGID_PENDING_OWNED ?
+				RENDER_RESULT_OK : capture == GAME_RIGID_FAILED ?
+				m_rigidDrawBatch.Failure() : SubmitGamePacket(state, packet);
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2246,7 +2482,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				}
 				catch (const std::bad_alloc &)
 				{
-					RecordGameFailure(RENDER_RESULT_OUT_OF_MEMORY);
+					RecordGameFailure(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__);
 					return RENDER_RESULT_OUT_OF_MEMORY;
 				}
 				const unsigned char *sourceIndices = m_gameSortedIndexBytes.data() +
@@ -2274,7 +2510,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					rebasedIndices.data(), indexCountSize * sizeof(unsigned short),
 					&submittedDraws);
 				if (result != RENDER_RESULT_OK)
-					RecordGameFailure(result);
+					RecordGameFailure(result, __FUNCTION__, __LINE__);
 				return result;
 			}
 			const RenderResult result = QueueGameSortedTriangles(state, packet,
@@ -2285,7 +2521,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				indexCountSize * sizeof(unsigned short),
 				command.boundingSphere);
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2344,7 +2580,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			const RenderResult result = QueueGameSortedTriangles(state, packet,
 				data.vertices, vertexBytes, data.indices, indexBytes, 0);
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2407,7 +2643,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				packet.textures[stage] = m_gameTextures[stage];
 			result = SubmitGamePacket(state, packet);
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2422,7 +2658,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				ValidateGameRenderTargetBinding(requestedBinding, 0);
 			if (validationResult != RENDER_RESULT_OK)
 			{
-				RecordGameFailure(validationResult);
+				RecordGameFailure(validationResult, __FUNCTION__, __LINE__);
 				return validationResult;
 			}
 			RenderResult pendingResult = RENDER_RESULT_OK;
@@ -2440,7 +2676,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					m_renderer.SetRenderTargetsExternal(requestedBinding);
 				if (result != RENDER_RESULT_OK)
 				{
-					RecordGameFailure(result);
+					RecordGameFailure(result, __FUNCTION__, __LINE__);
 					return result;
 				}
 			}
@@ -2455,7 +2691,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			m_sortedContextRestoreFailed = false;
 			const RenderResult identityResult = AdvanceSortedPassIdentity();
 			if (identityResult != RENDER_RESULT_OK)
-				RecordGameFailure(identityResult);
+				RecordGameFailure(identityResult, __FUNCTION__, __LINE__);
 			return FirstNativeThreadedFailure(pendingResult, identityResult);
 		}
 
@@ -2503,6 +2739,10 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 							result = RENDER_RESULT_UNSUPPORTED;
 					}
 					if (result == RENDER_RESULT_OK)
+						result = m_resources.ValidateTextureCopy(resource0);
+					if (result == RENDER_RESULT_OK)
+						result = FlushGameTextureDraws();
+					if (result == RENDER_RESULT_OK)
 					{
 						rts::frame_timing::Scope copyPublicationTiming(
 							rts::frame_timing::RendererTextureCopyPublication);
@@ -2513,7 +2753,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			else
 				result = m_resources.AcquireGpuContentLease(resource0, lease);
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2527,7 +2767,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			const RenderResult result = m_renderer.BeginFrame();
 			if (result != RENDER_RESULT_OK)
 			{
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 				return result;
 			}
 			// Complete the old failed output BEFORE a new clear can erase its
@@ -2536,10 +2776,11 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				m_sortedFlushFailed = false;
 			if (m_sortedFlushFailed && !m_nativeSortingRenderer.Empty())
 			{
+				sorted_diag::Scope sortedFailureScope;
 				const RenderResult retryResult = m_nativeSortingRenderer.Flush(*this, true);
 				if (retryResult != RENDER_RESULT_OK)
 				{
-					RecordGameFailure(retryResult);
+					RecordGameFailure(retryResult, __FUNCTION__, __LINE__);
 					(void)m_renderer.EndFrame(false);
 					return retryResult;
 				}
@@ -2559,8 +2800,8 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 				// and replace the target failure with INVALID_ARGUMENT.
 				const RenderResult endResult = m_renderer.EndFrame(false);
 				if (endResult != RENDER_RESULT_OK)
-					RecordGameFailure(endResult);
-				RecordGameFailure(targetResult);
+					RecordGameFailure(endResult, __FUNCTION__, __LINE__);
+				RecordGameFailure(targetResult, __FUNCTION__, __LINE__);
 				return targetResult;
 			}
 			const RenderResult viewportResult = m_gameViewportValid ?
@@ -2568,7 +2809,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			if (viewportResult != RENDER_RESULT_OK)
 			{
 				m_sortedContextRestoreFailed = true;
-				RecordGameFailure(viewportResult);
+				RecordGameFailure(viewportResult, __FUNCTION__, __LINE__);
 				(void)m_renderer.EndFrame(false);
 				return viewportResult;
 			}
@@ -2576,7 +2817,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			const RenderResult identityResult = AdvanceSortedPassIdentity();
 			if (identityResult != RENDER_RESULT_OK)
 			{
-				RecordGameFailure(identityResult);
+				RecordGameFailure(identityResult, __FUNCTION__, __LINE__);
 				(void)m_renderer.EndFrame(false);
 				return identityResult;
 			}
@@ -2593,8 +2834,8 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 					// and replace the clear failure with INVALID_ARGUMENT.
 					const RenderResult endResult = m_renderer.EndFrame(false);
 					if (endResult != RENDER_RESULT_OK)
-						RecordGameFailure(endResult);
-					RecordGameFailure(clearResult);
+						RecordGameFailure(endResult, __FUNCTION__, __LINE__);
+					RecordGameFailure(clearResult, __FUNCTION__, __LINE__);
 					return clearResult;
 				}
 			}
@@ -2621,20 +2862,20 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			}
 			if (m_sortedContextRestoreFailed)
 			{
-				RecordGameFailure(RENDER_RESULT_FAILED);
+				RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 				return RENDER_RESULT_FAILED;
 			}
 			const RenderResult identityResult = AdvanceSortedPassIdentity();
 			if (identityResult != RENDER_RESULT_OK)
 			{
-				RecordGameFailure(identityResult);
+				RecordGameFailure(identityResult, __FUNCTION__, __LINE__);
 				return identityResult;
 			}
 			const RenderResult result = m_renderer.ClearExternal(command.value0,
 				RenderFloat4(command.float0, command.float1, command.float2,
 					command.float3), command.float4, command.value1);
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2653,7 +2894,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	case GAME_RENDER_COMMAND_END_TEXTURE_RENDER_PASS:
 		if (command.value0 > static_cast<unsigned int>(RENDER_RESULT_FAILED))
 			goto invalid_command;
-		RecordGameFailure(static_cast<RenderResult>(command.value0));
+		RecordGameFailure(static_cast<RenderResult>(command.value0), __FUNCTION__, __LINE__);
 		return FinishGameTextureRenderFrame();
 
 	case GAME_RENDER_COMMAND_FLIP_RENDERER:
@@ -2668,19 +2909,19 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		{
 			if (m_borrowedBackend)
 			{
-				RecordGameFailure(RENDER_RESULT_UNSUPPORTED);
+				RecordGameFailure(RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 				return RENDER_RESULT_UNSUPPORTED;
 			}
 			if (m_renderer.IsFrameOpen())
 			{
-				RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+				RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 				return RENDER_RESULT_INVALID_ARGUMENT;
 			}
 			// Ordinary resize is not an intentional discard/recovery boundary.
 			// The caller must drain retained passes before releasing their outputs.
 			if (!m_nativeSortingRenderer.Empty())
 			{
-				RecordGameFailure(RENDER_RESULT_FAILED);
+				RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 				return RENDER_RESULT_FAILED;
 			}
 			// Resize invalidates every title-owned default/present resource. Keep
@@ -2713,7 +2954,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			{
 				m_rebuildingResources = false;
 				m_gameCaptureRequest.clear();
-				RecordGameFailure(RENDER_RESULT_FAILED);
+				RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 				return RENDER_RESULT_FAILED;
 			}
 			RenderResult result = m_renderer.Resize(command.value0,
@@ -2757,7 +2998,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			}
 			m_rebuildingResources = false;
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2777,7 +3018,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			const RenderResult result = m_renderer.CaptureBackBuffer(command.output,
 				command.outputBytes, command.value0, formatOutput);
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2788,7 +3029,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			const RenderResult result = m_renderer.GetBackBufferInfo(
 				static_cast<RenderBackBufferInfo *>(command.output));
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2799,7 +3040,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		{
 			const RenderResult result = m_renderer.SetSwapInterval(
 				static_cast<unsigned int>(command.signedLongValue));
-			if (result != RENDER_RESULT_OK) RecordGameFailure(result);
+			if (result != RENDER_RESULT_OK) RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 	case GAME_RENDER_COMMAND_GET_SWAP_INTERVAL:
@@ -2811,7 +3052,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			if (result == RENDER_RESULT_OK)
 				*static_cast<long *>(command.output) = static_cast<long>(interval);
 			else
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 	case GAME_RENDER_COMMAND_SET_GAMMA:
@@ -2824,7 +3065,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 			// default. Calibration is separate metadata, never the limit flag.
 			const RenderResult result = m_renderer.SetGamma(command.float0,
 				command.float1, command.float2, command.value0 != 0U, true);
-			if (result != RENDER_RESULT_OK) RecordGameFailure(result);
+			if (result != RENDER_RESULT_OK) RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 
@@ -2839,7 +3080,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		// The concrete device-selection and display policy values remain owned by
 		// the bootstrap adapter. They are intentionally not guessed from the
 		// current swap-chain dimensions here.
-		RecordGameFailure(RENDER_RESULT_UNSUPPORTED);
+		RecordGameFailure(RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 		return RENDER_RESULT_UNSUPPORTED;
 
 	case GAME_RENDER_COMMAND_SYNC_RENDERER:
@@ -2850,7 +3091,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 		{
 			const RenderResult result = PollThreadedCompletions();
 			if (result != RENDER_RESULT_OK)
-				RecordGameFailure(result);
+				RecordGameFailure(result, __FUNCTION__, __LINE__);
 			return result;
 		}
 	case GAME_RENDER_COMMAND_SET_TEXTURE_BITDEPTH:
@@ -2860,7 +3101,7 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	case GAME_RENDER_COMMAND_SET_ANY_DEVICE:
 	case GAME_RENDER_COMMAND_SET_NEXT_DEVICE:
 	case GAME_RENDER_COMMAND_TOGGLE_WINDOWED:
-		RecordGameFailure(RENDER_RESULT_UNSUPPORTED);
+		RecordGameFailure(RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 		return RENDER_RESULT_UNSUPPORTED;
 
 	default:
@@ -2868,7 +3109,10 @@ rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand(
 	}
 
 invalid_command:
-	RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT);
+	// Copy preflight rejection must preserve the accepted rigid/sorted prefix.
+	if (command.type != GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE)
+		(void)FlushNativeGameRigidDraws(*this);
+	RecordGameFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 	return RENDER_RESULT_INVALID_ARGUMENT;
 }
 
@@ -2987,13 +3231,13 @@ rts::render::RenderResult NativeW3D2::ApplyGameShaderBits(
 {
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	rts::render::LegacyPipelineState decoded;
 	if (!rts::render::DecodeLegacyShaderBits(shaderBits, &decoded))
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	// TrackLegacyShaderBits deliberately merges only the shader-owned subset,
@@ -3002,7 +3246,7 @@ rts::render::RenderResult NativeW3D2::ApplyGameShaderBits(
 	rts::render::LegacyPipelineState current;
 	if (!rts::render::GetTrackedLegacyPipelineState(&current))
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
+		RecordGameFailure(rts::render::RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_FAILED;
 	}
 	// The legacy adapter publishes combiners separately after shader bits.
@@ -3041,7 +3285,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 {
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 
@@ -3200,7 +3444,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 		// neutral input layout, so reject it rather than silently changing it.
 		if (value == rts::render::GAME_RENDER_SHADE_FLAT)
 		{
-			RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED);
+			RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 			return rts::render::RENDER_RESULT_UNSUPPORTED;
 		}
 		if (value != rts::render::GAME_RENDER_SHADE_GOURAUD)
@@ -3223,7 +3467,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 	case rts::render::GAME_RENDER_STATE_FILL_MODE:
 		if (value == rts::render::GAME_RENDER_FILL_POINT)
 		{
-			RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED);
+			RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 			return rts::render::RENDER_RESULT_UNSUPPORTED;
 		}
 		if (value == rts::render::GAME_RENDER_FILL_WIREFRAME)
@@ -3247,7 +3491,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 	case rts::render::GAME_RENDER_STATE_POINT_SCALE_A:
 	case rts::render::GAME_RENDER_STATE_POINT_SCALE_B:
 	case rts::render::GAME_RENDER_STATE_POINT_SCALE_C:
-		RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED);
+		RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_UNSUPPORTED;
 	default:
 		goto invalid_state;
@@ -3261,7 +3505,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderState(
 	return rts::render::RENDER_RESULT_OK;
 
 invalid_state:
-	RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+	RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 	return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 }
 
@@ -3271,7 +3515,7 @@ void NativeW3D2::SetGameRenderCamera(void *camera)
 	// owner hook explicit prevents an opaque pointer from being retained or
 	// interpreted in the shared native layer.
 	(void)camera;
-	RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED);
+	RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 }
 
 rts::render::RenderResult NativeW3D2::SetGameRenderCameraSnapshot(
@@ -3296,7 +3540,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderCameraSnapshot(
 		!IsFiniteGameFloat(snapshot.zFar) || snapshot.zNear < 0.0f ||
 		snapshot.zFar < snapshot.zNear)
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	for (unsigned int index = 0; index < 16; ++index)
@@ -3304,7 +3548,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderCameraSnapshot(
 		if (!IsFiniteGameFloat(snapshot.view.values[index]) ||
 			!IsFiniteGameFloat(snapshot.projection.values[index]))
 		{
-			RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 		}
 	}
@@ -3312,7 +3556,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderCameraSnapshot(
 		SetGameViewport(snapshot.viewport);
 	if (viewportResult != rts::render::RENDER_RESULT_OK)
 	{
-		RecordGameFailure(viewportResult);
+		RecordGameFailure(viewportResult, __FUNCTION__, __LINE__);
 		return viewportResult;
 	}
 	if (!rts::render::TrackLegacyTransform(
@@ -3321,7 +3565,7 @@ rts::render::RenderResult NativeW3D2::SetGameRenderCameraSnapshot(
 			rts::render::LEGACY_TRANSFORM_PROJECTION,
 		snapshot.projection.values))
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
+		RecordGameFailure(rts::render::RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_FAILED;
 	}
 	m_gameCameraView = snapshot.view;
@@ -3338,6 +3582,9 @@ rts::render::RenderResult NativeW3D2::CreateGameShaderFromAsset(
 	unsigned int declarationWordCount, unsigned int usage,
 	unsigned int *handle)
 {
+	if (handle != 0) *handle = 0;
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	(void)declarationWords;
 	(void)declarationWordCount;
 	(void)usage;
@@ -3346,7 +3593,7 @@ rts::render::RenderResult NativeW3D2::CreateGameShaderFromAsset(
 	if ((!IsOperational() && !CanRebuildResources()) ||
 		!m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	rts::render::RenderLegacyPixelProgram pixelProgram;
@@ -3354,7 +3601,7 @@ rts::render::RenderResult NativeW3D2::CreateGameShaderFromAsset(
 	if (!FindGameShaderAsset(assetPath, vertexShader, &pixelProgram,
 		&vertexProgram))
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED);
+		RecordGameFailure(rts::render::RENDER_RESULT_UNSUPPORTED, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_UNSUPPORTED;
 	}
 
@@ -3375,7 +3622,7 @@ rts::render::RenderResult NativeW3D2::CreateGameShaderFromAsset(
 		// handle to become valid after wraparound.
 		if (m_gameShaders.size() >= 0xffffU)
 		{
-			RecordGameFailure(rts::render::RENDER_RESULT_OUT_OF_MEMORY);
+			RecordGameFailure(rts::render::RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__);
 			return rts::render::RENDER_RESULT_OUT_OF_MEMORY;
 		}
 		try
@@ -3384,12 +3631,12 @@ rts::render::RenderResult NativeW3D2::CreateGameShaderFromAsset(
 		}
 		catch (const std::bad_alloc &)
 		{
-			RecordGameFailure(rts::render::RENDER_RESULT_OUT_OF_MEMORY);
+			RecordGameFailure(rts::render::RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__);
 			return rts::render::RENDER_RESULT_OUT_OF_MEMORY;
 		}
 		catch (...)
 		{
-			RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
+			RecordGameFailure(rts::render::RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 			return rts::render::RENDER_RESULT_FAILED;
 		}
 		slot = m_gameShaders.size() - 1;
@@ -3397,7 +3644,7 @@ rts::render::RenderResult NativeW3D2::CreateGameShaderFromAsset(
 	NativeShaderEntry &entry = m_gameShaders[slot];
 	if (entry.generation == 0 || entry.generation > 0xffffU)
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
+		RecordGameFailure(rts::render::RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_FAILED;
 	}
 	entry.live = true;
@@ -3411,10 +3658,11 @@ rts::render::RenderResult NativeW3D2::CreateGameShaderFromAsset(
 
 bool NativeW3D2::DeleteGameShader(bool vertexShader, unsigned int handle)
 {
+	if (rts::render::FlushNativeGameRigidDraws(*this) != rts::render::RENDER_RESULT_OK) return false;
 	if ((!IsOperational() && !IsRebuildingResources()) ||
 		!m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return false;
 	}
 	NativeShaderEntry *entry = 0;
@@ -3430,9 +3678,10 @@ bool NativeW3D2::DeleteGameShader(bool vertexShader, unsigned int handle)
 
 void NativeW3D2::SetGameVertexShader(unsigned int shaderOrFormat)
 {
+	if (rts::render::FlushNativeGameRigidDraws(*this) != rts::render::RENDER_RESULT_OK) return;
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return;
 	}
 	if (shaderOrFormat == 0)
@@ -3445,7 +3694,7 @@ void NativeW3D2::SetGameVertexShader(unsigned int shaderOrFormat)
 	{
 		if (rts::render::LegacyFvfVertexSize(shaderOrFormat) == 0)
 		{
-			RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 			return;
 		}
 		// Selecting an FVF replaces the programmable vertex shader. Water
@@ -3457,7 +3706,7 @@ void NativeW3D2::SetGameVertexShader(unsigned int shaderOrFormat)
 	const NativeShaderEntry *entry = 0;
 	if (!DecodeGameShaderHandle(true, shaderOrFormat, &entry))
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return;
 	}
 	rts::render::TrackLegacyVertexProgram(entry->vertexProgram);
@@ -3465,9 +3714,10 @@ void NativeW3D2::SetGameVertexShader(unsigned int shaderOrFormat)
 
 void NativeW3D2::SetGamePixelShader(unsigned int shader)
 {
+	if (rts::render::FlushNativeGameRigidDraws(*this) != rts::render::RENDER_RESULT_OK) return;
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return;
 	}
 	if (shader == 0)
@@ -3479,7 +3729,7 @@ void NativeW3D2::SetGamePixelShader(unsigned int shader)
 	const NativeShaderEntry *entry = 0;
 	if (!DecodeGameShaderHandle(false, shader, &entry))
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return;
 	}
 	rts::render::TrackLegacyPixelProgram(entry->pixelProgram);
@@ -3488,11 +3738,12 @@ void NativeW3D2::SetGamePixelShader(unsigned int shader)
 void NativeW3D2::SetGameLegacyVertexProgram(
 	rts::render::RenderLegacyVertexProgram program)
 {
+	if (rts::render::FlushNativeGameRigidDraws(*this) != rts::render::RENDER_RESULT_OK) return;
 	if (!IsOperational() || !m_resources.IsOwnerThread() ||
 		program < rts::render::RENDER_LEGACY_VERTEX_FIXED_FUNCTION ||
 		program > rts::render::RENDER_LEGACY_VERTEX_WATER_SEA)
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return;
 	}
 	rts::render::TrackLegacyVertexProgram(program);
@@ -3501,11 +3752,12 @@ void NativeW3D2::SetGameLegacyVertexProgram(
 void NativeW3D2::SetGameLegacyPixelProgram(
 	rts::render::RenderLegacyPixelProgram program)
 {
+	if (rts::render::FlushNativeGameRigidDraws(*this) != rts::render::RENDER_RESULT_OK) return;
 	if (!IsOperational() || !m_resources.IsOwnerThread() ||
 		program < rts::render::RENDER_LEGACY_PIXEL_FIXED_FUNCTION ||
 		program > rts::render::RENDER_LEGACY_PIXEL_PROFILER_SWIZZLE)
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return;
 	}
 	rts::render::TrackLegacyPixelProgram(program);
@@ -3514,6 +3766,8 @@ void NativeW3D2::SetGameLegacyPixelProgram(
 rts::render::RenderResult NativeW3D2::SetGameViewport(
 	const rts::render::RenderViewport &viewport)
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	if (!m_resources.IsOwnerThread() || !IsOperational() ||
 		!IsFiniteGameFloat(viewport.x) || !IsFiniteGameFloat(viewport.y) ||
 		!IsFiniteGameFloat(viewport.width) || !IsFiniteGameFloat(viewport.height) ||
@@ -3564,9 +3818,11 @@ rts::render::RenderResult NativeW3D2::SubmitGameTriangles(
 	const rts::render::LegacyLogicalState &state,
 	const rts::render::NativeDrawPacket &packet)
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	const rts::render::RenderResult result = SubmitGamePacket(state, packet);
 	if (result != rts::render::RENDER_RESULT_OK)
-		RecordGameFailure(result);
+		RecordGameFailure(result, __FUNCTION__, __LINE__);
 	return result;
 }
 
@@ -3576,9 +3832,11 @@ rts::render::RenderResult NativeW3D2::QueueGameSortedTriangles(
 	size_t vertexBytes, const void *indexData, size_t indexBytes,
 	const rts::render::GameBoundingSphere *sphere)
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	using namespace rts::render;
@@ -3593,7 +3851,7 @@ rts::render::RenderResult NativeW3D2::QueueGameSortedTriangles(
 		const RenderResult info = GetGameRenderTargetInfo(&target);
 		if (info != RENDER_RESULT_OK)
 		{
-			RecordGameFailure(info);
+			RecordGameFailure(info, __FUNCTION__, __LINE__);
 			return info;
 		}
 		m_gameViewport = RenderViewport(0, 0, static_cast<float>(target.width),
@@ -3609,7 +3867,7 @@ rts::render::RenderResult NativeW3D2::QueueGameSortedTriangles(
 				&pass.textures[stage]);
 			if (retained != RENDER_RESULT_OK)
 			{
-				RecordGameFailure(retained);
+				RecordGameFailure(retained, __FUNCTION__, __LINE__);
 				return retained;
 			}
 		}
@@ -3623,16 +3881,38 @@ rts::render::RenderResult NativeW3D2::QueueGameSortedTriangles(
 		result = m_nativeSortingRenderer.Queue(state, packet, vertexData, vertexBytes,
 			indexData, indexBytes, sphere, &pass, awaitMatchingBegin);
 	if (result != rts::render::RENDER_RESULT_OK)
-		RecordGameFailure(result);
+		RecordGameFailure(result, __FUNCTION__, __LINE__);
 	return result;
+}
+
+rts::render::RenderResult NativeW3D2::FlushGameTextureDraws()
+{
+	using namespace rts::render;
+	const RenderResult rigid = FlushNativeGameRigidDraws(*this);
+	if (rigid != RENDER_RESULT_OK) return rigid;
+	// Do not activate a closed-frame admission or submit an empty sorted batch.
+	if (m_renderer.IsFrameOpen() &&
+		(!m_nativeSortingRenderer.Empty() || m_sortedContextRestoreFailed))
+	{
+		const RenderResult sorted = FlushGameSortedTriangles();
+		if (sorted != RENDER_RESULT_OK) return sorted;
+	}
+	if (!m_nativeSortingRenderer.Empty()) return RENDER_RESULT_INVALID_ARGUMENT;
+	// Sorted admission alone cannot prove execution on serial/parallel owners.
+	// The resource publication fence intentionally excludes prior draw failure.
+	// EndFrame is asynchronous; a closed frame still needs its draw result.
+	return m_renderer.BorrowThreadedCompletionDevice() != 0 ?
+		m_renderer.DrainThreaded() : RENDER_RESULT_OK;
 }
 
 rts::render::RenderResult NativeW3D2::FlushGameSortedTriangles()
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	if (!IsOperational() || !m_resources.IsOwnerThread() ||
 		(!m_renderer.IsFrameOpen() && !m_nativeSortingRenderer.Empty()))
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	if (m_sortedContextRestoreFailed)
@@ -3640,15 +3920,16 @@ rts::render::RenderResult NativeW3D2::FlushGameSortedTriangles()
 		const rts::render::RenderResult restored = RestoreSortedContext();
 		if (restored != rts::render::RENDER_RESULT_OK)
 		{
-			RecordGameFailure(restored);
+			RecordGameFailure(restored, __FUNCTION__, __LINE__);
 			return restored;
 		}
 	}
+	sorted_diag::Scope sortedFailureScope;
 	const rts::render::RenderResult result =
 		m_nativeSortingRenderer.Flush(*this);
 	m_sortedFlushFailed = result != rts::render::RENDER_RESULT_OK;
 	if (result != rts::render::RENDER_RESULT_OK)
-		RecordGameFailure(result);
+		RecordGameFailure(result, __FUNCTION__, __LINE__);
 	return result;
 }
 
@@ -3661,15 +3942,18 @@ rts::render::RenderResult NativeW3D2::UploadTransientBuffer(
 	if (data == 0 || dataBytes == 0 || buffer == 0 ||
 		allocatedDescriptor == 0 || descriptor.byteCount != dataBytes)
 	{
-		return RENDER_RESULT_INVALID_ARGUMENT;
+		return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "upload-preflight", dataBytes, descriptor.byteCount, descriptor.stride, descriptor.binding);
 	}
 	if (buffer->isValid() && allocatedDescriptor->binding == descriptor.binding &&
 		allocatedDescriptor->usage == descriptor.usage &&
 		allocatedDescriptor->stride == descriptor.stride &&
 		allocatedDescriptor->byteCount >= dataBytes)
 	{
-		return m_resources.UpdateBuffer(*buffer, data, dataBytes, 0,
+		const RenderResult updateResult = m_resources.UpdateBuffer(*buffer, data, dataBytes, 0,
 			RENDER_BUFFER_UPDATE_DISCARD);
+		if (updateResult != RENDER_RESULT_OK)
+			sorted_diag::NoteFailure(updateResult, __FUNCTION__, __LINE__, "upload-update", dataBytes, descriptor.stride, descriptor.binding);
+		return updateResult;
 	}
 
 	GpuHandle replacement;
@@ -3677,16 +3961,16 @@ rts::render::RenderResult NativeW3D2::UploadTransientBuffer(
 		dataBytes, &replacement);
 	if (createResult != RENDER_RESULT_OK)
 	{
-		return createResult;
+		return sorted_diag::NoteFailure(createResult, __FUNCTION__, __LINE__, "upload-create", dataBytes, descriptor.stride, descriptor.binding);
 	}
 	if (buffer->isValid() && !m_resources.Destroy(*buffer))
 	{
 		// The old allocation is still the published scratch buffer. Roll the new
 		// candidate back so a resize failure cannot strand an unowned handle.
-		RecordGameFailure(RENDER_RESULT_FAILED);
+		RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 		if (!m_resources.Destroy(replacement))
 		{
-			RecordGameFailure(RENDER_RESULT_FAILED);
+			RecordGameFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 		}
 		return RENDER_RESULT_FAILED;
 	}
@@ -3700,20 +3984,21 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 	const void *vertexData, size_t vertexBytes, const void *indexData,
 	size_t indexBytes, unsigned int *submittedDrawCount)
 {
-	if (submittedDrawCount != 0)
-		*submittedDrawCount = 0;
+	if (submittedDrawCount != 0) *submittedDrawCount = 0;
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	if (!IsOperational() || draws == 0 || drawCount == 0 ||
 		vertexData == 0 || vertexBytes == 0 || indexData == 0 ||
 		indexBytes == 0 || submittedDrawCount == 0)
-		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+		return sorted_diag::NoteFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "batch-input", drawCount, vertexBytes, indexBytes);
 
 	const rts::render::NativeDrawPacket &firstPacket = draws[0].packet;
 	if (firstPacket.vertexStride == 0 ||
 		vertexBytes % firstPacket.vertexStride != 0)
-		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+		return sorted_diag::NoteFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "batch-vertex-stride", drawCount, vertexBytes, indexBytes, firstPacket.vertexStride);
 	if (indexBytes % sizeof(unsigned short) != 0 ||
 		indexBytes / sizeof(unsigned short) > 65535U)
-		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+		return sorted_diag::NoteFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "batch-index-size", drawCount, vertexBytes, indexBytes);
 
 	for (unsigned int drawIndex = 0; drawIndex < drawCount; ++drawIndex)
 	{
@@ -3731,7 +4016,7 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 			packet.vertexOffset > vertexBytes ||
 			packet.vertexCount > (vertexBytes - packet.vertexOffset) /
 				packet.vertexStride)
-			return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
+			return sorted_diag::NoteFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "batch-draw-preflight", drawIndex, packet.vertexStride, packet.vertexOffset, packet.vertexCount, packet.startIndex, packet.indexCount);
 	}
 
 	rts::render::BufferDescriptor vertexDescriptor;
@@ -3743,7 +4028,7 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 		vertexData, vertexBytes, &m_sortedVertexBuffer,
 		&m_sortedVertexDescriptor);
 	if (result != rts::render::RENDER_RESULT_OK)
-		return result;
+		return sorted_diag::NoteFailure(result, __FUNCTION__, __LINE__, "batch-upload", drawCount, vertexBytes, indexBytes);
 
 	rts::render::BufferDescriptor indexDescriptor;
 	indexDescriptor.byteCount = indexBytes;
@@ -3754,7 +4039,7 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 		&m_sortedIndexBuffer, &m_sortedIndexDescriptor);
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
-		return result;
+		return sorted_diag::NoteFailure(result, __FUNCTION__, __LINE__, "batch-upload", drawCount, vertexBytes, indexBytes);
 	}
 
 	rts::render::NativeW3DTextureBindingCache textureBindingCache;
@@ -3775,6 +4060,8 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedBatch(
 		++*submittedDrawCount;
 	}
 
+	if (result != rts::render::RENDER_RESULT_OK)
+		sorted_diag::NoteFailure(result, __FUNCTION__, __LINE__, "batch-submit", drawCount, *submittedDrawCount, vertexBytes, indexBytes);
 	return result;
 }
 
@@ -3784,41 +4071,57 @@ rts::render::RenderResult NativeW3D2::SubmitNativeSortedPassBatch(
 	const void *vertexData, size_t vertexBytes, const void *indexData,
 	size_t indexBytes, unsigned int *submittedDrawCount)
 {
+	if (submittedDrawCount != 0) *submittedDrawCount = 0;
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	using namespace rts::render;
-	if (submittedDrawCount != 0)
-		*submittedDrawCount = 0;
 	if (!pass.captured)
 		return SubmitNativeSortedBatch(draws, drawCount, vertexData, vertexBytes,
 			indexData, indexBytes, submittedDrawCount);
 	if (!IsOperational() || !m_resources.IsOwnerThread() ||
 		!m_renderer.IsFrameOpen() || m_sortedReplayActive)
-		return RENDER_RESULT_INVALID_ARGUMENT;
+		return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "pass-preflight", pass.identity, m_renderer.IsFrameOpen(), m_sortedReplayActive);
 	RenderResult result = ValidateGameRenderTargetBinding(pass.target, 0);
 	if (result != RENDER_RESULT_OK)
-		return result;
+		return sorted_diag::NoteFailure(result, __FUNCTION__, __LINE__, "pass-target-validation", pass.identity, pass.target.hasColor, pass.target.hasDepth);
 	m_sortedReplayActive = true;
 	try
 	{
 		result = m_renderer.SetRenderTargetsExternal(pass.target);
+		if (result != RENDER_RESULT_OK)
+			sorted_diag::NoteFailure(result, __FUNCTION__, __LINE__, "pass-target-set", pass.identity);
 		if (result == RENDER_RESULT_OK)
+		{
 			result = m_renderer.SetViewport(pass.viewport);
+			if (result != RENDER_RESULT_OK)
+				sorted_diag::NoteFailure(result, __FUNCTION__, __LINE__, "pass-viewport-set", pass.identity);
+		}
 		if (result == RENDER_RESULT_OK)
 			result = SubmitNativeSortedBatch(draws, drawCount, vertexData,
 				vertexBytes, indexData, indexBytes, submittedDrawCount);
 	}
 	catch (...)
 	{
-		result = RENDER_RESULT_FAILED;
+		result = sorted_diag::NoteFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__, "pass-exception", pass.identity);
 	}
 	// A replay never publishes the retained target as the producer's active
 	// target and never makes old content authority valid. Restore on ALL exits.
+	// Preserve the primary origin before restoration can publish another error.
+	if (result != RENDER_RESULT_OK)
+		sorted_diag::NoteFailure(result, __FUNCTION__, __LINE__, "pass-batch-return", pass.identity);
 	const RenderResult restored = RestoreSortedContext();
+	if (restored != RENDER_RESULT_OK)
+		sorted_diag::NoteFailure(restored, __FUNCTION__, __LINE__, "pass-context-restore", pass.identity);
 	m_sortedReplayActive = false;
 	return FirstNativeThreadedFailure(result, restored);
 }
 
 rts::render::RenderResult NativeW3D2::BeginGameDisplayIteration()
 {
+	if (!m_renderer.IsFrameOpen() && m_rigidDrawBatch.Count() == 0)
+		m_rigidDrawBatch.Abandon();
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	const bool previousIterationSucceeded = !m_gameFailure.hasFailure();
 	const rts::render::RenderResult serviceResult =
 		ServiceThreadedCompletions();
@@ -3854,6 +4157,8 @@ rts::render::RenderResult NativeW3D2::BeginGameDisplayIteration()
 rts::render::RenderResult NativeW3D2::ResetGameRenderFrameResources(
 	bool frameChanged)
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	const rts::render::RenderResult serviceResult =
 		ServiceThreadedCompletions();
 	if (serviceResult != rts::render::RENDER_RESULT_OK &&
@@ -3864,7 +4169,7 @@ rts::render::RenderResult NativeW3D2::ResetGameRenderFrameResources(
 	const rts::render::RenderResult result =
 		rts::render::Reset_Native_W3D_Buffer_Allocators(frameChanged);
 	if (result != rts::render::RENDER_RESULT_OK)
-		RecordGameFailure(result);
+		RecordGameFailure(result, __FUNCTION__, __LINE__);
 	return result;
 }
 
@@ -3929,7 +4234,7 @@ bool NativeW3D2::IsGameTextureFormatSupported(
 	}
 	if (!owner->m_resources.Destroy(handle))
 	{
-		owner->RecordGameFailure(rts::render::RENDER_RESULT_FAILED);
+		owner->RecordGameFailure(rts::render::RENDER_RESULT_FAILED, __FUNCTION__, __LINE__);
 		return false;
 	}
 	return true;
@@ -3990,6 +4295,8 @@ unsigned int NativeW3D2::GetMaxTexturesPerPass() const
 
 rts::render::RenderResult NativeW3D2::InvalidateGameMeshRendererCache()
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	return FlushGameSortedTriangles();
 }
 
@@ -4171,18 +4478,19 @@ rts::render::RenderResult NativeW3D2::QueueGameBackBufferCapture(
 	const rts::render::RenderCaptureRequestDescriptor &descriptor,
 	rts::render::RenderCaptureHandle *handle)
 {
-	if (handle != 0)
-		*handle = rts::render::RenderCaptureHandle();
+	if (handle != 0) *handle = rts::render::RenderCaptureHandle();
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	if (!IsOperational() || !m_resources.IsOwnerThread() ||
 		!m_gameCaptureQueue.bindOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	const rts::render::RenderResult result = m_gameCaptureQueue.enqueue(
 		descriptor, handle);
 	if (result != rts::render::RENDER_RESULT_OK)
-		RecordGameFailure(result);
+		RecordGameFailure(result, __FUNCTION__, __LINE__);
 	return result;
 }
 
@@ -4193,7 +4501,7 @@ unsigned int NativeW3D2::CancelGameBackBufferCaptures(
 		!m_gameCaptureQueue.bindOwnerThread())
 	{
 		if (IsOperational())
-			RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+			RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return 0;
 	}
 	return m_gameCaptureQueue.cancelConsumer(consumer, reason);
@@ -4201,12 +4509,28 @@ unsigned int NativeW3D2::CancelGameBackBufferCaptures(
 
 void NativeW3D2::RequestGameBackBufferCapture()
 {
+	const rts::render::RenderResult rigidBarrier =
+		rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK)
+	{
+		// This failed request must never expose a previous image or completion.
+		// An admitted descriptor still belongs to the queue: retire it through
+		// its cancellation callback, never by dropping its ownership flag.
+		remove(kNativeGameCaptureFile);
+		if (m_gameCaptureDescriptorQueued && m_resources.IsOwnerThread() &&
+			m_gameCaptureQueue.bindOwnerThread())
+			(void)m_gameCaptureQueue.cancelConsumer(this, rigidBarrier);
+		m_gameCaptureCompleted = true;
+		m_gameCaptureResult = rigidBarrier;
+		if (!m_gameCaptureDescriptorQueued) m_gameCaptureRequest.clear();
+		return;
+	}
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
 		m_gameCaptureCompleted = true;
 		m_gameCaptureResult = rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 		m_gameCaptureDescriptorQueued = false;
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return;
 	}
 	if (!m_gameCaptureRequest.isRequested())
@@ -4232,7 +4556,7 @@ void NativeW3D2::RequestGameBackBufferCapture()
 	{
 		m_gameCaptureCompleted = true;
 		m_gameCaptureResult = result;
-		RecordGameFailure(result);
+		RecordGameFailure(result, __FUNCTION__, __LINE__);
 		return;
 	}
 	m_gameCaptureDescriptorQueued = true;
@@ -4402,6 +4726,7 @@ rts::render::RenderResult NativeW3D2::CompleteGameBackBufferCaptures(
 void NativeW3D2::SetActiveRenderTargetKind(
 	rts::render::GameRenderTargetKind targetKind)
 {
+	if (rts::render::FlushNativeGameRigidDraws(*this) != rts::render::RENDER_RESULT_OK) return;
 	m_activeRenderTargetKind = targetKind;
 }
 
@@ -4412,9 +4737,11 @@ void NativeW3D2::SetGameDebugConsoleDisabled(bool disabled)
 
 rts::render::RenderResult NativeW3D2::SetGameShaderCullInverted(bool inverted)
 {
+	const rts::render::RenderResult rigidBarrier = rts::render::FlushNativeGameRigidDraws(*this);
+	if (rigidBarrier != rts::render::RENDER_RESULT_OK) return rigidBarrier;
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return rts::render::RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	m_gameShaderCullInverted = inverted;
@@ -4432,7 +4759,7 @@ void NativeW3D2::SetGameCleanupHook(
 {
 	if (!IsOperational() || !m_resources.IsOwnerThread())
 	{
-		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT);
+		RecordGameFailure(rts::render::RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__);
 		return;
 	}
 	// The hook is intentionally retained by the owner across reset/resize;
@@ -4447,13 +4774,22 @@ unsigned int NativeW3D2::DisplayIterationEpoch() const
 
 void NativeW3D2::RecordGameFailure(rts::render::RenderResult result)
 {
+	// Preserve the game-owner virtual interface for callers outside this file.
+	RecordGameFailure(result, "external-unknown", 0);
+}
+
+void NativeW3D2::RecordGameFailure(rts::render::RenderResult result,
+	const char *caller, unsigned int site)
+{
 	if (result != rts::render::RENDER_RESULT_OK)
 	{
+		// Inner owner publication may precede the sorted propagation wrapper.
+		sorted_diag::NoteFailure(result, caller, site, "owner-record-failure");
 		if (!m_gameFailure.hasFailure() && !g_gameFailureStreakObserved)
 		{
 			g_gameFailureStreakObserved = true;
 			TraceGameFailure(result, m_displayIterationEpoch,
-				m_renderer.LastThreadedSubmissionSequence(), g_failureCommand);
+				m_renderer.LastThreadedSubmissionSequence(), g_failureCommand, caller, site);
 		}
 		if (m_reacquiringResources)
 			m_reacquireFailure.record(result);

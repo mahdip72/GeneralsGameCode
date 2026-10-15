@@ -195,6 +195,8 @@ enum RenderResult
 // wider DXGI Present range so every owner/producer adapter validates the same
 // game-facing values.
 enum { RENDER_SWAP_INTERVAL_MAX = 3 };
+// Fixed owned batch bound shared by producer and backend.
+enum { RENDER_RIGID_INSTANCE_MAX = 32 };
 
 // Validates the complete neutral texture contract before caller-owned bytes are
 // copied or a backend allocation is attempted.  A zero maximumUploadBytes
@@ -598,6 +600,13 @@ public:
 	virtual RenderResult setLegacyStateForLayout(const LegacyLogicalState &state,
 		const LegacyVertexLayout &vertexLayout,
 		unsigned int texturePresenceMask) = 0;
+	// Optional atomic instanced state lane. Logical state remains caller-owned
+	// and unchanged. Backends without a separate physical domain use ordinary state.
+	virtual RenderResult setLegacyStateForInstancedDraw(const LegacyLogicalState &state,
+		const LegacyVertexLayout &vertexLayout, unsigned int texturePresenceMask)
+	{
+		return setLegacyStateForLayout(state, vertexLayout, texturePresenceMask);
+	}
 	virtual RenderResult setVertexBuffer(GpuHandle buffer, unsigned int stride,
 		unsigned int offset) = 0;
 	virtual RenderResult setIndexBuffer(GpuHandle buffer, RenderFormat format,
@@ -608,6 +617,16 @@ public:
 		unsigned int startVertex) = 0;
 	virtual RenderResult drawIndexed(unsigned int indexCount,
 		unsigned int startIndex, int baseVertex) = 0;
+	// Optional lane. Worlds must be consumed/copied before returning.
+	// The default accepts no work.
+	virtual RenderResult drawIndexedInstanced(unsigned int indexCount,
+		unsigned int startIndex, int baseVertex, const RenderMatrix4 *worlds,
+		unsigned int instanceCount)
+	{
+		(void)indexCount; (void)startIndex; (void)baseVertex;
+		(void)worlds; (void)instanceCount;
+		return RENDER_RESULT_UNSUPPORTED;
+	}
 	virtual RenderResult endFrame() = 0;
 };
 
@@ -617,6 +636,8 @@ public:
 	virtual ~IRenderDevice() {}
 	virtual RenderBackend backend() const = 0;
 	virtual bool isOperational() const = 0;
+	// Cached capability query, no queued commands.
+	virtual bool supportsRigidInstancing() const { return false; }
 	virtual RenderResult initialize(const RenderDeviceParameters &parameters) = 0;
 	virtual void shutdown() = 0;
 	virtual IRenderContext *immediateContext() = 0;

@@ -1847,6 +1847,13 @@ unsigned DX8TextureCategoryClass::Add_Mesh(
 
 void DX8TextureCategoryClass::Render()
 {
+	// A category/pass is an encounter-order boundary, before its material or
+	// mapper callbacks can mutate the logical state used by a saved prefix.
+	if (rts::render::FlushGameRigidDraws() != rts::render::RENDER_RESULT_OK)
+	{
+		Clear_Render_List();
+		return;
+	}
 	#ifdef WWDEBUG
 	if (!WW3D::Expose_Prelit()) {
 	#endif
@@ -1902,6 +1909,35 @@ void DX8TextureCategoryClass::Render()
 		*/
 		DX8PolygonRendererClass * renderer = prt->Peek_Polygon_Renderer();
 		MeshClass * mesh = prt->Peek_Mesh();
+		// The first native lane accepts only ordinary rigid, single-pass opaque
+		// material with no mapper or title override. Final eligibility is checked
+		// again against the complete resolved draw/state, after existing setup.
+		const bool rigidTask = !m_gForceMultiply && pass == 0 &&
+			mesh->Peek_Model()->Get_Pass_Count() == 1 &&
+			!mesh->Peek_Model()->Get_Flag(MeshModelClass::SKIN) &&
+			!mesh->Peek_Model()->Get_Flag(MeshModelClass::ALIGNED) &&
+			!mesh->Peek_Model()->Get_Flag(MeshModelClass::ORIENTED) &&
+			!mesh->Peek_Model()->Get_Flag(MeshGeometryClass::SORT) &&
+			mesh->Get_ObjectScale() == 1.0f && mesh->Get_Alpha_Override() == 1.0f &&
+			mesh->Get_User_Data() == nullptr && vmaterial != nullptr &&
+			vmaterial->Peek_Mapper(0) == nullptr &&
+			vmaterial->Peek_Mapper(1) == nullptr &&
+			theShader.Get_Alpha_Test() == ShaderClass::ALPHATEST_DISABLE &&
+			theShader.Get_Src_Blend_Func() == ShaderClass::SRCBLEND_ONE &&
+			theShader.Get_Dst_Blend_Func() == ShaderClass::DSTBLEND_ZERO &&
+			!DX8RendererDebugger::Is_Enabled()
+			#ifdef WWDEBUG
+			&& !WW3D::Expose_Prelit()
+			#endif
+			;
+		if (!rigidTask || mesh->Get_Base_Vertex_Offset() == VERTEX_BUFFER_OVERFLOW)
+		{
+			if (rts::render::FlushGameRigidDraws() != rts::render::RENDER_RESULT_OK)
+			{
+				Clear_Render_List();
+				return;
+			}
+		}
 
 		if (mesh->Get_Base_Vertex_Offset() == VERTEX_BUFFER_OVERFLOW)	//check if this mesh is valid
 		{	//skip this mesh so it gets rendered later after vertices are filled in.
@@ -2095,7 +2131,12 @@ void DX8TextureCategoryClass::Render()
 				rts::render::SetGameMaterial(vmaterial);	//restore previous material.
 			}
 		else
+		{
+			// Scope only the original ordinary callback, never repeat callbacks
+			// or inspect a future task to find a matching geometry.
+			rts::render::GameRigidDrawHintScope rigidScope(rigidTask, renderer, this);
 			renderer->Render(mesh->Get_Base_Vertex_Offset());
+		}
 		}
 
 		if (mesh->Get_ObjectScale() != 1.0f)
@@ -2119,6 +2160,11 @@ void DX8TextureCategoryClass::Render()
 		prt = next_prt;
 	}
 
+	if (rts::render::FlushGameRigidDraws() != rts::render::RENDER_RESULT_OK)
+	{
+		Clear_Render_List();
+		return;
+	}
 	if (!renderTasksRemaining)
 	{
 		WWASSERT(!render_task_head);

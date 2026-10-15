@@ -82,6 +82,19 @@ struct ThreadedIndexedDraw
 RenderResult SubmitThreadedIndexedDraw(IRenderDevice *device,
 	const ThreadedIndexedDraw &draw);
 
+// One complete owned batch. No caller matrices, game objects or materials are
+// retained after admission; resource handles keep the existing FIFO lifetime.
+struct ThreadedIndexedInstancedDraw
+{
+	ThreadedIndexedInstancedDraw();
+	explicit ThreadedIndexedInstancedDraw(const LegacyLogicalState &initialState);
+	ThreadedIndexedDraw shared;
+	RenderMatrix4 worlds[RENDER_RIGID_INSTANCE_MAX];
+	unsigned int instanceCount;
+};
+RenderResult SubmitThreadedIndexedInstancedDraw(IRenderDevice *device,
+	const ThreadedIndexedInstancedDraw &draw);
+
 // endFrame records teardown; present seals a visible packet. Non-visible
 // render-to-texture frames MUST be sealed explicitly with presentFrame=false.
 // A successful enqueue is NOT execution success. Poll every accepted frame's

@@ -108,6 +108,8 @@ NativeW3DBufferOwner::~NativeW3DBufferOwner()
 RenderResult NativeW3DBufferOwner::Create(
 	const BufferDescriptor &descriptor)
 {
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	if (m_resources != 0 || m_handle.isValid() || m_locked ||
 		descriptor.byteCount == 0 || descriptor.stride == 0 ||
@@ -177,6 +179,10 @@ RenderResult NativeW3DBufferOwner::Create(
 
 RenderResult NativeW3DBufferOwner::Reset()
 {
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	// A failed flush has relinquished its unsubmitted prefix and latched the
+	// original draw failure. Cleanup must still reach ordered owner retirement
+	// or the allocation-free ticket queue before a destructor drops this facade.
 	ReleaseStaging();
 	RenderResult result = RENDER_RESULT_OK;
 	if (m_deferredCleanupTicket != 0)
@@ -214,7 +220,7 @@ RenderResult NativeW3DBufferOwner::Reset()
 		// table reference prevents resource destruction until the owner can drain
 		// or explicitly resolve that ticket.
 		m_failedMutation = true;
-		return result;
+		return rigidBarrier != RENDER_RESULT_OK ? rigidBarrier : result;
 	}
 	m_deferredHandle = GpuHandle();
 	m_handle = GpuHandle();
@@ -227,11 +233,13 @@ RenderResult NativeW3DBufferOwner::Reset()
 	m_authoritative = 0;
 	m_authoritativeBytes = 0;
 	m_failedMutation = false;
-	return result;
+	return rigidBarrier != RENDER_RESULT_OK ? rigidBarrier : result;
 }
 
 RenderResult NativeW3DBufferOwner::RecreateForDiscard()
 {
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeW3DResources *resources = ActiveResources();
 	if (resources == 0 || !m_handle.isValid() || m_cleanupTicket == 0 ||
 		!resources->IsValid(m_handle))
@@ -320,12 +328,14 @@ RenderResult NativeW3DBufferOwner::LockForFullOverwrite(size_t destinationOffset
 RenderResult NativeW3DBufferOwner::LockImpl(size_t destinationOffset,
 	size_t byteCount, RenderBufferUpdateMode mode, void **data, bool fullOverwrite)
 {
+	if (data != 0) *data = 0;
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	if (data == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
-	*data = 0;
 	NativeW3DResources *resources = ActiveResources();
 	ObserveAuthorityFailure(resources);
 	if (resources == 0 || !m_handle.isValid() || m_locked ||
@@ -406,6 +416,8 @@ RenderResult NativeW3DBufferOwner::LockImpl(size_t destinationOffset,
 
 RenderResult NativeW3DBufferOwner::Unlock()
 {
+	const RenderResult rigidBarrier = FlushGameRigidDraws();
+	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	if (!m_locked)
 	{

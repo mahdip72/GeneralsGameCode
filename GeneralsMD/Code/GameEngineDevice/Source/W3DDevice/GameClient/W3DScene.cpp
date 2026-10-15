@@ -37,6 +37,7 @@
 // USER INCLUDES //////////////////////////////////////////////////////////////
 #include "Lib/BaseType.h"
 #include "Lib/FrameTimingDiagnostics.h"
+#include "Lib/ProducerCpuPhaseDiagnostics.h"
 #include "Common/GameUtility.h"
 #include "Common/GlobalData.h"
 #include "Common/PerfTimer.h"
@@ -1007,6 +1008,7 @@ void RTS3DScene::renderOneObject(RenderInfoClass &rinfo, RenderObjClass *robj, I
 void RTS3DScene::Flush(RenderInfoClass & rinfo)
 {
 	rts::frame_timing::Scope sceneFlushTiming(rts::frame_timing::RendererSceneFlush);
+	rts::producer_cpu::Scope producerCpuSceneFlush(rts::producer_cpu::SceneFlush);
 	// TheSuperHackers @bugfix Now always prepares shadows to guarantee correct state before doing any
 	// shadow draw calls. Originally just drawing shadows for trees would not properly prepare shadows.
 	{
@@ -1066,6 +1068,7 @@ void RTS3DScene::Flush(RenderInfoClass & rinfo)
 		//don't draw transparent in this mode because they interfere with destination alpha
 		if (m_customPassMode == SCENE_PASS_DEFAULT && Get_Extra_Pass_Polygon_Mode() == EXTRA_PASS_DISABLE)
 		{
+			rts::producer_cpu::Scope producerCpuParticles(rts::producer_cpu::Particles);
 			DoParticles(rinfo);	//queue up particles for rendering.
 		}
 

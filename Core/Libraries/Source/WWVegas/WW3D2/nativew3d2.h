@@ -5,6 +5,7 @@
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/RenderGameClient.h"
 #include "Renderer/RenderGameClientNative.h"
+#include "Renderer/GameRigidDrawBatch.h"
 #include "nativew3dsorting.h"
 #include "nativew3dline.h"
 
@@ -53,6 +54,12 @@ public:
 	// fences. They may rebuild logical shaders while frame/state admission stays
 	// closed; the capability gate consumes this narrow predicate separately.
 	virtual bool IsRebuildingResources() const;
+	virtual rts::render::RenderResult BeginGameRigidDrawScope(
+		const void *geometry, const void *category);
+	virtual void EndGameRigidDrawScope();
+	virtual rts::render::RenderResult FlushGameRigidDraws();
+	virtual rts::render::RenderResult GetGameRigidDrawMetrics(
+		rts::render::GameRigidDrawMetrics *metrics) const;
 	virtual rts::render::GameRenderTargetKind ActiveRenderTargetKind() const;
 	virtual rts::render::RenderResult ExecuteGameRenderCommand(
 		const rts::render::GameRenderCommand &command);
@@ -89,6 +96,7 @@ public:
 		const void *vertexData, size_t vertexBytes, const void *indexData,
 		size_t indexBytes, const rts::render::GameBoundingSphere *sphere);
 	virtual rts::render::RenderResult FlushGameSortedTriangles();
+	virtual rts::render::RenderResult FlushGameTextureDraws();
 	virtual rts::render::RenderResult BeginGameDisplayIteration();
 	virtual rts::render::RenderResult ResetGameRenderFrameResources(
 		bool frameChanged);
@@ -123,6 +131,9 @@ public:
 	virtual void RequestGameBackBufferCapture();
 	virtual bool ConsumeGameBackBufferCaptureSuccess();
 	virtual void RecordGameFailure(rts::render::RenderResult result);
+	// Explicit failure provenance for this implementation's call sites.
+	void RecordGameFailure(rts::render::RenderResult result,
+		const char *caller, unsigned int site);
 
 	// NativeSortedGeometrySink implementation.  The sorter passes one
 	// transient vertex/index image plus contiguous legacy state groups; this
@@ -156,12 +167,19 @@ public:
 
 private:
 	friend class rts::render::NativeW3DRecoveryTestAccess;
+	friend rts::render::RenderResult rts::render::FlushNativeGameRigidDraws(
+		NativeW3D2 &owner);
 	NativeW3D2(const NativeW3D2 &);
 	NativeW3D2 &operator=(const NativeW3D2 &);
 
 	rts::render::NativeW3DRenderer m_renderer;
 	rts::render::NativeW3DResourceHost m_resourceHost;
 	rts::render::NativeW3DResources m_resources;
+	rts::render::GameRigidDrawBatch m_rigidDrawBatch;
+	bool m_rigidHintEnabled;
+	uint64_t m_rigidGeometry;
+	uint64_t m_rigidCategory;
+	uint64_t m_rigidContextEpoch;
 	bool m_borrowedBackend;
 	// Title-owned resource publication is a separate availability gate from
 	// backend initialization.  Reset/resize/recovery clear it before releasing

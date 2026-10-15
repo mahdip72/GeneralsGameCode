@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
-from PRWorkflowPolicy import LANES, OUTPUTS, PolicyError, evaluate_readiness, load_yaml, validate_policy
+from PRWorkflowPolicy import (LANES, OUTPUTS, PolicyError, evaluate_readiness, load_yaml,
+                               validate_ctest_inventory, validate_policy)
 
 
 ROOT = Path(os.environ.get('WORKFLOW_POLICY_SOURCE_ROOT', Path(__file__).resolve().parents[2]))
@@ -69,12 +71,97 @@ class ReadinessTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+class CTestInventoryTests(unittest.TestCase):
+    pattern = '^(core_threaded_render_device_tests|core_native_w3d_render_state_tests)$'
+
+    def inventory(self):
+        return {'tests': [
+            {'name': name, 'properties': []}
+            for name in (
+                'core_threaded_render_device_tests',
+                'core_native_w3d_render_state_tests',
+                'unrelated_test',
+            )
+        ]}
+
+    def test_configured_inventory_accepts_each_exact_focused_registration(self):
+        validate_ctest_inventory(self.inventory(), self.pattern)
+
+    def test_general_manual_regex_checks_each_configured_match(self):
+        validate_ctest_inventory(
+            self.inventory(),
+            '^core_(threaded_render_device_tests|native_w3d_render_state_tests)$')
+
+    def test_inventory_cli_accepts_configured_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inventory_path = Path(directory) / 'ctest-inventory.json'
+            inventory_path.write_text(json.dumps(self.inventory()), encoding='utf-8')
+            result = subprocess.run([
+                sys.executable, str(Path(__file__).with_name('PRWorkflowPolicy.py')),
+                '--ctest-inventory', str(inventory_path),
+                '--focused-test-regex', self.pattern,
+            ], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_commenting_out_registration_removes_it_from_configured_inventory(self):
+        inventory = self.inventory()
+        inventory['tests'] = [test for test in inventory['tests']
+                              if test['name'] != 'core_threaded_render_device_tests']
+        with self.assertRaisesRegex(PolicyError, 'missing from the configured CTest inventory'):
+            validate_ctest_inventory(inventory, self.pattern)
+
+    def test_disabled_registration_is_rejected(self):
+        inventory = self.inventory()
+        next(test for test in inventory['tests']
+             if test['name'] == 'core_threaded_render_device_tests')['properties'].append(
+                 {'name': 'DISABLED', 'value': True})
+        with self.assertRaisesRegex(PolicyError, 'is disabled in the configured inventory'):
+            validate_ctest_inventory(inventory, self.pattern)
+
+    def test_will_fail_registration_is_rejected(self):
+        inventory = self.inventory()
+        next(test for test in inventory['tests']
+             if test['name'] == 'core_threaded_render_device_tests')['properties'].append(
+                 {'name': 'WILL_FAIL', 'value': True})
+        with self.assertRaisesRegex(PolicyError, 'can mask a nonzero exit by WILL_FAIL'):
+            validate_ctest_inventory(inventory, self.pattern)
+
+    def test_nonempty_pass_regex_registration_is_rejected(self):
+        inventory = self.inventory()
+        next(test for test in inventory['tests']
+             if test['name'] == 'core_native_w3d_render_state_tests')['properties'].append(
+                 {'name': 'PASS_REGULAR_EXPRESSION', 'value': ['ready', 'done']})
+        with self.assertRaisesRegex(PolicyError, 'can mask a nonzero exit by PASS_REGULAR_EXPRESSION'):
+            validate_ctest_inventory(inventory, self.pattern)
+
+    def test_empty_pass_regex_and_false_will_fail_remain_nonmasking(self):
+        inventory = self.inventory()
+        next(test for test in inventory['tests']
+             if test['name'] == 'core_threaded_render_device_tests')['properties'].extend((
+                 {'name': 'WILL_FAIL', 'value': False},
+                 {'name': 'PASS_REGULAR_EXPRESSION', 'value': []},
+             ))
+        validate_ctest_inventory(inventory, self.pattern)
+
+    def test_both_skip_capable_registration_properties_are_rejected(self):
+        for property_name, value in (('SKIP_RETURN_CODE', 77),
+                                     ('SKIP_REGULAR_EXPRESSION', ['not available'])):
+            inventory = self.inventory()
+            next(test for test in inventory['tests']
+                 if test['name'] == 'core_native_w3d_render_state_tests')['properties'].append(
+                     {'name': property_name, 'value': value})
+            with self.subTest(property_name=property_name):
+                with self.assertRaisesRegex(PolicyError, f'can be skipped by {property_name}'):
+                    validate_ctest_inventory(inventory, self.pattern)
+
+
 class WorkflowMutationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         directory = ROOT / '.github/workflows'
         cls.pr = load_yaml((directory / 'pr-ci.yml').read_text(encoding='utf-8'))
         cls.extended = load_yaml((directory / 'ci.yml').read_text(encoding='utf-8'))
+        cls.reusable = load_yaml((directory / 'build-toolchain.yml').read_text(encoding='utf-8'))
 
     def test_live_workflows(self):
         validate_policy(self.pr, self.extended, ROOT)
@@ -84,6 +171,12 @@ class WorkflowMutationTests(unittest.TestCase):
         mutate(pr, extended)
         with self.assertRaisesRegex(PolicyError, expected):
             validate_policy(pr, extended, ROOT)
+
+    def reject_reusable(self, mutate, expected):
+        reusable = copy.deepcopy(self.reusable)
+        mutate(reusable)
+        with self.assertRaisesRegex(PolicyError, expected):
+            validate_policy(copy.deepcopy(self.pr), copy.deepcopy(self.extended), ROOT, reusable)
 
     def test_duplicate_yaml_keys_fail(self):
         with self.assertRaisesRegex(PolicyError, 'duplicate'):
@@ -97,8 +190,8 @@ class WorkflowMutationTests(unittest.TestCase):
             (lambda p, e: p['jobs']['native-zerohour'].update(needs=['detect-changes', 'native-generals']), 'depend only'),
             (lambda p, e: p['jobs']['native-zerohour']['with'].update(preset='x64-asan-core'), 'Release'),
             (lambda p, e: p['jobs']['native-generals']['with'].update(focused_test_regex='core_'), 'anchored'),
-            (lambda p, e: p['jobs']['native-generals']['with'].update(focused_test_regex=p['jobs']['native-generals']['with']['focused_test_regex'].replace('g_xfer_crc_snapshot_tests', 'g_not_registered_tests')), 'not registered'),
-            (lambda p, e: p['jobs']['native-generals']['with'].update(focused_targets=p['jobs']['native-generals']['with']['focused_targets'].replace(',core_task_runtime_tests', '')), 'not selected'),
+            (lambda p, e: p['jobs']['native-generals']['with'].update(focused_test_regex=p['jobs']['native-generals']['with']['focused_test_regex'].replace('g_xfer_crc_snapshot_tests', 'g_not_registered_tests')), 'exact required 17 smoke tests'),
+            (lambda p, e: p['jobs']['native-generals']['with'].update(focused_targets=p['jobs']['native-generals']['with']['focused_targets'].replace(',core_task_runtime_tests', '')), 'exact required 14 build targets'),
             (lambda p, e: p['jobs']['pr-readiness'].update(**{'if': '${{ success() }}'}), 'always'),
             (lambda p, e: p['jobs']['pr-readiness'].update(name='Optional smoke'), 'stable'),
             (lambda p, e: p['jobs']['pr-readiness']['needs'].remove('native-zerohour'), 'consume every'),
@@ -125,7 +218,7 @@ class WorkflowMutationTests(unittest.TestCase):
                 settings = p['jobs'][lane]['with']
                 settings['focused_test_regex'] = settings['focused_test_regex'].replace('|core_task_runtime_tests', '')
                 settings['focused_targets'] = settings['focused_targets'].replace(',core_task_runtime_tests', '')
-            self.reject(remove_pair, 'exact required 13 smoke tests')
+            self.reject(remove_pair, 'exact required 17 smoke tests')
 
     def test_smoke_test_and_target_duplicates_are_rejected(self):
         for lane in ('native-generals', 'native-zerohour'):
@@ -136,6 +229,100 @@ class WorkflowMutationTests(unittest.TestCase):
             def duplicate_target(p, e):
                 p['jobs'][lane]['with']['focused_targets'] += ',core_task_runtime_tests'
             self.reject(duplicate_target, 'build targets must be distinct')
+
+    def test_retained_authoring_matrix_requires_modern_and_vc6_per_title(self):
+        for job in ('build-generals', 'build-generalsmd-win32'):
+            self.reject(lambda p, e: e['jobs'][job]['strategy']['matrix']['include'].pop(1),
+                        'authoring matrix')
+        self.reject(lambda p, e: e['jobs']['build-generalsmd-win32']['with'].update(game='Generals'),
+                    'GeneralsMD authoring job must pass its game')
+
+    def test_retained_authoring_jobs_require_activation_dependency_and_reusable_routing(self):
+        for job in ('build-generals', 'build-generalsmd-win32'):
+            with self.subTest(job=job, mutation='disabled activation'):
+                self.reject(lambda p, e: e['jobs'][job].update(**{'if': '${{ false }}'}),
+                            'authoring job activation condition')
+            with self.subTest(job=job, mutation='wrong dependency'):
+                self.reject(lambda p, e: e['jobs'][job].update(needs='workflow_dispatch'),
+                            'exact change-detection dependency')
+            with self.subTest(job=job, mutation='retargeted reusable workflow'):
+                self.reject(lambda p, e: e['jobs'][job].update(uses='./.github/workflows/other.yml'),
+                            'route to the retained reusable build workflow')
+
+    def test_focused_ctest_inventory_gate_cannot_be_removed_or_masked(self):
+        self.reject_reusable(
+            lambda r: r['jobs']['build']['steps'].remove(next(
+                step for step in r['jobs']['build']['steps']
+                if step.get('name') == 'Verify focused CTest inventory')),
+            'configured CTest inventory guard')
+        self.reject_reusable(
+            lambda r: next(step for step in r['jobs']['build']['steps']
+                           if step.get('name') == 'Verify focused CTest inventory').update(
+                               **{'if': 'inputs.extras'}),
+            'only for focused test lanes')
+        self.reject_reusable(
+            lambda r: next(step for step in r['jobs']['build']['steps']
+                           if step.get('name') == 'Verify focused CTest inventory').update(
+                               **{'continue-on-error': True}),
+            'fail the build lane')
+
+    def test_focused_ctest_gate_captures_exit_before_policy_cli(self):
+        def move_capture_after_cli(reusable):
+            step = next(step for step in reusable['jobs']['build']['steps']
+                        if step.get('name') == 'Verify focused CTest inventory')
+            lines = step['run'].splitlines()
+            capture = '$ctestInventoryExitCode = $LASTEXITCODE'
+            lines.remove(capture)
+            cli = next(index for index, line in enumerate(lines)
+                       if 'PRWorkflowPolicy.py --ctest-inventory' in line)
+            lines.insert(cli + 1, capture)
+            step['run'] = '\n'.join(lines)
+        self.reject_reusable(move_capture_after_cli, 'exact fail-closed command sequence')
+
+    def test_focused_ctest_gate_rejects_success_exit_before_enumeration(self):
+        def insert_exit(reusable):
+            step = next(step for step in reusable['jobs']['build']['steps']
+                        if step.get('name') == 'Verify focused CTest inventory')
+            lines = step['run'].splitlines()
+            ctest = next(index for index, line in enumerate(lines)
+                         if line.startswith('$inventoryJson = & ctest '))
+            lines.insert(ctest, 'exit 0')
+            step['run'] = '\n'.join(lines)
+        self.reject_reusable(insert_exit, 'exact fail-closed command sequence')
+
+    def test_focused_ctest_gate_rejects_success_exit_after_policy_cli(self):
+        def insert_exit(reusable):
+            step = next(step for step in reusable['jobs']['build']['steps']
+                        if step.get('name') == 'Verify focused CTest inventory')
+            lines = step['run'].splitlines()
+            cli = next(index for index, line in enumerate(lines)
+                       if 'PRWorkflowPolicy.py --ctest-inventory' in line)
+            lines.insert(cli + 1, 'exit 0')
+            step['run'] = '\n'.join(lines)
+        self.reject_reusable(insert_exit, 'exact fail-closed command sequence')
+
+    def test_focused_ctest_gate_rejects_exit_status_reset_after_policy_cli(self):
+        def reset_status(reusable):
+            step = next(step for step in reusable['jobs']['build']['steps']
+                        if step.get('name') == 'Verify focused CTest inventory')
+            lines = step['run'].splitlines()
+            cli = next(index for index, line in enumerate(lines)
+                       if 'PRWorkflowPolicy.py --ctest-inventory' in line)
+            lines.insert(cli + 1, '$LASTEXITCODE = 0')
+            step['run'] = '\n'.join(lines)
+        self.reject_reusable(reset_status, 'exact fail-closed command sequence')
+
+    def test_extended_focused_runtime_filter_cannot_drop_a_test_family(self):
+        reduced_filters = (
+            '^core_job_system_tests$',
+            '^core_(deterministic_simulation(_.*)?test|job_system_tests)$',
+        )
+        for pattern in reduced_filters:
+            with self.subTest(pattern=pattern):
+                self.reject(
+                    lambda p, e: e['jobs']['build-native-x64-focused-runtime']['with'].update(
+                        focused_test_regex=pattern),
+                    'extended x64 focused runtime must retain its exact test filter')
 
     def test_mandatory_policy_steps_cannot_be_disabled_or_masked(self):
         for index in (1, 2, 3):

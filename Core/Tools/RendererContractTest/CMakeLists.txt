@@ -153,6 +153,13 @@ add_test(NAME core_transform_constant_arena_policy_tests
     COMMAND core_renderer_contract_tests --constant-arena-policy)
 set_tests_properties(core_transform_constant_arena_policy_tests PROPERTIES TIMEOUT 30)
 
+add_executable(core_game_rigid_draw_batch_tests GameRigidDrawBatchTest.cpp)
+target_link_libraries(core_game_rigid_draw_batch_tests PRIVATE core_renderer)
+set_target_properties(core_game_rigid_draw_batch_tests PROPERTIES
+    CXX_STANDARD 98 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+add_test(NAME core_game_rigid_draw_batch_tests COMMAND core_game_rigid_draw_batch_tests)
+set_tests_properties(core_game_rigid_draw_batch_tests PROPERTIES TIMEOUT 30)
+
 if(WIN32 AND NOT IS_VS6_BUILD)
 
     # Production collector with a recording driver; no graphics device.
@@ -218,7 +225,7 @@ if(WIN32 AND NOT IS_VS6_BUILD)
     d3d11_sampler_fragment(D3D11SamplerEviction
         "\tbool evictSamplerState(" "\n\tbool evictInputLayout()")
     d3d11_sampler_fragment(D3D11SamplerLookup
-        "\tHRESULT findOrCreateSamplerState(" "\n\tHRESULT findOrCreateInputLayout(")
+        "\tHRESULT findOrCreateSamplerState(" "\n\tstatic LegacyVertexLayout rigidVertexLayout(")
     d3d11_sampler_fragment(D3D11SamplerGatherCall
         "\t\t\t\tresult = findOrCreateSamplerState(samplerDescriptor,"
         "\n\t\t\t}\n\t\t}")
@@ -231,10 +238,38 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         # context, including failed Map and the whole-block equality shortcut.
         d3d11_sampler_fragment(D3D11NormalConstants
             "struct LegacyTransformConstants" "\nstruct PresentationColorConstants")
+        d3d11_sampler_fragment(D3D11DomainResult
+            "RenderResult TranslateResult(" "\nHRESULT TranslateInjectedFault(")
         d3d11_sampler_fragment(D3D11NormalMultiply
             "void MultiplyMatrices(" "\nbool IsSeaWaveVertexLayout(")
-        d3d11_sampler_fragment(D3D11NormalPublication
+        d3d11_sampler_fragment(D3D11ReuseLayoutEquality
+            "bool EqualVertexLayouts(const LegacyVertexLayout &left," "\nunsigned int LegacyVertexLayoutFlags(")
+        d3d11_sampler_fragment(D3D11RigidVertexLayout
+            "\tstatic LegacyVertexLayout rigidVertexLayout(bool hasDiffuse = true)" "\n\tstatic HRESULT buildNativeInputElements(")
+        d3d11_sampler_fragment(D3D11InstancedDomainSetter
+            "\tvirtual RenderResult setLegacyStateForInstancedDraw(" "\n\tRenderResult setLegacyStateForLayoutInternal(")
+        d3d11_sampler_fragment(D3D11LayoutSetter
+            "\tvirtual RenderResult setLegacyStateForLayout(" "\n\tvirtual RenderResult setLegacyStateForInstancedDraw(")
+        d3d11_sampler_fragment(D3D11LegacyLayoutHelpers
+            "bool EqualVertexLayouts(const LegacyVertexLayout &left," "\nbool HasBlendVertexSemantics(")
+        d3d11_sampler_fragment(D3D11LegacyLayoutFlagConstants
+            "const unsigned int LEGACY_VERTEX_LAYOUT_PRETRANSFORMED =" "const unsigned int MAX_TEXTURE_REFRESH_SUBRESOURCES =")
+        d3d11_sampler_fragment(D3D11InstancedWorldAdmissionType
+            "\tstruct InstancedWorldAdmission" "\n\tvirtual RenderResult setLegacyState(")
+        d3d11_sampler_fragment(D3D11InstancedConstantUpdate
             "\tHRESULT updateTransformConstants(" "\n\tvoid releaseNativeSlot(")
+        d3d11_sampler_fragment(D3D11InstancedReuse
+            "\tbool tryReuseInstancedConstants(" "\n\tstatic bool useInstancedConstantDomain()")
+        d3d11_sampler_fragment(D3D11NormalPublication
+            "\tstatic bool useInstancedConstantDomain()" "\n\tvoid releaseNativeSlot(")
+        d3d11_sampler_fragment(D3D11InstancedDomainRefresh
+            "\tRenderResult refreshTransformConstantsForDraw(" "\n\tvoid cacheLegacyState(")
+        d3d11_sampler_fragment(D3D11DomainSetterPrefix
+            "\tvirtual RenderResult setLegacyState(" "\n\t\tif (state.pipeline.ambientMaterialSource >")
+        d3d11_sampler_fragment(D3D11DomainCacheState
+            "\tvoid cacheLegacyState(" "\n\tvoid invalidatePipelineBindings()")
+        d3d11_sampler_fragment(D3D11OriginalWorldAdmission
+            "\tbool validateOriginalInstancedWorld(" "\n\tHRESULT updateTransformConstants(")
         d3d11_sampler_fragment(D3D11NormalBeginFrame
             "\tvirtual RenderResult beginFrame()" "\n\tvirtual RenderResult updateBuffer(")
         d3d11_sampler_fragment(D3D11NormalInvalidation
@@ -298,6 +333,20 @@ if(WIN32 AND NOT IS_VS6_BUILD)
     add_test(NAME core_d3d11_constant_arena_tests
         COMMAND core_d3d11_index_validation_tests --constant-arena)
     set_tests_properties(core_d3d11_constant_arena_tests PROPERTIES TIMEOUT 30)
+
+    add_executable(core_d3d11_instancing_parity_tests
+        D3D11InstancingParityTest.cpp)
+    target_link_libraries(core_d3d11_instancing_parity_tests PRIVATE core_renderer user32)
+    set_target_properties(core_d3d11_instancing_parity_tests PROPERTIES
+        CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES CXX_EXTENSIONS NO)
+    option(RTS_BUILD_D3D11_HARDWARE_TESTS
+        "Register D3D11 tests requiring a physical hardware adapter" OFF)
+    if(RTS_BUILD_D3D11_HARDWARE_TESTS)
+        add_test(NAME d3d11_instancing_parity
+            COMMAND core_d3d11_instancing_parity_tests)
+        set_tests_properties(d3d11_instancing_parity PROPERTIES
+            TIMEOUT 60 LABELS "renderer;gpu;hardware;rigid-instancing")
+    endif()
 endif()
 
 add_test(NAME core_w3d_video_buffer_format_selection_tests

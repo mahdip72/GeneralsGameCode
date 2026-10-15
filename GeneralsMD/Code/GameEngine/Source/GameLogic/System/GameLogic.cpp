@@ -35,6 +35,8 @@
 #include "Common/CRCDebug.h"
 #include "Common/DeterministicCrcLiveVerifier.h"
 #include "Common/FramePacer.h"
+#include "Lib/FrameTimingDiagnostics.h"
+#include "Lib/ProducerCpuPhaseDiagnostics.h"
 #include "Common/GameAudio.h"
 #include "Common/GameEngine.h"
 #include "Common/GameThreadOwnership.h"
@@ -4936,6 +4938,8 @@ bool GameLogic::commitStage5PhaseGraphPhase( unsigned phaseId,
 // ------------------------------------------------------------------------------------------------
 Bool GameLogic::runOwnerIntakePhase( UnsignedInt &now )
 {
+	rts::frame_timing::Scope frameTiming(rts::frame_timing::LogicOwnerIntake);
+	rts::producer_cpu::Scope producerCpuPhase(rts::producer_cpu::LogicOwnerIntake);
 	validateStage5Owner("Stage5 owner-intake phase requires the attached game thread.");
 	USE_PERF_TIMER(GameLogic_update_owner_intake)
 	PROFILER_SECTION_NAME("Simulation.OwnerIntake");
@@ -5059,6 +5063,8 @@ Bool GameLogic::runOwnerIntakePhase( UnsignedInt &now )
 // ------------------------------------------------------------------------------------------------
 void GameLogic::runLegacyMutableIslandPhase( UnsignedInt now )
 {
+	rts::frame_timing::Scope frameTiming(rts::frame_timing::LogicMutableIsland);
+	rts::producer_cpu::Scope producerCpuPhase(rts::producer_cpu::LogicMutableIsland);
 	validateStage5Owner("Stage5 legacy mutable-island phase requires the attached game thread.");
 	USE_PERF_TIMER(GameLogic_update_legacy_mutable_island)
 	PROFILER_SECTION_NAME("Simulation.LegacyMutableIsland");
@@ -5314,6 +5320,8 @@ void GameLogic::runLegacyMutableIslandPhase( UnsignedInt now )
 // ------------------------------------------------------------------------------------------------
 void GameLogic::runSpatialPhase()
 {
+	rts::frame_timing::Scope frameTiming(rts::frame_timing::LogicSpatial);
+	rts::producer_cpu::Scope producerCpuPhase(rts::producer_cpu::LogicSpatial);
 	validateStage5Owner("Stage5 spatial phase requires the attached game thread.");
 	USE_PERF_TIMER(GameLogic_update_spatial)
 	PROFILER_SECTION_NAME("Simulation.Spatial");
@@ -5622,6 +5630,8 @@ static Bool runPreparedDisabledStatusSweep( GameLogic *logic
 // ------------------------------------------------------------------------------------------------
 void GameLogic::runOwnerTailPhase()
 {
+	rts::frame_timing::Scope frameTiming(rts::frame_timing::LogicOwnerTail);
+	rts::producer_cpu::Scope producerCpuPhase(rts::producer_cpu::LogicOwnerTail);
 	validateStage5Owner("Stage5 owner-tail phase requires the attached game thread.");
 	USE_PERF_TIMER(GameLogic_update_owner_tail)
 	PROFILER_SECTION_NAME("Simulation.OwnerTail");
@@ -5661,6 +5671,8 @@ void GameLogic::runOwnerTailPhase()
 // ------------------------------------------------------------------------------------------------
 void GameLogic::runVerificationAndPublicationPhase()
 {
+	rts::frame_timing::Scope frameTiming(rts::frame_timing::LogicVerificationPublication);
+	rts::producer_cpu::Scope producerCpuPhase(rts::producer_cpu::LogicVerificationPublication);
 	validateStage5Owner("Stage5 verification/publication phase requires the attached game thread.");
 	USE_PERF_TIMER(GameLogic_update_verification_publication)
 	PROFILER_SECTION_NAME("Simulation.VerificationPublication");

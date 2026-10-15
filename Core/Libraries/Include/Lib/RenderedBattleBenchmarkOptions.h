@@ -2,8 +2,147 @@
 
 #include "Lib/ValidationProfileRoot.h"
 #include <stdio.h>
+#include <string.h>
 
 namespace rts { namespace rendered_battle {
+
+enum BenchmarkProfile
+{
+	BENCHMARK_PROFILE_LEGACY_512 = 0,
+	BENCHMARK_PROFILE_COMBINED_ARMS_256,
+	BENCHMARK_PROFILE_COMBINED_ARMS_512,
+	BENCHMARK_PROFILE_MECHANIZED_256,
+	BENCHMARK_PROFILE_MECHANIZED_512,
+	BENCHMARK_PROFILE_INFANTRY_LINE_256,
+	BENCHMARK_PROFILE_INFANTRY_LINE_512
+};
+
+struct BenchmarkProfileContract
+{
+	const char *profileId;
+	const char *rosterContract;
+	const char *phaseContract;
+	unsigned int unitsPerPlayer;
+	unsigned int templateCounts[4];
+};
+
+inline const char *BenchmarkProfileSchema()
+{
+	return "ggc.r2.rendered-battle-profile.v1";
+}
+
+inline const char *BenchmarkPhaseContract()
+{
+	return "ggc.r2.rendered-battle.phase.normal30hz-150-450-1080p.v1";
+}
+
+inline bool IsExplicitBenchmarkProfile(BenchmarkProfile profile)
+{
+	return profile != BENCHMARK_PROFILE_LEGACY_512;
+}
+
+inline bool GetBenchmarkProfileContract(BenchmarkProfile profile, BenchmarkProfileContract *contract)
+{
+	if (!contract) return false;
+	contract->phaseContract = BenchmarkPhaseContract();
+	contract->unitsPerPlayer = 0;
+	for (unsigned int i = 0; i < 4; ++i) contract->templateCounts[i] = 0;
+	switch (profile)
+	{
+	case BENCHMARK_PROFILE_COMBINED_ARMS_256:
+		contract->profileId = "combined_arms_256";
+		contract->rosterContract = "ggc.r2.rendered-battle.roster.combined-arms-256.v1";
+		contract->unitsPerPlayer = 32;
+		contract->templateCounts[0] = 4; contract->templateCounts[1] = 4;
+		contract->templateCounts[2] = 12; contract->templateCounts[3] = 12;
+		return true;
+	case BENCHMARK_PROFILE_COMBINED_ARMS_512:
+		contract->profileId = "combined_arms_512";
+		contract->rosterContract = "ggc.r2.rendered-battle.roster.combined-arms-512.v1";
+		contract->unitsPerPlayer = 64;
+		contract->templateCounts[0] = 8; contract->templateCounts[1] = 8;
+		contract->templateCounts[2] = 24; contract->templateCounts[3] = 24;
+		return true;
+	case BENCHMARK_PROFILE_MECHANIZED_256:
+		contract->profileId = "mechanized_256";
+		contract->rosterContract = "ggc.r2.rendered-battle.roster.mechanized-256.v1";
+		contract->unitsPerPlayer = 32;
+		contract->templateCounts[0] = 16; contract->templateCounts[1] = 16;
+		return true;
+	case BENCHMARK_PROFILE_MECHANIZED_512:
+		contract->profileId = "mechanized_512";
+		contract->rosterContract = "ggc.r2.rendered-battle.roster.mechanized-512.v1";
+		contract->unitsPerPlayer = 64;
+		contract->templateCounts[0] = 32; contract->templateCounts[1] = 32;
+		return true;
+	case BENCHMARK_PROFILE_INFANTRY_LINE_256:
+		contract->profileId = "infantry_line_256";
+		contract->rosterContract = "ggc.r2.rendered-battle.roster.infantry-line-256.v1";
+		contract->unitsPerPlayer = 32;
+		contract->templateCounts[2] = 16; contract->templateCounts[3] = 16;
+		return true;
+	case BENCHMARK_PROFILE_INFANTRY_LINE_512:
+		contract->profileId = "infantry_line_512";
+		contract->rosterContract = "ggc.r2.rendered-battle.roster.infantry-line-512.v1";
+		contract->unitsPerPlayer = 64;
+		contract->templateCounts[2] = 32; contract->templateCounts[3] = 32;
+		return true;
+	default:
+		contract->profileId = NULL;
+		contract->rosterContract = NULL;
+		return false;
+	}
+}
+
+// Shared ordered type selection for the explicit benchmark profiles. Keep this
+// beside the immutable roster counts so the fixture producer and its tests use
+// the same selection rule. combined_arms_512 preserves the legacy creation
+// order rather than grouping the two infantry templates.
+inline int GetBenchmarkProfileUnitType(BenchmarkProfile profile, unsigned int unit)
+{
+	BenchmarkProfileContract contract;
+	if (!GetBenchmarkProfileContract(profile, &contract) || unit >= contract.unitsPerPlayer)
+		return -1;
+	if (profile == BENCHMARK_PROFILE_COMBINED_ARMS_512)
+		return unit >= 32 ? 2 + static_cast<int>(unit % 2) : static_cast<int>(unit % 4);
+	unsigned int remaining = unit;
+	for (int type = 0; type < 4; ++type)
+	{
+		if (remaining < contract.templateCounts[type]) return type;
+		remaining -= contract.templateCounts[type];
+	}
+	return -1;
+}
+
+inline bool ReadBenchmarkProfile(const char *value, BenchmarkProfile *profile)
+{
+	if (!value || !profile) return false;
+	if (strcmp(value, "combined_arms_256") == 0) *profile = BENCHMARK_PROFILE_COMBINED_ARMS_256;
+	else if (strcmp(value, "combined_arms_512") == 0) *profile = BENCHMARK_PROFILE_COMBINED_ARMS_512;
+	else if (strcmp(value, "mechanized_256") == 0) *profile = BENCHMARK_PROFILE_MECHANIZED_256;
+	else if (strcmp(value, "mechanized_512") == 0) *profile = BENCHMARK_PROFILE_MECHANIZED_512;
+	else if (strcmp(value, "infantry_line_256") == 0) *profile = BENCHMARK_PROFILE_INFANTRY_LINE_256;
+	else if (strcmp(value, "infantry_line_512") == 0) *profile = BENCHMARK_PROFILE_INFANTRY_LINE_512;
+	else return false;
+	return true;
+}
+
+inline bool ReadBenchmarkProfileEnvironment(BenchmarkProfile *profile)
+{
+	if (!profile) return false;
+	char value[64];
+	SetLastError(ERROR_SUCCESS);
+	const DWORD length = GetEnvironmentVariableA("RTS_RENDERED_BATTLE_PROFILE", value, sizeof(value));
+	if (length == 0)
+	{
+		if (GetLastError() != ERROR_ENVVAR_NOT_FOUND) return false;
+		*profile = BENCHMARK_PROFILE_LEGACY_512;
+		return true;
+	}
+	if (length >= sizeof(value)) return false;
+	value[length] = '\0';
+	return ReadBenchmarkProfile(value, profile);
+}
 
 struct TestOptions
 {
@@ -11,9 +150,11 @@ struct TestOptions
 	bool visualCaptureOnly;
 	bool visualSamples;
 	bool benchmarkRequested;
+	BenchmarkProfile benchmarkProfile;
 	char profileRoot[MAX_PATH];
 	TestOptions() : backgroundStartup(false), visualCaptureOnly(false),
-		visualSamples(false), benchmarkRequested(false) { profileRoot[0] = '\0'; }
+		visualSamples(false), benchmarkRequested(false),
+		benchmarkProfile(BENCHMARK_PROFILE_LEGACY_512) { profileRoot[0] = '\0'; }
 };
 
 // Shared by the startup parser, both title bootstraps, and the fixture. These
@@ -100,6 +241,12 @@ inline bool ConfigureTestOptions(int argc, const char *const *argv,
 		!ReadTestOptIn("RTS_RENDERED_BATTLE_VISUAL_CAPTURE", &requested.visualCaptureOnly) ||
 		!ReadTestOptIn("RTS_RENDER_VISUAL_CAPTURE_SAMPLES", &requested.visualSamples))
 		*reason = "invalid_test_opt_in";
+	int benchmarkOptions = 0;
+	for (int i = 1; argv && i < argc; ++i)
+		if (_stricmp(argv[i], "-runRenderedBattleBenchmark") == 0) ++benchmarkOptions;
+	if (!*reason && benchmarkOptions == 1 &&
+		!ReadBenchmarkProfileEnvironment(&requested.benchmarkProfile))
+		*reason = "invalid_rendered_battle_profile";
 	if (!*reason && (requested.backgroundStartup || requested.visualCaptureOnly || requested.visualSamples))
 	{
 		int benchmarks = 0, windows = 0, widths = 0, heights = 0, renderers = 0;

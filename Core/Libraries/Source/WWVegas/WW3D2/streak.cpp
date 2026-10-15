@@ -124,7 +124,7 @@ void StreakLineClass::Set_Locs( unsigned int num_points, Vector3 *locs )
 		return;
 	}
 
-	PointLocations.Delete_All();
+	PointLocations.Delete_All(false);
 	for (unsigned int i=0; i<num_points; i++) {
 		PointLocations.Add(locs[i],num_points);
 	}
@@ -139,7 +139,7 @@ void StreakLineClass::Set_Widths( unsigned int num_points, float *widths )
 		return;
 	}
 
-	PointWidths.Delete_All();
+	PointWidths.Delete_All(false);
 	for (unsigned int i=0; i<num_points; i++) {
 		PointWidths.Add(widths[i],num_points);
 	}
@@ -153,7 +153,7 @@ void StreakLineClass::Set_Colors( unsigned int num_points, Vector4 *colors )
 		return;
 	}
 
-	PointColors.Delete_All();
+	PointColors.Delete_All(false);
 	for (unsigned int i=0; i<num_points; i++) {
 		PointColors.Add(colors[i],num_points);
 	}

@@ -1,4 +1,6 @@
 #include "Renderer/NativeW3DRenderer.h"
+#include "Renderer/RigidInstancingPolicy.h"
+#include <climits>
 #include "Renderer/NativeW3DResources.h"
 #include "Renderer/NativeW3DRenderState.h"
 #include "Renderer/RenderTexturePublication.h"
@@ -51,6 +53,234 @@ int Check(bool condition, const char *message)
 	}
 	std::fprintf(stderr, "FAIL: %s\n", message);
 	return 1;
+}
+
+using namespace rts::render;
+// Exercise producer admission against real resource authority tables, with a
+// deterministic synchronous context that records only accepted commands.
+class InstancingTraceContext : public rts::render::IRenderContext
+{
+public:
+	InstancingTraceContext() : commands(0), ordinary(0), instanced(0),
+		drawResult(rts::render::RENDER_RESULT_OK), stateResult(rts::render::RENDER_RESULT_OK) {}
+	unsigned int commands, ordinary, instanced;
+	rts::render::RenderResult drawResult, stateResult;
+	rts::render::RenderMatrix4 copied[rts::render::RENDER_RIGID_INSTANCE_MAX];
+	unsigned int copiedCount;
+	enum Route { OrdinaryLayout, InstancedLayout, Vertex, Texture, Topology, Index, Indexed, Instanced };
+	std::vector<Route> route;
+	LegacyLogicalState routedState;
+	LegacyVertexLayout routedLayout;
+	unsigned int routedMask;
+	RenderResult recordLayout(Route kind, const LegacyLogicalState &state,
+		const LegacyVertexLayout &layout, unsigned int mask)
+	{
+		++commands; route.push_back(kind); routedState = state;
+		routedLayout = layout; routedMask = mask; return stateResult;
+	}
+
+RenderResult beginFrame() { return RENDER_RESULT_OK; }
+RenderResult updateBuffer(GpuHandle, const void *, size_t, size_t, RenderBufferUpdateMode) { return RENDER_RESULT_OK; }
+RenderResult clear(const RenderFloat4 &, float, unsigned int) { ++commands; return RENDER_RESULT_OK; }
+RenderResult clearTargets(unsigned int, const RenderFloat4 &, float, unsigned int) { ++commands; return RENDER_RESULT_OK; }
+RenderResult setRenderTargets(const RenderTargetBinding &) { ++commands; return RENDER_RESULT_OK; }
+RenderResult setRenderTargets(GpuHandle, GpuHandle) { ++commands; return RENDER_RESULT_OK; }
+RenderResult setViewport(float, float, float, float, float, float) { ++commands; return RENDER_RESULT_OK; }
+RenderResult setLegacyState(const LegacyLogicalState &, LegacyVertexFormat, unsigned int) { ++commands; return stateResult; }
+RenderResult setLegacyStateForLayout(const LegacyLogicalState &state, const LegacyVertexLayout &layout, unsigned int mask)
+{ return recordLayout(OrdinaryLayout, state, layout, mask); }
+RenderResult setLegacyStateForInstancedDraw(const LegacyLogicalState &state, const LegacyVertexLayout &layout, unsigned int mask)
+{ return recordLayout(InstancedLayout, state, layout, mask); }
+RenderResult setVertexBuffer(GpuHandle, unsigned int, unsigned int) { ++commands; route.push_back(Vertex); return RENDER_RESULT_OK; }
+RenderResult setIndexBuffer(GpuHandle, RenderFormat, unsigned int) { ++commands; route.push_back(Index); return RENDER_RESULT_OK; }
+RenderResult setTexture(unsigned int, GpuHandle) { ++commands; route.push_back(Texture); return RENDER_RESULT_OK; }
+RenderResult setPrimitiveTopology(RenderPrimitiveTopology) { ++commands; route.push_back(Topology); return RENDER_RESULT_OK; }
+RenderResult draw(unsigned int, unsigned int) { ++ordinary; return RENDER_RESULT_OK; }
+RenderResult drawIndexed(unsigned int, unsigned int, int) { ++ordinary; route.push_back(Indexed); return RENDER_RESULT_OK; }
+RenderResult drawIndexedInstanced(unsigned int, unsigned int, int, const RenderMatrix4 *worlds, unsigned int count)
+{
+	++commands; ++instanced; route.push_back(Instanced); copiedCount = count;
+	for (unsigned int i = 0; i < count; ++i) copied[i] = worlds[i];
+	return drawResult;
+}
+RenderResult endFrame() { return RENDER_RESULT_OK; }
+};
+class InstancingTraceDevice : public IRenderDevice
+{
+public:
+	InstancingTraceDevice() : capability(true), handles(16) {}
+	bool capability;
+	GpuHandleAllocator handles;
+	InstancingTraceContext context;
+	RenderBackend backend() const { return RENDER_BACKEND_D3D11; }
+	bool isOperational() const { return true; }
+	bool supportsRigidInstancing() const { return capability; }
+	RenderResult initialize(const RenderDeviceParameters &) { return RENDER_RESULT_OK; }
+	void shutdown() {}
+	IRenderContext *immediateContext() { return &context; }
+	RenderResult createBuffer(const BufferDescriptor &, const void *, size_t, GpuHandle *buffer)
+	{ *buffer = handles.allocate(); return buffer->isValid() ? RENDER_RESULT_OK : RENDER_RESULT_FAILED; }
+	RenderResult createTexture(const TextureDescriptor &, const TextureSubresourceData *, unsigned int, GpuHandle *texture)
+	{ *texture = handles.allocate(); return texture->isValid() ? RENDER_RESULT_OK : RENDER_RESULT_FAILED; }
+	RenderResult refreshTexture(GpuHandle, const TextureDescriptor &, const TextureSubresourceData *, unsigned int)
+	{ return RENDER_RESULT_UNSUPPORTED; }
+	RenderResult copyActiveColorTargetToTexture(GpuHandle) { return RENDER_RESULT_UNSUPPORTED; }
+	bool destroyResource(GpuHandle buffer) { return handles.release(buffer); }
+	RenderResult recoverDevice() { return RENDER_RESULT_UNSUPPORTED; }
+	RenderResult resize(unsigned int, unsigned int) { return RENDER_RESULT_UNSUPPORTED; }
+	RenderResult present() { return RENDER_RESULT_OK; }
+	RenderResult getBackBufferInfo(RenderBackBufferInfo *) const { return RENDER_RESULT_UNSUPPORTED; }
+	RenderResult captureBackBuffer(void *, size_t, size_t, RenderFormat *) { return RENDER_RESULT_UNSUPPORTED; }
+	RenderResult getDebugValidationErrorCount(unsigned int *count) const { *count = 0; return RENDER_RESULT_OK; }
+	RenderResult reportDebugLiveObjects() { return RENDER_RESULT_UNSUPPORTED; }
+};
+
+NativeDrawPacket RigidTestPacket()
+{
+	NativeDrawPacket p;
+	p.indexed = true; p.vertexCount = 3; p.indexCount = 3;
+	p.vertexStride = p.vertexLayout.stride = 36;
+	p.vertexFormat = RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1;
+	p.vertexLayout.elementCount = 4;
+	const RenderVertexSemantic semantics[] = { RENDER_VERTEX_SEMANTIC_POSITION,
+		RENDER_VERTEX_SEMANTIC_NORMAL, RENDER_VERTEX_SEMANTIC_DIFFUSE, RENDER_VERTEX_SEMANTIC_TEXTURE_COORDINATE };
+	const RenderVertexDataFormat formats[] = { RENDER_VERTEX_DATA_FLOAT3,
+		RENDER_VERTEX_DATA_FLOAT3, RENDER_VERTEX_DATA_COLOR_BGRA8, RENDER_VERTEX_DATA_FLOAT2 };
+	const unsigned int offsets[] = { 0, 12, 24, 28 };
+	for (unsigned int i = 0; i < 4; ++i) {
+		p.vertexLayout.elements[i].semantic = semantics[i];
+		p.vertexLayout.elements[i].format = formats[i];
+		p.vertexLayout.elements[i].byteOffset = offsets[i];
+	}
+	return p;
+}
+
+int TestInstancingAdmission()
+{
+	int result = 0;
+	InstancingTraceDevice device;
+	NativeW3DRenderer renderer;
+	NativeW3DResources resources;
+	NativeW3DRenderState *owner = NativeW3DRenderState::Create(8);
+	if (!owner) return Check(false, "instancing creates production owner state");
+	result |= Check(owner->BindOwner() == RENDER_RESULT_OK &&
+		NativeW3DRecoveryTestAccess::Attach(renderer, owner, &device) == RENDER_RESULT_OK &&
+		resources.Bind(&renderer) == RENDER_RESULT_OK, "instancing binds resource authority");
+	BufferDescriptor vb, ib;
+	vb.byteCount = 6 * 36; vb.stride = 36; vb.binding = RENDER_BUFFER_VERTEX;
+	vb.usage = RENDER_USAGE_DYNAMIC;
+	ib.byteCount = 6 * sizeof(unsigned short); ib.stride = sizeof(unsigned short);
+	ib.binding = RENDER_BUFFER_INDEX; ib.usage = RENDER_USAGE_DYNAMIC;
+	unsigned char vertices[6 * 36] = {};
+	unsigned short indices[6] = { 0, 1, 2, 3, 4, 5 };
+	NativeDrawPacket packet = RigidTestPacket();
+	result |= Check(resources.CreateBuffer(vb, 0, 0, &packet.vertexBuffer) == RENDER_RESULT_OK &&
+		resources.CreateBuffer(ib, 0, 0, &packet.indexBuffer) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(packet.vertexBuffer, vertices, 3 * 36, 0) == RENDER_RESULT_OK &&
+		resources.UpdateBuffer(packet.indexBuffer, indices, 3 * sizeof(unsigned short), 0) == RENDER_RESULT_OK,
+		"producer fixture publishes only initialized geometry prefixes");
+	LegacyLogicalState state;
+	RenderMatrix4 worlds[RENDER_RIGID_INSTANCE_MAX];
+	worlds[1].values[12] = 2;
+	const unsigned int before = device.context.commands;
+	result |= Check(!device.IRenderDevice::supportsRigidInstancing() &&
+		device.context.IRenderContext::drawIndexedInstanced(3, 0, 0, worlds, 2) == RENDER_RESULT_UNSUPPORTED &&
+		device.context.commands == before, "default optional seam accepts no commands");
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, packet, worlds, 1) == RENDER_RESULT_INVALID_ARGUMENT &&
+		renderer.SubmitInstancedExternal(resources, state, packet, worlds, 33) == RENDER_RESULT_INVALID_ARGUMENT &&
+		renderer.SubmitInstancedExternal(resources, state, packet, 0, 2) == RENDER_RESULT_INVALID_ARGUMENT &&
+		device.context.commands == before, "invalid capacity and null arrays admit no commands");
+	device.capability = false;
+	result |= Check(!renderer.SupportsRigidInstancing() &&
+		renderer.SubmitInstancedExternal(resources, state, packet, worlds, 2) == RENDER_RESULT_UNSUPPORTED &&
+		device.context.commands == before, "unsupported capability rejects before side effects");
+	device.capability = true;
+	NativeDrawPacket bad = packet; bad.minimumVertexIndex = 3;
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, bad, worlds, 2) == RENDER_RESULT_INVALID_ARGUMENT &&
+		device.context.commands == before, "uninitialized declared vertex range rejects before admission");
+	bad = packet; bad.startIndex = 3;
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, bad, worlds, 2) == RENDER_RESULT_INVALID_ARGUMENT &&
+		device.context.commands == before, "uninitialized index prefix rejects before admission");
+	bad = packet; bad.baseVertex = -1;
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, bad, worlds, 2) == RENDER_RESULT_INVALID_ARGUMENT &&
+		device.context.commands == before, "negative effective minimum vertex rejects");
+	bad = packet; bad.baseVertex = INT_MAX; bad.minimumVertexIndex = UINT_MAX;
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, bad, worlds, 2) == RENDER_RESULT_INVALID_ARGUMENT &&
+		device.context.commands == before, "overflowing base plus minimum rejects");
+	bad = packet; bad.vertexBuffer = GpuHandle(packet.vertexBuffer.index(), packet.vertexBuffer.generation() + 1);
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, bad, worlds, 2) == RENDER_RESULT_INVALID_ARGUMENT &&
+		device.context.commands == before, "stale generation rejects before admission");
+	bad = packet; bad.texturePresenceMask = 1;
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, bad, worlds, 2) == RENDER_RESULT_INVALID_ARGUMENT &&
+		device.context.commands == before, "texture mask mismatch rejects before admission");
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, packet, worlds, 2) == RENDER_RESULT_OK &&
+		device.context.instanced == 1 && device.context.ordinary == 0 &&
+		device.context.copiedCount == 2 && device.context.copied[1].values[12] == 2,
+		"one admitted batch owns distinct worlds without ordinary replay");
+	worlds[1].values[12] = 99;
+	result |= Check(device.context.copied[1].values[12] == 2, "caller world poison does not change accepted values");
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, packet, worlds, 32) == RENDER_RESULT_OK &&
+		device.context.copiedCount == 32, "maximum capacity accepted");
+	bad = packet; bad.minimumVertexIndex = 1; bad.baseVertex = -1;
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, bad, worlds, 2) == RENDER_RESULT_OK,
+		"indexed range uses base plus minimum rather than startVertex");
+	// This synchronous backend executes the real direct facade, with no threaded
+	// device special case or copy of SubmitInstancedInternal in the fixture.
+	TextureDescriptor texture; texture.width = texture.height = 1;
+	texture.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+	unsigned int pixel = 0xffffffffU; TextureSubresourceData textureData;
+	textureData.data = &pixel; textureData.rowPitch = textureData.slicePitch = sizeof(pixel);
+	NativeDrawPacket textured = packet;
+	result |= Check(resources.CreateTexture(texture, &textureData, 1,
+		&textured.textures[0]) == RENDER_RESULT_OK, "direct route publishes real texture authority");
+	textured.texturePresenceMask = 1;
+	device.context.route.clear();
+	result |= Check(renderer.BeginFrame() == RENDER_RESULT_OK &&
+		renderer.SubmitInstanced(resources, state, textured, worlds, 2) == RENDER_RESULT_OK,
+		"direct facade accepts an instanced textured record");
+	std::vector<InstancingTraceContext::Route> expectedRoute = {
+		InstancingTraceContext::InstancedLayout, InstancingTraceContext::Vertex};
+	expectedRoute.insert(expectedRoute.end(), LEGACY_TEXTURE_STAGE_COUNT, InstancingTraceContext::Texture);
+	expectedRoute.push_back(InstancingTraceContext::Topology);
+	expectedRoute.push_back(InstancingTraceContext::Index);
+	expectedRoute.push_back(InstancingTraceContext::Instanced);
+	result |= Check(device.context.route == expectedRoute && device.context.routedMask == 1,
+		"direct instanced setter precedes geometry and draw with the real mask");
+	const LegacyVertexLayout routed = device.context.routedLayout;
+	result |= Check(routed.stride == textured.vertexLayout.stride &&
+		routed.elementCount == textured.vertexLayout.elementCount &&
+		routed.preTransformed == textured.vertexLayout.preTransformed &&
+		device.context.routedState.constants.world.values[0] == state.constants.world.values[0],
+		"direct route preserves state and layout header");
+	for (unsigned int i = 0; i < textured.vertexLayout.elementCount; ++i)
+		result |= Check(routed.elements[i].semantic == textured.vertexLayout.elements[i].semantic &&
+			routed.elements[i].semanticIndex == textured.vertexLayout.elements[i].semanticIndex &&
+			routed.elements[i].format == textured.vertexLayout.elements[i].format &&
+			routed.elements[i].byteOffset == textured.vertexLayout.elements[i].byteOffset,
+			"direct route forwards every active layout element");
+	device.context.route.clear();
+	expectedRoute.front() = InstancingTraceContext::OrdinaryLayout;
+	expectedRoute.back() = InstancingTraceContext::Indexed;
+	result |= Check(renderer.Submit(resources, state, textured) == RENDER_RESULT_OK &&
+		device.context.route == expectedRoute && device.context.routedMask == 1 &&
+		renderer.EndFrame(false) == RENDER_RESULT_OK,
+		"ordinary direct draw retains its ordinary layout setter and order");
+	device.context.drawResult = RENDER_RESULT_UNSUPPORTED;
+	const unsigned int ordinaryBefore = device.context.ordinary;
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, packet, worlds, 2) == RENDER_RESULT_FAILED &&
+		device.context.ordinary == ordinaryBefore, "post-admission unsupported is terminal and never replays");
+	device.context.drawResult = RENDER_RESULT_FAILED;
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, packet, worlds, 2) == RENDER_RESULT_FAILED &&
+		device.context.ordinary == ordinaryBefore, "accepted execution failure is never ordinary replay");
+	device.context.stateResult = RENDER_RESULT_UNSUPPORTED;
+	const unsigned int instancedBefore = device.context.instanced;
+	result |= Check(renderer.SubmitInstancedExternal(resources, state, packet, worlds, 2) == RENDER_RESULT_FAILED &&
+		device.context.instanced == instancedBefore, "setup failure stops before draw and cannot invite replay");
+	result |= Check(resources.Shutdown() == RENDER_RESULT_OK, "fixture releases resources");
+	result |= Check(owner->BeginShutdown() == RENDER_RESULT_OK &&
+		NativeW3DRecoveryTestAccess::Detach(renderer, owner) == RENDER_RESULT_OK, "fixture detaches borrowed state");
+	owner->Release();
+	return result;
 }
 
 int TestTexturePublicationContract()
@@ -682,6 +912,7 @@ int TestD3D11TexturedInputLayoutSafety()
 int main()
 {
 	int result = 0;
+	result |= TestInstancingAdmission();
 	result |= TestTexturePublicationContract();
 	result |= TestTexturePublicationOperationalContract();
 	result |= TestTextureBindingCacheCommandTrace();

@@ -42,6 +42,18 @@ cbuffer LegacyTransformConstants : register(b0)
 	uint4 FogStateParameters;
 };
 
+// The instanced specialization uses the exact ordinary shader operations.
+// Mutable invocation-local globals route every helper through the uploaded rows.
+#if defined(LEGACY_RIGID_INSTANCED_INPUT)
+static float4x4 InstanceWVP, InstanceWV, InstanceWorld;
+static float3x3 InstanceWorldNormal, InstanceWVNormal;
+#define WorldViewProjection InstanceWVP
+#define WorldView InstanceWV
+#define World InstanceWorld
+#define WorldNormalMatrix InstanceWorldNormal
+#define WorldViewNormalMatrix InstanceWVNormal
+#endif
+
 bool UsesPreTransformedPosition()
 {
 	return (VertexLayoutParameters.w & 0x80000000U) != 0;
@@ -417,6 +429,27 @@ float4 PSMain(VertexOutput input) : SV_TARGET
 
 struct TexturedVertexInput
 {
+#if defined(LEGACY_RIGID_INSTANCED_INPUT)
+	float4 instanceRow0 : INSTANCE0;
+	float4 instanceRow1 : INSTANCE1;
+	float4 instanceRow2 : INSTANCE2;
+	float4 instanceRow3 : INSTANCE3;
+	float4 instanceRow4 : INSTANCE4;
+	float4 instanceRow5 : INSTANCE5;
+	float4 instanceRow6 : INSTANCE6;
+	float4 instanceRow7 : INSTANCE7;
+	float4 instanceRow8 : INSTANCE8;
+	float4 instanceRow9 : INSTANCE9;
+	float4 instanceRow10 : INSTANCE10;
+	float4 instanceRow11 : INSTANCE11;
+	float4 instanceRow12 : INSTANCE12;
+	float4 instanceRow13 : INSTANCE13;
+	float4 instanceRow14 : INSTANCE14;
+	float4 instanceRow15 : INSTANCE15;
+	float4 instanceRow16 : INSTANCE16;
+	float4 instanceRow17 : INSTANCE17;
+#endif
+
 	float4 position : POSITION;
 	float3 normal : NORMAL;
 	float4 color : COLOR0;
@@ -474,6 +507,14 @@ struct TexturedVertexOutput
 
 TexturedVertexOutput VSTextured(TexturedVertexInput input)
 {
+#if defined(LEGACY_RIGID_INSTANCED_INPUT)
+	InstanceWVP = float4x4(input.instanceRow0, input.instanceRow1, input.instanceRow2, input.instanceRow3);
+	InstanceWV = float4x4(input.instanceRow4, input.instanceRow5, input.instanceRow6, input.instanceRow7);
+	InstanceWorld = float4x4(input.instanceRow8, input.instanceRow9, input.instanceRow10, input.instanceRow11);
+	InstanceWorldNormal = float3x3(input.instanceRow12.xyz, input.instanceRow13.xyz, input.instanceRow14.xyz);
+	InstanceWVNormal = float3x3(input.instanceRow15.xyz, input.instanceRow16.xyz, input.instanceRow17.xyz);
+#endif
+
 	TexturedVertexOutput output;
 	if (ProgramParameters.x == 1U)
 	{

@@ -18,6 +18,7 @@
 #include "Common/GameMemory.h"
 #include "Common/GlobalData.h"
 #include "Common/SkirmishAITestRunner.h"
+#include "Lib/RenderedBattleBenchmarkOptions.h"
 #include "Common/PerformanceReceiptRuntime.h"
 #include "Common/SkirmishAILegacySaveTest.h"
 #include "Common/SkirmishAIReplayEpoch.h"
@@ -5663,8 +5664,63 @@ static void TestRenderedBattleDiagnosticLocalPlacement()
 	CHECK(candidates[8] == -99 && prefixes[8] == -99);
 }
 
+static void TestRenderedBattleProfileObjectNames()
+{
+	using namespace rts::rendered_battle;
+	const TestOptions savedOptions = ProcessTestOptions();
+	const BenchmarkProfile profiles[] = {
+		BENCHMARK_PROFILE_LEGACY_512,
+		BENCHMARK_PROFILE_COMBINED_ARMS_256, BENCHMARK_PROFILE_COMBINED_ARMS_512,
+		BENCHMARK_PROFILE_MECHANIZED_256, BENCHMARK_PROFILE_MECHANIZED_512,
+		BENCHMARK_PROFILE_INFANTRY_LINE_256, BENCHMARK_PROFILE_INFANTRY_LINE_512
+	};
+	const Int profileUnits[] = { 64, 32, 64, 32, 64, 32, 64 };
+	const char *expectedNames[3][4] = {
+		{ "AmericaTankCrusader", "AmericaVehicleHumvee", "AmericaInfantryRanger", "AmericaInfantryMissileDefender" },
+		{ "ChinaTankBattleMaster", "ChinaTankGattling", "ChinaInfantryRedguard", "ChinaInfantryTankHunter" },
+		{ "GLATankScorpion", "GLAVehicleTechnical", "GLAInfantryRebel", "GLAInfantryTunnelDefender" }
+	};
+	for (UnsignedInt profileIndex = 0; profileIndex < ARRAY_SIZE(profiles); ++profileIndex)
+	{
+		ProcessTestOptions().benchmarkProfile = profiles[profileIndex];
+		const Int units = profileUnits[profileIndex];
+		for (Int slot = 0; slot < 8; ++slot)
+		{
+			const Int faction = slot % 4 == 3 ? 0 : slot % 4;
+			for (Int unit = 0; unit < units; ++unit)
+			{
+				// Expected literal roster order is independent of the production selector.
+				const Int type = profileIndex == 0 || profileIndex == 2 ?
+					(unit < 32 ? unit % 4 : 2 + unit % 2) :
+					(profileIndex == 1 ? (unit < 4 ? 0 : unit < 8 ? 1 : unit < 20 ? 2 : 3) :
+					(profileIndex < 5 ? (unit < units / 2 ? 0 : 1) : (unit < units / 2 ? 2 : 3)));
+				const char *actual = GetRenderedBattleDiagnosticObjectName(slot, unit, TRUE);
+				CHECK(actual != nullptr);
+				if (actual) CHECK(strcmp(actual, expectedNames[faction][type]) == 0);
+			}
+			// Diagnostic FALSE keeps its original four-template cycle in every profile.
+			for (Int diagnosticUnit = 0; diagnosticUnit < 32; ++diagnosticUnit)
+			{
+				const char *actual = GetRenderedBattleDiagnosticObjectName(slot, diagnosticUnit, FALSE);
+				CHECK(actual != nullptr);
+				if (actual) CHECK(strcmp(actual, expectedNames[faction][diagnosticUnit % 4]) == 0);
+			}
+			CHECK(GetRenderedBattleDiagnosticObjectName(slot, -1, TRUE) == nullptr);
+			CHECK(GetRenderedBattleDiagnosticObjectName(slot, units, TRUE) == nullptr);
+			CHECK(GetRenderedBattleDiagnosticObjectName(slot, 64, TRUE) == nullptr);
+			CHECK(GetRenderedBattleDiagnosticObjectName(slot, 32, FALSE) == nullptr);
+		}
+		CHECK(GetRenderedBattleDiagnosticObjectName(-1, 0, TRUE) == nullptr);
+		CHECK(GetRenderedBattleDiagnosticObjectName(8, 0, TRUE) == nullptr);
+		CHECK(GetRenderedBattleDiagnosticObjectName(-1, 0, FALSE) == nullptr);
+		CHECK(GetRenderedBattleDiagnosticObjectName(8, 0, FALSE) == nullptr);
+	}
+	ProcessTestOptions() = savedOptions;
+}
+
 static void TestSkirmishAITestRunnerContract()
 {
+	TestRenderedBattleProfileObjectNames();
 	TestRenderedBattleDiagnosticSearch();
 	TestRenderedBattleDiagnosticLocalPlacement();
 
@@ -5806,6 +5862,22 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(SolveRenderedBattleBenchmarkPlacement(2, nullptr, domainRadii, domainMasks,
 		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_INVALID);
 
+	// AABB skip is permitted at exact radius-plus-three equality, while the
+	// adjacent lower representable coordinate still requires the exact gate.
+	memset(domainPositions, 0, sizeof(domainPositions));
+	domainRadii[0] = domainRadii[1] = 21.0f;
+	domainMasks[0] = domainMasks[1] = 1u;
+	domainPositions[9].x = 45.0f;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
+	CHECK(chosen[0] == 0 && chosen[1] == 0 && placementStats.pairComparisons == 0);
+	CHECK(AreRenderedBattleDiagnosticPositionsSeparated(domainPositions[0], 21.0f, domainPositions[9], 21.0f));
+	domainPositions[9].x = 45.0f - 0.00001f;
+	chosen[0] = chosen[1] = -7;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_UNSATISFIABLE);
+	CHECK(placementStats.pairComparisons > 0 && chosen[0] == -7 && chosen[1] == -7);
+
 	// All 512 actual canonical indices, with the conservative nominal gate.
 	// A solver may plan in any order but must return the original roster order.
 	for (Int index = 0; index < 512; ++index)
@@ -5818,7 +5890,8 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(SolveRenderedBattleBenchmarkPlacement(512, domainPositions, domainRadii, domainMasks,
 		RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
 	CHECK(placementStats.maxAssigned == 512 && placementStats.assignments == 512 &&
-		placementStats.pairComparisons == 130816 &&
+		placementStats.pairComparisons >= 0 && placementStats.pairComparisons < 130816 &&
+		placementStats.operations >= 130816 + 512 + 512 + 2 &&
 		placementStats.operations < RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS);
 	for (Int index = 0; index < 512; ++index)
 	{
