@@ -141,6 +141,19 @@ struct RenderedBattleBenchmarkGeometry
 };
 RenderedBattleBenchmarkGeometry GetRenderedBattleBenchmarkGeometry();
 
+// Fixed prospective ME512 stock-map fixture. Zero CRC/bytes preserve the
+// existing generic MapCache admission for every other scenario/profile.
+struct RenderedBattleDiagnosticMapDescriptor
+{
+	const char *mapName, *diagnosticToken, *unavailableReason;
+	UnsignedInt requiredCRC, requiredBytes;
+};
+RenderedBattleDiagnosticMapDescriptor GetRenderedBattleDiagnosticMapDescriptor(SkirmishAITestScenario scenario);
+// Additional identity check only; production must retain its generic map
+// existence, multiplayer/player-count and loaded-map identity checks.
+Bool IsRenderedBattleDiagnosticMapCacheIdentityValid(SkirmishAITestScenario scenario,
+	UnsignedInt crc, UnsignedInt bytes);
+
 // Pure admission/roster helpers used by the production diagnostic and fixture.
 // Ordinary command lines are accepted unchanged when the new flag is absent.
 Bool ValidateRenderedBattleDiagnosticArguments(Int argc, const char *const *argv,
@@ -170,8 +183,15 @@ struct RenderedBattleBenchmarkPlacementStats
 // Pure dense-only planner: canonical unit-major nine-position domains already
 // passed every live unary gate. MRV ties and position trials use ascending
 // canonical indices. Forward checking/backtracking never queries the world.
-// At most 512 units. Budget counts each MRV/copy scan, assignment and pair gate;
-// fixed nine-bit scans and bounded input validation are separate. On failure
+// At most 512 units. A private root arc-consistency prepass may prove an empty
+// domain and reject; consistent reduced masks are discarded before unchanged DFS.
+// Budget counts each MRV/copy scan, assignment and exact pair gate; AABB setup,
+// unit, active-point and unit-pair steps; root-AC allocation lifetimes, every CSR
+// offset/table visit/arc/support-word init, mask copy/flag init, queue action,
+// directed revision/support test/value removal and enqueue-neighbor visit.
+// These are bounded work steps, not individual CPU instructions or byte stores;
+// pairComparisons includes actual support-building point gates, not AABB tests.
+// Fixed nine-bit scans and bounded input validation are separate. On failure
 // choices remain untouched; stats describe the bounded attempt, not acceptance.
 RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
 	Int unitCount, const Coord3D *domains, const Real *radii, const UnsignedInt *domainMasks,
@@ -188,6 +208,10 @@ Bool GetRenderedBattleDiagnosticSearchCenter(Real loX, Real loY, Real hiX, Real 
 // zero; reject outside the complete inset envelope, never clamp. No world queries.
 Bool IsRenderedBattleBenchmarkRefinementEligible(Bool benchmark);
 Bool CanRenderedBattleBenchmarkRefinementQuery(Int used, Int queries);
+// Refinement-only scheduling: prior empty unit first, then remaining canonical
+// units once. Invalid/stale hint falls back to canonical; invalid rank/count -1.
+// No query/cache: caller counts every fresh nine-trial unit and stores by result.
+Int GetRenderedBattleBenchmarkRefinementUnaryUnit(Int rank, Int unitCount, Int previousEmptyUnit);
 Bool GetRenderedBattleBenchmarkRefinementCenter(Real loX, Real loY, Real hiX, Real hiY,
 	Int parentCandidate, Int offsetIndex, Coord3D *center);
 // Fixed local stencil, mirrored in X by battle side; no RNG or world queries.

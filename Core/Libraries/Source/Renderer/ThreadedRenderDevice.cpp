@@ -1720,7 +1720,8 @@ RenderResult ThreadedRenderDevice::executeCommand(const Packet &packet, const Co
 		RenderResult result = BackendCall([&] {
 			return draw.useVertexFormat ?
 				m_context->setLegacyState(draw.state, draw.vertexFormat, draw.texturePresenceMask) :
-				m_context->setLegacyStateForLayout(draw.state, draw.layout, draw.texturePresenceMask);
+				(instanced ? m_context->setLegacyStateForInstancedDraw(draw.state, draw.layout, draw.texturePresenceMask) :
+				 m_context->setLegacyStateForLayout(draw.state, draw.layout, draw.texturePresenceMask));
 		});
 		if (result != RENDER_RESULT_OK)
 		{

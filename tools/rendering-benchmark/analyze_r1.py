@@ -35,6 +35,33 @@ R2_PROFILE_CONTRACTS = {
     "infantry_line_256": {"roster_contract":"ggc.r2.rendered-battle.roster.infantry-line-256.v1", "units_per_player":32, "template_counts":(0,0,16,16), "unit_type_sequence":"2"*16+"3"*16},
     "infantry_line_512": {"roster_contract":"ggc.r2.rendered-battle.roster.infantry-line-512.v1", "units_per_player":64, "template_counts":(0,0,32,32), "unit_type_sequence":"2"*32+"3"*32},
 }
+ME512_LAYOUT_MARKER_PREFIX = "RENDERED_BATTLE_BENCHMARK_LAYOUT "
+ME512_MAP_CONTRACT = "ggc.r2.rendered-battle.map.mechanized-512.r2-arena.v1"
+ME512_WORKLOAD_CONTRACT = "ggc.r2.rendered-battle.workload.mechanized-512.rect16x4.r2-arena.v4"
+ME512_MAP_BEGIN_TOKEN = "R2_Mechanized_Arena"
+ME512_MAP_START_PATH = r"Maps\R2 Mechanized Arena\R2 Mechanized Arena.map"
+ME512_MAP_START_PATH_NORMALIZED = r"maps\r2 mechanized arena\r2 mechanized arena.map"
+ME512_MAP_CACHE_CRC = "B5AAEB44"
+ME512_MAP_SIZE_BYTES = 3021429
+ME512_MAP_PAYLOAD_SHA256 = "D2A2FD87763C92BECA4CB081BC6DF57EF5918CB63626452C70CBC8BE6DB8444A"
+ME512_MAP_ARCHIVE_SHA256 = "63474BA13A64E098B74EA4C509686E0353EC08D41C83AF01EC6559D2208DD528"
+FORTRESS_MAP_BEGIN_TOKEN = "Fortress_Avalanche"
+FORTRESS_MAP_START_PATH_NORMALIZED = r"maps\fortress avalanche\fortress avalanche.map"
+ME512_LAYOUT_EXPECTED = {
+    "layout_schema":"2",
+    "layout_contract":"ggc.r2.rendered-battle.layout.mechanized-512.rect16x4.v2",
+    "workload_contract":ME512_WORKLOAD_CONTRACT,
+    "map_contract":ME512_MAP_CONTRACT,
+    "profile_id":"mechanized_512",
+    "placement_schema":"9",
+    "columns":"16", "rows":"4", "grid_step":"42", "stagger":"21",
+    "row_step":"37", "band_step":"148", "formation_x":"746",
+    "formation_y":"278", "inset_x":"790", "inset_y":"322",
+    "reveal_radius":"850", "goal_x_offsets":"-95,95",
+    "goal_y_offsets":"-222,-74,74,222", "pair_clearance":"3",
+    "footprint_padding":"1", "height_limit":"8", "path_diameter_cells":"4",
+}
+ME512_SEARCH_SCHEMA = "mechanized512_rect16x4_refined10_mapwide100x104_local9_mrv_v9"
 
 class Reject(Exception): pass
 
@@ -94,6 +121,39 @@ def qualification_exclusion(root):
     reason=marker.get("reason")
     req(isinstance(reason,str) and bool(reason.strip()),"qualification exclusion marker requires a nonempty reason")
     return marker
+
+def native_render_failure_evidence(root, receipt):
+    enabled=receipt.get("failure_trace_enabled")
+    req(enabled is None or type(enabled) is bool,"native render failure trace enabled flag must be boolean")
+    unknown={"enabled":enabled,"status":"coverage_unknown",
+             "limitation":"Legacy controller did not enable the native failure trace; absence of rendering failures is not established."}
+    path=root/"native-render-failure.txt"
+    if enabled is True:
+        req(receipt.get("failure_trace_variable")=="RTS_RENDER_FAILURE_TRACE",
+            "enabled native render failure trace must bind the producer variable")
+        value=receipt.get("failure_trace_path")
+        req(isinstance(value,str) and bool(value),"enabled native render failure trace requires a recorded path")
+        recorded=Path(value)
+        req(recorded.is_absolute() and recorded==path,
+            "native render failure trace path must be the exact run-local native-render-failure.txt")
+    try: metadata=path.lstat()
+    except FileNotFoundError:
+        if enabled is not True: return unknown
+        return {"enabled":True,"path":str(path),"status":"absent",
+                "limitation":"Healthy opt-in writes no trace; absence does not independently prove the producer could write it."}
+    except OSError as e: raise Reject("cannot inspect native render failure trace: "+str(e))
+    req(stat.S_ISREG(metadata.st_mode) and not (getattr(metadata,"st_file_attributes",0)&0x400),
+        "native render failure trace must be an ordinary non-reparse file")
+    limit=1024*1024
+    req(metadata.st_size<=limit,"native render failure trace exceeds the 1 MiB safety limit")
+    try:
+        with path.open("rb") as stream: contents=stream.read(limit+1)
+    except OSError as e: raise Reject("cannot read native render failure trace: "+str(e))
+    req(len(contents)<=limit,"native render failure trace exceeds the 1 MiB safety limit")
+    req(not contents,"nonempty native render failure trace excludes qualification")
+    if enabled is not True: return unknown
+    return {"enabled":True,"path":str(path),"status":"empty",
+            "limitation":"No native failure was recorded; an empty trace does not independently prove complete rendering-failure coverage."}
 
 def digest(path):
     h = hashlib.sha256()
@@ -169,6 +229,112 @@ def rendered_battle_profile(marker):
             "units_per_player":units_per_player,"total_units":total_units,
             "template_counts":contract["template_counts"],
             "unit_type_sequence":contract["unit_type_sequence"]}
+
+def strict_marker_fields(marker, label, prefix, expected_keys=None, required_keys=None):
+    line=marker["_line"]
+    pairs=list(KV.finditer(line))
+    req(bool(pairs),label+" has no fields")
+    req(line.startswith(prefix) and pairs[0].start()==len(prefix),
+        label+" has a malformed marker prefix")
+    cursor=len(prefix)
+    for index,pair in enumerate(pairs):
+        gap=line[cursor:pair.start()]
+        if index==0:
+            req(not gap,label+" has text before its first field")
+        else:
+            req(bool(gap) and gap.isspace(),label+" fields are not whitespace-separated")
+        raw_value=pair.group(2)
+        if raw_value.startswith(('"',"'")):
+            quote=raw_value[0]
+            well_formed=(len(raw_value)>=2 and raw_value[-1]==quote and
+                         raw_value.count(quote)==2)
+        else:
+            well_formed='"' not in raw_value and "'" not in raw_value
+        req(well_formed,label+" contains an unmatched or malformed quoted value")
+        cursor=pair.end()
+    req(not line[cursor:].strip(),label+" contains a malformed or unparsed suffix")
+    keys=[pair.group(1) for pair in pairs]
+    req(len(keys)==len(set(keys)),label+" contains duplicate fields")
+    if expected_keys is not None:
+        req(set(keys)==set(expected_keys),label+" fields are missing or unknown")
+    if required_keys is not None:
+        req(set(required_keys).issubset(keys),label+" is missing required fields")
+    return fields(marker["_line"])
+
+def rendered_battle_layout(records, profile, preflight):
+    layout_lines=[r for r in records if r["_line"].startswith("RENDERED_BATTLE_BENCHMARK_LAYOUT")]
+    is_me512=profile is not None and profile["profile_id"]=="mechanized_512"
+    if not is_me512:
+        req(not layout_lines,"ME512 layout marker appears without the mechanized_512 profile")
+        return None
+    req(len(layout_lines)==1 and layout_lines[0]["_line"].startswith(ME512_LAYOUT_MARKER_PREFIX),
+        "mechanized_512 requires exactly one well-formed v2 layout marker")
+    marker=layout_lines[0]
+    values=strict_marker_fields(marker,"ME512 v2 layout marker",
+                                ME512_LAYOUT_MARKER_PREFIX,set(ME512_LAYOUT_EXPECTED))
+    for key,expected in ME512_LAYOUT_EXPECTED.items():
+        req(values.get(key)==expected,"ME512 v2 layout marker mismatch: "+key)
+
+    geometry=one(records,"RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS ")
+    geometry_keys={"vehicle_radius","infantry_radius","nominal_units","nominal_pairs",
+                   "grid_step","band_step","formation_x","formation_y","profile_id",
+                   "roster_contract"}
+    gv=strict_marker_fields(geometry,"ME512 v2 geometry marker",
+                            "RENDERED_BATTLE_BENCHMARK_GEOMETRY_PASS ",geometry_keys)
+    req(gv.get("profile_id")=="mechanized_512" and
+        gv.get("roster_contract")==R2_PROFILE_CONTRACTS["mechanized_512"]["roster_contract"],
+        "ME512 v2 geometry marker identity mismatch")
+    for key in ("grid_step","band_step","formation_x","formation_y"):
+        req(num(gv.get(key),"ME512 geometry."+key)==int(ME512_LAYOUT_EXPECTED[key]),
+            "ME512 geometry/layout marker contradiction: "+key)
+    req(num(gv.get("nominal_units"),"ME512 geometry.nominal_units")==512 and
+        num(gv.get("nominal_pairs"),"ME512 geometry.nominal_pairs")==130816,
+        "ME512 geometry marker density mismatch")
+
+    preflight_keys={"placement_schema","search_schema","grid_inset_x","grid_inset_y",
+                    "formation_x","formation_y","height_limit","path_diameter_cells",
+                    "map_crc","map_size"}
+    pv=strict_marker_fields(preflight,"ME512 v2 preflight marker",
+                            "RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY ",
+                            required_keys=preflight_keys)
+    preflight_expected={"placement_schema":"9","search_schema":ME512_SEARCH_SCHEMA,
+                        "grid_inset_x":"790","grid_inset_y":"322",
+                        "formation_x":"746","formation_y":"278",
+                        "height_limit":"8","path_diameter_cells":"4"}
+    for key,expected in preflight_expected.items():
+        req(pv.get(key)==expected,"ME512 v2 preflight/layout marker contradiction: "+key)
+    req(isinstance(pv.get("map_crc"),str) and
+        pv["map_crc"].upper()==ME512_MAP_CACHE_CRC,
+        "ME512 preflight MapCache CRC mismatch")
+    req(num(pv.get("map_size"),"ME512 preflight map_size")==ME512_MAP_SIZE_BYTES,
+        "ME512 preflight map size mismatch")
+    return {
+        "profile_id":"mechanized_512",
+        "layout_schema":2,
+        "layout_contract":ME512_LAYOUT_EXPECTED["layout_contract"],
+        "workload_contract":ME512_LAYOUT_EXPECTED["workload_contract"],
+        "map_contract":ME512_MAP_CONTRACT,
+        "map_asset_contract":{
+            "begin_token":ME512_MAP_BEGIN_TOKEN,
+            "start_path":ME512_MAP_START_PATH,
+            "map_cache_crc":ME512_MAP_CACHE_CRC,
+            "map_size_bytes":ME512_MAP_SIZE_BYTES,
+            "payload_sha256_expected":ME512_MAP_PAYLOAD_SHA256,
+            "archive_sha256_expected":ME512_MAP_ARCHIVE_SHA256,
+            "evidence_scope":"expected fixture asset metadata; payload/archive hashes are not runtime-observed",
+        },
+        "placement_schema":9,
+        "search_schema":ME512_SEARCH_SCHEMA,
+        "geometry":{
+            "columns":16,"rows":4,"grid_step":42,"stagger":21,"row_step":37,
+            "band_step":148,"formation_x":746,"formation_y":278,
+            "inset_x":790,"inset_y":322,"reveal_radius":850,
+        },
+        "goal_offsets":{"x":[-95,95],"y":[-222,-74,74,222]},
+        "declared_constraints":{"pair_clearance":3,"footprint_padding":1,
+                                "height_limit":8,"path_diameter_cells":4},
+        "evidence_scope":"producer_marker_declaration_only",
+    }
 
 def rendered_battle_rigid_metrics(warm, stop, begin):
     def marker_fields(marker):
@@ -368,7 +534,7 @@ def controller(root, multipage_proof=None):
     req(ready.get("status")=="ready" and ex.get("status")=="normal_exit", "ready/exit status is not successful")
     end=obj(ex.get("exit"),"exit")
     req(end.get("normal_exit") is True and end.get("forced_termination") is False and end.get("error") is None,"forced or abnormal game/launcher exit")
-    for k in ("run","runtime","scene","telemetry","telemetry_channels","controller_script_sha256","controller_script_path","shadow_experiment","source_commit","snapshot_identity","source_options_sha256","test_options_sha256","expected_executable_sha256","expected_launcher_sha256","requested_settings","arguments","launcher_configuration","affinity"):
+    for k in ("run","runtime","scene","telemetry","telemetry_channels","controller_script_sha256","controller_script_path","shadow_experiment","source_commit","snapshot_identity","source_options_sha256","test_options_sha256","expected_executable_sha256","expected_launcher_sha256","requested_settings","arguments","launcher_configuration","affinity","failure_trace_enabled","failure_trace_path","failure_trace_variable"):
         req(canon(ready.get(k))==canon(ex.get(k)), "ready/exit mismatch: "+k)
     launcher_configuration=verified_launcher_configuration(ready)
     req(ready.get("scene")=="Benchmark" and ready.get("telemetry") in ("minimalPresent","presentGpu","detailed"),"wrong scene or Present telemetry disabled")
@@ -407,7 +573,8 @@ def controller(root, multipage_proof=None):
     requested_fixture_seed(ready)
     settings=obj(ready.get("requested_settings"),"requested_settings")
     req(settings.get("Resolution")=="1920 1080" and settings.get("AntiAliasing")=="8" and settings.get("TextureFilter")=="Anisotropic" and settings.get("AnisotropyLevel")=="16","declared graphics settings differ from benchmark profile")
-    return ready, {"source_commit":ready["source_commit"].lower(),"snapshot_identity":ready["snapshot_identity"].upper(),"source_options_sha256":ready["source_options_sha256"].upper(),"test_options_sha256":ready["test_options_sha256"].upper(),"game_sha256":game["sha256"].upper(),"launcher_sha256":launcher["sha256"].upper(),"controller_script_sha256":str(controller_sha).upper() if controller_sha else None,"telemetry":ready["telemetry"],"telemetry_channels":ready.get("telemetry_channels"),"controller_script_path":controller_path,"shadow_experiment":shadow_settings,"shadow_multipage_arena":multipage_request,"shadow_multipage_evidence":multipage_evidence,"shadow_diagnostics_path":shadow_path,"settings":settings,"affinity":ready.get("affinity"),"captured_affinity":captured_affinity,"launcher_configuration":launcher_configuration}
+    failure_evidence=native_render_failure_evidence(root,ex)
+    return ready, {"source_commit":ready["source_commit"].lower(),"snapshot_identity":ready["snapshot_identity"].upper(),"source_options_sha256":ready["source_options_sha256"].upper(),"test_options_sha256":ready["test_options_sha256"].upper(),"game_sha256":game["sha256"].upper(),"launcher_sha256":launcher["sha256"].upper(),"controller_script_sha256":str(controller_sha).upper() if controller_sha else None,"telemetry":ready["telemetry"],"telemetry_channels":ready.get("telemetry_channels"),"controller_script_path":controller_path,"shadow_experiment":shadow_settings,"shadow_multipage_arena":multipage_request,"shadow_multipage_evidence":multipage_evidence,"shadow_diagnostics_path":shadow_path,"settings":settings,"affinity":ready.get("affinity"),"captured_affinity":captured_affinity,"launcher_configuration":launcher_configuration,"native_render_failure_evidence":failure_evidence}
 
 def diagnostic(path, ready):
     req(path.suffix==".txt" and not path.with_suffix(".txt.pending").exists(),"diagnostic is unpublished or has pending sibling")
@@ -423,12 +590,34 @@ def diagnostic(path, ready):
         "duplicate or malformed R2 profile identity marker")
     profile=rendered_battle_profile(one(rec,"RENDERED_BATTLE_BENCHMARK_PROFILE ")) if profile_lines else None
     begin=one(rec,"RENDERED_BATTLE_DIAGNOSTIC_BEGIN "); start=one(rec,"RENDERED_BATTLE_DIAGNOSTIC_START "); staged=one(rec,"RENDERED_BATTLE_DIAGNOSTIC_STAGED ")
+    begin_map_fields=strict_marker_fields(
+        begin,"diagnostic BEGIN map identity","RENDERED_BATTLE_DIAGNOSTIC_BEGIN ",
+        required_keys={"map"})
+    start_map_fields=strict_marker_fields(
+        start,"diagnostic START map identity","RENDERED_BATTLE_DIAGNOSTIC_START ",
+        required_keys={"map"})
     seed=num(begin.get("seed"),"diagnostic seed")
     req(seed==637808953 and seed==requested_fixture_seed(ready),"diagnostic seed differs from the required requested fixture seed")
     req(num(start.get("seed"),"START seed")==seed,"START seed differs from BEGIN/requested fixture seed")
-    start_map=start.get("map")
-    req(isinstance(start_map,str) and (start_map=="Fortress_Avalanche" or start_map.replace("/","\\").casefold()=="maps\\fortress avalanche\\fortress avalanche.map"),"START map differs from the required Fortress Avalanche fixture")
+    start_map=start_map_fields.get("map")
     pre=one(rec,"RENDERED_BATTLE_DIAGNOSTIC_PREFLIGHT_SUMMARY "); warm=one(rec,"RENDERED_BATTLE_BENCHMARK_PHASE phase=warmup_begin ")
+    begin_map=begin_map_fields.get("map")
+    is_me512=profile is not None and profile["profile_id"]=="mechanized_512"
+    if is_me512:
+        req(begin_map==ME512_MAP_BEGIN_TOKEN,
+            "ME512 BEGIN map token differs from the selected R2 Mechanized Arena fixture")
+        req(isinstance(start_map,str) and
+            start_map.replace("/","\\").casefold()==ME512_MAP_START_PATH_NORMALIZED,
+            "ME512 START map differs from the selected R2 Mechanized Arena relative path")
+    else:
+        req(begin_map==FORTRESS_MAP_BEGIN_TOKEN,
+            "BEGIN map token differs from the Fortress Avalanche fixture")
+        req(isinstance(start_map,str) and
+            (start_map==FORTRESS_MAP_BEGIN_TOKEN or
+             start_map.replace("/","\\").casefold()==FORTRESS_MAP_START_PATH_NORMALIZED),
+            "START map differs from the Fortress Avalanche fixture")
+        req(pre.get("map_crc") and pre.get("map_size"),"map identity missing")
+    layout_contract=rendered_battle_layout(rec,profile,pre)
     mb=one(rec,"RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_begin "); ms=one(rec,"RENDERED_BATTLE_BENCHMARK_PHASE phase=measurement_stop ")
     done=one(rec,"RENDERED_BATTLE_DIAGNOSTIC_COMPLETE "); footer=one(rec,"RENDERED_BATTLE_DIAGNOSTIC_REPORT_WRITE ")
     req(footer.get("status")=="complete" and footer.get("buffer_failed")=="0","diagnostic report footer failed")
@@ -445,7 +634,6 @@ def diagnostic(path, ready):
     req(num(warm.get("warmup_frames"),"warmup_frames")==150 and num(warm.get("measure_frames"),"measure_frames")==450 and num(ms.get("complete"),"complete")==1 and num(ms.get("actual_measure_frames"),"actual_measure_frames")==450 and num(ms.get("measured_attack_samples"),"measured_attack_samples")>0,"fixture phases or measured combat incomplete")
     req(begin.get("executable_sha256_observed")==ready["game"]["sha256"]==done.get("executable_sha256"),"source diagnostic executable identity differs")
     req(begin.get("source_sha256_supplied")==ready.get("snapshot_identity") and SHA.fullmatch(str(begin.get("source_sha256_supplied",""))),"source snapshot identity missing or mismatched")
-    req(begin.get("map")=="Fortress_Avalanche" and pre.get("map_crc") and pre.get("map_size"),"map identity missing")
     rosters=[r for r in rec if r["_line"].startswith("RENDERED_BATTLE_DIAGNOSTIC_ROSTER ")]
     req(len(rosters)==8,"expected eight roster lines")
     if profile:
@@ -524,7 +712,7 @@ def diagnostic(path, ready):
         req(len(found)==1,"missing/duplicate measured state sample at frame "+str(frame))
         sparse.append(sparse_sample(found[0],frame))
     state["sparse_samples"]=sparse
-    return {"seed":num(begin["seed"],"seed"),"map":start.get("map"),"map_crc":pre["map_crc"].upper(),"map_size":num(pre["map_size"],"map size"),"camera":cam,"roster":sig,"state":state,"profile_contract":({k:profile[k] for k in ("schema","profile_id","roster_contract","phase_contract","units_per_player","total_units","template_counts","unit_type_sequence")} if profile else None),"render_admission_metrics":render_admission_metrics,"phase":{"qpc_frequency":freq,"begin":qb,"stop":qe,"seconds":(qe-qb)/freq,"warmup_frames":150,"measured_frames":450}}
+    return {"seed":num(begin["seed"],"seed"),"map":start.get("map"),"map_crc":pre["map_crc"].upper(),"map_size":num(pre["map_size"],"map size"),"camera":cam,"roster":sig,"state":state,"profile_contract":({k:profile[k] for k in ("schema","profile_id","roster_contract","phase_contract","units_per_player","total_units","template_counts","unit_type_sequence")} if profile else None),"layout_contract":layout_contract,"render_admission_metrics":render_admission_metrics,"phase":{"qpc_frequency":freq,"begin":qb,"stop":qe,"seconds":(qe-qb)/freq,"warmup_frames":150,"measured_frames":450}}
 
 def pct(xs,p):
     if not xs:return None
@@ -549,7 +737,7 @@ def present(path, phase, ready, edge_ms=500.0, long_ms=500.0):
     for i,r in enumerate(ev,1):
         start=num(r["present_start_qpc"],"Present start"); end=num(r["present_end_qpc"],"Present end"); f=num(r["cpu_qpc_frequency"],"Present frequency"); hr=num(r["present_hresult"],"Present HRESULT")
         req(num(r["present_ordinal"],"Present ordinal")==i and start>0 and end>=start and f==freq,"Present event ordinal/QPC invalid")
-        req(start>prev[0] and end>prev[1],"Present ticks are nonmonotonic"); prev=(start,end)
+        req(start>prev[0] and end>prev[1],"Present ticks are nonmonotonic"); req(start>=prev[1],"Present intervals overlap"); prev=(start,end)
         status=r["status"]; req((hr==0 and status=="s_ok") or (hr>0 and status in ("positive","occluded")) or (hr<0 and status=="failed"),"Present status/HRESULT mismatch")
         frame={"owner_session":num(r["owner_session"],"Present session"),"process_id":num(r["process_id"],"Present PID"),"device_epoch":num(r["device_epoch"],"Present device epoch"),"backend_frame_ordinal":num(r["backend_frame_ordinal"],"Present backend frame ordinal"),"present_ordinal":num(r["present_ordinal"],"Present ordinal"),"present_start_qpc":start,"present_end_qpc":end,"cpu_qpc_frequency":f,"present_hresult":hr,"width":num(r["width"],"Present width"),"height":num(r["height"],"Present height")}
         qpc_index.setdefault((start,end,f),[]).append(frame)
@@ -769,7 +957,7 @@ def analyze(directory, edge_ms=500.0, long_ms=500.0, multipage_proof=None):
     else:
         window,window_reasons=window_evidence(load(wp),ready,fixture["phase"]); reasons.extend(window_reasons)
     identity.update(game_pid=ready["game"]["pid"],game_started_utc=ready["game"]["started_utc"],window_mode=window["mode"] if window else None,present_swap_interval=fps["swap_interval"],measurement_run_identity=measurement_run_identity({"present":fps,"phase":fixture["phase"]}))
-    workload={k:fixture[k] for k in ("seed","map","map_crc","map_size","camera","roster","state","profile_contract")}; workload["phase_shape"]={"warmup_frames":150,"measured_frames":450}
+    workload={k:fixture[k] for k in ("seed","map","map_crc","map_size","camera","roster","state","profile_contract","layout_contract")}; workload["phase_shape"]={"warmup_frames":150,"measured_frames":450}
     return {"schema":"ggc.r1-present-analysis.v1","run_directory":str(root),"qualified":not reasons,"qualification_failures":reasons,"identity":identity,"experiment_settings":{"shadow":identity["shadow_experiment"]},"experiment_paths":{"shadow_diagnostics":identity["shadow_diagnostics_path"]},"workload_identity":workload,"phase":fixture["phase"],"present":fps,"render_admission_metrics":fixture["render_admission_metrics"],"window_observations":window,"effective_quality_evidence":quality,"notes":["FPS is successful native Present completion count divided by exact measurement QPC duration.","Present completion is not scanout evidence. `presentGpu` verifies effective 1920x1080 resolution, 8x MSAA resolve, and native hardware adapter identity from sampled frame records; it does not record effective anisotropic filtering or driver name/version.","GPU query records are a bounded subset; quality evidence is accepted when at least one successful measured-phase GPU row joins uniquely to Present. Timestamp-query coverage is reported separately and does not need to equal the Present row count.","Optional rigid-draw counters are reported as native render-path admission statistics; they are not GPU completion evidence and do not affect FPS qualification.","Shadow upload/reuse options are recorded as experiment settings and are not effective-quality evidence.","`minimalPresent` and the existing `detailed` analysis remain effective-quality unmeasured. A `minimalPresent` comparison establishes data comparability for descriptive FPS only; stage status remains not_evaluated."]}
 
 def comparison_result(data_comparable, **details):
@@ -864,7 +1052,7 @@ def comparison(baseline,candidate,edge_ms,long_ms,multipage_proofs=None):
     if runs[0]["identity"].get("telemetry")=="presentGpu":
         for key in ("gpu_adapter_identity","effective_quality_contract"):
             same(runs,key,"presentGpu "+key)
-    for key in ("seed","map","map_crc","map_size","camera","roster","state","profile_contract"):
+    for key in ("seed","map","map_crc","map_size","camera","roster","state","profile_contract","layout_contract"):
         first=runs[0]["workload_identity"].get(key)
         for r in runs[1:]:
             if canon(r["workload_identity"].get(key))!=canon(first):reject.append({"run":r["run_directory"],"reasons":["fixture "+key+" mismatch"]})

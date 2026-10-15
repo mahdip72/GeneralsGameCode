@@ -5862,6 +5862,22 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(SolveRenderedBattleBenchmarkPlacement(2, nullptr, domainRadii, domainMasks,
 		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_INVALID);
 
+	// AABB skip is permitted at exact radius-plus-three equality, while the
+	// adjacent lower representable coordinate still requires the exact gate.
+	memset(domainPositions, 0, sizeof(domainPositions));
+	domainRadii[0] = domainRadii[1] = 21.0f;
+	domainMasks[0] = domainMasks[1] = 1u;
+	domainPositions[9].x = 45.0f;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
+	CHECK(chosen[0] == 0 && chosen[1] == 0 && placementStats.pairComparisons == 0);
+	CHECK(AreRenderedBattleDiagnosticPositionsSeparated(domainPositions[0], 21.0f, domainPositions[9], 21.0f));
+	domainPositions[9].x = 45.0f - 0.00001f;
+	chosen[0] = chosen[1] = -7;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_UNSATISFIABLE);
+	CHECK(placementStats.pairComparisons > 0 && chosen[0] == -7 && chosen[1] == -7);
+
 	// All 512 actual canonical indices, with the conservative nominal gate.
 	// A solver may plan in any order but must return the original roster order.
 	for (Int index = 0; index < 512; ++index)
@@ -5874,7 +5890,8 @@ static void TestSkirmishAITestRunnerContract()
 	CHECK(SolveRenderedBattleBenchmarkPlacement(512, domainPositions, domainRadii, domainMasks,
 		RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
 	CHECK(placementStats.maxAssigned == 512 && placementStats.assignments == 512 &&
-		placementStats.pairComparisons == 130816 &&
+		placementStats.pairComparisons >= 0 && placementStats.pairComparisons < 130816 &&
+		placementStats.operations >= 130816 + 512 + 512 + 2 &&
 		placementStats.operations < RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS);
 	for (Int index = 0; index < 512; ++index)
 	{

@@ -6,6 +6,7 @@
 
 #include "Utility/CppMacros.h"
 #include "nativew3dsorting.h"
+#include "nativesorteddiagnostics.h"
 #include "Lib/JobSystem.h"
 
 #include <stdio.h>
@@ -14,6 +15,8 @@
 #include <new>
 #include <type_traits>
 #include <vector>
+#include <string>
+#include <limits>
 
 bool NativeSortingRendererTestRetireAllComplete();
 bool NativeSortingRendererTestRetireMixedPending();
@@ -25,6 +28,9 @@ unsigned long long NativeSortingRendererTestLastFlushWorkspaceCapacityBytes();
 unsigned long long NativeSortingRendererTestLastOffsetInitializations();
 unsigned long long NativeSortingRendererTestLastOffsetResets();
 void NativeSortingRendererTestPrimeWorkspaceTrimOnNextFlush();
+void NativeSortingRendererTestUseFormerDrawReserveReference(bool enabled);
+unsigned long long NativeSortingRendererTestLastPreTrimDrawBytes();
+unsigned long long NativeSortingRendererTestLastPostTrimDrawBytes();
 unsigned long long NativeSortingRendererTestLastPreTrimCapacityBytes();
 unsigned long long NativeSortingRendererTestLastIndependentPreTrimCapacityBytes();
 unsigned long long NativeSortingRendererTestLastPreTrimDescriptorBytes();
@@ -2150,11 +2156,328 @@ void TestBoundedPreparationBatchesMatchFormerPreparationStream()
 	}
 }
 
+namespace {
+namespace sorted_diag = rts::render::sorted_diagnostics;
+unsigned int originClockCalls = 0;
+uint64_t TestOriginClock() { ++originClockCalls; return 123456; }
+class FailureTraceEnvironment
+{
+public:
+    FailureTraceEnvironment() : hadPrevious(getenv("RTS_RENDER_FAILURE_TRACE") != 0),
+        previous(hadPrevious ? getenv("RTS_RENDER_FAILURE_TRACE") : "") {}
+    ~FailureTraceEnvironment() { set(hadPrevious ? previous.c_str() : 0); }
+    void set(const char *value)
+    {
+#if defined(_WIN32)
+        CHECK(_putenv_s("RTS_RENDER_FAILURE_TRACE", value == 0 ? "" : value) == 0);
+#else
+        CHECK(value == 0 ? unsetenv("RTS_RENDER_FAILURE_TRACE") == 0 :
+            setenv("RTS_RENDER_FAILURE_TRACE", value, 1) == 0);
+#endif
+    }
+private:
+    bool hadPrevious;
+    std::string previous;
+};
+
+void TestNonfiniteDepthSnapshot()
+{
+    FailureTraceEnvironment environment;
+    environment.set("metadata-only-no-file");
+    const std::vector<unsigned short> indices = {0, 1, 2};
+    for (unsigned int scenario = 0; scenario < 2; ++scenario)
+    {
+        std::vector<TestVertex> vertices;
+        MakeVertices(vertices, std::vector<float>(3, scenario == 0 ? 2.0f :
+            std::numeric_limits<float>::max()));
+        if (scenario == 0) vertices[1].z = std::numeric_limits<float>::quiet_NaN();
+        unsigned int expectedXYZ[9];
+        for (unsigned int i = 0; i < 3; ++i)
+            memcpy(expectedXYZ + i * 3, &vertices[i].x, sizeof(float) * 3);
+        NativeSortingRenderer renderer;
+        QueueOne(renderer, 41, vertices, indices, 0);
+        // Queued immutable bytes must survive a caller changing its source.
+        for (unsigned int i = 0; i < 3; ++i) vertices[i].z = 0.0f;
+        RecordingSink unused;
+        for (unsigned int retry = 0; retry < 2; ++retry)
+        {
+            sorted_diag::Scope scope(TestOriginClock);
+            CHECK(renderer.Flush(unused) == RENDER_RESULT_INVALID_ARGUMENT);
+            const sorted_diag::Origin &origin = scope.origin();
+            CHECK(origin.present && strcmp(origin.reason, "output-depth") == 0);
+            const sorted_diag::DepthSnapshot &depth = origin.depth;
+            CHECK(depth.present && depth.bounds == 31U);
+            if (!depth.present) continue;
+            CHECK(depth.stride == sizeof(TestVertex) && depth.minimum == 0 && depth.vertexCount == 3);
+            CHECK(depth.sourceIndices[0] == 0 && depth.sourceIndices[1] == 1 && depth.sourceIndices[2] == 2);
+            CHECK(depth.outputIndices[0] == 0 && depth.outputIndices[1] == 1 && depth.outputIndices[2] == 2);
+            CHECK(memcmp(depth.xyzBits, expectedXYZ, sizeof(expectedXYZ)) == 0);
+            CHECK(depth.commonZ == 1 && depth.batchCount == 1 && depth.descriptorCount == 1);
+            CHECK(depth.submittedJobs == 0 && depth.completedJobs == 0 && depth.workerThreadsUsed == 0);
+            CHECK(depth.outputSlot == 0 && depth.firstIndex == 0 && depth.outputNode == 0);
+            CHECK(depth.zBits[0] == 0 && depth.zBits[1] == 0 && depth.zBits[2] == 0x3f800000U && depth.zBits[3] == 0);
+            // Offline scalar reconstruction is test-only. Production capture
+            // never changes FP state or computes a second triangle depth.
+            float z[3], actual;
+            for (unsigned int i = 0; i < 3; ++i) memcpy(&z[i], &depth.xyzBits[i * 3 + 2], sizeof(float));
+            memcpy(&actual, &depth.outputZ, sizeof(float));
+            const float reference = (z[0] + z[1] + z[2]) / 3.0f;
+            if (scenario == 0)
+            {
+                CHECK(actual != actual && reference != reference);
+                CHECK(depth.outputZ == expectedXYZ[5]);
+            }
+            else
+            {
+                CHECK(actual == std::numeric_limits<float>::infinity() && actual == reference);
+                CHECK(depth.outputZ == 0x7f800000U);
+            }
+            CHECK(unused.calls == 0 && !renderer.Empty());
+            const unsigned int outputBits = depth.outputZ;
+            CHECK(sorted_diag::NoteFailure(RENDER_RESULT_FAILED, "later", 9, "later") == RENDER_RESULT_FAILED);
+            CHECK(origin.depth.outputZ == outputBits && strcmp(origin.reason, "output-depth") == 0);
+        }
+    }
+    std::vector<TestVertex> vertices;
+    MakeVertices(vertices, std::vector<float>(3, std::numeric_limits<float>::quiet_NaN()));
+    NativeSortingRenderer disabled;
+    QueueOne(disabled, 42, vertices, indices, 0);
+    RecordingSink unused;
+    environment.set(0);
+    {
+        sorted_diag::Scope scope(TestOriginClock);
+        CHECK(disabled.Flush(unused) == RENDER_RESULT_INVALID_ARGUMENT);
+        CHECK(!scope.origin().present && !scope.origin().depth.present);
+    }
+    environment.set("metadata-only-no-file");
+    {
+        sorted_diag::Scope scope(TestOriginClock);
+        sorted_diag::NoteFailure(RENDER_RESULT_FAILED, "prior", 10, "prior");
+        CHECK(disabled.Flush(unused) == RENDER_RESULT_INVALID_ARGUMENT);
+        CHECK(strcmp(scope.origin().reason, "prior") == 0 && !scope.origin().depth.present);
+        CHECK(unused.calls == 0 && !disabled.Empty());
+    }
+}
+
+void TestDepthSnapshotMissingBounds()
+{
+    // The diagnostic reader must not read a second vertex beyond this receipt.
+    const float vertex[] = {1.0f, 2.0f, 3.0f};
+    const unsigned short indices[] = {0, 1, 2};
+    sorted_diag::DepthSnapshot depth;
+    memset(&depth, 0, sizeof(depth));
+    depth.stride = sizeof(TestVertex); depth.vertexCount = 3;
+    sorted_diag::ReadDepthSource(depth, reinterpret_cast<const unsigned char *>(vertex),
+        sizeof(vertex), indices, 3, 0);
+    CHECK(depth.bounds == 3U && depth.xyzBits[0] == 0x3f800000U);
+    CHECK(depth.xyzBits[3] == 0 && depth.xyzBits[6] == 0);
+    memset(&depth, 0, sizeof(depth));
+    depth.stride = 8; depth.vertexCount = 3;
+    sorted_diag::ReadDepthSource(depth, reinterpret_cast<const unsigned char *>(vertex),
+        sizeof(vertex), indices, 3, 0);
+    CHECK(depth.bounds == 1U && depth.xyzBits[0] == 0);
+    memset(&depth, 0, sizeof(depth));
+    depth.stride = sizeof(TestVertex); depth.vertexCount = 3;
+    sorted_diag::ReadDepthSource(depth, 0, 0, 0, 3, 0);
+    CHECK(depth.bounds == 0);
+    sorted_diag::ReadDepthSource(depth, 0, 0, indices, 3, static_cast<size_t>(-1));
+    CHECK(depth.bounds == 0);
+}
+void TestSortedFirstOrigin()
+{
+    using namespace rts::render;
+    FailureTraceEnvironment environment;
+    environment.set(0);
+    originClockCalls = 0;
+    CHECK(sorted_diag::ActiveOrigin() == 0);
+    {
+        sorted_diag::Scope disabled(TestOriginClock);
+        CHECK(sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, "disabled", 1, "disabled") == RENDER_RESULT_INVALID_ARGUMENT);
+        CHECK(disabled.origin().checked && !disabled.origin().present && originClockCalls == 0);
+        environment.set("metadata-only-no-file");
+        CHECK(sorted_diag::NoteFailure(RENDER_RESULT_FAILED, "disabled-again", 2, "disabled") == RENDER_RESULT_FAILED);
+        CHECK(!disabled.origin().present && originClockCalls == 0);
+    }
+    CHECK(sorted_diag::ActiveOrigin() == 0);
+    {
+        sorted_diag::Scope outer(TestOriginClock);
+        CHECK(sorted_diag::NoteFailure(RENDER_RESULT_OK, "success", 3, "success") == RENDER_RESULT_OK);
+        CHECK(!outer.origin().checked && originClockCalls == 0);
+        sorted_diag::Origin *active = sorted_diag::ActiveOrigin();
+        {
+            sorted_diag::Scope nested;
+            CHECK(sorted_diag::ActiveOrigin() == active);
+            CHECK(sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, "leaf", 4, "first", 7, 8) == RENDER_RESULT_INVALID_ARGUMENT);
+        }
+        CHECK(sorted_diag::ActiveOrigin() == active);
+        CHECK(sorted_diag::NoteFailure(RENDER_RESULT_FAILED, "propagation", 5, "later") == RENDER_RESULT_FAILED);
+        CHECK(outer.origin().result == RENDER_RESULT_INVALID_ARGUMENT && outer.origin().site == 4);
+        CHECK(strcmp(outer.origin().caller, "leaf") == 0 && strcmp(outer.origin().reason, "first") == 0);
+        CHECK(outer.origin().values[0] == 7 && outer.origin().values[1] == 8);
+        CHECK(outer.origin().qpc == 123456 && originClockCalls == 1);
+    }
+    CHECK(sorted_diag::ActiveOrigin() == 0);
+
+    std::vector<TestVertex> vertices;
+    MakeVertices(vertices, std::vector<float>(3, 2.0f));
+    const std::vector<unsigned short> indices = {0, 1, 2};
+    NativeSortingRenderer oneShot, retry;
+    QueueOne(oneShot, 11, vertices, indices, 0); QueueOne(oneShot, 12, vertices, indices, 0);
+    QueueOne(retry, 11, vertices, indices, 0); QueueOne(retry, 12, vertices, indices, 0);
+    RecordingSink expected, actual;
+    CHECK(oneShot.Flush(expected) == RENDER_RESULT_OK);
+    actual.failCall = 1; actual.acceptedOnFailure = 1;
+    {
+        sorted_diag::Scope failure;
+        CHECK(retry.Flush(actual) == RENDER_RESULT_FAILED);
+        CHECK(failure.origin().present && strcmp(failure.origin().reason, "sink-return") == 0);
+        CHECK(failure.origin().values[0] == 2 && failure.origin().values[1] == 1);
+        CHECK(!retry.Empty());
+    }
+    actual.failCall = 0;
+    CHECK(retry.Flush(actual) == RENDER_RESULT_OK && retry.Empty());
+    std::vector<CapturedDraw> expectedDraws, actualDraws;
+    CHECK(CaptureAcceptedTriangleStream(expected, expectedDraws));
+    CHECK(CaptureAcceptedTriangleStream(actual, actualDraws));
+    CHECK(SameAcceptedDrawStream(expectedDraws, actualDraws));
+
+    NativeSortingRenderer invalid;
+    LegacyLogicalState state;
+    state.constants.world.values[0] = std::numeric_limits<float>::infinity();
+    NativeDrawPacket packet = MakePacket(3, 3);
+    CHECK(invalid.Queue(state, packet, vertices.data(), vertices.size() * sizeof(TestVertex),
+        indices.data(), indices.size() * sizeof(unsigned short), 0) == RENDER_RESULT_OK);
+    RecordingSink unused;
+    {
+        sorted_diag::Scope failure;
+        CHECK(invalid.Flush(unused) == RENDER_RESULT_INVALID_ARGUMENT);
+        CHECK(failure.origin().present && strcmp(failure.origin().reason, "node-world-view") == 0);
+        CHECK(failure.origin().values[1] == 0 && failure.origin().values[2] == 1);
+        CHECK(unused.calls == 0 && !invalid.Empty());
+    }
+    CHECK(sorted_diag::ActiveOrigin() == 0);
+}
+} // namespace
+void QueueCoalescedDrawReserveFixture(NativeSortingRenderer &renderer,
+	unsigned int triangleCount)
+{
+	// Thousands of same-source triangles form one draw. A second small source
+	// forms another draw so a positive partial-prefix failure can also be tested.
+	const unsigned short corners[] = {0, 1, 2};
+	for (unsigned int source = 0; source < 2; ++source)
+	{
+		const unsigned int count = source == 0 ? triangleCount : 1;
+		std::vector<unsigned short> indices(count * 3);
+		for (size_t i = 0; i < indices.size(); ++i)
+			indices[i] = corners[i % 3];
+		std::vector<TestVertex> vertices(3);
+		for (unsigned int corner = 0; corner < 3; ++corner)
+		{
+			vertices[corner].x = static_cast<float>(corner);
+			vertices[corner].y = static_cast<float>(source);
+			vertices[corner].z = static_cast<float>(source);
+			vertices[corner].color = 0xff000000U + source * 16 + corner;
+		}
+		QueueOne(renderer, 12000 + source, vertices, indices, 0);
+	}
+}
+
+void TestDrawReserveHintRetainsCoalescedCapacityAndExactRetryBytes()
+{
+	const unsigned long long budget = 24ULL * 1024ULL * 1024ULL;
+	const unsigned int maximumChunkTriangles = 65535U / 3U;
+	const unsigned long long threshold = budget / sizeof(NativeSortedDraw) + 1;
+	CHECK(threshold + 1 <= maximumChunkTriangles);
+	if (threshold + 1 > maximumChunkTriangles)
+		return;
+	const unsigned int triangleCount = static_cast<unsigned int>(threshold);
+	CHECK(static_cast<unsigned long long>(triangleCount + 1) *
+		sizeof(NativeSortedDraw) > budget);
+
+	NativeSortingRenderer formerRenderer, hintRenderer;
+	RecordingSink formerSink, hintSink;
+	QueueCoalescedDrawReserveFixture(formerRenderer, triangleCount);
+	QueueCoalescedDrawReserveFixture(hintRenderer, triangleCount);
+	NativeSortingRendererTestUseFormerPreparationReference(true);
+	NativeSortingRendererTestUseFormerDrawReserveReference(true);
+	CHECK(formerRenderer.Flush(formerSink) == RENDER_RESULT_OK);
+	NativeSortingRendererTestUseFormerDrawReserveReference(false);
+	NativeSortingRendererTestUseFormerPreparationReference(false);
+	CHECK(formerRenderer.Empty());
+	CHECK(NativeSortingRendererTestLastPreTrimDrawBytes() > budget);
+	CHECK(NativeSortingRendererTestLastPreTrimCapacityBytes() ==
+		NativeSortingRendererTestLastIndependentPreTrimCapacityBytes());
+	CHECK(NativeSortingRendererTestLastPostTrimDrawBytes() == 0);
+	CHECK(formerSink.batches.size() == 1 && formerSink.batches[0].acceptedDrawCount == 2);
+
+	CHECK(hintRenderer.Flush(hintSink) == RENDER_RESULT_OK);
+	CHECK(hintRenderer.Empty());
+	const unsigned long long warmDrawBytes = NativeSortingRendererTestLastPostTrimDrawBytes();
+	const unsigned long long warmWorkspaceBytes = NativeSortingRendererTestLastFlushWorkspaceCapacityBytes();
+	CHECK(warmDrawBytes >= 2 * sizeof(NativeSortedDraw));
+	CHECK(NativeSortingRendererTestLastPreTrimDrawBytes() == warmDrawBytes);
+	CHECK(NativeSortingRendererTestLastPreTrimCapacityBytes() ==
+		NativeSortingRendererTestLastIndependentPreTrimCapacityBytes());
+	CHECK(NativeSortingRendererTestLastPreTrimCapacityBytes() <= budget);
+	CHECK(warmWorkspaceBytes <= budget);
+	CHECK(hintSink.batches.size() == formerSink.batches.size());
+	if (hintSink.batches.size() == 1 && formerSink.batches.size() == 1)
+		CHECK(SameCapturedBatchBytes(formerSink.batches[0], hintSink.batches[0]));
+
+	// A second identical Flush retains the warmed capacity and exact upload.
+	QueueCoalescedDrawReserveFixture(hintRenderer, triangleCount);
+	CHECK(hintRenderer.Flush(hintSink) == RENDER_RESULT_OK);
+	CHECK(hintRenderer.Empty());
+	CHECK(NativeSortingRendererTestLastPostTrimDrawBytes() == warmDrawBytes);
+	CHECK(NativeSortingRendererTestLastPreTrimDrawBytes() == warmDrawBytes);
+	CHECK(NativeSortingRendererTestLastFlushWorkspaceCapacityBytes() == warmWorkspaceBytes);
+	CHECK(NativeSortingRendererTestLastFlushPreparedGrowthCount() == 0);
+	CHECK(hintSink.batches.size() == 2);
+	if (hintSink.batches.size() == 2 && formerSink.batches.size() == 1)
+		CHECK(SameCapturedBatchBytes(formerSink.batches[0], hintSink.batches[1]));
+
+	NativeSortingRenderer formerRetryRenderer, hintRetryRenderer;
+	RecordingSink formerRetrySink, hintRetrySink;
+	QueueCoalescedDrawReserveFixture(formerRetryRenderer, triangleCount);
+	QueueCoalescedDrawReserveFixture(hintRetryRenderer, triangleCount);
+	formerRetrySink.failCall = hintRetrySink.failCall = 1;
+	formerRetrySink.acceptedOnFailure = hintRetrySink.acceptedOnFailure = 1;
+	NativeSortingRendererTestUseFormerPreparationReference(true);
+	NativeSortingRendererTestUseFormerDrawReserveReference(true);
+	CHECK(formerRetryRenderer.Flush(formerRetrySink) == RENDER_RESULT_FAILED);
+	NativeSortingRendererTestUseFormerDrawReserveReference(false);
+	NativeSortingRendererTestUseFormerPreparationReference(false);
+	CHECK(hintRetryRenderer.Flush(hintRetrySink) == RENDER_RESULT_FAILED);
+	CHECK(!formerRetryRenderer.Empty() && !hintRetryRenderer.Empty());
+	CHECK(NativeSortingRendererTestLastPreTrimCapacityBytes() <= budget);
+	CHECK(NativeSortingRendererTestLastPostTrimDrawBytes() == warmDrawBytes);
+	formerRetrySink.failCall = hintRetrySink.failCall = 0;
+	NativeSortingRendererTestUseFormerPreparationReference(true);
+	NativeSortingRendererTestUseFormerDrawReserveReference(true);
+	CHECK(formerRetryRenderer.Flush(formerRetrySink) == RENDER_RESULT_OK);
+	NativeSortingRendererTestUseFormerDrawReserveReference(false);
+	NativeSortingRendererTestUseFormerPreparationReference(false);
+	CHECK(hintRetryRenderer.Flush(hintRetrySink) == RENDER_RESULT_OK);
+	CHECK(formerRetryRenderer.Empty() && hintRetryRenderer.Empty());
+	CHECK(NativeSortingRendererTestLastPostTrimDrawBytes() == warmDrawBytes);
+	CHECK(formerRetrySink.batches.size() == hintRetrySink.batches.size());
+	for (size_t i = 0; i < formerRetrySink.batches.size() && i < hintRetrySink.batches.size(); ++i)
+		CHECK(SameCapturedBatchBytes(formerRetrySink.batches[i], hintRetrySink.batches[i]));
+	std::vector<CapturedDraw> expected, actual;
+	CHECK(CaptureAcceptedDrawStream(formerSink, expected));
+	CHECK(CaptureAcceptedDrawStream(hintRetrySink, actual));
+	CHECK(SameAcceptedDrawStream(expected, actual));
+}
+
 int main()
 {
 	// Keep this focused test within the project validation budget even when the
 	// host exposes more logical processors.
 	rts::JobSystem::setStartupWorkerCount(6);
+	TestSortedFirstOrigin();
+	TestNonfiniteDepthSnapshot();
+	TestDepthSnapshotMissingBounds();
+	TestDrawReserveHintRetainsCoalescedCapacityAndExactRetryBytes();
 	TestBoundedPreparationBatchesMatchFormerPreparationStream();
 	TestNodeOrderingAndFlushBoundary();
 	TestStableNodeOrderingPreservesEqualDepthAndSplice();

@@ -486,15 +486,13 @@ RenderResult NativeW3DTextureOwner::CopyActiveColorTarget(
 	NativeW3DGpuContentLease *gpuLease) const
 {
 	if (gpuLease != 0) *gpuLease = NativeW3DGpuContentLease();
-	const RenderResult rigidBarrier = FlushGameRigidDraws();
-	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	if (gpuLease == 0)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
 	}
 	NativeW3DResources *resources = ActiveResources();
-	if (resources == 0 || !m_handle.isValid())
+	if (resources == 0 || !resources->IsValid(m_handle))
 	{
 		return RENDER_RESULT_FAILED;
 	}
@@ -522,6 +520,10 @@ RenderResult NativeW3DTextureOwner::CopyActiveColorTarget(
 			 (source.width != m_descriptor.width || source.height != m_descriptor.height)))
 			return RENDER_RESULT_UNSUPPORTED;
 	}
+	const RenderResult validation = resources->ValidateTextureCopy(m_handle.resource);
+	if (validation != RENDER_RESULT_OK) return validation;
+	const RenderResult barrier = gameOwner->FlushGameTextureDraws();
+	if (barrier != RENDER_RESULT_OK) return barrier;
 	return resources->CopyActiveColorTargetToTexture(m_handle.resource,
 		gpuLease);
 }
@@ -531,16 +533,23 @@ RenderResult NativeW3DTextureOwner::RefreshCpuContent(
 	const TextureSubresourceData *subresources,
 	unsigned int subresourceCount) const
 {
-	const RenderResult rigidBarrier = FlushGameRigidDraws();
-	if (rigidBarrier != RENDER_RESULT_OK) return rigidBarrier;
 	NativeGameRenderOwnerScope ownerScope;
 	NativeW3DResources *resources = ActiveResources();
-	if (resources == 0 || !m_handle.isValid() ||
+	if (resources == 0 || !resources->IsValid(m_handle) ||
 		!EqualTextureDescriptors(descriptor, m_descriptor) ||
 		subresources == 0 ||
 		subresourceCount != descriptor.mipCount * descriptor.arrayCount)
 	{
 		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	const RenderResult validation = resources->ValidateTextureRefresh(
+		m_handle.resource, descriptor, subresources, subresourceCount);
+	if (validation != RENDER_RESULT_OK) return validation;
+	IGameRenderClientNativeOwner *gameOwner = ownerScope.Get();
+	if (gameOwner != 0)
+	{
+		const RenderResult barrier = gameOwner->FlushGameTextureDraws();
+		if (barrier != RENDER_RESULT_OK) return barrier;
 	}
 	return resources->RefreshTexture(m_handle, descriptor, subresources,
 		subresourceCount);

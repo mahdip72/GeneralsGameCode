@@ -136,7 +136,7 @@ public:
 
 	FakeRenderDevice() : m_allocator(64), m_operational(true),
 		m_failCreate(false), m_failRefresh(false), m_failDestroy(false),
-		m_failRecovery(false), m_createCount(0), m_refreshCount(0),
+		m_failRecovery(false), m_createCount(0), m_refreshCount(0), m_copyCount(0),
 		m_destroyCount(0), m_recoveryCount(0), m_textures(64)
 	{
 	}
@@ -196,6 +196,7 @@ public:
 	}
 	RenderResult copyActiveColorTargetToTexture(GpuHandle texture) override
 	{
+		++m_copyCount;
 		if (Find(texture) == 0)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
@@ -252,6 +253,7 @@ public:
 	void FailRecovery(bool fail) { m_failRecovery = fail; }
 	unsigned int CreateCount() const { return m_createCount; }
 	unsigned int RefreshCount() const { return m_refreshCount; }
+	unsigned int CopyCount() const { return m_copyCount; }
 	unsigned int DestroyCount() const { return m_destroyCount; }
 	unsigned int RecoveryCount() const { return m_recoveryCount; }
 	unsigned int LiveCount() const { return m_allocator.liveCount(); }
@@ -276,6 +278,7 @@ private:
 	bool m_failRecovery;
 	unsigned int m_createCount;
 	unsigned int m_refreshCount;
+	unsigned int m_copyCount;
 	unsigned int m_destroyCount;
 	unsigned int m_recoveryCount;
 	std::vector<Texture> m_textures;
@@ -1718,10 +1721,15 @@ int TestRigidFailureDestructorRetirement()
 			if (leaseOutput != 0 && !leaseOutput->isValid()) ++clearedOutputsAtBarrier;
 			return failure;
 		}
-		RenderResult GetGameActiveColorTargetInfo(RenderBackBufferInfo *, GpuHandle *) const override
+		RenderResult GetGameActiveColorTargetInfo(RenderBackBufferInfo *info, GpuHandle *source) const override
 		{
 			++sourceQueries;
-			return RENDER_RESULT_FAILED;
+			if (info == 0 || source == 0) return RENDER_RESULT_INVALID_ARGUMENT;
+			*info = RenderBackBufferInfo();
+			info->width = info->height = 4;
+			info->format = RENDER_FORMAT_R8G8B8A8_UNORM; info->multisampleCount = 1;
+			*source = GpuHandle(); // Back buffer is distinct from the watched texture.
+			return RENDER_RESULT_OK;
 		}
 		NativeW3DResources &table;
 		GpuHandle watched;
@@ -1752,7 +1760,9 @@ int TestRigidFailureDestructorRetirement()
 		{
 			NativeW3DTextureOwner owner;
 			NativeW3DTextureCandidate candidate;
-			result |= Check(owner.CreateCandidate(MakeCpuDescriptor(), data, 2,
+			// Published cases must pass destination preflight to reach the sticky barrier.
+			TextureDescriptor copyDescriptor = MakeCpuDescriptor(); copyDescriptor.mipCount = 1;
+			result |= Check(owner.CreateCandidate(copyDescriptor, data, 1,
 				&candidate) == RENDER_RESULT_OK, "sticky fixture creates a real owned candidate");
 			gameOwner.watched = candidate.Handle().resource;
 			if (mode != 0)
@@ -1770,12 +1780,30 @@ int TestRigidFailureDestructorRetirement()
 			result |= Check(owner.PublishOutputWrite(NativeW3DSurfaceHandle(), &outputLease) ==
 				RENDER_RESULT_FAILED && !outputLease.isValid(),
 				"failed rigid barrier clears the publication output lease before returning");
+			result |= Check(gameOwner.clearedOutputsAtBarrier == 1 && gameOwner.sourceQueries == 0,
+				"output publication reaches the sticky barrier with a cleared lease before any source query");
+			NativeW3DTextureDescription before, after;
+			result |= Check(resources.DescribeTexture(gameOwner.watched, &before) == RENDER_RESULT_OK,
+				"sticky copy fixture snapshots watched allocation authority");
 			outputLease = staleLease;
-			result |= Check(owner.CopyActiveColorTarget(&outputLease) == RENDER_RESULT_FAILED &&
-				!outputLease.isValid() && gameOwner.clearedOutputsAtBarrier == 2 &&
-				gameOwner.sourceQueries == 0 && resources.IsValid(gameOwner.watched) &&
-				device.DestroyCount() == destroyedBefore && gameOwner.failure == RENDER_RESULT_FAILED,
-				"lease outputs are cleared before the barrier with no source query or resource mutation");
+			const unsigned int barriersBefore = gameOwner.liveAtBarrier;
+			const unsigned int copiesBefore = device.CopyCount(), refreshesBefore = device.RefreshCount();
+			const RenderResult copyResult = owner.CopyActiveColorTarget(&outputLease);
+			result |= Check(copyResult == RENDER_RESULT_FAILED && !outputLease.isValid() &&
+				resources.IsValid(gameOwner.watched) && device.DestroyCount() == destroyedBefore &&
+				device.CopyCount() == copiesBefore && device.RefreshCount() == refreshesBefore &&
+				resources.DescribeTexture(gameOwner.watched, &after) == RENDER_RESULT_OK &&
+				after.authority == before.authority && after.authorityEpoch == before.authorityEpoch &&
+				gameOwner.failure == RENDER_RESULT_FAILED,
+				"rejected copy clears its lease without backend mutation or authority/retirement change");
+			if (mode == 0)
+				result |= Check(gameOwner.liveAtBarrier == barriersBefore &&
+					gameOwner.clearedOutputsAtBarrier == 1 && gameOwner.sourceQueries == 0,
+					"unpublished texture rejects before source query or sticky barrier without draining");
+			else
+				result |= Check(gameOwner.liveAtBarrier == barriersBefore + 1 &&
+					gameOwner.clearedOutputsAtBarrier == 2 && gameOwner.sourceQueries == 1,
+					"published valid copy preflights its source then reaches sticky barrier with cleared lease");
 			gameOwner.leaseOutput = 0;
 			if (mode == 2) device.FailDestroy(true);
 		} // Candidate and published owner destruct while the barrier stays failed.

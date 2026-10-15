@@ -1783,14 +1783,14 @@ RenderResult NativeW3DResources::RepublishStaticBuffers(
 	return RENDER_RESULT_OK;
 }
 
-RenderResult NativeW3DResources::RefreshTexture(GpuHandle handle,
+RenderResult NativeW3DResources::ValidateTextureRefresh(GpuHandle handle,
 	const TextureDescriptor &descriptor,
 	const TextureSubresourceData *subresources,
-	unsigned int subresourceCount)
+	unsigned int subresourceCount) const
 {
 	IRenderDevice *device = m_impl == 0 || m_impl->state == 0 ? 0 :
 		m_impl->state->Device();
-	Slot *slot = Find(handle);
+	const Slot *slot = Find(handle);
 	if (device == 0 || !device->isOperational() || slot == 0 ||
 		slot->kind != 2 || slot->retired ||
 		m_impl->stateGeneration != m_impl->state->Generation())
@@ -1816,6 +1816,19 @@ RenderResult NativeW3DResources::RefreshTexture(GpuHandle handle,
 	{
 		return validationResult;
 	}
+	return RENDER_RESULT_OK;
+}
+
+RenderResult NativeW3DResources::RefreshTexture(GpuHandle handle,
+	const TextureDescriptor &descriptor,
+	const TextureSubresourceData *subresources,
+	unsigned int subresourceCount)
+{
+	const RenderResult validation = ValidateTextureRefresh(handle, descriptor,
+		subresources, subresourceCount);
+	if (validation != RENDER_RESULT_OK) return validation;
+	IRenderDevice *device = m_impl->state->Device();
+	Slot *slot = Find(handle);
 	NativeW3DSubmissionSequence submissionSequence = 0;
 #if defined(RTS_RENDERER_HAS_D3D11)
 	// Render targets retain the synchronous path because a later GPU write in
@@ -1940,17 +1953,11 @@ RenderResult NativeW3DResources::DescribeTexture(GpuHandle handle,
 	return RENDER_RESULT_OK;
 }
 
-RenderResult NativeW3DResources::CopyActiveColorTargetToTexture(
-	GpuHandle handle, NativeW3DGpuContentLease *lease)
+RenderResult NativeW3DResources::ValidateTextureCopy(GpuHandle handle) const
 {
-	if (lease == 0)
-	{
-		return RENDER_RESULT_INVALID_ARGUMENT;
-	}
-	*lease = NativeW3DGpuContentLease();
 	IRenderDevice *device = m_impl == 0 || m_impl->state == 0 ? 0 :
 		m_impl->state->Device();
-	Slot *slot = Find(handle);
+	const Slot *slot = Find(handle);
 	if (device == 0 || !device->isOperational() || slot == 0 ||
 		slot->kind != 2 || slot->retired ||
 		m_impl->stateGeneration != m_impl->state->Generation())
@@ -1968,6 +1975,21 @@ RenderResult NativeW3DResources::CopyActiveColorTargetToTexture(
 	{
 		return RENDER_RESULT_UNSUPPORTED;
 	}
+	return RENDER_RESULT_OK;
+}
+
+RenderResult NativeW3DResources::CopyActiveColorTargetToTexture(
+	GpuHandle handle, NativeW3DGpuContentLease *lease)
+{
+	if (lease == 0)
+	{
+		return RENDER_RESULT_INVALID_ARGUMENT;
+	}
+	*lease = NativeW3DGpuContentLease();
+	const RenderResult validation = ValidateTextureCopy(handle);
+	if (validation != RENDER_RESULT_OK) return validation;
+	IRenderDevice *device = m_impl->state->Device();
+	Slot *slot = Find(handle);
 	const RenderResult result = CompleteMutation(device,
 		device->copyActiveColorTargetToTexture(handle));
 	if (result == RENDER_RESULT_OK)

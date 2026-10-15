@@ -16,6 +16,10 @@
 #define NOMINMAX
 #endif
 #include "Lib/FrameTimingDiagnostics.h"
+#include "Lib/ProducerCpuPhaseDiagnostics.h"
+#include "nativesorteddiagnostics.h"
+
+namespace sorted_diag = rts::render::sorted_diagnostics;
 
 #include <algorithm>
 #include <limits>
@@ -217,6 +221,9 @@ unsigned long long g_nativeSortingPreTrimDescriptorBytes = 0;
 unsigned long long g_nativeSortingPreTrimNodeMapBytes = 0;
 unsigned long long g_nativeSortingPostTrimDescriptorBytes = 0;
 unsigned long long g_nativeSortingPostTrimNodeMapBytes = 0;
+bool g_nativeSortingFormerDrawReserveReference = false;
+unsigned long long g_nativeSortingPreTrimDrawBytes = 0;
+unsigned long long g_nativeSortingPostTrimDrawBytes = 0;
 
 // An independent inventory makes omission of either new vector from product
 // RetainedCapacityBytes observable, rather than trusting that same helper twice.
@@ -253,6 +260,8 @@ public:
 	{
 #if defined(RTS_NATIVE_SORTING_TESTS)
 		g_nativeSortingPreTrimCapacityBytes = workspace.RetainedCapacityBytes();
+		g_nativeSortingPreTrimDrawBytes = static_cast<unsigned long long>(
+			workspace.draws.capacity()) * sizeof(NativeSortedDraw);
 		g_nativeSortingIndependentPreTrimCapacityBytes = TestWorkspaceCapacityInventory(workspace);
 		g_nativeSortingPreTrimDescriptorBytes = static_cast<unsigned long long>(
 			workspace.preparationDescriptors.capacity()) * sizeof(rts::SortingTriangleDescriptor);
@@ -264,6 +273,8 @@ public:
 #if defined(RTS_NATIVE_SORTING_TESTS)
 		g_nativeSortingLastFlushWorkspaceCapacityBytes =
 			workspace.RetainedCapacityBytes();
+		g_nativeSortingPostTrimDrawBytes = static_cast<unsigned long long>(
+			workspace.draws.capacity()) * sizeof(NativeSortedDraw);
 		g_nativeSortingPostTrimDescriptorBytes = static_cast<unsigned long long>(
 			workspace.preparationDescriptors.capacity()) * sizeof(rts::SortingTriangleDescriptor);
 		g_nativeSortingPostTrimNodeMapBytes = static_cast<unsigned long long>(
@@ -435,7 +446,7 @@ RenderResult AppendFormerPreparedTriangles(const SortedSubmission &submission,
 	std::vector<SortedTriangle> &triangles)
 {
 	if (!ValidateSourceIndices(submission))
-		return RENDER_RESULT_INVALID_ARGUMENT;
+		return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "former-source-indices", submissionIndex, submission.indices.size(), submission.packet.minimumVertexIndex, submission.packet.vertexCount);
 
 	const unsigned int triangleCount =
 		submission.packet.indexCount / 3U;
@@ -449,12 +460,13 @@ RenderResult AppendFormerPreparedTriangles(const SortedSubmission &submission,
 	options.parallel = true;
 	for (unsigned int batchStart = 0; batchStart < triangleCount; )
 	{
+		rts::frame_timing::Scope descriptorTiming(rts::frame_timing::RendererSortingDescriptorScratch);
 		const unsigned int batchCount = std::min(
 			MAX_SORTING_TRIANGLES_PER_KERNEL_CALL, triangleCount - batchStart);
 		if (batchCount == 0)
 			break;
 		if (!scratch.prepare(1, batchCount, options.maximumScratchBytes))
-			return RENDER_RESULT_OUT_OF_MEMORY;
+			return sorted_diag::NoteFailure(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__, "allocation-failed");
 
 		rts::SortingTriangleDescriptor descriptor;
 		descriptor.vertices = submission.vertices.data();
@@ -481,6 +493,9 @@ RenderResult AppendFormerPreparedTriangles(const SortedSubmission &submission,
 			if (growsCapacity)
 				++g_nativeSortingLastFlushPreparedGrowthCount;
 		}
+		descriptorTiming.finish();
+		rts::frame_timing::Scope kernelTiming(rts::frame_timing::RendererSortingKernel);
+		rts::producer_cpu::Scope cpu_kernelTiming(rts::producer_cpu::SortingKernel);
 		rts::SortingTriangleMetrics metrics;
 		rts::SortingTriangleResult result = rts::PrepareSortingTriangles(
 			&descriptor, 1, batchCount, prepared.data(), scratch.outputs(),
@@ -494,9 +509,14 @@ RenderResult AppendFormerPreparedTriangles(const SortedSubmission &submission,
 				prepared.data(), scratch.outputs(), options, &metrics);
 			options.parallel = true;
 		}
+		kernelTiming.finish();
+		cpu_kernelTiming.finish();
 		if (!rts::SortingTriangleCompleted(result))
-			return result == rts::SORTING_TRIANGLE_INVALID_INPUT ?
-				RENDER_RESULT_INVALID_ARGUMENT : RENDER_RESULT_FAILED;
+			return sorted_diag::NoteFailure(result == rts::SORTING_TRIANGLE_INVALID_INPUT ?
+				RENDER_RESULT_INVALID_ARGUMENT : RENDER_RESULT_FAILED, __FUNCTION__, __LINE__,
+				"former-kernel-result", static_cast<uint64_t>(result), 1, batchCount,
+				metrics.submittedJobs, metrics.completedJobs, metrics.workerThreadsUsed);
+		rts::frame_timing::Scope expansionTiming(rts::frame_timing::RendererSortingOutputExpansion);
 
 		for (unsigned int local = 0; local < batchCount; ++local)
 		{
@@ -505,7 +525,7 @@ RenderResult AppendFormerPreparedTriangles(const SortedSubmission &submission,
 				submission.submittedTriangles[sourceTriangle])
 				continue;
 			if (!IsFiniteFloat(prepared[local].z))
-				return RENDER_RESULT_INVALID_ARGUMENT;
+				return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "former-output-depth", submissionIndex, sourceTriangle, batchCount);
 			SortedTriangle triangle;
 			triangle.submissionIndex = submissionIndex;
 			triangle.sourceTriangle = sourceTriangle;
@@ -539,6 +559,7 @@ RenderResult AppendPreparedTriangleBatches(
 	unsigned int sourceStart = 0;
 	while (order < workspace.nodeOrder.size())
 	{
+		rts::frame_timing::Scope descriptorTiming(rts::frame_timing::RendererSortingDescriptorScratch);
 		descriptors.clear();
 		preparationNodes.clear();
 		unsigned int batchCount = 0;
@@ -550,7 +571,7 @@ RenderResult AppendPreparedTriangleBatches(
 			const SortedNode &node = workspace.nodes[nodeIndex];
 			const SortedSubmission &submission = submissions[node.submissionIndex];
 			if (sourceStart == 0 && !ValidateSourceIndices(submission))
-				return RENDER_RESULT_INVALID_ARGUMENT;
+				return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "source-indices", node.submissionIndex, submission.indices.size(), submission.packet.minimumVertexIndex, submission.packet.vertexCount, submission.vertices.size(), sourceStart);
 			const unsigned int triangleCount = submission.packet.indexCount / 3U;
 			const unsigned int count = std::min(triangleCount - sourceStart,
 				MAX_SORTING_TRIANGLES_PER_KERNEL_CALL - batchCount);
@@ -587,7 +608,7 @@ RenderResult AppendPreparedTriangleBatches(
 		}
 		const unsigned int descriptorCount = static_cast<unsigned int>(descriptors.size());
 		if (!scratch.prepare(descriptorCount, batchCount, options.maximumScratchBytes))
-			return RENDER_RESULT_OUT_OF_MEMORY;
+			return sorted_diag::NoteFailure(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__, "allocation-failed");
 		if (prepared.size() < batchCount)
 		{
 			const bool growsCapacity = prepared.capacity() < batchCount;
@@ -598,6 +619,9 @@ RenderResult AppendPreparedTriangleBatches(
 #endif
 		}
 		rts::SortingTriangleMetrics metrics;
+		descriptorTiming.finish();
+		rts::frame_timing::Scope kernelTiming(rts::frame_timing::RendererSortingKernel);
+		rts::producer_cpu::Scope cpu_kernelTiming(rts::producer_cpu::SortingKernel);
 		rts::SortingTriangleResult result = rts::PrepareSortingTriangles(
 			descriptors.data(), descriptorCount, batchCount, prepared.data(),
 			scratch.outputs(), options, &metrics);
@@ -615,9 +639,14 @@ RenderResult AppendPreparedTriangleBatches(
 				batchCount, prepared.data(), scratch.outputs(), options, &metrics);
 			options.parallel = parallel;
 		}
+		kernelTiming.finish();
+		cpu_kernelTiming.finish();
 		if (!rts::SortingTriangleCompleted(result))
-			return result == rts::SORTING_TRIANGLE_INVALID_INPUT ?
-				RENDER_RESULT_INVALID_ARGUMENT : RENDER_RESULT_FAILED;
+			return sorted_diag::NoteFailure(result == rts::SORTING_TRIANGLE_INVALID_INPUT ?
+				RENDER_RESULT_INVALID_ARGUMENT : RENDER_RESULT_FAILED, __FUNCTION__, __LINE__,
+				"kernel-result", static_cast<uint64_t>(result), descriptorCount, batchCount,
+				metrics.submittedJobs, metrics.completedJobs, metrics.workerThreadsUsed);
+		rts::frame_timing::Scope expansionTiming(rts::frame_timing::RendererSortingOutputExpansion);
 		for (unsigned int descriptorIndex = 0; descriptorIndex < descriptorCount;
 			++descriptorIndex)
 		{
@@ -631,7 +660,72 @@ RenderResult AppendPreparedTriangleBatches(
 			{
 				const rts::SortingTriangleOutput &output = prepared[descriptor.outputOffset + local];
 				if (!IsFiniteFloat(output.z))
-					return RENDER_RESULT_INVALID_ARGUMENT;
+				{
+					// Latch exactly the existing origin first. Disabled/already-latched
+					// traces perform no additional geometry reads or depth arithmetic.
+					sorted_diag::Origin *origin = sorted_diag::ActiveOrigin();
+					const bool alreadyPresent = origin != 0 && origin->present;
+					const RenderResult failure = sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "output-depth", submissionIndex, descriptorIndex, local, descriptor.outputOffset, descriptor.polygonCount, firstTriangle);
+					if (!alreadyPresent && origin != 0 && origin->present)
+					{
+						sorted_diag::DepthSnapshot &depth = origin->depth;
+						memset(&depth, 0, sizeof(depth));
+						depth.present = true;
+						depth.stride = descriptor.vertexStrideBytes;
+						depth.minimum = descriptor.minVertexIndex;
+						depth.vertexCount = descriptor.vertexCount;
+						depth.vertexFormat = static_cast<unsigned int>(submission.packet.vertexFormat);
+						depth.vertexHandleIndex = submission.packet.vertexBuffer.index();
+						depth.vertexHandleGeneration = submission.packet.vertexBuffer.generation();
+						depth.indexHandleIndex = submission.packet.indexBuffer.index();
+						depth.indexHandleGeneration = submission.packet.indexBuffer.generation();
+						depth.shaderBits = submission.state.pipeline.shaderBits;
+						depth.layoutCount = submission.packet.vertexLayout.elementCount;
+						depth.preTransformed = submission.packet.vertexLayout.preTransformed ? 1U : 0U;
+						for (unsigned int element = 0; element < depth.layoutCount &&
+							element < RenderVertexLayout::MAX_ELEMENT_COUNT; ++element)
+						{
+							const RenderVertexElement &value = submission.packet.vertexLayout.elements[element];
+							depth.layoutSemantic[element] = static_cast<unsigned int>(value.semantic);
+							depth.layoutIndex[element] = value.semanticIndex;
+							depth.layoutFormat[element] = static_cast<unsigned int>(value.format);
+							depth.layoutOffset[element] = value.byteOffset;
+						}
+						depth.commonZ = descriptor.commonZ;
+						memcpy(&depth.zBits[0], &descriptor.zX, sizeof(float));
+						memcpy(&depth.zBits[1], &descriptor.zY, sizeof(float));
+						memcpy(&depth.zBits[2], &descriptor.zZ, sizeof(float));
+						memcpy(&depth.zBits[3], &descriptor.zTranslation, sizeof(float));
+						depth.kernelResult = static_cast<unsigned int>(result);
+						depth.batchCount = batchCount;
+						depth.descriptorCount = descriptorCount;
+						depth.submittedJobs = metrics.submittedJobs;
+						depth.completedJobs = metrics.completedJobs;
+						depth.workerThreadsUsed = metrics.workerThreadsUsed;
+						depth.scratchOutputCount = scratch.outputCount();
+						depth.scratchCapacityBytes = scratch.capacityBytes();
+						depth.outputAddress = reinterpret_cast<size_t>(prepared.data());
+						depth.outputCount = prepared.size();
+						depth.scratchAddress = reinterpret_cast<size_t>(scratch.outputs());
+						depth.descriptorAddress = reinterpret_cast<size_t>(descriptors.data());
+						depth.outputSlot = static_cast<size_t>(descriptor.outputOffset) + local;
+						if (depth.outputSlot < prepared.size() && depth.outputSlot < batchCount)
+						{
+							depth.bounds |= 16U;
+							depth.outputIndices[0] = output.tri.i;
+							depth.outputIndices[1] = output.tri.j;
+							depth.outputIndices[2] = output.tri.k;
+							depth.outputNode = output.idx;
+							memcpy(&depth.outputZ, &output.z, sizeof(float));
+						}
+						const size_t triangle = static_cast<size_t>(firstTriangle) + local;
+						if (triangle <= static_cast<size_t>(-1) / 3)
+							sorted_diag::ReadDepthSource(depth, submission.vertices.data(),
+								submission.vertices.size(), submission.indices.data(),
+								submission.indices.size(), triangle * 3);
+					}
+					return failure;
+				}
 				SortedTriangle triangle;
 				triangle.submissionIndex = submissionIndex;
 				triangle.sourceTriangle = firstTriangle + local;
@@ -1063,15 +1157,19 @@ RenderResult SubmitChunk(NativeSortedGeometrySink &sink,
 {
 	if (draws.empty() || draws.size() != runs.size() || vertices.empty() ||
 		indices.empty())
-		return RENDER_RESULT_INVALID_ARGUMENT;
+		return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "chunk-preflight", draws.size(), runs.size(), vertices.size(), indices.size() * sizeof(unsigned short), chunkOffset, cohortSize);
 	unsigned int submittedDrawCount = 0;
 	const NativeSortedPass &pass = submissions[cohortStart].pass;
+	rts::frame_timing::Scope sinkTiming(rts::frame_timing::RendererSortingSink);
+	rts::producer_cpu::Scope cpu_sinkTiming(rts::producer_cpu::SortingSink);
 	const RenderResult result = sink.SubmitNativeSortedPassBatch(pass, draws.data(),
 		static_cast<unsigned int>(draws.size()), vertices.data(),
 		vertices.size(), indices.data(),
 		indices.size() * sizeof(unsigned short), &submittedDrawCount);
+	sinkTiming.finish();
+	cpu_sinkTiming.finish();
 	if (submittedDrawCount > draws.size())
-		return RENDER_RESULT_FAILED;
+		return sorted_diag::NoteFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__, "over-acknowledgement", draws.size(), submittedDrawCount, chunkOffset, cohortSize);
 	MarkRunsSubmitted(runs, triangles, chunkOffset, submittedDrawCount,
 		submissions);
 	// Seal on any valid acknowledgement, including a successful earlier chunk
@@ -1082,9 +1180,9 @@ RenderResult SubmitChunk(NativeSortedGeometrySink &sink,
 		acknowledgedCohortSize = cohortSize;
 	}
 	if (result != RENDER_RESULT_OK)
-		return result;
+		return sorted_diag::NoteFailure(result, __FUNCTION__, __LINE__, "sink-return", draws.size(), submittedDrawCount, vertices.size(), indices.size() * sizeof(unsigned short), chunkOffset, cohortSize);
 	return submittedDrawCount == draws.size() ? RENDER_RESULT_OK :
-		RENDER_RESULT_FAILED;
+		sorted_diag::NoteFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__, "incomplete-acknowledgement", draws.size(), submittedDrawCount, chunkOffset, cohortSize);
 }
 
 } // namespace
@@ -1153,7 +1251,7 @@ RenderResult NativeSortingRenderer::Queue(const LegacyLogicalState &state,
 		!ValidateSubmission(packet, vertexData, vertexBytes,
 		indexData, indexBytes, boundingSphere, &requiredVertexBytes,
 		&requiredIndexBytes))
-		return RENDER_RESULT_INVALID_ARGUMENT;
+		return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "queue-preflight", packet.vertexCount, packet.indexCount, vertexBytes, indexBytes, packet.vertexStride);
 
 	try
 	{
@@ -1181,11 +1279,11 @@ RenderResult NativeSortingRenderer::Queue(const LegacyLogicalState &state,
 	}
 	catch (const std::bad_alloc &)
 	{
-		return RENDER_RESULT_OUT_OF_MEMORY;
+		return sorted_diag::NoteFailure(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__, "allocation-failed");
 	}
 	catch (...)
 	{
-		return RENDER_RESULT_FAILED;
+		return sorted_diag::NoteFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__, "local-failed");
 	}
 	return RENDER_RESULT_OK;
 }
@@ -1210,6 +1308,7 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink,
 	bool firstCohortOnly)
 {
 	rts::frame_timing::Scope sortingTiming(rts::frame_timing::RendererSorting);
+	rts::producer_cpu::Scope cpu_sortingTiming(rts::producer_cpu::Sorting);
 #if defined(RTS_NATIVE_SORTING_TESTS)
 	g_nativeSortingLastFlushScratchAllocationCount = 0;
 	g_nativeSortingLastFlushPreparedGrowthCount = 0;
@@ -1220,7 +1319,7 @@ RenderResult NativeSortingRenderer::Flush(NativeSortedGeometrySink &sink,
 	if (m_impl == 0 || m_impl->submissions.empty())
 		return RENDER_RESULT_OK;
 	if (m_impl->flushing)
-		return RENDER_RESULT_FAILED;
+		return sorted_diag::NoteFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__, "local-failed");
 	FlushScope flushScope(m_impl->flushing);
 	FlushWorkspaceScope workspaceScope(m_impl->workspace);
 
@@ -1264,6 +1363,7 @@ nextCohort:
 		// SortingTriangleScratchLease is synchronously fenced by each kernel
 		// call, so one workspace safely serves every sorted node and Flush.
 		rts::SortingTriangleScratchLease scratch;
+		rts::frame_timing::Scope nodeTiming(rts::frame_timing::RendererSortingNodeOrder);
 		std::vector<SortedNode> &nodes = m_impl->workspace.nodes;
 		std::vector<size_t> &positiveNodes = m_impl->workspace.positiveNodes;
 		std::vector<size_t> &unsortedNodes = m_impl->workspace.unsortedNodes;
@@ -1283,13 +1383,13 @@ nextCohort:
 			MultiplySortingMatrices(submission.state.constants.world,
 				submission.state.constants.view, node.worldView);
 			if (!IsFiniteMatrix(node.worldView))
-				return RENDER_RESULT_INVALID_ARGUMENT;
+				return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "node-world-view", index, cohortStart, cohortSize, m_impl->submissions.size());
 			node.centerDepth = submission.hasSphere ? TransformDepth(
 				node.worldView,
 				submission.sphere.centerX, submission.sphere.centerY,
 				submission.sphere.centerZ) : 0.0f;
 			if (!IsFiniteFloat(node.centerDepth))
-				return RENDER_RESULT_INVALID_ARGUMENT;
+				return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "node-center-depth", index, cohortStart, cohortSize, m_impl->submissions.size());
 			nodes.push_back(node);
 			if (node.hasSphere)
 				positiveNodes.push_back(nodes.size() - 1);
@@ -1322,6 +1422,7 @@ nextCohort:
 		nodeOrder.insert(nodeOrder.end(), positiveNodes.begin() + splice,
 			positiveNodes.end());
 
+		nodeTiming.finish();
 		std::vector<SortedTriangle> &triangles = m_impl->workspace.triangles;
 		// Queue initializes all acknowledgements to zero; only an accepted
 		// draw can set them, and it also fixes the acknowledged retry cohort.
@@ -1355,7 +1456,8 @@ nextCohort:
 		g_nativeSortingLastFlushScratchAllocationCount = scratch.allocationCount();
 #endif
 		if (prepareResult != RENDER_RESULT_OK)
-			return prepareResult;
+			return sorted_diag::NoteFailure(prepareResult, __FUNCTION__, __LINE__, "preparation-return");
+		rts::frame_timing::Scope triangleTiming(rts::frame_timing::RendererSortingTriangleSort);
 		if (!triangles.empty())
 			Sort(triangles.data(), triangles.data() + triangles.size());
 		if (retryingAcknowledgedCohort)
@@ -1374,6 +1476,9 @@ nextCohort:
 			triangles.resize(pendingCount);
 		}
 
+		triangleTiming.finish();
+		rts::frame_timing::Scope packingSetupTiming(rts::frame_timing::RendererSortingGeometryPack);
+		rts::producer_cpu::Scope cpu_packingSetupTiming(rts::producer_cpu::SortingGeometryPack);
 		std::vector<size_t> &vertexOffsets = m_impl->workspace.vertexOffsets;
 		std::vector<size_t> &touchedSubmissionIndexes =
 			m_impl->workspace.touchedSubmissionIndexes;
@@ -1381,8 +1486,12 @@ nextCohort:
 	#if defined(RTS_NATIVE_SORTING_TESTS)
 		g_nativeSortingLastOffsetInitializations += cohortSize;
 	#endif
+		packingSetupTiming.finish();
+		cpu_packingSetupTiming.finish();
 		for (size_t chunkOffset = 0; chunkOffset < triangles.size(); )
 		{
+			rts::frame_timing::Scope packingTiming(rts::frame_timing::RendererSortingGeometryPack);
+			rts::producer_cpu::Scope cpu_packingTiming(rts::producer_cpu::SortingGeometryPack);
 			std::vector<unsigned char> &chunkVertices =
 				m_impl->workspace.chunkVertices;
 			std::vector<unsigned short> &chunkIndices =
@@ -1410,7 +1519,14 @@ nextCohort:
 				chunkOffset + static_cast<size_t>(
 					MAX_SORTING_TRIANGLES_PER_CHUNK));
 			chunkIndices.reserve((maximumChunkEnd - chunkOffset) * 3);
-			draws.reserve(maximumChunkEnd - chunkOffset);
+			// One source may contribute many triangles to a single draw. Use a
+			// small initial hint; interleaved runs still grow the vector normally.
+			size_t drawReserveHint = std::min(maximumChunkEnd - chunkOffset, cohortSize);
+#if defined(RTS_NATIVE_SORTING_TESTS)
+			if (g_nativeSortingFormerDrawReserveReference)
+				drawReserveHint = maximumChunkEnd - chunkOffset;
+#endif
+			draws.reserve(drawReserveHint);
 			runs.reserve(maximumChunkEnd - chunkOffset);
 
 			size_t local = 0;
@@ -1421,7 +1537,7 @@ nextCohort:
 				const SortedSubmission &submission = m_impl->submissions[
 					submissionIndex];
 				if (submissionIndex < cohortStart || submissionIndex - cohortStart >= vertexOffsets.size())
-					return RENDER_RESULT_INVALID_ARGUMENT;
+					return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "cohort-identity", submissionIndex, cohortStart, vertexOffsets.size(), chunkOffset, local);
 				const size_t relativeIndex = submissionIndex - cohortStart;
 				if (vertexOffsets[relativeIndex] ==
 					std::numeric_limits<size_t>::max())
@@ -1434,13 +1550,13 @@ nextCohort:
 
 					const size_t stride = submission.packet.vertexStride;
 					if (stride == 0 || chunkVertices.size() % stride != 0)
-						return RENDER_RESULT_INVALID_ARGUMENT;
+						return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "chunk-stride", stride, chunkVertices.size(), submissionIndex, chunkOffset, local);
 					const size_t currentVertexCount = chunkVertices.size() / stride;
 					if (submission.packet.vertexCount >
 						MAX_SORTING_VERTEX_CAPACITY - currentVertexCount)
 					{
 						if (local == 0)
-							return RENDER_RESULT_INVALID_ARGUMENT;
+							return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "first-source-capacity", submission.packet.vertexCount, currentVertexCount, MAX_SORTING_VERTEX_CAPACITY, submissionIndex, chunkOffset);
 						break;
 					}
 					const size_t vertexOffset = chunkVertices.size();
@@ -1453,14 +1569,14 @@ nextCohort:
 				const size_t vertexOffset = vertexOffsets[relativeIndex];
 				const size_t stride = submission.packet.vertexStride;
 				if (stride == 0 || vertexOffset % stride != 0)
-					return RENDER_RESULT_INVALID_ARGUMENT;
+					return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "source-offset-stride", stride, vertexOffset, submissionIndex, chunkOffset, local);
 				const size_t vertexBase = vertexOffset / stride;
 				if (vertexBase + triangle.i > MAX_SORTING_INDEX_COUNT ||
 					vertexBase + triangle.j > MAX_SORTING_INDEX_COUNT ||
 					vertexBase + triangle.k > MAX_SORTING_INDEX_COUNT)
-					return RENDER_RESULT_INVALID_ARGUMENT;
+					return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "chunk-index-bounds", vertexBase, triangle.i, triangle.j, triangle.k, submissionIndex, chunkOffset);
 				if (vertexOffset > std::numeric_limits<unsigned int>::max())
-					return RENDER_RESULT_OUT_OF_MEMORY;
+					return sorted_diag::NoteFailure(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__, "allocation-failed");
 
 				const bool adjacentToPreviousRun = !runs.empty() &&
 					runs.back().firstTriangle + runs.back().triangleCount == local;
@@ -1490,7 +1606,7 @@ nextCohort:
 								previousTriangle.submissionIndex < cohortStart ||
 								previousTriangle.submissionIndex - cohortStart >=
 								vertexOffsets.size())
-								return RENDER_RESULT_INVALID_ARGUMENT;
+								return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "previous-cohort-identity", previousTriangle.submissionIndex, cohortStart, vertexOffsets.size(), chunkOffset, previous);
 							const size_t previousRelativeIndex =
 								previousTriangle.submissionIndex - cohortStart;
 							const size_t previousVertexOffset =
@@ -1498,7 +1614,7 @@ nextCohort:
 							if (previousVertexOffset ==
 								std::numeric_limits<size_t>::max() ||
 								previousVertexOffset % stride != 0)
-								return RENDER_RESULT_INVALID_ARGUMENT;
+								return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "previous-offset-stride", previousVertexOffset, stride, previousRelativeIndex, chunkOffset, previous);
 							const size_t previousVertexBase =
 								previousVertexOffset / stride;
 							const SortedSubmission &previousSubmission =
@@ -1507,7 +1623,7 @@ nextCohort:
 							const size_t vertexEnd = previousVertexBase +
 								previousSubmission.packet.vertexCount;
 							if (vertexEnd > MAX_SORTING_VERTEX_CAPACITY)
-								return RENDER_RESULT_INVALID_ARGUMENT;
+								return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "previous-vertex-capacity", vertexEnd, MAX_SORTING_VERTEX_CAPACITY, previousRelativeIndex, chunkOffset, previous);
 							expandedVertexCount = std::max(expandedVertexCount,
 								vertexEnd);
 							const size_t rebased[] = {
@@ -1521,14 +1637,14 @@ nextCohort:
 							{
 								if (rebased[corner] > MAX_SORTING_INDEX_COUNT ||
 									indexStart + corner >= chunkIndices.size())
-									return RENDER_RESULT_INVALID_ARGUMENT;
+									return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "rebased-index-bounds", rebased[corner], indexStart + corner, chunkIndices.size(), chunkOffset, previous, corner);
 								chunkIndices[indexStart + corner] =
 									static_cast<unsigned short>(rebased[corner]);
 							}
 						}
 						if (expandedVertexCount >
 							std::numeric_limits<unsigned int>::max())
-							return RENDER_RESULT_OUT_OF_MEMORY;
+							return sorted_diag::NoteFailure(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__, "allocation-failed");
 						draw.packet.vertexOffset = 0;
 						draw.packet.vertexCount = static_cast<unsigned int>(
 							expandedVertexCount);
@@ -1541,7 +1657,7 @@ nextCohort:
 							submission.packet.vertexCount;
 						if (vertexEnd > MAX_SORTING_VERTEX_CAPACITY ||
 							vertexEnd > std::numeric_limits<unsigned int>::max())
-							return RENDER_RESULT_INVALID_ARGUMENT;
+							return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "merged-vertex-capacity", vertexEnd, MAX_SORTING_VERTEX_CAPACITY, submissionIndex, chunkOffset, local);
 						chunkIndices.push_back(static_cast<unsigned short>(
 							vertexBase + triangle.i));
 						chunkIndices.push_back(static_cast<unsigned short>(
@@ -1572,23 +1688,25 @@ nextCohort:
 			}
 
 			if (local == 0)
-				return RENDER_RESULT_INVALID_ARGUMENT;
+				return sorted_diag::NoteFailure(RENDER_RESULT_INVALID_ARGUMENT, __FUNCTION__, __LINE__, "empty-chunk-progress", chunkOffset, triangles.size(), maximumChunkEnd, chunkVertices.size(), chunkIndices.size());
+			packingTiming.finish();
+			cpu_packingTiming.finish();
 			const RenderResult result = SubmitChunk(sink, draws, runs, triangles,
 				chunkOffset, m_impl->submissions, cohortStart, cohortSize,
 				m_impl->acknowledgedCohortStart, m_impl->acknowledgedCohortSize,
 				chunkVertices, chunkIndices);
 			if (result != RENDER_RESULT_OK)
-				return result;
+				return sorted_diag::NoteFailure(result, __FUNCTION__, __LINE__, "chunk-return");
 			chunkOffset += local;
 		}
 	}
 	catch (const std::bad_alloc &)
 	{
-		return RENDER_RESULT_OUT_OF_MEMORY;
+		return sorted_diag::NoteFailure(RENDER_RESULT_OUT_OF_MEMORY, __FUNCTION__, __LINE__, "allocation-failed");
 	}
 	catch (...)
 	{
-		return RENDER_RESULT_FAILED;
+		return sorted_diag::NoteFailure(RENDER_RESULT_FAILED, __FUNCTION__, __LINE__, "local-failed");
 	}
 
 	// Reaching this point means every chunk was fully acknowledged. Failures
@@ -1627,6 +1745,21 @@ bool NativeSortingRenderer::Empty() const
 }
 
 #if defined(RTS_NATIVE_SORTING_TESTS)
+void NativeSortingRendererTestUseFormerDrawReserveReference(bool enabled)
+{
+	g_nativeSortingFormerDrawReserveReference = enabled;
+}
+
+unsigned long long NativeSortingRendererTestLastPreTrimDrawBytes()
+{
+	return g_nativeSortingPreTrimDrawBytes;
+}
+
+unsigned long long NativeSortingRendererTestLastPostTrimDrawBytes()
+{
+	return g_nativeSortingPostTrimDrawBytes;
+}
+
 void NativeSortingRendererTestPrimeWorkspaceTrimOnNextFlush()
 {
 	g_nativeSortingPrimeWorkspaceTrim = true;

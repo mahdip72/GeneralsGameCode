@@ -45,7 +45,7 @@ struct FakeRenderControl
 		failRefreshOnCall(0),
 		failCopy(0), failCopyResult(RENDER_RESULT_FAILED),
 		createCalls(0), updateCalls(0), refreshCalls(0),
-		copyCalls(0), refreshPixelSequence(0), passMode(false),
+		copyCalls(0), copyObservedDraws(0), refreshObservedDraws(0), refreshPixelSequence(0), passMode(false), rigidMode(false),
 		failDraw(0), failDrawOnCall(0), drawCalls(0),
 		failTargetOnCall(0), targetCalls(0), failClearOnCall(0), clearCalls(0), presentCalls(0),
 		failViewportOnCall(0), viewportCalls(0), endCalls(0), reflectionColorCreates(0) {}
@@ -61,10 +61,13 @@ struct FakeRenderControl
 	volatile long updateCalls;
 	volatile long refreshCalls;
 	volatile long copyCalls;
+	volatile long copyObservedDraws;
+	volatile long refreshObservedDraws;
 	volatile long refreshPixelSequence;
 	// Enabled before a mock owner is started; observations are read only after
 	// its exact completion/drain. Existing fixtures retain their strict mock.
 	bool passMode;
+	bool rigidMode;
 	volatile long failDraw;
 	volatile long failDrawOnCall;
 	volatile long drawCalls;
@@ -240,6 +243,8 @@ public:
 
 	RenderBackend backend() const override { return RENDER_BACKEND_D3D11; }
 	bool isOperational() const override { return m_operational; }
+	bool supportsRigidInstancing() const override
+	{ return m_control != 0 && m_control->rigidMode; }
 	RenderResult initialize(const RenderDeviceParameters &) override
 	{
 		if (m_operational)
@@ -350,6 +355,7 @@ public:
 		{
 			const long invocation =
 				InterlockedIncrement(&m_control->refreshCalls);
+			InterlockedExchange(&m_control->refreshObservedDraws, ReadCount(&m_control->drawCalls));
 			if (IsSet(&m_control->failRefresh) ||
 				invocation == ReadCount(&m_control->failRefreshOnCall))
 			{
@@ -384,6 +390,7 @@ public:
 		if (m_control != 0)
 		{
 			InterlockedIncrement(&m_control->copyCalls);
+			InterlockedExchange(&m_control->copyObservedDraws, ReadCount(&m_control->drawCalls));
 			if (IsSet(&m_control->failCopy))
 			{
 				return static_cast<RenderResult>(ReadCount(&m_control->failCopyResult));
@@ -882,7 +889,8 @@ RenderResult EndHiddenPass(NativeW3D2 &product, RenderResult first = RENDER_RESU
 	return product.ExecuteGameRenderCommand(command);
 }
 
-RenderResult QueuePassTriangle(NativeW3D2 &product, unsigned int stateBits, float z)
+RenderResult QueuePassTriangle(NativeW3D2 &product, unsigned int stateBits, float z,
+	GpuHandle sampled = GpuHandle())
 {
 	struct Vertex { float x, y, z; unsigned int color; };
 	const Vertex vertices[] = { { 0, 0, z, 0xffffffffU },
@@ -890,6 +898,7 @@ RenderResult QueuePassTriangle(NativeW3D2 &product, unsigned int stateBits, floa
 	const unsigned short indices[] = { 0, 1, 2 };
 	LegacyLogicalState state;
 	state.pipeline.shaderBits = stateBits;
+	state.texturePresenceMask = sampled.isValid() ? 1 : 0;
 	NativeDrawPacket packet;
 	packet.vertexStride = sizeof(Vertex);
 	packet.vertexLayout.stride = sizeof(Vertex);
@@ -901,6 +910,8 @@ RenderResult QueuePassTriangle(NativeW3D2 &product, unsigned int stateBits, floa
 	packet.vertexLayout.elements[1].byteOffset = sizeof(float) * 3;
 	packet.vertexCount = packet.indexCount = 3;
 	packet.indexed = true;
+	packet.textures[0] = sampled;
+	packet.texturePresenceMask = state.texturePresenceMask;
 	return product.QueueGameSortedTriangles(state, packet, vertices, sizeof(vertices),
 		indices, sizeof(indices), 0);
 }
@@ -1182,6 +1193,339 @@ int TestDeferredNativePassAdmissionsCpu()
 	return result;
 }
 
+// Use the public Native2 capture route, not a stand-in batch. One captured
+// instance intentionally takes the ordinary backend fallback at cleanup.
+RenderResult QueueBarrierRigidTriangle(NativeW3D2 &product, GpuHandle *vertex,
+	GpuHandle *index)
+{
+	const float vertices[24] = {};
+	const unsigned short indices[3] = { 0, 1, 2 };
+	BufferDescriptor descriptor;
+	descriptor.byteCount = sizeof(vertices); descriptor.stride = 32;
+	descriptor.binding = RENDER_BUFFER_VERTEX; descriptor.usage = RENDER_USAGE_IMMUTABLE;
+	RenderResult result = product.Resources().CreateBuffer(descriptor, vertices, sizeof(vertices), vertex);
+	if (result != RENDER_RESULT_OK) return result;
+	descriptor.byteCount = sizeof(indices); descriptor.stride = sizeof(unsigned short);
+	descriptor.binding = RENDER_BUFFER_INDEX;
+	result = product.Resources().CreateBuffer(descriptor, indices, sizeof(indices), index);
+	if (result != RENDER_RESULT_OK) return result;
+	GameRenderCommand command = {};
+	// Direct sorted admission carries its own state and does not seed the
+	// public command facade's tracked pipeline. Prepare that public state before
+	// DRAW_TRIANGLES so this fixture exercises actual owned rigid capture.
+	command.type = GAME_RENDER_COMMAND_APPLY_RENDER_STATE_CHANGES;
+	result = product.ExecuteGameRenderCommand(command);
+	if (result != RENDER_RESULT_OK) return result;
+	command = GameRenderCommand();
+	command.type = GAME_RENDER_COMMAND_SET_VERTEX_BUFFER;
+	command.resource0.index = vertex->index(); command.resource0.generation = vertex->generation();
+	command.value0 = 0x112; command.value1 = 32; // XYZ + NORMAL + TEX1
+	result = product.ExecuteGameRenderCommand(command);
+	if (result != RENDER_RESULT_OK) return result;
+	command = GameRenderCommand(); command.type = GAME_RENDER_COMMAND_SET_INDEX_BUFFER;
+	command.resource0.index = index->index(); command.resource0.generation = index->generation();
+	command.value0 = RENDER_FORMAT_R16_UINT;
+	result = product.ExecuteGameRenderCommand(command);
+	if (result != RENDER_RESULT_OK) return result;
+	result = product.BeginGameRigidDrawScope(vertex, index);
+	if (result != RENDER_RESULT_OK) return result;
+	command = GameRenderCommand(); command.type = GAME_RENDER_COMMAND_DRAW_TRIANGLES;
+	command.value1 = 1; command.value3 = 3;
+	result = product.ExecuteGameRenderCommand(command);
+	product.EndGameRigidDrawScope();
+	GameRigidDrawMetrics metrics;
+	if (result == RENDER_RESULT_OK &&
+		(product.GetGameRigidDrawMetrics(&metrics) != RENDER_RESULT_OK || metrics.capturedDraws != 1))
+		return RENDER_RESULT_FAILED;
+	return result;
+}
+
+int TestClosedFrameTextureBarriersCpu()
+{
+	int result = 0;
+	for (unsigned int mode = 0; mode < 3; ++mode)
+	for (unsigned int fault = 0; fault < 3; ++fault)
+	{
+		// Borrowed draws execute synchronously; only threaded End has a deferred failure.
+		if (mode == 0 && fault == 1) continue;
+		FakeRenderControl control; control.passMode = true;
+		ThreadedRenderOptions options; options.serial = mode == 1;
+		IRenderDevice *device = mode == 0 ? new FakeRenderDevice(false, &control) :
+			CreateThreadedRenderDevice(CreateThreadedFakeRenderDevice, &control, options);
+		if (!device) return result | Check(false, "closed barrier mock allocation");
+		RenderDeviceParameters parameters;
+		parameters.backend = RENDER_BACKEND_D3D11;
+		parameters.window = reinterpret_cast<void *>(1); parameters.width = parameters.height = 4;
+		if (device->initialize(parameters) != RENDER_RESULT_OK)
+		{ delete device; return result | Check(false, "closed barrier mock initialization"); }
+		ScopedPassDevice deviceLifetime(device);
+		NativeW3D2 product;
+		result |= Check(product.AttachBackend(device, device->immediateContext()) == RENDER_RESULT_OK,
+			"closed barrier attaches actual Native2 owner");
+		NativeW3DTextureOwner texture;
+		TextureDescriptor descriptor; descriptor.width = descriptor.height = 4;
+		descriptor.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+		descriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE; descriptor.usage = RENDER_USAGE_DEFAULT;
+		unsigned char pixels[64] = {};
+		TextureSubresourceData data; data.data = pixels; data.rowPitch = 16; data.slicePitch = sizeof(pixels);
+		NativeW3DTextureCandidate candidate; NativeW3DTextureHandle handle;
+		result |= Check(texture.CreateCandidate(descriptor, &data, 1, &candidate) == RENDER_RESULT_OK &&
+			texture.PublishCandidate(&candidate, 0) == RENDER_RESULT_OK &&
+			texture.AcquireForSampling(&handle, 0) == RENDER_RESULT_OK &&
+			BeginPassFrame(product, false) == RENDER_RESULT_OK,
+			"closed barrier creates owned texture before pending frame work");
+		NativeW3DTextureDescription before, after;
+		result |= Check(product.Resources().DescribeTexture(handle.resource, &before) == RENDER_RESULT_OK,
+			"closed barrier snapshots exact authority");
+		if (fault == 1) InterlockedExchange(&control.failDraw, 1);
+		const RenderResult queued = QueuePassTriangle(product, 601, 1, handle.resource);
+		const RenderResult flushed = product.FlushGameSortedTriangles();
+		const RenderResult ended = product.Renderer().EndFrame(false);
+		// Serial submit waits for its owner and returns the failed draw result;
+		// parallel submit admits the frame and leaves that result for the drain.
+		const RenderResult sealed = ended == RENDER_RESULT_OK ?
+			product.Renderer().FinalizeEndedFrame(false) : ended;
+		const RenderResult expectedSeal = mode == 1 && fault == 1 ? RENDER_RESULT_FAILED : RENDER_RESULT_OK;
+		if (queued != RENDER_RESULT_OK || flushed != RENDER_RESULT_OK || ended != RENDER_RESULT_OK || sealed != expectedSeal)
+			std::fprintf(stderr, "CLOSED_TEXTURE_SETUP mode=%u fault=%u queue=%d flush=%d end=%d seal=%d expected_seal=%d\n",
+				mode, fault, queued, flushed, ended, sealed, expectedSeal);
+		result |= Check(queued == RENDER_RESULT_OK && flushed == RENDER_RESULT_OK && ended == RENDER_RESULT_OK &&
+			sealed == expectedSeal && !product.Renderer().IsFrameOpen(),
+			"frame ends and seals with the exact serial/parallel failure contract");
+		if (fault == 2)
+			result |= Check(QueuePassTriangle(product, 602, 2) == RENDER_RESULT_OK,
+				"closed barrier preserves unactivated next-frame sorted admission");
+		pixels[0] = 99;
+		const RenderResult operation = texture.RefreshCpuContent(descriptor, &data, 1);
+		if (fault == 0)
+			result |= Check(operation == RENDER_RESULT_OK && ReadCount(&control.drawCalls) == 1 &&
+				ReadCount(&control.refreshCalls) == 1 && ReadCount(&control.refreshObservedDraws) == 1,
+				"closed healthy refresh waits for the previous draw before backend mutation in every lane");
+		else
+		{
+			// Pending sorted admission rejects without execution. Explicitly drain
+			// only after that operation, so all backend observations are synchronized.
+			if (fault == 2 && mode != 0)
+				result |= Check(product.Renderer().DrainThreaded() == RENDER_RESULT_OK,
+					"pending admission observation fences only previously ended frame");
+			result |= Check(operation == (fault == 1 ? RENDER_RESULT_FAILED : RENDER_RESULT_INVALID_ARGUMENT) &&
+				ReadCount(&control.drawCalls) == 1 && ReadCount(&control.refreshCalls) == 0 &&
+				product.Resources().DescribeTexture(handle.resource, &after) == RENDER_RESULT_OK &&
+				after.authority == before.authority && after.authorityEpoch == before.authorityEpoch,
+				"closed failed draw or inactive sorted admission forbids CPU mutation and preserves authority");
+			if (fault == 2)
+				result |= Check(BeginPassFrame(product, false) == RENDER_RESULT_OK &&
+					product.FlushGameSortedTriangles() == RENDER_RESULT_OK && EndHiddenPass(product) == RENDER_RESULT_OK &&
+					ReadCount(&control.drawCalls) == 2 && control.draws.back().shaderBits == 602,
+					"closed admission remains owned and activates exactly once at matching healthy Begin");
+		}
+		InterlockedExchange(&control.failDraw, 0);
+		if (fault == 1)
+		{
+			// A command-only draw failure is scoped to its ended owner frame. The
+			// next ordinary Begin resets that frame result; no recovery/rebind API
+			// or producer failure reset is needed for a still-operational device.
+			const RenderResult resumedBegin = BeginPassFrame(product, false);
+			const RenderResult resumedQueue = resumedBegin == RENDER_RESULT_OK ?
+				QueuePassTriangle(product, 603, 3, handle.resource) : resumedBegin;
+			const RenderResult refreshed = resumedQueue == RENDER_RESULT_OK ?
+				texture.RefreshCpuContent(descriptor, &data, 1) : resumedQueue;
+			// Refresh admits OP_REFRESH_TEXTURE asynchronously in this open CPU
+			// texture frame. Fence device work before inspecting backend counters.
+			const RenderResult refreshedFence = refreshed == RENDER_RESULT_OK ?
+				DrainThreadedRenderDevice(device) : refreshed;
+			if (resumedBegin != RENDER_RESULT_OK || resumedQueue != RENDER_RESULT_OK ||
+				refreshed != RENDER_RESULT_OK || refreshedFence != RENDER_RESULT_OK ||
+				ReadCount(&control.drawCalls) != 2 || ReadCount(&control.refreshCalls) != 1)
+				std::fprintf(stderr, "CLOSED_TEXTURE_RESUME mode=%u begin=%d queue=%d refresh=%d fence=%d draws=%ld refreshes=%ld observed=%ld\n",
+					mode, resumedBegin, resumedQueue, refreshed, refreshedFence,
+					ReadCount(&control.drawCalls), ReadCount(&control.refreshCalls), ReadCount(&control.refreshObservedDraws));
+			result |= Check(resumedBegin == RENDER_RESULT_OK && resumedQueue == RENDER_RESULT_OK &&
+				refreshed == RENDER_RESULT_OK && refreshedFence == RENDER_RESULT_OK &&
+				ReadCount(&control.drawCalls) == 2 && ReadCount(&control.refreshCalls) == 1 &&
+				ReadCount(&control.refreshObservedDraws) == 2,
+				"next valid frame resumes refresh after closed draw failure with prior draw completion");
+			result |= Check(QueuePassTriangle(product, 604, 4, handle.resource) == RENDER_RESULT_OK &&
+				EndHiddenPass(product) == RENDER_RESULT_OK && ReadCount(&control.drawCalls) == 3 &&
+				control.draws.back().shaderBits == 604 &&
+				product.Resources().DescribeTexture(handle.resource, &after) == RENDER_RESULT_OK &&
+				after.authority == NATIVE_W3D_CONTENT_CPU && after.authorityEpoch > before.authorityEpoch,
+				"resumed frame publishes fresh CPU authority and completes the final sampling draw");
+		}
+		result |= Check(texture.Reset() == RENDER_RESULT_OK && product.Shutdown() == RENDER_RESULT_OK,
+			"closed barrier fixture releases allocation and owner after completion");
+	}
+	return result;
+}
+
+int TestSortedTextureBarriersCpu()
+{
+	int result = TestClosedFrameTextureBarriersCpu();
+	for (unsigned int mode = 0; mode < 3; ++mode)
+	for (unsigned int route = 0; route < 3; ++route)
+	for (unsigned int fault = 0; fault < 6; ++fault)
+	{
+		// Keep null-output rejection separate from the non-null destination gate.
+		if (fault == 3 && route != 1) continue;
+		// Preserve the original 30 cases; add direct immutable/size rejections.
+		if (fault >= 4 && route != 0) continue;
+		FakeRenderControl control;
+		control.passMode = true;
+		control.rigidMode = fault >= 2;
+		ThreadedRenderOptions options;
+		options.serial = mode == 1;
+		IRenderDevice *device = mode == 0 ? new FakeRenderDevice(false, &control) :
+			CreateThreadedRenderDevice(CreateThreadedFakeRenderDevice, &control, options);
+		if (!device) return result | Check(false, "texture barrier mock allocation");
+		RenderDeviceParameters parameters;
+		parameters.backend = RENDER_BACKEND_D3D11;
+		parameters.window = reinterpret_cast<void *>(1);
+		parameters.width = parameters.height = 4;
+		if (device->initialize(parameters) != RENDER_RESULT_OK)
+		{
+			delete device;
+			return result | Check(false, "texture barrier mock initialization");
+		}
+		ScopedPassDevice deviceLifetime(device);
+		NativeW3D2 product;
+		result |= Check(product.AttachBackend(device, device->immediateContext()) == RENDER_RESULT_OK,
+			"texture barrier attaches actual Native2 owner");
+		NativeW3DTextureOwner texture, invalidDestination;
+		NativeW3DTextureHandle invalidHandle;
+		NativeW3DTextureDescription invalidBefore, invalidAfter;
+		TextureDescriptor descriptor;
+		descriptor.width = descriptor.height = 4;
+		descriptor.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+		descriptor.binding = RENDER_TEXTURE_SHADER_RESOURCE;
+		descriptor.usage = RENDER_USAGE_DEFAULT;
+		unsigned char pixels[64] = {};
+		TextureSubresourceData data;
+		data.data = pixels; data.rowPitch = 16; data.slicePitch = sizeof(pixels);
+		NativeW3DTextureCandidate candidate;
+		NativeW3DTextureHandle handle;
+		result |= Check(texture.CreateCandidate(descriptor, &data, 1, &candidate) == RENDER_RESULT_OK &&
+			texture.PublishCandidate(&candidate, 0) == RENDER_RESULT_OK &&
+			texture.AcquireForSampling(&handle, 0) == RENDER_RESULT_OK &&
+			BeginPassFrame(product, false) == RENDER_RESULT_OK,
+			"texture barrier creates typed resource and opens actual production frame");
+		NativeW3DGpuContentLease lease;
+		if (route != 2)
+		{
+			result |= Check(product.Resources().CopyActiveColorTargetToTexture(handle.resource, &lease) == RENDER_RESULT_OK && lease.isValid(),
+				"copy rejection fixture starts with an actual valid stale lease");
+			InterlockedExchange(&control.copyCalls, 0);
+		}
+		if (fault == 3 || fault == 4)
+		{
+			// Shape and source compatibility are valid, but immutable content is
+			// rejected by the actual resource destination validator. Seed the
+			// non-null output with the compatible texture's real old GPU lease.
+			TextureDescriptor immutable = descriptor;
+			immutable.usage = RENDER_USAGE_IMMUTABLE;
+			NativeW3DTextureCandidate invalidCandidate;
+			result |= Check(invalidDestination.CreateCandidate(immutable, &data, 1, &invalidCandidate) == RENDER_RESULT_OK &&
+				invalidDestination.PublishCandidate(&invalidCandidate, 0) == RENDER_RESULT_OK &&
+				invalidDestination.AcquireForSampling(&invalidHandle, 0) == RENDER_RESULT_OK &&
+				product.Resources().ValidateTextureCopy(invalidHandle.resource) == RENDER_RESULT_UNSUPPORTED &&
+				product.Resources().DescribeTexture(invalidHandle.resource, &invalidBefore) == RENDER_RESULT_OK && lease.isValid(),
+				"non-null typed-copy fixture reaches actual immutable destination preflight with valid stale lease");
+		}
+		result |= Check(QueuePassTriangle(product, 501, 1, route == 2 ? handle.resource : GpuHandle()) == RENDER_RESULT_OK,
+			"texture barrier retains queued draw until the mutation boundary");
+		GpuHandle rigidVertex, rigidIndex;
+		if (fault >= 2)
+		{
+			const RenderResult rigidSetup = QueueBarrierRigidTriangle(product, &rigidVertex, &rigidIndex);
+			if (rigidSetup != RENDER_RESULT_OK || ReadCount(&control.drawCalls) != 0)
+				std::fprintf(stderr, "TEXTURE_RIGID_SETUP mode=%u route=%u fault=%u result=%d draws=%ld\n",
+					mode, route, fault, rigidSetup, ReadCount(&control.drawCalls));
+			result |= Check(rigidSetup == RENDER_RESULT_OK && ReadCount(&control.drawCalls) == 0,
+				"invalid-preflight fixture owns pending rigid and sorted work without backend draws");
+		}
+		NativeW3DTextureDescription before, after;
+		result |= Check(product.Resources().DescribeTexture(handle.resource, &before) == RENDER_RESULT_OK,
+			"texture barrier snapshots authority before mutation");
+		if (fault == 1) InterlockedExchange(&control.failDraw, 1);
+		RenderResult operation;
+		if (route == 0)
+		{
+			GameRenderCommand command = {};
+			command.type = GAME_RENDER_COMMAND_COPY_ACTIVE_TARGET_TO_TEXTURE;
+			const GpuHandle destination = fault == 4 ? invalidHandle.resource : handle.resource;
+			command.resource0.index = destination.index();
+			command.resource0.generation = destination.generation() + (fault == 2 ? 1 : 0);
+			command.output = &lease;
+			command.outputBytes = fault == 5 ? sizeof(lease) - 1 : sizeof(lease);
+			operation = product.ExecuteGameRenderCommand(command);
+		}
+		else if (route == 1)
+			operation = fault == 3 ? invalidDestination.CopyActiveColorTarget(&lease) :
+				texture.CopyActiveColorTarget(fault == 2 ? 0 : &lease);
+		else
+		{
+			TextureSubresourceData requested = data;
+			if (fault == 2) requested.rowPitch = 1;
+			pixels[0] = 99;
+			operation = texture.RefreshCpuContent(descriptor, &requested, 1);
+		}
+		// Drain the device packet only, never Native2 logical batches. This
+		// catches an erroneous asynchronous eager rigid flush before observing zero
+		// draws. RecordGameFailure is latched in NativeW3DRenderer, so this device
+		// fence is healthy; EndHiddenPass must still report the facade error below.
+		if (fault >= 2 && mode != 0)
+			result |= Check(DrainThreadedRenderDevice(device) == RENDER_RESULT_OK,
+				"invalid preflight device fence completes without activating pending logical draws");
+		// All backend observations are read after an owner fence. In the invalid
+		// request case inspect BEFORE the cleanup fence can flush retained work.
+		if (fault == 0)
+		{
+			const RenderResult finished = EndHiddenPass(product);
+			result |= Check(operation == RENDER_RESULT_OK && finished == RENDER_RESULT_OK &&
+				ReadCount(&control.drawCalls) == 1 &&
+				(route == 2 ? ReadCount(&control.refreshObservedDraws) == 1 :
+				 ReadCount(&control.copyObservedDraws) == 1 && lease.isValid()),
+				"queued sorted draw executes before backend copy/refresh in borrowed, serial and parallel lanes");
+		}
+		else
+		{
+			result |= Check(operation == (fault == 1 ? RENDER_RESULT_FAILED :
+				 (fault == 3 || fault == 4) ? RENDER_RESULT_UNSUPPORTED : RENDER_RESULT_INVALID_ARGUMENT) &&
+				((route == 1 && fault == 2) || fault == 5 ? lease.isValid() : !lease.isValid()) &&
+				ReadCount(&control.copyCalls) == 0 && ReadCount(&control.refreshCalls) == 0 &&
+				(fault < 2 || ReadCount(&control.drawCalls) == 0) &&
+				product.Resources().DescribeTexture(handle.resource, &after) == RENDER_RESULT_OK &&
+				after.authority == before.authority && after.authorityEpoch == before.authorityEpoch,
+				"failed barrier or invalid preflight publishes no lease or mutation; null output leaves caller lease untouched");
+			if (fault == 3 || fault == 4)
+			{
+				result |= Check(product.Resources().DescribeTexture(invalidHandle.resource, &invalidAfter) == RENDER_RESULT_OK &&
+					invalidAfter.authority == invalidBefore.authority && invalidAfter.authorityEpoch == invalidBefore.authorityEpoch &&
+					product.FlushGameSortedTriangles() == RENDER_RESULT_OK &&
+					EndHiddenPass(product) == (route == 0 ? RENDER_RESULT_UNSUPPORTED : RENDER_RESULT_OK) &&
+					ReadCount(&control.drawCalls) == 2 && ReadCount(&control.copyCalls) == 0,
+					"non-null invalid typed destination preserves authority and queued draw for normal owner cleanup in every lane");
+			}
+			else
+			{
+				InterlockedExchange(&control.failDraw, 0);
+				if (fault >= 2)
+					result |= Check(product.FlushGameSortedTriangles() == RENDER_RESULT_OK &&
+						EndHiddenPass(product) == (route == 0 ? RENDER_RESULT_INVALID_ARGUMENT : RENDER_RESULT_OK) &&
+						ReadCount(&control.drawCalls) == 2,
+						"invalid copy/refresh retains both accepted draws for ordinary cleanup");
+				else (void)EndHiddenPass(product);
+			}
+		}
+		result |= Check((!rigidVertex.isValid() || product.Resources().Destroy(rigidVertex)) &&
+			(!rigidIndex.isValid() || product.Resources().Destroy(rigidIndex)),
+			"invalid-preflight fixture releases rigid resource ownership after completion");
+		result |= Check(invalidDestination.Reset() == RENDER_RESULT_OK &&
+			texture.Reset() == RENDER_RESULT_OK && product.Shutdown() == RENDER_RESULT_OK,
+			"texture barrier releases retained allocation after isolated completion");
+	}
+	return result;
+}
+
 int TestSortedPassOwnershipCpu()
 {
 	int result = TestDeferredNativePassAdmissionsCpu();
@@ -1254,10 +1598,12 @@ int TestSortedPassOwnershipCpu()
 			copyData.data = &copyPixels[0]; copyData.rowPitch = copyDescriptor.width * 4;
 			copyData.slicePitch = copyPixels.size();
 			NativeW3DGpuContentLease oldCopyLease;
+			NativeW3DTextureHandle seededCopyHandle;
 			const int copySetupFailed = Check(copyOwner.CreateCandidate(copyDescriptor, &copyData, 1, &copyCandidate) == RENDER_RESULT_OK &&
 				copyOwner.PublishCandidate(&copyCandidate, 0) == RENDER_RESULT_OK &&
-				copyOwner.CopyActiveColorTarget(&oldCopyLease) == RENDER_RESULT_OK && oldCopyLease.isValid(),
-				"actual typed owner seeds a valid old copy lease before sorted failure");
+				copyOwner.AcquireForSampling(&seededCopyHandle, 0) == RENDER_RESULT_OK &&
+				product.Resources().CopyActiveColorTargetToTexture(seededCopyHandle.resource, &oldCopyLease) == RENDER_RESULT_OK && oldCopyLease.isValid(),
+				"resource-only seed preserves pending cohort for typed barrier failure test");
 			result |= copySetupFailed;
 			if (copySetupFailed != 0) return result;
 			unsigned char cpuPixels[64] = {};
@@ -3171,6 +3517,8 @@ int TestRawHandlesAcrossFreshBackends()
 
 int main(int argc, char **argv)
 {
+	if (argc == 2 && std::strcmp(argv[1], "--sorted-texture-barriers-cpu") == 0)
+		return TestSortedTextureBarriersCpu();
 	if (argc == 2 && std::strcmp(argv[1], "--sorted-pass-ownership-cpu") == 0)
 		return TestSortedPassOwnershipCpu();
 	char benchmark[2] = {0};
@@ -3178,6 +3526,7 @@ int main(int argc, char **argv)
 		sizeof(benchmark)) == 1 && benchmark[0] == '1')
 		return BenchmarkThreadedAdjacentBufferPublication();
 	int result = 0;
+	result |= TestSortedTextureBarriersCpu();
 	result |= TestSortedPassOwnershipCpu();
 	result |= TestBufferUpdatePreflight();
 	result |= TestCopyExecutionFailures();

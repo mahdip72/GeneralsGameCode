@@ -1748,18 +1748,53 @@ static void TestRenderedBattleNamedGeometryAndArenaRetention()
 		ProcessTestOptions().benchmarkProfile = profiles[i];
 		const RenderedBattleBenchmarkGeometry g = GetRenderedBattleBenchmarkGeometry();
 		const Bool mech = profiles[i] == BENCHMARK_PROFILE_MECHANIZED_512;
-		CHECK(g.gridStep == (mech ? 64 : 52) && g.extraOffset == (mech ? 32 : 26));
-		CHECK(g.bandStep == (mech ? 256 : 208));
-		CHECK(g.formationX == (mech ? 543 : 459) && g.formationY == (mech ? 512 : 416));
+		CHECK(g.gridStep == (mech ? 42 : 52) && g.extraOffset == (mech ? 21 : 26));
+		CHECK(g.bandStep == (mech ? 148 : 208));
+		CHECK(g.formationX == (mech ? 746 : 459) && g.formationY == (mech ? 278 : 416));
 		CHECK(g.insetX == g.formationX + 44 && g.insetY == g.formationY + 44);
 		CHECK(g.revealRadius == (mech ? 850 : 700));
-		// Conservatively cover even the full local-offset/footprint envelope.
-		CHECK(static_cast<double>(g.insetX) * g.insetX +
-			static_cast<double>(g.insetY) * g.insetY <=
-			static_cast<double>(g.revealRadius) * g.revealRadius);
-		// The production validator checks every pair with the largest admitted
-		// vehicle radius, not a reduced value selected from one live report.
-		CHECK(ValidateRenderedBattleBenchmarkNominalGeometry(21.0f, 10.0f));
+		if (mech)
+		{
+			// V2 min spacing42 admits radius19.5 at exact +3 equality; radius21
+			// still fails the unchanged pair gate (required45). Do not relax it.
+			CHECK(ValidateRenderedBattleBenchmarkNominalGeometry(19.5f, 10.0f));
+			CHECK(!ValidateRenderedBattleBenchmarkNominalGeometry(21.0f, 10.0f));
+			Int pairs = 0;
+			for (Int index = 0; index < 512; ++index)
+			{
+				const Int slot = index / 64, unit = index % 64;
+				Coord3D position;
+				CHECK(GetRenderedBattleDiagnosticOffset(slot, unit, &position, TRUE));
+				CHECK(position.x == (slot < 4 ? -1.0f : 1.0f) * (95.0f + 42.0f * (unit % 16) + 21.0f * ((unit / 16) % 2)));
+				CHECK(position.y == ((slot % 4) - 1.5f) * 148.0f + (unit / 16 - 1.5f) * 37.0f);
+				// Actual unit centers with every local-square corner, plus the full
+				// admitted21+1 footprint, fit reveal850. Rectangular inset corners
+				// include unrelated per-axis padding and are not reveal witnesses.
+				const double centerReach = static_cast<double>(g.revealRadius) - 22.0;
+				for (Int y = -1; y <= 1; y += 2)
+					for (Int x = -1; x <= 1; x += 2)
+					{
+						const double dx = position.x + x * 22.0, dy = position.y + y * 22.0;
+						CHECK(dx * dx + dy * dy <= centerReach * centerReach);
+					}
+				for (Int earlier = 0; earlier < index; ++earlier)
+				{
+					Coord3D previous;
+					CHECK(GetRenderedBattleDiagnosticOffset(earlier / 64, earlier % 64, &previous, TRUE));
+					CHECK(AreRenderedBattleDiagnosticPositionsSeparated(position, 19.5f, previous, 19.5f));
+					++pairs;
+				}
+			}
+			CHECK(pairs == 130816);
+		}
+		else
+		{
+			// Other profile geometry and its conservative original checks remain.
+			CHECK(static_cast<double>(g.insetX) * g.insetX +
+				static_cast<double>(g.insetY) * g.insetY <=
+				static_cast<double>(g.revealRadius) * g.revealRadius);
+			CHECK(ValidateRenderedBattleBenchmarkNominalGeometry(21.0f, 10.0f));
+		}
 		CHECK(GetRenderedBattleDiagnosticSearchCount(0, 0, 2.0f * g.insetX, 2.0f * g.insetY, TRUE) == 130);
 		Coord3D center;
 		CHECK(GetRenderedBattleDiagnosticSearchCenter(0, 0, 2.0f * g.insetX, 2.0f * g.insetY, 49, &center, TRUE));
@@ -1826,8 +1861,8 @@ static void TestRenderedBattleMechanizedRefinement()
 			if (GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, parentIndex, offset, &center))
 			{
 				++accepted;
-				CHECK(center.x >= 587 && center.x <= 3593);
-				CHECK(center.y >= 556 && center.y <= 3574);
+				CHECK(center.x >= 790 && center.x <= 3390);
+				CHECK(center.y >= 322 && center.y <= 3808);
 			}
 			else ++rejected;
 		}
@@ -1835,13 +1870,13 @@ static void TestRenderedBattleMechanizedRefinement()
 	// Independent inclusive-edge witnesses; a strict inset comparison must fail.
 	Coord3D boundary;
 	CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 49, 48, &boundary));
-	CHECK(boundary.x == 587 && boundary.y == 566);
+	CHECK(boundary.x == 790 && boundary.y == 332);
 	CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 49, 40, &boundary));
-	CHECK(boundary.x == 597 && boundary.y == 556);
+	CHECK(boundary.x == 800 && boundary.y == 322);
 	CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 129, 31, &boundary));
-	CHECK(boundary.x == 3593 && boundary.y == 3564);
+	CHECK(boundary.x == 3390 && boundary.y == 3798);
 	CHECK(GetRenderedBattleBenchmarkRefinementCenter(0, 0, 4180, 4130, 129, 39, &boundary));
-	CHECK(boundary.x == 3583 && boundary.y == 3574);
+	CHECK(boundary.x == 3380 && boundary.y == 3808);
 	struct GuardedCenter { Int before; Coord3D value; Int after; } guarded;
 	guarded.before = 123; guarded.after = 456;
 	guarded.value.x = 901; guarded.value.y = 902; guarded.value.z = 903;
@@ -1856,7 +1891,7 @@ static void TestRenderedBattleMechanizedRefinement()
 	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, 0, nullptr));
 	// Exact-fit envelope cannot admit a nonzero shift; outputs remain intact.
 	for (Int offset = 0; offset < 80; ++offset)
-		CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 1174, 1112, 49, offset, &guarded.value));
+		CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 1580, 644, 49, offset, &guarded.value));
 	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(1, 0, 0, 10000, 24, 0, &guarded.value));
 	ProcessTestOptions().benchmarkProfile = BENCHMARK_PROFILE_MECHANIZED_256;
 	CHECK(!GetRenderedBattleBenchmarkRefinementCenter(0, 0, 10000, 10000, 24, 0, &guarded.value));
@@ -1876,8 +1911,69 @@ static void TestRenderedBattleMechanizedRefinement()
 	ProcessTestOptions() = saved;
 }
 
+static void TestRenderedBattleMapDescriptorContract()
+{
+	using namespace rts::rendered_battle;
+	const TestOptions saved = ProcessTestOptions();
+	const BenchmarkProfile profiles[] = {
+		BENCHMARK_PROFILE_LEGACY_512, BENCHMARK_PROFILE_COMBINED_ARMS_256,
+		BENCHMARK_PROFILE_COMBINED_ARMS_512, BENCHMARK_PROFILE_MECHANIZED_256,
+		BENCHMARK_PROFILE_MECHANIZED_512, BENCHMARK_PROFILE_INFANTRY_LINE_256,
+		BENCHMARK_PROFILE_INFANTRY_LINE_512
+	};
+	const SkirmishAITestScenario scenarios[] = {
+		SKIRMISH_AI_TEST_SCENARIO_4V3, SKIRMISH_AI_TEST_SCENARIO_4V2,
+		SKIRMISH_AI_TEST_SCENARIO_PRACTICAL_1V7, SKIRMISH_AI_TEST_SCENARIO_HARD_AI_2V6,
+		SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC,
+		SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK
+	};
+	for (UnsignedInt p = 0; p < ARRAY_SIZE(profiles); ++p)
+	{
+		ProcessTestOptions().benchmarkProfile = profiles[p];
+		for (UnsignedInt s = 0; s < ARRAY_SIZE(scenarios); ++s)
+		{
+			const Bool mech = scenarios[s] == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK &&
+				profiles[p] == BENCHMARK_PROFILE_MECHANIZED_512;
+			const Bool diagnostic = scenarios[s] == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC ||
+				scenarios[s] == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK;
+			const RenderedBattleDiagnosticMapDescriptor map = GetRenderedBattleDiagnosticMapDescriptor(scenarios[s]);
+			CHECK(strcmp(map.mapName, mech ? "Maps\\R2 Mechanized Arena\\R2 Mechanized Arena.map" : diagnostic ?
+				"Maps\\Fortress Avalanche\\Fortress Avalanche.map" : "Maps\\Twilight Flame\\Twilight Flame.map") == 0);
+			CHECK(strcmp(map.diagnosticToken, mech ? "R2_Mechanized_Arena" : diagnostic ? "Fortress_Avalanche" : "Twilight_Flame") == 0);
+			CHECK(strcmp(map.unavailableReason, mech ? "r2_mechanized_arena_unavailable" : diagnostic ?
+				"fortress_avalanche_unavailable" : "twilight_flame_unavailable") == 0);
+			CHECK(map.requiredCRC == (mech ? 0xB5AAEB44u : 0u));
+			CHECK(map.requiredBytes == (mech ? 3021429u : 0u));
+			SkirmishAITestPlan plan;
+			BuildSkirmishAITestPlan(637808953, scenarios[s], &plan);
+			CHECK(strcmp(plan.mapName, map.mapName) == 0 && plan.seed == 637808953);
+			CHECK(IsRenderedBattleDiagnosticMapCacheIdentityValid(scenarios[s], 0xB5AAEB44u, 3021429u));
+			CHECK(IsRenderedBattleDiagnosticMapCacheIdentityValid(scenarios[s], 0u, 0u) == !mech);
+			CHECK(IsRenderedBattleDiagnosticMapCacheIdentityValid(scenarios[s], 0xFFFFFFFFu, 0xFFFFFFFFu) == !mech);
+			if (mech)
+			{
+				// Failed stock Iron Dragon evidence cannot satisfy the new fixture.
+				CHECK(!IsRenderedBattleDiagnosticMapCacheIdentityValid(scenarios[s], 0x6541B363u, 306186u));
+				CHECK(!IsRenderedBattleDiagnosticMapCacheIdentityValid(scenarios[s], 0xB5AAEB43u, 3021429u));
+				CHECK(!IsRenderedBattleDiagnosticMapCacheIdentityValid(scenarios[s], 0xB5AAEB45u, 3021429u));
+				CHECK(!IsRenderedBattleDiagnosticMapCacheIdentityValid(scenarios[s], 0xB5AAEB44u, 3021428u));
+				CHECK(!IsRenderedBattleDiagnosticMapCacheIdentityValid(scenarios[s], 0xB5AAEB44u, 3021430u));
+			}
+			CHECK(ProcessTestOptions().benchmarkProfile == profiles[p]);
+		}
+	}
+	ProcessTestOptions().benchmarkProfile = static_cast<BenchmarkProfile>(-1);
+	CHECK(strcmp(GetRenderedBattleDiagnosticMapDescriptor(SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK).diagnosticToken,
+		"Fortress_Avalanche") == 0);
+	ProcessTestOptions().benchmarkProfile = BENCHMARK_PROFILE_MECHANIZED_512;
+	CHECK(strcmp(GetRenderedBattleDiagnosticMapDescriptor(static_cast<SkirmishAITestScenario>(-1)).diagnosticToken,
+		"Twilight_Flame") == 0);
+	ProcessTestOptions() = saved;
+}
+
 static void TestRenderedBattleDiagnosticContract()
 {
+	TestRenderedBattleMapDescriptorContract();
 	TestRenderedBattleProfileObjectNames();
 	TestRenderedBattleNamedGeometryAndArenaRetention();
 	TestRenderedBattleMechanizedRefinement();
@@ -1989,6 +2085,20 @@ static void TestRenderedBattleDiagnosticContract()
 		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
 	CHECK(chosen[0] == 1 && chosen[1] == 0 && chosen[2] == 0 && placementStats.backtracks > 0);
 
+	// Root-only exact AC proves this forced chain impossible before any DFS
+	// assignment. The caller's original masks and sentinel choices are immutable.
+	memset(domainPositions, 0, sizeof(domainPositions));
+	domainPositions[10].x = 60.0f; domainPositions[19].x = 60.0f;
+	for (Int index = 0; index < 3; ++index) { domainRadii[index] = 10.0f; chosen[index] = -7; }
+	domainMasks[0] = 1u; domainMasks[1] = 3u; domainMasks[2] = 2u;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(3, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_UNSATISFIABLE);
+	CHECK(placementStats.assignments == 0 && placementStats.backtracks == 0 && placementStats.maxAssigned == 0);
+	CHECK(placementStats.emptyDomains == 0 && placementStats.pairComparisons > 0);
+	CHECK(domainMasks[0] == 1u && domainMasks[1] == 3u && domainMasks[2] == 2u);
+	CHECK(chosen[0] == -7 && chosen[1] == -7 && chosen[2] == -7);
+	// Reestablish the following coincident-singleton fixture explicitly.
+	memset(domainPositions, 0, sizeof(domainPositions));
 	for (Int index = 0; index < 512; ++index) chosen[index] = -7;
 	domainMasks[0] = domainMasks[1] = 1u; // coincident singletons: proven unsatisfiable
 	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
@@ -2022,6 +2132,22 @@ static void TestRenderedBattleDiagnosticContract()
 	CHECK(SolveRenderedBattleBenchmarkPlacement(2, nullptr, domainRadii, domainMasks,
 		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_INVALID);
 
+	// Exact radius-plus-three equality is safe to skip; a nearby lower float
+	// must still execute the exact predicate and remain unsatisfiable.
+	memset(domainPositions, 0, sizeof(domainPositions));
+	domainRadii[0] = domainRadii[1] = 21.0f;
+	domainMasks[0] = domainMasks[1] = 1u;
+	domainPositions[9].x = 45.0f;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
+	CHECK(chosen[0] == 0 && chosen[1] == 0 && placementStats.pairComparisons == 0);
+	CHECK(AreRenderedBattleDiagnosticPositionsSeparated(domainPositions[0], 21.0f, domainPositions[9], 21.0f));
+	domainPositions[9].x = 45.0f - 0.00001f;
+	chosen[0] = chosen[1] = -7;
+	CHECK(SolveRenderedBattleBenchmarkPlacement(2, domainPositions, domainRadii, domainMasks,
+		1000, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_UNSATISFIABLE);
+	CHECK(placementStats.pairComparisons > 0 && chosen[0] == -7 && chosen[1] == -7);
+
 	// All 512 actual canonical indices, with the conservative nominal gate.
 	// A solver may plan in any order but must return the original roster order.
 	for (Int index = 0; index < 512; ++index)
@@ -2034,7 +2160,8 @@ static void TestRenderedBattleDiagnosticContract()
 	CHECK(SolveRenderedBattleBenchmarkPlacement(512, domainPositions, domainRadii, domainMasks,
 		RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_SOLVED);
 	CHECK(placementStats.maxAssigned == 512 && placementStats.assignments == 512 &&
-		placementStats.pairComparisons == 130816 &&
+		placementStats.pairComparisons >= 0 && placementStats.pairComparisons < 130816 &&
+		placementStats.operations >= 130816 + 512 + 512 + 2 &&
 		placementStats.operations < RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS);
 	for (Int index = 0; index < 512; ++index)
 	{
@@ -2067,6 +2194,36 @@ static void TestRenderedBattleDiagnosticContract()
 		completedOperations - 1, chosen, &placementStats) == RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED);
 	CHECK(placementStats.operations == completedOperations - 1);
 	for (Int index = 0; index < 512; ++index) CHECK(chosen[index] == -7);
+
+	// The actual public scheduling helper permutes full512 units without duplicate
+	// query groups; canonical storage bytes and query accounting survive reordering.
+	UnsignedInt canonicalUnary[512 * 9], reorderedUnary[512 * 9];
+	for (Int cell = 0; cell < 512 * 9; ++cell) canonicalUnary[cell] = static_cast<UnsignedInt>(cell + 1);
+	const Int unaryHints[] = {-3, -1, 0, 1, 255, 511, 512, 700};
+	for (Int hintCase = 0; hintCase < 8; ++hintCase)
+	{
+		Int visits[512] = {0}; Int queries = 0;
+		memset(reorderedUnary, 0, sizeof(reorderedUnary));
+		for (Int rank = 0; rank < 512; ++rank)
+		{
+			const Int index = GetRenderedBattleBenchmarkRefinementUnaryUnit(rank, 512, unaryHints[hintCase]);
+			CHECK(index >= 0 && index < 512); if (index < 0 || index >= 512) continue;
+			++visits[index]; CHECK(CanRenderedBattleBenchmarkRefinementQuery(queries, 9));
+			for (Int trial = 0; trial < 9; ++trial) { ++queries; reorderedUnary[index * 9 + trial] = canonicalUnary[index * 9 + trial]; }
+		}
+		CHECK(queries == 4608 && memcmp(canonicalUnary, reorderedUnary, sizeof(canonicalUnary)) == 0);
+		for (Int index = 0; index < 512; ++index) CHECK(visits[index] == 1);
+		if (unaryHints[hintCase] >= 0 && unaryHints[hintCase] < 512)
+			CHECK(GetRenderedBattleBenchmarkRefinementUnaryUnit(0, 512, unaryHints[hintCase]) == unaryHints[hintCase]);
+		else for (Int rank = 0; rank < 512; ++rank) CHECK(GetRenderedBattleBenchmarkRefinementUnaryUnit(rank, 512, unaryHints[hintCase]) == rank);
+	}
+	CHECK(GetRenderedBattleBenchmarkRefinementUnaryUnit(-1, 512, 0) == -1);
+	CHECK(GetRenderedBattleBenchmarkRefinementUnaryUnit(512, 512, 0) == -1);
+	CHECK(GetRenderedBattleBenchmarkRefinementUnaryUnit(0, 0, 0) == -1);
+	CHECK(GetRenderedBattleBenchmarkRefinementUnaryUnit(0, 513, 0) == -1);
+	CHECK(GetRenderedBattleBenchmarkRefinementUnaryUnit(0, 1, 0) == 0);
+	CHECK(CanRenderedBattleBenchmarkRefinementQuery(4000000 - 9, 9));
+	CHECK(!CanRenderedBattleBenchmarkRefinementQuery(4000000 - 8, 9));
 
 	CHECK(RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS == 16000000 &&
 		RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS == 4000000);

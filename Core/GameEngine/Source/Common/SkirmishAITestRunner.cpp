@@ -3989,16 +3989,47 @@ const char *GetRenderedBattleDiagnosticFactionName(Int slot)
 	return slot >= 0 && slot < SKIRMISH_AI_TEST_SLOT_COUNT ? names[slot % 4] : nullptr;
 }
 
+RenderedBattleDiagnosticMapDescriptor GetRenderedBattleDiagnosticMapDescriptor(SkirmishAITestScenario scenario)
+{
+	const RenderedBattleDiagnosticMapDescriptor mechanizedArena = {
+		"Maps\\R2 Mechanized Arena\\R2 Mechanized Arena.map", "R2_Mechanized_Arena", "r2_mechanized_arena_unavailable",
+		0xB5AAEB44u, 3021429u
+	};
+	const RenderedBattleDiagnosticMapDescriptor fortress = {
+		"Maps\\Fortress Avalanche\\Fortress Avalanche.map", "Fortress_Avalanche", "fortress_avalanche_unavailable",
+		0u, 0u
+	};
+	const RenderedBattleDiagnosticMapDescriptor twilight = {
+		"Maps\\Twilight Flame\\Twilight Flame.map", "Twilight_Flame", "twilight_flame_unavailable",
+		0u, 0u
+	};
+	if (scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK &&
+		rts::rendered_battle::ProcessTestOptions().benchmarkProfile ==
+			rts::rendered_battle::BENCHMARK_PROFILE_MECHANIZED_512) return mechanizedArena;
+	if (scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_DIAGNOSTIC ||
+		scenario == SKIRMISH_AI_TEST_SCENARIO_RENDERED_BATTLE_BENCHMARK) return fortress;
+	return twilight;
+}
+
+Bool IsRenderedBattleDiagnosticMapCacheIdentityValid(SkirmishAITestScenario scenario,
+	UnsignedInt crc, UnsignedInt bytes)
+{
+	const RenderedBattleDiagnosticMapDescriptor map = GetRenderedBattleDiagnosticMapDescriptor(scenario);
+	return (map.requiredCRC == 0u && map.requiredBytes == 0u) ||
+		(crc == map.requiredCRC && bytes == map.requiredBytes);
+}
+
 RenderedBattleBenchmarkGeometry GetRenderedBattleBenchmarkGeometry()
 {
 	RenderedBattleBenchmarkGeometry geometry = { 52, 26, 208, 459, 416, 503, 460, 700 };
 	if (rts::rendered_battle::ProcessTestOptions().benchmarkProfile ==
 		rts::rendered_battle::BENCHMARK_PROFILE_MECHANIZED_512)
 	{
-		// Two vehicle lattices require diagonal clearance for admitted radius21.
-		geometry.gridStep = 64; geometry.extraOffset = 32; geometry.bandStep = 256;
-		geometry.formationX = 543; geometry.formationY = 512;
-		geometry.insetX = 587; geometry.insetY = 556; geometry.revealRadius = 850;
+		// ME512 rectangular fixture v2: sixteen columns x four staggered rows.
+		// Row step is 37 (distinct from gridStep); bandStep also moves attack goals.
+		geometry.gridStep = 42; geometry.extraOffset = 21; geometry.bandStep = 148;
+		geometry.formationX = 746; geometry.formationY = 278;
+		geometry.insetX = 790; geometry.insetY = 322; geometry.revealRadius = 850;
 	}
 	return geometry;
 }
@@ -4049,8 +4080,19 @@ Bool GetRenderedBattleDiagnosticOffset(Int slot, Int unit, Coord3D *offset, Bool
 		unit >= unitsPerPlayer) return FALSE;
 	if (benchmark)
 	{
-		// Preserve the legacy layout except mechanized512, whose extra vehicles
-		// require grid64/diagonal32/bands256 to retain radius21 +3 clearance.
+		if (rts::rendered_battle::ProcessTestOptions().benchmarkProfile ==
+			rts::rendered_battle::BENCHMARK_PROFILE_MECHANIZED_512)
+		{
+			const Int row = unit / 16, column = unit % 16;
+			const Int rowStep = 37;
+			const RenderedBattleBenchmarkGeometry geometry = GetRenderedBattleBenchmarkGeometry();
+			offset->x = (slot < 4 ? -1.0f : 1.0f) * (95.0f +
+				geometry.gridStep * column + geometry.extraOffset * (row % 2));
+			offset->y = ((slot % 4) - 1.5f) * geometry.bandStep + (row - 1.5f) * rowStep;
+			offset->z = 0.0f;
+			return TRUE;
+		}
+		// Other benchmark profiles keep the existing layout exactly.
 		const Bool extra = unit >= RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
 		const Int withinGroup = unit % RENDERED_BATTLE_DIAGNOSTIC_UNITS_PER_PLAYER;
 		offset->x = (slot < 4 ? -1.0f : 1.0f) * (95.0f +
@@ -4167,10 +4209,76 @@ Bool GetRenderedBattleBenchmarkRefinementCenter(Real loX, Real loY, Real hiX, Re
 	return TRUE;
 }
 
+enum
+{
+	RENDERED_BATTLE_BENCHMARK_MAPWIDE_COLUMNS = 100,
+	RENDERED_BATTLE_BENCHMARK_MAPWIDE_ROWS = 104,
+	RENDERED_BATTLE_BENCHMARK_MAPWIDE_CANDIDATES =
+		RENDERED_BATTLE_BENCHMARK_MAPWIDE_COLUMNS * RENDERED_BATTLE_BENCHMARK_MAPWIDE_ROWS,
+	RENDERED_BATTLE_BENCHMARK_REFINEMENT_COMBINED_CANDIDATE_CAP = 20800
+};
+
+Bool GetRenderedBattleBenchmarkMapWideCenter(Real loX, Real loY, Real hiX, Real hiY,
+	Int candidate, Coord3D *center)
+{
+	if (!center || !IsRenderedBattleBenchmarkRefinementEligible(TRUE) || candidate < 0 ||
+		candidate >= RENDERED_BATTLE_BENCHMARK_MAPWIDE_CANDIDATES) return FALSE;
+	if (!(loX >= -FLT_MAX && loX <= FLT_MAX && loY >= -FLT_MAX && loY <= FLT_MAX &&
+		hiX >= -FLT_MAX && hiX <= FLT_MAX && hiY >= -FLT_MAX && hiY <= FLT_MAX &&
+		loX <= hiX && loY <= hiY)) return FALSE;
+
+	const RenderedBattleBenchmarkGeometry geometry = GetRenderedBattleBenchmarkGeometry();
+	const double safeLoX = static_cast<double>(loX) + geometry.insetX;
+	const double safeHiX = static_cast<double>(hiX) - geometry.insetX;
+	const double safeLoY = static_cast<double>(loY) + geometry.insetY;
+	const double safeHiY = static_cast<double>(hiY) - geometry.insetY;
+	const double spanX = safeHiX - safeLoX;
+	const double spanY = safeHiY - safeLoY;
+	if (!(spanX > 0.0 && spanY > 0.0)) return FALSE;
+
+	// Reject envelopes whose Real precision cannot represent distinct lattice
+	// points. This keeps the generated finite grid unique without a second buffer.
+	double magnitudeX = fabs(safeLoX);
+	if (fabs(safeHiX) > magnitudeX) magnitudeX = fabs(safeHiX);
+	double magnitudeY = fabs(safeLoY);
+	if (fabs(safeHiY) > magnitudeY) magnitudeY = fabs(safeHiY);
+	if (!(spanX / (RENDERED_BATTLE_BENCHMARK_MAPWIDE_COLUMNS - 1) >
+		2.0 * FLT_EPSILON * magnitudeX &&
+		spanY / (RENDERED_BATTLE_BENCHMARK_MAPWIDE_ROWS - 1) >
+		2.0 * FLT_EPSILON * magnitudeY)) return FALSE;
+
+	const Int column = candidate % RENDERED_BATTLE_BENCHMARK_MAPWIDE_COLUMNS;
+	const Int row = candidate / RENDERED_BATTLE_BENCHMARK_MAPWIDE_COLUMNS;
+	Coord3D result;
+	result.x = static_cast<Real>(safeLoX + spanX * column /
+		(RENDERED_BATTLE_BENCHMARK_MAPWIDE_COLUMNS - 1));
+	result.y = static_cast<Real>(safeLoY + spanY * row /
+		(RENDERED_BATTLE_BENCHMARK_MAPWIDE_ROWS - 1));
+	if (!(result.x >= -FLT_MAX && result.x <= FLT_MAX &&
+		result.y >= -FLT_MAX && result.y <= FLT_MAX &&
+		static_cast<double>(result.x) >= safeLoX &&
+		static_cast<double>(result.x) <= safeHiX &&
+		static_cast<double>(result.y) >= safeLoY &&
+		static_cast<double>(result.y) <= safeHiY)) return FALSE;
+	result.z = 0.0f;
+	*center = result;
+	return TRUE;
+}
+
 Bool CanRenderedBattleBenchmarkRefinementQuery(Int used, Int queries)
 {
 	return used >= 0 && queries > 0 && queries <= RENDERED_BATTLE_BENCHMARK_REFINEMENT_UNARY_CAP &&
 		used <= RENDERED_BATTLE_BENCHMARK_REFINEMENT_UNARY_CAP - queries;
+}
+
+Int GetRenderedBattleBenchmarkRefinementUnaryUnit(Int rank, Int unitCount, Int previousEmptyUnit)
+{
+	if (unitCount <= 0 || unitCount > 8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER) return -1;
+	if (rank < 0 || rank >= unitCount) return -1;
+	if (previousEmptyUnit < 0 || previousEmptyUnit >= unitCount) return rank;
+	if (rank == 0) return previousEmptyUnit;
+	const Int index = rank - 1;
+	return index >= previousEmptyUnit ? index + 1 : index;
 }
 
 Bool GetRenderedBattleDiagnosticLocalOffset(Int slot, Int trial, Coord3D *offset)
@@ -4249,6 +4357,160 @@ Bool ValidateRenderedBattleBenchmarkNominalGeometry(Real vehicleRadius, Real inf
 	return ValidateRenderedBattleBenchmarkNominalGeometry(templateRadii);
 }
 
+// Named non-local type keeps the cache compatible with C++98 templates.
+struct RenderedBattlePlacementDomainBounds { double minX, maxX, minY, maxY; };
+
+// A root-only rejection proof. Consistent reduced masks are discarded; the
+// original DFS retains its canonical MRV ties, trial order and returned choices.
+enum RenderedBattlePlacementArcResult
+{
+	RB_PLACEMENT_ARC_CONTINUE, RB_PLACEMENT_ARC_UNSATISFIABLE,
+	RB_PLACEMENT_ARC_BUDGET_EXHAUSTED, RB_PLACEMENT_ARC_INVALID
+};
+
+struct RenderedBattlePlacementArcStorage
+{
+	Int *starts, *neighbors, *queue;
+	UnsignedInt *masks;
+	unsigned short *supports;
+	unsigned char *queued;
+	RenderedBattlePlacementArcStorage()
+		: starts(NULL), neighbors(NULL), queue(NULL), masks(NULL), supports(NULL), queued(NULL) {}
+	~RenderedBattlePlacementArcStorage()
+	{
+		free(starts); free(neighbors); free(queue); free(masks); free(supports); free(queued);
+	}
+private:
+	RenderedBattlePlacementArcStorage(const RenderedBattlePlacementArcStorage &);
+	RenderedBattlePlacementArcStorage &operator=(const RenderedBattlePlacementArcStorage &);
+};
+
+static Bool ChargeRenderedBattlePlacementArcStep(Int operationBudget,
+	RenderedBattleBenchmarkPlacementStats *stats)
+{
+	if (stats->operations >= operationBudget) return FALSE;
+	++stats->operations;
+	return TRUE;
+}
+
+static RenderedBattlePlacementArcResult RejectRenderedBattlePlacementRootArcInconsistency(
+	Int unitCount, const Coord3D *domains, const Real *radii, const UnsignedInt *domainMasks,
+	const unsigned char *interacts, Int operationBudget, RenderedBattleBenchmarkPlacementStats *stats)
+{
+	// Caller already validated 1..512 units and all original active input values.
+	// Size products are bounded by 512*511 directed arcs and nine 9-bit rows.
+	const Int trials = RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT;
+	RenderedBattlePlacementArcStorage storage;
+	if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+	storage.starts = static_cast<Int *>(malloc(static_cast<size_t>(unitCount + 1) * sizeof(Int)));
+	if (!storage.starts) return RB_PLACEMENT_ARC_INVALID;
+	Int arcCount = 0;
+	for (Int unit = 0; unit < unitCount; ++unit)
+	{
+		if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+		storage.starts[unit] = arcCount;
+		for (Int other = 0; other < unitCount; ++other)
+		{
+			if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+			if (interacts[unit * unitCount + other]) ++arcCount;
+		}
+	}
+	if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+	storage.starts[unitCount] = arcCount;
+	if (!arcCount) return RB_PLACEMENT_ARC_CONTINUE;
+	if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+	storage.neighbors = static_cast<Int *>(malloc(static_cast<size_t>(arcCount) * sizeof(Int)));
+	if (!storage.neighbors) return RB_PLACEMENT_ARC_INVALID;
+	if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+	storage.supports = static_cast<unsigned short *>(malloc(static_cast<size_t>(arcCount) * trials * sizeof(unsigned short)));
+	if (!storage.supports) return RB_PLACEMENT_ARC_INVALID;
+	if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+	storage.masks = static_cast<UnsignedInt *>(malloc(static_cast<size_t>(unitCount) * sizeof(UnsignedInt)));
+	if (!storage.masks) return RB_PLACEMENT_ARC_INVALID;
+	if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+	storage.queue = static_cast<Int *>(malloc(static_cast<size_t>(unitCount) * sizeof(Int)));
+	if (!storage.queue) return RB_PLACEMENT_ARC_INVALID;
+	if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+	storage.queued = static_cast<unsigned char *>(malloc(static_cast<size_t>(unitCount) * sizeof(unsigned char)));
+	if (!storage.queued) return RB_PLACEMENT_ARC_INVALID;
+	for (Int unit = 0; unit < unitCount; ++unit)
+	{
+		Int arc = storage.starts[unit];
+		for (Int other = 0; other < unitCount; ++other)
+		{
+			if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+			if (!interacts[unit * unitCount + other]) continue;
+			if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+			storage.neighbors[arc] = other;
+			for (Int trial = 0; trial < trials; ++trial)
+			{
+				if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+				storage.supports[arc * trials + trial] = 0;
+			}
+			// Both directed rows are computed independently with the exact helper.
+			// Inactive values never become support bits; no partial table is used.
+			for (Int trial = 0; trial < trials; ++trial)
+				if (domainMasks[unit] & (1u << trial))
+					for (Int value = 0; value < trials; ++value)
+						if (domainMasks[other] & (1u << value))
+						{
+							if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+							++stats->pairComparisons;
+							if (AreRenderedBattleDiagnosticPositionsSeparated(domains[unit * trials + trial], radii[unit],
+								domains[other * trials + value], radii[other]))
+								storage.supports[arc * trials + trial] |= static_cast<unsigned short>(1u << value);
+						}
+			++arc;
+		}
+	}
+	Int head = 0, tail = 0, pending = 0;
+	for (Int unit = 0; unit < unitCount; ++unit)
+	{
+		if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+		storage.masks[unit] = domainMasks[unit];
+		if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+		storage.queued[unit] = 0;
+		if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+		storage.queue[tail] = unit; storage.queued[unit] = 1; ++pending;
+		if (++tail == unitCount) tail = 0;
+	}
+	while (pending)
+	{
+		if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+		const Int unit = storage.queue[head];
+		if (++head == unitCount) head = 0;
+		--pending; storage.queued[unit] = 0;
+		Bool changed = FALSE;
+		for (Int arc = storage.starts[unit]; arc < storage.starts[unit + 1]; ++arc)
+		{
+			if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+			const Int other = storage.neighbors[arc];
+			for (Int trial = 0; trial < trials; ++trial)
+				if (storage.masks[unit] & (1u << trial))
+				{
+					if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+					if (storage.supports[arc * trials + trial] & storage.masks[other]) continue;
+					if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+					storage.masks[unit] &= ~(1u << trial); changed = TRUE;
+					if (!storage.masks[unit]) return RB_PLACEMENT_ARC_UNSATISFIABLE;
+				}
+		}
+		if (changed)
+			for (Int arc = storage.starts[unit]; arc < storage.starts[unit + 1]; ++arc)
+			{
+				if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+				const Int other = storage.neighbors[arc];
+				if (storage.queued[other]) continue;
+				if (!ChargeRenderedBattlePlacementArcStep(operationBudget, stats)) return RB_PLACEMENT_ARC_BUDGET_EXHAUSTED;
+				if (pending >= unitCount) return RB_PLACEMENT_ARC_INVALID;
+				storage.queue[tail] = other; storage.queued[other] = 1; ++pending;
+				if (++tail == unitCount) tail = 0;
+			}
+	}
+	return RB_PLACEMENT_ARC_CONTINUE;
+}
+
+
 RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
 	Int unitCount, const Coord3D *domains, const Real *radii, const UnsignedInt *domainMasks,
 	Int operationBudget, Int *choices, RenderedBattleBenchmarkPlacementStats *stats)
@@ -4275,6 +4537,55 @@ RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
 	if (stats->emptyDomains) return RB_BENCHMARK_PLACEMENT_EMPTY_DOMAIN;
 	try
 	{
+		// Original active domains bound every later mask, including backtracks.
+		// A separated interval on either axis proves all point pairs satisfy +3;
+		// overlapping boxes remain uncertain and use the exact point predicate.
+		// Count each bounded allocation/setup before executing it, then every
+		// unit/active-point bound step and every pair-table classification below.
+		if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+		++stats->operations;
+		std::vector<RenderedBattlePlacementDomainBounds> bounds(unitCount);
+		if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+		++stats->operations;
+		std::vector<unsigned char> interacts(unitCount * unitCount, 0);
+		for (Int unit = 0; unit < unitCount; ++unit)
+		{
+			if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+			++stats->operations;
+			Int first = 0;
+			while (!(domainMasks[unit] & (1u << first))) ++first;
+			RenderedBattlePlacementDomainBounds &box = bounds[unit];
+			box.minX = box.maxX = domains[unit * trials + first].x;
+			box.minY = box.maxY = domains[unit * trials + first].y;
+			for (Int value = 0; value < trials; ++value)
+				if (domainMasks[unit] & (1u << value))
+				{
+					if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+					++stats->operations;
+					const Coord3D &point = domains[unit * trials + value];
+					if (point.x < box.minX) box.minX = point.x;
+					if (point.x > box.maxX) box.maxX = point.x;
+					if (point.y < box.minY) box.minY = point.y;
+					if (point.y > box.maxY) box.maxY = point.y;
+				}
+		}
+		for (Int unit = 0; unit < unitCount; ++unit)
+			for (Int other = 0; other < unit; ++other)
+			{
+				if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+				++stats->operations;
+				const RenderedBattlePlacementDomainBounds &a = bounds[unit], &b = bounds[other];
+				const double separation = static_cast<double>(radii[unit]) + radii[other] + 3.0;
+				const Bool safe = b.minX - a.maxX >= separation || a.minX - b.maxX >= separation ||
+					b.minY - a.maxY >= separation || a.minY - b.maxY >= separation;
+				interacts[unit * unitCount + other] = interacts[other * unitCount + unit] = safe ? 0 : 1;
+			}
+		const RenderedBattlePlacementArcResult arcResult = RejectRenderedBattlePlacementRootArcInconsistency(
+			unitCount, domains, radii, domainMasks, &interacts[0], operationBudget, stats);
+		if (arcResult == RB_PLACEMENT_ARC_UNSATISFIABLE) return RB_BENCHMARK_PLACEMENT_UNSATISFIABLE;
+		if (arcResult == RB_PLACEMENT_ARC_BUDGET_EXHAUSTED) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
+		if (arcResult == RB_PLACEMENT_ARC_INVALID) return RB_BENCHMARK_PLACEMENT_INVALID;
+		// The private root-AC masks are gone; use untouched original domains below.
 		// Heap snapshots avoid recursion and a large owner-thread stack.
 		// A parent mask retains tried values removed; child pruning is discarded
 		// on backtrack. No choice reaches the caller before all units are solved.
@@ -4328,6 +4639,7 @@ RenderedBattleBenchmarkPlacementResult SolveRenderedBattleBenchmarkPlacement(
 				if (stats->operations >= operationBudget) return RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED;
 				++stats->operations; next[other] = current[other];
 				if (picked[other] >= 0) continue;
+				if (!interacts[unit * unitCount + other]) continue;
 				for (Int value = 0; value < trials; ++value)
 					if (next[other] & (1u << value))
 					{
@@ -4444,6 +4756,9 @@ struct RenderedBattleDiagnosticState
 	const char *completionReason, *setupFailure;
 	char report[32768], reportPath[MAX_PATH], reportPendingPath[MAX_PATH], suppliedSourceHash[65];
 	UnsignedInt reportBytes, reportRecords;
+	std::vector<char> solverTrace;
+	UnsignedInt solverTraceBytes;
+	const char *solverTraceUnavailable;
 	Bool reportFailed;
 	HANDLE reportFile;
 	RenderedBattleDiagnosticState() : reportFile(INVALID_HANDLE_VALUE) { reset(); }
@@ -4470,6 +4785,8 @@ struct RenderedBattleDiagnosticState
 		memset(ids, 0, sizeof(ids));
 		report[0] = reportPath[0] = reportPendingPath[0] = suppliedSourceHash[0] = '\0';
 		reportBytes = reportRecords = 0; reportFailed = FALSE;
+		std::vector<char> emptyTrace; emptyTrace.swap(solverTrace);
+		solverTraceBytes = 0; solverTraceUnavailable = NULL;
 	}
 } s_renderedBattle;
 
@@ -4490,6 +4807,173 @@ void RecordRenderedBattleDiagnostic(const char *format, ...)
 	}
 	++s_renderedBattle.reportRecords;
 	printf("%s", line);
+}
+
+
+// Failure-only, bounded solver-input capture. The ordinary report formatter and
+// its limits remain unchanged. Four payloads plus one context consume five of
+// the existing 32 records; the published footer still uses the final record.
+UnsignedInt RenderedBattleSolverTraceBits(Real value)
+{
+	UnsignedInt bits = 0;
+	memcpy(&bits, &value, sizeof(bits));
+	return bits;
+}
+
+Bool AppendRenderedBattleSolverTraceSnapshot(const char *line, Int bytes)
+{
+	if (!line || bytes <= 0 || bytes >= 4096 || s_renderedBattle.solverTrace.size() != 20480 ||
+		!AppendRenderedBattleDiagnosticReportRecord(&s_renderedBattle.solverTrace[0],
+			20480, &s_renderedBattle.solverTraceBytes, line, static_cast<UnsignedInt>(bytes)))
+	{
+		s_renderedBattle.solverTraceBytes = 0;
+		s_renderedBattle.solverTraceUnavailable = "snapshot_format_unavailable";
+		return FALSE;
+	}
+	return TRUE;
+}
+
+void EmitRenderedBattleSolverTraceSnapshot()
+{
+	if (!s_renderedBattle.solverTraceBytes && !s_renderedBattle.solverTraceUnavailable) return;
+	// All ordinary summaries and terminal failure records have already been
+	// recorded. Reserve the direct-file footer's maximum256 bytes as well.
+	const UnsignedInt footerReserve = 256;
+	const UnsignedInt remaining = sizeof(s_renderedBattle.report) - s_renderedBattle.reportBytes;
+	if (s_renderedBattle.solverTraceBytes)
+	{
+		UnsignedInt records = 0;
+		for (UnsignedInt byte = 0; byte < s_renderedBattle.solverTraceBytes; ++byte)
+			if (s_renderedBattle.solverTrace[byte] == '\n') ++records;
+		if (records == 5 && s_renderedBattle.reportRecords <= 26 && remaining > footerReserve &&
+			s_renderedBattle.solverTraceBytes < remaining - footerReserve)
+		{
+			// One append publishes the entire validated packet or none of it.
+			if (AppendRenderedBattleDiagnosticReportRecord(s_renderedBattle.report,
+				sizeof(s_renderedBattle.report), &s_renderedBattle.reportBytes,
+				&s_renderedBattle.solverTrace[0], s_renderedBattle.solverTraceBytes))
+			{
+				s_renderedBattle.reportRecords += 5;
+				printf("%s", &s_renderedBattle.solverTrace[0]);
+			}
+			else s_renderedBattle.solverTraceUnavailable = "report_headroom_unavailable";
+		}
+		else s_renderedBattle.solverTraceUnavailable = "report_headroom_unavailable";
+	}
+	if (s_renderedBattle.solverTraceUnavailable)
+	{
+		char line[256];
+		const Int bytes = _snprintf(line, sizeof(line),
+			"RENDERED_BATTLE_SOLVER_DOMAIN_UNAVAILABLE schema=1 source_marker=source34_failure_domain_v1 "
+			"reason=%s reproduction_usable=0\n", s_renderedBattle.solverTraceUnavailable);
+		if (bytes > 0 && bytes < static_cast<Int>(sizeof(line)) && s_renderedBattle.reportRecords < 31 &&
+			remaining > footerReserve && static_cast<UnsignedInt>(bytes) < remaining - footerReserve)
+		{
+			if (AppendRenderedBattleDiagnosticReportRecord(s_renderedBattle.report,
+				sizeof(s_renderedBattle.report), &s_renderedBattle.reportBytes, line, static_cast<UnsignedInt>(bytes)))
+			{ ++s_renderedBattle.reportRecords; printf("%s", line); }
+		}
+	}
+	std::vector<char> emptyTrace;
+	emptyTrace.swap(s_renderedBattle.solverTrace);
+	s_renderedBattle.solverTraceBytes = 0;
+	s_renderedBattle.solverTraceUnavailable = NULL;
+}
+
+void RecordRenderedBattleSolverFailureDomain(const Coord3D &center,
+	const Coord3D *domains, const Real *radii, const UnsignedInt *masks,
+	Int candidate, Int phase, Int mapwideIndex, Int budget, Int previousOperations,
+	RenderedBattleBenchmarkPlacementResult result, const RenderedBattleBenchmarkPlacementStats &stats)
+{
+	// Only a bounded 20 KiB snapshot allocation; no queries, object creation, or
+	// solver mutation. Called only for a terminal complete mechanized-512
+	// phase2 solver-budget failure; success and continued search allocate none.
+	Coord3D offsets[512];
+	Bool supported = sizeof(Real) == 4 && sizeof(UnsignedInt) == 4;
+	for (Int unit = 0; unit < 512 && supported; ++unit)
+	{
+		if (!masks[unit] || (masks[unit] & ~511u) || !(radii[unit] > 0.0f && radii[unit] <= 21.0f) ||
+			!GetRenderedBattleDiagnosticOffset(unit / 64, unit % 64, &offsets[unit], TRUE))
+		{ supported = FALSE; break; }
+		for (Int trial = 0; trial < 9 && supported; ++trial)
+		{
+			const Coord3D &actual = domains[unit * 9 + trial];
+			if (!(masks[unit] & (1u << trial)))
+			{
+				// Unadmitted slots are explicitly initialized to all-zero bytes.
+				supported = RenderedBattleSolverTraceBits(actual.x) == 0 &&
+					RenderedBattleSolverTraceBits(actual.y) == 0 && RenderedBattleSolverTraceBits(actual.z) == 0;
+				continue;
+			}
+			Coord3D local;
+			if (!GetRenderedBattleDiagnosticLocalOffset(unit / 64, trial, &local))
+			{ supported = FALSE; break; }
+			// Independent binary32 decoder arithmetic: materialize the first add,
+			// then the offset add. If the producing compiler used different excess
+			// precision, the actual-bit comparison rejects this encoding truthfully.
+			volatile Real centeredX = center.x + local.x, centeredY = center.y + local.y;
+			const Real x = offsets[unit].x + centeredX, y = offsets[unit].y + centeredY;
+			supported = RenderedBattleSolverTraceBits(x) == RenderedBattleSolverTraceBits(actual.x) &&
+				RenderedBattleSolverTraceBits(y) == RenderedBattleSolverTraceBits(actual.y) &&
+				actual.x >= -FLT_MAX && actual.x <= FLT_MAX &&
+				actual.y >= -FLT_MAX && actual.y <= FLT_MAX && actual.z >= -FLT_MAX && actual.z <= FLT_MAX;
+		}
+	}
+	if (!supported)
+	{
+		s_renderedBattle.solverTraceUnavailable = "exact_binary32_roundtrip_unavailable";
+		return;
+	}
+	try { s_renderedBattle.solverTrace.resize(20480); }
+	catch (...) { s_renderedBattle.solverTraceUnavailable = "snapshot_allocation_unavailable"; return; }
+	s_renderedBattle.solverTraceBytes = 0;
+	char line[4096], context[1536];
+	const Int contextBytes = _snprintf(context, sizeof(context),
+		"RENDERED_BATTLE_SOLVER_DOMAIN_CONTEXT schema=1 source_marker=source34_failure_domain_v1 "
+		"source_sha256_supplied=%s profile_id=mechanized_512 roster_contract=ggc.r2.rendered-battle.roster.mechanized-512.v1 "
+		"candidate=%d phase=%d mapwide_index=%d center_xy_bits=%08X%08X unit_count=512 units_per_player=64 trials=9 "
+		"encoding=offsetxy_radius_mask_hex27 shards=4 units_per_shard=128 unit_order=canonical "
+		"arithmetic=f32(offset+f32(center+local)) local_recipe=pinned_local9_x_mirror "
+		"inactive_xyz=zero active_xy_bitverified=1 active_xyz_finite=1 radius_validation_passed=1 "
+		"pair_predicate=pinned_double_xy_radius_sum_plus3 result=%s arena_budget=%d previous_operations=%d "
+		"arena_cap=%d total_cap=%d operations=%d pair_comparisons=%d assignments=%d backtracks=%d max_assigned=%d\n",
+		s_renderedBattle.suppliedSourceHash[0] ? s_renderedBattle.suppliedSourceHash : "unavailable",
+		candidate, phase, mapwideIndex, RenderedBattleSolverTraceBits(center.x), RenderedBattleSolverTraceBits(center.y),
+		result == RB_BENCHMARK_PLACEMENT_UNSATISFIABLE ? "unsatisfiable" : "budget_exhausted", budget, previousOperations,
+		RENDERED_BATTLE_BENCHMARK_ARENA_SEARCH_OPERATIONS, RENDERED_BATTLE_BENCHMARK_TOTAL_SEARCH_OPERATIONS,
+		stats.operations, stats.pairComparisons, stats.assignments, stats.backtracks, stats.maxAssigned);
+	// Preflight all five records before emitting any: fixed shard prefix and
+	// payload widths make the aggregate size exact, including newline bytes.
+	Int shardPrefixBytes[4], totalBytes = contextBytes;
+	for (Int shard = 0; shard < 4; ++shard)
+	{
+		shardPrefixBytes[shard] = _snprintf(line, sizeof(line),
+			"RENDERED_BATTLE_SOLVER_DOMAIN_SHARD schema=1 shard=%d first_unit=%d count=128 data=", shard, shard * 128);
+		if (shardPrefixBytes[shard] < 0 || shardPrefixBytes[shard] + 128 * 27 + 1 >= 4096)
+		{ s_renderedBattle.solverTraceBytes = 0; s_renderedBattle.solverTraceUnavailable = "snapshot_format_unavailable"; return; }
+		totalBytes += shardPrefixBytes[shard] + 128 * 27 + 1;
+	}
+	if (contextBytes <= 0 || contextBytes >= static_cast<Int>(sizeof(context)) ||
+		static_cast<UnsignedInt>(totalBytes) >= 20480)
+	{ s_renderedBattle.solverTraceBytes = 0; s_renderedBattle.solverTraceUnavailable = "snapshot_format_unavailable"; return; }
+	if (!AppendRenderedBattleSolverTraceSnapshot(context, contextBytes)) return;
+	static const char hex[] = "0123456789ABCDEF";
+	for (Int shard = 0; shard < 4; ++shard)
+	{
+		Int used = _snprintf(line, sizeof(line),
+			"RENDERED_BATTLE_SOLVER_DOMAIN_SHARD schema=1 shard=%d first_unit=%d count=128 data=", shard, shard * 128);
+		if (used != shardPrefixBytes[shard]) { s_renderedBattle.solverTraceBytes = 0; s_renderedBattle.solverTraceUnavailable = "snapshot_format_unavailable"; return; }
+		for (Int unit = shard * 128; unit < (shard + 1) * 128; ++unit)
+		{
+			const UnsignedInt fields[4] = { RenderedBattleSolverTraceBits(offsets[unit].x),
+				RenderedBattleSolverTraceBits(offsets[unit].y), RenderedBattleSolverTraceBits(radii[unit]), masks[unit] };
+			for (Int field = 0; field < 4; ++field)
+				for (Int nibble = (field == 3 ? 2 : 7); nibble >= 0; --nibble)
+					line[used++] = hex[(fields[field] >> (nibble * 4)) & 15u];
+		}
+		line[used++] = '\n'; line[used] = '\0';
+		if (!AppendRenderedBattleSolverTraceSnapshot(line, used)) return;
+	}
 }
 
 #if defined(RTS_RENDERER_RIGID_INSTANCING_METRICS)
@@ -4669,6 +5153,50 @@ void RecordRenderedBattlePreflightFailure(const RenderedBattlePreflightFailure &
 		failure.blockerPosition.y, failure.blockerPosition.z, failure.blockerRadius);
 }
 
+// Failure-only ME512 diagnostics retain existing unary results, never queries.
+// Four arenas x nine trials are bounded independently of the candidate universe.
+struct RenderedBattleFirstEmptyTrace
+{
+	Bool valid, canonicalPrefixValid;
+	Int firstEmpty, nominalPrefix, mapwideIndex;
+	RenderedBattlePreflightFailure trials[RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT];
+	RenderedBattleFirstEmptyTrace() : valid(FALSE), canonicalPrefixValid(TRUE), firstEmpty(-1), nominalPrefix(-1), mapwideIndex(-1) {}
+};
+
+void RecordRenderedBattleFirstEmptyTrace(const RenderedBattleFirstEmptyTrace &trace,
+	const char *selection, const char *templateName)
+{
+	// Reserve three complete records together and leave terminal-report headroom.
+	if (!trace.valid || s_renderedBattle.reportRecords + 3 > 29) return;
+	const RenderedBattlePreflightFailure &first = trace.trials[0];
+	for (Int group = 0; group < 3; ++group)
+	{
+		char details[1536] = {0};
+		Int used = 0;
+		for (Int offset = 0; offset < 3; ++offset)
+		{
+			const RenderedBattlePreflightFailure &f = trace.trials[group * 3 + offset];
+			const Int bytes = _snprintf(details + used, sizeof(details) - used,
+				"%st%d:gate%s:p(%.9g,%.9g,%.9g):q(%.9g,%.9g,%.9g):target(%.9g,%.9g,%.9g)"
+				":radius%.9g:height_delta%.9g:cell%d/%d:blocker%u:bp(%.9g,%.9g,%.9g):br%.9g",
+				offset ? ";" : "", f.trial, RenderedBattlePreflightReasonName(f.reason),
+				f.position.x, f.position.y, f.position.z, f.query.x, f.query.y, f.query.z,
+				f.target.x, f.target.y, f.target.z, f.radius, f.heightDelta, f.cellType, f.cellFlags,
+				static_cast<UnsignedInt>(f.blocker), f.blockerPosition.x, f.blockerPosition.y,
+				f.blockerPosition.z, f.blockerRadius);
+			if (bytes < 0 || bytes >= static_cast<Int>(sizeof(details)) - used) return;
+			used += bytes;
+		}
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_FIRST_EMPTY_TRACE selection=%s "
+			"candidate=%d phase=%s mapwide_index=%d nominal_prefix=%d first_empty_index=%d empty_proof_unit=%d canonical_prefix_valid=%d "
+			"slot=%d unit=%d template=%s center=(%.9g,%.9g,%.9g) trial_group=%d rejected_trials=%s\n",
+			selection, first.candidate, first.phase == 1 ? "local9" : "mapwide_local9",
+			trace.mapwideIndex, trace.nominalPrefix, trace.canonicalPrefixValid ? trace.firstEmpty : -1,
+			trace.firstEmpty, trace.canonicalPrefixValid ? 1 : 0, first.slot, first.unit, templateName,
+			first.center.x, first.center.y, first.center.z, group, details);
+	}
+}
+
 Bool PreflightRenderedBattlePosition(const Coord3D &position, Real radius,
 	const Region3D &extent, Pathfinder *pathfinder, RenderedBattlePreflightFailure *failure)
 {
@@ -4828,6 +5356,15 @@ Bool StageRenderedBattleDiagnostic()
 	}
 	if (benchmark)
 	{
+		if (refinementEligible)
+			RecordRenderedBattleDiagnostic("RENDERED_BATTLE_BENCHMARK_LAYOUT layout_schema=2 "
+				"layout_contract=ggc.r2.rendered-battle.layout.mechanized-512.rect16x4.v2 "
+				"workload_contract=ggc.r2.rendered-battle.workload.mechanized-512.rect16x4.r2-arena.v4 "
+				"map_contract=ggc.r2.rendered-battle.map.mechanized-512.r2-arena.v1 "
+				"profile_id=mechanized_512 placement_schema=9 columns=16 rows=4 grid_step=42 stagger=21 row_step=37 "
+				"band_step=148 formation_x=746 formation_y=278 inset_x=790 inset_y=322 reveal_radius=850 "
+				"goal_x_offsets=-95,95 goal_y_offsets=-222,-74,74,222 pair_clearance=3 footprint_padding=1 "
+				"height_limit=8 path_diameter_cells=4\n");
 		if (namedBenchmarkProfile)
 		{
 			const Int nominalUnits = 8 * unitsPerPlayer;
@@ -4856,20 +5393,28 @@ Bool StageRenderedBattleDiagnostic()
 	Int solverOperations = 0, solverPairs = 0, solverAssignments = 0, solverBacktracks = 0;
 	Int domainEmptyUnits = 0, solverArenas = 0, solverInvalidArenas = 0;
 	Int refinedExamined = 0, refinedBoundsRejected = 0, refinedUnaryTrials = 0;
+	Int mapwideExamined = 0, mapwideBoundsRejected = 0, mapwideEmptyArenas = 0;
+	Bool mapwideUnaryBudgetExhausted = FALSE, mapwideSolverBudgetExhausted = FALSE;
 	Int refinedWitnessQueries = 0, refinedEmptyArenas = 0;
+	Int previousEmptyUnaryUnit = -1, unaryProbeArenas = 0, unaryProbeEmptyArenas = 0;
 	Bool refinementBudgetExhausted = FALSE;
 	Bool refinementSolverBudgetExhausted = FALSE;
 	char solverDetails[1024] = {0}, solverLastDetail[128] = {0};
 	Int solverDetailBytes = 0, solverDetailRecords = 0, solverDetailOmitted = 0;
+	Bool solverFailureDomainRecorded = FALSE;
 	const Int localArenaCapacity = namedBenchmarkProfile ?
 		RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP : RENDERED_BATTLE_DIAGNOSTIC_LOCAL_ARENA_CAP;
 	Int retained[RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP];
 	Int retainedPrefixes[RENDERED_BATTLE_BENCHMARK_NAMED_LOCAL_ARENA_CAP], retainedCount = 0;
 	RenderedBattlePreflightFailure examples[2], furthest;
+	RenderedBattleFirstEmptyTrace firstEmptyTraces[4];
 	RenderedBattlePreflightFailure firstWitnessFailure;
 	Bool witnessExampleRecorded = FALSE;
 	const Int searchCount = GetRenderedBattleDiagnosticSearchCount(
 		extent.lo.x, extent.lo.y, extent.hi.x, extent.hi.y, benchmark);
+	const Int refinedPrefixCount = searchCount * RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS;
+	const Int mapwideCandidateCount = RENDERED_BATTLE_BENCHMARK_MAPWIDE_CANDIDATES;
+	const Int refinementCandidateUniverse = refinedPrefixCount + mapwideCandidateCount;
 	// One bounded owner-thread buffer, reused for each arena. No queued queries.
 	std::vector<Coord3D> placementDomains;
 	// Nominal fixed order first, then ranked failed arenas. Named profiles retain
@@ -4878,9 +5423,10 @@ Bool StageRenderedBattleDiagnostic()
 	// No object is created until the complete requested roster passes every gate.
 	for (Int phase = 0; phase < (refinementEligible ? 3 : 2) && !found &&
 		!refinementBudgetExhausted && !refinementSolverBudgetExhausted; ++phase)
-		for (Int ordinal = 0; ordinal < (phase == 2 ? searchCount * RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS :
+		for (Int ordinal = 0; ordinal < (phase == 2 ? refinementCandidateUniverse :
 			(phase ? retainedCount : searchCount)) && !found && !refinementBudgetExhausted &&
-			!refinementSolverBudgetExhausted && (phase != 2 || ordinal < RENDERED_BATTLE_BENCHMARK_REFINEMENT_CANDIDATE_CAP); ++ordinal)
+			!refinementSolverBudgetExhausted && (phase != 2 ||
+			ordinal < RENDERED_BATTLE_BENCHMARK_REFINEMENT_COMBINED_CANDIDATE_CAP); ++ordinal)
 		{
 			const Int candidate = phase == 2 ? 130 + ordinal : (phase ? retained[ordinal] : ordinal);
 			RenderedBattlePreflightFailure failure;
@@ -4889,10 +5435,21 @@ Bool StageRenderedBattleDiagnostic()
 			if (phase == 2)
 			{
 				++refinedExamined;
-				if (!GetRenderedBattleBenchmarkRefinementCenter(extent.lo.x, extent.lo.y,
-					extent.hi.x, extent.hi.y, ordinal / RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS,
-					ordinal % RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS, &center))
-				{ ++refinedBoundsRejected; continue; }
+				if (ordinal < refinedPrefixCount)
+				{
+					// Keep the original refined10 centers and their exact ordering first.
+					if (!GetRenderedBattleBenchmarkRefinementCenter(extent.lo.x, extent.lo.y,
+						extent.hi.x, extent.hi.y, ordinal / RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS,
+						ordinal % RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS, &center))
+					{ ++refinedBoundsRejected; continue; }
+				}
+				else
+				{
+					++mapwideExamined;
+					if (!GetRenderedBattleBenchmarkMapWideCenter(extent.lo.x, extent.lo.y,
+						extent.hi.x, extent.hi.y, ordinal - refinedPrefixCount, &center))
+					{ ++refinedBoundsRejected; ++mapwideBoundsRejected; continue; }
+				}
 			}
 			else if (!GetRenderedBattleDiagnosticSearchCenter(extent.lo.x, extent.lo.y,
 				extent.hi.x, extent.hi.y, candidate, &center, benchmark)) break;
@@ -4909,6 +5466,7 @@ Bool StageRenderedBattleDiagnostic()
 				memset(&stats, 0, sizeof(stats));
 				RenderedBattleBenchmarkPlacementResult result = RB_BENCHMARK_PLACEMENT_INVALID;
 				Int firstEmpty = -1, firstEmptyGate = RB_PREFLIGHT_ACCEPTED;
+				Bool firstEmptyCanonical = TRUE;
 				Bool witnessFailureRecorded = FALSE;
 				try
 				{
@@ -4928,13 +5486,21 @@ Bool StageRenderedBattleDiagnostic()
 					Real domainRadii[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER] = {0};
 					Int choices[8 * RENDERED_BATTLE_BENCHMARK_UNITS_PER_PLAYER];
 					RenderedBattlePreflightFailure firstEmptyFailure;
-					// Each unary query is evaluated exactly once per unit/trial/arena.
-					// Pair pruning cannot relax terrain, footprint, occupancy or routes.
-					for (Int index = 0; index < total; ++index)
+					RenderedBattlePreflightFailure unaryFailures[RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT];
+					// The prior empty unit is only a scheduling hint: every verdict is
+					// queried fresh in this arena. Reuse its canonical slots, never query
+					// it twice, and fully materialize unchanged canonical domains on pass.
+					if (phase == 2 && (previousEmptyUnaryUnit < -1 || previousEmptyUnaryUnit >= total))
+						previousEmptyUnaryUnit = -1;
+					const Int probeUnit = phase == 2 ? previousEmptyUnaryUnit : -1;
+					for (Int rank = 0; rank < total; ++rank)
 					{
 						if (phase == 2 && !CanRenderedBattleBenchmarkRefinementQuery(
 							refinedUnaryTrials + refinedWitnessQueries, RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT))
 						{ refinementBudgetExhausted = TRUE; break; }
+						const Int index = phase == 2 ? GetRenderedBattleBenchmarkRefinementUnaryUnit(rank, total, probeUnit) : rank;
+						if (index < 0) { s_renderedBattle.setupFailure = "benchmark_planner_invalid"; return FALSE; }
+						if (probeUnit >= 0 && rank == 0) ++unaryProbeArenas;
 						const Int slot = index / unitsPerPlayer, unit = index % unitsPerPlayer;
 						domainRadii[index] = radii[slot][RenderedBattleUnitType(unit)];
 						for (Int trial = 0; trial < RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT; ++trial)
@@ -4961,11 +5527,35 @@ Bool StageRenderedBattleDiagnostic()
 								masks[index] |= 1u << trial; ++acceptedUnitTrials;
 							}
 							else ++trialRejected[attempt.reason];
+							if (refinementEligible && firstEmpty < 0 && !admitted) unaryFailures[trial] = attempt;
 							failure = attempt;
 						}
 						if (!masks[index] && firstEmpty < 0)
 						{
 							firstEmpty = index; firstEmptyFailure = failure; firstEmptyGate = failure.reason;
+							firstEmptyCanonical = !(phase == 2 && probeUnit >= 0 && rank == 0 && index > 0);
+							if (phase == 2)
+							{
+								previousEmptyUnaryUnit = index;
+								if (probeUnit >= 0 && rank == 0) ++unaryProbeEmptyArenas;
+							}
+							if (refinementEligible)
+							{
+								const Bool mapwide = phase == 2 && ordinal >= refinedPrefixCount;
+								for (Int sample = 0; sample < 4; ++sample)
+								{
+									const Bool keep = sample == 0 ? phase == 1 && ordinal == 0 :
+										(sample == 1 ? phase == 1 && (!firstEmptyTraces[sample].valid || index > firstEmptyTraces[sample].firstEmpty) :
+										(sample == 2 ? mapwide && firstEmptyCanonical && (!firstEmptyTraces[sample].valid || index > firstEmptyTraces[sample].firstEmpty) : mapwide));
+									if (!keep) continue;
+									RenderedBattleFirstEmptyTrace &trace = firstEmptyTraces[sample];
+									trace.valid = TRUE; trace.firstEmpty = index; trace.canonicalPrefixValid = firstEmptyCanonical;
+									trace.nominalPrefix = phase == 1 ? retainedPrefixes[ordinal] : -1;
+									trace.mapwideIndex = mapwide ? ordinal - refinedPrefixCount : -1;
+									for (Int copy = 0; copy < RENDERED_BATTLE_DIAGNOSTIC_LOCAL_TRIAL_COUNT; ++copy)
+										trace.trials[copy] = unaryFailures[copy];
+								}
+							}
 						}
 						if (phase == 2 && !masks[index]) { ++refinedEmptyArenas; break; }
 					}
@@ -4977,6 +5567,17 @@ Bool StageRenderedBattleDiagnostic()
 					{ result = RB_BENCHMARK_PLACEMENT_EMPTY_DOMAIN; stats.emptyDomains = 1; }
 					else result = SolveRenderedBattleBenchmarkPlacement(total, &domains[0], domainRadii,
 						masks, budget, choices, &stats);
+
+					if (!solverFailureDomainRecorded && phase == 2 && firstEmpty < 0 && !refinementBudgetExhausted &&
+						total == 512 && rts::rendered_battle::ProcessTestOptions().benchmarkProfile ==
+							rts::rendered_battle::BENCHMARK_PROFILE_MECHANIZED_512 &&
+						result == RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED)
+					{
+						solverFailureDomainRecorded = TRUE;
+						RecordRenderedBattleSolverFailureDomain(center, &domains[0], domainRadii, masks,
+							candidate, phase, phase == 2 && ordinal >= refinedPrefixCount ? ordinal - refinedPrefixCount : -1,
+							budget, solverOperations, result, stats);
+					}
 					validUnits = stats.maxAssigned;
 					// Recheck the complete selected witness, including all pairs, before
 					// publishing positions or allowing any object creation.
@@ -5036,6 +5637,13 @@ Bool StageRenderedBattleDiagnostic()
 					}
 					if (phase == 2 && result == RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED && !refinementBudgetExhausted)
 						refinementSolverBudgetExhausted = TRUE;
+					if (phase == 2 && ordinal >= refinedPrefixCount)
+					{
+							if (result == RB_BENCHMARK_PLACEMENT_EMPTY_DOMAIN) ++mapwideEmptyArenas;
+						if (refinementBudgetExhausted) mapwideUnaryBudgetExhausted = TRUE;
+						if (result == RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED &&
+							!refinementBudgetExhausted) mapwideSolverBudgetExhausted = TRUE;
+					}
 					if (result == RB_BENCHMARK_PLACEMENT_SOLVED)
 						for (Int index = 0; index < total; ++index)
 						{
@@ -5063,14 +5671,22 @@ Bool StageRenderedBattleDiagnostic()
 					(result == RB_BENCHMARK_PLACEMENT_BUDGET_EXHAUSTED ? RB_PREFLIGHT_SEARCH_BUDGET : RB_PREFLIGHT_PLANNER_INVALID)));
 				if (witnessFailureRecorded && !witnessExampleRecorded)
 				{ firstWitnessFailure = failure; witnessExampleRecorded = TRUE; }
-				const Int bytes = _snprintf(solverLastDetail, sizeof(solverLastDetail),
+				Int bytes = _snprintf(solverLastDetail, sizeof(solverLastDetail),
 					"%d:%s:empty%d:first%d:last_gate%s:max%d:ops%d", candidate,
 					arenaAccepted ? "solved" : RenderedBattlePreflightReasonName(failure.reason),
-					stats.emptyDomains, firstEmpty, RenderedBattlePreflightReasonName(witnessFailureRecorded ? failure.reason : firstEmptyGate),
+					stats.emptyDomains, firstEmptyCanonical ? firstEmpty : -1, RenderedBattlePreflightReasonName(witnessFailureRecorded ? failure.reason : firstEmptyGate),
 					stats.maxAssigned, stats.operations);
 				if (bytes < 0 || bytes >= static_cast<Int>(sizeof(solverLastDetail)))
 				{
 					s_renderedBattle.reportFailed = TRUE; return FALSE;
+				}
+				if (!firstEmptyCanonical)
+				{
+					const Int extra = _snprintf(solverLastDetail + bytes, sizeof(solverLastDetail) - bytes,
+						":probe_empty_unit%d", firstEmpty);
+					if (extra < 0 || extra >= static_cast<Int>(sizeof(solverLastDetail)) - bytes)
+					{ s_renderedBattle.reportFailed = TRUE; return FALSE; }
+					bytes += extra;
 				}
 				if (solverDetailRecords < 8)
 				{
@@ -5177,11 +5793,12 @@ Bool StageRenderedBattleDiagnostic()
 		"grid_hi=(%d,%d) cell_size=10 candidate_step=240 candidate_span=720 "
 		"formation_x=%d formation_y=%d footprint_margin_max=22 height_limit=8 path_diameter_cells=4 "
 		"frame=%u in_game=%d loading=%d loaded_identity_valid=%d map_crc=%08X map_size=%u\n",
-		examined, selected, benchmark ? (refinementEligible ? "mechanized512_refined10_local9_mrv_v7" : (namedBenchmarkProfile ? "named_profile_geometry_cached_local9_mrv_v6" :
+		examined, selected, benchmark ? (refinementEligible ? "mechanized512_rect16x4_refined10_mapwide100x104_local9_mrv_v9" : (namedBenchmarkProfile ? "named_profile_geometry_cached_local9_mrv_v6" :
 			"dense512_grid52_band208_cached_local9_mrv_v6")) : "legacy49_then_extent9x9_local9_v2",
-		refinementEligible ? 7 : (benchmark ? 6 : 2), selectedPhase < 0 ? "none" :
-			(selectedPhase == 2 ? "refined_local9" : (selectedPhase ? "local9" : "nominal")),
-		searchCount + localArenaCapacity + (refinementEligible ? searchCount * RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS : 0),
+		refinementEligible ? 9 : (benchmark ? 6 : 2), selectedPhase < 0 ? "none" :
+			(selectedPhase == 2 ? ((selected - 130) < refinedPrefixCount ? "refined10_local9" : "mapwide_local9") :
+				(selectedPhase ? "local9" : "nominal")),
+		searchCount + localArenaCapacity + (refinementEligible ? refinementCandidateUniverse : 0),
 		searchCount, nominalExamined, localExamined,
 		searchCount > 49 ? searchCount - 49 : 0, benchmark ? GetRenderedBattleBenchmarkGeometry().insetX : 447,
 		benchmark ? GetRenderedBattleBenchmarkGeometry().insetY : 410, localArenaCapacity, retainedCount,
@@ -5194,20 +5811,36 @@ Bool StageRenderedBattleDiagnostic()
 		benchmark ? GetRenderedBattleBenchmarkGeometry().formationY : 366, TheGameLogic->getFrame(),
 		TheGameLogic->isInGame() ? 1 : 0, TheGameLogic->isLoadingMap() ? 1 : 0,
 		s_runner.loadedStateValidated ? 1 : 0, s_runner.loadedMapCRC, s_runner.loadedMapSize);
-	char refinementFields[768] = "";
+	const Int selectedRefinementOrdinal = selectedPhase == 2 ? selected - 130 : -1;
+	const Int refinedSelectedParent = selectedRefinementOrdinal >= 0 &&
+		selectedRefinementOrdinal < refinedPrefixCount ?
+		selectedRefinementOrdinal / RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS : -1;
+	const Int refinedSelectedOffset = selectedRefinementOrdinal >= 0 &&
+		selectedRefinementOrdinal < refinedPrefixCount ?
+		selectedRefinementOrdinal % RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS : -1;
+	const Int mapwideSelectedIndex = selectedRefinementOrdinal >= refinedPrefixCount ?
+		selectedRefinementOrdinal - refinedPrefixCount : -1;
+	char refinementFields[1024] = "";
 	if (refinementEligible)
 	{
-		const Int bytes = _snprintf(refinementFields, sizeof(refinementFields), " refinement_schema=1 "
-			"refined_examined=%d refined_candidate_cap=%d refined_candidate_universe=%d refined_bounds_rejected=%d "
+		const Int bytes = _snprintf(refinementFields, sizeof(refinementFields), " refinement_schema=2 "
+			"refined_examined=%d refined_candidate_cap=%d refined_candidate_universe=%d "
+			"mapwide_candidate_count=%d mapwide_examined=%d mapwide_bounds_rejected=%d mapwide_empty_arenas=%d "
+			"mapwide_unary_budget_exhausted=%d mapwide_solver_budget_exhausted=%d refined_bounds_rejected=%d "
 			"refined_unary_trials=%d refined_witness_queries=%d refined_unary_cap=%d refined_budget_exhausted=%d refined_solver_budget_exhausted=%d refined_empty_arenas=%d "
-			"refined_empty_domain_count=first_only refined_parent_order=original_index refined_offset_order=row_major10_nonzero80 "
-			"refined_selected_parent=%d refined_selected_offset=%d",
-			refinedExamined, RENDERED_BATTLE_BENCHMARK_REFINEMENT_CANDIDATE_CAP,
-			searchCount * RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS, refinedBoundsRejected,
+			"refined_empty_domain_count=first_tested_only unary_order=last_empty_then_canonical "
+			"unary_probe_arenas=%d unary_probe_empty_arenas=%d refined_order=refined10_then_mapwide "
+			"refined_parent_order=original_index refined_offset_order=row_major10_nonzero80 "
+			"mapwide_order=row_major100x104 refined_selected_parent=%d refined_selected_offset=%d "
+			"mapwide_selected_index=%d",
+			refinedExamined, RENDERED_BATTLE_BENCHMARK_REFINEMENT_COMBINED_CANDIDATE_CAP,
+			refinementCandidateUniverse, mapwideCandidateCount, mapwideExamined,
+			mapwideBoundsRejected, mapwideEmptyArenas,
+			mapwideUnaryBudgetExhausted ? 1 : 0, mapwideSolverBudgetExhausted ? 1 : 0,
+			refinedBoundsRejected,
 			refinedUnaryTrials, refinedWitnessQueries, RENDERED_BATTLE_BENCHMARK_REFINEMENT_UNARY_CAP,
 			refinementBudgetExhausted ? 1 : 0, refinementSolverBudgetExhausted ? 1 : 0, refinedEmptyArenas,
-			selectedPhase == 2 ? (selected - 130) / RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS : -1,
-			selectedPhase == 2 ? (selected - 130) % RENDERED_BATTLE_BENCHMARK_REFINEMENT_OFFSETS : -1);
+			unaryProbeArenas, unaryProbeEmptyArenas, refinedSelectedParent, refinedSelectedOffset, mapwideSelectedIndex);
 		if (bytes < 0 || bytes >= static_cast<Int>(sizeof(refinementFields))) { s_renderedBattle.reportFailed = TRUE; return FALSE; }
 	}
 	RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_PLACEMENT_SUMMARY "
@@ -5259,7 +5892,22 @@ Bool StageRenderedBattleDiagnostic()
 		(exampleCount == 0 || furthest.candidate != examples[0].candidate || furthest.phase != examples[0].phase) &&
 		(exampleCount < 2 || furthest.candidate != examples[1].candidate || furthest.phase != examples[1].phase))
 		RecordRenderedBattlePreflightFailure(furthest, "furthest_progress");
-	if (!found) return FALSE;
+	if (!found)
+	{
+		if (refinementEligible)
+		{
+			const char *selections[4] = { "best_nominal_parent_local", "furthest_canonical_prefix_local", "furthest_observed_canonical_prefix_mapwide", "last_mapwide_first_empty" };
+			for (Int sample = 0; sample < 4; ++sample)
+				if (firstEmptyTraces[sample].valid)
+				{
+					const RenderedBattlePreflightFailure &unit = firstEmptyTraces[sample].trials[0];
+					RecordRenderedBattleFirstEmptyTrace(firstEmptyTraces[sample],
+						sample == 3 && !firstEmptyTraces[sample].canonicalPrefixValid ? "last_mapwide_probe_empty_unit" : selections[sample],
+						templates[unit.slot][RenderedBattleUnitType(unit.unit)]->getName().str());
+				}
+		}
+		return FALSE;
+	}
 	s_renderedBattle.setupFailure = "partial_creation_or_object_invalid";
 	try
 	{
@@ -5678,9 +6326,8 @@ void BuildSkirmishAITestPlan(Int seed, SkirmishAITestScenario scenario,
 		scenario = SKIRMISH_AI_TEST_SCENARIO_4V3;
 
 	plan->seed = seed;
-	// Diagnostic-only stock eight-player map; ordinary AI/replay plans stay unchanged.
-	plan->mapName = IsRenderedBattleDiagnostic(scenario) ? "Maps\\Fortress Avalanche\\Fortress Avalanche.map" :
-		"Maps\\Twilight Flame\\Twilight Flame.map";
+	// Only explicit ME512 benchmark changes its stock map; other plans retain their maps.
+	plan->mapName = GetRenderedBattleDiagnosticMapDescriptor(scenario).mapName;
 
 	const Bool hardAI2v6 = IsSkirmishAITestHardAI2v6(scenario);
 	SkirmishAITestSlotPlan &localSlot = plan->slots[0];
@@ -5926,9 +6573,10 @@ Bool StartSkirmishAITestRunner()
 			FailSkirmishAITest("isolated_report_profile_or_source_hash_invalid");
 			return FALSE;
 		}
-		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_BEGIN seed=%d map=Fortress_Avalanche "
+		const RenderedBattleDiagnosticMapDescriptor mapDescriptor = GetRenderedBattleDiagnosticMapDescriptor(s_runner.scenario);
+		RecordRenderedBattleDiagnostic("RENDERED_BATTLE_DIAGNOSTIC_BEGIN seed=%d map=%s "
 			"executable_sha256_observed=%s executable_sha256_supplied=%s source_sha256_supplied=%s\n",
-			s_runner.seed, s_executableHashObserved, s_executableHashInput,
+			s_runner.seed, mapDescriptor.diagnosticToken, s_executableHashObserved, s_executableHashInput,
 			s_renderedBattle.suppliedSourceHash[0] ? s_renderedBattle.suppliedSourceHash : "not_supplied");
 		if (IsRenderedBattleBenchmark() && rts::rendered_battle::IsExplicitBenchmarkProfile(
 			rts::rendered_battle::ProcessTestOptions().benchmarkProfile))
@@ -6021,14 +6669,19 @@ Bool StartSkirmishAITestRunner()
 		plan.mapName = s_reviewedMapIdentity.runtimePath;
 	}
 #endif
+	const RenderedBattleDiagnosticMapDescriptor mapDescriptor = GetRenderedBattleDiagnosticMapDescriptor(s_runner.scenario);
 	const MapMetaData *map = TheMapCache->findMap(plan.mapName);
 	const Int expectedMapPlayers = ExpectedSkirmishAITestAiCount(s_runner.scenario) +
 		(IsSkirmishAITestHardAI2v6(s_runner.scenario) ? 0 : 1);
 	if (!map || !map->m_doesExist || !map->m_isMultiplayer ||
 		map->m_numPlayers < expectedMapPlayers)
 	{
-		FailSkirmishAITest(IsRenderedBattleDiagnostic(s_runner.scenario) ?
-			"fortress_avalanche_unavailable" : "twilight_flame_unavailable");
+		FailSkirmishAITest(mapDescriptor.unavailableReason);
+		return FALSE;
+	}
+	if (!IsRenderedBattleDiagnosticMapCacheIdentityValid(s_runner.scenario, map->m_CRC, map->m_filesize))
+	{
+		FailSkirmishAITest("benchmark_map_cache_identity_mismatch");
 		return FALSE;
 	}
 	DEBUG_LOG(("SkirmishAITestRunner::start phase=map_ready"));
@@ -11490,6 +12143,7 @@ Int FinalizeSkirmishAITestRunner(Int engineExitCode)
 				? "fresh_cap_sample" : "unavailable_teardown_last_sparse");
 		if (s_renderedBattle.reportFailed)
 			FailSkirmishAITest("diagnostic_report_overflow");
+		if (s_runner.failed) EmitRenderedBattleSolverTraceSnapshot();
 		const Bool written = WriteRenderedBattleDiagnosticReport(s_runner.failed ? 1 : 0);
 		if (!written) FailSkirmishAITest("diagnostic_report_write_failed");
 		char result[512];

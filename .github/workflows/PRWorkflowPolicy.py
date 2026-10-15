@@ -49,6 +49,10 @@ def load_yaml(text):
 LANES = ('native-generals', 'native-zerohour', 'rendering-tools')
 REQUIRED = ('detect-changes', 'workflow-policy')
 OUTPUTS = ('generals', 'zerohour', 'shared', 'rendering_tools')
+EXTENDED_FOCUSED_RUNTIME_REGEX = (
+    r'^core_(deterministic_simulation(_.*)?test|job_system_tests|'
+    r'pipeline_execution_policy_(parser|owner|compute|race)_test)$'
+)
 CORE_SMOKE_TESTS = frozenset((
     'core_threaded_render_device_tests',
     'core_threaded_render_device_native_tests',
@@ -90,6 +94,173 @@ def required_smoke_tests(prefix):
 def required_smoke_targets(prefix):
     harness = 'g_skirmish_ai_runner_contract_tests' if prefix == 'g' else 'z_runtime_regression_tests'
     return CORE_SMOKE_TARGETS | {prefix + '_generals', harness}
+
+
+def focused_test_names(pattern):
+    require(isinstance(pattern, str) and pattern.startswith('^(') and pattern.endswith(')$'),
+            'CTest filter must be anchored')
+    names = pattern[2:-2].split('|')
+    require(names and all(re.fullmatch(r'[a-z0-9_]+', name) is not None for name in names),
+            'smoke filter must enumerate exact test names')
+    require(len(set(names)) == len(names), 'smoke suite must be distinct')
+    return names
+
+
+def _ctest_property_is_true(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() not in ('', '0', 'false', 'off', 'no')
+    return bool(value)
+
+
+def _ctest_property_is_nonempty(value):
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value != ''
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value) > 0
+    return True
+
+
+def validate_ctest_inventory(document, pattern):
+    require(isinstance(pattern, str) and pattern.startswith('^') and pattern.endswith('$'),
+            'focused CTest regex must be anchored')
+    try:
+        re.compile(pattern)
+    except re.error as error:
+        raise PolicyError(f'invalid focused CTest regex: {error}') from error
+    exact_names = None
+    if pattern.startswith('^(') and pattern.endswith(')$'):
+        alternatives = pattern[2:-2].split('|')
+        if alternatives and all(re.fullmatch(r'[a-z0-9_]+', name) is not None for name in alternatives):
+            exact_names = focused_test_names(pattern)
+    require(isinstance(document, dict), 'configured CTest inventory must be a JSON object')
+    tests = document.get('tests')
+    require(isinstance(tests, list), 'configured CTest inventory must contain a tests array')
+    by_name = {}
+    for test in tests:
+        require(isinstance(test, dict) and isinstance(test.get('name'), str),
+                'configured CTest inventory contains a malformed test entry')
+        name = test['name']
+        require(name not in by_name, f'duplicate test in configured CTest inventory: {name}')
+        properties = test.get('properties', [])
+        require(isinstance(properties, list), f'CTest properties are malformed for {name}')
+        property_map = {}
+        for prop in properties:
+            require(isinstance(prop, dict) and isinstance(prop.get('name'), str),
+                    f'CTest property is malformed for {name}')
+            property_name = prop['name']
+            require(property_name not in property_map,
+                    f'duplicate CTest property {property_name} for {name}')
+            property_map[property_name] = prop.get('value')
+        by_name[name] = property_map
+
+    registered = {name for name in by_name if re.fullmatch(pattern, name)}
+    if exact_names is not None:
+        expected = set(exact_names)
+        missing = sorted(expected - registered)
+        require(not missing,
+                'focused tests are missing from the configured CTest inventory (not registered): ' +
+                ', '.join(missing))
+        unexpected = sorted(registered - expected)
+        require(not unexpected,
+                'configured CTest inventory has unexpected focused tests: ' + ', '.join(unexpected))
+        names = exact_names
+    else:
+        require(registered, 'focused CTest regex matched no tests in the configured inventory')
+        names = sorted(registered)
+
+    for name in names:
+        properties = by_name[name]
+        require(not _ctest_property_is_true(properties.get('DISABLED', False)),
+                f'focused CTest is disabled in the configured inventory: {name}')
+        require(not _ctest_property_is_true(properties.get('WILL_FAIL', False)),
+                f'focused CTest can mask a nonzero exit by WILL_FAIL: {name}')
+        require(not _ctest_property_is_nonempty(properties.get('PASS_REGULAR_EXPRESSION')),
+                f'focused CTest can mask a nonzero exit by PASS_REGULAR_EXPRESSION: {name}')
+        for skip_property in ('SKIP_RETURN_CODE', 'SKIP_REGULAR_EXPRESSION'):
+            value = properties.get(skip_property)
+            if _ctest_property_is_nonempty(value):
+                raise PolicyError(f'focused CTest can be skipped by {skip_property}: {name}')
+
+
+def validate_retained_authoring_matrices(extended):
+    contracts = (
+        ('build-generals', 'Generals', 'win32-generals-authoring'),
+        ('build-generalsmd-win32', 'GeneralsMD', 'win32-zerohour-authoring'),
+    )
+    jobs = extended.get('jobs', {})
+    for job_name, title, modern_preset in contracts:
+        job = jobs.get(job_name)
+        require(isinstance(job, dict), f'{title} authoring job is missing')
+        expected_conditions = {
+            'build-generals': "${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generals == 'true' || needs.detect-changes.outputs.shared == 'true' }}",
+            'build-generalsmd-win32': "${{ github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.generalsmd == 'true' || needs.detect-changes.outputs.shared == 'true' }}",
+        }
+        require(' '.join(job.get('if', '').split()) == expected_conditions[job_name],
+                f'{title} authoring job activation condition changed')
+        require(needs_list(job.get('needs', [])) == ['detect-changes'],
+                f'{title} authoring job must retain its exact change-detection dependency')
+        require(job.get('uses') == './.github/workflows/build-toolchain.yml',
+                f'{title} authoring job must route to the retained reusable build workflow')
+        expected_matrix = {'include': [
+            {'preset': modern_preset, 'tools': True, 'extras': False, 'product': False},
+            {'preset': 'vc6', 'tools': True, 'extras': False, 'product': False},
+        ]}
+        matrix = job.get('strategy', {}).get('matrix')
+        require(matrix == expected_matrix,
+                f'{title} authoring matrix must retain exactly modern Win32 and VC6 entries')
+        expected_with = {
+            'game': title,
+            'preset': '${{ matrix.preset }}',
+            'tools': '${{ matrix.tools }}',
+            'extras': '${{ matrix.extras }}',
+            'product': '${{ matrix.product }}',
+        }
+        settings = job.get('with', {})
+        require(all(settings.get(key) == value for key, value in expected_with.items()),
+                f'{title} authoring job must pass its game, extras, and product matrix settings')
+
+
+def validate_focused_ctest_gate(reusable):
+    steps = reusable.get('jobs', {}).get('build', {}).get('steps', [])
+    gates = [(index, step) for index, step in enumerate(steps)
+             if step.get('name') == 'Verify focused CTest inventory']
+    ctest_runs = [(index, step) for index, step in enumerate(steps)
+                  if (step.get('name') or '').startswith('Run Core extras tests ')]
+    require(len(gates) == 1, 'exactly one configured CTest inventory guard is required')
+    require(len(ctest_runs) == 1, 'exactly one Core extras CTest step is required')
+    gate_index, gate = gates[0]
+    ctest_index, ctest_step = ctest_runs[0]
+    require(gate_index < ctest_index, 'configured CTest inventory guard must precede focused CTest')
+    require(gate.get('if') == "inputs.focused_test_regex != ''" and gate.get('shell') == 'pwsh',
+            'configured CTest inventory guard must run only for focused test lanes')
+    require('continue-on-error' not in gate and 'continue-on-error' not in ctest_step,
+            'configured CTest inventory failures must fail the build lane')
+    run = gate.get('run', '')
+    expected_run = (
+        "$inventoryPath = Join-Path $env:RUNNER_TEMP 'focused-ctest-inventory.json'",
+        "$configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }",
+        '$inventoryJson = & ctest --test-dir "build\\${{ inputs.preset }}" --show-only=json-v1 -C $configuration',
+        '$ctestInventoryExitCode = $LASTEXITCODE',
+        'if ($ctestInventoryExitCode -ne 0) { exit $ctestInventoryExitCode }',
+        '$inventoryJson | Set-Content -LiteralPath $inventoryPath -Encoding utf8',
+        "py -3 .github/workflows/PRWorkflowPolicy.py --ctest-inventory $inventoryPath --focused-test-regex '${{ inputs.focused_test_regex }}'",
+        'exit $LASTEXITCODE',
+    )
+    run_lines = tuple(line.strip() for line in run.splitlines() if line.strip())
+    require(run_lines == expected_run,
+            'configured CTest inventory gate must preserve the exact fail-closed command sequence')
+    ctest_run = ctest_step.get('run', '')
+    require("$configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }" in ctest_run and
+            "$arguments += @('-C', $configuration)" in ctest_run and
+            "$arguments += @('-R', '${{ inputs.focused_test_regex }}')" in ctest_run and
+            '& ctest @arguments' in ctest_run,
+            'focused CTest execution must use the guarded regex without failure masking')
 
 
 def evaluate_readiness(needs):
@@ -145,10 +316,14 @@ def validate_manual_policy(extended, root):
         require(set(needs_list(jobs[name].get('needs', []))) ==
                 {'detect-changes', 'build-generals-x64', 'build-generalsmd-x64', 'stage5-execution-cohort'},
                 f'manual replay must wait for both downloaded title artifacts: {name}')
-    matrix = jobs['build-native-x64-focused-runtime']['strategy']['matrix']
+    focused_runtime = jobs['build-native-x64-focused-runtime']
+    matrix = focused_runtime['strategy']['matrix']
     require(matrix == {'include': [{'preset': preset} for preset in
                                    ('x64-debug-core', 'x64-profile-core', 'x64-asan-core')]},
             'manual Debug/Profile/ASAN matrix must retain exactly three presets')
+    require(focused_runtime.get('with', {}).get('focused_test_regex') ==
+            EXTENDED_FOCUSED_RUNTIME_REGEX,
+            'extended x64 focused runtime must retain its exact test filter')
     manual = "github.event_name == 'workflow_dispatch'"
     conditions = {
         'stage5-replaycheck-generalsmd-x64': [manual, "inputs.stage5_fixture_manifest != ''", "inputs.stage5_acceptance_manifest != ''"],
@@ -174,7 +349,7 @@ def validate_manual_policy(extended, root):
             'external performance must retain its dedicated runner labels')
 
 
-def validate_policy(pr, extended, root):
+def validate_policy(pr, extended, root, reusable=None):
     require(pr.get('name') == 'PR CI', 'ordinary workflow must retain its identity')
     triggers = pr.get('on', {})
     require(set(triggers) == {'pull_request', 'push'},
@@ -183,6 +358,7 @@ def validate_policy(pr, extended, root):
     require(triggers['push'] == {'branches': ['main']}, 'push trigger must target main')
     require(set(extended.get('on', {})) == {'workflow_dispatch'},
             'extended qualification must remain manual')
+    validate_retained_authoring_matrices(extended)
     validate_manual_policy(extended, root)
     concurrency = pr.get('concurrency', {})
     require('github.workflow' in concurrency.get('group', '') and
@@ -191,13 +367,15 @@ def validate_policy(pr, extended, root):
     require(concurrency.get('cancel-in-progress') == "${{ github.event_name == 'pull_request' }}",
             'superseded PR runs must cancel without cancelling main validation')
     require(pr.get('permissions') == {'contents': 'read'}, 'PR CI must use read-only permissions')
-    reusable = load_yaml((root / '.github/workflows/build-toolchain.yml').read_text(encoding='utf-8'))
+    if reusable is None:
+        reusable = load_yaml((root / '.github/workflows/build-toolchain.yml').read_text(encoding='utf-8'))
     require(reusable.get('permissions') == {'contents': 'read'},
             'reusable PR build must not elevate caller permissions')
     reusable_inputs = reusable['on']['workflow_call']['inputs']
     for option in ('package', 'validation_scratch'):
         require(reusable_inputs[option].get('default') is True,
                 f'manual extended builds must preserve {option} by default')
+    validate_focused_ctest_gate(reusable)
     jobs = pr['jobs']
     require(set(jobs) == set(REQUIRED + LANES + ('pr-readiness',)), 'unexpected PR jobs')
     detector = jobs['detect-changes']
@@ -221,8 +399,6 @@ def validate_policy(pr, extended, root):
         'native-zerohour': "${{ needs.detect-changes.outputs.zerohour == 'true' || needs.detect-changes.outputs.shared == 'true' }}",
         'rendering-tools': "${{ needs.detect-changes.outputs.rendering_tools == 'true' }}",
     }
-    cmake = '\n'.join(path.read_text(encoding='utf-8') for source in ('Core', 'Generals', 'GeneralsMD')
-                      for path in (root / source).rglob('CMakeLists.txt'))
     for lane, condition in expected_conditions.items():
         require(jobs[lane].get('if') == condition, f'{lane} selection condition changed')
         require(needs_list(jobs[lane].get('needs')) == ['detect-changes'],
@@ -242,13 +418,8 @@ def validate_policy(pr, extended, root):
                 settings.get('package') is False and settings.get('validation_scratch') is False,
                 f'{lane} must use bounded extras without packaging/qualification scratch')
         pattern = settings.get('focused_test_regex', '')
-        require(pattern.startswith('^(') and pattern.endswith(')$'), f'{lane} CTest filter must be anchored')
-        names = pattern[2:-2].split('|')
-        require(len(set(names)) == len(names), f'{lane} smoke suite must be distinct')
+        names = focused_test_names(pattern)
         for name in names:
-            require(re.fullmatch(r'[a-z0-9_]+', name) is not None, 'smoke filter must enumerate exact test names')
-            require(re.search(r'add_test\(\s*NAME\s+' + re.escape(name) + r'\s', cmake),
-                    f'CTest name is not registered in source: {name}')
             require(not re.search(r'acceptance|host_validation|combined_native|stage5_performance', name, re.I),
                     f'expensive qualification selected: {name}')
             require(name.startswith(('core_', prefix + '_')), f'wrong-title CTest selected: {name}')
@@ -258,13 +429,8 @@ def validate_policy(pr, extended, root):
                 f'{lane} must compile product and title runtime harness')
         require(len(set(targets)) == len(targets), f'{lane} build targets must be distinct')
         for target in targets:
-            require(re.fullmatch(r'[a-z0-9_]+', target) is not None and
-                    re.search(r'(?:add_executable|rts_add_game_executable)\(\s*' + re.escape(target) + r'[\s)]', cmake),
-                    f'build target is not defined in source: {target}')
-        for name in names:
-            command = re.search(r'add_test\(\s*NAME\s+' + re.escape(name) + r'\s+COMMAND\s+(\w+)', cmake)
-            require(command and command.group(1) in targets,
-                    f'CTest executable is not selected for compilation: {name}')
+            require(re.fullmatch(r'[a-z0-9_]+', target) is not None,
+                    f'focused build target must have an exact name: {target}')
         require(set(names) == required_smoke_tests(prefix),
                 f'{lane} must retain the exact required 17 smoke tests')
         require(set(targets) == required_smoke_targets(prefix),
@@ -310,11 +476,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source-root', type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument('--readiness', action='store_true')
+    parser.add_argument('--ctest-inventory', type=Path)
+    parser.add_argument('--focused-test-regex')
     args = parser.parse_args()
     if args.readiness:
+        require(args.ctest_inventory is None and args.focused_test_regex is None,
+                '--readiness cannot be combined with CTest inventory options')
         evaluate_readiness(json.loads(os.environ['NEEDS_JSON']))
         print('PR readiness passed.')
+    elif args.ctest_inventory is not None:
+        require(args.focused_test_regex is not None,
+                '--ctest-inventory requires --focused-test-regex')
+        inventory = json.loads(args.ctest_inventory.read_text(encoding='utf-8-sig'))
+        validate_ctest_inventory(inventory, args.focused_test_regex)
+        print('Focused CTest configured inventory passed.')
     else:
+        require(args.focused_test_regex is None,
+                '--focused-test-regex requires --ctest-inventory')
         directory = args.source_root / '.github/workflows'
         validate_policy(load_yaml((directory / 'pr-ci.yml').read_text(encoding='utf-8')),
                         load_yaml((directory / 'ci.yml').read_text(encoding='utf-8')), args.source_root)

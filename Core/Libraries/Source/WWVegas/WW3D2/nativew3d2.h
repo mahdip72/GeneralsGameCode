@@ -96,6 +96,7 @@ public:
 		const void *vertexData, size_t vertexBytes, const void *indexData,
 		size_t indexBytes, const rts::render::GameBoundingSphere *sphere);
 	virtual rts::render::RenderResult FlushGameSortedTriangles();
+	virtual rts::render::RenderResult FlushGameTextureDraws();
 	virtual rts::render::RenderResult BeginGameDisplayIteration();
 	virtual rts::render::RenderResult ResetGameRenderFrameResources(
 		bool frameChanged);
@@ -130,6 +131,9 @@ public:
 	virtual void RequestGameBackBufferCapture();
 	virtual bool ConsumeGameBackBufferCaptureSuccess();
 	virtual void RecordGameFailure(rts::render::RenderResult result);
+	// Explicit failure provenance for this implementation's call sites.
+	void RecordGameFailure(rts::render::RenderResult result,
+		const char *caller, unsigned int site);
 
 	// NativeSortedGeometrySink implementation.  The sorter passes one
 	// transient vertex/index image plus contiguous legacy state groups; this

@@ -25,3 +25,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/Core/GameEngine/Source/GameLogic/AI/AIPathfind.cpp"
     "${CMAKE_SOURCE_DIR}/Core/GameEngine/Include/GameLogic/AIPathfind.h")
 include(ColdCellAdmission.cmake)
+
+set(OPEN_LIST_SOURCE_ROOT "${CMAKE_SOURCE_DIR}")
+set(OPEN_LIST_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/open-list")
+include(OpenListInsertion.cmake)

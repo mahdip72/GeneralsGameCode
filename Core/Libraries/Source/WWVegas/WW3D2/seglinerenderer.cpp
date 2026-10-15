@@ -791,7 +791,7 @@ void SegLineRendererClass::Render
 							unsigned int new_count = curr_int->PointCount + next_int->PointCount;
 							float oo_new_count = 1.0f / (float)new_count;
 							float curr_factor = oo_new_count * (float)curr_int->PointCount;
-							float next_factor = oo_new_count * (float)curr_int->PointCount;
+							float next_factor = oo_new_count * (float)next_int->PointCount;
 							Vector3 new_point = curr_int->Point * curr_factor + next_int->Point * next_factor;
 							float new_tex_v = curr_int->TexV * curr_factor + next_int->TexV * next_factor;
 							Vector4 new_diffuse = curr_int->RGBA * curr_factor + next_int->RGBA * next_factor;
@@ -830,7 +830,7 @@ void SegLineRendererClass::Render
 								pl.Normalize();
 
 								if (curr_int->Parallel) {
-									new_direction = new_direction - pl * Vector3::Dot_Product(pl, new_direction);
+									new_direction = curr_int->Direction - pl * Vector3::Dot_Product(pl, curr_int->Direction);
 									new_direction.Normalize();
 								} else {
 									Vector3::Cross_Product(curr_seg->EdgePlane[edge], pl, &new_direction);

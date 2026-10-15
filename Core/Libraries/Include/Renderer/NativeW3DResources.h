@@ -226,6 +226,11 @@ public:
 	// Explicit recovery advances the buffer epoch, then restores only static
 	// ranges backed by an authoritative CPU image.
 	RenderResult RestoreStaticBuffersAfterRecovery();
+	RenderResult ValidateTextureRefresh(GpuHandle handle,
+		const TextureDescriptor &descriptor,
+		const TextureSubresourceData *subresources,
+		unsigned int subresourceCount) const;
+	RenderResult ValidateTextureCopy(GpuHandle handle) const;
 	RenderResult RefreshTexture(GpuHandle handle,
 		const TextureDescriptor &descriptor,
 		const TextureSubresourceData *subresources,

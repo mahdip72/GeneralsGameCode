@@ -45,6 +45,11 @@ enum Phase
 	RendererNativeSubmitCommandSampled64, RendererNativeExecuteCommandSampled64,
 	RendererNativeServiceThreadedCompletionsSampled64,
 	RendererNativeCommandBodySampled64,
+	RendererSortingNodeOrder, RendererSortingDescriptorScratch,
+	RendererSortingKernel, RendererSortingOutputExpansion,
+	RendererSortingTriangleSort, RendererSortingGeometryPack, RendererSortingSink,
+	LogicOwnerIntake, LogicMutableIsland, LogicSpatial, LogicOwnerTail,
+	LogicVerificationPublication,
 	PhaseCount
 };
 
@@ -445,7 +450,12 @@ private:
 			"renderer_skin_draw_categories", "renderer_resource_lookup_scan", "renderer_readiness_check_sampled64",
 			"renderer_native_submit_command_sampled64", "renderer_native_execute_command_sampled64",
 			"renderer_native_service_threaded_completions_sampled64",
-			"renderer_native_command_body_sampled64"
+			"renderer_native_command_body_sampled64",
+			"renderer_sorting_node_order", "renderer_sorting_descriptor_scratch",
+			"renderer_sorting_kernel", "renderer_sorting_output_expansion",
+			"renderer_sorting_triangle_sort", "renderer_sorting_geometry_pack", "renderer_sorting_sink",
+			"logic_owner_intake", "logic_mutable_island", "logic_spatial", "logic_owner_tail",
+			"logic_verification_publication"
 		};
 		static_assert(sizeof(names) / sizeof(names[0]) == PhaseCount,
 			"Every diagnostic phase must retain its CSV name");

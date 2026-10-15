@@ -264,6 +264,19 @@ jobs:
           & $test.FullName
           exit $LASTEXITCODE
 
+      - name: Verify focused CTest inventory
+        if: inputs.focused_test_regex != ''
+        shell: pwsh
+        run: |
+          $inventoryPath = Join-Path $env:RUNNER_TEMP 'focused-ctest-inventory.json'
+          $configuration = if ('${{ inputs.preset }}' -match 'debug|asan') { 'Debug' } else { 'Release' }
+          $inventoryJson = & ctest --test-dir "build\${{ inputs.preset }}" --show-only=json-v1 -C $configuration
+          $ctestInventoryExitCode = $LASTEXITCODE
+          if ($ctestInventoryExitCode -ne 0) { exit $ctestInventoryExitCode }
+          $inventoryJson | Set-Content -LiteralPath $inventoryPath -Encoding utf8
+          py -3 .github/workflows/PRWorkflowPolicy.py --ctest-inventory $inventoryPath --focused-test-regex '${{ inputs.focused_test_regex }}'
+          exit $LASTEXITCODE
+
       - name: Run Core extras tests for ${{ inputs.game }} with ${{ inputs.preset }}
         if: inputs.extras
         shell: pwsh

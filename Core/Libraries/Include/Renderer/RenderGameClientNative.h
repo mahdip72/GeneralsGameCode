@@ -299,6 +299,8 @@ public:
 		{ return RENDER_RESULT_UNSUPPORTED; }
 	virtual void EndGameRigidDrawScope() {}
 	virtual RenderResult FlushGameRigidDraws() { return RENDER_RESULT_OK; }
+	// Content mutations need the accepted draw prefix, not a resource-only fence.
+	virtual RenderResult FlushGameTextureDraws() { return FlushGameRigidDraws(); }
 	virtual RenderResult GetGameRigidDrawMetrics(GameRigidDrawMetrics *) const
 		{ return RENDER_RESULT_UNSUPPORTED; }
 	virtual bool IsInitialized() const = 0;

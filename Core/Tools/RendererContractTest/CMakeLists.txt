@@ -238,10 +238,38 @@ if(WIN32 AND NOT IS_VS6_BUILD)
         # context, including failed Map and the whole-block equality shortcut.
         d3d11_sampler_fragment(D3D11NormalConstants
             "struct LegacyTransformConstants" "\nstruct PresentationColorConstants")
+        d3d11_sampler_fragment(D3D11DomainResult
+            "RenderResult TranslateResult(" "\nHRESULT TranslateInjectedFault(")
         d3d11_sampler_fragment(D3D11NormalMultiply
             "void MultiplyMatrices(" "\nbool IsSeaWaveVertexLayout(")
-        d3d11_sampler_fragment(D3D11NormalPublication
+        d3d11_sampler_fragment(D3D11ReuseLayoutEquality
+            "bool EqualVertexLayouts(const LegacyVertexLayout &left," "\nunsigned int LegacyVertexLayoutFlags(")
+        d3d11_sampler_fragment(D3D11RigidVertexLayout
+            "\tstatic LegacyVertexLayout rigidVertexLayout(bool hasDiffuse = true)" "\n\tstatic HRESULT buildNativeInputElements(")
+        d3d11_sampler_fragment(D3D11InstancedDomainSetter
+            "\tvirtual RenderResult setLegacyStateForInstancedDraw(" "\n\tRenderResult setLegacyStateForLayoutInternal(")
+        d3d11_sampler_fragment(D3D11LayoutSetter
+            "\tvirtual RenderResult setLegacyStateForLayout(" "\n\tvirtual RenderResult setLegacyStateForInstancedDraw(")
+        d3d11_sampler_fragment(D3D11LegacyLayoutHelpers
+            "bool EqualVertexLayouts(const LegacyVertexLayout &left," "\nbool HasBlendVertexSemantics(")
+        d3d11_sampler_fragment(D3D11LegacyLayoutFlagConstants
+            "const unsigned int LEGACY_VERTEX_LAYOUT_PRETRANSFORMED =" "const unsigned int MAX_TEXTURE_REFRESH_SUBRESOURCES =")
+        d3d11_sampler_fragment(D3D11InstancedWorldAdmissionType
+            "\tstruct InstancedWorldAdmission" "\n\tvirtual RenderResult setLegacyState(")
+        d3d11_sampler_fragment(D3D11InstancedConstantUpdate
             "\tHRESULT updateTransformConstants(" "\n\tvoid releaseNativeSlot(")
+        d3d11_sampler_fragment(D3D11InstancedReuse
+            "\tbool tryReuseInstancedConstants(" "\n\tstatic bool useInstancedConstantDomain()")
+        d3d11_sampler_fragment(D3D11NormalPublication
+            "\tstatic bool useInstancedConstantDomain()" "\n\tvoid releaseNativeSlot(")
+        d3d11_sampler_fragment(D3D11InstancedDomainRefresh
+            "\tRenderResult refreshTransformConstantsForDraw(" "\n\tvoid cacheLegacyState(")
+        d3d11_sampler_fragment(D3D11DomainSetterPrefix
+            "\tvirtual RenderResult setLegacyState(" "\n\t\tif (state.pipeline.ambientMaterialSource >")
+        d3d11_sampler_fragment(D3D11DomainCacheState
+            "\tvoid cacheLegacyState(" "\n\tvoid invalidatePipelineBindings()")
+        d3d11_sampler_fragment(D3D11OriginalWorldAdmission
+            "\tbool validateOriginalInstancedWorld(" "\n\tHRESULT updateTransformConstants(")
         d3d11_sampler_fragment(D3D11NormalBeginFrame
             "\tvirtual RenderResult beginFrame()" "\n\tvirtual RenderResult updateBuffer(")
         d3d11_sampler_fragment(D3D11NormalInvalidation

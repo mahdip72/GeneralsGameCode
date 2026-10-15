@@ -120,6 +120,7 @@ struct Fixture
 	std::vector<LegacyLogicalState> submittedLayoutStates;
 	std::vector<LegacyVertexLayout> submittedLayouts;
 	std::vector<unsigned int> submittedLayoutMasks;
+	std::vector<bool> submittedLayoutInstanced;
 	std::vector<TextureBindingExecution> textureBindings;
 	std::atomic<bool> busyEntered, busyRelease;
 	int gateEvent;
@@ -410,7 +411,15 @@ public:
 		f.layoutState = state; f.layoutValue = layout;
 		f.submittedLayoutStates.push_back(state); f.submittedLayouts.push_back(layout);
 		f.submittedLayoutMasks.push_back(mask);
+		f.submittedLayoutInstanced.push_back(false);
 		f.layoutStride = layout.stride; f.layoutOffset = layout.elements[0].byteOffset; return RENDER_RESULT_OK;
+	}
+	RenderResult setLegacyStateForInstancedDraw(const LegacyLogicalState &state,
+		const LegacyVertexLayout &layout, unsigned int mask) override
+	{
+		const RenderResult result = setLegacyStateForLayout(state, layout, mask);
+		f.submittedLayoutInstanced.back() = true;
+		return result;
 	}
 	RenderResult setVertexBuffer(GpuHandle handle, unsigned int stride, unsigned int offset) override
 	{ f.event(VERTEX); CHECK(!handle.isValid() || handles.isLive(handle));
@@ -1196,6 +1205,79 @@ ThreadedIndexedInstancedDraw InstancedRecord(IRenderDevice *device,
 	draw.worlds[0].values[0] = 31.0f;
 	draw.worlds[1].values[0] = 47.0f;
 	return draw;
+}
+
+void InstancedAndOrdinaryStateRoute()
+{
+	for (unsigned int serial = 0; serial != 2; ++serial)
+	{
+		Fixture f; ThreadedRenderOptions options; options.serial = serial != 0;
+		auto device = Device(f, options); auto draw = InstancedRecord(device.get());
+		draw.shared.layout.elements[1].semantic = RENDER_VERTEX_SEMANTIC_DIFFUSE;
+		draw.shared.layout.elements[1].format = RENDER_VERTEX_DATA_COLOR_BGRA8;
+		TextureDescriptor texture; texture.width = texture.height = 1;
+		texture.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+		unsigned int pixel = 0xffffffffU; TextureSubresourceData data;
+		data.data = &pixel; data.rowPitch = data.slicePitch = sizeof(pixel);
+		CHECK(device->createTexture(texture, &data, 1, &draw.shared.textures[0]) == RENDER_RESULT_OK);
+		draw.shared.texturePresenceMask = 1;
+		const ThreadedIndexedDraw expected = draw.shared;
+		ThreadedIndexedDraw ordinary = expected;
+		CHECK(device->createTexture(texture, &data, 1, &ordinary.textures[0]) == RENDER_RESULT_OK);
+		// Force real bindings on the second draw instead of proving an empty
+		// cached binding sequence. Both records still use the same layout/mask.
+		ordinary.topology = RENDER_PRIMITIVE_LINE_STRIP;
+		CHECK(DrainThreadedRenderDevice(device.get()) == RENDER_RESULT_OK);
+		f.events.clear(); auto context = device->immediateContext();
+		CHECK(context->beginFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedInstancedDraw(device.get(), draw) == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedIndexedDraw(device.get(), ordinary) == RENDER_RESULT_OK);
+		// The record owns its state/layout/mask even if the caller changes them.
+		draw.shared.state.constants.world.values[0] = -91;
+		draw.shared.layout.elements[0].byteOffset = 9;
+		draw.shared.texturePresenceMask = 0;
+		CHECK(context->endFrame() == RENDER_RESULT_OK);
+		CHECK(SubmitThreadedRenderFrame(device.get(), false) == RENDER_RESULT_OK);
+		CHECK(!Complete(device.get()).presented && !f.wrongThread);
+		CHECK(f.submittedLayoutInstanced == std::vector<bool>({true, false}));
+		CHECK(f.submittedLayouts.size() == 2 && f.submittedLayoutStates.size() == 2 &&
+			f.submittedLayoutMasks == std::vector<unsigned int>({1, 1}));
+		for (unsigned int n = 0; n != 2; ++n)
+		{
+			const auto &actual = f.submittedLayouts[n];
+			CHECK(actual.stride == expected.layout.stride &&
+				actual.elementCount == expected.layout.elementCount &&
+				actual.preTransformed == expected.layout.preTransformed);
+			for (unsigned int i = 0; i != actual.elementCount; ++i)
+				CHECK(actual.elements[i].semantic == expected.layout.elements[i].semantic &&
+					actual.elements[i].semanticIndex == expected.layout.elements[i].semanticIndex &&
+					actual.elements[i].format == expected.layout.elements[i].format &&
+					actual.elements[i].byteOffset == expected.layout.elements[i].byteOffset);
+			CHECK(f.submittedLayoutStates[n].constants.world.values[0] ==
+				expected.state.constants.world.values[0]);
+		}
+		// Segment at each draw boundary, not at LAYOUT: an early binding before
+		// the second setter must remain in that second draw's slice and fail.
+		std::vector<int> segment;
+		unsigned int completed = 0;
+		for (const int event : f.events)
+		{
+			if (event != LAYOUT && event != VERTEX && event != BIND_TEXTURE &&
+				event != TOPOLOGY && event != INDEX && event != DRAW_INDEXED &&
+				event != DRAW_INDEXED_INSTANCED) continue;
+			// Several adjacent texture stages form one required binding group.
+			if (event != BIND_TEXTURE || segment.empty() || segment.back() != BIND_TEXTURE)
+				segment.push_back(event);
+			if (event != DRAW_INDEXED && event != DRAW_INDEXED_INSTANCED) continue;
+			CHECK(completed < 2);
+			const int expectedDraw = completed == 0 ? DRAW_INDEXED_INSTANCED : DRAW_INDEXED;
+			CHECK(segment == std::vector<int>({LAYOUT, VERTEX, BIND_TEXTURE,
+				TOPOLOGY, INDEX, expectedDraw}));
+			segment.clear(); ++completed;
+		}
+		CHECK(completed == 2 && segment.empty());
+		CHECK(f.instancedExecutions.size() == 1 && f.indexedExecutions.size() == 1);
+	}
 }
 
 void OwnedInstancedDrawPoisonAndFifo()
@@ -3151,6 +3233,7 @@ int main(int argc, char **argv)
 #endif
 		ProducerTextureBindingCachePreservesOrderedInvalidation();
 		ProducerTopologyCachePreservesAdmissionAndFailure();
+		InstancedAndOrdinaryStateRoute();
 		OwnedInstancedDrawPoisonAndFifo();
 		OwnedInstancedDrawAdmissionAndFailure();
 		OwnedInstancedSingletonRejectedBeforeAdmission();

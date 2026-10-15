@@ -67,6 +67,17 @@ public:
 	rts::render::RenderResult drawResult, stateResult;
 	rts::render::RenderMatrix4 copied[rts::render::RENDER_RIGID_INSTANCE_MAX];
 	unsigned int copiedCount;
+	enum Route { OrdinaryLayout, InstancedLayout, Vertex, Texture, Topology, Index, Indexed, Instanced };
+	std::vector<Route> route;
+	LegacyLogicalState routedState;
+	LegacyVertexLayout routedLayout;
+	unsigned int routedMask;
+	RenderResult recordLayout(Route kind, const LegacyLogicalState &state,
+		const LegacyVertexLayout &layout, unsigned int mask)
+	{
+		++commands; route.push_back(kind); routedState = state;
+		routedLayout = layout; routedMask = mask; return stateResult;
+	}
 
 RenderResult beginFrame() { return RENDER_RESULT_OK; }
 RenderResult updateBuffer(GpuHandle, const void *, size_t, size_t, RenderBufferUpdateMode) { return RENDER_RESULT_OK; }
@@ -76,16 +87,19 @@ RenderResult setRenderTargets(const RenderTargetBinding &) { ++commands; return 
 RenderResult setRenderTargets(GpuHandle, GpuHandle) { ++commands; return RENDER_RESULT_OK; }
 RenderResult setViewport(float, float, float, float, float, float) { ++commands; return RENDER_RESULT_OK; }
 RenderResult setLegacyState(const LegacyLogicalState &, LegacyVertexFormat, unsigned int) { ++commands; return stateResult; }
-RenderResult setLegacyStateForLayout(const LegacyLogicalState &, const LegacyVertexLayout &, unsigned int) { ++commands; return stateResult; }
-RenderResult setVertexBuffer(GpuHandle, unsigned int, unsigned int) { ++commands; return RENDER_RESULT_OK; }
-RenderResult setIndexBuffer(GpuHandle, RenderFormat, unsigned int) { ++commands; return RENDER_RESULT_OK; }
-RenderResult setTexture(unsigned int, GpuHandle) { ++commands; return RENDER_RESULT_OK; }
-RenderResult setPrimitiveTopology(RenderPrimitiveTopology) { ++commands; return RENDER_RESULT_OK; }
+RenderResult setLegacyStateForLayout(const LegacyLogicalState &state, const LegacyVertexLayout &layout, unsigned int mask)
+{ return recordLayout(OrdinaryLayout, state, layout, mask); }
+RenderResult setLegacyStateForInstancedDraw(const LegacyLogicalState &state, const LegacyVertexLayout &layout, unsigned int mask)
+{ return recordLayout(InstancedLayout, state, layout, mask); }
+RenderResult setVertexBuffer(GpuHandle, unsigned int, unsigned int) { ++commands; route.push_back(Vertex); return RENDER_RESULT_OK; }
+RenderResult setIndexBuffer(GpuHandle, RenderFormat, unsigned int) { ++commands; route.push_back(Index); return RENDER_RESULT_OK; }
+RenderResult setTexture(unsigned int, GpuHandle) { ++commands; route.push_back(Texture); return RENDER_RESULT_OK; }
+RenderResult setPrimitiveTopology(RenderPrimitiveTopology) { ++commands; route.push_back(Topology); return RENDER_RESULT_OK; }
 RenderResult draw(unsigned int, unsigned int) { ++ordinary; return RENDER_RESULT_OK; }
-RenderResult drawIndexed(unsigned int, unsigned int, int) { ++ordinary; return RENDER_RESULT_OK; }
+RenderResult drawIndexed(unsigned int, unsigned int, int) { ++ordinary; route.push_back(Indexed); return RENDER_RESULT_OK; }
 RenderResult drawIndexedInstanced(unsigned int, unsigned int, int, const RenderMatrix4 *worlds, unsigned int count)
 {
-	++commands; ++instanced; copiedCount = count;
+	++commands; ++instanced; route.push_back(Instanced); copiedCount = count;
 	for (unsigned int i = 0; i < count; ++i) copied[i] = worlds[i];
 	return drawResult;
 }
@@ -106,8 +120,8 @@ public:
 	IRenderContext *immediateContext() { return &context; }
 	RenderResult createBuffer(const BufferDescriptor &, const void *, size_t, GpuHandle *buffer)
 	{ *buffer = handles.allocate(); return buffer->isValid() ? RENDER_RESULT_OK : RENDER_RESULT_FAILED; }
-	RenderResult createTexture(const TextureDescriptor &, const TextureSubresourceData *, unsigned int, GpuHandle *)
-	{ return RENDER_RESULT_UNSUPPORTED; }
+	RenderResult createTexture(const TextureDescriptor &, const TextureSubresourceData *, unsigned int, GpuHandle *texture)
+	{ *texture = handles.allocate(); return texture->isValid() ? RENDER_RESULT_OK : RENDER_RESULT_FAILED; }
 	RenderResult refreshTexture(GpuHandle, const TextureDescriptor &, const TextureSubresourceData *, unsigned int)
 	{ return RENDER_RESULT_UNSUPPORTED; }
 	RenderResult copyActiveColorTargetToTexture(GpuHandle) { return RENDER_RESULT_UNSUPPORTED; }
@@ -210,6 +224,47 @@ int TestInstancingAdmission()
 	bad = packet; bad.minimumVertexIndex = 1; bad.baseVertex = -1;
 	result |= Check(renderer.SubmitInstancedExternal(resources, state, bad, worlds, 2) == RENDER_RESULT_OK,
 		"indexed range uses base plus minimum rather than startVertex");
+	// This synchronous backend executes the real direct facade, with no threaded
+	// device special case or copy of SubmitInstancedInternal in the fixture.
+	TextureDescriptor texture; texture.width = texture.height = 1;
+	texture.format = RENDER_FORMAT_R8G8B8A8_UNORM;
+	unsigned int pixel = 0xffffffffU; TextureSubresourceData textureData;
+	textureData.data = &pixel; textureData.rowPitch = textureData.slicePitch = sizeof(pixel);
+	NativeDrawPacket textured = packet;
+	result |= Check(resources.CreateTexture(texture, &textureData, 1,
+		&textured.textures[0]) == RENDER_RESULT_OK, "direct route publishes real texture authority");
+	textured.texturePresenceMask = 1;
+	device.context.route.clear();
+	result |= Check(renderer.BeginFrame() == RENDER_RESULT_OK &&
+		renderer.SubmitInstanced(resources, state, textured, worlds, 2) == RENDER_RESULT_OK,
+		"direct facade accepts an instanced textured record");
+	std::vector<InstancingTraceContext::Route> expectedRoute = {
+		InstancingTraceContext::InstancedLayout, InstancingTraceContext::Vertex};
+	expectedRoute.insert(expectedRoute.end(), LEGACY_TEXTURE_STAGE_COUNT, InstancingTraceContext::Texture);
+	expectedRoute.push_back(InstancingTraceContext::Topology);
+	expectedRoute.push_back(InstancingTraceContext::Index);
+	expectedRoute.push_back(InstancingTraceContext::Instanced);
+	result |= Check(device.context.route == expectedRoute && device.context.routedMask == 1,
+		"direct instanced setter precedes geometry and draw with the real mask");
+	const LegacyVertexLayout routed = device.context.routedLayout;
+	result |= Check(routed.stride == textured.vertexLayout.stride &&
+		routed.elementCount == textured.vertexLayout.elementCount &&
+		routed.preTransformed == textured.vertexLayout.preTransformed &&
+		device.context.routedState.constants.world.values[0] == state.constants.world.values[0],
+		"direct route preserves state and layout header");
+	for (unsigned int i = 0; i < textured.vertexLayout.elementCount; ++i)
+		result |= Check(routed.elements[i].semantic == textured.vertexLayout.elements[i].semantic &&
+			routed.elements[i].semanticIndex == textured.vertexLayout.elements[i].semanticIndex &&
+			routed.elements[i].format == textured.vertexLayout.elements[i].format &&
+			routed.elements[i].byteOffset == textured.vertexLayout.elements[i].byteOffset,
+			"direct route forwards every active layout element");
+	device.context.route.clear();
+	expectedRoute.front() = InstancingTraceContext::OrdinaryLayout;
+	expectedRoute.back() = InstancingTraceContext::Indexed;
+	result |= Check(renderer.Submit(resources, state, textured) == RENDER_RESULT_OK &&
+		device.context.route == expectedRoute && device.context.routedMask == 1 &&
+		renderer.EndFrame(false) == RENDER_RESULT_OK,
+		"ordinary direct draw retains its ordinary layout setter and order");
 	device.context.drawResult = RENDER_RESULT_UNSUPPORTED;
 	const unsigned int ordinaryBefore = device.context.ordinary;
 	result |= Check(renderer.SubmitInstancedExternal(resources, state, packet, worlds, 2) == RENDER_RESULT_FAILED &&

@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <float.h>
+#include <stddef.h>
 #include <limits.h>
 #include <new>
 #include <string.h>
@@ -752,7 +753,7 @@ public:
 		m_cachedLegacyTexturePresenceMask(0), m_cachedLegacyCubeTextureMask(0),
 		m_cachedLegacySignedTextureMask(0),
 		m_cachedLegacyVertexLayoutFlags(0), m_cachedLegacyInputLayout(0),
-		m_transformConstantsValid(false),
+		m_transformConstantsValid(false), m_transformConstantsForInstancing(false), m_transformConstantsOrdinaryRestorePending(false), m_originalWorldAdmissionValid(false), m_originalWorldAdmissionControls(0), m_instancedReuseLayoutValid(false), m_instancedPublicationControls(0), m_instancedReuseInputLayout(0),
 		m_transformConstantsChanged(false), m_hasInputLayoutOverride(false),
 		m_inputLayoutOverride(0), m_renderTargetsBound(false),
 		m_textureBindingsValid(false),
@@ -1995,7 +1996,11 @@ public:
 			unbindTextureResources();
 		}
 		m_pipelineStateValid = false;
+		m_transformConstantsOrdinaryRestorePending = false;
 		m_transformConstantsValid = false;
+		m_transformConstantsForInstancing = false;
+		m_instancedReuseLayoutValid = false;
+		m_originalWorldAdmissionValid = false;
 		// A frame reset must discard, never NO_OVERWRITE an earlier live slice.
 		m_transformArenaPolicy.reset();
 		m_pipelineBound = false;
@@ -2502,13 +2507,29 @@ public:
 		return RENDER_RESULT_OK;
 	}
 
+	struct InstancedWorldAdmission
+	{
+		InstancedWorldAdmission(const RenderMatrix4 &source, unsigned int validatedControls) :
+			world(&source), controls(validatedControls) {}
+		const RenderMatrix4 *world;
+		unsigned int controls;
+	};
+
 	virtual RenderResult setLegacyState(const LegacyLogicalState &state,
 		LegacyVertexFormat vertexFormat, unsigned int texturePresenceMask)
+	{
+		return setLegacyStateInternal(state, vertexFormat, texturePresenceMask, false);
+	}
+
+	RenderResult setLegacyStateInternal(const LegacyLogicalState &state,
+		LegacyVertexFormat vertexFormat, unsigned int texturePresenceMask,
+		bool instancedConstants, const InstancedWorldAdmission *admission = 0)
 	{
 		if (!isOwner() || !m_frameOpen)
 		{
 			return RENDER_RESULT_INVALID_ARGUMENT;
 		}
+		if (!instancedConstants) m_instancedReuseLayoutValid = false;
 		const bool hasTextures = texturePresenceMask != 0;
 		const bool useFullPipeline = hasTextures || vertexFormat ==
 			RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1;
@@ -2552,6 +2573,8 @@ public:
 			m_cachedLegacySignedTextureMask == m_boundSignedTextureMask &&
 			m_cachedLegacyVertexLayoutFlags == vertexLayoutFlags &&
 			m_cachedLegacyInputLayout == inputLayout &&
+			m_transformConstantsForInstancing == instancedConstants &&
+			(instancedConstants || !m_transformConstantsOrdinaryRestorePending) &&
 			memcmp(m_cachedLegacyState, &state, sizeof(state)) == 0)
 		{
 			return RENDER_RESULT_OK;
@@ -2568,7 +2591,7 @@ public:
 				sizeof(state.pipeline)) == 0)
 		{
 			const HRESULT transformResult = updateTransformConstants(state,
-				vertexLayoutFlags, texturePresenceMask, m_boundCubeTextureMask);
+				vertexLayoutFlags, texturePresenceMask, m_boundCubeTextureMask, instancedConstants, admission);
 			if (FAILED(transformResult))
 			{
 				return TranslateResult(transformResult);
@@ -2619,7 +2642,7 @@ public:
 			return RENDER_RESULT_UNSUPPORTED;
 		}
 		const HRESULT transformResult = updateTransformConstants(state,
-			vertexLayoutFlags, texturePresenceMask, m_boundCubeTextureMask);
+			vertexLayoutFlags, texturePresenceMask, m_boundCubeTextureMask, instancedConstants, admission);
 		if (FAILED(transformResult))
 		{
 			return TranslateResult(transformResult);
@@ -2904,8 +2927,92 @@ public:
 	}
 
 	virtual RenderResult setLegacyStateForLayout(const LegacyLogicalState &state,
-		const LegacyVertexLayout &vertexLayout,
-		unsigned int texturePresenceMask)
+		const LegacyVertexLayout &vertexLayout, unsigned int texturePresenceMask)
+	{
+		return setLegacyStateForLayoutInternal(state, vertexLayout, texturePresenceMask, false);
+	}
+
+	virtual RenderResult setLegacyStateForInstancedDraw(const LegacyLogicalState &state,
+		const LegacyVertexLayout &vertexLayout, unsigned int texturePresenceMask)
+	{
+		if (!isOwner() || !m_frameOpen) return RENDER_RESULT_INVALID_ARGUMENT;
+		bool originalWorldAdmitted = false;
+		if (tryReuseInstancedConstants(state, vertexLayout, texturePresenceMask, &originalWorldAdmitted))
+			return RENDER_RESULT_OK;
+		if (!originalWorldAdmitted)
+		{
+		if (!useInstancedConstantDomain())
+		{
+			m_originalWorldAdmissionValid = false;
+			return setLegacyStateForLayout(state, vertexLayout, texturePresenceMask);
+		}
+		if (!supportsRigidInstancing() ||
+			(!EqualVertexLayouts(vertexLayout, rigidVertexLayout(true)) &&
+			 !EqualVertexLayouts(vertexLayout, rigidVertexLayout(false))) ||
+			state.pipeline.vertexProgram != RENDER_LEGACY_VERTEX_FIXED_FUNCTION ||
+			state.pipeline.pixelProgram != RENDER_LEGACY_PIXEL_FIXED_FUNCTION ||
+			state.pipeline.alphaTestEnable || state.pipeline.blend.blendEnable ||
+			state.pipeline.nPatchEnable) return RENDER_RESULT_UNSUPPORTED;
+		// Validate the original owner world before the pack-local normalization.
+		if (!validateOriginalInstancedWorld(state.constants.world)) return RENDER_RESULT_INVALID_ARGUMENT;
+		}
+		const size_t worldOffset = offsetof(LegacyLogicalState, constants) +
+			offsetof(LegacyFixedFunctionConstants, world);
+		const size_t worldEnd = worldOffset + sizeof(state.constants.world);
+		const size_t viewOffset = offsetof(LegacyLogicalState, constants) +
+			offsetof(LegacyFixedFunctionConstants, view);
+		const size_t viewEnd = viewOffset + sizeof(state.constants.view);
+		const unsigned char *stateBytes = reinterpret_cast<const unsigned char *>(&state);
+		const bool ordinaryViewChange = m_cachedLegacyStateValid &&
+			m_cachedLegacyTexturePresenceMask == texturePresenceMask &&
+			m_cachedLegacyCubeTextureMask == m_boundCubeTextureMask &&
+			m_cachedLegacySignedTextureMask == m_boundSignedTextureMask &&
+			memcmp(m_cachedLegacyState + viewOffset, &state.constants.view, sizeof(state.constants.view)) != 0 &&
+			(originalWorldAdmitted ||
+			 (m_cachedLegacyVertexFormat == RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1 &&
+			  m_cachedLegacyInputLayout == m_instancedReuseInputLayout &&
+			  EqualVertexLayouts(m_instancedReuseLayout, vertexLayout) &&
+			  memcmp(m_cachedLegacyState, stateBytes, worldOffset) == 0)) &&
+			memcmp(m_cachedLegacyState + worldEnd, stateBytes + worldEnd, viewOffset - worldEnd) == 0 &&
+			memcmp(m_cachedLegacyState + viewEnd, stateBytes + viewEnd, sizeof(state) - viewEnd) == 0;
+		// Both sources name the CURRENT validated controls; neither publishes a proof before success.
+		const unsigned int admittedControls = originalWorldAdmitted ?
+			m_instancedPublicationControls : m_originalWorldAdmissionControls;
+		const InstancedWorldAdmission admission(state.constants.world, admittedControls);
+		m_instancedReuseLayoutValid = false;
+		RenderResult result;
+		if (ordinaryViewChange && originalWorldAdmitted)
+		{
+			const HRESULT transformResult = updateTransformConstants(state,
+				m_cachedLegacyVertexLayoutFlags, texturePresenceMask, m_boundCubeTextureMask, false);
+			if (FAILED(transformResult)) return TranslateResult(transformResult);
+			m_transformConstantsChanged = false;
+			// Strict selection proved every other logical byte and all metadata unchanged.
+			memcpy(m_cachedLegacyState + worldOffset, &state.constants.world, sizeof(state.constants.world));
+			memcpy(m_cachedLegacyState + viewOffset, &state.constants.view, sizeof(state.constants.view));
+			result = RENDER_RESULT_OK;
+		}
+		else
+		{
+			result = ordinaryViewChange ?
+				setLegacyStateForLayout(state, vertexLayout, texturePresenceMask) :
+				setLegacyStateForLayoutInternal(state, vertexLayout, texturePresenceMask, true, &admission);
+		}
+		if (result == RENDER_RESULT_OK && m_transformConstantsValid &&
+			(ordinaryViewChange || m_transformConstantsForInstancing) && !m_transformConstantsChanged)
+		{
+			if (ordinaryViewChange) m_instancedPublicationControls = admittedControls;
+			if (!ordinaryViewChange && !originalWorldAdmitted)
+				memcpy(&m_instancedReuseLayout, &vertexLayout, sizeof(vertexLayout));
+			m_instancedReuseInputLayout = m_cachedLegacyInputLayout;
+			m_instancedReuseLayoutValid = true;
+		}
+		return result;
+	}
+
+	RenderResult setLegacyStateForLayoutInternal(const LegacyLogicalState &state,
+		const LegacyVertexLayout &vertexLayout, unsigned int texturePresenceMask,
+		bool instancedConstants, const InstancedWorldAdmission *admission = 0)
 	{
 		if (!isOwner() || !m_frameOpen)
 		{
@@ -2937,8 +3044,8 @@ public:
 		m_vertexLayoutFlagsOverride = layoutFlags;
 		m_hasInputLayoutOverride = true;
 		m_inputLayoutOverride = inputLayout;
-		const RenderResult stateResult = setLegacyState(state,
-			RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, texturePresenceMask);
+		const RenderResult stateResult = setLegacyStateInternal(state,
+			RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1, texturePresenceMask, instancedConstants, admission);
 		m_hasVertexLayoutFlagsOverride = false;
 		m_vertexLayoutFlagsOverride = 0;
 		m_hasInputLayoutOverride = false;
@@ -3365,7 +3472,7 @@ public:
 			memcpy(records[i].world, worlds[i].values, sizeof(records[i].world));
 			BuildLegacyInverseTransposeNormalMatrix(worldView, records[i].viewNormal);
 		}
-		result = refreshTransformConstantsForDraw();
+		result = refreshTransformConstantsForDraw(m_transformConstantsForInstancing);
 		if (result != RENDER_RESULT_OK)
 			return result == RENDER_RESULT_UNSUPPORTED ? RENDER_RESULT_FAILED : result;
 		D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -3832,6 +3939,9 @@ private:
 		m_context->PSSetConstantBuffers(0, 1, &emptyConstantBuffer);
 		// Presentation overwrote b0; identical bytes must rebind a fresh range.
 		m_transformConstantsValid = false;
+		m_transformConstantsForInstancing = false;
+		m_instancedReuseLayoutValid = false;
+		m_originalWorldAdmissionValid = false;
 		m_transformConstantsChanged = true;
 		m_context->VSSetShader(0, 0, 0);
 		m_context->PSSetShader(0, 0, 0);
@@ -3968,9 +4078,11 @@ private:
 		return true;
 	}
 
-	RenderResult refreshTransformConstantsForDraw()
+	RenderResult refreshTransformConstantsForDraw(bool instancedConstants = false)
 	{
-		if (!m_transformConstantsChanged)
+		instancedConstants = instancedConstants && useInstancedConstantDomain();
+		if (!m_transformConstantsChanged &&
+			m_transformConstantsForInstancing == instancedConstants)
 		{
 			return RENDER_RESULT_OK;
 		}
@@ -3985,7 +4097,7 @@ private:
 		memcpy(&state, m_cachedLegacyState, sizeof(state));
 		const HRESULT result = updateTransformConstants(state,
 			m_cachedLegacyVertexLayoutFlags,
-			m_cachedLegacyTexturePresenceMask, m_boundCubeTextureMask);
+			m_cachedLegacyTexturePresenceMask, m_boundCubeTextureMask, instancedConstants);
 		if (FAILED(result))
 		{
 			return TranslateResult(result);
@@ -4018,11 +4130,15 @@ private:
 
 	void invalidatePipelineBindings()
 	{
+		m_transformConstantsOrdinaryRestorePending = false;
 		m_pipelineStateValid = false;
 		m_pipelineBound = false;
 		m_cachedLegacyStateValid = false;
 		m_cachedLegacyPipelineValid = false;
 		m_transformConstantsValid = false;
+		m_transformConstantsForInstancing = false;
+		m_instancedReuseLayoutValid = false;
+		m_originalWorldAdmissionValid = false;
 		m_transformConstantsChanged = true;
 #if defined(_MSC_VER) && defined(_M_X64)
 		m_worldNormalCache.invalidate();
@@ -4588,14 +4704,152 @@ private:
 		return S_OK;
 	}
 
+	bool tryReuseInstancedConstants(const LegacyLogicalState &state,
+		const LegacyVertexLayout &vertexLayout, unsigned int texturePresenceMask,
+		bool *originalWorldAdmitted = 0)
+	{
+		if (originalWorldAdmitted) *originalWorldAdmitted = false;
+#if defined(_MSC_VER) && defined(_M_X64)
+		// A successful physical publication, not the mathematical memo, certifies eligibility.
+		if (!m_instancedReuseLayoutValid || !m_transformConstantsValid ||
+			m_transformConstantsChanged ||
+			m_transformConstantsOrdinaryRestorePending || !m_pipelineStateValid ||
+			!m_pipelineBound || !m_cachedLegacyStateValid || !m_cachedLegacyPipelineValid ||
+			m_cachedLegacyVertexFormat != RENDER_VERTEX_POSITION3_NORMAL_COLOR_TEX1 ||
+			m_cachedLegacyInputLayout != m_instancedReuseInputLayout ||
+			!supportsRigidInstancing() || !EqualVertexLayouts(m_instancedReuseLayout, vertexLayout))
+			return false;
+		const unsigned int controls = detail::ReadNormalMatrixCacheControls() & ~0x3fU;
+		if ((controls & 0x1f80U) != 0x1f80U || controls != m_instancedPublicationControls)
+			return false;
+		const size_t worldOffset = offsetof(LegacyLogicalState, constants) +
+			offsetof(LegacyFixedFunctionConstants, world);
+		const size_t worldEnd = worldOffset + sizeof(state.constants.world);
+		const unsigned char *bytes = reinterpret_cast<const unsigned char *>(&state);
+		// This includes every pipeline byte and any padding before the original world.
+		if (memcmp(m_cachedLegacyState, bytes, worldOffset) != 0) return false;
+		const bool sameWorld = memcmp(m_cachedLegacyState + worldOffset,
+			&state.constants.world, sizeof(state.constants.world)) == 0;
+		if (!sameWorld && !validateOriginalInstancedWorld(state.constants.world)) return false;
+		// Local proof permits the regular setter to handle changed live constants/masks.
+		if (originalWorldAdmitted) *originalWorldAdmitted = true;
+		if (!m_transformConstantsForInstancing ||
+			m_cachedLegacyTexturePresenceMask != texturePresenceMask ||
+			m_cachedLegacyCubeTextureMask != m_boundCubeTextureMask ||
+			m_cachedLegacySignedTextureMask != m_boundSignedTextureMask ||
+			memcmp(m_cachedLegacyState + worldEnd, bytes + worldEnd, sizeof(state) - worldEnd) != 0)
+			return false;
+		if (!sameWorld)
+			memcpy(m_cachedLegacyState + worldOffset, &state.constants.world, sizeof(state.constants.world));
+		return true;
+#else
+		(void)state; (void)vertexLayout; (void)texturePresenceMask;
+		return false;
+#endif
+	}
+
+	static bool useInstancedConstantDomain()
+	{
+#if defined(_MSC_VER) && defined(_M_X64)
+		return (detail::ReadNormalMatrixCacheControls() & 0x1f80U) == 0x1f80U;
+#else
+		return false;
+#endif
+	}
+
+	bool validateOriginalInstancedWorld(const RenderMatrix4 &world)
+	{
+#if defined(_MSC_VER) && defined(_M_X64)
+		const unsigned int rawControls = detail::ReadNormalMatrixCacheControls();
+		if ((rawControls & 0x1f80U) != 0x1f80U)
+		{
+			m_originalWorldAdmissionValid = false;
+			return false;
+		}
+		// All MXCSR control bits are keyed; bits0..5 are sticky status, not controls.
+		const unsigned int controls = rawControls & ~0x3fU;
+		if (m_originalWorldAdmissionValid &&
+			m_originalWorldAdmissionControls == controls &&
+			memcmp(m_originalWorldAdmissionValues, world.values, sizeof(world.values)) == 0)
+			return true;
+		m_originalWorldAdmissionValid = false;
+		if (!RigidInstancingWorldValid(world)) return false;
+		memcpy(m_originalWorldAdmissionValues, world.values, sizeof(world.values));
+		m_originalWorldAdmissionControls = controls;
+		m_originalWorldAdmissionValid = true;
+		return true;
+#else
+		(void)world;
+		m_originalWorldAdmissionValid = false;
+		return false;
+#endif
+	}
+
 	HRESULT updateTransformConstants(const LegacyLogicalState &state,
 		unsigned int vertexLayoutFlags, unsigned int texturePresenceMask,
-		unsigned int cubeTextureMask)
+		unsigned int cubeTextureMask, bool instancedConstants = false, const InstancedWorldAdmission *admission = 0)
+	{
+		bool originalWorldAdmitted = false;
+#if defined(_MSC_VER) && defined(_M_X64)
+		// A stack-local proof is consumed only for the same immutable owner-call argument.
+		// Re-read controls after layout/D3D calls; no ABI-preservation assumption.
+		if (instancedConstants && admission && admission->world == &state.constants.world)
+		{
+			const unsigned int controls = detail::ReadNormalMatrixCacheControls() & ~0x3fU;
+			originalWorldAdmitted = (controls & 0x1f80U) == 0x1f80U && controls == admission->controls;
+		}
+#endif
+		if (instancedConstants && (originalWorldAdmitted || useInstancedConstantDomain()))
+		{
+			if (!originalWorldAdmitted && !validateOriginalInstancedWorld(state.constants.world)) return E_INVALIDARG;
+			// RenderMatrix4 constructs identity. No full logical state copy.
+			const RenderMatrix4 canonicalWorld;
+			return updateTransformConstantsPacked(state, vertexLayoutFlags,
+				texturePresenceMask, cubeTextureMask, true, canonicalWorld);
+		}
+		if (instancedConstants) m_originalWorldAdmissionValid = false;
+		m_instancedReuseLayoutValid = false;
+		// Centralize effective ordinary publication, including an unmasked true request.
+		if (m_transformConstantsForInstancing)
+			m_transformConstantsOrdinaryRestorePending = true;
+		return updateTransformConstantsPacked(state, vertexLayoutFlags,
+			texturePresenceMask, cubeTextureMask, false, state.constants.world);
+	}
+
+	HRESULT updateTransformConstantsPacked(const LegacyLogicalState &state,
+		unsigned int vertexLayoutFlags, unsigned int texturePresenceMask,
+		unsigned int cubeTextureMask, bool instancedConstants, const RenderMatrix4 &world)
 	{
 		rts::frame_timing::Scope packingTiming(rts::frame_timing::RendererConstantPack);
 		LegacyTransformConstants shaderConstants;
+#if defined(_MSC_VER) && defined(_M_X64)
+		detail::NormalMatrixSubgroupCache::Entry pendingWorldNormal;
+		detail::NormalMatrixSubgroupCache::Entry pendingWorldViewNormal;
+		unsigned int normalControls = 0;
+#endif
+		if (instancedConstants)
+		{
+#if defined(_MSC_VER) && defined(_M_X64)
+			normalControls = detail::ReadNormalMatrixCacheControls();
+#endif
+			// These five globals are replaced by instance records in the admitted VS,
+			// and are unused by the admitted fixed-function PS. View stays live below.
+			for (unsigned int component = 0; component < 16; ++component)
+			{
+				shaderConstants.worldView[component] = world.values[component];
+				shaderConstants.worldViewProjection[component] = world.values[component];
+			}
+			for (unsigned int component = 0; component < 12; ++component)
+			{
+				const float value = component == 0 || component == 5 || component == 10 ? 1.0f : 0.0f;
+				shaderConstants.worldNormalMatrix[component] = value;
+				shaderConstants.worldViewNormalMatrix[component] = value;
+			}
+		}
+		else
+		{
 		RenderMatrix4 worldViewMatrix;
-		MultiplyMatrices(state.constants.world.values, state.constants.view.values,
+		MultiplyMatrices(world.values, state.constants.view.values,
 			worldViewMatrix.values);
 		for (unsigned int component = 0; component < 16; ++component)
 		{
@@ -4608,19 +4862,18 @@ private:
 		// multiplies by these matrices; it must not perform a cofactor/determinant
 		// calculation for every vertex.
 #if defined(_MSC_VER) && defined(_M_X64)
-		detail::NormalMatrixSubgroupCache::Entry pendingWorldNormal;
-		detail::NormalMatrixSubgroupCache::Entry pendingWorldViewNormal;
-		const unsigned int normalControls = detail::ReadNormalMatrixCacheControls();
-		m_worldNormalCache.stage(state.constants.world,
+		normalControls = detail::ReadNormalMatrixCacheControls();
+		m_worldNormalCache.stage(world,
 			shaderConstants.worldNormalMatrix, pendingWorldNormal, normalControls);
 		m_worldViewNormalCache.stage(worldViewMatrix,
 			shaderConstants.worldViewNormalMatrix, pendingWorldViewNormal, normalControls);
 #else
-		BuildLegacyInverseTransposeNormalMatrix(state.constants.world,
+		BuildLegacyInverseTransposeNormalMatrix(world,
 			shaderConstants.worldNormalMatrix);
 		BuildLegacyInverseTransposeNormalMatrix(worldViewMatrix,
 			shaderConstants.worldViewNormalMatrix);
 #endif
+		}
 		// The legacy shader has three distinct fog equations.  The scale-fragment
 		// variant deliberately sets the fixed-function fog color to black so that
 		// the visibility factor multiplies the fragment instead of blending it
@@ -4727,7 +4980,7 @@ private:
 			static_cast<float>((textureFactor >> 24) & 0xffU) / 255.0f;
 		for (unsigned int component = 0; component < 16; ++component)
 		{
-			shaderConstants.world[component] = state.constants.world.values[component];
+			shaderConstants.world[component] = world.values[component];
 			shaderConstants.view[component] = state.constants.view.values[component];
 		}
 		shaderConstants.materialDiffuse[0] = state.constants.material.diffuse.x;
@@ -4861,13 +5114,19 @@ private:
 		shaderConstants.clipPlaneParameters[1] = 0;
 		shaderConstants.clipPlaneParameters[2] = 0;
 		shaderConstants.clipPlaneParameters[3] = 0;
-		if (m_transformConstantsValid && memcmp(&m_lastTransformConstants,
+		if (m_transformConstantsValid &&
+			m_transformConstantsForInstancing == instancedConstants && memcmp(&m_lastTransformConstants,
 			&shaderConstants, sizeof(shaderConstants)) == 0)
 		{
 			m_transformConstantsChanged = false;
+			if (!instancedConstants) m_transformConstantsOrdinaryRestorePending = false;
 #if defined(_MSC_VER) && defined(_M_X64)
+			if (instancedConstants) m_instancedPublicationControls = normalControls & ~0x3fU;
+			else
+			{
 			m_worldNormalCache.commit(pendingWorldNormal);
 			m_worldViewNormalCache.commit(pendingWorldViewNormal);
+			}
 #endif
 			return S_OK;
 		}
@@ -4888,6 +5147,9 @@ private:
 		if (FAILED(result))
 		{
 			m_transformConstantsValid = false;
+		m_transformConstantsForInstancing = false;
+		m_instancedReuseLayoutValid = false;
+		m_originalWorldAdmissionValid = false;
 			m_transformConstantsChanged = true;
 			return result;
 		}
@@ -4895,6 +5157,9 @@ private:
 		{
 			m_context->Unmap(constantBuffer, 0);
 			m_transformConstantsValid = false;
+		m_transformConstantsForInstancing = false;
+		m_instancedReuseLayoutValid = false;
+		m_originalWorldAdmissionValid = false;
 			m_transformConstantsChanged = true;
 			return E_FAIL;
 		}
@@ -4916,6 +5181,9 @@ private:
 				// The published slice cannot be reused with NO_OVERWRITE on retry.
 				m_transformArenaPolicy.reset();
 				m_transformConstantsValid = false;
+		m_transformConstantsForInstancing = false;
+		m_instancedReuseLayoutValid = false;
+		m_originalWorldAdmissionValid = false;
 				m_transformConstantsChanged = true;
 				return E_FAIL;
 			}
@@ -4926,11 +5194,17 @@ private:
 			m_context->PSSetConstantBuffers(0, 1, &constantBuffer);
 		}
 		m_lastTransformConstants = shaderConstants;
+		m_transformConstantsForInstancing = instancedConstants;
+		if (!instancedConstants) m_transformConstantsOrdinaryRestorePending = false;
 		m_transformConstantsValid = true;
 		m_transformConstantsChanged = true;
 #if defined(_MSC_VER) && defined(_M_X64)
+		if (instancedConstants) m_instancedPublicationControls = normalControls & ~0x3fU;
+		else
+		{
 		m_worldNormalCache.commit(pendingWorldNormal);
 		m_worldViewNormalCache.commit(pendingWorldViewNormal);
+		}
 #endif
 		return S_OK;
 	}
@@ -6346,6 +6620,9 @@ private:
 		}
 		m_transformArenaPolicy.reset();
 		m_transformConstantsValid = false;
+		m_transformConstantsForInstancing = false;
+		m_instancedReuseLayoutValid = false;
+		m_originalWorldAdmissionValid = false;
 		if (m_presentationSampler != 0)
 		{
 			m_presentationSampler->Release();
@@ -6638,6 +6915,15 @@ private:
 	detail::NormalMatrixSubgroupCache m_worldViewNormalCache;
 #endif
 	bool m_transformConstantsValid;
+	bool m_transformConstantsForInstancing;
+	bool m_transformConstantsOrdinaryRestorePending;
+	bool m_originalWorldAdmissionValid;
+	unsigned int m_originalWorldAdmissionControls;
+	float m_originalWorldAdmissionValues[16];
+	bool m_instancedReuseLayoutValid;
+	unsigned int m_instancedPublicationControls;
+	ID3D11InputLayout *m_instancedReuseInputLayout;
+	LegacyVertexLayout m_instancedReuseLayout;
 	bool m_transformConstantsChanged;
 	bool m_hasInputLayoutOverride;
 	ID3D11InputLayout *m_inputLayoutOverride;

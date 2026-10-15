@@ -17,7 +17,7 @@ function Add-Receipt([string]$Text,[int]$Start,[string]$Body,[string]$Pattern,[s
     $receipts.Add([pscustomobject]@{title=$Title;path=$Path;pattern=$Pattern;
         first_line=1+($Text.Substring(0,$Start).Split("`n").Length-1);sha256=(Hash-Text $Body)})
 }
-function Extract-Method([string]$Text,[string]$Pattern,[string]$Path) {
+function Extract-Method([string]$Text,[string]$Pattern,[string]$Path,[switch]$SkipReceipt) {
     $matches=[regex]::Matches($Text,$Pattern,[System.Text.RegularExpressions.RegexOptions]::Multiline)
     if($matches.Count -ne 1){throw "Expected unique method $Pattern in $Path, got $($matches.Count)"}
     $start=$matches[0].Index
@@ -44,7 +44,7 @@ function Extract-Method([string]$Text,[string]$Pattern,[string]$Path) {
     }
     if($end -lt 0){throw "Unbalanced or truncated method $Pattern in $Path"}
     $body=$Text.Substring($start,$end-$start)+"`n"
-    Add-Receipt $Text $start $body $Pattern $Path
+    if(!$SkipReceipt){Add-Receipt $Text $start $body $Pattern $Path}
     return $body
 }
 function Put-Generated([string]$Name,[string]$Text) {
@@ -94,10 +94,14 @@ $owner=Read-Source $ownerPath
 $helpers=(Extract-Method $owner '^bool IsFiniteGameFloat\(' $ownerPath)+
     (Extract-Method $owner '^bool IsFiniteGameColor\(' $ownerPath)+
     (Extract-Method $owner '^bool IsValidGameMaterialSource\(' $ownerPath)
-$begins=[regex]::Matches($owner,'^\tcase GAME_RENDER_COMMAND_SET_MATERIAL:$',[System.Text.RegularExpressions.RegexOptions]::Multiline)
-$ends=[regex]::Matches($owner,'^\tcase GAME_RENDER_COMMAND_SET_LIGHT:$',[System.Text.RegularExpressions.RegexOptions]::Multiline)
+# Scope labels to the actual balanced command method; helper switches reuse them.
+$commandMethod=Extract-Method $owner '^rts::render::RenderResult NativeW3D2::ExecuteGameRenderCommand\(' $ownerPath -SkipReceipt
+$commandStart=$owner.IndexOf($commandMethod,[System.StringComparison]::Ordinal)
+if($commandStart -lt 0){throw 'Command method does not match its source bytes'}
+$begins=[regex]::Matches($commandMethod,'^\tcase GAME_RENDER_COMMAND_SET_MATERIAL:$',[System.Text.RegularExpressions.RegexOptions]::Multiline)
+$ends=[regex]::Matches($commandMethod,'^\tcase GAME_RENDER_COMMAND_SET_LIGHT:$',[System.Text.RegularExpressions.RegexOptions]::Multiline)
 if($begins.Count -ne 1 -or $ends.Count -ne 1 -or $ends[0].Index -le $begins[0].Index){throw 'Ambiguous/truncated owner material case'}
-$begin=$begins[0].Index;$end=$ends[0].Index
+$begin=$commandStart+$begins[0].Index;$end=$commandStart+$ends[0].Index
 $body=$owner.Substring($begin,$end-$begin)
 Add-Receipt $owner $begin $body 'SET_MATERIAL case through next SET_LIGHT label' $ownerPath
 Put-Generated 'owner-material.inc' ($helpers+"namespace rts { namespace render {`nRenderResult IGameRenderClientNativeOwner::ExecuteGameRenderCommand(const GameRenderCommand &command)`n{`n if (refuseCommand) { RecordGameFailure(RENDER_RESULT_FAILED); return RENDER_RESULT_FAILED; }`n ++commands; switch(command.type) {`n"+$body+"default: return RENDER_RESULT_INVALID_ARGUMENT; }`n}`n} }`n")

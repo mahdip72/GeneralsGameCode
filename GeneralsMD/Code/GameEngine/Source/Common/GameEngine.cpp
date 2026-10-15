@@ -34,6 +34,7 @@
 #include "Common/CRCDebug.h"
 #include "Common/FramePacer.h"
 #include "Lib/FrameTimingDiagnostics.h"
+#include "Lib/ProducerCpuPhaseDiagnostics.h"
 #include "Common/AnimatedMenuBenchmark.h"
 #include "Common/GameThreadOwnership.h"
 #include "Common/Radar.h"
@@ -1247,6 +1248,7 @@ void GameEngine::update()
 			{
 				PROFILER_SECTION_NAME("Engine.Update.Radar");
 				rts::frame_timing::Scope frameTiming(rts::frame_timing::Radar);
+				rts::producer_cpu::Scope producerCpuDetail(rts::producer_cpu::Radar);
 				TheRadar->UPDATE();
 			}
 
@@ -1255,17 +1257,20 @@ void GameEngine::update()
 			{
 				PROFILER_SECTION_NAME("Engine.Update.Audio");
 				rts::frame_timing::Scope frameTiming(rts::frame_timing::Audio);
+				rts::producer_cpu::Scope producerCpuDetail(rts::producer_cpu::Audio);
 				TheAudio->UPDATE();
 			}
 			{
 				PROFILER_SECTION_NAME("Engine.Update.Client");
 				rts::frame_timing::Scope frameTiming(rts::frame_timing::Client);
+				rts::producer_cpu::Scope producerCpuDetail(rts::producer_cpu::Client);
 				TheGameClient->UPDATE();
 				UpdateSkirmishAILegacySaveTest();
 			}
 			{
 				PROFILER_SECTION_NAME("Engine.Update.MessageStream");
 				rts::frame_timing::Scope frameTiming(rts::frame_timing::Messages);
+				rts::producer_cpu::Scope producerCpuDetail(rts::producer_cpu::Messages);
 				TheMessageStream->propagateMessages();
 			}
 
@@ -1292,6 +1297,7 @@ void GameEngine::update()
 			{
 				PROFILER_SECTION_NAME("Engine.Update.ClientStep");
 				rts::frame_timing::Scope frameTiming(rts::frame_timing::ClientStep);
+				rts::producer_cpu::Scope producerCpuDetail(rts::producer_cpu::ClientStep);
 				TheGameClient->step();
 			}
 			startHeadlessSimulationJobsAfterUnsafeInitialization();
@@ -1316,6 +1322,7 @@ Bool GameEngine::prepareHeadlessSimulationJobsForInstalledQualification()
 void GameEngine::execute()
 {
 	ASSERT_GAME_THREAD("GameEngine::execute");
+	rts::producer_cpu::Session producerCpuSession;
 	rts::frame_timing::Session frameTimingSession(
 		TheGlobalData != 0 && TheGlobalData->m_headless ? "headless" : "interactive");
 #if defined(RTS_DEBUG)
@@ -1327,6 +1334,8 @@ void GameEngine::execute()
 	{
 		const unsigned previousFrame = TheGameLogic->getFrame();
 		rts::frame_timing::BeginFrame(previousFrame);
+		rts::producer_cpu::BeginFrame(previousFrame);
+		rts::producer_cpu::Scope producerCpuFrame(rts::producer_cpu::ProducerFrame);
 
 		//if (TheGlobalData->m_vTune)
 		{
@@ -1395,6 +1404,7 @@ void GameEngine::execute()
 			{
 				PROFILER_SECTION_NAME("Engine.FramePacer");
 				rts::frame_timing::Scope frameTiming(rts::frame_timing::Wait);
+				rts::producer_cpu::Scope producerCpuDetail(rts::producer_cpu::MainWait);
 				TheFramePacer->update();
 			}
 		}

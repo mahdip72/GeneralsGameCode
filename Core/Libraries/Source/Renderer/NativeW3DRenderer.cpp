@@ -519,7 +519,7 @@ RenderResult NativeW3DRenderer::SubmitInstancedInternal(
 #endif
 	LegacyVertexLayout layout;
 	PopulateLegacyLayout(packet.vertexLayout, layout);
-	RenderResult result = context->setLegacyStateForLayout(state, layout,
+	RenderResult result = context->setLegacyStateForInstancedDraw(state, layout,
 		packet.texturePresenceMask);
 	if (result == RENDER_RESULT_OK)
 		result = context->setVertexBuffer(packet.vertexBuffer,

@@ -600,6 +600,13 @@ public:
 	virtual RenderResult setLegacyStateForLayout(const LegacyLogicalState &state,
 		const LegacyVertexLayout &vertexLayout,
 		unsigned int texturePresenceMask) = 0;
+	// Optional atomic instanced state lane. Logical state remains caller-owned
+	// and unchanged. Backends without a separate physical domain use ordinary state.
+	virtual RenderResult setLegacyStateForInstancedDraw(const LegacyLogicalState &state,
+		const LegacyVertexLayout &vertexLayout, unsigned int texturePresenceMask)
+	{
+		return setLegacyStateForLayout(state, vertexLayout, texturePresenceMask);
+	}
 	virtual RenderResult setVertexBuffer(GpuHandle buffer, unsigned int stride,
 		unsigned int offset) = 0;
 	virtual RenderResult setIndexBuffer(GpuHandle buffer, RenderFormat format,

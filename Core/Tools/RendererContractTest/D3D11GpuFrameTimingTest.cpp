@@ -611,17 +611,74 @@ struct WindowsConfigurationReadHandle
     HANDLE file;
     int& result;
 };
+void ReportWindowsConfigurationReadFailure(const char *operation, const wchar_t *path,
+    BOOL succeeded, DWORD error, DWORD count, DWORD requested)
+{
+    fprintf(stderr, "GPU_CONFIGURATION_READ operation=%s path=%ls succeeded=%u error=%lu count=%lu requested=%lu\n",
+        operation, path, succeeded ? 1U : 0U, error, count, requested);
+}
 bool ReadWindowsConfiguration(const wchar_t *path, std::string& bytes, int& result)
 {
-    WindowsConfigurationReadHandle input(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
-        0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0), result);
-    if (input.file == INVALID_HANDLE_VALUE) return false;
+    SetLastError(ERROR_SUCCESS);
+    const HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ,
+        0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+    const DWORD openError = GetLastError();
+    WindowsConfigurationReadHandle input(file, result);
+    if (input.file == INVALID_HANDLE_VALUE)
+    {
+        ReportWindowsConfigurationReadFailure("open", path, FALSE, openError, 0, 0);
+        return false;
+    }
     char text[512]; DWORD count = 0;
-    if (!ReadFile(input.file, text, sizeof(text), &count, 0)) return false;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL read = ReadFile(input.file, text, sizeof(text), &count, 0);
+    const DWORD readError = GetLastError();
+    if (!read)
+    {
+        ReportWindowsConfigurationReadFailure("read", path, read, readError, count, sizeof(text));
+        return false;
+    }
+    // A count below 512 is expected for this short JSON. Retain the count in
+    // EOF failures so a short first read is observable without accepting it.
     char extra = 0; DWORD extraCount = 1;
-    if (!ReadFile(input.file, &extra, 1, &extraCount, 0) || extraCount != 0) return false;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL eof = ReadFile(input.file, &extra, 1, &extraCount, 0);
+    const DWORD eofError = GetLastError();
+    if (!eof || extraCount != 0)
+    {
+        ReportWindowsConfigurationReadFailure("initial_read_before_eof_failure", path,
+            read, readError, count, sizeof(text));
+        ReportWindowsConfigurationReadFailure("eof", path, eof, eofError, extraCount, 1);
+        if (eof && extraCount)
+            fprintf(stderr, "GPU_CONFIGURATION_READ trailing_byte_hex=%02x\n",
+                static_cast<unsigned int>(static_cast<unsigned char>(extra)));
+        return false;
+    }
     bytes.assign(text, count);
     return true;
+}
+bool EqualWindowsConfigurationBytes(const std::string& observed, const std::string& expected,
+    const char *comparison)
+{
+    if (observed == expected) return true;
+    size_t mismatch = 0;
+    while (mismatch < observed.size() && mismatch < expected.size() &&
+        observed[mismatch] == expected[mismatch]) ++mismatch;
+    fprintf(stderr, "GPU_CONFIGURATION_COMPARE comparison=%s observed_length=%llu expected_length=%llu first_mismatch=%llu\n",
+        comparison, static_cast<unsigned long long>(observed.size()),
+        static_cast<unsigned long long>(expected.size()), static_cast<unsigned long long>(mismatch));
+    // At most 16 bytes per side, starting at the first mismatch. No string
+    // truncation, parsing, normalization or relaxed comparison is introduced.
+    const std::string *sides[2] = { &observed, &expected };
+    const char *names[2] = { "observed", "expected" };
+    for (unsigned int side = 0; side < 2; ++side)
+    {
+        fprintf(stderr, "GPU_CONFIGURATION_COMPARE %s_hex=", names[side]);
+        for (size_t index = mismatch; index < sides[side]->size() && index - mismatch < 16; ++index)
+            fprintf(stderr, "%02x", static_cast<unsigned int>(static_cast<unsigned char>((*sides[side])[index])));
+        fputc('\n', stderr);
+    }
+    return false;
 }
 bool ExactWindowsConfiguration(const std::string& bytes)
 {
@@ -632,7 +689,12 @@ bool ExactWindowsConfiguration(const std::string& bytes)
         "\"record_capacity\":65536,\"record_bytes\":%llu,\"record_storage_bytes\":%llu,\"allocation_proven\":false}\n",
         GetCurrentProcessId(), static_cast<unsigned long long>(sizeof(GpuTimingRecord)),
         static_cast<unsigned long long>(65536ULL * sizeof(GpuTimingRecord)));
-    return count > 0 && bytes == std::string(expected, static_cast<size_t>(count));
+    if (count <= 0)
+    {
+        fprintf(stderr, "GPU_CONFIGURATION_COMPARE comparison=canonical expected_format_count=%d\n", count);
+        return false;
+    }
+    return EqualWindowsConfigurationBytes(bytes, std::string(expected, static_cast<size_t>(count)), "canonical");
 }
 bool ReadWindowsEnvironment(const wchar_t *name, std::wstring& value, bool& present)
 {
@@ -699,7 +761,8 @@ int ActualWindowsConfigurationProvenance()
             result |= Check(!WriteGpuTimingConfiguration(duplicate, GetCurrentProcessId(), 8192, sizeof(GpuTimingRecord)),
                 "second actual writer refuses an existing same-PID sidecar through CREATE_NEW");
             std::string unchanged;
-            result |= Check(ReadWindowsConfiguration(directory.sidecar, unchanged, result) && unchanged == original,
+            result |= Check(ReadWindowsConfiguration(directory.sidecar, unchanged, result) &&
+                EqualWindowsConfigurationBytes(unchanged, original, "refused_write_unchanged"),
                 "refused same-PID write leaves every original sidecar byte unchanged");
             wchar_t missing[MAX_PATH];
             const bool fits = _snwprintf_s(missing, _countof(missing), _TRUNCATE, L"%ls\\missing", directory.path) >= 0;
